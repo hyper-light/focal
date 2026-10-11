@@ -23,9 +23,11 @@
 //! how the log never runs out of room to free room.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::mpsc::SyncSender;
 use std::time::Instant;
 
 use crate::codec::Writer as Payload;
+use crate::device::Carrier;
 use crate::format::{self, Owned, Placed, Record};
 use crate::state::{
     self, DAMAGED_BYTES, Group, HARD_STATE_BYTES, PROPOSAL_EXTRA, Place, RELEASED_BYTES,
@@ -35,7 +37,7 @@ use crate::ticket::Ticket;
 use crate::{Class, Config, LogError, Marks, Params, Update};
 
 /// An update on its way to a frame.
-pub(crate) struct Submission {
+pub(crate) struct Submission<F> {
     pub(crate) group: u128,
     pub(crate) update: Update,
     pub(crate) marks: Marks,
@@ -55,9 +57,10 @@ pub(crate) struct Submission {
     /// For a handle's write laid into a frame, where its entries' terms and lengths are in the
     /// frame's list (`owner::Buffers::lens`), the entries having gone back with its answer.
     pub(crate) lens: (usize, usize),
-    /// Whether its caller waits on its ticket from the moment it sends it until its answer, so
-    /// that its frame's I/O may be given to it to do (`owner::Owner::start`).
-    pub(crate) waits: bool,
+    /// Where its caller, which waits on its ticket from the moment it sends it until its answer,
+    /// takes its frame's I/O to do, should the owner hand it over (`owner::Owner::start`): the
+    /// sending end of the caller's job slot (`device::Slot`).
+    pub(crate) doer: Option<SyncSender<Box<Carrier<F>>>>,
     /// For a handle's write, how many of the handle's writes had been refused when it was sent
     /// (`GroupLog`): a write sent before its handle heard of a refusal is refused
     /// [`LogError::Behind`], so the group's writes stay in the order submitted. Zero otherwise.
@@ -83,7 +86,7 @@ pub(crate) struct Tags {
 /// when it was passed over and its class, or its start tag, then when it was taken.
 pub(crate) type Key = (u8, u128, u64);
 
-fn key(s: &Submission) -> Key {
+fn key<F>(s: &Submission<F>) -> Key {
     let class = match s.class {
         Class::Latency => 1u8,
         Class::Normal => 2,
@@ -105,9 +108,9 @@ fn key(s: &Submission) -> Key {
 /// mantle sorts twice with a stable sort, which allocates; here each sort is unstable over keys
 /// made unique by position, which orders exactly as the stable sort does, in `keyed` and `last`,
 /// which the owner keeps between frames.
-pub(crate) fn order(
-    batch: &mut VecDeque<Submission>,
-    keyed: &mut Vec<(Key, u64, Submission)>,
+pub(crate) fn order<F>(
+    batch: &mut VecDeque<Submission<F>>,
+    keyed: &mut Vec<(Key, u64, Submission<F>)>,
     last: &mut HashMap<u128, Key>,
 ) {
     keyed.clear();
@@ -200,7 +203,7 @@ pub(crate) fn slot_start(config: &Config, slot: u32) -> Result<u64, LogError> {
 }
 
 /// What a submission's frame makes durable for its group, as its persist record says it.
-pub(crate) fn persisted(s: &Submission) -> format::Persisted {
+pub(crate) fn persisted<F>(s: &Submission<F>) -> format::Persisted {
     let u = &s.update;
     format::Persisted {
         group: s.group,
@@ -830,10 +833,10 @@ pub(crate) fn frees(update: &Update, marks: Marks) -> bool {
 }
 
 /// Whether `s` may be written as the group stands, and whether it makes a new group.
-pub(crate) fn validate(
+pub(crate) fn validate<F>(
     state: &State,
     config: &Config,
-    s: &Submission,
+    s: &Submission<F>,
     new_groups: usize,
 ) -> Result<bool, LogError> {
     let (group, update) = (s.group, &s.update);
@@ -1071,12 +1074,12 @@ impl Lay<'_> {
 /// Makes the durable frame visible: the segment it opened, where swept pieces now are,
 /// every update's pieces, and the tails that died. The updates' bytes move into the state, which
 /// keeps them while they are recent.
-pub(crate) fn publish(
+pub(crate) fn publish<F>(
     state: &mut State,
     p: &Params,
     target: &Target,
     sweep: Option<Sweep>,
-    taken: &mut [(Submission, Placement)],
+    taken: &mut [(Submission<F>, Placement)],
     tail: u64,
     lens: &[(u64, u32)],
 ) -> Result<(), LogError> {
@@ -1160,10 +1163,10 @@ fn open_segment(state: &mut State, target: &Target) -> Result<(), LogError> {
 type Places<'a> = dyn Fn(usize) -> Result<Place, LogError> + 'a;
 
 /// Applies a durable update to the group's state, taking its entries' and proposals' bytes.
-fn apply(
+fn apply<F>(
     state: &mut State,
     config: &Config,
-    s: &mut Submission,
+    s: &mut Submission<F>,
     placement: &Placement,
     place: &Places<'_>,
     handed: &[(u64, u32)],

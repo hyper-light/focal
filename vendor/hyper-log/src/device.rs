@@ -4,6 +4,14 @@
 //! it and comes back to the owner with the completion (hyper-raft CLAUDE.md §1, the sans-io rule's
 //! exception).
 //!
+//! The way back is the thread's, not the job's: each thread that does jobs holds its own [`Lines`]
+//! to the owner, the I/O thread's and each handle's a caller does its frame's I/O through (`Log`,
+//! `GroupLog`, `LogOpener`), and lends them to each job it does. The carrier and the device hold
+//! no channel, so nothing that goes back to the owner holds a way back to itself, and no drop runs
+//! itself (mantle CLAUDE.md §10). A caller is handed its frame's I/O through a job slot of its own
+//! ([`Slot`]), never its reply port: the I/O holds the tickets of the frame's callers, which hold
+//! reply ports.
+//!
 //! The completion comes back through the owner's returns, which wake no one: the owner reads them
 //! before every message it takes, so anything a caller sends after hearing an answer the device
 //! gave is heard after the completion that freed its room, as when the writer answered under its
@@ -26,8 +34,9 @@
 //! caller that submits again on hearing it finds the room given back, as it did when the writer
 //! answered under its lock.
 
+use std::any::Any;
 use std::cell::RefCell;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 
 use hyper_block::block::BlockFile;
 use hyper_block::buf::{AlignedBuf, Alignment, Pool};
@@ -36,7 +45,7 @@ use crate::format::{self, FRAME_HEADER_BYTES, FRAME_HEADER_LEN, Owned};
 use crate::owner::Message;
 use crate::recover::{Found, Reader, Segment};
 use crate::stats::{self, Timing};
-use crate::ticket::{Answer, Ticket};
+use crate::ticket::{Answer, Ticket, Waiting};
 use crate::{Entry, LogError};
 
 /// Jobs the owner holds for the device at most: one write-path job (a sweep, a frame or a
@@ -62,20 +71,88 @@ pub(crate) const TOKENS: usize = 2;
 /// A look at the file a caller runs on the thread that holds the device.
 pub(crate) type Look<F> = Box<dyn FnOnce(&F) + Send>;
 
-/// I/O handed to a thread to do: a job and the device, which go back to the owner once done.
-pub(crate) trait Io: Send {
-    /// Does the job, gives the owner back the device and the completion, and gives the answers
-    /// the job gave.
-    fn run(self: Box<Self>);
-}
-
 /// What the I/O thread is asked to do.
-pub(crate) enum Request {
+pub(crate) enum Request<F> {
     /// A job, no caller doing it.
-    Job(Box<dyn Io>),
+    Job(Box<Carrier<F>>),
     /// Wake the owner once the job of this sequence is back, the token of each job back coming
     /// through this receiver; the receiver goes back to the owner with the word.
     Watch(u64, Receiver<u64>),
+}
+
+/// Where a thread that does the log's jobs reaches the owner: its inbox, the slot for a frame's
+/// word that it is flushed while the device confirms it (`owner::Owner::flushes`), its returns,
+/// and the token of each job back, for a watch (`serve`). Every thread that does jobs holds its own
+/// and lends it to the job (module docs).
+pub(crate) struct Lines<F> {
+    pub(crate) inbox: SyncSender<Message<F>>,
+    pub(crate) flushed: SyncSender<Completion>,
+    pub(crate) returns: SyncSender<Box<Carrier<F>>>,
+    pub(crate) tokens: SyncSender<u64>,
+}
+
+impl<F> Clone for Lines<F> {
+    fn clone(&self) -> Self {
+        Self {
+            inbox: self.inbox.clone(),
+            flushed: self.flushed.clone(),
+            returns: self.returns.clone(),
+            tokens: self.tokens.clone(),
+        }
+    }
+}
+
+/// A caller's job slot, both ends: where the owner puts the frame's I/O for a caller that waits on
+/// its answer from the moment it submits, before telling it so through its port
+/// (`ticket::Reply::Job`).
+pub(crate) type Slot<F> = (SyncSender<Box<Carrier<F>>>, Receiver<Box<Carrier<F>>>);
+
+/// Jobs a slot holds: a caller is handed at most the one frame its submission is in.
+const SLOT_JOBS: usize = 1;
+
+thread_local! {
+    /// This thread's free job slots, at most one for each type of file of a log it waited on a
+    /// write to: a thread waits on one write at a time.
+    static SLOTS: RefCell<Vec<Box<dyn Any>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A free job slot of this thread's for a log of `F`, or a new one.
+pub(crate) fn slot<F: 'static>() -> Box<Slot<F>> {
+    SLOTS
+        .try_with(|slots| {
+            let mut slots = slots.try_borrow_mut().ok()?;
+            let at = slots.iter().position(|slot| slot.is::<Slot<F>>())?;
+            slots.swap_remove(at).downcast::<Slot<F>>().ok()
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| Box::new(sync_channel(SLOT_JOBS)))
+}
+
+/// Keeps a job slot, its caller answered and the slot empty, for this thread's next write.
+pub(crate) fn keep_slot<F: 'static>(slot: Box<Slot<F>>) {
+    let _ = SLOTS.try_with(|slots| {
+        if let Ok(mut slots) = slots.try_borrow_mut() {
+            slots.push(slot);
+        }
+    });
+}
+
+/// Waits on `waiting` for the answer of a submission whose caller does its frame's I/O when told
+/// to: the owner puts it in `slot`, and it goes back to the owner through `lines`. The caller keeps
+/// the slot until its answer, which only that I/O gives, so the job is never left in a slot no one
+/// reads.
+pub(crate) fn wait_doing<F: BlockFile + Send + 'static>(
+    waiting: &Waiting,
+    slot: &Receiver<Box<Carrier<F>>>,
+    lines: &Lines<F>,
+) -> Result<Answer, LogError> {
+    waiting.wait_doing(|| {
+        // The owner puts the job in the slot before it tells the caller.
+        if let Ok(carrier) = slot.try_recv() {
+            carrier.run(lines);
+        }
+    })
 }
 
 /// A job and the device on their way to the thread that does it, and the completion and the
@@ -105,8 +182,10 @@ thread_local! {
     static ANSWERS: RefCell<Vec<Answering>> = const { RefCell::new(Vec::new()) };
 }
 
-impl<F: BlockFile + Send + 'static> Io for Carrier<F> {
-    fn run(mut self: Box<Self>) {
+impl<F: BlockFile + Send + 'static> Carrier<F> {
+    /// Does the job, gives the owner back the device and the completion through `lines`, the
+    /// doing thread's own, and gives the answers the job gave.
+    pub(crate) fn run(mut self: Box<Self>, lines: &Lines<F>) {
         let (Some(job), Some(mut device)) = (self.job.take(), self.device.take()) else {
             return;
         };
@@ -115,25 +194,20 @@ impl<F: BlockFile + Send + 'static> Io for Carrier<F> {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let completion = device.execute(job, &mut answers);
+        let completion = device.execute(job, &mut answers, lines);
         // A confirmation that held answered every caller it confirms: the owner has only room to
         // give back and the frame to settle, which it does before the next message it takes.
         let tell = !matches!(completion, Completion::Confirm { result: Ok(()), .. });
-        let (returns, tokens, inbox) = (
-            device.returns.clone(),
-            device.tokens.clone(),
-            device.inbox.clone(),
-        );
         let sequence = self.sequence;
         self.completion = Some(completion);
         self.device = Some(device);
         // The owner holds the completion before anyone hears an answer the job gave; should the
         // owner have gone, the answers are dropped and each caller hears the log closed.
-        if returns.send(self).is_ok() {
+        if lines.returns.send(self).is_ok() {
             // Every token is sent, so a watch for this job ends (`TOKENS`).
-            let _ = tokens.send(sequence);
+            let _ = lines.tokens.send(sequence);
             if tell {
-                let _ = inbox.send(Message::Returned);
+                let _ = lines.inbox.send(Message::Returned);
             }
             for answering in answers.drain(..) {
                 answering.durable();
@@ -150,10 +224,13 @@ impl<F: BlockFile + Send + 'static> Io for Carrier<F> {
 
 /// The log's I/O thread: it does the jobs no caller does, and wakes the owner when it asks to be
 /// woken for a job back. It ends once the owner has.
-pub(crate) fn serve<F>(requests: &Receiver<Request>, inbox: &SyncSender<Message<F>>) {
+pub(crate) fn serve<F: BlockFile + Send + 'static>(
+    requests: &Receiver<Request<F>>,
+    lines: &Lines<F>,
+) {
     while let Ok(request) = requests.recv() {
         match request {
-            Request::Job(io) => io.run(),
+            Request::Job(carrier) => carrier.run(lines),
             Request::Watch(sequence, tokens) => {
                 loop {
                     match tokens.recv() {
@@ -162,7 +239,7 @@ pub(crate) fn serve<F>(requests: &Receiver<Request>, inbox: &SyncSender<Message<
                         Err(_) => return,
                     }
                 }
-                if inbox.send(Message::Watched(tokens)).is_err() {
+                if lines.inbox.send(Message::Watched(tokens)).is_err() {
                     return;
                 }
             }
@@ -368,47 +445,19 @@ pub(crate) struct Device<F> {
     segment_bytes: u64,
     /// The owner's word that another frame follows the one with this sequence.
     more: Receiver<u64>,
-    /// Where the owner hears of a frame's flush while the device confirms it, before the frame
-    /// before's callers do (`owner::Owner::flushes`).
-    flushed: SyncSender<Completion>,
-    /// The owner's inbox, for a word that cannot wait in `flushed`, and to wake the owner for a
-    /// completion it must answer.
-    inbox: SyncSender<Message<F>>,
     /// A sealed log's framing MAC, which every frame a sweep reads is checked against.
     mac: Option<hyper_seal::log::FrameMac>,
-    /// Where the carrier goes back to the owner, and where each job back is told by its
-    /// sequence, for a watch (`serve`).
-    returns: SyncSender<Box<Carrier<F>>>,
-    tokens: SyncSender<u64>,
-}
-
-/// Where a device's jobs go back to the owner (`Device::returns`, `Device::tokens`).
-pub(crate) struct Returns<F> {
-    pub(crate) returns: SyncSender<Box<Carrier<F>>>,
-    pub(crate) tokens: SyncSender<u64>,
 }
 
 impl<F: BlockFile> Device<F> {
-    pub(crate) fn new(
-        file: F,
-        pool: Pool,
-        segment_bytes: u64,
-        more: Receiver<u64>,
-        flushed: SyncSender<Completion>,
-        inbox: SyncSender<Message<F>>,
-        back: Returns<F>,
-    ) -> Self {
+    pub(crate) fn new(file: F, pool: Pool, segment_bytes: u64, more: Receiver<u64>) -> Self {
         Self {
             file,
             pool,
             zeros: None,
             segment_bytes,
             more,
-            flushed,
-            inbox,
             mac: None,
-            returns: back.returns,
-            tokens: back.tokens,
         }
     }
 
@@ -424,10 +473,15 @@ impl<F: BlockFile> Device<F> {
     }
 
     /// Does `job`: the completion for the owner, with `answers` holding the answers to give once
-    /// the owner's inbox holds it.
-    pub(crate) fn execute(&mut self, job: Job<F>, answers: &mut Vec<Answering>) -> Completion {
+    /// the owner's inbox holds it; `lines` are the doing thread's.
+    pub(crate) fn execute(
+        &mut self,
+        job: Job<F>,
+        answers: &mut Vec<Answering>,
+        lines: &Lines<F>,
+    ) -> Completion {
         match job {
-            Job::Frame(frame) => self.frame(frame, answers),
+            Job::Frame(frame) => self.frame(frame, answers, lines),
             Job::Confirm {
                 mut record,
                 record_at,
@@ -471,7 +525,12 @@ impl<F: BlockFile> Device<F> {
 
     /// A frame, its record and one flush; the frame before answered; this one confirmed and
     /// answered unless another frame follows.
-    fn frame(&mut self, mut f: Frame, answers: &mut Vec<Answering>) -> Completion {
+    fn frame(
+        &mut self,
+        mut f: Frame,
+        answers: &mut Vec<Answering>,
+        lines: &Lines<F>,
+    ) -> Completion {
         let (result, timing) = self.write_then_flush(
             f.zero,
             (&mut f.frame, f.at),
@@ -509,10 +568,10 @@ impl<F: BlockFile> Device<F> {
         // The owner reads the word before any message a caller sends on hearing its answer. It
         // has read the last frame's word before it hands over the next frame, so the slot is free;
         // should it not be, the word goes through the inbox.
-        let heard = match self.flushed.try_send(flushed) {
+        let heard = match lines.flushed.try_send(flushed) {
             Ok(()) => true,
             Err(TrySendError::Full(word) | TrySendError::Disconnected(word)) => {
-                self.inbox.send(Message::Done(word)).is_ok()
+                lines.inbox.send(Message::Done(word)).is_ok()
             }
         };
         if heard {

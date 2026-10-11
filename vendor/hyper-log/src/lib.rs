@@ -60,8 +60,9 @@ pub use seal::Sealing;
 pub use stats::LogStats;
 pub use ticket::{Fetching, Pending};
 
+use device::{Carrier, Lines};
 use owner::{Message, Owner, Query};
-use ticket::{Answer, Ticket, Waiting};
+use ticket::Answer;
 use writer::Submission;
 
 /// The log's parameters. Each comes from the node: the segment size from the device's
@@ -484,11 +485,11 @@ pub struct With {
 }
 
 /// What starting a log needs besides its file and its state.
-struct Prepared {
+struct Prepared<F> {
     p: Params,
     room: room::Room,
     /// The owner's first batch: the restore of a lost frame, if any.
-    first: Vec<Submission>,
+    first: Vec<Submission<F>>,
     /// The handles that answer the first batch.
     pending: Vec<Pending>,
 }
@@ -512,20 +513,21 @@ impl<F> Refused<F> {
 }
 
 /// What a submitter hears, and how it waits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Hears {
+enum Hears<F> {
     /// Its admission, waited for as it submits, then its answer.
     Admission,
     /// Only its answer, which it waits for from the moment it submits: its frame's I/O may be
-    /// given to it to do (`owner::Owner::start`).
-    Waits,
+    /// given to it to do (`owner::Owner::start`), through its job slot, whose sending end this is.
+    Waits(SyncSender<Box<Carrier<F>>>),
     /// Only its answer, through its waker, the caller going on meanwhile.
     Answer,
 }
 
 /// The log: a handle to its owner, which any number of threads may share by reference.
 pub struct Log<F: BlockFile + 'static> {
-    inbox: SyncSender<Message<F>>,
+    /// Where the log's handles reach its owner, and where a caller that does its frame's I/O sends
+    /// it back (`device::Lines`).
+    lines: Lines<F>,
     /// The log's two threads: the owner's, which gives back the file when the log closes, and
     /// the I/O thread.
     threads: [Option<JoinHandle<Option<F>>>; 2],
@@ -753,7 +755,7 @@ impl<F: BlockFile + 'static> Log<F> {
         id: u128,
         restores: Vec<recover::Restore>,
         sealed: bool,
-    ) -> Result<Prepared, LogError> {
+    ) -> Result<Prepared<F>, LogError> {
         let room_bytes = frame_room(&config, align, sealed)?;
         let queue_bytes = writer::charge(room_bytes)
             .and_then(|largest| largest.checked_mul(u64::try_from(PIPELINE_FRAMES).ok()?))
@@ -790,8 +792,8 @@ impl<F: BlockFile + 'static> Log<F> {
                 .and_then(writer::charge)
                 .ok_or(LogError::TooLarge(usize::MAX))?;
             room.hold(r.group, bytes)?;
-            let (reply, answer) = ticket::port();
-            pending.push(Pending(Waiting::new(answer)));
+            let (ticket, waiting) = ticket::call(None);
+            pending.push(Pending(waiting));
             first.push(Submission {
                 group: r.group,
                 update: r.update,
@@ -799,11 +801,11 @@ impl<F: BlockFile + 'static> Log<F> {
                 bytes,
                 class: Class::Normal,
                 tags: writer::Tags::default(),
-                ticket: Ticket::new(reply, None),
+                ticket,
                 admit: false,
                 handle: false,
                 lens: (0, 0),
-                waits: false,
+                doer: None,
                 epoch: 0,
                 submitted: stats::now(),
             });
@@ -827,7 +829,7 @@ impl<F: BlockFile + 'static> Log<F> {
         p: Params,
         state: state::State,
         room: room::Room,
-        first: Vec<Submission>,
+        first: Vec<Submission<F>>,
         sealer: Option<seal::Sealer>,
         gate: Option<growth::Gate>,
     ) -> Result<Self, Refused<F>> {
@@ -844,6 +846,17 @@ impl<F: BlockFile + 'static> Log<F> {
             .saturating_add(1)
             .saturating_add(config.max_groups);
         let (inbox, messages) = sync_channel(capacity);
+        // One frame's flush is told at a time: the owner reads it before the next frame goes out.
+        let (flushed, flushes) = sync_channel(1);
+        // One job is out at a time, and comes back before the next goes out.
+        let (back, returns) = sync_channel(1);
+        let (token, tokens) = sync_channel(device::TOKENS);
+        let lines = Lines {
+            inbox,
+            flushed,
+            returns: back,
+            tokens: token,
+        };
         // The owner's thread waits for the owner, which holds the file, until both threads run.
         let (to_owner, owned) = sync_channel::<Box<Owner<F>>>(1);
         let (requests, asked) = sync_channel(device::REQUESTS);
@@ -853,11 +866,11 @@ impl<F: BlockFile + 'static> Log<F> {
         else {
             return Err(Refused::with(LogError::Closed, file));
         };
-        let done = inbox.clone();
+        let io_lines = lines.clone();
         let Ok(io) = std::thread::Builder::new()
             .name("hyper-log-io".into())
             .spawn(move || {
-                device::serve(&asked, &done);
+                device::serve(&asked, &io_lines);
                 None
             })
         else {
@@ -869,24 +882,8 @@ impl<F: BlockFile + 'static> Log<F> {
         let largest = usize::try_from(config.segment_bytes).unwrap_or(usize::MAX);
         let pool = Pool::new(p.align, largest.saturating_mul(2), largest);
         let (more, told) = sync_channel(device::MORE);
-        // One frame's flush is told at a time: the owner reads it before the next frame goes out.
-        let (flushed, flushes) = sync_channel(1);
-        // One job is out at a time, and comes back before the next goes out.
-        let (back, returns) = sync_channel(1);
-        let (token, tokens) = sync_channel(device::TOKENS);
-        let device = device::Device::new(
-            file,
-            pool,
-            config.segment_bytes,
-            told,
-            flushed,
-            inbox.clone(),
-            device::Returns {
-                returns: back,
-                tokens: token,
-            },
-        )
-        .sealed(sealer.as_ref().map(seal::Sealer::frame_mac));
+        let device = device::Device::new(file, pool, config.segment_bytes, told)
+            .sealed(sealer.as_ref().map(seal::Sealer::frame_mac));
         let wiring = owner::Wiring {
             device,
             more,
@@ -907,7 +904,7 @@ impl<F: BlockFile + 'static> Log<F> {
             });
         }
         Ok(Self {
-            inbox,
+            lines,
             threads: [Some(owner_thread), Some(io)],
             p,
         })
@@ -983,10 +980,10 @@ impl<F: BlockFile + 'static> Log<F> {
         update: Update,
         wait: bool,
         waker: Option<Waker>,
-        hears: Hears,
+        hears: Hears<F>,
     ) -> Result<Pending, LogError> {
         send(
-            &self.inbox,
+            &self.lines.inbox,
             &self.p,
             group,
             update,
@@ -1001,7 +998,7 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// Asks the owner and waits for its answer.
     fn ask(&self, query: Query) -> Result<Answer, LogError> {
-        ask(&self.inbox, query)
+        ask(&self.lines.inbox, query)
     }
 
     /// The log's id: what it was created with, and what its file must name to open.
@@ -1035,7 +1032,7 @@ impl<F: BlockFile + 'static> Log<F> {
     /// A handle that claims this log's groups from any thread ([`LogOpener`]).
     pub fn opener(&self) -> LogOpener<F> {
         LogOpener {
-            inbox: self.inbox.clone(),
+            lines: self.lines.clone(),
             p: self.p,
         }
     }
@@ -1055,15 +1052,13 @@ impl<F: BlockFile + 'static> Log<F> {
     /// full. The caller hears only the answer, a refusal included, and is not woken for the
     /// admission between.
     pub fn write(&self, group: u128, update: Update) -> Result<(), LogError> {
-        self.send(group, Class::Normal, update, false, None, Hears::Waits)?
-            .wait()
+        write_doing(&self.lines, &self.p, group, update, false)
     }
 
     /// Submits `update`, waiting for room, and waits until it is durable, hearing only the
     /// answer.
     pub fn write_waiting(&self, group: u128, update: Update) -> Result<(), LogError> {
-        self.send(group, Class::Normal, update, true, None, Hears::Waits)?
-            .wait()
+        write_doing(&self.lines, &self.p, group, update, true)
     }
 
     /// The handle through which `group` is written and read from here on (`group.rs`): the log
@@ -1071,12 +1066,12 @@ impl<F: BlockFile + 'static> Log<F> {
     /// is dropped. Refused `Claimed` while another handle holds it, `Damaged` for a group whose
     /// records are damaged, and `TooManyGroups` past the log's bound on groups.
     pub fn group(&self, group: u128) -> Result<GroupLog<F>, LogError> {
-        claim(&self.inbox, self.p, group)
+        claim(&self.lines, self.p, group)
     }
 
     /// The groups the log holds.
     pub fn groups(&self) -> Result<Vec<u128>, LogError> {
-        groups(&self.inbox)
+        groups(&self.lines.inbox)
     }
 
     /// A group's durable state; `None` for a group the log holds nothing of.
@@ -1152,8 +1147,7 @@ impl<F: BlockFile + 'static> Log<F> {
         into: Fetched,
         waker: Option<Waker>,
     ) -> Result<Fetching, LogError> {
-        let (reply, answer) = ticket::port();
-        let waiting = Waiting::new(answer);
+        let (ticket, waiting) = ticket::call(waker);
         let query = Query::Entries {
             group,
             low,
@@ -1161,8 +1155,9 @@ impl<F: BlockFile + 'static> Log<F> {
             max_bytes,
             into,
         };
-        self.inbox
-            .send(Message::Query(query, Ticket::new(reply, waker)))
+        self.lines
+            .inbox
+            .send(Message::Query(query, ticket))
             .map_err(|_| LogError::Closed)?;
         Ok(Fetching(waiting))
     }
@@ -1203,7 +1198,8 @@ impl<F: BlockFile + 'static> Log<F> {
         let boxed: device::Look<F> = Box::new(move |file: &F| {
             let _ = result.try_send(look(file));
         });
-        self.inbox
+        self.lines
+            .inbox
             .send(Message::Look(boxed))
             .map_err(|_| LogError::Closed)?;
         back.recv().map_err(|_| LogError::Closed)
@@ -1218,7 +1214,7 @@ impl<F: BlockFile + 'static> Log<F> {
         if self.threads.iter().all(Option::is_none) {
             return None;
         }
-        let _ = self.inbox.send(Message::Close);
+        let _ = self.lines.inbox.send(Message::Close);
         let mut file = None;
         for thread in &mut self.threads {
             if let Some(Ok(Some(f))) = thread.take().map(JoinHandle::join) {
@@ -1236,22 +1232,22 @@ impl<F: BlockFile + 'static> Drop for Log<F> {
     }
 }
 
-/// Submits `update` for `group` to the log's owner (`Log::send`).
 /// How a submission is sent: its class, whether the sender waits for room in the queue, the waker
 /// its answer wakes, and what the sender hears.
-struct Sending {
+struct Sending<F> {
     class: Class,
     wait: bool,
     waker: Option<Waker>,
-    hears: Hears,
+    hears: Hears<F>,
 }
 
+/// Submits `update` for `group` to the log's owner (`Log::send`).
 fn send<F: BlockFile + 'static>(
     inbox: &SyncSender<Message<F>>,
     p: &Params,
     group: u128,
     update: Update,
-    how: Sending,
+    how: Sending<F>,
 ) -> Result<Pending, LogError> {
     let Sending {
         class,
@@ -1267,8 +1263,12 @@ fn send<F: BlockFile + 'static>(
         return Err(LogError::TooLarge(len));
     }
     let bytes = writer::charge(len).ok_or(LogError::TooLarge(len))?;
-    let (reply, answer) = ticket::port();
-    let waiting = Waiting::new(answer);
+    let (ticket, waiting) = ticket::call(waker);
+    let admit = matches!(hears, Hears::Admission);
+    let doer = match hears {
+        Hears::Waits(slot) => Some(slot),
+        Hears::Admission | Hears::Answer => None,
+    };
     let submission = Submission {
         group,
         update,
@@ -1276,11 +1276,11 @@ fn send<F: BlockFile + 'static>(
         bytes,
         class,
         tags: writer::Tags::default(),
-        ticket: Ticket::new(reply, waker),
-        admit: hears == Hears::Admission,
+        ticket,
+        admit,
         handle: false,
         lens: (0, 0),
-        waits: hears == Hears::Waits,
+        doer,
         epoch: 0,
         submitted: stats::now(),
     };
@@ -1294,10 +1294,38 @@ fn send<F: BlockFile + 'static>(
         })
     };
     sent?;
-    if hears == Hears::Admission {
+    if admit {
         waiting.admitted()?;
     }
     Ok(Pending(waiting))
+}
+
+/// Submits `update` for `group` and waits until it is durable, waiting for room in the queue when
+/// `wait`: the caller hears only the answer, a refusal included, and does its frame's I/O should
+/// the owner hand it over, through a job slot of its thread's (`device::slot`).
+fn write_doing<F: BlockFile + 'static>(
+    lines: &Lines<F>,
+    p: &Params,
+    group: u128,
+    update: Update,
+    wait: bool,
+) -> Result<(), LogError> {
+    let slot = device::slot::<F>();
+    let how = Sending {
+        class: Class::Normal,
+        wait,
+        waker: None,
+        hears: Hears::Waits(slot.0.clone()),
+    };
+    let answer = send(&lines.inbox, p, group, update, how)
+        .and_then(|pending| device::wait_doing(&pending.0, &slot.1, lines));
+    // Answered or refused, its caller holds no job: its frame's I/O, if handed over, was done
+    // before the answer it gives.
+    device::keep_slot(slot);
+    match answer? {
+        Answer::Durable(_) => Ok(()),
+        _ => Err(LogError::Closed),
+    }
 }
 
 /// Asks the log's owner `query` and waits for its answer.
@@ -1305,27 +1333,26 @@ fn ask<F: BlockFile + 'static>(
     inbox: &SyncSender<Message<F>>,
     query: Query,
 ) -> Result<Answer, LogError> {
-    let (reply, answer) = ticket::port();
-    let waiting = Waiting::new(answer);
+    let (ticket, waiting) = ticket::call(None);
     inbox
-        .send(Message::Query(query, Ticket::new(reply, None)))
+        .send(Message::Query(query, ticket))
         .map_err(|_| LogError::Closed)?;
     waiting.wait()
 }
 
 /// Claims `group` from the log's owner: the handle its writes and reads go through.
 fn claim<F: BlockFile + 'static>(
-    inbox: &SyncSender<Message<F>>,
+    lines: &Lines<F>,
     p: Params,
     group: u128,
 ) -> Result<GroupLog<F>, LogError> {
-    let (reply, answer) = ticket::port();
-    let waiting = Waiting::new(answer);
-    inbox
-        .send(Message::Claim(group, Ticket::new(reply, None)))
+    let (ticket, waiting) = ticket::call(None);
+    lines
+        .inbox
+        .send(Message::Claim(group, ticket))
         .map_err(|_| LogError::Closed)?;
     match waiting.wait()? {
-        Answer::Claimed(mirror) => Ok(GroupLog::new(inbox.clone(), p, group, *mirror)),
+        Answer::Claimed(mirror) => Ok(GroupLog::new(lines.clone(), p, group, *mirror)),
         _ => Err(LogError::Closed),
     }
 }
@@ -1360,14 +1387,14 @@ fn entry_room(p: &Params) -> Result<usize, LogError> {
 /// Once the log has closed, every call answers [`LogError::Closed`]; a claim through an opener is
 /// the log's claim, refused [`LogError::Claimed`] while another handle holds the group.
 pub struct LogOpener<F: BlockFile + 'static> {
-    inbox: SyncSender<Message<F>>,
+    lines: Lines<F>,
     p: Params,
 }
 
 impl<F: BlockFile + 'static> Clone for LogOpener<F> {
     fn clone(&self) -> Self {
         Self {
-            inbox: self.inbox.clone(),
+            lines: self.lines.clone(),
             p: self.p,
         }
     }
@@ -1384,18 +1411,18 @@ impl<F: BlockFile + 'static> std::fmt::Debug for LogOpener<F> {
 impl<F: BlockFile + 'static> LogOpener<F> {
     /// The handle through which `group` is written and read from here on: as [`Log::group`].
     pub fn group(&self, group: u128) -> Result<GroupLog<F>, LogError> {
-        claim(&self.inbox, self.p, group)
+        claim(&self.lines, self.p, group)
     }
 
     /// The groups the log holds.
     pub fn groups(&self) -> Result<Vec<u128>, LogError> {
-        groups(&self.inbox)
+        groups(&self.lines.inbox)
     }
 
     /// What the log has measured: as [`Log::stats`], for an owner that holds only an opener and
     /// exports the log's counts.
     pub fn stats(&self, into: Option<Box<LogStats>>) -> Result<Box<LogStats>, LogError> {
-        match ask(&self.inbox, Query::Stats(into))? {
+        match ask(&self.lines.inbox, Query::Stats(into))? {
             Answer::Stats(stats) => Ok(stats),
             _ => Err(LogError::Closed),
         }
@@ -1414,19 +1441,7 @@ impl<F: BlockFile + 'static> LogOpener<F> {
     /// Submits `update` for `group` and waits until it is durable, waiting for room in the queue:
     /// as [`Log::write_waiting`].
     pub fn write_waiting(&self, group: u128, update: Update) -> Result<(), LogError> {
-        send(
-            &self.inbox,
-            &self.p,
-            group,
-            update,
-            Sending {
-                class: Class::Normal,
-                wait: true,
-                waker: None,
-                hears: Hears::Waits,
-            },
-        )?
-        .wait()
+        write_doing(&self.lines, &self.p, group, update, true)
     }
 
     /// Payload bytes one frame holds: as [`Log::frame_room`].

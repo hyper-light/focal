@@ -92,6 +92,11 @@ caller hands in the alignment, queue and measured depth it found.
    pass of five batches, 15 before. Mantle measured this round trip as about 88 % of its engine's
    steady-state allocations over a 3 M-put fill and drain. A failed batch still drops its vector
    and buffers, as before.
+10. **The shared simulated device opens a handle on a queue the handle brings** (`sim::shared`):
+   the link opening a handle makes its answer queue and sends the queue's sending end with the
+   request, where the device made it and sent the receiving end back in its answer, so an answer
+   held a queue of answers and its drop ran its own (mantle `CLAUDE.md` §10, no runtime
+   recursion). The handles and the device's answers are as before.
 
 ## Planned
 

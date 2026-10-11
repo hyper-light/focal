@@ -28,11 +28,12 @@ use std::task::Waker;
 
 use hyper_block::block::BlockFile;
 
+use crate::device::{self, Carrier, Lines};
 use crate::format::{HardState, Start};
 use crate::owner::{Message, Query};
 use crate::room::GROUP_SUBMISSIONS;
 use crate::state::resolves;
-use crate::ticket::{self, Answer, Ticket, Waiting};
+use crate::ticket::{self, Answer, Waiting};
 use crate::writer::{self, Submission};
 use crate::{Class, Entries, Entry, Fetched, LogError, Marks, Params, Proposal, Update, View};
 
@@ -267,7 +268,9 @@ struct Out {
 /// its answered writes left it: a read while a write is out answers as of the writes answered
 /// before it.
 pub struct GroupLog<F: BlockFile + 'static> {
-    inbox: SyncSender<Message<F>>,
+    /// Where the handle reaches the log's owner, and where a write whose frame's I/O it does sends
+    /// it back (`device::Lines`).
+    lines: Lines<F>,
     p: Params,
     group: u128,
     mirror: Mirror,
@@ -293,14 +296,9 @@ impl<F: BlockFile + 'static> std::fmt::Debug for GroupLog<F> {
 }
 
 impl<F: BlockFile + 'static> GroupLog<F> {
-    pub(crate) fn new(
-        inbox: SyncSender<Message<F>>,
-        p: Params,
-        group: u128,
-        mirror: Mirror,
-    ) -> Self {
+    pub(crate) fn new(lines: Lines<F>, p: Params, group: u128, mirror: Mirror) -> Self {
         Self {
-            inbox,
+            lines,
             p,
             group,
             mirror,
@@ -355,22 +353,36 @@ impl<F: BlockFile + 'static> GroupLog<F> {
     /// taken with [`GroupLog::wait`] or [`GroupLog::poll`], in the order submitted. `Busy` when
     /// the handle already has as many writes out as the log would take for one group.
     pub fn submit(&mut self, update: Update) -> Result<(), LogError> {
-        self.send(update, None, false)
+        self.send(update, None, None)
     }
 
     /// Submits `update` as [`GroupLog::submit`] does, and wakes `waker` once its answer has
     /// come.
     pub fn submit_waking(&mut self, update: Update, waker: Waker) -> Result<(), LogError> {
-        self.send(update, Some(waker), false)
+        self.send(update, Some(waker), None)
     }
 
     /// Submits `update` and waits until it is durable, or refused.
     pub fn write(&mut self, update: Update) -> Result<(), LogError> {
+        if !self.out.is_empty() {
+            self.send(update, None, None)?;
+            return self.wait().unwrap_or(Err(LogError::Closed));
+        }
         // With nothing else out, the wait below is on this write's own ticket from the moment
-        // it is sent, so its frame's I/O may be given to this thread to do.
-        let waits = self.out.is_empty();
-        self.send(update, None, waits)?;
-        self.wait().unwrap_or(Err(LogError::Closed))
+        // it is sent, so its frame's I/O may be given to this thread to do, through a job slot
+        // of the thread's (`device::slot`).
+        let slot = device::slot::<F>();
+        let answer = self
+            .send(update, None, Some(slot.0.clone()))
+            .and_then(|()| {
+                let out = self.out.pop_front().ok_or(LogError::Closed)?;
+                let answer = device::wait_doing(&out.waiting, &slot.1, &self.lines);
+                self.took(out.write, answer)
+            });
+        // Answered or refused, its caller holds no job: its frame's I/O, if handed over, was done
+        // before the answer it gives.
+        device::keep_slot(slot);
+        answer
     }
 
     /// Waits for the oldest write out to be answered and takes its answer: `None` with none out.
@@ -387,7 +399,15 @@ impl<F: BlockFile + 'static> GroupLog<F> {
         Some(self.took(out.write, answer))
     }
 
-    fn send(&mut self, update: Update, waker: Option<Waker>, waits: bool) -> Result<(), LogError> {
+    /// Sends `update` to the owner, its answer to come in `out`; `doer` is the sending end of the
+    /// caller's job slot, for a caller that waits on the answer from now on and may do its
+    /// frame's I/O.
+    fn send(
+        &mut self,
+        update: Update,
+        waker: Option<Waker>,
+        doer: Option<SyncSender<Box<Carrier<F>>>>,
+    ) -> Result<(), LogError> {
         if self.out.len() >= OUT {
             return Err(LogError::Busy);
         }
@@ -405,7 +425,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
             released: update.released,
             remove: update.remove,
         };
-        let (reply, answer) = ticket::port();
+        let (ticket, waiting) = ticket::call(waker);
         let submission = Submission {
             group: self.group,
             update,
@@ -413,24 +433,22 @@ impl<F: BlockFile + 'static> GroupLog<F> {
             bytes,
             class: Class::Normal,
             tags: writer::Tags::default(),
-            ticket: Ticket::new(reply, waker),
+            ticket,
             admit: false,
             handle: true,
             lens: (0, 0),
-            waits,
+            doer,
             epoch: self.epoch,
             submitted: crate::stats::now(),
         };
-        self.inbox
+        self.lines
+            .inbox
             .send(Message::Submit {
                 submission,
                 wait: true,
             })
             .map_err(|_| LogError::Closed)?;
-        self.out.push_back(Out {
-            waiting: Waiting::new(answer),
-            write,
-        });
+        self.out.push_back(Out { waiting, write });
         Ok(())
     }
 
@@ -463,10 +481,10 @@ impl<F: BlockFile + 'static> GroupLog<F> {
     /// Asks the log's owner, for what the handle does not hold.
     fn ask(&self, query: Query) -> Result<Answer, LogError> {
         self.asked.set(self.asked.get().saturating_add(1));
-        let (reply, answer) = ticket::port();
-        let waiting = Waiting::new(answer);
-        self.inbox
-            .send(Message::Query(query, Ticket::new(reply, None)))
+        let (ticket, waiting) = ticket::call(None);
+        self.lines
+            .inbox
+            .send(Message::Query(query, ticket))
             .map_err(|_| LogError::Closed)?;
         waiting.wait()
     }
@@ -607,7 +625,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
 impl<F: BlockFile + 'static> Drop for GroupLog<F> {
     fn drop(&mut self) {
         // The log keeps room in its inbox for each group's release.
-        let _ = self.inbox.try_send(Message::Release(self.group));
+        let _ = self.lines.inbox.try_send(Message::Release(self.group));
     }
 }
 

@@ -24,6 +24,13 @@
 //!
 //! The owner keeps the buffers and collections a frame needs from one frame to the next, so the
 //! write path allocates nothing a frame once they have grown to the largest frame's needs.
+//!
+//! The owner's loop is flat (mantle CLAUDE.md §10): it hears one thing at a time, a message, a
+//! frame's word that it is flushed or a job back, and whatever that leads to next, the writer's
+//! loop going round or a message's submissions starting a batch, is asked for on the owner's
+//! agenda and done by the loop at its next turn, before anything else ([`Agenda`]). No handler
+//! calls the loop's steps, and a step that takes what waits in the inbox leaves a flush's word for
+//! the loop to hear, so nothing the owner does calls itself.
 
 mod read;
 mod write;
@@ -37,7 +44,7 @@ use hyper_block::buf::AlignedBuf;
 use hyper_block::commit::Anticipation;
 
 use crate::codec::Writer as Payload;
-use crate::device::{Answering, Carrier, Completion, Device, Io, Job, Look, Request};
+use crate::device::{Answering, Carrier, Completion, Device, Job, Look, Request};
 use crate::format;
 use crate::room::{Room, Take};
 use crate::state::State;
@@ -53,16 +60,16 @@ use write::{Gather, Phase, Unconfirmed};
 /// What reaches the owner.
 pub(crate) enum Message<F> {
     /// A submission, admitted at once, held to wait for room when `wait`, or refused.
-    Submit { submission: Submission, wait: bool },
+    Submit {
+        submission: Submission<F>,
+        wait: bool,
+    },
     /// A question about the log's state, answered through its ticket.
     Query(Query, Ticket),
     /// A frame's word that it is flushed, when the device's slot for it was taken.
     Done(Completion),
     /// A job is back in the owner's returns with a completion the owner must answer.
     Returned,
-    /// A job and the device back from the thread that did it, as the owner read them from its
-    /// returns.
-    Back(Box<Carrier<F>>),
     /// The I/O thread saw the job the owner waits for come back; the receiver of the returns'
     /// tokens comes back with the word.
     Watched(Receiver<u64>),
@@ -76,12 +83,32 @@ pub(crate) enum Message<F> {
     Close,
 }
 
+/// What the owner hears, in the order it hears it: a message from its inbox, or what came back
+/// from the device before it (`Owner::arrived`).
+enum Heard<F> {
+    Message(Message<F>),
+    /// A frame's word that it is flushed.
+    Done(Completion),
+    /// A job and the device back from the thread that did it.
+    Back(Box<Carrier<F>>),
+}
+
+/// What the owner does next, before anything else, in this order: the writer's loop goes round
+/// (`Owner::step`), then the submissions a message brought start a batch or join the one gathered
+/// (`Owner::went_on`). A handler that leads to one asks for it here as it returns, and the owner's
+/// loop does it at its next turn (`Owner::lead`), as the handler would have on its way out. Each
+/// ask is the last thing its handler does, so neither is asked again before the loop does it.
+struct Agenda {
+    step: bool,
+    went_on: bool,
+}
+
 /// The writer's schedule: what it holds back, its fair queue, its wait for returning
 /// submitters, and what it has written.
-struct Schedule {
+struct Schedule<F> {
     /// Updates held for the next batch: those a frame passed over for room, and those whose
     /// group had an update in it.
-    held: VecDeque<Submission>,
+    held: VecDeque<Submission<F>>,
     /// Start-time fair queueing's virtual time, in charged bytes: the largest start tag laid
     /// into a frame, and the largest finish tag once the backlog empties [SFQ96 §2].
     virtual_time: u128,
@@ -111,7 +138,7 @@ struct Schedule {
 /// What the write path keeps from one frame to the next so that it allocates nothing once
 /// each has grown to the largest frame's needs: a frame's payload, its persist record, the
 /// aligned buffers the device writes, and the batch's ordering scratch.
-struct Buffers {
+struct Buffers<F> {
     payload: Payload,
     /// A persist record's groups and its encoding.
     persist: format::Persist,
@@ -121,16 +148,16 @@ struct Buffers {
     frame: Option<AlignedBuf>,
     record: Option<AlignedBuf>,
     /// The ordering's keys and each group's last key (`writer::order`).
-    keyed: Vec<(Key, u64, Submission)>,
+    keyed: Vec<(Key, u64, Submission<F>)>,
     last: HashMap<u128, Key>,
     /// Groups a frame has taken an update of.
     seen: HashSet<u128>,
     /// A batch's collection, kept between batches.
-    batch: VecDeque<Submission>,
+    batch: VecDeque<Submission<F>>,
     /// Lists of a frame's updates and where they went, kept between frames: one for each frame
     /// the writer holds at once, the frame on the device and the frame awaiting its confirmation
     /// ([`SPARE_FRAMES`]).
-    taken: Vec<Vec<(Submission, Placement)>>,
+    taken: Vec<Vec<(Submission<F>, Placement)>>,
     /// Waiters room was just handed to.
     admitted: Vec<u64>,
     /// The aligned buffers frames' own confirmations were laid out in, kept for later frames':
@@ -163,30 +190,37 @@ pub(crate) struct Wiring<F> {
     pub(crate) flushes: Receiver<Completion>,
     pub(crate) returns: Receiver<Box<Carrier<F>>>,
     pub(crate) tokens: Receiver<u64>,
-    pub(crate) requests: SyncSender<Request>,
+    pub(crate) requests: SyncSender<Request<F>>,
 }
 
-/// A job waiting for the device, and the port of the caller who waits on it and may do it.
-type Waiting<F> = (Job<F>, Option<SyncSender<Reply>>);
+/// A job waiting for the device, and the caller who waits on it and may do it.
+type Waiting<F> = (Job<F>, Option<Doer<F>>);
+
+/// A caller that may do its frame's I/O: its job slot, where the job goes, and its port, where it
+/// hears the job is there.
+struct Doer<F> {
+    slot: SyncSender<Box<Carrier<F>>>,
+    tell: SyncSender<Reply>,
+}
 
 pub(crate) struct Owner<F> {
     p: Params,
     state: State,
     room: Room,
     /// Admitted submissions not yet taken into a batch, in the order admitted.
-    intake: VecDeque<Submission>,
+    intake: VecDeque<Submission<F>>,
     /// Submissions waiting for room, by arrival number: at most the room's waiters.
-    waiting: HashMap<u64, Submission>,
-    phase: Phase,
-    gather: Option<Gather>,
+    waiting: HashMap<u64, Submission<F>>,
+    phase: Phase<F>,
+    gather: Option<Gather<F>>,
     /// The owner waits for a submission to make the next batch of.
     parked: bool,
-    schedule: Schedule,
+    schedule: Schedule<F>,
     /// The last frame flushed, while nothing durable yet says its flush completed: the next
     /// frame's persist record will, or a confirmation written when no frame follows at once
     /// (mantle docs/design/raft-log.md §3, §6). Its updates are answered only then.
-    unconfirmed: Option<Unconfirmed>,
-    buffers: Buffers,
+    unconfirmed: Option<Unconfirmed<F>>,
+    buffers: Buffers<F>,
     fenced: bool,
     /// The device, while no thread does I/O with it.
     device: Option<Device<F>>,
@@ -202,7 +236,7 @@ pub(crate) struct Owner<F> {
     /// Each job's sequence once it is back, while the I/O thread does not watch for one.
     tokens: Option<Receiver<u64>>,
     /// The I/O thread's requests.
-    requests: SyncSender<Request>,
+    requests: SyncSender<Request<F>>,
     /// The box jobs travel in, while no job is out.
     carrier: Option<Box<Carrier<F>>>,
     /// Jobs given out so far: the sequence of the last.
@@ -211,14 +245,15 @@ pub(crate) struct Owner<F> {
     more: SyncSender<u64>,
     /// The owner has told the device so for the frame it has, or laid it out knowing.
     more_told: bool,
-    /// The inbox, until the owner's thread takes it to read.
-    inbox: Option<Receiver<Message<F>>>,
-    /// The owner has taken its first step: the restore of a lost frame at open.
-    started: bool,
-    /// Messages a step's drain of the inbox stopped at, handled at the loop's top, in order: a
-    /// completion, whose job the draining step may belong to, or a frame's flush, a job back and
-    /// the message the drain took after them. At most three.
-    deferred: VecDeque<Message<F>>,
+    /// Where callers and the log's threads reach the owner.
+    inbox: Receiver<Message<F>>,
+    /// What the owner does next, before anything else.
+    agenda: Agenda,
+    /// What the owner heard and acts on at the loop's top, in order: a frame's word that it is
+    /// flushed that a step's drain of the inbox stopped at, since the draining step may be the
+    /// one the word's job belongs to, or a frame's flush, a job back and the message taken after
+    /// them. At most three.
+    deferred: VecDeque<Heard<F>>,
     /// The device's word that a frame is flushed while it writes the frame's confirmation
     /// (`device.rs`). It wakes no one: the owner reads it before every message it takes from the
     /// inbox, since anything a caller sends after hearing of the frame comes after the word.
@@ -252,7 +287,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         p: Params,
         state: State,
         room: Room,
-        restores: Vec<Submission>,
+        restores: Vec<Submission<F>>,
         wiring: Wiring<F>,
         seal: Option<crate::seal::Sealer>,
         gate: Option<crate::growth::Gate>,
@@ -295,8 +330,12 @@ impl<F: BlockFile + 'static> Owner<F> {
             jobs: 0,
             more,
             more_told: false,
-            inbox: Some(inbox),
-            started: false,
+            inbox,
+            // The first step is the restore of a lost frame at open.
+            agenda: Agenda {
+                step: true,
+                went_on: false,
+            },
             deferred: VecDeque::new(),
             flushes,
             fetches: VecDeque::new(),
@@ -315,12 +354,15 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// Runs the owner until the log closes and nothing is left to answer: the file, unless the
     /// device was lost.
     pub(crate) fn lead(mut self) -> Option<F> {
-        let inbox = self.inbox.take()?;
-        if !self.started {
-            self.started = true;
-            self.step(&inbox);
-        }
         loop {
+            if std::mem::take(&mut self.agenda.step) {
+                self.step();
+                continue;
+            }
+            if std::mem::take(&mut self.agenda.went_on) {
+                self.went_on();
+                continue;
+            }
             if self.device.is_some()
                 && let Some((job, doer)) = self.io.pop_front()
                 && let Some(device) = self.device.take()
@@ -328,8 +370,8 @@ impl<F: BlockFile + 'static> Owner<F> {
                 self.start(job, doer, device);
                 continue;
             }
-            if let Some(message) = self.deferred.pop_front() {
-                self.handle(message, &inbox);
+            if let Some(heard) = self.deferred.pop_front() {
+                self.hear(heard);
                 continue;
             }
             if self.arrived() {
@@ -339,16 +381,16 @@ impl<F: BlockFile + 'static> Owner<F> {
                 break;
             }
             self.watch();
-            match self.next(&inbox) {
+            match self.next() {
                 // What came back before the message is heard first.
                 Ok(Some(m)) => {
                     if self.arrived() {
-                        self.deferred.push_back(m);
+                        self.deferred.push_back(Heard::Message(m));
                     } else {
-                        self.handle(m, &inbox);
+                        self.hear(Heard::Message(m));
                     }
                 }
-                Ok(None) => self.gathered(&inbox),
+                Ok(None) => self.gathered(),
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -356,12 +398,12 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// Hands a job and the device to the caller waiting on it, or else to the I/O thread.
-    fn start(&mut self, job: Job<F>, doer: Option<SyncSender<Reply>>, device: Device<F>) {
+    fn start(&mut self, job: Job<F>, doer: Option<Doer<F>>, device: Device<F>) {
         self.jobs = self.jobs.wrapping_add(1);
         if matches!(job, Job::Frame(_) | Job::Confirm { .. }) {
             self.flushing_since = Some(stats::now());
         }
-        let carrier = match self.carrier.take() {
+        let mut carrier = match self.carrier.take() {
             Some(mut c) => {
                 c.job = Some(job);
                 c.device = Some(device);
@@ -371,19 +413,20 @@ impl<F: BlockFile + 'static> Owner<F> {
             }
             None => Box::new(Carrier::new(job, device, self.jobs)),
         };
-        let mut io: Box<dyn Io> = carrier;
-        if let Some(port) = doer {
-            match port.try_send(Reply::Io(io)) {
-                Ok(()) => return,
+        if let Some(Doer { slot, tell }) = doer {
+            match slot.try_send(carrier) {
+                Ok(()) => {
+                    // The caller keeps its slot and its port until its answer, which only this
+                    // job gives, so it hears the job is there and does it.
+                    let _ = tell.try_send(Reply::Job);
+                    return;
+                }
                 // The caller stopped waiting: the I/O thread does the job.
-                Err(TrySendError::Full(r) | TrySendError::Disconnected(r)) => match r {
-                    Reply::Io(back) => io = back,
-                    _ => return,
-                },
+                Err(TrySendError::Full(back) | TrySendError::Disconnected(back)) => carrier = back,
             }
         }
         // Never full: the I/O thread holds at most this job and a watch (`device::REQUESTS`).
-        let _ = self.requests.send(Request::Job(io));
+        let _ = self.requests.send(Request::Job(carrier));
     }
 
     /// What came back from the device since the owner last looked, queued to be heard in order:
@@ -395,10 +438,10 @@ impl<F: BlockFile + 'static> Owner<F> {
         let word = self.flushes.try_recv().ok();
         let came = back.is_some() || word.is_some();
         if let Some(word) = word {
-            self.deferred.push_back(Message::Done(word));
+            self.deferred.push_back(Heard::Done(word));
         }
         if let Some(back) = back {
-            self.deferred.push_back(Message::Back(back));
+            self.deferred.push_back(Heard::Back(back));
         }
         came
     }
@@ -440,15 +483,16 @@ impl<F: BlockFile + 'static> Owner<F> {
         clippy::disallowed_methods,
         reason = "hyper-log's owner waits on its own deadline (CLAUDE.md §1, sans-io's one exception)"
     )]
-    fn next(&self, inbox: &Receiver<Message<F>>) -> Result<Option<Message<F>>, RecvTimeoutError> {
+    fn next(&self) -> Result<Option<Message<F>>, RecvTimeoutError> {
         let Some(deadline) = self.gather.as_ref().map(|g| g.deadline) else {
-            return inbox
+            return self
+                .inbox
                 .recv()
                 .map(Some)
                 .map_err(|_| RecvTimeoutError::Disconnected);
         };
         let left = deadline.saturating_duration_since(Instant::now());
-        match inbox.recv_timeout(left) {
+        match self.inbox.recv_timeout(left) {
             Ok(m) => Ok(Some(m)),
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(e) => Err(e),
@@ -468,29 +512,29 @@ impl<F: BlockFile + 'static> Owner<F> {
             && self.deferred.is_empty()
     }
 
-    fn handle(&mut self, message: Message<F>, inbox: &Receiver<Message<F>>) {
-        self.take(message, inbox);
-        self.went_on(inbox);
+    /// Acts on what the owner heard; what its message brought goes on next (`Agenda`).
+    fn hear(&mut self, heard: Heard<F>) {
+        match heard {
+            Heard::Message(message) => {
+                if let Some(word) = self.take(message) {
+                    self.done(word);
+                }
+            }
+            Heard::Done(word) => self.done(word),
+            Heard::Back(back) => self.back(back),
+        }
+        self.agenda.went_on = true;
     }
 
-    /// Acts on one message.
-    fn take(&mut self, message: Message<F>, inbox: &Receiver<Message<F>>) {
+    /// Acts on one message, but for a frame's word that it is flushed, which it gives back: the
+    /// word is acted on in its turn by the loop (`Owner::hear`), never by a step that takes what
+    /// waits in the inbox (`Owner::drain`), since the step may be the one the word's job belongs
+    /// to.
+    fn take(&mut self, message: Message<F>) -> Option<Completion> {
         match message {
             Message::Submit { submission, wait } => self.submit(submission, wait),
             Message::Query(query, ticket) => self.query(query, ticket),
-            Message::Done(word) => self.done(word, inbox),
-            Message::Back(mut back) => {
-                let completion = back.completion.take();
-                self.device = back.device.take();
-                self.carrier = Some(back);
-                // Tokens of jobs back are for a watch; none is wanted once the job is heard.
-                if let Some(tokens) = &self.tokens {
-                    while tokens.try_recv().is_ok() {}
-                }
-                if let Some(completion) = completion {
-                    self.done(completion, inbox);
-                }
-            }
+            Message::Done(word) => return Some(word),
             Message::Returned => {}
             Message::Watched(tokens) => {
                 // Tokens of jobs back are for a watch: none is wanted until the next.
@@ -509,34 +553,45 @@ impl<F: BlockFile + 'static> Owner<F> {
             }
             Message::Close => self.closing = true,
         }
+        None
     }
 
-    /// Handles every message already waiting, without waiting for more. It stops at a completion,
-    /// since the step that drains may be the one the completion's job belongs to, and at a word
-    /// that a frame is flushed or a job back, which come before the message taken with them:
-    /// those, and what follows them, are handled at the loop's top, in order.
-    fn drain(&mut self, inbox: &Receiver<Message<F>>) {
+    /// A job and the device back from the thread that did it: the device is the owner's again,
+    /// and the job's completion is acted on.
+    fn back(&mut self, mut back: Box<Carrier<F>>) {
+        let completion = back.completion.take();
+        self.device = back.device.take();
+        self.carrier = Some(back);
+        // Tokens of jobs back are for a watch; none is wanted once the job is heard.
+        if let Some(tokens) = &self.tokens {
+            while tokens.try_recv().is_ok() {}
+        }
+        if let Some(completion) = completion {
+            self.done(completion);
+        }
+    }
+
+    /// Acts on every message already waiting, without waiting for more. It stops at a frame's
+    /// word that it is flushed, and at a word or a job back, which come before the message taken
+    /// with them: those, and what follows them, are heard at the loop's top, in order.
+    fn drain(&mut self) {
         if !self.deferred.is_empty() {
             return;
         }
-        loop {
-            let Ok(message) = inbox.try_recv() else {
-                return;
-            };
+        while let Ok(message) = self.inbox.try_recv() {
             if self.arrived() {
-                self.deferred.push_back(message);
+                self.deferred.push_back(Heard::Message(message));
                 return;
             }
-            if matches!(message, Message::Done(..)) {
-                self.deferred.push_back(message);
+            if let Some(word) = self.take(message) {
+                self.deferred.push_back(Heard::Done(word));
                 return;
             }
-            self.take(message, inbox);
         }
     }
 
     /// Admits a submission, holds it to wait for room, or refuses it.
-    fn submit(&mut self, mut s: Submission, wait: bool) {
+    fn submit(&mut self, mut s: Submission<F>, wait: bool) {
         if self.fenced {
             s.ticket.answer(Err(LogError::Fenced));
             return;
@@ -585,7 +640,7 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// Answers a submission, and gives back its room in the queue to the waiters it fits.
-    fn answer(&mut self, mut s: Submission, result: Result<(), LogError>) {
+    fn answer(&mut self, mut s: Submission<F>, result: Result<(), LogError>) {
         if result.is_err() {
             self.note_refusal(&s);
         }
@@ -602,7 +657,7 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// A handle's write was refused: every write its handle sent in the same epoch or before is
     /// refused after it (`Owner::behind`).
-    fn note_refusal(&mut self, s: &Submission) {
+    fn note_refusal(&mut self, s: &Submission<F>) {
         if s.handle && self.claimed.contains(&s.group) {
             let epoch = self.refused.entry(s.group).or_insert(s.epoch);
             *epoch = (*epoch).max(s.epoch);
@@ -611,7 +666,7 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// Whether `s` was sent by its handle before the handle heard of a refusal of an earlier
     /// write: then it is refused too. A write of a later epoch ends the refusal.
-    pub(super) fn behind(&mut self, s: &Submission) -> bool {
+    pub(super) fn behind(&mut self, s: &Submission<F>) -> bool {
         if !s.handle {
             return false;
         }
@@ -664,9 +719,9 @@ impl<F: BlockFile + 'static> Owner<F> {
         }
     }
 
-    fn done(&mut self, completion: Completion, inbox: &Receiver<Message<F>>) {
+    fn done(&mut self, completion: Completion) {
         match completion {
-            Completion::Sweep(swept) => self.swept(swept, inbox),
+            Completion::Sweep(swept) => self.swept(swept),
             Completion::Frame {
                 frame,
                 record,
@@ -690,7 +745,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                     before,
                     these,
                 };
-                self.written(done, inbox);
+                self.written(done);
             }
             Completion::Confirm {
                 record,
@@ -701,7 +756,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                 self.give_confirm(record);
                 self.tally.job(&timing, false);
                 self.flushing_since = None;
-                self.confirmed(result, these, timing.flushed_at, inbox);
+                self.confirmed(result, these, timing.flushed_at);
             }
             Completion::Read(reads) => self.read(reads),
             Completion::Looked => {
@@ -746,8 +801,8 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 }
 
-impl Schedule {
-    fn new(restores: Vec<Submission>) -> Self {
+impl<F> Schedule<F> {
+    fn new(restores: Vec<Submission<F>>) -> Self {
         Self {
             restoring: !restores.is_empty(),
             held: restores.into(),
@@ -765,7 +820,7 @@ impl Schedule {
     }
 }
 
-impl Buffers {
+impl<F> Buffers<F> {
     fn new() -> Self {
         Self {
             payload: Payload::default(),

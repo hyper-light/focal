@@ -80,12 +80,27 @@ struct Request {
 
 #[derive(Debug)]
 enum Op {
-    Read { buf: Vec<u8>, offset: u64, end: u64 },
-    Write { buf: Vec<u8>, offset: u64, end: u64 },
-    WriteDurable { buf: Vec<u8>, offset: u64, end: u64 },
+    Read {
+        buf: Vec<u8>,
+        offset: u64,
+        end: u64,
+    },
+    Write {
+        buf: Vec<u8>,
+        offset: u64,
+        end: u64,
+    },
+    WriteDurable {
+        buf: Vec<u8>,
+        offset: u64,
+        end: u64,
+    },
     Sync,
     Len,
-    Open,
+    /// A new handle, whose answers come through the queue this brings: the link opening it makes
+    /// the queue, so no reply carries a queue of replies, whose drop would run its own (mantle
+    /// CLAUDE.md §10).
+    Open(SyncSender<Reply>),
     Close,
     Inject(Fault),
     ClearFaults,
@@ -101,7 +116,8 @@ enum Reply {
     Durable(Result<Durable, DiskError>, Vec<u8>),
     Done(Result<(), DiskError>),
     Len(Result<u64, DiskError>),
-    Opened(Result<(usize, Receiver<Reply>), DiskError>),
+    /// The new handle's slot.
+    Opened(Result<usize, DiskError>),
     Stats(SimStats),
     Image(Vec<u8>),
 }
@@ -214,10 +230,11 @@ impl Link {
 
     /// A new handle onto the device, transferring at `align`.
     fn open(&self, align: Alignment) -> Result<SimHandle, DiskError> {
-        let Reply::Opened(opened) = self.call(Op::Open)? else {
+        let (reply, replies) = sync_channel(1);
+        let Reply::Opened(opened) = self.call(Op::Open(reply))? else {
             return Err(mismatched());
         };
-        let (slot, replies) = opened?;
+        let slot = opened?;
         Ok(SimHandle {
             link: Link {
                 slot,
@@ -254,7 +271,7 @@ fn serve(mut disk: Disk, requests: &Receiver<Request>, mut answer: Vec<Option<Sy
                 }
                 continue;
             }
-            Op::Open => Reply::Opened(open(&mut answer)),
+            Op::Open(reply) => Reply::Opened(open(&mut answer, reply)),
             Op::Read {
                 mut buf,
                 offset,
@@ -296,17 +313,19 @@ fn serve(mut disk: Disk, requests: &Receiver<Request>, mut answer: Vec<Option<Sy
     }
 }
 
-/// Takes a free slot for a new handle and makes its answer queue.
-fn open(answer: &mut [Option<SyncSender<Reply>>]) -> Result<(usize, Receiver<Reply>), DiskError> {
+/// Takes a free slot for a new handle, which answers it through `reply`.
+fn open(
+    answer: &mut [Option<SyncSender<Reply>>],
+    reply: SyncSender<Reply>,
+) -> Result<usize, DiskError> {
     let (slot, entry) = answer
         .iter_mut()
         .enumerate()
         .skip(DEVICE_SLOT.saturating_add(1))
         .find(|(_, entry)| entry.is_none())
         .ok_or_else(|| sim_error("every handle of the simulated device is open"))?;
-    let (reply, replies) = sync_channel(1);
     *entry = Some(reply);
-    Ok((slot, replies))
+    Ok(slot)
 }
 
 fn stopped() -> DiskError {

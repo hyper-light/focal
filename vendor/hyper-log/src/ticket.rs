@@ -7,37 +7,41 @@
 //! completion wakes only its submitter (research/26 §5.3). Nothing is shared but the channel the
 //! answer moves through.
 //!
-//! A port is made once and reused. The final answer carries the port's sending end back to the
-//! caller, which then holds both ends and keeps them for its next call, so a steady caller makes
-//! no channel per call. Each thread keeps the ports it has finished with; it holds at most as many
-//! as it once had calls out at a time, which the log's queue bounds for submissions and which is
-//! one for a call that waits (`Log::view`, `Log::term`, ...).
+//! A port is made once and reused. The caller keeps both its ends and gives the ticket a copy of
+//! the sending end, which the answer uses up, so a steady caller makes no channel per call. Each
+//! thread keeps the ports it has finished with; it holds at most as many as it once had calls out
+//! at a time, which the log's queue bounds for submissions and which is one for a call that waits
+//! (`Log::view`, `Log::term`, ...). What goes through a port holds no port: a reply that carried a
+//! port's sending end would hold a channel of its own kind, and its drop would run itself (mantle
+//! CLAUDE.md §10).
 //!
-//! A caller that waits on its answer from the moment it submits may be handed its frame's I/O
-//! through its port (`Reply::Io`): it does the I/O on its own thread, as mantle's writer did on
-//! its, and hears its answer when the I/O is done (`owner::Owner::start`).
+//! A caller that waits on its answer from the moment it submits may be handed its frame's I/O: it
+//! is told so through its port (`Reply::Job`), takes the I/O from a job slot of its own
+//! (`device::Slot`), does it on its own thread, as mantle's writer did on its, and hears its answer
+//! when the I/O is done (`owner::Owner::start`). The I/O holds the tickets of the frame's callers,
+//! so it never travels a port.
 
 use std::cell::{Cell, RefCell};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::task::Waker;
 
-use crate::device::Io;
 use crate::group::Mirror;
 use crate::{Entry, Fetched, LogError, View};
 
 /// Replies one ticket carries at most: its admission, for a submission whose caller hears of it,
-/// or its frame's I/O, for one whose caller waits on its answer and never hears of its admission
-/// (the two are never the same ticket's); and its answer.
+/// or word of its frame's I/O, for one whose caller waits on its answer and never hears of its
+/// admission (the two are never the same ticket's); and its answer.
 const REPLIES: usize = 2;
 
 /// A reply through a ticket.
 pub(crate) enum Reply {
     /// The submission holds its room in the queue; its answer follows once it is durable.
     Admitted,
-    /// The call's answer, and the port's sending end, given back with it.
-    Answer(Result<Answer, LogError>, SyncSender<Reply>),
-    /// The I/O of the frame that carries the submission, for its caller to do.
-    Io(Box<dyn Io>),
+    /// The call's answer.
+    Answer(Result<Answer, LogError>),
+    /// The I/O of the frame that carries the submission is in its caller's job slot, for the
+    /// caller to do (`Waiting::wait_doing`).
+    Job,
 }
 
 /// What a call is answered.
@@ -73,6 +77,14 @@ pub(crate) fn port() -> Port {
         .unwrap_or_else(|| sync_channel(REPLIES))
 }
 
+/// A call's two sides, over a free port of this thread's or a new one: the ticket the owner answers
+/// through, and the caller's wait for the answer.
+pub(crate) fn call(waker: Option<Waker>) -> (Ticket, Waiting) {
+    let (reply, receive) = port();
+    let ticket = Ticket::new(reply.clone(), waker);
+    (ticket, Waiting::new(reply, receive))
+}
+
 /// Keeps a port, answered and empty, for this thread's next call.
 fn keep(port: Port) {
     let _ = PORTS.try_with(|ports| {
@@ -89,7 +101,7 @@ pub(crate) struct Ticket {
 }
 
 impl Ticket {
-    pub(crate) fn new(reply: SyncSender<Reply>, waker: Option<Waker>) -> Self {
+    fn new(reply: SyncSender<Reply>, waker: Option<Waker>) -> Self {
         Self {
             reply: Some(reply),
             waker,
@@ -106,7 +118,7 @@ impl Ticket {
     }
 
     /// Where the caller hears its replies, for a caller that waits on them from the moment it
-    /// submits: its frame's I/O may go there. `None` once answered.
+    /// submits: word of its frame's I/O may go there. `None` once answered.
     pub(crate) fn port(&self) -> Option<SyncSender<Reply>> {
         self.reply.clone()
     }
@@ -123,8 +135,7 @@ impl Ticket {
     /// Answers the call, once, and wakes its waker.
     pub(crate) fn answer(&mut self, answer: Result<Answer, LogError>) {
         if let Some(reply) = self.reply.take() {
-            let back = reply.clone();
-            let _ = reply.try_send(Reply::Answer(answer, back));
+            let _ = reply.try_send(Reply::Answer(answer));
         }
         if let Some(waker) = self.waker.take() {
             waker.wake();
@@ -146,35 +157,40 @@ impl Drop for Ticket {
     }
 }
 
-/// The caller's side of a call: its port's receiving end until the answer comes.
+/// The caller's side of a call: its port, both ends, the sending end kept so that the port serves
+/// the caller's next call once the answer has come.
 pub(crate) struct Waiting {
-    receive: Option<Receiver<Reply>>,
-    /// The port's sending end, once the answer brought it back.
-    back: Cell<Option<SyncSender<Reply>>>,
+    port: Option<Port>,
     /// The answer was taken: a later look finds the call closed.
     taken: Cell<bool>,
 }
 
 impl Waiting {
-    pub(crate) fn new(receive: Receiver<Reply>) -> Self {
+    fn new(reply: SyncSender<Reply>, receive: Receiver<Reply>) -> Self {
         Self {
-            receive: Some(receive),
-            back: Cell::new(None),
+            port: Some((reply, receive)),
             taken: Cell::new(false),
         }
     }
 
     /// Waits for the answer.
     pub(crate) fn wait(&self) -> Result<Answer, LogError> {
-        let receive = self.receive.as_ref().ok_or(LogError::Closed)?;
+        // Only a caller that keeps a job slot is handed its frame's I/O (`Waiting::wait_doing`).
+        self.wait_doing(|| {})
+    }
+
+    /// Waits for the answer, doing the frame's I/O when told it is in the caller's job slot:
+    /// `run` takes it from there and does it.
+    pub(crate) fn wait_doing(&self, mut run: impl FnMut()) -> Result<Answer, LogError> {
+        let (_, receive) = self.port.as_ref().ok_or(LogError::Closed)?;
         if self.taken.get() {
             return Err(LogError::Closed);
         }
         loop {
             match receive.recv() {
                 Ok(Reply::Admitted) => {}
-                Ok(Reply::Io(io)) => io.run(),
-                Ok(Reply::Answer(answer, back)) => return self.took(answer, back),
+                Ok(Reply::Job) => run(),
+                Ok(Reply::Answer(answer)) => return self.took(answer),
                 Err(_) => return Err(LogError::Closed),
             }
         }
@@ -182,7 +198,7 @@ impl Waiting {
 
     /// The answer if it has come.
     pub(crate) fn poll(&self) -> Option<Result<Answer, LogError>> {
-        let Some(receive) = self.receive.as_ref() else {
+        let Some((_, receive)) = self.port.as_ref() else {
             return Some(Err(LogError::Closed));
         };
         if self.taken.get() {
@@ -190,9 +206,9 @@ impl Waiting {
         }
         loop {
             match receive.try_recv() {
-                Ok(Reply::Admitted) => {}
-                Ok(Reply::Io(io)) => io.run(),
-                Ok(Reply::Answer(answer, back)) => return Some(self.took(answer, back)),
+                // A caller that polls keeps no job slot, so it is never handed I/O.
+                Ok(Reply::Admitted | Reply::Job) => {}
+                Ok(Reply::Answer(answer)) => return Some(self.took(answer)),
                 Err(TryRecvError::Empty) => return None,
                 Err(TryRecvError::Disconnected) => return Some(Err(LogError::Closed)),
             }
@@ -201,25 +217,21 @@ impl Waiting {
 
     /// Waits for a submission's admission: `Ok` once admitted, its refusal otherwise.
     pub(crate) fn admitted(&self) -> Result<(), LogError> {
-        let receive = self.receive.as_ref().ok_or(LogError::Closed)?;
+        let (_, receive) = self.port.as_ref().ok_or(LogError::Closed)?;
         loop {
             match receive.recv() {
                 Ok(Reply::Admitted) => return Ok(()),
-                Ok(Reply::Io(io)) => io.run(),
-                Ok(Reply::Answer(answer, back)) => {
-                    return self.took(answer, back).and(Err(LogError::Closed));
+                // A caller that hears its admission keeps no job slot, so it is never handed I/O.
+                Ok(Reply::Job) => {}
+                Ok(Reply::Answer(answer)) => {
+                    return self.took(answer).and(Err(LogError::Closed));
                 }
                 Err(_) => return Err(LogError::Closed),
             }
         }
     }
 
-    fn took(
-        &self,
-        answer: Result<Answer, LogError>,
-        back: SyncSender<Reply>,
-    ) -> Result<Answer, LogError> {
-        self.back.set(Some(back));
+    fn took(&self, answer: Result<Answer, LogError>) -> Result<Answer, LogError> {
         self.taken.set(true);
         answer
     }
@@ -227,19 +239,12 @@ impl Waiting {
 
 impl Drop for Waiting {
     fn drop(&mut self) {
-        // Answered: both ends are here and the port is empty, so it serves the next call.
-        if let (Some(back), Some(receive)) = (self.back.take(), self.receive.take()) {
-            keep((back, receive));
-            return;
-        }
-        // A caller that leaves before its answer does any I/O handed to it, which holds the
-        // log's device and other callers' answers.
-        if let Some(receive) = self.receive.take() {
-            while let Ok(reply) = receive.try_recv() {
-                if let Reply::Io(io) = reply {
-                    io.run();
-                }
-            }
+        // Answered: the port is empty, so it serves the next call. A caller that leaves before its
+        // answer leaves the port to the ticket, which answers into it and is gone with it.
+        if let Some(port) = self.port.take()
+            && self.taken.get()
+        {
+            keep(port);
         }
     }
 }

@@ -1840,8 +1840,17 @@ impl<S: Storage> Raft<S> {
         }
         Ok(())
     }
-    /// Commits what the quorum holds, if it is of this term.
+    /// Commits what the quorum holds, if it is of this term, and leaves a joint configuration that
+    /// leaves by itself once the entry that entered it is committed: whether the commit moved.
     pub fn maybe_commit(&mut self) -> Result<bool> {
+        if !self.commit()? {
+            return Ok(false);
+        }
+        self.leave_joint_when_committed()?;
+        Ok(true)
+    }
+    /// Commits what the quorum holds, if it is of this term: whether the commit moved.
+    fn commit(&mut self) -> Result<bool> {
         let index = self.tracker.quorum_index();
         let term = if self.planted(crate::Mutant::OlderTermCommit) {
             self.log.term(index).unwrap_or(self.term)
@@ -1871,7 +1880,6 @@ impl<S: Storage> Raft<S> {
             progress.update_committed(committed);
         }
         self.release_deferred_reads()?;
-        self.leave_joint_when_committed()?;
         Ok(true)
     }
     /// A joint configuration that leaves by itself does so once the entry that entered it is
@@ -2668,6 +2676,15 @@ impl<S: Storage> Raft<S> {
     }
 
     fn campaign(&mut self, campaign: Campaign) -> Result<()> {
+        // A pre-election its own vote wins is followed by its election at once.
+        if self.ask_votes(campaign)? == Tally::Won && campaign == Campaign::PreElection {
+            self.ask_votes(Campaign::Election)?;
+        }
+        Ok(())
+    }
+    /// Stands in `campaign`: counts its own vote and asks every other voter for theirs, unless its
+    /// own vote decided. The count after its own vote.
+    fn ask_votes(&mut self, campaign: Campaign) -> Result<Tally> {
         let (kind, term) = if campaign == Campaign::PreElection {
             self.become_pre_candidate()?;
             (MessageType::MsgRequestPreVote, self.term.saturating_add(1))
@@ -2677,9 +2694,10 @@ impl<S: Storage> Raft<S> {
         };
         // A member whose log may lack what it acknowledged does not count
         // its own vote (R-7): it is no witness for its own log.
-        if self.poll(self.id, self.lost.is_none())? == Tally::Won {
+        let tally = self.poll(self.id, self.lost.is_none())?;
+        if tally == Tally::Won {
             // The one voter there is.
-            return Ok(());
+            return Ok(tally);
         }
         let (commit, commit_term) = self.log.commit_info()?;
         let (index, log_term) = (self.log.last_index()?, self.log.last_term()?);
@@ -2705,16 +2723,18 @@ impl<S: Storage> Raft<S> {
             }
             push(msgs, id, own_term, priority, message)?;
         }
-        Ok(())
+        Ok(tally)
     }
+    /// Counts `from`'s vote and acts on the count: a candidate that won leads, and one that lost
+    /// follows. A pre-candidate that won is left to whoever counted, which stands in the election
+    /// next (`Raft::campaign`, the answers a candidate hears): no count starts a campaign itself, so
+    /// standing never calls itself (mantle CLAUDE.md §10).
     fn poll(&mut self, from: NodeId, vote: bool) -> Result<Tally> {
         self.tracker.record_vote(from, vote)?;
         let tally = self.tracker.tally_votes();
         match tally {
             Tally::Won => {
-                if self.state == StateRole::PreCandidate {
-                    self.campaign(Campaign::Election)?;
-                } else {
+                if self.state != StateRole::PreCandidate {
                     self.become_leader()?;
                     self.bcast_append()?;
                 }
@@ -3496,7 +3516,12 @@ impl<S: Storage> Raft<S> {
                 if !message.reject && kind == MessageType::MsgRequestVoteResponse {
                     self.hear_report(&message)?;
                 }
-                self.poll(message.from, !message.reject)?;
+                // A pre-election won is followed by the election at once.
+                if self.poll(message.from, !message.reject)? == Tally::Won
+                    && self.state == StateRole::PreCandidate
+                {
+                    self.campaign(Campaign::Election)?;
+                }
                 self.maybe_commit_by_vote(&message)
             }
             MessageType::MsgTimeoutNow => {
@@ -4058,7 +4083,11 @@ impl<S: Storage> Raft<S> {
         if self.state != StateRole::Leader {
             return Ok(());
         }
-        if self.maybe_commit()? {
+        // A leader's configuration changes only by an entry it has just written, above the commit,
+        // so no joint configuration is due to be left here (`leave_joint_when_committed`): the
+        // entry that leaves is written by a commit that reaches the one that entered, never by a
+        // change being written, and writing never calls itself (mantle CLAUDE.md §10).
+        if self.commit()? {
             // A smaller quorum may hold more.
             self.bcast_append()?;
         } else {

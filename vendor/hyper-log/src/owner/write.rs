@@ -17,13 +17,12 @@
 //! when its flush returned.
 
 use std::collections::VecDeque;
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use hyper_block::block::BlockFile;
 use hyper_block::buf::AlignedBuf;
 
-use super::{Message, Owner};
+use super::{Doer, Owner};
 use crate::codec::Writer as Payload;
 use crate::device::{Answering, Frame, Job, Swept};
 use crate::format::{self, SegmentHeader};
@@ -34,28 +33,28 @@ use crate::{LogError, Waits};
 
 /// A frame flushed and not yet confirmed, and the updates it carried: at most one frame's. Its
 /// answers are the owner's while no frame on the device carries them.
-pub(super) struct Unconfirmed {
+pub(super) struct Unconfirmed<F> {
     sequence: u64,
-    updates: Vec<(Submission, Placement)>,
+    updates: Vec<(Submission<F>, Placement)>,
     answering: Vec<Answering>,
     /// The frame's own confirmation, laid out with the frame.
     confirm: Option<AlignedBuf>,
 }
 
 /// What the writer is waiting on the device for.
-pub(super) enum Phase {
+pub(super) enum Phase<F> {
     /// Nothing: the loop runs at its next step.
     Idle,
     /// The tail's frames, read for a sweep, before the batch is laid out after the copies.
     Sweeping {
-        batch: VecDeque<Submission>,
+        batch: VecDeque<Submission<F>>,
         whole: bool,
         read: SweepRead,
     },
     /// A frame's write and flush.
-    Writing(Writing),
+    Writing(Writing<F>),
     /// A confirmation's write and flush; `forget` once it is done when it followed a commit.
-    Confirming { frame: Unconfirmed, forget: bool },
+    Confirming { frame: Unconfirmed<F>, forget: bool },
 }
 
 /// What the device says of a frame's flush (`device::Completion::Frame`).
@@ -71,15 +70,15 @@ pub(super) struct Flushed {
 }
 
 /// A frame on the device.
-pub(super) struct Writing {
-    taken: Vec<(Submission, Placement)>,
+pub(super) struct Writing<F> {
+    taken: Vec<(Submission<F>, Placement)>,
     sweep: Option<Sweep>,
     target: Target,
     tail: u64,
     sequence: u64,
 }
 
-impl Writing {
+impl<F> Writing<F> {
     /// The frame's sequence.
     pub(super) fn sequence(&self) -> u64 {
         self.sequence
@@ -87,8 +86,8 @@ impl Writing {
 }
 
 /// The writer's wait for the submitters the last frame answered (`hyper_block::commit`).
-pub(super) struct Gather {
-    batch: VecDeque<Submission>,
+pub(super) struct Gather<F> {
+    batch: VecDeque<Submission<F>>,
     /// Submissions in the batch sent before the answers went out.
     before: u64,
     answered: u64,
@@ -98,16 +97,16 @@ pub(super) struct Gather {
 
 /// A frame laid out: its payload and record count, the sweep before its updates, and the
 /// updates with where they went.
-struct Laid {
+struct Laid<F> {
     records: u32,
     sweep: Option<Sweep>,
-    taken: Vec<(Submission, Placement)>,
+    taken: Vec<(Submission<F>, Placement)>,
 }
 
 impl<F: BlockFile + 'static> Owner<F> {
     /// After a message: a submission that came while the owner was parked starts a batch, and
     /// one that came while it gathered joins the batch.
-    pub(super) fn went_on(&mut self, inbox: &Receiver<Message<F>>) {
+    pub(super) fn went_on(&mut self) {
         if self.intake.is_empty() {
             return;
         }
@@ -116,15 +115,15 @@ impl<F: BlockFile + 'static> Owner<F> {
             let mut batch = std::mem::take(&mut self.buffers.batch);
             self.take_intake(&mut batch);
             let (answered, before) = (self.schedule.answered, self.schedule.backlog);
-            self.gather_then_commit(batch, answered, before, inbox);
+            self.gather_then_commit(batch, answered, before);
         } else if self.gather.is_some() {
             self.join_gathering();
-            self.keep_gathering(inbox);
+            self.keep_gathering();
         }
     }
 
     /// Moves what is queued into `batch`, each stamped as taken.
-    fn take_intake(&mut self, batch: &mut VecDeque<Submission>) {
+    fn take_intake(&mut self, batch: &mut VecDeque<Submission<F>>) {
         while let Some(s) = self.intake.pop_front() {
             let s = self.taken(s);
             batch.push_back(s);
@@ -143,23 +142,23 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// The top of mantle's loop: the batch is what was held and what is queued.
-    pub(super) fn step(&mut self, inbox: &Receiver<Message<F>>) {
+    pub(super) fn step(&mut self) {
         loop {
             if !matches!(self.phase, Phase::Idle) || self.gather.is_some() || self.parked {
                 return;
             }
-            self.drain(inbox);
+            self.drain();
             let mut batch = std::mem::take(&mut self.schedule.held);
             let held = u64::try_from(batch.len()).unwrap_or(u64::MAX);
             self.schedule.held = std::mem::take(&mut self.buffers.batch);
             self.take_intake(&mut batch);
             if !batch.is_empty() {
                 let (answered, backlog) = (self.schedule.answered, self.schedule.backlog);
-                self.gather_then_commit(batch, answered, backlog.saturating_add(held), inbox);
+                self.gather_then_commit(batch, answered, backlog.saturating_add(held));
                 return;
             }
             self.buffers.batch = batch;
-            if !self.idle(inbox) {
+            if !self.idle() {
                 return;
             }
         }
@@ -168,12 +167,12 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// Nothing is queued: the last frame is confirmed on its own, at once, since no frame would
     /// carry the confirmation; or, with none to confirm, the owner parks. Whether the loop goes
     /// round again at once.
-    fn idle(&mut self, inbox: &Receiver<Message<F>>) -> bool {
+    fn idle(&mut self) -> bool {
         if self.unconfirmed.is_some() {
             if self.confirm(false) {
                 return false;
             }
-            self.schedule.backlog = self.queued(inbox);
+            self.schedule.backlog = self.queued();
             return true;
         }
         self.end_busy_period();
@@ -200,8 +199,8 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// Submissions sent before the answers about to go out: they are queued ahead of any the
     /// answered submitters send next.
-    fn queued(&mut self, inbox: &Receiver<Message<F>>) -> u64 {
-        self.drain(inbox);
+    fn queued(&mut self) -> u64 {
+        self.drain();
         u64::try_from(self.intake.len()).unwrap_or(u64::MAX)
     }
 
@@ -213,7 +212,7 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// its group's last finish tag, and its finish tag its start plus its charge [SFQ96 §2
     /// eqs. 4–5]. Every group weighs the same, so a group's share of a full frame's bytes is the
     /// others' (Theorem 1); the class orders tiers instead of weighting them.
-    fn taken(&mut self, mut s: Submission) -> Submission {
+    fn taken(&mut self, mut s: Submission<F>) -> Submission<F> {
         let schedule = &mut self.schedule;
         schedule.received = schedule.received.saturating_add(1);
         let start = schedule
@@ -240,15 +239,9 @@ impl<F: BlockFile + 'static> Owner<F> {
         clippy::disallowed_methods,
         reason = "hyper-log's owner times its own writes (CLAUDE.md §1, sans-io's one exception)"
     )]
-    fn gather_then_commit(
-        &mut self,
-        batch: VecDeque<Submission>,
-        answered: u64,
-        before: u64,
-        inbox: &Receiver<Message<F>>,
-    ) {
+    fn gather_then_commit(&mut self, batch: VecDeque<Submission<F>>, answered: u64, before: u64) {
         if answered == 0 || self.p.config.waits == Waits::Never {
-            self.commit_unless_fenced(batch, inbox);
+            self.commit_unless_fenced(batch);
             return;
         }
         let gathered = batch
@@ -261,13 +254,13 @@ impl<F: BlockFile + 'static> Owner<F> {
             gathered,
             deadline: Instant::now(),
         });
-        self.keep_gathering(inbox);
+        self.keep_gathering();
     }
 
     /// Waits on for one more submitter, or ends the gathering. A batch that holds a frame's
     /// worth already is not waited on: what came next would go in a later frame whatever the
     /// wait.
-    fn keep_gathering(&mut self, inbox: &Receiver<Message<F>>) {
+    fn keep_gathering(&mut self) {
         let full = u64::try_from(self.p.frame_room).unwrap_or(u64::MAX);
         let limit = self.p.config.queue_submissions;
         let step = match &self.gather {
@@ -278,34 +271,34 @@ impl<F: BlockFile + 'static> Owner<F> {
         };
         match (step, self.gather.as_mut()) {
             (Some(step), Some(g)) => g.deadline = deadline(step),
-            _ => self.gathered(inbox),
+            _ => self.gathered(),
         }
     }
 
     /// The gathering is over: the writer learns how many returned and commits the batch.
-    pub(super) fn gathered(&mut self, inbox: &Receiver<Message<F>>) {
+    pub(super) fn gathered(&mut self) {
         let Some(g) = self.gather.take() else {
             return;
         };
         self.schedule.anticipation.learn(g.answered, returned(&g));
-        self.commit_unless_fenced(g.batch, inbox);
+        self.commit_unless_fenced(g.batch);
     }
 
-    fn commit_unless_fenced(&mut self, batch: VecDeque<Submission>, inbox: &Receiver<Message<F>>) {
+    fn commit_unless_fenced(&mut self, batch: VecDeque<Submission<F>>) {
         if self.fenced {
             let mut batch = batch;
             for s in batch.drain(..) {
                 self.answer(s, Err(LogError::Fenced));
             }
             self.buffers.batch = batch;
-            self.step(inbox);
+            self.agenda.step = true;
             return;
         }
-        self.commit(batch, inbox);
+        self.commit(batch);
     }
 
     /// Commits a batch: a sweep of the tail first if it is due, then the frame.
-    fn commit(&mut self, batch: VecDeque<Submission>, inbox: &Receiver<Message<F>>) {
+    fn commit(&mut self, batch: VecDeque<Submission<F>>) {
         let whole = std::mem::replace(&mut self.schedule.restoring, false);
         // The sweep is decided on the segments the file may use, its owner's admission among them
         // (`crate::growth`).
@@ -329,9 +322,9 @@ impl<F: BlockFile + 'static> Owner<F> {
             Ok(None) => {
                 let mut payload = std::mem::take(&mut self.buffers.payload);
                 payload.clear();
-                self.lay_out(batch, whole, None, payload, 0, inbox);
+                self.lay_out(batch, whole, None, payload, 0);
             }
-            Err(e) => self.failed(batch, Vec::new(), e, inbox),
+            Err(e) => self.failed(batch, Vec::new(), e),
         }
     }
 
@@ -341,11 +334,7 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// The tail is read: its live pieces go first in the payload, then the batch.
-    pub(super) fn swept(
-        &mut self,
-        swept: Result<Vec<Swept>, LogError>,
-        inbox: &Receiver<Message<F>>,
-    ) {
+    pub(super) fn swept(&mut self, swept: Result<Vec<Swept>, LogError>) {
         let Phase::Sweeping { batch, whole, read } =
             std::mem::replace(&mut self.phase, Phase::Idle)
         else {
@@ -369,8 +358,8 @@ impl<F: BlockFile + 'static> Owner<F> {
             )
         });
         match sweep {
-            Ok(sweep) => self.lay_out(batch, whole, Some(sweep), payload, records, inbox),
-            Err(e) => self.failed(batch, Vec::new(), e, inbox),
+            Ok(sweep) => self.lay_out(batch, whole, Some(sweep), payload, records),
+            Err(e) => self.failed(batch, Vec::new(), e),
         }
     }
 
@@ -422,12 +411,11 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// Lays the batch into a frame after any sweep, and hands the frame to the device.
     fn lay_out(
         &mut self,
-        mut batch: VecDeque<Submission>,
+        mut batch: VecDeque<Submission<F>>,
         whole: bool,
         sweep: Option<Sweep>,
         mut payload: Payload,
         records: u32,
-        inbox: &Receiver<Message<F>>,
     ) {
         self.schedule.walks = self.schedule.walks.saturating_add(1);
         writer::order(&mut batch, &mut self.buffers.keyed, &mut self.buffers.last);
@@ -440,23 +428,23 @@ impl<F: BlockFile + 'static> Owner<F> {
             Ok(refused) => refused,
             Err(e) => {
                 self.buffers.payload = payload;
-                self.failed(batch, laid.taken, e, inbox);
+                self.failed(batch, laid.taken, e);
                 return;
             }
         };
         self.buffers.batch = batch;
         if whole && (refused || !self.schedule.held.is_empty()) {
             self.buffers.payload = payload;
-            self.restore_in_parts(laid.taken, inbox);
+            self.restore_in_parts(laid.taken);
             return;
         }
         if laid.taken.is_empty() && laid.sweep.is_none() {
             self.buffers.payload = payload;
             self.keep_list(laid.taken);
-            self.no_frame(inbox);
+            self.no_frame();
             return;
         }
-        self.place(payload, laid, inbox);
+        self.place(payload, laid);
     }
 
     /// Lays each update of the ordered batch that the frame takes; passes over, holds or
@@ -465,9 +453,9 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// rest of the batch for the commit's failure.
     fn take_batch(
         &mut self,
-        batch: &mut VecDeque<Submission>,
+        batch: &mut VecDeque<Submission<F>>,
         payload: &mut Payload,
-        laid: &mut Laid,
+        laid: &mut Laid<F>,
     ) -> Result<bool, LogError> {
         let mut refused = false;
         let mut seen = std::mem::take(&mut self.buffers.seen);
@@ -495,11 +483,11 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// refused and answered. One that does not encode goes back to the front of `batch`.
     fn lay(
         &mut self,
-        mut s: Submission,
+        mut s: Submission<F>,
         payload: &mut Payload,
-        laid: &mut Laid,
+        laid: &mut Laid<F>,
         new_groups: usize,
-        batch: &mut VecDeque<Submission>,
+        batch: &mut VecDeque<Submission<F>>,
     ) -> Result<Option<bool>, LogError> {
         if self.behind(&s) {
             let group = s.group;
@@ -539,7 +527,7 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// Whether `s` may be written as its group stands and fits a frame: whether it makes a new
     /// group, and the payload bytes its records take.
-    fn fits(&self, s: &Submission, new_groups: usize) -> Result<(bool, usize), LogError> {
+    fn fits(&self, s: &Submission<F>, new_groups: usize) -> Result<(bool, usize), LogError> {
         let new = writer::validate(&self.state, &self.p.config, s, new_groups)?;
         match writer::submission_len(s.group, &s.update, s.marks, self.p.tag) {
             Some(len) if len <= self.p.frame_room => Ok((new, len)),
@@ -551,25 +539,21 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// A restore in parts would overwrite the lost frame's persist record with the first part's,
     /// and a crash before the last part was durable would leave the rest restored nowhere: none
     /// of it is written, and the open fails (mantle docs/design/raft-log.md §6).
-    fn restore_in_parts(
-        &mut self,
-        mut taken: Vec<(Submission, Placement)>,
-        inbox: &Receiver<Message<F>>,
-    ) {
+    fn restore_in_parts(&mut self, mut taken: Vec<(Submission<F>, Placement)>) {
         let held = std::mem::take(&mut self.schedule.held);
         let parts = taken.drain(..).map(|(s, _)| s);
-        let all: Vec<Submission> = parts.chain(held).collect();
+        let all: Vec<Submission<F>> = parts.chain(held).collect();
         self.keep_list(taken);
         for s in all {
             let refusal = LogError::Damaged("a lost frame's restore does not fit one frame");
             self.answer(s, Err(refusal));
         }
-        self.no_frame(inbox);
+        self.no_frame();
     }
 
     /// Places the frame and hands it, with its persist record, to the device; or, when no
     /// segment can take it, refuses its updates `Full`.
-    fn place(&mut self, payload: Payload, laid: Laid, inbox: &Receiver<Message<F>>) {
+    fn place(&mut self, payload: Payload, laid: Laid<F>) {
         let tail = match &laid.sweep {
             Some(s) => s.next_tail,
             None => self.state.tail_incarnation(),
@@ -577,7 +561,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         let advances = tail > self.state.durable_tail;
         // A frame makes room if it names a later tail, whose durability frees a segment, or if
         // its every update only frees what its group held: a compaction, a removal, a fence.
-        let frees = |taken: &[(Submission, Placement)]| {
+        let frees = |taken: &[(Submission<F>, Placement)]| {
             !taken.is_empty() && taken.iter().all(|(s, _)| writer::frees(&s.update, s.marks))
         };
         let makes_room = advances || frees(&laid.taken);
@@ -588,14 +572,14 @@ impl<F: BlockFile + 'static> Owner<F> {
         }
         let target = self.target_for(payload.len(), makes_room);
         match target {
-            Ok(Some(target)) => self.write(payload, laid, target, tail, inbox),
+            Ok(Some(target)) => self.write(payload, laid, target, tail),
             Ok(None) => {
                 self.buffers.payload = payload;
-                self.full(laid.taken, inbox);
+                self.full(laid.taken);
             }
             Err(e) => {
                 self.buffers.payload = payload;
-                self.failed(VecDeque::new(), laid.taken, e, inbox);
+                self.failed(VecDeque::new(), laid.taken, e);
             }
         }
     }
@@ -636,14 +620,7 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// Lays the frame, its persist record and its own confirmation into aligned buffers and hands
     /// them to the device, with the answers of its updates and of the frame before.
-    fn write(
-        &mut self,
-        payload: Payload,
-        laid: Laid,
-        target: Target,
-        tail: u64,
-        inbox: &Receiver<Message<F>>,
-    ) {
+    fn write(&mut self, payload: Payload, laid: Laid<F>, target: Target, tail: u64) {
         let sequence = self.state.next_sequence;
         let built = self.frame_bytes(&target, laid.records, payload.as_slice(), tail, sequence);
         self.buffers.payload = payload;
@@ -672,10 +649,11 @@ impl<F: BlockFile + 'static> Owner<F> {
                     sweep, mut taken, ..
                 } = laid;
                 // A caller of the frame that waits on its answer does the frame's I/O.
-                let doer = taken
-                    .iter()
-                    .find(|(s, _)| s.waits)
-                    .and_then(|(s, _)| s.ticket.port());
+                let doer = taken.iter_mut().find_map(|(s, _)| {
+                    let slot = s.doer.take()?;
+                    let tell = s.ticket.port()?;
+                    Some(Doer { slot, tell })
+                });
                 let these = self.answers_of(&mut taken);
                 let before = self
                     .unconfirmed
@@ -707,13 +685,13 @@ impl<F: BlockFile + 'static> Owner<F> {
                     doer,
                 ));
             }
-            Err(e) => self.failed(VecDeque::new(), laid.taken, e, inbox),
+            Err(e) => self.failed(VecDeque::new(), laid.taken, e),
         }
     }
 
     /// The answers of a frame's updates, taken from them for the device to give: each ticket,
     /// and a handle's entries, whose terms and lengths stay for publishing the frame.
-    fn answers_of(&mut self, taken: &mut [(Submission, Placement)]) -> Vec<Answering> {
+    fn answers_of(&mut self, taken: &mut [(Submission<F>, Placement)]) -> Vec<Answering> {
         let mut these = self.buffers.answering.pop().unwrap_or_default();
         self.buffers.lens.clear();
         for (s, _) in taken.iter_mut() {
@@ -870,7 +848,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         &mut self,
         sequence: u64,
         confirms: u64,
-        updates: impl Iterator<Item = &'a Submission>,
+        updates: impl Iterator<Item = &'a Submission<F>>,
         kept: Option<AlignedBuf>,
     ) -> Result<AlignedBuf, LogError> {
         let b = &mut self.buffers;
@@ -911,7 +889,7 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// The frame is on the device: published, the frame before answered, and the loop goes on,
     /// with the frame's own confirmation on the device when no other frame follows.
-    pub(super) fn written(&mut self, done: Flushed, inbox: &Receiver<Message<F>>) {
+    pub(super) fn written(&mut self, done: Flushed) {
         let Flushed {
             result,
             timing,
@@ -973,7 +951,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             self.fence();
             self.answer_each(these, Err(LogError::Fenced));
             self.give_confirm(confirm);
-            self.failed(VecDeque::new(), taken, e, inbox);
+            self.failed(VecDeque::new(), taken, e);
             return;
         }
         let schedule = &mut self.schedule;
@@ -1008,7 +986,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         self.schedule.answered = confirmed;
         self.forget();
         self.schedule.backlog = backlog;
-        self.step(inbox);
+        self.agenda.step = true;
     }
 
     /// Keeps a confirmation's buffer for a later frame's: one for each frame whose confirmation
@@ -1048,19 +1026,19 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// No frame was written, so none confirms the last: a confirmation does, so that no answer
     /// waits on traffic that may only ever be refused.
-    fn no_frame(&mut self, inbox: &Receiver<Message<F>>) {
+    fn no_frame(&mut self) {
         if self.confirm(true) {
             return;
         }
         self.forget();
-        self.schedule.backlog = self.queued(inbox);
-        self.step(inbox);
+        self.schedule.backlog = self.queued();
+        self.agenda.step = true;
     }
 
     /// No segment can take the frame: every one holds live records the tail's sweep cannot
     /// free. Groups must compact. A frame that carried no update was a sweep making room for
     /// those held: none can come, and they are refused too.
-    fn full(&mut self, mut taken: Vec<(Submission, Placement)>, inbox: &Receiver<Message<F>>) {
+    fn full(&mut self, mut taken: Vec<(Submission<F>, Placement)>) {
         let sweep_only = taken.is_empty();
         for (s, _) in taken.drain(..) {
             self.answer(s, Err(LogError::Full));
@@ -1069,7 +1047,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         if sweep_only {
             self.refuse_held();
         }
-        self.no_frame(inbox);
+        self.no_frame();
     }
 
     /// Answers every held update `Full`: no room can be made for them until groups compact.
@@ -1087,10 +1065,9 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// whose confirmation will never come.
     fn failed(
         &mut self,
-        batch: VecDeque<Submission>,
-        taken: Vec<(Submission, Placement)>,
+        batch: VecDeque<Submission<F>>,
+        taken: Vec<(Submission<F>, Placement)>,
         _error: LogError,
-        inbox: &Receiver<Message<F>>,
     ) {
         self.phase = Phase::Idle;
         self.fence();
@@ -1103,8 +1080,8 @@ impl<F: BlockFile + 'static> Owner<F> {
         }
         self.schedule.answered = 0;
         self.forget();
-        self.schedule.backlog = self.queued(inbox);
-        self.step(inbox);
+        self.schedule.backlog = self.queued();
+        self.agenda.step = true;
     }
 
     /// Hands the device a confirmation of the last frame, written over the frame's own record in
@@ -1143,7 +1120,7 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// A frame whose confirmation will never come: its updates are answered `Fenced`.
-    fn unanswerable(&mut self, frame: Unconfirmed) {
+    fn unanswerable(&mut self, frame: Unconfirmed<F>) {
         self.settle(frame, Err(()), None);
         self.schedule.answered = 0;
     }
@@ -1155,7 +1132,6 @@ impl<F: BlockFile + 'static> Owner<F> {
         result: Result<(), LogError>,
         these: Vec<Answering>,
         durable: Option<Instant>,
-        inbox: &Receiver<Message<F>>,
     ) {
         let Phase::Confirming { mut frame, forget } =
             std::mem::replace(&mut self.phase, Phase::Idle)
@@ -1183,7 +1159,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             self.forget();
         }
         self.schedule.backlog = backlog;
-        self.step(inbox);
+        self.agenda.step = true;
     }
 
     /// Gives back the room of the updates of a frame whose confirmation is durable, `Ok`, or
@@ -1192,7 +1168,7 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// ended, which each update's commit wait runs to.
     fn settle(
         &mut self,
-        frame: Unconfirmed,
+        frame: Unconfirmed<F>,
         result: Result<(), ()>,
         durable: Option<Instant>,
     ) -> u64 {
@@ -1223,7 +1199,7 @@ impl<F: BlockFile + 'static> Owner<F> {
 
     /// Keeps an emptied list of a frame's updates for a later frame, while the writer holds
     /// fewer than it can use.
-    fn keep_list(&mut self, list: Vec<(Submission, Placement)>) {
+    fn keep_list(&mut self, list: Vec<(Submission<F>, Placement)>) {
         if list.capacity() > 0 && self.buffers.taken.len() < super::SPARE_FRAMES {
             self.buffers.taken.push(list);
         }
@@ -1261,7 +1237,7 @@ fn aligned(
 }
 
 /// Submitters of the batch that came back since the answers went out.
-fn returned(g: &Gather) -> u64 {
+fn returned<F>(g: &Gather<F>) -> u64 {
     u64::try_from(g.batch.len())
         .unwrap_or(u64::MAX)
         .saturating_sub(g.before)

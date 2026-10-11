@@ -1005,3 +1005,29 @@ them. slates is read at `ec5e0df` (its `main`, 2026-10-03).
   send, their groups' members, queues of several messages), the end-to-end members (a message of
   their measured datagram, their voters, queues of their log's bound), the shell's tests, the
   comparisons and the liveness bench.
+
+### No runtime recursion
+
+mantle's rule 10 (`CLAUDE.md` §10; hyper-raft's floor is the union of the projects' rules), checked
+on the code compiled at opt-level 0, where no call is inlined: every direct call in the LLVM IR of
+the workspace's targets, and their strongly connected components. Two cycles ran through the core;
+each now ends where it began, and what the core does is unchanged.
+
+- **Standing and counting.** A pre-candidate whose count won stood in the election from inside
+  the count: `campaign` → `poll` → `campaign`. The count (`poll`) now acts only for a candidate,
+  which leads on winning, and for a loser, which follows; a pre-candidate's win goes back to
+  whoever counted, which stands in the election next: `campaign`, for a pre-election its own vote
+  wins, and the answers a candidate hears.
+- **Committing and leaving a joint configuration.** A commit that reached the entry entering a
+  joint configuration wrote the entry leaving it, and writing a change counts the commit again
+  under the new configuration: `maybe_commit` → `leave_joint_when_committed` → `append_entry` →
+  `append_entries` → `refresh_configuration` → `configuration_changed` → `maybe_commit`. The
+  commit (`commit`) is now apart from the leave; `maybe_commit` is the two, and a changed
+  configuration counts the commit alone. A leader's configuration changes only by an entry it has
+  just written, above the commit, so no leave was ever due there: the second count found the
+  configuration no longer joint.
+- **Checked**: the same counts and finds before and after for the round searches that play the
+  real core (`tests/strategies.rs`: three lagged rounds, 6,552 rounds played, 182 states, 539
+  pruned; two rounds of three members, 45,036, 139, 186; the read before the first commit caught
+  after 13,917 rounds, the vote before durable after 11), the differential against raft-rs, and the
+  gates.

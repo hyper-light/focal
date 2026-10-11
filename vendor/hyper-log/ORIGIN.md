@@ -290,3 +290,58 @@ file's slots take at open. Without a `Growth` the log is mantle's.
 - `a_gate_that_admits_everything_writes_as_no_gate`: the same frames and file across a reopen;
   without the admission ahead of the sweep decision, the reopened log sweeps segments it has room
   beside and the file differs.
+
+## No runtime recursion: a flat owner loop, and nothing that holds a way back to itself
+
+mantle's rule 10 (`CLAUDE.md` §10, no runtime recursion; hyper-raft's floor is the union of the
+projects' rules) is checked with a tool on the built code: the direct calls in a binary's
+disassembly, and their strongly connected components. On this crate's release test binaries it
+found two kinds of cycle.
+
+- **The owner's loop called itself.** A handler that ended where mantle's writer went round its
+  loop called the loop's top: a frame flushed (`written`), a confirmation (`confirmed`), a failure
+  (`failed`), no frame (`no_frame`), a batch refused for a fence (`commit_unless_fenced`) each
+  called `step`, which took what waited in the inbox through `take`, which acted on a completion
+  through `done`, which led back to them: eight functions in one cycle (`gather_then_commit`,
+  `commit_unless_fenced`, `lay_out`, `failed`, `done`, `drain`, `take`, `step`). Each call was its
+  handler's last, and the drain never handed a completion on, so the stack never grew deep; the
+  tool reads the graph, not the run, and the rule is the graph's.
+  - Each handler now asks for what follows on the owner's agenda (`Agenda`) as it returns, the
+    writer's step or a message's submissions starting or joining a batch (`went_on`), and the loop
+    does it at its next turn, before anything else, as the handler did on its way out. `take` acts
+    on every message but a frame's word that it is flushed, which it gives back to be heard in its
+    turn, so a step's drain of the inbox reaches no completion. What the device sends back is the
+    owner's own (`Heard`), never a message. The order of everything the owner does is unchanged:
+    the 48 equivalence files are byte-identical to mantle-log's.
+- **Types that held a channel of themselves**, so that a drop ran its own drop:
+  - an answer carried its port's sending end back to the caller (`Reply::Answer` held a
+    `SyncSender<Reply>`). The caller now keeps both ends and gives the ticket a copy
+    (`ticket::call`): one copy a call, where the answer made one.
+  - the device held the owner's inbox, its flush slot, its returns and their tokens, and travelled
+    in the carrier its returns carry, which a message could hold (`Message::Back`): a carrier held
+    a channel of carriers, and a message a channel of messages. Each thread that does jobs now
+    holds its own lines to the owner (`device::Lines`: the I/O thread's, and each `Log`'s,
+    `GroupLog`'s and `LogOpener`'s) and lends them to the job it does; the device holds the file,
+    its buffers and the owner's word that another frame follows, and no channel. Lending also
+    saves the three channel copies a job made to send itself back.
+  - a blocking caller was handed its frame's I/O through its reply port (`Reply::Io`), and the I/O
+    holds the tickets of the frame's callers, which hold reply ports: a cycle through the trait
+    object, which the tool cannot see. The I/O now goes into a job slot of the caller's
+    (`device::Slot`, typed by the file, one for each kind of file a thread writes to, kept as
+    ports are), and the port only says it is there (`Reply::Job`). The caller keeps the slot and
+    its port until its answer, which only that I/O gives, so a job is never left where no one reads
+    it, and a caller that leaves its wait holds no job. The submission carries the slot's sending
+    end (`Submission::doer`), so the owner hands the job over typed and takes it back typed if
+    the caller has gone.
+- **The tool, before and after** (release test binaries of this crate): the owner's cycle once for
+  each kind of file the tests run it on (four), the carrier's and the device's drop cycle (four),
+  the reply's (one); after, no cycle but the standard library's own sorts (`core::slice::sort`'s
+  quicksorts and its recursive choice of pivot, `median3_rec`), which the writer's ordering of a
+  batch (`writer::order`) and the tests instantiate.
+- **Measured** (`docs/benchmarks.md`, "No runtime recursion"): allocations, reallocations and minor
+  faults per append, fetch, term and view unchanged; the replica's path the same 68.3 allocations,
+  0.2 reallocations and 12.2 context switches a committed entry, the wall time within the runs'
+  spread (median 58.5 µs against main's 61.3).
+- **Test**: `every_blocking_writer_flushes_its_own_frame`: a log's write and waiting write, an
+  opener's and a group's handle's, from the test's thread and another, each frame flushed and
+  confirmed on its writer's thread, with a thread writing to logs of two kinds of file between.
