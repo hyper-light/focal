@@ -707,7 +707,30 @@ impl Fleet {
     }
     async fn leader_at(&self, target: Option<u64>) -> usize {
         let (live, mut wait) = self.wait(Duration::from_secs(10));
+        // DIAG (not for merge): what each node says and what each relay carried, every 200 ms.
+        let diag_began = std::time::Instant::now();
+        let mut diag_round = 0u64;
         loop {
+            if diag_round % 10 == 0 {
+                let relays: Vec<_> = self
+                    .relays
+                    .iter()
+                    .map(|relay| {
+                        (
+                            relay.carried_toward_back(),
+                            relay.carried_toward_front(),
+                            relay.dropped(),
+                        )
+                    })
+                    .collect();
+                println!(
+                    "diag t={}ms nodes(node,stopped,leader,seq,term)={:?} relays(back,front,(dropped back,front))={:?}",
+                    diag_began.elapsed().as_millis(),
+                    self.report(),
+                    relays
+                );
+            }
+            diag_round += 1;
             for (index, replica) in self.replicas.iter().enumerate() {
                 let progress = replica.host.progress();
                 if !progress.stopped

@@ -525,6 +525,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         let (server, client) = config.tls.prepare(&transport)?;
         let mut endpoint = EndpointConfig::default();
         endpoint.config_slots(config_slots(&config.limits.admission)?);
+        // DIAG (not for merge): Careful Resume without its warm-up.
+        if std::env::var_os("FOCAL_DIAG_NO_WARM_UP").is_some() {
+            let mut resume = hyper_quic::CarefulResumeConfig::default();
+            resume.warm_up(false);
+            endpoint.careful_resume(Some(resume));
+        }
         let mut quic =
             hyper_quic::Endpoint::new(endpoint, server, true, None).map_err(|_| Refusal::Quic)?;
         let client = quic

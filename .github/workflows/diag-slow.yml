@@ -1,0 +1,33 @@
+name: Diag slow path
+# DIAG (not for merge): the 128 kbit/s crossing alone on Linux, with and without the warm-up.
+on:
+  push:
+    branches: ["diag/slow-**"]
+permissions:
+  contents: read
+jobs:
+  slow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: rustup toolchain install 1.98.1 --profile minimal
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Build the test
+        run: bash scripts/cargo.sh test -p focal-node --test evidence_quic --locked --no-run
+      - name: Warm-up on, six runs
+        run: |
+          for i in 1 2 3 4 5 6; do
+            echo "::group::warm-up on, run $i"
+            bash scripts/cargo.sh test -p focal-node --test evidence_quic --locked -- --exact a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second --nocapture 2>&1 | grep -E "diag t=|panicked|test result|no quorum|left|right" || true
+            echo "::endgroup::"
+          done
+      - name: Warm-up off, six runs
+        env:
+          FOCAL_DIAG_NO_WARM_UP: "1"
+        run: |
+          for i in 1 2 3 4 5 6; do
+            echo "::group::warm-up off, run $i"
+            bash scripts/cargo.sh test -p focal-node --test evidence_quic --locked -- --exact a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second --nocapture 2>&1 | grep -E "diag t=|panicked|test result|no quorum|left|right" || true
+            echo "::endgroup::"
+          done
