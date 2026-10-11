@@ -194,8 +194,8 @@ pub struct SessionCounters {
     pub frames_stale: u64,
     pub frames_waited: u64,
     /// What the session turned away for room (`pace::InputRefusals`).
-    pub frames_refused: u64,
-    pub requests_refused: u64,
+    pub frames_refused: RefusedBy,
+    pub requests_refused: RefusedBy,
     pub frames_dropped: u64,
     pub requests_dropped: u64,
     pub replication_dropped: u64,
@@ -206,6 +206,36 @@ pub struct SessionCounters {
     pub waits_swept: u64,
     pub waits_handed: u64,
     pub refused_periods: u64,
+}
+/// One kind of input a session's host turned away for room before it was
+/// queued, by the bound that turned it away (`pace::InputBound`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RefusedBy {
+    /// The node's memory budget had no room for its reservation.
+    pub memory: u64,
+    /// The runtime had no reply cell for it.
+    pub reply: u64,
+    /// Its queue was full.
+    pub queue: u64,
+}
+impl RefusedBy {
+    pub fn total(&self) -> u64 {
+        self.memory
+            .saturating_add(self.reply)
+            .saturating_add(self.queue)
+    }
+    fn add(&mut self, other: &Self) {
+        self.memory = self.memory.saturating_add(other.memory);
+        self.reply = self.reply.saturating_add(other.reply);
+        self.queue = self.queue.saturating_add(other.queue);
+    }
+    fn bounds(&self) -> [(&'static str, u64); 3] {
+        [
+            ("memory", self.memory),
+            ("reply", self.reply),
+            ("queue", self.queue),
+        ]
+    }
 }
 impl SessionCounters {
     /// A replica's counts, read in place, and the periods its owner was
@@ -237,7 +267,7 @@ impl SessionCounters {
             refused_periods,
         }
     }
-    fn fields(&self) -> [u64; 19] {
+    fn fields(&self) -> [u64; 23] {
         [
             self.peers_unreachable,
             self.appends_rejected,
@@ -246,8 +276,12 @@ impl SessionCounters {
             self.frames_let_go,
             self.frames_stale,
             self.frames_waited,
-            self.frames_refused,
-            self.requests_refused,
+            self.frames_refused.memory,
+            self.frames_refused.reply,
+            self.frames_refused.queue,
+            self.requests_refused.memory,
+            self.requests_refused.reply,
+            self.requests_refused.queue,
             self.frames_dropped,
             self.requests_dropped,
             self.replication_dropped,
@@ -281,8 +315,8 @@ impl SessionCounters {
         self.frames_let_go = sum(self.frames_let_go, other.frames_let_go);
         self.frames_stale = sum(self.frames_stale, other.frames_stale);
         self.frames_waited = sum(self.frames_waited, other.frames_waited);
-        self.frames_refused = sum(self.frames_refused, other.frames_refused);
-        self.requests_refused = sum(self.requests_refused, other.requests_refused);
+        self.frames_refused.add(&other.frames_refused);
+        self.requests_refused.add(&other.requests_refused);
         self.frames_dropped = sum(self.frames_dropped, other.frames_dropped);
         self.requests_dropped = sum(self.requests_dropped, other.requests_dropped);
         self.replication_dropped = sum(self.replication_dropped, other.replication_dropped);
@@ -1460,16 +1494,6 @@ impl MetricsSnapshot {
                 totals.frames_waited,
             ),
             (
-                "focal_sessions_frames_refused_total",
-                "Peers' frames a hosted session refused for room before it queued them, its queue or memory full: each lost to its peer.",
-                totals.frames_refused,
-            ),
-            (
-                "focal_sessions_requests_refused_total",
-                "Participants' requests a hosted session refused for room before it queued them, its queue or memory full.",
-                totals.requests_refused,
-            ),
-            (
                 "focal_sessions_frames_dropped_total",
                 "Peers' frames the fleet's scheduler dropped at a session's quota once queued.",
                 totals.frames_dropped,
@@ -1521,6 +1545,23 @@ impl MetricsSnapshot {
             ),
         ] {
             text.counter(name, help, value);
+        }
+        for (name, help, refused) in [
+            (
+                "focal_sessions_frames_refused_total",
+                "Peers' frames a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue): each lost to its peer.",
+                totals.frames_refused,
+            ),
+            (
+                "focal_sessions_requests_refused_total",
+                "Participants' requests a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue).",
+                totals.requests_refused,
+            ),
+        ] {
+            text.header(name, "counter", help);
+            for (bound, count) in refused.bounds() {
+                text.labeled(name, &[("bound", bound)], count);
+            }
         }
         let series: [(&str, &str, &str); 32] = [
             (
@@ -2011,6 +2052,42 @@ mod tests {
         ] {
             assert!(text.contains(line), "missing {line}");
         }
+    }
+    /// What a node's sessions turned away for room is exported by the bound
+    /// that turned it away — the node's memory, a reply cell, the queue —
+    /// peers' frames and participants' requests apart, every bound named
+    /// whether or not it refused.
+    #[test]
+    fn a_node_exports_what_its_sessions_refused_by_the_bound_that_refused_it() {
+        let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
+        let mut sample = snapshot(budget.stats());
+        sample.session_aggregates.totals.requests_refused = RefusedBy {
+            memory: 2,
+            reply: 0,
+            queue: 5,
+        };
+        sample.session_aggregates.totals.frames_refused = RefusedBy {
+            memory: 0,
+            reply: 1,
+            queue: 3,
+        };
+        let text = sample.render();
+        for line in [
+            "# TYPE focal_sessions_requests_refused_total counter\n",
+            "focal_sessions_requests_refused_total{bound=\"memory\"} 2\n",
+            "focal_sessions_requests_refused_total{bound=\"reply\"} 0\n",
+            "focal_sessions_requests_refused_total{bound=\"queue\"} 5\n",
+            "# TYPE focal_sessions_frames_refused_total counter\n",
+            "focal_sessions_frames_refused_total{bound=\"memory\"} 0\n",
+            "focal_sessions_frames_refused_total{bound=\"reply\"} 1\n",
+            "focal_sessions_frames_refused_total{bound=\"queue\"} 3\n",
+        ] {
+            assert!(text.contains(line), "missing {line}");
+        }
+        assert!(
+            !text.contains("\nfocal_sessions_requests_refused_total "),
+            "no unlabeled sample"
+        );
     }
     /// The audit's F65: a session whose owner did not answer says so and
     /// carries no owner-side number — never a zero read as health.

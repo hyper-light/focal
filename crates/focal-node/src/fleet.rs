@@ -1872,13 +1872,15 @@ impl ReplicaHost {
             },
             amount,
         ) else {
-            self.pace.refuse_input(replication);
+            self.pace
+                .refuse_input(replication, crate::pace::InputBound::Memory);
             return OwnedResponse::new(full);
         };
         // A reply's cell is refused at the runtime's bound: the request is
         // refused for the room, as one the budget refused.
         let Ok((send, receive)) = hyper_rt::sync::oneshot() else {
-            self.pace.refuse_input(replication);
+            self.pace
+                .refuse_input(replication, crate::pace::InputBound::Reply);
             return OwnedResponse::new(full);
         };
         let work = Work::Request(
@@ -1900,7 +1902,8 @@ impl ReplicaHost {
                 .await
                 .unwrap_or_else(|_| OwnedResponse::new(unknown)),
             Err(HostQueueError::Full) => {
-                self.pace.refuse_input(replication);
+                self.pace
+                    .refuse_input(replication, crate::pace::InputBound::Queue);
                 OwnedResponse::new(full)
             }
             Err(HostQueueError::Disconnected) => OwnedResponse::new(closed),

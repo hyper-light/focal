@@ -54,8 +54,8 @@ struct TickShared {
     /// away (`InputRefusals`): beside its periods because its host and its
     /// owner, on threads of their own, both turn input away and both hold
     /// this, and the node's metrics read it in place.
-    frames_refused: AtomicU64,
-    requests_refused: AtomicU64,
+    frames_refused: RefusalCounts,
+    requests_refused: RefusalCounts,
     frames_dropped: AtomicU64,
     requests_dropped: AtomicU64,
     /// The room the peers' frames have on their way to the owner: how many
@@ -65,6 +65,43 @@ struct TickShared {
     /// the participants' queue and never in it (F56).
     frame_room: AtomicUsize,
     frames_queued: AtomicUsize,
+}
+/// The bound a session's host turned an input away at, before it was
+/// queued ([`TickPeriod::refuse_input`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputBound {
+    /// The node's memory budget had no room for what the input holds on
+    /// its way: its frame, its reply's room and its place.
+    Memory,
+    /// The runtime had no reply cell for it.
+    Reply,
+    /// Its queue was full: the participants' queue for a request, the room
+    /// the owner's peer reserve gives for a peer's frame.
+    Queue,
+}
+/// One kind of input's refusals, a count for each bound.
+#[derive(Default)]
+struct RefusalCounts {
+    memory: AtomicU64,
+    reply: AtomicU64,
+    queue: AtomicU64,
+}
+impl RefusalCounts {
+    fn count(&self, bound: InputBound) {
+        match bound {
+            InputBound::Memory => &self.memory,
+            InputBound::Reply => &self.reply,
+            InputBound::Queue => &self.queue,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+    fn read(&self) -> crate::metrics::RefusedBy {
+        crate::metrics::RefusedBy {
+            memory: self.memory.load(Ordering::Relaxed),
+            reply: self.reply.load(Ordering::Relaxed),
+            queue: self.queue.load(Ordering::Relaxed),
+        }
+    }
 }
 /// One of the places the owner's peer reserve gives the peers' frames
 /// queued for it (`TickPeriod::queue_frame`), held by the frame until the
@@ -90,8 +127,8 @@ impl Drop for FrameTicket {
 /// once, then counts lost.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct InputRefusals {
-    pub(crate) frames_refused: u64,
-    pub(crate) requests_refused: u64,
+    pub(crate) frames_refused: crate::metrics::RefusedBy,
+    pub(crate) requests_refused: crate::metrics::RefusedBy,
     pub(crate) frames_dropped: u64,
     pub(crate) requests_dropped: u64,
 }
@@ -215,14 +252,13 @@ impl TickPeriod {
         self.0.refused.fetch_add(1, Ordering::Relaxed);
     }
     /// The host refused a peer's frame (`frame`) or a participant's request
-    /// for room before it was queued.
-    pub(crate) fn refuse_input(&self, frame: bool) {
-        let counter = if frame {
-            &self.0.frames_refused
+    /// for room before it was queued, at `bound`.
+    pub(crate) fn refuse_input(&self, frame: bool, bound: InputBound) {
+        if frame {
+            self.0.frames_refused.count(bound);
         } else {
-            &self.0.requests_refused
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
+            self.0.requests_refused.count(bound);
+        }
     }
     /// The owner states the room its peers' frames have on their way to it:
     /// its peer reserve (`Owner::peer_reserve`). A room made smaller takes
@@ -266,8 +302,8 @@ impl TickPeriod {
     }
     pub(crate) fn input_refusals(&self) -> InputRefusals {
         InputRefusals {
-            frames_refused: self.0.frames_refused.load(Ordering::Relaxed),
-            requests_refused: self.0.requests_refused.load(Ordering::Relaxed),
+            frames_refused: self.0.frames_refused.read(),
+            requests_refused: self.0.requests_refused.read(),
             frames_dropped: self.0.frames_dropped.load(Ordering::Relaxed),
             requests_dropped: self.0.requests_dropped.load(Ordering::Relaxed),
         }
