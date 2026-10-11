@@ -14384,3 +14384,60 @@ recursion), `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3275
 passed, 0 failed, 20 ignored. The land-5 and land-6 entries above counted 167 test binaries; their
 gate logs hold 166, as this one does.
+
+### 2026-10-11 — A preparation edits its directory in place where the nodes are its own; grouping and planning descend once a group
+
+**A preparation copies each node on its edited paths once.** Each page a batch rebuilt copied the
+directory's path from root to leaf, and let go of the copy the edit before it had made. A claim's
+18 rows in 16 regions of the key space copied 16 paths and freed 15. A node this preparation has
+already copied is now changed in place, and a node it shares is copied once (shadowing: Rodeh
+2008, "B-trees, shadowing, and clones"). A replace, and an insert into a leaf with room, edit in
+place; a split or a removal copies its path as before.
+
+**Grouping a batch by page descends once a group.** It found a group's page rank (summing the
+pages left of its path at every level), then the page and the page after it by rank. `locate`
+finds the rank, the page and the page after in one descent, in the planner and in the
+preparation. A search reads a node's first key (at the end of its leftmost path) only where the
+cached prefixes tie; it had read it at every probe. A shared handle that is let go returns before
+the unwinding stack is laid out.
+
+**A plan finds each changed key in its group's page.** Planning looked up every change's key in
+the base, a descent and a page search, to learn whether a put adds a key and that a deletion's key
+is held. A key the base holds is in the page whose span holds it, its group's page, so each change
+is now found there by that page's search alone.
+
+Authored claim creation over 11,000 claims on a node's leaves (128 entries, 4 KiB), interleaved
+A/B: prepare 37.8–38.4 to 29.3–30.1 µs a claim (the tests' 8-entry leaves: 37.5 to 29.8–30.0);
+the plan's lookups took the last 1,000 claims from 31.4–31.9 to 30.4–30.6 µs. The harness measures
+a node's leaves with FOCAL_MEASURE_PAGE_BYTES.
+
+Tests:
+- Replacing pages in several leaves issues the charges of the union of their paths, each node once,
+  and the base keeps every page.
+- An edit in place refused at every byte short of its need keeps every page in order and gives
+  back all it took: a replace, and an insert that grows its leaf, each twice.
+- Locating every page's key, and keys between pages, gives its rank, its page and the page after.
+- A plan refuses deleting an absent key wherever it falls (before the first page, inside a page,
+  between pages, past the last), alone or among other groups, and counts a batch's new length.
+- The shape audit checks each node's and page's cached prefix.
+
+On one runner, against land-7 (A/B run 38159221354: two rounds, A then B and then B then A; each
+side's nodes driven by one generator; measured writes):
+
+| offered/s | land-7 committed | land-8 committed | land-7 p99 | land-8 p99 |
+|---|---|---|---|---|
+| 100 | 6,059 / 6,059 | 6,059 / 6,059 | 7.7 / 27.4 ms | 7.2 / 7.7 ms |
+| 1,000 | 29,694 / 30,063 | 31,808 / 31,448 | 248.7 / 237.8 ms | 239.6 / 259.2 ms |
+| 4,000 | 22,082 / 24,255 | 22,666 / 24,312 | 495.8 / 415.3 ms | 487.2 / 460.8 ms |
+
+At 1,000 a second land-8 committed 6% more; the p99s lie within each other's spread. The comparison
+run on a runner of its own (38154875102) had measured 29,707 at 1,000/s against land-7's 31,655:
+that runner's Kafka p99 at 1,000/s was 26.3 ms, against 10.7 ms in land-7's comparison.
+
+The gate on the landing tree (head `075fa63`, macOS 26.4.1 arm64, under other work's load), exit
+0: `cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes,
+15 vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1152 production sources, no policy allowance, no runtime
+recursion), `cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3279
+passed, 0 failed, 20 ignored.
