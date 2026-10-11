@@ -119,6 +119,7 @@ struct Source {
     contributor_passes: Cell<usize>,
     on_check: Cell<Option<(usize, Change)>>,
     on_contributors: Cell<Option<(usize, Change)>>,
+    replays: Cell<bool>,
 }
 impl Source {
     fn new() -> Self {
@@ -130,6 +131,7 @@ impl Source {
             contributor_passes: Cell::new(0),
             on_check: Cell::new(None),
             on_contributors: Cell::new(None),
+            replays: Cell::new(false),
         }
     }
     fn handlers_for(&self, phase: PolicyPhase) -> &'static [HandlerPolicy<'static>] {
@@ -285,6 +287,9 @@ impl ValidationSource<'static> for Source {
             source: self,
             index: 0,
         }
+    }
+    fn replays(&self) -> bool {
+        self.replays.get()
     }
 }
 
@@ -537,5 +542,47 @@ fn values_changed_during_copy_are_checked_again_as_an_owned_descriptor() {
         assert_eq!(source.contributor_passes.get(), 2);
         source.reset();
         assert!(prepare(&source).build(charge, visits).is_ok());
+    }
+}
+
+/// A source that replays what its plan read is not inspected again by its
+/// build: the build reads its check handlers twice (the declaration's
+/// preparation and build) and its contributors once (the copy), where another
+/// source's build inspects it first (three and two). Its descriptor is still
+/// inspected and held to the plan, so a source that claims to replay and
+/// changes during its copy, a handler or a contributor, is refused.
+#[test]
+fn a_replaying_source_is_not_inspected_again_and_its_copy_is_still_checked() {
+    let source = Source::new();
+    source.replays.set(true);
+    let plan = prepare(&source);
+    let intent = plan.intent_fingerprint();
+    let charge = plan.construction_charge();
+    let visits = plan.build_visits();
+    source.checks.set(0);
+    source.contributor_passes.set(0);
+    assert_eq!(
+        plan.build(charge, visits).unwrap().intent_fingerprint(),
+        intent
+    );
+    assert_eq!(
+        (source.checks.get(), source.contributor_passes.get()),
+        (2, 1)
+    );
+    for handler in [true, false] {
+        source.reset();
+        let plan = prepare(&source);
+        source.checks.set(0);
+        source.contributor_passes.set(0);
+        if handler {
+            source.on_check.set(Some((1, Change::Version)));
+        } else {
+            source.on_contributors.set(Some((1, Change::Contributor)));
+        }
+        assert_eq!(
+            plan.build(charge, visits).unwrap_err(),
+            ContractError::ContentConflict,
+            "handler {handler}"
+        );
     }
 }

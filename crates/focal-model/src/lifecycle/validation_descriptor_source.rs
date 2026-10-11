@@ -58,6 +58,15 @@ pub trait ValidationSource<'a>: PolicySource {
     fn fields(&self) -> ValidationFields<'a>;
     fn contributor_count(&self) -> usize;
     fn contributors(&self) -> Self::Contributors<'_>;
+    /// Whether every read yields what its plan's read did: a source over
+    /// bytes it borrows (which cannot change while borrowed), read by the same
+    /// decoder. A build from such a source's plan does not inspect it again;
+    /// the descriptor it builds is still inspected and held to the plan's
+    /// content and specification. Any other source is inspected again, so one
+    /// that changes is refused.
+    fn replays(&self) -> bool {
+        false
+    }
 }
 
 impl<'a> PolicySource for ValidationSpec<'a> {
@@ -502,18 +511,24 @@ pub(super) fn build<'a, S: ValidationSource<'a>>(
     bytes::fits(shape.charge, max_bytes)?;
     bytes::fits(shape.build_visits, max_visits)?;
     let mut visits = VisitBudget::new(shape.build_visits);
-    let (fields, actual) = inspect(principal, source, limits, visits.remaining())?;
-    visits.charge(actual.inspection_visits)?;
-    if !hash::same_intent(
-        fields.declaration(actual.content_hash).binding,
-        expected.declaration(shape.content_hash).binding,
-    ) || actual.specification_hash != shape.specification_hash
-        || actual.heap != shape.heap
-        || actual.allocations != shape.allocations
-        || actual.contributors != shape.contributors
-    {
-        return Err(ContractError::ContentConflict);
-    }
+    // A source that replays what its plan read is not inspected again.
+    let fields = if source.replays() {
+        expected
+    } else {
+        let (fields, actual) = inspect(principal, source, limits, visits.remaining())?;
+        visits.charge(actual.inspection_visits)?;
+        if !hash::same_intent(
+            fields.declaration(actual.content_hash).binding,
+            expected.declaration(shape.content_hash).binding,
+        ) || actual.specification_hash != shape.specification_hash
+            || actual.heap != shape.heap
+            || actual.allocations != shape.allocations
+            || actual.contributors != shape.contributors
+        {
+            return Err(ContractError::ContentConflict);
+        }
+        fields
+    };
     let adapter = DeclarationAdapter {
         source,
         fields: fields.declaration(shape.content_hash),
