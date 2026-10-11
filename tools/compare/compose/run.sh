@@ -58,6 +58,31 @@ cpu_stat() {
     awk -v p="$phase" -v c="$c" '{ print p, c, $1, $2 }' "/sys/fs/cgroup$group/cpu.stat"
   done
 }
+# Each of the run's containers' network as its own namespace counts it, read
+# on the host (`/proc/PID/net` is the namespace of PID): its UDP and TCP
+# counters and its interface's bytes and packets each way, before and after
+# the load, each line `PHASE CONTAINER KEY VALUE`, for what a write costs the
+# network: datagrams or segments, and bytes. Prints nothing off Linux.
+net_stat() {
+  local phase=$1 c pid
+  for c in $(dc ps --format '{{.Name}}'); do
+    pid=$(docker inspect --format '{{.State.Pid}}' "$c" 2>/dev/null) || continue
+    [ -r "/proc/$pid/net/snmp" ] && [ -r "/proc/$pid/net/dev" ] || continue
+    awk -v p="$phase" -v c="$c" '
+      $1 == "Udp:" || $1 == "Tcp:" {
+        if (!($1 in names)) { names[$1] = $0; next }
+        n = split(names[$1], k); split($0, v)
+        for (i = 2; i <= n; i++) print p, c, substr($1, 1, length($1) - 1) "." k[i], v[i]
+      }' "/proc/$pid/net/snmp"
+    awk -v p="$phase" -v c="$c" '
+      { sub(/^[ \t]+/, "") }
+      /^eth0:/ {
+        sub(/^eth0:[ \t]*/, ""); split($0, f, /[ \t]+/)
+        print p, c, "eth0.rx_bytes", f[1]; print p, c, "eth0.rx_packets", f[2]
+        print p, c, "eth0.tx_bytes", f[9]; print p, c, "eth0.tx_packets", f[10]
+      }' "/proc/$pid/net/dev"
+  done
+}
 # Each image the profile runs, pulled once and one at a time before the cluster
 # starts: a registry's anonymous pulls are rate-limited per address (ECR Public
 # answers `Rate exceeded` past about one a second, Docker Hub refuses past its
@@ -117,6 +142,7 @@ EOF
     # Bounded at four times the run's intended length and two minutes more: a
     # run that cannot keep the offered rate still ends, its evidence printed.
     cpu_stat before > "$out/$report.cpu.txt"
+    net_stat before > "$out/$report.net.txt"
     if ! timeout $(( (seconds + warmup) * 4 + 120 )) docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
       focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
@@ -124,6 +150,7 @@ EOF
       exit 1
     fi
     cpu_stat after >> "$out/$report.cpu.txt"
+    net_stat after >> "$out/$report.net.txt"
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
     dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true
@@ -153,8 +180,10 @@ if [ "$system" != focal ]; then
       --seconds "$seconds" --warmup "$warmup" --out "/reports/$report"
   }
   cpu_stat before > "$out/$report.cpu.txt"
+  net_stat before > "$out/$report.net.txt"
   retry 60 generate || { evidence; exit 1; }
   cpu_stat after >> "$out/$report.cpu.txt"
+  net_stat after >> "$out/$report.net.txt"
   dc exec -T generator cat "/reports/$report" > "$out/$report"
 fi
 echo "wrote $out/$report"
