@@ -14158,3 +14158,62 @@ The gate on the landing tree (head `b81f945`, macOS 26.4.1 arm64, under other wo
 `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3264
 passed, 0 failed, 20 ignored.
+
+### 2026-10-11 — No runtime recursion
+
+The owner banned runtime recursion implementation-wide on 2026-10-10. CLAUDE.md §1a states the
+rule: no recursive or mutually recursive functions, no future that awaits itself, and no type
+whose drop reaches its own drop, in any code compiled outside a test.
+
+`scripts/check_recursion.py`, run by `scripts/check-production.sh`, enforces it:
+- It builds every library and binary target, the vendored hyper-* crates included, to LLVM IR at
+  opt-level 0 with one codegen unit, so every call is explicit, each target's IR to its own path.
+- It finds the call graph's cycles with an iterative Tarjan. A cycle through the workspace's code
+  or its types' drop glue is refused; a dependency's own cycle is listed.
+- It also refuses, in the source, a future-returning function that calls itself by name.
+- It proves itself on fixtures first: self, mutual and drop-glue recursion refused, a dependency
+  cycle listed, a boxed async self-call refused.
+
+Its first run found 18 roots, 14 in focal's code. Each now walks with a loop over a stated bound:
+- directory creation, the GC's quarantine deletion, CLI error classification, the config schema
+  walk, the MCP value cost and schema pruner, and the JSON shape pass, which a differential test
+  holds to the serde visitor it replaced on 6,000 generated documents;
+- the fleet owner's accept, progress and tick cycle, and its install replies, which now name the
+  incarnation installed rather than holding a handle on the replica's owner and its input queue;
+- the memory budget's levels. They now live in one bounded table of slots, and no level holds
+  another;
+- the range directory's nodes, which are now let go a level at a time by one loop.
+
+The shared crates' cycles (hyper-tls, hyper-log's owner step chain, two in hyper-raft) are fixed
+upstream and vendored at `b13d50d`. The check now finds no runtime recursion in the workspace's
+code and lists 408 cycles in dependencies: std's sorts and `BTreeMap`, `serde_json`,
+`serde_saphyr` and webpki.
+
+**The memory budget holds no `Arc`.**
+- A budget handle is a reference to its level's slot, one pointer.
+- An allocation is its level, its bytes, and its kind and lane, three words where it was four.
+- Reserving and releasing count no references. A level lives while it is held or charged.
+- The last release of a hold, and the last of a byte or credit, each read the other's count after
+  their own. A compare-and-swap on the slot's generation lets exactly one of them end the level.
+
+Measured with `cargo bench -p focal-memory --bench budget`: 2,000,000 operations, 7 rounds a case,
+7 interleaved passes, on macOS arm64 under other work's load.
+
+| Budget design | Uncontended, one level | Uncontended, three levels | Child budget |
+|---|---|---|---|
+| No `Arc` (landed) | 7.8 ns | 20.1 ns | 25 ns |
+| Two `Arc`s (recursion-free) | 7.3 ns | 20.0 ns | 45 ns |
+| One `Arc` (the cycle itself) | 7.2 ns | 17.4 ns | 25 ns |
+
+Contended medians at 2–8 threads are within ±10% of the two-`Arc` design either way. A test lets a
+level go on several threads at once over 2,000 rounds and finds it ends exactly once; it fails at
+round 4 when any release may end it. A test refuses directory edits at every byte short of their
+need and finds each refusal leaves the budget where it was.
+
+The gate on the landing tree (head `d98f858`, macOS 26.4.1 arm64, under other work's load), exit
+0: `cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes,
+15 vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1152 production sources, no policy allowance, no runtime
+recursion), `cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3271
+passed, 0 failed, 20 ignored.
