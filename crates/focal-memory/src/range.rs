@@ -529,12 +529,6 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
     pub fn entries(&self) -> impl Iterator<Item = &Entry<K, V>> {
         self.root.from(0, 0)
     }
-    /// Ordered entries from the first of the page at rank `page` (none past
-    /// the last page), reached by one descent where `entries` walks from the
-    /// first row. The caller bounds the number of returned entries it consumes.
-    pub fn entries_from_page(&self, page: usize) -> impl Iterator<Item = &Entry<K, V>> {
-        self.root.from(page, 0)
-    }
     /// Ordered entries at or after `key`, excluding equality when `exclusive`.
     /// The cursor borrows this committed prefix, not the search key; seeking
     /// and iteration allocate nothing and retain no extra root handles.
