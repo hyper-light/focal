@@ -863,7 +863,7 @@ fn a_session_with_a_write_out_refuses_what_its_queue_has_no_room_for_and_counts_
             );
         }
         let refused = crate::test_waits::within(&[&host], steps, TICK, async {
-            while host.input_refusals().requests_refused == 0 {
+            while host.input_refusals().requests_refused.total() == 0 {
                 focal_rt::time::sleep(Duration::from_millis(1))
                     .await
                     .unwrap();
@@ -886,8 +886,15 @@ fn a_session_with_a_write_out_refuses_what_its_queue_has_no_room_for_and_counts_
         shutdown(fixture).await;
         refused.unwrap();
         assert_eq!(capacity, 1, "one write found no room");
-        assert_eq!(counted.requests_refused, 1, "and was counted");
-        assert_eq!(counted.frames_refused, 0);
+        assert_eq!(
+            counted.requests_refused,
+            crate::metrics::RefusedBy {
+                queue: 1,
+                ..Default::default()
+            },
+            "and was counted at its queue"
+        );
+        assert_eq!(counted.frames_refused.total(), 0);
         assert_eq!(counted.requests_dropped, 0);
     })
     .unwrap()
@@ -948,7 +955,7 @@ fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_full() {
             );
         }
         crate::test_waits::within(&[&host], steps, TICK, async {
-            while host.input_refusals().requests_refused == 0 {
+            while host.input_refusals().requests_refused.total() == 0 {
                 focal_rt::time::sleep(Duration::from_millis(1))
                     .await
                     .unwrap();
@@ -988,7 +995,7 @@ fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_full() {
             );
         }
         crate::test_waits::within(&[&host], steps, TICK, async {
-            while host.input_refusals().frames_refused == 0 {
+            while host.input_refusals().frames_refused.total() == 0 {
                 focal_rt::time::sleep(Duration::from_millis(1))
                     .await
                     .unwrap();
@@ -1033,8 +1040,12 @@ fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_full() {
         shutdown(fixture).await;
         assert_eq!(refused, 1, "only the frame past the room is refused");
         assert_eq!(capacity, 1, "one write found no room");
-        assert_eq!(counted.frames_refused, 1, "and was counted");
-        assert_eq!(counted.requests_refused, 1);
+        let queue = crate::metrics::RefusedBy {
+            queue: 1,
+            ..Default::default()
+        };
+        assert_eq!(counted.frames_refused, queue, "and was counted at its room");
+        assert_eq!(counted.requests_refused, queue);
         assert_eq!(counted.frames_dropped, 0);
         assert_eq!(counted.requests_dropped, 0);
     })
