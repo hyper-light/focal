@@ -75,6 +75,15 @@ use hyper_timing::RoundBudget;
 use crate::Refusal;
 use crate::credit::MIN_DATAGRAM;
 
+/// DIAG (not for landing): wall-clock milliseconds, the test's clock, when FOCAL_DIAG_JUDGE is set.
+pub(crate) fn diag_judge() -> Option<u128> {
+    std::env::var_os("FOCAL_DIAG_JUDGE")?;
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() % 1_000_000)
+}
+
 /// The least a period must move: one datagram of the smallest size a QUIC path carries
 /// (RFC 9000 §14; focal `frame.rs`'s `LEAST_PROGRESS`).
 pub const LEAST_PROGRESS: u64 = MIN_DATAGRAM;
@@ -202,6 +211,9 @@ impl Carry {
     }
     /// The exchange is asking: `owed` bytes are to be sent on the connection, its own included.
     pub(crate) fn asking(&mut self, now: Instant, moved: Moved, owed: u64) {
+        if let Some(t) = diag_judge() {
+            eprintln!("DIAG carry asking t={t} period={:?} owed={owed} moved={moved:?}", self.period);
+        }
         self.restart(now, moved);
         self.phase = Phase::Asking {
             owed,
@@ -212,6 +224,9 @@ impl Carry {
     /// The exchange is answered: `remaining` bytes of body are to arrive, and the peer has
     /// `backlog` to deliver of the exchange's class and the less urgent ones, this body included.
     pub(crate) fn answering(&mut self, now: Instant, moved: Moved, remaining: u64, backlog: u64) {
+        if let Some(t) = diag_judge() {
+            eprintln!("DIAG carry answering t={t} remaining={remaining} backlog={backlog}");
+        }
         self.restart(now, moved);
         self.phase = Phase::Answering {
             owed: backlog.max(remaining),
@@ -234,6 +249,9 @@ impl Carry {
     /// or has not written what the peer would take): no evidence against the peer, so the wait
     /// starts afresh from `now`, an answer's charge anew against the `backlog` the peer has now.
     pub(crate) fn hold(&mut self, now: Instant, moved: Moved, backlog: u64) {
+        if let Some(t) = diag_judge() {
+            eprintln!("DIAG carry hold t={t} phase={:?}", self.phase);
+        }
         self.restart(now, moved);
         if let Phase::Answering {
             owed,
@@ -292,6 +310,15 @@ impl Carry {
             return Ok(());
         }
         let ready = self.since.checked_add(floor).unwrap_or(now);
+        if let Some(t) = diag_judge() {
+            eprintln!(
+                "DIAG judge t={t} window_ms={} floor={floor:?} postponed={} phase={:?} moved={moved:?} before={:?} held={held} backlog={backlog} acknowledged={acknowledged}",
+                now.saturating_duration_since(self.since).as_millis(),
+                now < ready,
+                self.phase,
+                self.before
+            );
+        }
         if now < ready {
             self.next = ready;
             return Ok(());

@@ -26,5 +26,5 @@ jobs:
         run: |
           for run in 1 2 3 4 5 6 7 8 9 10; do
             echo "== run $run"
-            cargo test -p focal-wire --lib --locked -- --nocapture a_stall_past_the_request_deadline 2>&1 | grep -E 'DIAG|test result|FAILED|panicked' || true
+            FOCAL_DIAG_JUDGE=1 cargo test -p focal-wire --lib --locked -- --nocapture a_stall_past_the_request_deadline 2>&1 | grep -E 'DIAG|test result|FAILED|panicked' || true
           done

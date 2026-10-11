@@ -5937,8 +5937,9 @@ fn a_group_message_still_out_makes_its_peer_late_while_it_lasts() {
 /// a half-second stall when the two were one, 2026-10-07).
 /// DIAG: milliseconds since the first call, one clock for both threads.
 fn diag_ms() -> u64 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() % 1_000_000) as u64
 }
 #[test]
 fn a_stall_past_the_request_deadline_keeps_the_connection() {
