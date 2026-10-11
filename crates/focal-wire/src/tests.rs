@@ -320,15 +320,21 @@ fn a_local_slow_response_keeps_its_output_charge_until_written_or_disconnected()
             .unwrap();
             stream.shutdown(hyper_rt::tcp::Shutdown::Write).unwrap();
             // The response's header arriving is the server's write begun; this
-            // client reads no further, so the write cannot finish, and its
-            // output charge is still held.
+            // client reads no further, so the write cannot finish where the
+            // kernel holds less than the response, and its output charge is
+            // still held. Windows' AF_UNIX takes the whole 900 KB response into
+            // the kernel before a byte is read (Windows CI run 38119678828: the
+            // charge was given back as the header arrived): there the write has
+            // finished, and nothing is held for it.
             let header = unfrozen(
                 "the response never began",
                 read_frame_header(&mut stream, FrameKind::Response, limits().max_frame_bytes),
             )
             .await
             .unwrap();
-            assert!(budget.stats().used >= 900 * 1024 * 3);
+            if cfg!(unix) {
+                assert!(budget.stats().used >= 900 * 1024 * 3);
+            }
             if !disconnect {
                 let mut buffer = vec![0; header.payload_bytes()];
                 let payload = read_frame_payload_into(&mut stream, header, &mut buffer)
