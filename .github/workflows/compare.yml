@@ -96,6 +96,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Let perf sample a container's process
+        run: sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0
       - name: The disk the runs write to
         run: |
           mkdir -p tools/compare/compose/reports
@@ -122,8 +124,8 @@ jobs:
           BENCH_LIBRARY: ${{ needs.image.outputs.registry || 'public.ecr.aws/docker/library' }}
           BENCH_KAFKA: ${{ needs.image.outputs.registry && format('{0}/kafka', needs.image.outputs.registry) || 'apache/kafka' }}
         run: |
-          for system in ${{ github.event.inputs.systems || 'focal kafka nats redis' }}; do
-            for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'compare/deliver') && '50 100 200 400' || '100 200 1000 4000') }}; do
+          for system in ${{ github.event.inputs.systems || 'focal' }}; do
+            for rate in ${{ github.event.inputs.rates || '1000 4000' }}; do
               bash tools/compare/compose/run.sh "$system" "$rate" \
                 "${{ github.event.inputs.seconds || '60' }}" \
                 "${{ github.event.inputs.warmup || '15' }}" \
