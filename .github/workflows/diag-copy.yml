@@ -1,0 +1,34 @@
+name: Diag copy bytes
+# DIAG (not for merge): evidence_quic's copy-bytes test on Linux, with and without the path's warm-up,
+# each warm-up's start and end printed (hyper-quic patch Q12's warm-up suspected of the extra bytes).
+on:
+  push:
+    branches: ["diag/copy-**"]
+permissions:
+  contents: read
+jobs:
+  copy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - run: rustup toolchain install 1.98.1 --profile minimal
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Build the test
+        run: bash scripts/cargo.sh test -p focal-node --test evidence_quic --locked --no-run
+      - name: Warm-up on, three runs
+        run: |
+          for i in 1 2 3; do
+            echo "::group::warm-up on, run $i"
+            bash scripts/cargo.sh test -p focal-node --test evidence_quic --locked -- --exact a_copy_is_sent_the_chunks_it_lacks_and_none_it_holds --nocapture 2>&1 | grep -E "DIAGWU|DIAGT|bytes crossed|test result|panicked" || true
+            echo "::endgroup::"
+          done
+      - name: Warm-up off, three runs
+        env:
+          FOCAL_DIAG_NO_WARM_UP: "1"
+        run: |
+          for i in 1 2 3; do
+            echo "::group::warm-up off, run $i"
+            bash scripts/cargo.sh test -p focal-node --test evidence_quic --locked -- --exact a_copy_is_sent_the_chunks_it_lacks_and_none_it_holds --nocapture 2>&1 | grep -E "DIAGWU|DIAGT|bytes crossed|test result|panicked" || true
+            echo "::endgroup::"
+          done

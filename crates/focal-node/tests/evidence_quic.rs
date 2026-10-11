@@ -1470,10 +1470,18 @@ async fn bytes_crossed_for_a_second_object(old: &'static [u64]) -> u64 {
     for byte in &mut second[SHARED_CHUNK..2 * SHARED_CHUNK] {
         *byte = if *byte == b' ' { b'\t' } else { b' ' };
     }
+    let unix = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    };
+    eprintln!("DIAGT fleet up unix_ms={} toward_copy={}", unix(), fleet.relays[1].carried_toward_back());
     sealed(&fleet, leader, &slow, 1, &first).await;
     let before = fleet.relays[1].carried_toward_back();
+    eprintln!("DIAGT first sealed unix_ms={} toward_copy={before}", unix());
     let reference = sealed(&fleet, leader, &slow, 2, &second).await;
     let crossed = fleet.relays[1].carried_toward_back() - before;
+    eprintln!("DIAGT second sealed unix_ms={} crossed={crossed}", unix());
     assert_bytes(
         download(&fleet.replicas[1].actor, &reference).await,
         &second,

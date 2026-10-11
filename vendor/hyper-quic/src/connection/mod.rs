@@ -199,6 +199,8 @@ pub struct Connection {
     endpoint_events: VecDeque<EndpointEventInner>,
     /// Careful Resume over the current path's congestion controller (RFC 9959)
     resume: CarefulResume,
+    /// DIAG (not for merge): whether this connection's warm-up end was printed
+    diag_wu_reported: bool,
     /// When the last ack-eliciting 1-RTT packet arrived: the warm-up waits a round trip past it
     received_eliciting: Option<Instant>,
     /// What the path's losses say of their bursts: the endpoint's memory of the remote when the
@@ -371,6 +373,7 @@ impl Connection {
             undecryptable_bytes: 0,
             endpoint_events: VecDeque::new(),
             resume,
+            diag_wu_reported: false,
             received_eliciting: None,
             ledger: Ledger::new(losses),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
@@ -1374,6 +1377,7 @@ impl Connection {
             tx.num_datagrams = 1;
         } else if !tx.congestion_blocked {
             self.warm_up(now, buf, tx);
+            self.diag_warm_up_end();
         }
     }
 
@@ -1428,6 +1432,27 @@ impl Connection {
     /// padded to `size`, the path's MTU, ack-eliciting and in flight, under the congestion window
     /// and the pacer like any packet. `Some(true)` when it was written, `Some(false)` when the
     /// window or the pacer holds it back, `None` when the connection cannot send one yet.
+    /// DIAG (not for merge): print this connection's warm-up end once
+    fn diag_warm_up_end(&mut self) {
+        if self.diag_wu_reported {
+            return;
+        }
+        if let Some(end) = self.resume.warm_up_end() {
+            self.diag_wu_reported = true;
+            eprintln!(
+                "DIAGWU end remote={} unix_ms={} end={:?} sent_packets={} rtt={:?} min={:?}",
+                self.path.remote,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis()),
+                end,
+                self.stats.path.sent_warm_up_packets,
+                self.path.rtt.get(),
+                self.path.rtt.min()
+            );
+        }
+    }
+
     fn write_warm_up(&mut self, now: Instant, buf: &mut Vec<u8>, size: u16) -> Option<bool> {
         // It waits for the handshake's confirmation (RFC 9001 §4.1.2: the server's at its
         // completion, the client's at HANDSHAKE_DONE, each discarding its Handshake keys): before
@@ -1468,6 +1493,18 @@ impl Connection {
         };
         builder.finish_and_track(now, self, Some(sent_frames), buf);
         self.resume.on_warm_up_sent(bytes);
+        if self.stats.path.sent_warm_up_packets == 0 {
+            eprintln!(
+                "DIAGWU start remote={} unix_ms={} rtt={:?} min={:?} in_flight={}",
+                self.path.remote,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis()),
+                self.path.rtt.get(),
+                self.path.rtt.min(),
+                self.path.in_flight.bytes
+            );
+        }
         self.stats.path.sent_warm_up_packets =
             self.stats.path.sent_warm_up_packets.saturating_add(1);
         trace!(size, "writing a warm-up packet");
@@ -2028,6 +2065,7 @@ impl Connection {
         if let Some(sample) = sample.filter(|_| warm_up_acked) {
             self.resume.on_rtt_sample(now, sample, self.path.rtt.get());
         }
+        self.diag_warm_up_end();
         // The warm-up's measurement goes to the endpoint as soon as it is made
         if let Some(saved) = self
             .resume
