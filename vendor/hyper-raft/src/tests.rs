@@ -209,6 +209,66 @@ fn what_a_peer_may_not_say_is_refused_and_changes_nothing() {
     assert_eq!(node.raft.log().last_index().unwrap(), 4);
 }
 
+/// An append behind the commit that runs past it is taken past the commit:
+/// what it carries at or below the commit is committed, and what it carries
+/// after is new to the member. Answered with the commit and dropped whole, an
+/// append that a path held back past its leader's patience lost its new
+/// entries with it, and every append the leader had sent behind it was refused
+/// for the hole (focal's fleet: one append of 33 entries held 700 ms, 27
+/// refused behind it). One that adds nothing past the commit, or that names
+/// another entry at the commit, is answered with the commit as before.
+#[test]
+fn an_append_behind_the_commit_is_taken_past_it() {
+    // Entries 1 to 3 of term 1, the commit at 2.
+    let mut node = follower();
+    let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
+    append.index = 1;
+    append.log_term = 1;
+    append.commit = 3;
+    append.entries = vec![entry(2, 1), entry(3, 1), entry(4, 1), entry(5, 1)];
+    node.step(append).unwrap();
+    let answered = drain(&mut node);
+    assert_eq!(answered.len(), 1);
+    assert_eq!((answered[0].index, answered[0].reject), (5, false));
+    assert_eq!(
+        crate::raft::held(&node.raft),
+        vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+    );
+    assert_eq!(node.raft.log().committed(), 3);
+    // Nothing past the commit: answered with it, and nothing changes.
+    let hard = node.raft.hard_state();
+    let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
+    append.index = 1;
+    append.log_term = 1;
+    append.entries = vec![entry(2, 1), entry(3, 1)];
+    node.step(append).unwrap();
+    let answered = drain(&mut node);
+    assert_eq!(answered.len(), 1);
+    assert_eq!((answered[0].index, answered[0].reject), (3, false));
+    unchanged(&node, &hard, 5);
+    // Another entry named at the commit: answered with it, and nothing
+    // changes.
+    let mut append = answer(MessageType::MsgAppend, 1, 2, 1);
+    append.index = 1;
+    append.log_term = 1;
+    append.entries = vec![
+        entry(2, 9),
+        entry(3, 9),
+        entry(4, 9),
+        entry(5, 9),
+        entry(6, 9),
+    ];
+    node.step(append).unwrap();
+    let answered = drain(&mut node);
+    assert_eq!(answered.len(), 1);
+    assert_eq!((answered[0].index, answered[0].reject), (3, false));
+    unchanged(&node, &hard, 5);
+    assert_eq!(
+        crate::raft::held(&node.raft),
+        vec![(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+    );
+}
+
 #[test]
 fn what_is_not_of_the_network_is_refused() {
     let mut node = leader();
