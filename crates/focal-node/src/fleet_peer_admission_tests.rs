@@ -28,7 +28,14 @@ fn summary(fixture: &mut Fixture, id: u128) -> hyper_rt::sync::OneshotReceiver<O
         .unwrap()
         .commit();
     let (send, receive) = hyper_rt::sync::oneshot().unwrap();
-    owner.request(verified, send, charge, None, None);
+    owner.request(
+        verified,
+        send,
+        charge,
+        None,
+        None,
+        std::time::Duration::ZERO,
+    );
     receive
 }
 /// Every frame owner `from` sent, as (target, request).
@@ -54,26 +61,48 @@ fn ingress(
         .unwrap()
         .commit();
     let (send, receive) = hyper_rt::sync::oneshot().unwrap();
-    owner.request(verified, send, charge, None, None);
+    owner.request(
+        verified,
+        send,
+        charge,
+        None,
+        None,
+        std::time::Duration::ZERO,
+    );
     receive
+}
+
+/// Holds all the room the owner's budget has left in the ordinary lane, the lane participants'
+/// requests are charged in: what a full participant queue is, its bound being memory.
+fn fill_ordinary(budget: &MemoryBudget) -> Vec<Allocation> {
+    let mut held = Vec::new();
+    let mut size = budget.reservation_limit(BudgetLane::Ordinary);
+    while size > 0 {
+        match budget.reserve(BudgetKind::Query, BudgetLane::Ordinary, size) {
+            Ok(reservation) => held.push(reservation.commit()),
+            Err(_) => size /= 2,
+        }
+    }
+    held
 }
 
 #[test]
 fn a_full_participant_queue_still_admits_the_acknowledgments_it_waits_on() {
     let root = tempfile::tempdir().unwrap();
     let mut fixture = Fixture::open(root.path());
-    fixture.owners[0].config.pending_clients = 1;
-    // One participant read takes the only participant slot; it waits for
-    // the leader's read barrier, a quorum of heartbeat answers.
+    // One participant read waits for the leader's read barrier, a quorum of heartbeat
+    // answers; then the participants' lane is full.
     let mut waiting = summary(&mut fixture, 1);
     fixture.owners[0].drain().unwrap();
     assert!(matches!(waiting.try_recv(), Ok(None)));
-    // A second participant is refused: the participants' bound holds.
-    let mut second = summary(&mut fixture, 2);
-    assert!(matches!(
-        second.try_recv().unwrap().unwrap().envelope().result,
-        Response::Error(AccessError::Capacity)
-    ));
+    let full = fill_ordinary(&fixture.owners[0].budget);
+    // A second participant cannot be charged: the participants' bound holds.
+    assert!(
+        fixture.owners[0]
+            .budget
+            .reserve(BudgetKind::Query, BudgetLane::Ordinary, 64 * 1024)
+            .is_err()
+    );
     // The leader's heartbeats, carrying the read's context, reach the
     // followers; their answers come back through the leader's authenticated
     // ingress — the path a full participant queue used to refuse.
@@ -101,6 +130,7 @@ fn a_full_participant_queue_still_admits_the_acknowledgments_it_waits_on() {
     }
     assert!(answered.len() >= 2, "both followers answer");
     fixture.owners[0].drain().unwrap();
+    drop(full);
     for receiver in &mut answered {
         assert!(
             matches!(
@@ -164,7 +194,14 @@ fn deliver(
         .unwrap()
         .commit();
     let (send, receive) = hyper_rt::sync::oneshot().unwrap();
-    owner.request(verified, send, charge, None, None);
+    owner.request(
+        verified,
+        send,
+        charge,
+        None,
+        None,
+        std::time::Duration::ZERO,
+    );
     receive
 }
 /// The writes `owner`'s log has completed: what a wait on its persistence

@@ -22,7 +22,14 @@ fn read(fixture: &mut Fixture, id: u128) -> hyper_rt::sync::OneshotReceiver<Owne
         .unwrap()
         .commit();
     let (send, receive) = hyper_rt::sync::oneshot().unwrap();
-    owner.request(verified, send, charge, None, None);
+    owner.request(
+        verified,
+        send,
+        charge,
+        None,
+        None,
+        std::time::Duration::ZERO,
+    );
     receive
 }
 
@@ -31,17 +38,20 @@ fn summary_waiters_release_allowance_on_cancel_deadline_route_change_and_deliver
     let root = tempfile::tempdir().unwrap();
     let mut fixture = Fixture::open(root.path());
     let before = fixture.owners[0].session.sequence();
-    fixture.owners[0].config.pending_clients = 1;
+    let unheld = fixture.owners[0].budget.stats().used;
     let mut first = read(&mut fixture, 1);
     fixture.owners[0].drain().unwrap();
     assert!(matches!(first.try_recv(), Ok(None)));
-    let mut full = read(&mut fixture, 2);
-    assert!(matches!(
-        full.try_recv().unwrap().unwrap().envelope().result,
-        Response::Error(AccessError::Capacity)
-    ));
+    // What bounds the waiters is the memory each holds while it waits, charged as it is
+    // admitted: a second waits beside the first, and each gives its charge back as it goes.
+    let mut second = read(&mut fixture, 2);
+    fixture.owners[0].drain().unwrap();
+    assert!(matches!(second.try_recv(), Ok(None)));
+    assert_eq!(fixture.owners[0].pending.len(), 2);
     let held = fixture.owners[0].budget.stats().used;
+    assert!(held > unheld);
     drop(first);
+    drop(second);
     fixture.owners[0].expire_pending();
     assert!(fixture.owners[0].pending.is_empty());
     assert!(fixture.owners[0].budget.stats().used < held);
