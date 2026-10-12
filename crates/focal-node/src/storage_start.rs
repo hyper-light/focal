@@ -61,8 +61,9 @@ pub(crate) fn open(
     )?)
 }
 
-/// The WAL a test's node opened on: a node founded in a test's fresh directory is below the
-/// storage level, so its storage is focal-log's.
+/// The WAL a test's node opened on, for a test that exercises focal-log itself: it founds its
+/// node below the storage level (`upgrade::announce_for_test(BELOW_STORAGE_LEVEL)`), so its
+/// storage is focal-log's.
 #[cfg(test)]
 #[allow(clippy::panic)]
 pub(crate) fn test_wal(storage: &focal_consensus::NodeStorage) -> &focal_log::SharedWal {
@@ -72,4 +73,15 @@ pub(crate) fn test_wal(storage: &focal_consensus::NodeStorage) -> &focal_log::Sh
             panic!("a test's node opened on the shell where it expected its WAL")
         }
     }
+}
+/// A group member a test opens by hand on its node's storage, whichever the node's level gave
+/// it, as a hosted session's member is opened (`network_service`).
+#[cfg(test)]
+pub(crate) fn test_member(
+    config: focal_consensus::NodeConfig,
+    storage: &focal_consensus::NodeStorage,
+) -> Result<focal_consensus::DurableNode, focal_consensus::ConsensusError> {
+    let budget = MemoryBudget::new(512 * 1024 * 1024, 128 * 1024 * 1024)
+        .map_err(|_| focal_consensus::ConsensusError::Capacity)?;
+    storage.open_member(config, &budget, focal_ledger::entry_needs)
 }

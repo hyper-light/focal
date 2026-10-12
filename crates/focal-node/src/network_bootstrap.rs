@@ -81,6 +81,15 @@ pub struct FoundingNetwork {
     // The physical directory is released after every owned store/driver.
     pub directory: NodeDirectory,
 }
+/// What a founder's start reads on the executor before its blocking work: where it listens and
+/// what it advertises, whether it elects itself alone, and the level it announces.
+struct FounderStart {
+    listen: std::net::SocketAddr,
+    advertise: std::net::SocketAddr,
+    endpoint: Option<String>,
+    local_readiness: bool,
+    announced: u32,
+}
 impl FoundingNetwork {
     pub async fn open(settings: &Settings) -> NetworkResult<Self> {
         Self::open_inner(settings, true).await
@@ -131,16 +140,17 @@ impl FoundingNetwork {
         // blocking thread so it neither stalls the async runtime nor executes on
         // the executor's shallow poll stack (a Windows main thread is 1 MiB).
         let settings = settings.clone();
+        let start = FounderStart {
+            listen,
+            advertise,
+            endpoint,
+            local_readiness,
+            // Read here, as the start begins, and not on the pool thread the founding runs on:
+            // the level the process announces is the start's input, as its addresses are.
+            announced: crate::upgrade::announced_level(),
+        };
         focal_rt::on_pool(&focal_rt::FILES, move || {
-            Self::bootstrap_blocking(
-                &settings,
-                directory,
-                saved,
-                listen,
-                advertise,
-                endpoint,
-                local_readiness,
-            )
+            Self::bootstrap_blocking(&settings, directory, saved, start)
         })
         .await?
     }
@@ -149,11 +159,15 @@ impl FoundingNetwork {
         settings: &Settings,
         directory: NodeDirectory,
         saved: Option<NetworkState>,
-        listen: std::net::SocketAddr,
-        advertise: std::net::SocketAddr,
-        endpoint: Option<String>,
-        local_readiness: bool,
+        start: FounderStart,
     ) -> NetworkResult<Self> {
+        let FounderStart {
+            listen,
+            advertise,
+            endpoint,
+            local_readiness,
+            announced,
+        } = start;
         let identity = directory.identity();
         let budget = crate::memory_envelope::node_budget(settings)?;
         // Covers bounded manifest decode, founding PKI/draft buffers and duplicate
@@ -227,7 +241,7 @@ impl FoundingNetwork {
             // founder announces (24 §21): the compiled level, or the lower
             // one an operator staged a rollout at — never a level the
             // founder itself would refuse to serve under.
-            crate::upgrade::announced_level(),
+            announced,
             now,
         )?;
         // The credential lifetime is the cluster's policy, committed in the

@@ -30,13 +30,13 @@ fn local_expansion_keeps_identity_log_genesis_and_credentials_on_restart() {
         let network = FoundingNetwork::open(&settings).await.unwrap();
         assert_eq!(network.directory.identity(), &identity);
         assert_eq!(network.state.genesis.founder, identity);
-        let consensus = focal_consensus::DurableNode::open_on_wal(
+        let consensus = crate::storage_start::test_member(
             focal_consensus::NodeConfig::single(
                 identity.node,
                 identity.cluster,
                 identity.ledger.session.0,
             ),
-            crate::storage_start::test_wal(&network.storage.storage).clone(),
+            &network.storage.storage,
         )
         .unwrap();
         assert_eq!(consensus.status().term, local_term);
@@ -318,7 +318,11 @@ fn a_wal_node_is_converted_at_its_first_start_at_the_storage_level() {
     focal_rt::block_on(async move {
         let directory = tempfile::tempdir().unwrap();
         let settings = settings(directory.path());
-        let below = FoundingNetwork::open(&settings).await.unwrap();
+        // Founded below the storage level, as a cluster that began before it was opened.
+        let below = {
+            let _level = crate::upgrade::announce_for_test(crate::upgrade::BELOW_STORAGE_LEVEL);
+            FoundingNetwork::open(&settings).await.unwrap()
+        };
         assert!(matches!(
             below.storage.storage,
             focal_consensus::NodeStorage::Wal(_)

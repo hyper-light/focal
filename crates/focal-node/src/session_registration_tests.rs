@@ -5,7 +5,7 @@ use crate::{
     network_bootstrap::{FoundingNetwork, unix_time},
     placement_proof::ProofWindow,
 };
-use focal_consensus::{DurableNode, NodeConfig};
+use focal_consensus::NodeConfig;
 use focal_control::*;
 use focal_directory::*;
 use focal_ledger::{SessionLimits, Submission};
@@ -49,9 +49,9 @@ async fn setup(path: &std::path::Path) -> (FoundingNetwork, Settings, Session, F
     settings.node.advertise = Some("127.0.0.1:7443".into());
     let mut network = FoundingNetwork::open(&settings).await.unwrap();
     let id = network.directory.identity().clone();
-    let consensus = DurableNode::open_on_wal(
+    let consensus = crate::storage_start::test_member(
         NodeConfig::single(id.node, id.cluster, id.ledger.session.0),
-        crate::storage_start::test_wal(&network.storage.storage).clone(),
+        &network.storage.storage,
     )
     .unwrap();
     let mut session = Session::from_node(id.ledger, consensus, SessionLimits::default()).unwrap();
@@ -332,9 +332,9 @@ fn founder_registration_preserves_existing_application_and_replays_exact_metadat
         assert_eq!(postcard::to_stdvec(create.command()).unwrap(), serialized);
         session.checkpoint().unwrap();
         drop(session);
-        let consensus = DurableNode::open_on_wal(
+        let consensus = crate::storage_start::test_member(
             NodeConfig::single(id.node, id.cluster, id.ledger.session.0),
-            crate::storage_start::test_wal(&network.storage.storage).clone(),
+            &network.storage.storage,
         )
         .unwrap();
         let session = Session::from_node(id.ledger, consensus, SessionLimits::default()).unwrap();

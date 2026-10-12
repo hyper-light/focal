@@ -209,6 +209,8 @@ fn delivered_journal_reply_retains_charge_and_lock_until_consumed() {
 
 #[test]
 fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and_reopens() {
+    // focal-log's writer, paused: a node below the storage level.
+    let _level = crate::upgrade::announce_for_test(crate::upgrade::BELOW_STORAGE_LEVEL);
     focal_rt::block_on(async move {
         use crate::directory_bootstrap::tests::prepared_network;
         use focal_directory::{AuthorityCommand, AuthorityOperation};

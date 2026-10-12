@@ -437,6 +437,8 @@ fn first_directory_planner_uses_owned_root_observation_and_committed_comparisons
 
 #[test]
 fn interrupted_activation_recovers_the_logged_request_before_selecting_a_successor() {
+    // focal-log's fault points: a node below the storage level.
+    let _level = crate::upgrade::announce_for_test(crate::upgrade::BELOW_STORAGE_LEVEL);
     focal_rt::block_on(async move {
         let directory = tempfile::tempdir().unwrap();
         let (network, plan) = prepared_network(directory.path()).await;
@@ -444,11 +446,11 @@ fn interrupted_activation_recovers_the_logged_request_before_selecting_a_success
         let permit =
             authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
                 .unwrap();
-        let mut replica = ControlReplica::open_on_wal(
+        let mut replica = ControlReplica::open_on_storage(
             plan.options(),
             plan.bootstrap(None).unwrap(),
             budget.clone(),
-            crate::storage_start::test_wal(&network.storage.storage).clone(),
+            &network.storage.storage,
         )
         .unwrap();
         establish_barrier(&mut replica, plan).unwrap();
@@ -480,11 +482,11 @@ fn interrupted_activation_recovers_the_logged_request_before_selecting_a_success
         let mut settings = Settings::default();
         settings.node.data_dir = Some(directory.path().into());
         let network = FoundingNetwork::open(&settings).await.unwrap();
-        let mut replica = ControlReplica::open_on_wal(
+        let mut replica = ControlReplica::open_on_storage(
             plan.options(),
             plan.bootstrap(None).unwrap(),
             budget.clone(),
-            crate::storage_start::test_wal(&network.storage.storage).clone(),
+            &network.storage.storage,
         )
         .unwrap();
         establish_barrier(&mut replica, plan).unwrap();
