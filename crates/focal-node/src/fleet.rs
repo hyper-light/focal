@@ -525,10 +525,20 @@ pub(crate) struct ReceiptProbe {
     pub known: Option<Response>,
     pub allocation: Allocation,
 }
+/// What a native write holds on its way to its owner beside its encoding and its reply's room:
+/// its admitted request, its work item, its reply cell and the record that waits for its answer.
+const NATIVE_REQUEST_PLACE_BYTES: usize = size_of::<AdmittedRequest>()
+    .saturating_add(size_of::<Work>())
+    .saturating_add(size_of::<OwnedResponse>())
+    .saturating_add(size_of::<Pending>());
 struct AdmittedRequest {
     verified: VerifiedRequest,
     witness: Option<EvidenceWitness>,
     native: Option<focal_evidence::VerifiedNativeArtifact>,
+    /// A participant's request's place in the queue to its owner, taken
+    /// when the owner takes the request: how long it waited is the
+    /// session's queueing delay ([`crate::pace::TickPeriod::queueing_delay`]).
+    queued: Option<crate::pace::QueueTicket>,
 }
 struct MembershipCall {
     request: Option<SessionMembershipRequest>,
@@ -921,11 +931,18 @@ struct Pending {
     /// the owner's rounds and not the clock's (27 §3.1 P2), so an owner
     /// that a loaded machine slows gives up nothing it would have answered.
     deadline: u64,
+    /// A participant's request's service time, read as it is answered: the
+    /// session's mean service time bounds the delay new work may be queued
+    /// behind (`TickPeriod::delay_bound`). None for a peer's frame.
+    served: Option<crate::pace::ServiceClock>,
     _charge: Allocation,
 }
 impl Pending {
     fn finish(mut self, result: Response) {
         self.header.result = result;
+        if let Some(served) = self.served.take() {
+            served.answered();
+        }
         drop(self.waiting);
         let _ = self
             .response
@@ -1847,6 +1864,16 @@ impl ReplicaHost {
             request.request().operation,
             Operation::Raft { .. } | Operation::RaftOrdered { .. }
         );
+        // New work waits no longer than the session's own service time bounds it to: past that
+        // bound it is refused here, before it is charged or queued, so a session past its capacity
+        // spends nothing on what it cannot serve (Breakwater's AQM, Cho et al., OSDI '20,
+        // §3.2.3). A peer's frame has its own room, and progress or termination of work already
+        // admitted is what lets the queue drain: neither is refused for the delay.
+        if !replication && !completion_request(&request) && self.pace.delay_exceeded() {
+            self.pace
+                .refuse_input(false, crate::pace::InputBound::Delay);
+            return OwnedResponse::new(full);
+        }
         let response_bytes = match &request.request().operation {
             Operation::Monitor { .. } => crate::monitor_reads::RESPONSE_BYTES,
             Operation::Summary => {
@@ -1897,15 +1924,27 @@ impl ReplicaHost {
             }
             _ => 0,
         };
+        let native_write = matches!(request.request().operation, Operation::Native { .. });
         let amount = postcard::experimental::serialized_size(request.request())
             .ok()
-            .and_then(|n| n.checked_mul(if replication { 2 } else { 32 }))
             .and_then(|n| {
-                response_bytes
-                    .checked_mul(32)
-                    .and_then(|reply| n.checked_add(reply))
+                if native_write {
+                    // A native write waits as the bytes it came in (`Operation::Native` is its
+                    // frame), decoded by the owner against the owner's own budget as it prepares
+                    // it: what it holds on its way is its encoding, its reply's room and its
+                    // place, no more.
+                    n.checked_add(response_bytes)?
+                        .checked_add(NATIVE_REQUEST_PLACE_BYTES)
+                } else {
+                    n.checked_mul(if replication { 2 } else { 32 })
+                        .and_then(|n| {
+                            response_bytes
+                                .checked_mul(32)
+                                .and_then(|reply| n.checked_add(reply))
+                        })
+                        .and_then(|n| n.checked_add(4096))
+                }
             })
-            .and_then(|n| n.checked_add(4096))
             // A frame's place on its way to a fleet's owner, apart from the
             // participants' queue, which that queue's backing does not hold.
             .and_then(|n| {
@@ -1938,11 +1977,13 @@ impl ReplicaHost {
                 .refuse_input(replication, crate::pace::InputBound::Reply);
             return OwnedResponse::new(full);
         };
+        let queued = (!replication).then(|| self.pace.queue_request());
         let work = Work::Request(
             Box::new(AdmittedRequest {
                 verified: request,
                 witness,
                 native,
+                queued,
             }),
             send,
             charge.commit(),
@@ -2851,14 +2892,17 @@ impl Owner {
         response: OneshotSender<OwnedResponse>,
         charge: Allocation,
     ) -> Result<(), LedgerError> {
+        let AdmittedRequest {
+            verified,
+            witness,
+            native,
+            queued,
+        } = *request;
+        if let Some(queued) = queued {
+            queued.taken();
+        }
         let waiting = self.session.reads_waiting();
-        self.request(
-            request.verified,
-            response,
-            charge,
-            request.witness,
-            request.native,
-        );
+        self.request(verified, response, charge, witness, native);
         // A request that only asked a read is not drained for here:
         // the owner's loop takes what else is queued first, and the
         // round that leaves with its drain carries every read asked
@@ -3343,6 +3387,7 @@ impl Owner {
         let header = verified
             .request()
             .reply(Response::Error(AccessError::OutcomeUnknown));
+        let served = self.pace.service_clock();
         // A peer's frame has a path of its own: stepped now, or held for
         // the frame it overtook (27 §12), and answered at the Ready fence
         // either way.
@@ -3364,6 +3409,7 @@ impl Owner {
                     waiting: WaitingFor::PeerPersistence,
                     term: self.session.scalars().term,
                     deadline,
+                    served: None,
                     _charge: charge,
                 }),
                 Ok(Replication::Held {
@@ -3388,6 +3434,7 @@ impl Owner {
                             waiting: WaitingFor::PeerPersistence,
                             term: self.session.scalars().term,
                             deadline,
+                            served: None,
                             _charge: charge,
                         },
                     };
@@ -3424,6 +3471,7 @@ impl Owner {
                                 waiting: WaitingFor::PeerPersistence,
                                 term: self.session.scalars().term,
                                 deadline,
+                                served: None,
                                 _charge: charge,
                             },
                         },
@@ -4158,6 +4206,7 @@ impl Owner {
                 waiting,
                 term: self.session.scalars().term,
                 deadline,
+                served: Some(served),
                 _charge: charge,
             });
         } else {

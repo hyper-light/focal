@@ -627,21 +627,6 @@ pub(super) struct ManagementOwner {
     /// The queue-slot allowance every tenant's per-session slots descend from.
     items: MemoryBudget,
 }
-/// The scheduler quota every tenant receives.
-fn tenant_quota(weight: u32, max_sessions: usize) -> TenantQuota {
-    TenantQuota {
-        weight,
-        max_items: 256,
-        reserved_items: 32,
-        max_bytes: 16 * 1024 * 1024,
-        reserved_bytes: 2 * 1024 * 1024,
-        session_items: 128,
-        session_reserved_items: 16,
-        session_bytes: 8 * 1024 * 1024,
-        session_reserved_bytes: 1024 * 1024,
-        max_sessions,
-    }
-}
 impl ManagementOwner {
     fn admit_tenant(
         &mut self,
@@ -655,16 +640,13 @@ impl ManagementOwner {
             .scheduler
             .register_tenant(
                 tenant.tenant,
-                tenant_quota(tenant.weight, self.max_sessions),
+                super::scheduler_quota(tenant.weight, self.max_sessions),
             )
             .map_err(|error| match error {
                 DirectoryError::Duplicate => FleetError::Conflict,
                 _ => FleetError::Capacity,
             })?;
-        let items = self
-            .items
-            .child(256, 32)
-            .map_err(|_| FleetError::Capacity)?;
+        let items = super::queue_share(&self.items).map_err(|_| FleetError::Capacity)?;
         self.state.send_modify(|state| {
             state.tenants.insert(tenant.tenant, (tenant.budget, items));
         });
@@ -763,9 +745,7 @@ impl ManagementOwner {
         let ingress = tenant
             .child(64 * 1024 * 1024, 24 * 1024 * 1024)
             .map_err(|_| FleetError::Capacity)?;
-        let slots = items
-            .child(replica.config.queue_items, replica.config.queue_items / 4)
-            .map_err(|_| FleetError::Capacity)?;
+        let slots = super::queue_share(items).map_err(|_| FleetError::Capacity)?;
         let metadata = size_of::<Owner>()
             .checked_add(4096)
             .ok_or(FleetError::Capacity)?;
@@ -1051,10 +1031,13 @@ impl ReplicaFleet {
             scheduler
                 .register_tenant(
                     tenant.tenant,
-                    tenant_quota(tenant.weight, config.max_sessions),
+                    super::scheduler_quota(tenant.weight, config.max_sessions),
                 )
                 .map_err(|_| LedgerError::Capacity)?;
-            tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
+            tenant_budgets.insert(
+                tenant.tenant,
+                (tenant.budget, super::queue_share(&item_budget)?),
+            );
         }
         let (sender, (receiver, frames, signals, overflows)) = OwnerQueue::new();
         let (outbound, outgoing) =

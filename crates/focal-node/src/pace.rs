@@ -65,6 +65,24 @@ struct TickShared {
     /// the participants' queue and never in it (F56).
     frame_room: AtomicUsize,
     frames_queued: AtomicUsize,
+    /// The participants' requests queued for the owner and not yet taken,
+    /// each holding its place ([`QueueTicket`]); since when the queue has
+    /// held one without emptying (the admission of the one that ended its
+    /// last empty spell); when the owner last took one, and how long that
+    /// one had waited: what the session's queueing delay is read from
+    /// ([`TickPeriod::queueing_delay`]), in nanoseconds since the process
+    /// began.
+    requests_queued: AtomicU64,
+    busy_since_ns: AtomicU64,
+    taken_ns: AtomicU64,
+    sojourn_ns: AtomicU64,
+    /// The least time the owner took to answer a participant's request
+    /// once it took it, over the last [`BASE_WINDOW`], and when that least
+    /// was measured: the session's write cycle uncongested — what its
+    /// queueing delay is judged by ([`TickPeriod::delay_bound`]). Zero until
+    /// one is measured ([`TickPeriod::served`]).
+    base_service_ns: AtomicU64,
+    base_seen_ns: AtomicU64,
 }
 /// The bound a session's host turned an input away at, before it was
 /// queued ([`TickPeriod::refuse_input`]).
@@ -78,6 +96,12 @@ pub(crate) enum InputBound {
     /// Its queue was full: the participants' queue for a request, the room
     /// the owner's peer reserve gives for a peer's frame.
     Queue,
+    /// Its session's queueing delay was past the bound the session's own
+    /// service time gives it ([`TickPeriod::delay_bound`]): a request
+    /// queued then would wait beyond what the session serves in, so it is
+    /// refused before it is charged or queued, as Breakwater's AQM drops
+    /// one (Cho et al., OSDI '20, §3.2.3).
+    Delay,
 }
 /// One kind of input's refusals, a count for each bound.
 #[derive(Default)]
@@ -85,6 +109,7 @@ struct RefusalCounts {
     memory: AtomicU64,
     reply: AtomicU64,
     queue: AtomicU64,
+    delay: AtomicU64,
 }
 impl RefusalCounts {
     fn count(&self, bound: InputBound) {
@@ -92,6 +117,7 @@ impl RefusalCounts {
             InputBound::Memory => &self.memory,
             InputBound::Reply => &self.reply,
             InputBound::Queue => &self.queue,
+            InputBound::Delay => &self.delay,
         }
         .fetch_add(1, Ordering::Relaxed);
     }
@@ -100,6 +126,7 @@ impl RefusalCounts {
             memory: self.memory.load(Ordering::Relaxed),
             reply: self.reply.load(Ordering::Relaxed),
             queue: self.queue.load(Ordering::Relaxed),
+            delay: self.delay.load(Ordering::Relaxed),
         }
     }
 }
@@ -118,6 +145,73 @@ impl Drop for FrameTicket {
                 });
     }
 }
+/// A participant's request's place in the queue to its owner
+/// ([`TickPeriod::queue_request`]), held from its admission until the owner
+/// takes it ([`QueueTicket::taken`]) or it is dropped, which gives the place
+/// back: the queue's count is right whatever ends the request's wait.
+pub(crate) struct QueueTicket {
+    pace: TickPeriod,
+    admitted_ns: u64,
+}
+impl QueueTicket {
+    /// The owner takes the request: how long it waited is the session's
+    /// latest sojourn, and now is when the owner last took one.
+    pub(crate) fn taken(self) {
+        let now = now_ns();
+        let shared = &self.pace.0;
+        shared
+            .sojourn_ns
+            .store(now.saturating_sub(self.admitted_ns), Ordering::Relaxed);
+        shared.taken_ns.store(now, Ordering::Relaxed);
+    }
+}
+impl Drop for QueueTicket {
+    fn drop(&mut self) {
+        let _ = self.pace.0.requests_queued.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |queued| queued.checked_sub(1),
+        );
+    }
+}
+/// When the owner took a participant's request, for its service time once it
+/// is answered ([`TickPeriod::served`]).
+pub(crate) struct ServiceClock {
+    pace: TickPeriod,
+    taken: std::time::Instant,
+}
+impl ServiceClock {
+    /// The request taken at this clock's start is answered now.
+    pub(crate) fn answered(self) {
+        self.pace.served(self.taken.elapsed());
+    }
+}
+/// Now, in nanoseconds since the process began.
+fn now_ns() -> u64 {
+    u64::try_from(began().elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+/// How long the least service time a session measured stands before a
+/// newer, longer one replaces it: BBR's min-RTT filter (Cardwell et al.,
+/// "BBR: Congestion-Based Congestion Control", ACM Queue 2016;
+/// draft-cardwell-iccrg-bbr-congestion-control, MinRTTFilterLen = 10 s). A
+/// least taken over a window and not a mean: a mean of the time a request
+/// takes to be answered grows with the queue a congested pipeline holds it
+/// in, and a bound that grows with the congestion it bounds holds nothing
+/// (measured 2026-10-12: a bound of eight mean service times let the p99
+/// reach 2.9 s at 1,000 writes a second).
+const BASE_WINDOW: Duration = Duration::from_secs(10);
+/// The multiple of a session's least service time a request may wait queued
+/// before it is refused: Breakwater's AQM threshold, twice its target delay,
+/// the target being 40% of an SLO of ten times a request's service and round
+/// trip (Cho et al., OSDI '20, §3.2.3 and §5.1: AQM at 2·d_t, d_t = 0.4·SLO,
+/// SLO = 10 × (service + RTT)); 2 × 0.4 × 10 = 8. A session's service and
+/// round trip together are the time it takes to answer a request it took,
+/// read uncongested (its least over [`BASE_WINDOW`]). Two such times were
+/// measured too few: a session on focal-log takes no input while its write
+/// is out, so a request queued behind a busy write cycle waited 15–70 ms
+/// against a least of 12 ms at 1,000 writes a second, uncongested, and was
+/// refused (2026-10-12).
+const DELAY_BOUND_CYCLES: u32 = 8;
 /// What a session turned away for room, of peers' frames and participants'
 /// requests apart: refused by its host before it was queued — the room the
 /// peers' frames have, the participants' queue or its memory full — and
@@ -281,6 +375,91 @@ impl TickPeriod {
             })
             .ok()?;
         Some(FrameTicket(self.clone()))
+    }
+    /// A place in the queue to the owner for a participant's request
+    /// admitted now. The first to find the queue empty starts its busy
+    /// spell: the sojourn the last spell ended with says nothing of this one.
+    pub(crate) fn queue_request(&self) -> QueueTicket {
+        let admitted_ns = now_ns();
+        if self.0.requests_queued.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.0.sojourn_ns.store(0, Ordering::Relaxed);
+            self.0.busy_since_ns.store(admitted_ns, Ordering::Relaxed);
+        }
+        QueueTicket {
+            pace: self.clone(),
+            admitted_ns,
+        }
+    }
+    /// How long the oldest of the participants' requests queued now has
+    /// waited, as near as the queue's own marks tell it: none while none is
+    /// queued; otherwise at least since the owner last took one or since
+    /// the queue last stopped being empty, whichever is later (no request
+    /// queued now came before that), and at least as long as the one taken
+    /// last had waited (each was queued no later than the one after it in
+    /// its class). Breakwater's congestion signal (Cho et al., OSDI '20,
+    /// §3.1): the delay a request is kept, which a load's variance in
+    /// service time does not blur as a queue's length does.
+    pub(crate) fn queueing_delay(&self) -> Duration {
+        if self.0.requests_queued.load(Ordering::Acquire) == 0 {
+            return Duration::ZERO;
+        }
+        let now = now_ns();
+        let since = self
+            .0
+            .taken_ns
+            .load(Ordering::Relaxed)
+            .max(self.0.busy_since_ns.load(Ordering::Relaxed));
+        Duration::from_nanos(
+            now.saturating_sub(since)
+                .max(self.0.sojourn_ns.load(Ordering::Relaxed)),
+        )
+    }
+    /// A clock started as the owner takes a participant's request, read when
+    /// the request is answered ([`ServiceClock::answered`]).
+    pub(crate) fn service_clock(&self) -> ServiceClock {
+        ServiceClock {
+            pace: self.clone(),
+            taken: std::time::Instant::now(),
+        }
+    }
+    /// The owner answered a participant's request it took `service` ago. The
+    /// least service time stands for [`BASE_WINDOW`]: a sample no longer
+    /// replaces it until then (BBR's min-RTT update: a sample at or under the
+    /// least, or a least that expired). Only the owner thread answers, so the
+    /// two marks have one writer.
+    pub(crate) fn served(&self, service: Duration) {
+        let sample = u64::try_from(service.as_nanos()).unwrap_or(u64::MAX).max(1);
+        let now = now_ns();
+        let base = self.0.base_service_ns.load(Ordering::Relaxed);
+        let seen = self.0.base_seen_ns.load(Ordering::Relaxed);
+        let window = u64::try_from(BASE_WINDOW.as_nanos()).unwrap_or(u64::MAX);
+        if base == 0 || sample <= base || now.saturating_sub(seen) > window {
+            self.0.base_service_ns.store(sample, Ordering::Relaxed);
+            self.0.base_seen_ns.store(now, Ordering::Relaxed);
+        }
+    }
+    /// The session's least service time over the last [`BASE_WINDOW`]: its
+    /// write cycle uncongested; none until one is measured.
+    pub(crate) fn base_service(&self) -> Option<Duration> {
+        match self.0.base_service_ns.load(Ordering::Relaxed) {
+            0 => None,
+            ns => Some(Duration::from_nanos(ns)),
+        }
+    }
+    /// The longest a request may wait queued before the session refuses
+    /// more ([`InputBound::Delay`]): [`DELAY_BOUND_CYCLES`] of its write
+    /// cycle uncongested. None until the session has served a request: what
+    /// it refuses is judged by what it measured, never by a number picked
+    /// for it.
+    pub(crate) fn delay_bound(&self) -> Option<Duration> {
+        self.base_service()
+            .map(|base| base.saturating_mul(DELAY_BOUND_CYCLES))
+    }
+    /// Whether a participant's request is to be refused now for the delay
+    /// it would be queued behind ([`Self::delay_bound`]).
+    pub(crate) fn delay_exceeded(&self) -> bool {
+        self.delay_bound()
+            .is_some_and(|bound| self.queueing_delay() > bound)
     }
     /// The room the owner last stated, and the frames queued in it now.
     #[cfg(test)]

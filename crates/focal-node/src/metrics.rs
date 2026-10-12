@@ -217,23 +217,29 @@ pub struct RefusedBy {
     pub reply: u64,
     /// Its queue was full.
     pub queue: u64,
+    /// Its session's queueing delay was past what the session's service
+    /// time bounds it to.
+    pub delay: u64,
 }
 impl RefusedBy {
     pub fn total(&self) -> u64 {
         self.memory
             .saturating_add(self.reply)
             .saturating_add(self.queue)
+            .saturating_add(self.delay)
     }
     fn add(&mut self, other: &Self) {
         self.memory = self.memory.saturating_add(other.memory);
         self.reply = self.reply.saturating_add(other.reply);
         self.queue = self.queue.saturating_add(other.queue);
+        self.delay = self.delay.saturating_add(other.delay);
     }
-    fn bounds(&self) -> [(&'static str, u64); 3] {
+    fn bounds(&self) -> [(&'static str, u64); 4] {
         [
             ("memory", self.memory),
             ("reply", self.reply),
             ("queue", self.queue),
+            ("delay", self.delay),
         ]
     }
 }
@@ -267,7 +273,7 @@ impl SessionCounters {
             refused_periods,
         }
     }
-    fn fields(&self) -> [u64; 23] {
+    fn fields(&self) -> [u64; 25] {
         [
             self.peers_unreachable,
             self.appends_rejected,
@@ -279,9 +285,11 @@ impl SessionCounters {
             self.frames_refused.memory,
             self.frames_refused.reply,
             self.frames_refused.queue,
+            self.frames_refused.delay,
             self.requests_refused.memory,
             self.requests_refused.reply,
             self.requests_refused.queue,
+            self.requests_refused.delay,
             self.frames_dropped,
             self.requests_dropped,
             self.replication_dropped,
@@ -1632,12 +1640,12 @@ impl MetricsSnapshot {
         for (name, help, refused) in [
             (
                 "focal_sessions_frames_refused_total",
-                "Peers' frames a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue): each lost to its peer.",
+                "Peers' frames a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue, queueing delay): each lost to its peer.",
                 totals.frames_refused,
             ),
             (
                 "focal_sessions_requests_refused_total",
-                "Participants' requests a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue).",
+                "Participants' requests a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue, queueing delay past what its service time bounds it to).",
                 totals.requests_refused,
             ),
         ] {
@@ -2158,9 +2166,9 @@ mod tests {
         }
     }
     /// What a node's sessions turned away for room is exported by the bound
-    /// that turned it away — the node's memory, a reply cell, the queue —
-    /// peers' frames and participants' requests apart, every bound named
-    /// whether or not it refused.
+    /// that turned it away — the node's memory, a reply cell, the queue, the
+    /// queueing delay — peers' frames and participants' requests apart,
+    /// every bound named whether or not it refused.
     #[test]
     fn a_node_exports_what_its_sessions_refused_by_the_bound_that_refused_it() {
         let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
@@ -2169,11 +2177,13 @@ mod tests {
             memory: 2,
             reply: 0,
             queue: 5,
+            delay: 7,
         };
         sample.session_aggregates.totals.frames_refused = RefusedBy {
             memory: 0,
             reply: 1,
             queue: 3,
+            delay: 0,
         };
         let text = sample.render();
         for line in [
@@ -2181,10 +2191,12 @@ mod tests {
             "focal_sessions_requests_refused_total{bound=\"memory\"} 2\n",
             "focal_sessions_requests_refused_total{bound=\"reply\"} 0\n",
             "focal_sessions_requests_refused_total{bound=\"queue\"} 5\n",
+            "focal_sessions_requests_refused_total{bound=\"delay\"} 7\n",
             "# TYPE focal_sessions_frames_refused_total counter\n",
             "focal_sessions_frames_refused_total{bound=\"memory\"} 0\n",
             "focal_sessions_frames_refused_total{bound=\"reply\"} 1\n",
             "focal_sessions_frames_refused_total{bound=\"queue\"} 3\n",
+            "focal_sessions_frames_refused_total{bound=\"delay\"} 0\n",
         ] {
             assert!(text.contains(line), "missing {line}");
         }

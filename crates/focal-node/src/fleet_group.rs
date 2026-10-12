@@ -13,6 +13,38 @@ pub(super) mod management;
 const QUEUED: usize = 1024;
 const RESERVED: usize = 128;
 const SLICE: usize = 32;
+/// The scheduler quota every tenant receives. A tenant, and each session of it, may queue as much
+/// as the owner's whole input holds ([`QUEUED`]), keeping the completion lane's share of it the
+/// owner keeps ([`RESERVED`]); the byte quotas count the scheduler's bookkeeping of each item,
+/// which is less than an item's greatest cost (`SchedulerConfig::max_cost`), so they never bind
+/// before the items do. What caps a session's queue is its admission — its slots
+/// ([`queue_share`]) and its queueing delay (`TickPeriod::delay_bound`) — and a request admitted
+/// is never refused here once queued: one dropped after admission is answered with an outcome
+/// its participant cannot know (the scheduler's per-session 128 items dropped 92,015 admitted
+/// writes in 25 s at 1,000/s once the participants' 24 slots were lifted, 2026-10-12).
+fn scheduler_quota(weight: u32, max_sessions: usize) -> TenantQuota {
+    let item_bytes = usize::try_from(SchedulerConfig::default().max_cost).unwrap_or(usize::MAX);
+    TenantQuota {
+        weight,
+        max_items: QUEUED,
+        reserved_items: RESERVED,
+        max_bytes: QUEUED.saturating_mul(item_bytes),
+        reserved_bytes: RESERVED.saturating_mul(item_bytes),
+        session_items: QUEUED,
+        session_reserved_items: RESERVED,
+        session_bytes: QUEUED.saturating_mul(item_bytes),
+        session_reserved_bytes: RESERVED.saturating_mul(item_bytes),
+        max_sessions,
+    }
+}
+/// A tenant's, or a session's, share of the owner's input: all of it, the completion lane's
+/// share kept as the owner keeps it. A session alone takes the whole queue; sessions together
+/// share it as they arrive, each bounded by its own queueing delay rather than by a count picked
+/// for it (a session's 24 participant slots held a node at 425 writes a second when its write
+/// cycle took 24 ms: Little's law, 2026-10-12).
+fn queue_share(items: &MemoryBudget) -> Result<MemoryBudget, focal_memory::MemoryError> {
+    items.child(QUEUED, RESERVED)
+}
 const STACK_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct FleetReplica {
@@ -285,23 +317,9 @@ impl ReplicaFleet {
                 return Err(LedgerError::Capacity);
             }
             scheduler
-                .register_tenant(
-                    tenant.tenant,
-                    TenantQuota {
-                        weight: tenant.weight,
-                        max_items: 256,
-                        reserved_items: 32,
-                        max_bytes: 16 * 1024 * 1024,
-                        reserved_bytes: 2 * 1024 * 1024,
-                        session_items: 128,
-                        session_reserved_items: 16,
-                        session_bytes: 8 * 1024 * 1024,
-                        session_reserved_bytes: 1024 * 1024,
-                        max_sessions: 4096,
-                    },
-                )
+                .register_tenant(tenant.tenant, scheduler_quota(tenant.weight, 4096))
                 .map_err(|_| LedgerError::Capacity)?;
-            tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
+            tenant_budgets.insert(tenant.tenant, (tenant.budget, queue_share(&item_budget)?));
         }
         let (sender, (receiver, frames, signals, overflows)) = OwnerQueue::new();
         let (outbound, outgoing) =
@@ -347,7 +365,7 @@ impl ReplicaFleet {
                 return Err(LedgerError::Capacity);
             }
             let ingress = tenant.child(64 * 1024 * 1024, 24 * 1024 * 1024)?;
-            let slots = items.child(replica.config.queue_items, replica.config.queue_items / 4)?;
+            let slots = queue_share(items)?;
             let wake = sender.clone();
             let sender = HostSender::Group {
                 ledger,
