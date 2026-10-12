@@ -15043,3 +15043,85 @@ recursion), `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3295
 passed, 0 failed, 22 ignored. Windows CI passed on the batch's production code (run 38196351701,
 at `d3ccd09`, before the two tests' fixes).
+
+
+### 2026-10-12 — The binary allocates with mimalloc; an encoder's fields move without memcpy calls; a grouped owner tries a retained delivery at its tick; a data directory too long for its sockets is refused by name; a peer's `Unavailable` is its own loss; a placement intent resolves across a change of client
+
+**Where the CPU went, by whole stacks.** The cluster profile now folds every sample's whole stack per thread (run 38187112271, on land-12b, every node at 100, 1,000 and 4,000/s). It found 20–30% of every node's CPU in two routines of the C library the release links, musl:
+- `memcpy`, at 12–23% of each node: 42% of a checkpoint's encoding, and 12% of the leader's session owner.
+- The allocator, at 4–11%. A follower lost about 10% more to the page faults of memory musl handed back to the kernel and took again (`do_user_addr_fault`, `clear_page_erms`, `zap_present_ptes`).
+
+musl's x86-64 `memcpy` moves an unaligned head and the tail a byte at a time and the rest with `rep movsq`. For the one- to thirty-two-byte fields an encoder writes one at a time, the call is the whole cost. Local runs on macOS, whose C library is fast at both, could not see either: this is most of why the owner's CPU per write on the comparison was about ten times what the local measurements gave.
+
+**The allocator.** The `focal` binary allocates with mimalloc (`#[global_allocator]`; Leijen, Zorn and de Moura, "Mimalloc: Free List Sharding in Action", APLAS 2019; its v2 line, MIT):
+- thread-local free lists and no global lock;
+- pages reused before they are returned.
+
+ripgrep makes the same move on its musl builds, and Redis ships jemalloc for the same reason. The memory budget still accounts every allocation focal makes; the allocator only places them.
+
+Measured on one runner a side at a time, split at the session's fill as land-12's entry describes (medians of the rounds, A → B):
+
+| A/B | offered/s | commit rate | refused | p99 |
+|---|---|---|---|---|
+| mimalloc (run 38190217938, 2 rounds) | 100 | 95 → 95/s | 0 → 0% | 13.9 → 17.2 ms |
+| | 1,000 | 790 → 852/s | 20 → 14% | 93.0 → 82.3 ms |
+| | 4,000 | 893 → 940/s | 78 → 77% | 161.5 → 144.9 ms |
+| mimalloc (run 38196512476, 4 rounds) | 4,000 | 615 → 718/s | 85 → 82% | 287.6 → 182.8 ms |
+
+At 100/s both builds' rounds spread from 8 to 26 ms. The two-round run's committed column had read 29,650 → 25,324 at 4,000/s: B filled its session at 25–29 s of the 60, A at 30–37 s, so B's window held fewer of the writes it committed faster. Four rounds on another runner, where A never filled and B filled at 44–49 s, settle it.
+
+**An encoder's fields.** `focal_memory::short_copy::copy` moves up to 32 bytes as two fixed-size moves that overlap where the length falls between sizes, the technique of glibc's and LLVM libc's `memcpy` for small sizes. On x86-64 these compile to byte, dword, qword or SSE loads and stores, with no call. The record and checkpoint sinks and the digest's batch use it, and a checkpoint's sealer fills a chunk sized once instead of growing a vector a field at a time.
+
+A/B against land-12b on mimalloc (run 38190609999, two rounds): 829 → 855/s at 1,000/s and 751 → 778/s at 4,000/s committed before the fill, p99 94.7 → 91.7 and 183.3 → 170.2 ms; all nodes' CPU a write −3.3% at 1,000/s and −3.6% at 4,000/s.
+
+**A grouped owner tries a retained delivery at its tick.** A delivery retained for what it lacks (the memory to apply it, custody objects, seed chunks) kept its session ready, and a grouped owner ran a ready session again at once.
+- A follower short of memory was drained 54 times a period, each drain refused, for as long as the memory was short.
+- Reproduced on three QUIC voters with native history, the follower's tenant budget taken but for a few kilobytes as a write committed: 1,080 drains in 20 periods. With the change, 40 in 17.
+
+The decision is now `GroupDue::at`, a function of what the session has to do. A session holding a retained delivery waits for its tick, or its beat while it leads at a stretched period, unless a batch owes it a drain; a chunk landing or custody arriving asks again as before. Tests cover each branch of the decision.
+
+**A data directory too long for its sockets is refused by name.** A node binds `focal.sock` and `focal-admin.sock` in its data directory. A local socket's address holds at most 103 bytes of path on macOS and 107 on Linux and Windows (`sun_path` with its nul: `<sys/un.h>`, unix(7), `afunix.h`).
+- A longer path failed the bind, which focal-wire reported as `wire: connection unavailable` (exit 1, `operation_failed`).
+- That came after `start node` had initialized the directory, and after a join had spent its invitation.
+- Found running the comparison's bootstrap locally under a 114-byte scratch path: the founder wrote its identity, network, policy and log, then stopped so.
+
+`focal_wire::socket_path_fits` now refuses such a path as `WireError::SocketPath`, naming the path and the bound (PostgreSQL refuses its socket's path alike):
+- `LocalServer::bind_watched` and `LocalRemote::new` check it before any bind or connect;
+- `start node` and `join node` check both sockets before the directory is touched or an invitation read;
+- the CLI classes it `invalid_input` (exit 2), and the client's retry loop ends on it as a refusal before sending.
+
+Tests: a socket's path at the bound binds and serves on each system, and one byte past it is refused by name by the check, the server (no file left) and the client, std's own address agreeing on Unix. `start node` on a directory past the bound, with and without an invitation file that does not exist, exits 2 naming the socket's path and leaves the directory empty; without the start's check, it wrote 9 files. docs/manual-cli.md states the bound.
+
+**A peer's `Unavailable` is its own loss.** The peer pool counted a message the peer refused `Unavailable` on every attempt with those whose outcome it could not say (`focal_peer_messages_lost_by_cause_total{cause="unknown"}`). So the comparison's leader reported 13–14 messages lost "of unknown outcome" in every run, at every rate.
+
+The same local bootstrap, each lost request logged with its operation and answer, accounted for the founder's 34:
+- 30 were Raft and ordered Raft messages for the session the deployment placed on all three nodes, which the two followers answered `Unavailable`. The member that opens a new session first leads it, and sends to members whose copy is not open yet; each refusal is without effect, and Raft sends again.
+- 3 were control requests with no route yet, and one was for the founder's own session.
+
+`Unavailable` is now its own cause (`cause="unavailable"`), and `unknown` is `OutcomeUnknown` alone. Test: a peer that refuses one group `Unavailable` and another `OutcomeUnknown` on every attempt has its two messages counted one under each cause.
+
+**A placement intent resolves across a change of client.** A node names its partition intents by its local client where it leads the partition and by its principal where it follows (24 §16, the audit's F24). Both ways in present an intent as the client it was journaled under, so an intent journaled while the node led still resolves through the node that leads now. But a journal reopened under the other client with an intent pending was refused (`placement intent journal is inconsistent with this node`).
+
+This batch's Windows CI failed `placement_agent::split::tests::a_crowded_partition_splits_survives_a_restart_and_merges_back` on it (run 38201579852):
+- the founder, restarted, followed the upper partition its seated peer led at term 2;
+- its agent's last error was that refusal;
+- the merge was never reached in 1,200 periods.
+
+Twelve local runs, six at a time, all passed: who leads after the restart is the election's. A journal holding an intent now keeps the client it was journaled under until the intent resolves, and adopts the client it was opened with once it has, each client's retry window kept as when it adopts one with nothing pending.
+
+Tests:
+- a journal left with an intent under the local client opens under the principal with the intent as journaled;
+- on its receipt the journal is the principal's, at the principal's window, the local client's kept;
+- one with nothing pending adopts its opener at once, and a refused intent frees its sequence;
+- another owner's journal, an intent out of its client's sequence and a full table of clients are refused.
+
+Each failed on the journal as it was.
+
+The gate on the landing tree (head `d5af34d`, macOS 26.4.1 arm64, under other work's load), exit 0:
+`cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes, 15
+vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1156 production sources, no policy allowance, no runtime
+recursion), `cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 167 test binaries, 3307
+passed, 0 failed, 22 ignored. CI on the same head passed on Linux and macOS (run 38204821696) and
+Windows (run 38204821646).
