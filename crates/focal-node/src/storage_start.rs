@@ -30,12 +30,22 @@ pub(crate) fn facts() -> StorageFacts {
 
 /// Opens the storage of the node `identity` names in the data directory `root`, its memory
 /// within `budget`, its shell's keys under the root key file `key_file` (29 §2).
+///
+/// `genesis_level` is the fence the cluster held from its genesis, which never lowers: a cluster
+/// founded at the storage level runs every node's groups on the shell from the node's first
+/// start, the founder's and each joiner's alike. It is recorded before the storage is chosen;
+/// left to the controller's first observation of the fence, as it had been, the node opened the
+/// WAL at its first start and converted only at its next.
 pub(crate) fn open(
     root: &Path,
     identity: WalIdentity,
     budget: &MemoryBudget,
     key_file: &Path,
+    genesis_level: u32,
 ) -> Result<OpenedStorage, NodeError> {
+    if genesis_level >= crate::upgrade::STORAGE_LEVEL {
+        crate::storage_level::record(root, genesis_level)?;
+    }
     let disk = crate::network_service::disk_budget().map_err(NodeError::Content)?;
     let fence_open = crate::storage_level::storage_opened(root)?;
     Ok(focal_consensus::storage_open::open_node_storage(
