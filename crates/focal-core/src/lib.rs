@@ -12,6 +12,9 @@
 )]
 //! Deterministic domain reducer and audited ordered-epoch execution. Authority,
 //! time, IDs and evaluator results are inputs. Owned row updates publish atomically.
+#[cfg(all(test, feature = "diag-mimalloc"))]
+#[global_allocator]
+static DIAG_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod access;
 mod admission;
 #[cfg(test)]
