@@ -690,6 +690,12 @@ impl JoinedNode {
         })
     }
 }
+/// The fence the cluster held from its genesis: a floor under every fence it commits after.
+pub(crate) fn genesis_fence(
+    genesis: &NetworkGenesis,
+) -> Result<focal_enrollment::UpgradeFence, JoinError> {
+    Ok(genesis_registry(genesis)?.fence())
+}
 fn genesis_registry(genesis: &NetworkGenesis) -> Result<EnrollmentRegistry, JoinError> {
     let ControlBootstrap::Root { enrollment, .. } = &genesis.bootstrap else {
         return Err(JoinError::Invalid);
