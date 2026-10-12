@@ -3,8 +3,10 @@
 //! order, out of order and from a sorted iterator, and after half its entries
 //! were removed again.
 //!
-//! One test function only: the counters are process-global, so a second
-//! concurrent test in the same binary would race them.
+//! The counters are the measuring thread's own: another thread's allocations
+//! (the test harness's, or a second test's) are never counted in a build.
+//! Process-wide counters took the harness's: macOS CI counted 304 bytes for
+//! an empty map (contracts run 38201518060).
 #![allow(unsafe_code)]
 #![allow(
     clippy::panic,
@@ -20,26 +22,45 @@
 
 use focal_memory::{ALLOCATOR_OVERHEAD, map_bytes};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Counting;
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static BLOCKS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Constant-initialized cells without destructors: reading them allocates
+    // nothing and never fails, so the allocator itself may use them.
+    static LIVE: Cell<usize> = const { Cell::new(0) };
+    static BLOCKS: Cell<usize> = const { Cell::new(0) };
+}
+/// Adds `bytes` and `blocks` (each signed by `grow`) to this thread's counts.
+fn count(bytes: usize, grow: bool) {
+    LIVE.with(|live| {
+        live.set(if grow {
+            live.get().wrapping_add(bytes)
+        } else {
+            live.get().wrapping_sub(bytes)
+        })
+    });
+    BLOCKS.with(|blocks| {
+        blocks.set(if grow {
+            blocks.get().wrapping_add(1)
+        } else {
+            blocks.get().wrapping_sub(1)
+        })
+    });
+}
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY (test allocator): delegates to the system allocator with the
-        // same layout; the accounting is ordinary atomic adds.
+        // same layout; the accounting is the calling thread's own counts.
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
-            BLOCKS.fetch_add(1, Ordering::Relaxed);
+            count(layout.size(), true);
         }
         ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        BLOCKS.fetch_sub(1, Ordering::Relaxed);
+        count(layout.size(), false);
         // SAFETY: `ptr`/`layout` are the pair this allocator returned.
         unsafe { System.dealloc(ptr, layout) };
     }
@@ -50,10 +71,10 @@ static ALLOC: Counting = Counting;
 /// What `build`'s result holds: the bytes its live blocks asked for and each
 /// block's bookkeeping, as the budget charges an allocation.
 fn held<T>(build: impl FnOnce() -> T) -> (T, usize) {
-    let (bytes, blocks) = (LIVE.load(Ordering::Relaxed), BLOCKS.load(Ordering::Relaxed));
+    let (bytes, blocks) = (LIVE.with(Cell::get), BLOCKS.with(Cell::get));
     let value = build();
-    let grown = LIVE.load(Ordering::Relaxed) - bytes;
-    let added = BLOCKS.load(Ordering::Relaxed) - blocks;
+    let grown = LIVE.with(Cell::get).wrapping_sub(bytes);
+    let added = BLOCKS.with(Cell::get).wrapping_sub(blocks);
     (value, grown + added * ALLOCATOR_OVERHEAD)
 }
 
