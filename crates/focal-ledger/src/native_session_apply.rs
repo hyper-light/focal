@@ -152,6 +152,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     ) -> Result<(), NativeSessionError> {
         self.ready_term = None;
         self.pending.clear();
+        self.flush_stalled = false;
         let domain = self.domain.take().ok_or(NativeSessionError::Failed)?;
         let core = match domain {
             Domain::Passive(core) => core,

@@ -3172,6 +3172,77 @@ fn membership_request(
     }
 }
 
+/// Native candidates a replica holds for its batch's end, which it can no
+/// longer propose (it heard of a newer term first), owe its host no drain: a
+/// host that drains whatever is owed at once (a grouped owner) would otherwise
+/// run the replica again and again, each drain proposing nothing, until the
+/// newer term's barrier lets them go — for as long as a partition keeps that
+/// barrier from it. A candidate admitted later owes a drain again.
+#[test]
+fn held_candidates_a_deposed_replica_cannot_propose_owe_no_drain() {
+    let mut cluster = Cluster::new(3, &[true, true, true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    cluster.settle(&[]);
+    cluster.node(1).set_native_proposals_deferred(true);
+    for claim in 1..=3u128 {
+        let input = creation(cluster.next(PARTIES.issuer), claim);
+        cluster.clock += 1;
+        let clock = cluster.clock;
+        let store = &mut cluster.stores[0];
+        let submission = cluster.nodes[0]
+            .as_mut()
+            .unwrap()
+            .propose_native(
+                context(PARTIES.issuer, clock),
+                input,
+                NativeCustody::Store(store),
+            )
+            .unwrap();
+        assert!(matches!(submission, NativeSubmission::Pending { .. }));
+    }
+    assert!(cluster.node(1).has_ready(), "a held batch owes its drain");
+    cluster.elect(2, &[1]);
+    // The new leader's heartbeat alone reaches the old one, which steps down
+    // with the newer term's barrier not yet in its log.
+    let mut heard = false;
+    for _ in 0..ELECTION_TICKS {
+        cluster.node(2).tick().unwrap();
+        let messages = match cluster.node(2).poll() {
+            Ok(events) => events.messages,
+            Err(LedgerError::Consensus(ConsensusError::PersistencePending)) => Vec::new(),
+            Err(error) => panic!("poll: {error:?}"),
+        };
+        for message in messages {
+            if message.to == 1 && message.msg_type == MessageType::MsgHeartbeat {
+                cluster.node(1).step(message).unwrap();
+                heard = true;
+            }
+        }
+        if heard {
+            break;
+        }
+    }
+    assert!(heard, "the new leader sent the old a heartbeat");
+    // The batch ends on a replica that no longer leads: nothing is proposed,
+    // and once what it has to send is taken nothing more is owed.
+    cluster.node(1).flush_deferred_native_proposals().unwrap();
+    for _ in 0..8 {
+        match cluster.node(1).poll() {
+            Ok(_) | Err(LedgerError::Consensus(ConsensusError::PersistencePending)) => {}
+            Err(error) => panic!("poll: {error:?}"),
+        }
+    }
+    assert!(!cluster.node(1).is_authoritative());
+    assert!(
+        !cluster.node(1).has_ready(),
+        "held candidates it cannot propose owe the deposed replica no drain"
+    );
+    // The newer term's barrier lets them go; the keys commit elsewhere.
+    cluster.settle(&[]);
+    assert!(!cluster.node(1).has_ready());
+}
+
 /// Native writes admitted while their host defers proposals (a batch it
 /// takes) are encoded and not proposed; when the batch ends they are proposed
 /// as one, and each follower is sent one append of them all, where each

@@ -33,6 +33,15 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// a candidate sent each member an append, drew an answer and a commit's
     /// broadcast of its own.
     pub(super) defer_proposals: bool,
+    /// The last flush of a batch left candidates it could not propose: the
+    /// replica no longer leads, or the log or the memory has no room for
+    /// them. No drain is owed them until a candidate is admitted; each drain
+    /// tries them again all the same, and room is made by what a drain
+    /// takes (a commit, an applied entry), authority returns only through a
+    /// newer term's barrier, which lets them go. Owed, a host that drains
+    /// at once what is owed (a grouped owner) ran the replica round after
+    /// round, each drain proposing nothing.
+    pub(super) flush_stalled: bool,
     pub(super) domain: Option<Domain>,
     pub(super) reader: ContentReader,
     /// Where checkpoint seeds are read from on install (25 §5); the writer
@@ -183,6 +192,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             delivery: None,
             pending,
             defer_proposals: false,
+            flush_stalled: false,
             domain: Some(Domain::Passive(core)),
             reader,
             seeds,
@@ -1078,6 +1088,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     submitted: false,
                     term,
                 });
+                // A candidate admitted is owed a drain, whatever the last
+                // flush could not propose.
+                self.flush_stalled = false;
                 (candidate, outcome)
             }
         };
@@ -1116,9 +1129,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn set_proposals_deferred(&mut self, deferred: bool) {
         self.defer_proposals = deferred;
     }
-    /// Whether deferred candidates wait to be proposed: a drain is owed them.
+    /// Whether deferred candidates wait to be proposed: a drain is owed them,
+    /// unless the last flush could propose none of what waits
+    /// ([`Self::flush_stalled`]).
     pub(crate) fn has_deferred(&self) -> bool {
-        self.defer_proposals && self.pending.iter().any(|pending| !pending.submitted)
+        self.defer_proposals
+            && !self.flush_stalled
+            && self.pending.iter().any(|pending| !pending.submitted)
     }
     /// Propose every candidate the host deferred, together, on an authority;
     /// pressure, authority moving and a refused candidate keep or answer them
@@ -1127,18 +1144,21 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         &mut self,
         consensus: &mut DurableNode,
     ) -> Option<NativeSessionError> {
-        if self.pending.iter().all(|pending| pending.submitted)
+        let refusal = if self.pending.iter().all(|pending| pending.submitted)
             || !self.is_authoritative(&consensus.scalars())
         {
-            return None;
-        }
-        match self.flush_proposals(consensus) {
-            Err(error) if error.class() == FailureClass::FailClosed => {
-                self.fail_closed(&error);
-                Some(error)
+            None
+        } else {
+            match self.flush_proposals(consensus) {
+                Err(error) if error.class() == FailureClass::FailClosed => {
+                    self.fail_closed(&error);
+                    Some(error)
+                }
+                Ok(()) | Err(_) => None,
             }
-            Ok(()) | Err(_) => None,
-        }
+        };
+        self.flush_stalled = self.pending.iter().any(|pending| !pending.submitted);
+        refusal
     }
     /// Encode every unsubmitted candidate in chain order, and name the first
     /// of them. Encoding refusals discard the candidate and its suffix.

@@ -28,11 +28,23 @@ fn open_node_with(
     parent: &MemoryBudget,
     limits: NativeSessionLimits,
 ) -> Result<Opened<BuiltinNativeSchemas>, NativeSessionError> {
+    open_node_configured(dir, id, parent, limits, &|_| {})
+}
+/// A node opened under the replica configuration `configure` amends.
+fn open_node_configured(
+    dir: &std::path::Path,
+    id: u64,
+    parent: &MemoryBudget,
+    limits: NativeSessionLimits,
+    configure: &dyn Fn(&mut NodeConfig),
+) -> Result<Opened<BuiltinNativeSchemas>, NativeSessionError> {
     let content = dir.join(format!("content-{id}"));
     std::fs::create_dir_all(&content).unwrap();
+    let mut node = config(id);
+    configure(&mut node);
     NativeSession::open(
         dir.join(format!("wal-{id}")),
-        config(id),
+        node,
         ledger(),
         RangeId(u128::from(id)),
         NativeContentProfile::ProjectionOnly,
@@ -94,6 +106,13 @@ impl Cluster {
     /// A cluster whose nodes open under per-node limits (the materializer's
     /// worker count differs per follower in the differential tests).
     fn with_limits(limits_for: impl Fn(u64) -> NativeSessionLimits) -> Self {
+        Self::configured(limits_for, &|_| {})
+    }
+    /// A cluster whose nodes' replica configuration `configure` amends.
+    fn configured(
+        limits_for: impl Fn(u64) -> NativeSessionLimits,
+        configure: &dyn Fn(&mut NodeConfig),
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let parents: Vec<MemoryBudget> = (1..=3u64)
             .map(|id| {
@@ -111,9 +130,14 @@ impl Cluster {
         let mut inbox = Vec::new();
         let nodes = (1..=3u64)
             .map(|id| {
-                let opened =
-                    open_node_with(dir.path(), id, &parents[id as usize - 1], limits_for(id))
-                        .unwrap();
+                let opened = open_node_configured(
+                    dir.path(),
+                    id,
+                    &parents[id as usize - 1],
+                    limits_for(id),
+                    configure,
+                )
+                .unwrap();
                 inbox.extend(opened.initial.consensus.messages);
                 Some(opened.session)
             })
@@ -672,6 +696,88 @@ fn a_batch_held_past_its_leaders_deposition_is_never_proposed() {
     }
     cluster.settle(&[]);
     cluster.assert_same_state(&[1, 2, 3, 4]);
+}
+
+/// A batch the leader's log has no room for whole, beside a write it holds
+/// uncommitted, is proposed a candidate at a time, as many as there is room
+/// for. The rest wait and owe no drain (each would propose nothing until room
+/// is made); the flush after the earlier ones commit proposes them. Every
+/// candidate commits once, at the place it was admitted to.
+#[test]
+fn a_batch_the_log_has_no_room_for_is_proposed_as_room_is_made() {
+    const ROOM: u64 = 17 * 1024;
+    let mut cluster = Cluster::configured(|_| limits(), &|config| {
+        config.max_entry_bytes = 16 * 1024;
+        config.max_uncommitted_bytes = ROOM;
+    });
+    cluster.elect(1, &[]);
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    cluster.node(1).engine.set_proposals_deferred(true);
+    // One write proposed and held uncommitted, then a batch of nine.
+    let mut admitted = Vec::new();
+    let mut held = None;
+    for claim in 2..=11u128 {
+        let input = cluster.creation(claim);
+        let key = input.request;
+        let NativeSubmission::Pending { candidate, outcome } =
+            cluster.propose(1, PARTIES.issuer, input)
+        else {
+            panic!("fresh candidates are pending");
+        };
+        admitted.push((key, outcome));
+        if claim == 2 {
+            held = Some(candidate);
+            let node = cluster.node(1);
+            assert!(node.engine.flush_deferred(&mut node.consensus).is_none());
+        }
+    }
+    let before = cluster.node(1).consensus.last_index().unwrap();
+    // The batch does not fit beside the held write; its first does.
+    let sizes: Vec<u64> = {
+        let Some(engine::Domain::Active(owner, _)) = cluster.node(1).engine.domain.as_ref() else {
+            panic!("the leader's owner is active");
+        };
+        owner
+            .encoded_from(held.unwrap())
+            .unwrap()
+            .map(|record| record.len() as u64)
+            .collect()
+    };
+    assert_eq!(sizes.len(), 10);
+    assert!(
+        sizes.iter().sum::<u64>() > ROOM && sizes[0] + sizes[1] <= ROOM,
+        "records of {sizes:?} bytes do not exercise a partial batch in {ROOM}"
+    );
+    let node = cluster.node(1);
+    assert!(node.engine.flush_deferred(&mut node.consensus).is_none());
+    let proposed = cluster.node(1).consensus.last_index().unwrap() - before;
+    assert!(
+        (1..9).contains(&proposed),
+        "{proposed} of nine proposed beside the held write, records of {sizes:?} bytes"
+    );
+    assert!(
+        !cluster.node(1).engine.has_deferred(),
+        "what had no room owes no drain until a candidate is admitted"
+    );
+    // Room is made as the held write and the proposed ones commit; the next
+    // flush proposes the rest.
+    cluster.pump(&[]);
+    let node = cluster.node(1);
+    assert!(node.engine.flush_deferred(&mut node.consensus).is_none());
+    node.engine.set_proposals_deferred(false);
+    cluster.settle(&[]);
+    assert_eq!(cluster.node(1).pending_count(), 0);
+    for (key, outcome) in admitted {
+        for id in 1..=3 {
+            assert_eq!(
+                cluster.node(id).outcome(key).unwrap(),
+                Some(outcome),
+                "node {id}"
+            );
+        }
+    }
+    cluster.assert_same_state(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 }
 
 #[test]
