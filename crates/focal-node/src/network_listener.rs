@@ -174,6 +174,10 @@ impl NetworkListener {
     pub async fn admission(&self) -> AdmissionStats {
         self.server.admission().await
     }
+    /// What this listener's socket did.
+    pub async fn io(&self) -> hyper_rt::udp::IoStats {
+        self.server.io().await
+    }
     pub fn close(&self) {
         // A close the shard could not queue leaves the endpoint to the service's shutdown, which
         // awaits its end.

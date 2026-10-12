@@ -533,6 +533,14 @@ impl QuicServer {
     pub(crate) fn network(&self) -> &Network {
         &self.network
     }
+    /// What this server's socket did ([`crate::net::NetStats::io`]).
+    pub async fn io(&self) -> hyper_rt::udp::IoStats {
+        self.network
+            .call(|reply| Command::Stats { reply })
+            .await
+            .unwrap_or_default()
+            .io
+    }
     /// Who holds this server's connections, and what it refused.
     pub async fn admission(&self) -> AdmissionStats {
         let stats = self
