@@ -14745,3 +14745,40 @@ recursion), `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3286
 passed, 0 failed, 22 ignored. Land-10's Linux CI had failed the 128 kbit/s crossing (run
 38168585066); this batch's warm-up is the fix for it.
+
+
+### 2026-10-11 — A path's warm-up stops where it cannot measure and keeps what it measured; the copy test counts the copy's chunks alone
+
+**Land-11's Linux CI failed the copy test** (`evidence_quic::a_copy_is_sent_the_chunks_it_lacks_and_none_it_holds`, run 38178582432): 276,948 bytes crossed toward the copy for one chunk of 65,536 it lacked. macOS and Windows passed.
+
+A diagnostic run printed every path warm-up's start and end, with timestamps around the two seals, and ran the test with and without the warm-up (diag/copy-1, run 38182656943):
+- with the warm-up on, 2 of 3 runs failed;
+- with it off, 3 of 3 passed, at 68,886–69,221 bytes;
+- in the failing runs, warm-ups ended between the first seal and the second, inside the count.
+
+Run locally with each warm-up round printed, the fleet's warm-ups mostly ran to their budget of 160 packets (232 KB) and measured nothing.
+
+On loopback, BBR's window sat at its floor of four datagrams: the bandwidth-delay product of an 86 µs path is a few kilobytes. Every round trip after that delivered three datagrams, while the warm-up's own window kept doubling. Its target, four initial windows a round trip, was out of reach.
+
+**hyper-quic patch Q13** (the shared crates at hyper-raft 82ffe76):
+- **A plateau ends the warm-up.** BBR's full-pipe test (draft-ietf-ccwg-bbr §4.3.1.2): three round trips that each grow its delivery by less than a quarter, short of the target, end it as an attempt.
+  - It judges the warm-up's own acknowledged bytes. A reply the application had in flight as the warm-up began otherwise set the bar: on hyper-quic's 500 ms geo path, the warm-up's 1,200, 3,600 and 9,600 bytes were counted as no growth against 12,647 bytes of a reply.
+  - It judges only round trips a window held it back in.
+- **The budget stops the sending, not the measurement.** It ended the warm-up as it sent, so the round trip in flight, the one that met the target, came to an ended warm-up and its measurement was lost. The warm-up now ends once its last packet is acknowledged. A pair under BBR at 100 Mbit/s and 40 µs one way now measures where it ended at the budget.
+- **The statistics say what the warm-up sent and whether it is still to come** (`PathFacts::warm_up_bytes` and `PathFacts::warming_up`).
+
+**The copy test counts the copy's chunks alone.** Before its counted window, it waits until no node's connection to the copy has a warm-up still to come, read live (`PeerPool::path_now`). The wait is bounded within four exchanges across the path, in the replicas' periods, as a seal is waited. A connection warms its path up at most once, so none can send padding into the count. The test checks that none did.
+
+Taking the padding out by the sender's count instead failed 1 Linux run of 6, counting 27,218 bytes for a chunk of 65,536 (diag/copy-2). The relay counts a datagram once it has carried it, or never if it drops it; the sender counts it as it sends. The assertion is unchanged. Locally: 70,074–70,405 bytes for the one chunk, and 204,778–205,293 with the first chunk lacked.
+
+On Linux CI (diag/copy-3, run 38185184289), the copy test passed 6 of 6: 68,978–70,427 bytes for
+the one chunk, and 203,695–226,908 with the first chunk lacked. The 128 kbit/s crossing passed 3 of
+3, each seal 72.0–72.8 s after its upload began.
+
+The gate on the landing tree (head `4274a9e`, macOS 26.4.1 arm64, under other work's load), exit 0:
+`cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes, 15
+vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1153 production sources, no policy allowance, no runtime
+recursion), `cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3286
+passed, 0 failed, 22 ignored. Windows CI passed on the same code (run 38185184315).
