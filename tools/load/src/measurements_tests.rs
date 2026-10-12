@@ -11,6 +11,11 @@ fn sample(start: u128, delay: u128, latency: u128, outcome: WriteOutcome) -> Wri
         epoch: RequestEpoch(1),
         request: start,
         outcome,
+        refusal: if outcome == WriteOutcome::Refused {
+            RefusalCause::Other
+        } else {
+            RefusalCause::None
+        },
     }
 }
 
@@ -59,6 +64,7 @@ fn csv_preserves_identity_outcome_and_both_time_origins() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("trace.csv");
     let mut later = sample(120, 10, 20, WriteOutcome::Refused);
+    later.refusal = RefusalCause::OwnerMemory;
     later.worker = 2;
     later.write = 3;
     later.attempt = 1;
@@ -75,10 +81,11 @@ fn csv_preserves_identity_outcome_and_both_time_origins() {
     assert_eq!(lines.len(), 3);
     assert_eq!(
         lines[1],
-        "0,25,5,25,0,1,0,1,00000000000000000000000000000064,committed,100,1000000"
+        "0,25,5,25,0,1,0,1,00000000000000000000000000000064,committed,100,1000000,"
     );
     assert_eq!(
         lines[2],
-        "20,20,30,40,2,3,1,4,00000000000000000000000000000005,refused,120,1000000"
+        "20,20,30,40,2,3,1,4,00000000000000000000000000000005,refused,120,1000000,owner_memory"
     );
+    assert!(lines[0].ends_with(",refusal"));
 }

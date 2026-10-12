@@ -35,6 +35,33 @@ impl WriteOutcome {
     }
 }
 
+/// Why a write was refused, as its reply named it: the native owner's memory (a session full),
+/// another of its bounds (its pending candidates), the node's ingress (`access: Capacity`: the
+/// session's queue or the listener's share), a node that could not serve it now, or another
+/// refusal. A full session's refusals and an overloaded node's read alike as `refused` without
+/// it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RefusalCause {
+    None,
+    OwnerMemory,
+    OwnerBound,
+    IngressCapacity,
+    Unavailable,
+    Other,
+}
+impl RefusalCause {
+    fn name(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::OwnerMemory => "owner_memory",
+            Self::OwnerBound => "owner_bound",
+            Self::IngressCapacity => "ingress_capacity",
+            Self::Unavailable => "unavailable",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct WriteSample {
     pub start_ns: u128,
@@ -46,6 +73,7 @@ pub struct WriteSample {
     pub epoch: RequestEpoch,
     pub request: u128,
     pub outcome: WriteOutcome,
+    pub refusal: RefusalCause,
 }
 impl WriteSample {
     pub fn latency_ns(&self) -> u128 {
@@ -226,12 +254,12 @@ fn write_csv<'a>(
     }
     writeln!(
         output,
-        "start_ns,latency_ns,sent_ns,finished_ns,worker,write,attempt,epoch,request,outcome,phase_start_ns,run_start_epoch_ns"
+        "start_ns,latency_ns,sent_ns,finished_ns,worker,write,attempt,epoch,request,outcome,phase_start_ns,run_start_epoch_ns,refusal"
     )?;
     for sample in &ordered.values {
         writeln!(
             output,
-            "{},{},{},{},{},{},{},{},{:032x},{},{},{}",
+            "{},{},{},{},{},{},{},{},{:032x},{},{},{},{}",
             sample.start_ns.saturating_sub(origin),
             sample.latency_ns(),
             sample.sent_ns.saturating_sub(origin),
@@ -243,7 +271,8 @@ fn write_csv<'a>(
             sample.request,
             sample.outcome.name(),
             sample.start_ns,
-            run_start_epoch_ns
+            run_start_epoch_ns,
+            sample.refusal.name()
         )?;
     }
     output.flush()?;
