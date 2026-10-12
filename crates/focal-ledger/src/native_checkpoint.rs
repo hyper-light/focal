@@ -90,7 +90,12 @@ fn root_limits(limits: Limits) -> record_codec::EncodingLimits {
 struct Sealer {
     batch: SeedBatch,
     table: Vec<SeedChunk>,
+    /// A chunk's bytes, `filled` of them written: sized once, so a field of
+    /// a few bytes is moved into it without a call to the C library's
+    /// memcpy (`focal_memory::short_copy`), where growing a vector called
+    /// it for every field.
     buffer: Vec<u8>,
+    filled: usize,
     most: usize,
     _charge: Allocation,
 }
@@ -113,40 +118,51 @@ impl Sealer {
         buffer
             .try_reserve_exact(SEED_CHUNK_BYTES)
             .map_err(|_| MemoryError::AllocationFailed)?;
+        buffer.resize(SEED_CHUNK_BYTES, 0);
         Ok(Self {
             batch,
             table,
             buffer,
+            filled: 0,
             most,
             _charge: charge,
         })
     }
     fn push(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
         while !bytes.is_empty() {
-            let room = SEED_CHUNK_BYTES.saturating_sub(self.buffer.len());
+            let room = SEED_CHUNK_BYTES.saturating_sub(self.filled);
             let take = room.min(bytes.len());
             let (head, tail) = bytes.split_at_checked(take).ok_or(Error::Truncated)?;
-            self.buffer.extend_from_slice(head);
+            let end = fields::add(self.filled, take)?;
+            let target = self
+                .buffer
+                .get_mut(self.filled..end)
+                .ok_or(Error::Capacity)?;
+            if !focal_memory::short_copy::copy(target, head) {
+                return Err(Error::Capacity);
+            }
+            self.filled = end;
             bytes = tail;
-            if self.buffer.len() == SEED_CHUNK_BYTES {
+            if self.filled == SEED_CHUNK_BYTES {
                 self.seal()?;
             }
         }
         Ok(())
     }
     fn seal(&mut self) -> Result<(), Error> {
-        if self.buffer.is_empty() {
+        if self.filled == 0 {
             return Ok(());
         }
         if self.table.len() >= self.most {
             return Err(Error::Invalid("seed chunk count"));
         }
-        let hash = self.batch.add(&self.buffer)?;
+        let chunk = self.buffer.get(..self.filled).ok_or(Error::Capacity)?;
+        let hash = self.batch.add(chunk)?;
         self.table.push(SeedChunk {
             hash,
-            length: u32::try_from(self.buffer.len()).map_err(|_| Error::Capacity)?,
+            length: u32::try_from(self.filled).map_err(|_| Error::Capacity)?,
         });
-        self.buffer.clear();
+        self.filled = 0;
         Ok(())
     }
     /// The chunks' table and the batch's commit, the remainder sealed.

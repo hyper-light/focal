@@ -263,10 +263,16 @@ impl<S: Sink> Sink for HashSink<'_, S> {
             let take = HASH_BATCH.saturating_sub(self.held).min(bytes.len());
             let (head, rest) = bytes.split_at_checked(take).ok_or(CodecError::Capacity)?;
             let end = add(self.held, take)?;
-            self.batch
-                .get_mut(self.held..end)
-                .ok_or(CodecError::Capacity)?
-                .copy_from_slice(head);
+            // A field of a few bytes is moved without a call to the C
+            // library's memcpy (`focal_memory::short_copy`).
+            if !focal_memory::short_copy::copy(
+                self.batch
+                    .get_mut(self.held..end)
+                    .ok_or(CodecError::Capacity)?,
+                head,
+            ) {
+                return Err(CodecError::Capacity);
+            }
             self.held = end;
             bytes = rest;
             if self.held == HASH_BATCH {

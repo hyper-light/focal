@@ -257,8 +257,12 @@ impl Sink for SliceSink<'_> {
             .bytes
             .get_mut(self.written..end)
             .ok_or(Error::Capacity)?;
-        // The checked range has exactly bytes.len() elements.
-        target.copy_from_slice(bytes);
+        // The checked range has exactly bytes.len() elements; a field of a
+        // few bytes is moved without a call to the C library's memcpy
+        // (`focal_memory::short_copy`).
+        if !focal_memory::short_copy::copy(target, bytes) {
+            return Err(Error::Capacity);
+        }
         self.written = end;
         self.visits.used = used;
         Ok(())
