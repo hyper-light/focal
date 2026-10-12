@@ -194,6 +194,17 @@ EOF
       # DIAG: the session owner's callers of its heaviest symbols (the range store's point lookup,
       # memcpy, malloc), as the frame-pointer call graphs recorded them
       dc exec -T "$n" sh -c "perf report -i /data/perf.data --stdio --no-children --comm focal-node-sess --sort symbol -g caller,0.5,callee,function,percent --percent-limit 1.5 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -600" || true
+      # DIAG: every sample's whole stack, folded root first under its thread's name, counted
+      # (Brendan Gregg's collapsed format), for attributing a symbol to every caller it has.
+      dc exec -T "$n" sh -c "perf script -i /data/perf.data -F comm,ip,sym 2>/dev/null" \
+        | awk '
+          function emit(  s, i) { if (n == 0) return; s = comm; for (i = n; i >= 1; i--) s = s ";" f[i]; c[s]++; n = 0 }
+          /^\t/ { n++; sym = $2; for (j = 3; j <= NF; j++) sym = sym " " $j; f[n] = sym; next }
+          /^[ \t]*$/ { emit(); next }
+          { emit(); comm = $1; next }
+          END { emit(); for (k in c) print k, c[k] }
+        ' > "$out/$report.$n.folded" || true
+      wc -l "$out/$report.$n.folded" || true
       echo "::endgroup::"
     done
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
