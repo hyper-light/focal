@@ -2906,11 +2906,9 @@ impl Owner {
             native,
             queued,
         } = *request;
-        if let Some(queued) = queued {
-            queued.taken();
-        }
+        let waited = queued.map_or(Duration::ZERO, crate::pace::QueueTicket::taken);
         let waiting = self.session.reads_waiting();
-        self.request(verified, response, charge, witness, native);
+        self.request(verified, response, charge, witness, native, waited);
         // A request that only asked a read is not drained for here:
         // the owner's loop takes what else is queued first, and the
         // round that leaves with its drain carries every read asked
@@ -3137,6 +3135,23 @@ impl Owner {
     fn queue_pending(&mut self, pending: Pending) {
         self.earliest_deadline = self.earliest_deadline.min(pending.deadline);
         self.pending.push_back(pending);
+        self.publish_oldest_write();
+    }
+    /// States to the pace when the oldest write this owner holds unanswered was admitted: the
+    /// first native write in the queue, which keeps them in the order they were taken
+    /// (`TickPeriod::service_delay`).
+    fn publish_oldest_write(&self) {
+        let oldest = self
+            .pending
+            .iter()
+            .find(|pending| matches!(pending.waiting, WaitingFor::NativeMutation { .. }))
+            .and_then(|pending| {
+                pending
+                    .served
+                    .as_ref()
+                    .map(crate::pace::ServiceClock::admitted_ns)
+            });
+        self.pace.set_oldest_write(oldest);
     }
     /// The Raft traffic admitted beside the participants' bound (F56): every
     /// member the configuration names — voters, learners and the admitted —
@@ -3393,11 +3408,12 @@ impl Owner {
         charge: Allocation,
         witness: Option<EvidenceWitness>,
         native: Option<focal_evidence::VerifiedNativeArtifact>,
+        queued: Duration,
     ) {
         let header = verified
             .request()
             .reply(Response::Error(AccessError::OutcomeUnknown));
-        let served = self.pace.service_clock();
+        let served = self.pace.service_clock(queued);
         // A peer's frame has a path of its own: stepped now, or held for
         // the frame it overtook (27 §12), and answered at the Ready fence
         // either way.
@@ -4300,6 +4316,7 @@ impl Owner {
             }
         }
         self.resolve(&events)?;
+        self.publish_oldest_write();
         self.send(&events.messages)?;
         self.poll_snapshot_feedback()?;
         // The write is durable: what waited for it is stepped now, and owes
@@ -5008,6 +5025,7 @@ impl Owner {
                 }
             }
             self.earliest_deadline = earliest;
+            self.publish_oldest_write();
         }
         // A frame that waited for a write past its deadline is given up, a
         // loss to its source's stream as a frame not stepped is; those

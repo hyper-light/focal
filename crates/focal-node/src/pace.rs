@@ -83,6 +83,14 @@ struct TickShared {
     /// one is measured ([`TickPeriod::served`]).
     base_service_ns: AtomicU64,
     base_seen_ns: AtomicU64,
+    /// When the oldest write the owner took and has not answered was admitted, in nanoseconds
+    /// since the process began, zero while it holds none ([`TickPeriod::set_oldest_write`]): the
+    /// age of the oldest request in the session's pipeline, Breakwater's signal (the oldest
+    /// timestamp a queue holds, Cho et al., OSDI '20, §3.1) taken over the queue and the
+    /// pipeline both. A request the owner took at once and then held behind a deep pipeline waits
+    /// there, not in the queue, and its wait is seen only here; and as the session refuses, its
+    /// oldest writes are answered and the age falls, so a refusal never keeps itself in force.
+    oldest_write_ns: AtomicU64,
 }
 /// The bound a session's host turned an input away at, before it was
 /// queued ([`TickPeriod::refuse_input`]).
@@ -155,14 +163,15 @@ pub(crate) struct QueueTicket {
 }
 impl QueueTicket {
     /// The owner takes the request: how long it waited is the session's
-    /// latest sojourn, and now is when the owner last took one.
-    pub(crate) fn taken(self) {
+    /// latest sojourn, and now is when the owner last took one. The wait,
+    /// returned, is the first part of the request's time to its answer.
+    pub(crate) fn taken(self) -> Duration {
         let now = now_ns();
         let shared = &self.pace.0;
-        shared
-            .sojourn_ns
-            .store(now.saturating_sub(self.admitted_ns), Ordering::Relaxed);
+        let waited = now.saturating_sub(self.admitted_ns);
+        shared.sojourn_ns.store(waited, Ordering::Relaxed);
         shared.taken_ns.store(now, Ordering::Relaxed);
+        Duration::from_nanos(waited)
     }
 }
 impl Drop for QueueTicket {
@@ -174,16 +183,32 @@ impl Drop for QueueTicket {
         );
     }
 }
-/// When the owner took a participant's request, for its service time once it
-/// is answered ([`TickPeriod::served`]).
+/// When the owner took a participant's request and how long it had waited to
+/// be taken, for its service time and its time to its answer once it is
+/// answered ([`TickPeriod::served`]); held while the request is in service,
+/// and given back however it ends.
 pub(crate) struct ServiceClock {
     pace: TickPeriod,
     taken: std::time::Instant,
+    queued: Duration,
+    /// Whether the pipeline held no other write as this one was taken: its
+    /// service is the session's uncongested time, the only kind that may set
+    /// the least ([`TickPeriod::base_service`]).
+    alone: bool,
 }
 impl ServiceClock {
     /// The request taken at this clock's start is answered now.
     pub(crate) fn answered(self) {
-        self.pace.served(self.taken.elapsed());
+        if self.alone {
+            self.pace.served(self.taken.elapsed());
+        }
+    }
+    /// When the request was admitted, in nanoseconds since the process began:
+    /// taken less what it waited to be taken.
+    pub(crate) fn admitted_ns(&self) -> u64 {
+        let taken = u64::try_from(self.taken.saturating_duration_since(began()).as_nanos())
+            .unwrap_or(u64::MAX);
+        taken.saturating_sub(u64::try_from(self.queued.as_nanos()).unwrap_or(u64::MAX))
     }
 }
 /// Now, in nanoseconds since the process began.
@@ -414,19 +439,27 @@ impl TickPeriod {
                 .max(self.0.sojourn_ns.load(Ordering::Relaxed)),
         )
     }
-    /// A clock started as the owner takes a participant's request, read when
-    /// the request is answered ([`ServiceClock::answered`]).
-    pub(crate) fn service_clock(&self) -> ServiceClock {
+    /// A clock started as the owner takes a participant's request that waited
+    /// `queued` to be taken, read when the request is answered
+    /// ([`ServiceClock::answered`]); the request is in service while it is held.
+    pub(crate) fn service_clock(&self, queued: Duration) -> ServiceClock {
         ServiceClock {
             pace: self.clone(),
             taken: std::time::Instant::now(),
+            queued,
+            alone: self.0.oldest_write_ns.load(Ordering::Relaxed) == 0,
         }
     }
-    /// The owner answered a participant's request it took `service` ago. The
-    /// least service time stands for [`BASE_WINDOW`]: a sample no longer
-    /// replaces it until then (BBR's min-RTT update: a sample at or under the
-    /// least, or a least that expired). Only the owner thread answers, so the
-    /// two marks have one writer.
+    /// The owner answered, `service` after taking it, a participant's request it
+    /// took with no other write in its pipeline: uncongested. The least such
+    /// time stands for [`BASE_WINDOW`]: a sample no longer replaces it until
+    /// then (BBR's min-RTT update: a sample at or under the least, or a least
+    /// that expired). Only uncongested samples: under a load that never empties
+    /// the pipeline every request waits behind others, and a least taken from
+    /// those rose with the congestion it bounds (BBR drains its pipe to
+    /// re-measure, ProbeRTT; a session needs no drain, as a request that finds
+    /// its pipeline empty is the measurement). Only the owner thread answers, so
+    /// these marks have one writer.
     pub(crate) fn served(&self, service: Duration) {
         let sample = u64::try_from(service.as_nanos()).unwrap_or(u64::MAX).max(1);
         let now = now_ns();
@@ -437,6 +470,26 @@ impl TickPeriod {
             self.0.base_service_ns.store(sample, Ordering::Relaxed);
             self.0.base_seen_ns.store(now, Ordering::Relaxed);
         }
+    }
+    /// The owner states when the oldest write it holds unanswered was admitted
+    /// ([`ServiceClock::admitted_ns`]), or none.
+    pub(crate) fn set_oldest_write(&self, admitted_ns: Option<u64>) {
+        self.0
+            .oldest_write_ns
+            .store(admitted_ns.unwrap_or(0), Ordering::Relaxed);
+    }
+    /// How long the session's pipeline has held its oldest write past the time
+    /// one takes uncongested; none while it holds none.
+    pub(crate) fn service_delay(&self) -> Duration {
+        let oldest = self.0.oldest_write_ns.load(Ordering::Relaxed);
+        if oldest == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_nanos(
+            now_ns()
+                .saturating_sub(oldest)
+                .saturating_sub(self.0.base_service_ns.load(Ordering::Relaxed)),
+        )
     }
     /// The session's least service time over the last [`BASE_WINDOW`]: its
     /// write cycle uncongested; none until one is measured.
@@ -459,7 +512,7 @@ impl TickPeriod {
     /// it would be queued behind ([`Self::delay_bound`]).
     pub(crate) fn delay_exceeded(&self) -> bool {
         self.delay_bound()
-            .is_some_and(|bound| self.queueing_delay() > bound)
+            .is_some_and(|bound| self.queueing_delay() > bound || self.service_delay() > bound)
     }
     /// The room the owner last stated, and the frames queued in it now.
     #[cfg(test)]
