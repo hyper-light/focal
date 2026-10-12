@@ -239,31 +239,37 @@ impl CellRef {
         true
     }
 
-    /// Forgets the waiting task, if any (its handle leaves the cell to a next user).
+    /// Forgets the waiting task, if any (its handle leaves the cell to a next user). Only for a cell no
+    /// thread waits in.
     pub(crate) fn clear_waiter(self) {
         if let Some(cell) = self.cell() {
             crate::handoff::clear_waiter(&cell.waiter);
         }
     }
 
-    /// Records `word` as the task to wake (replacing any earlier one: one waiter at a time). A
-    /// read-modify-write, so a waiter that registers and then checks the state never misses a publisher
-    /// that changes the state and then wakes (`crate::handoff`; mantle's final review, second pass,
-    /// finding 2: a plain store let both sides read stale values).
+    /// Records `word` as the task to wake (replacing any earlier one: one waiter at a time), fenced so the
+    /// caller's check of the state that follows cannot miss a publisher that changes the state and then wakes
+    /// (`crate::handoff`; mantle's final review, second pass, finding 2).
     pub(crate) fn register(self, word: Encoded) {
         if let Some(cell) = self.cell() {
-            crate::handoff::register_waiter(&cell.waiter, word.word());
+            crate::handoff::register_task(&cell.waiter, word.word());
         }
     }
 
-    /// Wakes the waiting task, if one waits (taking it).
+    /// Wakes the waiter, if one waits: a task through the registry, a blocked thread by its handle. Of several
+    /// publishers, one wakes each registration (`crate::handoff`).
     pub(crate) fn wake(self) {
-        let Some(cell) = self.cell() else {
-            return;
-        };
-        if let Some(word) = crate::handoff::take_waiter(&cell.waiter) {
-            crate::registry::wake(Encoded::from_word(word));
+        if let Some(cell) = self.cell() {
+            crate::handoff::wake_waiter(&cell.waiter);
         }
+    }
+
+    /// Waits on the calling plain thread until `ready` answers, the thread registered as the cell's waiter
+    /// between its checks (`crate::handoff::wait_as_thread`). `None` when this handle's cell is gone, which a
+    /// caller holding one of its handles never sees.
+    pub(crate) fn wait_as_thread<R>(self, ready: impl FnMut() -> Option<R>) -> Option<R> {
+        let cell = self.cell()?;
+        Some(crate::handoff::wait_as_thread(&cell.waiter, ready))
     }
 }
 

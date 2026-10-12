@@ -132,13 +132,16 @@ impl Ticket {
         }
     }
 
-    /// Answers the call, once, and wakes its waker.
+    /// Answers the call, once, and wakes its waker. The waker is the caller's code, run on
+    /// whichever of the log's threads answers, holding the device or other callers' answers: it is
+    /// called inside an unwind boundary of its own, so a waker that unwinds costs its caller only
+    /// the wake, the answer already in its port (CLAUDE.md §1).
     pub(crate) fn answer(&mut self, answer: Result<Answer, LogError>) {
         if let Some(reply) = self.reply.take() {
             let _ = reply.try_send(Reply::Answer(answer));
         }
         if let Some(waker) = self.waker.take() {
-            waker.wake();
+            let _ = crate::unwind::contained(|| waker.wake());
         }
     }
 

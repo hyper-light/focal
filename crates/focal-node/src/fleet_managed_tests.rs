@@ -77,7 +77,7 @@ fn support(owner: &mut Owner) -> Result<ManagedSupportReply, LedgerError> {
         .reserve(BudgetKind::Control, BudgetLane::Completion, 192 * 1024)
         .unwrap()
         .commit();
-    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
+    let (send, mut receive) = hyper_rt::sync::oneshot().unwrap();
     owner.accept_managed_support(
         SupportCall {
             received: None,

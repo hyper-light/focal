@@ -119,7 +119,7 @@ pub fn block_on_shards<T: Send + 'static>(
     let first = *runtime.shard_ids().first().ok_or(RtError::BadConfig {
         what: "a runtime of no shards",
     })?;
-    let (sender, receiver) = hyper_rt::sync::oneshot()?;
+    let (sender, mut receiver) = hyper_rt::sync::oneshot()?;
     runtime.spawn_on(first, async move {
         let _ = sender.send(future.await);
     })?;

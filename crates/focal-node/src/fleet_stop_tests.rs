@@ -48,7 +48,7 @@ fn stop_drains_election_readiness_without_waiting_and_reopens_the_same_prefix() 
         .unwrap();
         // Call exactly the same owned Stop handler used by direct/group hosts,
         // without allowing an initial worker tick to hide the readiness window.
-        let (send, receive) = hyper_rt::sync::oneshot().unwrap();
+        let (send, mut receive) = hyper_rt::sync::oneshot().unwrap();
         assert!(owner.accept(Work::Stop(send)).unwrap());
         receive.blocking_recv().unwrap().unwrap();
         assert_eq!(owner.session.status().committed_index, 1);

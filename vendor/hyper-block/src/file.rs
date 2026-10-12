@@ -50,6 +50,8 @@ pub struct DeviceFile {
     layout: Alignment,
     /// A device node rather than a regular file.
     node: bool,
+    /// What this handle needs to read from memory alone ([`DeviceFile::read_resident_at`]).
+    resident: crate::resident::Resident,
 }
 
 impl DeviceFile {
@@ -97,6 +99,7 @@ impl DeviceFile {
             align,
             layout,
             node,
+            resident: crate::resident::Resident::new(),
         })
     }
 
@@ -121,6 +124,8 @@ impl DeviceFile {
             align: self.align,
             layout: self.layout,
             node: self.node,
+            // A duplicate maps its own window when it first reads from memory.
+            resident: crate::resident::Resident::new(),
         })
     }
 
@@ -197,6 +202,28 @@ impl DeviceFile {
             }
         }
         Ok(())
+    }
+
+    /// Fills `buf` from `offset` only if the OS holds every byte of it in memory now, without
+    /// waiting for the device (`crate::resident`): true when it read, false when the read would
+    /// wait, the file ends first, or the platform cannot tell, leaving the read to a thread that
+    /// may wait ([`crate::issuer`]). A direct file has no OS cache to read from, so it never reads
+    /// here.
+    pub fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
+        if self.caching == Caching::Direct {
+            return Ok(false);
+        }
+        self.check_alignment(offset, buf.len())?;
+        match self.resident.read(&self.file, buf, offset) {
+            Ok(read) => Ok(read),
+            Err(e) => Err(self.io_error("read from memory", e)),
+        }
+    }
+
+    /// Whether [`Self::read_resident_at`] can read anything: a buffered file, where the platform
+    /// can tell what the OS holds (`crate::resident`).
+    pub fn reads_resident(&self) -> bool {
+        self.caching == Caching::Buffered && cfg!(any(target_os = "linux", target_vendor = "apple"))
     }
 
     /// Fills `buf` from `offset`; reaching the end of the file first is an error.
@@ -840,6 +867,73 @@ mod tests {
                 assert_eq!(source.kind(), io::ErrorKind::NotFound);
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Do: write pages through the cache, then read them only from memory: one the write left
+    /// there, one past the file's end, one written far past the window the first read mapped, and
+    /// one through a duplicate. Expect: where the platform can tell, each page in memory is read
+    /// here with the file's bytes and the one past the end is not; where it cannot (or the file
+    /// system refuses `RWF_NOWAIT`), none is, and the handle says so.
+    #[test]
+    fn a_buffered_file_reads_what_memory_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = DeviceFile::open(
+            &dir.path().join("resident"),
+            true,
+            CachingRequest::Buffered,
+            align(),
+        )
+        .unwrap();
+        let page = 4096usize;
+        let bytes: Vec<u8> = (0..4 * page).map(|i| (i % 251) as u8).collect();
+        file.write_all_at(&bytes, 0).unwrap();
+        let mut buf = vec![0u8; page];
+        let read = file.read_resident_at(&mut buf, page as u64).unwrap();
+        // A regular file on macOS is always mapped: its probes never refuse.
+        assert!(!(cfg!(target_vendor = "apple") && file.resident.refused()));
+        assert_eq!(read, !file.resident.refused());
+        if read {
+            assert_eq!(buf, &bytes[page..2 * page]);
+        }
+        assert!(!file.read_resident_at(&mut buf, 8 * page as u64).unwrap());
+        // Far past any window mapped so far: the mapping grows to reach it.
+        let far = 1u64 << 22;
+        file.write_all_at(&bytes[..page], far).unwrap();
+        buf.fill(0);
+        assert_eq!(
+            file.read_resident_at(&mut buf, far).unwrap(),
+            !file.resident.refused()
+        );
+        if !file.resident.refused() {
+            assert_eq!(buf, &bytes[..page]);
+        }
+        let mut twin = file.try_clone().unwrap();
+        buf.fill(0);
+        assert_eq!(
+            twin.read_resident_at(&mut buf, 0).unwrap(),
+            !twin.resident.refused()
+        );
+        if !twin.resident.refused() {
+            assert_eq!(buf, &bytes[..page]);
+        }
+    }
+
+    /// Do: read a direct file only from memory. Expect: nothing read, without a transfer: a
+    /// direct file has no OS cache to read from.
+    #[test]
+    fn a_direct_file_reads_nothing_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = DeviceFile::open(
+            &dir.path().join("direct"),
+            true,
+            CachingRequest::PreferDirect,
+            align(),
+        )
+        .unwrap();
+        if file.caching() == Caching::Direct {
+            let mut buf = vec![0u8; 4096];
+            assert!(!file.read_resident_at(&mut buf, 0).unwrap());
         }
     }
 }

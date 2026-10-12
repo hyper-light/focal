@@ -47,6 +47,28 @@ struct ShardCells {
     ended: CellRef,
 }
 
+/// One retained cell owned by an accept future, including before its first poll.
+#[derive(Debug)]
+struct HeldCell(CellRef);
+
+impl HeldCell {
+    fn retained(cell: CellRef) -> Self {
+        cell.retain();
+        Self(cell)
+    }
+
+    // A method borrows the whole guard, so precise async capture cannot move only its Copy field.
+    fn get(&self) -> CellRef {
+        self.0
+    }
+}
+
+impl Drop for HeldCell {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 /// An address served on a runtime's shards. Dropping it gives the counts back; the accept loops end with
 /// the runtime.
 #[derive(Debug)]
@@ -212,19 +234,19 @@ where
             what: "served shards",
             bound: rt.shard_ids().len(),
         })?;
+    let mut serving = Serving {
+        addr: addr.into(),
+        shards,
+    };
     for shard in rt.shard_ids() {
         let count = claim(1)?;
         let ended = claim(1).inspect_err(|_| count.release())?;
-        shards.push(ShardCells {
+        serving.shards.push(ShardCells {
             shard: *shard,
             count,
             ended,
         });
     }
-    let mut serving = Serving {
-        addr: addr.into(),
-        shards,
-    };
     let holders = serving
         .shards
         .iter()
@@ -266,13 +288,11 @@ where
         listeners.push(listener);
     }
     for ((cells, holder), listener) in serving.shards.iter().zip(holders).zip(listeners) {
-        cells.count.retain();
-        cells.ended.retain();
-        let (count, ended, handler) = (cells.count, cells.ended, handler.clone());
+        let count = HeldCell::retained(cells.count);
+        let ended = HeldCell::retained(cells.ended);
+        let handler = handler.clone();
         let accept = async move {
-            accept_here(&listener, count, ended, handler).await;
-            count.release();
-            ended.release();
+            accept_here(&listener, count.get(), ended.get(), handler).await;
         };
         let request = Box::new(SpawnRequest::new(Box::pin(accept), None));
         registry::send_control_to_holder(*holder, Control::Spawn(request))?;
@@ -336,17 +356,12 @@ where
             bound: serving.shards.len(),
         })?;
     for (cells, holder) in serving.shards.iter().zip(holders) {
-        cells.count.retain();
-        targets.push((*holder, cells.count));
+        targets.push((*holder, HeldCell::retained(cells.count)));
     }
-    first.ended.retain();
-    let (ended, handler) = (first.ended, handler.clone());
+    let ended = HeldCell::retained(first.ended);
+    let handler = handler.clone();
     let accept = async move {
-        accept_and_hand_off(&listener, &targets, ended, handler).await;
-        for (_, count) in &targets {
-            count.release();
-        }
-        ended.release();
+        accept_and_hand_off(&listener, &targets, ended.get(), handler).await;
     };
     let request = Box::new(SpawnRequest::new(Box::pin(accept), None));
     registry::send_control_to_holder(*acceptor, Control::Spawn(request))?;
@@ -357,26 +372,25 @@ where
 #[cfg(not(target_os = "linux"))]
 async fn accept_and_hand_off<H, F>(
     listener: &TcpListener,
-    targets: &[(SlotHolder, CellRef)],
+    targets: &[(SlotHolder, HeldCell)],
     ended: CellRef,
     handler: H,
 ) where
     H: Fn(TcpStream) -> F + Clone + Send + 'static,
     F: Future<Output = ()> + 'static,
 {
-    let counts: Vec<CellRef> = targets.iter().map(|(_, count)| *count).collect();
+    let counts: Vec<CellRef> = targets.iter().map(|(_, count)| count.get()).collect();
     let here = registry::with_current(|context| context.id);
     loop {
         match listener.accept().await {
             Ok(mut stream) => {
-                let Some((holder, count)) = targets
-                    .iter()
-                    .min_by_key(|(_, count)| open(*count))
-                    .copied()
+                let Some((holder, count)) =
+                    targets.iter().min_by_key(|(_, count)| open(count.get()))
                 else {
                     continue;
                 };
-                stream.count_in(count);
+                let holder = *holder;
+                stream.count_in(count.get());
                 if here == Some(holder.shard()) {
                     let _ = crate::futures::spawn_detached(handler(stream));
                     continue;

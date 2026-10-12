@@ -25,6 +25,11 @@ rustix = { version = "1.1", features = ["fs", "system", "param", "process", "tim
 # Linux's native AIO system calls (`aio`): io_setup, io_submit, io_getevents, io_destroy.
 libc = "0.2.189"
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# mmap(2), mincore(2) and munmap(2) (`resident`): which pages of a file the unified buffer cache
+# holds, so a read of them is made without waiting for the device.
+libc = "0.2.189"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",

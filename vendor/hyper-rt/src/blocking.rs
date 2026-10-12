@@ -47,6 +47,20 @@ pub struct Share {
     pub waiting: usize,
 }
 
+impl Share {
+    /// A share of `limit` places and no line: past its places a job is refused at once, as the pool
+    /// refused before shares had lines. The constructor a consumer's `Share { name, limit }` from
+    /// before `waiting` becomes.
+    #[must_use]
+    pub const fn new(name: &'static str, limit: usize) -> Self {
+        Self {
+            name,
+            limit,
+            waiting: 0,
+        }
+    }
+}
+
 /// The pool's shape, the consumer's (derived from its own measurement: a device's queue and knee, a
 /// sandbox's concurrency budget).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,8 +351,8 @@ where
         state.held.fetch_sub(1, Ordering::AcqRel);
     })?;
     let wrapped: Job = Box::new(move || {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-        if outcome.is_err() {
+        let outcome = crate::unwind::contained(job);
+        if outcome.is_none() {
             PANICKED.fetch_add(1, Ordering::Relaxed);
         }
         // The share is given back before the receiver can see anything: a task that awaited this job's
@@ -347,10 +361,13 @@ where
             state.held.fetch_sub(1, Ordering::AcqRel);
         }
         FINISHED.fetch_add(1, Ordering::Relaxed);
+        // A dropped receiver discards the result, whose drop is the job's code: inside an unwind
+        // boundary too.
         match outcome {
-            // A dropped receiver discards the result.
-            Ok(value) => drop(sender.send(value)),
-            Err(_) => drop(sender),
+            Some(value) => {
+                let _ = crate::unwind::contained(move || drop(sender.send(value)));
+            }
+            None => drop(sender),
         }
     });
     match pool.submit.send(Message::Job {

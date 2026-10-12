@@ -43,8 +43,14 @@ pub trait Growth: Send {
 const AHEAD: u32 = 2;
 
 /// The log's side of a [`Growth`]: what is admitted and not yet durable.
+///
+/// The [`Growth`] is the owner's code, run on the log's owner thread: each call into it is inside
+/// an unwind boundary (CLAUDE.md §1). One that unwinds is never called again, its state unknown:
+/// from then on every admission reads as a refusal, so the file grows no further and a frame that
+/// needs a slot is answered `Full`, as at `max_segments`.
 pub(crate) struct Gate {
-    growth: Box<dyn Growth>,
+    /// The owner's admission, until a call into it unwinds.
+    growth: Option<Box<dyn Growth>>,
     /// Bytes of one slot.
     segment: u64,
     /// Slots admitted and not yet durable, all past the file's last.
@@ -55,20 +61,43 @@ pub(crate) struct Gate {
 
 impl Gate {
     /// The gate over `growth`, the file taking `held` bytes already.
-    pub(crate) fn new(mut growth: Box<dyn Growth>, segment: u64, held: u64) -> Self {
-        growth.held(held);
-        Self {
-            growth,
+    pub(crate) fn new(growth: Box<dyn Growth>, segment: u64, held: u64) -> Self {
+        let mut gate = Self {
+            growth: Some(growth),
             segment,
             pending: 0,
             refused: 0,
+        };
+        gate.call((), |growth| growth.held(held));
+        gate
+    }
+
+    /// Runs `op` on the owner's admission inside an unwind boundary: `refused` once the admission
+    /// has unwound, now or before. One that unwinds is dropped, inside a boundary too.
+    fn call<T>(&mut self, refused: T, op: impl FnOnce(&mut dyn Growth) -> T) -> T {
+        let Some(growth) = self.growth.as_mut() else {
+            return refused;
+        };
+        match crate::unwind::contained(|| op(growth.as_mut())) {
+            Some(answer) => answer,
+            None => {
+                self.drop_growth();
+                refused
+            }
+        }
+    }
+
+    /// Drops the owner's admission, whose drop is its code too.
+    fn drop_growth(&mut self) {
+        if let Some(growth) = self.growth.take() {
+            let _ = crate::unwind::contained(move || drop(growth));
         }
     }
 
     /// Admits `bytes` the file is about to take outside a slot's opening: a new log's persist area
     /// and first slot.
     pub(crate) fn take(&mut self, bytes: u64) -> bool {
-        let admitted = self.growth.admit(bytes);
+        let admitted = self.call(false, |growth| growth.admit(bytes));
         if !admitted {
             self.refused = self.refused.saturating_add(1);
         }
@@ -77,12 +106,12 @@ impl Gate {
 
     /// Bytes [`Gate::take`] admitted are durable in the file.
     pub(crate) fn hold(&mut self, bytes: u64) {
-        self.growth.commit(bytes);
+        self.call((), |growth| growth.commit(bytes));
     }
 
     /// Bytes [`Gate::take`] admitted that the file will not hold.
     pub(crate) fn give(&mut self, bytes: u64) {
-        self.growth.release(bytes);
+        self.call((), |growth| growth.release(bytes));
     }
 
     /// Admits slots until [`AHEAD`] are usable past the file's last, or `max_segments` is
@@ -90,8 +119,9 @@ impl Gate {
     /// (`State::ceiling`).
     pub(crate) fn refill(&mut self, state: &mut State, max_segments: u32) {
         let slots = u32::try_from(state.segments.incarnation.len()).unwrap_or(u32::MAX);
+        let segment = self.segment;
         while state.ceiling < max_segments && state.ceiling.saturating_sub(slots) < AHEAD {
-            if !self.growth.admit(self.segment) {
+            if !self.call(false, |growth| growth.admit(segment)) {
                 self.refused = self.refused.saturating_add(1);
                 return;
             }
@@ -105,8 +135,8 @@ impl Gate {
         let taken = slots.min(self.pending);
         self.pending = self.pending.saturating_sub(taken);
         if taken > 0 {
-            self.growth
-                .commit(self.segment.saturating_mul(u64::from(taken)));
+            let bytes = self.segment.saturating_mul(u64::from(taken));
+            self.call((), |growth| growth.commit(bytes));
         }
     }
 
@@ -119,16 +149,18 @@ impl Gate {
 
     fn give_back(&mut self) {
         if self.pending > 0 {
-            self.growth
-                .release(self.segment.saturating_mul(u64::from(self.pending)));
+            let bytes = self.segment.saturating_mul(u64::from(self.pending));
+            self.call((), |growth| growth.release(bytes));
             self.pending = 0;
         }
     }
 }
 
 impl Drop for Gate {
-    /// The log ended: what it admitted and never used goes back.
+    /// The log ended: what it admitted and never used goes back, and the owner's admission is
+    /// dropped inside an unwind boundary.
     fn drop(&mut self) {
         self.give_back();
+        self.drop_growth();
     }
 }

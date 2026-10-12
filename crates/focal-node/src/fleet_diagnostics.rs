@@ -189,7 +189,7 @@ mod tests {
         .unwrap();
         assert!(!owner.session.managed_support_demanded());
         let baseline = budget.stats().used;
-        let (send, receive) = hyper_rt::sync::oneshot().unwrap();
+        let (send, mut receive) = hyper_rt::sync::oneshot().unwrap();
         let charge = budget
             .reserve(
                 BudgetKind::Control,

@@ -3,30 +3,37 @@
 //! another shard, and a plain thread. One mechanism per primitive, never a local and a remote variant.
 //!
 //! **What the ends share** is a [`cell`]: a few atomic words in a process-wide generational table (the
-//! waiting task's word, a state word, a version), freed by the last handle. **What crosses** is moved, never
-//! shared: a value travels through `std::sync::mpsc::sync_channel`, bounded at the primitive's capacity.
+//! waiter's word, a state word, a version), freed by the last handle. **What crosses** is moved, never
+//! shared: a value travels through a [`ring`], bounded at the primitive's capacity, in a block the ends
+//! share for as long as the cell's handles live (`ring::Shared`). No path takes a lock: the values used to
+//! travel through `std::sync::mpsc::sync_channel`, whose blocked receivers and notifying senders meet in a
+//! pthread mutex (mantle `docs/design/event-loop.md` D4).
 //!
-//! **Waiting.** A task waits by registering its own word in the cell and checking again before it returns
-//! `Pending`; a sender publishes, then wakes the registered word. The order (publish then wake, register then
-//! check) means no wake is lost: a sender that published before the register is seen by the check, and one
-//! that published after finds the word (DERIVED). A plain thread uses the blocking calls, which wait in the
-//! standard channel and never touch the cell's waiter.
+//! **Waiting.** A waiter, a task or a plain thread blocked in a call, registers itself in the cell and
+//! checks again before it waits; a sender publishes, then wakes the registered waiter. The order (publish
+//! then wake, register then check), with a fence on each side, means no wake is lost: a sender that published
+//! before the register is seen by the check, and one that published after finds the waiter
+//! (`crate::handoff`). A thread waits parked, and the publisher that takes it unparks it: one wake a
+//! registration, however many publish.
 //!
 //! **No broadcast.** A wake reaches one waiter (docs/runtime.md §8; mantle note 26 §5): a watched word's
 //! receivers each have their own cell, which the sender wakes one by one, at most the configured receivers.
 
 pub mod cell;
+pub(crate) mod ring;
+mod room;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
 use std::task::{Context, Poll};
 
 use crate::error::RtError;
 use crate::waker::polling_task;
 
 use cell::{CellRef, claim};
+use ring::{Refused, Ring, Shared};
+use room::Room;
 
 /// Why a primitive's call ended without a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +50,24 @@ pub enum SyncError<T> {
 const CLOSED: u64 = 1;
 /// Format: the state bit a pending notification sets.
 const PENDING: u64 = 1 << 1;
+/// Format: a channel's or one-shot's state bit once its receiver is gone (a send is refused `Closed`).
+const RECEIVER_GONE: u64 = 1 << 5;
+/// Format: a channel's or one-shot's state bit once every sender is gone (the receiver, its values taken,
+/// sees `Closed`).
+const SENDERS_GONE: u64 = 1 << 6;
+
+/// Whether `bit` is set in the state of `cell`; a cell that is gone reads as every bit set.
+fn state_has(cell: CellRef, bit: u64) -> bool {
+    cell.cell()
+        .is_none_or(|words| words.state.load(Ordering::Acquire) & bit != 0)
+}
+
+/// Sets `bit` in the state of `cell` (a release: what the setter did before is seen by a reader of the bit).
+fn set_state(cell: CellRef, bit: u64) {
+    if let Some(words) = cell.cell() {
+        words.state.fetch_or(bit, Ordering::AcqRel);
+    }
+}
 
 // ------------------------------------------------------------------------------------------ Notify
 
@@ -90,15 +115,15 @@ impl Future for Notified<'_> {
     type Output = Result<(), RtError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Some(word) = polling_task(cx.waker()) else {
+            return Poll::Ready(Err(RtError::NotOnShardThread));
+        };
         let Some(cell) = self.notify.cell.cell() else {
             return Poll::Ready(Err(RtError::ShardGone { shard: 0 }));
         };
         if cell.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
             return Poll::Ready(Ok(()));
         }
-        let Some(word) = polling_task(cx.waker()) else {
-            return Poll::Ready(Err(RtError::NotOnShardThread));
-        };
         self.notify.cell.register(word);
         if cell.state.fetch_and(!PENDING, Ordering::AcqRel) & PENDING != 0 {
             return Poll::Ready(Ok(()));
@@ -109,39 +134,37 @@ impl Future for Notified<'_> {
 
 // ------------------------------------------------------------------------------------------ oneshot
 
-/// Format: a one-shot's cell state once its receiver has gone ([`OneshotSender::is_closed`]); a bit of
-/// its own beside the sender's [`CLOSED`].
-const RECEIVER_GONE: u64 = 1 << 5;
+/// What a one-shot's ends share: the one value's slot.
+#[derive(Debug)]
+struct OneshotState<T> {
+    value: Ring<T>,
+}
 
 /// The sending half of a one-shot.
 #[derive(Debug)]
 pub struct OneshotSender<T> {
-    value: SyncSender<T>,
-    /// After `value`: its wake runs once the channel has disconnected ([`WakeOnDrop`]).
-    cell: WakeOnDrop,
+    /// `None` once the value went: the drop then says nothing.
+    shared: Option<Shared<OneshotState<T>>>,
 }
 
 /// The receiving half of a one-shot: a future of the value, or `Closed` when the sender went without
 /// sending.
 #[derive(Debug)]
 pub struct OneshotReceiver<T> {
-    value: Receiver<T>,
-    cell: CellRef,
+    shared: Shared<OneshotState<T>>,
 }
 
 /// A one-shot: one value, from one sender to one receiver. Refused `Capacity` at the cell bound.
 pub fn oneshot<T>() -> Result<(OneshotSender<T>, OneshotReceiver<T>), RtError> {
-    let cell = claim(2)?;
-    let (value, receiver) = sync_channel(1);
+    let value = Ring::new(1)?;
+    let cell = claim(1)?;
+    let sender = Shared::new(OneshotState { value }, cell);
+    let receiver = sender.share();
     Ok((
         OneshotSender {
-            value,
-            cell: WakeOnDrop(cell),
+            shared: Some(sender),
         },
-        OneshotReceiver {
-            value: receiver,
-            cell,
-        },
+        OneshotReceiver { shared: receiver },
     ))
 }
 
@@ -149,103 +172,87 @@ impl<T> OneshotSender<T> {
     /// Whether the receiver has gone, so a value sent now would be refused: what an owner holding replies
     /// for its callers sweeps by, before their deadlines, once a caller stopped waiting.
     pub fn is_closed(&self) -> bool {
-        self.cell
-            .0
-            .cell()
-            .is_none_or(|cell| cell.state.load(Ordering::Acquire) & RECEIVER_GONE != 0)
+        self.shared
+            .as_ref()
+            .is_none_or(|shared| state_has(shared.cell(), RECEIVER_GONE))
     }
 
     /// Sends the value; `Closed` when the receiver is gone.
-    pub fn send(self, value: T) -> Result<(), SyncError<T>> {
-        let sent = match self.value.try_send(value) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Disconnected(value) | TrySendError::Full(value)) => {
-                Err(SyncError::Closed(value))
-            }
+    pub fn send(mut self, value: T) -> Result<(), SyncError<T>> {
+        let Some(shared) = self.shared.take() else {
+            return Err(SyncError::Closed(value));
         };
-        self.cell.0.wake();
+        let cell = shared.cell();
+        if state_has(cell, RECEIVER_GONE) {
+            set_state(cell, SENDERS_GONE);
+            return Err(SyncError::Closed(value));
+        }
+        let ring = &shared.get().value;
+        // The one place is the one send's, so a refusal is the receiver's close (`ring`'s mark).
+        let sent = match ring.push(value) {
+            Ok(()) => {
+                // A receiver that closed after this push claimed its place may have drained before it
+                // landed: the value is dropped here, as a close drops what was sent.
+                fence(Ordering::SeqCst);
+                if ring.is_closed() {
+                    ring.drain();
+                }
+                Ok(())
+            }
+            Err(Refused::Full(value) | Refused::Closed(value)) => Err(SyncError::Closed(value)),
+        };
+        // The one value went (or could not): the receiver may stop waiting either way.
+        set_state(cell, SENDERS_GONE);
+        cell.wake();
         sent
     }
 }
 
 impl<T> Drop for OneshotSender<T> {
     fn drop(&mut self) {
-        // The receiver learns the sender went (its channel disconnects); `cell` wakes it to see so once
-        // `value` has dropped.
-        if let Some(cell) = self.cell.0.cell() {
-            cell.state.fetch_or(CLOSED, Ordering::AcqRel);
+        // Gone without sending: the receiver learns so, then is woken to see it.
+        if let Some(shared) = self.shared.take() {
+            set_state(shared.cell(), SENDERS_GONE);
+            shared.cell().wake();
         }
-    }
-}
-
-/// A cell handle that wakes the cell's waiter, then gives the handle back, when it drops. A sending half
-/// declares it after its std channel half: fields drop in declaration order after `Drop::drop`, so the
-/// channel has disconnected before the wake, and the woken receiver's retry sees the disconnect. Waking in
-/// `Drop::drop` itself ran before the disconnect: the receiver could retry, find the channel empty and still
-/// connected, and wait for good (CI run 37543499272, `a_thread_and_a_task_exchange_values_both_ways`).
-#[derive(Debug)]
-struct WakeOnDrop(CellRef);
-
-impl Drop for WakeOnDrop {
-    fn drop(&mut self) {
-        self.0.wake();
-        self.0.release();
-    }
-}
-
-/// A sender's waiter cell in a channel's queue of senders waiting for room. Dropping it, whether the receiver
-/// took it or the queue went with the receiver, grants the room to a sender still waiting (0 → `GRANTED`),
-/// wakes it, and gives the queue's handle back: a sender queued as the receiver goes is woken to find the
-/// channel closed, and its cell is not left behind in the dropped queue.
-#[derive(Debug)]
-struct Queued(CellRef);
-
-impl Queued {
-    /// Grants the room to the waiter if it still waits, and wakes it; `false` for one that left.
-    fn grant(&self) -> bool {
-        let granted = self.0.cell().is_some_and(|words| {
-            words
-                .state
-                .compare_exchange(0, GRANTED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        });
-        if granted {
-            self.0.wake();
-        }
-        granted
-    }
-}
-
-impl Drop for Queued {
-    fn drop(&mut self) {
-        self.grant();
-        self.0.release();
     }
 }
 
 impl<T> OneshotReceiver<T> {
-    /// Waits for the value on a plain thread.
-    pub fn blocking_recv(self) -> Result<T, SyncError<()>> {
-        self.value.recv().map_err(|_| SyncError::Closed(()))
+    /// Waits for the value on a plain thread, parked until the sender wakes it.
+    pub fn blocking_recv(&mut self) -> Result<T, SyncError<()>> {
+        if crate::registry::current_shard().is_some() {
+            return Err(SyncError::NotOnShardThread(()));
+        }
+        let cell = self.shared.cell();
+        cell.wait_as_thread(|| poll_value(&mut self.try_recv()))
+            .unwrap_or(Err(SyncError::Closed(())))
     }
 
     /// The value if it came, without waiting.
     pub fn try_recv(&mut self) -> Result<Option<T>, SyncError<()>> {
-        match self.value.try_recv() {
-            Ok(value) => Ok(Some(value)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(SyncError::Closed(())),
+        if let Some(value) = self.shared.get().value.pop() {
+            return Ok(Some(value));
+        }
+        if !state_has(self.shared.cell(), SENDERS_GONE) {
+            return Ok(None);
+        }
+        // The sender is gone; what it sent before going is visible now (its state bit was set after).
+        match self.shared.get().value.pop() {
+            Some(value) => Ok(Some(value)),
+            None => Err(SyncError::Closed(())),
         }
     }
 }
 
 impl<T> Drop for OneshotReceiver<T> {
     fn drop(&mut self) {
-        // Marked before the handle goes: the sender holds its own, so the cell outlives the mark.
-        if let Some(cell) = self.cell.cell() {
-            cell.state.fetch_or(RECEIVER_GONE, Ordering::AcqRel);
-        }
-        self.cell.release();
+        // The sender refuses from now on: a send that has not claimed the place is refused with its value,
+        // and one that has is dropped here or by its sender (`ring`'s close).
+        set_state(self.shared.cell(), RECEIVER_GONE);
+        let ring = &self.shared.get().value;
+        ring.close();
+        ring.drain();
     }
 }
 
@@ -253,13 +260,13 @@ impl<T> Future for OneshotReceiver<T> {
     type Output = Result<T, SyncError<()>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(ready) = poll_value(&mut self.as_mut().try_recv()) {
-            return Poll::Ready(ready);
-        }
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
-        self.cell.register(word);
+        if let Some(ready) = poll_value(&mut self.as_mut().try_recv()) {
+            return Poll::Ready(ready);
+        }
+        self.shared.cell().register(word);
         match poll_value(&mut self.as_mut().try_recv()) {
             Some(ready) => Poll::Ready(ready),
             None => Poll::Pending,
@@ -278,42 +285,38 @@ fn poll_value<T>(tried: &mut Result<Option<T>, SyncError<()>>) -> Option<Result<
 
 // ------------------------------------------------------------------------------------------ channel
 
+/// What a channel's ends share: its values, the senders waiting for room, and how many senders live.
+#[derive(Debug)]
+struct ChannelState<T> {
+    values: Ring<T>,
+    room: Room,
+    /// The live senders; the last to go closes the channel for the receiver.
+    senders: AtomicUsize,
+}
+
 /// The sending half of a bounded channel; clone it for more senders.
 #[derive(Debug)]
 pub struct Sender<T> {
-    value: SyncSender<T>,
-    /// Where a sender that found the channel full queues its waiter cell to be woken when room appears.
-    room: SyncSender<Queued>,
-    /// After `value`: its wake runs once the last sender's drop has disconnected the channel ([`WakeOnDrop`]).
-    cell: WakeOnDrop,
+    shared: Shared<ChannelState<T>>,
 }
 
 /// The receiving half of a bounded channel.
 #[derive(Debug)]
 pub struct ChannelReceiver<T> {
-    /// Dropped first: senders that retry see the channel closed.
-    value: Receiver<T>,
-    /// Dropped after `value`: each sender still queued is granted, woken to find the channel closed, and its
-    /// cell given back ([`Queued`]).
-    room: Receiver<Queued>,
-    cell: CellRef,
+    shared: Shared<ChannelState<T>>,
 }
 
-/// Format: the channel cell's state bit set when a sender that was handed room dropped its send unused: the
-/// receiver passes that room to the next waiting sender (mantle's review of hyper-rt, finding 3).
-const OWED: u64 = 1 << 4;
-
 /// A bounded channel of `capacity` values from any number of senders to one receiver. A sender waiting for
-/// room queues its word, at most `capacity` of them (a sender past that is told `Full`), and the receiver
-/// wakes one waiting sender for each value it takes, oldest first. Refused `Capacity` at the cell bound and
-/// `BadConfig` for a zero capacity.
+/// room holds one of `capacity` places (a sender past that is told `Full`), and each value the receiver
+/// takes grants its room to one waiting sender, round the places ([`room`]). Refused `Capacity` at the cell
+/// bound and `BadConfig` for a zero capacity.
 pub fn channel<T>(capacity: usize) -> Result<(Sender<T>, ChannelReceiver<T>), RtError> {
     channel_with(capacity, capacity)
 }
 
-/// A bounded channel of `capacity` values, with room for `waiters` senders waiting at once (past it a send
-/// is told `Full`): for many concurrent senders on a small channel. Refused `BadConfig` for a zero capacity or
-/// no waiters.
+/// A bounded channel of `capacity` values, with places for `waiters` senders waiting at once (past it a send
+/// is told `Full`): size it to the senders, tasks or threads, that may wait at once. Refused `BadConfig` for a
+/// zero capacity, no waiters, or a capacity whose slots cannot be laid out.
 pub fn channel_with<T>(
     capacity: usize,
     waiters: usize,
@@ -323,30 +326,40 @@ pub fn channel_with<T>(
             what: "a channel of no capacity, or no room for a waiting sender",
         });
     }
-    let cell = claim(2)?;
-    let (value, receiver) = sync_channel(capacity);
-    let (room, waiting) = sync_channel(waiters);
-    Ok((
-        Sender {
-            value,
+    let values = Ring::new(capacity)?;
+    let room = Room::new(waiters)?;
+    let cell = claim(1)?;
+    let sender = Shared::new(
+        ChannelState {
+            values,
             room,
-            cell: WakeOnDrop(cell),
+            senders: AtomicUsize::new(1),
         },
-        ChannelReceiver {
-            value: receiver,
-            room: waiting,
-            cell,
-        },
+        cell,
+    );
+    let receiver = sender.share();
+    Ok((
+        Sender { shared: sender },
+        ChannelReceiver { shared: receiver },
     ))
 }
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        self.cell.0.retain();
+        self.shared.get().senders.fetch_add(1, Ordering::Relaxed);
         Self {
-            value: self.value.clone(),
-            room: self.room.clone(),
-            cell: WakeOnDrop(self.cell.0),
+            shared: self.shared.share(),
+        }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        // The last sender closes the channel for the receiver, then wakes it to see so: its values, and every
+        // earlier sender's (each released by its own count above), are visible to a receiver that reads the bit.
+        if self.shared.get().senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            set_state(self.shared.cell(), SENDERS_GONE);
+            self.shared.cell().wake();
         }
     }
 }
@@ -354,25 +367,62 @@ impl<T> Clone for Sender<T> {
 impl<T> Sender<T> {
     /// Sends without waiting: `Full` when the channel is at its capacity, `Closed` when the receiver is gone.
     pub fn try_send(&self, value: T) -> Result<(), SyncError<T>> {
-        match self.value.try_send(value) {
+        let cell = self.shared.cell();
+        if state_has(cell, RECEIVER_GONE) {
+            return Err(SyncError::Closed(value));
+        }
+        let values = &self.shared.get().values;
+        match values.push(value) {
             Ok(()) => {
-                self.cell.0.wake();
+                // A receiver that closed after this push claimed its place may have drained before it
+                // landed: what is left is dropped here, as the receiver's drop drops what was sent.
+                fence(Ordering::SeqCst);
+                if values.is_closed() {
+                    values.drain();
+                }
+                cell.wake();
                 Ok(())
             }
-            Err(TrySendError::Full(value)) => Err(SyncError::Full(value)),
-            Err(TrySendError::Disconnected(value)) => Err(SyncError::Closed(value)),
+            Err(Refused::Closed(value)) => Err(SyncError::Closed(value)),
+            Err(Refused::Full(value)) if state_has(cell, RECEIVER_GONE) => {
+                Err(SyncError::Closed(value))
+            }
+            Err(Refused::Full(value)) => Err(SyncError::Full(value)),
         }
     }
 
-    /// Sends on a plain thread, waiting for room.
+    /// Sends on a plain thread, waiting for room: parked in a place of its own until a take grants it room,
+    /// as a task waits ([`Sender::send`]); a grant whose room another sender took leaves it waiting in the same
+    /// place ([`room`]). Ends when the value goes in, or the receiver goes (`Closed`); `Full` when every place
+    /// for a waiting sender is held.
     pub fn blocking_send(&self, value: T) -> Result<(), SyncError<T>> {
-        match self.value.send(value) {
-            Ok(()) => {
-                self.cell.0.wake();
-                Ok(())
-            }
-            Err(std::sync::mpsc::SendError(value)) => Err(SyncError::Closed(value)),
+        if crate::registry::current_shard().is_some() {
+            return Err(SyncError::NotOnShardThread(value));
         }
+        let value = match self.try_send(value) {
+            Err(SyncError::Full(value)) => value,
+            sent => return sent,
+        };
+        let room = &self.shared.get().room;
+        let Some(place) = room.hold() else {
+            return Err(SyncError::Full(value));
+        };
+        let cell = self.shared.cell();
+        room.send_waiting(
+            place,
+            value,
+            |value| match self.try_send(value) {
+                Err(SyncError::Full(value)) => Err(value),
+                sent => Ok(sent),
+            },
+            |waiter, granted| {
+                crate::handoff::wait_as_thread(waiter, || {
+                    (granted() || state_has(cell, RECEIVER_GONE)).then_some(())
+                });
+            },
+            crate::handoff::wake_waiter,
+        )
+        .unwrap_or_else(|value| Err(SyncError::Full(value)))
     }
 
     /// Sends, waiting for room as a task.
@@ -380,64 +430,35 @@ impl<T> Sender<T> {
         Send {
             sender: self,
             value: Some(value),
-            waiter: None,
+            place: None,
         }
     }
 }
 
 /// The wait of [`Sender::send`].
 ///
-/// A sender that finds the channel full queues a waiter cell of its own (state 0, waiting) behind the senders
-/// already waiting. The receiver, taking a value, grants the room to the oldest live waiter (0 → `GRANTED`)
-/// and wakes it, skipping waiters that left (`ABANDONED`). A woken sender whose room a racing sender took
-/// queues again; one dropped while waiting leaves its cell `ABANDONED`; one dropped after its grant, unused,
-/// marks the channel `OWED` and wakes the receiver, which hands the room on (mantle's review, finding 3: a
-/// woken sender used to wait for good, and a cancelled one's word used to spend a later wake).
+/// A sender that finds the channel full holds a place of its own among the waiting senders, its task's word
+/// registered there, and checks once more; each value the receiver takes grants one waiting place its room and
+/// wakes it. A woken sender whose room a racing sender took waits again in its place. One dropped while
+/// waiting frees its place; one dropped after a grant it did not use hands the room on to another waiting
+/// sender (mantle's review, finding 3: a woken sender used to wait for good, and a cancelled one's word used
+/// to spend a later wake).
 #[derive(Debug)]
 pub struct Send<'a, T> {
     sender: &'a Sender<T>,
     value: Option<T>,
-    /// The waiter cell queued for room, while one is.
-    waiter: Option<CellRef>,
+    /// The place held among the waiting senders, while one is.
+    place: Option<usize>,
 }
 
 impl<T> Unpin for Send<'_, T> {}
 
 impl<T> Send<'_, T> {
-    /// Leaves the queue: the waiter's cell marked abandoned, unless the room was granted to it and not `used`,
-    /// which then passes on through the receiver.
+    /// Lets the place go, if one is held: a grant this send did not use goes on (`Room::leave`).
     fn leave(&mut self, used: bool) {
-        let Some(waiter) = self.waiter.take() else {
-            return;
-        };
-        if let Some(words) = waiter.cell() {
-            let previous =
-                words
-                    .state
-                    .compare_exchange(0, ABANDONED, Ordering::AcqRel, Ordering::Acquire);
-            if previous == Err(GRANTED) && !used {
-                if let Some(channel) = self.sender.cell.0.cell() {
-                    channel.state.fetch_or(OWED, Ordering::AcqRel);
-                }
-                self.sender.cell.0.wake();
-            }
+        if let Some(place) = self.place.take() {
+            self.sender.shared.get().room.leave(place, used);
         }
-        waiter.release();
-    }
-
-    /// Queues a waiter cell holding `word`; `false` when the queue of waiting senders is full or no cell is free.
-    fn queue(&mut self, word: crate::mem::Encoded) -> bool {
-        let Ok(waiter) = claim(2) else {
-            return false;
-        };
-        waiter.register(word);
-        if self.sender.room.try_send(Queued(waiter)).is_err() {
-            // The refused `Queued` gave the queue's handle back as it dropped; this gives back the wait's.
-            waiter.release();
-            return false;
-        }
-        self.waiter = Some(waiter);
-        true
     }
 }
 
@@ -454,53 +475,51 @@ impl<T> Future for Send<'_, T> {
         let Some(value) = self.value.take() else {
             return Poll::Ready(Ok(()));
         };
-        let value = match self.sender.try_send(value) {
-            Ok(()) => {
-                self.leave(true);
-                return Poll::Ready(Ok(()));
-            }
-            Err(SyncError::Full(value)) => value,
-            Err(refused) => {
-                self.leave(true);
-                return Poll::Ready(Err(refused));
-            }
-        };
         let Some(word) = polling_task(cx.waker()) else {
             self.leave(false);
             return Poll::Ready(Err(SyncError::NotOnShardThread(value)));
         };
-        // Still waiting with a cell not yet granted: keep the place, with the latest word registered.
-        let waiting = self
-            .waiter
-            .and_then(CellRef::cell)
-            .is_some_and(|words| words.state.load(Ordering::Acquire) == 0);
-        if waiting {
-            if let Some(waiter) = self.waiter {
-                waiter.register(word);
+        let sender = self.sender;
+        let room = &sender.shared.get().room;
+        // A grant seen before the try is used by a send that follows it.
+        let granted = self.place.is_some_and(|place| room.granted(place));
+        let value = match sender.try_send(value) {
+            Err(SyncError::Full(value)) => value,
+            sent => {
+                self.leave(granted);
+                return Poll::Ready(sent);
             }
-        } else {
-            // No place yet, or the room granted was taken by a racing sender: queue again, at the back.
-            if let Some(granted) = self.waiter.take() {
-                granted.release();
+        };
+        let place = match self.place {
+            Some(place) => {
+                if room.granted(place) {
+                    // Granted, and the room went to a racing sender: wait again in the same place.
+                    room.wait_again(place);
+                }
+                place
             }
-            if !self.queue(word) {
-                // The queue is full, or went with the receiver: the channel itself says which.
-                return Poll::Ready(self.sender.try_send(value));
-            }
-        }
-        // Room may have appeared between the try and the queueing: try again before waiting.
-        match self.sender.try_send(value) {
-            Ok(()) => {
-                self.leave(true);
-                Poll::Ready(Ok(()))
-            }
+            None => match room.hold() {
+                Some(place) => {
+                    self.place = Some(place);
+                    place
+                }
+                None => return Poll::Ready(Err(SyncError::Full(value))),
+            },
+        };
+        room.register_task(place, word.word());
+        // Room made before the place showed waiting is seen here; room made after it is granted to the place.
+        match sender.try_send(value) {
             Err(SyncError::Full(value)) => {
                 self.value = Some(value);
+                if room.granted(place) {
+                    // A grant landed before this task's word did, so its wake went nowhere: be polled again.
+                    cx.waker().wake_by_ref();
+                }
                 Poll::Pending
             }
-            Err(refused) => {
-                self.leave(true);
-                Poll::Ready(Err(refused))
+            sent => {
+                self.leave(false);
+                Poll::Ready(sent)
             }
         }
     }
@@ -509,56 +528,50 @@ impl<T> Future for Send<'_, T> {
 impl<T> ChannelReceiver<T> {
     /// Takes a value without waiting: `None` when the channel is empty, `Closed` when every sender is gone.
     pub fn try_recv(&mut self) -> Result<Option<T>, SyncError<()>> {
-        self.settle_owed();
-        match self.value.try_recv() {
-            Ok(value) => {
-                self.wake_one_sender();
+        let state = self.shared.get();
+        if let Some(value) = state.values.pop() {
+            state.room.grant_one();
+            return Ok(Some(value));
+        }
+        if !state_has(self.shared.cell(), SENDERS_GONE) {
+            return Ok(None);
+        }
+        // Every sender is gone; what they sent before going is visible now (the last set the bit after).
+        match state.values.pop() {
+            Some(value) => {
+                state.room.grant_one();
                 Ok(Some(value))
             }
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(SyncError::Closed(())),
+            None => Err(SyncError::Closed(())),
         }
     }
 
-    /// Takes a value on a plain thread, waiting for one.
+    /// Takes a value on a plain thread, parked until a sender wakes it.
     pub fn blocking_recv(&mut self) -> Result<T, SyncError<()>> {
-        let value = self.value.recv().map_err(|_| SyncError::Closed(()))?;
-        self.wake_one_sender();
-        Ok(value)
+        if crate::registry::current_shard().is_some() {
+            return Err(SyncError::NotOnShardThread(()));
+        }
+        let cell = self.shared.cell();
+        cell.wait_as_thread(|| poll_value(&mut self.try_recv()))
+            .unwrap_or(Err(SyncError::Closed(())))
     }
 
     /// Takes a value, waiting as a task: `Closed` once every sender is gone and the channel is empty.
     pub fn recv(&mut self) -> Recv<'_, T> {
         Recv { receiver: self }
     }
-
-    /// The room one value made goes to the live sender that waited longest; waiters that left are skipped,
-    /// at most the queue's length of them.
-    fn wake_one_sender(&self) {
-        while let Ok(waiter) = self.room.try_recv() {
-            // Dropping `waiter` gives the queue's handle back.
-            if waiter.grant() {
-                return;
-            }
-        }
-    }
-
-    /// Hands on room a sender was granted and dropped unused (`OWED`).
-    fn settle_owed(&self) {
-        if self
-            .cell
-            .cell()
-            .is_some_and(|cell| cell.state.fetch_and(!OWED, Ordering::AcqRel) & OWED != 0)
-        {
-            self.wake_one_sender();
-        }
-    }
 }
 
 impl<T> Drop for ChannelReceiver<T> {
     fn drop(&mut self) {
-        // Then `value` disconnects and `room` wakes every sender still queued to see so ([`Queued`]).
-        self.cell.release();
+        // Senders refuse from now on (`ring`'s close: a push that has not claimed its place is refused with
+        // its value, so none lands in the room this drain frees); the values sent drop now, a sender whose
+        // claim came first drops its own, and every sender waiting for room is woken to find the channel closed.
+        set_state(self.shared.cell(), RECEIVER_GONE);
+        let values = &self.shared.get().values;
+        values.close();
+        values.drain();
+        self.shared.get().room.wake_all();
     }
 }
 
@@ -572,13 +585,13 @@ impl<T> Future for Recv<'_, T> {
     type Output = Result<T, SyncError<()>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(ready) = poll_value(&mut self.receiver.try_recv()) {
-            return Poll::Ready(ready);
-        }
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
-        self.receiver.cell.register(word);
+        if let Some(ready) = poll_value(&mut self.receiver.try_recv()) {
+            return Poll::Ready(ready);
+        }
+        self.receiver.shared.cell().register(word);
         match poll_value(&mut self.receiver.try_recv()) {
             Some(ready) => Poll::Ready(ready),
             None => Poll::Pending,
@@ -881,12 +894,12 @@ impl Future for Changed<'_> {
     type Output = Result<(), SyncError<()>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(ready) = self.receiver.check() {
-            return Poll::Ready(ready);
-        }
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(SyncError::NotOnShardThread(())));
         };
+        if let Some(ready) = self.receiver.check() {
+            return Poll::Ready(ready);
+        }
         self.receiver.own.register(word);
         match self.receiver.check() {
             Some(ready) => Poll::Ready(ready),
@@ -904,8 +917,10 @@ impl Future for Changed<'_> {
 pub struct Semaphore {
     /// The free permits (`state`) and the waiters queued (`aux`).
     cell: CellRef,
-    queue: SyncSender<CellRef>,
-    queued: Receiver<CellRef>,
+    /// The queued acquirers' cells, oldest first.
+    queue: Ring<CellRef>,
+    /// Used from one thread at a time, as it was when its queue was a std channel (`Send`, not `Sync`).
+    one_thread: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
 /// Format: a waiter's cell state when the permit was granted to it.
@@ -934,15 +949,15 @@ impl Semaphore {
                 what: "a semaphore no acquirer may wait on",
             });
         }
+        let queue = Ring::new(waiters)?;
         let cell = claim(1)?;
         if let Some(words) = cell.cell() {
             words.state.store(permits, Ordering::Release);
         }
-        let (queue, queued) = sync_channel(waiters);
         Ok(Self {
             cell,
             queue,
-            queued,
+            one_thread: std::marker::PhantomData,
         })
     }
 
@@ -981,7 +996,7 @@ impl Semaphore {
         let Some(cell) = self.cell.cell() else {
             return;
         };
-        while let Ok(waiter) = self.queued.try_recv() {
+        while let Some(waiter) = self.queue.pop() {
             cell.aux.fetch_sub(1, Ordering::AcqRel);
             let Some(words) = waiter.cell() else {
                 continue;
@@ -1004,7 +1019,7 @@ impl Semaphore {
 
 impl Drop for Semaphore {
     fn drop(&mut self) {
-        while let Ok(waiter) = self.queued.try_recv() {
+        while let Some(waiter) = self.queue.pop() {
             waiter.wake();
             waiter.release();
         }
@@ -1024,6 +1039,9 @@ impl<'a> Future for Acquire<'a> {
     type Output = Result<Permit<'a>, SyncError<()>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Some(word) = polling_task(cx.waker()) else {
+            return Poll::Ready(Err(SyncError::NotOnShardThread(())));
+        };
         let semaphore = self.semaphore;
         if let Some(own) = self.waiting {
             let granted = own
@@ -1034,17 +1052,12 @@ impl<'a> Future for Acquire<'a> {
                 own.release();
                 return Poll::Ready(Ok(Permit { semaphore }));
             }
-            if let Some(word) = polling_task(cx.waker()) {
-                own.register(word);
-            }
+            own.register(word);
             return Poll::Pending;
         }
         if let Some(permit) = semaphore.try_acquire() {
             return Poll::Ready(Ok(permit));
         }
-        let Some(word) = polling_task(cx.waker()) else {
-            return Poll::Ready(Err(SyncError::NotOnShardThread(())));
-        };
         let Ok(own) = claim(2) else {
             return Poll::Ready(Err(SyncError::Full(())));
         };
@@ -1052,7 +1065,7 @@ impl<'a> Future for Acquire<'a> {
         if let Some(cell) = semaphore.cell.cell() {
             cell.aux.fetch_add(1, Ordering::AcqRel);
         }
-        if semaphore.queue.try_send(own).is_err() {
+        if semaphore.queue.push(own).is_err() {
             if let Some(cell) = semaphore.cell.cell() {
                 cell.aux.fetch_sub(1, Ordering::AcqRel);
             }

@@ -250,4 +250,17 @@ pub trait LogStore {
     /// Makes `write` durable before returning: what a replica writes as it opens, before anything
     /// else (`docs/durable.md` §4.3).
     fn write_now(&mut self, write: &Write<'_>) -> Result<(), Fault>;
+
+    /// The entries after `index` are ones the replica will read back: those it has yet to apply,
+    /// and on a leader those a replicating member has yet to acknowledge of what was sent to it
+    /// (`docs/durable.md` §8). A store that keeps entries in memory for those reads keeps these
+    /// whatever its own cache's budget, and lets the rest go by that budget. Called as the replica
+    /// opens and at the end of every drive; an `index` below one already given changes nothing.
+    /// Every store says what it does with it, a wrapper by passing it on: a default that did
+    /// nothing let a wrapper drop it unseen.
+    fn keep_after(&mut self, index: u64);
+
+    /// The bytes the store keeps in memory past its own budget for [`LogStore::keep_after`], which
+    /// the replica's budget counts with what it holds itself.
+    fn kept_bytes(&self) -> u64;
 }

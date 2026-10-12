@@ -68,6 +68,71 @@ pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtEr
         .ok_or(RtError::NotOnShardThread)?
 }
 
+/// Spawns a joinable service on the current shard. Unlike ordinary tasks,
+/// cancellation is a level the service observes; its future remains owned until Ready.
+/// Cleanup after driver loss must use channel completions, not new native readiness waits.
+/// A service must turn typed failures into cleanup. A panicked future cannot be safely
+/// resumed; this opt-in does not promise recovery from panic or a blocking destructor.
+pub fn spawn_service<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
+    registry::with_current(|ctx| ctx.spawn_service_local(boxed(future), None))
+        .ok_or(RtError::NotOnShardThread)?
+}
+
+/// Awaits cancellation of this service. Repeated polls are level-triggered. Dropping
+/// this borrowed future does not clear cancellation or release the service's slot.
+pub fn cancelled() -> Cancelled {
+    Cancelled
+}
+
+/// The current service's cancellation level, without registering another waiter.
+/// A service checks it before admitting another operation between borrowed waits.
+pub fn cancellation_requested() -> Result<bool, RtError> {
+    registry::with_current(|ctx| {
+        let task = ctx.current_task().ok_or(RtError::NotOnShardThread)?;
+        let cell = ctx.task(task.0.slot()).ok_or(RtError::NotOnShardThread)?;
+        if !cell.service.get() {
+            return Err(RtError::BadConfig {
+                what: "cancellation cleanup requires service admission",
+            });
+        }
+        Ok(cell.cancelled.get())
+    })
+    .ok_or(RtError::NotOnShardThread)?
+}
+
+/// A service's cancellation level, with no allocation or stored waker.
+#[derive(Debug)]
+pub struct Cancelled;
+
+impl Future for Cancelled {
+    type Output = Result<(), RtError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Some(word) = polling_task(cx.waker()) else {
+            return Poll::Ready(Err(RtError::NotOnShardThread));
+        };
+        registry::with_current(|ctx| {
+            let Some(cell) = ctx.task(word.slot()) else {
+                return Poll::Ready(Err(RtError::NotOnShardThread));
+            };
+            if word.shard() != ctx.id || word.generation() != cell.generation.get() {
+                return Poll::Ready(Err(RtError::NotOnShardThread));
+            }
+            if !cell.service.get() {
+                return Poll::Ready(Err(RtError::BadConfig {
+                    what: "cancellation cleanup requires service admission",
+                }));
+            }
+            if cell.cancelled.get() {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .unwrap_or(Poll::Ready(Err(RtError::NotOnShardThread)))
+    }
+}
+
 /// Spawns a detached task on the current shard: nobody joins it, and its slot is freed when it ends (a
 /// server's per-connection task).
 pub fn spawn_detached<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
@@ -192,6 +257,12 @@ impl Future for Sleep {
         let Some(word) = polling_task(cx.waker()) else {
             return Poll::Ready(Err(RtError::NotOnShardThread));
         };
+        if registry::with_current(|ctx| ctx.driver_lost()) == Some(true) {
+            if let Some(id) = self.timer.take() {
+                let _ = registry::with_current(|ctx| ctx.disarm_timer(id));
+            }
+            return Poll::Ready(Err(RtError::DriverLost));
+        }
         let span = self.ns;
         let held = self.timer;
         let polled = registry::with_current(|ctx| {

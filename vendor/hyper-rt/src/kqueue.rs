@@ -33,7 +33,7 @@ const EVENTS_PER_WAIT: usize = 64;
 /// The driver.
 pub struct KqueueDriver {
     kq: KickFd,
-    /// The host monotonic reading the driver counts its clock from.
+    /// The shard-clock reading the driver counts its clock from (`machine::clock::shard_clock_ns`).
     epoch: u64,
     events: Vec<Event>,
     nops: Vec<u64>,
@@ -87,7 +87,7 @@ impl KqueueDriver {
     pub fn from_prepared(kq: KickFd) -> KqueueDriver {
         KqueueDriver {
             kq,
-            epoch: crate::machine::clock::monotonic_ns(),
+            epoch: crate::machine::clock::shard_clock_ns(),
             events: Vec::with_capacity(EVENTS_PER_WAIT),
             nops: Vec::new(),
         }

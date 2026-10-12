@@ -41,13 +41,19 @@ pub enum RtError {
         /// Which value.
         what: &'static str,
     },
-    /// A shard's control channel is full: its admission limit of spawns is pending.
+    /// A shard's control queue is full: its admission limit of spawns is pending.
     ControlFull {
         /// The shard.
         shard: u16,
     },
     /// The shard named no longer runs (or never existed).
     ShardGone {
+        /// The shard.
+        shard: u16,
+    },
+    /// A `block_on`'s root future unwound: the shard's boundary ended its task `Outcome::Unwound`, so no
+    /// output will come, and what the root left running was cancelled and joined.
+    RootUnwound {
         /// The shard.
         shard: u16,
     },
@@ -65,8 +71,9 @@ pub enum RtError {
         /// The shard.
         shard: u16,
     },
-    /// A shard's worker thread ended without a result: it panicked (AUD-29-12). Its slot was still given
-    /// back and its siblings still stopped and joined.
+    /// A shard's worker thread ended without a result: it unwound outside its tasks, in a caller's
+    /// driver (AUD-29-12; a task that unwinds ends `Outcome::Unwound` and costs its shard nothing).
+    /// Its slot was still given back and its siblings still stopped and joined.
     WorkerFailed {
         /// The shard.
         shard: u16,
@@ -111,8 +118,9 @@ impl fmt::Display for RtError {
             Self::DriverLost => f.write_str("the driver was lost while waiting"),
             Self::NotOnShardThread => f.write_str("not on a shard thread"),
             Self::BadConfig { what } => write!(f, "bad configuration: {what}"),
-            Self::ControlFull { shard } => write!(f, "shard {shard}'s control channel is full"),
+            Self::ControlFull { shard } => write!(f, "shard {shard}'s control queue is full"),
             Self::ShardGone { shard } => write!(f, "shard {shard} is gone"),
+            Self::RootUnwound { shard } => write!(f, "shard {shard}'s root future unwound"),
             Self::Mem(e) => write!(f, "memory: {e}"),
             Self::KeptInUse { shard } => write!(f, "shard {shard}'s kept values are borrowed"),
             Self::RingClaimed { shard } => write!(

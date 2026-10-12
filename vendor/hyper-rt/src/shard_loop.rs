@@ -1,7 +1,7 @@
 //! The shard's loop: one thread, one task table, one run queue, one timing wheel, one driver, and the
 //! loop that ties them (slates §4.3, "Loop"; docs/runtime.md §3.4).
 //!
-//! Each step: drain the control channel and the wake bitmap (spawns, cancels, shutdown, wakes from other
+//! Each step: drain the control queue and the wake bitmap (spawns, cancels, shutdown, wakes from other
 //! threads) and the driver's completions into the run queue; expire timers; poll ready tasks, at most a
 //! batch of them, applying what each poll asked of the desk before the next; then, if nothing is ready,
 //! spin out the idle window that client activity opened, and park in the driver until a kick, a completion
@@ -16,7 +16,6 @@
 //! no `RefCell` and nothing a nested call could find borrowed.
 
 use std::pin::Pin;
-use std::sync::mpsc::Receiver;
 use std::task::{Context, Poll};
 
 use crate::attribution::{self, Attribution, Tracker};
@@ -26,6 +25,7 @@ use crate::error::RtError;
 use crate::interests::{self, Interests, Readiness};
 use crate::machine::wake::WakeEstimate;
 use crate::mem::Encoded;
+use crate::park_cost::ParkCost;
 use crate::parking::{Parked, Woken};
 use crate::registry::{self, Entry};
 use crate::runtime::RuntimeConfig;
@@ -72,12 +72,21 @@ pub struct Counters {
     pub wake_unslept: u64,
     /// The online wake estimate, nanoseconds.
     pub wake_cost_ns: u64,
+    /// The online cost of blocking: the CPU one park/wake cycle costs, the shard's park and its sender's
+    /// kick, nanoseconds (`park_cost`); a tracking shard's idle spin lasts this long. 0 before the first
+    /// measured park, and where the OS keeps no fine per-thread clock.
+    pub park_cost_ns: u64,
+    /// Parks whose CPU was measured into [`Counters::park_cost_ns`].
+    pub park_samples: u64,
     /// Tasks admitted.
     pub spawns: u64,
     /// Tasks whose future returned.
     pub completed: u64,
     /// Tasks whose future was dropped.
     pub cancelled: u64,
+    /// Tasks whose poll unwound ([`Outcome::Unwound`]), and futures whose drop unwound: each caught by
+    /// the shard's boundary around the task's code.
+    pub unwound: u64,
     /// Wakes that arrived from other threads (the wake bitmap).
     pub wakes_foreign: u64,
     /// Of those, wakes for a slot with no task when drained: the task ended after the wake was sent. Not
@@ -99,6 +108,9 @@ pub struct Counters {
     /// Reads of the thread's CPU account (`attribution::thread_account`), each a system call: made only
     /// while poll attribution is armed, and at a poll past the step quantum.
     pub thread_accounts: u64,
+    /// Reads of the thread's CPU clock to learn what a park costs, each a system call: two for each park
+    /// the shard waits in while it learns ([`Counters::park_samples`]), and none otherwise.
+    pub park_cost_reads: u64,
     /// Driver completions delivered.
     pub completions: u64,
     /// Times the driver was lost.
@@ -144,8 +156,6 @@ pub struct ShardSeed {
     pub driver: DriverSeed,
     /// The kick the driver answers to.
     pub kick: Kick,
-    /// The control channel's receiving end.
-    pub control: Receiver<Control>,
     /// The configuration.
     pub config: RuntimeConfig,
 }
@@ -164,7 +174,7 @@ impl ShardSeed {
         kick: registry::RegisterKick,
     ) -> Result<ShardSeed, RtError> {
         config.validate_shape()?;
-        let (holder, control) = registry::register_slot(
+        let holder = registry::register_runtime_slot(
             config.tasks_per_shard,
             config.ring_entries,
             config.interests_per_shard,
@@ -177,7 +187,6 @@ impl ShardSeed {
             holder,
             driver,
             kick,
-            control,
             config: config.clone(),
         })
     }
@@ -195,7 +204,6 @@ struct Core {
     tasks: Box<[TaskSlot]>,
     timers: Wheel,
     driver: Box<dyn Driver>,
-    control: Option<Receiver<Control>>,
     config: RuntimeConfig,
     counters: Counters,
     shutting_down: bool,
@@ -212,6 +220,12 @@ struct Core {
     waited_for_ns: Option<u64>,
     /// The online wake estimate (§4.1, §4.3), when the configuration carries a measured prior.
     wake: Option<WakeEstimate>,
+    /// The CPU a park costs this shard's thread, and a kick its senders' (`crate::park_cost`): a tracking
+    /// shard's idle spin. Learned only while the wake is tracked on a real clock.
+    park_cost: ParkCost,
+    kick_cost: ParkCost,
+    /// The parking word's kick sums last folded into `kick_cost`.
+    kicks_seen: (u64, u64),
     idle_ratio: u64,
     fixed_quantum_ns: u64,
     fixed_spin_ns: u64,
@@ -246,9 +260,44 @@ impl Drop for Shard {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         self.close_control();
+        // A caught foreign poll panic leaves this existing marker set and its
+        // already-unwound future absent. Retire that metadata before driving peers.
+        if let Some(slot) = self.desk.current_task.take()
+            && self
+                .task_mut(slot)
+                .is_some_and(|task| task.state == State::Running && task.future.is_none())
+        {
+            self.finish(slot, Outcome::Cancelled);
+        }
+        // An apply/drop unwind can occur after current_task was cleared. Only an
+        // actual unwind permits this exceptional classification; ordinary missing
+        // ownership is never silently treated as completed service cleanup.
+        if std::thread::panicking() {
+            for index in 0..self.core.tasks.len() {
+                let Ok(slot) = u32::try_from(index) else {
+                    continue;
+                };
+                let interrupted = self.task_mut(slot).is_some_and(|task| {
+                    task.future.is_none()
+                        && (task.state == State::Running
+                            || (task.state == State::Finishing && task.outcome.is_none()))
+                });
+                if interrupted {
+                    self.finish(slot, Outcome::Cancelled);
+                }
+            }
+        }
+        self.core.shutting_down = true;
+        self.cancel_all();
+        // A service may still own accepted physical I/O. Its future is never forcibly
+        // dropped because a poll count expired; only its Ready proves retirement.
+        self.finish_cancelled();
         let entered = registry::enter(&self.desk);
         for task in self.core.tasks.iter_mut() {
-            drop(task.future.take());
+            if let Some(future) = task.future.take() {
+                // A future's drop is its task's code: inside an unwind boundary of the shard's own.
+                let _ = crate::unwind::contained(move || drop(future));
+            }
         }
         drop(entered);
         registry::note_arena_generation(self.desk.id, self.core.generation_high);
@@ -262,6 +311,7 @@ impl Shard {
         let config = seed.config;
         let mut driver = (seed.driver)(seed.kick)?;
         driver.reserve_handles(config.interests_per_shard)?;
+        registry::bind_cleanup_thread(seed.holder)?;
         let is_sim = driver.kind() == DriverKind::Simulation;
         let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);
         let desk = Box::new(ShardContext::new(
@@ -287,7 +337,6 @@ impl Shard {
                 .map(|_| TaskSlot::empty())
                 .collect(),
             timers: Wheel::new(config.timer_tick_ns, config.timers_per_shard, now_ns),
-            control: Some(seed.control),
             fired: Vec::with_capacity(config.timers_per_shard),
             completions: Vec::with_capacity(config.ring_entries),
             waiting: Interests::new(config.interests_per_shard)?,
@@ -301,6 +350,9 @@ impl Shard {
             wake: config
                 .wake_tracking
                 .map(|tracking| WakeEstimate::new(tracking.prior_ns, tracking.shift)),
+            park_cost: ParkCost::new(),
+            kick_cost: ParkCost::new(),
+            kicks_seen: (0, 0),
             idle_ratio: config
                 .wake_tracking
                 .map_or(1, |tracking| tracking.idle_ratio),
@@ -364,6 +416,8 @@ impl Shard {
         c.timer_waits = c.timer_waits.saturating_add(self.desk.timer_waits.get());
         c.scheduler_overrun_ns = self.desk.scheduler_overrun_ns.get();
         c.wake_cost_ns = self.quantum_ns();
+        c.park_cost_ns = self.blocking_cost_ns().unwrap_or(0);
+        c.park_samples = self.core.park_cost.samples();
         c
     }
 
@@ -397,7 +451,11 @@ impl Shard {
 
     /// The driver's clock.
     pub fn now_ns(&self) -> u64 {
-        self.core.driver.now_ns()
+        if self.core.driver_lost {
+            self.desk.now_ns.get()
+        } else {
+            self.core.driver.now_ns()
+        }
     }
 
     /// The step quantum now: the online wake estimate while the shard tracks one, else the configured budget.
@@ -408,16 +466,29 @@ impl Shard {
             .max(1)
     }
 
-    /// The idle spin window now: the wake estimate times the idle ratio while tracking, else the configured
-    /// spin.
+    /// The idle spin window now: while the shard tracks its costs, what blocking costs it times the idle
+    /// ratio (none before its first measured park: until then it parks at once); else the configured spin.
+    /// Spin-then-block is 2-competitive in CPU when the spin lasts as long as blocking costs [A: Karlin, Li,
+    /// Manasse, Owicki, SOSP'91]; sizing it by the wake's latency instead made it as long as the host's
+    /// scheduler queue (`crate::park_cost`).
     fn spin_window_ns(&self) -> u64 {
-        self.core.wake.map_or(self.core.fixed_spin_ns, |estimate| {
-            estimate.mean_ns().saturating_mul(self.core.idle_ratio)
-        })
+        if self.core.wake.is_none() {
+            return self.core.fixed_spin_ns;
+        }
+        self.blocking_cost_ns()
+            .unwrap_or(0)
+            .saturating_mul(self.core.idle_ratio)
+    }
+
+    /// What one park/wake cycle costs in CPU, the shard's park and its sender's kick, once a park has been
+    /// measured.
+    fn blocking_cost_ns(&self) -> Option<u64> {
+        let park = self.core.park_cost.mean_ns()?;
+        Some(park.saturating_add(self.core.kick_cost.mean_ns().unwrap_or(0)))
     }
 
     fn publish_clock(&self) {
-        self.desk.now_ns.set(self.core.driver.now_ns());
+        self.desk.now_ns.set(self.now_ns());
     }
 
     // ------------------------------------------------------------------ admission
@@ -425,6 +496,14 @@ impl Shard {
     /// Admits a spawn request (from any thread's message, or the runtime that owns the shard): detached. The
     /// request's receipt, if it carries one, is answered with the outcome.
     pub fn spawn_request(&mut self, request: SpawnRequest) -> Result<TaskId, RtError> {
+        self.spawn_request_with(request, false)
+    }
+
+    fn spawn_request_with(
+        &mut self,
+        request: SpawnRequest,
+        service: bool,
+    ) -> Result<TaskId, RtError> {
         let SpawnRequest {
             future,
             parent,
@@ -446,6 +525,7 @@ impl Shard {
             future,
             parent,
             joinable: false,
+            service,
         });
         if admitted.is_ok() {
             self.apply();
@@ -465,6 +545,18 @@ impl Shard {
             });
         }
         let id = self.desk.spawn_local(future, None)?;
+        self.apply();
+        Ok(id)
+    }
+
+    /// Owner-side service admission, before the future can first be polled.
+    pub(crate) fn spawn_service_local(&mut self, future: BoxedFuture) -> Result<TaskId, RtError> {
+        if self.core.shutting_down || self.core.exited {
+            return Err(RtError::ShardGone {
+                shard: self.desk.id,
+            });
+        }
+        let id = self.desk.spawn_service_local(future, None)?;
         self.apply();
         Ok(id)
     }
@@ -506,12 +598,8 @@ impl Shard {
                 ready,
             });
         }
-        if asks & ask::CANCEL != 0
-            && let Some(task) = self.task_mut(slot)
-            && task.state != State::Done
-        {
-            task.cancel_requested = true;
-            self.desk.wake_local(slot);
+        if asks & ask::CANCEL != 0 {
+            self.request_cancel(slot);
         }
         if asks & ask::DETACH != 0
             && let Some(task) = self.task_mut(slot)
@@ -531,6 +619,7 @@ impl Shard {
             future,
             parent,
             joinable,
+            service: _,
         } = incoming;
         let parent = parent.filter(|p| self.live(*p));
         if let Some(task) = self.task_mut(slot) {
@@ -594,7 +683,7 @@ impl Shard {
             if self.spin_after_activity(outcome.next_deadline_ns) {
                 continue;
             }
-            self.park(outcome.next_deadline_ns);
+            self.park_owned(outcome.next_deadline_ns);
         }
     }
 
@@ -625,7 +714,7 @@ impl Shard {
     /// quantum; idle turns retrieve immediately. Simulation has no elapsed CPU time to cross a quantum,
     /// so a registered deterministic event is retrieved on its next turn without advancing virtual time.
     fn harvest_turn(&mut self) -> bool {
-        if self.core.shutting_down {
+        if self.core.driver_lost || self.core.exited {
             return false;
         }
         let now = self.desk.now_ns.get();
@@ -736,7 +825,8 @@ impl Shard {
     /// shard arms the driver only for its waits, `apply_interest` and `deliver`), so no system call is made:
     /// a kick left behind returns the next park at once, as it would have.
     fn harvest_io(&mut self, now_ns: u64) -> bool {
-        if self.core.shutting_down
+        if self.core.driver_lost
+            || self.core.exited
             || (self.core.waiting.is_empty() && !self.core.driver.has_pending())
         {
             return false;
@@ -770,6 +860,9 @@ impl Shard {
     /// Spins out the rest of the idle window the last client activity opened; true when something arrived or
     /// a timer fell due during the spin.
     fn spin_after_activity(&mut self, deadline_ns: Option<u64>) -> bool {
+        if self.core.driver_lost {
+            return false;
+        }
         let Some(activity) = self.desk.activity_ns.get() else {
             return false;
         };
@@ -810,7 +903,8 @@ impl Shard {
                 self.core.counters.spin_hits = self.core.counters.spin_hits.saturating_add(1);
                 return true;
             }
-            let now = self.now_ns();
+            // Re-read only after the driver was asked (a system call); otherwise this turn's reading stands.
+            let now = if harvest_due { self.now_ns() } else { now };
             if let Some(deadline) = deadline_ns
                 && now >= deadline
             {
@@ -831,7 +925,7 @@ impl Shard {
     }
 
     /// Whether anything waits in the shard's inboxes (no system call).
-    fn has_inbound(&self) -> bool {
+    pub(crate) fn has_inbound(&self) -> bool {
         !self.desk.local.is_empty()
             || self
                 .desk
@@ -848,10 +942,13 @@ impl Shard {
                 exit: true,
             };
         }
+        // The step's one reading of the clock: the overrun of a wait just ended, the attribution window, the
+        // timers and the harvest's quantum all take it.
+        self.publish_clock();
         // Only while armed: the account is a system call, and every step paid it before the tracker
         // threw an unarmed read away.
         if self.core.real_time && self.core.attribution.armed() {
-            let read = account_now(self.now_ns());
+            let read = account_now(self.desk.now_ns.get());
             self.core.counters.thread_accounts =
                 self.core.counters.thread_accounts.saturating_add(1);
             self.core.attribution.step_began(|| read);
@@ -869,36 +966,46 @@ impl Shard {
         if let Some(deadline) = self.core.waited_for_ns.take() {
             self.note_wait_overrun(deadline);
         }
-        self.publish_clock();
         self.desk.counters.set(self.counters());
+        let harvests = self.core.counters.harvests;
         let mut did_work = self.drain_control();
         did_work |= self.drain_wakes();
         did_work |= self.expire_timers();
         did_work |= self.wake_ready_pollers();
         self.apply();
         did_work |= self.harvest_turn();
-        let batch = self.desk.local.batch(self.core.config.batch.max(1));
+        // The configured poll budget bounds this phase, including wakes produced by
+        // earlier polls. The FIFO keeps already-ready tasks ahead of those wakes;
+        // a local request/reply handoff need not repeat the whole loop for each end.
+        let batch = self.core.config.batch.max(1);
+        // One clock read a poll: each poll's end is the next one's start, so the bookkeeping between two polls
+        // is counted to the second. The first poll starts from the step's reading when the step's drains,
+        // timers, pollers and driver did nothing since (a few loads); after any of them, from a fresh one.
+        let mut mark =
+            (!did_work && self.core.counters.harvests == harvests).then(|| self.desk.now_ns.get());
         for _ in 0..batch {
             let Some(slot) = self.desk.local.pop() else {
                 break;
             };
             did_work = true;
-            self.poll_slot(slot);
+            let start = match mark {
+                Some(start) => start,
+                None => self.now_ns(),
+            };
+            mark = Some(self.poll_slot(slot, start));
             self.apply();
         }
         // Running tasks, not occupied slots: a finished task that waits for a joiner holds its slot, and after
         // shutdown nobody joins it, so waiting on it would never end (found by `tcp::serve`'s handlers).
-        let exit = self.core.shutting_down && self.running_tasks() == 0;
-        if exit {
-            self.core.exited = true;
-            self.close_control();
-            registry::note_arena_generation(self.desk.id, self.core.generation_high);
-            registry::note_exited(self.desk.id);
-        }
+        let exit = self.exit_if_drained();
         self.core.attribution.step_ended(did_work);
         StepOutcome {
             did_work,
-            next_deadline_ns: self.core.timers.next_deadline_ns(),
+            next_deadline_ns: if self.core.driver_lost {
+                None
+            } else {
+                self.core.timers.next_deadline_ns()
+            },
             exit,
         }
     }
@@ -906,49 +1013,136 @@ impl Shard {
     /// Parks in the driver until a kick, a completion or `deadline_ns`. The parking announcement comes first
     /// and the inbox re-check second (the protocol and its loom model: [`crate::parking`]).
     pub fn park(&mut self, deadline_ns: Option<u64>) {
+        self.park_with_cleanup(deadline_ns, false);
+    }
+
+    /// The owning run/block_on/Drop loop may await terminal channel completions.
+    /// Manual and simulation park must instead return with cooperative work retained.
+    pub(crate) fn park_owned(&mut self, deadline_ns: Option<u64>) {
+        self.park_with_cleanup(deadline_ns, true);
+    }
+
+    fn park_with_cleanup(&mut self, deadline_ns: Option<u64>, block_cleanup: bool) {
         if self.core.exited {
             return;
         }
         if self.core.driver_lost {
-            self.finish_cancelled();
+            self.finish_hard_cancelled();
+            if block_cleanup && !self.core.exited {
+                self.park_cleanup();
+            }
             return;
         }
         self.apply();
         if self.core.driver_lost {
-            self.finish_cancelled();
+            self.finish_hard_cancelled();
+            if block_cleanup && !self.core.exited {
+                self.park_cleanup();
+            }
             return;
         }
         self.core.waited_for_ns = deadline_ns;
         self.core.attribution.wait_began();
-        let mut lost = false;
-        let retrieved = match self.desk.entry {
-            Some(entry) => {
-                let learns = self.core.real_time && self.core.wake.is_some();
-                let mut switches_before_wait = None;
-                let pending = self.has_inbound();
-                let parked = entry.parking.park_unless_pending(
-                    || pending || entry.wakes.is_pending() || entry.control_pending.is_pending(),
-                    || {
-                        if learns {
-                            switches_before_wait = attribution::voluntary_switches_now();
-                        }
-                        lost = self.wait_in_driver(deadline_ns);
-                    },
-                );
-                if let Parked::Waited(Some(woken)) = parked {
-                    self.note_wake(entry, woken, switches_before_wait);
-                }
-                matches!(parked, Parked::Waited(_))
-            }
-            None => {
-                lost = self.wait_in_driver(deadline_ns);
-                true
-            }
+        let (retrieved, lost) = match self.desk.entry {
+            Some(entry) => self.park_announced(entry, deadline_ns),
+            None => (true, self.wait_in_driver(deadline_ns)),
         };
         self.wait_ended(retrieved);
         if lost {
             self.fail_all();
+            self.finish_hard_cancelled();
         }
+    }
+
+    /// The registered shard's park: announced, then a wait in the driver unless an inbox already holds work
+    /// (the protocol of [`crate::parking`]), learning from a wait what the wake took and what the park
+    /// cost. Whether it waited, and whether the driver was lost.
+    fn park_announced(&mut self, entry: &'static Entry, deadline_ns: Option<u64>) -> (bool, bool) {
+        let learns = self.core.real_time && self.core.wake.is_some();
+        let mut switches_before_wait = None;
+        let mut lost = false;
+        // The CPU clock is read (a system call) only by a learning shard, only around a wait it makes, and
+        // the second time only after a first. A tuple of the two readings read it after every park, learning
+        // or not: that doubled the cost of the loop item the runtime calibrates its poll batch by, which
+        // halved every shard's batch (`benchmark-results/rtloop-async-fill-bisect-20261010`).
+        let mut cpu_before = None;
+        let pending = self.has_inbound();
+        let parked = entry.parking.park_unless_pending(
+            || pending || entry.wakes.is_pending() || entry.control_pending.is_pending(),
+            || {
+                if learns {
+                    switches_before_wait = attribution::voluntary_switches_now();
+                    cpu_before = attribution::thread_cpu_now();
+                    self.core.counters.park_cost_reads =
+                        self.core.counters.park_cost_reads.saturating_add(1);
+                }
+                lost = self.wait_in_driver(deadline_ns);
+            },
+        );
+        let Parked::Waited(woken) = parked else {
+            return (false, lost);
+        };
+        if let Some(woken) = woken {
+            self.note_wake(entry, woken, switches_before_wait);
+        }
+        if let Some(before) = cpu_before {
+            self.core.counters.park_cost_reads =
+                self.core.counters.park_cost_reads.saturating_add(1);
+            if let Some(after) = attribution::thread_cpu_now() {
+                self.note_park_cost(entry, after.saturating_sub(before));
+            }
+        }
+        (true, lost)
+    }
+
+    /// Driver loss closed admission and marked every live task. A single arena
+    /// pass can retire ordinary cancellation without polling a cooperative future,
+    /// invoking step recursively, or waiting for a receiver. Service ownership and
+    /// any hard parent's live service children remain until their own Ready.
+    fn finish_hard_cancelled(&mut self) {
+        for index in 0..self.core.tasks.len() {
+            let Ok(slot) = u32::try_from(index) else {
+                break;
+            };
+            let ordinary = self.desk.task(slot).is_some_and(|cell| !cell.service.get());
+            let ready = self.task_mut(slot).is_some_and(|task| {
+                task.cancel_requested
+                    && task.future.is_some()
+                    && matches!(task.state, State::Idle | State::Queued)
+            });
+            if ordinary && ready {
+                let start = self.now_ns();
+                self.poll_slot(slot, start);
+            }
+        }
+        self.apply();
+        self.exit_if_drained();
+    }
+
+    fn exit_if_drained(&mut self) -> bool {
+        let exit = self.core.shutting_down && self.running_tasks() == 0;
+        if exit {
+            self.core.exited = true;
+            self.close_control();
+            registry::note_arena_generation(self.desk.id, self.core.generation_high);
+            registry::note_exited(self.desk.id);
+        }
+        exit
+    }
+
+    /// Event-driven terminal park after the owner has observed native driver loss.
+    /// The ordinary wake bitmap is published before this same announce/recheck protocol;
+    /// the thread permit replaces only the unusable kernel kick/wait, never the payload.
+    fn park_cleanup(&self) {
+        let Some(entry) = self.desk.entry else {
+            return;
+        };
+        entry.parking.park_unless_pending(
+            || self.has_inbound(),
+            || {
+                std::thread::park();
+            },
+        );
     }
 
     /// Folds a park's measured wake into the online estimate (slates §4.3).
@@ -985,10 +1179,26 @@ impl Shard {
         entry.pulse.record_wake_cost(mean);
     }
 
+    /// Folds one waited park's CPU on this thread into the cost of blocking, and the kicks its senders
+    /// measured since the last fold.
+    fn note_park_cost(&mut self, entry: &Entry, park_cpu_ns: u64) {
+        self.core.park_cost.record(park_cpu_ns);
+        let (sum, kicks) = entry.parking.kick_cpu();
+        let (seen_sum, seen_kicks) = self.core.kicks_seen;
+        if let Some(cost) = kicks
+            .checked_sub(seen_kicks)
+            .filter(|fresh| *fresh > 0)
+            .and_then(|fresh| sum.saturating_sub(seen_sum).checked_div(fresh))
+        {
+            self.core.kick_cost.record(cost);
+            self.core.kicks_seen = (sum, kicks);
+        }
+    }
+
     /// Folds one finished wait into the measured scheduler overrun: the shard waited for `deadline_ns` and
-    /// this step is the first to run after it.
+    /// this step, whose clock was just published, is the first to run after it.
     fn note_wait_overrun(&mut self, deadline_ns: u64) {
-        let overrun = self.now_ns().saturating_sub(deadline_ns);
+        let overrun = self.desk.now_ns.get().saturating_sub(deadline_ns);
         let held = self.desk.scheduler_overrun_ns.get();
         let forgotten = held.saturating_sub(held >> OVERRUN_FORGET_SHIFT);
         let measured = forgotten.max(overrun);
@@ -1044,13 +1254,10 @@ impl Shard {
         self.core.driver_lost
     }
 
-    /// Cancels every task with a terminal completion and exits: the driver is gone. Bounded by twice the
-    /// tasks live when it began, plus one: each task needs at most a poll to drop and one to complete.
+    /// Driver loss has already marked cancellation. The normal loop keeps owning
+    /// service futures until their event-driven cleanup returns Ready, then exits.
     fn fail_all(&mut self) {
-        self.finish_cancelled();
-        self.core.exited = true;
-        self.close_control();
-        registry::note_exited(self.desk.id);
+        self.cancel_all();
     }
 
     /// Closes admission before cancellation; called outside nested task polling, or marks
@@ -1068,25 +1275,33 @@ impl Shard {
                 .accepting
                 .store(false, std::sync::atomic::Ordering::Release);
             entry.stop.store(true, std::sync::atomic::Ordering::Release);
+            // No native wait can still be parked: loss was observed by this owner.
+            entry
+                .cleanup_mode
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         self.close_control();
         self.cancel_all();
     }
 
+    /// Closes the control queue: what is queued is dropped with the desk entered, as a task's future is.
     fn close_control(&mut self) {
-        let control = self.core.control.take();
+        let Some(entry) = self.desk.entry else {
+            return;
+        };
         let entered = registry::enter(&self.desk);
-        drop(control);
+        entry.close_control();
         drop(entered);
     }
 
     fn finish_cancelled(&mut self) {
-        let mut bound = self.live_tasks().saturating_mul(2).saturating_add(1);
-        while self.running_tasks() > 0 && bound > 0 {
+        while self.running_tasks() > 0 {
             let outcome = self.step();
-            bound = bound.saturating_sub(1);
             if outcome.exit {
                 break;
+            }
+            if !outcome.did_work {
+                self.park_owned(outcome.next_deadline_ns);
             }
         }
     }
@@ -1103,12 +1318,7 @@ impl Shard {
         let batch = self.core.config.batch.max(1);
         let mut drained: usize = 0;
         while drained < batch {
-            let Some(message) = self
-                .core
-                .control
-                .as_ref()
-                .and_then(|control| control.try_recv().ok())
-            else {
+            let Some(message) = entry.take_control() else {
                 break;
             };
             drained = drained.saturating_add(1);
@@ -1193,6 +1403,12 @@ impl Shard {
                         self.core.counters.admission_refused.saturating_add(1);
                 }
             }
+            Control::SpawnService(request) => {
+                if let Err(RtError::TooManyTasks { .. }) = self.spawn_request_with(*request, true) {
+                    self.core.counters.admission_refused =
+                        self.core.counters.admission_refused.saturating_add(1);
+                }
+            }
             Control::Cancel(word) => {
                 let _ = self.desk.cancel(TaskId(word));
             }
@@ -1211,7 +1427,11 @@ impl Shard {
     }
 
     fn expire_timers(&mut self) -> bool {
-        let now = self.core.driver.now_ns();
+        if self.core.driver_lost {
+            return false;
+        }
+        // The step's published time: a timer that fell due since then fires at the next step.
+        let now = self.desk.now_ns.get();
         let mut fired = std::mem::take(&mut self.core.fired);
         self.core.timers.advance(now, &mut fired);
         let any = !fired.is_empty();
@@ -1232,41 +1452,67 @@ impl Shard {
         any
     }
 
-    fn poll_slot(&mut self, slot: u32) {
+    /// Polls the task in `slot`, timed from `start`; the time the poll ended, or `start` when nothing ran.
+    fn poll_slot(&mut self, slot: u32, start: u64) -> u64 {
+        let service = self.desk.task(slot).is_some_and(|cell| cell.service.get());
+        if service
+            && self
+                .desk
+                .task(slot)
+                .is_some_and(|cell| cell.cancelled.get())
+        {
+            self.cancel_children_once(slot);
+        }
         let Some(generation) = self.desk.task(slot).map(|cell| cell.generation.get()) else {
-            return;
+            return start;
         };
         let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
-            return;
+            return start;
         };
         if matches!(task.state, State::Finishing | State::Done | State::Running) {
-            return;
+            return start;
         }
         let Some(mut future) = task.future.take() else {
-            return;
+            return start;
         };
-        if task.cancel_requested {
+        if task.cancel_requested && !service {
             task.state = State::Finishing;
             self.drop_entered(future);
             self.finish(slot, Outcome::Cancelled);
-            return;
+            return start;
         }
         task.state = State::Running;
         let word = Encoded::pack(self.desk.id, slot, generation).unwrap_or(Encoded::from_word(0));
         let waker = waker_for(word);
         let mut cx = Context::from_waker(&waker);
         self.desk.current_task.set(Some(slot));
-        let start = self.now_ns();
         self.desk.now_ns.set(start);
         let entered = registry::enter(&self.desk);
-        let poll = future.as_mut().poll(&mut cx);
+        // The poll is the task's code: inside an unwind boundary of the shard's own, so a task that
+        // panics ends there, typed, and costs the shard and its other tasks nothing (CLAUDE.md §1).
+        let poll = crate::unwind::contained(|| future.as_mut().poll(&mut cx));
         drop(entered);
         let ended = self.now_ns();
         self.desk.current_task.set(None);
+        // A request served in this poll opens the idle window from where the poll ended, not where it began:
+        // the spin covers the moments after the shard goes idle, however long the serving took.
+        if self.desk.activity_noted.replace(false) {
+            self.desk.activity_ns.set(Some(ended));
+        }
         // What the poll asked takes effect before its result is recorded: a parent that spawned children and
         // finished in one poll has them installed, linked and so cancelled with it.
         self.apply();
         let attributed = self.attribute_poll(start, ended);
+        let Some(poll) = poll else {
+            // A future that unwound is in no state to poll again: it is dropped, and the task ends.
+            if let Some(task) = slot_mut(&mut self.core.tasks, slot) {
+                task.state = State::Finishing;
+            }
+            self.drop_entered(future);
+            self.finish(slot, Outcome::Unwound);
+            self.desk.note_unwound(TaskId(word));
+            return ended;
+        };
         self.after_poll(PollDone {
             slot,
             future,
@@ -1274,14 +1520,19 @@ impl Shard {
             done: matches!(poll, Poll::Ready(())),
             attributed,
         });
+        ended
     }
 
     /// Drops a task's future with the desk entered: its destructors may wake or cancel other tasks of this
-    /// shard, or let their timers go.
-    fn drop_entered(&self, future: BoxedFuture) {
+    /// shard, or let their timers go. The drop is the task's code, inside an unwind boundary of the shard's
+    /// own; one that unwinds is counted.
+    fn drop_entered(&mut self, future: BoxedFuture) {
         let entered = registry::enter(&self.desk);
-        drop(future);
+        let dropped = crate::unwind::contained(move || drop(future));
         drop(entered);
+        if dropped.is_none() {
+            self.core.counters.unwound = self.core.counters.unwound.saturating_add(1);
+        }
     }
 
     /// Wakes the task `word` names: on this shard directly, elsewhere through the registry.
@@ -1308,6 +1559,7 @@ impl Shard {
             count_long_poll(&mut self.core.counters, attributed);
         }
         self.core.counters.longest_step_ns = self.core.counters.longest_step_ns.max(elapsed);
+        let service = self.desk.task(slot).is_some_and(|cell| cell.service.get());
         let Some(task) = slot_mut(&mut self.core.tasks, slot) else {
             return;
         };
@@ -1316,14 +1568,15 @@ impl Shard {
             task.long_steps = task.long_steps.saturating_add(1);
         }
         task.longest_step_ns = task.longest_step_ns.max(elapsed);
-        if done || task.cancel_requested {
+        if done || (task.cancel_requested && !service) {
+            let cancelled = task.cancel_requested;
             self.drop_entered(future);
             self.finish(
                 slot,
-                if done {
-                    Outcome::Completed
-                } else {
+                if cancelled && service || !done {
                     Outcome::Cancelled
+                } else {
+                    Outcome::Completed
                 },
             );
             return;
@@ -1350,6 +1603,9 @@ impl Shard {
             Outcome::Cancelled => {
                 self.core.counters.cancelled = self.core.counters.cancelled.saturating_add(1);
             }
+            Outcome::Unwound => {
+                self.core.counters.unwound = self.core.counters.unwound.saturating_add(1);
+            }
         }
         let mut child = first_child;
         // Bounded by the task table: a child list never holds more than every other slot.
@@ -1364,6 +1620,9 @@ impl Shard {
                 }
                 None => break,
             };
+            if let Some(cell) = self.desk.task(child) {
+                cell.cancelled.set(true);
+            }
             if done {
                 unlink_child(&mut self.core.tasks, slot, child);
                 self.free_slot(child);
@@ -1473,6 +1732,41 @@ impl Shard {
         }
     }
 
+    /// Every cancellation writer publishes the same level before scheduling the task.
+    fn request_cancel(&mut self, slot: u32) {
+        if let Some(task) = self.task_mut(slot)
+            && task.state != State::Done
+        {
+            task.cancel_requested = true;
+            if let Some(cell) = self.desk.task(slot) {
+                cell.cancelled.set(true);
+            }
+            self.desk.wake_local(slot);
+        }
+    }
+
+    /// Direct children are scheduled for cancellation before a service can await them.
+    /// A cancelled service child performs its own direct pass when polled: no recursive
+    /// traversal stack, additional allocation, or unbounded linked-list walk is introduced.
+    fn cancel_children_once(&mut self, slot: u32) {
+        let Some(cell) = self.desk.task(slot) else {
+            return;
+        };
+        if cell.cancel_children.replace(true) {
+            return;
+        }
+        let mut child = self.task_mut(slot).map_or(NO_LINK, |task| task.first_child);
+        let mut budget = self.core.tasks.len();
+        while child != NO_LINK && budget > 0 {
+            budget = budget.saturating_sub(1);
+            let Some(next) = self.task_mut(child).map(|task| task.next_sibling) else {
+                break;
+            };
+            self.request_cancel(child);
+            child = next;
+        }
+    }
+
     fn cancel_all(&mut self) {
         for (slot, task) in self.core.tasks.iter_mut().enumerate() {
             if let Ok(slot) = u32::try_from(slot)
@@ -1483,6 +1777,9 @@ impl Shard {
                 && task.state != State::Done
             {
                 task.cancel_requested = true;
+                if let Some(cell) = self.desk.task(slot) {
+                    cell.cancelled.set(true);
+                }
                 self.desk.wake_local(slot);
             }
         }

@@ -6,10 +6,10 @@
 //! [`CellRing`] (docs/runtime.md §3.4), so nothing is borrowed and nothing is refused: slates' version
 //! kept its lists in `RefCell`s and counted the re-entrant accesses it refused.
 //!
-//! A step takes at most one batch, the oldest first, counted when the batch starts
-//! ([`LocalQueue::batch`]): wakes that arrive while the batch runs (a task waking another, or itself)
-//! queue behind it and are taken by the next step, so a step costs its batch, never the whole ready set
-//! (slates' 2026-09-26 fix: a drain of N ready tasks once cost O(N² / batch)).
+//! A step takes at most its configured poll budget, oldest first. Wakes that arrive while the phase
+//! runs join the same FIFO behind tasks already ready and may use its remaining budget. A task waking
+//! itself cannot extend that budget, so the phase never drains an unbounded ready set. `batch` can
+//! still capture the number ready now for callers that need a fixed snapshot.
 
 use std::cell::Cell;
 

@@ -15,7 +15,8 @@
         clippy::arithmetic_side_effects,
         clippy::disallowed_macros,
         clippy::cognitive_complexity,
-        clippy::cast_possible_truncation
+        clippy::cast_possible_truncation,
+        clippy::panic_in_result_fn
     )
 )]
 
@@ -31,10 +32,12 @@ pub mod image;
 pub mod issuer;
 mod node;
 pub mod record;
+mod resident;
 pub mod scratch;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
 pub mod threads;
+mod unwind;
 
 /// What a device operation fails with.
 #[derive(Debug, thiserror::Error)]

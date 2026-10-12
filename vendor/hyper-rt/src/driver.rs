@@ -216,8 +216,8 @@ pub trait Driver {
 /// so a task that measures time inside one poll sees it pass.
 #[derive(Clone, Copy, Debug)]
 pub enum Clock {
-    /// Host monotonic nanoseconds since the driver's epoch, itself a host monotonic reading (the OS drivers;
-    /// [`crate::machine::clock::monotonic_ns`]).
+    /// Shard-clock nanoseconds since the driver's epoch, itself a shard-clock reading (the OS drivers;
+    /// [`crate::machine::clock::shard_clock_ns`]).
     Since(u64),
     /// The simulation's virtual clock.
     Sim(&'static crate::sim::SimShared),
@@ -312,10 +312,10 @@ pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
     })
 }
 
-/// Host monotonic nanoseconds since `epoch_ns` (an earlier [`crate::machine::clock::monotonic_ns`] reading),
+/// Shard-clock nanoseconds since `epoch_ns` (an earlier [`crate::machine::clock::shard_clock_ns`] reading),
 /// saturating at zero.
 pub fn nanos_since(epoch_ns: u64) -> u64 {
-    crate::machine::clock::monotonic_ns().saturating_sub(epoch_ns)
+    crate::machine::clock::shard_clock_ns().saturating_sub(epoch_ns)
 }
 
 /// A rustix refusal as the driver's typed error.
@@ -341,7 +341,7 @@ mod tests {
         // Exercise the real registration and retirement protocol, including the foreign kick.
         // The registration outlives its driver and retires even when an assertion unwinds (its drop):
         // otherwise the parallel registry stress test can fill its abandoned ring and wait forever.
-        let (registration, _control) =
+        let registration =
             crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd))
                 .unwrap();
         let shard = registration.shard();
@@ -434,7 +434,7 @@ mod tests {
         let prepared = os_driver(64).unwrap();
         // The registration outlives its driver and retires even when an assertion unwinds (its drop):
         // otherwise the parallel registry stress test can fill its abandoned ring and wait forever.
-        let (registration, _control) =
+        let registration =
             crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd))
                 .unwrap();
         let shard = registration.shard();

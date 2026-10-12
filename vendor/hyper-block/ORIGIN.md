@@ -98,6 +98,41 @@ caller hands in the alignment, queue and measured depth it found.
    held a queue of answers and its drop ran its own (mantle `CLAUDE.md` §10, no runtime
    recursion). The handles and the device's answers are as before.
 
+11. **Reusable asynchronous device completion and terminal retirement** (`issuer.rs`,
+    local development repair): each actual attachment owns a submission lane and reusable
+    numbered answer channel bounded by its declared batches. Output credit includes queued,
+    in-flight and unanswered batches; in-credit submission does not block on a shared data
+    inbox. Retirement follows out0 on the same empty lane. A capacity-one dirty doorbell
+    coalesces submissions/retirements, and publication wakes the existing dispatcher thread.
+    There is no workers+batches cap on cold attachments. A canceled borrowed completion or
+    retirement wait keeps its number and owner; foreign context refuses before publication.
+    Completion closure follows all native worker duplicate Drops/joins even during concurrent
+    issuer Stop. Pre-Stop accepted batches are answered with numbered refusal; owning Drop
+    retains its blocking plain-thread contract.
+    The warm allocation oracle (`tests/issuer_allocs.rs`) and its hyper-measure dev-dependency
+    came with it. Made in mantle's copy (`6f05bd8`) and taken here (2026-10-12).
+
+12. **Terminal ownership and typed lifecycle failures** (`issuer.rs`, development):
+    each completion channel holds its declared B numbered results plus one physical
+    terminal role; batch/data admission remains B. The slot/ticket and array layouts
+    are checked before channel construction or file duplication, and cold batch storage
+    is fallibly reserved. Retirement publication reserves its worker news and receipt
+    storage before transferring Client ownership. Any entered-shard owning Drop closes
+    its sole lane and notifies without a success acknowledgement; the broker retains
+    accepted batches and completion senders through actual duplicate retirement and
+    abnormal native joins. Guarded duplicate Drop and worker/broker lifecycle failures
+    become terminal errors, never successful Detached. `is_retired` follows actual
+    Detached or post-join completion closure, including error; context/admission and
+    numbered I/O errors are not terminal facts. `retire_async` checks the actual task
+    waker before each receive poll; canceled borrowed waits retain the same receipt.
+    Cold `retire_blocking` shares that terminal state and returns lifecycle failures,
+    while refusing any entered shard before mutation. Raw Drop remains unacknowledged
+    cleanup. Made in mantle's copy (`6f05bd8`) and taken here (2026-10-12); in the merge with
+    `main`, an unwound payload the issuer does not keep for a later disposal is dropped inside a
+    boundary of its own (`unwind::contained`): a duplicate's drop that unwinds with a payload
+    that unwinds again costs that drop alone, and the worker lives on
+    (`tests/attachment_watch_native.rs`).
+
 ## Planned
 
 - The log's frame writes and flushes through the device's issuer, and the issuer's own reads (mantle

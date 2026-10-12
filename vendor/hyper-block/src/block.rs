@@ -43,6 +43,21 @@ pub trait BlockFile: Send {
     /// Fills `buf` from `offset`; reaching the end of the file first is an error.
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError>;
 
+    /// Fills `buf` from `offset` only if the OS holds every byte of it in memory now, without
+    /// waiting for the device: true when it read; false when the read would wait, leaving it to
+    /// a thread that may ([`crate::issuer`]). By default false: a file that cannot tell reads
+    /// nothing here.
+    fn read_resident_at(&mut self, _buf: &mut [u8], _offset: u64) -> Result<bool, DiskError> {
+        Ok(false)
+    }
+
+    /// Whether [`BlockFile::read_resident_at`] can read anything: what an issuer asks before it
+    /// keeps a submitter a duplicate to read with ([`crate::issuer::Attached::read_resident_at`]).
+    /// False by default.
+    fn reads_resident(&self) -> bool {
+        false
+    }
+
     /// Writes all of `buf` at `offset`, extending the file if it ends past the end.
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError>;
 
@@ -98,6 +113,14 @@ impl BlockFile for DeviceFile {
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
         DeviceFile::read_exact_at(self, buf, offset)
+    }
+
+    fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
+        DeviceFile::read_resident_at(self, buf, offset)
+    }
+
+    fn reads_resident(&self) -> bool {
+        DeviceFile::reads_resident(self)
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {

@@ -418,19 +418,20 @@ pub(crate) struct Wanted {
     pub(crate) len: u32,
 }
 
-/// The failure a file operation that unwound is taken for.
-fn unwound() -> LogError {
+/// The failure the caller's code run on the file is taken for when it unwound, `op` naming it: a
+/// file operation (the file is the caller's), or a look at the file (`Log::with_file`).
+pub(crate) fn unwound(op: &'static str) -> LogError {
     LogError::Disk(hyper_block::DiskError::Io {
-        op: "a file operation unwound",
+        op,
         path: std::path::PathBuf::new(),
-        source: std::io::Error::other("the file unwound"),
+        source: std::io::Error::other("the caller's code unwound"),
     })
 }
 
 /// Runs `op` on the file inside an unwind boundary: the file is the caller's code, and should it
 /// unwind the operation fails as a failed write, flush or read would (CLAUDE.md §1).
-fn guarded<R>(op: impl FnOnce() -> Result<R, LogError>) -> Result<R, LogError> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)).unwrap_or_else(|_| Err(unwound()))
+pub(crate) fn guarded<R>(op: impl FnOnce() -> Result<R, LogError>) -> Result<R, LogError> {
+    crate::unwind::contained(op).unwrap_or_else(|| Err(unwound("a file operation unwound")))
 }
 
 /// The log's file, with what reading it back keeps, and where the owner says another frame
@@ -505,19 +506,17 @@ impl<F: BlockFile> Device<F> {
             } => Completion::Sweep(guarded(|| self.sweep(segment, offset, end))),
             Job::Read(reads) => {
                 let group = reads.group;
-                let read =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.read(reads)))
-                        .unwrap_or_else(|_| Reads {
-                            group,
-                            result: Err(unwound()),
-                            ..Reads::none()
-                        });
+                let read = crate::unwind::contained(|| self.read(reads)).unwrap_or_else(|| Reads {
+                    group,
+                    result: Err(unwound("a file operation unwound")),
+                    ..Reads::none()
+                });
                 Completion::Read(read)
             }
             Job::Look(look) => {
-                let file = &self.file;
-                // A look that unwinds is its caller's: the caller hears the log closed.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| look(file)));
+                // A look holds its caller's code inside an unwind boundary of its own
+                // (`Log::with_file`).
+                look(&self.file);
                 Completion::Looked
             }
         }
@@ -614,9 +613,12 @@ impl<F: BlockFile> Device<F> {
     ) -> (Result<(), LogError>, Timing) {
         let started = stats::now();
         let mut bytes = 0u64;
-        let zero = zero.filter(|_| self.file.fills_new_space());
+        // Every call into the file, its asking whether it fills new space included, is inside the
+        // boundary: the file is the caller's code.
         let wrote = guarded(|| {
-            if let Some((at, len)) = zero {
+            if let Some((at, len)) = zero
+                && self.file.fills_new_space()
+            {
                 bytes = self.zero_fill(at, len)?;
             }
             bytes = bytes.saturating_add(self.write(first.0, first.1)?);

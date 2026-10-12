@@ -346,6 +346,36 @@ found two kinds of cycle.
   opener's and a group's handle's, from the test's thread and another, each frame flushed and
   confirmed on its writer's thread, with a thread writing to logs of two kinds of file between.
 
+## The caller's code behind unwind boundaries
+
+The panic ban (CLAUDE.md §1: production code never panics; a dependency or the caller's code that
+can is called behind an unwind boundary). A tool lists every call from this workspace's code into
+the caller's (a waker, a closure, a trait method of a type a test defines, a call through a pointer)
+and whether an unwind boundary of the workspace's own encloses it, from the code compiled at opt-level 0
+with line tables; it marks the calls made on a thread the workspace spawns. In this crate it found:
+
+- **A waker, woken on whichever of the log's threads answers**: the I/O thread, a blocking writer's
+  own thread doing its frame's I/O, the owner's. One that unwound killed that thread: the I/O thread,
+  so no job ran again and the log stopped; a writer's, holding the device mid-frame, so the device was
+  dropped and every other caller of the frame heard `Closed` though durable. `Ticket::answer` now wakes
+  inside a boundary: a waker that unwinds costs its caller only the wake, its answer already in its port.
+- **A look at the file** (`Log::with_file`), run on the thread that holds the device: one that unwound
+  was answered `Closed`. It is answered as a failed operation on the file now, typed (`LogError::Disk`,
+  "a look at the file unwound"), and the log goes on.
+- **The owner's admission** (`Growth`), run on the owner thread: one that unwound killed the owner, and
+  every caller heard `Closed`. Each call is inside a boundary now; an admission that unwinds is dropped,
+  inside a boundary too, and every admission reads as a refusal from then on: `Full`, never a fence.
+- **The file**, asked whether it fills new space outside the boundary its writes are in, on the
+  device's thread; and read and written by recovery and formatting on the caller's thread at open and
+  create. Each is inside a boundary now, so a file that unwinds fails the operation as a failed write
+  would, and an open or a create refuses with the file given back.
+- Every boundary drops the unwind's payload inside a boundary of its own (`unwind::contained`).
+- **Tests** (`tests/unwind.rs`, `tests/growth.rs`): a waker that unwinds, woken by the I/O thread, a
+  blocking writer's thread and the owner's, each caller answered typed, the device working on (hung on
+  main); a look that unwinds, answered typed (`Closed` on main); an admission that unwinds, `Full` and
+  never fenced (the owner thread died on main); a file whose flush unwinds, the write failed typed and
+  the device handed back at close (as on main: the frame's writes and flush were inside the boundary).
+
 ## The seal walks a group's release
 
 focal found that a sealed frame carrying a `Released` record fenced the log: the seal's walk of a
@@ -357,3 +387,30 @@ walk takes its eight bytes now.
   kind so a kind added later fails to build until it is laid there too, and the walk reaches the end and
   the payload decodes whole; `a_sealed_log_writes_and_reopens_a_release` writes a release to a sealed log
   and reads it back after a reopen. Both fail without the arm: "the walk stopped short", and `Fenced`.
+
+## A group's handle keeps what its replica has yet to apply
+
+focal found its shell's session owner waiting 57% of its time on reads of entries it had written
+(5,000 writes a second, macOS `sample`: 3,370 of 5,960 samples in `GroupLog::ask` under the store's
+fetch, 2,288 of them from apply): a leader's entries are durable at its own write and committed at
+its followers' answers, by then the core has let them go, and its apply read each back. The handle
+held each written entry's bytes, from its write's answer, only within its share of the log's cache
+(`group_cache`, 64 KiB a group in focal: 64 MiB over 1,024 groups), so at that rate the entries
+had left it before they were applied, and each read went through the owner to the device, behind
+its flushes.
+
+- `GroupLog::keep_after(index)` keeps the entries after `index` whatever the share, until a later
+  call raises it; those at or before it are kept by the share alone, as before any call.
+  `GroupLog::kept_bytes` counts what is kept past the share, for its caller to bound: hyper-durable's
+  replica marks what it will read back as it opens and after every drive (what it has yet to apply,
+  and on a leader what a replicating member has yet to acknowledge of what was sent it), and counts
+  the bytes with what it holds, so its owner's budget bounds them (hyper-raft `docs/durable.md` §8). The bytes are the
+  ones the answer brought back: nothing is copied to keep them, where focal's first form of the fix,
+  a second copy in the store, made one allocation and one copy an entry.
+- **Tests**: `a_handle_keeps_what_its_replica_has_yet_to_apply` (`tests/group.rs`, every count exact,
+  through a suffix replaced past the mark and a lower mark that changes nothing); the property test
+  `a_handle_reads_as_the_log_does` with a mark raised at random on every step: what the handle keeps
+  changes where a read is answered, never what it says. `benches/allocs.rs`: appends through marked
+  handles on a byte's share make no allocation, as through the unmarked handle, and the entry a
+  replica has yet to apply is fetched with no allocation and no ask of the log (`docs/benchmarks.md`,
+  "The handle keeps what its replica has yet to apply").

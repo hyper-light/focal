@@ -210,4 +210,13 @@ impl LogStore for RamStore {
     fn write_now(&mut self, write: &Write<'_>) -> Result<(), Fault> {
         self.apply(write)
     }
+
+    /// Every entry the publication holds is in memory already, read from there: nothing is kept apart.
+    fn keep_after(&mut self, index: u64) {
+        let _ = index;
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        0
+    }
 }

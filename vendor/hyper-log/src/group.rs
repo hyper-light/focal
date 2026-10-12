@@ -56,6 +56,12 @@ pub(crate) struct Mirror {
     pub(crate) cache_from: u64,
     /// Bytes in `cache`.
     pub(crate) cached: u64,
+    /// The entries after this index stay in `cache` whatever its budget: those its replica has not
+    /// yet applied (`GroupLog::keep_after`). `None`: the budget alone decides, as the log's own
+    /// cache.
+    pub(crate) kept_after: Option<u64>,
+    /// Bytes in `cache` of the entries after `kept_after`.
+    pub(crate) kept: u64,
     pub(crate) hard: Option<HardState>,
     /// The proposals no update released: index and term.
     pub(crate) proposals: BTreeMap<u64, u64>,
@@ -75,6 +81,8 @@ impl Mirror {
             cache: VecDeque::new(),
             cache_from: 1,
             cached: 0,
+            kept_after: None,
+            kept: 0,
             hard: None,
             proposals: BTreeMap::new(),
             uncertain: None,
@@ -120,6 +128,8 @@ impl Mirror {
             cache,
             cache_from,
             cached,
+            kept_after: None,
+            kept: 0,
             hard: g.hard.map(|(h, _)| h),
             proposals: g.proposals.iter().map(|(&i, p)| (i, p.term)).collect(),
             uncertain: g.uncertain.map(|(mark, _)| mark),
@@ -149,7 +159,7 @@ impl Mirror {
         let first = start.index.saturating_add(1);
         while self.cache_from < first && !self.cache.is_empty() {
             if let Some(bytes) = self.cache.pop_front() {
-                self.cached = self.cached.saturating_sub(len(&bytes));
+                self.forget(self.cache_from, &bytes);
             }
             self.cache_from = self.cache_from.saturating_add(1);
         }
@@ -172,7 +182,7 @@ impl Mirror {
         let end = first.saturating_sub(1);
         while self.last > end && self.last >= self.cache_from && !self.cache.is_empty() {
             if let Some(bytes) = self.cache.pop_back() {
-                self.cached = self.cached.saturating_sub(len(&bytes));
+                self.forget(self.last, &bytes);
             }
             self.last = self.last.saturating_sub(1);
         }
@@ -188,17 +198,75 @@ impl Mirror {
             if self.runs.back().is_none_or(|&(_, t)| t != entry.term) {
                 self.runs.push_back((self.last, entry.term));
             }
-            self.cached = self.cached.saturating_add(len(&entry.bytes));
+            let bytes = len(&entry.bytes);
+            self.cached = self.cached.saturating_add(bytes);
+            if self.keeps(self.last) {
+                self.kept = self.kept.saturating_add(bytes);
+            }
             self.cache.push_back(entry.bytes);
         }
         self.cache_from = self.cache_from.max(self.start.index.saturating_add(1));
-        while self.cached > budget {
+        self.evict(budget);
+    }
+
+    /// Whether the entry at `index` is one kept whatever the budget.
+    fn keeps(&self, index: u64) -> bool {
+        self.kept_after.is_some_and(|after| index > after)
+    }
+
+    /// The cached entry at `index`, of `bytes`, leaves the cache.
+    fn forget(&mut self, index: u64, bytes: &[u8]) {
+        self.cached = self.cached.saturating_sub(len(bytes));
+        if self.keeps(index) {
+            self.kept = self.kept.saturating_sub(len(bytes));
+        }
+    }
+
+    /// The oldest entries leave while the cache is past `budget`, except those kept whatever it.
+    fn evict(&mut self, budget: u64) {
+        while self.cached > budget && !self.keeps(self.cache_from) {
             let Some(bytes) = self.cache.pop_front() else {
                 break;
             };
-            self.cached = self.cached.saturating_sub(len(&bytes));
+            self.forget(self.cache_from, &bytes);
             self.cache_from = self.cache_from.saturating_add(1);
         }
+    }
+
+    /// Keeps the entries after `index` whatever the budget, and lets those at or before it go by the
+    /// budget: `index` only rises. The first mark counts what the cache holds past it; a later one
+    /// uncounts only the entries it passes.
+    fn keep_after(&mut self, index: u64, budget: u64) {
+        match self.kept_after {
+            None => {
+                let mut kept = 0u64;
+                for (at, bytes) in (self.cache_from..).zip(self.cache.iter()) {
+                    if at > index {
+                        kept = kept.saturating_add(len(bytes));
+                    }
+                }
+                self.kept = kept;
+                self.kept_after = Some(index);
+            }
+            Some(after) if index > after => {
+                let low = after.saturating_add(1).max(self.cache_from);
+                let mut at = low;
+                while at <= index {
+                    let Some(bytes) = at
+                        .checked_sub(self.cache_from)
+                        .and_then(|offset| usize::try_from(offset).ok())
+                        .and_then(|offset| self.cache.get(offset))
+                    else {
+                        break;
+                    };
+                    self.kept = self.kept.saturating_sub(len(bytes));
+                    at = at.saturating_add(1);
+                }
+                self.kept_after = Some(index);
+            }
+            Some(_) => {}
+        }
+        self.evict(budget);
     }
 
     /// What the log has reached is no longer uncertain (`writer::reach`); proposals outlive
@@ -313,6 +381,24 @@ impl<F: BlockFile + 'static> GroupLog<F> {
     /// entries older than its cache, views with proposals, and every read after a failure.
     pub fn asked(&self) -> u64 {
         self.asked.get()
+    }
+
+    /// Keeps the entries after `index` in the handle whatever the log's `group_cache`, until a
+    /// later call raises it; those at or before it are kept by that budget alone, as before the
+    /// first call. A replica marks what it has applied: the entries it has yet to apply, whose
+    /// writes it may already have had answered, it reads back from here, never through the log's
+    /// owner, however small the group's share of the log's cache (hyper-raft `docs/durable.md`
+    /// §8). What is kept past the budget is the caller's to bound ([`GroupLog::kept_bytes`]).
+    /// `index` only rises: a lower one changes nothing.
+    pub fn keep_after(&mut self, index: u64) {
+        let budget = self.p.config.group_cache;
+        self.mirror.keep_after(index, budget);
+    }
+
+    /// The bytes of the entries the handle keeps past [`GroupLog::keep_after`]'s mark: zero
+    /// before the first mark.
+    pub fn kept_bytes(&self) -> u64 {
+        self.mirror.kept
     }
 
     /// The group.
