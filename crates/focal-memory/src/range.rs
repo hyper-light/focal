@@ -653,14 +653,16 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
             .build_with(copy)
     }
 
-    fn prepare_planned_with<F>(
+    fn prepare_planned_with<F, R>(
         &self,
         funded: preflight::FundedPreparation<'_, K, V>,
         source: &MemoryBudget,
         copy: &mut F,
+        replaced: &mut R,
     ) -> Result<PreparedRange<K, V>, MemoryError>
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
+        R: FnMut(&K, &V) -> Result<(), MemoryError>,
     {
         let preflight::FundedPreparation { plan, input } = funded;
         let RangePreparationPlan {
@@ -709,16 +711,24 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
                 .flatten();
             let mut merge = |old: &[Entry<K, V>], count, rank, replace| {
                 let mut produced = 0;
-                self.merge_page_with(old, changes, count, (source, lane), copy, &mut |page| {
-                    let at = checked_add(rank, produced)?;
-                    if replace && produced == 0 {
-                        pages.replace_owned(at, page, &mut directory_build)?;
-                    } else {
-                        pages.insert_owned(at, page, &mut directory_build)?;
-                    }
-                    produced = checked_add(produced, 1)?;
-                    Ok(())
-                })?;
+                self.merge_page_with(
+                    old,
+                    changes,
+                    count,
+                    (source, lane),
+                    copy,
+                    replaced,
+                    &mut |page| {
+                        let at = checked_add(rank, produced)?;
+                        if replace && produced == 0 {
+                            pages.replace_owned(at, page, &mut directory_build)?;
+                        } else {
+                            pages.insert_owned(at, page, &mut directory_build)?;
+                        }
+                        produced = checked_add(produced, 1)?;
+                        Ok(())
+                    },
+                )?;
                 if replace && produced == 0 {
                     pages.remove_owned(rank, &mut directory_build)?;
                 }
@@ -936,17 +946,20 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
         Ok(())
     }
 
-    fn merge_page_with<F, E>(
+    #[allow(clippy::too_many_arguments)]
+    fn merge_page_with<F, R, E>(
         &self,
         old: &[Entry<K, V>],
         changes: &mut std::vec::IntoIter<Change<K, V>>,
         count: usize,
         funding: (&MemoryBudget, BudgetLane),
         copy: &mut F,
+        replaced: &mut R,
         emit_page: &mut E,
     ) -> Result<(), MemoryError>
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
+        R: FnMut(&K, &V) -> Result<(), MemoryError>,
         E: FnMut(Arc<Page<K, V>>) -> Result<(), MemoryError>,
     {
         let (source, lane) = funding;
@@ -961,6 +974,7 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
                     classify,
                 },
                 copy,
+                replaced,
                 emit_page,
             ),
             None => self.merge_partition_with(
@@ -973,22 +987,26 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
                     classify: |_: &K| (),
                 },
                 copy,
+                replaced,
                 emit_page,
             ),
         }
     }
 
-    fn merge_partition_with<F, E, P: Copy + Eq>(
+    #[allow(clippy::too_many_arguments)]
+    fn merge_partition_with<F, R, E, P: Copy + Eq>(
         &self,
         old: &[Entry<K, V>],
         changes: &mut std::vec::IntoIter<Change<K, V>>,
         count: usize,
         funding: PartitionFunding<'_, K, P>,
         copy: &mut F,
+        replaced: &mut R,
         emit_page: &mut E,
     ) -> Result<(), MemoryError>
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
+        R: FnMut(&K, &V) -> Result<(), MemoryError>,
         E: FnMut(Arc<Page<K, V>>) -> Result<(), MemoryError>,
     {
         let PartitionFunding {
@@ -1006,9 +1024,12 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
         let staging_bytes = merge_partition_charge::<K, V, P>(max_entries)?;
         let _staging = source.reserve(BudgetKind::Pending, lane, staging_bytes)?;
         let mut merged = bounded_vec(max_entries)?;
-        visit_merged(old, selected, |key, entry| {
-            bounded_push(&mut merged, (entry, classify(key)), max_entries)
-        })?;
+        visit_merged(
+            old,
+            selected,
+            |key, entry| bounded_push(&mut merged, (entry, classify(key)), max_entries),
+            replaced,
+        )?;
         // Planning only borrows old rows. The incoming descriptors carry a
         // charge, allowing each owned Put to move out of the input exactly once.
         let mut incoming = changes
@@ -1207,10 +1228,13 @@ fn bounded_push<T>(values: &mut Vec<T>, value: T, limit: usize) -> Result<(), Me
 
 // Both preflight and construction visit the same ordered retained/incoming
 // sequence. Preflight only adds counts and charges; it never copies a row.
+/// Visits a changed page's old entries merged with its changes, in key order; an old entry a change
+/// replaces or deletes is given to `replaced` instead, where it leaves the page.
 fn visit_merged<'a, K: crate::RangeKey, V>(
     old: &'a [Entry<K, V>],
     selected: &[Change<K, V>],
     mut visit: impl FnMut(&K, MergeEntry<'a, K, V>) -> Result<(), MemoryError>,
+    replaced: &mut impl FnMut(&K, &V) -> Result<(), MemoryError>,
 ) -> Result<(), MemoryError> {
     let mut existing = old.iter().peekable();
     for change in selected {
@@ -1224,8 +1248,9 @@ fn visit_merged<'a, K: crate::RangeKey, V>(
         if existing
             .peek()
             .is_some_and(|entry| &entry.key == change.key())
+            && let Some(entry) = existing.next()
         {
-            existing.next();
+            replaced(&entry.key, &entry.value)?;
         }
         if let Change::Put(entry) = change {
             visit(

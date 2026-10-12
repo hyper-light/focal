@@ -89,14 +89,16 @@ fn altered(
         .collect::<Vec<_>>();
     assert!(changes.len() <= core.limits.range.max_batch_entries);
     let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
     let range = core
         .state
         .rows
-        .prepare_batch_with(
+        .prepare_batch_replacing(
             original.outcome.sequence.0,
             changes,
             BudgetLane::Ordinary,
             prepare::copy,
+            |key, row| removed.count(key, row),
         )
         .unwrap();
     NativePrepared {
@@ -104,6 +106,7 @@ fn altered(
         outcome: original.outcome,
         writes: crate::native::mutation::WriteSet::unrecorded(),
         encoded_added,
+        encoded_removed: removed.bytes(),
     }
 }
 

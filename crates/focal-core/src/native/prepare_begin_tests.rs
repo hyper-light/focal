@@ -199,6 +199,7 @@ fn altered(
         )));
     }
     let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
     let range = core
         .state
         .rows
@@ -211,13 +212,16 @@ fn altered(
             usize::MAX,
         )
         .unwrap()
-        .build_in_with(&core.state.budget, copy_row)
+        .build_in_replacing(&core.state.budget, copy_row, |key, row| {
+            removed.count(key, row)
+        })
         .unwrap();
     NativePrepared {
         fragments: range,
         outcome,
         writes: crate::native::mutation::WriteSet::unrecorded(),
         encoded_added,
+        encoded_removed: removed.bytes(),
     }
 }
 

@@ -503,15 +503,17 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
     )
     .unwrap();
     let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
     let range = core
         .state
         .rows
-        .prepare_after_with(
+        .prepare_after_replacing(
             &receipt.fragments,
             sequence.0,
             changes,
             BudgetLane::Ordinary,
             prepare::copy,
+            |key, row| removed.count(key, row),
         )
         .unwrap();
     let sealed = NativePrepared {
@@ -519,6 +521,7 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         outcome,
         writes: mutation::WriteSet::unrecorded(),
         encoded_added,
+        encoded_removed: removed.bytes(),
     };
     assert_eq!(core.native_sequence(), original_sequence);
     for (id, members) in &original {

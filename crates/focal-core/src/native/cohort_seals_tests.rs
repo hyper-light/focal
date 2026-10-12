@@ -158,14 +158,16 @@ fn publish(core: &mut Core<NativeState>, changes: SealedChanges) -> NativeOutcom
     let outcome = changes.outcome;
     let encoded_added =
         crate::native::encoded_added(changes.changes.iter(), core.state.ledger).unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
     let range = core
         .state
         .rows
-        .prepare_batch_with(
+        .prepare_batch_replacing(
             outcome.sequence.0,
             changes.changes,
             BudgetLane::Ordinary,
             prepare::copy,
+            |key, row| removed.count(key, row),
         )
         .unwrap();
     core.publish_native(NativePrepared {
@@ -173,6 +175,7 @@ fn publish(core: &mut Core<NativeState>, changes: SealedChanges) -> NativeOutcom
         outcome,
         writes: mutation::WriteSet::unrecorded(),
         encoded_added,
+        encoded_removed: removed.bytes(),
     })
     .unwrap()
 }

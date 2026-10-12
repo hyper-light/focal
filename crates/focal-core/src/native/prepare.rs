@@ -1664,7 +1664,14 @@ impl<'a> Fresh<'a> {
                 .commit(),
         )?;
         let encoded_added = super::encoded_added(range_plan.changes(), view.state.ledger)?;
-        let fragments = range_plan.build_in_with(source, copy)?;
+        // What the rows this mutation replaces or deletes took in a checkpoint, summed as the
+        // build takes each out of its page: published, the mutation takes them away without
+        // looking each up again from the range's root (publication's lookups were a quarter of
+        // the leader's owner's range lookups on 1-CPU CI nodes, profile run 38287539180).
+        let mut removed = super::EncodedRemoved::new(view.state.ledger);
+        let fragments =
+            range_plan.build_in_replacing(source, copy, |key, row| removed.count(key, row))?;
+        let encoded_removed = removed.bytes();
         writes.check(&fragments)?;
         BuiltNative::new(
             NativePrepared {
@@ -1672,6 +1679,7 @@ impl<'a> Fresh<'a> {
                 outcome,
                 writes,
                 encoded_added,
+                encoded_removed,
             },
             seals,
             allocation,

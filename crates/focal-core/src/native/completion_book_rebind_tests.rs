@@ -236,6 +236,7 @@ fn with_seals(
         }
     }
     let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
     let range = match tail {
         Some(tail) => core.state.rows.plan_after(
             &core.state.budget,
@@ -254,7 +255,9 @@ fn with_seals(
         ),
     }
     .unwrap()
-    .build_in_with(&core.state.budget, copy_row)
+    .build_in_replacing(&core.state.budget, copy_row, |key, row| {
+        removed.count(key, row)
+    })
     .unwrap();
     // Events above retain their original member order. This fixture has distinct
     // Admission definitions, so the complete before binding orders its tokens.
@@ -282,6 +285,7 @@ fn with_seals(
             outcome,
             writes: crate::native::mutation::WriteSet::unrecorded(),
             encoded_added,
+            encoded_removed: removed.bytes(),
         },
         ReportAdvance { key, before, usage },
         seals,

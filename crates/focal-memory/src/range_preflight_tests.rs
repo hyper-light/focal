@@ -547,3 +547,124 @@ fn a_batch_past_a_writes_bound_is_planned_under_its_callers_bound() {
     assert_eq!(range.prefix(), 2);
     assert_eq!(range.entries().count(), 112);
 }
+
+/// A build gives its caller every entry of its base that a change replaces or deletes, once each,
+/// in key order and as the base held it, and nothing else. Over seeded batches of new, replacing
+/// and deleting changes, on pages of four entries and on pages a
+/// single oversized entry fills alone, each batch is built on the published range or on an
+/// unpublished predecessor.
+#[test]
+fn a_build_gives_back_each_entry_its_changes_replace() {
+    use std::collections::{BTreeMap, BTreeSet};
+    fn versioned(key: u64, label: u64, bytes: usize) -> Entry<u64, Row> {
+        let value = Row {
+            label,
+            bytes: vec![3; bytes],
+        };
+        let heap = value.bytes.capacity() + ALLOCATOR_OVERHEAD;
+        Entry::new(key, value, heap)
+    }
+    let budget = MemoryBudget::new(256_000_000, 0).unwrap();
+    let config = RangeConfig {
+        page_entries: 4,
+        page_bytes: 4096,
+        max_batch_entries: 64,
+        ..RangeConfig::default()
+    };
+    let mut range = RangeStore::new(RangeId(17), 0, config, budget.clone()).unwrap();
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut model = BTreeMap::<u64, u64>::new();
+    let mut label = 0u64;
+    let mut batch = |next: &mut dyn FnMut() -> u64, model: &BTreeMap<u64, u64>| {
+        let mut keys = BTreeSet::new();
+        for _ in 0..1 + next() % 12 {
+            keys.insert(next() % 96);
+        }
+        let mut changes = Vec::new();
+        let mut after = model.clone();
+        let mut expected = Vec::new();
+        for key in keys {
+            if let Some(&held) = model.get(&key) {
+                expected.push((key, held));
+            }
+            // A delete names a key the base holds; one it does not is refused.
+            if model.contains_key(&key) && next().is_multiple_of(3) {
+                changes.push(Change::Delete(key));
+                after.remove(&key);
+            } else {
+                label += 1;
+                let bytes = if next().is_multiple_of(16) {
+                    5_000
+                } else {
+                    8 + (next() % 64) as usize
+                };
+                changes.push(Change::Put(versioned(key, label, bytes)));
+                after.insert(key, label);
+            }
+        }
+        (changes, expected, after)
+    };
+    let mut builds = 0;
+    let mut replacing = 0;
+    for _ in 0..400 {
+        let prefix = range.prefix();
+        let (changes, expected, after) = batch(&mut next, &model);
+        let mut given = Vec::new();
+        let first = range
+            .plan_batch(prefix + 1, changes, BudgetLane::Ordinary, usize::MAX)
+            .unwrap()
+            .build_in_replacing(&budget, copy, |key, row| {
+                given.push((*key, row.label));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(given, expected);
+        builds += 1;
+        replacing += usize::from(!expected.is_empty());
+        model = after;
+        if next().is_multiple_of(2) {
+            let (changes, expected, after) = batch(&mut next, &model);
+            let mut given = Vec::new();
+            let second = range
+                .plan_after(
+                    &first,
+                    prefix + 2,
+                    changes,
+                    BudgetLane::Ordinary,
+                    usize::MAX,
+                )
+                .unwrap()
+                .build_in_replacing(&budget, copy, |key, row| {
+                    given.push((*key, row.label));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(given, expected);
+            builds += 1;
+            replacing += usize::from(!expected.is_empty());
+            model = after;
+            range.publish(first).unwrap();
+            range.publish(second).unwrap();
+        } else {
+            range.publish(first).unwrap();
+        }
+        let held = range
+            .entries()
+            .map(|entry| (entry.key, entry.value.label))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            held,
+            model.iter().map(|(&k, &v)| (k, v)).collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        builds > 500 && replacing > 400,
+        "{builds} builds, {replacing} replacing"
+    );
+}

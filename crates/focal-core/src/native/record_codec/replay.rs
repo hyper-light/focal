@@ -638,25 +638,31 @@ pub(super) fn install(
     // retains that charge through every refusal and through destination-page
     // construction; the incoming vector/payloads are not admitted a second time.
     let input = allocation.split_off(input_bytes)?;
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
     let fragments = plan
-        .build_in_funded_with(&core.state.budget, input, |row| {
-            let work = match read_dispatch::objects::copy_work(row) {
-                Ok(work) => work,
-                Err(error) => {
-                    failure.set(Some(error));
+        .build_in_funded_replacing(
+            &core.state.budget,
+            input,
+            |row| {
+                let work = match read_dispatch::objects::copy_work(row) {
+                    Ok(work) => work,
+                    Err(error) => {
+                        failure.set(Some(error));
+                        return Err(MemoryError::InvalidConfiguration(
+                            "native replay copy work exhausted",
+                        ));
+                    }
+                };
+                if let Err(error) = meters.model.charge(work) {
+                    failure.set(Some(read_evidence::codec(error)));
                     return Err(MemoryError::InvalidConfiguration(
                         "native replay copy work exhausted",
                     ));
                 }
-            };
-            if let Err(error) = meters.model.charge(work) {
-                failure.set(Some(read_evidence::codec(error)));
-                return Err(MemoryError::InvalidConfiguration(
-                    "native replay copy work exhausted",
-                ));
-            }
-            prepare::copy(row)
-        })
+                prepare::copy(row)
+            },
+            |key, row| removed.count(key, row),
+        )
         .map_err(|error| failure.take().unwrap_or_else(|| error.into()))?;
     writes.check(&fragments)?;
     Ok(NativePrepared {
@@ -664,5 +670,6 @@ pub(super) fn install(
         outcome: header.outcome,
         writes,
         encoded_added,
+        encoded_removed: removed.bytes(),
     })
 }

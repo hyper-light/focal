@@ -805,3 +805,48 @@ fn a_checkpoint_projection_bounds_the_checkpoint_it_projects() {
     let after = owner.checkpoint_projection().unwrap();
     assert_eq!((after.rows, after.bytes), (actual.rows, actual.bytes));
 }
+
+/// A publication takes away what the committed rows it replaces or deletes took in a checkpoint,
+/// counted as its build took them out of their pages rather than looked up again: through
+/// creations, posts, a begun admission and cancellations, each prepared on the rows the one before
+/// it leaves, the running total is at every publication what a lookup of each written key gives,
+/// and what the committed rows encode to.
+#[test]
+fn a_publication_takes_away_what_its_build_replaced() {
+    let mut owner = NativeOwner::new(core()).unwrap();
+    let required = [(ValidationMode::Required, false)];
+    let claims = 12u128;
+    let mut staged = Vec::new();
+    for id in 1..=claims {
+        let time = u64::try_from(id).unwrap();
+        staged.push(stage(&mut owner, time, creation(id, id, &required, None)).0);
+    }
+    for id in 1..=claims {
+        let time = u64::try_from(100 + id).unwrap();
+        staged.push(stage(&mut owner, time, post(100 + id, binding(id))).0);
+    }
+    let claim = owner.effective().claim(key(1).claim).unwrap().binding();
+    let evaluation = owner.effective().evaluation(key(1)).unwrap().binding();
+    staged.push(stage(&mut owner, 200, begin(200, claim, 1, evaluation)).0);
+    for id in (2..=claims).step_by(2) {
+        let expected = owner
+            .effective()
+            .claim(ClaimId::from_u128(id))
+            .unwrap()
+            .binding();
+        let time = u64::try_from(300 + id).unwrap();
+        staged.push(stage(&mut owner, time, cancel(300 + id, expected)).0);
+    }
+    for candidate in staged {
+        let head = &owner.pending.front().unwrap().prepared;
+        let looked_up = owner.core.encoded_after_by_lookup(head).unwrap();
+        owner.publish_after_durable(candidate).unwrap();
+        let state = &owner.core.state;
+        assert_eq!(state.encoded_rows, looked_up);
+        assert_eq!(
+            state.encoded_rows,
+            crate::native::encoded_rows_of(&state.rows, state.ledger).unwrap()
+        );
+    }
+    assert_eq!(owner.pending_len(), 0);
+}

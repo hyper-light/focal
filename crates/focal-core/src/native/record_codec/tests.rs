@@ -418,13 +418,18 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
     )
     .unwrap();
     let encoded_added = crate::native::encoded_added(plan.changes(), core.state.ledger).unwrap();
+    let mut taken = crate::native::EncodedRemoved::new(core.state.ledger);
+    let fragments = plan
+        .build_in_replacing(&core.state.budget, prepare::copy, |key, row| {
+            taken.count(key, row)
+        })
+        .unwrap();
     let prepared = NativePrepared {
-        fragments: plan
-            .build_in_with(&core.state.budget, prepare::copy)
-            .unwrap(),
+        fragments,
         outcome,
         writes,
         encoded_added,
+        encoded_removed: taken.bytes(),
     };
     let bytes = encode(&prepared);
     let record = StructuralRecord::inspect(&bytes, inspection(bytes.len())).unwrap();

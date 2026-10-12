@@ -1450,6 +1450,10 @@ pub struct NativePrepared {
     /// What the rows this mutation puts take in a checkpoint: its whole addition, before what
     /// it replaces or deletes is taken away at publication.
     encoded_added: usize,
+    /// What the committed rows this mutation replaces or deletes take in a checkpoint, as its
+    /// build took them out of their pages: what its publication takes away. Built on the root
+    /// its predecessors leave, which is the root it publishes onto.
+    encoded_removed: usize,
 }
 impl std::fmt::Debug for NativePrepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1966,15 +1970,26 @@ impl Core<NativeState> {
         // What the rows take in a checkpoint after this mutation: what it puts, less what it
         // replaces or deletes as the committed root holds it now, every predecessor published.
         // Computed before anything is published, so a refusal leaves the root as it was.
-        let encoded = match self.encoded_after(&prepared) {
-            Ok(encoded) => encoded,
-            Err(error) => return Err(NativePublishError { error, prepared }),
+        let encoded = match self
+            .state
+            .encoded_rows
+            .checked_sub(prepared.encoded_removed)
+            .and_then(|rest| rest.checked_add(prepared.encoded_added))
+        {
+            Some(encoded) => encoded,
+            None => {
+                return Err(NativePublishError {
+                    error: MemoryError::CounterExhausted("checkpoint bytes"),
+                    prepared,
+                });
+            }
         };
         let NativePrepared {
             fragments,
             outcome,
             writes,
             encoded_added,
+            encoded_removed,
         } = prepared;
         self.state
             .rows
@@ -1986,13 +2001,19 @@ impl Core<NativeState> {
                     outcome,
                     writes,
                     encoded_added,
+                    encoded_removed,
                 },
             })?;
         self.state.encoded_rows = encoded;
         Ok(outcome)
     }
-    /// What the rows take in a checkpoint once `prepared` publishes.
-    fn encoded_after(&self, prepared: &NativePrepared) -> Result<usize, MemoryError> {
+    /// What the rows take in a checkpoint once `prepared` publishes, each replaced or deleted row
+    /// looked up in the committed root: what the preparation's own count must equal.
+    #[cfg(test)]
+    pub(crate) fn encoded_after_by_lookup(
+        &self,
+        prepared: &NativePrepared,
+    ) -> Result<usize, MemoryError> {
         let unencodable = |_| MemoryError::InvalidConfiguration("a committed row does not encode");
         let mut removed = 0usize;
         for (key, _) in prepared.writes.entries() {
@@ -2350,6 +2371,33 @@ pub(in crate::native) fn encoded_rows_of(
         sum.checked_add(bytes)
             .ok_or(NativeError::Capacity("checkpoint bytes"))
     })
+}
+
+/// What the committed rows a build replaces or deletes take in a checkpoint, counted as the build
+/// takes each out of its page (`RangesPlan::build_in_replacing`): what publishing the build takes
+/// away from the running total, with no row looked up again.
+#[derive(Debug)]
+pub(in crate::native) struct EncodedRemoved {
+    ledger: LedgerId,
+    bytes: usize,
+}
+
+impl EncodedRemoved {
+    pub(in crate::native) fn new(ledger: LedgerId) -> Self {
+        Self { ledger, bytes: 0 }
+    }
+    pub(in crate::native) fn count(&mut self, key: &Key, row: &Row) -> Result<(), MemoryError> {
+        let bytes = record_codec::checkpoint::row_bytes(*key, row, self.ledger)
+            .map_err(|_| MemoryError::InvalidConfiguration("a committed row does not encode"))?;
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(MemoryError::CounterExhausted("checkpoint bytes"))?;
+        Ok(())
+    }
+    pub(in crate::native) fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 /// What the rows `changes` put take in a checkpoint: each put's row, as it will be written.

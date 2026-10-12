@@ -677,6 +677,23 @@ impl NativeRanges {
     where
         F: FnMut(&Row) -> Result<Row, MemoryError>,
     {
+        self.prepare_batch_replacing(prefix, changes, lane, copy, |_, _| Ok(()))
+    }
+    /// [`Self::prepare_batch_with`], giving `replaced` every committed row a change replaces or
+    /// deletes ([`RangesPlan::build_in_replacing`]).
+    #[cfg(test)]
+    pub(super) fn prepare_batch_replacing<F, R>(
+        &self,
+        prefix: u64,
+        changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        copy: F,
+        replaced: R,
+    ) -> Result<Fragments, MemoryError>
+    where
+        F: FnMut(&Row) -> Result<Row, MemoryError>,
+        R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
+    {
         let budget = self
             .stores
             .first()
@@ -684,20 +701,23 @@ impl NativeRanges {
             .budget()
             .clone();
         self.plan_batch(&budget, prefix, changes, lane, usize::MAX)?
-            .build_in_with(&budget, copy)
+            .build_in_replacing(&budget, copy, replaced)
     }
-    /// Prepare one write against an unpublished predecessor's fragments.
+    /// Prepare one write against an unpublished predecessor's fragments, giving `replaced` every
+    /// row of the predecessor's a change replaces or deletes ([`RangesPlan::build_in_replacing`]).
     #[cfg(test)]
-    pub(super) fn prepare_after_with<F>(
+    pub(super) fn prepare_after_replacing<F, R>(
         &self,
         predecessor: &Fragments,
         prefix: u64,
         changes: Vec<Change<Key, Row>>,
         lane: BudgetLane,
         copy: F,
+        replaced: R,
     ) -> Result<Fragments, MemoryError>
     where
         F: FnMut(&Row) -> Result<Row, MemoryError>,
+        R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
     {
         let budget = self
             .stores
@@ -706,7 +726,7 @@ impl NativeRanges {
             .budget()
             .clone();
         self.plan_after(&budget, predecessor, prefix, changes, lane, usize::MAX)?
-            .build_in_with(&budget, copy)
+            .build_in_replacing(&budget, copy, replaced)
     }
     #[cfg(test)]
     pub(super) fn get_entry(&self, key: &Key) -> Option<&Entry<Key, Row>> {
@@ -1229,20 +1249,41 @@ impl<'a> RangesPlan<'a> {
     {
         self.build_each(source, |plan| plan.build_in_with(source, &mut copy))
     }
+    /// [`Self::build_in_with`], giving `replaced` every committed row a change replaces or
+    /// deletes as the build takes it out of its page
+    /// (`RangePreparationPlan::build_in_replacing`).
+    pub(super) fn build_in_replacing<F, R>(
+        self,
+        source: &MemoryBudget,
+        mut copy: F,
+        mut replaced: R,
+    ) -> Result<Fragments, MemoryError>
+    where
+        F: FnMut(&Row) -> Result<Row, MemoryError>,
+        R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
+    {
+        self.build_each(source, |plan| {
+            plan.build_in_replacing(source, &mut copy, &mut replaced)
+        })
+    }
     /// Build every fragment with the input already funded by `input`, which
-    /// is divided among the members by each plan's input bytes.
-    pub(super) fn build_in_funded_with<F>(
+    /// is divided among the members by each plan's input bytes, giving
+    /// `replaced` every committed row a change replaces or deletes
+    /// ([`Self::build_in_replacing`]).
+    pub(super) fn build_in_funded_replacing<F, R>(
         self,
         source: &MemoryBudget,
         mut input: Allocation,
         mut copy: F,
+        mut replaced: R,
     ) -> Result<Fragments, MemoryError>
     where
         F: FnMut(&Row) -> Result<Row, MemoryError>,
+        R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
     {
         self.build_each(source, |plan| {
             let part = input.split_off(plan.charges().input_pending_bytes())?;
-            plan.build_in_funded_with(source, part, &mut copy)
+            plan.build_in_funded_replacing(source, part, &mut copy, &mut replaced)
         })
     }
     fn build_each(

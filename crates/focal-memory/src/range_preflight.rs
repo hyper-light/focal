@@ -117,6 +117,21 @@ impl<K: crate::RangeKey + Clone, V> RangePreparationPlan<'_, K, V> {
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
     {
+        self.build_in_replacing(source, copy, |_, _| Ok(()))
+    }
+
+    /// [`Self::build_in_with`], giving `replaced` every committed entry a change replaces or
+    /// deletes ([`Self::build_in_funded_replacing`]).
+    pub fn build_in_replacing<F, R>(
+        self,
+        source: &MemoryBudget,
+        copy: F,
+        replaced: R,
+    ) -> Result<PreparedRange<K, V>, MemoryError>
+    where
+        F: FnMut(&V) -> Result<V, MemoryError>,
+        R: FnMut(&K, &V) -> Result<(), MemoryError>,
+    {
         if !source.is_within(&self.store.budget) {
             return Err(MemoryError::InvalidConfiguration(
                 "range funding source is outside its owner budget",
@@ -129,7 +144,7 @@ impl<K: crate::RangeKey + Clone, V> RangePreparationPlan<'_, K, V> {
                 self.charges.input_pending_bytes(),
             )?
             .commit();
-        self.build_in_funded_with(source, input, copy)
+        self.build_in_funded_replacing(source, input, copy, replaced)
     }
 
     /// Transfer the already held incoming write-set permit into this build.
@@ -146,10 +161,28 @@ impl<K: crate::RangeKey + Clone, V> RangePreparationPlan<'_, K, V> {
         self,
         source: &MemoryBudget,
         input: Allocation,
-        mut copy: F,
+        copy: F,
     ) -> Result<PreparedRange<K, V>, MemoryError>
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
+    {
+        self.build_in_funded_replacing(source, input, copy, |_, _| Ok(()))
+    }
+
+    /// [`Self::build_in_funded_with`], giving `replaced` every committed entry a change replaces
+    /// or deletes as the build takes it out of its page: what the build leaves behind, in hand
+    /// where it is, so its caller need not look it up again (each such lookup walks the range
+    /// from its root).
+    pub fn build_in_funded_replacing<F, R>(
+        self,
+        source: &MemoryBudget,
+        input: Allocation,
+        mut copy: F,
+        mut replaced: R,
+    ) -> Result<PreparedRange<K, V>, MemoryError>
+    where
+        F: FnMut(&V) -> Result<V, MemoryError>,
+        R: FnMut(&K, &V) -> Result<(), MemoryError>,
     {
         let funded = FundedPreparation { plan: self, input };
         if !source.is_within(&funded.plan.store.budget) {
@@ -168,7 +201,7 @@ impl<K: crate::RangeKey + Clone, V> RangePreparationPlan<'_, K, V> {
             ));
         }
         let store = funded.plan.store;
-        store.prepare_planned_with(funded, source, &mut copy)
+        store.prepare_planned_with(funded, source, &mut copy, &mut replaced)
     }
 
     pub fn build_in(self, source: &MemoryBudget) -> Result<PreparedRange<K, V>, MemoryError>
@@ -423,13 +456,18 @@ impl Counts {
             Ok(())
         };
         let mut previous = None;
-        visit_merged(old, selected, |key, entry| {
-            let label = classify.map_or(0, |classify| classify(key));
-            let boundary = previous.is_some_and(|previous| previous != label);
-            partition.push(entry.heap_bytes(), boundary, &mut emit)?;
-            previous = Some(label);
-            Ok(())
-        })?;
+        visit_merged(
+            old,
+            selected,
+            |key, entry| {
+                let label = classify.map_or(0, |classify| classify(key));
+                let boundary = previous.is_some_and(|previous| previous != label);
+                partition.push(entry.heap_bytes(), boundary, &mut emit)?;
+                previous = Some(label);
+                Ok(())
+            },
+            &mut |_, _| Ok(()),
+        )?;
         partition.finish(&mut emit)?;
         self.merge_pending_bytes = self.merge_pending_bytes.max(merge_layout_charge::<K, V>(
             checked_add(old.len(), selected.len())?,
