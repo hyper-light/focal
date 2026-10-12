@@ -1942,10 +1942,12 @@ impl Core<NativeState> {
     pub fn native_stats(&self) -> RangeStats {
         self.state.rows.stats()
     }
+    /// Audits a chain of candidates a caller holds, every link: each built on the one before it,
+    /// the first on the published prefix. An owner's own preparations check only its chain's head
+    /// (`check_native_chain`): it builds each candidate on its tail, so the head's link is the one
+    /// a publication can have moved, and a walk of every link on every preparation cost each the
+    /// chain's length.
     pub fn validate_native_chain(&self, pending: &[&NativePrepared]) -> Result<(), NativeError> {
-        if pending.len() > self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
-        }
         self.state
             .rows
             .validate_chain(pending.iter().map(|item| &item.fragments))?;

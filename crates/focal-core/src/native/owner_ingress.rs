@@ -35,21 +35,18 @@ fn check_frame_header(
 impl NativeOwner {
     /// Refuses, from its header alone, a request its frame's decoding would
     /// end in refusing: a fresh request (its key has no outcome, committed or
-    /// pending) while as many candidates are pending as this owner holds. The
+    /// pending) while the owner's memory funds no more pending candidates. The
     /// owner refused it only after planning its frame (every validation body
     /// in it inspected), so at its bound each refusal cost a decode. A header
     /// that does not read, that names another ledger, profile or actor, a
     /// faulted owner and a retry of a request with an outcome are decoded as
     /// before, which says why they are refused or answers them.
     fn refuse_when_full(
-        &self,
+        &mut self,
         context: NativeContext,
         bytes: &[u8],
     ) -> Result<(), NativeOwnerError> {
-        if self.faulted
-            || (self.pending.len() < self.core.limits.pending
-                && self.pending.len() < self.pending.capacity())
-        {
+        if self.faulted || self.reserve_pending().is_ok() {
             return Ok(());
         }
         let Ok(header) = StructuralInput::peek_header(bytes) else {
@@ -226,6 +223,8 @@ impl NativeOwner {
             .request
             .ok_or(ContractError::WrongActor)
             .map_err(NativeError::from)?;
+        // Room for the candidate, made before its chain is borrowed (`prepare_using`).
+        let room = self.reserve_pending().is_ok();
         let checked = self.core.check_request_identity_chain(
             context,
             request,
@@ -259,7 +258,7 @@ impl NativeOwner {
         self.next_serial
             .checked_add(1)
             .ok_or(MemoryError::CounterExhausted("native candidate serial"))?;
-        if self.pending.len() == self.pending.capacity() {
+        if !room {
             return Err(NativeError::Capacity("pending candidates").into());
         }
         input.check_build(self.core.limits.preparation_bytes, max_build_visits)?;

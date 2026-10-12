@@ -444,6 +444,14 @@ pub struct NativeOwner {
     _queue_allocation: Allocation,
     incarnation: OwnerId,
     next_serial: u64,
+    /// What the pending candidates add to a checkpoint, kept as the chain changes: their writes
+    /// and their encoded bytes ([`NativeOwner::checkpoint_projection`]). Summed over the chain at
+    /// each admission, it was a walk of the whole pipeline for every write, quadratic in its depth
+    /// once the depth was the memory's to bound ([`NativeOwner::reserve_pending`]). Bounded by
+    /// what the pending candidates are charged, so a sum never nears `usize::MAX`; it saturates
+    /// rather than wrap, which could only overstate it and refuse admission.
+    pending_rows: usize,
+    pending_bytes: usize,
 }
 impl std::fmt::Debug for NativeOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -568,6 +576,8 @@ impl NativeOwner {
                 _queue_allocation: allocation,
                 incarnation,
                 next_serial: 0,
+                pending_rows: 0,
+                pending_bytes: 0,
             }),
             Err(error) => Err(NativeOwnerInitError {
                 error: error.into(),
@@ -596,6 +606,75 @@ impl NativeOwner {
 
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Room for one more pending candidate: a full queue doubles its capacity, the growth charged
+    /// to the core's budget before it is allocated. The candidates a leader holds in flight are as
+    /// many as its memory funds, never a count picked for them: a queue fixed at
+    /// `NativeLimits::pending` held a session on hyper-durable's shell at 355 writes a second
+    /// against a 55 ms commit, every write past the 32nd in flight refused (Little's law,
+    /// 2026-10-12). That limit remains the committed headroom a seal's outcome is checked
+    /// against, which every replica replays alike; the depth of one leader's pipeline is its own.
+    pub(super) fn reserve_pending(&mut self) -> Result<(), NativeError> {
+        if self.pending.len() < self.pending.capacity() {
+            return Ok(());
+        }
+        let wanted = self
+            .pending
+            .capacity()
+            .max(1)
+            .checked_mul(2)
+            .ok_or(MemoryError::CounterExhausted("native candidate queue"))?;
+        let bytes = prepare::array::<Pending>(wanted)?;
+        let reservation =
+            self.core
+                .state
+                .budget
+                .reserve(BudgetKind::Pending, BudgetLane::Ordinary, bytes)?;
+        self.pending
+            .try_reserve_exact(wanted.saturating_sub(self.pending.len()))
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        // Allocator rounding cannot silently widen the charge.
+        prepare::within(prepare::array::<Pending>(self.pending.capacity())?, bytes)?;
+        self._queue_allocation = reservation.commit();
+        Ok(())
+    }
+
+    /// Gives back what a burst grew the chain to once it has drained to a quarter of it: the chain
+    /// moves into a buffer half as large, never below the committed headroom it began at, and its
+    /// charge shrinks to match. Kept grown, every session that once ran deep would hold that
+    /// memory from its rows for good. A buffer the allocator cannot give leaves the chain as it
+    /// is, and a charge that cannot shrink stays as it was, more than the chain holds: neither
+    /// is a failure of the publication that drained the chain.
+    fn shrink_pending(&mut self) {
+        let capacity = self.pending.capacity();
+        let floor = self.core.limits.pending;
+        if capacity <= floor || self.pending.len() > capacity / 4 {
+            return;
+        }
+        let wanted = (capacity / 2).max(floor);
+        let mut smaller = VecDeque::new();
+        if smaller.try_reserve_exact(wanted).is_err() {
+            return;
+        }
+        // Within the reserved capacity: no reallocation.
+        smaller.extend(self.pending.drain(..));
+        self.pending = smaller;
+        if let Ok(bytes) = prepare::array::<Pending>(self.pending.capacity()) {
+            let _ = self._queue_allocation.shrink_to(bytes);
+        }
+    }
+
+    /// Adds `prepared` to what the pending candidates add to a checkpoint.
+    fn count_pending(&mut self, prepared: &NativePrepared) {
+        self.pending_rows = self.pending_rows.saturating_add(prepared.mutation_count());
+        self.pending_bytes = self.pending_bytes.saturating_add(prepared.encoded_added);
+    }
+
+    /// Takes `prepared` from what the pending candidates add to a checkpoint.
+    fn uncount_pending(&mut self, prepared: &NativePrepared) {
+        self.pending_rows = self.pending_rows.saturating_sub(prepared.mutation_count());
+        self.pending_bytes = self.pending_bytes.saturating_sub(prepared.encoded_added);
     }
 
     pub fn oldest(&self) -> Option<NativeCandidate> {
@@ -706,6 +785,9 @@ impl NativeOwner {
         custody: Option<(&mut ContentStore, ContentDomainId)>,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
+        // Room for the candidate, made before its chain is borrowed: a retry is answered whatever
+        // the memory says, a fresh request is refused only where no room could be funded.
+        let room = self.reserve_pending().is_ok();
         let pending = self.pending.iter().map(|row| &row.prepared);
         let preparation = match input {
             OwnerInput::Request(context, input) => {
@@ -751,9 +833,7 @@ impl NativeOwner {
                     .next_serial
                     .checked_add(1)
                     .ok_or(MemoryError::CounterExhausted("native candidate serial"))?;
-                if self.pending.len() >= self.core.limits.pending
-                    || self.pending.len() == self.pending.capacity()
-                {
+                if !room {
                     return Err(NativeError::Capacity("pending candidates").into());
                 }
                 let lane = fresh.lane();
@@ -819,6 +899,7 @@ impl NativeOwner {
                     serial,
                 };
                 let outcome = prepared.outcome();
+                self.count_pending(&prepared);
                 self.pending.push_back(Pending {
                     candidate,
                     record,
@@ -848,9 +929,11 @@ impl NativeOwner {
             .pending
             .pop_front()
             .ok_or(NativeOwnerError::UnknownCandidate)?;
+        self.uncount_pending(&head.prepared);
         match self.core.publish_native(head.prepared) {
             Ok(outcome) => {
                 drop(head.record);
+                self.shrink_pending();
                 if let Err(error) = self.book.commit_candidate(head.journal) {
                     self.faulted = true;
                     return Err(error.into());
@@ -866,6 +949,7 @@ impl NativeOwner {
             Err(refused) => {
                 // pop_front retained this exact slot: restoration cannot grow
                 // the buffer, allocate, change the ticket, or reorder the chain.
+                self.count_pending(&refused.prepared);
                 self.pending.push_front(Pending {
                     candidate: head.candidate,
                     record: head.record,
@@ -890,6 +974,7 @@ impl NativeOwner {
             .ok_or(NativeOwnerError::UnknownCandidate)?;
         while self.pending.len() > position {
             if let Some(row) = self.pending.pop_back() {
+                self.uncount_pending(&row.prepared);
                 drop(row.record);
                 drop(row.prepared);
                 if let Err(error) = self.book.rollback_candidate(row.journal) {
@@ -912,6 +997,7 @@ impl NativeOwner {
     pub fn discard_all(&mut self) -> usize {
         let count = self.pending.len();
         while let Some(row) = self.pending.pop_back() {
+            self.uncount_pending(&row.prepared);
             drop(row.record);
             drop(row.prepared);
             if self.book.rollback_candidate(row.journal).is_err() {
@@ -928,9 +1014,17 @@ impl NativeOwner {
         if candidate.owner != self.incarnation {
             return Err(NativeOwnerError::WrongOwner);
         }
+        // The chain is in serial order: each candidate takes the next serial at its back, the head
+        // leaves at its front, and a discard takes a suffix. So a candidate is found by halving,
+        // not by a walk, which for the candidate just prepared at the back was the whole chain.
         self.pending
-            .iter()
-            .position(|row| row.candidate == candidate)
+            .binary_search_by_key(&candidate.serial, |row| row.candidate.serial)
+            .ok()
+            .filter(|&at| {
+                self.pending
+                    .get(at)
+                    .is_some_and(|row| row.candidate == candidate)
+            })
             .ok_or(NativeOwnerError::UnknownCandidate)
     }
 
@@ -959,11 +1053,11 @@ impl NativeOwner {
         let capacity =
             |_: ()| NativeOwnerError::Native(NativeError::Capacity("checkpoint projection"));
         let rows = self
-            .pending
-            .iter()
-            .try_fold(self.core.state.rows.len(), |rows, pending| {
-                rows.checked_add(pending.prepared.mutation_count())
-            })
+            .core
+            .state
+            .rows
+            .len()
+            .checked_add(self.pending_rows)
             .ok_or_else(|| capacity(()))?;
         // What the committed root encodes to, exactly (its frame and the rows' running total,
         // `Core::checkpoint_bytes`), and every row a pending candidate puts, whole: what a
@@ -973,11 +1067,9 @@ impl NativeOwner {
         // checkpoint of authored claims encodes to, and admission refused at a twentieth of
         // what a checkpoint holds.
         let bytes = self
-            .pending
-            .iter()
-            .try_fold(self.core.checkpoint_bytes()?, |bytes, pending| {
-                bytes.checked_add(pending.prepared.encoded_added)
-            })
+            .core
+            .checkpoint_bytes()?
+            .checked_add(self.pending_bytes)
             .ok_or_else(|| capacity(()))?;
         Ok(CheckpointProjection { rows, bytes })
     }

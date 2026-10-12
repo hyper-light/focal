@@ -308,6 +308,30 @@ impl<S: Sink> Sink for RowSize<'_, S> {
 
 /// The record's bytes before its digest, each changed row's through `row`
 /// (which writes its length and then its body, or counts them).
+/// Each row a record carries: its key's family, and the bytes its key and its value take there —
+/// what a record's bytes are made of, for a measurement.
+#[cfg(test)]
+pub(in crate::native) fn row_bytes(
+    prepared: &NativePrepared,
+) -> Result<Vec<(u16, usize, usize)>, CodecError> {
+    let ledger = prepared.outcome.ledger;
+    let mut out = Vec::new();
+    for (key, deleted) in prepared.writes.entries() {
+        let mut keys = CountingSink::new(usize::MAX, usize::MAX);
+        fixed::key(&mut keys, key)?;
+        let value = match prepared.fragments.get(&key) {
+            Some(row) if !deleted => {
+                let mut values = CountingSink::new(usize::MAX, usize::MAX);
+                rows::value(&mut values, key, row, ledger)?;
+                values.len()
+            }
+            _ => 0,
+        };
+        out.push((super::layout::family(&key), keys.len(), value));
+    }
+    Ok(out)
+}
+
 fn frame<S: Sink>(
     sink: &mut S,
     prepared: &NativePrepared,

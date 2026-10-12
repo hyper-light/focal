@@ -448,11 +448,13 @@ fn raw_actor_header_is_checked_before_scanning_an_untrusted_body() {
     assert_eq!(owner.pending_len(), 0);
 }
 
-/// An owner holding as many candidates as it may refuses a fresh request from
-/// its frame's header alone, before reading the rest: a header with nothing
-/// after it is refused for the full queue where an owner with room reads on
-/// and refuses it as truncated. Its exact retry of a pending request is still
-/// answered, and a header naming another actor is still refused as such.
+/// An owner holding as many candidates as its memory funds refuses a fresh
+/// request from its frame's header alone, before reading the rest: a header
+/// with nothing after it is refused for the full queue where an owner with room
+/// reads on and refuses it as truncated. Its queue's places filled and the
+/// memory that would grow it taken, it is full. Its exact retry of a pending
+/// request is still answered, and a header naming another actor is still
+/// refused as such.
 #[test]
 fn a_full_owner_refuses_a_fresh_request_from_its_header() {
     let mut owner = NativeOwner::new(core()).unwrap();
@@ -484,6 +486,16 @@ fn a_full_owner_refuses_a_fresh_request_from_its_header() {
         }
     }
     assert_eq!(owner.pending_len(), full);
+    // The queue's places are filled; with the memory that would double them taken, nothing more
+    // is funded.
+    let budget = owner.core.state.budget.clone();
+    let pressure = budget
+        .reserve(
+            BudgetKind::Payload,
+            BudgetLane::Completion,
+            budget.limit() - budget.stats().used,
+        )
+        .unwrap();
     let fresh = encoded(
         &creation(900, 900, &[], None),
         NativeContentProfile::ProjectionOnly,
@@ -508,6 +520,7 @@ fn a_full_owner_refuses_a_fresh_request_from_its_header() {
             ContractError::WrongActor
         )))
     ));
+    drop(pressure);
     owner.publish_after_durable(candidate).unwrap();
     assert!(matches!(
         owner.prepare_frame(context(ISSUER, 10), header, limits, None),

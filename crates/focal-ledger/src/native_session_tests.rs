@@ -601,8 +601,11 @@ fn borrowed_frames_share_identity_with_typed_input_and_timer_namespaces_are_refu
     assert!(session.read_at_least(boundary).is_ok());
 }
 
+/// The pending queue grows as the session's memory funds it, from the headroom it began at: a
+/// queue at its one slot whose growth the memory cannot fund refuses the next fresh candidate,
+/// which holds no slot and no memory, and admits it once the memory returns and a slot frees.
 #[test]
-fn pending_queue_bound_refuses_the_next_fresh_candidate_until_a_slot_frees() {
+fn a_pending_queue_its_memory_cannot_grow_refuses_the_next_fresh_candidate_until_a_slot_frees() {
     let dir = tempfile::tempdir().unwrap();
     let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
     let mut bounded = limits();
@@ -614,6 +617,17 @@ fn pending_queue_bound_refuses_the_next_fresh_candidate_until_a_slot_frees() {
     else {
         panic!("fresh")
     };
+    // The session's memory, taken: the queue's one slot cannot grow.
+    let budget = session.budget_for_test();
+    let stats = budget.stats();
+    let pressure = budget
+        .reserve(
+            BudgetKind::Payload,
+            BudgetLane::Completion,
+            stats.limit - stats.used,
+        )
+        .unwrap()
+        .commit();
     let before = session.budget_for_test().stats();
     let refused = session.propose(context(), create(2, 2)).unwrap_err();
     assert_eq!(refused.class(), FailureClass::Retryable, "{refused:?}");
@@ -629,6 +643,7 @@ fn pending_queue_bound_refuses_the_next_fresh_candidate_until_a_slot_frees() {
         session.propose(context(), create(1, 1)).unwrap(),
         NativeSubmission::Pending { outcome, .. } if outcome == first
     ));
+    drop(pressure);
     let mut committed = false;
     for _ in 0..16 {
         let events = session.poll().unwrap();

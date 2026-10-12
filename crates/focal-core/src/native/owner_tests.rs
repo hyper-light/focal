@@ -61,6 +61,88 @@ fn pressured(budget: &MemoryBudget) -> focal_memory::Reservation {
         .unwrap()
 }
 
+/// The chain keeps what its candidates add to a checkpoint as it changes, never walking it:
+/// through preparations, a discard and publications its sums are what a walk gives. A candidate
+/// is found by halving the chain, after a discard's gap in the serials as before it. And a chain
+/// a burst grew past its headroom gives back its buffer, and the buffer's charge, as it drains.
+#[test]
+fn the_chain_keeps_its_projection_finds_by_serial_and_gives_back_a_bursts_memory() {
+    let core = core();
+    let floor = core.limits.pending;
+    let mut owner = NativeOwner::new(core).unwrap();
+    let walk = |owner: &NativeOwner| -> (usize, usize) {
+        let rows = owner
+            .pending
+            .iter()
+            .map(|row| row.prepared.mutation_count())
+            .sum::<usize>();
+        let bytes = owner
+            .pending
+            .iter()
+            .map(|row| row.prepared.encoded_added)
+            .sum::<usize>();
+        (rows, bytes)
+    };
+    let kept = |owner: &NativeOwner| (owner.pending_rows, owner.pending_bytes);
+    let required = [(ValidationMode::Required, false)];
+    // A burst of four times the headroom grows the chain past it.
+    let burst = floor * 4;
+    let mut staged = Vec::new();
+    for id in 1..=u128::try_from(burst).unwrap() {
+        let time = u64::try_from(id).unwrap();
+        staged.push(stage(&mut owner, time, creation(id, id, &required, None)).0);
+        assert_eq!(kept(&owner), walk(&owner));
+    }
+    let grown = owner.pending.capacity();
+    let charged = owner._queue_allocation.bytes();
+    assert!(grown >= burst && grown > floor);
+    for candidate in &staged {
+        assert!(owner.prepared_candidate(*candidate).is_ok());
+    }
+    // A discard of the last quarter leaves a gap in the serials; the next candidate takes the
+    // serial after the discarded ones, and both sides of the gap are found.
+    let cut = staged[burst * 3 / 4];
+    owner.discard_from(cut).unwrap();
+    assert_eq!(kept(&owner), walk(&owner));
+    assert!(
+        owner.prepared_candidate(cut).is_err(),
+        "a discarded candidate is not found"
+    );
+    let id = u128::try_from(burst).unwrap() + 1;
+    let (after_gap, _) = stage(
+        &mut owner,
+        u64::try_from(id).unwrap(),
+        creation(id, id, &required, None),
+    );
+    assert!(owner.prepared_candidate(after_gap).is_ok());
+    assert!(owner.prepared_candidate(staged[0]).is_ok());
+    assert_eq!(kept(&owner), walk(&owner));
+    // Published in order, the chain drains: its sums follow it to nothing, and below a quarter of
+    // what it grew to it moves into a buffer half as large, never below its headroom.
+    let remaining = staged[..burst * 3 / 4].iter().copied().chain([after_gap]);
+    for candidate in remaining {
+        owner.publish_after_durable(candidate).unwrap();
+        assert_eq!(kept(&owner), walk(&owner));
+    }
+    assert_eq!(kept(&owner), (0, 0));
+    assert!(
+        owner.pending.capacity() < grown,
+        "the drained chain gave back its buffer"
+    );
+    assert!(
+        owner.pending.capacity() >= floor,
+        "never below the headroom it began at"
+    );
+    assert!(
+        owner._queue_allocation.bytes() < charged,
+        "and the buffer's charge"
+    );
+    assert_eq!(
+        owner._queue_allocation.bytes(),
+        prepare::array::<Pending>(owner.pending.capacity()).unwrap()
+    );
+}
+
 #[test]
 fn one_owner_chain_exposes_distinct_candidate_and_committed_facts_until_ordered_publication() {
     let mut core = core();

@@ -152,6 +152,8 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     ) -> Result<(), NativeSessionError> {
         self.ready_term = None;
         self.pending.clear();
+        self.encoded = 0;
+        self.submitted = 0;
         self.flush_stalled = false;
         let domain = self.domain.take().ok_or(NativeSessionError::Failed)?;
         let core = match domain {
@@ -727,7 +729,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             return Err(NativeSessionError::Corrupt);
         }
         let matches = self.pending.front().is_some_and(|pending| {
-            pending.submitted
+            self.submitted > 0
                 && pending.hash == Some(header.hash)
                 && pending.outcome == header.outcome
                 && header.range == self.range
@@ -743,6 +745,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             };
             let outcome = owner.publish_after_durable(candidate)?;
             self.pending.pop_front();
+            self.encoded = self.encoded.saturating_sub(1);
+            self.submitted = self.submitted.saturating_sub(1);
+            self.shrink_pending();
             outcome
         } else {
             if !self.pending.is_empty() {

@@ -15,7 +15,6 @@ pub(super) struct Pending {
     pub(super) candidate: NativeCandidate,
     pub(super) outcome: NativeOutcome,
     pub(super) hash: Option<ContentHash>,
-    pub(super) submitted: bool,
     pub(super) term: u64,
 }
 #[allow(clippy::large_enum_variant)] // One instance per session; variants move only at authority transitions.
@@ -42,6 +41,14 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// at once what is owed (a grouped owner) ran the replica round after
     /// round, each drain proposing nothing.
     pub(super) flush_stalled: bool,
+    /// How many of the chain's candidates, from its head, are encoded, and how many proposed:
+    /// each a prefix of it, as candidates are encoded and proposed in chain order. Kept as the
+    /// chain changes, so a flush starts where the last left off: walked from the head at each
+    /// admission and each drain, the chain cost a session's owner work in its whole depth for
+    /// every write (`flush_deferred_native_proposals`, 4.6% of the owner's own time at 10,000
+    /// writes a second, 2026-10-12, and growing with the depth memory allows).
+    pub(super) encoded: usize,
+    pub(super) submitted: usize,
     pub(super) domain: Option<Domain>,
     pub(super) reader: ContentReader,
     /// Where checkpoint seeds are read from on install (25 §5); the writer
@@ -193,6 +200,8 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             pending,
             defer_proposals: false,
             flush_stalled: false,
+            encoded: 0,
+            submitted: 0,
             domain: Some(Domain::Passive(core)),
             reader,
             seeds,
@@ -954,8 +963,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if self.seal.is_some() {
             return Err(NativeSessionError::Sealing);
         }
-        let limit = self.limits.recovery.native.pending;
-        let full = self.pending.len() >= limit || self.pending.len() == self.pending.capacity();
+        // Room for the candidate, funded by the session's memory before it is prepared: the
+        // candidates a leader holds in flight are as many as its memory funds (`reserve_pending`).
+        let full = self.reserve_pending().is_err();
         let domain = self.limits.content_domain;
         let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
             return Err(NativeSessionError::Failed);
@@ -1018,6 +1028,57 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             }
         }
         self.submit_staged(consensus, staged, status.term)
+    }
+    /// Room for one more submitted candidate: a full queue doubles its capacity, the growth
+    /// charged to the session's budget before it is allocated, as the native owner's own queue
+    /// grows (`NativeOwner::reserve_pending`). `NativeLimits::pending`, the count this queue was
+    /// fixed at, remains the committed headroom of a seal's outcome; a leader's pipeline is as
+    /// deep as its memory funds.
+    fn reserve_pending(&mut self) -> Result<(), NativeSessionError> {
+        if self.pending.len() < self.pending.capacity() {
+            return Ok(());
+        }
+        let wanted = self
+            .pending
+            .capacity()
+            .max(1)
+            .checked_mul(2)
+            .ok_or(NativeSessionError::Capacity("pending candidates"))?;
+        let bytes = array::<Pending>(wanted)?;
+        let permit = self
+            .budget
+            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, bytes)?;
+        self.pending
+            .try_reserve_exact(wanted.saturating_sub(self.pending.len()))
+            .map_err(|_| NativeSessionError::Capacity("pending candidates"))?;
+        if array::<Pending>(self.pending.capacity())? > bytes {
+            return Err(NativeSessionError::Capacity("pending candidates"));
+        }
+        self._pending_allocation = permit.commit();
+        Ok(())
+    }
+    /// Gives back what a burst grew the chain to once it has drained to a quarter of it, as the
+    /// native owner's chain does (`NativeOwner::shrink_pending`): the chain moves into a buffer
+    /// half as large, never below the committed headroom it began at, its charge shrunk to match.
+    /// A buffer the allocator cannot give leaves the chain as it is, and a charge that cannot
+    /// shrink stays as it was, more than the chain holds.
+    pub(super) fn shrink_pending(&mut self) {
+        let capacity = self.pending.capacity();
+        let floor = self.limits.recovery.native.pending;
+        if capacity <= floor || self.pending.len() > capacity / 4 {
+            return;
+        }
+        let wanted = (capacity / 2).max(floor);
+        let mut smaller = VecDeque::new();
+        if smaller.try_reserve_exact(wanted).is_err() {
+            return;
+        }
+        // Within the reserved capacity: no reallocation.
+        smaller.extend(self.pending.drain(..));
+        self.pending = smaller;
+        if let Ok(bytes) = array::<Pending>(self.pending.capacity()) {
+            let _ = self._pending_allocation.shrink_to(bytes);
+        }
     }
     /// Whether the committed root, with every pending candidate published,
     /// still fits a checkpoint (rule 2): what this session admits it must be
@@ -1091,7 +1152,6 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     candidate,
                     outcome,
                     hash: None,
-                    submitted: false,
                     term,
                 });
                 // A candidate admitted is owed a drain, whatever the last
@@ -1139,9 +1199,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// unless the last flush could propose none of what waits
     /// ([`Self::flush_stalled`]).
     pub(crate) fn has_deferred(&self) -> bool {
-        self.defer_proposals
-            && !self.flush_stalled
-            && self.pending.iter().any(|pending| !pending.submitted)
+        self.defer_proposals && !self.flush_stalled && self.submitted < self.pending.len()
     }
     /// Propose every candidate the host deferred, together, on an authority;
     /// pressure, authority moving and a refused candidate keep or answer them
@@ -1150,7 +1208,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         &mut self,
         consensus: &mut DurableNode,
     ) -> Option<NativeSessionError> {
-        let refusal = if self.pending.iter().all(|pending| pending.submitted)
+        let refusal = if self.submitted >= self.pending.len()
             || !self.is_authoritative(&consensus.scalars())
         {
             None
@@ -1163,7 +1221,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 Ok(()) | Err(_) => None,
             }
         };
-        self.flush_stalled = self.pending.iter().any(|pending| !pending.submitted);
+        self.flush_stalled = self.submitted < self.pending.len();
         refusal
     }
     /// Encode every unsubmitted candidate in chain order, and name the first
@@ -1174,29 +1232,30 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
             return Err(NativeSessionError::Failed);
         };
-        let mut first = None;
-        let mut position = 0usize;
+        // Only what the last encoding left: the candidates before are encoded already.
+        let mut position = self.encoded;
         while let Some(pending) = self.pending.get_mut(position) {
-            if !pending.submitted {
-                let encoded = match owner.encode_candidate(pending.candidate, self.limits.encoding)
-                {
-                    Ok(encoded) => encoded,
-                    Err(error) => {
-                        let error = NativeSessionError::Owner(error);
-                        if error.class() == FailureClass::Request {
-                            let candidate = pending.candidate;
-                            owner.discard_from(candidate)?;
-                            self.pending.truncate(position);
-                        }
-                        return Err(error);
+            let encoded = match owner.encode_candidate(pending.candidate, self.limits.encoding) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    let error = NativeSessionError::Owner(error);
+                    if error.class() == FailureClass::Request {
+                        let candidate = pending.candidate;
+                        owner.discard_from(candidate)?;
+                        self.pending.truncate(position);
+                        self.submitted = self.submitted.min(position);
                     }
-                };
-                pending.hash = Some(encoded.hash());
-                first.get_or_insert(pending.candidate);
-            }
+                    return Err(error);
+                }
+            };
+            pending.hash = Some(encoded.hash());
             position = add(position, 1)?;
+            self.encoded = position;
         }
-        Ok(first)
+        Ok(self
+            .pending
+            .get(self.submitted)
+            .map(|pending| pending.candidate))
     }
     /// Encode and propose every unsubmitted candidate in chain order, in one
     /// proposal: the leader sends each member one append of them all.
@@ -1219,19 +1278,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             .map_err(NativeSessionError::Owner)?;
         // The unsubmitted candidates are the chain's suffix from the first of
         // them, in the owner's chain and in this one alike.
-        let unsubmitted = self
-            .pending
-            .iter()
-            .filter(|pending| !pending.submitted)
-            .count();
+        let unsubmitted = self.pending.len().saturating_sub(self.submitted);
         if records.clone().count() != unsubmitted {
             return Err(NativeSessionError::Failed);
         }
         match consensus.propose_batch_borrowed_in(records, BudgetLane::Completion) {
             Ok(()) => {
-                for pending in self.pending.iter_mut() {
-                    pending.submitted = true;
-                }
+                self.submitted = self.pending.len();
                 Ok(())
             }
             Err(ConsensusError::Capacity) => self.propose_each(consensus),
@@ -1244,16 +1297,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
             return Err(NativeSessionError::Failed);
         };
-        let mut position = 0usize;
-        while let Some(pending) = self.pending.get_mut(position) {
-            if !pending.submitted {
-                let encoded = owner
-                    .encode_candidate(pending.candidate, self.limits.encoding)
-                    .map_err(NativeSessionError::Owner)?;
-                consensus.propose_borrowed_in(encoded.bytes(), BudgetLane::Completion)?;
-                pending.submitted = true;
-            }
-            position = add(position, 1)?;
+        while let Some(pending) = self.pending.get(self.submitted) {
+            let encoded = owner
+                .encode_candidate(pending.candidate, self.limits.encoding)
+                .map_err(NativeSessionError::Owner)?;
+            consensus.propose_borrowed_in(encoded.bytes(), BudgetLane::Completion)?;
+            self.submitted = add(self.submitted, 1)?;
+            self.encoded = self.encoded.max(self.submitted);
         }
         Ok(())
     }
