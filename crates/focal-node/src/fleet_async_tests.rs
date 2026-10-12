@@ -868,9 +868,18 @@ fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
         .await
         .unwrap();
         // Then the session measures a cycle of a microsecond: the request queued has waited
-        // past twice that, and the next is refused.
+        // past twice that, and once it has stood past it an interval (a microsecond's cycle
+        // twice), the next is refused.
         host.pace.served(Duration::from_micros(1));
-        assert!(host.pace.delay_exceeded());
+        crate::test_waits::within(&[&host], steps, TICK, async {
+            while !host.pace.delay_exceeded() {
+                focal_rt::time::sleep(Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
         let refused = dispatch(&host, peer(), write(300), &ReplicaHost::wire_limits()).await;
         assert!(matches!(
             refused.result,
