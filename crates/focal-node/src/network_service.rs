@@ -559,6 +559,7 @@ impl Prepared {
                 &settings
                     .root_key_file(state.node)
                     .map_err(NodeError::Config)?,
+                crate::network_join::genesis_fence(&state.genesis)?.level,
             )?;
             let options = ControlOptions::new(NodeConfig::joining(
                 state.node,

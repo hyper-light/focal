@@ -308,6 +308,7 @@ impl FoundingNetwork {
             &settings
                 .root_key_file(identity.node)
                 .map_err(NodeError::Config)?,
+            founder.registry().fence().level,
         )?;
         let mut control = ControlReplica::open_on_storage(
             options,
