@@ -328,10 +328,10 @@ impl ReplicaFleet {
             // the shell writes the node's log, which the node owns past the fleet.
             if let Ok(writer) = replica.session.shared_wal()
                 && !wal_owners.iter().any(|retained: &focal_consensus::NodeStorage| {
-                    matches!(retained, focal_consensus::NodeStorage::Wal(wal) if writer.is_same_writer(wal))
+                    matches!(retained.backend(), focal_consensus::StorageBackend::Wal(wal) if writer.is_same_writer(wal))
                 })
             {
-                wal_owners.push(focal_consensus::NodeStorage::Wal(writer));
+                wal_owners.push(focal_consensus::NodeStorage::wal(writer));
             }
             let ledger = replica.session.ledger();
             ReplicaHost::validate(&replica.config, &limits)?;
@@ -455,6 +455,15 @@ fn report_stop(ledger: LedgerId, error: &LedgerError) {
 fn takes_input(owner: &Owner) -> bool {
     !owner.session.persistence_pending()
         && (owner.stopping.is_none() || owner.handing_off.is_some())
+}
+/// Whether a session takes its participants' work now: it takes input, and no session decision
+/// it proposed (a layout change, a retirement, a seal) waits to apply, behind which it admits no
+/// write. Its participants' work waits for it with the scheduler, as for a write out on
+/// focal-log, where taken it was refused for capacity ("a committed seal is in flight"): on the
+/// shell an owner takes input while its writes persist, and so met the decision a write had
+/// waited out. Its peers' frames go on: they carry the decision's commit.
+fn takes_participants(owner: &Owner) -> bool {
+    takes_input(owner) && !owner.session.native_decision_in_flight()
 }
 /// A peer's frame into its session's own queue, behind those that came
 /// before it; dropped, and counted, where the queue cannot grow.
@@ -772,7 +781,7 @@ impl GroupOwner {
                 let sessions = &self.sessions;
                 match self
                     .scheduler
-                    .schedule_when(|ledger| sessions.get(&ledger).is_none_or(takes_input))
+                    .schedule_when(|ledger| sessions.get(&ledger).is_none_or(takes_participants))
                     .map_err(|_| LedgerError::Failed)?
                 {
                     ScheduleOutcome::Work(mut dispatch) => {

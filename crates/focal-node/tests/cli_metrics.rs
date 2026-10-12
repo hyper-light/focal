@@ -161,7 +161,9 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
         "focal_memory_used_bytes",
         "focal_memory_limit_bytes",
         "focal_disk_outstanding_bytes",
-        "focal_wal_appended_records_total",
+        // A node founded at this binary's level writes its groups through hyper-log's log
+        // under the shell (`upgrade::STORAGE_LEVEL`): its log's frames, not focal-log's records.
+        "focal_log_frames_total",
         "focal_fleet_installed",
         "focal_root_applied_index",
         "focal_peer_messages_delivered_total",

@@ -278,21 +278,24 @@ impl ControlReplica {
     }
 
     /// A control group's member through the node's storage handle (27 §15.11): on focal-log as
-    /// [`ControlReplica::open_on_wal`], on the shell as [`ControlReplica::open_on_shell`].
+    /// [`ControlReplica::open_on_wal`], on the shell as [`ControlReplica::open_on_shell`], carrying
+    /// the handle's wire from its first message (27 §15.9).
     pub fn open_on_storage(
         options: ControlOptions,
         bootstrap: ControlBootstrap,
         budget: MemoryBudget,
         storage: &focal_consensus::NodeStorage,
     ) -> Result<Self, ControlError> {
-        match storage {
-            focal_consensus::NodeStorage::Wal(wal) => {
+        let mut replica = match storage.backend() {
+            focal_consensus::StorageBackend::Wal(wal) => {
                 Self::open_on_wal(options, bootstrap, budget, wal.clone())
             }
-            focal_consensus::NodeStorage::Shell(shell) => {
+            focal_consensus::StorageBackend::Shell(shell) => {
                 Self::open_on_shell(options, bootstrap, budget, shell)
             }
-        }
+        }?;
+        replica.set_raft_wire(storage.wire())?;
+        Ok(replica)
     }
 
     fn open_with(

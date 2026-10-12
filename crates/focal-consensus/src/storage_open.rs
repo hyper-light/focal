@@ -134,7 +134,7 @@ pub fn open_node_storage(
                 disk,
             )?;
             Ok(OpenedStorage {
-                storage: NodeStorage::Wal(wal),
+                storage: NodeStorage::wal(wal),
                 log: None,
                 cache: None,
                 keys: None,
@@ -196,7 +196,7 @@ fn open_shell(
     };
     let shell = ShellStorage::new(root, &log, disk, identity, budget, &plan.key_file)?;
     Ok(OpenedStorage {
-        storage: NodeStorage::Shell(Box::new(shell)),
+        storage: NodeStorage::shell(shell),
         log: Some(log),
         cache: Some(cache),
         keys: Some(keys),

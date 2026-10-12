@@ -14,6 +14,8 @@ fn runtime(plan: FirstDirectoryPlan) -> AuthenticatedPeer {
 
 #[test]
 fn directory_owner_is_registered_before_blocking_recovery_and_retains_escaped_egress_charge() {
+    // focal-log's writer, paused: a node below the storage level.
+    let _level = crate::upgrade::announce_for_test(crate::upgrade::BELOW_STORAGE_LEVEL);
     focal_rt::block_on(async move {
         let directory = tempfile::tempdir().unwrap();
         let (network, plan) = prepared_network(directory.path()).await;
@@ -123,7 +125,7 @@ fn directory_startup_failure_closes_ingress_and_preserves_host_charge_after_egre
         .unwrap();
         let (host, owner, outgoing) = ControlHost::spawn_directory(
             permit,
-            focal_consensus::NodeStorage::Wal(wrong),
+            focal_consensus::NodeStorage::wal(wrong),
             budget.clone(),
             None,
         )

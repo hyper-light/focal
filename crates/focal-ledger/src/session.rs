@@ -727,7 +727,7 @@ impl Session {
         let _decode = self
             .budget
             .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?;
-        let message = focal_consensus::decode_message(encoded)?;
+        let message = focal_consensus::decode_message_in(encoded, self.consensus.wire())?;
         if peer_node_id == 0 || message.from != peer_node_id {
             return Err(ConsensusError::MalformedMessage(
                 "Raft sender does not match authenticated peer",
@@ -1238,6 +1238,14 @@ impl Session {
     /// Whether the log tells this session's owner when what the replica
     /// waits for is answered (`DurableNode::wakes_owner`). A delivery that
     /// is retained waits for no write: its owner asks again.
+    /// Whether a native session decision is proposed and not yet applied (a layout change, a
+    /// retirement or a seal), behind which the session admits no native write: its owner holds
+    /// participants' work until it applies rather than take it to refuse it.
+    pub fn native_decision_in_flight(&self) -> bool {
+        self.native
+            .as_deref()
+            .is_some_and(engine::NativeEngine::decision_in_flight)
+    }
     pub fn wakes_owner(&self) -> bool {
         self.retained.is_none() && self.consensus.wakes_owner()
     }

@@ -361,6 +361,8 @@ fn stop_commits_admitted_refresh_without_starting_a_postcommit_read_before_check
 
 #[test]
 fn canceled_admitted_refresh_keeps_exact_intent_and_recovers_unknown_commit() {
+    // focal-log's fault points: a node below the storage level.
+    let _level = crate::upgrade::announce_for_test(crate::upgrade::BELOW_STORAGE_LEVEL);
     focal_rt::block_on(async move {
         let directory = tempfile::tempdir().unwrap();
         let (mut network, plan) = prepared_network(directory.path()).await;
@@ -456,7 +458,7 @@ fn canceled_admitted_refresh_keeps_exact_intent_and_recovers_unknown_commit() {
         let network = crate::network_bootstrap::FoundingNetwork::open(&settings)
             .await
             .unwrap();
-        let mut replica = ControlReplica::open_on_wal(
+        let mut replica = ControlReplica::open_on_storage(
             ControlOptions::new(focal_consensus::NodeConfig::single(
                 plan.founder_node(),
                 plan.identity().unwrap().cluster.0,
@@ -464,7 +466,7 @@ fn canceled_admitted_refresh_keeps_exact_intent_and_recovers_unknown_commit() {
             )),
             plan.bootstrap(None).unwrap(),
             budget.clone(),
-            crate::storage_start::test_wal(&network.storage.storage).clone(),
+            &network.storage.storage,
         )
         .unwrap();
         for _ in 0..8 {

@@ -544,9 +544,10 @@ impl ShellNode {
         self.heard(proposed)
     }
     /// As focal-log's backend's: the fields beyond raft-rs's this member's peers carry, from
-    /// now on, and whether it keeps what arrives ahead of a hole.
+    /// now on, and whether it keeps what arrives ahead of a hole; set before the member takes or
+    /// sends anything, its decoder confirmed or not.
     pub fn set_raft_wire(&mut self, wire: Wire) -> Result<(), ConsensusError> {
-        self.check()?;
+        self.check_state()?;
         self.wire = wire;
         self.replica.set_ahead(match wire {
             Wire::Frozen => hyper_raft::Ahead::Refused,

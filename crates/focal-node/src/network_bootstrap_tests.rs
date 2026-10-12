@@ -30,13 +30,13 @@ fn local_expansion_keeps_identity_log_genesis_and_credentials_on_restart() {
         let network = FoundingNetwork::open(&settings).await.unwrap();
         assert_eq!(network.directory.identity(), &identity);
         assert_eq!(network.state.genesis.founder, identity);
-        let consensus = focal_consensus::DurableNode::open_on_wal(
+        let consensus = crate::storage_start::test_member(
             focal_consensus::NodeConfig::single(
                 identity.node,
                 identity.cluster,
                 identity.ledger.session.0,
             ),
-            crate::storage_start::test_wal(&network.storage.storage).clone(),
+            &network.storage.storage,
         )
         .unwrap();
         assert_eq!(consensus.status().term, local_term);
@@ -283,8 +283,8 @@ fn a_founder_at_the_storage_level_founds_and_restarts_on_the_shell() {
         crate::storage_level::record(directory.path(), crate::upgrade::STORAGE_LEVEL).unwrap();
         let network = FoundingNetwork::open(&settings).await.unwrap();
         assert!(matches!(
-            network.storage.storage,
-            focal_consensus::NodeStorage::Shell(_)
+            network.storage.storage.backend(),
+            focal_consensus::StorageBackend::Shell(_)
         ));
         assert!(network.storage.log.is_some());
         assert!(
@@ -292,6 +292,11 @@ fn a_founder_at_the_storage_level_founds_and_restarts_on_the_shell() {
                 .path()
                 .join(focal_consensus::convert::LOG_FILE)
                 .exists()
+        );
+        assert_eq!(
+            network.control.wire(),
+            focal_consensus::Wire::Kept,
+            "a member opened under a fence at the storage level carries the fields beyond raft-rs's"
         );
         let state = network.state.clone();
         let term = network.control.status().term;
@@ -301,12 +306,51 @@ fn a_founder_at_the_storage_level_founds_and_restarts_on_the_shell() {
         assert_eq!(budget.stats().used, 0);
         let again = FoundingNetwork::open(&settings).await.unwrap();
         assert!(matches!(
-            again.storage.storage,
-            focal_consensus::NodeStorage::Shell(_)
+            again.storage.storage.backend(),
+            focal_consensus::StorageBackend::Shell(_)
         ));
         assert_eq!(again.state, state);
         assert!(again.control.status().term >= term);
+        assert_eq!(again.control.wire(), focal_consensus::Wire::Kept);
         drop(again);
+    })
+    .unwrap()
+}
+
+/// A founder whose fence is below `RAFT_KEPT_LEVEL` opens its root on raft-rs's fields alone, as a
+/// cluster that began before the level was opened, and keeps them across a restart; one founded
+/// at the level carries the fields beyond them from genesis, on focal-log's WAL as on the shell
+/// (27 §15.9).
+#[test]
+fn a_founders_root_carries_the_wire_its_genesis_fence_opens() {
+    focal_rt::block_on(async move {
+        let below = tempfile::tempdir().unwrap();
+        let settings_below = settings(below.path());
+        let network = {
+            let _level = crate::upgrade::announce_for_test(crate::upgrade::RAFT_KEPT_LEVEL - 1);
+            FoundingNetwork::open(&settings_below).await.unwrap()
+        };
+        assert_eq!(network.control.wire(), focal_consensus::Wire::Frozen);
+        drop(network);
+        let again = FoundingNetwork::open(&settings_below).await.unwrap();
+        assert_eq!(
+            again.control.wire(),
+            focal_consensus::Wire::Frozen,
+            "a restart opens the root under the fence the cluster holds, not the binary's level"
+        );
+        drop(again);
+
+        let at = tempfile::tempdir().unwrap();
+        let network = {
+            let _level = crate::upgrade::announce_for_test(crate::upgrade::RAFT_KEPT_LEVEL);
+            FoundingNetwork::open(&settings(at.path())).await.unwrap()
+        };
+        assert!(matches!(
+            network.storage.storage.backend(),
+            focal_consensus::StorageBackend::Wal(_)
+        ));
+        assert_eq!(network.control.wire(), focal_consensus::Wire::Kept);
+        drop(network);
     })
     .unwrap()
 }
@@ -318,10 +362,14 @@ fn a_wal_node_is_converted_at_its_first_start_at_the_storage_level() {
     focal_rt::block_on(async move {
         let directory = tempfile::tempdir().unwrap();
         let settings = settings(directory.path());
-        let below = FoundingNetwork::open(&settings).await.unwrap();
+        // Founded below the storage level, as a cluster that began before it was opened.
+        let below = {
+            let _level = crate::upgrade::announce_for_test(crate::upgrade::BELOW_STORAGE_LEVEL);
+            FoundingNetwork::open(&settings).await.unwrap()
+        };
         assert!(matches!(
-            below.storage.storage,
-            focal_consensus::NodeStorage::Wal(_)
+            below.storage.storage.backend(),
+            focal_consensus::StorageBackend::Wal(_)
         ));
         let term = below.control.status().term;
         let identity = below.directory.identity().clone();
@@ -338,8 +386,8 @@ fn a_wal_node_is_converted_at_its_first_start_at_the_storage_level() {
         );
         let converted = FoundingNetwork::open(&settings).await.unwrap();
         assert!(matches!(
-            converted.storage.storage,
-            focal_consensus::NodeStorage::Shell(_)
+            converted.storage.storage.backend(),
+            focal_consensus::StorageBackend::Shell(_)
         ));
         assert!(
             converted.control.status().term >= term,

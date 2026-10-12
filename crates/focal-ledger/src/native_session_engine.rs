@@ -928,6 +928,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// Stage one input against the owner and submit the resulting candidate.
     /// An exact retry of committed work is answered from the root before any
     /// queue, disk or memory admission applies to fresh work.
+    /// Whether a session decision is proposed and not yet applied: a layout change, a
+    /// retirement or a seal, behind which no candidate is admitted (`admit` refuses it
+    /// `LayoutChanging`, `Retiring` or `Sealing`).
+    pub(crate) fn decision_in_flight(&self) -> bool {
+        self.layout_change.is_some() || self.retirement.is_some() || self.seal.is_some()
+    }
     pub(crate) fn admit(
         &mut self,
         consensus: &mut DurableNode,

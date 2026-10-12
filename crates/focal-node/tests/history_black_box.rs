@@ -719,8 +719,14 @@ fn offline_reader_is_an_independent_publication_source() {
         owner.join().unwrap();
 
         // Independent recovery of the committed prefix (no live server).
-        let outcomes = focal_node::history::offline_native_publications(root.path(), &identity)
-            .expect("offline reopen of the stopped node");
+        // An embedded node's groups live on focal-log's WAL, which no key seals: the key file
+        // the reader is given is the node's own as its settings name it, unread here.
+        let key_file = focal_node::config::Settings::default()
+            .root_key_file(identity.node)
+            .unwrap();
+        let outcomes =
+            focal_node::history::offline_native_publications(root.path(), &identity, &key_file)
+                .expect("offline reopen of the stopped node");
         let recovered: Vec<(SessionSeq, ContentHash)> = outcomes
             .iter()
             .map(|outcome| (outcome.sequence, outcome.intent))

@@ -2381,8 +2381,9 @@ impl<V: AuthorityVerifier> Owner<V> {
                 let _ = self.lost_sender.try_send(message.to);
                 continue;
             };
-            let encoded =
-                focal_consensus::encode_message(&message).map_err(|_| ControlError::Failed)?;
+            // Under the member's own wire: a refusal it kept ahead of a hole says so (R17).
+            let encoded = focal_consensus::encode_message_in(&message, self.replica.wire())
+                .map_err(|_| ControlError::Failed)?;
             if encoded
                 .len()
                 .checked_add(256)

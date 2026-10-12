@@ -40,13 +40,13 @@ fn only_installed_group_and_real_committed_fence_can_produce_an_accounted_share(
         let mut network = FoundingNetwork::open(&settings).await.unwrap();
         let identity = network.directory.identity().clone();
         let now = unix_time().unwrap();
-        let consensus = focal_consensus::DurableNode::open_on_wal(
+        let consensus = crate::storage_start::test_member(
             focal_consensus::NodeConfig::single(
                 identity.node,
                 identity.cluster,
                 identity.ledger.session.0,
             ),
-            crate::storage_start::test_wal(&network.storage.storage).clone(),
+            &network.storage.storage,
         )
         .unwrap();
         let mut session =

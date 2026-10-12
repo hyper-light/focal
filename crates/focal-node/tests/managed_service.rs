@@ -119,7 +119,7 @@ fn one_handler_routes_live_installations_without_management_round_trips_and_pres
         let (manager, owner, outgoing) = ReplicaFleet::spawn_managed(
             1,
             CLUSTER,
-            vec![focal_consensus::NodeStorage::Wal(wal.clone())],
+            vec![focal_consensus::NodeStorage::wal(wal.clone())],
             tenants
                 .iter()
                 .enumerate()

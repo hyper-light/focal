@@ -158,6 +158,13 @@ fn cached_enrolled_peer_cannot_dispatch_root_raft_or_read_after_committed_revoca
 
 #[test]
 fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
+    // One drain of focal-log's WAL persists, commits and publishes the revoke and completes the
+    // earlier read's barrier: the turn this test pins. On the shell a drain's write leaves with it
+    // and is published by a later drain, so the earlier read leaves first, at the state before the
+    // revoke — linearizable, the read having come first and the reader enrolled when it is served
+    // (measured: answered at applied index 1, the revoke published one drain later at 2). The
+    // recheck at a barrier's completion is the same on both.
+    let _level = crate::upgrade::announce_for_test(crate::upgrade::BELOW_STORAGE_LEVEL);
     focal_rt::block_on(async move {
         let directory = tempfile::tempdir().unwrap();
         let mut settings = Settings::default();

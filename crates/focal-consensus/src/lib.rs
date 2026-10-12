@@ -32,7 +32,7 @@ mod log_metrics;
 pub mod node_log;
 pub use log_metrics::{LogLatency, LogMetrics};
 mod node_storage;
-pub use node_storage::{LogWriterId, NodeStorage, ShellStorage, StorageWriter};
+pub use node_storage::{LogWriterId, NodeStorage, ShellStorage, StorageBackend, StorageWriter};
 /// The log a node's groups live in on the durable shell (27 §15.3): one hyper-log a data directory.
 pub type ShellLog = hyper_log::Log<hyper_block::file::DeviceFile>;
 /// A handle on the node's [`ShellLog`] that claims its groups from any thread (`Log::opener`): what
@@ -1069,10 +1069,12 @@ impl LogNode {
     /// that can elect without a leader.
     /// The fields beyond raft-rs's this member's peers carry, from now on (`Wire`): under
     /// `Wire::Kept` it reads a refusal's `kept` and `lost` and keeps what arrives ahead of a hole
-    /// (R17); under `Wire::Frozen` it does neither. focal-node raises it once the upgrade fence
-    /// opens `RAFT_KEPT_LEVEL`, before a member opened under that fence sends.
+    /// (R17); under `Wire::Frozen` it does neither. focal-node opens a member on it once the
+    /// upgrade fence opens `RAFT_KEPT_LEVEL`, before the member sends (`NodeStorage::with_wire`).
+    /// It is set on a member whose decoder is not confirmed yet, as a restored one's is not: what a
+    /// member carries is set before it takes or sends anything, which the decoder gates.
     pub fn set_raft_wire(&mut self, wire: Wire) -> Result<(), ConsensusError> {
-        self.check()?;
+        self.check_state()?;
         self.wire = wire;
         let ahead = match wire {
             Wire::Frozen => hyper_raft::Ahead::Refused,

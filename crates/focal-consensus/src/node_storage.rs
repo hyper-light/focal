@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use focal_log::{SharedWal, WalIdentity, WalWriterId};
 use focal_memory::{DiskBudget, MemoryBudget, OwnerId};
 
-use crate::{ConsensusError, DurableNode, NodeConfig, RestoredLog, ShellLog, ShellLogOpener};
+use crate::{ConsensusError, DurableNode, NodeConfig, RestoredLog, ShellLog, ShellLogOpener, Wire};
 
 /// Process-local provenance of the log a shell handle writes: drawn when the node opens its log,
 /// never serialized and never reused after the log is opened again, as focal-log's
@@ -87,9 +87,19 @@ impl ShellStorage {
     }
 }
 
-/// Where the node's groups live.
+/// Where the node's groups live, and what their members carry on the wire.
 #[derive(Clone)]
-pub enum NodeStorage {
+pub struct NodeStorage {
+    backend: StorageBackend,
+    /// The fields beyond raft-rs's every member opened through this handle carries (27 §15.9):
+    /// set by the node's start from the upgrade fence it last knew, and applied as each member is
+    /// opened, before it sends.
+    wire: Wire,
+}
+
+/// The log a node's groups are written to.
+#[derive(Clone)]
+pub enum StorageBackend {
     /// focal-log's WAL: below the upgrade fence's storage level.
     Wal(SharedWal),
     /// The node's hyper-log log under the shell, boxed: the handle carries the data directory, the
@@ -99,41 +109,78 @@ pub enum NodeStorage {
 
 impl std::fmt::Debug for NodeStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Wal(wal) => f.debug_tuple("Wal").field(&wal.writer_id()).finish(),
-            Self::Shell(shell) => f.debug_tuple("Shell").field(shell).finish(),
+        match &self.backend {
+            StorageBackend::Wal(wal) => f
+                .debug_tuple("Wal")
+                .field(&wal.writer_id())
+                .field(&self.wire)
+                .finish(),
+            StorageBackend::Shell(shell) => f
+                .debug_tuple("Shell")
+                .field(shell)
+                .field(&self.wire)
+                .finish(),
         }
     }
 }
 
 impl NodeStorage {
+    /// The handle on focal-log's `wal`, its members on raft-rs's fields alone until
+    /// [`Self::with_wire`] says otherwise.
+    pub fn wal(wal: SharedWal) -> Self {
+        Self {
+            backend: StorageBackend::Wal(wal),
+            wire: Wire::Frozen,
+        }
+    }
+    /// The handle on the node's hyper-log log under the shell, its members on raft-rs's fields
+    /// alone until [`Self::with_wire`] says otherwise.
+    pub fn shell(shell: ShellStorage) -> Self {
+        Self {
+            backend: StorageBackend::Shell(Box::new(shell)),
+            wire: Wire::Frozen,
+        }
+    }
+    /// This handle, its members opened from now on carrying `wire`.
+    pub fn with_wire(mut self, wire: Wire) -> Self {
+        self.wire = wire;
+        self
+    }
+    /// The log the node's groups are written to.
+    pub fn backend(&self) -> &StorageBackend {
+        &self.backend
+    }
+    /// What every member opened through this handle carries on the wire.
+    pub fn wire(&self) -> Wire {
+        self.wire
+    }
     /// The writer every member opened through this handle goes through.
     pub fn writer(&self) -> StorageWriter {
-        match self {
-            Self::Wal(wal) => StorageWriter::Wal(wal.writer_id()),
-            Self::Shell(shell) => StorageWriter::Log(shell.writer),
+        match &self.backend {
+            StorageBackend::Wal(wal) => StorageWriter::Wal(wal.writer_id()),
+            StorageBackend::Shell(shell) => StorageWriter::Log(shell.writer),
         }
     }
     /// The node and cluster the storage was made for.
     pub fn identity(&self) -> Result<WalIdentity, ConsensusError> {
-        match self {
-            Self::Wal(wal) => Ok(wal.identity()?),
-            Self::Shell(shell) => Ok(shell.identity),
+        match &self.backend {
+            StorageBackend::Wal(wal) => Ok(wal.identity()?),
+            StorageBackend::Shell(shell) => Ok(shell.identity),
         }
     }
     /// The disk envelope the storage draws from, for the node's other durable owners.
     pub fn disk_budget(&self) -> DiskBudget {
-        match self {
-            Self::Wal(wal) => wal.disk_budget(),
-            Self::Shell(shell) => shell.disk.clone(),
+        match &self.backend {
+            StorageBackend::Wal(wal) => wal.disk_budget(),
+            StorageBackend::Shell(shell) => shell.disk.clone(),
         }
     }
     /// Free bytes on the volume, past what a write has been promised, from a sample the disk
     /// envelope refreshes at its bounded cadence; zero while the volume cannot be sampled.
     pub fn available_bytes(&self) -> Result<u64, ConsensusError> {
-        match self {
-            Self::Wal(wal) => Ok(wal.available_bytes()?),
-            Self::Shell(shell) => {
+        match &self.backend {
+            StorageBackend::Wal(wal) => Ok(wal.available_bytes()?),
+            StorageBackend::Shell(shell) => {
                 let root = &shell.root;
                 shell
                     .disk
@@ -144,26 +191,32 @@ impl NodeStorage {
     }
     /// Whether the storage's own memory is charged within `parent`.
     pub fn is_budgeted_within(&self, parent: &MemoryBudget) -> bool {
-        match self {
-            Self::Wal(wal) => wal.is_budgeted_within(parent),
-            Self::Shell(shell) => shell.budget.is_within(parent),
+        match &self.backend {
+            StorageBackend::Wal(wal) => wal.is_budgeted_within(parent),
+            StorageBackend::Shell(shell) => shell.budget.is_within(parent),
         }
     }
-    /// A member of group `config`, its memory charged within `parent`. `needs` names the decoder
-    /// an entry of the owner's needs, where the shell holds a write for it (27 §15.5, O2); on
-    /// focal-log the owner confirms decoders itself.
+    /// A member of group `config`, its memory charged within `parent`, carrying this handle's
+    /// wire from its first message. `needs` names the decoder an entry of the owner's needs, where
+    /// the shell holds a write for it (27 §15.5, O2); on focal-log the owner confirms decoders
+    /// itself.
     pub fn open_member(
         &self,
         config: NodeConfig,
         parent: &MemoryBudget,
         needs: fn(&[u8]) -> Option<[u8; 32]>,
     ) -> Result<DurableNode, ConsensusError> {
-        match self {
-            Self::Wal(wal) => DurableNode::open_on_wal_in(config, wal.clone(), parent),
-            Self::Shell(shell) => DurableNode::open_on_shell(config, shell, parent, needs),
-        }
+        let mut member = match &self.backend {
+            StorageBackend::Wal(wal) => DurableNode::open_on_wal_in(config, wal.clone(), parent),
+            StorageBackend::Shell(shell) => {
+                DurableNode::open_on_shell(config, shell, parent, needs)
+            }
+        }?;
+        member.set_raft_wire(self.wire)?;
+        Ok(member)
     }
-    /// A member of group `config` whose log begins at a restored image (26 §6).
+    /// A member of group `config` whose log begins at a restored image (26 §6), carrying this
+    /// handle's wire from its first message.
     pub fn restore_member(
         &self,
         config: NodeConfig,
@@ -171,12 +224,16 @@ impl NodeStorage {
         needs: fn(&[u8]) -> Option<[u8; 32]>,
         image: RestoredLog,
     ) -> Result<DurableNode, ConsensusError> {
-        match self {
-            Self::Wal(wal) => DurableNode::restore_on_wal_in(config, wal.clone(), parent, image),
-            Self::Shell(shell) => {
+        let mut member = match &self.backend {
+            StorageBackend::Wal(wal) => {
+                DurableNode::restore_on_wal_in(config, wal.clone(), parent, image)
+            }
+            StorageBackend::Shell(shell) => {
                 DurableNode::restore_on_shell(config, shell, parent, needs, image)
             }
-        }
+        }?;
+        member.set_raft_wire(self.wire)?;
+        Ok(member)
     }
 }
 

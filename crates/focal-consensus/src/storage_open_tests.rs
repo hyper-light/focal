@@ -2,6 +2,7 @@
 //! (created, then reopened with the same configuration), a WAL converted first, and the log's
 //! plan the same at every start.
 use super::*;
+use crate::StorageBackend;
 use crate::convert::Start;
 use focal_memory::DiskBudgetConfig;
 
@@ -75,7 +76,7 @@ fn opened(root: &Path, fence_open: bool) -> OpenedStorage {
 fn below_the_storage_level_the_node_runs_on_its_wal() {
     let dir = data_dir();
     let opened = opened(dir.path(), false);
-    assert!(matches!(opened.storage, NodeStorage::Wal(_)));
+    assert!(matches!(opened.storage.backend(), StorageBackend::Wal(_)));
     assert!(opened.log.is_none() && opened.cache.is_none());
     assert!(!dir.path().join(convert::RAFT_DIR).exists());
 }
@@ -101,7 +102,7 @@ fn at_the_storage_level_a_founded_directory_opens_and_reopens_its_log() {
         &key_of(dir.path()),
     )
     .unwrap();
-    assert!(matches!(opened.storage, NodeStorage::Shell(_)));
+    assert!(matches!(opened.storage.backend(), StorageBackend::Shell(_)));
     let log = opened.log.unwrap();
     assert!(envelope.stats().used > 0, "the cache is charged");
     let config = log.config();
@@ -130,7 +131,7 @@ fn at_the_storage_level_a_wal_is_converted_first() {
         Start::Convert
     );
     let opened = opened_in(dir.path());
-    assert!(matches!(opened.storage, NodeStorage::Shell(_)));
+    assert!(matches!(opened.storage.backend(), StorageBackend::Shell(_)));
     drop(opened.log.unwrap().close().unwrap());
     assert_eq!(
         convert::start(dir.path(), identity(), true).unwrap(),

@@ -21,7 +21,9 @@ struct Fixture {
     sequence: u64,
     budget: MemoryBudget,
     _replication: hyper_rt::sync::ChannelReceiver<ControlReplicationFrame>,
-    _wal: focal_log::SharedWal,
+    /// The node's storage, its log held open for the fixture's life as a node holds it for its
+    /// own (`OpenedStorage::log`): a handle on its groups alone does not keep the shell's log open.
+    _storage: focal_consensus::storage_open::OpenedStorage,
     directory: NodeDirectory,
 }
 impl Fixture {
@@ -36,7 +38,6 @@ impl Fixture {
             directory,
             ..
         } = FoundingNetwork::open(&settings).await.unwrap();
-        let wal = crate::storage_start::test_wal(&storage.storage).clone();
         drop(control);
         let mut options = ControlOptions::new(focal_consensus::NodeConfig::single(
             state.node,
@@ -45,11 +46,11 @@ impl Fixture {
         ));
         options.authority.max_nodes = max_nodes;
         let budget = MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
-        let mut control = ControlReplica::open_on_wal(
+        let mut control = ControlReplica::open_on_storage(
             options,
             state.genesis.bootstrap.clone(),
             budget.clone(),
-            wal.clone(),
+            &storage.storage,
         )
         .unwrap();
         control.drain(&NoDirectoryAuthority).unwrap();
@@ -80,7 +81,7 @@ impl Fixture {
             sequence: 0,
             budget,
             _replication: replication,
-            _wal: wal,
+            _storage: storage,
             directory,
         };
         let observation = fixture.observe().await;

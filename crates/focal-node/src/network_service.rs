@@ -574,6 +574,7 @@ impl Prepared {
                 budget.child(192 * 1024 * 1024, 64 * 1024 * 1024)?,
                 &storage.storage,
             )?;
+            control.set_raft_wire(crate::storage_level::member_wire(joined.directory.root())?)?;
             if control.identity() != state.genesis.root {
                 return Err(NodeError::Identity.into());
             }
@@ -876,7 +877,7 @@ impl NetworkService {
                     storage.disk_budget(),
                 )?;
                 let session = if founder {
-                    let consensus = storage.open_member(
+                    let mut consensus = storage.open_member(
                         NodeConfig::single(
                             identity.node,
                             identity.cluster,
@@ -885,6 +886,7 @@ impl NetworkService {
                         &tenant,
                         focal_ledger::entry_needs,
                     )?;
+                    consensus.set_raft_wire(crate::storage_level::member_wire(&root)?)?;
                     let limits = crate::memory_envelope::found_limits(&root, &settings, &consensus)
                         .map_err(ServiceError::from)?;
                     let hosting = native_hosting(&root, &identity, storage.disk_budget(), &limits)
@@ -1597,11 +1599,11 @@ impl NetworkService {
             disk,
             staged_uploads,
             staged_bytes,
-            storage: match &self.storage {
-                focal_consensus::NodeStorage::Wal(wal) => {
+            storage: match self.storage.backend() {
+                focal_consensus::StorageBackend::Wal(wal) => {
                     wal.stats().ok().map(crate::metrics::StorageMetrics::Wal)
                 }
-                focal_consensus::NodeStorage::Shell(shell) => shell.log_stats().map(|stats| {
+                focal_consensus::StorageBackend::Shell(shell) => shell.log_stats().map(|stats| {
                     crate::metrics::StorageMetrics::Log(focal_consensus::LogMetrics::of(&stats))
                 }),
             },

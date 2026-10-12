@@ -727,8 +727,9 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     assert!(issuers["successor"].is_null(), "{issuers}");
     assert!(issuers["retiring"].is_null(), "{issuers}");
     assert_eq!(issuers["current"]["endorsed"], false, "{issuers}");
-    assert_eq!(
-        issuers["fence_level"], issuers["succession_level"],
+    // The fence a cluster founded at this binary's level holds opens issuer succession.
+    assert!(
+        issuers["fence_level"].as_u64() >= issuers["succession_level"].as_u64(),
         "{issuers}"
     );
     let genesis_issuer = issuers["current"]["fingerprint"].clone();

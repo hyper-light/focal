@@ -313,7 +313,12 @@ fn cli_native_creates_are_linearizable_against_the_offline_log() {
     drop(server);
 
     // Independent publication order from the durable log.
-    let outcomes = focal_node::history::offline_native_publications(root, &identity)
+    // The node's root key, where its settings put it: hyper-log's log under the shell is sealed
+    // under it.
+    let key_file = focal_node::config::Settings::default()
+        .root_key_file(identity.node)
+        .unwrap();
+    let outcomes = focal_node::history::offline_native_publications(root, &identity, &key_file)
         .expect("offline reopen of the killed node");
     let publications: Vec<MutationReceipt> = outcomes.iter().map(outcome_to_receipt).collect();
     assert!(

@@ -64,6 +64,23 @@ pub fn storage_opened(root: &Path) -> Result<bool, NodeError> {
     Ok(known(root)?.is_some_and(|level| level >= crate::upgrade::STORAGE_LEVEL))
 }
 
+/// The fields beyond raft-rs's a member opened now carries (27 §15.9): `Wire::Kept` once the fence
+/// the node last knew opens `RAFT_KEPT_LEVEL`, raft-rs's alone below it. Read as each member is
+/// opened, before it sends, so a member opened under the fence sends under it from its first
+/// message, the founder's and each joiner's alike; a member already open when the fence rose is
+/// raised at the node's next start, as its storage is converted then. Members raised at different
+/// moments are the case §15.9 designs for: a raised member's `kept` is skipped by one not yet
+/// raised, which answers as raft-rs does, at the cost of a resend.
+pub fn member_wire(root: &Path) -> Result<focal_consensus::Wire, NodeError> {
+    Ok(
+        if known(root)?.is_some_and(|level| level >= crate::upgrade::RAFT_KEPT_LEVEL) {
+            focal_consensus::Wire::Kept
+        } else {
+            focal_consensus::Wire::Frozen
+        },
+    )
+}
+
 #[cfg(test)]
 #[cfg_attr(
     test,
@@ -102,5 +119,33 @@ mod tests {
         assert!(storage_opened(dir.path()).is_err());
         std::fs::write(dir.path().join(FILE), b"short").unwrap();
         assert!(matches!(known(dir.path()), Err(NodeError::Corrupt(_))));
+    }
+
+    /// A member runs raft-rs's fields alone until the recorded fence opens `RAFT_KEPT_LEVEL`, and
+    /// the fields beyond them from there; a damaged record opens no member.
+    #[test]
+    fn a_member_runs_kept_once_the_recorded_fence_opens_its_level() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            member_wire(dir.path()).unwrap(),
+            focal_consensus::Wire::Frozen
+        );
+        record(dir.path(), crate::upgrade::RAFT_KEPT_LEVEL - 1).unwrap();
+        assert_eq!(
+            member_wire(dir.path()).unwrap(),
+            focal_consensus::Wire::Frozen
+        );
+        record(dir.path(), crate::upgrade::RAFT_KEPT_LEVEL).unwrap();
+        assert_eq!(
+            member_wire(dir.path()).unwrap(),
+            focal_consensus::Wire::Kept
+        );
+        record(dir.path(), crate::upgrade::STORAGE_LEVEL).unwrap();
+        assert_eq!(
+            member_wire(dir.path()).unwrap(),
+            focal_consensus::Wire::Kept
+        );
+        std::fs::write(dir.path().join(FILE), b"short").unwrap();
+        assert!(member_wire(dir.path()).is_err());
     }
 }

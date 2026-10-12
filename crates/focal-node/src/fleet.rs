@@ -4454,7 +4454,9 @@ impl Owner {
                 let _ = self.lost_sender.try_send(message.to);
                 continue;
             };
-            let Ok(message_bytes) = focal_consensus::encode_message(message) else {
+            let Ok(message_bytes) =
+                focal_consensus::encode_message_in(message, self.session.wire())
+            else {
                 drop(snapshot);
                 self.dropped = self.dropped.saturating_add(1);
                 let _ = self.lost_sender.try_send(message.to);

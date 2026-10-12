@@ -59,7 +59,7 @@ fn log_in(dir: &Path) -> ShellLog {
 fn a_member_names_the_writer_of_the_handle_it_was_opened_through() {
     let dir = tempfile::tempdir().unwrap();
     let wal = SharedWal::open(dir.path().join("wal"), WalOptions::new(identity())).unwrap();
-    let on_wal = NodeStorage::Wal(wal);
+    let on_wal = NodeStorage::wal(wal);
     let member = on_wal.open_member(group(1), &budget(), no_needs).unwrap();
     assert_eq!(member.storage_writer().unwrap(), on_wal.writer());
     assert_eq!(on_wal.identity().unwrap(), identity());
@@ -75,7 +75,7 @@ fn a_member_names_the_writer_of_the_handle_it_was_opened_through() {
         &crate::node_storage::test_key_file(dir.path()),
     )
     .unwrap();
-    let on_shell = NodeStorage::Shell(Box::new(shell.clone()));
+    let on_shell = NodeStorage::shell(shell.clone());
     let member = on_shell.open_member(group(2), &budget(), no_needs).unwrap();
     assert_eq!(member.storage_writer().unwrap(), on_shell.writer());
     assert_eq!(on_shell.identity().unwrap(), identity());
@@ -91,16 +91,58 @@ fn a_member_names_the_writer_of_the_handle_it_was_opened_through() {
         &crate::node_storage::test_key_file(dir.path()),
     )
     .unwrap();
-    assert_ne!(
-        NodeStorage::Shell(Box::new(again)).writer(),
-        on_shell.writer()
-    );
+    assert_ne!(NodeStorage::shell(again).writer(), on_shell.writer());
     // A clone is the same handle, and the same writer.
-    assert_eq!(
-        NodeStorage::Shell(Box::new(shell)).writer(),
-        on_shell.writer()
-    );
+    assert_eq!(NodeStorage::shell(shell).writer(), on_shell.writer());
     drop(member);
+    drop(log.close().unwrap());
+}
+
+/// A member opened or restored through the handle carries the handle's wire from its first
+/// message (27 §15.9): raft-rs's fields alone on a handle as opened, the fields beyond them on
+/// one the node's start raised, on either backend.
+#[test]
+fn a_member_carries_the_wire_of_the_handle_it_was_opened_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = SharedWal::open(dir.path().join("wal"), WalOptions::new(identity())).unwrap();
+    let frozen = NodeStorage::wal(wal.clone());
+    assert_eq!(frozen.wire(), Wire::Frozen);
+    let member = frozen.open_member(group(1), &budget(), no_needs).unwrap();
+    assert_eq!(member.wire(), Wire::Frozen);
+    drop(member);
+    let kept = NodeStorage::wal(wal).with_wire(Wire::Kept);
+    assert_eq!(kept.wire(), Wire::Kept);
+    let member = kept.open_member(group(2), &budget(), no_needs).unwrap();
+    assert_eq!(member.wire(), Wire::Kept);
+    drop(member);
+
+    let log = log_in(dir.path());
+    let shell = ShellStorage::new(
+        dir.path(),
+        &log,
+        disk(),
+        identity(),
+        budget(),
+        &crate::node_storage::test_key_file(dir.path()),
+    )
+    .unwrap();
+    let kept = NodeStorage::shell(shell).with_wire(Wire::Kept);
+    let member = kept.open_member(group(3), &budget(), no_needs).unwrap();
+    assert_eq!(member.wire(), Wire::Kept);
+    drop(member);
+    let image = RestoredLog {
+        index: 9,
+        term: 2,
+        data: b"state".to_vec(),
+        floor: [3; 32],
+        transition: None,
+    };
+    let restored = kept
+        .restore_member(group(4), &budget(), no_needs, image)
+        .unwrap();
+    assert_eq!(restored.wire(), Wire::Kept);
+    drop(restored);
+    drop(kept);
     drop(log.close().unwrap());
 }
 
@@ -110,7 +152,7 @@ fn the_handle_measures_its_volume_and_charges_within_its_budget() {
     let log = log_in(dir.path());
     let parent = budget();
     let child = parent.child(1 << 20, 1 << 20).unwrap();
-    let storage = NodeStorage::Shell(Box::new(
+    let storage = NodeStorage::shell(
         ShellStorage::new(
             dir.path(),
             &log,
@@ -120,7 +162,7 @@ fn the_handle_measures_its_volume_and_charges_within_its_budget() {
             &crate::node_storage::test_key_file(dir.path()),
         )
         .unwrap(),
-    ));
+    );
     assert!(storage.is_budgeted_within(&parent));
     assert!(!storage.is_budgeted_within(&budget()));
     // The volume is sampled, and with nothing promised the handle gives what the volume has
@@ -142,7 +184,7 @@ fn the_handle_restores_a_group_on_either_backend() {
         transition: None,
     };
     let dir = tempfile::tempdir().unwrap();
-    let wal = NodeStorage::Wal(
+    let wal = NodeStorage::wal(
         SharedWal::open(dir.path().join("wal"), WalOptions::new(identity())).unwrap(),
     );
     let restored = wal
@@ -151,7 +193,7 @@ fn the_handle_restores_a_group_on_either_backend() {
     assert_eq!(restored.snapshot_index(), 9);
     drop(restored);
     let log = log_in(dir.path());
-    let shell = NodeStorage::Shell(Box::new(
+    let shell = NodeStorage::shell(
         ShellStorage::new(
             dir.path(),
             &log,
@@ -161,7 +203,7 @@ fn the_handle_restores_a_group_on_either_backend() {
             &crate::node_storage::test_key_file(dir.path()),
         )
         .unwrap(),
-    ));
+    );
     let restored = shell
         .restore_member(group(2), &budget(), no_needs, image())
         .unwrap();

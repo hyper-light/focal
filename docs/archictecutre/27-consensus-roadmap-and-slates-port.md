@@ -1674,9 +1674,13 @@ rule, at 1,588 commits a second, against 126 ms at the full 4,000 with R17. At 2
 
 - **Below the fence** no node writes either field. Its groups run `Wire::Frozen`: `Ahead::Refused`,
   and the envelope refuses to encode a message that holds either.
-- **At or above it** a node raises every group it hosts to `Wire::Kept` (`set_raft_wire`) when the
-  activation applies, and opens a group there before it sends. Under `Wire::Kept` a member keeps
-  what arrives ahead of a hole and says so, and reads both fields.
+- **At or above it** a node opens every group it hosts on `Wire::Kept`, before the member sends,
+  from its first start at which the fence it knows opens the level: the node's storage handle
+  carries the wire its start read from the level it recorded (`storage_level::member_wire`,
+  `NodeStorage::with_wire`), and every member opened or restored through it carries it. A cluster
+  founded at the level runs it from genesis; in one whose fence rose while a node ran, the node
+  raises its groups at its next start, as it converts its storage at `STORAGE_LEVEL`. Under
+  `Wire::Kept` a member keeps what arrives ahead of a hole and says so, and reads both fields.
 - **Nodes apply the activation at different moments**, so a raised member sends `kept` to one not
   yet raised. That member reads field 17 as raft-rs reads a field it does not know, skipped. The
   refusal is then exactly raft-rs's own for an append past the end of a log: `reject`, the append's
