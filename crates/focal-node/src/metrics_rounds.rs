@@ -615,6 +615,7 @@ impl MetricsSnapshot {
             },
             peers: focal_wire::PeerPoolStats::default(),
             listener: focal_wire::AdmissionStats::default(),
+            sockets: crate::metrics::SocketMetrics::default(),
             peer_rtts: Vec::new(),
             liveness: LivenessMetrics::default(),
             credential: Some(CredentialMetrics::default()),

@@ -1587,6 +1587,10 @@ impl PeerConnectionPool {
         });
         Ok(waiting)
     }
+    /// What the pool's socket did ([`crate::net::NetStats::io`]).
+    pub async fn io(&self) -> hyper_rt::udp::IoStats {
+        self.connector.stats().await.io
+    }
     pub fn stats(&self) -> PeerPoolStats {
         PeerPoolStats {
             delivered: self.counters.delivered.load(Ordering::Relaxed),
