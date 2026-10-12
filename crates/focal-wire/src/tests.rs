@@ -958,6 +958,75 @@ fn a_watched_local_grant_governs_connections_accepted_after_it_changes() {
     .unwrap()
 }
 
+/// A local socket's path at the most its address holds binds and serves; one
+/// byte longer is refused by name by the server and by its client, before
+/// anything is bound, where the operating system's refusal had read as an
+/// unavailable connection (a node whose data directory was 114 bytes could
+/// not start, `wire: connection unavailable`).
+#[test]
+fn a_local_socket_path_past_its_address_is_refused_by_name() {
+    focal_rt::block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "focal.sock";
+        // The directory's own path, a separator, the filler, a separator and
+        // the socket's name: the filler takes the socket's path to the bound.
+        let fill = SOCKET_PATH_BYTES
+            .checked_sub(dir.path().as_os_str().len() + 2 + name.len())
+            .expect("the temporary directory leaves room under the bound");
+        let at = dir.path().join("d".repeat(fill));
+        std::fs::create_dir(&at).unwrap();
+        let socket = at.join(name);
+        assert_eq!(socket.as_os_str().len(), SOCKET_PATH_BYTES);
+        let past = dir.path().join("d".repeat(fill + 1));
+        std::fs::create_dir(&past).unwrap();
+        let too_long = past.join(name);
+        assert_eq!(too_long.as_os_str().len(), SOCKET_PATH_BYTES + 1);
+        #[cfg(unix)]
+        {
+            // The bound is the address's own, as std builds it.
+            assert!(std::os::unix::net::SocketAddr::from_pathname(&socket).is_ok());
+            assert!(std::os::unix::net::SocketAddr::from_pathname(&too_long).is_err());
+        }
+        assert!(socket_path_fits(&socket).is_ok());
+        let refused = |error: WireError| {
+            matches!(
+                error,
+                WireError::SocketPath { path, most }
+                    if path == too_long && most == SOCKET_PATH_BYTES
+            )
+        };
+        assert!(refused(socket_path_fits(&too_long).unwrap_err()));
+        assert!(refused(
+            LocalServer::bind(&too_long, grant(), limits())
+                .err()
+                .unwrap()
+        ));
+        assert!(!too_long.exists());
+        assert!(refused(
+            LocalRemote::new(&too_long, limits()).err().unwrap()
+        ));
+        // At the bound the system binds the socket and serves through it.
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        let server = Arc::new(LocalServer::bind(&socket, grant(), limits()).unwrap());
+        let running = server.clone();
+        let handling = handler.clone();
+        let task = spawn(async move { running.serve(handling).await });
+        let remote = LocalRemote::new(&socket, limits()).unwrap();
+        let expected = dispatch(
+            handler.as_ref(),
+            AuthenticatedPeer::local(grant()).unwrap(),
+            request(1),
+            &limits(),
+        )
+        .await;
+        assert_eq!(remote.request(&request(1)).await.unwrap(), expected);
+        server.close();
+        task.join().await.unwrap();
+    })
+    .unwrap()
+}
+
 #[test]
 fn a_local_socket_is_its_owners_alone_and_serves_the_same_verified_handler() {
     focal_rt::block_on(async move {

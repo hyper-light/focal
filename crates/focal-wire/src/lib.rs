@@ -37,7 +37,7 @@ pub use auth::*;
 pub use frame::*;
 pub use handler::*;
 pub use list::*;
-pub use local::{LocalGrant, LocalRemote, LocalServer};
+pub use local::{LocalGrant, LocalRemote, LocalServer, SOCKET_PATH_BYTES, socket_path_fits};
 pub use managed::*;
 pub use message::*;
 pub use native::*;

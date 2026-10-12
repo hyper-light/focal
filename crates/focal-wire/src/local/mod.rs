@@ -46,6 +46,28 @@ fn backlog(limits: &WireLimits) -> u32 {
     u32::try_from(limits.max_connections).unwrap_or(u32::MAX)
 }
 
+/// The most bytes a local socket's path may have: its address's `sun_path` holds the path and
+/// its terminating nul, 108 bytes on Linux (unix(7)) and in Windows' `SOCKADDR_UN` (`afunix.h`),
+/// 104 on macOS and the BSDs (`<sys/un.h>`). Every caller of the socket must fit the path, so
+/// this is the bound with the nul, which std's own addresses keep too.
+#[cfg(any(target_os = "linux", target_os = "android", windows))]
+pub const SOCKET_PATH_BYTES: usize = 107;
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+pub const SOCKET_PATH_BYTES: usize = 103;
+
+/// `path` fits a local socket's address, or the refusal names it and the bound. A longer path
+/// cannot be bound or reached at all (PostgreSQL refuses its socket's path alike), and the
+/// operating system's refusal of it said only that the connection was unavailable.
+pub fn socket_path_fits(path: &Path) -> Result<(), WireError> {
+    if path.as_os_str().len() > SOCKET_PATH_BYTES {
+        return Err(WireError::SocketPath {
+            path: path.to_path_buf(),
+            most: SOCKET_PATH_BYTES,
+        });
+    }
+    Ok(())
+}
+
 pub struct LocalServer {
     listener: LocalListener,
     path: PathBuf,
@@ -72,6 +94,7 @@ impl LocalServer {
         require_runtime()?;
         AuthenticatedPeer::local(grant.get()?)?;
         let path = path.as_ref().to_path_buf();
+        socket_path_fits(&path)?;
         let parent = path.parent().ok_or(WireError::Authentication)?;
         if !focal_platform::fs::dir_not_writable_by_others(parent)? {
             return Err(WireError::Authentication);
@@ -170,6 +193,7 @@ pub struct LocalRemote {
 impl LocalRemote {
     pub fn new(path: impl AsRef<Path>, limits: WireLimits) -> Result<Self, WireError> {
         limits.validate()?;
+        socket_path_fits(path.as_ref())?;
         Ok(Self {
             path: path.as_ref().to_path_buf(),
             limits,

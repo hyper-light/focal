@@ -44,6 +44,17 @@ pub enum WireError {
     Connection,
     #[error("protocol rejected: {0}")]
     Access(#[from] crate::AccessError),
+    /// A local socket's path longer than this system's socket address holds
+    /// ([`crate::SOCKET_PATH_BYTES`]): nothing can bind or reach a socket there.
+    #[error(
+        "the local socket path {} is {} bytes, more than the {most} a local socket's address holds on this system; choose a shorter data directory",
+        .path.display(),
+        .path.as_os_str().len()
+    )]
+    SocketPath {
+        path: std::path::PathBuf,
+        most: usize,
+    },
 }
 
 /// A checked frame envelope, without payload or participant authority. Read it

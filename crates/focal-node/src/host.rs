@@ -612,7 +612,7 @@ pub(crate) fn dispatch(
             epoch: RouteEpoch(1),
             endpoint: node
                 .root()
-                .join("focal.sock")
+                .join(crate::network_admin::LOCAL_SOCKET)
                 .to_string_lossy()
                 .into_owned(),
             server_name: "local".into(),

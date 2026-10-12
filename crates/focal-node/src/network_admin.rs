@@ -20,6 +20,18 @@ use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 pub const ADMIN_SOCKET: &str = "focal-admin.sock";
+/// The node's local socket in its data directory, which its local clients reach.
+pub const LOCAL_SOCKET: &str = "focal.sock";
+
+/// Both local sockets of the data directory at `root` fit a local socket's address. A node checks
+/// it before it starts or joins, so a directory whose sockets could not be bound is refused by
+/// name before anything is written in it or its invitation is spent.
+pub fn local_sockets_fit(root: &std::path::Path) -> Result<(), WireError> {
+    for name in [LOCAL_SOCKET, ADMIN_SOCKET] {
+        socket_path_fits(&root.join(name))?;
+    }
+    Ok(())
+}
 const MAGIC: &[u8] = b"FCLADMIN1";
 pub(crate) const MAX_COMMAND: usize = 60 * 1024;
 /// The lease a repair's export holds; a walk that outlives it resumes.

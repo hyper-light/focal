@@ -1648,6 +1648,10 @@ pub(crate) fn clone_error(error: &WireError) -> WireError {
         WireError::Unpinned => WireError::Unpinned,
         WireError::Connection => WireError::Connection,
         WireError::Access(access) => WireError::Access(access.clone()),
+        WireError::SocketPath { path, most } => WireError::SocketPath {
+            path: path.clone(),
+            most: *most,
+        },
     }
 }
 

@@ -803,7 +803,7 @@ impl NetworkService {
             connector,
             PeerPoolLimits::for_consensus(focal_consensus::DEFAULT_INFLIGHT_WINDOW),
         )?;
-        let socket = root.join("focal.sock");
+        let socket = root.join(crate::network_admin::LOCAL_SOCKET);
         clean_socket(&socket, &root)?;
         // The local grant follows the committed registry: the controller
         // adds every admitted tenant on each refresh (doc 24 §16).

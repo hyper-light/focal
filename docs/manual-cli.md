@@ -16,6 +16,8 @@ focal --data-dir /tmp/focal-manual start node
 
 Use the same `--data-dir` in another terminal. The examples below abbreviate that common option. `--config FILE` and `--data-dir DIR` work before or after subcommands. `--help` lists the flags at each level.
 
+The node's sockets live in its data directory (`focal.sock`, `focal-admin.sock`), and a local socket's address holds at most 103 bytes of path on macOS and 107 on Linux and Windows, so the data directory's path may be at most 86 and 90 bytes respectively. A longer one is refused (`invalid_input`, naming the socket's path) before anything is written in it or an invitation is read.
+
 ## Offline schemas, examples and completion
 
 These commands need no running service, node identity or saved configuration. They

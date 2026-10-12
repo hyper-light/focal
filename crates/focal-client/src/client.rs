@@ -160,7 +160,7 @@ impl std::fmt::Display for ClientError {
             ),
             Self::InvalidResponse => write!(f, "invalid server response"),
             Self::Transport => write!(f, "transport unavailable"),
-            Self::Configuration => write!(f, "invalid client limits"),
+            Self::Configuration => write!(f, "invalid client configuration"),
         }
     }
 }
@@ -832,6 +832,14 @@ impl<T: ClientTransport> Client<T> {
                         break;
                     }
                     return Err(ClientError::Unauthenticated);
+                }
+                // A local socket's path no address holds: refused before
+                // anything was sent, as every later attempt would be.
+                Ok(Err(WireError::SocketPath { .. })) => {
+                    if uncertain && request.operation.is_mutation() {
+                        break;
+                    }
+                    return Err(ClientError::Configuration);
                 }
                 Ok(Err(
                     WireError::Io(_)

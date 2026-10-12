@@ -140,6 +140,13 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
         {
             return Failure::error("permission_denied", 2);
         }
+        // A data directory whose local sockets do not fit a socket's address:
+        // the directory to choose again, not a connection to retry.
+        if let Some(focal_wire::WireError::SocketPath { .. }) =
+            current.downcast_ref::<focal_wire::WireError>()
+        {
+            return Failure::error("invalid_input", 2);
+        }
         cause = current.source();
     }
     if let Some(error) = error.downcast_ref::<serde_json::Error>() {

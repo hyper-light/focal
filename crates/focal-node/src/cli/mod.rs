@@ -153,8 +153,11 @@ impl Context {
                     CliError::Input(format!("invalid local node client context: {error}"))
                 })?;
         let limits = WireLimits::default();
-        let transport = LocalTransport::connect(root.join("focal.sock"), limits.clone())
-            .map_err(|e| CliError::Other(Box::new(e)))?;
+        let transport = LocalTransport::connect(
+            root.join(focal_node::network_admin::LOCAL_SOCKET),
+            limits.clone(),
+        )
+        .map_err(|e| CliError::Other(Box::new(e)))?;
         let client = Client::new(
             context::Transport::Unix(transport),
             RetryPolicy::default(),

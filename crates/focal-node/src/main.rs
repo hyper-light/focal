@@ -18,7 +18,9 @@ use focal_node::{
     config::Settings,
     embedded::{EmbeddedNode, decode_identity},
     host::LocalHost,
-    network_admin::{ADMIN_SOCKET, AdminCommand, admin_wire_limits},
+    network_admin::{
+        ADMIN_SOCKET, AdminCommand, LOCAL_SOCKET, admin_wire_limits, local_sockets_fit,
+    },
     network_join::{NodeInvitation, PendingJoin},
     network_state::{network_requested, resolve_addresses},
 };
@@ -392,6 +394,9 @@ async fn run(args: Args) -> Result<()> {
                 settings.node.listen = Some(listen);
             }
             settings.validate()?;
+            // Sockets that could not be bound are refused before the directory is
+            // initialized or an invitation spent on it.
+            local_sockets_fit(&settings.data_dir()?)?;
             // An uninitialized directory enrolls first; an initialized one
             // keeps its identity and ignores the invitation.
             if let Some(invite_file) = invite_file
@@ -428,6 +433,7 @@ async fn run(args: Args) -> Result<()> {
             if let Some(listen) = listen {
                 settings.node.listen = Some(listen);
             }
+            local_sockets_fit(&settings.data_dir()?)?;
             join(&settings, &invite_file).await
         }
         Commands::Demo => {
@@ -504,7 +510,7 @@ async fn start(settings: Settings) -> Result<()> {
         return start_network(settings, show).await;
     }
     let node = EmbeddedNode::open(&settings)?;
-    let path = node.root().join("focal.sock");
+    let path = node.root().join(LOCAL_SOCKET);
     // The exclusive data-directory owner may clean its socket after a crash, but
     // it must never remove an ordinary file or a symlink at that location.
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
