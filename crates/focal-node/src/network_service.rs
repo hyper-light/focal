@@ -1626,6 +1626,10 @@ impl NetworkService {
             },
             peers: self.pool.stats(),
             listener: self.listener.admission().await,
+            sockets: crate::metrics::SocketMetrics {
+                listener: self.listener.io().await,
+                peers: self.pool.io().await,
+            },
             peer_rtts,
             liveness,
             credential,

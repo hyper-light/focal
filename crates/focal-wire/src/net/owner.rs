@@ -136,6 +136,10 @@ pub struct NetStats {
     /// Dials started: a route's first, and each after its connection went. A caller that joins a
     /// dial in flight, or finds the route's connection up, starts none.
     pub dials: u64,
+    /// What the endpoint's socket did: datagrams and the system calls that moved them, and
+    /// whether the kernel segments its sends and coalesces its receives (`UDP_SEGMENT`,
+    /// `UDP_GRO`).
+    pub io: hyper_rt::udp::IoStats,
 }
 
 /// What a handle asks of the owner.
@@ -685,6 +689,7 @@ impl Owner {
         NetStats {
             endpoint: endpoint.stats(),
             budget: endpoint.budget().stats(),
+            io: self.driver.stats(),
             ..self.stats
         }
     }

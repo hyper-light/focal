@@ -1396,6 +1396,67 @@ fn a_peers_refusals_are_counted_by_what_it_answered() {
     .unwrap()
 }
 
+/// Each side's socket says what it moved: after an exchange, the server's
+/// and the pool's both sent and received datagrams, in no more system calls
+/// than datagrams (the batching the kernel saw).
+#[test]
+fn a_sockets_datagrams_and_calls_are_counted() {
+    focal_rt::block_on(async move {
+        use std::collections::BTreeMap;
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        let mut node_grant = grant();
+        node_grant.role = PeerRole::Node { node_id: 7 };
+        registry
+            .register_certificate(&certificate, node_grant)
+            .unwrap();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(move |verified: VerifiedRequest| async move {
+                verified.request().reply(Response::PeerAccepted)
+            });
+        let (server, task) = server(&pki, registry, handler).await;
+        let pool = PeerConnectionPool::new(
+            node_connector(&pki, certificate, key),
+            PeerPoolLimits {
+                retry_backoff: Duration::ZERO,
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap();
+        pool.replace_routes(
+            1,
+            BTreeMap::from([(
+                2,
+                PeerEndpoint {
+                    address: server.local_addr().unwrap(),
+                    server_name: "localhost".into(),
+                    name: None,
+                },
+            )]),
+        )
+        .unwrap();
+        let mut packet = request(93);
+        packet.operation = Operation::Raft {
+            group: [5; 16],
+            message: vec![3],
+        };
+        pool.send(2, &packet).await.unwrap();
+        for io in [server.io().await, pool.io().await] {
+            assert!(io.sent > 0 && io.received > 0, "{io:?}");
+            assert!(io.send_calls > 0 && io.send_calls <= io.sent, "{io:?}");
+            assert!(
+                io.receive_calls > 0 && io.receive_calls <= io.received,
+                "{io:?}"
+            );
+            assert_eq!(io.send_errors + io.outbox_full, 0, "{io:?}");
+        }
+        server.close().unwrap();
+        task.join().await.unwrap();
+    })
+    .unwrap()
+}
+
 #[test]
 fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_routes() {
     focal_rt::block_on(async move {

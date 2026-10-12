@@ -413,6 +413,13 @@ pub enum StorageMetrics {
     Wal(WalWriterStats),
     Log(LogMetrics),
 }
+/// What the node's two sockets did: the listener's (clients, and the peers that dial this node)
+/// and the peer pool's (what this node sends its peers and their answers).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SocketMetrics {
+    pub listener: hyper_rt::udp::IoStats,
+    pub peers: hyper_rt::udp::IoStats,
+}
 /// One sample of the node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricsSnapshot {
@@ -429,6 +436,8 @@ pub struct MetricsSnapshot {
     /// Who holds the listener's connections and what it refused (27 §3.1
     /// P5).
     pub listener: focal_wire::AdmissionStats,
+    /// What the node's two sockets did.
+    pub sockets: SocketMetrics,
     /// The last measured round-trip time to each peer, bounded by the
     /// fleet's member count (24 §22): the operator's view of inter-node,
     /// and so inter-region, latency.
@@ -1211,6 +1220,78 @@ impl MetricsSnapshot {
             "Bytes of request bodies permitted to the listener's identities and not yet given back.",
             self.listener.bytes,
         );
+        let sockets = [
+            ("listener", self.sockets.listener),
+            ("peers", self.sockets.peers),
+        ];
+        text.header(
+            "focal_udp_datagrams_total",
+            "counter",
+            "Datagrams a socket sent and received: the listener's (clients, and the peers that dial this node) and the peer pool's (what this node sends its peers); a coalesced receive counts each datagram it held.",
+        );
+        for (socket, io) in sockets {
+            text.labeled(
+                "focal_udp_datagrams_total",
+                &[("socket", socket), ("direction", "sent")],
+                io.sent,
+            );
+            text.labeled(
+                "focal_udp_datagrams_total",
+                &[("socket", socket), ("direction", "received")],
+                io.received,
+            );
+        }
+        text.header(
+            "focal_udp_calls_total",
+            "counter",
+            "System calls that moved a socket's datagrams: datagrams over calls is the batching the kernel saw.",
+        );
+        for (socket, io) in sockets {
+            text.labeled(
+                "focal_udp_calls_total",
+                &[("socket", socket), ("direction", "sent")],
+                io.send_calls,
+            );
+            text.labeled(
+                "focal_udp_calls_total",
+                &[("socket", socket), ("direction", "received")],
+                io.receive_calls,
+            );
+        }
+        text.header(
+            "focal_udp_dropped_total",
+            "counter",
+            "Datagrams a socket dropped: refused by the kernel (too large for the interface, the network down) or past its outbox's bound; QUIC recovers them.",
+        );
+        for (socket, io) in sockets {
+            text.labeled(
+                "focal_udp_dropped_total",
+                &[("socket", socket), ("cause", "refused")],
+                io.send_errors,
+            );
+            text.labeled(
+                "focal_udp_dropped_total",
+                &[("socket", socket), ("cause", "outbox_full")],
+                io.outbox_full,
+            );
+        }
+        text.header(
+            "focal_udp_offload",
+            "gauge",
+            "Whether the kernel segments a socket's sends (gso, `UDP_SEGMENT`) and coalesces its receives (gro, `UDP_GRO`): 1 in use, 0 not.",
+        );
+        for (socket, io) in sockets {
+            text.labeled(
+                "focal_udp_offload",
+                &[("socket", socket), ("kind", "gso")],
+                u8::from(io.gso),
+            );
+            text.labeled(
+                "focal_udp_offload",
+                &[("socket", socket), ("kind", "gro")],
+                u8::from(io.gro),
+            );
+        }
         text.gauge(
             "focal_peer_rtt_measured",
             "Peers with a measured round-trip time.",
@@ -1945,6 +2026,7 @@ mod tests {
                 closes_refused: 0,
             },
             listener: focal_wire::AdmissionStats::default(),
+            sockets: SocketMetrics::default(),
             peer_rtts: vec![PeerRtt {
                 peer: 9,
                 rtt_ms: 42,
@@ -2039,6 +2121,15 @@ mod tests {
         sample.peers.lost_unknown = 2;
         sample.peers.lost_unavailable = 2;
         sample.peers.lost_rejected = 1;
+        sample.sockets.peers = hyper_rt::udp::IoStats {
+            sent: 40,
+            send_calls: 10,
+            received: 12,
+            receive_calls: 3,
+            outbox_full: 2,
+            gso: true,
+            ..Default::default()
+        };
         let text = sample.render();
         for line in [
             "# TYPE focal_wal_sync_seconds histogram\n",
@@ -2054,6 +2145,14 @@ mod tests {
             "focal_peer_messages_lost_by_cause_total{cause=\"unavailable\"} 2\n",
             "focal_peer_messages_lost_by_cause_total{cause=\"rejected\"} 1\n",
             "focal_peer_messages_lost_by_cause_total{cause=\"unanswered\"} 3\n",
+            "focal_udp_datagrams_total{socket=\"peers\",direction=\"sent\"} 40\n",
+            "focal_udp_datagrams_total{socket=\"peers\",direction=\"received\"} 12\n",
+            "focal_udp_calls_total{socket=\"peers\",direction=\"sent\"} 10\n",
+            "focal_udp_calls_total{socket=\"peers\",direction=\"received\"} 3\n",
+            "focal_udp_dropped_total{socket=\"peers\",cause=\"outbox_full\"} 2\n",
+            "focal_udp_offload{socket=\"peers\",kind=\"gso\"} 1\n",
+            "focal_udp_offload{socket=\"peers\",kind=\"gro\"} 0\n",
+            "focal_udp_datagrams_total{socket=\"listener\",direction=\"sent\"} 0\n",
         ] {
             assert!(text.contains(line), "missing {line}");
         }
