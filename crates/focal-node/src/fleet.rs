@@ -4863,7 +4863,11 @@ impl Owner {
     /// What a request the owner gives up is answered with: a read parked
     /// with an empty page gets that page — its barrier was current when it
     /// crossed it (the audit's F61) — and every other request the outcome
-    /// the owner can vouch for.
+    /// the owner can vouch for. A write it admitted may be in the log of
+    /// members it reached, which can commit it under another leader: its
+    /// outcome is unknown, never a refusal without effect, which a client
+    /// reports as definite. Every kind is named, so a kind added later is
+    /// classed by a decision and not by a default.
     fn given_up(&self, pending: &mut Pending) -> Response {
         match &mut pending.waiting {
             WaitingFor::Stream(stream) => {
@@ -4874,11 +4878,22 @@ impl Owner {
             }
             WaitingFor::ManagedStream { stream, .. } => Response::Error(stream.interrupted()),
             WaitingFor::Mutation(_)
+            | WaitingFor::NativeMutation { .. }
             | WaitingFor::ManagedMutation { .. }
             | WaitingFor::RequestStreamControl { .. } => {
                 Response::Error(AccessError::OutcomeUnknown)
             }
-            _ => Response::Error(AccessError::Unavailable),
+            WaitingFor::NativeRead { .. }
+            | WaitingFor::RequestStreamRead { .. }
+            | WaitingFor::PeerPersistence
+            | WaitingFor::Read { .. }
+            | WaitingFor::List { .. }
+            | WaitingFor::Select { .. }
+            | WaitingFor::Validators { .. }
+            | WaitingFor::Traverse { .. }
+            | WaitingFor::Summary { .. }
+            | WaitingFor::Monitor { .. }
+            | WaitingFor::Reconcile { .. } => Response::Error(AccessError::Unavailable),
         }
     }
     /// The owner's period at which a request taken now is given up: the

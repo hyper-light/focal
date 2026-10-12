@@ -692,6 +692,23 @@ impl Fleet {
             replica.pool.replace_routes(self.revision, routes).unwrap();
         }
     }
+    /// No other replica reaches `index` any longer, while it still reaches
+    /// them: what it sends arrives, and nothing it is sent in answer does.
+    fn deafen(&mut self, index: usize) {
+        self.revision += 1;
+        for (source, replica) in self.replicas.iter().enumerate() {
+            let routes = if source == index {
+                self.routes.clone()
+            } else {
+                self.routes
+                    .iter()
+                    .filter(|(node, _)| **node != index as u64 + 1)
+                    .map(|(node, endpoint)| (*node, endpoint.clone()))
+                    .collect()
+            };
+            replica.pool.replace_routes(self.revision, routes).unwrap();
+        }
+    }
     /// Every replica reaches every other again, at a new route revision.
     fn reconnect(&mut self) {
         self.revision += 1;
@@ -1732,6 +1749,191 @@ fn a_fresh_copy_is_brought_up_by_a_native_snapshot_by_any_leader() {
         let (leader, _) = membership_on_leader(&fleet).await;
         managed::promise_of(&fleet, leader, fresh_node).await;
         promote_when_caught_up(&fleet, fresh_node, [32; 16]).await;
+        fleet.stop().await;
+    })
+    .unwrap()
+}
+
+/// The fleet's actor (999) creates claim `claim` under request `id`, as a
+/// frame of the projection-only profile.
+fn native_create(id: u128, claim: u128) -> RequestEnvelope {
+    use focal_core::native::{fixtures as fx, input_codec};
+    let parties = fx::Parties::numbered(999);
+    let declaration =
+        fx::delivery_declaration(ledger(), parties, claim, claim * 1000 + 300, 1000).unwrap();
+    let input = fx::creation(
+        ledger(),
+        parties,
+        fx::request(parties.issuer, 1, id),
+        claim,
+        vec![declaration],
+        &[fx::Slot {
+            slot: 0,
+            missing_declaration_index: 20,
+            mode: ValidationMode::Required,
+            checks: vec![],
+        }],
+    )
+    .unwrap();
+    let plan = input_codec::EncodingPlan::prepare(
+        input_codec::InputFrame::Request {
+            ledger: ledger(),
+            profile: focal_ledger::NativeContentProfile::ProjectionOnly,
+            input: &input,
+        },
+        input_codec::EncodingLimits {
+            bytes: 1 << 20,
+            visits: 1 << 28,
+        },
+    )
+    .unwrap();
+    let mut frame = vec![0; plan.quote().bytes];
+    plan.write_into(&mut frame).unwrap();
+    RequestEnvelope {
+        protocol: NATIVE_PROTOCOL_VERSION,
+        ledger: ledger(),
+        route_epoch: RouteEpoch(1),
+        request_epoch: RequestEpoch(1),
+        request_id: RequestId::from_u128(id),
+        operation: Operation::Native { frame },
+    }
+}
+
+/// A linearizable read of claim `claim`.
+fn native_claim(id: u128, claim: u128) -> RequestEnvelope {
+    RequestEnvelope {
+        protocol: NATIVE_PROTOCOL_VERSION,
+        ledger: ledger(),
+        route_epoch: RouteEpoch(1),
+        request_epoch: RequestEpoch(1),
+        request_id: RequestId::from_u128(id),
+        operation: Operation::NativeRead(NativeReadRequest {
+            consistency: ReadConsistency::Linearizable,
+            query: NativeReadQuery::Objects(vec![NativeObjectRef::Claim(ClaimId::from_u128(
+                claim,
+            ))]),
+            max_items: 16,
+        }),
+    }
+}
+
+/// The voters promise the native decoder to each other and the leader
+/// activates projection-only native history; the leader then hosts native
+/// admission.
+async fn activate_projection_only(fleet: &Fleet) {
+    let leader = fleet.leader(None).await;
+    managed::install_support(fleet, leader).await;
+    let mut moved = 0;
+    loop {
+        let leader = fleet.leader(None).await;
+        match fleet.replicas[leader]
+            .host
+            .activate_native(focal_node::fleet::ActivateNativeCall {
+                profile: focal_ledger::NativeContentProfile::ProjectionOnly,
+                chunk_bytes: 1024 * 1024,
+                max_manifest_bytes: 8 * 1024 * 1024,
+            })
+            .await
+        {
+            Ok(()) => break,
+            Err(LedgerError::NotReady { .. }) if moved < 40 => {
+                moved += 1;
+                focal_rt::time::sleep(Duration::from_millis(50))
+                    .await
+                    .unwrap();
+            }
+            Err(error) => panic!("activation: {error}; replicas={:?}", fleet.diagnostics()),
+        }
+    }
+    let mut wait = fleet.wait(Duration::from_secs(10));
+    loop {
+        let leader = fleet.leader(None).await;
+        if let Ok(reply) = fleet.replicas[leader].host.diagnostics().await
+            && reply.value().native_active
+            && reply.value().native_authoritative
+        {
+            return;
+        }
+        if let Err(spent) = wait.check(fleet) {
+            panic!(
+                "native never activated: {spent}; replicas={:?}",
+                fleet.diagnostics()
+            );
+        }
+        focal_rt::time::sleep(TICK).await.unwrap();
+    }
+}
+
+/// A native write its leader admitted and sent on, then gave up on (its
+/// request time spent with no member's answer reaching it), is of unknown
+/// outcome: the members it reached hold it, elect a leader among themselves
+/// and commit it. Answered as refused without effect, its client would
+/// report a committed write as refused, and a caller retrying it under a new
+/// request would write it twice.
+#[test]
+fn a_native_write_its_leader_gives_up_on_is_of_unknown_outcome() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fleet = Fleet::open_with(directory.path(), true, 3, true).await;
+        activate_projection_only(&fleet).await;
+        // The group serves native writes.
+        let mut wait = fleet.wait(Duration::from_secs(10));
+        loop {
+            let leader = fleet.leader(None).await;
+            let answer = fleet.replicas[leader]
+                .actor
+                .request(&native_create(1, 1))
+                .await
+                .unwrap();
+            match answer.result {
+                Response::Native(NativeMutationReply::Committed(_)) => break,
+                Response::Error(AccessError::OutcomeUnknown | AccessError::Unavailable) => {}
+                other => panic!("first write: {other:?}"),
+            }
+            if let Err(spent) = wait.check(&fleet) {
+                panic!("the first write never committed: {spent}");
+            }
+            focal_rt::time::sleep(TICK).await.unwrap();
+        }
+        // Nothing the members send reaches the leader any longer; what it
+        // sends reaches them. It admits the write and sends it on, hears no
+        // answer, and gives it up when its request time is spent.
+        let leader = fleet.leader(None).await;
+        fleet.deafen(leader);
+        let given_up = match fleet.replicas[leader]
+            .actor
+            .request(&native_create(2, 2))
+            .await
+        {
+            Ok(answer) => answer.result,
+            Err(WireError::Timeout) => Response::Error(AccessError::OutcomeUnknown),
+            Err(error) => panic!("the deafened leader's connection failed: {error:?}"),
+        };
+        // The members that hold the write elect a leader among themselves,
+        // which commits it with its term's first entry: it took effect.
+        let replacement = fleet.leader(Some(leader)).await;
+        let mut wait = fleet.wait(Duration::from_secs(10));
+        loop {
+            let read = fleet.replicas[replacement]
+                .actor
+                .request(&native_claim(3, 2))
+                .await
+                .unwrap();
+            if let Response::NativeRead(page) = &read.result
+                && !page.objects.is_empty()
+            {
+                break;
+            }
+            if let Err(spent) = wait.check(&fleet) {
+                panic!("the write never committed under {replacement}: {spent}; {read:?}");
+            }
+            focal_rt::time::sleep(TICK).await.unwrap();
+        }
+        assert!(
+            matches!(given_up, Response::Error(AccessError::OutcomeUnknown)),
+            "a write that took effect was answered {given_up:?}"
+        );
+        fleet.reconnect();
         fleet.stop().await;
     })
     .unwrap()
