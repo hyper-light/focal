@@ -17,7 +17,7 @@ on:
     inputs:
       rates:
         description: "Offered records a second, space-separated"
-        default: "100 1000 4000"
+        default: "1000 4000 16000"
       rounds:
         description: "Rounds of every rate, each running both sides"
         default: "2"
@@ -148,7 +148,7 @@ jobs:
           for round in $(seq 1 "$rounds"); do
             order="a b"
             if [ $((round % 2)) -eq 0 ]; then order="b a"; fi
-            for rate in ${{ github.event.inputs.rates || '100 1000 4000' }}; do
+            for rate in ${{ github.event.inputs.rates || '1000 4000 16000' }}; do
               for side in $order; do
                 docker tag "focal:bench-$side" focal:bench
                 # A failed run is recorded and the rest still run.
