@@ -11,7 +11,9 @@
 use crate::authored;
 use crate::error::LoadError;
 use crate::generations::{Finished, Generations};
-use crate::measurements::{self, WriteMeasurements, WriteOutcome, WriteSample, WriteSamples};
+use crate::measurements::{
+    self, RefusalCause, WriteMeasurements, WriteOutcome, WriteSample, WriteSamples,
+};
 use crate::native;
 use crate::report::{self, Latency, Report};
 use crate::shape::{Profile, Transport, WorkloadShape};
@@ -29,9 +31,10 @@ use focal_node::{
     host::LocalHost,
 };
 use focal_wire::{
-    AuthenticatedPeer, NativeClaimExpand, NativeErrorCode, NativeMutationReply, NativeObject,
-    NativeReadQuery, NativeReadRequest, NativeRefusalKind, Operation, PeerGrant, PeerRole,
-    QuicConnector, ReadConsistency, RequestEnvelope, Response, ResponseEnvelope, WireLimits,
+    AccessError, AuthenticatedPeer, NativeClaimExpand, NativeErrorCode, NativeMutationReply,
+    NativeObject, NativeReadQuery, NativeReadRequest, NativeRefusalKind, Operation, PeerGrant,
+    PeerRole, QuicConnector, ReadConsistency, RequestEnvelope, Response, ResponseEnvelope,
+    WireLimits,
 };
 use hyper_rt::combine::{Either, race2};
 use std::{
@@ -56,14 +59,22 @@ const PROTOCOL_OFFSET: u128 = 0xC000_0000;
 const ATTEMPTS: u128 = 2;
 /// The worker index the reopen probe uses; above every real worker.
 const PROBE_WORKER: u128 = 0xFF;
-/// Distinct refusal reasons kept per run.
+/// Distinct refusal reasons kept per run, the last place for those past the others
+/// ([`OTHER_REASONS`]).
 const MAX_REFUSALS: usize = 8;
+/// What the refusals past the kept reasons are counted under: the reasons sum to the
+/// refusals they name, however many kinds there were.
+const OTHER_REASONS: &str = "(other reasons)";
 /// Characters kept of one refusal reason.
 const MAX_REASON_CHARS: usize = 200;
 /// Directory entries the size walk visits before it refuses to count further.
 const MAX_WALK_ENTRIES: usize = 100_000;
 /// Directory depth the size walk descends to.
 const MAX_WALK_DEPTH: usize = 16;
+
+#[cfg(test)]
+#[path = "driver_tests.rs"]
+mod tests;
 
 /// What the run's connections are opened to.
 enum Connector {
@@ -199,12 +210,38 @@ struct Outcome {
 fn note(refusals: &mut Vec<(String, u64)>, reason: String) {
     note_count(refusals, reason, 1);
 }
+/// A reason as it is counted: each run of digits read as `#`, so a refusal that names its own
+/// figures (a memory refusal's request and room, an epoch) is counted with the others of its
+/// kind.
+fn reason_shape(reason: &str) -> String {
+    let mut shaped = String::new();
+    let mut digits = false;
+    for character in reason.chars().take(MAX_REASON_CHARS) {
+        if character.is_ascii_digit() {
+            if !digits {
+                shaped.push('#');
+            }
+            digits = true;
+        } else {
+            shaped.push(character);
+            digits = false;
+        }
+    }
+    shaped
+}
 fn note_count(refusals: &mut Vec<(String, u64)>, reason: String, count: u64) {
-    let reason: String = reason.chars().take(MAX_REASON_CHARS).collect();
+    let reason = reason_shape(&reason);
     if let Some((_, seen)) = refusals.iter_mut().find(|(seen, _)| *seen == reason) {
         *seen = seen.saturating_add(count);
-    } else if refusals.len() < MAX_REFUSALS {
+        return;
+    }
+    if refusals.len() < MAX_REFUSALS.saturating_sub(1) {
         refusals.push((reason, count));
+        return;
+    }
+    match refusals.iter_mut().find(|(seen, _)| seen == OTHER_REASONS) {
+        Some((_, seen)) => *seen = seen.saturating_add(count),
+        None => refusals.push((OTHER_REASONS.to_owned(), count)),
     }
 }
 
@@ -237,8 +274,17 @@ enum Reply {
     /// Refused by name: the request's generation is closed, or not admitted
     /// yet (the audit's F12); never executed.
     Expired,
-    Refused(String),
+    Refused(String, RefusalCause),
     Unknown(String),
+}
+
+/// The cause of a refusal the node's access layer made.
+fn access(error: &AccessError) -> RefusalCause {
+    match error {
+        AccessError::Capacity => RefusalCause::IngressCapacity,
+        AccessError::Unavailable => RefusalCause::Unavailable,
+        _ => RefusalCause::Other,
+    }
 }
 
 fn classify(result: Result<ResponseEnvelope, ClientError>) -> Reply {
@@ -256,17 +302,30 @@ fn classify(result: Result<ResponseEnvelope, ClientError>) -> Reply {
                 Reply::Expired
             }
             Response::Native(NativeMutationReply::Refused(refusal)) => {
-                Reply::Refused(format!("refused: {refusal:?}"))
+                // The owner names the bound that refused (its memory, its pending
+                // candidates): a full session is refused for its memory.
+                let cause = match refusal.kind {
+                    NativeRefusalKind::Capacity
+                        if refusal.detail.starts_with("native owner memory") =>
+                    {
+                        RefusalCause::OwnerMemory
+                    }
+                    NativeRefusalKind::Capacity => RefusalCause::OwnerBound,
+                    _ => RefusalCause::Other,
+                };
+                Reply::Refused(format!("refused: {refusal:?}"), cause)
             }
             Response::Native(NativeMutationReply::Pending(_)) => {
                 Reply::Unknown("pending: ticket, not a receipt".into())
             }
-            Response::Error(error) => Reply::Refused(format!("access: {error:?}")),
-            _ => Reply::Refused("unexpected reply kind".into()),
+            Response::Error(error) => Reply::Refused(format!("access: {error:?}"), access(&error)),
+            _ => Reply::Refused("unexpected reply kind".into(), RefusalCause::Other),
         },
         // The client gave up on a refusal the node made (capacity, after
         // its bounded retries): admitted nothing, so refused, not unknown.
-        Err(ClientError::Access(error)) => Reply::Refused(format!("access: {error:?}")),
+        Err(ClientError::Access(error)) => {
+            Reply::Refused(format!("access: {error:?}"), access(&error))
+        }
         Err(error) => Reply::Unknown(format!("client: {error}")),
     }
 }
@@ -413,7 +472,7 @@ impl Shared<'_> {
                 self.generations.advance_failed()?;
                 self.learn().await.map(|_| ())
             }
-            Reply::Refused(reason) | Reply::Unknown(reason) => {
+            Reply::Refused(reason, _) | Reply::Unknown(reason) => {
                 self.generations.advance_failed()?;
                 self.note(format!("floor advance: {reason}"));
                 Ok(())
@@ -460,8 +519,12 @@ impl Shared<'_> {
                 outcome: match &reply {
                     Reply::Committed => WriteOutcome::Committed,
                     Reply::Expired => WriteOutcome::Expired,
-                    Reply::Refused(_) => WriteOutcome::Refused,
+                    Reply::Refused(..) => WriteOutcome::Refused,
                     Reply::Unknown(_) => WriteOutcome::Unknown,
+                },
+                refusal: match &reply {
+                    Reply::Refused(_, cause) => *cause,
+                    _ => RefusalCause::None,
                 },
             })?;
             if let Finished::Advance { epoch, minimum } = self.generations.finish(minted.epoch)? {
@@ -485,7 +548,7 @@ impl Shared<'_> {
                         "refused by name in the generation the owner named".into(),
                     );
                 }
-                Reply::Refused(reason) => {
+                Reply::Refused(reason, _) => {
                     let mut outcome = self.outcome.borrow_mut();
                     outcome.refused = outcome.refused.saturating_add(1);
                     note(&mut outcome.refusals, reason);
