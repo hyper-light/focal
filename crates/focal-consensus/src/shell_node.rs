@@ -159,6 +159,9 @@ pub(crate) struct ShellNode {
     quiet_due: bool,
     /// The last drive left more to do without an answer from the log (`Driven::more`).
     more: bool,
+    /// Whether the log had room for another write as the last drive left it (`LogStore::room`):
+    /// a `Ready` the replica cannot write is not one it can take ([`ShellNode::ready_takeable`]).
+    room: bool,
     /// What tells the owner a write of the group was answered (`notify_persisted`).
     persisted: Option<PersistedSignal>,
     /// The waker the latest writes went out with, made from the owner's signal; none until a
@@ -371,6 +374,7 @@ impl ShellNode {
             periods: 0,
             quiet_due: false,
             more: false,
+            room: true,
             persisted: None,
             waker: None,
             decoders,
@@ -1083,7 +1087,23 @@ impl ShellNode {
                 || (!stalled
                     && (self.quiet_due
                         || (self.replica.in_flight() > 0 && !self.wakes_owner())
-                        || self.replica.core().has_ready())))
+                        || self.ready_takeable())))
+    }
+    /// Whether a drive could take the core's next `Ready` now, by the replica's own rule
+    /// (hyper-durable's `Replica::ready_due`): the core has one, fewer of its `Ready`s' writes are
+    /// out than its depth, and a write may go out — fewer are out than the depth and the shell's
+    /// own one, and the log had room as the last drive left it. A `Ready` the core has but no
+    /// write may carry is taken by the drive the log's answer brings, which the log tells the
+    /// owner of (`wakes_owner`). Counted as ready at once, the core's own `has_ready` held a
+    /// grouped owner in a loop for as long as the writes were out: about 400,000 passes a second
+    /// with nothing to take, at 100 writes a second (macOS, 2026-10-12).
+    fn ready_takeable(&self) -> bool {
+        let core = self.replica.core();
+        let depth = core.raft.config().limits.readies_in_flight;
+        self.room
+            && core.in_flight() < depth
+            && self.replica.in_flight() < depth.saturating_add(1)
+            && core.has_ready()
     }
     pub fn try_drain(&mut self) -> Result<Option<NodeEvents>, ConsensusError> {
         self.poll_drain(false)
@@ -1241,6 +1261,7 @@ impl ShellNode {
         let driven = self.replica.drive(self.periods, &waker, &mut self.out);
         let driven = self.heard(driven)?;
         self.more = driven.more;
+        self.room = self.replica.log_mut().room();
         self.quiet_due = false;
         events
             .messages
