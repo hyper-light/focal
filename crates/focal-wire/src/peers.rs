@@ -138,10 +138,13 @@ pub struct PeerPoolStats {
     pub lost: u64,
     /// Of `lost`, what the peer answered: refused for room
     /// (`AccessError::Capacity`), an outcome it could not say on any attempt
-    /// (`OutcomeUnknown`, `Unavailable`), or refused otherwise. The rest
-    /// had no answer: lost on the way, or their route changed under them.
+    /// (`OutcomeUnknown`), refused as serving no such group or service now
+    /// (`Unavailable`, without effect: a member whose copy of a group is not
+    /// open yet answers so until it is), or refused otherwise. The rest had
+    /// no answer: lost on the way, or their route changed under them.
     pub lost_refused: u64,
     pub lost_unknown: u64,
+    pub lost_unavailable: u64,
     pub lost_rejected: u64,
     pub busy: u64,
     /// Dials attempted, successful or not.
@@ -164,6 +167,7 @@ struct Counters {
     lost: AtomicU64,
     lost_refused: AtomicU64,
     lost_unknown: AtomicU64,
+    lost_unavailable: AtomicU64,
     lost_rejected: AtomicU64,
     busy: AtomicU64,
     dials: AtomicU64,
@@ -1035,9 +1039,12 @@ impl PeerConnectionPool {
                     PeerSendError::Rejected(AccessError::Capacity) => {
                         increment(&self.counters.lost_refused);
                     }
-                    PeerSendError::Rejected(
-                        AccessError::OutcomeUnknown | AccessError::Unavailable,
-                    ) => increment(&self.counters.lost_unknown),
+                    PeerSendError::Rejected(AccessError::OutcomeUnknown) => {
+                        increment(&self.counters.lost_unknown);
+                    }
+                    PeerSendError::Rejected(AccessError::Unavailable) => {
+                        increment(&self.counters.lost_unavailable);
+                    }
                     PeerSendError::Rejected(_) => increment(&self.counters.lost_rejected),
                     _ => {}
                 }
@@ -1586,6 +1593,7 @@ impl PeerConnectionPool {
             lost: self.counters.lost.load(Ordering::Relaxed),
             lost_refused: self.counters.lost_refused.load(Ordering::Relaxed),
             lost_unknown: self.counters.lost_unknown.load(Ordering::Relaxed),
+            lost_unavailable: self.counters.lost_unavailable.load(Ordering::Relaxed),
             lost_rejected: self.counters.lost_rejected.load(Ordering::Relaxed),
             busy: self.counters.busy.load(Ordering::Relaxed),
             dials: self.counters.dials.load(Ordering::Relaxed),

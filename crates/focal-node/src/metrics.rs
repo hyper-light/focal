@@ -1105,16 +1105,18 @@ impl MetricsSnapshot {
         text.header(
             "focal_peer_messages_lost_by_cause_total",
             "counter",
-            "Peer requests lost, by what the peer answered: refused for room, an outcome it could not say on any attempt, refused otherwise; or no answer, lost on the way.",
+            "Peer requests lost, by what the peer answered: refused for room, an outcome it could not say on any attempt, unavailable (it serves no such group now, as a member whose copy is not yet open; without effect), refused otherwise; or no answer, lost on the way.",
         );
         let answered = self
             .peers
             .lost_refused
             .saturating_add(self.peers.lost_unknown)
+            .saturating_add(self.peers.lost_unavailable)
             .saturating_add(self.peers.lost_rejected);
         for (cause, lost) in [
             ("refused", self.peers.lost_refused),
             ("unknown", self.peers.lost_unknown),
+            ("unavailable", self.peers.lost_unavailable),
             ("rejected", self.peers.lost_rejected),
             ("unanswered", self.peers.lost.saturating_sub(answered)),
         ] {
@@ -1931,6 +1933,7 @@ mod tests {
                 lost: 0,
                 lost_refused: 0,
                 lost_unknown: 0,
+                lost_unavailable: 0,
                 lost_rejected: 0,
                 busy: 0,
                 dials: 1,
@@ -2031,9 +2034,10 @@ mod tests {
             syncs,
             ..Default::default()
         }));
-        sample.peers.lost = 7;
+        sample.peers.lost = 9;
         sample.peers.lost_refused = 1;
         sample.peers.lost_unknown = 2;
+        sample.peers.lost_unavailable = 2;
         sample.peers.lost_rejected = 1;
         let text = sample.render();
         for line in [
@@ -2047,6 +2051,7 @@ mod tests {
             "focal_wal_sync_seconds_count 6\n",
             "focal_peer_messages_lost_by_cause_total{cause=\"refused\"} 1\n",
             "focal_peer_messages_lost_by_cause_total{cause=\"unknown\"} 2\n",
+            "focal_peer_messages_lost_by_cause_total{cause=\"unavailable\"} 2\n",
             "focal_peer_messages_lost_by_cause_total{cause=\"rejected\"} 1\n",
             "focal_peer_messages_lost_by_cause_total{cause=\"unanswered\"} 3\n",
         ] {

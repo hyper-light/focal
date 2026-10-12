@@ -1321,6 +1321,81 @@ fn oversized_upload_is_denied_before_handler_and_bad_upload_reply_is_unknown() {
     .unwrap()
 }
 
+/// A message the peer refuses on every attempt is counted lost by what the
+/// peer answered: serving no such group (`Unavailable`, as a member whose
+/// copy of a new session is not open yet answers its leader) apart from an
+/// outcome it could not say. The two had been counted as one, so a
+/// comparison's leader showed 13 lost "of unknown outcome" at every start,
+/// each a refusal without effect.
+#[test]
+fn a_peers_refusals_are_counted_by_what_it_answered() {
+    focal_rt::block_on(async move {
+        use std::collections::BTreeMap;
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        let mut node_grant = grant();
+        node_grant.role = PeerRole::Node { node_id: 7 };
+        registry
+            .register_certificate(&certificate, node_grant)
+            .unwrap();
+        let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+            let refusal = match &verified.request().operation {
+                Operation::Raft { group, .. } if *group == [3; 16] => AccessError::Unavailable,
+                _ => AccessError::OutcomeUnknown,
+            };
+            async move { verified.request().reply(Response::Error(refusal)) }
+        });
+        let (server, task) = server(&pki, registry, handler).await;
+        let pool = PeerConnectionPool::new(
+            node_connector(&pki, certificate, key),
+            PeerPoolLimits {
+                retry_backoff: Duration::ZERO,
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap();
+        pool.replace_routes(
+            1,
+            BTreeMap::from([(
+                2,
+                PeerEndpoint {
+                    address: server.local_addr().unwrap(),
+                    server_name: "localhost".into(),
+                    name: None,
+                },
+            )]),
+        )
+        .unwrap();
+        let mut unopened = request(91);
+        unopened.operation = Operation::Raft {
+            group: [3; 16],
+            message: vec![1],
+        };
+        let mut unknown = request(92);
+        unknown.operation = Operation::Raft {
+            group: [4; 16],
+            message: vec![2],
+        };
+        assert_eq!(
+            pool.send(2, &unopened).await,
+            Err(PeerSendError::Rejected(AccessError::Unavailable))
+        );
+        assert_eq!(
+            pool.send(2, &unknown).await,
+            Err(PeerSendError::Rejected(AccessError::OutcomeUnknown))
+        );
+        let stats = pool.stats();
+        assert_eq!(stats.lost, 2);
+        assert_eq!(stats.lost_unavailable, 1);
+        assert_eq!(stats.lost_unknown, 1);
+        assert_eq!(stats.lost_refused + stats.lost_rejected, 0);
+        server.close().unwrap();
+        task.join().await.unwrap();
+    })
+    .unwrap()
+}
+
 #[test]
 fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_routes() {
     focal_rt::block_on(async move {
