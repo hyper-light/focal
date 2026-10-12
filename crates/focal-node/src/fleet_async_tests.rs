@@ -835,9 +835,8 @@ fn the_only_stopped_session_past_the_first_512_shows_in_the_first_round() {
 
 /// A session refuses a participant's write that would wait past its delay bound — once its
 /// window's worth is queued for its pipeline, the next would be taken only after a bound —
-/// before it is charged or queued, and counts it at the delay; what queued and then waited
-/// past the bound is dropped at the head as it is taken, counted alike, never served late;
-/// and once its queue drains the session takes writes again.
+/// before it is charged or queued, and counts it at the delay; what the door let in is served
+/// however long it waited; and once its queue drains the session takes writes again.
 #[test]
 fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
     focal_rt::block_on(async move {
@@ -924,25 +923,19 @@ fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
         );
         resume.send(()).unwrap();
         drop(disk.join().unwrap());
-        // The write out is answered; the queued ones had waited past a bound of a few
-        // microseconds as they were taken: dropped at the head, refused, counted.
-        let mut answers = answers.into_iter();
-        let written = answers.next().unwrap().await.unwrap().result;
-        assert!(
-            !matches!(written, Response::Error(AccessError::Capacity)),
-            "{written:?}"
-        );
+        // The write out is answered, and the queued ones the door let in are served however long
+        // they waited: only the door's refusal is counted.
         for answer in answers {
             let result = answer.await.unwrap().result;
             assert!(
-                matches!(result, Response::Error(AccessError::Capacity)),
-                "a write queued past its bound is dropped at the head: {result:?}"
+                !matches!(result, Response::Error(AccessError::Capacity)),
+                "a write the door let in is served: {result:?}"
             );
         }
         assert_eq!(
             host.input_refusals().requests_refused.delay,
-            1 + window,
-            "the door's and the head's"
+            1,
+            "the door's alone"
         );
         // The queue drained: with a cycle the queue can be taken within, the session takes
         // writes again.

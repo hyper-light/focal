@@ -71,18 +71,13 @@ struct TickShared {
     /// reads, so each kind's delay is its own.
     writes: QueueMarks,
     others: QueueMarks,
-    /// The least time a write took from its taking to its answer, in the term
-    /// the session leads in: its write cycle uncongested, what every delay is
-    /// judged by ([`TickPeriod::delay_bound`]). Zero until one is measured
+    /// The least time a write took from its taking to its answer with no
+    /// other write in its pipeline, in the term the session leads in: its
+    /// write cycle uncongested, what every delay is judged by
+    /// ([`TickPeriod::delay_bound`]). Zero until one is measured
     /// ([`TickPeriod::served`]); only falls within a term
     /// ([`TickPeriod::reset_base`]).
     base_service_ns: AtomicU64,
-    /// The longest a write took from its taking to its answer over the last
-    /// [`BASE_WINDOW`], and when that was: the longest stall the session's
-    /// writes met (a checkpoint, a slow flush), which a queue must outlast to be
-    /// standing ([`TickPeriod::standing_interval`]).
-    slowest_service_ns: AtomicU64,
-    slowest_seen_ns: AtomicU64,
     /// The writes the owner answered within one bound, counted interval by
     /// interval as they are answered: when the current interval began and
     /// how many it has answered; and the most any interval answered over the
@@ -625,21 +620,10 @@ impl TickPeriod {
     /// where the other round's was 130). Only the owner thread answers, so
     /// these marks have one writer.
     pub(crate) fn served(&self, service: Duration) {
-        self.served_at(service, now_ns());
-    }
-    fn served_at(&self, service: Duration, now: u64) {
         let sample = u64::try_from(service.as_nanos()).unwrap_or(u64::MAX).max(1);
         let base = self.0.base_service_ns.load(Ordering::Relaxed);
         if base == 0 || sample <= base {
             self.0.base_service_ns.store(sample, Ordering::Relaxed);
-        }
-        // The slowest of the window stands until a longer one comes or it ages out of it.
-        let slowest = self.0.slowest_service_ns.load(Ordering::Relaxed);
-        let seen = self.0.slowest_seen_ns.load(Ordering::Relaxed);
-        let window = u64::try_from(BASE_WINDOW.as_nanos()).unwrap_or(u64::MAX);
-        if sample >= slowest || now.saturating_sub(seen) > window {
-            self.0.slowest_service_ns.store(sample, Ordering::Relaxed);
-            self.0.slowest_seen_ns.store(now, Ordering::Relaxed);
         }
     }
     /// The session leads in a new term: what it measured of its cycle and its
@@ -655,8 +639,6 @@ impl TickPeriod {
     /// term changes: a new leader has new followers to reach.
     pub(crate) fn reset_base(&self) {
         self.0.base_service_ns.store(0, Ordering::Relaxed);
-        self.0.slowest_service_ns.store(0, Ordering::Relaxed);
-        self.0.slowest_seen_ns.store(0, Ordering::Relaxed);
         self.0.interval_began_ns.store(0, Ordering::Relaxed);
         self.0.interval_answered.store(0, Ordering::Relaxed);
         self.0.answered_most.store(0, Ordering::Relaxed);
@@ -720,23 +702,16 @@ impl TickPeriod {
         self.0.others.above_since_ns.store(0, Ordering::Relaxed);
     }
     /// How long a queue's delay must stay past its bound before it is a
-    /// standing queue: [`STANDING_BOUNDS`] bounds, or the slowest write the
-    /// session answered over the window if longer. A burst that drains within
+    /// standing queue: [`STANDING_BOUNDS`] bounds. A burst that drains within
     /// it is a good queue and is refused nothing; one that stands is a bad
-    /// queue. A stall the session's writes met (a checkpoint, a slow flush)
-    /// queues what comes in it, and that queue drains once the stall ends: at
-    /// 100 writes a second on 1-CPU CI nodes a bound of four cycles, a few
-    /// milliseconds, dropped what one stall queued, its writes answered
-    /// refused after 100-200 ms where land-14 committed them (A/B run
-    /// 38298672150). A write's time from its taking is held to a bound or two
-    /// by the pipeline's gate, so under an overload with no stall the slowest
-    /// stays near two bounds: the interval it gives is the stall's, not the
-    /// load's (taken from admission, 557bd8b's interval rose with the load to
-    /// 494 ms). None until the session has served a write.
+    /// queue. Of the bound, which only falls within a term, and not of the
+    /// slowest uncongested write over a window: that rose with the load too
+    /// (to 494 ms at 16,000 writes a second locally), and a queue stood that
+    /// long before it was refused for. None until the session has served a
+    /// write.
     pub(crate) fn standing_interval(&self) -> Option<Duration> {
-        let slowest = Duration::from_nanos(self.0.slowest_service_ns.load(Ordering::Relaxed));
         self.delay_bound()
-            .map(|bound| bound.saturating_mul(STANDING_BOUNDS).max(slowest))
+            .map(|bound| bound.saturating_mul(STANDING_BOUNDS))
     }
     /// Whether a participant's request (a `write` or not) is to be refused now
     /// for the delay it would be queued behind: CoDel's test (Nichols and
@@ -753,46 +728,20 @@ impl TickPeriod {
         self.delay_exceeded_at(write, now_ns())
     }
     /// [`Self::delay_exceeded`] as of `now`, in nanoseconds since the process began. A write is
-    /// refused once its queue holds its window while that queue stands: taken in at most a
-    /// window a bound ([`Self::write_window`]), the next would wait past the bound to be taken
-    /// (Little's law read forward), and a queue that stands is an overload's, where one that
-    /// drains is a stall's (Facebook's adaptive CoDel: lenient until the queue has not emptied
-    /// for an interval, Maurer, "Fail at Scale", ACM Queue 2015).
+    /// refused once its queue holds its window: taken in at most a window a bound
+    /// ([`Self::write_window`]), the next would wait past the bound to be taken — Little's law
+    /// read forward, as no interval need pass to know it.
     fn delay_exceeded_at(&self, write: bool, now: u64) -> bool {
-        let (Some(bound), Some(interval)) = (self.delay_bound(), self.standing_interval()) else {
-            return false;
-        };
         if write {
-            let full = self.write_window().is_some_and(|window| {
+            return self.write_window().is_some_and(|window| {
                 usize::try_from(self.0.writes.queued.load(Ordering::Acquire)).unwrap_or(usize::MAX)
                     >= window
             });
-            return full && self.0.writes.standing_at(now, bound, interval);
         }
-        self.marks(write).standing_at(now, bound, interval)
-    }
-    /// Whether the owner drops a write it takes now after `waited` queued,
-    /// without serving it: past the bound while its queue stands, and past the
-    /// interval while it does not. CoDel drops at the head (RFC 8289 §5), as
-    /// Facebook's servers drop a request queued past its timeout, short while
-    /// the queue stands and long while it drains ("Fail at Scale"): the door
-    /// keeps a standing queue within its window, and this catches what the
-    /// window let in before the rate fell, at the cost of a dequeue, where
-    /// served it would cost a preparation its answer comes too late to be
-    /// worth. A stall's queue is served late, not refused.
-    pub(crate) fn head_drop(&self, waited: Duration) -> bool {
-        self.head_drop_at(waited, now_ns())
-    }
-    fn head_drop_at(&self, waited: Duration, now: u64) -> bool {
         let (Some(bound), Some(interval)) = (self.delay_bound(), self.standing_interval()) else {
             return false;
         };
-        let limit = if self.0.writes.standing_at(now, bound, interval) {
-            bound
-        } else {
-            interval
-        };
-        waited > limit
+        self.marks(write).standing_at(now, bound, interval)
     }
     /// The room the owner last stated, and the frames queued in it now.
     #[cfg(test)]
@@ -1024,7 +973,6 @@ mod admission_tests {
             !pace.delay_exceeded(true),
             "nothing is refused before a cycle is measured"
         );
-        assert!(!pace.head_drop(ms(10_000)));
         assert!(pace.pipeline_open(1_000_000));
         pace.served(ms(9));
         pace.served(ms(4));
@@ -1117,50 +1065,22 @@ mod admission_tests {
         assert!(pace.pipeline_open_at(100, now));
     }
 
-    /// A write is refused at the door once its queue holds its window while that queue stands,
-    /// and one taken after waiting past the bound is dropped at the head while it stands, past
-    /// the interval while it drains; the rest's queue is judged apart, so writes held for the
-    /// pipeline never refuse a read.
+    /// A write is refused at the door once its queue holds its window; the rest's queue is judged
+    /// apart, so writes held for the pipeline never refuse a read.
     #[test]
-    fn writes_are_refused_at_their_window_and_dropped_past_their_bound_while_their_queue_stands() {
-        running_for(ms(2_000));
-        // Bound 50 ms; the interval two bounds, the slowest write so far being 12.5 ms.
+    fn writes_are_refused_at_their_window() {
         let pace = measured(CYCLE, 100);
-        assert_eq!(pace.standing_interval(), Some(ms(100)));
-        let mut queued: Vec<QueueTicket> = (0..100).map(|_| pace.queue_request(true)).collect();
-        let busy = now_ns() - ns(ms(1_000));
-        pace.0.writes.busy_since_ns.store(busy, Ordering::Relaxed);
-        let at = |after: u64| busy + ns(ms(after));
+        let mut queued: Vec<QueueTicket> = (0..99).map(|_| pace.queue_request(true)).collect();
+        assert!(!pace.delay_exceeded(true));
+        queued.push(pace.queue_request(true));
         assert!(
-            !pace.delay_exceeded_at(true, at(51)),
-            "its window queued, the delay first past the bound: a stall's queue"
+            pace.delay_exceeded(true),
+            "its window queued: the next waits past the bound"
         );
-        assert!(
-            !pace.head_drop_at(ms(51), at(52)),
-            "past the bound, not the interval"
-        );
-        assert!(pace.head_drop_at(ms(101), at(52)), "past the interval");
-        assert!(!pace.delay_exceeded_at(true, at(150)), "99 ms past it");
-        assert!(
-            pace.delay_exceeded_at(true, at(151)),
-            "an interval past it, its window queued: refused"
-        );
-        assert!(
-            pace.head_drop_at(ms(51), at(152)),
-            "standing: past the bound"
-        );
-        assert!(
-            !pace.delay_exceeded_at(false, at(152)),
-            "the reads' queue is apart"
-        );
+        assert!(!pace.delay_exceeded(false), "the reads' queue is apart");
+        assert_eq!(pace.queueing_delay(false), Duration::ZERO);
         drop(queued.pop());
-        assert!(
-            !pace.delay_exceeded_at(true, at(153)),
-            "under its window, standing or not"
-        );
-        // A slower write widens the interval: what a stall took, a queue must outlast.
-        pace.served_at(ms(400), at(154));
-        assert_eq!(pace.standing_interval(), Some(ms(400)));
+        assert!(!pace.delay_exceeded(true));
     }
 
     /// The rest's queue is CoDel's: a delay past its bound is a standing queue only once it

@@ -2968,22 +2968,14 @@ impl Owner {
             native,
             queued,
         } = *request;
-        let waited = queued.map_or(Duration::ZERO, crate::pace::QueueTicket::taken);
-        // A write taken after waiting past the bound is dropped at the head, unserved
-        // (`TickPeriod::head_drop`): refused as at the door, for its delay, at the cost of its
-        // dequeue.
-        if grouped::request_class(&verified) == focal_directory::WorkClass::Append
-            && self.pace.head_drop(waited)
-        {
-            self.pace
-                .refuse_input(false, crate::pace::InputBound::Delay);
-            drop(charge);
-            let _ = response.send(OwnedResponse::new(
-                verified
-                    .request()
-                    .reply(Response::Error(AccessError::Capacity)),
-            ));
-            return Ok(());
+        // What the request waited in its queue is marked as the owner takes it; a write the door
+        // let in is served however long it waited. Dropped at the head once past the bound, the
+        // writes a stall had queued were refused after 100-200 ms where they would have been
+        // served (100 writes a second on 1-CPU CI nodes, A/B run 38298672150), and under an
+        // overload a refusal that waited held its client's slot as long as an answer (12,000 a
+        // second, A/B run 38309970974): the door, at the window, refuses at once.
+        if let Some(ticket) = queued {
+            let _waited = ticket.taken();
         }
         let waiting = self.session.reads_waiting();
         self.request(verified, response, charge, witness, native);
