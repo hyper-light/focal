@@ -1015,6 +1015,13 @@ struct Owner {
     streams: Streams,
     runtime: Option<focal_runtime::Runtime>,
     pending: VecDeque<Pending>,
+    /// No pending request's deadline is earlier: a bound from below, lowered as each request is
+    /// queued and made exact by the scan that gives up the expired ones (`expire_pending`), so a
+    /// pass with nothing past its deadline looks at none of them. Each pass rotated the whole
+    /// queue to look: at 5,000 writes a second, with every write a session had in flight queued
+    /// here, that was 39% of the owner, nearly all of it moving the records
+    /// (`_platform_memmove`, 2026-10-12).
+    earliest_deadline: u64,
     memberships: VecDeque<PendingMembershipCall>,
     /// The members the committed directory names for this session, sorted:
     /// the peers whose replication this replica admits beside those of its
@@ -1286,6 +1293,7 @@ impl ReplicaHost {
             streams,
             runtime,
             pending: VecDeque::new(),
+            earliest_deadline: u64::MAX,
             memberships: VecDeque::new(),
             admitted: Vec::new(),
             near: Near::default(),
@@ -3124,6 +3132,12 @@ impl Owner {
             .saturating_add(self.resequencer.held())
             .saturating_add(self.waiting_frames.len())
     }
+    /// Queues a request to wait for its answer, its deadline the earliest pending one if it is
+    /// ([`Owner::earliest_deadline`]).
+    fn queue_pending(&mut self, pending: Pending) {
+        self.earliest_deadline = self.earliest_deadline.min(pending.deadline);
+        self.pending.push_back(pending);
+    }
     /// The Raft traffic admitted beside the participants' bound (F56): every
     /// member the configuration names — voters, learners and the admitted —
     /// may have its whole in-flight window outstanding at once, the window
@@ -3359,7 +3373,7 @@ impl Owner {
         match self.session.step_authenticated(source, &message) {
             Ok(()) => {
                 pending.waiting = WaitingFor::PeerPersistence;
-                self.pending.push_back(pending);
+                self.queue_pending(pending);
                 if lost {
                     self.lost_to(source);
                 }
@@ -3399,7 +3413,7 @@ impl Owner {
         };
         if let Some((group, order)) = replication {
             match self.admit_replication(&verified, group, order) {
-                Ok(Replication::Stepped(deadline)) => self.pending.push_back(Pending {
+                Ok(Replication::Stepped(deadline)) => self.queue_pending(Pending {
                     header,
                     response,
                     waiting: WaitingFor::PeerPersistence,
@@ -4148,7 +4162,7 @@ impl Owner {
             }
         })();
         if let Some((waiting, deadline)) = waiting {
-            self.pending.push_back(Pending {
+            self.queue_pending(Pending {
                 header,
                 response,
                 waiting,
@@ -4974,19 +4988,26 @@ impl Owner {
         }
         // Rotate in place: no replacement queue allocation is needed while a
         // stalled disk retains both its Ready and client input reservations.
-        let count = self.pending.len();
-        for _ in 0..count {
-            let Some(mut pending) = self.pending.pop_front() else {
-                break;
-            };
-            if pending.response.is_closed() {
-                drop(pending);
-            } else if now >= pending.deadline {
-                let result = self.given_up(&mut pending);
-                pending.finish(result);
-            } else {
-                self.pending.push_back(pending);
+        // Only once a deadline may have passed: a request whose caller left is
+        // answered as it resolves or expires, its room held until then.
+        if now >= self.earliest_deadline {
+            let mut earliest = u64::MAX;
+            let count = self.pending.len();
+            for _ in 0..count {
+                let Some(mut pending) = self.pending.pop_front() else {
+                    break;
+                };
+                if pending.response.is_closed() {
+                    drop(pending);
+                } else if now >= pending.deadline {
+                    let result = self.given_up(&mut pending);
+                    pending.finish(result);
+                } else {
+                    earliest = earliest.min(pending.deadline);
+                    self.pending.push_back(pending);
+                }
             }
+            self.earliest_deadline = earliest;
         }
         // A frame that waited for a write past its deadline is given up, a
         // loss to its source's stream as a frame not stepped is; those
