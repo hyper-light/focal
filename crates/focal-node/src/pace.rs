@@ -225,18 +225,21 @@ fn now_ns() -> u64 {
 /// (measured 2026-10-12: a bound of eight mean service times let the p99
 /// reach 2.9 s at 1,000 writes a second).
 const BASE_WINDOW: Duration = Duration::from_secs(10);
-/// The multiple of a session's least service time a request may wait queued
-/// before it is refused: Breakwater's AQM threshold, twice its target delay,
-/// the target being 40% of an SLO of ten times a request's service and round
-/// trip (Cho et al., OSDI '20, §3.2.3 and §5.1: AQM at 2·d_t, d_t = 0.4·SLO,
-/// SLO = 10 × (service + RTT)); 2 × 0.4 × 10 = 8. A session's service and
-/// round trip together are the time it takes to answer a request it took,
-/// read uncongested (its least over [`BASE_WINDOW`]). Two such times were
-/// measured too few: a session on focal-log takes no input while its write
-/// is out, so a request queued behind a busy write cycle waited 15–70 ms
-/// against a least of 12 ms at 1,000 writes a second, uncongested, and was
-/// refused (2026-10-12).
-const DELAY_BOUND_CYCLES: u32 = 8;
+/// The multiple of a session's uncongested service time its oldest request may
+/// have waited before it refuses new work: Breakwater's AQM threshold, twice
+/// its target delay (Cho et al., OSDI '20, §3.2.3: AQM at 2·d_t), the target
+/// one uncongested write cycle. A session on the shell takes work while its
+/// writes persist and batches what it took into its next write, so a request
+/// waits up to a cycle for its batch whatever the load, and by Little's law a
+/// cycle's arrivals in flight are all that its throughput needs: past that a
+/// write queues and adds latency, not throughput (CoDel's bad queue, RFC 8289
+/// §2). Breakwater's own target, 40% of an SLO of ten service times, is set for
+/// microsecond RPCs whose service is short against the network; a session's
+/// service is a whole write cycle, and eight cycles held a 1-CPU node at 869
+/// writes a second at p50 143 ms and p99 666 ms, where 32 candidates in flight
+/// held 862 a second at 17.5 and 99 ms (CI profile runs 38225223563 and
+/// 38196905347, before the session filled).
+const DELAY_BOUND_CYCLES: u32 = 2;
 /// What a session turned away for room, of peers' frames and participants'
 /// requests apart: refused by its host before it was queued — the room the
 /// peers' frames have, the participants' queue or its memory full — and

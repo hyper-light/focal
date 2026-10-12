@@ -939,3 +939,40 @@ fn measure_key_variant_widths() {
         println!("{name:<20} {width}");
     }
 }
+
+/// Measurement, not a check: what an authored claim's creation record is made of, by row family —
+/// the bytes a leader replicates for it and every member writes. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "measurement"]
+fn measure_record_bytes_by_family() {
+    let core = measured_core();
+    let prepared = prepare(&core, create(7, vec![proposal(7, 10_007)]), &[]);
+    let limits = record_codec::EncodingLimits {
+        bytes: 1 << 24,
+        visits: usize::MAX,
+        rows: 1 << 16,
+    };
+    let total = record_codec::EncodingPlan::prepare(&prepared, limits)
+        .unwrap()
+        .quote()
+        .bytes;
+    let rows = record_codec::row_bytes(&prepared).unwrap();
+    let mut by_family: std::collections::BTreeMap<u16, (usize, usize, usize)> =
+        std::collections::BTreeMap::new();
+    for (family, key, value) in &rows {
+        let entry = by_family.entry(*family).or_default();
+        entry.0 += 1;
+        entry.1 += key;
+        entry.2 += value;
+    }
+    let keys: usize = rows.iter().map(|(_, k, _)| k).sum();
+    let values: usize = rows.iter().map(|(_, _, v)| v).sum();
+    println!(
+        "record {total} bytes: {} rows, keys {keys}, values {values}, framing {}",
+        rows.len(),
+        total - keys - values
+    );
+    for (family, (count, key, value)) in by_family {
+        println!("family {family:3}: {count:2} rows, keys {key:5}, values {value:6}");
+    }
+}
