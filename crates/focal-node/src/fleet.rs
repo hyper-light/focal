@@ -932,6 +932,61 @@ impl Pending {
             .send(finish_response(self.header, self._charge));
     }
 }
+/// What decides when a grouped owner runs a session next ([`Owner::group_deadline`]).
+#[derive(Clone, Copy, Debug)]
+struct GroupDue {
+    /// A stop or an evidence call is in flight: it is looked at each millisecond.
+    pressed: bool,
+    /// The replica waits for a write of its log.
+    persistence_pending: bool,
+    /// A delivery is retained for what it lacks.
+    delivery_retained: bool,
+    /// The batch it took owes it a drain.
+    drain_owed: bool,
+    /// It has something to drain (`Session::has_ready`).
+    has_ready: bool,
+    /// It leads at a stretched period, and beats between its ticks.
+    beats: bool,
+}
+impl GroupDue {
+    /// When the session is run next, from `now`, its next tick and its next beat.
+    fn at(self, now: Instant, next_tick: Instant, next_beat: Instant) -> Option<Instant> {
+        if self.pressed {
+            return now.checked_add(Duration::from_millis(1));
+        }
+        if self.persistence_pending {
+            // The log tells this owner when what the replica waits for is
+            // answered (`Session::wakes_owner`, 27 §9), and the owner drains
+            // the session then: nothing is asked at intervals, and the tick
+            // is the bound on a signal that was lost. A write the log had no
+            // room for tells no one: it is asked again as the log answers
+            // the owner's other sessions, which is when room is made
+            // (`GroupOwner::signalled`), and at the tick.
+            return Some(next_tick);
+        }
+        let waiting = if self.beats {
+            next_tick.min(next_beat)
+        } else {
+            next_tick
+        };
+        // A delivery retained for what it lacks — the memory to apply it,
+        // custody objects, seed chunks its host has not pulled — makes no
+        // progress until that comes: memory returns with what other work
+        // releases, custody and seeds with their host (a chunk landing asks
+        // again). Run again at once, a follower short of memory was drained
+        // round after round, 54 times a period, each refused; it is tried
+        // again at the tick, as a replica on its own thread tries it when its
+        // tick or its next request comes. The drain a batch owes is due at
+        // once either way.
+        if self.delivery_retained && !self.drain_owed {
+            return Some(waiting);
+        }
+        if self.drain_owed || self.has_ready {
+            return Some(next_tick.min(now));
+        }
+        Some(waiting)
+    }
+}
 struct Owner {
     session: Session,
     /// The owner's slowest recent steps, for the replica's diagnostics.
@@ -2539,31 +2594,16 @@ impl Owner {
         self.progress_stale = true;
     }
     fn group_deadline(&self) -> Result<Instant, LedgerError> {
-        if self.stopping.is_some() || self.evidence.is_some() {
-            return Instant::now()
-                .checked_add(Duration::from_millis(1))
-                .ok_or(LedgerError::Failed);
+        GroupDue {
+            pressed: self.stopping.is_some() || self.evidence.is_some(),
+            persistence_pending: self.session.persistence_pending(),
+            delivery_retained: self.session.delivery_retained(),
+            drain_owed: self.drain_owed,
+            has_ready: self.session.has_ready(),
+            beats: self.beats(),
         }
-        if self.session.persistence_pending() {
-            // The log tells this owner when what the replica waits for is
-            // answered (`Session::wakes_owner`, 27 §9), and the owner drains
-            // the session then: nothing is asked at intervals, and the tick
-            // is the bound on a signal that was lost. A write the log had no
-            // room for tells no one: it is asked again as the log answers
-            // the owner's other sessions, which is when room is made
-            // (`GroupOwner::signalled`), and at the tick.
-            return Ok(self.next_tick);
-        }
-        // A delivery waiting for seed chunks its host has not pulled yet
-        // makes no progress on its own; it resumes when a chunk lands. The
-        // drain a batch owes is due at once either way.
-        if self.drain_owed || (self.session.has_ready() && !self.session.seed_waiting()) {
-            return Ok(self.next_tick.min(Instant::now()));
-        }
-        if self.beats() {
-            return Ok(self.next_tick.min(self.next_beat));
-        }
-        Ok(self.next_tick)
+        .at(Instant::now(), self.next_tick, self.next_beat)
+        .ok_or(LedgerError::Failed)
     }
     fn accept(&mut self, work: Work) -> Result<bool, LedgerError> {
         match self.managed_gate(&work) {
