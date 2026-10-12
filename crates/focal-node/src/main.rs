@@ -36,6 +36,13 @@ use std::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// The binary's allocator is mimalloc (Leijen, Zorn and de Moura, "Mimalloc: Free List Sharding
+/// in Action", APLAS 2019), the same on every platform. The release links musl, whose allocator
+/// took 4–11% of every node's CPU in the comparison, and a follower about 10% more in the page
+/// faults of memory it handed back and took again (cluster profile run 38187112271).
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(
     name = "focal",

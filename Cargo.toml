@@ -30,6 +30,11 @@ blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
 crc32fast = "1.5"
 getrandom = "0.3"
+# The focal binary's allocator: musl's, which the release links, cost every node of the
+# comparison 4–11% of its CPU and a follower ~10% more in page-fault churn (cluster profile
+# run 38187112271). mimalloc: Leijen, Zorn and de Moura, "Mimalloc: Free List Sharding in
+# Action", APLAS 2019; its v2 line.
+mimalloc = { version = "=0.1.52", default-features = false, features = ["v2"] }
 rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 postcard = { version = "1.1", features = ["alloc", "use-std"] }
 # Pin projection for focal-rt's named waits (`timeout`): the work held in place,
