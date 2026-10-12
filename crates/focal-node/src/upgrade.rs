@@ -9,7 +9,7 @@ use focal_enrollment::UpgradeFence;
 /// The capability level this binary implements. Raised by a release that
 /// activates behaviour older binaries cannot follow; the fence gates that
 /// behaviour until every node runs such a binary.
-pub const CAPABILITY_LEVEL: u32 = 2;
+pub const CAPABILITY_LEVEL: u32 = 4;
 /// The level at which the issuer succeeds itself (24 §11): a credential
 /// issued under a successor issuer is presented with the predecessor's
 /// endorsement, which a binary below this level cannot verify.
