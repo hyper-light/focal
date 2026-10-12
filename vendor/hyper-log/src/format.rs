@@ -1169,6 +1169,7 @@ fn sealables_of(
         START | UNCERTAIN => drop(r.take(16)?),
         REMOVED | DAMAGED => {}
         KEY => drop(r.take(KEY_FRAME_LEN)?),
+        RELEASED => drop(r.take(8)?),
         _ => return None,
     }
     Some(())
@@ -1223,6 +1224,104 @@ mod tests {
         let mut bad = frame.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert!(!header.verifies(&bad));
+    }
+
+    /// One record of each kind. The match names every kind, so a kind added later fails to build
+    /// here until it is laid here too.
+    fn one_of_each(key: &[u8; KEY_FRAME_LEN]) -> Vec<Record<'_>> {
+        const ENTRIES: &[(u64, &[u8])] = &[(2, b"abc")];
+        const RELOCATED: &[(u64, &[u8])] = &[(1, b"d")];
+        let start = Start { index: 3, term: 1 };
+        let all = vec![
+            Record::Entries {
+                group: 5,
+                first: 10,
+                entries: ENTRIES,
+            },
+            Record::Relocated {
+                group: 5,
+                first: 4,
+                entries: RELOCATED,
+            },
+            Record::HardState {
+                group: 5,
+                state: HardState {
+                    term: 2,
+                    vote: 1,
+                    commit: 9,
+                },
+            },
+            Record::Start { group: 5, start },
+            Record::Proposal {
+                group: 5,
+                index: 12,
+                term: 2,
+                bytes: b"xy",
+            },
+            Record::Removed { group: 6 },
+            Record::Uncertain {
+                group: 7,
+                mark: start,
+            },
+            Record::Damaged { group: 8 },
+            Record::Key { frame: key },
+            Record::Released {
+                group: 5,
+                through: 11,
+            },
+        ];
+        for record in &all {
+            match record {
+                Record::Entries { .. }
+                | Record::Relocated { .. }
+                | Record::HardState { .. }
+                | Record::Start { .. }
+                | Record::Proposal { .. }
+                | Record::Removed { .. }
+                | Record::Uncertain { .. }
+                | Record::Damaged { .. }
+                | Record::Key { .. }
+                | Record::Released { .. } => {}
+            }
+        }
+        all
+    }
+
+    /// The seal's walk takes every kind of record a sealed frame may carry, as the decoder does:
+    /// a frame of one of each walks to its end and decodes whole. A kind the walk did not know
+    /// failed the frame's sealing and fenced the log (`RELEASED`, found by focal).
+    #[test]
+    fn the_seal_walks_every_kind_of_record() {
+        let key = [7u8; KEY_FRAME_LEN];
+        let laid = one_of_each(&key);
+        let mut payload = Writer::with_capacity(512);
+        for record in &laid {
+            put(&mut payload, record, TAG_LEN).unwrap();
+        }
+        let count = u32::try_from(laid.len()).unwrap();
+        let mut bytes = payload.into_vec();
+        let mut seen = Vec::new();
+        assert!(
+            sealables(&bytes, count, |s| {
+                seen.push(s);
+                Some(())
+            })
+            .is_some(),
+            "the walk stopped short"
+        );
+        // Each entry and proposal: the entries record's, the relocated one's and the proposal.
+        assert_eq!(seen.len(), 3);
+        // The seal's part, each CRC written over the stored bytes, and the payload decodes whole.
+        for s in &seen {
+            let crc = entry_crc(
+                s.group,
+                s.index,
+                s.term,
+                &bytes[s.bytes_at..s.bytes_at + s.stored],
+            );
+            bytes[s.crc_at..s.crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+        }
+        assert_eq!(records(&bytes, count).unwrap().len(), laid.len());
     }
 
     /// A sealed log's layout: each entry's and proposal's length counts its tag and room for the
