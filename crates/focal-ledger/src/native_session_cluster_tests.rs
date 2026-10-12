@@ -520,6 +520,160 @@ fn a_conflicting_committed_prefix_discards_the_isolated_leaders_candidates() {
     );
 }
 
+/// A leader holding a batch (its host defers proposals until the batch ends)
+/// that flushes it after a newer term began elsewhere, before it heard of it:
+/// the batch enters its own log in the old term and never a quorum's, the
+/// newer term's entries replace it, and each held candidate is proven dead.
+/// Every request key is then free: each commits once under the new authority.
+#[test]
+fn a_batch_a_deposed_leader_flushes_before_it_hears_is_proven_dead() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    cluster.node(1).engine.set_proposals_deferred(true);
+    let before = cluster.node(1).consensus.last_index().unwrap();
+    let mut held = Vec::new();
+    for claim in 2..=4u128 {
+        let input = cluster.creation(claim);
+        held.push((input.request, claim));
+        let NativeSubmission::Pending { .. } = cluster.propose(1, PARTIES.issuer, input) else {
+            panic!("fresh candidates are pending");
+        };
+    }
+    cluster.pump(&[1]);
+    assert_eq!(cluster.node(1).pending_count(), 3);
+    assert_eq!(
+        cluster.node(1).consensus.last_index().unwrap(),
+        before,
+        "a held batch is not proposed"
+    );
+    cluster.elect(2, &[1]);
+    // The batch ends on the old leader, which has not heard of the new term.
+    let node = cluster.node(1);
+    assert!(node.engine.flush_deferred(&mut node.consensus).is_none());
+    node.engine.set_proposals_deferred(false);
+    assert_eq!(
+        cluster.node(1).consensus.last_index().unwrap(),
+        before + 3,
+        "proposed into its own log, in its old term"
+    );
+    cluster.pump(&[1]);
+    assert_eq!(
+        cluster.node(1).pending_count(),
+        3,
+        "unresolved while isolated"
+    );
+    cluster.settle(&[]);
+    assert_eq!(cluster.node(1).pending_count(), 0);
+    assert!(!cluster.node(1).is_authoritative());
+    for (key, claim) in &held {
+        assert_eq!(cluster.node(1).outcome(*key).unwrap(), None);
+        assert_eq!(
+            cluster.status(2, *claim),
+            None,
+            "claim {claim} never committed"
+        );
+    }
+    cluster.assert_same_state(&[1, 2]);
+    for (key, claim) in held {
+        let retried = cluster.commit(2, PARTIES.issuer, creation_for(key, claim), &[]);
+        assert_eq!(retried.invocation, NativeInvocation::Request(key));
+        for id in 1..=3 {
+            assert_eq!(
+                cluster.node(id).outcome(key).unwrap(),
+                Some(retried),
+                "node {id}"
+            );
+        }
+    }
+    cluster.settle(&[]);
+    cluster.assert_same_state(&[1, 2, 3, 4]);
+}
+
+/// A leader holding a batch that hears of a newer term before the batch ends:
+/// the role change alone does not discard its candidates, the batch's end
+/// proposes nothing on a replica that no longer leads, and the newer term's
+/// barrier, once applied, proves them dead. Nothing of them enters any log,
+/// and each request key commits once under the new authority.
+#[test]
+fn a_batch_held_past_its_leaders_deposition_is_never_proposed() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    cluster.node(1).engine.set_proposals_deferred(true);
+    let mut held = Vec::new();
+    for claim in 2..=4u128 {
+        let input = cluster.creation(claim);
+        held.push((input.request, claim));
+        let NativeSubmission::Pending { .. } = cluster.propose(1, PARTIES.issuer, input) else {
+            panic!("fresh candidates are pending");
+        };
+    }
+    cluster.pump(&[1]);
+    let before = cluster.node(1).consensus.last_index().unwrap();
+    cluster.elect(2, &[1]);
+    // The new leader's heartbeat alone reaches the old: it steps down, the
+    // newer term's barrier not yet in its log.
+    let mut heard = false;
+    for _ in 0..ELECTION_TICKS {
+        cluster.node(2).tick().unwrap();
+        let events = cluster.node(2).poll().unwrap();
+        for message in events.consensus.messages {
+            if message.to == 1 && message.msg_type == MessageType::MsgHeartbeat {
+                cluster.node(1).step(message).unwrap();
+                heard = true;
+            }
+        }
+        if heard {
+            break;
+        }
+    }
+    assert!(heard, "the new leader sent the old a heartbeat");
+    let _ = cluster.node(1).poll().unwrap();
+    assert_eq!(cluster.node(1).status().role, StateRole::Follower);
+    assert_eq!(
+        cluster.node(1).pending_count(),
+        3,
+        "a role change alone must not discard the candidates"
+    );
+    // The batch ends on a replica that no longer leads: nothing is proposed.
+    let node = cluster.node(1);
+    assert!(node.engine.flush_deferred(&mut node.consensus).is_none());
+    node.engine.set_proposals_deferred(false);
+    assert_eq!(cluster.node(1).consensus.last_index().unwrap(), before);
+    assert_eq!(cluster.node(1).pending_count(), 3);
+    cluster.settle(&[]);
+    assert_eq!(
+        cluster.node(1).pending_count(),
+        0,
+        "resolved by the applied barrier"
+    );
+    for (key, claim) in &held {
+        assert_eq!(cluster.node(1).outcome(*key).unwrap(), None);
+        assert_eq!(
+            cluster.status(2, *claim),
+            None,
+            "claim {claim} never committed"
+        );
+    }
+    cluster.assert_same_state(&[1, 2]);
+    for (key, claim) in held {
+        let retried = cluster.commit(2, PARTIES.issuer, creation_for(key, claim), &[]);
+        assert_eq!(retried.invocation, NativeInvocation::Request(key));
+        for id in 1..=3 {
+            assert_eq!(
+                cluster.node(id).outcome(key).unwrap(),
+                Some(retried),
+                "node {id}"
+            );
+        }
+    }
+    cluster.settle(&[]);
+    cluster.assert_same_state(&[1, 2, 3, 4]);
+}
+
 #[test]
 fn a_commit_before_the_reply_survives_the_leader_crash_and_exact_retry_finds_it() {
     let mut cluster = Cluster::new();
