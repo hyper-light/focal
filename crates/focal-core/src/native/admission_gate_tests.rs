@@ -107,13 +107,16 @@ fn checked_retries_resolve_before_full_queue_memory_and_new_logical_time() {
         context(ISSUER, 0), creation(1, 1, &[], None), std::iter::once(&first),
     ).unwrap(), Checked::Existing { outcome: found, committed: false } if found == outcome));
     assert_eq!(parent.stats(), before);
+    // A fresh request is checked whatever the pending count: how many candidates a leader holds
+    // is its owner's, as its memory funds them (`NativeOwner::reserve_pending`), never the core's
+    // check. The check takes nothing of the memory.
     assert!(matches!(
         core.check_native_chain(
             context(ISSUER, 6),
             creation(2, 2, &[], None),
             std::iter::once(&first),
         ),
-        Err(NativeError::Capacity("pending candidates"))
+        Ok(Checked::Fresh(_))
     ));
     assert_eq!(parent.stats(), before);
     core.publish_native(first).unwrap();
