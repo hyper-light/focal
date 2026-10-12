@@ -93,7 +93,7 @@ jobs:
           NODE_CPUS: "1"
         run: |
           for system in ${{ github.event.inputs.systems || 'focal' }}; do
-            for rate in ${{ github.event.inputs.rates || '100 1000 4000' }}; do
+            for rate in ${{ github.event.inputs.rates || '1000 4000' }}; do
               bash tools/compare/compose/run.sh "$system" "$rate" \
                 "${{ github.event.inputs.seconds || '60' }}" \
                 "${{ github.event.inputs.warmup || '15' }}" \
