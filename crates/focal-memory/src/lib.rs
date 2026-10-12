@@ -43,6 +43,7 @@ mod range_elastic_tests;
 mod range_map;
 #[cfg(feature = "serde")]
 pub mod serde_bytes;
+pub mod short_copy;
 mod snapshot;
 mod traversal;
 
