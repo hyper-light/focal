@@ -1,0 +1,45 @@
+name: Owner measurements
+
+# Diagnostic, not for merge: the session owner's isolated costs a claim on the
+# comparison's runner type, to set beside the cluster profile of the same code
+# (the cluster's owner spent about 250 µs a write preparing claims; the same
+# measurement on an M-series Mac takes about 40 µs).
+on:
+  push:
+    branches: ["measure/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Toolchain
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Protobuf
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: The processor
+        run: lscpu | head -25; nproc
+      - name: Build the measurements
+        run: bash scripts/cargo.sh test --release --locked -p focal-core -p focal-ledger --lib --no-run
+      - name: Authored claims, prepare and publish (4 KiB leaves, 50,000 claims)
+        run: |
+          for round in 1 2 3; do
+            FOCAL_MEASURE_PAGE_BYTES=4096 FOCAL_MEASURE_CLAIMS=50000 /usr/bin/time -f '%U s user, %S s system, %e s wall' \
+              bash scripts/cargo.sh test --release --locked -p focal-core --lib -- --ignored --nocapture measure_time_per_authored_claim 2>&1 \
+              | grep -E 'claims: prepare|user'
+          done
+      - name: A claim from its frame, the session's whole path (20,000 claims)
+        run: |
+          for round in 1 2; do
+            CLAIMS=20000 /usr/bin/time -f '%U s user, %S s system, %e s wall' \
+              bash scripts/cargo.sh test --release --locked -p focal-ledger --lib -- --ignored --nocapture measure_time_per_claim_from_its_frame 2>&1 \
+              | grep -E 'round|user'
+          done
+      - name: The checkpoint's encoding (4,500 claims)
+        run: |
+          bash scripts/cargo.sh test --release --locked -p focal-ledger --lib -- --ignored --nocapture measure_the_checkpoint_of_a_ledger_of_thousands_of_claims 2>&1 \
+            | grep -E 'root|owner budget|Pages'
