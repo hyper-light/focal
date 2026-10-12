@@ -14782,3 +14782,264 @@ vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked 
 recursion), `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3286
 passed, 0 failed, 22 ignored. Windows CI passed on the same code (run 38185184315).
+
+### 2026-10-11 — A session's writes are proposed together at its owner's drain; a follower checks a record's acceptance once; a native write its owner gives up on is of unknown outcome; what a batch cannot propose owes no drain
+
+**A session's native writes are proposed together at its owner's drain.** The leader's network threads
+cost 730 µs of CPU a committed write at 1,000/s (cluster profile, land-11 entry above), and the
+leader sent 4.2 peer messages a committed write and each follower 2.1.
+
+Reproduced in-process with three voters on focal-log, every write proposed as it was admitted sent:
+- each member an append of its own;
+- drew an answer of its own;
+- drew a commit's broadcast of its own.
+
+That is eight Raft messages an entry: 56 for a round of seven writes, against 8 for the same round
+proposed as one (one append of all seven to each follower, its commit, and their answers).
+
+hyper-raft's core already appends every entry a proposal carries and broadcasts once.
+`DurableNode::propose_batch_borrowed_in` steps one proposal of many entries through the core's public
+step (`MsgPropose` is no local message), on focal-log and on the shell alike. Each entry is checked,
+and the batch is reserved and refused whole.
+
+While its host defers (`Session::set_native_proposals_deferred`), the native engine:
+- encodes each candidate as it is admitted, so an encoding refusal is still the request's own;
+- proposes the unsubmitted suffix as one when the host flushes (`flush_deferred_native_proposals`);
+- falls back to proposing a candidate at a time where the log has no room for the batch whole.
+
+A poll's flush after a delivery waits for the host's, and `Session::has_ready` says a drain is owed
+them. The fleet's owner flushes at every drain and defers again while it batches: a grouped owner
+(every hosted session) always, a standalone one for the batch it takes.
+
+What the batching does to the comparison's cluster, measured on 1-CPU nodes at 1,000/s offered
+(cluster profile 38171800248, against land-11's 38164600339 and 38165626497):
+
+| | land-11 | batched |
+|---|---|---|
+| writes committed in 76 s | 43,000–47,000 | 49,940 |
+| leader CPU a committed write | 1,745 µs | 1,366 µs |
+| follower CPU a committed write | 1,140 µs | 922–925 µs |
+| leader UDP datagrams a write (out / in) | 12.4 / 13.8 | 5.6 / 6.0 |
+| follower UDP datagrams a write (out / in) | 5.7 / 4.9 | 1.9 / 1.7 |
+
+The leader is still the bound: 90% busy, its quota holding it back 24 s of the 76. Its CPU by
+thread:
+- the session owner, 47%;
+- the network threads, 33% (they had been more than half);
+- checkpoints, 13%;
+- the WAL, 3.5%.
+
+Of the owner's, the range store's lookups (the page directory's descent and a page's binary search,
+with their key comparisons) are about 13% of the process, and preparing a claim 16%.
+
+**A follower checks a claim's acceptance against a record once.** A follower spent 428 µs of CPU a
+committed write replaying records at 1,000/s, 83 µs of it re-inspecting each claim's acceptance and
+100 µs in BLAKE3. The record's acceptance source now replays (`AcceptanceSource::replays`): its slots
+and declarations are read from the record's borrowed bytes by the same decoder at every pass, and each
+declaration is the object the record's objects hold. Its later passes are not hashed; their order,
+counts and shape still are, and the built policy is still hashed against the plan's intent.
+
+An authored claim's record replayed and published on a follower, over 3,000 claims, interleaved A/B
+(the authored measurement's new `FOCAL_MEASURE_REPLAY`): 75.7–91.1 to 61.3–61.8 µs.
+
+Tests:
+- A round proposed at once sends each member one append of it, and its commit once: 8 messages for
+  seven entries, 56 one at a time. Every entry commits on every member in order.
+- A batch holding an entry no proposal holds, or an empty one, is refused whole.
+- On the shell, a batch goes to each follower as one append.
+- Through hosted sessions of three voters, writes admitted while deferred send nothing until the
+  flush, then reach each follower as one append of all five, and commit on every replica.
+
+Each measured alone on one runner against land-11 (two rounds, A then B and then B then A;
+medians of the rounds):
+
+| offered/s | | committed | p99 | busiest node's CPU a write |
+|---|---|---|---|---|
+| 100 | batching (run 38171216076) | 6,059 → 6,059 | 4.03 → 4.21 ms | 2,165 → 2,247 µs |
+| 1,000 | batching | 36,792 → 36,220 | 181.6 → 133.9 ms | 1,530 → 1,397 µs |
+| 4,000 | batching | 31,966 → 36,460 | 357.3 → 228.5 ms | 1,806 → 1,513 µs |
+| 100 | follower (run 38171218243) | 6,059 → 6,059 | 6.34 → 6.78 ms | 1,707 → 1,691 µs |
+| 1,000 | follower | 35,628 → 35,588 | 140.6 → 128.0 ms | 1,228 → 1,218 µs |
+| 4,000 | follower | 32,790 → 33,870 | 191.8 → 201.9 ms | 1,365 → 1,380 µs |
+
+Batching at 1,000/s also took the leader's median from 57 to 31 ms, and the time its quota held it
+back from 40 to 27 s. The follower's check is a follower's CPU, which the busiest node's column
+does not show: at 1,000/s the two followers spent 1,530–1,574 µs a write against 1,667–1,686.
+
+**The learned write window does not land.** Its A/B (run 38171221130) at 1,000/s:
+- committed +4.6%;
+- median 19 → 6 ms, p99 151 → 61 ms.
+
+At 100/s the p99 rose from 5.8 to 7.5 ms. In one round the window refused 19 writes
+(`focal_sessions_requests_refused_total{bound="window"}`), which the generator retried, and that
+round's p99.9 was 82 ms.
+
+At a light load the window sits at its floor of four writes (the delivery rate times the least
+latency is a fifth of a write), while independent clients still arrive five at once. A congestion
+window delays what exceeds it; this one refused it.
+
+A full window now takes a burst while it has been full for less than a round of its writes, and
+refuses past it only when its queue stands for a whole round. This is CoDel's rule (RFC 8289 §3),
+with the writes' own round trip as the interval. That removed the light-load refusals: none at
+100/s, and its p99 equal to A's.
+
+On top of this batch's batching, though, the window measured no gain (A/B run 38180253419,
+three rounds):
+- at 1,000/s, a p99 of 119 → 139 ms, the rounds' spreads overlapping;
+- at 4,000/s, 306 → 299 ms.
+
+The learned window collapsed to its floor of four under load, and the burst rule took 12,000–15,000
+writes past it at 1,000/s. Batching makes the pipeline's throughput grow with what is in flight
+(each Raft round's fixed cost spread over more writes). BBR's model assumes the rate does not depend
+on that, and settles its rate times the least latency (about 3 ms uncongested) at two writes.
+
+The window does not land. Admission by queueing delay against a target (Breakwater, OSDI '20) is
+indifferent to batching, and is what the latency it showed without batching calls for next.
+
+Both together on one runner, against land-11 (A/B run 38179812910, two rounds; medians of the
+rounds):
+
+| offered/s | committed | median | p99 | busiest node's CPU a write |
+|---|---|---|---|---|
+| 100 | 6,059 → 6,059 | 3.06 → 2.97 ms | 4.90 → 4.74 ms | 2,530 → 2,517 µs |
+| 1,000 | 35,662 → 36,172 | 68.0 → 35.9 ms | 204.2 → 145.7 ms | 1,623 → 1,381 µs |
+| 4,000 | 29,022 → 36,760 | 118.9 → 69.8 ms | 423.6 → 281.1 ms | 2,041 → 1,519 µs |
+
+At 1,000/s the leader went from 99% busy to 90%.
+
+**What the committed column measures.** The load tool never closes a claim, and on the comparison's
+2 GiB runners a session holds about 50,000 of its claims: the native allowance (a quarter of the
+three quarters of the detected envelope) at about 7 KB of pages a claim. From the fill on, every
+write is refused. A run's committed writes in its measured window are therefore at most about 50,000
+less what its warm-up committed, and a build that commits faster fills sooner, so the column
+understates a gain wherever B fills (the batched cluster profile's 49,940 above is that fill).
+
+Split at the fill (the first second after which nothing commits) and measured before it, the same
+runs read (medians of the rounds, A → B):
+
+| A/B | offered/s | commit rate | refused | p99 |
+|---|---|---|---|---|
+| batching (38171216076) | 1,000 | 603 → 724/s | 39 → 27% | 181.6 → 134.0 ms |
+| | 4,000 | 533 → 608/s | 87 → 85% | 357.4 → 228.6 ms |
+| follower (38171218243) | 1,000 | 784 → 819/s | 21 → 17% | 140.7 → 128.0 ms |
+| | 4,000 | 804 → 709/s | 80 → 82% | 191.8 → 201.9 ms |
+| both (38179812910) | 1,000 | 585 → 731/s | 41 → 26% | 204.2 → 145.7 ms |
+| | 4,000 | 484 → 613/s | 88 → 85% | 423.6 → 281.2 ms |
+| window (38171221130) | 1,000 | 775 → 632/s | 22 → 36% | 150.6 → 61.5 ms |
+| window on batching (38180253419) | 1,000 | 748 → 738/s | 25 → 26% | 119.0 → 138.9 ms |
+| | 4,000 | 630 → 608/s | 84 → 85% | 305.6 → 298.7 ms |
+
+- The follower check's rounds at 4,000/s spread 751–857/s (A) and 666–752/s (B). Two rounds of a
+  change that runs on followers only do not measure a loss.
+- Runners differ by as much: land-11 committed 585–804/s at 1,000/s across these runs, which is why
+  each comparison is made on one runner.
+- The rate falls as the session grows. The warm-up, from an empty session to about 15,000 claims,
+  committed 1,124/s at 4,000/s offered in the follower A/B's first round, where its measured window
+  committed 751/s.
+
+**Land-11's 4,000/s question.** Land-11's split-point search was measured alone: land-11 against
+itself with the commit reverted, four rounds a side (run 38178536730).
+
+| offered/s | committed | p99 | median |
+|---|---|---|---|
+| 1,000 | 37,676 → 37,786 | 192.5 → 186.0 ms | |
+| 4,000 | 32,400 → 31,934 | 388.8 → 372.8 ms | 105.2 → 105.1 ms |
+
+Land-11's own A/B against land-10 had shown a 4,000/s median of 103.4 → 124.0 ms. That
+difference was the runner's spread, not the search.
+
+**A native write its owner gives up on is of unknown outcome.** The owner classed what it gives up
+(its request time spent, or its term moved on) by a match whose default answered `Unavailable`. The
+native write's wait, added after that match, fell to the default. A client takes `Unavailable` for a
+refusal without effect: it resends, and once its resends are spent it reports the write as refused,
+even though a write the owner admitted and sent on may be in the logs of the members it reached. A
+caller that then retries under a new request writes twice.
+
+Reproduced on three QUIC voters with native history
+(`fleet_quic::a_native_write_its_leader_gives_up_on_is_of_unknown_outcome`):
+- the leader is deafened: what it sends arrives, and nothing sent to it does;
+- it admits a create, sends it on, hears no answer, and at its request time answered `Unavailable`;
+- the two members holding the write elect a leader between them, which commits it with its term's
+  first entry and serves the claim.
+
+The deafened leader now answers `OutcomeUnknown`. Every kind of wait is named in the match, so a kind
+added later is classed by a decision, not by a default. The owner's other two classifications, the
+refusal of a moved route and the answers at its close, already treated a native write as a write.
+
+**A batch held when its leader's authority moves** (two tests, three in-process voters):
+- a deposed leader that flushes before it hears of the newer term puts the batch in its own log in
+  its old term, where the newer term's entries replace it;
+- one that hears first (the new leader's heartbeat alone, the newer term's barrier not yet in its
+  log) keeps its candidates through the role change, proposes nothing at the batch's end, and lets
+  them go when the barrier applies.
+
+In both, no held claim committed, and each request key commits once under the new authority on every
+replica.
+
+**Candidates a batch's flush could not propose owe no drain.** A replica that defers its native
+proposals to its drains (a grouped owner always does) was owed a drain for as long as any candidate
+waited unproposed (`Session::has_ready`). A grouped owner runs a session that is owed one at once
+(`group_deadline`). Where the flush could propose none of them, every round drained the replica
+again and proposed nothing, until the newer term's barrier let them go or room was made. That
+happens when the replica heard of a newer term between the candidates' admission and the flush, or
+when the log or the memory had no room beside what it holds uncommitted. A deposed leader cut off
+from the group's new leader would spin for the partition's length.
+
+The engine now remembers that its last flush left candidates it could not propose
+(`flush_stalled`), and owes no drain for them until a candidate is admitted. Every drain still
+flushes: room is made by what drains take, and authority returns only through a barrier that lets
+the held candidates go.
+
+Tests:
+- A deposed replica holding three candidates (only the new leader's heartbeat reached it) owes no
+  drain once it has sent what it had. Before the fix, `has_ready` held.
+- A batch of nine beside a held write, in a log with room for seven records (2,202-byte records,
+  17 KiB uncommitted), is proposed a candidate at a time as far as there is room. The rest owe no
+  drain, and the flush after the earlier ones commit proposes them. Every candidate commits at its
+  admitted place on every replica. This is the first test of the batch's capacity fallback.
+
+**An append behind a follower's commit is taken past it** (the shared crates at hyper-raft 9fdf7ff).
+This batch's first gate failed `fleet_quic::a_peers_appends_are_stepped_in_their_order_across_a_lossy_path`:
+17 refusals were counted as the order's to have spared. Alone, as six copies at once and under every
+core busy, it passed (9 runs).
+
+It failed again, 1 run in 2 to 4, once the test's relay held one datagram in sixty back 700 ms,
+past the leader's exchange timeout (18 to 73 such refusals). Traced at every frame and answer:
+- a follower whose log stood at 140, with its commit at 121, stepped in its order an append of 33
+  entries from 120;
+- the core answered "taken, 121" and kept nothing (raft-rs's and etcd's rule: an append behind the
+  commit is answered with the commit and dropped whole);
+- the follower then refused the 27 appends from 153 that the leader had sent behind it, with no loss
+  of its own to account for them.
+
+Every entry an append carries at or below the commit is committed (Leader Completeness, Raft §5.4).
+So where the entry it names at the commit is the one held there, what follows is now taken after it
+(§5.3: a receiver appends any new entries not already in its log; hashicorp/raft does likewise). An
+append that adds nothing past the commit, or that names another entry there, is answered with the
+commit as before.
+
+With the change and the same stalls, 6 runs of 6 passed, with 0–2 ordered refusals a run where there
+had been 19–74. hyper-raft's differential, which compares the core with raft-rs, loses such an append
+for both cores as it does each decided difference; its campaigns reach the case 1,759–3,899 times
+each.
+
+**Two tests follow what they wait on.** Linux CI of the A/B branches failed two tests, neither of whose
+paths this batch changes:
+- `quorum_enrollment::quorum_decisions_survive_lost_responses_leader_change_and_signer_restart`
+  submitted an operator's revoke to the host it had found leading after a restart, which had since
+  been deposed (`NotLeader`). What it reads and asks of the group from there now goes to the host that
+  leads at the time, as its transport for the signer already did.
+- `network_listener::one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data` filled the
+  network budget's ordinary lane again once no handshake was pending. The refused dial's last release
+  could come after that fill and fund the body the test expects refused. It now fills once the budget
+  holds the listener's residency, what it admitted and the pressure alone: everything the dial held
+  has been given back.
+
+The gate on the landing tree (head `6461f75`, macOS 26.4.1 arm64, under other work's load), exit 0:
+`cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1561 links, 37 source hashes, 15
+vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1153 production sources, no policy allowance, no runtime
+recursion), `cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 166 test binaries, 3295
+passed, 0 failed, 22 ignored. Windows CI passed on the batch's production code (run 38196351701,
+at `d3ccd09`, before the two tests' fixes).
