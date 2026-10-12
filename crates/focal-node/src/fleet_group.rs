@@ -239,16 +239,31 @@ fn class(work: &Work) -> WorkClass {
         | Work::Evidence(..) => WorkClass::Control,
         Work::Probe(request, ..) if completion_request(request) => WorkClass::Completion,
         Work::Probe(..) => WorkClass::Query,
-        Work::Request(request, ..) => match request.verified.request().operation {
-            Operation::Raft { .. } | Operation::RaftOrdered { .. } => WorkClass::Apply,
-            Operation::Read(_)
-            | Operation::Stream(_)
-            | Operation::Reconcile(_)
-            | Operation::RequestStreamRead { .. }
-            | Operation::ManagedSupport { .. } => WorkClass::Query,
-            _ if completion_request(&request.verified) => WorkClass::Completion,
-            _ => WorkClass::Append,
-        },
+        Work::Request(request, ..) => request_class(&request.verified),
+    }
+}
+/// The class a participant's or a peer's request is scheduled in: a peer's
+/// frame applies, a read queries, a completion request completes, and the
+/// rest append — the writes a session holds for its pipeline
+/// ([`takes_class`]).
+pub(super) fn request_class(request: &VerifiedRequest) -> WorkClass {
+    match request.request().operation {
+        Operation::Raft { .. } | Operation::RaftOrdered { .. } => WorkClass::Apply,
+        Operation::Read(_)
+        | Operation::Stream(_)
+        | Operation::Reconcile(_)
+        | Operation::RequestStreamRead { .. }
+        | Operation::ManagedSupport { .. }
+        | Operation::NativeRead(_)
+        | Operation::NativeList(_)
+        | Operation::List(_)
+        | Operation::Traverse(_)
+        | Operation::Validators(_)
+        | Operation::Summary
+        | Operation::Monitor { .. }
+        | Operation::Select(_) => WorkClass::Query,
+        _ if completion_request(request) => WorkClass::Completion,
+        _ => WorkClass::Append,
     }
 }
 impl ReplicaFleet {
@@ -485,6 +500,15 @@ fn takes_input(owner: &Owner) -> bool {
 /// waited out. Its peers' frames go on: they carry the decision's commit.
 fn takes_participants(owner: &Owner) -> bool {
     takes_input(owner) && !owner.session.native_decision_in_flight()
+}
+/// Whether a session takes work of `class` now: as it takes its
+/// participants' work, and its writes only while its pipeline is open
+/// (`TickPeriod::pipeline_open`): a session whose oldest write has waited
+/// past its bound holds the next in their queue, where their delay is
+/// judged, and answers its reads meanwhile.
+fn takes_class(owner: &Owner, class: WorkClass) -> bool {
+    takes_participants(owner)
+        && (class != WorkClass::Append || owner.pace.pipeline_open(owner.writes_in_flight()))
 }
 /// A peer's frame into its session's own queue, behind those that came
 /// before it; dropped, and counted, where the queue cannot grow.
@@ -802,7 +826,11 @@ impl GroupOwner {
                 let sessions = &self.sessions;
                 match self
                     .scheduler
-                    .schedule_when(|ledger| sessions.get(&ledger).is_none_or(takes_participants))
+                    .schedule_where(|ledger, class| {
+                        sessions
+                            .get(&ledger)
+                            .is_none_or(|owner| takes_class(owner, class))
+                    })
                     .map_err(|_| LedgerError::Failed)?
                 {
                     ScheduleOutcome::Work(mut dispatch) => {

@@ -47,6 +47,8 @@ focal --data-dir /tmp/focal-worker-2 start node
 
 The founder’s `Ready` record also waits for committed initial directory activation. This requires no new configuration or geographic labels.
 
+`Ready` is said once the node's own session serves a write: its replica leads a term it is ready in (the term's first entry committed and the read barrier asked behind it answered), or follows a leader it names, to which the node routes the write. A leader not yet ready in its term refuses a write; said on a known leader alone, `Ready` came before the term was ready in 11 of about 140 starts under load (2026-10-12).
+
 A planned stop — SIGTERM, a process manager's stop — prints one last record,
 `{"condition": "Stopped", "sessions_led": n, "sessions_handed_off": m}`: the
 sessions this node led when it was told to stop, and how many of those it handed

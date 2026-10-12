@@ -2158,8 +2158,9 @@ impl NetworkService {
             }
         }
     }
-    /// Says the node is ready once its founder's replica and partition serve with a known leader;
-    /// a host that runs no session says so at once. Then holds until the run ends.
+    /// Says the node is ready once its founder's replica serves writes and its partition serves
+    /// with a known leader; a host that runs no session says so at once. Then holds until the run
+    /// ends.
     async fn ready<R>(&self, on_status: &mut R) -> Result<(), ServiceError>
     where
         R: FnMut(&NetworkServiceStatus) -> std::io::Result<()>,
@@ -2171,26 +2172,28 @@ impl NetworkService {
                     tenants: BTreeSet::from([self.status.ledger.tenant]),
                     role: PeerRole::Runtime,
                 })?;
-                if matches!(
+                let membership = matches!(
                     self.handles
                         .control
                         .read(peer, RequestId::from_u128(1), ControlRead::Membership)
                         .await,
                     Ok(ControlReadResult::Membership(_))
-                ) && {
-                    // The founder's replica is running with a known
-                    // leader: itself, or another voter of the group it
-                    // rejoined after a restart (it follows then, and its
-                    // local socket routes to the leader as any node's).
-                    let progress = ledger.progress();
-                    !progress.stopped && progress.leader != 0
-                } && self.handles.directory.host().is_some_and(|host| {
-                    // The partition's replica likewise: it leads, or it
-                    // follows a known leader among the voters the group
-                    // grew to (F24); readiness never requires leadership.
-                    let progress = host.progress();
-                    !progress.stopped && progress.applied_index > 0 && progress.leader != 0
-                }) {
+                );
+                // The founder's replica serves (`ReplicaProgress::serves`): it
+                // leads a term it is ready in, or follows another voter of the
+                // group it rejoined after a restart (its local socket routes to
+                // the leader as any node's). A known leader alone was not
+                // enough: one not yet ready in its term refuses a write.
+                if membership
+                    && ledger.observe(crate::fleet::ReplicaProgress::serves)
+                    && self.handles.directory.host().is_some_and(|host| {
+                        // The partition's replica: it leads, or it follows a
+                        // known leader among the voters the group grew to
+                        // (F24); readiness never requires leadership.
+                        let progress = host.progress();
+                        !progress.stopped && progress.applied_index > 0 && progress.leader != 0
+                    })
+                {
                     break;
                 }
                 focal_rt::time::sleep(Duration::from_millis(25)).await?;

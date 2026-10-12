@@ -296,6 +296,11 @@ pub struct ReplicaProgress {
     /// The replica's role in its term: a member that names no leader is
     /// told apart as following, asking for votes or holding them.
     pub role: StateRole,
+    /// The replica leads a term it is ready in: its first entry committed and
+    /// the barrier asked behind it answered (`Session::is_authoritative`). A
+    /// leader takes writes only then: before, one is refused `NotReady`, the
+    /// participant told `Unavailable`.
+    pub authoritative: bool,
     /// The hand-off a planned stop made, once the stop began.
     pub stop_hand_off: Option<StopHandOff>,
     pub sequence: SessionSeq,
@@ -375,6 +380,16 @@ pub struct ReplicaProgress {
     /// A retained delivery this replica cannot apply until its host pulls
     /// the content objects it names from a required copy (24 §20).
     pub custody_pending: Option<CustodyPending>,
+}
+impl ReplicaProgress {
+    /// Whether the replica serves its participants' writes: it leads a term it is ready in
+    /// ([`Self::authoritative`]), or it follows a leader it names, to which its node routes them.
+    /// A leader whose term's first entry is not yet committed and asked behind refuses a write
+    /// `NotReady`. A node said Ready on a known leader alone, and so said it before its replica's
+    /// term was ready in 11 of about 140 starts under load (2026-10-12).
+    pub fn serves(&self) -> bool {
+        !self.stopped && self.leader != 0 && (self.leader != self.node || self.authoritative)
+    }
 }
 /// The objects a retained delivery still lacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -943,8 +958,13 @@ impl Pending {
         matches!(self.waiting, WaitingFor::NativeMutation { .. })
     }
     fn finish(mut self, result: Response) {
+        // Only an answer that is not an error measures the session: a write refused, or of an
+        // outcome unknown, was never served the cycle a committed one takes.
+        let served_well = !matches!(result, Response::Error(_));
         self.header.result = result;
-        if let Some(served) = self.served.take() {
+        if let Some(served) = self.served.take()
+            && served_well
+        {
             served.answered();
         }
         drop(self.waiting);
@@ -1028,6 +1048,9 @@ struct Owner {
     /// (its rate times its commit time), each answered as its outcome commits; their deadlines
     /// are looked at only once one may have passed ([`Owner::earliest_deadline`]).
     writes: VecDeque<Pending>,
+    /// The term the pace's measured cycle and rate are of
+    /// (`TickPeriod::reset_base`): a new term measures them again.
+    paced_term: u64,
     /// No waiting write's deadline is earlier: a bound from below, lowered as each write is
     /// queued and made exact by the scan that gives up the expired ones (`expire_pending`), so a
     /// pass with nothing past its deadline looks at none of them. Each pass rotated every write
@@ -1245,6 +1268,7 @@ impl ReplicaHost {
                 leader: status.leader_id,
                 term: status.term,
                 role: status.role,
+                authoritative: session.is_authoritative(),
                 stop_hand_off: None,
                 sequence: session.sequence(),
                 dropped_replication: 0,
@@ -1307,6 +1331,7 @@ impl ReplicaHost {
             runtime,
             pending: VecDeque::new(),
             writes: VecDeque::new(),
+            paced_term: 0,
             earliest_deadline: u64::MAX,
             memberships: VecDeque::new(),
             admitted: Vec::new(),
@@ -1891,7 +1916,10 @@ impl ReplicaHost {
         // spends nothing on what it cannot serve (Breakwater's AQM, Cho et al., OSDI '20,
         // §3.2.3). A peer's frame has its own room, and progress or termination of work already
         // admitted is what lets the queue drain: neither is refused for the delay.
-        if !replication && !completion_request(&request) && self.pace.delay_exceeded() {
+        // A write's queue and the rest's are judged apart: a session holds its writes for its
+        // pipeline while it answers its reads (`grouped::takes_class`).
+        let appends = grouped::request_class(&request) == focal_directory::WorkClass::Append;
+        if !replication && !completion_request(&request) && self.pace.delay_exceeded(appends) {
             self.pace
                 .refuse_input(false, crate::pace::InputBound::Delay);
             return OwnedResponse::new(full);
@@ -1999,7 +2027,7 @@ impl ReplicaHost {
                 .refuse_input(replication, crate::pace::InputBound::Reply);
             return OwnedResponse::new(full);
         };
-        let queued = (!replication).then(|| self.pace.queue_request());
+        let queued = (!replication).then(|| self.pace.queue_request(appends));
         let work = Work::Request(
             Box::new(AdmittedRequest {
                 verified: request,
@@ -2538,6 +2566,11 @@ impl Owner {
         Ok(())
     }
     fn progress_group(&mut self) -> Result<bool, LedgerError> {
+        let term = self.session.scalars().term;
+        if term != self.paced_term {
+            self.paced_term = term;
+            self.pace.reset_base();
+        }
         // The room its peers' frames have, as its configuration is now: at
         // least once a period, and so within one of a change.
         self.pace.set_frame_room(self.peer_reserve());
@@ -2921,8 +2954,24 @@ impl Owner {
             queued,
         } = *request;
         let waited = queued.map_or(Duration::ZERO, crate::pace::QueueTicket::taken);
+        // A write taken after waiting past the bound is dropped at the head, unserved
+        // (`TickPeriod::head_drop`): refused as at the door, for its delay, at the cost of its
+        // dequeue.
+        if grouped::request_class(&verified) == focal_directory::WorkClass::Append
+            && self.pace.head_drop(waited)
+        {
+            self.pace
+                .refuse_input(false, crate::pace::InputBound::Delay);
+            drop(charge);
+            let _ = response.send(OwnedResponse::new(
+                verified
+                    .request()
+                    .reply(Response::Error(AccessError::Capacity)),
+            ));
+            return Ok(());
+        }
         let waiting = self.session.reads_waiting();
-        self.request(verified, response, charge, witness, native, waited);
+        self.request(verified, response, charge, witness, native);
         // A request that only asked a read is not drained for here:
         // the owner's loop takes what else is queued first, and the
         // round that leaves with its drain carries every read asked
@@ -3102,6 +3151,7 @@ impl Owner {
                 leader: status.leader_id,
                 term: status.term,
                 role: status.role,
+                authoritative: self.session.is_authoritative(),
                 sequence: self.session.sequence(),
                 dropped_replication: self.dropped,
                 peers_unreachable: self.unreachable,
@@ -3170,15 +3220,19 @@ impl Owner {
             self.pending.push_back(pending);
         }
     }
-    /// States to the pace when the oldest write this owner holds unanswered was admitted: the
-    /// first in [`Owner::writes`], which keeps them in the order they were taken
-    /// (`TickPeriod::service_delay`).
+    /// The native writes this owner holds in its pipeline, taken and not yet answered.
+    pub(super) fn writes_in_flight(&self) -> usize {
+        self.writes.len()
+    }
+    /// States to the pace when this owner took the oldest write it holds unanswered: the first
+    /// in [`Owner::writes`], which keeps them in the order they were taken
+    /// (`TickPeriod::pipeline_open`).
     fn publish_oldest_write(&self) {
         let oldest = self.writes.front().and_then(|write| {
             write
                 .served
                 .as_ref()
-                .map(crate::pace::ServiceClock::admitted_ns)
+                .map(crate::pace::ServiceClock::taken_ns)
         });
         self.pace.set_oldest_write(oldest);
     }
@@ -3437,15 +3491,14 @@ impl Owner {
         charge: Allocation,
         witness: Option<EvidenceWitness>,
         native: Option<focal_evidence::VerifiedNativeArtifact>,
-        queued: Duration,
     ) {
         let header = verified
             .request()
             .reply(Response::Error(AccessError::OutcomeUnknown));
-        let served = self.pace.service_clock(
-            queued,
-            matches!(verified.request().operation, Operation::Native { .. }),
-        );
+        let served = self.pace.service_clock(matches!(
+            verified.request().operation,
+            Operation::Native { .. }
+        ));
         // A peer's frame has a path of its own: stepped now, or held for
         // the frame it overtook (27 §12), and answered at the Ready fence
         // either way.

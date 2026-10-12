@@ -569,6 +569,10 @@ fn service_preserves_laptop_identity_receipts_content_and_owner_lock() {
         let network = settings(directory.path());
         let running = Running::start(&network).await;
         assert_eq!(running.status.condition, "Ready");
+        // Ready is said once the founder's replica serves a write: a single voter leads, ready
+        // in its term (`ReplicaProgress::serves`).
+        let progress = running.handles.ledger.as_ref().unwrap().progress();
+        assert!(progress.serves() && progress.authoritative, "{progress:?}");
         assert_eq!(running.status.node, identity.node);
         assert_eq!(running.handles.fleet.status().installed, 1);
         let first_directory = running
@@ -674,6 +678,8 @@ fn service_preserves_laptop_identity_receipts_content_and_owner_lock() {
         );
         running.stop().await;
         let reopened = Running::start(&network).await;
+        let progress = reopened.handles.ledger.as_ref().unwrap().progress();
+        assert!(progress.serves() && progress.authoritative, "{progress:?}");
         let recovered_directory = reopened.handles.directory.host().unwrap();
         assert_eq!(recovered_directory.progress().identity, directory_identity);
         assert!(recovered_directory.progress().applied_index >= directory_index);

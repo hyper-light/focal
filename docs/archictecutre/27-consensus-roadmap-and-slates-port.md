@@ -1856,3 +1856,71 @@ terminating goal's tenth condition), so the switch is measured on flushes as wel
   §1: a key file off the data device, the keychain or a TPM, or a key service).
 - `ControlReplica` over the shell, the owners' wiring through one storage handle, the commands
   (`focal convert storage`, `focal remove converted-storage`), and §15.10's crash cuts and qualification.
+
+## 16. What a session takes in under load (2026-10-12)
+
+A session's owner takes its participants' requests from their queues and its writes into a
+pipeline it batches by the write cycle. Overload is where both are kept short: a write
+taken is answered within a bound, the excess is refused at the door or dropped at the
+head, cheaply, and the session commits at its capacity throughout.
+
+**What failed before.** The A/B of land-15's admission against land-14 (d2be089; CI run
+38237423947, one CPU a node) committed more at 4,000 writes a second offered, about 1,600
+a second against 900, and answered them in seconds: p99 175 ms became 8.6 s, and a
+refusal took about 300 ms where it had taken 12. Three causes, each measured with a trace
+of the controller on three local nodes at 16,000 writes a second offered:
+
+- The pipeline was bounded by memory alone, so it took in every request the clients had
+  out (about 1,000) before its delay judged anything.
+- The uncongested cycle the delay was judged by was the least of a 10 s window of writes
+  taken alone, and a write taken alone while a load runs waits on what the load left: the
+  least rose from 22 ms to 124 ms within seconds, and the bound with it.
+- The participants' queue held 896 requests and a request was judged by its delay only
+  once the delay had stood past the bound for an interval of the slowest uncongested
+  write, up to 494 ms; a write that waited there was then prepared and served late.
+
+**As built.**
+
+- *Writes and the rest are queued apart* (`pace::QueueMarks`): each kind's delay is its
+  own, and the scheduler (`FairScheduler::schedule_where`) holds a session's writes while
+  it answers its reads. Reads that were scheduled as appends (native reads and lists,
+  summaries, monitors, selections, traversals) are queries.
+- *The cycle only falls within a term.* The least write cycle taken alone stands for the
+  session's term (`TickPeriod::reset_base` at a new one): a shorter sample replaces it, a
+  longer one never does. A probe of it under load (BBR's ProbeRTT, the pipeline drained)
+  read 91 ms where the session's cycle was 22: its followers were still replaying the
+  batch before.
+- *The bound is ten cycles.* A cycle carrying `n` writes takes about the uncongested cycle
+  `b` and a cost `c` for each write, so it answers `n / (b + c·n)` a second, approaching
+  `1/c`; a batch of `k·b/c` writes takes `(k + 1)·b` and answers `k / (k + 1)` of that
+  most. A bound of `m` cycles buys `1 - 1/m` of the session's greatest throughput whatever
+  its costs: ten cycles, nine tenths. Two (Breakwater's AQM at twice its target) bought
+  half: 2,000 writes a second locally where the pipeline unbounded held 4,500.
+- *The window is what the session answers in one bound* (`TickPeriod::write_window`,
+  Little's law read as a count): the most writes answered within one bound over 10 s,
+  and at least ten (RFC 6928). Counted, not derived from a rate: a rate sampled over a
+  write's own wait read high (a batch answered at once read at the batch's rate over the
+  wait of its first write), and each answer's rate over the time since the answer before
+  it read the batch's rate over a microsecond. The pipeline takes a write while it holds
+  fewer than its window and its oldest was taken within the bound
+  (`TickPeriod::pipeline_open`), its age counted from its taking, not its admission (a
+  write the queue had held past the bound closed the pipeline the moment it was taken,
+  and the pipeline took one write a cycle). The bound's cycles are the window's gain, as
+  BBR's cwnd_gain: a pipeline that answers in a cycle what it took grows by them each
+  cycle, so the window grows with the batches until the cycle reaches the bound. Only
+  an answer that is not an error is counted or measured: a refused write was never
+  served the cycle a committed one takes.
+- *A write is refused at the door once its queue holds its window* (`delay_exceeded`):
+  taken in at most a window a bound, the next would wait past the bound to be taken, and
+  no interval need pass to know it. A write taken after waiting past the bound is dropped
+  at the head unserved (`head_drop`; CoDel's drop at dequeue, RFC 8289 §5, and Facebook's
+  "Fail at Scale", ACM Queue 2015), at the cost of its dequeue. Both are counted at
+  `bound="delay"`.
+- The rest keep CoDel's test, past the bound for two bounds.
+
+**Measured** on three local nodes (macOS, 16,000 writes a second offered, 400,000 claims, the
+client holding at most 1,024 in flight; 2026-10-12): 361,927 committed, 38,073 refused, none of
+unknown outcome. Each 5 s committed about 20,000 (4,000 a second), at a client p50 of 210–385 ms
+and p99 of 335–827 ms against a bound of 234 ms (ten of the 23 ms cycle macOS's flush gives). A
+refusal at the door was answered in 15–19 ms, a head drop at about the bound. Before, on CI at
+4,000 a second (A/B #3's B): a p99 of 8.6 s.

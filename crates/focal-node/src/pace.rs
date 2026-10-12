@@ -66,31 +66,31 @@ struct TickShared {
     frame_room: AtomicUsize,
     frames_queued: AtomicUsize,
     /// The participants' requests queued for the owner and not yet taken,
-    /// each holding its place ([`QueueTicket`]); since when the queue has
-    /// held one without emptying (the admission of the one that ended its
-    /// last empty spell); when the owner last took one, and how long that
-    /// one had waited: what the session's queueing delay is read from
-    /// ([`TickPeriod::queueing_delay`]), in nanoseconds since the process
-    /// began.
-    requests_queued: AtomicU64,
-    busy_since_ns: AtomicU64,
-    taken_ns: AtomicU64,
-    sojourn_ns: AtomicU64,
-    /// The least time the owner took to answer a participant's request
-    /// once it took it, over the last [`BASE_WINDOW`], and when that least
-    /// was measured: the session's write cycle uncongested — what its
-    /// queueing delay is judged by ([`TickPeriod::delay_bound`]). Zero until
-    /// one is measured ([`TickPeriod::served`]).
+    /// writes and the rest apart ([`QueueMarks`]): a session holds its writes
+    /// for its pipeline ([`TickPeriod::pipeline_open`]) while it answers its
+    /// reads, so each kind's delay is its own.
+    writes: QueueMarks,
+    others: QueueMarks,
+    /// The least time a write took from its taking to its answer with no
+    /// other write in its pipeline, in the term the session leads in: its
+    /// write cycle uncongested, what every delay is judged by
+    /// ([`TickPeriod::delay_bound`]). Zero until one is measured
+    /// ([`TickPeriod::served`]); only falls within a term
+    /// ([`TickPeriod::reset_base`]).
     base_service_ns: AtomicU64,
-    base_seen_ns: AtomicU64,
-    /// The most time an uncongested write took over the last [`BASE_WINDOW`], and when it was
-    /// measured: how long the session's cycle runs when nothing queues, the interval a delay must
-    /// stay past its bound for before it is a standing queue ([`TickPeriod::standing_interval`]).
-    slow_service_ns: AtomicU64,
-    slow_seen_ns: AtomicU64,
-    /// Since when the session's delay has been past its bound without a break, zero while it is
-    /// not: CoDel's `first_above_time` (RFC 8289 §5.5).
-    above_since_ns: AtomicU64,
+    /// The writes the owner answered within one bound, counted interval by
+    /// interval as they are answered: when the current interval began and
+    /// how many it has answered; and the most any interval answered over the
+    /// last [`BASE_WINDOW`], and when that was. What the pipeline answers
+    /// within a bound is its window by Little's law ([`TickPeriod::write_window`]),
+    /// counted directly and not as a rate times the bound: a delivery-rate
+    /// sample taken as each write is answered read the pipeline's bursts of
+    /// answers — 20,000 writes a second where it answered 5,000 (three local
+    /// nodes, 2026-10-12) — and a window built of them bounded nothing.
+    interval_began_ns: AtomicU64,
+    interval_answered: AtomicU64,
+    answered_most: AtomicU64,
+    answered_most_seen_ns: AtomicU64,
     /// When the oldest write the owner took and has not answered was admitted, in nanoseconds
     /// since the process began, zero while it holds none ([`TickPeriod::set_oldest_write`]): the
     /// age of the oldest request in the session's pipeline, Breakwater's signal (the oldest
@@ -99,6 +99,90 @@ struct TickShared {
     /// there, not in the queue, and its wait is seen only here; and as the session refuses, its
     /// oldest writes are answered and the age falls, so a refusal never keeps itself in force.
     oldest_write_ns: AtomicU64,
+}
+/// One kind of the participants' requests queued for the owner: how many
+/// wait, each holding its place ([`QueueTicket`]); since when the queue has
+/// held one without emptying (the admission of the one that ended its last
+/// empty spell); when the owner last took one, and how long that one had
+/// waited, in nanoseconds since the process began: what its queueing delay
+/// is read from ([`QueueMarks::delay_at`]). And since when that delay has
+/// been past its bound without a break, zero while it is not: CoDel's
+/// `first_above_time` (RFC 8289 §5.5).
+#[derive(Default)]
+struct QueueMarks {
+    queued: AtomicU64,
+    busy_since_ns: AtomicU64,
+    taken_ns: AtomicU64,
+    sojourn_ns: AtomicU64,
+    above_since_ns: AtomicU64,
+}
+impl QueueMarks {
+    /// One more is queued at `now`. The first to find the queue empty
+    /// starts its busy spell: the sojourn the last spell ended with says
+    /// nothing of this one.
+    fn enter(&self, now: u64) {
+        if self.queued.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.sojourn_ns.store(0, Ordering::Relaxed);
+            self.busy_since_ns.store(now, Ordering::Relaxed);
+        }
+    }
+    /// One left the queue, taken or dropped.
+    fn leave(&self) {
+        let _ = self
+            .queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                queued.checked_sub(1)
+            });
+    }
+    /// The owner took one admitted at `admitted` now: how long it waited.
+    fn taken(&self, admitted: u64, now: u64) -> u64 {
+        let waited = now.saturating_sub(admitted);
+        self.sojourn_ns.store(waited, Ordering::Relaxed);
+        self.taken_ns.store(now, Ordering::Relaxed);
+        waited
+    }
+    /// How long the oldest queued now has waited, as near as the marks tell
+    /// it: none while none is queued; otherwise at least since the owner
+    /// last took one or since the queue last stopped being empty, whichever
+    /// is later (none queued now came before that), and at least as long as
+    /// the one taken last had waited (each was queued no later than the one
+    /// after it). Breakwater's congestion signal (Cho et al., OSDI '20,
+    /// §3.1): the delay a request is kept, which a load's variance in
+    /// service time does not blur as a queue's length does.
+    fn delay_at(&self, now: u64) -> Duration {
+        if self.queued.load(Ordering::Acquire) == 0 {
+            return Duration::ZERO;
+        }
+        let since = self
+            .taken_ns
+            .load(Ordering::Relaxed)
+            .max(self.busy_since_ns.load(Ordering::Relaxed));
+        Duration::from_nanos(
+            now.saturating_sub(since)
+                .max(self.sojourn_ns.load(Ordering::Relaxed)),
+        )
+    }
+    /// CoDel's test (RFC 8289 §5.5): whether the delay, past `bound` now, has
+    /// stayed past it a whole `interval` without a break. A delay at or
+    /// under the bound even once starts the interval again.
+    fn standing_at(&self, now: u64, bound: Duration, interval: Duration) -> bool {
+        if self.delay_at(now) <= bound {
+            self.above_since_ns.store(0, Ordering::Relaxed);
+            return false;
+        }
+        // Zero is "not above": a delay first past its bound as the process began is marked a
+        // nanosecond later.
+        let since = match self.above_since_ns.compare_exchange(
+            0,
+            now.max(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return false,
+            Err(since) => since,
+        };
+        now.saturating_sub(since) >= u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX)
+    }
 }
 /// The bound a session's host turned an input away at, before it was
 /// queued ([`TickPeriod::refuse_input`]).
@@ -168,27 +252,21 @@ impl Drop for FrameTicket {
 pub(crate) struct QueueTicket {
     pace: TickPeriod,
     admitted_ns: u64,
+    write: bool,
 }
 impl QueueTicket {
-    /// The owner takes the request: how long it waited is the session's
-    /// latest sojourn, and now is when the owner last took one. The wait,
-    /// returned, is the first part of the request's time to its answer.
+    /// The owner takes the request: how long it waited is its kind's latest
+    /// sojourn, and now is when the owner last took one of that kind. The
+    /// wait, returned, is the first part of the request's time to its
+    /// answer.
     pub(crate) fn taken(self) -> Duration {
-        let now = now_ns();
-        let shared = &self.pace.0;
-        let waited = now.saturating_sub(self.admitted_ns);
-        shared.sojourn_ns.store(waited, Ordering::Relaxed);
-        shared.taken_ns.store(now, Ordering::Relaxed);
-        Duration::from_nanos(waited)
+        let marks = self.pace.marks(self.write);
+        Duration::from_nanos(marks.taken(self.admitted_ns, now_ns()))
     }
 }
 impl Drop for QueueTicket {
     fn drop(&mut self) {
-        let _ = self.pace.0.requests_queued.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |queued| queued.checked_sub(1),
-        );
+        self.pace.marks(self.write).leave();
     }
 }
 /// When the owner took a participant's request and how long it had waited to
@@ -198,56 +276,63 @@ impl Drop for QueueTicket {
 pub(crate) struct ServiceClock {
     pace: TickPeriod,
     taken: std::time::Instant,
-    queued: Duration,
     /// Whether this is a write and the pipeline held no other as it was taken:
     /// its service is the session's uncongested time, the only kind that may
     /// set the least ([`TickPeriod::base_service`]).
     alone: bool,
+    /// Whether it is a write: its answer is counted in its interval.
+    write: bool,
 }
 impl ServiceClock {
     /// The request taken at this clock's start is answered now.
     pub(crate) fn answered(self) {
+        let service = self.taken.elapsed();
+        if self.write {
+            self.pace.delivered();
+        }
         if self.alone {
-            self.pace.served(self.taken.elapsed());
+            self.pace.served(service);
         }
     }
-    /// When the request was admitted, in nanoseconds since the process began:
-    /// taken less what it waited to be taken.
-    pub(crate) fn admitted_ns(&self) -> u64 {
-        let taken = u64::try_from(self.taken.saturating_duration_since(began()).as_nanos())
-            .unwrap_or(u64::MAX);
-        taken.saturating_sub(u64::try_from(self.queued.as_nanos()).unwrap_or(u64::MAX))
+    /// When the owner took the request, in nanoseconds since the process
+    /// began: its time in the pipeline starts here.
+    pub(crate) fn taken_ns(&self) -> u64 {
+        u64::try_from(self.taken.saturating_duration_since(began()).as_nanos()).unwrap_or(u64::MAX)
     }
 }
 /// Now, in nanoseconds since the process began.
 fn now_ns() -> u64 {
     u64::try_from(began().elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
-/// How long the least service time a session measured stands before a
-/// newer, longer one replaces it: BBR's min-RTT filter (Cardwell et al.,
-/// "BBR: Congestion-Based Congestion Control", ACM Queue 2016;
-/// draft-cardwell-iccrg-bbr-congestion-control, MinRTTFilterLen = 10 s). A
-/// least taken over a window and not a mean: a mean of the time a request
-/// takes to be answered grows with the queue a congested pipeline holds it
-/// in, and a bound that grows with the congestion it bounds holds nothing
-/// (measured 2026-10-12: a bound of eight mean service times let the p99
-/// reach 2.9 s at 1,000 writes a second).
+/// How long the most writes a session answered in one bound stands before a
+/// lower count replaces it: BBR's bandwidth filter, over a window as its min
+/// RTT's (Cardwell et al., "BBR: Congestion-Based Congestion Control", ACM
+/// Queue 2016; draft-cardwell-iccrg-bbr-congestion-control, MinRTTFilterLen =
+/// 10 s).
 const BASE_WINDOW: Duration = Duration::from_secs(10);
-/// The multiple of a session's uncongested service time its oldest request may
-/// have waited before it refuses new work: Breakwater's AQM threshold, twice
-/// its target delay (Cho et al., OSDI '20, §3.2.3: AQM at 2·d_t), the target
-/// one uncongested write cycle. A session on the shell takes work while its
-/// writes persist and batches what it took into its next write, so a request
-/// waits up to a cycle for its batch whatever the load, and by Little's law a
-/// cycle's arrivals in flight are all that its throughput needs: past that a
-/// write queues and adds latency, not throughput (CoDel's bad queue, RFC 8289
-/// §2). Breakwater's own target, 40% of an SLO of ten service times, is set for
-/// microsecond RPCs whose service is short against the network; a session's
-/// service is a whole write cycle, and eight cycles held a 1-CPU node at 869
-/// writes a second at p50 143 ms and p99 666 ms, where 32 candidates in flight
-/// held 862 a second at 17.5 and 99 ms (CI profile runs 38225223563 and
-/// 38196905347, before the session filled).
-const DELAY_BOUND_CYCLES: u32 = 2;
+/// The multiple of a session's uncongested write cycle a write may take in its
+/// pipeline, and wait in its queue, before the session holds the next: the
+/// latency it gives for its throughput. A pipeline batches: a cycle carrying
+/// `n` writes takes about the cycle uncongested, `b`, and a cost `c` for each
+/// write, so it answers `n / (b + c·n)` a second, approaching `1/c`, and a
+/// batch of `k·b/c` writes takes `(k + 1)·b` to answer `k / (k + 1)` of that
+/// most. A bound of `m` cycles therefore buys `1 - 1/m` of the session's
+/// greatest throughput, whatever its costs: ten cycles, nine tenths. Two
+/// cycles (Breakwater's AQM at twice its target, Cho et al., OSDI '20) bought
+/// half: on three local nodes at 16,000 writes a second offered it held
+/// 2,000 a second where the pipeline unbounded held 4,500, at a third of the
+/// latency (2026-10-12).
+const DELAY_BOUND_CYCLES: u32 = 10;
+/// The bounds a queue's delay must stay past its bound for before it is a
+/// standing queue ([`TickPeriod::standing_interval`]): two, the bound already
+/// being ten cycles — a burst that drains within twice what a write may take
+/// is a good queue (RFC 8289 §2), where CoDel's own ratio (its target 5 to
+/// 10% of its interval, §4.4) is set for a target well under a round trip.
+const STANDING_BOUNDS: u32 = 2;
+/// The write window before a rate is measured, and its least: TCP's initial
+/// window (RFC 6928, ten segments), so a session that has not yet answered
+/// a write a cycle's worth takes ten.
+pub(crate) const INITIAL_WINDOW: usize = 10;
 /// What a session turned away for room, of peers' frames and participants'
 /// requests apart: refused by its host before it was queued — the room the
 /// peers' frames have, the participants' queue or its memory full — and
@@ -412,134 +497,192 @@ impl TickPeriod {
             .ok()?;
         Some(FrameTicket(self.clone()))
     }
-    /// A place in the queue to the owner for a participant's request
-    /// admitted now. The first to find the queue empty starts its busy
-    /// spell: the sojourn the last spell ended with says nothing of this one.
-    pub(crate) fn queue_request(&self) -> QueueTicket {
-        let admitted_ns = now_ns();
-        if self.0.requests_queued.fetch_add(1, Ordering::AcqRel) == 0 {
-            self.0.sojourn_ns.store(0, Ordering::Relaxed);
-            self.0.busy_since_ns.store(admitted_ns, Ordering::Relaxed);
+    /// The marks of one kind of participants' request: writes, or the rest.
+    fn marks(&self, write: bool) -> &QueueMarks {
+        if write {
+            &self.0.writes
+        } else {
+            &self.0.others
         }
+    }
+    /// A place in the queue to the owner for a participant's request
+    /// admitted now, a `write` or not.
+    pub(crate) fn queue_request(&self, write: bool) -> QueueTicket {
+        let admitted_ns = now_ns();
+        self.marks(write).enter(admitted_ns);
         QueueTicket {
             pace: self.clone(),
             admitted_ns,
+            write,
         }
     }
-    /// How long the oldest of the participants' requests queued now has
-    /// waited, as near as the queue's own marks tell it: none while none is
-    /// queued; otherwise at least since the owner last took one or since
-    /// the queue last stopped being empty, whichever is later (no request
-    /// queued now came before that), and at least as long as the one taken
-    /// last had waited (each was queued no later than the one after it in
-    /// its class). Breakwater's congestion signal (Cho et al., OSDI '20,
-    /// §3.1): the delay a request is kept, which a load's variance in
-    /// service time does not blur as a queue's length does.
+    /// How long the oldest queued request of its kind has waited
+    /// ([`QueueMarks::delay_at`]).
     #[cfg(test)]
-    pub(crate) fn queueing_delay(&self) -> Duration {
-        self.queueing_delay_at(now_ns())
+    pub(crate) fn queueing_delay(&self, write: bool) -> Duration {
+        self.marks(write).delay_at(now_ns())
     }
-    /// [`Self::queueing_delay`] as of `now`.
-    fn queueing_delay_at(&self, now: u64) -> Duration {
-        if self.0.requests_queued.load(Ordering::Acquire) == 0 {
-            return Duration::ZERO;
-        }
-        let since = self
-            .0
-            .taken_ns
-            .load(Ordering::Relaxed)
-            .max(self.0.busy_since_ns.load(Ordering::Relaxed));
-        Duration::from_nanos(
-            now.saturating_sub(since)
-                .max(self.0.sojourn_ns.load(Ordering::Relaxed)),
-        )
+    /// How many requests of its kind are queued.
+    #[cfg(test)]
+    pub(crate) fn queued(&self, write: bool) -> u64 {
+        self.marks(write).queued.load(Ordering::Acquire)
     }
-    /// A clock started as the owner takes a participant's request that waited
-    /// `queued` to be taken, read when the request is answered
+    /// A clock started as the owner takes a participant's request, read when
+    /// the request is answered
     /// ([`ServiceClock::answered`]); the request is in service while it is held.
     /// Only a `write` taken with no other write in its pipeline measures the
     /// session's uncongested cycle: a read's answer waits on a barrier and not a
     /// write, and a least taken from reads would hold the writes to a cycle they
     /// never take.
-    pub(crate) fn service_clock(&self, queued: Duration, write: bool) -> ServiceClock {
+    pub(crate) fn service_clock(&self, write: bool) -> ServiceClock {
+        let alone = write && self.0.oldest_write_ns.load(Ordering::Relaxed) == 0;
         ServiceClock {
             pace: self.clone(),
             taken: std::time::Instant::now(),
-            queued,
-            alone: write && self.0.oldest_write_ns.load(Ordering::Relaxed) == 0,
+            alone,
+            write,
         }
     }
-    /// The owner answered, `service` after taking it, a participant's request it
-    /// took with no other write in its pipeline: uncongested. The least such
-    /// time stands for [`BASE_WINDOW`]: a sample no longer replaces it until
-    /// then (BBR's min-RTT update: a sample at or under the least, or a least
-    /// that expired). Only uncongested samples: under a load that never empties
-    /// the pipeline every request waits behind others, and a least taken from
-    /// those rose with the congestion it bounds (BBR drains its pipe to
-    /// re-measure, ProbeRTT; a session needs no drain, as a request that finds
-    /// its pipeline empty is the measurement). Only the owner thread answers, so
-    /// these marks have one writer.
-    pub(crate) fn served(&self, service: Duration) {
-        self.served_at(service, now_ns());
+    /// A write is answered now: counted in its interval, and an interval
+    /// that has run a bound is closed, its count taken into the windowed
+    /// most ([`TickPeriod::write_window`]).
+    fn delivered(&self) {
+        self.delivered_at(now_ns());
     }
-    /// [`Self::served`] as of `now`, in nanoseconds since the process began.
-    fn served_at(&self, service: Duration, now: u64) {
-        let sample = u64::try_from(service.as_nanos()).unwrap_or(u64::MAX).max(1);
-        let base = self.0.base_service_ns.load(Ordering::Relaxed);
-        let seen = self.0.base_seen_ns.load(Ordering::Relaxed);
+    fn delivered_at(&self, now: u64) {
+        let Some(bound) = self.delay_bound() else {
+            return;
+        };
+        let bound = u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX);
+        let began = self.0.interval_began_ns.load(Ordering::Relaxed);
+        if began == 0 {
+            self.0
+                .interval_began_ns
+                .store(now.max(1), Ordering::Relaxed);
+            self.0.interval_answered.store(1, Ordering::Relaxed);
+            return;
+        }
+        let answered = self
+            .0
+            .interval_answered
+            .load(Ordering::Relaxed)
+            .saturating_add(1);
+        if now.saturating_sub(began) < bound {
+            self.0.interval_answered.store(answered, Ordering::Relaxed);
+            return;
+        }
+        // The interval ran its bound: what it answered is a sample, and this
+        // answer begins the next.
+        let most = self.0.answered_most.load(Ordering::Relaxed);
+        let seen = self.0.answered_most_seen_ns.load(Ordering::Relaxed);
         let window = u64::try_from(BASE_WINDOW.as_nanos()).unwrap_or(u64::MAX);
-        if base == 0 || sample <= base || now.saturating_sub(seen) > window {
-            self.0.base_service_ns.store(sample, Ordering::Relaxed);
-            self.0.base_seen_ns.store(now, Ordering::Relaxed);
+        let sample = answered.saturating_sub(1);
+        if sample >= most || now.saturating_sub(seen) > window {
+            self.0.answered_most.store(sample, Ordering::Relaxed);
+            self.0.answered_most_seen_ns.store(now, Ordering::Relaxed);
         }
-        // The slowest stands for the window as the least does: a sample at or over it, or one
-        // after the window has passed since it was measured, takes its place (BBR's max filter).
-        let slow = self.0.slow_service_ns.load(Ordering::Relaxed);
-        let slow_seen = self.0.slow_seen_ns.load(Ordering::Relaxed);
-        if slow == 0 || sample >= slow || now.saturating_sub(slow_seen) > window {
-            self.0.slow_service_ns.store(sample, Ordering::Relaxed);
-            self.0.slow_seen_ns.store(now, Ordering::Relaxed);
-        }
+        self.0
+            .interval_began_ns
+            .store(now.max(1), Ordering::Relaxed);
+        self.0.interval_answered.store(1, Ordering::Relaxed);
     }
-    /// The owner states when the oldest write it holds unanswered was admitted
-    /// ([`ServiceClock::admitted_ns`]), or none.
-    pub(crate) fn set_oldest_write(&self, admitted_ns: Option<u64>) {
-        // Zero is none: a write admitted as the process began is marked a nanosecond later.
-        self.0.oldest_write_ns.store(
-            admitted_ns.map_or(0, |admitted| admitted.max(1)),
-            Ordering::Relaxed,
-        );
-    }
-    /// How long the session's pipeline has held its oldest write past the time
-    /// one takes uncongested; none while it holds none.
-    #[cfg(test)]
-    pub(crate) fn service_delay(&self) -> Duration {
-        self.service_delay_at(now_ns())
-    }
-    /// [`Self::service_delay`] as of `now`.
-    fn service_delay_at(&self, now: u64) -> Duration {
-        let oldest = self.0.oldest_write_ns.load(Ordering::Relaxed);
-        if oldest == 0 {
-            return Duration::ZERO;
-        }
-        Duration::from_nanos(
-            now.saturating_sub(oldest)
-                .saturating_sub(self.0.base_service_ns.load(Ordering::Relaxed)),
+    /// The writes the session may hold in its pipeline, and in their queue
+    /// for it: by Little's law what it answers within its bound — the most
+    /// writes it answered in one bound ([`Self::delay_bound`]) over the
+    /// window, and at least [`INITIAL_WINDOW`]. Taken in to that depth, a
+    /// write waits for the pipeline at most a bound, and queued to it, at most
+    /// a bound to be taken; past it, a write adds latency, not throughput
+    /// (CoDel's bad queue, RFC 8289 §2). The bound's cycles are its window's
+    /// gain, as BBR's cwnd_gain over its BDP: a pipeline that answers in one
+    /// cycle what it took grows its window by them each cycle, so it grows
+    /// with the batches a deeper pipeline makes until its cycle reaches the
+    /// bound — where its answers in one least cycle would hold it at whatever
+    /// it began with (the learned window of 2026-10-11 settled at two
+    /// writes). None until the session has served a write.
+    pub(crate) fn write_window(&self) -> Option<usize> {
+        self.delay_bound()?;
+        let most = self.0.answered_most.load(Ordering::Relaxed);
+        Some(
+            usize::try_from(most)
+                .unwrap_or(usize::MAX)
+                .max(INITIAL_WINDOW),
         )
     }
-    /// The session's least service time over the last [`BASE_WINDOW`]: its
-    /// write cycle uncongested; none until one is measured.
+    /// The owner answered, `service` after taking it, a write it took with no
+    /// other write in its pipeline: uncongested. A sample at or under the
+    /// least replaces it; a longer one never does while the session leads in
+    /// the term it measured it in ([`Self::reset_base`]). Only the owner
+    /// thread answers, so these marks have one writer.
+    pub(crate) fn served(&self, service: Duration) {
+        let sample = u64::try_from(service.as_nanos()).unwrap_or(u64::MAX).max(1);
+        let base = self.0.base_service_ns.load(Ordering::Relaxed);
+        if base == 0 || sample <= base {
+            self.0.base_service_ns.store(sample, Ordering::Relaxed);
+        }
+    }
+    /// The session leads in a new term: what it measured of its cycle and its
+    /// rate under the last is forgotten, and measured again. Within a term
+    /// the least only falls: a write taken alone while a load runs waits on
+    /// the work the load left (its followers still replaying the last batch,
+    /// its owner's queue), so a least that expired into such samples, or
+    /// that a probe re-measured under load (BBR's ProbeRTT), rose with the
+    /// load (22 ms to 124 ms within seconds, and a probe's 91 ms, at 16,000
+    /// writes a second
+    /// on three local nodes, 2026-10-12), and its bound let the pipeline
+    /// hold every request its clients had out. A leader's paths are what a
+    /// term changes: a new leader has new followers to reach.
+    pub(crate) fn reset_base(&self) {
+        self.0.base_service_ns.store(0, Ordering::Relaxed);
+        self.0.interval_began_ns.store(0, Ordering::Relaxed);
+        self.0.interval_answered.store(0, Ordering::Relaxed);
+        self.0.answered_most.store(0, Ordering::Relaxed);
+        self.0.answered_most_seen_ns.store(0, Ordering::Relaxed);
+    }
+    /// The owner states when it took the oldest write it holds unanswered
+    /// ([`ServiceClock::taken_ns`]), or none: its time in the pipeline, apart
+    /// from what it waited in its queue, which that queue's delay judges.
+    /// Judged from its admission, a write the queue had held past the bound
+    /// closed the pipeline the moment it was taken, and the pipeline took
+    /// one write a cycle (2026-10-12).
+    pub(crate) fn set_oldest_write(&self, taken_ns: Option<u64>) {
+        // Zero is none: a write taken as the process began is marked a nanosecond later.
+        self.0
+            .oldest_write_ns
+            .store(taken_ns.map_or(0, |taken| taken.max(1)), Ordering::Relaxed);
+    }
+    /// Whether the owner may take another participant's write into its
+    /// pipeline, which holds `in_flight` now: while it holds none, and
+    /// otherwise while it holds fewer than its window ([`Self::write_window`])
+    /// and its oldest was taken within the bound ([`Self::delay_bound`]). A
+    /// write past the window, or behind one that has waited past the bound,
+    /// waits in its queue, where its delay is judged, and the session's
+    /// other work goes on.
+    pub(crate) fn pipeline_open(&self, in_flight: usize) -> bool {
+        self.pipeline_open_at(in_flight, now_ns())
+    }
+    fn pipeline_open_at(&self, in_flight: usize, now: u64) -> bool {
+        let oldest = self.0.oldest_write_ns.load(Ordering::Relaxed);
+        if oldest == 0 {
+            return true;
+        }
+        let (Some(bound), Some(window)) = (self.delay_bound(), self.write_window()) else {
+            return true;
+        };
+        in_flight < window && Duration::from_nanos(now.saturating_sub(oldest)) <= bound
+    }
+    /// The session's least write cycle uncongested; none until one is
+    /// measured.
     pub(crate) fn base_service(&self) -> Option<Duration> {
         match self.0.base_service_ns.load(Ordering::Relaxed) {
             0 => None,
             ns => Some(Duration::from_nanos(ns)),
         }
     }
-    /// The longest a request may wait queued before the session refuses
-    /// more ([`InputBound::Delay`]): [`DELAY_BOUND_CYCLES`] of its write
-    /// cycle uncongested. None until the session has served a request: what
-    /// it refuses is judged by what it measured, never by a number picked
-    /// for it.
+    /// The longest a write may wait, in its queue or in the pipeline, before
+    /// the session judges it congested: [`DELAY_BOUND_CYCLES`] of its write
+    /// cycle uncongested. None until the session has served a write: what it
+    /// refuses is judged by what it measured, never by a number picked for
+    /// it.
     pub(crate) fn delay_bound(&self) -> Option<Duration> {
         self.base_service()
             .map(|base| base.saturating_mul(DELAY_BOUND_CYCLES))
@@ -548,54 +691,61 @@ impl TickPeriod {
     /// of a queue's own room sets the delay bound aside with it.
     #[cfg(test)]
     pub(crate) fn forget_service(&self) {
-        self.0.base_service_ns.store(0, Ordering::Relaxed);
-        self.0.base_seen_ns.store(0, Ordering::Relaxed);
-        self.0.slow_service_ns.store(0, Ordering::Relaxed);
-        self.0.slow_seen_ns.store(0, Ordering::Relaxed);
-        self.0.above_since_ns.store(0, Ordering::Relaxed);
+        self.reset_base();
+        self.0.writes.above_since_ns.store(0, Ordering::Relaxed);
+        self.0.others.above_since_ns.store(0, Ordering::Relaxed);
     }
-    /// How long the session's delay must stay past its bound before it is a standing queue: the
-    /// most an uncongested write took over the window, and at least the bound. A write the disk
-    /// was slow to flush is past the bound for as long as it is slower than that, which is never a
-    /// whole interval of the slowest a write has been with nothing queued; a queue that stands
-    /// holds the delay past the bound for good. None until the session has served a write.
+    /// How long a queue's delay must stay past its bound before it is a
+    /// standing queue: [`STANDING_BOUNDS`] bounds. A burst that drains within
+    /// it is a good queue and is refused nothing; one that stands is a bad
+    /// queue. Of the bound, which only falls within a term, and not of the
+    /// slowest uncongested write over a window: that rose with the load too
+    /// (to 494 ms at 16,000 writes a second locally), and a queue stood that
+    /// long before it was refused for. None until the session has served a
+    /// write.
     pub(crate) fn standing_interval(&self) -> Option<Duration> {
-        let bound = self.delay_bound()?;
-        let slow = Duration::from_nanos(self.0.slow_service_ns.load(Ordering::Relaxed));
-        Some(slow.max(bound))
+        self.delay_bound()
+            .map(|bound| bound.saturating_mul(STANDING_BOUNDS))
     }
-    /// Whether a participant's request is to be refused now for the delay it would be queued
-    /// behind: CoDel's test (Nichols and Jacobson, RFC 8289 §5.5; Facebook's server queues refuse
-    /// so, Maurer, "Fail at Scale", ACM Queue 2015). The delay past its bound
-    /// ([`Self::delay_bound`]) is a standing queue once it has stayed there a whole interval
-    /// ([`Self::standing_interval`]) without a break; a delay that falls to the bound even once
-    /// starts the interval again. Judged at once, a single write the disk was slow to flush refused
-    /// what came behind it: at 100 writes a second on macOS, whose flush time varies several-fold,
-    /// a quarter of all writes were refused with nothing queued (2026-10-12).
-    pub(crate) fn delay_exceeded(&self) -> bool {
-        self.delay_exceeded_at(now_ns())
+    /// Whether a participant's request (a `write` or not) is to be refused now
+    /// for the delay it would be queued behind: CoDel's test (Nichols and
+    /// Jacobson, RFC 8289 §5.5; Facebook's server queues refuse so, Maurer,
+    /// "Fail at Scale", ACM Queue 2015) on its kind's queue. The delay past
+    /// its bound ([`Self::delay_bound`]) is a standing queue once it has
+    /// stayed there a whole interval ([`Self::standing_interval`]) without a
+    /// break; a delay that falls to the bound even once starts the interval
+    /// again. Judged at once, a single write the disk was slow to flush
+    /// refused what came behind it: at 100 writes a second on macOS, whose
+    /// flush time varies several-fold, a quarter of all writes were refused
+    /// with nothing queued (2026-10-12).
+    pub(crate) fn delay_exceeded(&self, write: bool) -> bool {
+        self.delay_exceeded_at(write, now_ns())
     }
-    /// [`Self::delay_exceeded`] as of `now`, in nanoseconds since the process began.
-    fn delay_exceeded_at(&self, now: u64) -> bool {
+    /// [`Self::delay_exceeded`] as of `now`, in nanoseconds since the process began. A write is
+    /// refused once its queue holds its window: taken in at most a window a bound
+    /// ([`Self::write_window`]), the next would wait past the bound to be taken — Little's law
+    /// read forward, as no interval need pass to know it.
+    fn delay_exceeded_at(&self, write: bool, now: u64) -> bool {
+        if write {
+            return self.write_window().is_some_and(|window| {
+                usize::try_from(self.0.writes.queued.load(Ordering::Acquire)).unwrap_or(usize::MAX)
+                    >= window
+            });
+        }
         let (Some(bound), Some(interval)) = (self.delay_bound(), self.standing_interval()) else {
             return false;
         };
-        if self.queueing_delay_at(now) <= bound && self.service_delay_at(now) <= bound {
-            self.0.above_since_ns.store(0, Ordering::Relaxed);
-            return false;
-        }
-        // Zero is "not above": a delay first past its bound as the process began is marked a
-        // nanosecond later.
-        let since = match self.0.above_since_ns.compare_exchange(
-            0,
-            now.max(1),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return false,
-            Err(since) => since,
-        };
-        now.saturating_sub(since) >= u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX)
+        self.marks(write).standing_at(now, bound, interval)
+    }
+    /// Whether the owner drops a write it takes now after `waited` queued,
+    /// without serving it: it waited past the bound. CoDel drops at the head
+    /// (RFC 8289 §5), as Facebook's servers drop a request queued past its
+    /// target ("Fail at Scale"): the door keeps the queue within its window,
+    /// and this catches what the window let in before the rate fell, at the
+    /// cost of a dequeue, where served it would cost a preparation its answer
+    /// comes too late to be worth.
+    pub(crate) fn head_drop(&self, waited: Duration) -> bool {
+        self.delay_bound().is_some_and(|bound| waited > bound)
     }
     /// The room the owner last stated, and the frames queued in it now.
     #[cfg(test)]
@@ -789,10 +939,6 @@ mod admission_tests {
     fn ns(duration: Duration) -> u64 {
         u64::try_from(duration.as_nanos()).unwrap()
     }
-    /// A clock for a write taken now, its pipeline otherwise empty or not as the pace says.
-    fn write(pace: &TickPeriod) -> ServiceClock {
-        pace.service_clock(Duration::ZERO, true)
-    }
     /// Waits until the process has run `at_least`: the marks these tests set in the past are
     /// times since it began.
     fn running_for(at_least: Duration) {
@@ -805,39 +951,44 @@ mod admission_tests {
             std::thread::sleep(Duration::from_nanos(at_least - now));
         }
     }
+    /// A pace whose cycle is `base` and that answered at most `per_bound` writes in one bound.
+    fn measured(base: Duration, per_bound: u64) -> TickPeriod {
+        let pace = TickPeriod::default();
+        pace.served(base);
+        pace.0.answered_most.store(per_bound, Ordering::Relaxed);
+        pace.0
+            .answered_most_seen_ns
+            .store(now_ns(), Ordering::Relaxed);
+        pace
+    }
 
-    /// The uncongested cycle is the least a write took with no other write in its pipeline,
-    /// standing for the window: a longer sample does not replace it until the window has
-    /// passed, a shorter one does at once, and nothing is bounded before one is measured.
+    /// The uncongested cycle is the least a write took with no other write in its pipeline: a
+    /// shorter sample replaces it at once and a longer one never does in the term, however long
+    /// it stands; a new term forgets it, and nothing is bounded before one is measured.
     #[test]
-    fn the_uncongested_cycle_is_the_least_over_the_window() {
+    fn the_uncongested_cycle_only_falls_within_a_term() {
         let pace = TickPeriod::default();
         assert_eq!(pace.base_service(), None);
         assert_eq!(pace.delay_bound(), None);
+        assert_eq!(pace.write_window(), None);
         assert!(
-            !pace.delay_exceeded(),
+            !pace.delay_exceeded(true),
             "nothing is refused before a cycle is measured"
         );
+        assert!(!pace.head_drop(ms(10_000)));
+        assert!(pace.pipeline_open(1_000_000));
         pace.served(ms(9));
         pace.served(ms(4));
         pace.served(ms(7));
         assert_eq!(pace.base_service(), Some(ms(4)));
         assert_eq!(pace.delay_bound(), Some(ms(4) * DELAY_BOUND_CYCLES));
-        // Within the window a longer sample leaves the least; once the window has passed
-        // since the least was measured, the next sample replaces it.
-        let seen = pace.0.base_seen_ns.load(Ordering::Relaxed);
-        pace.served_at(ms(6), seen + ns(BASE_WINDOW));
+        // A load's longer cycles never raise it within the term.
+        pace.served(ms(400));
         assert_eq!(pace.base_service(), Some(ms(4)));
-        pace.served_at(ms(6), seen + ns(BASE_WINDOW) + 1);
+        pace.reset_base();
+        assert_eq!(pace.base_service(), None);
+        pace.served(ms(6));
         assert_eq!(pace.base_service(), Some(ms(6)));
-        // The slowest stands for the window alike: the 9 ms of the first samples expired with
-        // it, and the samples since are 6 ms; the interval is at least the bound, twice 6 ms.
-        assert_eq!(pace.standing_interval(), Some(ms(12)));
-        // A slower uncongested write within the window sets it at once, and leaves the least.
-        let later = pace.0.base_seen_ns.load(Ordering::Relaxed) + 1;
-        pace.served_at(ms(30), later);
-        assert_eq!(pace.base_service(), Some(ms(6)));
-        assert_eq!(pace.standing_interval(), Some(ms(30)));
     }
 
     /// Only a write taken alone measures the cycle: a read never does, and a write taken
@@ -845,11 +996,11 @@ mod admission_tests {
     #[test]
     fn only_a_write_taken_alone_measures_the_cycle() {
         let pace = TickPeriod::default();
-        pace.service_clock(Duration::ZERO, false).answered();
+        pace.service_clock(false).answered();
         assert_eq!(pace.base_service(), None, "a read measures nothing");
-        let first = write(&pace);
-        pace.set_oldest_write(Some(first.admitted_ns()));
-        let behind = write(&pace);
+        let first = pace.service_clock(true);
+        pace.set_oldest_write(Some(first.taken_ns()));
+        let behind = pace.service_clock(true);
         behind.answered();
         assert_eq!(
             pace.base_service(),
@@ -860,71 +1011,119 @@ mod admission_tests {
         assert!(pace.base_service().is_some(), "the one taken alone does");
     }
 
-    /// The service delay is the age of the oldest write the pipeline holds past the
-    /// uncongested cycle; none while it holds none. Past the bound, the session refuses.
+    /// The window is the most writes answered in one bound over the window, counted interval
+    /// by interval as they are answered, and at least the initial window; a burst of answers
+    /// counts as many as it answered within its bound, never as a rate it ran at.
     #[test]
-    fn the_oldest_write_past_its_cycle_is_the_service_delay() {
-        running_for(ms(60));
-        let pace = TickPeriod::default();
-        pace.served(ms(10));
-        assert_eq!(pace.service_delay(), Duration::ZERO);
-        pace.set_oldest_write(Some(now_ns().saturating_sub(ns(ms(50)))));
-        let delay = pace.service_delay();
-        assert!(delay >= ms(40), "{delay:?}");
-        // 40 ms past a 10 ms cycle is past twice the cycle; it is a standing queue once it has
-        // stayed so an interval (the slowest uncongested cycle, here 10 ms, and at least 20 ms).
-        let now = now_ns();
-        assert!(!pace.delay_exceeded_at(now), "first past its bound");
-        assert!(pace.delay_exceeded_at(now + ns(ms(20))));
-        pace.set_oldest_write(Some(now_ns()));
-        assert!(
-            !pace.delay_exceeded(),
-            "a write admitted just now is within its cycle"
+    fn the_write_window_is_what_one_bound_answered() {
+        running_for(ms(2_000));
+        // 5 ms a cycle, bound 50 ms: 100 answered in a bound hold 100 in the pipeline.
+        let pace = measured(ms(5), 100);
+        assert_eq!(pace.delay_bound(), Some(ms(50)));
+        assert_eq!(pace.write_window(), Some(100));
+        assert_eq!(measured(ms(5), 3).write_window(), Some(INITIAL_WINDOW));
+        // Counted: 150 answered at once in the first interval, 40 in the next two; the first
+        // interval's count is taken once the next answer finds it past its bound.
+        let pace = measured(ms(5), 0);
+        let began = now_ns() - ns(ms(1_000));
+        for _ in 0..150 {
+            pace.delivered_at(began);
+        }
+        assert_eq!(
+            pace.write_window(),
+            Some(INITIAL_WINDOW),
+            "an interval not yet closed"
         );
-        pace.set_oldest_write(None);
-        assert_eq!(pace.service_delay(), Duration::ZERO);
-        assert!(!pace.delay_exceeded());
+        for at in 0..40 {
+            pace.delivered_at(began + ns(ms(50)) + ns(ms(at)));
+        }
+        assert_eq!(pace.write_window(), Some(150));
+        pace.delivered_at(began + ns(ms(150)));
+        assert_eq!(
+            pace.write_window(),
+            Some(150),
+            "a lower interval leaves the most"
+        );
     }
 
-    /// CoDel's test: a delay past its bound is a standing queue only once it has stayed past it a
-    /// whole interval, the slowest an uncongested write took over the window. A write the disk was
-    /// slow to flush is refused nothing for; a delay that falls to the bound once starts the
-    /// interval again; one that stands is refused for until it falls.
+    /// The pipeline takes a write while it holds none, and otherwise while it holds fewer than
+    /// its window and its oldest was taken within the bound.
     #[test]
-    fn a_delay_is_refused_for_only_once_it_stands_an_interval() {
-        running_for(ms(500));
-        let pace = TickPeriod::default();
-        // Uncongested writes took 10 ms at least and 60 ms at most: bound 20 ms, interval 60 ms.
-        pace.served(ms(10));
-        pace.served(ms(60));
-        assert_eq!(pace.delay_bound(), Some(ms(20)));
-        assert_eq!(pace.standing_interval(), Some(ms(60)));
-        // One write held 70 ms in all: past its bound from 30 ms, for 40 ms, less than the interval.
-        let admitted = now_ns().saturating_sub(ns(ms(400)));
-        pace.set_oldest_write(Some(admitted));
-        let at = |after: u64| admitted + ns(ms(after));
-        assert!(!pace.delay_exceeded_at(at(31)), "first past its bound");
-        assert!(
-            !pace.delay_exceeded_at(at(70)),
-            "40 ms past it: less than an interval"
-        );
-        // It is answered: the delay falls, and the interval starts again.
+    fn the_pipeline_takes_writes_under_its_window_and_bound() {
+        running_for(ms(200));
+        let pace = measured(ms(5), 100);
+        assert!(pace.pipeline_open(500), "an empty pipeline takes one");
+        let now = now_ns();
+        pace.set_oldest_write(Some(now - ns(ms(10))));
+        assert!(pace.pipeline_open_at(99, now));
+        assert!(!pace.pipeline_open_at(100, now), "at its window");
+        pace.set_oldest_write(Some(now - ns(ms(51))));
+        assert!(!pace.pipeline_open_at(1, now), "its oldest past the bound");
         pace.set_oldest_write(None);
-        assert!(!pace.delay_exceeded_at(at(71)));
-        // A queue that stands: the oldest write past its bound from 101 ms, and an interval on.
-        pace.set_oldest_write(Some(at(71)));
-        assert!(!pace.delay_exceeded_at(at(102)));
-        assert!(!pace.delay_exceeded_at(at(161)), "59 ms past it");
+        assert!(pace.pipeline_open_at(100, now));
+    }
+
+    /// A write is refused at the door once its queue holds its window, and one taken after
+    /// waiting past the bound is dropped at the head; the rest's queue is judged apart, so
+    /// writes held for the pipeline never refuse a read.
+    #[test]
+    fn writes_are_refused_at_their_window_and_dropped_past_their_bound() {
+        let pace = measured(ms(5), 100);
+        let mut queued: Vec<QueueTicket> = (0..99).map(|_| pace.queue_request(true)).collect();
+        assert!(!pace.delay_exceeded(true));
+        queued.push(pace.queue_request(true));
         assert!(
-            pace.delay_exceeded_at(at(162)),
-            "an interval past it: refused"
+            pace.delay_exceeded(true),
+            "its window queued: the next waits past the bound"
+        );
+        assert!(!pace.delay_exceeded(false), "the reads' queue is apart");
+        assert_eq!(pace.queueing_delay(false), Duration::ZERO);
+        drop(queued.pop());
+        assert!(!pace.delay_exceeded(true));
+        assert!(!pace.head_drop(ms(50)));
+        assert!(pace.head_drop(ms(51)));
+    }
+
+    /// The rest's queue is CoDel's: a delay past its bound is a standing queue only once it
+    /// has stayed past it a whole interval, two bounds; one that falls to the bound once starts
+    /// the interval again, and one that stands is refused for until it falls.
+    #[test]
+    fn the_rests_delay_is_refused_for_only_once_it_stands_an_interval() {
+        running_for(ms(2_000));
+        let pace = measured(ms(5), 0);
+        assert_eq!(pace.delay_bound(), Some(ms(50)));
+        assert_eq!(pace.standing_interval(), Some(ms(100)));
+        let first = pace.queue_request(false);
+        let busy = now_ns() - ns(ms(1_000));
+        pace.0.others.busy_since_ns.store(busy, Ordering::Relaxed);
+        let at = |after: u64| busy + ns(ms(after));
+        assert!(
+            !pace.delay_exceeded_at(false, at(51)),
+            "first past its bound"
+        );
+        assert!(!pace.delay_exceeded_at(false, at(150)), "99 ms past it");
+        assert!(
+            pace.delay_exceeded_at(false, at(151)),
+            "an interval past it"
         );
         assert!(
-            pace.delay_exceeded_at(at(300)),
-            "and refused for while it stands"
+            pace.delay_exceeded_at(false, at(400)),
+            "and while it stands"
         );
-        pace.set_oldest_write(None);
-        assert!(!pace.delay_exceeded_at(at(301)), "until it falls");
+        // The owner takes it: the delay falls, and the interval starts again.
+        drop(first);
+        assert!(!pace.delay_exceeded_at(false, at(401)));
+        let _second = pace.queue_request(false);
+        pace.0
+            .others
+            .busy_since_ns
+            .store(at(401), Ordering::Relaxed);
+        assert!(
+            !pace.delay_exceeded_at(false, at(452)),
+            "first seen past its bound"
+        );
+        assert!(!pace.delay_exceeded_at(false, at(551)));
+        assert!(pace.delay_exceeded_at(false, at(552)));
     }
 
     /// The queueing delay is none while nothing is queued; while the queue holds a request it
@@ -933,33 +1132,27 @@ mod admission_tests {
     #[test]
     fn the_queueing_delay_is_the_oldest_wait_the_queue_marks_tell() {
         running_for(ms(40));
-        let pace = TickPeriod::default();
-        pace.served(ms(5));
-        assert_eq!(pace.queueing_delay(), Duration::ZERO);
-        let first = pace.queue_request();
-        let second = pace.queue_request();
+        let pace = measured(ms(5), 0);
+        assert_eq!(pace.queueing_delay(true), Duration::ZERO);
+        let mut first = pace.queue_request(true);
+        let second = pace.queue_request(true);
         // The queue has been busy for 30 ms with nothing taken.
         pace.0
+            .writes
             .busy_since_ns
             .store(now_ns().saturating_sub(ns(ms(30))), Ordering::Relaxed);
-        assert!(pace.queueing_delay() >= ms(30));
-        // 30 ms queued is past twice a 5 ms cycle, a standing queue an interval (10 ms) on.
-        let now = now_ns();
-        assert!(!pace.delay_exceeded_at(now));
-        assert!(pace.delay_exceeded_at(now + ns(ms(10))));
+        assert!(pace.queueing_delay(true) >= ms(30));
         // The owner takes the first, which had waited 30 ms: the one behind it waited at
         // least as long.
-        let mut first = first;
         first.admitted_ns = now_ns().saturating_sub(ns(ms(30)));
         assert!(first.taken() >= ms(30));
-        assert!(pace.queueing_delay() >= ms(30));
+        assert!(pace.queueing_delay(true) >= ms(30));
         // Once the queue empties, nothing is queued and no delay is read.
         drop(second);
-        assert_eq!(pace.queueing_delay(), Duration::ZERO);
-        assert!(!pace.delay_exceeded());
+        assert_eq!(pace.queueing_delay(true), Duration::ZERO);
         // The next to find it empty starts a new spell: the last spell's sojourn says
         // nothing of it.
-        let _third = pace.queue_request();
-        assert!(pace.queueing_delay() < ms(30));
+        let _third = pace.queue_request(true);
+        assert!(pace.queueing_delay(true) < ms(30));
     }
 }

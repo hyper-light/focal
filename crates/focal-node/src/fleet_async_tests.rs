@@ -57,6 +57,25 @@ fn fixture(path: &std::path::Path, count: u128) -> Fixture {
 /// Owners whose period may be stretched to `ceiling` by the paths they are
 /// told of (`ReplicaHost::pace`).
 fn fixture_stretching(path: &std::path::Path, count: u128, ceiling: Duration) -> Fixture {
+    fixture_with(path, count, ceiling, FirstTerm::Durable, |_| ()).0
+}
+/// What a fixture's sessions have made of their first term when their owners take them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FirstTerm {
+    /// Each campaigned and made its term's first entry durable: it leads, ready in its term.
+    Durable,
+    /// Each campaigned, its first entry not yet written: it leads a term it is not yet ready in.
+    Campaigned,
+}
+/// A fixture whose sessions have done `first` of their first term, and what `before_spawn` made
+/// of its log before their owners took them.
+fn fixture_with<R>(
+    path: &std::path::Path,
+    count: u128,
+    ceiling: Duration,
+    first: FirstTerm,
+    before_spawn: impl FnOnce(&SharedWal) -> R,
+) -> (Fixture, R) {
     // A session with a write out holds some nine megabytes reserved (its
     // request, its staging, its reply): the tenant has room for every
     // session to have one out at once.
@@ -97,8 +116,10 @@ fn fixture_stretching(path: &std::path::Path, count: u128, ceiling: Duration) ->
                 Session::from_node_in(ledger(index), node, SessionLimits::default(), &tenant)
                     .unwrap();
             session.campaign().unwrap();
-            for _ in 0..3 {
-                session.poll().unwrap();
+            if first == FirstTerm::Durable {
+                for _ in 0..3 {
+                    session.poll().unwrap();
+                }
             }
             let mut config = ReplicaConfig::new(RootCommandId::from_u128(119));
             config.tick = TICK;
@@ -107,6 +128,7 @@ fn fixture_stretching(path: &std::path::Path, count: u128, ceiling: Duration) ->
             FleetReplica { session, config }
         })
         .collect();
+    let held = before_spawn(&wal);
     let (hosts, owner, outgoing) = ReplicaFleet::spawn(
         1,
         replicas,
@@ -119,14 +141,17 @@ fn fixture_stretching(path: &std::path::Path, count: u128, ceiling: Duration) ->
         ReplicaHost::wire_limits(),
     )
     .unwrap();
-    Fixture {
-        hosts,
-        owner,
-        outgoing,
-        wal,
-        wal_budget,
-        budget,
-    }
+    (
+        Fixture {
+            hosts,
+            owner,
+            outgoing,
+            wal,
+            wal_budget,
+            budget,
+        },
+        held,
+    )
 }
 async fn settle(fixture: &Fixture) {
     for (id, host) in &fixture.hosts {
@@ -810,10 +835,11 @@ fn the_only_stopped_session_past_the_first_512_shows_in_the_first_round() {
     .unwrap()
 }
 
-/// A session refuses a participant's request that would wait past its delay bound — twice
-/// its uncongested write cycle, Breakwater's AQM (Cho et al., OSDI '20, §3.2.3) — before it
-/// is charged or queued, and counts it at the delay; what is already queued is answered,
-/// and once its queue drains the session takes requests again.
+/// A session refuses a participant's write that would wait past its delay bound — once its
+/// window's worth is queued for its pipeline, the next would be taken only after a bound —
+/// before it is charged or queued, and counts it at the delay; what queued and then waited
+/// past the bound is dropped at the head as it is taken, counted alike, never served late;
+/// and once its queue drains the session takes writes again.
 #[test]
 fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
     focal_rt::block_on(async move {
@@ -849,17 +875,21 @@ fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
             .await
             .unwrap()
             .unwrap();
-        // With no cycle measured nothing is refused for its delay: the next request queues
-        // behind the write out.
-        let queued = host.clone();
-        answers.push(
-            focal_rt::spawn(async move {
-                dispatch(&queued, peer(), write(200), &ReplicaHost::wire_limits()).await
-            })
-            .unwrap(),
-        );
+        // With no cycle measured nothing is refused for its delay: the next writes queue
+        // behind the write out, the initial window's worth of them.
+        for id in 0..crate::pace::INITIAL_WINDOW {
+            let queued = host.clone();
+            let id = 200 + u128::try_from(id).unwrap();
+            answers.push(
+                focal_rt::spawn(async move {
+                    dispatch(&queued, peer(), write(id), &ReplicaHost::wire_limits()).await
+                })
+                .unwrap(),
+            );
+        }
+        let window = u64::try_from(crate::pace::INITIAL_WINDOW).unwrap();
         crate::test_waits::within(&[&host], steps, TICK, async {
-            while host.pace.queueing_delay() == Duration::ZERO {
+            while host.pace.queued(true) < window {
                 focal_rt::time::sleep(Duration::from_millis(1))
                     .await
                     .unwrap();
@@ -867,12 +897,12 @@ fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
         })
         .await
         .unwrap();
-        // Then the session measures a cycle of a microsecond: the request queued has waited
-        // past twice that, and once it has stood past it an interval (a microsecond's cycle
-        // twice), the next is refused.
+        assert!(host.pace.queueing_delay(true) > Duration::ZERO);
+        // Then the session measures a cycle of a microsecond: its window is the initial ten,
+        // and with ten writes queued for it the next would wait past its bound, refused.
         host.pace.served(Duration::from_micros(1));
         crate::test_waits::within(&[&host], steps, TICK, async {
-            while !host.pace.delay_exceeded() {
+            while !host.pace.delay_exceeded(true) {
                 focal_rt::time::sleep(Duration::from_millis(1))
                     .await
                     .unwrap();
@@ -896,16 +926,32 @@ fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
         );
         resume.send(()).unwrap();
         drop(disk.join().unwrap());
+        // The write out is answered; the queued ones had waited past a bound of ten
+        // microseconds as they were taken: dropped at the head, refused, counted.
+        let mut answers = answers.into_iter();
+        let written = answers.next().unwrap().await.unwrap().result;
+        assert!(
+            !matches!(written, Response::Error(AccessError::Capacity)),
+            "{written:?}"
+        );
         for answer in answers {
             let result = answer.await.unwrap().result;
             assert!(
-                !matches!(result, Response::Error(AccessError::Capacity)),
-                "what was queued is answered: {result:?}"
+                matches!(result, Response::Error(AccessError::Capacity)),
+                "a write queued past its bound is dropped at the head: {result:?}"
             );
         }
-        // The queue drained: the session takes requests again.
-        assert_eq!(host.pace.queueing_delay(), Duration::ZERO);
-        assert!(!host.pace.delay_exceeded());
+        assert_eq!(
+            host.input_refusals().requests_refused.delay,
+            1 + window,
+            "the door's and the head's"
+        );
+        // The queue drained: with a cycle the queue can be taken within, the session takes
+        // writes again.
+        assert_eq!(host.pace.queueing_delay(true), Duration::ZERO);
+        host.pace.forget_service();
+        host.pace.served(Duration::from_millis(100));
+        assert!(!host.pace.delay_exceeded(true));
         let again = dispatch(&host, peer(), write(400), &ReplicaHost::wire_limits()).await;
         assert!(!matches!(
             again.result,
@@ -1159,6 +1205,78 @@ fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_full() {
         assert_eq!(counted.requests_refused, queue);
         assert_eq!(counted.frames_dropped, 0);
         assert_eq!(counted.requests_dropped, 0);
+    })
+    .unwrap()
+}
+/// A session that leads a term it is not yet ready in does not serve: its progress names it leader,
+/// not authoritative (`ReplicaProgress::serves`), until the term's first entry is durable and the
+/// barrier asked behind it answered. A write sent meanwhile waits for the term, held by its owner
+/// while the entry persists, and commits. A node's Ready waits on the same fact: said on a known
+/// leader alone, it was said before the term was ready in 11 of about 140 starts under load
+/// (2026-10-12).
+#[test]
+fn a_leader_serves_once_its_term_is_ready() {
+    focal_rt::block_on(async move {
+        let path = tempfile::tempdir().unwrap();
+        // The paused writer holds the campaign's first entry: the session leads, not ready.
+        let (fixture, (resume, disk)) = fixture_with(
+            path.path(),
+            1,
+            Duration::from_secs(2),
+            FirstTerm::Campaigned,
+            |wal| pause(blocker(wal)),
+        );
+        let host = fixture.hosts[&ledger(1)].clone();
+        let progress = host.progress();
+        assert_eq!(progress.leader, progress.node, "{progress:?}");
+        assert!(
+            !progress.authoritative && !progress.serves(),
+            "{progress:?}"
+        );
+        let writer = host.clone();
+        let write = focal_rt::spawn(async move {
+            dispatch(
+                &writer,
+                peer(),
+                envelope(
+                    1,
+                    Operation::OpenEpoch {
+                        epoch: RequestEpoch(1),
+                    },
+                ),
+                &ReplicaHost::wire_limits(),
+            )
+            .await
+        })
+        .unwrap();
+        let steps = TICK * (2 * crate::test_waits::STEP);
+        crate::test_waits::within(&[&host], steps, TICK, async {
+            while host.pace.queued(true) < 1 {
+                focal_rt::time::sleep(Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        resume.send(()).unwrap();
+        let lease = disk.join().unwrap();
+        let reply = crate::test_waits::within(&[&host], steps, TICK, write)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                reply.result,
+                Response::Submitted(MutationReply::Committed(_))
+            ),
+            "{reply:?}"
+        );
+        let progress = host.progress();
+        assert!(progress.authoritative && progress.serves(), "{progress:?}");
+        drop(lease);
+        drop(host);
+        shutdown(fixture).await;
     })
     .unwrap()
 }

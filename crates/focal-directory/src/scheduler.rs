@@ -621,6 +621,17 @@ impl<T> FairScheduler<T> {
         &mut self,
         mut eligible: impl FnMut(LedgerId) -> bool,
     ) -> Result<ScheduleOutcome<T>, DirectoryError> {
+        self.schedule_where(|ledger, _| eligible(ledger))
+    }
+
+    /// As [`Self::schedule_when`], with eligibility judged per session and
+    /// class: a session may hold one kind of work back while it takes
+    /// another (a session whose writes wait for its pipeline still answers
+    /// its reads). Eligibility must stay stable during this call.
+    pub fn schedule_where(
+        &mut self,
+        mut eligible: impl FnMut(LedgerId, WorkClass) -> bool,
+    ) -> Result<ScheduleOutcome<T>, DirectoryError> {
         self.reap_finished();
         let ordinary = !self.ready.ordinary.is_empty();
         let priority = !self.ready.priority.is_empty();
@@ -650,7 +661,7 @@ impl<T> FairScheduler<T> {
     fn schedule_lane(
         &mut self,
         lane: Lane,
-        eligible: &mut impl FnMut(LedgerId) -> bool,
+        eligible: &mut impl FnMut(LedgerId, WorkClass) -> bool,
     ) -> Result<ScheduleOutcome<T>, DirectoryError> {
         if self.ready.get(lane).is_empty() {
             return Ok(ScheduleOutcome::Idle);
@@ -673,7 +684,7 @@ impl<T> FairScheduler<T> {
                     .queues
                     .get(class)
                     .iter()
-                    .position(|job| eligible(job.metadata.key.ledger))
+                    .position(|job| eligible(job.metadata.key.ledger, class))
                 {
                     selected = Some(position);
                     break;
