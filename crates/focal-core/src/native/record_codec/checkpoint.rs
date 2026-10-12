@@ -134,10 +134,59 @@ impl<E: std::error::Error + 'static> std::error::Error for WriteError<E> {
     }
 }
 
+/// Bytes gathered before the output takes them. An encoding is written a piece at a time (a
+/// field, a length, a staged row), and a seeded checkpoint's output copies each into its chunk:
+/// a call and a loop a piece took 15% of a checkpoint's encoding on the comparison (cluster
+/// profile run 38196905347, `Sealer::push`). In batches the output takes them a buffer at a
+/// time; the meter still charges every piece as it comes.
+const OUTPUT_BATCH: usize = 4096;
+
 struct CallbackSink<'a, F, E> {
     meter: CountingSink,
     output: &'a mut F,
     error: Option<E>,
+    batch: [u8; OUTPUT_BATCH],
+    held: usize,
+}
+
+impl<'a, F, E> CallbackSink<'a, F, E>
+where
+    F: FnMut(&[u8]) -> Result<(), E>,
+{
+    fn new(meter: CountingSink, output: &'a mut F) -> Self {
+        Self {
+            meter,
+            output,
+            error: None,
+            batch: [0; OUTPUT_BATCH],
+            held: 0,
+        }
+    }
+    /// Hands the output `bytes`, or what is held when `bytes` is `None`.
+    fn emit(&mut self, bytes: Option<&[u8]>) -> Result<(), CodecError> {
+        let bytes = match bytes {
+            Some(bytes) => bytes,
+            None => {
+                let held = self.held;
+                self.held = 0;
+                if held == 0 {
+                    return Ok(());
+                }
+                self.batch.get(..held).ok_or(CodecError::Capacity)?
+            }
+        };
+        match (self.output)(bytes) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.error = Some(error);
+                Err(CodecError::InvalidTag("checkpoint output"))
+            }
+        }
+    }
+    /// Hands the output what is still held, once the encoding has written its last piece.
+    fn finish(&mut self) -> Result<(), CodecError> {
+        self.emit(None)
+    }
 }
 
 impl<F, E> Sink for CallbackSink<'_, F, E>
@@ -147,13 +196,21 @@ where
     fn write(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
         // Debit complete output byte/work bounds before calling user code.
         self.meter.write(bytes)?;
-        match (self.output)(bytes) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.error = Some(error);
-                Err(CodecError::InvalidTag("checkpoint output"))
+        let end = add(self.held, bytes.len())?;
+        if end > OUTPUT_BATCH {
+            self.emit(None)?;
+            if bytes.len() >= OUTPUT_BATCH {
+                return self.emit(Some(bytes));
             }
         }
+        let start = self.held;
+        let end = add(start, bytes.len())?;
+        let target = self.batch.get_mut(start..end).ok_or(CodecError::Capacity)?;
+        if !focal_memory::short_copy::copy(target, bytes) {
+            return Err(CodecError::Capacity);
+        }
+        self.held = end;
+        Ok(())
     }
 
     fn visit(&mut self, amount: usize) -> Result<(), CodecError> {
@@ -189,12 +246,9 @@ impl<'a> EncodingPlan<'a> {
         if source.len() > limits.rows {
             return Err(WriteError::Codec(CodecError::Capacity));
         }
-        let mut sink = CallbackSink {
-            meter: CountingSink::new(limits.bytes, limits.visits),
-            output: &mut output,
-            error: None,
-        };
-        let result = frame(&mut sink, source);
+        let mut sink =
+            CallbackSink::new(CountingSink::new(limits.bytes, limits.visits), &mut output);
+        let result = frame(&mut sink, source).and_then(|hash| sink.finish().map(|()| hash));
         if let Some(error) = sink.error.take() {
             return Err(WriteError::Output(error));
         }
@@ -276,12 +330,11 @@ impl<'a> EncodingPlan<'a> {
         &self,
         mut output: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<ContentHash, WriteError<E>> {
-        let mut sink = CallbackSink {
-            meter: CountingSink::new(self.quote.bytes, self.quote.visits),
-            output: &mut output,
-            error: None,
-        };
-        let result = frame(&mut sink, self.source);
+        let mut sink = CallbackSink::new(
+            CountingSink::new(self.quote.bytes, self.quote.visits),
+            &mut output,
+        );
+        let result = frame(&mut sink, self.source).and_then(|hash| sink.finish().map(|()| hash));
         if let Some(error) = sink.error.take() {
             return Err(WriteError::Output(error));
         }
@@ -864,6 +917,7 @@ pub(in crate::native) fn archive_frame<'a>(
     write_u64(&mut hashed, count)?;
     let iteration = iteration_work()?;
     let mut previous = None;
+    let mut stage = Stage::new();
     for _ in 0..frame.count {
         hashed.visit(iteration)?;
         let (key, value) = entries
@@ -874,7 +928,7 @@ pub(in crate::native) fn archive_frame<'a>(
         }
         rows::family(key, value)?;
         previous = Some(key);
-        put_row(&mut hashed, key, value, frame.ledger)?;
+        put_row(&mut hashed, &mut stage, key, value, frame.ledger)?;
     }
     if entries.next().is_some() {
         return Err(CodecError::InvalidTag("archive row count"));
@@ -1032,6 +1086,7 @@ pub(in crate::native) fn seal_frame<'a>(
     };
     let iteration = iteration_work()?;
     let mut previous = None;
+    let mut stage = Stage::new();
     for _ in 0..count {
         hashed.visit(iteration)?;
         let (key, value) = entries
@@ -1044,7 +1099,7 @@ pub(in crate::native) fn seal_frame<'a>(
         }
         rows::family(key, value)?;
         previous = Some(key);
-        put_row(&mut hashed, key, value, ledger)?;
+        put_row(&mut hashed, &mut stage, key, value, ledger)?;
     }
     if entries.next().is_some() {
         return Err(CodecError::InvalidTag("seal row count"));
@@ -1094,6 +1149,7 @@ fn frame_entries<'a>(
             .ok_or(CodecError::Capacity)?,
     )?;
     let mut previous = None;
+    let mut stage = Stage::new();
     let mut meta = false;
     let mut outcome = false;
     for _ in 0..count {
@@ -1108,7 +1164,7 @@ fn frame_entries<'a>(
         previous = Some(key);
         meta |= key == Key::Meta;
         outcome |= matches!(key, Key::Outcome(_));
-        put_row(&mut hashed, key, value, frame.ledger)?;
+        put_row(&mut hashed, &mut stage, key, value, frame.ledger)?;
     }
     hashed.visit(iteration)?;
     if entries.next().is_some() {
@@ -1153,8 +1209,21 @@ pub(in crate::native) fn row_bytes(
     row: &Row,
     ledger: LedgerId,
 ) -> Result<usize, CodecError> {
+    // The body is measured once and counted, not walked a second time to be counted again.
     let mut sink = CountingSink::new(usize::MAX, usize::MAX);
-    put_row(&mut sink, key, row, ledger)?;
+    write_u8(&mut sink, 1)?;
+    fixed::key(&mut sink, key)?;
+    let mut measure = RowSize {
+        sink: &mut sink,
+        bytes: 0,
+    };
+    rows::value(&mut measure, key, row, ledger)?;
+    let size = measure.bytes;
+    if size == 0 {
+        return Err(CodecError::InvalidTag("empty checkpoint body"));
+    }
+    write_count(&mut sink, size)?;
+    sink.count(size)?;
     Ok(sink.len())
 }
 
@@ -1179,15 +1248,94 @@ pub(in crate::native) fn frame_bytes(state: &NativeState) -> Result<usize, Codec
     Ok(sink.len())
 }
 
-fn put_row(sink: &mut impl Sink, key: Key, row: &Row, ledger: LedgerId) -> Result<(), CodecError> {
+/// The longest row body a [`Stage`] holds. A body is encoded once into the stage and written
+/// whole after its length; measured first, as it had been, every field of every row was walked
+/// twice (once to count it, once to write it), and each piece reached the sink on its own. Most
+/// bodies are a few hundred bytes; one longer than this is counted as it is staged and walked a
+/// second time into the sink.
+const ROW_STAGE: usize = 4096;
+
+/// A row body staged before its length is written (see [`ROW_STAGE`]).
+struct Stage {
+    bytes: [u8; ROW_STAGE],
+    held: usize,
+    /// The body's whole length, held or not.
+    size: usize,
+    /// The body outgrew the stage: it is written by a second walk.
+    spilled: bool,
+}
+impl Stage {
+    fn new() -> Self {
+        Self {
+            bytes: [0; ROW_STAGE],
+            held: 0,
+            size: 0,
+            spilled: false,
+        }
+    }
+}
+
+/// Encodes a row body into a [`Stage`], charging each write the work [`RowSize`] charges for
+/// measuring it.
+struct Staging<'a, S> {
+    sink: &'a mut S,
+    stage: &'a mut Stage,
+}
+impl<S: Sink> Sink for Staging<'_, S> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+        let size = add(self.stage.size, bytes.len())?;
+        u32::try_from(size).map_err(|_| CodecError::Capacity)?;
+        self.sink.visit(add(1, bytes.len())?)?;
+        self.stage.size = size;
+        if !self.stage.spilled {
+            let end = add(self.stage.held, bytes.len())?;
+            match self.stage.bytes.get_mut(self.stage.held..end) {
+                Some(target) => {
+                    if !focal_memory::short_copy::copy(target, bytes) {
+                        return Err(CodecError::Capacity);
+                    }
+                    self.stage.held = end;
+                }
+                None => self.stage.spilled = true,
+            }
+        }
+        Ok(())
+    }
+    fn visit(&mut self, amount: usize) -> Result<(), CodecError> {
+        self.sink.visit(amount)
+    }
+}
+
+fn put_row(
+    sink: &mut impl Sink,
+    stage: &mut Stage,
+    key: Key,
+    row: &Row,
+    ledger: LedgerId,
+) -> Result<(), CodecError> {
     write_u8(sink, 1)?;
     fixed::key(sink, key)?;
-    let mut measure = RowSize { sink, bytes: 0 };
-    rows::value(&mut measure, key, row, ledger)?;
-    let size = measure.bytes;
-    if size == 0 {
+    stage.held = 0;
+    stage.size = 0;
+    stage.spilled = false;
+    rows::value(
+        &mut Staging {
+            sink: &mut *sink,
+            stage: &mut *stage,
+        },
+        key,
+        row,
+        ledger,
+    )?;
+    if stage.size == 0 {
         return Err(CodecError::InvalidTag("empty checkpoint body"));
     }
-    write_count(sink, size)?;
-    rows::value(sink, key, row, ledger)
+    write_count(sink, stage.size)?;
+    if stage.spilled {
+        return rows::value(sink, key, row, ledger);
+    }
+    write_raw(
+        sink,
+        stage.bytes.get(..stage.held).ok_or(CodecError::Capacity)?,
+    )
 }

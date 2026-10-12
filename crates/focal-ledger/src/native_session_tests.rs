@@ -1404,6 +1404,39 @@ fn measure_the_checkpoint_of_a_ledger_of_thousands_of_claims() {
             ),
         )
         .unwrap();
+        // The same walk into what a seeded checkpoint writes to: each piece
+        // copied into a chunk of its seed size, a full chunk hashed.
+        let mut chunk: Vec<u8> = Vec::with_capacity(focal_evidence::SEED_CHUNK_BYTES);
+        let mut chunks = 0usize;
+        let started = std::time::Instant::now();
+        focal_core::native::record_codec::checkpoint::EncodingPlan::write_frozen(
+            &frozen,
+            limits,
+            |mut piece: &[u8]| -> Result<(), ()> {
+                while !piece.is_empty() {
+                    let room = focal_evidence::SEED_CHUNK_BYTES - chunk.len();
+                    let (head, tail) = piece.split_at(room.min(piece.len()));
+                    chunk.extend_from_slice(head);
+                    piece = tail;
+                    if chunk.len() == focal_evidence::SEED_CHUNK_BYTES {
+                        std::hint::black_box(blake3::hash(&chunk));
+                        chunk.clear();
+                        chunks += 1;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        std::hint::black_box(blake3::hash(&chunk));
+        std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "frozen root into {chunks} sealed chunks: {:?}\n",
+                started.elapsed()
+            ),
+        )
+        .unwrap();
     }
     for _ in 0..3 {
         let started = std::time::Instant::now();
