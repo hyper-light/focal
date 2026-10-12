@@ -1,9 +1,10 @@
 name: Owner measurements
 
-# Diagnostic, not for merge: the session owner's isolated costs a claim on the
-# comparison's runner type, to set beside the cluster profile of the same code
-# (the cluster's owner spent about 250 µs a write preparing claims; the same
-# measurement on an M-series Mac takes about 40 µs).
+# Diagnostic, not for merge: the session owner's isolated path, profiled as the
+# cluster's nodes are (musl, mimalloc, frame pointers, perf at 499 Hz with fp call
+# graphs, every sample's stack folded root first), to set beside the cluster's
+# folded stacks of the same code: the cluster's owner spends 406-563 µs a write in
+# `propose_native_frame` where the isolated path takes about 150 µs.
 on:
   push:
     branches: ["measure/**"]
@@ -14,53 +15,39 @@ permissions:
 jobs:
   measure:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Toolchain
-        run: rustup toolchain install 1.98.1 --profile minimal
-      - name: Protobuf
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: The processor
         run: lscpu | head -25; nproc
-      - name: Build the measurements
-        run: bash scripts/cargo.sh test --release --locked -p focal-core -p focal-ledger --lib --no-run
-      - name: Authored claims, prepare and publish (4 KiB leaves, 50,000 claims)
+      - name: Perf may sample
+        run: sudo sysctl kernel.perf_event_paranoid=1
+      - name: The isolated path in the release's lane, profiled
         run: |
-          for round in 1 2 3; do
-            FOCAL_MEASURE_PAGE_BYTES=4096 FOCAL_MEASURE_CLAIMS=50000 /usr/bin/time -f '%U s user, %S s system, %e s wall' \
-              bash scripts/cargo.sh test --release --locked -p focal-core --lib -- --ignored --nocapture measure_time_per_authored_claim 2>&1 \
-              | grep -E 'claims: prepare|user'
-          done
-      - name: Authored claims with mimalloc (glibc)
-        run: |
-          for round in 1 2; do
-            FOCAL_MEASURE_PAGE_BYTES=4096 FOCAL_MEASURE_CLAIMS=50000 \
-              bash scripts/cargo.sh test --release --locked -p focal-core --lib --features diag-mimalloc -- --ignored --nocapture measure_time_per_authored_claim 2>&1 \
-              | grep -E 'claims: prepare'
-          done
-      - name: Authored claims on musl, the release's lane (its allocator, then mimalloc)
-        run: |
-          docker run --rm -v "$PWD":/src -w /src \
+          docker run --rm --cap-add SYS_ADMIN --cap-add PERFMON -v "$PWD":/src -w /src \
             public.ecr.aws/docker/library/rust:1.98.1-alpine@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f \
-            sh -c 'apk add --no-cache build-base protoc bash perl linux-headers > /dev/null \
-              && export RUSTFLAGS="-C target-feature=+crt-static" CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=cc \
-              && for features in "" "--features diag-mimalloc"; do \
-                   echo "musl $features"; \
-                   for round in 1 2; do \
-                     FOCAL_MEASURE_PAGE_BYTES=4096 FOCAL_MEASURE_CLAIMS=50000 cargo test --release --locked -p focal-core --lib \
-                       --target x86_64-unknown-linux-musl $features -- --ignored --nocapture measure_time_per_authored_claim 2>&1 \
-                       | grep -E "claims: prepare"; \
-                   done; \
-                 done'
-      - name: A claim from its frame, the session's whole path (20,000 claims)
-        run: |
-          for round in 1 2; do
-            CLAIMS=20000 /usr/bin/time -f '%U s user, %S s system, %e s wall' \
-              bash scripts/cargo.sh test --release --locked -p focal-ledger --lib -- --ignored --nocapture measure_time_per_claim_from_its_frame 2>&1 \
-              | grep -E 'round|user'
-          done
-      - name: The checkpoint's encoding (4,500 claims)
-        run: |
-          bash scripts/cargo.sh test --release --locked -p focal-ledger --lib -- --ignored --nocapture measure_the_checkpoint_of_a_ledger_of_thousands_of_claims 2>&1 \
-            | grep -E 'root|owner budget|Pages'
+            sh -c 'fold_stacks() { perf script -i "$1" -F comm,ip,sym 2>/dev/null | awk "
+                   function emit(  s, i) { if (n == 0) return; s = comm; for (i = n; i >= 1; i--) s = s \";\" f[i]; c[s]++; n = 0 }
+                   /^\t/ { n++; sym = \$2; for (j = 3; j <= NF; j++) sym = sym \" \" \$j; f[n] = sym; next }
+                   /^[ \t]*\$/ { emit(); next }
+                   { emit(); comm = \$1; next }
+                   END { emit(); for (k in c) print k, c[k] }
+                 " > "$2"; wc -l "$2"; }; \
+              apk add --no-cache build-base protoc bash perl linux-headers perf > /dev/null \
+              && export RUSTFLAGS="-C target-feature=+crt-static -C force-frame-pointers=yes" CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+              && cargo test --release --locked -p focal-core --lib --target x86_64-unknown-linux-musl --features diag-mimalloc --no-run 2>&1 | tail -2 \
+              && bin=$(ls -t target/x86_64-unknown-linux-musl/release/deps/focal_core-* | grep -v "\.d$" | head -1) \
+              && echo "binary $bin" \
+              && FOCAL_MEASURE_PAGE_BYTES=4096 FOCAL_MEASURE_CLAIMS=50000 perf record -F 499 --call-graph fp -o /src/authored.perf -- \
+                   "$bin" --ignored --nocapture --test-threads=1 measure_time_per_authored_claim 2>&1 | grep -E "claims: prepare|samples" \
+              && fold_stacks /src/authored.perf /src/authored.folded \
+              && perf record -F 499 --call-graph fp -o /src/decode.perf -- \
+                   "$bin" --ignored --nocapture --test-threads=1 measure_time_to_decode_an_authored_frame 2>&1 | grep -E "µs|samples" \
+              && fold_stacks /src/decode.perf /src/decode.folded \
+              && perf report -i /src/authored.perf --stdio --children --sort symbol -g none --percent-limit 1 2>/dev/null | grep -v "^#" | grep -v "^\$" | head -80'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: isolated-folded
+          path: |
+            authored.folded
+            decode.folded
