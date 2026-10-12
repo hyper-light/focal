@@ -948,8 +948,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if self.seal.is_some() {
             return Err(NativeSessionError::Sealing);
         }
-        let limit = self.limits.recovery.native.pending;
-        let full = self.pending.len() >= limit || self.pending.len() == self.pending.capacity();
+        // Room for the candidate, funded by the session's memory before it is prepared: the
+        // candidates a leader holds in flight are as many as its memory funds (`reserve_pending`).
+        let full = self.reserve_pending().is_err();
         let domain = self.limits.content_domain;
         let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
             return Err(NativeSessionError::Failed);
@@ -1012,6 +1013,34 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             }
         }
         self.submit_staged(consensus, staged, status.term)
+    }
+    /// Room for one more submitted candidate: a full queue doubles its capacity, the growth
+    /// charged to the session's budget before it is allocated, as the native owner's own queue
+    /// grows (`NativeOwner::reserve_pending`). `NativeLimits::pending`, the count this queue was
+    /// fixed at, remains the committed headroom of a seal's outcome; a leader's pipeline is as
+    /// deep as its memory funds.
+    fn reserve_pending(&mut self) -> Result<(), NativeSessionError> {
+        if self.pending.len() < self.pending.capacity() {
+            return Ok(());
+        }
+        let wanted = self
+            .pending
+            .capacity()
+            .max(1)
+            .checked_mul(2)
+            .ok_or(NativeSessionError::Capacity("pending candidates"))?;
+        let bytes = array::<Pending>(wanted)?;
+        let permit = self
+            .budget
+            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, bytes)?;
+        self.pending
+            .try_reserve_exact(wanted.saturating_sub(self.pending.len()))
+            .map_err(|_| NativeSessionError::Capacity("pending candidates"))?;
+        if array::<Pending>(self.pending.capacity())? > bytes {
+            return Err(NativeSessionError::Capacity("pending candidates"));
+        }
+        self._pending_allocation = permit.commit();
+        Ok(())
     }
     /// Whether the committed root, with every pending candidate published,
     /// still fits a checkpoint (rule 2): what this session admits it must be

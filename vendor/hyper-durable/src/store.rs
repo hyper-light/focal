@@ -250,4 +250,16 @@ pub trait LogStore {
     /// Makes `write` durable before returning: what a replica writes as it opens, before anything
     /// else (`docs/durable.md` §4.3).
     fn write_now(&mut self, write: &Write<'_>) -> Result<(), Fault>;
+
+    /// The replica has applied its log through `index`: what the store kept in memory for the
+    /// replica to read back before it applied it may go. A store that keeps nothing ignores it.
+    fn applied(&mut self, index: u64) {
+        let _ = index;
+    }
+
+    /// The bytes the store keeps in memory for the replica's reads, which the replica's budget
+    /// counts with what it holds itself. Zero for a store that keeps none.
+    fn kept_bytes(&self) -> u64 {
+        0
+    }
 }

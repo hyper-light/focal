@@ -598,6 +598,38 @@ impl NativeOwner {
         self.pending.len()
     }
 
+    /// Room for one more pending candidate: a full queue doubles its capacity, the growth charged
+    /// to the core's budget before it is allocated. The candidates a leader holds in flight are as
+    /// many as its memory funds, never a count picked for them: a queue fixed at
+    /// `NativeLimits::pending` held a session on hyper-durable's shell at 355 writes a second
+    /// against a 55 ms commit, every write past the 32nd in flight refused (Little's law,
+    /// 2026-10-12). That limit remains the committed headroom a seal's outcome is checked
+    /// against, which every replica replays alike; the depth of one leader's pipeline is its own.
+    pub(super) fn reserve_pending(&mut self) -> Result<(), NativeError> {
+        if self.pending.len() < self.pending.capacity() {
+            return Ok(());
+        }
+        let wanted = self
+            .pending
+            .capacity()
+            .max(1)
+            .checked_mul(2)
+            .ok_or(MemoryError::CounterExhausted("native candidate queue"))?;
+        let bytes = prepare::array::<Pending>(wanted)?;
+        let reservation =
+            self.core
+                .state
+                .budget
+                .reserve(BudgetKind::Pending, BudgetLane::Ordinary, bytes)?;
+        self.pending
+            .try_reserve_exact(wanted.saturating_sub(self.pending.len()))
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        // Allocator rounding cannot silently widen the charge.
+        prepare::within(prepare::array::<Pending>(self.pending.capacity())?, bytes)?;
+        self._queue_allocation = reservation.commit();
+        Ok(())
+    }
+
     pub fn oldest(&self) -> Option<NativeCandidate> {
         self.pending.front().map(|row| row.candidate)
     }
@@ -706,6 +738,9 @@ impl NativeOwner {
         custody: Option<(&mut ContentStore, ContentDomainId)>,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
+        // Room for the candidate, made before its chain is borrowed: a retry is answered whatever
+        // the memory says, a fresh request is refused only where no room could be funded.
+        let room = self.reserve_pending().is_ok();
         let pending = self.pending.iter().map(|row| &row.prepared);
         let preparation = match input {
             OwnerInput::Request(context, input) => {
@@ -751,9 +786,7 @@ impl NativeOwner {
                     .next_serial
                     .checked_add(1)
                     .ok_or(MemoryError::CounterExhausted("native candidate serial"))?;
-                if self.pending.len() >= self.core.limits.pending
-                    || self.pending.len() == self.pending.capacity()
-                {
+                if !room {
                     return Err(NativeError::Capacity("pending candidates").into());
                 }
                 let lane = fresh.lane();

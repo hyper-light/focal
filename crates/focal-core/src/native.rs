@@ -1942,13 +1942,15 @@ impl Core<NativeState> {
     pub fn native_stats(&self) -> RangeStats {
         self.state.rows.stats()
     }
+    /// The pending chain's first candidate is built on the published prefix. Every later one was
+    /// built on the one before it when it was prepared (`plan_after` its predecessor), and the
+    /// chain changes only at its ends — a candidate appended on the tail, the head published,
+    /// a suffix discarded — so the head's link is the one a publication can have moved; a walk of
+    /// every link on every check cost each preparation the chain's length.
     pub fn validate_native_chain(&self, pending: &[&NativePrepared]) -> Result<(), NativeError> {
-        if pending.len() > self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
-        }
         self.state
             .rows
-            .validate_chain(pending.iter().map(|item| &item.fragments))?;
+            .validate_chain(pending.iter().take(1).map(|item| &item.fragments))?;
         Ok(())
     }
     /// The external log owner calls this only after durability. This method has

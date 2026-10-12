@@ -31,6 +31,133 @@ struct Parts {
     sent: usize,
     answered: usize,
     outcome: Result<(), Fault>,
+    /// The write's number in the store's order of writes: its entries kept in the tail
+    /// ([`Tail`]) are read once it is answered.
+    number: u64,
+}
+
+/// The entries this store wrote that its replica has not yet applied, each as the log was given
+/// it, kept so the replica reads them back without the log (`docs/durable.md` §8). A leader's
+/// entries are durable at its own write and committed at its followers' answers; by then the core
+/// has let them go from its unstable log, and its apply read each from the log: across the log's
+/// thread, and past the handle's cache (its share of the log's) to the device, queued behind its
+/// flushes. focal's session owner spent 57% of its time waiting on those reads at 5,000 writes a
+/// second, the log's thread idle and its device thread flushing (2026-10-12).
+///
+/// An entry is read from here once the write that put it here is answered, so reads give what the
+/// answered writes left, as the log's own do: a write that replaces a suffix takes the replaced
+/// entries out as it is made, and the indices it carries are read from the log until it is
+/// answered. Entries are let go once applied ([`LogStore::applied`]); their bytes are counted with
+/// the replica's own ([`LogStore::kept_bytes`]), so its budget bounds them.
+#[derive(Debug, Default)]
+struct Tail {
+    /// The index of the first entry kept.
+    first: u64,
+    /// Each entry's term, the number of the write that gave it, and its bytes, contiguous from
+    /// `first`.
+    entries: VecDeque<(u64, u64, Vec<u8>)>,
+    /// The bytes the entries hold, with their places.
+    bytes: u64,
+    /// The number of the last write answered whole, in order: entries of writes up to it are read.
+    answered: u64,
+    /// The number the next write takes.
+    next: u64,
+}
+
+/// What one kept entry holds besides its bytes.
+const KEPT_ENTRY: u64 = std::mem::size_of::<(u64, u64, Vec<u8>)>() as u64;
+
+impl Tail {
+    /// One past the last index kept.
+    fn end(&self) -> u64 {
+        self.first
+            .saturating_add(u64::try_from(self.entries.len()).unwrap_or(u64::MAX))
+    }
+
+    /// Lets every entry go.
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    /// Lets go of the entries at and past `index`.
+    fn clear_from(&mut self, index: u64) {
+        while self.end() > index.max(self.first) {
+            match self.entries.pop_back() {
+                Some((_, _, bytes)) => self.forget(&bytes),
+                None => break,
+            }
+        }
+    }
+
+    /// Lets go of the entries at and before `index`.
+    fn drop_through(&mut self, index: u64) {
+        while self.first <= index {
+            match self.entries.pop_front() {
+                Some((_, _, bytes)) => {
+                    self.forget(&bytes);
+                    self.first = self.first.saturating_add(1);
+                }
+                None => {
+                    self.first = index.saturating_add(1);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn forget(&mut self, bytes: &[u8]) {
+        let held = u64::try_from(bytes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(KEPT_ENTRY);
+        self.bytes = self.bytes.saturating_sub(held);
+    }
+
+    /// Keeps `entries` from `first`, written by write `number`, in place of what is kept at and
+    /// past `first`. An entry that cannot be kept for memory leaves the tail ending before it:
+    /// what it lacks is read from the log.
+    fn keep(&mut self, first: u64, entries: &[hyper_log::Entry], number: u64) {
+        self.clear_from(first);
+        if self.entries.is_empty() || self.end() != first {
+            self.clear();
+            self.first = first;
+        }
+        if self.entries.try_reserve(entries.len()).is_err() {
+            return;
+        }
+        for entry in entries {
+            let mut bytes = Vec::new();
+            if bytes.try_reserve_exact(entry.bytes.len()).is_err() {
+                return;
+            }
+            bytes.extend_from_slice(&entry.bytes);
+            self.bytes = self
+                .bytes
+                .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+                .saturating_add(KEPT_ENTRY);
+            self.entries.push_back((entry.term, number, bytes));
+        }
+    }
+
+    /// Whether every entry of `[low, high)` is kept and its write answered.
+    fn holds(&self, low: u64, high: u64) -> bool {
+        if low >= high || low < self.first || high > self.end() {
+            return false;
+        }
+        let last = high.saturating_sub(1).saturating_sub(self.first);
+        usize::try_from(last)
+            .ok()
+            .and_then(|at| self.entries.get(at))
+            .is_some_and(|(_, number, _)| *number <= self.answered)
+    }
+
+    /// The entry kept at `index`: its term and bytes.
+    fn get(&self, index: u64) -> Option<(u64, &[u8])> {
+        let at = usize::try_from(index.checked_sub(self.first)?).ok()?;
+        self.entries
+            .get(at)
+            .map(|(term, _, bytes)| (*term, bytes.as_slice()))
+    }
 }
 
 impl Parts {
@@ -53,6 +180,8 @@ pub struct GroupStore<F: BlockFile + 'static> {
     fetched: Cell<Option<Fetched>>,
     /// Writes not yet answered, oldest first.
     writes: VecDeque<Parts>,
+    /// The entries written and not yet applied, kept for the replica's reads.
+    tail: Tail,
     /// Parts not yet sent, in order.
     queued: VecDeque<Update>,
     waker: Option<Waker>,
@@ -144,6 +273,7 @@ impl<F: BlockFile + 'static> GroupStore<F> {
             page,
             fetched: Cell::new(None),
             writes: VecDeque::new(),
+            tail: Tail::default(),
             queued: VecDeque::new(),
             waker: None,
         }
@@ -419,6 +549,28 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
         if low >= high {
             return Ok(());
         }
+        if self.tail.holds(low, high) {
+            let mut taken = 0u64;
+            for index in low..high {
+                let (term, bytes) = self
+                    .tail
+                    .get(index)
+                    .ok_or(StorageError::Other("a kept entry is missing"))?;
+                let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                if index > low && taken.saturating_add(len) > max_bytes {
+                    break;
+                }
+                taken = taken.saturating_add(len);
+                let entry = decode_entry(index, term, bytes)
+                    .ok_or(StorageError::Other("an entry does not decode"))?;
+                into.try_reserve(1)
+                    .map_err(|_| StorageError::Other("no memory for the entries asked"))?;
+                let mut copy = Entry::default();
+                entry.copy_into(&mut copy);
+                into.push(copy);
+            }
+            return Ok(());
+        }
         let fetched = self.fetch(low, high, max_bytes)?;
         into.try_reserve_exact(fetched.len())
             .map_err(|_| StorageError::Other("no memory for the entries asked"))?;
@@ -443,6 +595,20 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
         page: u64,
         visit: &mut dyn FnMut(EntryRef<'_>) -> bool,
     ) -> Result<(), StorageError> {
+        if self.tail.holds(low, high) {
+            for index in low..high {
+                let (term, bytes) = self
+                    .tail
+                    .get(index)
+                    .ok_or(StorageError::Other("a kept entry is missing"))?;
+                let entry = decode_entry(index, term, bytes)
+                    .ok_or(StorageError::Other("an entry does not decode"))?;
+                if visit(entry) {
+                    break;
+                }
+            }
+            return Ok(());
+        }
         let page = page.min(self.page);
         let mut next = low;
         while next < high {
@@ -500,12 +666,28 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
 
     fn submit(&mut self, write: &Write<'_>, waker: &Waker) -> Result<(), Fault> {
         let update = update_of(write)?;
-        let parts = self.group.parts(update).map_err(|e| fault(&e))?;
+        let number = self.tail.next;
+        self.tail.next = number.saturating_add(1);
+        if let Some(start) = &update.start {
+            self.tail.drop_through(start.index);
+        }
+        if let Some(entries) = &update.entries {
+            self.tail.keep(entries.first, &entries.entries, number);
+        }
+        let parts = match self.group.parts(update) {
+            Ok(parts) => parts,
+            Err(e) => {
+                // Never made: what it put in the tail goes, and reads go to the log.
+                self.tail.clear();
+                return Err(fault(&e));
+            }
+        };
         self.writes.push_back(Parts {
             total: parts.len(),
             sent: 0,
             answered: 0,
             outcome: Ok(()),
+            number,
         });
         self.queued.extend(parts);
         match &self.waker {
@@ -520,7 +702,16 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
         loop {
             let front = self.writes.front_mut()?;
             if front.answered >= front.total {
-                return self.writes.pop_front().map(|parts| parts.outcome);
+                let parts = self.writes.pop_front()?;
+                match &parts.outcome {
+                    // Writes are answered in order: every kept entry of this write and the ones
+                    // before it is the log's now.
+                    Ok(()) => self.tail.answered = parts.number,
+                    // Refused or failed, it changed nothing, or the log is fenced: what it put
+                    // in the tail is not the log's, and reads go to the log.
+                    Err(_) => self.tail.clear(),
+                }
+                return Some(parts.outcome);
             }
             if front.answered >= front.sent {
                 self.send_queued();
@@ -540,11 +731,21 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
     }
 
     fn write_now(&mut self, write: &Write<'_>) -> Result<(), Fault> {
+        // What an opening writes is read from the log: nothing is kept past it.
+        self.tail.clear();
         let update = update_of(write)?;
         let parts = self.group.parts(update).map_err(|e| fault(&e))?;
         for part in parts {
             self.group.write(part).map_err(|e| fault(&e))?;
         }
         Ok(())
+    }
+
+    fn applied(&mut self, index: u64) {
+        self.tail.drop_through(index);
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        self.tail.bytes
     }
 }

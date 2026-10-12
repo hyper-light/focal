@@ -9,13 +9,9 @@ impl Core<NativeState> {
         logical_time: u64,
         mut pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
     ) -> Result<Checked<'a>, NativeError> {
-        let pending_count = pending.len();
-        if pending_count > self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
-        }
         self.state
             .rows
-            .validate_chain(pending.clone().map(|item| &item.fragments))?;
+            .validate_chain(pending.clone().take(1).map(|item| &item.fragments))?;
         let intent = intent::monitor_deadline_fingerprint(self.state.ledger, input)?;
         let view = View {
             state: &self.state,
@@ -30,9 +26,6 @@ impl Core<NativeState> {
             } else {
                 Err(NativeError::RequestConflict)
             };
-        }
-        if pending_count == self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
         }
         let mut meta = view.meta();
         if logical_time < meta.logical_time {

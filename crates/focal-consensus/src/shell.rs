@@ -509,6 +509,16 @@ impl<L: LogStore> LogStore for FloorStore<L> {
         // Opening's own writes repair what is durable; they carry no entry of the owner's.
         self.inner.write_now(write)
     }
+
+    fn applied(&mut self, index: u64) {
+        // What the log's store kept for the replica's reads goes as the replica applies it; a
+        // floor this store holds keeps nothing of its own.
+        self.inner.applied(index);
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        self.inner.kept_bytes()
+    }
 }
 
 #[cfg(test)]
