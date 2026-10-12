@@ -729,6 +729,7 @@ dependencies = [
  "focal-evidence",
  "focal-memory",
  "focal-model",
+ "mimalloc",
  "postcard",
  "serde",
  "serde_json",
