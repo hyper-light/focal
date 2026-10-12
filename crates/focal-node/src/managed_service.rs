@@ -83,11 +83,11 @@ impl ManagedService {
             // A current read is served here, whoever leads.
             return None;
         }
-        let leader = replica
-            .diagnostics()
-            .await
-            .map(|diagnostics| diagnostics.value().leader)
-            .unwrap_or(0);
+        // The leader the replica published at its last drain: its progress, read where it is.
+        // Asked of its owner, every client write (refused ones as well) cost the owner a
+        // diagnostics round: 4.2% of the leader's owner at 4,000 writes a second offered on
+        // 1-CPU CI nodes (profile run 38287539180).
+        let leader = replica.observe(|progress| progress.leader);
         let to_leader = async |epoch: RouteEpoch| {
             if leader == *node || leader == 0 {
                 Some(RouteHint {
