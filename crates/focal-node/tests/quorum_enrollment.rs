@@ -54,8 +54,11 @@ fn namespace() -> LedgerId {
     }
 }
 fn peer(role: PeerRole) -> AuthenticatedPeer {
+    peer_of(OPERATOR, role)
+}
+fn peer_of(principal: [u8; 16], role: PeerRole) -> AuthenticatedPeer {
     AuthenticatedPeer::local(PeerGrant {
-        principal: ParticipantId(OPERATOR),
+        principal: ParticipantId(principal),
         tenants: [namespace().tenant].into_iter().collect(),
         role,
     })
@@ -276,6 +279,8 @@ struct Router {
     /// Whether this transport reaches the whole group and asks the host
     /// that leads, as a node's does, or one host alone.
     follows: bool,
+    /// Who asks.
+    principal: [u8; 16],
 }
 enum Ask {
     Read(RequestId),
@@ -302,12 +307,20 @@ impl Router {
             fault: Arc::new(AtomicU64::new(0)),
             isolated: rig.isolated.clone(),
             follows: false,
+            principal: OPERATOR,
         }
     }
     fn following(rig: &Rig, leader: usize) -> Self {
         Self {
             follows: true,
             ..Self::new(rig, leader)
+        }
+    }
+    /// A transport that follows the leader, asking as `principal`.
+    fn following_as(rig: &Rig, leader: usize, principal: [u8; 16]) -> Self {
+        Self {
+            principal,
+            ..Self::following(rig, leader)
         }
     }
     /// The hosts the network reaches, by index.
@@ -333,12 +346,19 @@ impl Router {
             let asked = match &ask {
                 Ask::Read(id) => self
                     .host()
-                    .read(peer(PeerRole::Runtime), *id, ControlRead::State)
+                    .read(
+                        peer_of(self.principal, PeerRole::Runtime),
+                        *id,
+                        ControlRead::State,
+                    )
                     .await
                     .map(|read| Answer::Read(Box::new(read))),
                 Ask::Submit(request) => self
                     .host()
-                    .submit(peer(PeerRole::Runtime), (**request).clone())
+                    .submit(
+                        peer_of(self.principal, PeerRole::Runtime),
+                        (**request).clone(),
+                    )
                     .await
                     .map(Answer::Receipt),
             };
@@ -513,7 +533,16 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         let task = serve(driver, router.clone());
         let recovered = host.redeem(join.clone()).await.unwrap();
         assert_eq!(recovered, committed);
-        assert_eq!(registry(&rig.state(leader).await).enrollments().count(), 1);
+        // Leadership observed is not leadership held: what is read and asked
+        // of the group from here goes to the host that leads at the time
+        // (Linux CI: the leader found after the restart was deposed before the
+        // other operator's revoke, refused `NotLeader`).
+        assert_eq!(
+            registry(&router.read_state(RequestId::from_u128(901)).await.unwrap())
+                .enrollments()
+                .count(),
+            1
+        );
         assert!(
             host.invite(request, node_intent)
                 .await
@@ -546,26 +575,18 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         ));
         // Another authenticated operator wins the comparison while this signer's
         // invitation is unresolved. Exact retry rebases the same persisted token.
-        let public = registry(&rig.state(leader).await);
+        let public = registry(&router.read_state(RequestId::from_u128(902)).await.unwrap());
         let command = public.prepare_revoke(invitation.id(), now()).unwrap();
         let external = [64; 16];
-        rig.hosts[leader]
-            .submit(
-                AuthenticatedPeer::local(PeerGrant {
-                    principal: ParticipantId(external),
-                    tenants: [namespace().tenant].into_iter().collect(),
-                    role: PeerRole::Runtime,
-                })
-                .unwrap(),
-                ControlRequest {
-                    id: ControlRequestId {
-                        client: external,
-                        sequence: 1,
-                    },
-                    acknowledged_through: 0,
-                    command: ControlCommand::Enrollment(command),
+        Router::following_as(&rig, leader, external)
+            .submit(ControlRequest {
+                id: ControlRequestId {
+                    client: external,
+                    sequence: 1,
                 },
-            )
+                acknowledged_through: 0,
+                command: ControlCommand::Enrollment(command),
+            })
             .await
             .unwrap();
         let actor_invite = host

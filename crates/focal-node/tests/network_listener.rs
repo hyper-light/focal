@@ -612,13 +612,26 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
                 .await
                 .is_err()
         );
+        // Filled again once everything the refused dial held is given back:
+        // nothing pending, and the budget holding the listener's residency,
+        // what it admitted and the pressure alone. Filled once nothing was
+        // pending, the dial's last release could come after the fill and fund
+        // the body below (Linux CI, a run of ab/short-copy).
         let settled = listener.admission().await.changes;
+        let held = pressure.as_ref().map_or(0, focal_memory::Allocation::bytes);
         owners::counted_async(
             async || vec![listener.admission().await.changes],
             settled,
             Duration::from_millis(5),
             async {
-                while listener.admission().await.pending != 0 {
+                loop {
+                    let admission = listener.admission().await;
+                    if admission.pending == 0
+                        && network_budget.stats().used
+                            == listener_residency + admission.bytes + held
+                    {
+                        break;
+                    }
                     focal_rt::time::sleep(Duration::from_millis(5))
                         .await
                         .unwrap();
