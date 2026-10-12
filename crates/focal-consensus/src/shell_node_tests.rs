@@ -568,6 +568,59 @@ fn the_owners_signal_is_called_when_the_log_answers_a_write() {
     assert_eq!(gave, vec![(2, b"a".to_vec())]);
 }
 
+/// A write out with the log, whose answer will wake the owner, is nothing for a drain to do: the
+/// owner waits for the wake rather than running the member again while the write is out (a grouped
+/// owner ran a member that counted it as ready again at once, a whole core at 100 writes a second).
+/// Once the log has answered, the member is ready, and the drain gives what became durable.
+#[test]
+fn a_write_the_log_will_answer_with_a_wake_is_not_ready_until_it_is_answered() {
+    let mut member = sole(no_needs);
+    elected(&mut member);
+    let (tell, told) = std::sync::mpsc::sync_channel::<()>(64);
+    member.node().notify_persisted(Some(Box::new(move || {
+        let tell = tell.clone();
+        Box::new(move || {
+            let _ = tell.try_send(());
+        })
+    })));
+    // Large entries, so each write is out for a while after the drain that sent it.
+    let entry = vec![7u8; ENTRY / 2];
+    let mut gave = 0;
+    for _ in 0..8 {
+        member.node().propose(entry.clone()).unwrap();
+        for _ in 0..DRAINS {
+            match member.node().try_drain().unwrap() {
+                Some(events) => {
+                    gave += events.committed.len();
+                    if !member.node().has_ready() {
+                        break;
+                    }
+                }
+                None => {
+                    // Read in this order: a waker only ever goes from armed to fired, so a member
+                    // that is ready while its waker is still armed counted the write out.
+                    let ready = member.node().has_ready();
+                    let wakes = member.node().wakes_owner();
+                    assert!(
+                        !(ready && wakes),
+                        "a write the log will answer with a wake made the member ready"
+                    );
+                    if wakes {
+                        // The wake is the fact waited on, buffered when it came first; one left
+                        // from an earlier write is taken and the wait goes on, until this write's
+                        // waker has woken.
+                        while member.node().wakes_owner() {
+                            told.recv().unwrap();
+                        }
+                        assert!(member.node().has_ready(), "the answer is something to take");
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(gave, 8, "every write was given once, durable");
+}
+
 /// A log on a file of its own under `dir`, made the first time.
 fn log_in(dir: &std::path::Path) -> Log<DeviceFile> {
     let path = dir.join("raft.log");

@@ -159,6 +159,9 @@ pub(crate) struct ShellNode {
     quiet_due: bool,
     /// The last drive left more to do without an answer from the log (`Driven::more`).
     more: bool,
+    /// Whether the log had room for another write as the last drive left it (`LogStore::room`):
+    /// a `Ready` the replica cannot write is not one it can take ([`ShellNode::ready_takeable`]).
+    room: bool,
     /// What tells the owner a write of the group was answered (`notify_persisted`).
     persisted: Option<PersistedSignal>,
     /// The waker the latest writes went out with, made from the owner's signal; none until a
@@ -371,6 +374,7 @@ impl ShellNode {
             periods: 0,
             quiet_due: false,
             more: false,
+            room: true,
             persisted: None,
             waker: None,
             decoders,
@@ -1067,7 +1071,14 @@ impl ShellNode {
     }
     /// Whether a drain has something to do. A replica that waits, whole, for room or for a
     /// record takes no `Ready`: its next drain is due once a tick or a record says it may go
-    /// again (`more`).
+    /// again (`more`). A write out with the log is something to do only where nothing will say
+    /// it was answered: where the log wakes the owner as it answers (`wakes_owner`), the owner
+    /// waits for that, as it waits on focal-log's persistence (`persistence_pending`), and runs
+    /// the replica again for the answer. Counted as ready while it was out, a grouped owner ran
+    /// the replica again at once, round after round, for as long as each write took: a whole
+    /// core at 100 writes a second on a disk whose flush takes milliseconds (macOS, 2026-10-12;
+    /// on 1-CPU CI nodes the shell's busiest node spent 1,088 µs more a write than focal-log's
+    /// at 100/s, run 38206662353).
     pub fn has_ready(&self) -> bool {
         let stalled = self.replica.is_stalled();
         !self.failed()
@@ -1075,8 +1086,24 @@ impl ShellNode {
                 || self.more
                 || (!stalled
                     && (self.quiet_due
-                        || self.replica.in_flight() > 0
-                        || self.replica.core().has_ready())))
+                        || (self.replica.in_flight() > 0 && !self.wakes_owner())
+                        || self.ready_takeable())))
+    }
+    /// Whether a drive could take the core's next `Ready` now, by the replica's own rule
+    /// (hyper-durable's `Replica::ready_due`): the core has one, fewer of its `Ready`s' writes are
+    /// out than its depth, and a write may go out — fewer are out than the depth and the shell's
+    /// own one, and the log had room as the last drive left it. A `Ready` the core has but no
+    /// write may carry is taken by the drive the log's answer brings, which the log tells the
+    /// owner of (`wakes_owner`). Counted as ready at once, the core's own `has_ready` held a
+    /// grouped owner in a loop for as long as the writes were out: about 400,000 passes a second
+    /// with nothing to take, at 100 writes a second (macOS, 2026-10-12).
+    fn ready_takeable(&self) -> bool {
+        let core = self.replica.core();
+        let depth = core.raft.config().limits.readies_in_flight;
+        self.room
+            && core.in_flight() < depth
+            && self.replica.in_flight() < depth.saturating_add(1)
+            && core.has_ready()
     }
     pub fn try_drain(&mut self) -> Result<Option<NodeEvents>, ConsensusError> {
         self.poll_drain(false)
@@ -1234,6 +1261,7 @@ impl ShellNode {
         let driven = self.replica.drive(self.periods, &waker, &mut self.out);
         let driven = self.heard(driven)?;
         self.more = driven.more;
+        self.room = self.replica.log_mut().room();
         self.quiet_due = false;
         events
             .messages
