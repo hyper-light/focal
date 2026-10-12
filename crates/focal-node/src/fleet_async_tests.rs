@@ -810,6 +810,104 @@ fn the_only_stopped_session_past_the_first_512_shows_in_the_first_round() {
     .unwrap()
 }
 
+/// A session refuses a participant's request that would wait past its delay bound — twice
+/// its uncongested write cycle, Breakwater's AQM (Cho et al., OSDI '20, §3.2.3) — before it
+/// is charged or queued, and counts it at the delay; what is already queued is answered,
+/// and once its queue drains the session takes requests again.
+#[test]
+fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
+    focal_rt::block_on(async move {
+        let path = tempfile::tempdir().unwrap();
+        let fixture = fixture(path.path(), 1);
+        settle(&fixture).await;
+        let host = fixture.hosts[&ledger(1)].clone();
+        let write = |id: u128| RequestEnvelope {
+            request_id: RequestId::from_u128(id),
+            ..envelope(
+                1,
+                Operation::OpenEpoch {
+                    epoch: RequestEpoch(1),
+                },
+            )
+        };
+        let lease = blocker(&fixture.wal);
+        let (resume, disk) = pause(lease);
+        host.pace.forget_service();
+        // One write takes the session's write out; the paused writer holds it.
+        let mut observation = host.progress.clone();
+        observation.borrow_and_update();
+        let mut answers = Vec::new();
+        let first = host.clone();
+        answers.push(
+            focal_rt::spawn(async move {
+                dispatch(&first, peer(), write(100), &ReplicaHost::wire_limits()).await
+            })
+            .unwrap(),
+        );
+        let steps = TICK * (2 * crate::test_waits::STEP);
+        crate::test_waits::within(&[&host], steps, TICK, observation.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        // With no cycle measured nothing is refused for its delay: the next request queues
+        // behind the write out.
+        let queued = host.clone();
+        answers.push(
+            focal_rt::spawn(async move {
+                dispatch(&queued, peer(), write(200), &ReplicaHost::wire_limits()).await
+            })
+            .unwrap(),
+        );
+        crate::test_waits::within(&[&host], steps, TICK, async {
+            while host.pace.queueing_delay() == Duration::ZERO {
+                focal_rt::time::sleep(Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        // Then the session measures a cycle of a microsecond: the request queued has waited
+        // past twice that, and the next is refused.
+        host.pace.served(Duration::from_micros(1));
+        assert!(host.pace.delay_exceeded());
+        let refused = dispatch(&host, peer(), write(300), &ReplicaHost::wire_limits()).await;
+        assert!(matches!(
+            refused.result,
+            Response::Error(AccessError::Capacity)
+        ));
+        let counted = host.input_refusals();
+        assert_eq!(
+            counted.requests_refused,
+            crate::metrics::RefusedBy {
+                delay: 1,
+                ..Default::default()
+            },
+            "counted at the delay"
+        );
+        resume.send(()).unwrap();
+        drop(disk.join().unwrap());
+        for answer in answers {
+            let result = answer.await.unwrap().result;
+            assert!(
+                !matches!(result, Response::Error(AccessError::Capacity)),
+                "what was queued is answered: {result:?}"
+            );
+        }
+        // The queue drained: the session takes requests again.
+        assert_eq!(host.pace.queueing_delay(), Duration::ZERO);
+        assert!(!host.pace.delay_exceeded());
+        let again = dispatch(&host, peer(), write(400), &ReplicaHost::wire_limits()).await;
+        assert!(!matches!(
+            again.result,
+            Response::Error(AccessError::Capacity)
+        ));
+        drop(host);
+        shutdown(fixture).await;
+    })
+    .unwrap()
+}
+
 /// A session whose write is in flight is handed no work: what comes for it
 /// waits in its queue, a participant's within the participants' share, and
 /// what finds no room is refused — counted where it was refused, a
@@ -833,6 +931,9 @@ fn a_session_with_a_write_out_refuses_what_its_queue_has_no_room_for_and_counts_
         };
         let lease = blocker(&fixture.wal);
         let (resume, disk) = pause(lease);
+        // The queue's own room is what is tested: the delay its session measured would refuse
+        // the writes behind a paused disk before the room is full.
+        host.pace.forget_service();
         // One write takes the session's write out; the paused writer holds it.
         let mut observation = host.progress.clone();
         observation.borrow_and_update();
@@ -850,8 +951,7 @@ fn a_session_with_a_write_out_refuses_what_its_queue_has_no_room_for_and_counts_
             .unwrap()
             .unwrap();
         // The participants' share of the session's queue, and one more.
-        let queue = ReplicaConfig::new(RootCommandId::from_u128(119)).queue_items;
-        let share = queue - queue / 4;
+        let share = grouped::PARTICIPANT_SLOTS;
         for id in 0..=share {
             let host = host.clone();
             let request = write(200 + id as u128);
@@ -925,6 +1025,9 @@ fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_full() {
         };
         let lease = blocker(&fixture.wal);
         let (resume, disk) = pause(lease);
+        // The queue's own room is what is tested: the delay its session measured would refuse
+        // the writes behind a paused disk before the room is full.
+        host.pace.forget_service();
         // One write takes the session's write out; the paused writer holds it.
         let mut observation = host.progress.clone();
         observation.borrow_and_update();
@@ -942,8 +1045,7 @@ fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_full() {
             .unwrap()
             .unwrap();
         // The participants' share of the session's queue, and one more.
-        let queue = ReplicaConfig::new(RootCommandId::from_u128(119)).queue_items;
-        let share = queue - queue / 4;
+        let share = grouped::PARTICIPANT_SLOTS;
         for id in 0..=share {
             let host = host.clone();
             let request = write(200 + id as u128);

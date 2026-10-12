@@ -191,9 +191,9 @@ pub(crate) struct ServiceClock {
     pace: TickPeriod,
     taken: std::time::Instant,
     queued: Duration,
-    /// Whether the pipeline held no other write as this one was taken: its
-    /// service is the session's uncongested time, the only kind that may set
-    /// the least ([`TickPeriod::base_service`]).
+    /// Whether this is a write and the pipeline held no other as it was taken:
+    /// its service is the session's uncongested time, the only kind that may
+    /// set the least ([`TickPeriod::base_service`]).
     alone: bool,
 }
 impl ServiceClock {
@@ -445,12 +445,16 @@ impl TickPeriod {
     /// A clock started as the owner takes a participant's request that waited
     /// `queued` to be taken, read when the request is answered
     /// ([`ServiceClock::answered`]); the request is in service while it is held.
-    pub(crate) fn service_clock(&self, queued: Duration) -> ServiceClock {
+    /// Only a `write` taken with no other write in its pipeline measures the
+    /// session's uncongested cycle: a read's answer waits on a barrier and not a
+    /// write, and a least taken from reads would hold the writes to a cycle they
+    /// never take.
+    pub(crate) fn service_clock(&self, queued: Duration, write: bool) -> ServiceClock {
         ServiceClock {
             pace: self.clone(),
             taken: std::time::Instant::now(),
             queued,
-            alone: self.0.oldest_write_ns.load(Ordering::Relaxed) == 0,
+            alone: write && self.0.oldest_write_ns.load(Ordering::Relaxed) == 0,
         }
     }
     /// The owner answered, `service` after taking it, a participant's request it
@@ -464,8 +468,11 @@ impl TickPeriod {
     /// its pipeline empty is the measurement). Only the owner thread answers, so
     /// these marks have one writer.
     pub(crate) fn served(&self, service: Duration) {
+        self.served_at(service, now_ns());
+    }
+    /// [`Self::served`] as of `now`, in nanoseconds since the process began.
+    fn served_at(&self, service: Duration, now: u64) {
         let sample = u64::try_from(service.as_nanos()).unwrap_or(u64::MAX).max(1);
-        let now = now_ns();
         let base = self.0.base_service_ns.load(Ordering::Relaxed);
         let seen = self.0.base_seen_ns.load(Ordering::Relaxed);
         let window = u64::try_from(BASE_WINDOW.as_nanos()).unwrap_or(u64::MAX);
@@ -477,9 +484,11 @@ impl TickPeriod {
     /// The owner states when the oldest write it holds unanswered was admitted
     /// ([`ServiceClock::admitted_ns`]), or none.
     pub(crate) fn set_oldest_write(&self, admitted_ns: Option<u64>) {
-        self.0
-            .oldest_write_ns
-            .store(admitted_ns.unwrap_or(0), Ordering::Relaxed);
+        // Zero is none: a write admitted as the process began is marked a nanosecond later.
+        self.0.oldest_write_ns.store(
+            admitted_ns.map_or(0, |admitted| admitted.max(1)),
+            Ordering::Relaxed,
+        );
     }
     /// How long the session's pipeline has held its oldest write past the time
     /// one takes uncongested; none while it holds none.
@@ -510,6 +519,13 @@ impl TickPeriod {
     pub(crate) fn delay_bound(&self) -> Option<Duration> {
         self.base_service()
             .map(|base| base.saturating_mul(DELAY_BOUND_CYCLES))
+    }
+    /// Forgets the session's measured service time, as one that has served nothing yet: a test
+    /// of a queue's own room sets the delay bound aside with it.
+    #[cfg(test)]
+    pub(crate) fn forget_service(&self) {
+        self.0.base_service_ns.store(0, Ordering::Relaxed);
+        self.0.base_seen_ns.store(0, Ordering::Relaxed);
     }
     /// Whether a participant's request is to be refused now for the delay
     /// it would be queued behind ([`Self::delay_bound`]).
@@ -686,5 +702,150 @@ mod frame_room_tests {
         assert!(pace.queue_frame().is_none());
         drop(fourth);
         assert_eq!(pace.frame_room(), (1, 0));
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
+mod admission_tests {
+    use super::*;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+    fn ns(duration: Duration) -> u64 {
+        u64::try_from(duration.as_nanos()).unwrap()
+    }
+    /// A clock for a write taken now, its pipeline otherwise empty or not as the pace says.
+    fn write(pace: &TickPeriod) -> ServiceClock {
+        pace.service_clock(Duration::ZERO, true)
+    }
+    /// Waits until the process has run `at_least`: the marks these tests set in the past are
+    /// times since it began.
+    fn running_for(at_least: Duration) {
+        let at_least = ns(at_least);
+        loop {
+            let now = now_ns();
+            if now >= at_least {
+                return;
+            }
+            std::thread::sleep(Duration::from_nanos(at_least - now));
+        }
+    }
+
+    /// The uncongested cycle is the least a write took with no other write in its pipeline,
+    /// standing for the window: a longer sample does not replace it until the window has
+    /// passed, a shorter one does at once, and nothing is bounded before one is measured.
+    #[test]
+    fn the_uncongested_cycle_is_the_least_over_the_window() {
+        let pace = TickPeriod::default();
+        assert_eq!(pace.base_service(), None);
+        assert_eq!(pace.delay_bound(), None);
+        assert!(
+            !pace.delay_exceeded(),
+            "nothing is refused before a cycle is measured"
+        );
+        pace.served(ms(9));
+        pace.served(ms(4));
+        pace.served(ms(7));
+        assert_eq!(pace.base_service(), Some(ms(4)));
+        assert_eq!(pace.delay_bound(), Some(ms(4) * DELAY_BOUND_CYCLES));
+        // Within the window a longer sample leaves the least; once the window has passed
+        // since the least was measured, the next sample replaces it.
+        let seen = pace.0.base_seen_ns.load(Ordering::Relaxed);
+        pace.served_at(ms(6), seen + ns(BASE_WINDOW));
+        assert_eq!(pace.base_service(), Some(ms(4)));
+        pace.served_at(ms(6), seen + ns(BASE_WINDOW) + 1);
+        assert_eq!(pace.base_service(), Some(ms(6)));
+    }
+
+    /// Only a write taken alone measures the cycle: a read never does, and a write taken
+    /// behind another waits on that one's cycle as well as its own.
+    #[test]
+    fn only_a_write_taken_alone_measures_the_cycle() {
+        let pace = TickPeriod::default();
+        pace.service_clock(Duration::ZERO, false).answered();
+        assert_eq!(pace.base_service(), None, "a read measures nothing");
+        let first = write(&pace);
+        pace.set_oldest_write(Some(first.admitted_ns()));
+        let behind = write(&pace);
+        behind.answered();
+        assert_eq!(
+            pace.base_service(),
+            None,
+            "a write behind another measures nothing"
+        );
+        first.answered();
+        assert!(pace.base_service().is_some(), "the one taken alone does");
+    }
+
+    /// The service delay is the age of the oldest write the pipeline holds past the
+    /// uncongested cycle; none while it holds none. Past the bound, the session refuses.
+    #[test]
+    fn the_oldest_write_past_its_cycle_is_the_service_delay() {
+        running_for(ms(60));
+        let pace = TickPeriod::default();
+        pace.served(ms(10));
+        assert_eq!(pace.service_delay(), Duration::ZERO);
+        pace.set_oldest_write(Some(now_ns().saturating_sub(ns(ms(50)))));
+        let delay = pace.service_delay();
+        assert!(delay >= ms(40), "{delay:?}");
+        assert!(
+            pace.delay_exceeded(),
+            "40 ms past a 10 ms cycle is past twice the cycle"
+        );
+        pace.set_oldest_write(Some(now_ns()));
+        assert!(
+            !pace.delay_exceeded(),
+            "a write admitted just now is within its cycle"
+        );
+        pace.set_oldest_write(None);
+        assert_eq!(pace.service_delay(), Duration::ZERO);
+        assert!(!pace.delay_exceeded());
+    }
+
+    /// The queueing delay is none while nothing is queued; while the queue holds a request it
+    /// is at least the time since the queue last stopped being empty or the owner last took
+    /// one, whichever is later, and at least what the one taken last had waited.
+    #[test]
+    fn the_queueing_delay_is_the_oldest_wait_the_queue_marks_tell() {
+        running_for(ms(40));
+        let pace = TickPeriod::default();
+        pace.served(ms(5));
+        assert_eq!(pace.queueing_delay(), Duration::ZERO);
+        let first = pace.queue_request();
+        let second = pace.queue_request();
+        // The queue has been busy for 30 ms with nothing taken.
+        pace.0
+            .busy_since_ns
+            .store(now_ns().saturating_sub(ns(ms(30))), Ordering::Relaxed);
+        assert!(pace.queueing_delay() >= ms(30));
+        assert!(
+            pace.delay_exceeded(),
+            "30 ms queued is past twice a 5 ms cycle"
+        );
+        // The owner takes the first, which had waited 30 ms: the one behind it waited at
+        // least as long.
+        let mut first = first;
+        first.admitted_ns = now_ns().saturating_sub(ns(ms(30)));
+        assert!(first.taken() >= ms(30));
+        assert!(pace.queueing_delay() >= ms(30));
+        // Once the queue empties, nothing is queued and no delay is read.
+        drop(second);
+        assert_eq!(pace.queueing_delay(), Duration::ZERO);
+        assert!(!pace.delay_exceeded());
+        // The next to find it empty starts a new spell: the last spell's sojourn says
+        // nothing of it.
+        let _third = pace.queue_request();
+        assert!(pace.queueing_delay() < ms(30));
     }
 }

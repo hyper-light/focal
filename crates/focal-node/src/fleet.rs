@@ -932,12 +932,16 @@ struct Pending {
     /// that a loaded machine slows gives up nothing it would have answered.
     deadline: u64,
     /// A participant's request's service time, read as it is answered: the
-    /// session's mean service time bounds the delay new work may be queued
+    /// least taken uncongested bounds the delay new work may be queued
     /// behind (`TickPeriod::delay_bound`). None for a peer's frame.
     served: Option<crate::pace::ServiceClock>,
     _charge: Allocation,
 }
 impl Pending {
+    /// A native write waiting for its outcome ([`Owner::writes`]).
+    fn is_write(&self) -> bool {
+        matches!(self.waiting, WaitingFor::NativeMutation { .. })
+    }
     fn finish(mut self, result: Response) {
         self.header.result = result;
         if let Some(served) = self.served.take() {
@@ -1014,13 +1018,22 @@ struct Owner {
     views: ReadViews,
     streams: Streams,
     runtime: Option<focal_runtime::Runtime>,
+    /// Every request waiting for its answer but the native writes: reads behind their barriers,
+    /// waits for an event, peers' frames behind persistence. Each pass looks at all of them, so
+    /// a caller that stopped waiting gives its room back at once (a long wait holds the largest
+    /// reply room a session gives).
     pending: VecDeque<Pending>,
-    /// No pending request's deadline is earlier: a bound from below, lowered as each request is
+    /// The native writes waiting for their outcomes, in the order they were taken: the oldest
+    /// first ([`Owner::publish_oldest_write`]). There are as many as a session has in flight
+    /// (its rate times its commit time), each answered as its outcome commits; their deadlines
+    /// are looked at only once one may have passed ([`Owner::earliest_deadline`]).
+    writes: VecDeque<Pending>,
+    /// No waiting write's deadline is earlier: a bound from below, lowered as each write is
     /// queued and made exact by the scan that gives up the expired ones (`expire_pending`), so a
-    /// pass with nothing past its deadline looks at none of them. Each pass rotated the whole
-    /// queue to look: at 5,000 writes a second, with every write a session had in flight queued
-    /// here, that was 39% of the owner, nearly all of it moving the records
-    /// (`_platform_memmove`, 2026-10-12).
+    /// pass with nothing past its deadline looks at none of them. Each pass rotated every write
+    /// to look: at 5,000 writes a second that was 39% of the owner, nearly all of it moving the
+    /// records (`_platform_memmove`, 2026-10-12). A write whose caller left keeps its room
+    /// until its outcome commits or its deadline passes: its work is in the pipeline by then.
     earliest_deadline: u64,
     memberships: VecDeque<PendingMembershipCall>,
     /// The members the committed directory names for this session, sorted:
@@ -1293,6 +1306,7 @@ impl ReplicaHost {
             streams,
             runtime,
             pending: VecDeque::new(),
+            writes: VecDeque::new(),
             earliest_deadline: u64::MAX,
             memberships: VecDeque::new(),
             admitted: Vec::new(),
@@ -3071,6 +3085,12 @@ impl Owner {
             };
             pending.finish(Response::Error(error));
         }
+        // A write may be in the log of the members it reached: its outcome is unknown.
+        while let Some(write) = self.writes.pop_front() {
+            write.finish(Response::Error(AccessError::OutcomeUnknown));
+        }
+        self.earliest_deadline = u64::MAX;
+        self.publish_oldest_write();
         self.publish_progress(true);
     }
     fn publish_progress(&mut self, stopped: bool) {
@@ -3130,27 +3150,36 @@ impl Owner {
             .saturating_add(self.resequencer.held())
             .saturating_add(self.waiting_frames.len())
     }
-    /// Queues a request to wait for its answer, its deadline the earliest pending one if it is
-    /// ([`Owner::earliest_deadline`]).
+    /// Queues a request to wait for its answer: a native write behind the others taken
+    /// ([`Owner::writes`], its deadline the earliest one if it is), any other request with the
+    /// rest ([`Owner::pending`]).
     fn queue_pending(&mut self, pending: Pending) {
-        self.earliest_deadline = self.earliest_deadline.min(pending.deadline);
-        self.pending.push_back(pending);
-        self.publish_oldest_write();
+        if pending.is_write() {
+            self.earliest_deadline = self.earliest_deadline.min(pending.deadline);
+            self.writes.push_back(pending);
+            self.publish_oldest_write();
+        } else {
+            self.pending.push_back(pending);
+        }
+    }
+    /// Puts back a request a pass looked at and left waiting, where it was.
+    fn requeue(&mut self, pending: Pending) {
+        if pending.is_write() {
+            self.writes.push_back(pending);
+        } else {
+            self.pending.push_back(pending);
+        }
     }
     /// States to the pace when the oldest write this owner holds unanswered was admitted: the
-    /// first native write in the queue, which keeps them in the order they were taken
+    /// first in [`Owner::writes`], which keeps them in the order they were taken
     /// (`TickPeriod::service_delay`).
     fn publish_oldest_write(&self) {
-        let oldest = self
-            .pending
-            .iter()
-            .find(|pending| matches!(pending.waiting, WaitingFor::NativeMutation { .. }))
-            .and_then(|pending| {
-                pending
-                    .served
-                    .as_ref()
-                    .map(crate::pace::ServiceClock::admitted_ns)
-            });
+        let oldest = self.writes.front().and_then(|write| {
+            write
+                .served
+                .as_ref()
+                .map(crate::pace::ServiceClock::admitted_ns)
+        });
         self.pace.set_oldest_write(oldest);
     }
     /// The Raft traffic admitted beside the participants' bound (F56): every
@@ -3413,7 +3442,10 @@ impl Owner {
         let header = verified
             .request()
             .reply(Response::Error(AccessError::OutcomeUnknown));
-        let served = self.pace.service_clock(queued);
+        let served = self.pace.service_clock(
+            queued,
+            matches!(verified.request().operation, Operation::Native { .. }),
+        );
         // A peer's frame has a path of its own: stepped now, or held for
         // the frame it overtook (27 §12), and answered at the Ready fence
         // either way.
@@ -4316,7 +4348,6 @@ impl Owner {
             }
         }
         self.resolve(&events)?;
-        self.publish_oldest_write();
         self.send(&events.messages)?;
         self.poll_snapshot_feedback()?;
         // The write is durable: what waited for it is stepped now, and owes
@@ -4540,9 +4571,17 @@ impl Owner {
         self.resolve_memberships(events)?;
         self.resolve_placement(events)?;
         let status = self.session.scalars();
-        let count = self.pending.len();
-        for _ in 0..count {
-            let mut pending = self.pending.pop_front().ok_or(LedgerError::Corrupt)?;
+        // Each waiting request is looked at once, the writes after the rest; one left waiting
+        // goes back where it was, in its order.
+        let others = self.pending.len();
+        let count = others.saturating_add(self.writes.len());
+        for index in 0..count {
+            let queue = if index < others {
+                &mut self.pending
+            } else {
+                &mut self.writes
+            };
+            let mut pending = queue.pop_front().ok_or(LedgerError::Corrupt)?;
             if !self.serves_route(pending.header.route_epoch)
                 && !matches!(
                     pending.waiting,
@@ -4923,9 +4962,10 @@ impl Owner {
                 let result = self.given_up(&mut pending);
                 pending.finish(result);
             } else {
-                self.pending.push_back(pending);
+                self.requeue(pending);
             }
         }
+        self.publish_oldest_write();
         Ok(())
     }
     /// What a request the owner gives up is answered with: a read parked
@@ -5005,23 +5045,36 @@ impl Owner {
         }
         // Rotate in place: no replacement queue allocation is needed while a
         // stalled disk retains both its Ready and client input reservations.
-        // Only once a deadline may have passed: a request whose caller left is
-        // answered as it resolves or expires, its room held until then.
+        let count = self.pending.len();
+        for _ in 0..count {
+            let Some(mut pending) = self.pending.pop_front() else {
+                break;
+            };
+            if pending.response.is_closed() {
+                drop(pending);
+            } else if now >= pending.deadline {
+                let result = self.given_up(&mut pending);
+                pending.finish(result);
+            } else {
+                self.pending.push_back(pending);
+            }
+        }
+        // The writes only once a deadline may have passed ([`Owner::earliest_deadline`]).
         if now >= self.earliest_deadline {
             let mut earliest = u64::MAX;
-            let count = self.pending.len();
+            let count = self.writes.len();
             for _ in 0..count {
-                let Some(mut pending) = self.pending.pop_front() else {
+                let Some(mut write) = self.writes.pop_front() else {
                     break;
                 };
-                if pending.response.is_closed() {
-                    drop(pending);
-                } else if now >= pending.deadline {
-                    let result = self.given_up(&mut pending);
-                    pending.finish(result);
+                if write.response.is_closed() {
+                    drop(write);
+                } else if now >= write.deadline {
+                    let result = self.given_up(&mut write);
+                    write.finish(result);
                 } else {
-                    earliest = earliest.min(pending.deadline);
-                    self.pending.push_back(pending);
+                    earliest = earliest.min(write.deadline);
+                    self.writes.push_back(write);
                 }
             }
             self.earliest_deadline = earliest;

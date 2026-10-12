@@ -41,7 +41,14 @@ fn request(
         .unwrap()
         .commit();
     let (send, receive) = hyper_rt::sync::oneshot().unwrap();
-    owner.request(verified, send, charge, None, None, std::time::Duration::ZERO);
+    owner.request(
+        verified,
+        send,
+        charge,
+        None,
+        None,
+        std::time::Duration::ZERO,
+    );
     receive
 }
 fn page(reply: OwnedResponse) -> TraversalPage {

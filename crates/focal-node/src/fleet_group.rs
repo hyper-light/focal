@@ -45,6 +45,9 @@ fn scheduler_quota(weight: u32, max_sessions: usize) -> TenantQuota {
 fn queue_share(items: &MemoryBudget) -> Result<MemoryBudget, focal_memory::MemoryError> {
     items.child(QUEUED, RESERVED)
 }
+/// The places a session's share gives participants' requests: all but the completion lane's.
+#[cfg(test)]
+pub(super) const PARTICIPANT_SLOTS: usize = QUEUED.saturating_sub(RESERVED);
 const STACK_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct FleetReplica {
