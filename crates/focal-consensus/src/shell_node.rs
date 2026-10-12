@@ -1067,7 +1067,14 @@ impl ShellNode {
     }
     /// Whether a drain has something to do. A replica that waits, whole, for room or for a
     /// record takes no `Ready`: its next drain is due once a tick or a record says it may go
-    /// again (`more`).
+    /// again (`more`). A write out with the log is something to do only where nothing will say
+    /// it was answered: where the log wakes the owner as it answers (`wakes_owner`), the owner
+    /// waits for that, as it waits on focal-log's persistence (`persistence_pending`), and runs
+    /// the replica again for the answer. Counted as ready while it was out, a grouped owner ran
+    /// the replica again at once, round after round, for as long as each write took: a whole
+    /// core at 100 writes a second on a disk whose flush takes milliseconds (macOS, 2026-10-12;
+    /// on 1-CPU CI nodes the shell's busiest node spent 1,088 µs more a write than focal-log's
+    /// at 100/s, run 38206662353).
     pub fn has_ready(&self) -> bool {
         let stalled = self.replica.is_stalled();
         !self.failed()
@@ -1075,7 +1082,7 @@ impl ShellNode {
                 || self.more
                 || (!stalled
                     && (self.quiet_due
-                        || self.replica.in_flight() > 0
+                        || (self.replica.in_flight() > 0 && !self.wakes_owner())
                         || self.replica.core().has_ready())))
     }
     pub fn try_drain(&mut self) -> Result<Option<NodeEvents>, ConsensusError> {
