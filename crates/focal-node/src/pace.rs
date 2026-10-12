@@ -276,22 +276,16 @@ impl Drop for QueueTicket {
 pub(crate) struct ServiceClock {
     pace: TickPeriod,
     taken: std::time::Instant,
-    /// Whether this is a write and the pipeline held no other as it was taken:
-    /// its service is the session's uncongested time, the only kind that may
-    /// set the least ([`TickPeriod::base_service`]).
-    alone: bool,
-    /// Whether it is a write: its answer is counted in its interval.
+    /// Whether it is a write: its answer is counted in its interval, and its
+    /// service is a sample of the session's cycle ([`TickPeriod::served`]).
     write: bool,
 }
 impl ServiceClock {
     /// The request taken at this clock's start is answered now.
     pub(crate) fn answered(self) {
-        let service = self.taken.elapsed();
         if self.write {
             self.pace.delivered();
-        }
-        if self.alone {
-            self.pace.served(service);
+            self.pace.served(self.taken.elapsed());
         }
     }
     /// When the owner took the request, in nanoseconds since the process
@@ -317,15 +311,23 @@ const BASE_WINDOW: Duration = Duration::from_secs(10);
 /// write, so it answers `n / (b + c·n)` a second, approaching `1/c`, and a
 /// batch of `k·b/c` writes takes `(k + 1)·b` to answer `k / (k + 1)` of that
 /// most. A bound of `m` cycles therefore buys `1 - 1/m` of the session's
-/// greatest throughput, whatever its costs: ten cycles, nine tenths. Two
-/// cycles (Breakwater's AQM at twice its target, Cho et al., OSDI '20) bought
-/// half: on three local nodes at 16,000 writes a second offered it held
-/// 2,000 a second where the pipeline unbounded held 4,500, at a third of the
-/// latency (2026-10-12).
-const DELAY_BOUND_CYCLES: u32 = 10;
+/// greatest throughput, whatever its costs, and doubling the pipeline from
+/// `m` cycles takes it to `2m - 1`: from 2.5 cycles a doubling buys a quarter
+/// more, from four a seventh, at twice the latency. A quarter is where BBR
+/// judges a pipe full (Cardwell et al., ACM Queue 2016: the delivery rate grew
+/// less than 25% over three rounds of doubling), so the bound is four cycles,
+/// three quarters of the most. Ten bought the last part at the latency it
+/// costs: on 1-CPU CI nodes at 4,000 writes a second, about a tenth more
+/// committed than land-14's fixed 32 writes in flight, at three times its
+/// client p50 (130 ms against 45) and refusals answered in 50 ms where
+/// land-14's took 10 (A/B run 38287321502). Two (Breakwater's AQM at twice
+/// its target, Cho et al., OSDI '20) bought half: on three local nodes at
+/// 16,000 writes a second offered it held 2,000 a second where the pipeline
+/// unbounded held 4,500 (2026-10-12).
+const DELAY_BOUND_CYCLES: u32 = 4;
 /// The bounds a queue's delay must stay past its bound for before it is a
 /// standing queue ([`TickPeriod::standing_interval`]): two, the bound already
-/// being ten cycles — a burst that drains within twice what a write may take
+/// being four cycles — a burst that drains within twice what a write may take
 /// is a good queue (RFC 8289 §2), where CoDel's own ratio (its target 5 to
 /// 10% of its interval, §4.4) is set for a target well under a round trip.
 const STANDING_BOUNDS: u32 = 2;
@@ -530,16 +532,13 @@ impl TickPeriod {
     /// A clock started as the owner takes a participant's request, read when
     /// the request is answered
     /// ([`ServiceClock::answered`]); the request is in service while it is held.
-    /// Only a `write` taken with no other write in its pipeline measures the
-    /// session's uncongested cycle: a read's answer waits on a barrier and not a
-    /// write, and a least taken from reads would hold the writes to a cycle they
-    /// never take.
+    /// Only a `write` measures the session's cycle: a read's answer waits on a
+    /// barrier and not a write, and a least taken from reads would hold the
+    /// writes to a cycle they never take.
     pub(crate) fn service_clock(&self, write: bool) -> ServiceClock {
-        let alone = write && self.0.oldest_write_ns.load(Ordering::Relaxed) == 0;
         ServiceClock {
             pace: self.clone(),
             taken: std::time::Instant::now(),
-            alone,
             write,
         }
     }
@@ -608,11 +607,18 @@ impl TickPeriod {
                 .max(INITIAL_WINDOW),
         )
     }
-    /// The owner answered, `service` after taking it, a write it took with no
-    /// other write in its pipeline: uncongested. A sample at or under the
-    /// least replaces it; a longer one never does while the session leads in
-    /// the term it measured it in ([`Self::reset_base`]). Only the owner
-    /// thread answers, so these marks have one writer.
+    /// The owner answered a write, `service` after taking it. Any write's
+    /// service is at least the cycle of the batch it was proposed in, which is
+    /// at least the session's uncongested cycle, so the least of every write's
+    /// is that cycle from above: a sample at or under the least replaces it,
+    /// and a longer one never does while the session leads in the term it
+    /// measured it in ([`Self::reset_base`]). Taken from writes taken alone
+    /// only, the least was what the first such write took and nothing after:
+    /// under an overload that never empties the pipeline, a session whose
+    /// first writes were slow kept a bound of 3 s for a whole run (A/B run
+    /// 38287321502, 4,000 writes a second on 1-CPU nodes, client p50 370 ms
+    /// where the other round's was 130). Only the owner thread answers, so
+    /// these marks have one writer.
     pub(crate) fn served(&self, service: Duration) {
         let sample = u64::try_from(service.as_nanos()).unwrap_or(u64::MAX).max(1);
         let base = self.0.base_service_ns.load(Ordering::Relaxed);
@@ -622,7 +628,7 @@ impl TickPeriod {
     }
     /// The session leads in a new term: what it measured of its cycle and its
     /// rate under the last is forgotten, and measured again. Within a term
-    /// the least only falls: a write taken alone while a load runs waits on
+    /// the least only falls: a write taken while a load runs waits on
     /// the work the load left (its followers still replaying the last batch,
     /// its owner's queue), so a least that expired into such samples, or
     /// that a probe re-measured under load (BBR's ProbeRTT), rose with the
@@ -951,6 +957,8 @@ mod admission_tests {
             std::thread::sleep(Duration::from_nanos(at_least - now));
         }
     }
+    /// The cycle these tests measure: its bound, [`DELAY_BOUND_CYCLES`] of it, is 50 ms.
+    const CYCLE: Duration = Duration::from_micros(12_500);
     /// A pace whose cycle is `base` and that answered at most `per_bound` writes in one bound.
     fn measured(base: Duration, per_bound: u64) -> TickPeriod {
         let pace = TickPeriod::default();
@@ -991,10 +999,11 @@ mod admission_tests {
         assert_eq!(pace.base_service(), Some(ms(6)));
     }
 
-    /// Only a write taken alone measures the cycle: a read never does, and a write taken
-    /// behind another waits on that one's cycle as well as its own.
+    /// Every write answered measures the cycle, a write taken behind another as well: its
+    /// service is at least its batch's cycle, and the least of all of them is the cycle from
+    /// above. A read never measures it.
     #[test]
-    fn only_a_write_taken_alone_measures_the_cycle() {
+    fn every_write_measures_the_cycle_and_a_read_none() {
         let pace = TickPeriod::default();
         pace.service_clock(false).answered();
         assert_eq!(pace.base_service(), None, "a read measures nothing");
@@ -1002,13 +1011,17 @@ mod admission_tests {
         pace.set_oldest_write(Some(first.taken_ns()));
         let behind = pace.service_clock(true);
         behind.answered();
-        assert_eq!(
-            pace.base_service(),
-            None,
-            "a write behind another measures nothing"
-        );
+        let measured = pace
+            .base_service()
+            .expect("a write behind another measures the cycle");
+        // Taken first and answered last, the first write took longer: the least stands.
         first.answered();
-        assert!(pace.base_service().is_some(), "the one taken alone does");
+        assert_eq!(pace.base_service(), Some(measured), "the least only falls");
+        // A slow first sample does not hold the bound: a quicker write lowers it.
+        pace.reset_base();
+        pace.served(ms(300));
+        pace.served(ms(13));
+        assert_eq!(pace.base_service(), Some(ms(13)));
     }
 
     /// The window is the most writes answered in one bound over the window, counted interval
@@ -1017,14 +1030,14 @@ mod admission_tests {
     #[test]
     fn the_write_window_is_what_one_bound_answered() {
         running_for(ms(2_000));
-        // 5 ms a cycle, bound 50 ms: 100 answered in a bound hold 100 in the pipeline.
-        let pace = measured(ms(5), 100);
+        // 12.5 ms a cycle, bound 50 ms: 100 answered in a bound hold 100 in the pipeline.
+        let pace = measured(CYCLE, 100);
         assert_eq!(pace.delay_bound(), Some(ms(50)));
         assert_eq!(pace.write_window(), Some(100));
-        assert_eq!(measured(ms(5), 3).write_window(), Some(INITIAL_WINDOW));
+        assert_eq!(measured(CYCLE, 3).write_window(), Some(INITIAL_WINDOW));
         // Counted: 150 answered at once in the first interval, 40 in the next two; the first
         // interval's count is taken once the next answer finds it past its bound.
-        let pace = measured(ms(5), 0);
+        let pace = measured(CYCLE, 0);
         let began = now_ns() - ns(ms(1_000));
         for _ in 0..150 {
             pace.delivered_at(began);
@@ -1051,7 +1064,7 @@ mod admission_tests {
     #[test]
     fn the_pipeline_takes_writes_under_its_window_and_bound() {
         running_for(ms(200));
-        let pace = measured(ms(5), 100);
+        let pace = measured(CYCLE, 100);
         assert!(pace.pipeline_open(500), "an empty pipeline takes one");
         let now = now_ns();
         pace.set_oldest_write(Some(now - ns(ms(10))));
@@ -1068,7 +1081,7 @@ mod admission_tests {
     /// writes held for the pipeline never refuse a read.
     #[test]
     fn writes_are_refused_at_their_window_and_dropped_past_their_bound() {
-        let pace = measured(ms(5), 100);
+        let pace = measured(CYCLE, 100);
         let mut queued: Vec<QueueTicket> = (0..99).map(|_| pace.queue_request(true)).collect();
         assert!(!pace.delay_exceeded(true));
         queued.push(pace.queue_request(true));
@@ -1090,7 +1103,7 @@ mod admission_tests {
     #[test]
     fn the_rests_delay_is_refused_for_only_once_it_stands_an_interval() {
         running_for(ms(2_000));
-        let pace = measured(ms(5), 0);
+        let pace = measured(CYCLE, 0);
         assert_eq!(pace.delay_bound(), Some(ms(50)));
         assert_eq!(pace.standing_interval(), Some(ms(100)));
         let first = pace.queue_request(false);
@@ -1132,7 +1145,7 @@ mod admission_tests {
     #[test]
     fn the_queueing_delay_is_the_oldest_wait_the_queue_marks_tell() {
         running_for(ms(40));
-        let pace = measured(ms(5), 0);
+        let pace = measured(CYCLE, 0);
         assert_eq!(pace.queueing_delay(true), Duration::ZERO);
         let mut first = pace.queue_request(true);
         let second = pace.queue_request(true);

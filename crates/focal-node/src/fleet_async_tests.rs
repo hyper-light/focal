@@ -924,7 +924,7 @@ fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
         );
         resume.send(()).unwrap();
         drop(disk.join().unwrap());
-        // The write out is answered; the queued ones had waited past a bound of ten
+        // The write out is answered; the queued ones had waited past a bound of a few
         // microseconds as they were taken: dropped at the head, refused, counted.
         let mut answers = answers.into_iter();
         let written = answers.next().unwrap().await.unwrap().result;
