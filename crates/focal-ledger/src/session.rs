@@ -807,6 +807,16 @@ impl Session {
         let status = self.scalars();
         !self.failed && status.role == StateRole::Leader && self.ready_term == Some(status.term)
     }
+    /// Whether this replica leads a term it is not yet ready in: elected, the term's first entry
+    /// not yet committed or the barrier asked behind it not yet answered. It refuses a write
+    /// `NotReady` until it is, so its owner holds its participants' writes for the term, as a
+    /// read waits for it at its barrier (`read_waits`). Bounded by an election timeout: a leader
+    /// that cannot commit steps down (`check_quorum`). A failed replica is not readying: its
+    /// refusals are final.
+    pub fn readying(&self) -> bool {
+        let status = self.scalars();
+        !self.failed && status.role == StateRole::Leader && self.ready_term != Some(status.term)
+    }
     pub fn sequence(&self) -> SessionSeq {
         self.core.sequence()
     }

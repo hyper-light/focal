@@ -505,10 +505,21 @@ fn takes_participants(owner: &Owner) -> bool {
 /// participants' work, and its writes only while its pipeline is open
 /// (`TickPeriod::pipeline_open`): a session whose oldest write has waited
 /// past its bound holds the next in their queue, where their delay is
-/// judged, and answers its reads meanwhile.
+/// judged, and answers its reads meanwhile. A leader not yet ready in its term
+/// (`Session::readying`) holds its writes, and the completions that commit as
+/// writes do, for the term: taken, each was refused `NotReady` at every change
+/// of leader until the term's first entry committed and its readiness round
+/// came back. Its peers' frames and its control work go on: they are what makes
+/// it ready.
 fn takes_class(owner: &Owner, class: WorkClass) -> bool {
     takes_participants(owner)
-        && (class != WorkClass::Append || owner.pace.pipeline_open(owner.writes_in_flight()))
+        && match class {
+            WorkClass::Append => {
+                !owner.session.readying() && owner.pace.pipeline_open(owner.writes_in_flight())
+            }
+            WorkClass::Completion => !owner.session.readying(),
+            _ => true,
+        }
 }
 /// A peer's frame into its session's own queue, behind those that came
 /// before it; dropped, and counted, where the queue cannot grow.

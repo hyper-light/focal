@@ -57,7 +57,7 @@ fn fixture(path: &std::path::Path, count: u128) -> Fixture {
 /// Owners whose period may be stretched to `ceiling` by the paths they are
 /// told of (`ReplicaHost::pace`).
 fn fixture_stretching(path: &std::path::Path, count: u128, ceiling: Duration) -> Fixture {
-    fixture_with(path, count, ceiling, FirstTerm::Durable, |_| ()).0
+    fixture_with(path, count, ceiling, FirstTerm::Durable, |_| {}, |_| ()).0
 }
 /// What a fixture's sessions have made of their first term when their owners take them.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,13 +67,14 @@ enum FirstTerm {
     /// Each campaigned, its first entry not yet written: it leads a term it is not yet ready in.
     Campaigned,
 }
-/// A fixture whose sessions have done `first` of their first term, and what `before_spawn` made
-/// of its log before their owners took them.
+/// A fixture whose sessions, configured by `configure`, have done `first` of their first term,
+/// and what `before_spawn` made of its log before their owners took them.
 fn fixture_with<R>(
     path: &std::path::Path,
     count: u128,
     ceiling: Duration,
     first: FirstTerm,
+    configure: impl Fn(&mut NodeConfig),
     before_spawn: impl FnOnce(&SharedWal) -> R,
 ) -> (Fixture, R) {
     // A session with a write out holds some nine megabytes reserved (its
@@ -106,12 +107,9 @@ fn fixture_with<R>(
     .unwrap();
     let replicas = (1..=count)
         .map(|index| {
-            let node = DurableNode::open_on_wal_in(
-                NodeConfig::single(1, CLUSTER, ledger(index).session.0),
-                wal.clone(),
-                &tenant,
-            )
-            .unwrap();
+            let mut node_config = NodeConfig::single(1, CLUSTER, ledger(index).session.0);
+            configure(&mut node_config);
+            let node = DurableNode::open_on_wal_in(node_config, wal.clone(), &tenant).unwrap();
             let mut session =
                 Session::from_node_in(ledger(index), node, SessionLimits::default(), &tenant)
                     .unwrap();
@@ -1224,6 +1222,7 @@ fn a_leader_serves_once_its_term_is_ready() {
             1,
             Duration::from_secs(2),
             FirstTerm::Campaigned,
+            |_| {},
             |wal| pause(blocker(wal)),
         );
         let host = fixture.hosts[&ledger(1)].clone();
@@ -1277,6 +1276,290 @@ fn a_leader_serves_once_its_term_is_ready() {
         drop(lease);
         drop(host);
         shutdown(fixture).await;
+    })
+    .unwrap()
+}
+/// One of a group's other voters, played by the test: a session of its own on its own disk, its
+/// messages stepped and its answers carried by hand.
+fn voter(path: &std::path::Path, node: u64) -> focal_ledger::Session {
+    let mut config = NodeConfig::single(node, CLUSTER, ledger(1).session.0);
+    config.voters = vec![1, 2, 3];
+    focal_ledger::Session::open(
+        path.join(node.to_string()),
+        ledger(1),
+        config,
+        SessionLimits::default(),
+    )
+    .unwrap()
+}
+fn node_peer(node: u64) -> AuthenticatedPeer {
+    AuthenticatedPeer::local(PeerGrant {
+        principal: ParticipantId::from_u128(u128::from(node)),
+        tenants: [ledger(1).tenant].into_iter().collect(),
+        role: PeerRole::Node { node_id: node },
+    })
+    .unwrap()
+}
+/// What the voters the test plays send the leader, and how they take its answer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Carry {
+    /// Every answer is carried, and accepted.
+    All,
+    /// Their answers to its appends are held; the rest are carried, and accepted.
+    HoldingAppendAnswers,
+    /// The leader stops: what it is sent may be refused as it does.
+    Stopping,
+}
+/// Carries what the leader sent to the voters the test plays and their answers back, once each;
+/// an answer to an append is kept in `held` while they are held. Whether anything moved.
+async fn carry(
+    host: &ReplicaHost,
+    outgoing: &mut FleetReplication,
+    voters: &mut [focal_ledger::Session; 2],
+    how: Carry,
+    held: &mut Vec<(u64, focal_consensus::Message)>,
+) -> bool {
+    let mut moved = false;
+    while let Some(frame) = outgoing.try_recv() {
+        let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+            &frame.request.operation
+        else {
+            continue;
+        };
+        let Some(voter) = frame
+            .target
+            .checked_sub(2)
+            .and_then(|index| voters.get_mut(usize::try_from(index).unwrap()))
+        else {
+            continue;
+        };
+        let message = focal_consensus::decode_message_in(message, voter.wire()).unwrap();
+        voter.step(message).unwrap();
+        moved = true;
+    }
+    for (index, voter) in voters.iter_mut().enumerate() {
+        let from = u64::try_from(index).unwrap() + 2;
+        let wire = voter.wire();
+        for message in voter.poll().unwrap().messages {
+            moved = true;
+            if how == Carry::HoldingAppendAnswers
+                && message.msg_type == focal_consensus::MessageType::MsgAppendResponse
+            {
+                held.push((from, message));
+                continue;
+            }
+            send(host, wire, from, &message, how != Carry::Stopping).await;
+        }
+    }
+    moved
+}
+/// One voter's message to the leader, as its node sends it; `accepted`, the leader must take it.
+async fn send(
+    host: &ReplicaHost,
+    wire: focal_consensus::Wire,
+    from: u64,
+    message: &focal_consensus::Message,
+    accepted: bool,
+) {
+    let reply = dispatch(
+        host,
+        node_peer(from),
+        RequestEnvelope {
+            protocol: PROTOCOL_VERSION,
+            ledger: ledger(1),
+            route_epoch: RouteEpoch(1),
+            request_epoch: RequestEpoch(1),
+            request_id: RequestId::from_u128((u128::from(from) << 64) | u128::from(message.index)),
+            operation: Operation::Raft {
+                group: ledger(1).session.0,
+                message: focal_consensus::encode_message_in(message, wire).unwrap(),
+            },
+        },
+        &ReplicaHost::wire_limits(),
+    )
+    .await;
+    assert!(
+        matches!(reply.result, Response::PeerAccepted)
+            || (!accepted
+                && matches!(
+                    reply.result,
+                    Response::Error(AccessError::Unavailable | AccessError::OutcomeUnknown)
+                )),
+        "{:?}",
+        reply.result
+    );
+}
+/// A new leader of three voters that has written its term's first entry, its followers' answers
+/// to it not yet come, is not ready in its term: a participant's write sent then waits for the
+/// term and commits. Taken, it was refused `NotReady` (the participant told `Unavailable`): at
+/// every change of leader, each write that came before the term's first entry committed and its
+/// readiness round came back.
+#[test]
+fn a_new_leader_of_three_holds_a_write_until_its_term_is_ready() {
+    focal_rt::block_on(async move {
+        let path = tempfile::tempdir().unwrap();
+        let (fixture, ()) = fixture_with(
+            path.path(),
+            1,
+            Duration::from_secs(2),
+            FirstTerm::Campaigned,
+            |config| config.voters = vec![1, 2, 3],
+            |_| (),
+        );
+        let Fixture {
+            hosts,
+            owner,
+            mut outgoing,
+            wal,
+            wal_budget,
+            budget,
+        } = fixture;
+        let host = hosts[&ledger(1)].clone();
+        let mut voters = [voter(path.path(), 2), voter(path.path(), 3)];
+        let mut held = Vec::new();
+        let steps = TICK * (4 * crate::test_waits::STEP);
+        // The votes are carried; the answers to the leader's first entry are held.
+        crate::test_waits::within(&[&host], steps, TICK, async {
+            loop {
+                let progress = host.progress();
+                if progress.leader == progress.node && held.len() >= 2 {
+                    break;
+                }
+                if !carry(
+                    &host,
+                    &mut outgoing,
+                    &mut voters,
+                    Carry::HoldingAppendAnswers,
+                    &mut held,
+                )
+                .await
+                {
+                    focal_rt::time::sleep(Duration::from_millis(1))
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let progress = host.progress();
+        assert!(
+            !progress.authoritative && !progress.serves(),
+            "{progress:?}"
+        );
+        let writer = host.clone();
+        let mut write = focal_rt::spawn(async move {
+            dispatch(
+                &writer,
+                peer(),
+                envelope(
+                    1,
+                    Operation::OpenEpoch {
+                        epoch: RequestEpoch(1),
+                    },
+                ),
+                &ReplicaHost::wire_limits(),
+            )
+            .await
+        })
+        .unwrap();
+        // The write reaches the session's queue and waits there for the term, its followers'
+        // answers held, while the owner runs two periods.
+        crate::test_waits::within(&[&host], steps, TICK, async {
+            while host.pace.queued(true) < 1 && !write.is_finished() {
+                focal_rt::time::sleep(Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let before = host.periods();
+        crate::test_waits::within(&[&host], steps, TICK, async {
+            while host.periods() < before + 2 && !write.is_finished() {
+                carry(
+                    &host,
+                    &mut outgoing,
+                    &mut voters,
+                    Carry::HoldingAppendAnswers,
+                    &mut held,
+                )
+                .await;
+                focal_rt::time::sleep(Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !write.is_finished(),
+            "the write was answered before its term was ready: {:?}",
+            (&mut write).await.unwrap().result
+        );
+        // The answers come: the term's first entry commits, its readiness round is carried, and
+        // the write commits.
+        for (from, message) in std::mem::take(&mut held) {
+            send(&host, voters[0].wire(), from, &message, true).await;
+        }
+        let reply = crate::test_waits::within(&[&host], steps, TICK, async {
+            loop {
+                if write.is_finished() {
+                    break (&mut write).await.unwrap();
+                }
+                if !carry(&host, &mut outgoing, &mut voters, Carry::All, &mut held).await {
+                    focal_rt::time::sleep(Duration::from_millis(1))
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                reply.result,
+                Response::Submitted(MutationReply::Committed(_))
+            ),
+            "{:?}",
+            reply.result
+        );
+        let progress = host.progress();
+        assert!(progress.authoritative && progress.serves(), "{progress:?}");
+        // A leader's stop hands its log off to a voter: what it sends them is carried until it
+        // stops.
+        let stopper = host.clone();
+        let mut stopping = focal_rt::spawn(async move { stopper.stop().await }).unwrap();
+        crate::test_waits::within(&[&host], steps, TICK, async {
+            while !stopping.is_finished() {
+                if !carry(
+                    &host,
+                    &mut outgoing,
+                    &mut voters,
+                    Carry::Stopping,
+                    &mut held,
+                )
+                .await
+                {
+                    focal_rt::time::sleep(Duration::from_millis(1))
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        (&mut stopping).await.unwrap().unwrap();
+        drop(host);
+        shutdown(Fixture {
+            hosts,
+            owner,
+            outgoing,
+            wal,
+            wal_budget,
+            budget,
+        })
+        .await;
     })
     .unwrap()
 }
