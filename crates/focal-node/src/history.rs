@@ -16,10 +16,10 @@
 //! of a `focal ledger publications` reader.
 
 use crate::embedded::NodeIdentity;
-use focal_consensus::{DurableNode, NodeConfig};
+use focal_consensus::NodeConfig;
 use focal_core::native::NativeOutcome;
 use focal_ledger::Session;
-use focal_log::{SharedWal, WalIdentity, WalOptions};
+use focal_log::WalIdentity;
 use std::path::Path;
 
 /// A generous cap on drive polls; a single-voter node becomes authoritative and
@@ -43,31 +43,53 @@ pub enum PublicationsError {
     NotAuthoritative,
     #[error("the node's session allowance: {0}")]
     Allowance(Box<crate::embedded::NodeError>),
+    #[error("the node's storage: {0}")]
+    Storage(Box<crate::embedded::NodeError>),
+    #[error("the node's memory envelope: {0}")]
+    Memory(#[from] focal_memory::MemoryError),
 }
 
 /// The committed native prefix of the stopped node rooted at `root`, as ordered
 /// outcomes — one per committed record, in native-sequence order (each carries
 /// its `invocation`, `sequence` and `intent`). The node must not be running (its
-/// WAL lock must be free); reopening replays committed history without admitting
-/// new work.
+/// storage's lock must be free); reopening replays committed history without
+/// admitting new work. The node's storage is opened as the node opens it: its
+/// groups on focal-log's WAL below the storage level and on hyper-log's log under
+/// the shell at it, whichever its data directory records, the shell's log sealed
+/// under `key_file`, the node's root key.
 pub fn offline_native_publications(
     root: &Path,
     identity: &NodeIdentity,
+    key_file: &Path,
 ) -> Result<Vec<NativeOutcome>, PublicationsError> {
-    let wal = SharedWal::open(
-        root.join("wal"),
-        WalOptions::new(WalIdentity {
+    let mut settings = crate::config::Settings::default();
+    settings.node.data_dir = Some(root.to_path_buf());
+    let budget = crate::memory_envelope::node_budget(&settings)?;
+    // No genesis level of its own: what the data directory recorded chooses the storage.
+    let storage = crate::storage_start::open(
+        root,
+        WalIdentity {
             cluster: identity.cluster,
             node: identity.node,
             stream: 0,
-        }),
-    )?;
+        },
+        &budget,
+        key_file,
+        0,
+    )
+    .map_err(|error| PublicationsError::Storage(Box::new(error)))?;
     let config = NodeConfig::single(identity.node, identity.cluster, identity.ledger.session.0);
-    let consensus = DurableNode::open_on_wal(config, wal.clone())?;
+    let consensus = storage
+        .storage
+        .open_member(config, &budget, focal_ledger::entry_needs)?;
     let limits = crate::memory_envelope::founded_limits(root)
         .map_err(|error| PublicationsError::Allowance(Box::new(error)))?;
-    let hosting =
-        crate::network_service::native_hosting(root, identity, wal.disk_budget(), &limits)?;
+    let hosting = crate::network_service::native_hosting(
+        root,
+        identity,
+        storage.storage.disk_budget(),
+        &limits,
+    )?;
     let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;
     session.campaign()?;
     let mut authoritative = false;

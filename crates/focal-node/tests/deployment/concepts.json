@@ -2795,7 +2795,7 @@
           "activate",
           "upgrade",
           "--fence",
-          "3"
+          "5"
         ]
       },
       {
@@ -2810,7 +2810,7 @@
           "activate",
           "upgrade",
           "--fence",
-          "3"
+          "5"
         ]
       },
       {
@@ -2825,7 +2825,7 @@
           "activate",
           "upgrade",
           "--fence",
-          "2"
+          "4"
         ]
       },
       {
