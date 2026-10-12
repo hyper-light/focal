@@ -161,8 +161,19 @@ impl EmbeddedNode {
             wal.disk_budget(),
         )?;
         let limits = crate::memory_envelope::found_limits(root, settings, &consensus)?;
-        let hosting =
-            crate::network_service::native_hosting(root, &identity, wal.disk_budget(), &limits)?;
+        // An embedded node is its own cluster: the level its binary announces is its fence.
+        let rule = if crate::upgrade::announced_level() >= crate::upgrade::SEAL_LEVEL {
+            focal_ledger::SealRule::Anchored
+        } else {
+            focal_ledger::SealRule::Derived
+        };
+        let hosting = crate::network_service::native_hosting(
+            root,
+            &identity,
+            wal.disk_budget(),
+            &limits,
+            rule,
+        )?;
         let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;
         session.campaign()?;
         // One voter can establish the committed current-term read barrier locally.

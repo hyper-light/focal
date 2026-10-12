@@ -536,6 +536,73 @@ replica re-derives and checks them. A client whose generation was closed under
 it learns so by name on its next request, resolves the outcome it may already
 have from the seal, and continues in the generation the owner admits.
 
+**The anchored rule (2026-10-12, `SEAL_LEVEL`).** The derived rule above
+never lands under steady writes and can wedge for good, measured on three
+local nodes with a window of 3,000 at 500 writes a second: 2,962 committed,
+then every write refused `outcomes` for the rest of the run, no seal ever
+proposed. Three causes. A plan derived at a prefix is proposable only at
+that prefix with nothing pending, and custody takes long enough for a write
+to commit, so under any steady load the plan is always stale. Pressure is
+noticed at the agent's tick and closes generations only with the
+custody-paced seal, while its headroom is `limits.pending` (32): the window
+filled long before a tick. And at a full window the seal was held to the
+bound for its own outcome, refused, so the window never emptied. A node
+whose fence opens `SEAL_LEVEL` seals by the anchored rule instead:
+
+- *Seals are anchored.* The plan is derived at prefix P with no floors —
+  the generations closed there, every row of them, and the decisions' own
+  outcomes at or below P — and the `FOCALSO2` record names it: the
+  principals with their first and last sealed generation, P, the ordinal and
+  the count. Where the record applies, every replica derives the plan the
+  record names again (`Core::anchored_plan`): each range starts at its
+  window's sealed mark and is closed, its rows are the same, as a closed
+  generation's rows never change and a decision's outcome is never
+  rewritten. So the commits made while the bundle was under custody leave
+  it applicable; a window records the seal through the range's last
+  generation (`EpochWindow::record_seal_through`), and what closed since
+  awaits the next seal.
+- *The owner closes generations itself.* Pressure starts within a quarter
+  of the bound (`Core::close_pressure`), and the rule closes the least
+  recent open generations until what awaits a seal would bring the window
+  back to half once sealed (`Core::close_floors`); what already awaits
+  counts first, so once closed nothing more closes while the seal is on its
+  way. The owner counts down the slack the rule grants
+  (`Core::close_slack`) and asks again only when it is spent, so admission
+  stays O(1) below the pressure. When the rule would force floors, admission
+  holds, the pipeline drains, and a *closing seal* carries them: an
+  anchored record naming floors and nothing to seal (no bundle, count zero;
+  its `Seal(ordinal)` row holds no bundle and its outcome is published as
+  any seal's). A client meets the closure by name before it can meet the
+  bound; only a window whose seals cannot keep up meets the bound.
+- *A seal waits for the drain instead of being refused for it.* The agent
+  hands its seal over with candidates pending; the engine holds it, holds
+  admission behind it (the grouped owner holds participants), and proposes
+  it once the pipeline drains, with the floors the pressure forces at that
+  prefix. A held seal whose ordinal another seal took is let go and counted
+  (`seals_dropped`); its bundle is the collector's.
+- *A seal that empties the window is never refused for the room it makes.*
+  A seal takes at least one outcome with it, so its own outcome is checked
+  against the committed headroom, as its apply checks it — under both rules.
+- *A request below its floor is refused by name before the window's bound*
+  (`epochs::fence` precedes the bound in a request's check): that refusal is
+  final, the bound's is not, and a client retrying the bound's refusal would
+  meet the name next.
+- *The agent keeps pace.* While a seal is held, in flight or was just
+  proposed on a replica, the agent asks for its seals again every 20 ms
+  between ticks (`BACKLOG_INTERVAL`), so a window that fills faster than one
+  bundle an interval seals as fast as custody and its commits go. The
+  trigger is half a bundle of closed rows or half the window if that is
+  less, or the pressure.
+
+Replay bounds a record by the resident window, as admission and a
+checkpoint's validation do: it had bounded the lifetime count, so a follower
+refused every record once its session had sealed more than a window's worth
+— under either rule (`replay_validate_counts`; the cluster test that fills
+and seals three windows fails without it). The operator reads each
+replica's window and seals in its diagnostics (`AdminSealing`: the rule, the
+resident outcomes and the bound, seals, closing seals, seals applied nothing
+for, seals let go, and whether one is held or in flight).
+
 **Reading a sealed outcome.** An exact retry of a sealed request is refused
 `RequestHistoryExpired`; its outcome is read by `inspect request --remote` (and
 the adapter's `request.inspect`): the owner answers an outcome read whose

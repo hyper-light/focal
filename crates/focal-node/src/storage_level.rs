@@ -81,6 +81,21 @@ pub fn member_wire(root: &Path) -> Result<focal_consensus::Wire, NodeError> {
     )
 }
 
+/// How the sessions a node hosts seal (F12, 26 §4a): by the anchored rule once the fence it last
+/// knew opens `SEAL_LEVEL`, as a node founded there does from its first start; by the derived
+/// rule below it. Read as each session's hosting is built: a node that saw the fence rise while it
+/// ran takes the anchored rule at its next start, and every binary at the level applies the
+/// records of both rules meanwhile.
+pub fn seal_rule(root: &Path) -> Result<focal_ledger::SealRule, NodeError> {
+    Ok(
+        if known(root)?.is_some_and(|level| level >= crate::upgrade::SEAL_LEVEL) {
+            focal_ledger::SealRule::Anchored
+        } else {
+            focal_ledger::SealRule::Derived
+        },
+    )
+}
+
 #[cfg(test)]
 #[cfg_attr(
     test,

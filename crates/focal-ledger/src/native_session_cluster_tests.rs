@@ -2849,3 +2849,272 @@ fn a_committed_split_applies_on_an_authority_whose_memory_is_spoken_for() {
     cluster.commit(1, PARTIES.issuer, next, &[]);
     assert_same_digest(&mut cluster, &[1, 2, 3]);
 }
+
+/// Under the anchored rule (F12, level 5) the seal the authority derived is
+/// put under custody while the session goes on committing: handed over
+/// with a candidate pending, it is held, admission holds behind it, and it
+/// is proposed once the pipeline drains — never refused for the commits its
+/// custody took — and applied alike on every replica, a follower cut off
+/// meanwhile included. As the window comes within a quarter of its bound
+/// the owner closes the least recent generation itself with a closing
+/// seal, before any client meets the bound: the next request of the closed
+/// generation is refused by name, the next generation is admitted, and the
+/// next seal takes the closed generation whole.
+#[test]
+fn an_anchored_seal_outlives_its_custody_and_pressure_closes_in_band() {
+    use focal_core::native::NativeCommand;
+    use focal_core::native::seal::{DEFAULT_SEAL_ROWS_PER_BUNDLE, SealBound, SealPlan};
+    use focal_model::RequestEpoch;
+    let anchored = |_| {
+        let mut limits = limits_with_outcomes(16);
+        limits.seal_rule = crate::SealRule::Anchored;
+        limits
+    };
+    let mut cluster = Cluster::with_limits(anchored);
+    cluster.elect(1, &[]);
+    for claim in 1..=3u128 {
+        let creation = cluster.creation(claim);
+        cluster.commit(1, PARTIES.issuer, creation, &[]);
+    }
+    cluster.epoch = 2;
+    let advance = NativeInput {
+        request: cluster.next(PARTIES.issuer),
+        command: NativeCommand::AdvanceEpochFloor {
+            minimum: RequestEpoch(2),
+        },
+    };
+    cluster.commit(1, PARTIES.issuer, advance, &[]);
+    // The plan and its bundle at four, derived as the archive agent does.
+    fn derive(cluster: &mut Cluster) -> (SealPlan, ContentHash, u64) {
+        let core = cluster.node(1).committed_core().unwrap();
+        let plan = core
+            .seal_plan(
+                &[],
+                SealBound {
+                    principals: core.native_limits().principals,
+                    rows: DEFAULT_SEAL_ROWS_PER_BUNDLE,
+                },
+            )
+            .unwrap();
+        let quote = core.seal_quote(&plan, limits().encoding).unwrap();
+        let mut bytes = vec![0; quote.bytes];
+        let hash = core.seal_into(&plan, &mut bytes, quote.visits).unwrap();
+        (plan, hash, bytes.len() as u64)
+    }
+    let (plan, bundle, length) = derive(&mut cluster);
+    assert_eq!(plan.through, SessionSeq(4));
+    // Custody takes a while: the issuer commits on, and hands the seal over
+    // with a candidate pending.
+    let fifth = cluster.creation(5);
+    cluster.commit(1, PARTIES.issuer, fifth, &[]);
+    let sixth = cluster.creation(6);
+    let sixth_request = sixth.request;
+    let NativeSubmission::Pending { outcome, .. } = cluster.propose(1, PARTIES.issuer, sixth)
+    else {
+        panic!("a fresh proposal is pending until the log commits it");
+    };
+    cluster
+        .node(1)
+        .propose_seal(&plan, bundle, length, None)
+        .unwrap();
+    assert!(cluster.node(1).seal_wanted());
+    assert!(cluster.node(1).anchored_in_flight().is_none());
+    // Held for the drain: fresh work holds behind it.
+    let seventh = cluster.creation(7);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose(fx::context(PARTIES.issuer, clock), seventh),
+        Err(NativeSessionError::Sealing)
+    ));
+    // The candidate commits, the pipeline drains, the seal is proposed and
+    // applied; node 3 misses it and catches up in one delivery.
+    for _ in 0..16 {
+        cluster.pump(&[3]);
+        if cluster.node(1).seals_applied() == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        cluster.node(1).outcome(sixth_request).unwrap(),
+        Some(outcome)
+    );
+    assert_eq!(cluster.node(1).seals_applied(), 1);
+    assert!(!cluster.node(1).seal_wanted());
+    let seventh = cluster.creation(7);
+    cluster.commit(1, PARTIES.issuer, seventh, &[]);
+    cluster.settle(&[]);
+    for id in 1..=3u64 {
+        assert_eq!(cluster.node(id).seals_applied(), 1, "node {id}");
+        assert_eq!(cluster.node(id).seals_inert(), 0, "node {id}");
+        let core = cluster.node(id).committed_core().unwrap();
+        let (_, row) = core.native_seal(1).unwrap();
+        assert_eq!((row.bundle, row.through), (bundle, SessionSeq(4)));
+        assert_eq!(
+            core.native_epochs(PARTIES.issuer).unwrap().sealed,
+            RequestEpoch(2)
+        );
+    }
+    assert_same_digest(&mut cluster, &[1, 2, 3, 5, 6, 7]);
+    // Pressure: within a quarter of sixteen, past twelve resident. The
+    // admission that brings the window there holds the next behind a
+    // closing seal of the issuer's generation, which every replica applies.
+    let mut claim = 8u128;
+    // (The commit's own drive may carry the closing seal through.)
+    while !cluster.node(1).seal_wanted() && cluster.node(1).closes_applied() == 0 {
+        assert!(
+            cluster
+                .node(1)
+                .committed_core()
+                .unwrap()
+                .resident_outcomes()
+                < 16
+        );
+        let creation = cluster.creation(claim);
+        cluster.commit(1, PARTIES.issuer, creation, &[]);
+        claim += 1;
+    }
+    for _ in 0..16 {
+        cluster.pump(&[]);
+        if cluster.node(1).closes_applied() == 1 {
+            break;
+        }
+    }
+    cluster.settle(&[]);
+    for id in 1..=3u64 {
+        assert_eq!(cluster.node(id).closes_applied(), 1, "node {id}");
+        let core = cluster.node(id).committed_core().unwrap();
+        let window = core.native_epochs(PARTIES.issuer).unwrap();
+        assert_eq!(
+            (window.floor, window.sealed),
+            (RequestEpoch(3), RequestEpoch(2))
+        );
+        assert!(core.resident_outcomes() <= 16);
+    }
+    // The closed generation's next request is refused by name, not by the
+    // bound; the next generation is admitted.
+    let stale = cluster.creation(claim);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose(fx::context(PARTIES.issuer, clock), stale),
+        Err(NativeSessionError::Owner(NativeOwnerError::Native(
+            NativeError::Contract(ContractError::RequestHistoryExpired)
+        )))
+    ));
+    cluster.epoch = 3;
+    let fresh = cluster.creation(claim + 1);
+    cluster.commit(1, PARTIES.issuer, fresh, &[]);
+    // The next seal takes the closed generation whole, with both seals' own
+    // outcomes; the window is back under half.
+    let (plan, bundle, length) = derive(&mut cluster);
+    assert_eq!(
+        (
+            plan.ordinal,
+            plan.principals[0].first,
+            plan.principals[0].last
+        ),
+        (3, RequestEpoch(2), RequestEpoch(2))
+    );
+    cluster
+        .node(1)
+        .propose_seal(&plan, bundle, length, None)
+        .unwrap();
+    cluster.settle(&[]);
+    for id in 1..=3u64 {
+        assert_eq!(cluster.node(id).seals_applied(), 2, "node {id}");
+        let core = cluster.node(id).committed_core().unwrap();
+        assert!(core.resident_outcomes() < 8, "node {id}");
+    }
+    assert_same_digest(&mut cluster, &[1, 2, 3, 5, 6, 7]);
+}
+
+/// Under the derived rule a window at its bound still seals: a seal takes
+/// at least one outcome with it, so its own outcome is checked against the
+/// committed headroom, as its apply checks it, and not the bound — held to
+/// the bound, the seal that empties a full window was refused for good and
+/// the session refused every write after. Every replica replays past a
+/// window's worth of lifetime outcomes: the bound a record is replayed
+/// under is the resident window's, as admission's.
+#[test]
+fn a_full_window_seals_and_replicas_replay_past_a_window_of_lifetime_outcomes() {
+    use focal_core::native::seal::{DEFAULT_SEAL_ROWS_PER_BUNDLE, SealBound};
+    use focal_model::RequestEpoch;
+    let mut cluster = Cluster::with_limits(|_| limits_with_outcomes(6));
+    cluster.elect(1, &[]);
+    let mut claim = 1u128;
+    for round in 1..=3u64 {
+        // Fill the window in this round's generation.
+        cluster.epoch = round;
+        while cluster
+            .node(1)
+            .committed_core()
+            .unwrap()
+            .resident_outcomes()
+            < 6
+        {
+            let creation = cluster.creation(claim);
+            cluster.commit(1, PARTIES.issuer, creation, &[]);
+            claim += 1;
+        }
+        // Full: the next fresh request is refused by the bound.
+        let refused = cluster.creation(claim);
+        cluster.clock = cluster.clock.saturating_add(1);
+        let clock = cluster.clock;
+        assert!(matches!(
+            cluster
+                .node(1)
+                .propose(fx::context(PARTIES.issuer, clock), refused),
+            Err(NativeSessionError::Owner(NativeOwnerError::Native(
+                NativeError::Capacity("outcomes")
+            )))
+        ));
+        // The seal is proposable at the full window, and empties it on
+        // every replica.
+        cluster.node(1).check_seal().unwrap();
+        let (plan, hash, length) = {
+            let core = cluster.node(1).committed_core().unwrap();
+            let floors = core
+                .pressure_floors(crate::native_session::seal::MAX_FLOORS)
+                .unwrap();
+            assert_eq!(floors, vec![(PARTIES.issuer, RequestEpoch(round + 1))]);
+            let plan = core
+                .seal_plan(
+                    &floors,
+                    SealBound {
+                        principals: core.native_limits().principals,
+                        rows: DEFAULT_SEAL_ROWS_PER_BUNDLE,
+                    },
+                )
+                .unwrap();
+            let quote = core.seal_quote(&plan, limits().encoding).unwrap();
+            let mut bytes = vec![0; quote.bytes];
+            let hash = core.seal_into(&plan, &mut bytes, quote.visits).unwrap();
+            (plan, hash, bytes.len() as u64)
+        };
+        cluster
+            .node(1)
+            .propose_seal(&plan, hash, length, None)
+            .unwrap();
+        cluster.settle(&[]);
+        for id in 1..=3u64 {
+            assert_eq!(cluster.node(id).seals_applied(), round, "node {id}");
+            assert!(
+                cluster
+                    .node(id)
+                    .committed_core()
+                    .unwrap()
+                    .resident_outcomes()
+                    < 6,
+                "node {id}"
+            );
+        }
+    }
+    // Three windows' worth committed and replayed alike.
+    assert!(cluster.sequence(1).0 > 18);
+    assert_same_digest(&mut cluster, &[1, 2, 3]);
+}

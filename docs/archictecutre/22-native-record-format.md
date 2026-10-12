@@ -573,7 +573,18 @@ record format to one Raft group through the consensus replica. Its contract:
    reached its bound, and the generation floors the pressure forces, under a
    digest under `focal.native.session.seal-record.v1`; at most 64 KiB;
    applying one advances the native sequence by one through the seal's own
-   outcome),
+   outcome) and anchored seal records (`FOCALSO2`, from the fence's
+   `SEAL_LEVEL`, [26 §4a](26-custody-archive-retention-and-restore.md):
+   magic, version, ledger, the native prefix it applies at, the seal's
+   ordinal, the prefix its plan was derived at, the bundle's content root and
+   length, the row count, the resident outcome bound, a fold, then the counts
+   and lists of the floors the pressure forces where it applies and of the
+   sealed principals with the first and last generation of each, under a
+   digest under `focal.native.session.anchored-seal-record.v1`; at most
+   64 KiB; a closing seal names floors and seals nothing — count zero, no
+   bundle, no fold, derived at its own prefix — and its `Seal(ordinal)` row
+   holds no bundle; applying either advances the native sequence by one
+   through the seal's own outcome),
    membership and Raft no-ops advance only the Raft prefix. Membership and native entries are merged
    by Raft index during delivery, so the configuration index never exceeds the
    applied index at a retained cursor.

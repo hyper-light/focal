@@ -711,13 +711,18 @@ impl Core<NativeState> {
         }
         meta.logical_time = context.logical_time;
         meta.outcomes = add(meta.outcomes, 1)?;
+        // The generation fence (F12), after the exact-retry lookup and
+        // before the window's own bound: a request below its principal's
+        // floor is refused here by name, never executed — whatever the
+        // window holds, as that refusal is final and a full window's is
+        // not (a client retrying the bound's refusal would be refused by
+        // name the next time). Then the window's bound, then the
+        // principal's share of it; the window itself is written by the
+        // build.
+        super::epochs::fence(&view, request)?;
         if meta.outcomes.saturating_sub(meta.sealed) > self.limits.outcomes {
             return Err(NativeError::Capacity("outcomes"));
         }
-        // The generation fence (F12), after the exact-retry lookup and the
-        // window's own bound: a request below its principal's floor is
-        // refused here, never executed; the window itself is written by
-        // the build.
         super::epochs::check(&view, meta, request, self.limits)?;
         let sequence = SessionSeq(
             view.prefix()

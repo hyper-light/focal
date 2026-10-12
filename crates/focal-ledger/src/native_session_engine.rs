@@ -99,6 +99,24 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// for since it opened (a diagnostic).
     pub(super) seals_applied: u64,
     pub(super) seals_inert: u64,
+    /// The anchored seal this authority proposed and has not seen applied
+    /// (F12, `SealRule::Anchored`); native admission waits for it, and a
+    /// term change lets it go.
+    pub(super) anchored: Option<super::seal::AnchoredSealRecord>,
+    /// An anchored seal whose bundle is under custody, held for the
+    /// pipeline to drain, and its charge.
+    pub(super) waiting_seal: Option<(WaitingSeal, Allocation)>,
+    /// The window came under the pressure that forces floors: admission
+    /// holds for the pipeline to drain, and a seal carries them.
+    pub(super) close_wanted: bool,
+    /// The committed and pending resident outcomes at which admission asks
+    /// the pressure rule again; zero asks at the next admission.
+    pub(super) close_check_at: usize,
+    /// Anchored seals let go before proposal (another seal took their
+    /// ordinal, or what they name no longer awaits a seal) and closing
+    /// seals applied, since this engine opened: diagnostics.
+    pub(super) seals_dropped: u64,
+    pub(super) closes_applied: u64,
     /// The chunks of this replica's latest checkpoint seed (25 §5): what
     /// its seed store must keep for peers that seed from it (26 §5).
     pub(super) seed_chunks: Vec<ContentHash>,
@@ -136,6 +154,31 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     pub(super) failure: Option<Box<str>>,
     pub(super) materializer: super::MaterializerStats,
     pub(super) _pending_allocation: Allocation,
+}
+
+/// An anchored seal whose bundle is under custody, held for the pipeline to
+/// drain (F12, `SealRule::Anchored`): what its record will name.
+#[derive(Debug)]
+pub(super) struct WaitingSeal {
+    ordinal: u64,
+    through: SessionSeq,
+    principals: Vec<focal_core::native::seal::SealedPrincipal>,
+    count: u64,
+    bundle: ContentHash,
+    bytes: u64,
+    fold: Option<focal_core::native::seal::Fold>,
+}
+impl WaitingSeal {
+    /// Whether the committed state still names this plan: its ordinal the
+    /// next, every range awaiting a seal from its window's mark, its rows
+    /// the same — what the apply derives again.
+    fn holds(&self, core: &Core<NativeState>) -> bool {
+        core.native_seal_ordinal() == Some(self.ordinal)
+            && usize::try_from(self.count).is_ok_and(|rows| {
+                core.anchored_plan(self.through, &self.principals, rows)
+                    .is_ok_and(|plan| plan.rows() == rows)
+            })
+    }
 }
 
 /// What the engine reads from this node's disk beside the log: the content
@@ -229,6 +272,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             seal: None,
             seals_applied: 0,
             seals_inert: 0,
+            anchored: None,
+            waiting_seal: None,
+            close_wanted: false,
+            close_check_at: 0,
+            seals_dropped: 0,
+            closes_applied: 0,
             seed_chunks: Vec::new(),
             staged_chunks: Vec::new(),
             seed_root_bytes: 0,
@@ -340,7 +389,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
         }
-        if self.seal.is_some() {
+        if self.sealing() {
             return Err(NativeSessionError::Sealing);
         }
         if self
@@ -399,6 +448,27 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     }
     pub(crate) fn seals_inert(&self) -> u64 {
         self.seals_inert
+    }
+    /// Closing seals applied, and anchored seals let go before proposal,
+    /// since this engine opened (F12, `SealRule::Anchored`).
+    pub(crate) fn closes_applied(&self) -> u64 {
+        self.closes_applied
+    }
+    pub(crate) fn seals_dropped(&self) -> u64 {
+        self.seals_dropped
+    }
+    /// The anchored seal this authority proposed and has not seen applied.
+    pub(crate) fn anchored_in_flight(&self) -> Option<&super::seal::AnchoredSealRecord> {
+        self.anchored.as_ref()
+    }
+    /// How this session's authority seals (F12).
+    pub(crate) fn seal_rule(&self) -> super::SealRule {
+        self.limits.seal_rule
+    }
+    /// A seal held for the drain or in flight: the archive agent looks
+    /// again soon rather than at its next tick.
+    pub(crate) fn seal_busy(&self) -> bool {
+        self.sealing() || self.decision_wanted()
     }
     /// The owner must be reconstructed before this engine is authoritative
     /// again: a record it did not author through its owner applied through
@@ -478,7 +548,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
         }
-        if self.seal.is_some() {
+        if self.sealing() {
             return Err(NativeSessionError::Sealing);
         }
         if self.layout_change.is_some() {
@@ -590,20 +660,43 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.retirement = Some(record);
         Ok(())
     }
-    /// Whether this authority could propose a seal now (F12): the gates a
-    /// retirement passes, and the owner's reservation of outcomes for the
-    /// reports it promised (the seal publishes one outcome of its own).
+    /// Whether this authority could propose a seal now (F12). Derived: the
+    /// gates a retirement passes — no candidate pending — and room for the
+    /// seal's own outcome within the bound and the committed headroom (a
+    /// seal takes at least one outcome with it, so it never leaves the
+    /// window fuller; held to the bound alone, a full window refused the
+    /// seal that empties it, for good). Anchored: authority, and no seal in
+    /// flight or held for the drain — its plan is derived from the
+    /// committed core whatever the pipeline holds.
     pub(crate) fn check_seal(
         &self,
         status: &focal_consensus::NodeScalars,
     ) -> Result<(), NativeSessionError> {
-        self.retirement_gates(status)?;
-        self.retirement_reservation()
+        match self.limits.seal_rule {
+            super::SealRule::Derived => {
+                self.retirement_gates(status)?;
+                self.committed_core()?
+                    .check_seal_outcome()
+                    .map_err(NativeSessionError::Seal)
+            }
+            super::SealRule::Anchored => {
+                self.require_authority(status)?;
+                if self.sealing() || self.waiting_seal.is_some() {
+                    return Err(NativeSessionError::Sealing);
+                }
+                Ok(())
+            }
+        }
     }
-    /// Propose one seal as a session decision (F12). Only an authority with
-    /// no pending candidate and nothing else in flight may; the plan must
-    /// have been derived at the committed prefix (a plan derived earlier is
-    /// refused, never proposed), and the core must hold the seal's outcome.
+    /// Propose one seal as a session decision (F12). Derived: only an
+    /// authority with no pending candidate and nothing else in flight may;
+    /// the plan must have been derived at the committed prefix (a plan
+    /// derived earlier is refused, never proposed), and the core must hold
+    /// the seal's outcome. Anchored: the plan must still be what the
+    /// committed state names for it (its ordinal next, every range awaiting
+    /// a seal from its window's mark, its rows the same); the seal is held
+    /// for the pipeline to drain and proposed then (`propose_wanted`), with
+    /// the floors the pressure forces there.
     pub(crate) fn propose_seal(
         &mut self,
         consensus: &mut DurableNode,
@@ -612,6 +705,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         bytes: u64,
         fold: Option<focal_core::native::seal::Fold>,
     ) -> Result<(), NativeSessionError> {
+        if self.limits.seal_rule == super::SealRule::Anchored {
+            return self.hold_seal(consensus, plan, bundle, bytes, fold);
+        }
         let status = consensus.scalars();
         self.retirement_gates(&status)?;
         let core = self.committed_core()?;
@@ -629,7 +725,6 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         core.check_seal_outcome()
             .map_err(NativeSessionError::Seal)?;
-        self.retirement_reservation()?;
         // The floors the plan was derived under are the pressure floors of
         // this prefix: the record names them, and apply derives them again.
         let floors = core
@@ -662,6 +757,154 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.seal = Some(record);
         Ok(())
     }
+    /// Hold an anchored seal for the drain (F12): checked against the
+    /// committed state as it stands, charged to the session while held, and
+    /// proposed at once when nothing is pending.
+    fn hold_seal(
+        &mut self,
+        consensus: &mut DurableNode,
+        plan: &focal_core::native::seal::SealPlan,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<focal_core::native::seal::Fold>,
+    ) -> Result<(), NativeSessionError> {
+        let status = consensus.scalars();
+        self.check_seal(&status)?;
+        let invalid = || -> NativeSessionError {
+            NativeError::Contract(focal_model::lifecycle::ContractError::InvalidManifest).into()
+        };
+        if bundle.0 == [0; 32]
+            || bytes == 0
+            || plan.rows() == 0
+            || plan.principals.len() > super::seal::MAX_PRINCIPALS
+            || fold.is_some_and(|fold| fold.last >= plan.ordinal)
+        {
+            return Err(invalid());
+        }
+        let count =
+            u64::try_from(plan.rows()).map_err(|_| NativeSessionError::Capacity("seal rows"))?;
+        let mut principals =
+            reserved::<focal_core::native::seal::SealedPrincipal>(plan.principals.len())?;
+        principals.extend_from_slice(&plan.principals);
+        let waiting = WaitingSeal {
+            ordinal: plan.ordinal,
+            through: plan.through,
+            principals,
+            count,
+            bundle,
+            bytes,
+            fold,
+        };
+        // What it names is checked in full where it is proposed; here, that
+        // no other seal took its ordinal while its bundle was under custody.
+        if self.committed_core()?.native_seal_ordinal() != Some(waiting.ordinal) {
+            return Err(invalid());
+        }
+        let charge = self
+            .budget
+            .reserve(
+                BudgetKind::Pending,
+                BudgetLane::Completion,
+                array::<focal_core::native::seal::SealedPrincipal>(waiting.principals.len())?,
+            )?
+            .commit();
+        self.waiting_seal = Some((waiting, charge));
+        self.propose_wanted(consensus)
+    }
+    /// Propose the seal this authority holds for the drain (F12,
+    /// `SealRule::Anchored`) once the pipeline has drained and nothing else
+    /// is in flight: the held seal, if what it names still awaits a seal
+    /// (else it is let go and counted, its bundle left to the collector),
+    /// with the floors the pressure forces at this prefix; or, with no seal
+    /// held, a closing seal of the floors alone. Waits, proposing nothing,
+    /// while anything is pending or in flight; nothing to propose ends the
+    /// want.
+    pub(crate) fn propose_wanted(
+        &mut self,
+        consensus: &mut DurableNode,
+    ) -> Result<(), NativeSessionError> {
+        if self.limits.seal_rule != super::SealRule::Anchored || !self.decision_wanted() {
+            return Ok(());
+        }
+        let status = consensus.scalars();
+        if !self.is_authoritative(&status)
+            || self.layout_change.is_some()
+            || self.retirement.is_some()
+            || self.sealing()
+            || self.movement.as_ref().is_some_and(|movement| {
+                movement.pending().is_some() || movement.in_flight.is_some()
+            })
+            || !self.pending.is_empty()
+            || self.delivery.is_some()
+        {
+            return Ok(());
+        }
+        let waiting = self.waiting_seal.take();
+        self.close_wanted = false;
+        // What the seal changes moves the pressure: asked again at the next
+        // admission.
+        self.close_check_at = 0;
+        let core = self.committed_core()?;
+        let prefix = core.native_sequence();
+        let ordinal = core
+            .native_seal_ordinal()
+            .ok_or(NativeSessionError::Capacity("seals"))?;
+        let floors = core
+            .close_floors(super::seal::MAX_ANCHORED_FLOORS)
+            .map_err(NativeSessionError::Native)?;
+        let held = waiting.is_some();
+        let waiting = match waiting {
+            Some((waiting, _charge)) if waiting.holds(core) => Some(waiting),
+            _ => None,
+        };
+        core.check_seal_outcome()
+            .map_err(NativeSessionError::Seal)?;
+        if held && waiting.is_none() {
+            self.seals_dropped = self.seals_dropped.saturating_add(1);
+        }
+        if waiting.is_none() && floors.is_empty() {
+            return Ok(());
+        }
+        let outcome_limit = u64::try_from(self.limits.recovery.native.outcomes)
+            .map_err(|_| NativeSessionError::Capacity("outcome limit"))?;
+        let record = match waiting {
+            Some(waiting) => super::seal::AnchoredSealRecord {
+                ledger: self.ledger,
+                expected_prefix: prefix,
+                ordinal,
+                through: waiting.through,
+                bundle: waiting.bundle,
+                bytes: waiting.bytes,
+                count: waiting.count,
+                outcome_limit,
+                fold: waiting.fold,
+                floors,
+                principals: waiting.principals,
+            },
+            None => super::seal::AnchoredSealRecord {
+                ledger: self.ledger,
+                expected_prefix: prefix,
+                ordinal,
+                through: prefix,
+                bundle: ContentHash([0; 32]),
+                bytes: 0,
+                count: 0,
+                outcome_limit,
+                fold: None,
+                floors,
+                principals: Vec::new(),
+            },
+        };
+        let encoded = record.encode()?;
+        let _permit = self.budget.reserve(
+            BudgetKind::Pending,
+            BudgetLane::Completion,
+            array::<u8>(encoded.len())?,
+        )?;
+        consensus.propose_borrowed_in(&encoded, BudgetLane::Completion)?;
+        self.anchored = Some(record);
+        Ok(())
+    }
     /// Propose one movement step (25 §6). The step is prepared against the
     /// committed coordinator state under the session verifier before the
     /// record is proposed, so an applicable record is what the log carries;
@@ -679,7 +922,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
         }
-        if self.seal.is_some() {
+        if self.sealing() {
             return Err(NativeSessionError::Sealing);
         }
         if !self.pending.is_empty() || self.delivery.is_some() {
@@ -941,7 +1184,18 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// retirement or a seal, behind which no candidate is admitted (`admit` refuses it
     /// `LayoutChanging`, `Retiring` or `Sealing`).
     pub(crate) fn decision_in_flight(&self) -> bool {
-        self.layout_change.is_some() || self.retirement.is_some() || self.seal.is_some()
+        self.layout_change.is_some() || self.retirement.is_some() || self.sealing()
+    }
+    /// A seal of either kind proposed and not yet applied.
+    pub(super) fn sealing(&self) -> bool {
+        self.seal.is_some() || self.anchored.is_some()
+    }
+    /// A seal this authority holds for the pipeline to drain (F12,
+    /// `SealRule::Anchored`): a bundle under custody, or floors the
+    /// pressure forces. Admission holds behind it as behind a decision in
+    /// flight, so the drain ends under any load.
+    pub(crate) fn decision_wanted(&self) -> bool {
+        self.close_wanted || self.waiting_seal.is_some()
     }
     pub(crate) fn admit(
         &mut self,
@@ -960,7 +1214,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
         }
-        if self.seal.is_some() {
+        // A seal held for the drain holds admission too: under any load the
+        // pipeline then drains and the seal is proposed.
+        if self.sealing() || self.decision_wanted() {
             return Err(NativeSessionError::Sealing);
         }
         // Room for the candidate, funded by the session's memory before it is prepared: the
@@ -1027,7 +1283,36 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 return Err(NativeSessionError::Capacity(bound));
             }
         }
-        self.submit_staged(consensus, staged, status.term)
+        let submission = self.submit_staged(consensus, staged, status.term)?;
+        if matches!(submission, NativeSubmission::Pending { .. }) {
+            self.note_pressure()?;
+        }
+        Ok(submission)
+    }
+    /// After a fresh admission under `SealRule::Anchored` (F12): once the
+    /// committed and pending resident outcomes reach where the pressure rule
+    /// could force a floor, ask it; when it would, hold admission for a seal
+    /// that carries the floors (`propose_wanted`), else note how far the
+    /// window may go before it could. O(1) below that point; the rule's
+    /// count of what awaits a seal runs once per distance it grants.
+    fn note_pressure(&mut self) -> Result<(), NativeSessionError> {
+        if self.limits.seal_rule != super::SealRule::Anchored || self.close_wanted || self.sealing()
+        {
+            return Ok(());
+        }
+        let pending = self.pending.len();
+        let core = self.committed_core()?;
+        let resident = core.resident_outcomes();
+        if resident.saturating_add(pending) < self.close_check_at {
+            return Ok(());
+        }
+        let slack = core.close_slack()?;
+        if slack == 0 {
+            self.close_wanted = true;
+        } else {
+            self.close_check_at = resident.saturating_add(slack);
+        }
+        Ok(())
     }
     /// Room for one more submitted candidate: a full queue doubles its capacity, the growth
     /// charged to the session's budget before it is allocated, as the native owner's own queue

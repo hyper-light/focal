@@ -875,9 +875,17 @@ impl Core<NativeState> {
             Row::Outcome(Box::new(OutcomeRow::stored(&outcome, self.state.ledger)?)),
             0,
         )));
-        self.state
-            .rows
-            .publish_changes(sequence.0, changes, focal_memory::BudgetLane::Ordinary)?;
+        // One publication of what a family's bound allows: its rows, a
+        // continuation per member, the meta and the outcome.
+        let bound = MAX_FAMILY_ROWS
+            .saturating_add(MAX_FAMILY_MEMBERS)
+            .saturating_add(2);
+        self.state.rows.publish_changes(
+            sequence.0,
+            changes,
+            focal_memory::BudgetLane::Ordinary,
+            bound,
+        )?;
         Ok(count)
     }
 }

@@ -508,3 +508,42 @@ fn deletion_empty_batches_and_input_capacity_preserve_quote_components() {
     assert_eq!(larger.new_pages_bytes(), compact.new_pages_bytes());
     assert_eq!(larger.directory_bytes(), compact.directory_bytes());
 }
+
+/// A batch past a write's bound is refused by `plan_batch` and planned by
+/// `plan_bounded` under the bound its caller states — charged and built as
+/// any batch, published in one prefix — and refused past that bound too.
+#[test]
+fn a_batch_past_a_writes_bound_is_planned_under_its_callers_bound() {
+    let budget = MemoryBudget::new(8_000_000, 0).unwrap();
+    let mut range = seed(&budget);
+    let wide: Vec<Change<u64, Row>> = (0..100u64)
+        .map(|n| Change::Put(entry(1_000 + n, 16)))
+        .collect();
+    let more = || -> Vec<Change<u64, Row>> {
+        (0..100u64)
+            .map(|n| Change::Put(entry(1_000 + n, 16)))
+            .collect()
+    };
+    assert!(matches!(
+        range.plan_batch(2, wide, BudgetLane::Ordinary, usize::MAX),
+        Err(MemoryError::Capacity {
+            requested: 100,
+            available: 64
+        })
+    ));
+    assert!(matches!(
+        range.plan_bounded(2, more(), BudgetLane::Ordinary, usize::MAX, 99),
+        Err(MemoryError::Capacity {
+            requested: 100,
+            available: 99
+        })
+    ));
+    let candidate = range
+        .plan_bounded(2, more(), BudgetLane::Ordinary, usize::MAX, 100)
+        .unwrap()
+        .build_with(copy)
+        .unwrap();
+    range.publish(candidate).unwrap();
+    assert_eq!(range.prefix(), 2);
+    assert_eq!(range.entries().count(), 112);
+}

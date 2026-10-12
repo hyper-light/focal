@@ -9,7 +9,7 @@ use focal_enrollment::UpgradeFence;
 /// The capability level this binary implements. Raised by a release that
 /// activates behaviour older binaries cannot follow; the fence gates that
 /// behaviour until every node runs such a binary.
-pub const CAPABILITY_LEVEL: u32 = 4;
+pub const CAPABILITY_LEVEL: u32 = 5;
 /// The level at which the issuer succeeds itself (24 §11): a credential
 /// issued under a successor issuer is presented with the predecessor's
 /// endorsement, which a binary below this level cannot verify.
@@ -27,6 +27,12 @@ pub const RAFT_KEPT_LEVEL: u32 = 3;
 /// starts there. A binary below this level reads the converted WAL's fence as one it does not know
 /// and refuses to open.
 pub const STORAGE_LEVEL: u32 = 4;
+/// The level at which a session's authority seals by the anchored rule (F12; 26 §4a): a seal
+/// names what it seals and applies after the commits its custody took, the owner closes
+/// generations itself as its window comes under pressure through a closing seal, and a seal is
+/// held for the pipeline to drain. Its records (`FOCALSO2`) are ones a binary below this level
+/// cannot read; every binary at it applies both kinds.
+pub const SEAL_LEVEL: u32 = 5;
 /// The environment variable that lowers the announced level for a staged
 /// rollout or a rehearsal; it can never raise it.
 pub const ANNOUNCED_LEVEL_ENV: &str = "FOCAL_CAPABILITY_LEVEL";

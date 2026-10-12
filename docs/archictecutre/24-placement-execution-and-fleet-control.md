@@ -1724,7 +1724,15 @@ At or above it each node raises every group it hosts to `Wire::Kept` (its
 members keep what arrives ahead of a hole and say so) when the activation
 applies, and opens every group there before it sends. Nodes apply the
 activation at different moments, and a node not yet raised reads `kept` as
-raft-rs's own refusal, so the moments between cost a resend. A cluster founded by a binary holds the fence at the level
+raft-rs's own refusal, so the moments between cost a resend. Groups live on
+hyper-log under hyper-durable's shell from level 4 (`upgrade::STORAGE_LEVEL`;
+27 §15.8). Sessions seal by the anchored rule from level 5
+(`upgrade::SEAL_LEVEL`; 26 §4a): the `FOCALSO2` records it proposes are ones
+a binary below the level cannot read, so a node takes the rule from the
+fence it last recorded (`storage_level::seal_rule`), at its next start once
+the fence rose while it ran, and every binary at the level applies the
+records of both rules meanwhile; an embedded node, its own cluster, takes it
+from the level it announces. A cluster founded by a binary holds the fence at the level
 its founder *announces* from genesis (its one node runs it; a founder
 staging a rollout at a lower level founds at that level, never at one it
 would refuse to serve under), so what the fence gates is open to a fresh

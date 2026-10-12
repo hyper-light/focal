@@ -889,8 +889,14 @@ impl NetworkService {
                     consensus.set_raft_wire(crate::storage_level::member_wire(&root)?)?;
                     let limits = crate::memory_envelope::found_limits(&root, &settings, &consensus)
                         .map_err(ServiceError::from)?;
-                    let hosting = native_hosting(&root, &identity, storage.disk_budget(), &limits)
-                        .map_err(NodeError::Content)?;
+                    let hosting = native_hosting(
+                        &root,
+                        &identity,
+                        storage.disk_budget(),
+                        &limits,
+                        crate::storage_level::seal_rule(&root)?,
+                    )
+                    .map_err(NodeError::Content)?;
                     Some(Session::from_node_in_hosted(
                         identity.ledger,
                         consensus,
@@ -2256,12 +2262,15 @@ pub(crate) fn native_hosting(
     identity: &crate::embedded::NodeIdentity,
     disk: focal_memory::DiskBudget,
     session: &SessionLimits,
+    seal_rule: focal_ledger::SealRule,
 ) -> Result<focal_ledger::NativeHosting, focal_evidence::ContentError> {
+    let mut limits = native_limits(
+        focal_model::ContentDomainId(identity.ledger.tenant.0),
+        session.native_memory_bytes(),
+    )?;
+    limits.seal_rule = seal_rule;
     Ok(focal_ledger::NativeHosting {
-        limits: native_limits(
-            focal_model::ContentDomainId(identity.ledger.tenant.0),
-            session.native_memory_bytes(),
-        )?,
+        limits,
         reader: focal_evidence::ContentReader::open(root.join("content"))?,
         seeds: focal_evidence::SeedStore::open(
             crate::custody::seed_directory(&root.join("seeds"), identity.ledger),

@@ -79,41 +79,62 @@ pub(crate) fn archived_family(
     }))
 }
 /// The seal the committed state yields now, when it is worth proposing
-/// (F12): under pressure (the floors it forces are not empty), or when the
-/// closed outcomes fill half a bundle at the read bound; a fold of the
-/// oldest half of the seal rows when the next seal would reach the bound.
-/// The bundle is written at the bound the read serves, the rows halved
-/// until it fits.
+/// (F12): under pressure, or when the closed outcomes fill half a bundle at
+/// the read bound — under the anchored rule, or half the window if that is
+/// less; a fold of the oldest half of the seal rows when the next seal
+/// would reach the bound. The bundle is written at the bound the read
+/// serves, the rows halved until it fits. Derived rule: the plan is taken
+/// under the pressure's floors, and it is proposable only at this prefix.
+/// Anchored rule: the plan is what is closed now, no floors (the owner
+/// forces those itself, and a later seal takes what they close), and it
+/// stays proposable while the pipeline commits around its custody.
 pub(crate) fn sealed_outcomes(
     session: &Session,
     budget: &MemoryBudget,
-) -> Result<Option<SealedOutcomes>, LedgerError> {
+) -> Result<SealOffer, LedgerError> {
     if !session.native_authoritative() {
-        return Ok(None);
+        return Ok(SealOffer::Nothing);
     }
     if session.native_check_seal().is_err() {
-        return Ok(None);
+        return Ok(if session.native_seal_busy()? {
+            SealOffer::Busy
+        } else {
+            SealOffer::Nothing
+        });
     }
+    let anchored = session.native_seal_rule()? == focal_ledger::SealRule::Anchored;
     let mut limits = session.native_encoding_limits()?;
     limits.bytes = limits
         .bytes
         .min(focal_core::native::seal::SEAL_BUNDLE_BYTES);
     let core = session.native_core()?;
-    let floors = core
-        .pressure_floors(focal_ledger::native_session::seal::MAX_FLOORS)
-        .map_err(|error| LedgerError::Native(error.into()))?;
+    let floors = if anchored {
+        Vec::new()
+    } else {
+        core.pressure_floors(focal_ledger::native_session::seal::MAX_FLOORS)
+            .map_err(|error| LedgerError::Native(error.into()))?
+    };
+    let pressed = if anchored {
+        core.close_pressure(0)
+    } else {
+        !floors.is_empty()
+    };
+    let window = core.native_limits().outcomes;
     let mut bound = SealBound {
-        principals: core.native_limits().principals,
+        principals: core
+            .native_limits()
+            .principals
+            .min(focal_ledger::native_session::seal::MAX_PRINCIPALS),
         rows: focal_core::native::seal::DEFAULT_SEAL_ROWS_PER_BUNDLE,
     };
     let (plan, quote) = loop {
         let plan = match core.seal_plan(&floors, bound) {
             Ok(plan) => plan,
-            Err(SealRefusal::Nothing) => return Ok(None),
+            Err(SealRefusal::Nothing) => return Ok(SealOffer::Nothing),
             Err(SealRefusal::Capacity) => return Err(LedgerError::Capacity),
             Err(_) => return Err(LedgerError::Corrupt),
         };
-        // Short of half a bundle and pressed by no floor, nothing is
+        // Short of half a bundle and pressed by nothing, nothing is
         // proposed, and that is known from the plan: its bundle is not
         // encoded to be dropped. The quote of a plan short of it was
         // encoded at every round of the archive agent and dropped, on the
@@ -121,9 +142,16 @@ pub(crate) fn sealed_outcomes(
         // fewer than half a bundle (a stall every five seconds that grew
         // with them, 70 to 153 ms at 200 writes a second). The same rule
         // as when the quote came first: a plan short of half a bundle
-        // fits the bundle, so its quote never halved the bound.
-        if floors.is_empty() && plan.rows() < (bound.rows / 2).max(1) {
-            return Ok(None);
+        // fits the bundle, so its quote never halved the bound. Under the
+        // anchored rule half the window, if less, is enough: a window
+        // smaller than a bundle seals before it fills.
+        let enough = if anchored {
+            (bound.rows / 2).min(window / 2).max(1)
+        } else {
+            (bound.rows / 2).max(1)
+        };
+        if !pressed && plan.rows() < enough {
+            return Ok(SealOffer::Nothing);
         }
         match core.seal_quote(&plan, limits) {
             Ok(quote) => break (plan, quote),
@@ -182,11 +210,21 @@ pub(crate) fn sealed_outcomes(
         }
         None => None,
     };
-    Ok(Some(SealedOutcomes {
+    Ok(SealOffer::Ready(Box::new(SealedOutcomes {
         plan,
         bundle,
         digest,
         fold,
         _allocation: allocation,
-    }))
+    })))
+}
+/// What the archive agent finds when it asks a replica for a seal (F12).
+pub enum SealOffer {
+    /// A seal is held for the pipeline to drain or in flight: the agent
+    /// asks again soon, not at its next tick.
+    Busy,
+    /// Nothing worth proposing now.
+    Nothing,
+    /// A seal and its bundle, to put under custody and propose.
+    Ready(Box<SealedOutcomes>),
 }

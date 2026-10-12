@@ -158,7 +158,7 @@ pub(super) enum RangeCall {
     },
     /// The seal the committed state yields now, with its bundle (F12).
     SealBundle {
-        reply: OneshotSender<Result<Option<SealedOutcomes>, LedgerError>>,
+        reply: OneshotSender<Result<crate::archive_derive::SealOffer, LedgerError>>,
     },
     /// Propose one seal (F12).
     Seal {
@@ -396,7 +396,7 @@ impl ReplicaHost {
     }
     /// The seal the committed state yields now and its bundle, when this
     /// replica is the authority and a seal is worth proposing (F12).
-    pub async fn seal_bundle(&self) -> Result<Option<SealedOutcomes>, LedgerError> {
+    pub async fn seal_bundle(&self) -> Result<crate::archive_derive::SealOffer, LedgerError> {
         self.range_call(|reply| RangeCall::SealBundle { reply })
             .await
     }
@@ -596,7 +596,7 @@ impl Owner {
     }
     /// The seal the committed state yields now (F12), derived as
     /// `archive_derive::sealed_outcomes` says.
-    fn seal_bundle(&self) -> Result<Option<SealedOutcomes>, LedgerError> {
+    fn seal_bundle(&self) -> Result<crate::archive_derive::SealOffer, LedgerError> {
         crate::archive_derive::sealed_outcomes(&self.session, &self.budget)
     }
     fn range_view(&self, digests: bool) -> Result<RangeView, LedgerError> {

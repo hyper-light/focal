@@ -517,7 +517,7 @@ impl NativeRanges {
         lane: BudgetLane,
         max_bytes: usize,
     ) -> Result<RangesPlan<'a>, MemoryError> {
-        self.plan(source, None, prefix, changes, lane, max_bytes)
+        self.plan(source, None, prefix, changes, lane, max_bytes, None)
     }
     /// Plan one write against an unpublished predecessor's fragments.
     pub(super) fn plan_after<'a>(
@@ -532,8 +532,19 @@ impl NativeRanges {
         if predecessor.parts.len() != self.stores.len() {
             return Err(MemoryError::WrongRange);
         }
-        self.plan(source, Some(predecessor), prefix, changes, lane, max_bytes)
+        self.plan(
+            source,
+            Some(predecessor),
+            prefix,
+            changes,
+            lane,
+            max_bytes,
+            None,
+        )
     }
+    /// `max_entries`: a decision's own bound on its batch, where a write is
+    /// held to the members' `max_batch_entries`.
+    #[allow(clippy::too_many_arguments)]
     fn plan<'a>(
         &'a self,
         source: &MemoryBudget,
@@ -542,6 +553,7 @@ impl NativeRanges {
         mut changes: Vec<Change<Key, Row>>,
         lane: BudgetLane,
         max_bytes: usize,
+        max_entries: Option<usize>,
     ) -> Result<RangesPlan<'a>, MemoryError> {
         changes.sort_unstable_by(|left, right| left.key().cmp(right.key()));
         let members = self.stores.len();
@@ -575,12 +587,13 @@ impl NativeRanges {
             } else {
                 stack.pop().unwrap_or_default()
             };
-            let plan = match predecessor {
-                Some(predecessor) => {
+            let plan = match (predecessor, max_entries) {
+                (Some(predecessor), _) => {
                     let base = predecessor.part(index).ok_or(MemoryError::WrongRange)?;
                     store.plan_after(base, prefix, part, lane, remaining)?
                 }
-                None => store.plan_batch(prefix, part, lane, remaining)?,
+                (None, Some(bound)) => store.plan_bounded(prefix, part, lane, remaining, bound)?,
+                (None, None) => store.plan_batch(prefix, part, lane, remaining)?,
             };
             remaining = remaining.saturating_sub(plan.charges().additional_peak_bytes());
             let member = RangesMember {
@@ -615,12 +628,21 @@ impl NativeRanges {
     /// Publish one set of changes at `prefix` (the next prefix) as a session
     /// decision applies it (26 §4): planned over the published members,
     /// built under the group's budget and published whole or not at all.
+    /// The batch is held to `max_entries`, the decision's own bound (a seal's
+    /// rows, a family's), not to a write's: a decision is one publication
+    /// however many rows it takes. Past its own bound it is refused as a
+    /// contract the record broke — never as memory, which its caller would
+    /// retry for good.
     pub(super) fn publish_changes(
         &mut self,
         prefix: u64,
         changes: Vec<Change<Key, Row>>,
         lane: BudgetLane,
+        max_entries: usize,
     ) -> Result<(), NativeError> {
+        if changes.len() > max_entries {
+            return Err(NativeError::Contract(ContractError::InvalidManifest));
+        }
         let budget = self
             .stores
             .first()
@@ -628,7 +650,15 @@ impl NativeRanges {
             .budget()
             .clone();
         let fragments = self
-            .plan_batch(&budget, prefix, changes, lane, usize::MAX)?
+            .plan(
+                &budget,
+                None,
+                prefix,
+                changes,
+                lane,
+                usize::MAX,
+                Some(max_entries),
+            )?
             .build_in_with(&budget, super::prepare::copy)?;
         self.publish_recoverable(fragments)
             .map_err(|(error, _)| error)?;

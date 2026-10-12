@@ -197,7 +197,31 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
         lane: BudgetLane,
         max_bytes: usize,
     ) -> Result<RangePreparationPlan<'_, K, V>, MemoryError> {
-        self.plan_root(&self.root, prefix, changes, lane, max_bytes)
+        self.plan_root(
+            &self.root,
+            prefix,
+            changes,
+            lane,
+            max_bytes,
+            self.config.max_batch_entries,
+        )
+    }
+
+    /// Preflight a batch bounded by `max_entries`, the bound its caller states,
+    /// instead of a write's `max_batch_entries`: a decision that takes many
+    /// rows at one prefix (a seal of a closed window, a retired family) is
+    /// planned and charged as any batch, in one publication. Held to a write's
+    /// bound such a batch was refused as if for memory, and a refusal for
+    /// memory is one its caller retries.
+    pub fn plan_bounded(
+        &self,
+        prefix: u64,
+        changes: Vec<Change<K, V>>,
+        lane: BudgetLane,
+        max_bytes: usize,
+        max_entries: usize,
+    ) -> Result<RangePreparationPlan<'_, K, V>, MemoryError> {
+        self.plan_root(&self.root, prefix, changes, lane, max_bytes, max_entries)
     }
 
     /// Preflight against the exact owned predecessor. Publication must still
@@ -213,7 +237,14 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
         if predecessor.root.owner != self.root.owner {
             return Err(MemoryError::WrongRange);
         }
-        self.plan_root(&predecessor.root, prefix, changes, lane, max_bytes)
+        self.plan_root(
+            &predecessor.root,
+            prefix,
+            changes,
+            lane,
+            max_bytes,
+            self.config.max_batch_entries,
+        )
     }
 
     fn plan_root<'a>(
@@ -223,6 +254,7 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
         mut changes: Vec<Change<K, V>>,
         lane: BudgetLane,
         max_bytes: usize,
+        max_entries: usize,
     ) -> Result<RangePreparationPlan<'a, K, V>, MemoryError> {
         let expected = base
             .prefix
@@ -234,10 +266,10 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
                 actual: prefix,
             });
         }
-        if changes.len() > self.config.max_batch_entries {
+        if changes.len() > max_entries {
             return Err(MemoryError::Capacity {
                 requested: changes.len(),
-                available: self.config.max_batch_entries,
+                available: max_entries,
             });
         }
         changes.sort_unstable_by(|left, right| left.key().cmp(right.key()));

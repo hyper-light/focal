@@ -10,11 +10,12 @@
 )]
 //! The audit's F12 through the real binary: a principal's requests are
 //! issued in generations; the node's resident outcome window is bounded, and
-//! under pressure the archive agent closes the least recently used
-//! generations and seals their outcomes into bundles under custody. A client
-//! whose generation the owner closed learns it by name, resumes in the
-//! generation the owner admits, and reads the outcome of a sealed operation
-//! from its seal — through a restart of the node too.
+//! under pressure the owner closes the least recently used generations
+//! itself (a closing seal) before a client meets the bound, and the archive
+//! agent seals their outcomes into bundles under custody. A client whose
+//! generation the owner closed learns it by name, resumes in the generation
+//! the owner admits, and reads the outcome of a sealed operation from its
+//! seal — through a restart of the node too.
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader},
@@ -43,8 +44,8 @@ fn address() -> String {
     ports::address()
 }
 /// The resident outcome window of this node (F12): pressure on it forces
-/// the generation floors once the resident outcomes and the candidates
-/// that may still be admitted (the standard thirty-two) would pass it.
+/// the generation floors once the resident outcomes come within a quarter
+/// of it (26 §4a).
 const OUTCOMES: &str = "48";
 /// A node on the network when `advertise` names its endpoint, else the
 /// embedded node of the data directory alone.
@@ -183,6 +184,11 @@ fn seals_proposed(root: &Path) -> u64 {
         .as_u64()
         .unwrap()
 }
+/// The founder's replica's live window and its seals (F12, 26 §4a).
+fn sealing(root: &Path) -> Value {
+    let shown = admin(root, None, &["inspect", "replicas", "--replicas"]);
+    shown["result"]["diagnostics"]["sealing"].clone()
+}
 /// The founder's committed outcome for `operation`, read from the owner —
 /// from the live window or from the seal that holds it.
 fn observed(root: &Path, operation: &str) -> Value {
@@ -249,10 +255,12 @@ fn a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read
     let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
 
     // The founder issues claims until the owner closes its generation: the
-    // resident window fills, the archive agent forces the founder's floor
-    // (the only open generation is the least recent one) and seals the
+    // resident window comes within a quarter of its bound, the owner forces
+    // the founder's floor itself (the only open generation is the least
+    // recent one) through a closing seal, and the archive agent seals the
     // closed generation's outcomes. The refused command is refused by name;
-    // no other refusal, and no unknown outcome, is acceptable.
+    // no other refusal — the bound's least of all — and no unknown outcome
+    // is acceptable.
     let mut committed_ops: Vec<(String, Value)> = Vec::new();
     let mut expired = None;
     let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
@@ -286,6 +294,28 @@ fn a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read
         "closed before any pressure: {}",
         committed_ops.len()
     );
+    // Closed in-band before the bound, by a closing seal; the archive agent
+    // seals the closed generation after it.
+    let closed = sealing(root);
+    assert_eq!(closed["rule"], "anchored", "{closed}");
+    assert_eq!(closed["closes_applied"], 1, "{closed}");
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
+    loop {
+        let view = sealing(root);
+        if view["seals_applied"].as_u64().unwrap() >= 1 && view["busy"] == false {
+            assert!(
+                view["resident_outcomes"].as_u64().unwrap()
+                    < view["outcome_bound"].as_u64().unwrap() / 2,
+                "{view}"
+            );
+            break;
+        }
+        assert!(
+            deadline.open(),
+            "the closed generation was never sealed: {view}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert!(seals_proposed(root) >= 1);
     // The refused operation never executed and never will: its journal
     // holds the refusal, and the owner has no outcome for it.

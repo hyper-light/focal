@@ -84,11 +84,14 @@ pub fn offline_native_publications(
         .open_member(config, &budget, focal_ledger::entry_needs)?;
     let limits = crate::memory_envelope::founded_limits(root)
         .map_err(|error| PublicationsError::Allowance(Box::new(error)))?;
+    let rule = crate::storage_level::seal_rule(root)
+        .map_err(|error| PublicationsError::Storage(Box::new(error)))?;
     let hosting = crate::network_service::native_hosting(
         root,
         identity,
         storage.storage.disk_budget(),
         &limits,
+        rule,
     )?;
     let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;
     session.campaign()?;

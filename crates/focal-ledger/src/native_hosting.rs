@@ -1207,6 +1207,21 @@ impl Session {
         let engine = self.native_engine()?;
         Ok((engine.seals_applied(), engine.seals_inert()))
     }
+    /// Closing seals applied through this replica's applied prefix, and
+    /// anchored seals this authority let go before proposal (F12).
+    pub fn native_closes(&self) -> Result<(u64, u64), LedgerError> {
+        let engine = self.native_engine()?;
+        Ok((engine.closes_applied(), engine.seals_dropped()))
+    }
+    /// How this session's authority seals (F12): what the archive agent
+    /// derives a plan under.
+    pub fn native_seal_rule(&self) -> Result<crate::SealRule, LedgerError> {
+        Ok(self.native_engine()?.seal_rule())
+    }
+    /// Whether a seal is held for the pipeline to drain or in flight (F12).
+    pub fn native_seal_busy(&self) -> Result<bool, LedgerError> {
+        Ok(self.native_engine()?.seal_busy())
+    }
     /// The seal this authority proposed and has not seen applied (F12).
     pub fn native_seal_in_flight(&self) -> Result<Option<crate::native_session::SealRecord>, LedgerError> {
         Ok(self.native_engine()?.seal_in_flight())

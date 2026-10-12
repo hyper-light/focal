@@ -120,11 +120,33 @@ impl Owner {
                     at_ms: step.at_ms,
                 })
                 .collect(),
+            sealing: self.sealing(),
         };
         ReplicaDiagnosticsReply {
             value,
             _charge: charge,
         }
+    }
+}
+impl Owner {
+    /// The live window and its seals (F12), when the session is native.
+    fn sealing(&self) -> Option<Box<focal_client::admin::AdminSealing>> {
+        let core = self.session.native_core().ok()?;
+        let (seals_applied, seals_inert) = self.session.native_seals().ok()?;
+        let (closes_applied, seals_dropped) = self.session.native_closes().ok()?;
+        Some(Box::new(focal_client::admin::AdminSealing {
+            rule: match self.session.native_seal_rule().ok()? {
+                focal_ledger::SealRule::Derived => "derived".to_owned(),
+                focal_ledger::SealRule::Anchored => "anchored".to_owned(),
+            },
+            resident_outcomes: u64::try_from(core.resident_outcomes()).unwrap_or(u64::MAX),
+            outcome_bound: u64::try_from(core.native_limits().outcomes).unwrap_or(u64::MAX),
+            seals_applied,
+            closes_applied,
+            seals_inert,
+            seals_dropped,
+            busy: self.session.native_seal_busy().unwrap_or(false),
+        }))
     }
 }
 fn hex(bytes: &[u8]) -> String {

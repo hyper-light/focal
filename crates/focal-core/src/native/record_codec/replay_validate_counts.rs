@@ -185,7 +185,7 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
             previous.outcomes,
             counts.added.outcomes,
             next.outcomes,
-            read.limits.outcomes,
+            usize::MAX,
         ),
         (
             previous.events,
@@ -270,6 +270,14 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
         if actual > maximum {
             return Err(ContractError::Capacity.into());
         }
+    }
+    // The outcome bound is the resident window's (F12): the lifetime count
+    // less what left into seals and retirement bundles, as admission and a
+    // checkpoint's validation hold it. Held to the lifetime count, a
+    // follower refused every record once its session had sealed more than
+    // a window's worth: replicas that do not apply what they hold.
+    if next.outcomes.saturating_sub(next.sealed) > read.limits.outcomes {
+        return Err(ContractError::Capacity.into());
     }
     let outcome = read.outcome;
     let pairs = [

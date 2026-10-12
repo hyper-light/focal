@@ -134,6 +134,9 @@ pub enum AgentError {
     Admission(#[from] crate::admission::AdmissionRefusal),
     #[error("session fact collection: {0}")]
     Collect(#[from] CollectError),
+    /// The fence level this node recorded, which chooses how a copy seals.
+    #[error("storage level: {0}")]
+    Level(Box<crate::embedded::NodeError>),
 }
 impl AgentError {
     /// The partition or session owner is mid-transition; the same intent or a
@@ -1715,6 +1718,8 @@ impl PlacementAgent {
             &identity,
             self.storage.disk_budget(),
             &limits,
+            crate::storage_level::seal_rule(&self.root)
+                .map_err(|error| AgentError::Level(Box::new(error)))?,
         )?;
         let session = Session::from_node_in_hosted(ledger, consensus, limits, tenant, hosting)?;
         // A reopened copy serves the route its log has committed; a fresh copy

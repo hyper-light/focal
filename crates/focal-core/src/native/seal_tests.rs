@@ -717,3 +717,355 @@ fn a_seal_record_that_differs_from_the_derived_plan_is_refused_unchanged() {
         plan.rows()
     );
 }
+
+/// Derive an anchored seal at the committed prefix as the archive agent
+/// does (the plan with no floors), and write its bundle: the record's parts
+/// for a later apply, wherever the prefix has moved to by then.
+fn anchored_bundle(core: &Core<NativeState>) -> (SealPlan, ContentHash, u64) {
+    let plan = core.seal_plan(&[], bound(core)).unwrap();
+    let quote = core.seal_quote(&plan, limits()).unwrap();
+    let mut bytes = vec![0; quote.bytes];
+    let hash = core.seal_into(&plan, &mut bytes, quote.visits).unwrap();
+    (plan, hash, bytes.len() as u64)
+}
+fn anchored_record<'a>(
+    plan: &'a SealPlan,
+    hash: ContentHash,
+    bytes: u64,
+    floors: &'a [(ParticipantId, RequestEpoch)],
+) -> AnchoredRecord<'a> {
+    AnchoredRecord {
+        floors,
+        ordinal: plan.ordinal,
+        through: plan.through,
+        principals: &plan.principals,
+        count: plan.rows() as u64,
+        bundle: hash,
+        bytes,
+        fold: None,
+    }
+}
+/// A closing seal at the committed prefix, its floors to be named.
+fn closing(core: &Core<NativeState>) -> AnchoredRecord<'static> {
+    AnchoredRecord {
+        floors: &[],
+        ordinal: meta(core).seals as u64 + 1,
+        through: core.native_sequence(),
+        principals: &[],
+        count: 0,
+        bundle: ContentHash([0; 32]),
+        bytes: 0,
+        fold: None,
+    }
+}
+
+/// An anchored seal (F12 level 5) names what was closed where it was
+/// derived, so the writes committed while its bundle was under custody
+/// leave it applicable: it seals exactly the generations it names, a
+/// generation closed since awaits the next seal, and the next takes it with
+/// the first seal's own outcome. The derived rule refuses the same plan
+/// once the prefix moved. A record that names another ordinal, a range
+/// another seal took, or more rows than the plan is refused unchanged.
+#[test]
+fn an_anchored_seal_applies_after_the_writes_its_custody_took() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ckpt::store(directory.path());
+    let mut core = f::core();
+    core.limits.pending = 1;
+    core.limits.outcomes = 64;
+    for claim in 1..=3u128 {
+        f::publish(&mut core, 10 * claim as u64, creation_in(1, claim, claim));
+    }
+    f::publish(&mut core, 40, advance(f::ISSUER, 2, 4, 2));
+    // Derived at four: the issuer's first generation.
+    let (plan, hash, bytes) = anchored_bundle(&core);
+    assert_eq!((plan.through, plan.ordinal), (SessionSeq(4), 1));
+    assert_eq!(
+        plan.principals,
+        vec![SealedPrincipal {
+            principal: f::ISSUER,
+            first: RequestEpoch(1),
+            last: RequestEpoch(1),
+        }]
+    );
+    // While the bundle is under custody the issuer writes on and closes
+    // its second generation too.
+    for claim in 5..=6u128 {
+        f::publish(&mut core, 10 * claim as u64, creation_in(2, claim, claim));
+    }
+    f::publish(&mut core, 70, advance(f::ISSUER, 3, 7, 3));
+    assert_eq!(core.native_sequence(), SessionSeq(7));
+    // The derived rule derives again at the prefix and finds more: refused.
+    assert!(matches!(
+        core.apply_seal(SealRecord {
+            floors: &[],
+            bound: SealBound {
+                principals: 1,
+                rows: plan.rows(),
+            },
+            bundle: hash,
+            bytes,
+            count: plan.rows() as u64,
+            fold: None,
+        }),
+        Err(NativeError::Contract(ContractError::InvalidManifest))
+    ));
+    // Records that do not hold are refused, and nothing changes.
+    let sequence = core.native_sequence();
+    let mut later = plan.clone();
+    later.ordinal = 2;
+    let wider = vec![SealedPrincipal {
+        principal: f::ISSUER,
+        first: RequestEpoch(1),
+        last: RequestEpoch(3),
+    }];
+    let skipped = vec![SealedPrincipal {
+        principal: f::ISSUER,
+        first: RequestEpoch(2),
+        last: RequestEpoch(2),
+    }];
+    for bad in [
+        anchored_record(&later, hash, bytes, &[]),
+        AnchoredRecord {
+            principals: &wider,
+            ..anchored_record(&plan, hash, bytes, &[])
+        },
+        AnchoredRecord {
+            principals: &skipped,
+            ..anchored_record(&plan, hash, bytes, &[])
+        },
+        AnchoredRecord {
+            count: plan.rows() as u64 + 1,
+            ..anchored_record(&plan, hash, bytes, &[])
+        },
+        AnchoredRecord {
+            floors: &[(f::ISSUER, RequestEpoch(4))],
+            ..anchored_record(&plan, hash, bytes, &[])
+        },
+    ] {
+        assert!(matches!(
+            core.apply_anchored(bad),
+            Err(NativeError::Contract(ContractError::InvalidManifest))
+        ));
+        assert_eq!(core.native_sequence(), sequence);
+        assert_eq!(meta(&core).seals, 0);
+    }
+    // The anchored record applies at seven: the first generation leaves,
+    // the second still awaits a seal, the seal's own outcome is published.
+    let left = core
+        .apply_anchored(anchored_record(&plan, hash, bytes, &[]))
+        .unwrap();
+    assert_eq!(left, plan.rows());
+    assert_eq!(core.native_sequence(), SessionSeq(8));
+    let issuer = window(&core, f::ISSUER);
+    assert_eq!(
+        (issuer.floor, issuer.sealed),
+        (RequestEpoch(3), RequestEpoch(2))
+    );
+    assert_eq!(
+        issuer.awaiting_seal(),
+        Some((RequestEpoch(2), RequestEpoch(3)))
+    );
+    assert_eq!(
+        core.native_outcome(NativeInvocation::Request(key(f::ISSUER, 1, 1))),
+        None
+    );
+    assert!(
+        core.native_outcome(NativeInvocation::Request(key(f::ISSUER, 2, 5)))
+            .is_some()
+    );
+    let (_, row) = core.native_seal(1).unwrap();
+    assert_eq!(
+        (row.through, row.sealed_at, row.count),
+        (SessionSeq(4), SessionSeq(8), plan.rows() as u64)
+    );
+    // The next seal takes the second generation and the first seal's own
+    // outcome, published at eight.
+    let (next, next_hash, next_bytes) = anchored_bundle(&core);
+    assert_eq!(next.ordinal, 2);
+    assert_eq!(
+        next.principals,
+        vec![SealedPrincipal {
+            principal: f::ISSUER,
+            first: RequestEpoch(2),
+            last: RequestEpoch(2),
+        }]
+    );
+    assert!(next.keys.contains(&Key::Outcome(NativeInvocation::Seal(1))));
+    f::publish(&mut core, 90, creation_in(3, 8, 8));
+    core.apply_anchored(anchored_record(&next, next_hash, next_bytes, &[]))
+        .unwrap();
+    assert_eq!(window(&core, f::ISSUER).sealed, RequestEpoch(3));
+    assert_eq!(core.native_outcome(NativeInvocation::Seal(1)), None);
+    assert!(core.native_outcome(NativeInvocation::Seal(2)).is_some());
+    let restored = restore_with(&core, &store);
+    assert_eq!(window(&restored, f::ISSUER), window(&core, f::ISSUER));
+}
+
+/// Under the anchored rule (F12 level 5) pressure starts within a quarter
+/// of the bound and closes the least recent open generations until what
+/// awaits a seal would bring the window back to half: what already awaits
+/// counts first, so once closed nothing more closes while the seal is on
+/// its way, and the slack the owner counts down says when the rule would
+/// close again. A closing seal forces the floors and seals nothing (its row
+/// names no bundle, its outcome is published as any seal's); a later seal
+/// takes the closed generation whole, and the index — a closing row among
+/// its members — folds and restores as any.
+#[test]
+fn pressure_closes_in_band_and_a_later_seal_takes_what_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ckpt::store(directory.path());
+    let mut core = f::core();
+    core.limits.pending = 1;
+    core.limits.outcomes = 12;
+    core.limits.seals = 2;
+    // Nine resident: at the quarter, not past it.
+    for claim in 1..=9u128 {
+        f::publish(&mut core, 10 * claim as u64, creation_in(1, claim, claim));
+    }
+    assert!(!core.close_pressure(0));
+    assert!(core.close_pressure(1));
+    assert_eq!(core.close_slack().unwrap(), 1);
+    assert!(core.close_floors(8).unwrap().is_empty());
+    // Ten: the issuer's generation closes (it holds the need, four).
+    f::publish(&mut core, 100, creation_in(1, 10, 10));
+    assert_eq!(core.close_slack().unwrap(), 0);
+    let floors = core.close_floors(8).unwrap();
+    assert_eq!(floors, vec![(f::ISSUER, RequestEpoch(2))]);
+    assert!(core.close_floors(0).unwrap().is_empty());
+    // A closing seal naming other floors, or none, is refused.
+    for bad in [
+        AnchoredRecord {
+            floors: &[(f::ISSUER, RequestEpoch(3))],
+            ..closing(&core)
+        },
+        closing(&core),
+    ] {
+        assert!(core.apply_anchored(bad).is_err());
+    }
+    assert_eq!(core.native_sequence(), SessionSeq(10));
+    core.apply_anchored(AnchoredRecord {
+        floors: &floors,
+        ..closing(&core)
+    })
+    .unwrap();
+    assert_eq!(core.native_sequence(), SessionSeq(11));
+    let issuer = window(&core, f::ISSUER);
+    assert_eq!(
+        (issuer.floor, issuer.sealed, issuer.open),
+        (RequestEpoch(2), RequestEpoch(1), 0)
+    );
+    let (ordinal, row) = core.native_seal(1).unwrap();
+    assert_eq!(ordinal, 1);
+    assert!(row.is_closing(1) && row.valid(1));
+    assert_eq!(
+        core.native_outcome(NativeInvocation::Seal(1))
+            .unwrap()
+            .changed,
+        0
+    );
+    // A request in the closed generation is refused by name; the issuer
+    // goes on in the next. What awaits (ten and the closing seal's own
+    // outcome) covers the need: nothing more closes, and the slack says
+    // how far the window may go before it would.
+    assert!(matches!(
+        refused(prepare(&mut core, 110, creation_in(1, 11, 11))),
+        NativeError::Contract(ContractError::RequestHistoryExpired)
+    ));
+    f::publish(&mut core, 110, creation_in(2, 12, 12));
+    assert_eq!(core.resident_outcomes(), 12);
+    assert!(core.close_floors(8).unwrap().is_empty());
+    // Eleven await, six are needed: counted to an eighth of the bound
+    // past the need, one, the window may take two more before asking.
+    assert_eq!(core.close_slack().unwrap(), 12 / 8 + 1);
+    // The next seal takes the closed generation whole, with the closing
+    // seal's outcome: the window is back under half.
+    let (plan, hash, bytes) = anchored_bundle(&core);
+    assert_eq!(plan.ordinal, 2);
+    assert_eq!(plan.outcomes(), 11);
+    core.apply_anchored(anchored_record(&plan, hash, bytes, &[]))
+        .unwrap();
+    assert_eq!(core.resident_outcomes(), 2);
+    assert!(!core.close_pressure(0));
+    assert_eq!(window(&core, f::ISSUER).sealed, RequestEpoch(2));
+    // The index restores with the closing row among its rows, and folds
+    // at its bound with it as a member.
+    let restored = restore_with(&core, &store);
+    assert_eq!(
+        restored.native_seal_rows().unwrap(),
+        core.native_seal_rows().unwrap()
+    );
+    let fold_plan = core.fold_plan(1, 2).unwrap();
+    assert_eq!(fold_plan.count, plan.rows() as u64);
+    let quote = core.fold_quote(&fold_plan, limits()).unwrap();
+    let mut directory_bytes = vec![0; quote.bytes];
+    let directory_hash = core
+        .fold_into(&fold_plan, &mut directory_bytes, quote.visits)
+        .unwrap();
+    let folded = record_codec::StructuralSeal::inspect(&directory_bytes, inspection()).unwrap();
+    assert!(folded.header().member(1).unwrap().is_closing(1));
+    f::publish(&mut core, 120, advance(f::ISSUER, 3, 13, 3));
+    let (third, third_hash, third_bytes) = anchored_bundle(&core);
+    core.apply_anchored(AnchoredRecord {
+        fold: Some(Fold {
+            first: 1,
+            last: 2,
+            bundle: directory_hash,
+            bytes: directory_bytes.len() as u64,
+        }),
+        ..anchored_record(&third, third_hash, third_bytes, &[])
+    })
+    .unwrap();
+    let (covering, row) = core.native_seal(1).unwrap();
+    assert_eq!((covering, row.first, row.count), (2, 1, plan.rows() as u64));
+    let restored = restore_with(&core, &store);
+    assert_eq!(
+        restored.native_seal_rows().unwrap(),
+        core.native_seal_rows().unwrap()
+    );
+}
+
+/// A seal is one publication of what its own bound allows, however many
+/// rows a write may change at once: a seal of more rows than a write's
+/// batch applies under both rules. Held to a write's batch it was refused
+/// as if for memory — a refusal every replica retried for good, the
+/// session's delivery retained and nothing applied after it.
+#[test]
+fn a_seal_larger_than_a_writes_batch_applies_in_one_publication() {
+    for anchored in [false, true] {
+        let mut core = f::core();
+        let batch = core.limits.range.max_batch_entries;
+        let mut claim = 1u128;
+        let mut time = 10u64;
+        loop {
+            f::publish(&mut core, time, creation_in(1, claim, claim));
+            claim += 1;
+            time += 10;
+            if core.resident_outcomes() > batch + 8 {
+                break;
+            }
+        }
+        f::publish(&mut core, time, advance(f::ISSUER, 2, claim, 2));
+        let (plan, hash, bytes) = anchored_bundle(&core);
+        assert!(plan.rows() > batch, "{} rows", plan.rows());
+        let left = if anchored {
+            core.apply_anchored(anchored_record(&plan, hash, bytes, &[]))
+                .unwrap()
+        } else {
+            core.apply_seal(SealRecord {
+                floors: &[],
+                bound: SealBound {
+                    principals: plan.principals.len().max(1),
+                    rows: plan.rows(),
+                },
+                bundle: hash,
+                bytes,
+                count: plan.rows() as u64,
+                fold: None,
+            })
+            .unwrap()
+        };
+        assert_eq!(left, plan.rows());
+        assert_eq!(window(&core, f::ISSUER).sealed, RequestEpoch(2));
+    }
+}

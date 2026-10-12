@@ -242,6 +242,30 @@ pub struct AdminReplicaDiagnostics {
     /// sixteen, oldest first): what held every request queued behind it.
     #[serde(default)]
     pub slow_steps: Vec<AdminSlowStep>,
+    /// The native session's live window and its seals (F12, 26 §4a), as
+    /// this replica holds them. Absent for a session that is not native.
+    #[serde(default)]
+    pub sealing: Option<Box<AdminSealing>>,
+}
+/// A native session's live outcome window and its seals on one replica
+/// (F12, 26 §4a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminSealing {
+    /// How the session's authority seals: `derived` or `anchored`.
+    pub rule: String,
+    /// The outcomes the live core holds, and the window's bound.
+    pub resident_outcomes: u64,
+    pub outcome_bound: u64,
+    /// Seals applied (closing seals apart), closing seals applied, seal
+    /// records applied nothing for, and anchored seals let go before
+    /// proposal, since this replica opened or from its checkpoint.
+    pub seals_applied: u64,
+    pub closes_applied: u64,
+    pub seals_inert: u64,
+    pub seals_dropped: u64,
+    /// A seal is held for the pipeline to drain or in flight.
+    pub busy: bool,
 }
 /// One step a replica's owner took at least 10 ms over.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

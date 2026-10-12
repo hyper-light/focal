@@ -1878,11 +1878,14 @@ impl Core<NativeState> {
                     root: value.bundle,
                     bytes: value.bytes,
                 })?,
-                (Key::Seal(ordinal), Row::Seal(value)) => push(ContentRoot::Seal {
-                    ordinal: *ordinal,
-                    root: value.bundle,
-                    bytes: value.bytes,
-                })?,
+                // A closing seal's row names no bundle (F12 level 5).
+                (Key::Seal(ordinal), Row::Seal(value)) if !value.is_closing(*ordinal) => {
+                    push(ContentRoot::Seal {
+                        ordinal: *ordinal,
+                        root: value.bundle,
+                        bytes: value.bytes,
+                    })?
+                }
                 _ => {}
             }
             Ok(true)

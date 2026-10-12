@@ -1239,12 +1239,13 @@ impl Session {
     /// waits for is answered (`DurableNode::wakes_owner`). A delivery that
     /// is retained waits for no write: its owner asks again.
     /// Whether a native session decision is proposed and not yet applied (a layout change, a
-    /// retirement or a seal), behind which the session admits no native write: its owner holds
-    /// participants' work until it applies rather than take it to refuse it.
+    /// retirement or a seal), or a seal is held for the pipeline to drain (F12), behind which the
+    /// session admits no native write: its owner holds participants' work until it applies rather
+    /// than take it to refuse it.
     pub fn native_decision_in_flight(&self) -> bool {
         self.native
             .as_deref()
-            .is_some_and(engine::NativeEngine::decision_in_flight)
+            .is_some_and(|engine| engine.decision_in_flight() || engine.decision_wanted())
     }
     pub fn wakes_owner(&self) -> bool {
         self.retained.is_none() && self.consensus.wakes_owner()

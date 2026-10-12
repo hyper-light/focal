@@ -156,16 +156,8 @@ impl EpochWindow {
         logical_time: u64,
         share: usize,
     ) -> Result<(), NativeError> {
-        if epoch.0 == 0 {
-            return Err(ContractError::InvalidTarget.into());
-        }
-        if epoch.0 < self.floor.0 {
-            return Err(ContractError::RequestHistoryExpired.into());
-        }
+        self.fence(epoch)?;
         let next = self.next();
-        if epoch.0 > next.0 || (epoch == next && usize::from(self.open) >= OPEN_EPOCHS) {
-            return Err(ContractError::EpochNotAdmitted.into());
-        }
         if self.open_outcomes() >= share {
             return Err(NativeError::Capacity("principal outcomes"));
         }
@@ -191,6 +183,23 @@ impl EpochWindow {
             .checked_add(1)
             .ok_or(NativeError::Capacity("epoch outcomes"))?;
         count.last = count.last.max(logical_time);
+        Ok(())
+    }
+    /// What [`EpochWindow::admit`] refuses by name for `epoch`, whatever
+    /// the window holds: below the floor, `RequestHistoryExpired`; past the
+    /// next generation, or the next while [`OPEN_EPOCHS`] are open,
+    /// `EpochNotAdmitted`.
+    pub fn fence(&self, epoch: RequestEpoch) -> Result<(), NativeError> {
+        if epoch.0 == 0 {
+            return Err(ContractError::InvalidTarget.into());
+        }
+        if epoch.0 < self.floor.0 {
+            return Err(ContractError::RequestHistoryExpired.into());
+        }
+        let next = self.next();
+        if epoch.0 > next.0 || (epoch == next && usize::from(self.open) >= OPEN_EPOCHS) {
+            return Err(ContractError::EpochNotAdmitted.into());
+        }
         Ok(())
     }
     /// Advance the floor to `minimum`: above the floor, at most the next
@@ -219,9 +228,32 @@ impl EpochWindow {
     /// The generations awaiting a seal went into `seal`: one more range,
     /// within `limit` ranges (`Capacity` at the bound — a fold makes room).
     pub fn record_seal(&mut self, seal: u64, limit: usize) -> Result<(), NativeError> {
+        let Some((_, floor)) = self.awaiting_seal() else {
+            return Err(ContractError::InvalidTransition.into());
+        };
+        self.record_seal_through(seal, RequestEpoch(floor.0.saturating_sub(1)), limit)
+    }
+    /// The generations awaiting a seal up to `last` went into `seal` (an
+    /// anchored seal, F12 level 5: the generations closed where it was
+    /// derived, while later ones may have closed since): one more range,
+    /// within `limit` ranges; `last` must await a seal.
+    pub fn record_seal_through(
+        &mut self,
+        seal: u64,
+        last: RequestEpoch,
+        limit: usize,
+    ) -> Result<(), NativeError> {
         let Some((first, floor)) = self.awaiting_seal() else {
             return Err(ContractError::InvalidTransition.into());
         };
+        if last.0 < first.0 || last.0 >= floor.0 {
+            return Err(ContractError::InvalidTransition.into());
+        }
+        let after = RequestEpoch(
+            last.0
+                .checked_add(1)
+                .ok_or(NativeError::Capacity("epoch"))?,
+        );
         if self.ranges.len() >= limit {
             return Err(NativeError::Capacity("sealed ranges"));
         }
@@ -230,12 +262,8 @@ impl EpochWindow {
                 .try_reserve_exact(1)
                 .map_err(|_| NativeError::Memory(MemoryError::AllocationFailed))?;
         }
-        self.ranges.push(SealedRange {
-            first,
-            last: RequestEpoch(floor.0.saturating_sub(1)),
-            seal,
-        });
-        self.sealed = floor;
+        self.ranges.push(SealedRange { first, last, seal });
+        self.sealed = after;
         Ok(())
     }
     /// Seals `first..=last` were folded into the row keyed `last`: the ranges
@@ -338,6 +366,18 @@ impl View<'_> {
             _ => None,
         }
     }
+}
+
+/// The generation fence alone (F12): what [`EpochWindow::admit`] refuses
+/// by name — below the floor (`RequestHistoryExpired`) or past the next
+/// generation (`EpochNotAdmitted`) — for a fresh request before any bound
+/// is asked, as that refusal is final for the request and a full window's
+/// is not.
+pub(super) fn fence(view: &View<'_>, request: RequestKey) -> Result<(), NativeError> {
+    let Some(window) = view.epochs(request.principal) else {
+        return EpochWindow::first().fence(request.epoch);
+    };
+    window.fence(request.epoch)
 }
 
 /// The fence every fresh request passes after its exact-retry lookup: what

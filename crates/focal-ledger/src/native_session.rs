@@ -43,7 +43,7 @@ pub mod retirement;
 pub mod seal;
 pub use range::LayoutOperation;
 pub use retirement::RetirementRecord;
-pub use seal::SealRecord;
+pub use seal::{AnchoredSealRecord, SealRecord};
 #[path = "native_session_movement.rs"]
 pub mod movement;
 pub use movement::{LedgerRangeVerifier, MovementRecord};
@@ -81,6 +81,24 @@ pub struct NativeSessionLimits {
     /// Bounds on the movement coordinator (25 §6): members, historical maps,
     /// pins and the movement section of a checkpoint.
     pub ranges: focal_ranges::RangeLimits,
+    /// How this session's authority seals (F12): the node sets it from the
+    /// fence it knows (`SEAL_LEVEL`); every replica applies both records.
+    pub seal_rule: SealRule,
+}
+/// How an authority seals the closed outcomes of its live window (F12).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SealRule {
+    /// The seal is derived at the committed prefix under the pressure's
+    /// floors and applies only there; the archive agent notices the
+    /// pressure at its tick. What a node runs below the fence's
+    /// `SEAL_LEVEL`.
+    #[default]
+    Derived,
+    /// The seal names what was closed where it was derived and applies after
+    /// the commits its custody took; the owner closes generations itself as
+    /// the window comes under pressure, through a closing seal; a seal waits
+    /// for the pipeline to drain instead of being refused for it.
+    Anchored,
 }
 /// What the materializer has done since this session opened.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -246,6 +264,7 @@ impl NativeSessionLimits {
             disk_headroom_bytes: 64 << 20,
             materializer: record::materialize::MaterializerLimits::default(),
             ranges: focal_ranges::RangeLimits::default(),
+            seal_rule: SealRule::Derived,
         }
     }
 }
@@ -818,6 +837,11 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         self.engine
             .propose_seal(&mut self.consensus, plan, bundle, bytes, fold)
     }
+    /// Whether this authority could propose a seal now (F12): what the
+    /// archive agent asks before it derives a plan and writes a bundle.
+    pub fn check_seal(&self) -> Result<(), NativeSessionError> {
+        self.engine.check_seal(&self.consensus.scalars())
+    }
     /// The seal this authority proposed and has not seen applied.
     pub fn seal_in_flight(&self) -> Option<SealRecord> {
         self.engine.seal_in_flight()
@@ -825,6 +849,22 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     /// Seals applied through this replica's applied prefix.
     pub fn seals_applied(&self) -> u64 {
         self.engine.seals_applied()
+    }
+    /// Closing seals applied through this replica's applied prefix.
+    pub fn closes_applied(&self) -> u64 {
+        self.engine.closes_applied()
+    }
+    /// Anchored seals this authority let go before proposal.
+    pub fn seals_dropped(&self) -> u64 {
+        self.engine.seals_dropped()
+    }
+    /// The anchored seal this authority proposed and has not seen applied.
+    pub fn anchored_in_flight(&self) -> Option<AnchoredSealRecord> {
+        self.engine.anchored_in_flight().cloned()
+    }
+    /// Whether a seal is held for the pipeline to drain.
+    pub fn seal_wanted(&self) -> bool {
+        self.engine.decision_wanted()
     }
     /// Committed seal records this replica applied nothing for.
     pub fn seals_inert(&self) -> u64 {

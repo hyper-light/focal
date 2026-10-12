@@ -25,6 +25,10 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 /// the core for. The default is one day.
 pub const GRACE_ENV: &str = "FOCAL_RETIRE_AFTER_MS";
 const DEFAULT_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
+/// How soon the agent asks again for the seals of a replica whose seal is
+/// held, in flight or was just proposed (F12): between ticks, so sealing
+/// keeps pace with a window that fills faster than a bundle an interval.
+const BACKLOG_INTERVAL: Duration = Duration::from_millis(20);
 /// Status-index rows one tick visits per replica.
 const VISITS_PER_TICK: usize = 1024;
 /// Replicas the agent keeps a walk cursor for.
@@ -109,29 +113,67 @@ impl ArchiveAgent {
         let (interval, grace_ms) = settings_from_env();
         Self::new(interval, grace_ms)
     }
+    /// Ticks at the interval; while a seal is held, in flight or was just
+    /// proposed on a replica (F12), its seals are asked again every
+    /// [`BACKLOG_INTERVAL`] between ticks, so a window that seals faster
+    /// than one bundle an interval is sealed as fast as custody and its
+    /// commits go, and the next tick's walk waits for the interval.
     pub async fn run(mut self, handles: &NetworkHandles) -> Result<(), AccessError> {
         if hyper_rt::futures::shard_id().is_none() {
             return Err(AccessError::Unavailable);
         }
+        let mut ticked = std::time::Instant::now();
+        let mut backlog = false;
         loop {
-            focal_rt::time::sleep(self.interval)
+            let wait = self.interval.saturating_sub(ticked.elapsed());
+            let wait = if backlog {
+                wait.min(BACKLOG_INTERVAL)
+            } else {
+                wait
+            };
+            focal_rt::time::sleep(wait)
                 .await
                 .map_err(|_| AccessError::Unavailable)?;
-            self.tick(handles).await;
+            if ticked.elapsed() >= self.interval {
+                backlog = self.tick(handles).await;
+                ticked = std::time::Instant::now();
+            } else {
+                backlog = self.seal_round(handles).await;
+            }
         }
     }
-    /// One pass over the replicas this node hosts.
-    pub async fn tick(&mut self, handles: &NetworkHandles) {
+    /// One pass over the replicas this node hosts; whether a seal is held,
+    /// in flight or was just proposed on any of them.
+    pub async fn tick(&mut self, handles: &NetworkHandles) -> bool {
         let mut after = None;
+        let mut backlog = false;
         while let Some((ledger, host)) = handles.fleet.next_host(after) {
             after = Some(ledger);
             // A replica that is not native, not authoritative, or refuses
             // the walk simply waits for a later tick.
             let _ = self.step(ledger, &host, handles).await;
-            let _ = self.seal_step(ledger, &host, handles).await;
+            backlog |= self
+                .seal_step(ledger, &host, handles)
+                .await
+                .unwrap_or(false);
         }
         self.ticks = self.ticks.saturating_add(1);
         self.publish();
+        backlog
+    }
+    /// The seals alone, between ticks while one is held or in flight.
+    async fn seal_round(&mut self, handles: &NetworkHandles) -> bool {
+        let mut after = None;
+        let mut backlog = false;
+        while let Some((ledger, host)) = handles.fleet.next_host(after) {
+            after = Some(ledger);
+            backlog |= self
+                .seal_step(ledger, &host, handles)
+                .await
+                .unwrap_or(false);
+        }
+        self.publish();
+        backlog
     }
     /// One seal for the replica when the committed state yields one worth
     /// proposing (F12): the bundle (and a fold's) sealed as content under
@@ -142,13 +184,15 @@ impl ArchiveAgent {
         ledger: LedgerId,
         host: &ReplicaHost,
         handles: &NetworkHandles,
-    ) -> Result<(), AccessError> {
-        let Some(sealed) = host
+    ) -> Result<bool, AccessError> {
+        let sealed = match host
             .seal_bundle()
             .await
             .map_err(|_| AccessError::Unavailable)?
-        else {
-            return Ok(());
+        {
+            crate::archive_derive::SealOffer::Ready(sealed) => sealed,
+            crate::archive_derive::SealOffer::Busy => return Ok(true),
+            crate::archive_derive::SealOffer::Nothing => return Ok(false),
         };
         let crate::fleet::SealedOutcomes {
             plan,
@@ -156,7 +200,7 @@ impl ArchiveAgent {
             fold,
             _allocation,
             ..
-        } = sealed;
+        } = *sealed;
         let policy = handles
             .content
             .policy(ledger)
@@ -178,7 +222,7 @@ impl ArchiveAgent {
                 .is_some_and(|(_, outcome)| !outcome.obligation.satisfied())
         {
             self.seals_waiting = self.seals_waiting.saturating_add(1);
-            return Ok(());
+            return Ok(false);
         }
         let fold = folded.map(|(plan, outcome)| focal_core::native::seal::Fold {
             first: plan.first,
@@ -190,7 +234,7 @@ impl ArchiveAgent {
             .await
             .map_err(|_| AccessError::Unavailable)?;
         self.seals_proposed = self.seals_proposed.saturating_add(1);
-        Ok(())
+        Ok(true)
     }
     async fn step(
         &mut self,
@@ -380,7 +424,9 @@ impl EmbeddedArchive {
         node: &mut crate::embedded::EmbeddedNode,
         budget: &focal_memory::MemoryBudget,
     ) -> Result<(), crate::embedded::NodeError> {
-        let Some(sealed) = crate::archive_derive::sealed_outcomes(&node.session, budget)? else {
+        let crate::archive_derive::SealOffer::Ready(sealed) =
+            crate::archive_derive::sealed_outcomes(&node.session, budget)?
+        else {
             return Ok(());
         };
         let crate::fleet::SealedOutcomes {
@@ -389,7 +435,7 @@ impl EmbeddedArchive {
             fold,
             _allocation,
             ..
-        } = sealed;
+        } = *sealed;
         let reference = Self::seal(node, bundle)?;
         let fold = match fold {
             Some((plan, bytes, _)) => {

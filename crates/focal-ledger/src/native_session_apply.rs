@@ -528,6 +528,84 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.seals_applied = self.seals_applied.saturating_add(1);
         Ok(())
     }
+    /// Apply a committed anchored seal record (F12, `SealRule::Anchored`):
+    /// inert when the prefix it named has passed or a movement is pending,
+    /// as a derived seal's; otherwise the floors are the pressure's here (a
+    /// replica under another resident outcome bound fails closed by name,
+    /// `OutcomeBound`; under the same bound they are a divergence), and the
+    /// plan the record names is derived again and published
+    /// (`Core::apply_anchored`). The authority proposed it with nothing
+    /// pending, and admission held behind it, so the state it applies to is
+    /// the state it was proposed against: a plan or an ordinal that does
+    /// not hold is a divergence. A closing seal is counted apart.
+    fn apply_anchored_seal(&mut self, data: &[u8]) -> Result<(), NativeSessionError> {
+        let record = seal::AnchoredSealRecord::decode(data)?;
+        if record.ledger != self.ledger {
+            return Err(NativeSessionError::Corrupt);
+        }
+        if self.anchored.as_ref() == Some(&record) {
+            self.anchored = None;
+        }
+        if self.sequence()? != record.expected_prefix {
+            self.seals_inert = self.seals_inert.saturating_add(1);
+            return Ok(());
+        }
+        if self
+            .movement
+            .as_ref()
+            .is_some_and(|movement| movement.pending().is_some())
+        {
+            self.seals_inert = self.seals_inert.saturating_add(1);
+            return Ok(());
+        }
+        if !self.pending.is_empty() {
+            self.resolve_suffix(SuffixEvidence::Retired)?;
+        } else if matches!(self.domain, Some(Domain::Active(..))) {
+            self.passive_for_replay()?;
+        }
+        self.readiness_requested = None;
+        self.reconstruction_needed = true;
+        self.close_check_at = 0;
+        let local = u64::try_from(self.limits.recovery.native.outcomes).unwrap_or(u64::MAX);
+        let Some(Domain::Passive(core)) = self.domain.as_mut() else {
+            return Err(NativeSessionError::Failed);
+        };
+        let floors = core
+            .close_floors(record.floors.len())
+            .map_err(NativeSessionError::Native)?;
+        if floors != record.floors {
+            if record.outcome_limit != local {
+                return Err(NativeSessionError::OutcomeBound {
+                    committed: record.outcome_limit,
+                    local,
+                });
+            }
+            return Err(NativeSessionError::Corrupt);
+        }
+        let applied = core.apply_anchored(focal_core::native::seal::AnchoredRecord {
+            floors: &record.floors,
+            ordinal: record.ordinal,
+            through: record.through,
+            principals: &record.principals,
+            count: record.count,
+            bundle: record.bundle,
+            bytes: record.bytes,
+            fold: record.fold,
+        });
+        match applied {
+            Ok(_) => {}
+            Err(error @ (NativeError::Memory(_) | NativeError::Capacity(_))) => {
+                return Err(error.into());
+            }
+            Err(_) => return Err(NativeSessionError::Corrupt),
+        }
+        if record.is_closing() {
+            self.closes_applied = self.closes_applied.saturating_add(1);
+        } else {
+            self.seals_applied = self.seals_applied.saturating_add(1);
+        }
+        Ok(())
+    }
     /// Apply a committed movement record (25 §6): the coordinator's step at
     /// the current native prefix under a proof minted from the entry; inert
     /// when the committed state refuses it, the same on every replica.
@@ -614,6 +692,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             self.layout_change = None;
             self.retirement = None;
             self.seal = None;
+            self.anchored = None;
+            self.waiting_seal = None;
+            self.close_wanted = false;
+            self.close_check_at = 0;
             if let Some(movement) = self.movement.as_mut() {
                 movement.in_flight = None;
             }
@@ -629,6 +711,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             || data.starts_with(&movement::MAGIC)
             || data.starts_with(&retirement::MAGIC)
             || data.starts_with(&seal::MAGIC)
+            || data.starts_with(&seal::ANCHORED_MAGIC)
     }
     /// Caller-issued read barriers carry this correlation namespace.
     pub(crate) fn is_correlated_read(context: &[u8]) -> bool {
@@ -706,6 +789,14 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 return Err(NativeSessionError::Corrupt);
             }
             self.apply_seal(&entry.data)?;
+            self.applied_raft = entry.index;
+            return Ok(());
+        }
+        if entry.data.starts_with(&seal::ANCHORED_MAGIC) {
+            if self.genesis.is_none() {
+                return Err(NativeSessionError::Corrupt);
+            }
+            self.apply_anchored_seal(&entry.data)?;
             self.applied_raft = entry.index;
             return Ok(());
         }
@@ -1067,12 +1158,18 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         &mut self,
         consensus: &mut DurableNode,
     ) -> Option<NativeSessionError> {
-        // A host taking a batch proposes its candidates when the batch ends
-        // (`flush_deferred`), not at a poll inside it.
-        if self.defer_proposals || !self.is_authoritative(&consensus.scalars()) {
+        if !self.is_authoritative(&consensus.scalars()) {
             return None;
         }
-        match self.flush_proposals(consensus) {
+        // A host taking a batch proposes its candidates when the batch ends
+        // (`flush_deferred`), not at a poll inside it; a seal held for the
+        // drain is proposed once nothing is pending, batch or not.
+        let flushed = if self.defer_proposals {
+            Ok(())
+        } else {
+            self.flush_proposals(consensus)
+        };
+        match flushed.and_then(|()| self.propose_wanted(consensus)) {
             Ok(()) => None,
             Err(error) => {
                 if error.class() == FailureClass::FailClosed {
