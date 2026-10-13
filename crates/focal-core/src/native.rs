@@ -29,6 +29,7 @@ mod delivery;
 mod delivery_owned;
 #[cfg(test)]
 mod event_budget_tests;
+mod event_index;
 pub mod event_record;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixtures;
@@ -265,6 +266,9 @@ pub struct NativeState {
     /// What admission projects a checkpoint to is this and the frame, never a bound inferred
     /// from the memory the rows are charged.
     encoded_rows: usize,
+    /// Each object's events by where they were published (doc 31 M2): derived from the rows,
+    /// never encoded, kept as each publication commits.
+    events: event_index::EventIndex,
 }
 impl std::fmt::Debug for NativeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1458,6 +1462,10 @@ pub struct NativePrepared {
     /// What its changes may take in an owner's pending index
     /// ([`pending_index::entry_charge`]), funded with the rest of it.
     _index: Option<focal_memory::Allocation>,
+    /// What its events take in the event index (doc 31 M2,
+    /// [`event_index::entry_charge`]), funded with the rest of it and handed to
+    /// the index as it publishes.
+    events: Option<focal_memory::Allocation>,
 }
 impl std::fmt::Debug for NativePrepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1763,6 +1771,7 @@ impl Core<NativeState> {
     ) -> Result<Self, NativeError> {
         limits = checked_native_limits(ledger, limits)?;
         let rows = ranges::NativeRanges::new(range, limits.range, &budget, page_partition)?;
+        let events = event_index::EventIndex::empty(&budget)?;
         Ok(Self {
             state: NativeState {
                 ledger,
@@ -1770,6 +1779,7 @@ impl Core<NativeState> {
                 rows,
                 budget,
                 encoded_rows: 0,
+                events,
             },
             limits,
         })
@@ -1995,7 +2005,10 @@ impl Core<NativeState> {
         Ok(())
     }
     /// The external log owner calls this only after durability. This method has
-    /// no codec or IO; it performs no allocation, including producing its result.
+    /// no codec or IO; the publication performs no allocation, including producing
+    /// its result. Once it stands, the events it published are filed in the event
+    /// index (doc 31 M2), which may grow; a refusal there drops the index, never
+    /// the publication.
     #[allow(clippy::result_large_err)] // Return the owned candidate without allocating on refusal.
     pub fn publish_native(
         &mut self,
@@ -2025,11 +2038,10 @@ impl Core<NativeState> {
             encoded_added,
             encoded_removed,
             _index,
+            events,
         } = prepared;
-        self.state
-            .rows
-            .publish_recoverable(fragments)
-            .map_err(|(error, fragments)| NativePublishError {
+        if let Err((error, fragments)) = self.state.rows.publish_recoverable(fragments) {
+            return Err(NativePublishError {
                 error,
                 prepared: fragments.map(|fragments| NativePrepared {
                     fragments,
@@ -2038,10 +2050,69 @@ impl Core<NativeState> {
                     encoded_added,
                     encoded_removed,
                     _index,
+                    events,
                 }),
-            })?;
+            });
+        }
         self.state.encoded_rows = encoded;
+        self.file_events(outcome, events);
         Ok(outcome)
+    }
+    /// File the events `outcome` published, every one at its sequence, on the charge its
+    /// preparation funded (doc 31 M2). A publication not funded for them, or a row that is not
+    /// the event it should be, lets the index go, for the rows to build again.
+    fn file_events(&mut self, outcome: NativeOutcome, funding: Option<focal_memory::Allocation>) {
+        let NativeState {
+            rows,
+            events,
+            ledger,
+            ..
+        } = &mut self.state;
+        if outcome.events == 0 || !events.complete() {
+            return;
+        }
+        let funded = event_index::charge_for(outcome.events)
+            .ok()
+            .is_some_and(|wanted| {
+                funding
+                    .as_ref()
+                    .is_some_and(|funding| funding.bytes() == wanted)
+            });
+        match funding {
+            Some(funding) if funded => events.fund(funding),
+            _ => {
+                events.drop_all();
+                return;
+            }
+        }
+        for ordinal in 0..outcome.events {
+            let event = match rows.get(&Key::Event(outcome.sequence, ordinal)) {
+                Some(Row::Event(stored)) => stored.get(*ledger),
+                _ => None,
+            };
+            let Some(event) = event else {
+                events.drop_all();
+                return;
+            };
+            events.file(
+                event_index::home(event),
+                event_index::Position {
+                    sequence: outcome.sequence,
+                    ordinal,
+                },
+            );
+        }
+    }
+    /// Build the event index from the committed rows where it is not built (a restored core's,
+    /// or one whose memory was refused): a walk of every event, once.
+    pub fn build_event_index(&mut self) {
+        if !self.state.events.complete() {
+            self.state.events = event_index::EventIndex::build(
+                &self.state.rows,
+                self.state.ledger,
+                &self.state.budget,
+            );
+        }
     }
     /// What the rows take in a checkpoint once `prepared` publishes, each replaced or deleted row
     /// looked up in the committed root: what the preparation's own count must equal.

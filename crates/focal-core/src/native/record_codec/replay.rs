@@ -671,6 +671,20 @@ pub(super) fn install(
         })
         .map_err(|error| failure.take().unwrap_or_else(|| error.into()))?;
     writes.check(&fragments)?;
+    // Its events' place in the event index (doc 31 M2): completion work, as the rest of it.
+    let events = match header.outcome.events {
+        0 => None,
+        count => Some(
+            core.state
+                .budget
+                .reserve(
+                    BudgetKind::Index,
+                    BudgetLane::Completion,
+                    crate::native::event_index::charge_for(count)?,
+                )?
+                .commit(),
+        ),
+    };
     Ok(NativePrepared {
         fragments,
         outcome: header.outcome,
@@ -679,5 +693,6 @@ pub(super) fn install(
         encoded_removed: removed.bytes(),
         // A replay is published at once, never held in a chain.
         _index: None,
+        events,
     })
 }

@@ -520,6 +520,7 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         encoded_added,
         encoded_removed: removed.bytes(),
         _index: None,
+        events: None,
     };
     assert_eq!(core.native_sequence(), original_sequence);
     for (id, members) in &original {

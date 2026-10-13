@@ -256,6 +256,7 @@ impl<'a> StructuralArchive<'a> {
                     encoded_rows: crate::native::encoded_rows_of(&rows, self.header.ledger)?,
                     rows,
                     budget,
+                    events: crate::native::event_index::EventIndex::unbuilt(),
                 },
                 limits: limits.native,
             },

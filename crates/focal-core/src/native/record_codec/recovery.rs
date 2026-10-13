@@ -363,19 +363,21 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
         },
     )?;
     let (rows, envelope) = hydrated.assemble(range, layout, &budget, lane)?;
-    Ok((
-        Core {
-            state: NativeState {
-                ledger: header.ledger,
-                profile: header.profile,
-                encoded_rows: crate::native::encoded_rows_of(&rows, header.ledger)?,
-                rows,
-                budget,
-            },
-            limits: limits.native,
+    let mut core = Core {
+        state: NativeState {
+            ledger: header.ledger,
+            profile: header.profile,
+            encoded_rows: crate::native::encoded_rows_of(&rows, header.ledger)?,
+            rows,
+            budget,
+            events: crate::native::event_index::EventIndex::unbuilt(),
         },
-        envelope,
-    ))
+        limits: limits.native,
+    };
+    // Its event index, built from the restored rows (doc 31 M2); where its charge is refused it
+    // waits, unbuilt, for the next retirement to build it.
+    core.build_event_index();
+    Ok((core, envelope))
 }
 /// Rows hydrated from a frame and validated as a whole, not yet laid out:
 /// what a checkpoint restore lays out per its recorded layout and an

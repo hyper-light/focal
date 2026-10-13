@@ -427,6 +427,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         let Some(Domain::Passive(core)) = self.domain.as_mut() else {
             return Err(NativeSessionError::Failed);
         };
+        // A family is derived through the event index (doc 31 M2); one a restore could not
+        // fund is built now.
+        core.build_event_index();
         let family = match core.retirement_family(record.root) {
             Ok(family) => family,
             Err(focal_core::native::retirement::RetirementRefusal::OutcomeCapacity) => {

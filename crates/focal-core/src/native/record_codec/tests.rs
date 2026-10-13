@@ -435,6 +435,7 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
         encoded_added,
         encoded_removed: taken.bytes(),
         _index: None,
+        events: None,
     };
     let bytes = encode(&prepared);
     let record = StructuralRecord::inspect(&bytes, inspection(bytes.len())).unwrap();

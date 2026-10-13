@@ -532,7 +532,9 @@ impl Core<NativeState> {
             }
         }
         // Events of everything above, attributed to the member whose rows
-        // they describe.
+        // they describe: read from the event index under each object's home
+        // (doc 31 M2), in proportion to the family; where the index is not
+        // built, by a walk of every event, which finds the same.
         let mut events = Vec::new();
         let mut through = SessionSeq(0);
         let mut counts = Vec::new();
@@ -540,17 +542,7 @@ impl Core<NativeState> {
             .try_reserve_exact(closure.members.len())
             .map_err(|_| RetirementRefusal::TooLarge)?;
         counts.extend(closure.members.iter().map(|_| 0u32));
-        for entry in self
-            .state
-            .rows
-            .entries_from(&Key::Event(SessionSeq(0), 0), false)
-        {
-            let Key::Event(..) = entry.key else {
-                break;
-            };
-            let Row::Event(stored) = &entry.value else {
-                return Err(RetirementRefusal::Corrupt);
-            };
+        let mut consider = |key: Key, stored: &OwnedEvent| -> Result<(), RetirementRefusal> {
             let event = stored
                 .get(self.state.ledger)
                 .ok_or(RetirementRefusal::Corrupt)?;
@@ -559,7 +551,7 @@ impl Core<NativeState> {
                 if events.len() >= MAX_FAMILY_ROWS {
                     return Err(RetirementRefusal::TooLarge);
                 }
-                events.push(entry.key);
+                events.push(key);
                 through = through.max(event.sequence);
                 let owner = ClaimId(layout::affinity(&object));
                 let slot = closure
@@ -569,6 +561,40 @@ impl Core<NativeState> {
                     .unwrap_or(0);
                 let count = counts.get_mut(slot).ok_or(RetirementRefusal::Corrupt)?;
                 *count = count.checked_add(1).ok_or(RetirementRefusal::TooLarge)?;
+            }
+            Ok(())
+        };
+        if self.state.events.complete() {
+            let homes: BTreeSet<[u8; 16]> = closure
+                .members
+                .iter()
+                .map(|member| member.0)
+                .chain(closure.artifacts.iter().map(|artifact| artifact.0))
+                .chain(closure.testaments.iter().map(|testament| testament.0))
+                .chain(closure.definitions.iter().map(|definition| definition.0))
+                .collect();
+            for home in homes {
+                for position in self.state.events.positions(home) {
+                    let key = Key::Event(position.sequence, position.ordinal);
+                    let Some(Row::Event(stored)) = self.state.rows.get(&key) else {
+                        return Err(RetirementRefusal::Corrupt);
+                    };
+                    consider(key, stored)?;
+                }
+            }
+        } else {
+            for entry in self
+                .state
+                .rows
+                .entries_from(&Key::Event(SessionSeq(0), 0), false)
+            {
+                let Key::Event(..) = entry.key else {
+                    break;
+                };
+                let Row::Event(stored) = &entry.value else {
+                    return Err(RetirementRefusal::Corrupt);
+                };
+                consider(entry.key, stored)?;
             }
         }
         for key in events {
@@ -709,6 +735,33 @@ impl Core<NativeState> {
         )?;
         sink.finish()?;
         Ok(hash)
+    }
+    /// Unfile every event of `family` from the event index (doc 31 M2).
+    fn unfile_family_events(&mut self, family: &RetirementFamily) {
+        let NativeState {
+            rows,
+            events,
+            ledger,
+            ..
+        } = &mut self.state;
+        for key in &family.keys {
+            let Key::Event(sequence, ordinal) = *key else {
+                continue;
+            };
+            if !events.complete() {
+                return;
+            }
+            match rows.get(key) {
+                Some(Row::Event(stored)) => match stored.get(*ledger) {
+                    Some(event) => events.unfile(
+                        event_index::home(event),
+                        event_index::Position { sequence, ordinal },
+                    ),
+                    None => events.drop_all(),
+                },
+                _ => events.drop_all(),
+            }
+        }
     }
     /// Retire the family (26 §4): one publication at the next native prefix
     /// that deletes every row of the family, leaves a `Retired` continuation
@@ -876,16 +929,22 @@ impl Core<NativeState> {
             0,
         )));
         // One publication of what a family's bound allows: its rows, a
-        // continuation per member, the meta and the outcome.
+        // continuation per member, the meta and the outcome. Its events are
+        // unfiled first, while their rows still say where they are filed; a
+        // publication refused after that leaves the index to be built again.
+        self.unfile_family_events(family);
         let bound = MAX_FAMILY_ROWS
             .saturating_add(MAX_FAMILY_MEMBERS)
             .saturating_add(2);
-        self.state.rows.publish_changes(
+        if let Err(error) = self.state.rows.publish_changes(
             sequence.0,
             changes,
             focal_memory::BudgetLane::Ordinary,
             bound,
-        )?;
+        ) {
+            self.state.events.drop_all();
+            return Err(error);
+        }
         Ok(count)
     }
 }

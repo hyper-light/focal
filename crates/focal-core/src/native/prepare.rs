@@ -1683,6 +1683,19 @@ impl<'a> Fresh<'a> {
             .checked_mul(changed)
             .ok_or(NativeError::Capacity("pending index charge"))?;
         let index = source.reserve(BudgetKind::Pending, lane, index)?.commit();
+        // Its events' place in the event index (doc 31 M2), funded as the rest of it is.
+        let events = match outcome.events {
+            0 => None,
+            count => Some(
+                source
+                    .reserve(
+                        BudgetKind::Index,
+                        lane,
+                        super::event_index::charge_for(count)?,
+                    )?
+                    .commit(),
+            ),
+        };
         BuiltNative::new(
             NativePrepared {
                 fragments,
@@ -1691,6 +1704,7 @@ impl<'a> Fresh<'a> {
                 encoded_added,
                 encoded_removed,
                 _index: Some(index),
+                events,
             },
             seals,
             allocation,

@@ -829,3 +829,124 @@ fn a_bundle_hydrates_into_a_core_of_the_family_read_as_the_live_one_was() {
         live_binding
     );
 }
+
+/// Measurement, run by hand: what deriving one family costs as the session
+/// holds more open claims and their events. `FOCAL_MEASURE_CLAIMS` claims
+/// are created and left open, one more is created, cancelled and released,
+/// and its family's derivation is timed (the mean of ten). A derivation
+/// whose cost follows the session's events, not the family's, cannot keep
+/// pace with completions.
+#[test]
+#[ignore = "measurement: run by hand"]
+fn measure_family_derivation_against_resident_events() {
+    let claims: u128 = std::env::var("FOCAL_MEASURE_CLAIMS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4096);
+    let mut core = Core::new_native(
+        f::ledger(),
+        RangeId(81),
+        NativeLimits::default(),
+        MemoryBudget::new(8 << 30, 64 << 20).unwrap(),
+    )
+    .unwrap();
+    for claim in 0..claims {
+        f::publish(
+            &mut core,
+            10,
+            f::creation(1_000_000 + claim, 1_000_000 + claim, &[], None),
+        );
+    }
+    finished(&mut core, 1, 1, 20);
+    let events = core
+        .state
+        .rows
+        .entries_from(&Key::Event(SessionSeq(0), 0), false)
+        .take_while(|entry| matches!(entry.key, Key::Event(..)))
+        .count();
+    let family = core.retirement_family(id(1)).unwrap();
+    let time = |core: &Core<NativeState>| {
+        let started = std::time::Instant::now();
+        for _ in 0..10 {
+            assert_eq!(core.retirement_family(id(1)).unwrap(), family);
+        }
+        started.elapsed() / 10
+    };
+    let indexed = time(&core);
+    core.state.events.drop_all();
+    let walked = time(&core);
+    let started = std::time::Instant::now();
+    core.build_event_index();
+    let built = started.elapsed();
+    eprintln!(
+        "claims {claims} events {events} family rows {}: a derivation {indexed:?} through the \
+         event index, {walked:?} by a walk of every event; the index built in {built:?}",
+        family.rows(),
+    );
+}
+
+/// The family `root` derived with the event index, then with it dropped (a walk of every
+/// event), then with it built again from the rows: the same family each way (doc 31 M2).
+fn derived_three_ways(core: &mut Core<NativeState>, root: u128) -> RetirementFamily {
+    assert!(core.state.events.complete());
+    let indexed = core.retirement_family(id(root)).unwrap();
+    core.state.events.drop_all();
+    let walked = core.retirement_family(id(root)).unwrap();
+    core.build_event_index();
+    assert!(core.state.events.complete());
+    let rebuilt = core.retirement_family(id(root)).unwrap();
+    assert_eq!(indexed, walked, "the index finds what a walk finds");
+    assert_eq!(indexed, rebuilt, "and the rows build the same index");
+    indexed
+}
+
+/// The event index files every event a publication makes and unfiles a family's with its
+/// retirement; a family's derivation through it is the derivation through a walk of every
+/// event, among open claims that are not retiring; and a restored core's index is built from
+/// its rows to the same.
+#[test]
+fn the_event_index_finds_what_a_walk_of_every_event_finds() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ckpt::store(directory.path());
+    let mut core = f::core();
+    for claim in 0..16 {
+        f::publish(
+            &mut core,
+            5,
+            f::creation(500 + claim, 500 + claim, &[], None),
+        );
+    }
+    finished(&mut core, 1, 1, 10);
+    finished(&mut core, 2, 10, 40);
+    let events = core
+        .state
+        .rows
+        .entries_from(&Key::Event(SessionSeq(0), 0), false)
+        .take_while(|entry| matches!(entry.key, Key::Event(..)))
+        .count();
+    assert_eq!(core.state.events.len(), events, "every event is filed");
+    let one = derived_three_ways(&mut core, 1);
+    derived_three_ways(&mut core, 2);
+    let (family, hash, bytes, through) = bundle_of(&core, one.root);
+    assert_eq!(family, one);
+    core.retire_native_family(&family, hash, bytes, through)
+        .unwrap();
+    assert!(core.state.events.complete());
+    assert_eq!(
+        core.state.events.len(),
+        events - family.events.iter().sum::<u32>() as usize,
+        "its events are unfiled with it"
+    );
+    assert_eq!(core.state.events.positions(id(1).0).count(), 0);
+    derived_three_ways(&mut core, 2);
+    let restored = restore_with(&core, core.limits, &store).unwrap();
+    assert!(
+        restored.state.events.complete(),
+        "a restored core's index is built from its rows"
+    );
+    assert_eq!(restored.state.events.len(), core.state.events.len());
+    assert_eq!(
+        restored.retirement_family(id(2)).unwrap(),
+        core.retirement_family(id(2)).unwrap()
+    );
+}

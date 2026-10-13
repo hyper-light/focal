@@ -108,6 +108,7 @@ fn altered(
         encoded_added,
         encoded_removed: removed.bytes(),
         _index: None,
+        events: None,
     }
 }
 
