@@ -538,6 +538,70 @@ fn a_sparse_plan_refuses_what_a_batch_plan_refuses() {
     ));
 }
 
+/// A sparse publication spends no more nodes than its plan reserved
+/// (`PageDirectory::sparse_bound`, a change's path and the larger of two
+/// inserted pages and one removed): in a directory four levels deep whose
+/// every node and page a capture shares, each change of a batch under
+/// another branch, every put an oversized row splitting its leaf in three and
+/// every delete emptying its leaf. A publication that ran short would be
+/// refused and poison the store. Measured here, a publication keeps about
+/// 1.4 nodes a change of the 32 a change it reserves (doc 30 §9.2).
+#[test]
+fn a_sparse_publication_spends_within_its_node_bound() {
+    // Two rows a leaf: a row too large for a leaf beside another goes in a
+    // leaf of its own, so a put of one between a leaf's two rows makes three.
+    let leaves = RangeConfig {
+        max_batch_entries: 65_536,
+        ..config(2, 4096)
+    };
+    let budget = MemoryBudget::new(1 << 30, 0).unwrap();
+    let mut store = RangeStore::<u64, Value>::new(RangeId(9), 0, leaves, budget.clone()).unwrap();
+    // 65,536 rows in 32,768 leaves: a directory four levels deep.
+    let rows = (0..65_536u64)
+        .map(|n| Change::Put(Entry::new(n * 16, Value(n), 0)))
+        .collect();
+    store.apply_batch(1, rows, BudgetLane::Ordinary).unwrap();
+    let mut draw = Draw(9);
+    let mut deleted = std::collections::BTreeSet::new();
+    for prefix in 2..=40u64 {
+        let capture = store.freeze().unwrap();
+        // 24 changes, spread across the directory.
+        let mut changes = Vec::new();
+        for slot in 0..24u64 {
+            let leaf = slot * 1365 + draw.below(1365);
+            let first = leaf * 32;
+            if draw.below(3) == 0 && !deleted.contains(&first) {
+                // Every row of the leaf deleted, the leaf removed.
+                for key in [first, first + 16] {
+                    if store.get_entry(&key).is_some() {
+                        changes.push(Change::Delete(key));
+                    }
+                }
+                deleted.insert(first);
+            } else {
+                changes.push(Change::Put(Entry::new(first + 8, Value(prefix), 6000)));
+            }
+        }
+        changes.sort_by_key(|change| *change.key());
+        changes.dedup_by_key(|change| *change.key());
+        let sparse = store
+            .plan_sparse(
+                store.budget(),
+                SparseBase::Committed,
+                prefix,
+                changes,
+                BudgetLane::Ordinary,
+                store.config.max_batch_entries,
+                |key| store.get_entry(key).map(|entry| entry.heap_bytes),
+            )
+            .unwrap();
+        if let Err(refusal) = store.publish_sparse(sparse, copy) {
+            panic!("prefix {prefix}: {:?}", refusal.error());
+        }
+        drop(capture);
+    }
+}
+
 /// A key whose order is its prefix, as focal's native key orders by its
 /// affinity first: a search settles on the cached prefixes and reads a page's
 /// rows only where they tie.

@@ -341,10 +341,13 @@ impl<K, V> PageDirectory<K, V> {
     /// What a publication in place of `changed` changes may spend on nodes,
     /// the directory holding at most `max_leaf_count` pages as it publishes
     /// (doc 30 §9). A change's page has its path made the directory's own, a
-    /// node a level where a capture still shares it; a change inserts at most
-    /// two pages (`insert_owned`: a path a level and its splits, and a root,
-    /// where its leaf is full) and removes at most one (`remove_owned`: four a
-    /// level and two roots). Every other edit is made where it stands.
+    /// node a level where a capture still shares it. A put inserts at most two
+    /// pages (`insert_owned`: a path a level and its splits, and a root, where
+    /// its leaf is full); a delete removes at most one (`remove_owned`: four a
+    /// level and two roots). A change is one or the other: a page is removed
+    /// only where its group deleted every row, which no put leaves, so a
+    /// change pays its path and the larger of the two, never both. Every other
+    /// edit is made where it stands.
     pub(super) fn sparse_bound(
         changed: usize,
         max_leaf_count: usize,
@@ -356,7 +359,7 @@ impl<K, V> PageDirectory<K, V> {
         let owned = levels;
         let inserted = checked_mul(2, checked_add(checked_mul(2, levels)?, 1)?)?;
         let removed = checked_add(checked_mul(4, levels)?, 2)?;
-        let nodes = checked_add(owned, checked_add(inserted, removed)?)?;
+        let nodes = checked_add(owned, inserted.max(removed))?;
         checked_mul(changed, checked_mul(nodes, node_charge::<K, V>(MAX)?)?)
     }
 

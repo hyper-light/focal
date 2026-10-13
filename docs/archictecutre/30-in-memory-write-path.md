@@ -501,7 +501,10 @@ Next, from the replay's profile (§6.3):
 
 An admitted preparation took 23.7–35.8 µs over the same runs.
 
-**Still to do.** The reservations themselves are worst cases far above what a write retains: a 2.3 MB transient for 7 KB retained, and a directory path for every change where a claim's twenty changes share one to three paths. Every pending candidate holds its plan's share until it publishes, so the pipeline's depth is bounded by these quotes, not by memory used. Bounding the directory by the pages a candidate touches is the next lever.
+**The pipeline the quotes allow.** In the CI comparison at 4000/s, before the session filled, land-16's refusals were mostly `ingress_capacity` and the sparse side's were mostly `owner_memory`. The sparse side committed about 30% fewer writes a second (2,023 against 1,407/s, run 38388339435, split at the fill). Every pending candidate holds its plan's worst case until it publishes, so the owner ran out of headroom for candidates long before it ran out of room for claims.
+- The directory part counted each change's path, two inserted pages and a removed page. A change is a put or a delete: only a delete can empty its page and only a put splits one. So it now pays its path and the larger of the two (5 nodes a level and 2, against 9 and 4), 44% less: a creation's 501 KB of nodes becomes about 276 KB.
+- Measured with every node and page shared by a capture (`a_sparse_publication_spends_within_its_node_bound`, a directory four levels deep): a publication kept about 1.4 nodes a change of the 32 a change it reserved.
+- What remains is the copy-on-write worst case. A path or a page is copied only where a capture shares it, yet every candidate pays for it, captured or not. Charging the copies to the capture is the next lever: a checkpoint's freeze reserves the pending candidates' copies, and candidates planned while it lives reserve theirs. So is the construction's 1 MiB of scratch, held during each preparation.
 
 ## Sources
 
