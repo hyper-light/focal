@@ -173,6 +173,9 @@ pub(crate) enum Command {
     },
     /// Close every connection to `peer`.
     Disconnect { peer: PeerId },
+    /// Size the stream pool the endpoint's participants share (hyper-transport's
+    /// `Endpoint::set_stream_pool`).
+    StreamPool { streams: u32 },
     /// Run the connections made from now on under `tls`.
     SetTls {
         tls: Box<Tls>,
@@ -429,7 +432,9 @@ fn refused(refusal: Refusal) -> WireError {
         Refusal::Corrupt => WireError::InvalidFrame,
         Refusal::Identity => WireError::Authentication,
         Refusal::Kind => WireError::Access(AccessError::Unauthorized),
-        Refusal::Budget
+        // Never sent: its peer granted no stream for a period, so the request was not taken.
+        Refusal::Unsent
+        | Refusal::Budget
         | Refusal::Exchanges
         | Refusal::Lanes
         | Refusal::LaneFull
@@ -634,6 +639,10 @@ impl Owner {
             Command::Disconnect { peer } => {
                 let now = self.now();
                 self.driver.endpoint().disconnect(now, peer);
+            }
+            Command::StreamPool { streams } => {
+                // Refused only under fixed credit, which focal's endpoints never run.
+                let _ = self.driver.endpoint().set_stream_pool(streams);
             }
             Command::SetTls { tls, reply } => {
                 let set = self

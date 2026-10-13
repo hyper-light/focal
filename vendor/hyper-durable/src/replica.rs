@@ -856,10 +856,19 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         Ok(Some(span))
     }
 
-    /// When the owner is to drive the replica though nothing arrives (`Driven::wake`); none when
-    /// nothing is timed.
+    /// When the owner is to drive the replica though nothing arrives (`Driven::wake`): the core's
+    /// next timer, or the end of the quiet period at which a commit no write has stated is written
+    /// (§4.1, `quiet_commit`), while the log has room for it; none when nothing is timed. Without
+    /// the second, a group that went quiet with its applied index past its durable commit was
+    /// driven by nothing again, and stayed there.
     pub fn deadline(&self) -> Option<u64> {
-        self.node.deadline()
+        let quiet = self.quiet_since.filter(|_| self.has_slot()).map(|since| {
+            since.saturating_add(u64::try_from(self.quiet.as_nanos()).unwrap_or(u64::MAX))
+        });
+        match (self.node.deadline(), quiet) {
+            (Some(core), Some(quiet)) => Some(core.min(quiet)),
+            (core, quiet) => core.or(quiet),
+        }
     }
 
     /// Wakes the core at the owner's clock (timing step L-2): what it armed since the last

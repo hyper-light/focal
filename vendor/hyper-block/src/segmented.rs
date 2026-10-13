@@ -724,8 +724,19 @@ mod tests {
         let mut fresh = open(&base, 4);
         let mut b = piece(0);
         if direct {
-            for i in 0..3 {
-                assert!(!fresh.read_resident_at(b.as_mut_slice(), at(i)).unwrap());
+            for i in 0..3u64 {
+                // On Linux the page cache is asked itself: a resident read of a page not in memory
+                // starts its read-ahead, which takes the next piece of the same segment too, and
+                // reads what that brought in by the time it looks (`resident::linux`).
+                #[cfg(target_os = "linux")]
+                let held = {
+                    let (index, s) = fresh.segment(at(i), PIECE).unwrap();
+                    let segment = std::fs::File::open(segment_path(&base, index)).unwrap();
+                    crate::resident::cached(&segment, at(i) - s.start, PIECE).unwrap()
+                };
+                #[cfg(not(target_os = "linux"))]
+                let held = fresh.read_resident_at(b.as_mut_slice(), at(i)).unwrap();
+                assert!(!held, "piece {i} is in memory");
             }
         }
         fresh.write_all_at(piece(8).as_slice(), at(1)).unwrap();

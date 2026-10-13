@@ -234,6 +234,18 @@ struct Core {
     /// Whether the driver's clock is real time (the simulation's is not).
     real_time: bool,
     attribution: Tracker,
+    /// The step's long polls left for one reading at its end ([`Tracker::defers`]): at most the step's poll
+    /// budget, reserved at build, so judging by step allocates nothing.
+    deferred: Vec<Deferred>,
+}
+
+/// A long poll left for the step's end: the task, as its slot and generation, so a slot reused since
+/// is not charged, and how far the poll ran past the quantum by the wall clock.
+#[derive(Clone, Copy, Debug)]
+struct Deferred {
+    slot: u32,
+    generation: u32,
+    overrun_ns: u64,
 }
 
 /// A shard: its desk and its loop, owned together by whoever runs it (a worker thread, a
@@ -361,6 +373,7 @@ impl Shard {
             last_driver_ns: now_ns,
             real_time: !is_sim,
             attribution: Tracker::default(),
+            deferred: Vec::with_capacity(config.batch.max(1)),
             config,
             driver,
         };
@@ -945,9 +958,9 @@ impl Shard {
         // The step's one reading of the clock: the overrun of a wait just ended, the attribution window, the
         // timers and the harvest's quantum all take it.
         self.publish_clock();
-        // Only while armed: the account is a system call, and every step paid it before the tracker
-        // threw an unarmed read away.
-        if self.core.real_time && self.core.attribution.armed() {
+        // Only where the step's start opens a window: the account is a system call, and every step paid it
+        // before the tracker threw an unarmed read away; judging by step, the last step's reading is open.
+        if self.core.real_time && self.core.attribution.reads_at_step_start() {
             let read = account_now(self.desk.now_ns.get());
             self.core.counters.thread_accounts =
                 self.core.counters.thread_accounts.saturating_add(1);
@@ -995,6 +1008,7 @@ impl Shard {
             mark = Some(self.poll_slot(slot, start));
             self.apply();
         }
+        self.judge_deferred();
         // Running tasks, not occupied slots: a finished task that waits for a joiner holds its slot, and after
         // shutdown nobody joins it, so waiting on it would never end (found by `tcp::serve`'s handlers).
         let exit = self.exit_if_drained();
@@ -1026,6 +1040,8 @@ impl Shard {
         if self.core.exited {
             return;
         }
+        // A wait closes the window, so nothing left for a step's end may wait past it.
+        self.judge_deferred();
         if self.core.driver_lost {
             self.finish_hard_cancelled();
             if block_cleanup && !self.core.exited {
@@ -1115,6 +1131,7 @@ impl Shard {
                 self.poll_slot(slot, start);
             }
         }
+        self.judge_deferred();
         self.apply();
         self.exit_if_drained();
     }
@@ -1224,14 +1241,33 @@ impl Shard {
     }
 
     /// Attributes a poll against the step quantum: within it by the wall clock it is within; past it, the
-    /// attribution windows decide whose it was ([`crate::attribution`]).
-    fn attribute_poll(&mut self, poll_started_ns: u64, ended_ns: u64) -> Option<Attribution> {
+    /// attribution windows decide whose it was ([`crate::attribution`]), at once or, judging by step, at the
+    /// step's end ([`Shard::judge_deferred`]), for which it returns `None` now.
+    fn attribute_poll(
+        &mut self,
+        slot: u32,
+        generation: u32,
+        poll_started_ns: u64,
+        ended_ns: u64,
+    ) -> Option<Attribution> {
         let quantum = self.quantum_ns();
-        if ended_ns.saturating_sub(poll_started_ns) <= quantum {
+        let wall_ns = ended_ns.saturating_sub(poll_started_ns);
+        if wall_ns <= quantum {
             return None;
         }
         if !self.core.real_time {
             return Some(Attribution::Long);
+        }
+        if self.core.attribution.defers()
+            && self.core.deferred.len() < self.core.deferred.capacity()
+        {
+            self.core.deferred.push(Deferred {
+                slot,
+                generation,
+                overrun_ns: wall_ns.saturating_sub(quantum),
+            });
+            self.core.attribution.long_poll_deferred();
+            return None;
         }
         let end = attribution::thread_account();
         self.core.counters.thread_accounts = self.core.counters.thread_accounts.saturating_add(1);
@@ -1240,6 +1276,44 @@ impl Shard {
                 .attribution
                 .long_poll(poll_started_ns, ended_ns, end, quantum),
         )
+    }
+
+    /// The long polls left for the step's end, judged at one reading of the thread's account
+    /// ([`Tracker::close_step`], [`attribution::judge_in_window`]) and counted as the polls' own attribution
+    /// would have been; a task's own count only while its slot still holds it.
+    fn judge_deferred(&mut self) {
+        if self.core.deferred.is_empty() {
+            return;
+        }
+        let now = self.now_ns();
+        let end = attribution::thread_account();
+        self.core.counters.thread_accounts = self.core.counters.thread_accounts.saturating_add(1);
+        let off_cpu_ns = self.core.attribution.close_step(now, end);
+        let mut undecided = false;
+        for deferred in self.core.deferred.drain(..) {
+            let attributed = match (off_cpu_ns, end) {
+                (_, None) => Attribution::NoClock,
+                (None, Some(_)) => Attribution::NoWindow,
+                (Some(off_cpu_ns), Some(_)) => {
+                    attribution::judge_in_window(deferred.overrun_ns, off_cpu_ns)
+                }
+            };
+            undecided |= matches!(attributed, Attribution::NoWindow | Attribution::Ambiguous);
+            count_long_poll(&mut self.core.counters, attributed);
+            let still_held = self
+                .desk
+                .task(deferred.slot)
+                .is_some_and(|cell| cell.generation.get() == deferred.generation);
+            if attributed.is_tasks()
+                && still_held
+                && let Some(task) = slot_mut(&mut self.core.tasks, deferred.slot)
+            {
+                task.long_steps = task.long_steps.saturating_add(1);
+            }
+        }
+        if undecided {
+            self.core.attribution.undecided();
+        }
     }
 
     /// The driver's blocking wait until a kick, a completion or `deadline_ns`, its completions queued; true
@@ -1502,7 +1576,7 @@ impl Shard {
         // What the poll asked takes effect before its result is recorded: a parent that spawned children and
         // finished in one poll has them installed, linked and so cancelled with it.
         self.apply();
-        let attributed = self.attribute_poll(start, ended);
+        let attributed = self.attribute_poll(slot, generation, start, ended);
         let Some(poll) = poll else {
             // A future that unwound is in no state to poll again: it is dropped, and the task ends.
             if let Some(task) = slot_mut(&mut self.core.tasks, slot) {

@@ -56,6 +56,13 @@ pub enum Refusal {
     /// A period of the exchange's progress deadline moved less than a datagram (T39).
     #[error("a period moved less than a datagram")]
     Stalled,
+    /// The exchange waited for a stream its peer did not grant for a whole period of its progress
+    /// deadline (policy C): none of it was sent, so the peer never saw it. Distinct from
+    /// [`Refusal::Stalled`], whose exchange may have reached the peer, so an asker knows a request
+    /// refused so was not taken, as a peer granting streams as wanted (`StreamCredit::Pooled`)
+    /// holds requests back while it is busy.
+    #[error("the exchange waited a period for a stream it was not granted: nothing was sent")]
+    Unsent,
     /// The connection closed, or the exchange was abandoned by its owner.
     #[error("the connection closed")]
     Closed,

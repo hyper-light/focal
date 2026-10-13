@@ -249,7 +249,9 @@ impl DeviceFile {
     /// waiting for the device (`crate::resident`): true when it read, false when the read would
     /// wait, the file ends first, or the platform cannot tell, leaving the read to a thread that
     /// may wait ([`crate::issuer`]). A direct file has no OS cache to read from, so it never reads
-    /// here.
+    /// here. On Linux a page not in memory has its read started before the call answers, and the
+    /// call reads it if that read finished first: true says the bytes were read without waiting,
+    /// not that they were in memory before.
     pub fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
         self.read_resident(buf, offset, None)
     }

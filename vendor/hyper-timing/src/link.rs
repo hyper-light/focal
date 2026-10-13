@@ -901,53 +901,6 @@ impl LinkEstimator {
         self.margin_ns.map(Duration::from_nanos)
     }
 
-    /// The interval at which this link's heartbeats would be independent, while its integrated
-    /// autocorrelation time cannot be measured at the interval it is at
-    /// ([`Refusal::CorrelationUnmeasured`]); `None` while it is measured, before an Allan level
-    /// long enough to say has its windows, and while the refusal is within the levels' own
-    /// uncertainty.
-    ///
-    /// The variance of an `m`-mean of a correlated series is `V·τ_int/m` (Sokal 1997, §3): `τ_int`
-    /// consecutive heartbeats carry what one independent heartbeat does, so heartbeats `τ_int`
-    /// intervals apart are independent, and at that spacing the history measures its own `τ_int`
-    /// within Madras and Sokal's window `m ≥ c·τ̂(m)`, `c = 6`, at the first level that can hold
-    /// it, windows of eight, once it has seven: 56 heartbeats. The longest level with its windows
-    /// gives the estimate, `τ̂(m) = m·σ²_A(m)/V`, the most of the correlation the history has seen;
-    /// a level shorter than the correlation sees only part of it, so the estimate is low, never
-    /// high. It is taken at the low end of its uncertainty: the level's Allan deviation is known
-    /// to within `1/√(2(K−1))` for its `K` windows (the tolerance `n_A` takes, Allan 1966), so
-    /// `τ̂` to within that factor squared, and a link whose `τ̂` fails the window by less than that
-    /// waits for longer levels, which narrow it. Where it fails by more, `τ̂` at the low end is
-    /// past `m/c ≥ 8/6`, so each move lengthens the interval by more than a third, and a link still
-    /// too correlated at the interval given is moved again; the moves end at the first interval
-    /// whose heartbeats its history can tell apart, the link's correlation time measured online
-    /// (`docs/timing.md` §2.8).
-    pub fn independent_interval(&self) -> Option<Duration> {
-        if self.correlation.is_some() {
-            return None;
-        }
-        let variance = self.errors.variance()?;
-        let (window, allan, windows) = self
-            .allan
-            .qualified(u64::MAX)
-            .filter(|(window, ..)| *window as f64 >= SOKAL_C)
-            .last()?;
-        let m = window as f64;
-        let tau = if variance > 0.0 {
-            (m * allan / variance).max(1.0)
-        } else {
-            1.0
-        };
-        let spread = 1.0 + 1.0 / (2.0 * windows.saturating_sub(1) as f64).sqrt();
-        let least = tau / (spread * spread);
-        if least <= m / SOKAL_C {
-            return None;
-        }
-        let spacing = self.interval_ns as f64 * least;
-        // f64 → Duration: an interval past what a Duration holds is held at its maximum.
-        Some(Duration::try_from_secs_f64(spacing.ceil() / 1e9).unwrap_or(Duration::MAX))
-    }
-
     /// A margin from elsewhere, in force until [`configure`](Self::configure) gives the link its
     /// own: the margin a node's pool of its links configures for this one while this one's own
     /// evidence is short (`docs/timing.md` §3, item 10). The trust follows it as a configuration's
@@ -1435,88 +1388,61 @@ mod tests {
         ));
     }
 
-    /// A link whose heartbeats are correlated far past any window its history holds at its
-    /// interval (an AR(1) delay with a correlation time of about 200 ms, heartbeats every
-    /// millisecond) refuses for want of `τ_int` until a level of thousands of heartbeats has its
-    /// windows, and a link whose correlation outgrows every level, never; moved to the interval its
-    /// levels give each time it refuses, it reaches one its history can measure and configures, in
-    /// a few hundred heartbeats, each move longer than the last by more than a third. Over 64
-    /// seeds: configured within 576 heartbeats, at a final interval of 166 ms at the median
-    /// (the correlation time is 199 ms) and 1.26 s at the most.
+    /// A link whose heartbeats are correlated far past the windows a short history holds (an AR(1)
+    /// delay of `ρ = 0.99`, `τ_int = (1 + ρ)/(1 − ρ) = 199` heartbeats at one a millisecond) refuses
+    /// for want of `τ_int` at its interval until a level holding Madras and Sokal's window has its
+    /// seven windows, and then configures there: by the first level of at least `6·τ_int = 1,194`
+    /// heartbeats, 2,048, seven windows of which are 14,336 heartbeats, or sooner where a shorter
+    /// level's estimate, which is low, never high, already holds its own window. It asks no longer
+    /// interval (`docs/timing.md` §2.8, "The interval the evidence needs"). Over the 64 seeds it
+    /// configured at its interval within 63 to 1,201 heartbeats, 182 at the median: 1.2 s at the most
+    /// at a millisecond, where moved for its evidence it took up to 576 heartbeats at intervals up to
+    /// 1.26 s.
     #[test]
-    fn a_link_too_correlated_to_measure_moves_to_the_interval_its_levels_give() {
-        // The delay at fine steps of one millisecond: x' = ρx + ε, ρ = 0.99, τ_int = 199 steps.
-        let step = MS;
+    fn a_link_too_correlated_to_measure_yet_configures_at_its_interval_once_a_level_holds_its_window()
+     {
+        // The first level at least `SOKAL_C · τ_int` long, and the heartbeats its seven windows take.
+        let tau = 199.0f64;
+        let window = 1u64 << (SOKAL_C * tau).log2().ceil() as u32;
+        let bound = ALLAN_WINDOWS * window;
+        assert_eq!((window, bound), (2_048, 14_336));
         let rho = 0.99f64;
+        let mut taken_by_seed = Vec::new();
         for seed in 1..=64u64 {
             let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
             let mut x = 0.0f64;
-            let mut fine = |state: &mut u64| {
-                // A uniform innovation of mean zero and deviation 100 µs.
-                let u = (noise(state) >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
-                x = rho * x + u * 100_000.0 * 12f64.sqrt();
-                x
-            };
-            let fixed = || {
+            let mut link =
                 LinkEstimator::new(Duration::from_millis(1), Duration::from_micros(50), None)
-                    .unwrap()
-            };
-            // At the interval it starts at, the seeds' first link refuses after a thousand heartbeats,
-            // more than any moved link takes: its levels measure `τ_int` once one of `6·τ_int`
-            // heartbeats has its seven windows, some 8,000 heartbeats, unless a short one's estimate
-            // falls under its window by chance (`docs/timing.md` §3, item 3).
-            let mut t = 0u64;
-            if seed == 1 {
-                let mut stuck = fixed();
-                for seq in 0..1_000u64 {
-                    let delay = 5 * MS as i64 + fine(&mut state) as i64;
-                    t += step;
-                    stuck.on_heartbeat(seq, (t as i64 + delay) as u64).unwrap();
-                }
-                assert_eq!(
-                    stuck.configure(&costs(), GRANULARITY, GRANULARITY),
-                    Err(Refusal::CorrelationUnmeasured)
-                );
-                assert!(stuck.independent_interval().unwrap() > Duration::from_millis(1));
-            }
-            // Moved each time it refuses with a level to say, it configures.
-            let mut link = fixed();
-            let (mut seq, mut taken, mut moves) = (0u64, 0u64, Vec::new());
-            let mut every = 1u64;
-            loop {
-                let mut latest = 0.0;
-                for _ in 0..every {
-                    t += step;
-                    latest = fine(&mut state);
-                }
-                let delay = 5 * MS as i64 + latest as i64;
-                link.on_heartbeat(seq, (t as i64 + delay) as u64).unwrap();
-                seq += 1;
-                taken += 1;
-                let interval = link.interval();
+                    .unwrap();
+            let mut configured = None;
+            for seq in 0..bound {
+                // A uniform innovation of mean zero and deviation 100 µs.
+                let u = (noise(&mut state) >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+                x = rho * x + u * 100_000.0 * 12f64.sqrt();
+                let delay = 5 * MS as i64 + x as i64;
+                link.on_heartbeat(seq, ((seq + 1) * MS) as i64 as u64 + delay as u64)
+                    .unwrap();
                 match link.configure(&costs(), GRANULARITY, GRANULARITY) {
-                    Ok(_) => break,
-                    Err(Refusal::CorrelationUnmeasured) => {
-                        if let Some(next) = link.independent_interval() {
-                            assert!(next.as_secs_f64() > interval.as_secs_f64() * 4.0 / 3.0);
-                            every = (next.as_nanos() as u64).div_ceil(step);
-                            link.retime(Duration::from_nanos(every * step), None)
-                                .unwrap();
-                            moves.push(every);
-                        }
+                    Ok(_) => {
+                        configured = Some(seq + 1);
+                        break;
                     }
-                    Err(Refusal::TooFewHeartbeats) => {}
+                    Err(Refusal::CorrelationUnmeasured | Refusal::TooFewHeartbeats) => {}
                     Err(refusal @ (Refusal::Unconfigurable | Refusal::Unavailable)) => {
-                        panic!("{refusal:?}")
+                        panic!("seed {seed}: {refusal:?}")
                     }
                 }
-                assert!(
-                    taken < 1_000,
-                    "not configured after {taken}: moves {moves:?}"
-                );
             }
-            println!("seed {seed}: configured after {taken} heartbeats, moves {moves:?}");
+            let taken = configured
+                .unwrap_or_else(|| panic!("seed {seed}: not configured in {bound} heartbeats"));
+            assert_eq!(link.interval(), Duration::from_millis(1), "seed {seed}");
+            taken_by_seed.push(taken);
         }
+        taken_by_seed.sort_unstable();
+        println!(
+            "configured at its interval over 64 seeds: least {} heartbeats, median {}, most {}",
+            taken_by_seed[0], taken_by_seed[32], taken_by_seed[63]
+        );
     }
 
     /// Latenesses given are folded as the same offsets measured would be, for their levels, their

@@ -1844,7 +1844,7 @@ impl NetworkService {
         let handles = &this.handles;
         // Every other driver, each mapped to how its end ends the run: a shutdown signalled
         // (`true`), the run over with nothing to stop (`false`), or why it failed.
-        let mut drivers: [Ending<'_>; 18] = [
+        let mut drivers: [Ending<'_>; 19] = [
             focal_rt::boxed(
                 || async move { shutdown.await.map_err(ServiceError::Io).map(|()| true) },
             ),
@@ -1949,6 +1949,10 @@ impl NetworkService {
             focal_rt::boxed(|| async move {
                 this.pace().await;
                 Err(ServiceError::Owner("pace driver ended"))
+            }),
+            focal_rt::boxed(|| async move {
+                this.size_stream_pool().await;
+                Err(ServiceError::Owner("stream pool sizer ended"))
             }),
             focal_rt::boxed(|| async move {
                 match metrics_listener {
@@ -2066,6 +2070,40 @@ impl NetworkService {
             .await
             .is_err()
             {
+                return;
+            }
+        }
+    }
+    /// Sizes the stream pool the listener's participants share (hyper-transport's
+    /// `StreamCredit::Pooled`, docs/archictecutre/27 §17) to twice the writes the sessions this
+    /// node leads take at once, and never under one connection's streams, so a node that leads
+    /// nothing still answers redirects and reads. A session holds about its write window queued
+    /// and as many in its pipeline before its door refuses, so participants granted twice it send
+    /// no write the door would refuse; and a window is the most writes answered in one bound, so
+    /// twice it leaves it room to grow, a doubling a bound as a slow start's. It is sized again
+    /// each least bound of those sessions, what a window is counted within, and never more often
+    /// than the transport's timer granularity; with none led, at the metrics cadence.
+    async fn size_stream_pool(&self) {
+        let floor = u64::from(self.listener.streams_per_connection());
+        let mut sized = None;
+        loop {
+            let mut admission = self.handles.fleet.led_admission();
+            if let Some(host) = &self.handles.ledger
+                && let Some(led) = host.led_admission()
+            {
+                admission = crate::fleet::add_admission(admission, led);
+            }
+            let (windows, least) = admission;
+            let streams = u32::try_from(windows.saturating_mul(2).max(floor)).unwrap_or(u32::MAX);
+            if sized != Some(streams) && self.listener.set_stream_pool(streams).is_ok() {
+                sized = Some(streams);
+            }
+            // Never more often than the transport's timers are judged at: a bound of a few hundred
+            // microseconds on a fast device would wake it for nothing in between.
+            let next = least
+                .unwrap_or(crate::metrics::SAMPLE_INTERVAL)
+                .max(focal_wire::TIMER_GRANULARITY);
+            if focal_rt::time::sleep(next).await.is_err() {
                 return;
             }
         }

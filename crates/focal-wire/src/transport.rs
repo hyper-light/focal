@@ -142,6 +142,13 @@ pub fn endpoint_limits(
             per_identity: admission.connections.max(1),
         },
         streams_per_connection: streams,
+        // A connection's handshake grants one stream, its greeting's: a participant is granted
+        // more from the node's pool as it is blocked (`FocalClasses::pooled`), and any other
+        // peer every stream once its role is known (docs/archictecutre/27 §17).
+        stream_credit: hyper_transport::StreamCredit::Pooled { initial: 1 },
+        // A node's own asks wait for streams as long as their queue moves; a participant's are
+        // bounded where it runs ([`endpoint_driver`]).
+        ask_queue: hyper_transport::AskQueue::Table,
         exchanges: endpoint_exchanges(limits),
         // focal's traffic is exchanges; no lane is opened.
         lanes_per_peer: 1,
@@ -430,10 +437,17 @@ pub(crate) fn endpoint_driver(
     admission: &AdmissionLimits,
     budget: MemoryBudget,
 ) -> Result<Driver, WireError> {
+    let mut endpoint_limits = endpoint_limits(limits, admission)?;
+    // A participant asks of nodes that grant it streams from their pools (`FocalClasses::pooled`):
+    // what it would queue past a round of what it is granted is refused where it is asked, nothing
+    // sent, as the node's door would refuse it there (docs/archictecutre/27 §17).
+    if role == Sender::Participant {
+        endpoint_limits.ask_queue = hyper_transport::AskQueue::Credit;
+    }
     let config = Config {
         tls,
         role,
-        limits: endpoint_limits(limits, admission)?,
+        limits: endpoint_limits,
         congestion: congestion(),
     };
     let io = hyper_rt::udp::Io { batch: IO_BATCH };
@@ -556,6 +570,12 @@ impl QuicServer {
     /// Present `tls` to every handshake from now on: a renewed identity, roots that changed.
     pub async fn replace_tls(&self, tls: ServerTls) -> Result<(), WireError> {
         self.identity().replace(tls).await
+    }
+    /// Size the stream pool this server's participants share: the exchanges they may have open
+    /// here at once, all their connections' together (hyper-transport's `StreamCredit::Pooled`).
+    /// Its owner hears it as soon as its queue has room.
+    pub fn set_stream_pool(&self, streams: u32) -> Result<(), WireError> {
+        self.network.send_now(Command::StreamPool { streams })
     }
     /// A handle that presents another identity to this server's next handshakes, held apart from
     /// the server (a credential's renewal swaps it while the server serves).
