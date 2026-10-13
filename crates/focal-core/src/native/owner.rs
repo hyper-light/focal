@@ -467,6 +467,11 @@ pub struct NativeOwner {
     /// rather than wrap, which could only overstate it and refuse admission.
     pending_rows: usize,
     pending_bytes: usize,
+    /// The last fresh request of each of a few commands that this owner's
+    /// memory refused, while the headroom stays short of what it needed:
+    /// another like it is refused from its header
+    /// ([`NativeOwner::refuse_when_full`]).
+    shortfalls: [Option<ingress::Shortfall>; ingress::SHORTFALLS],
 }
 impl std::fmt::Debug for NativeOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -601,6 +606,7 @@ impl NativeOwner {
                 next_serial: 0,
                 pending_rows: 0,
                 pending_bytes: 0,
+                shortfalls: [None; ingress::SHORTFALLS],
             }),
             Err(error) => Err(NativeOwnerInitError {
                 error: error.into(),

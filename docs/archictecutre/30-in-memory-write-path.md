@@ -473,6 +473,36 @@ Next, from the replay's profile (§6.3):
 - The prepay walk is about 4 µs a claim. It is mostly a directory descent a group, which the publication repeats.
 
 
+### 9.2 Refusal at the memory's bound (2026-10-13)
+
+**What the A/B found.** In the CI comparison at 4000/s, 83% of the writes were refused, nearly all with `native owner memory: Capacity`: the allowance stays full, since the workload creates claims and never retires them. The sparse side's leader was busier than land-16's (70% against 60%) with the same commits and refusals.
+
+**Why a refusal cost a preparation.**
+- A claim creation's construction and publication reserve about 2.3 MB of headroom: 1.65 MB of construction bounds (1 MiB of it scratch), then the plan's 605 KB (501 KB of it directory nodes, a worst-case path a change), the mutation set and the pending index. The claim retains about 7 KB.
+- Each reservation is taken as the preparation reaches it. Once less than one write's need is left, the construction reservation still succeeds and a late one is refused, after the build.
+- Measured in the isolated harness: a refused preparation took 19.0 µs against 22.9 µs for one admitted.
+
+**The fix: a shortfall, refused from the header.**
+- When the owner's own budget refuses a fresh request, the owner keeps a shortfall: the request's command, its frame's size, the lane, and the least it needed. That is the headroom it found plus the part of the refused reservation the headroom lacked.
+- While that lane's headroom stays below the need, a fresh request of the command with a frame at least as large is refused from its header. Nothing is decoded and no reservation is tried. This is how a zero receive window refuses data (RFC 9293 §3.8.6.1), and how Redis refuses a write command past `maxmemory` before running it (`processCommand`).
+- **Exact retries.** An exact retry is still answered.
+- **When the shortfall ends.** Memory come back ends the shortfall, as does a like request that is prepared.
+- **Probes.** Every 32nd refused request is prepared after all, a probe, so a request that needs less with a frame as large is never refused for good. The interval doubles each time the memory refuses again, up to 1,024, as a zero window's probes back off.
+- **Proof the budget refused.** `MemoryBudget::refusals` counts the reservations a budget refused, with the last one's lane, request and availability. The owner keeps a shortfall only for the refusal its budget counted. Many bounds report `MemoryError::Capacity`, and only the budget's should leave one.
+- **Several commands at once.** An owner keeps the shortfalls of up to eight commands, so a refused post does not undo a refused creation.
+
+**Measured.** `measure_refusal_at_the_memory_bound`: an owner fills its 80 MB budget with claim creations, then is sent 5,000 more.
+
+| | Each refusal | Reaching the budget |
+|---|---|---|
+| Before | 19.0 µs, a preparation's 83% | 5,000 |
+| Shortfall, probe every 32 | 0.82 µs | 156 |
+| Shortfall, probes backing off | 0.17 µs | 8 |
+
+An admitted preparation took 23.7–35.8 µs over the same runs.
+
+**Still to do.** The reservations themselves are worst cases far above what a write retains: a 2.3 MB transient for 7 KB retained, and a directory path for every change where a claim's twenty changes share one to three paths. Every pending candidate holds its plan's share until it publishes, so the pipeline's depth is bounded by these quotes, not by memory used. Bounding the directory by the pages a candidate touches is the next lever.
+
 ## Sources
 
 - [FASTER] Chandramouli et al., *FASTER: An Embedded Concurrent Key-Value Store for State

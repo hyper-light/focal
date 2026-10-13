@@ -49,7 +49,8 @@ mod traversal;
 
 pub use arena::{Arena, ArenaConfig, ArenaId, Handle};
 pub use budget::{
-    Allocation, BudgetKind, BudgetLane, BudgetStats, ElasticFundedPool, MemoryBudget, Reservation,
+    Allocation, BudgetKind, BudgetLane, BudgetRefusals, BudgetStats, ElasticFundedPool,
+    MemoryBudget, Reservation,
 };
 pub use content::{ImmutableContent, VersionedRecord};
 pub use disk::{

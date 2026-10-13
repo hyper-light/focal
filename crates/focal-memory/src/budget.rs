@@ -310,6 +310,13 @@ struct Level {
     depth: AtomicU8,
     /// The parent's slot, or [`NO_PARENT`].
     parent: AtomicU32,
+    /// The reservations made at this level that a level of their walk
+    /// refused (`reserve_tree`), and the last one's lane, request and what
+    /// was then available ([`MemoryBudget::refusals`]).
+    refusals: AtomicU64,
+    refused_lane: AtomicU8,
+    refused_requested: AtomicUsize,
+    refused_available: AtomicUsize,
     // A single owner-level pool holds its backing through the lifetime of every
     // issued allocation and descendant budget. Never one pool per domain row.
     // While in use, ancestor kinds are reclassified but its total stays held.
@@ -485,6 +492,10 @@ impl Level {
             kinds: KindCounters::new(),
             depth: AtomicU8::new(0),
             parent: AtomicU32::new(NO_PARENT),
+            refusals: AtomicU64::new(0),
+            refused_lane: AtomicU8::new(0),
+            refused_requested: AtomicUsize::new(0),
+            refused_available: AtomicUsize::new(0),
             backing: Backing::new(),
         }
     }
@@ -506,6 +517,10 @@ impl Level {
             Ordering::Relaxed,
         );
         self.backing.set(&terms.funding);
+        self.refusals.store(0, Ordering::Relaxed);
+        self.refused_lane.store(0, Ordering::Relaxed);
+        self.refused_requested.store(0, Ordering::Relaxed);
+        self.refused_available.store(0, Ordering::Relaxed);
         self.holds.store(1, Ordering::Relaxed);
         self.state.fetch_or(1, Ordering::Release);
     }
@@ -714,6 +729,24 @@ fn reserve_tree(
     loop {
         if let Err(error) = current.reserve_local(kind, lane, bytes) {
             release_levels(level, kind, lane, bytes, taken);
+            if let MemoryError::Capacity {
+                requested,
+                available,
+            } = error
+            {
+                // Its fields before its count: a reader that sees the count
+                // sees the request it counts, or a later one.
+                level.refused_lane.store(
+                    match lane {
+                        BudgetLane::Ordinary => 0,
+                        BudgetLane::Completion => 1,
+                    },
+                    Ordering::Relaxed,
+                );
+                level.refused_requested.store(requested, Ordering::Relaxed);
+                level.refused_available.store(available, Ordering::Relaxed);
+                level.refusals.fetch_add(1, Ordering::Release);
+            }
             return Err(error);
         }
         taken = taken.saturating_add(1);
@@ -831,6 +864,18 @@ impl std::fmt::Debug for MemoryBudget {
             .field("funding_lane", &self.level.backing.lane())
             .finish()
     }
+}
+
+/// A budget's capacity refusals ([`MemoryBudget::refusals`]): their count,
+/// and the last one's lane, request and what was then available. Where two
+/// threads' reservations at one budget are refused at once, the last one's
+/// fields may be either one's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetRefusals {
+    pub count: u64,
+    pub lane: BudgetLane,
+    pub requested: usize,
+    pub available: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1013,6 +1058,61 @@ impl MemoryBudget {
             })
             .min()
             .unwrap_or(usize::MAX)
+    }
+
+    /// The most one reservation on `lane` could take now: at this budget and
+    /// each ancestor a reservation's walk reaches (`reserve_tree`, ending at
+    /// a funded pool), the least that any level's limits and an elastic
+    /// pool's credit leave. A snapshot for refusing early, never a grant: a
+    /// concurrent reservation or release moves it before the next one.
+    pub fn headroom(&self, lane: BudgetLane) -> usize {
+        let mut headroom = usize::MAX;
+        for level in lineage(self.level) {
+            let (funding, elastic) = level.backing.funding();
+            if lane == BudgetLane::Ordinary && funding == Some(BudgetLane::Completion) {
+                return 0;
+            }
+            if elastic {
+                headroom = headroom.min(level.backing.available.load(Ordering::Acquire));
+            }
+            if lane == BudgetLane::Ordinary {
+                headroom = headroom.min(
+                    level
+                        .ordinary_limit
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(level.ordinary.load(Ordering::Acquire)),
+                );
+            }
+            headroom = headroom.min(
+                level
+                    .limit
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(level.total.load(Ordering::Acquire)),
+            );
+            if funding.is_some() {
+                break;
+            }
+        }
+        headroom
+    }
+
+    /// How many of the reservations made at this budget were refused for
+    /// capacity, at it or at an ancestor, and the last one's lane, request
+    /// and what was then available. A caller that reads the count before its
+    /// work and finds it grown by its own refusal knows the budget refused
+    /// it, not another bound that reports `Capacity`.
+    pub fn refusals(&self) -> BudgetRefusals {
+        let level = self.level;
+        let count = level.refusals.load(Ordering::Acquire);
+        BudgetRefusals {
+            count,
+            lane: match level.refused_lane.load(Ordering::Relaxed) {
+                0 => BudgetLane::Ordinary,
+                _ => BudgetLane::Completion,
+            },
+            requested: level.refused_requested.load(Ordering::Relaxed),
+            available: level.refused_available.load(Ordering::Relaxed),
+        }
     }
 
     /// Counters are individually exact. A concurrent allocation/drop can make

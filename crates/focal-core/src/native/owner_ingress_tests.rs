@@ -528,3 +528,255 @@ fn a_full_owner_refuses_a_fresh_request_from_its_header() {
     ));
     assert_eq!(owner.pending_len(), full - 1);
 }
+
+/// A fresh request the owner's own memory refused leaves its shortfall:
+/// another of its command, its frame as large, is refused from its header,
+/// no reservation tried (the budget meets no further refusal), while the
+/// headroom stays short of what the refused one needed; every
+/// `SHORTFALL_PROBE`th is prepared after all, and refused on its merits; an
+/// exact retry is still answered; a smaller frame and another command are
+/// prepared as before; and memory given back ends the shortfall. A capacity
+/// the budget did not refuse leaves none.
+#[test]
+fn a_request_the_memory_refused_refuses_its_like_from_its_header() {
+    let mut owner = NativeOwner::new(core()).unwrap();
+    let limits = NativeDecodeLimits::for_native(
+        owner.core.limits,
+        1 << 20,
+        DecodeWork {
+            parse: 1 << 24,
+            source: 1 << 24,
+            model: 1 << 24,
+            acceptance: 1 << 24,
+            native: 1 << 24,
+        },
+    )
+    .unwrap();
+    let frame = |id: u128, requirements: &[(ValidationMode, bool)]| {
+        encoded(
+            &creation(id, id, requirements, None),
+            NativeContentProfile::ProjectionOnly,
+        )
+    };
+    let large = |id: u128| frame(id, &[(ValidationMode::Required, false)]);
+    let retried = large(700);
+    let candidate = ticket(
+        owner
+            .prepare_frame(context(ISSUER, 10), &retried, limits, None)
+            .unwrap(),
+    );
+    // The ordinary lane squeezed to less than a creation needs.
+    let budget = owner.core.state.budget.clone();
+    let left = 64 * 1024;
+    let pressure = budget
+        .reserve(
+            BudgetKind::Payload,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary) - left,
+        )
+        .unwrap();
+    let refusals = budget.refusals().count;
+    let first = owner.prepare_frame(context(ISSUER, 10), &large(701), limits, None);
+    assert!(
+        matches!(
+            first,
+            Err(NativeOwnerError::Native(NativeError::Memory(
+                MemoryError::Capacity { .. }
+            )))
+        ),
+        "{first:?}"
+    );
+    assert_eq!(budget.refusals().count, refusals + 1);
+    let need = owner.shortfalls[0].unwrap().need;
+    assert!(need > left, "{need}");
+    for n in 1..SHORTFALL_PROBE {
+        let refused = owner.prepare_frame(
+            context(ISSUER, 10),
+            &large(701 + u128::from(n)),
+            limits,
+            None,
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(NativeOwnerError::Native(NativeError::Memory(
+                    MemoryError::Capacity { requested, available }
+                ))) if requested == need && available == left
+            ),
+            "{n}: {refused:?}"
+        );
+        assert_eq!(budget.refusals().count, refusals + 1, "{n}");
+    }
+    let probe = owner.prepare_frame(context(ISSUER, 10), &large(800), limits, None);
+    assert!(
+        matches!(
+            probe,
+            Err(NativeOwnerError::Native(NativeError::Memory(
+                MemoryError::Capacity { .. }
+            )))
+        ),
+        "{probe:?}"
+    );
+    assert_eq!(budget.refusals().count, refusals + 2);
+    // Refused again, the next probe waits twice as long.
+    for n in 1..2 * SHORTFALL_PROBE {
+        let id = 2000 + u128::from(n);
+        assert!(
+            owner
+                .prepare_frame(context(ISSUER, 10), &large(id), limits, None)
+                .is_err()
+        );
+        assert_eq!(budget.refusals().count, refusals + 2, "{n}");
+    }
+    assert!(
+        owner
+            .prepare_frame(context(ISSUER, 10), &large(3000), limits, None)
+            .is_err()
+    );
+    assert_eq!(budget.refusals().count, refusals + 3);
+    assert!(matches!(
+        owner.prepare_frame(context(ISSUER, 10), &retried, limits, None),
+        Ok(NativeStaging::Existing { candidate: Some(again), .. }) if again == candidate
+    ));
+    // A smaller frame of the command is prepared, and refused on its merits.
+    let smaller = owner.prepare_frame(context(ISSUER, 10), &frame(801, &[]), limits, None);
+    assert!(
+        matches!(
+            smaller,
+            Err(NativeOwnerError::Native(NativeError::Memory(
+                MemoryError::Capacity { .. }
+            )))
+        ),
+        "{smaller:?}"
+    );
+    assert_eq!(budget.refusals().count, refusals + 4);
+    // Another command is decoded and prepared: the budget refuses it on its
+    // merits, and its shortfall is kept beside the creation's.
+    let other = encoded(
+        &post(802, binding(802)),
+        NativeContentProfile::ProjectionOnly,
+    );
+    let posted = owner.prepare_frame(context(ISSUER, 10), &other, limits, None);
+    assert!(
+        matches!(
+            posted,
+            Err(NativeOwnerError::Native(NativeError::Memory(
+                MemoryError::Capacity { .. }
+            )))
+        ),
+        "{posted:?}"
+    );
+    assert_eq!(budget.refusals().count, refusals + 5);
+    assert_eq!(owner.shortfalls.iter().flatten().count(), 2);
+    let refused = owner.prepare_frame(context(ISSUER, 10), &large(805), limits, None);
+    assert!(
+        matches!(
+            refused,
+            Err(NativeOwnerError::Native(NativeError::Memory(
+                MemoryError::Capacity { .. }
+            )))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(budget.refusals().count, refusals + 5);
+    // A capacity the budget did not refuse leaves no shortfall.
+    let held = owner.shortfalls;
+    owner.shortfalls = [None; SHORTFALLS];
+    let before = Before {
+        refusals: budget.refusals().count,
+        ordinary: budget.headroom(BudgetLane::Ordinary),
+        completion: budget.headroom(BudgetLane::Completion),
+    };
+    owner.note_shortfall(
+        &large(803),
+        before,
+        &NativeOwnerError::Native(NativeError::Memory(MemoryError::Capacity {
+            requested: 300,
+            available: 256,
+        })),
+    );
+    assert!(owner.shortfalls.iter().all(Option::is_none));
+    owner.shortfalls = held;
+    // Memory given back ends it.
+    drop(pressure);
+    assert!(matches!(
+        owner.prepare_frame(context(ISSUER, 10), &large(804), limits, None),
+        Ok(NativeStaging::Prepared { .. })
+    ));
+    assert!(
+        owner
+            .shortfalls
+            .iter()
+            .flatten()
+            .all(|shortfall| shortfall.command != command(&large(806)).unwrap())
+    );
+}
+
+/// The owner's preparation of a fresh claim creation, and then of 5,000 more
+/// once its memory refuses them: what each refusal costs and how many reach
+/// the budget (the shortfall's probes). Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "measurement"]
+fn measure_refusal_at_the_memory_bound() {
+    let mut owner = NativeOwner::new(core()).unwrap();
+    let limits = NativeDecodeLimits::for_native(
+        owner.core.limits,
+        1 << 20,
+        DecodeWork {
+            parse: 1 << 24,
+            source: 1 << 24,
+            model: 1 << 24,
+            acceptance: 1 << 24,
+            native: 1 << 24,
+        },
+    )
+    .unwrap();
+    let frame = |id: u128| {
+        encoded(
+            &creation(id, id, &[], None),
+            NativeContentProfile::ProjectionOnly,
+        )
+    };
+    let mut id = 10_000u128;
+    let mut prepared_ns = 0u128;
+    let mut prepared = 0u128;
+    loop {
+        id += 1;
+        let bytes = frame(id);
+        let started = std::time::Instant::now();
+        let staged = owner.prepare_frame(context(ISSUER, 10), &bytes, limits, None);
+        let took = started.elapsed().as_nanos();
+        match staged {
+            Ok(NativeStaging::Prepared { candidate, .. }) => {
+                prepared_ns += took;
+                prepared += 1;
+                owner.publish_after_durable(candidate).unwrap();
+            }
+            Ok(other) => panic!("{other:?}"),
+            Err(error) => {
+                println!("first refusal after {prepared} claims: {error}");
+                break;
+            }
+        }
+    }
+    let budget = owner.core.state.budget.clone();
+    let frames: Vec<_> = (0..5000u128).map(|n| frame(id + 1 + n)).collect();
+    let before = budget.refusals().count;
+    let started = std::time::Instant::now();
+    let mut refused = 0usize;
+    for bytes in &frames {
+        if owner
+            .prepare_frame(context(ISSUER, 10), bytes, limits, None)
+            .is_err()
+        {
+            refused += 1;
+        }
+    }
+    let each = started.elapsed().as_nanos() / 5000;
+    println!(
+        "prepared {:.1} µs each; then {refused} of 5000 refused at {:.2} µs each, {} reaching the budget",
+        prepared_ns as f64 / prepared as f64 / 1000.0,
+        each as f64 / 1000.0,
+        budget.refusals().count - before
+    );
+}

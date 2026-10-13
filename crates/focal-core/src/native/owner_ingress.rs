@@ -4,13 +4,22 @@
 use super::*;
 use crate::native::artifact_intent::{ArtifactCommand, ReportKind};
 use crate::native::input_codec::{
-    DecodeError, DecodedPlan, DecodedRequest, InputHeader, NativeDecodeLimits, StructuralInput,
+    DecodeError, DecodedPlan, DecodedRequest, FrameKind, InputHeader, NativeDecodeLimits,
+    StructuralInput,
 };
 use focal_memory::Reservation;
 
 #[cfg(test)]
 #[path = "owner_ingress_tests.rs"]
 mod tests;
+
+/// The command of a request frame, from its header.
+fn command(bytes: &[u8]) -> Option<u8> {
+    match StructuralInput::peek_header(bytes).ok()?.kind {
+        FrameKind::Request { command } => Some(command),
+        _ => None,
+    }
+}
 
 fn check_frame_header(
     context: NativeContext,
@@ -32,21 +41,76 @@ fn check_frame_header(
     Ok(())
 }
 
+/// After this many refusals of a [`Shortfall`]'s requests from their headers,
+/// one is decoded and prepared after all, to be refused or admitted on its
+/// merits: a zero window's probe (RFC 9293 §3.8.6.1). A request that needs
+/// less than the one the memory refused, its frame as large, is so never
+/// refused for good while the headroom stays as it is. Each probe the memory
+/// refuses again doubles the interval, as a zero window's probes back off, up
+/// to [`SHORTFALL_PROBE_MAX`]: measured at the bound, a probe's preparation
+/// was three quarters of what refusing at one in 32 cost.
+const SHORTFALL_PROBE: u32 = 32;
+const SHORTFALL_PROBE_MAX: u32 = 1024;
+
+/// The commands whose shortfalls an owner keeps at once: a refusal of one
+/// command never undoes another's, as a single shortfall did where creations
+/// and posts were both refused. A command takes its own slot, an empty one,
+/// or the one its tag picks.
+pub(super) const SHORTFALLS: usize = 8;
+
+/// A fresh request the owner's budget refused once its frame was decoded and
+/// its candidate built: its command, its frame's size, the lane its
+/// reservations took, and the least it needed, the headroom it found and the
+/// part of a reservation that headroom lacked. It retained nothing, so while
+/// the lane's headroom stays below that, another fresh request of its
+/// command, its frame at least as large, needs more than there is and is
+/// refused from its header, as a zero window refuses data. At the memory's
+/// bound each refusal had cost a preparation, 19 µs of a 23 µs claim creation
+/// in the isolated harness: a creation's construction and publication take
+/// 2.3 MB of headroom for the 7 KB its claim retains, and only its last
+/// reservation was refused.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Shortfall {
+    command: u8,
+    frame_bytes: usize,
+    lane: BudgetLane,
+    need: usize,
+    /// Refused from their headers since the last probe, and how many make
+    /// the next.
+    refused: u32,
+    probe: u32,
+}
+
+/// What the owner's budget showed before a frame was prepared: the refusals
+/// it had met and each lane's headroom.
+#[derive(Clone, Copy)]
+struct Before {
+    refusals: u64,
+    ordinary: usize,
+    completion: usize,
+}
+
 impl NativeOwner {
     /// Refuses, from its header alone, a request its frame's decoding would
     /// end in refusing: a fresh request (its key has no outcome, committed or
-    /// pending) while the owner's memory funds no more pending candidates. The
-    /// owner refused it only after planning its frame (every validation body
-    /// in it inspected), so at its bound each refusal cost a decode. A header
-    /// that does not read, that names another ledger, profile or actor, a
-    /// faulted owner and a retry of a request with an outcome are decoded as
-    /// before, which says why they are refused or answers them.
+    /// pending) while the owner's memory funds no more pending candidates, or
+    /// while it stays short of what a like request was refused for
+    /// ([`Shortfall`]). The owner refused it only after planning its frame
+    /// (every validation body in it inspected), and the memory only after
+    /// building its candidate, so at either bound each refusal cost that work.
+    /// A header that does not read, that names another ledger, profile or
+    /// actor, a faulted owner and a retry of a request with an outcome are
+    /// decoded as before, which says why they are refused or answers them.
     fn refuse_when_full(
         &mut self,
         context: NativeContext,
         bytes: &[u8],
     ) -> Result<(), NativeOwnerError> {
-        if self.faulted || self.reserve_pending().is_ok() {
+        if self.faulted {
+            return Ok(());
+        }
+        let queue_full = self.reserve_pending().is_err();
+        if !queue_full && self.shortfalls.iter().all(Option::is_none) {
             return Ok(());
         }
         let Ok(header) = StructuralInput::peek_header(bytes) else {
@@ -70,7 +134,145 @@ impl NativeOwner {
         if view.outcome(request.into()).is_some() {
             return Ok(());
         }
-        Err(NativeError::Capacity("pending candidates").into())
+        if queue_full {
+            return Err(NativeError::Capacity("pending candidates").into());
+        }
+        match self.short_of_memory(header.kind, bytes.len()) {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// The refusal a fresh request of `kind`, its frame `frame_bytes` long,
+    /// meets while the owner's memory stays short of the last request of its
+    /// command it refused, if any. Memory come back since ends that
+    /// shortfall.
+    fn short_of_memory(&mut self, kind: FrameKind, frame_bytes: usize) -> Option<MemoryError> {
+        let FrameKind::Request { command } = kind else {
+            return None;
+        };
+        let slot = self
+            .shortfalls
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|shortfall| shortfall.command == command))?;
+        let shortfall = (*slot)?;
+        let headroom = self.core.state.budget.headroom(shortfall.lane);
+        if headroom >= shortfall.need {
+            *slot = None;
+            return None;
+        }
+        if frame_bytes < shortfall.frame_bytes {
+            return None;
+        }
+        let refused = shortfall.refused.saturating_add(1);
+        if refused >= shortfall.probe {
+            *slot = Some(Shortfall {
+                refused: 0,
+                ..shortfall
+            });
+            return None;
+        }
+        *slot = Some(Shortfall {
+            refused,
+            ..shortfall
+        });
+        Some(MemoryError::Capacity {
+            requested: shortfall.need,
+            available: headroom,
+        })
+    }
+
+    /// The slot for `command`'s shortfall: its own, an empty one, or the one
+    /// its tag picks.
+    fn shortfall_slot(&mut self, command: u8) -> Option<&mut Option<Shortfall>> {
+        let at = self
+            .shortfalls
+            .iter()
+            .position(|slot| slot.is_some_and(|shortfall| shortfall.command == command))
+            .or_else(|| self.shortfalls.iter().position(Option::is_none))
+            .unwrap_or_else(|| usize::from(command).checked_rem(SHORTFALLS).unwrap_or(0));
+        self.shortfalls.get_mut(at)
+    }
+
+    /// Prepares a frame by `prepare` where [`Self::refuse_when_full`] does not
+    /// refuse it. A fresh request the owner's budget then refuses leaves its
+    /// [`Shortfall`]; one of its command, its frame as large, prepared ends it.
+    fn admit_frame(
+        &mut self,
+        context: NativeContext,
+        bytes: &[u8],
+        prepare: impl FnOnce(&mut Self) -> Result<NativeStaging, NativeOwnerError>,
+    ) -> Result<NativeStaging, NativeOwnerError> {
+        self.refuse_when_full(context, bytes)?;
+        let budget = &self.core.state.budget;
+        let before = Before {
+            refusals: budget.refusals().count,
+            ordinary: budget.headroom(BudgetLane::Ordinary),
+            completion: budget.headroom(BudgetLane::Completion),
+        };
+        let result = prepare(self);
+        match &result {
+            Ok(NativeStaging::Prepared { .. }) => {
+                if let Some(command) = command(bytes)
+                    && let Some(slot) = self.shortfalls.iter_mut().find(|slot| {
+                        slot.is_some_and(|shortfall| {
+                            shortfall.command == command && bytes.len() >= shortfall.frame_bytes
+                        })
+                    })
+                {
+                    *slot = None;
+                }
+            }
+            Ok(NativeStaging::Existing { .. }) => {}
+            Err(error) => self.note_shortfall(bytes, before, error),
+        }
+        result
+    }
+
+    /// Leaves the [`Shortfall`] of a fresh request whose preparation the
+    /// owner's own budget refused: the refusal its error reports is the one
+    /// the budget has counted since `before`, not another bound that reports
+    /// capacity, and the headroom it found is its lane's.
+    fn note_shortfall(&mut self, bytes: &[u8], before: Before, error: &NativeOwnerError) {
+        let NativeOwnerError::Native(NativeError::Memory(MemoryError::Capacity {
+            requested,
+            available,
+        })) = error
+        else {
+            return;
+        };
+        let refused = self.core.state.budget.refusals();
+        if refused.count == before.refusals
+            || refused.requested != *requested
+            || refused.available != *available
+        {
+            return;
+        }
+        let Some(command) = command(bytes) else {
+            return;
+        };
+        let headroom = match refused.lane {
+            BudgetLane::Ordinary => before.ordinary,
+            BudgetLane::Completion => before.completion,
+        };
+        let Some(slot) = self.shortfall_slot(command) else {
+            return;
+        };
+        // Refused again while short: the next probe waits twice as long.
+        let probe = match *slot {
+            Some(shortfall) if shortfall.command == command => {
+                shortfall.probe.saturating_mul(2).min(SHORTFALL_PROBE_MAX)
+            }
+            _ => SHORTFALL_PROBE,
+        };
+        *slot = Some(Shortfall {
+            command,
+            frame_bytes: bytes.len(),
+            lane: refused.lane,
+            need: headroom.saturating_add(requested.saturating_sub(*available)),
+            refused: 0,
+            probe,
+        });
     }
 
     /// Decode a complete borrowed actor frame with cumulative input work limits.
@@ -83,17 +285,18 @@ impl NativeOwner {
         limits: NativeDecodeLimits,
         evidence: Option<&VerifiedNativeArtifact>,
     ) -> Result<NativeStaging, NativeOwnerError> {
-        self.refuse_when_full(context, bytes)?;
-        let ledger = self.core.state.ledger;
-        let profile = self.core.state.profile;
-        limits.with_header_check(
-            self.core.limits,
-            bytes,
-            |header| check_frame_header(context, ledger, profile, header),
-            |input, quote| {
-                self.prepare_decoded(context, input, quote.construction.total()?, evidence)
-            },
-        )?
+        self.admit_frame(context, bytes, |owner| {
+            let ledger = owner.core.state.ledger;
+            let profile = owner.core.state.profile;
+            limits.with_header_check(
+                owner.core.limits,
+                bytes,
+                |header| check_frame_header(context, ledger, profile, header),
+                |input, quote| {
+                    owner.prepare_decoded(context, input, quote.construction.total()?, evidence)
+                },
+            )?
+        })
     }
 
     #[allow(clippy::too_many_arguments)] // Same custody boundary as decoded ingress.
@@ -106,24 +309,25 @@ impl NativeOwner {
         inline_domain: ContentDomainId,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
-        self.refuse_when_full(context, bytes)?;
-        let ledger = self.core.state.ledger;
-        let profile = self.core.state.profile;
-        limits.with_header_check(
-            self.core.limits,
-            bytes,
-            |header| check_frame_header(context, ledger, profile, header),
-            |input, quote| {
-                self.prepare_decoded_with_custody(
-                    context,
-                    input,
-                    quote.construction.total()?,
-                    store,
-                    inline_domain,
-                    schemas,
-                )
-            },
-        )?
+        self.admit_frame(context, bytes, |owner| {
+            let ledger = owner.core.state.ledger;
+            let profile = owner.core.state.profile;
+            limits.with_header_check(
+                owner.core.limits,
+                bytes,
+                |header| check_frame_header(context, ledger, profile, header),
+                |input, quote| {
+                    owner.prepare_decoded_with_custody(
+                        context,
+                        input,
+                        quote.construction.total()?,
+                        store,
+                        inline_domain,
+                        schemas,
+                    )
+                },
+            )?
+        })
     }
 
     pub fn prepare_frame_evidenced_with_schemas(
@@ -134,23 +338,24 @@ impl NativeOwner {
         evidence: Option<&VerifiedNativeArtifact>,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
-        self.refuse_when_full(context, bytes)?;
-        let ledger = self.core.state.ledger;
-        let profile = self.core.state.profile;
-        limits.with_header_check(
-            self.core.limits,
-            bytes,
-            |header| check_frame_header(context, ledger, profile, header),
-            |input, quote| {
-                self.prepare_decoded_evidenced_with_schemas(
-                    context,
-                    input,
-                    quote.construction.total()?,
-                    evidence,
-                    schemas,
-                )
-            },
-        )?
+        self.admit_frame(context, bytes, |owner| {
+            let ledger = owner.core.state.ledger;
+            let profile = owner.core.state.profile;
+            limits.with_header_check(
+                owner.core.limits,
+                bytes,
+                |header| check_frame_header(context, ledger, profile, header),
+                |input, quote| {
+                    owner.prepare_decoded_evidenced_with_schemas(
+                        context,
+                        input,
+                        quote.construction.total()?,
+                        evidence,
+                        schemas,
+                    )
+                },
+            )?
+        })
     }
 
     /// Stage a complete decoded actor command. Variable fields stay borrowed
