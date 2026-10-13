@@ -694,5 +694,6 @@ pub(super) fn install(
         // A replay is published at once, never held in a chain.
         _index: None,
         events,
+        retire: None,
     })
 }

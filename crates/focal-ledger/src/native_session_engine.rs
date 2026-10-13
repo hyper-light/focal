@@ -465,6 +465,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn seal_rule(&self) -> super::SealRule {
         self.limits.seal_rule
     }
+    /// How this session's authority retires (doc 31 M2).
+    pub(crate) fn retire_rule(&self) -> super::RetireRule {
+        self.limits.retire_rule
+    }
     /// A seal held for the drain or in flight: the archive agent looks
     /// again soon rather than at its next tick.
     pub(crate) fn seal_busy(&self) -> bool {
@@ -1206,6 +1210,41 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             ContentDomainId,
         ) -> Result<NativeStaging, NativeOwnerError>,
     ) -> Result<NativeSubmission, NativeSessionError> {
+        let ((), submission) = self.admit_with(consensus, |owner, schemas, domain| {
+            prepare(owner, schemas, domain).map(|staged| ((), Some(staged)))
+        })?;
+        submission.ok_or(NativeSessionError::Failed)
+    }
+    /// Retire the families `offers` name as the leader's next candidate (doc 31 M2), admitted
+    /// as any write is, so it takes its place among them: what the owner made of the offers,
+    /// and the batch's submission, none when nothing retires.
+    pub(crate) fn retire(
+        &mut self,
+        consensus: &mut DurableNode,
+        offers: &[focal_core::native::retirement_batch::RetireOffer],
+    ) -> Result<
+        (
+            focal_core::native::retirement_batch::RetireBatch,
+            Option<NativeSubmission>,
+        ),
+        NativeSessionError,
+    > {
+        if self.limits.retire_rule != super::RetireRule::Pipeline {
+            return Err(NativeSessionError::RetireExact);
+        }
+        self.admit_with(consensus, |owner, _, _| owner.prepare_retirement(offers))
+    }
+    /// Admit what `prepare` makes of the owner, a candidate or none, as a write is: every gate a
+    /// write meets, the movement's fence, the session's room, and the submission.
+    fn admit_with<T>(
+        &mut self,
+        consensus: &mut DurableNode,
+        prepare: impl FnOnce(
+            &mut NativeOwner,
+            &S,
+            ContentDomainId,
+        ) -> Result<(T, Option<NativeStaging>), NativeOwnerError>,
+    ) -> Result<(T, Option<NativeSubmission>), NativeSessionError> {
         let status = consensus.scalars();
         self.require_authority(&status)?;
         if self.layout_change.is_some() {
@@ -1229,7 +1268,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         let owner: &mut NativeOwner = owner;
         // An exact retry never needs a fresh slot, so the owner looks it up first
         // and refuses fresh work itself when its own queue is full.
-        let staged = prepare(owner, &self.schemas, domain)?;
+        let (made, staged) = prepare(owner, &self.schemas, domain)?;
+        let Some(staged) = staged else {
+            return Ok((made, None));
+        };
         // Between a transfer's barrier and its activation nothing lands on a
         // moving member (25 §6): the fresh candidate is discarded and the
         // caller retries after activation.
@@ -1287,7 +1329,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if matches!(submission, NativeSubmission::Pending { .. }) {
             self.note_pressure()?;
         }
-        Ok(submission)
+        Ok((made, Some(submission)))
     }
     /// After a fresh admission under `SealRule::Anchored` (F12): once the
     /// committed and pending resident outcomes reach where the pressure rule

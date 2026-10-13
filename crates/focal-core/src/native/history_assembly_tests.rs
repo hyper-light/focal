@@ -160,6 +160,7 @@ fn publish(core: &mut Core<NativeState>, staged: Staged) -> (NativeOutcome, Vec<
         encoded_removed: removed.bytes(),
         _index: None,
         events: None,
+        retire: None,
     })
     .unwrap();
     assert_eq!(fixture::events(core, outcome), facts);

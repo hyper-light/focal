@@ -34,6 +34,29 @@ pub enum Transport {
     Enrolled,
 }
 
+/// What becomes of each claim after its creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lifecycle {
+    /// Created and left open: the comparison's workload.
+    #[default]
+    Create,
+    /// Created, cancelled by its issuer, then its scope released: terminal
+    /// and released, so it may retire (26 §4, doc 31 M2). Each later step
+    /// reads the claim first, as an agent resolves what it binds to, and is
+    /// sent once the step before it committed.
+    CancelRelease,
+}
+impl Lifecycle {
+    /// The writes one claim's lifecycle takes.
+    pub fn steps(self) -> u8 {
+        match self {
+            Self::Create => 1,
+            Self::CancelRelease => 3,
+        }
+    }
+}
+
 /// The native content profile the request frames are encoded for. It must be
 /// the profile the ledger was activated with: the embedded node is activated
 /// by this tool (`projection_only` unless the shape says otherwise); a node
@@ -109,6 +132,15 @@ pub struct WorkloadShape {
     /// (docs/qualification/competitive-p99.md). Zero (the default) measures all.
     #[serde(default)]
     pub warmup_ms: u64,
+    /// What becomes of each claim after its creation (default `create`: left
+    /// open). Every step of a lifecycle counts as a write; `claims` and `rate`
+    /// count lifecycles, each started at its place on the schedule.
+    #[serde(default)]
+    pub lifecycle: Lifecycle,
+    /// The most of one caller's lifecycle reads under way at once (default 1): each read waits
+    /// for its claim's step to commit, so at a caller's write depth they run beside its writes.
+    #[serde(default = "default_lifecycle_reads")]
+    pub lifecycle_reads: u16,
     /// `embedded` only: after the run, close the node and reopen the same
     /// directory, timing exec-to-serving and the first linearizable read —
     /// single-node recovery at exactly this run's retained size.
@@ -123,6 +155,9 @@ fn default_concurrency() -> u16 {
     1
 }
 fn default_inflight() -> u16 {
+    1
+}
+fn default_lifecycle_reads() -> u16 {
     1
 }
 
@@ -148,6 +183,9 @@ impl WorkloadShape {
         }
         if self.inflight == 0 || self.inflight > MAX_INFLIGHT {
             return Err(format!("inflight must be 1..={MAX_INFLIGHT}"));
+        }
+        if self.lifecycle_reads == 0 || self.lifecycle_reads > self.inflight {
+            return Err("lifecycle_reads must be 1..=inflight".to_string());
         }
         // The seed sits above bit 40 of the id space; a larger one would fold
         // onto another seed's identities.

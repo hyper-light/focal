@@ -22,6 +22,18 @@ use std::{
     time::Duration,
 };
 
+std::thread_local! {
+    /// The capability level this test's nodes and commands announce: the compiled level, or a
+    /// lower one through `FOCAL_CAPABILITY_LEVEL` (a cluster founded there holds its fence there).
+    static ANNOUNCED: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+fn announced(command: &mut Command) -> &mut Command {
+    if let Some(level) = ANNOUNCED.with(std::cell::Cell::get) {
+        command.env("FOCAL_CAPABILITY_LEVEL", level);
+    }
+    command
+}
+
 struct Server(Child);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -66,7 +78,7 @@ fn start(root: &Path, advertise: &str) -> Server {
     deadline::observe(root);
     // Four rows per member: the balancer splits the group while the
     // workflow runs (doc 25 §8), so every step below runs across a reshape.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
+    let mut child = announced(&mut Command::new(env!("CARGO_BIN_EXE_focal")))
         .args([
             "--data-dir",
             root.to_str().unwrap(),
@@ -110,6 +122,7 @@ fn start(root: &Path, advertise: &str) -> Server {
 }
 fn run(root: &Path, context: Option<&str>, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
+    announced(&mut command);
     command.args(["--data-dir", root.to_str().unwrap()]);
     if let Some(context) = context {
         command.args(["--client-context", context]);
@@ -228,6 +241,17 @@ fn archived(page: &Value, continuation: &Value) -> Vec<Value> {
 
 #[test]
 fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept() {
+    retire_and_read(None);
+}
+/// Below the retirement fence (a cluster founded by a binary announcing level 5, the level before
+/// `RETIRE_LEVEL`) the agent retires a family at a time, as a cluster with a binary that cannot
+/// read a batch must, and the family is read alike.
+#[test]
+fn below_the_retirement_fence_a_family_retires_alone_and_is_read_alike() {
+    retire_and_read(Some("5"));
+}
+fn retire_and_read(level: Option<&'static str>) {
+    ANNOUNCED.with(|announced| announced.set(level));
     let founder = scratch("focal-archive-");
     let client = scratch("focal-archive-client-");
     private(founder.path());

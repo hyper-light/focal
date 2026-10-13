@@ -271,6 +271,7 @@ fn with_seals(
             encoded_removed: removed.bytes(),
             _index: None,
             events: None,
+            retire: None,
         },
         ReportAdvance { key, before, usage },
         seals,

@@ -16,6 +16,7 @@ fn sample(start: u128, delay: u128, latency: u128, outcome: WriteOutcome) -> Wri
         } else {
             RefusalCause::None
         },
+        step: 0,
     }
 }
 
@@ -70,6 +71,7 @@ fn csv_preserves_identity_outcome_and_both_time_origins() {
     later.attempt = 1;
     later.epoch = RequestEpoch(4);
     later.request = 5;
+    later.step = 2;
     let samples = [
         later,
         sample(100, 5, 25, WriteOutcome::Committed),
@@ -81,11 +83,11 @@ fn csv_preserves_identity_outcome_and_both_time_origins() {
     assert_eq!(lines.len(), 3);
     assert_eq!(
         lines[1],
-        "0,25,5,25,0,1,0,1,00000000000000000000000000000064,committed,100,1000000,"
+        "0,25,5,25,0,1,0,1,00000000000000000000000000000064,committed,100,1000000,,0"
     );
     assert_eq!(
         lines[2],
-        "20,20,30,40,2,3,1,4,00000000000000000000000000000005,refused,120,1000000,owner_memory"
+        "20,20,30,40,2,3,1,4,00000000000000000000000000000005,refused,120,1000000,owner_memory,2"
     );
-    assert!(lines[0].ends_with(",refusal"));
+    assert!(lines[0].ends_with(",refusal,step"));
 }

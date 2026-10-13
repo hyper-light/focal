@@ -55,6 +55,9 @@ fn bundle_of(
     root: ClaimId,
 ) -> (RetirementFamily, ContentHash, u64, SessionSeq) {
     let family = core.retirement_family(root).unwrap();
+    // Every family the tests build digests whole, every key it takes written as a record
+    // writes it (doc 31 M2): a batch's offer names it so.
+    super::retirement_batch::family_digest(core.state.ledger, &family).unwrap();
     let through = core.native_sequence();
     let quote = core
         .archive_family_quote(&family, through, limits())

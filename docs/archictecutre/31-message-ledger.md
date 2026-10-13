@@ -382,6 +382,70 @@ Each stage lands on its own, measured:
    - The cold store starts as per-partition segment files with a sorted index, and moves to the
      STBε engine in M7.
    - Measure: hours of steady state with claims completing, memory flat.
+   - **What retirement did, read from the code** (to be confirmed under a lifecycle load):
+     - **A retirement was a session decision of its own.** A record named one family, its
+       bundle and the prefix it was derived at. It applied only at exactly that prefix, so any
+       write committed while the bundle went under custody left the record inert on every
+       replica. Under steady writes, nothing retired.
+     - **It stopped the pipeline.** The authority proposed only with nothing pending,
+       admission refused writes (`Retiring`) until the record committed, and applying the
+       record discarded the authority's candidates and rebuilt its owner, a walk of every row.
+     - **It was slow by construction.** One family per replica per 5-second tick.
+     - **Deriving a family walked every event the session held**, since events leave the core
+       only with their family: about 67 ns an event, 4.4 ms with 32,768 open claims.
+   - **First step, as built (A1).**
+     - **The event index.** A family's events are read from an index of each object's events,
+       a funded B-tree set that is never encoded. It is built from the rows at restore, kept as
+       each publication commits, and let go whole wherever it cannot be kept exactly, after
+       which a walk finds the same family.
+       - Measured: 3.6 µs a derivation with 32,768 open claims, against 4.4 ms by the walk.
+     - **Retirement in the owner's pipeline** (`retirement_batch.rs`).
+       - The owner prepares a batch of up to 64 families as one candidate at its chain's
+         sequence, admitted as a write is, among the writes around it.
+       - Each family is derived from the committed rows and deferred where a pending
+         candidate changes a row its derivation read. An eligible family's rows cannot
+         change, so the chain derives the same family.
+       - Its record (`FCRETIRE`) carries each family's root and bundle, never its rows: 56
+         bytes a family.
+       - Every replica derives the families at the record's place and checks them against the
+         batch's digest, the outcome's intent. A replica that cannot match them fails closed
+         as diverged.
+       - No exact prefix is needed, no admission held, no pipeline drained, no owner rebuilt.
+     - **The archive agent** seals each eligible family's bundle under custody as before. It
+       offers each with the digest of the family the bundle holds, so a bundle never stands
+       for other rows, and retires them a batch at a time. A batch that filled sends the agent
+       on at once rather than at the next tick.
+     - **Behind the upgrade fence.** A binary below `RETIRE_LEVEL` (6) cannot read `FCRETIRE`
+       records.
+       - A node takes its sessions' rule from the fence it last recorded, as it does the
+         seal rule.
+       - Below the fence the engine refuses a batch by name (`RetireExact`), and the agent
+         retires a family at a time as before (`FOCALRT1`).
+       - Every binary at the level applies both kinds of record.
+     - **Measured under a lifecycle load.** Three local nodes ran 100 lifecycles a second for
+       40 s: each lifecycle creates a claim, cancels it, releases it and reads it, and the
+       nodes retire at once (`FOCAL_RETIRE_AFTER_MS=0`).
+       - Before (1701678): 6,731 committed, p99 842 ms, no family retired.
+       - After: 13,365 committed, p99 337 ms. Families retire among the writes: 26 on the
+         leader in the window.
+       - Two defects stood in the way first, both now fixed:
+         - Every native read reserved 32 times the client's frame for as long as it waited.
+         - Custody charged every export the manifest's bound (4 MiB), kept for a minute.
+           That filled the content budget, and the archive's replication was refused.
+       - **What the run proves: per-family custody cannot keep pace.** Retirement ran at
+         about 0.6 families a second against 100 arriving, so resident outcomes still grew
+         linearly (12,146 at the end).
+         - Each family is a custody object: it is sealed on the leader, then pushed to and
+           sealed on each peer. That is about twelve fsyncs across three nodes.
+         - Timed, it is 230 ms a family on an idle machine and about 1 s under the write
+           load.
+         - Concurrency would not change the order of magnitude: the flushes are the cost.
+     - **Next (A2).** The local cold store replaces custody bundles for retirement, and stubs
+       leave memory (the design follows).
+       - A replica applies a retirement record by writing the families to its own cold
+         stream, deterministically and in the background.
+       - Its durability joins the checkpoint the log already waits for.
+       - No seal, no transfer and no fsync is made per family.
 3. **M3, the claim table.**
    - SwissTable index, slot chunks and log-resident payloads for the claim families, replacing
      the row store for live claims.

@@ -162,10 +162,16 @@ impl EmbeddedNode {
         )?;
         let limits = crate::memory_envelope::found_limits(root, settings, &consensus)?;
         // An embedded node is its own cluster: the level its binary announces is its fence.
-        let rule = if crate::upgrade::announced_level() >= crate::upgrade::SEAL_LEVEL {
+        let level = crate::upgrade::announced_level();
+        let rule = if level >= crate::upgrade::SEAL_LEVEL {
             focal_ledger::SealRule::Anchored
         } else {
             focal_ledger::SealRule::Derived
+        };
+        let retire = if level >= crate::upgrade::RETIRE_LEVEL {
+            focal_ledger::RetireRule::Pipeline
+        } else {
+            focal_ledger::RetireRule::Exact
         };
         let hosting = crate::network_service::native_hosting(
             root,
@@ -173,6 +179,7 @@ impl EmbeddedNode {
             wal.disk_budget(),
             &limits,
             rule,
+            retire,
         )?;
         let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;
         session.campaign()?;

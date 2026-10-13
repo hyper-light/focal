@@ -1705,6 +1705,7 @@ impl<'a> Fresh<'a> {
                 encoded_removed,
                 _index: Some(index),
                 events,
+                retire: None,
             },
             seals,
             allocation,

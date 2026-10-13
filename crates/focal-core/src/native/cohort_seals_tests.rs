@@ -169,6 +169,7 @@ fn publish(core: &mut Core<NativeState>, changes: SealedChanges) -> NativeOutcom
         encoded_removed: removed.bytes(),
         _index: None,
         events: None,
+        retire: None,
     })
     .unwrap()
 }

@@ -96,6 +96,19 @@ pub fn seal_rule(root: &Path) -> Result<focal_ledger::SealRule, NodeError> {
     )
 }
 
+/// How the sessions a node hosts retire (doc 31 M2): in batches among their writes once the fence
+/// it last knew opens `RETIRE_LEVEL`, as a node founded there does from its first start; a family
+/// at a time below it. Read as each session's hosting is built, as [`seal_rule`] is.
+pub fn retire_rule(root: &Path) -> Result<focal_ledger::RetireRule, NodeError> {
+    Ok(
+        if known(root)?.is_some_and(|level| level >= crate::upgrade::RETIRE_LEVEL) {
+            focal_ledger::RetireRule::Pipeline
+        } else {
+            focal_ledger::RetireRule::Exact
+        },
+    )
+}
+
 #[cfg(test)]
 #[cfg_attr(
     test,

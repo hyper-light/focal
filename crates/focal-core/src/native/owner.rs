@@ -775,6 +775,106 @@ impl NativeOwner {
         )
     }
 
+    /// Prepare the retirement of the families `offers` name as the next candidate
+    /// (doc 31 M2): planned on the chain as it stands and ordered with every write
+    /// before and after it, so nothing waits for it and it waits for nothing. A
+    /// family a pending candidate touches is deferred and a refused one says why;
+    /// with none to retire, no candidate is made. It publishes as any candidate does
+    /// once durable; its record carries its families' roots and bundles, and every
+    /// replica derives the rest.
+    pub fn prepare_retirement(
+        &mut self,
+        offers: &[retirement_batch::RetireOffer],
+    ) -> Result<(retirement_batch::RetireBatch, Option<NativeStaging>), NativeOwnerError> {
+        let room = self.reserve_pending().is_ok();
+        let batch = self.core.plan_retirement_batch(
+            offers,
+            Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),
+        )?;
+        if batch.families.is_empty() {
+            return Ok((batch, None));
+        }
+        if self.faulted {
+            return Err(NativeError::Capacity("completion owner requires reconstruction").into());
+        }
+        if let Err(error) = self.book.check_health() {
+            self.faulted = true;
+            return Err(error.into());
+        }
+        let serial = self
+            .next_serial
+            .checked_add(1)
+            .ok_or(MemoryError::CounterExhausted("native candidate serial"))?;
+        if !room {
+            return Err(NativeError::Capacity("pending candidates").into());
+        }
+        let lane = BudgetLane::Ordinary;
+        let source = View::over(
+            &self.core.state,
+            Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),
+        );
+        let prepared = self.core.prepare_retirement_batch(
+            &source,
+            &batch.families,
+            &self.core.state.budget,
+            lane,
+        )?;
+        let journal = self.book.apply_prepared(
+            &source,
+            &prepared,
+            None,
+            None,
+            &[],
+            JournalFunding::External {
+                source: &self.core.state.budget,
+                lane,
+            },
+        )?;
+        let journal = CandidateJournal::single(journal);
+        let checked = source.with_own(&prepared).and_then(|view| {
+            self.book
+                .check_slots(view.meta(), view.prefix(), prepared.fragments.len())
+                .and_then(|()| self.book.check_serial(serial))
+                .and_then(|()| self.book.check_parents(&view, &prepared))
+                .and_then(|()| self.book.check_graph_growth(&view, &prepared))
+        });
+        let record = match checked {
+            Ok(()) => record_codec::PendingRecord::reserve(
+                &prepared,
+                &self.core.state.budget,
+                lane,
+                self.record_buffers,
+            ),
+            Err(error) => Err(error.into()),
+        };
+        let record = match record {
+            Ok(record) => record,
+            Err(error) => {
+                drop(prepared);
+                if let Err(rollback) = self.book.rollback_candidate(journal) {
+                    self.faulted = true;
+                    return Err(rollback.into());
+                }
+                return Err(error);
+            }
+        };
+        let candidate = NativeCandidate {
+            owner: self.incarnation,
+            serial,
+        };
+        let outcome = prepared.outcome();
+        self.index.add(serial, &prepared.fragments);
+        self.count_pending(&prepared);
+        self.pending.push_back(Pending {
+            candidate,
+            record,
+            prepared,
+            journal,
+        });
+        self.next_serial = serial;
+        Ok((batch, Some(NativeStaging::Prepared { candidate, outcome })))
+    }
+
     /// Check participant authority and the exact pending attempt before touching
     /// evidence storage. Verification and native construction use the same held
     /// owner capacity. Focal verifies submitted evidence; it does not run the

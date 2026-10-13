@@ -142,6 +142,7 @@ pub(crate) fn limits() -> NativeSessionLimits {
         materializer: record::materialize::MaterializerLimits::default(),
         ranges: focal_ranges::RangeLimits::default(),
         seal_rule: SealRule::Derived,
+        retire_rule: RetireRule::Pipeline,
     }
 }
 fn definition(binding: Binding) -> validation::Declaration {

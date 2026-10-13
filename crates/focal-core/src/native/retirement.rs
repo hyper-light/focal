@@ -737,7 +737,7 @@ impl Core<NativeState> {
         Ok(hash)
     }
     /// Unfile every event of `family` from the event index (doc 31 M2).
-    fn unfile_family_events(&mut self, family: &RetirementFamily) {
+    pub(super) fn unfile_family_events(&mut self, family: &RetirementFamily) {
         let NativeState {
             rows,
             events,

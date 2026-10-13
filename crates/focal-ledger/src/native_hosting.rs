@@ -963,6 +963,36 @@ impl Session {
             NativeTimerInput::Monitor(input) => owner.prepare_monitor_deadline(input, logical_time),
         })
     }
+    /// Retire the families `offers` name as the authority's next candidate (doc 31 M2):
+    /// admitted as a write is, among the writes around it, its record carrying the families
+    /// and their bundles. What the owner made of the offers, and the batch's submission, none
+    /// when nothing retires.
+    pub fn native_retire(
+        &mut self,
+        offers: &[focal_core::native::retirement_batch::RetireOffer],
+    ) -> Result<
+        (
+            focal_core::native::retirement_batch::RetireBatch,
+            Option<NativeSubmission>,
+        ),
+        LedgerError,
+    > {
+        self.check()?;
+        if !self.is_authoritative() || self.retained.is_some() {
+            return Err(LedgerError::NotReady {
+                leader: self.scalars().leader_id,
+            });
+        }
+        let engine = self
+            .native
+            .as_deref_mut()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        let retired = engine.retire(&mut self.consensus, offers)?;
+        if engine.failed() {
+            self.failed = true;
+        }
+        Ok(retired)
+    }
     pub fn native_outcome(
         &self,
         request: impl Into<NativeInvocation>,
@@ -1217,6 +1247,11 @@ impl Session {
     /// derives a plan under.
     pub fn native_seal_rule(&self) -> Result<crate::SealRule, LedgerError> {
         Ok(self.native_engine()?.seal_rule())
+    }
+    /// How this session's authority retires (doc 31 M2): a family at a time below the
+    /// upgrade fence, in batches at it.
+    pub fn native_retire_rule(&self) -> Result<crate::RetireRule, LedgerError> {
+        Ok(self.native_engine()?.retire_rule())
     }
     /// Whether a seal is held for the pipeline to drain or in flight (F12).
     pub fn native_seal_busy(&self) -> Result<bool, LedgerError> {

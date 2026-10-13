@@ -1,16 +1,19 @@
 //! The archive agent (26 §4). On every node, for every replica it hosts,
 //! the agent offers terminal, released claims to the committed core; where
 //! this node is the authority and the retention floor has passed a family's
-//! last event, it takes the family's bundle from the core, seals it as
+//! last event, it takes the family's bundle from the core and seals it as
 //! content of the ledger under its current placement with a receipt from
-//! every required copy, and proposes the retirement record. One family per
-//! replica per tick; a family that is not eligible yet, a copy that has not
-//! answered, or a refusal waits for a later tick. The agent holds no state
-//! the records do not: a restart resumes its walk from the status index.
+//! every required copy. The families a walk finds retire in batches, each one
+//! candidate among the authority's writes (doc 31 M2), so retirement keeps
+//! pace with completions and never holds a write; a batch that filled asks
+//! for the next one at once. A family that is not eligible yet, a copy that
+//! has not answered, or a refusal waits for a later walk. The agent holds no
+//! state the records do not: a restart resumes its walk from the status index.
 use crate::fleet::ReplicaHost;
 use crate::network_service::NetworkHandles;
 use focal_client::admin::AdminArchiveAgent;
 use focal_core::native::retirement::RetirementCursor;
+use focal_core::native::retirement_batch::{MAX_RETIRE_FAMILIES, RetireOffer};
 use focal_model::LedgerId;
 use focal_rt::watch;
 use focal_wire::AccessError;
@@ -123,10 +126,10 @@ impl ArchiveAgent {
             return Err(AccessError::Unavailable);
         }
         let mut ticked = std::time::Instant::now();
-        let mut backlog = false;
+        let mut backlog = Backlog::default();
         loop {
             let wait = self.interval.saturating_sub(ticked.elapsed());
-            let wait = if backlog {
+            let wait = if backlog.seals || backlog.retirements {
                 wait.min(BACKLOG_INTERVAL)
             } else {
                 wait
@@ -134,25 +137,28 @@ impl ArchiveAgent {
             focal_rt::time::sleep(wait)
                 .await
                 .map_err(|_| AccessError::Unavailable)?;
-            if ticked.elapsed() >= self.interval {
+            // A batch of retirements that filled means more are ready: the
+            // walk goes on at once rather than at the next interval.
+            if ticked.elapsed() >= self.interval || backlog.retirements {
                 backlog = self.tick(handles).await;
                 ticked = std::time::Instant::now();
             } else {
-                backlog = self.seal_round(handles).await;
+                backlog.seals = self.seal_round(handles).await;
             }
         }
     }
-    /// One pass over the replicas this node hosts; whether a seal is held,
-    /// in flight or was just proposed on any of them.
-    pub async fn tick(&mut self, handles: &NetworkHandles) -> bool {
+    /// One pass over the replicas this node hosts: whether a seal is held, in
+    /// flight or was just proposed on any of them, and whether a batch of
+    /// retirements filled on any.
+    pub async fn tick(&mut self, handles: &NetworkHandles) -> Backlog {
         let mut after = None;
-        let mut backlog = false;
+        let mut backlog = Backlog::default();
         while let Some((ledger, host)) = handles.fleet.next_host(after) {
             after = Some(ledger);
             // A replica that is not native, not authoritative, or refuses
             // the walk simply waits for a later tick.
-            let _ = self.step(ledger, &host, handles).await;
-            backlog |= self
+            backlog.retirements |= self.step(ledger, &host, handles).await.unwrap_or(false);
+            backlog.seals |= self
                 .seal_step(ledger, &host, handles)
                 .await
                 .unwrap_or(false);
@@ -236,12 +242,16 @@ impl ArchiveAgent {
         self.seals_proposed = self.seals_proposed.saturating_add(1);
         Ok(true)
     }
+    /// One walk of the replica's status index: every eligible family it
+    /// finds sealed under custody and retired, a batch at a time, each batch
+    /// one candidate among the authority's writes (doc 31 M2). Whether a batch
+    /// filled: more may be ready at once.
     async fn step(
         &mut self,
         ledger: LedgerId,
         host: &ReplicaHost,
         handles: &NetworkHandles,
-    ) -> Result<(), AccessError> {
+    ) -> Result<bool, AccessError> {
         let cursor = self.cursors.get(&ledger).copied().flatten();
         let candidates = host
             .retirement_candidates(cursor, VISITS_PER_TICK)
@@ -251,6 +261,15 @@ impl ArchiveAgent {
             self.cursors.clear();
         }
         self.cursors.insert(ledger, candidates.next);
+        let rule = host
+            .retire_rule()
+            .await
+            .map_err(|_| AccessError::Unavailable)?;
+        let mut offers = Vec::new();
+        offers
+            .try_reserve_exact(MAX_RETIRE_FAMILIES)
+            .map_err(|_| AccessError::Capacity)?;
+        let mut full = false;
         for root in candidates.claims {
             let Some(archived) = host
                 .archive_family(root, self.grace_ms)
@@ -261,6 +280,7 @@ impl ArchiveAgent {
             };
             let crate::fleet::ArchivedFamily {
                 bundle,
+                family,
                 through,
                 _allocation,
                 ..
@@ -273,25 +293,79 @@ impl ArchiveAgent {
             let route = policy.scope().route_epoch;
             let outcome = handles.evidence.archive(ledger, route, bundle).await?;
             drop(_allocation);
+            let exact = rule == focal_ledger::RetireRule::Exact;
             if !outcome.obligation.satisfied() {
                 // A required copy has not answered with a receipt; the
-                // bundle is sealed and the next tick asks again.
+                // bundle is sealed and the next walk asks again.
                 self.waiting = self.waiting.saturating_add(1);
-                return Ok(());
+                if exact {
+                    return Ok(false);
+                }
+                continue;
             }
-            host.propose_retirement(
+            if exact {
+                // Below the upgrade fence a family retires alone, at the prefix it was derived
+                // at (`FOCALRT1`): a binary there cannot read a batch.
+                host.propose_retirement(
+                    root,
+                    outcome.reference.root,
+                    outcome.reference.length,
+                    through,
+                )
+                .await
+                .map_err(|_| AccessError::Unavailable)?;
+                self.proposed = self.proposed.saturating_add(1);
+                return Ok(false);
+            }
+            // Within the capacity reserved above: a full batch is retired
+            // before another offer is taken.
+            offers.push(RetireOffer {
                 root,
-                outcome.reference.root,
-                outcome.reference.length,
-                through,
-            )
+                family,
+                bundle: outcome.reference.root,
+                bytes: outcome.reference.length,
+            });
+            if offers.len() == MAX_RETIRE_FAMILIES {
+                full = true;
+                self.retire_batch(host, &mut offers).await?;
+            }
+        }
+        if !offers.is_empty() {
+            self.retire_batch(host, &mut offers).await?;
+        }
+        Ok(full)
+    }
+    /// Retire `offers` as one batch, leaving them empty for the next.
+    async fn retire_batch(
+        &mut self,
+        host: &ReplicaHost,
+        offers: &mut Vec<RetireOffer>,
+    ) -> Result<(), AccessError> {
+        let batch = host
+            .retire(std::mem::take(offers))
             .await
             .map_err(|_| AccessError::Unavailable)?;
-            self.proposed = self.proposed.saturating_add(1);
-            return Ok(());
-        }
+        offers
+            .try_reserve_exact(MAX_RETIRE_FAMILIES)
+            .map_err(|_| AccessError::Capacity)?;
+        self.proposed = self
+            .proposed
+            .saturating_add(u64::try_from(batch.families.len()).unwrap_or(u64::MAX));
+        self.waiting = self.waiting.saturating_add(
+            u64::try_from(batch.deferred.len().saturating_add(batch.refused.len()))
+                .unwrap_or(u64::MAX),
+        );
         Ok(())
     }
+}
+
+/// What a pass of the agent left to do before its next interval.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Backlog {
+    /// A seal is held, in flight or was just proposed (F12).
+    pub seals: bool,
+    /// A batch of retirements filled: more may be ready (doc 31 M2).
+    pub retirements: bool,
 }
 
 /// The interval and grace from the environment, else the defaults.
@@ -384,6 +458,9 @@ impl EmbeddedArchive {
         }
         Ok(())
     }
+    /// One walk of the status index: every eligible family it finds sealed
+    /// into the node's own store and retired, a batch at a time, each batch one
+    /// candidate among the session's writes (doc 31 M2), polled to commitment.
     fn retire_step(
         &mut self,
         node: &mut crate::embedded::EmbeddedNode,
@@ -394,6 +471,11 @@ impl EmbeddedArchive {
                 .map_err(|error| focal_ledger::LedgerError::Native(error.into()))
         })?;
         self.cursor = candidates.next;
+        let exact = node.session.native_retire_rule()? == focal_ledger::RetireRule::Exact;
+        let mut offers = Vec::new();
+        offers
+            .try_reserve_exact(MAX_RETIRE_FAMILIES)
+            .map_err(|_| crate::embedded::NodeError::Domain("retirement offers".into()))?;
         for root in candidates.claims {
             let Some(archived) =
                 crate::archive_derive::archived_family(&node.session, budget, root, self.grace_ms)?
@@ -402,20 +484,56 @@ impl EmbeddedArchive {
             };
             let crate::fleet::ArchivedFamily {
                 bundle,
+                family,
                 through,
                 _allocation,
                 ..
             } = archived;
             let reference = Self::seal(node, bundle)?;
             drop(_allocation);
-            node.session.native_propose_retirement(
+            if exact {
+                // Below the level it announces a family retires alone, at the prefix it was
+                // derived at (`FOCALRT1`).
+                node.session.native_propose_retirement(
+                    root,
+                    reference.root,
+                    reference.length,
+                    through,
+                )?;
+                self.proposed = self.proposed.saturating_add(1);
+                return Self::settle(node);
+            }
+            // Within the capacity reserved above: a full batch is retired
+            // before another offer is taken.
+            offers.push(RetireOffer {
                 root,
-                reference.root,
-                reference.length,
-                through,
-            )?;
-            self.proposed = self.proposed.saturating_add(1);
-            return Self::settle(node);
+                family,
+                bundle: reference.root,
+                bytes: reference.length,
+            });
+            if offers.len() == MAX_RETIRE_FAMILIES {
+                self.retire_batch(node, &mut offers)?;
+            }
+        }
+        if !offers.is_empty() {
+            self.retire_batch(node, &mut offers)?;
+        }
+        Ok(())
+    }
+    /// Retire `offers` as one batch and poll it to commitment, leaving them
+    /// empty for the next.
+    fn retire_batch(
+        &mut self,
+        node: &mut crate::embedded::EmbeddedNode,
+        offers: &mut Vec<RetireOffer>,
+    ) -> Result<(), crate::embedded::NodeError> {
+        let (batch, submission) = node.session.native_retire(offers)?;
+        offers.clear();
+        self.proposed = self
+            .proposed
+            .saturating_add(u64::try_from(batch.families.len()).unwrap_or(u64::MAX));
+        if submission.is_some() {
+            Self::settle(node)?;
         }
         Ok(())
     }

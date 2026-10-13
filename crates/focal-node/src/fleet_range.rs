@@ -4,6 +4,7 @@
 //! from its committed rows, and the operator's view names every member.
 use super::*;
 use focal_core::native::retirement::{RetirementCandidates, RetirementCursor};
+use focal_core::native::retirement_batch::{RetireBatch, RetireOffer};
 use focal_core::native::seal::{Fold, FoldPlan, SealPlan};
 use focal_core::native::{ContentRootsPage, NativeRowCursor, RetiredClaim};
 use focal_ledger::LedgerRangeVerifier;
@@ -151,6 +152,17 @@ pub(super) enum RangeCall {
         through: SessionSeq,
         reply: OneshotSender<Result<(), LedgerError>>,
     },
+    /// Retire a batch of families as the authority's next candidate, among its writes
+    /// (doc 31 M2).
+    RetireBatch {
+        offers: Vec<RetireOffer>,
+        reply: OneshotSender<Result<RetireBatch, LedgerError>>,
+    },
+    /// How the authority retires: a family at a time below the upgrade fence, in batches at it
+    /// (doc 31 M2).
+    RetireRule {
+        reply: OneshotSender<Result<focal_ledger::RetireRule, LedgerError>>,
+    },
     /// The continuation of a retired claim.
     Retired {
         claim: ClaimId,
@@ -196,6 +208,8 @@ impl RangeCall {
             Self::Candidates { .. } => "range: retirement candidates",
             Self::Archive { .. } => "range: archive family",
             Self::Retire { .. } => "range: retire",
+            Self::RetireBatch { .. } => "range: retire batch",
+            Self::RetireRule { .. } => "range: retire rule",
             Self::Retired { .. } => "range: retired claim",
             Self::SealBundle { .. } => "range: seal bundle",
             Self::Seal { .. } => "range: seal",
@@ -226,6 +240,9 @@ pub struct ArchivedFamily {
     pub through: SessionSeq,
     /// The frame's own digest, verified again wherever the bundle is read.
     pub digest: ContentHash,
+    /// What the family is (`retirement_batch::family_digest`): its batch's owner refuses it
+    /// unless the family it derives is this one (doc 31 M2).
+    pub family: ContentHash,
     pub rows: usize,
     pub bundle: Vec<u8>,
     pub(crate) _allocation: Allocation,
@@ -376,6 +393,17 @@ impl ReplicaHost {
             reply,
         })
         .await
+    }
+    /// Retire the families `offers` name, each under custody already, as the authority's next
+    /// candidate among its writes (doc 31 M2): what its owner made of them.
+    pub async fn retire(&self, offers: Vec<RetireOffer>) -> Result<RetireBatch, LedgerError> {
+        self.range_call(|reply| RangeCall::RetireBatch { offers, reply })
+            .await
+    }
+    /// How the authority retires (doc 31 M2): what the archive agent offers it under.
+    pub async fn retire_rule(&self) -> Result<focal_ledger::RetireRule, LedgerError> {
+        self.range_call(|reply| RangeCall::RetireRule { reply })
+            .await
     }
     /// Propose one family's retirement as a session decision (26 §4).
     pub async fn propose_retirement(
@@ -535,6 +563,16 @@ impl Owner {
                 let result = self
                     .session
                     .native_propose_retirement(root, bundle, bytes, through);
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::RetireBatch { offers, reply } => {
+                let result = self.session.native_retire(&offers).map(|(batch, _)| batch);
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::RetireRule { reply } => {
+                let result = self.session.native_retire_rule();
                 drop(charge);
                 let _ = reply.send(result);
             }

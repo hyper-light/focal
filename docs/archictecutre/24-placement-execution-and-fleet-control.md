@@ -1732,7 +1732,13 @@ a binary below the level cannot read, so a node takes the rule from the
 fence it last recorded (`storage_level::seal_rule`), at its next start once
 the fence rose while it ran, and every binary at the level applies the
 records of both rules meanwhile; an embedded node, its own cluster, takes it
-from the level it announces. A cluster founded by a binary holds the fence at the level
+from the level it announces. Sessions retire in batches among their writes
+from level 6 (`upgrade::RETIRE_LEVEL`; 31 M2): the `FCRETIRE` records are ones
+a binary below the level cannot read, so a node takes the rule from the fence
+it last recorded (`storage_level::retire_rule`) as it does the seal rule, the
+engine refuses a batch under the rule below it (`RetireExact`), and the agent
+there retires a family at a time (`FOCALRT1`); every binary at the level
+applies both. A cluster founded by a binary holds the fence at the level
 its founder *announces* from genesis (its one node runs it; a founder
 staging a rollout at a lower level founds at that level, never at one it
 would refuse to serve under), so what the fence gates is open to a fresh

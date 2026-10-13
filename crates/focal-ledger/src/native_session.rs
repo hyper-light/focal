@@ -84,6 +84,9 @@ pub struct NativeSessionLimits {
     /// How this session's authority seals (F12): the node sets it from the
     /// fence it knows (`SEAL_LEVEL`); every replica applies both records.
     pub seal_rule: SealRule,
+    /// How this session's authority retires (doc 31 M2): the node sets it from the fence it
+    /// knows (`RETIRE_LEVEL`); every replica applies both records.
+    pub retire_rule: RetireRule,
 }
 /// How an authority seals the closed outcomes of its live window (F12).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -99,6 +102,18 @@ pub enum SealRule {
     /// the window comes under pressure, through a closing seal; a seal waits
     /// for the pipeline to drain instead of being refused for it.
     Anchored,
+}
+/// How an authority retires families (doc 31 M2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RetireRule {
+    /// One family at a time, as a session decision at the exact prefix it was derived at
+    /// (`FOCALRT1`): what a node runs below the fence's `RETIRE_LEVEL`, whose binaries cannot
+    /// read a batch.
+    #[default]
+    Exact,
+    /// Batches of families as candidates among the writes (`FCRETIRE`), derived and checked by
+    /// every replica where they apply.
+    Pipeline,
 }
 /// What the materializer has done since this session opened.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -265,6 +280,7 @@ impl NativeSessionLimits {
             materializer: record::materialize::MaterializerLimits::default(),
             ranges: focal_ranges::RangeLimits::default(),
             seal_rule: SealRule::Derived,
+            retire_rule: RetireRule::Exact,
         }
     }
 }
@@ -335,6 +351,13 @@ pub enum NativeSessionError {
     Range(focal_ranges::RangeError),
     #[error("a committed retirement is in flight; propose again once it applies")]
     Retiring,
+    /// A batch of retirements asked of an authority that retires a family at a time
+    /// ([`RetireRule::Exact`]): its cluster's fence has not opened `RETIRE_LEVEL`, so a binary
+    /// in it may be one that cannot read a batch.
+    #[error(
+        "retirement batches wait for the upgrade fence; this session retires a family at a time"
+    )]
+    RetireExact,
     #[error("a committed seal is in flight; propose again once it applies")]
     Sealing,
     #[error("seal refused: {0:?}")]
@@ -397,7 +420,7 @@ impl NativeSessionError {
             | Self::Retiring
             | Self::Sealing
             | Self::RangeMoving => Retryable,
-            Self::Retirement(_) | Self::Seal(_) => Request,
+            Self::Retirement(_) | Self::Seal(_) | Self::RetireExact => Request,
             Self::Range(
                 focal_ranges::RangeError::Capacity | focal_ranges::RangeError::Memory(_),
             ) => Retryable,
@@ -1095,6 +1118,21 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
             .admit(&mut self.consensus, |owner, schemas, domain| {
                 owner.prepare_frame_with_custody(context, frame, limits, store, domain, schemas)
             })
+    }
+    /// Retire the families `offers` name as the leader's next candidate (doc 31 M2), among
+    /// the writes around it: what the owner made of the offers, and the batch's submission,
+    /// none when nothing retires.
+    pub fn retire(
+        &mut self,
+        offers: &[focal_core::native::retirement_batch::RetireOffer],
+    ) -> Result<
+        (
+            focal_core::native::retirement_batch::RetireBatch,
+            Option<NativeSubmission>,
+        ),
+        NativeSessionError,
+    > {
+        self.engine.retire(&mut self.consensus, offers)
     }
     /// Trusted timer delivery from the host's clock. Participants cannot reach
     /// this path; the owner deduplicates exact firings through the outcome row.

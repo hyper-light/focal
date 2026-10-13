@@ -246,6 +246,7 @@ fn altered(
         encoded_removed: removed.bytes(),
         _index: None,
         events: None,
+        retire: None,
     }
 }
 

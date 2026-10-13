@@ -74,6 +74,8 @@ pub struct WriteSample {
     pub request: u128,
     pub outcome: WriteOutcome,
     pub refusal: RefusalCause,
+    /// The step of the claim's lifecycle the write is (0: its creation).
+    pub step: u8,
 }
 impl WriteSample {
     pub fn latency_ns(&self) -> u128 {
@@ -254,12 +256,12 @@ fn write_csv<'a>(
     }
     writeln!(
         output,
-        "start_ns,latency_ns,sent_ns,finished_ns,worker,write,attempt,epoch,request,outcome,phase_start_ns,run_start_epoch_ns,refusal"
+        "start_ns,latency_ns,sent_ns,finished_ns,worker,write,attempt,epoch,request,outcome,phase_start_ns,run_start_epoch_ns,refusal,step"
     )?;
     for sample in &ordered.values {
         writeln!(
             output,
-            "{},{},{},{},{},{},{},{},{:032x},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{:032x},{},{},{},{},{}",
             sample.start_ns.saturating_sub(origin),
             sample.latency_ns(),
             sample.sent_ns.saturating_sub(origin),
@@ -272,7 +274,8 @@ fn write_csv<'a>(
             sample.outcome.name(),
             sample.start_ns,
             run_start_epoch_ns,
-            sample.refusal.name()
+            sample.refusal.name(),
+            sample.step
         )?;
     }
     output.flush()?;

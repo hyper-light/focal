@@ -895,6 +895,7 @@ impl NetworkService {
                         storage.disk_budget(),
                         &limits,
                         crate::storage_level::seal_rule(&root)?,
+                        crate::storage_level::retire_rule(&root)?,
                     )
                     .map_err(NodeError::Content)?;
                     Some(Session::from_node_in_hosted(
@@ -2304,12 +2305,14 @@ pub(crate) fn native_hosting(
     disk: focal_memory::DiskBudget,
     session: &SessionLimits,
     seal_rule: focal_ledger::SealRule,
+    retire_rule: focal_ledger::RetireRule,
 ) -> Result<focal_ledger::NativeHosting, focal_evidence::ContentError> {
     let mut limits = native_limits(
         focal_model::ContentDomainId(identity.ledger.tenant.0),
         session.native_memory_bytes(),
     )?;
     limits.seal_rule = seal_rule;
+    limits.retire_rule = retire_rule;
     Ok(focal_ledger::NativeHosting {
         limits,
         reader: focal_evidence::ContentReader::open(root.join("content"))?,

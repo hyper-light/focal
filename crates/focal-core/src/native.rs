@@ -90,9 +90,13 @@ mod responses;
 mod result_owned;
 mod retired_cycles;
 pub mod retirement;
+pub mod retirement_batch;
 pub use epochs::{EpochWindow, OPEN_EPOCHS, OpenEpoch, SealedRange};
 pub mod seal;
 pub use seal::SealRow;
+#[cfg(test)]
+#[path = "native/retirement_batch_tests.rs"]
+mod retirement_batch_tests;
 #[cfg(test)]
 #[path = "native/retirement_tests.rs"]
 mod retirement_tests;
@@ -1466,6 +1470,9 @@ pub struct NativePrepared {
     /// [`event_index::entry_charge`]), funded with the rest of it and handed to
     /// the index as it publishes.
     events: Option<focal_memory::Allocation>,
+    /// A retirement's families and their bundles (doc 31 M2): what its record
+    /// carries in place of its rows, every replica deriving the rest.
+    retire: Option<Vec<retirement_batch::RetiredBundle>>,
 }
 impl std::fmt::Debug for NativePrepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2039,8 +2046,17 @@ impl Core<NativeState> {
             encoded_removed,
             _index,
             events,
+            retire,
         } = prepared;
+        // A retirement's events leave with their families: unfiled while their rows still say
+        // where they are filed (doc 31 M2).
+        if retire.is_some() {
+            self.unfile_deleted_events(&fragments);
+        }
         if let Err((error, fragments)) = self.state.rows.publish_recoverable(fragments) {
+            if retire.is_some() {
+                self.state.events.drop_all();
+            }
             return Err(NativePublishError {
                 error,
                 prepared: fragments.map(|fragments| NativePrepared {
@@ -2051,12 +2067,44 @@ impl Core<NativeState> {
                     encoded_removed,
                     _index,
                     events,
+                    retire,
                 }),
             });
         }
         self.state.encoded_rows = encoded;
         self.file_events(outcome, events);
         Ok(outcome)
+    }
+    /// Unfile every event `fragments` deletes from the event index (doc 31 M2).
+    fn unfile_deleted_events(&mut self, fragments: &ranges::Fragments) {
+        let NativeState {
+            rows,
+            events,
+            ledger,
+            ..
+        } = &mut self.state;
+        for (_, _, change) in fragments.changes() {
+            let focal_memory::Change::Delete(key) = change else {
+                continue;
+            };
+            let Key::Event(sequence, ordinal) = *key else {
+                continue;
+            };
+            if !events.complete() {
+                return;
+            }
+            let event = match rows.get(key) {
+                Some(Row::Event(stored)) => stored.get(*ledger),
+                _ => None,
+            };
+            match event {
+                Some(event) => events.unfile(
+                    event_index::home(event),
+                    event_index::Position { sequence, ordinal },
+                ),
+                None => events.drop_all(),
+            }
+        }
     }
     /// File the events `outcome` published, every one at its sequence, on the charge its
     /// preparation funded (doc 31 M2). A publication not funded for them, or a row that is not

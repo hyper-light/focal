@@ -115,3 +115,60 @@ pub fn create_envelope(
         claim,
     })
 }
+
+/// A later step of a claim's lifecycle (`claim.cancel`, `claim.release_scope`),
+/// compiled against the claim as it was just read (`objects`), as the CLI
+/// compiles it after resolving what it binds to. It mints no identity.
+#[allow(clippy::too_many_arguments)] // One frame's identities, each its own.
+pub fn step_envelope(
+    ledger: LedgerId,
+    profile: NativeContentProfile,
+    actor: ParticipantId,
+    root: RootCommandId,
+    request: RequestKey,
+    operation: &NativeAuthoredOperation,
+    objects: &[focal_wire::NativeObject],
+) -> Result<RequestEnvelope, LoadError> {
+    let context = BuildContext {
+        ledger,
+        actor,
+        root,
+        policy_revision: 1,
+    };
+    let resolved = Resolved::from_objects(ledger, objects).map_err(fixture("resolved objects"))?;
+    let mut ids = || -> Result<[u8; 16], InputError> { Err(InputError::Capacity) };
+    let compiled = compile(
+        operation,
+        &context,
+        request,
+        &mut ids,
+        &resolved,
+        &CompileLimits::default(),
+    )
+    .map_err(fixture("compile"))?;
+    let frame = encode_frame(
+        ledger,
+        profile,
+        &compiled.input,
+        EncodingLimits {
+            bytes: FRAME_BYTES,
+            visits: FRAME_VISITS,
+        },
+    )
+    .map_err(fixture("frame"))?;
+    Ok(RequestEnvelope {
+        protocol: NATIVE_PROTOCOL_VERSION,
+        ledger,
+        route_epoch: RouteEpoch(1),
+        request_epoch: request.epoch,
+        request_id: request.id,
+        operation: Operation::Native { frame },
+    })
+}
+
+/// The document a lifecycle step names its claim by.
+pub fn claim_target(claim: u128) -> focal_client::operations::NativeClaimTargetDocument {
+    focal_client::operations::NativeClaimTargetDocument {
+        claim: hex(claim.to_be_bytes()),
+    }
+}

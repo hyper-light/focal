@@ -1720,6 +1720,8 @@ impl PlacementAgent {
             &limits,
             crate::storage_level::seal_rule(&self.root)
                 .map_err(|error| AgentError::Level(Box::new(error)))?,
+            crate::storage_level::retire_rule(&self.root)
+                .map_err(|error| AgentError::Level(Box::new(error)))?,
         )?;
         let session = Session::from_node_in_hosted(ledger, consensus, limits, tenant, hosting)?;
         // A reopened copy serves the route its log has committed; a fresh copy

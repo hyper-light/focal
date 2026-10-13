@@ -28,6 +28,8 @@ mod read_dispatch;
 mod read_evaluation;
 mod read_events;
 mod read_evidence;
+mod retire;
+pub use retire::{RETIRE_MAGIC, RetireRecord};
 mod read_fields;
 mod read_history;
 mod read_index;
@@ -81,6 +83,19 @@ pub(in crate::native) fn counting_sink(max_bytes: usize, max_visits: usize) -> C
 pub(in crate::native) fn slice_sink(bytes: &mut [u8], max_visits: usize) -> SliceSink<'_> {
     SliceSink::new(bytes, max_visits)
 }
+/// The most bytes one key takes as a record writes it, with room to spare: the widest key, a
+/// result's, is a tag, three identities, a target and two counters.
+const KEY_BYTES: usize = 256;
+/// The most visits writing one key takes: a write a field, each its bytes and one more.
+const KEY_VISITS: usize = 4 * KEY_BYTES;
+/// Feed `key`, as a record writes it, to `hasher`.
+pub(in crate::native) fn hash_key(hasher: &mut blake3::Hasher, key: Key) -> Result<(), CodecError> {
+    let mut buffer = [0u8; KEY_BYTES];
+    let mut sink = slice_sink(&mut buffer, KEY_VISITS);
+    fixed::key(&mut sink, key)?;
+    hasher.update(sink.written());
+    Ok(())
+}
 pub use archive::{ArchiveHeader, StructuralArchive};
 pub use inspect::{
     EncodedRow, InspectionLimits, InspectionQuote, RecordHeader, RecordRows, StructuralRecord,
@@ -126,6 +141,26 @@ impl<'a> EncodingPlan<'a> {
         prepared: &'a NativePrepared,
         limits: EncodingLimits,
     ) -> Result<Self, CodecError> {
+        // A retirement's record carries its families, never its rows (doc 31 M2).
+        if let Some(retired) = prepared.retire.as_deref() {
+            if retired.len() > limits.rows {
+                return Err(CodecError::Capacity);
+            }
+            let mut sink = CountingSink::new(limits.bytes, limits.visits);
+            retire::frame(&mut sink, prepared, retired)?;
+            let hashed = sink.len();
+            digest_visits(&mut sink, hashed)?;
+            sink.write(&[0; 32])?;
+            return Ok(Self {
+                prepared,
+                quote: EncodingQuote {
+                    bytes: sink.len(),
+                    visits: sink.visits_used(),
+                    rows: retired.len(),
+                    hash: ContentHash([0; 32]),
+                },
+            });
+        }
         if prepared.mutation_count() == 0 || prepared.mutation_count() > limits.rows {
             return Err(CodecError::Capacity);
         }
@@ -166,6 +201,20 @@ impl<'a> EncodingPlan<'a> {
             return Err(CodecError::Capacity);
         }
         let mut sink = SliceSink::new(output, self.quote.visits);
+        if let Some(retired) = self.prepared.retire.as_deref() {
+            retire::frame(&mut sink, self.prepared, retired)?;
+            let hashed = sink.len();
+            digest_visits(&mut sink, hashed)?;
+            let mut hash = retire::hasher();
+            hash.update(sink.written());
+            let hash = ContentHash(*hash.finalize().as_bytes());
+            sink.write(&hash.0)?;
+            if sink.len() != self.quote.bytes || sink.visits_used() != self.quote.visits {
+                return Err(CodecError::InvalidTag("retirement record source"));
+            }
+            sink.finish()?;
+            return Ok(hash);
+        }
         frame(&mut sink, self.prepared, |sink, key, value, ledger| {
             let at = sink.len();
             write_count(sink, 0)?;

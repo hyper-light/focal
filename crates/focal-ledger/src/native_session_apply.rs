@@ -710,6 +710,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn is_native_entry(data: &[u8]) -> bool {
         data.starts_with(&genesis::MAGIC)
             || data.starts_with(&record::MAGIC)
+            || data.starts_with(&record::RETIRE_MAGIC)
             || data.starts_with(&range::MAGIC)
             || data.starts_with(&movement::MAGIC)
             || data.starts_with(&retirement::MAGIC)
@@ -803,6 +804,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             self.applied_raft = entry.index;
             return Ok(());
         }
+        if entry.data.starts_with(&record::RETIRE_MAGIC) {
+            if self.genesis.is_none() {
+                return Err(NativeSessionError::Corrupt);
+            }
+            return self.apply_retire_record(entry, output);
+        }
         if !entry.data.starts_with(&record::MAGIC) {
             return Err(NativeSessionError::Legacy);
         }
@@ -829,20 +836,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 && header.range == self.range
         });
         let outcome = if matches {
-            let candidate = self
-                .pending
-                .front()
-                .ok_or(NativeSessionError::Corrupt)?
-                .candidate;
-            let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
-                return Err(NativeSessionError::Corrupt);
-            };
-            let outcome = owner.publish_after_durable(candidate)?;
-            self.pending.pop_front();
-            self.encoded = self.encoded.saturating_sub(1);
-            self.submitted = self.submitted.saturating_sub(1);
-            self.shrink_pending();
-            outcome
+            self.publish_own_head()?
         } else {
             if !self.pending.is_empty() {
                 // A different record at our committed prefix: the whole suffix
@@ -900,6 +894,87 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             record_hash: header.hash,
             outcome,
         });
+        self.applied_raft = entry.index;
+        self.recording_range = Some(header.range);
+        self.recording_term = entry.term;
+        Ok(())
+    }
+    /// Publish this leader's own oldest candidate, which the committed entry carries.
+    fn publish_own_head(&mut self) -> Result<NativeOutcome, NativeSessionError> {
+        let candidate = self
+            .pending
+            .front()
+            .ok_or(NativeSessionError::Corrupt)?
+            .candidate;
+        let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
+            return Err(NativeSessionError::Corrupt);
+        };
+        let outcome = owner.publish_after_durable(candidate)?;
+        self.pending.pop_front();
+        self.encoded = self.encoded.saturating_sub(1);
+        self.submitted = self.submitted.saturating_sub(1);
+        self.shrink_pending();
+        Ok(outcome)
+    }
+    /// Apply a committed retirement batch (doc 31 M2), in Raft order with the native records
+    /// around it and under the same header rules: this leader's own candidate published where
+    /// the entry carries it, else the families derived from the committed rows at the record's
+    /// place and retired alike. Rows that cannot derive them alike are a divergence that stops
+    /// this replica (`InvalidManifest`), never a retirement skipped.
+    fn apply_retire_record(
+        &mut self,
+        entry: &focal_consensus::CommittedEntry,
+        output: &mut NativeOutput,
+    ) -> Result<(), NativeSessionError> {
+        let record = record::RetireRecord::inspect(
+            &entry.data,
+            self.limits.inspection,
+            focal_core::native::retirement_batch::MAX_RETIRE_FAMILIES,
+        )?;
+        let header = record.header();
+        if header.ledger != self.ledger
+            || header.profile != self.profile
+            || header.range.0 == 0
+            || header.base != self.sequence()?
+            || entry.term == 0
+            || entry.term < self.recording_term
+            || (entry.term == self.recording_term && self.recording_range != Some(header.range))
+            || (self.recording_range.is_none() && header.base != self.records_floor)
+        {
+            return Err(NativeSessionError::Corrupt);
+        }
+        let matches = self.pending.front().is_some_and(|pending| {
+            self.submitted > 0
+                && pending.hash == Some(header.hash)
+                && pending.outcome == header.outcome
+                && header.range == self.range
+        });
+        let outcome = if matches {
+            self.publish_own_head()?
+        } else {
+            if !self.pending.is_empty() {
+                self.resolve_suffix(SuffixEvidence::ConflictingCommittedPrefix)?;
+            } else if matches!(self.domain, Some(Domain::Active(..))) {
+                self.passive_for_replay()?;
+            }
+            let Some(Domain::Passive(core)) = self.domain.as_mut() else {
+                return Err(NativeSessionError::Failed);
+            };
+            core.build_event_index();
+            core.apply_retirement_record(&record)?
+        };
+        if output.committed.len() == output.committed.capacity() {
+            return Err(NativeSessionError::Capacity("committed output"));
+        }
+        output.committed.push(NativeCommit {
+            raft_index: entry.index,
+            raft_term: entry.term,
+            record_hash: header.hash,
+            outcome,
+        });
+        self.retired_families = self
+            .retired_families
+            .saturating_add(u64::try_from(record.retired().len()).unwrap_or(u64::MAX));
         self.applied_raft = entry.index;
         self.recording_range = Some(header.range);
         self.recording_term = entry.term;

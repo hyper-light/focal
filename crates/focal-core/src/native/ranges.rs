@@ -541,7 +541,31 @@ impl NativeRanges {
         lane: BudgetLane,
         present: impl FnMut(&Key) -> Option<usize>,
     ) -> Result<Fragments, MemoryError> {
-        self.plan_sparse_from(source, None, tail, prefix, changes, lane, present)
+        self.plan_sparse_from(source, None, tail, prefix, changes, lane, None, present)
+    }
+    /// [`Self::plan_sparse`] of a change set that may pass the store's bound on a batch, up to
+    /// `max_entries`: a retirement's, whose one family may (doc 31 M2).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_sparse_bounded(
+        &self,
+        source: &MemoryBudget,
+        tail: Option<&Fragments>,
+        prefix: u64,
+        changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        max_entries: usize,
+        present: impl FnMut(&Key) -> Option<usize>,
+    ) -> Result<Fragments, MemoryError> {
+        self.plan_sparse_from(
+            source,
+            None,
+            tail,
+            prefix,
+            changes,
+            lane,
+            Some(max_entries),
+            present,
+        )
     }
     /// [`Self::plan_sparse`] over the published members alone, each member's
     /// part of the changes funded from `funding`, which its caller reserved
@@ -555,7 +579,16 @@ impl NativeRanges {
         lane: BudgetLane,
         present: impl FnMut(&Key) -> Option<usize>,
     ) -> Result<Fragments, MemoryError> {
-        self.plan_sparse_from(source, Some(funding), None, prefix, changes, lane, present)
+        self.plan_sparse_from(
+            source,
+            Some(funding),
+            None,
+            prefix,
+            changes,
+            lane,
+            None,
+            present,
+        )
     }
     #[allow(clippy::too_many_arguments)]
     fn plan_sparse_from(
@@ -566,6 +599,7 @@ impl NativeRanges {
         prefix: u64,
         mut changes: Vec<Change<Key, Row>>,
         lane: BudgetLane,
+        max_entries: Option<usize>,
         mut present: impl FnMut(&Key) -> Option<usize>,
     ) -> Result<Fragments, MemoryError> {
         #[cfg(test)]
@@ -596,7 +630,7 @@ impl NativeRanges {
                     prefix,
                     part,
                     lane,
-                    store.max_batch_entries(),
+                    max_entries.unwrap_or(store.max_batch_entries()),
                     &mut present,
                 )?,
                 None => store.plan_sparse(
@@ -605,7 +639,7 @@ impl NativeRanges {
                     prefix,
                     part,
                     lane,
-                    store.max_batch_entries(),
+                    max_entries.unwrap_or(store.max_batch_entries()),
                     &mut present,
                 )?,
             };

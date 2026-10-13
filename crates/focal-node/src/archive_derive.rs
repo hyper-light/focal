@@ -25,12 +25,6 @@ pub(crate) fn archived_family(
     if !session.native_authoritative() {
         return Ok(None);
     }
-    // What the proposal will ask short of the family: nothing in flight,
-    // and the owner's outcome to spare beyond those it promised. A
-    // bundle is not sealed for a family that cannot be proposed.
-    if session.native_check_retirement().is_err() {
-        return Ok(None);
-    }
     let now = crate::native_ingress::logical_time(session)
         .map_err(|_| LedgerError::NotReady { leader: 0 })?;
     let report = session.native_retention()?;
@@ -68,11 +62,14 @@ pub(crate) fn archived_family(
         .archive_family_into(&family, through, &mut bundle, quote.visits)
         .map_err(|error| LedgerError::Native(error.into()))?;
     let rows = family.rows();
+    let identity = focal_core::native::retirement_batch::family_digest(session.ledger(), &family)
+        .map_err(|error| LedgerError::Native(error.into()))?;
     Ok(Some(ArchivedFamily {
         root,
         members: family.members,
         through,
         digest,
+        family: identity,
         rows,
         bundle,
         _allocation: allocation,

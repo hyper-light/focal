@@ -3118,3 +3118,153 @@ fn a_full_window_seals_and_replicas_replay_past_a_window_of_lifetime_outcomes() 
     assert!(cluster.sequence(1).0 > 18);
     assert_same_digest(&mut cluster, &[1, 2, 3]);
 }
+
+/// The two finished families `claims` (each created, cancelled and released) on `leader`, and
+/// what the archive agent would offer for them: each family's digest and a bundle.
+fn finished_offers(
+    cluster: &mut Cluster,
+    leader: u64,
+    claims: &[u128],
+) -> Vec<focal_core::native::retirement_batch::RetireOffer> {
+    use focal_core::native::NativeCommand;
+    use focal_core::native::retirement_batch::{RetireOffer, family_digest};
+    for &claim in claims {
+        let create = cluster.creation(claim);
+        cluster.commit(leader, PARTIES.issuer, create, &[]);
+        let expected = cluster.claim(leader, claim);
+        let cancel = fx::cancel(cluster.next(PARTIES.issuer), expected);
+        cluster.commit(leader, PARTIES.issuer, cancel, &[]);
+        let expected = cluster.claim(leader, claim);
+        let release = NativeInput {
+            request: cluster.next(PARTIES.issuer),
+            command: NativeCommand::ReleaseScope { expected },
+        };
+        cluster.commit(leader, PARTIES.issuer, release, &[]);
+    }
+    let core = cluster.node(leader).committed_core().unwrap();
+    claims
+        .iter()
+        .map(|claim| {
+            let family = core.retirement_family(ClaimId::from_u128(*claim)).unwrap();
+            RetireOffer {
+                root: ClaimId::from_u128(*claim),
+                family: family_digest(ledger(), &family).unwrap(),
+                bundle: ContentHash([u8::try_from(*claim).unwrap(); 32]),
+                bytes: 4096,
+            }
+        })
+        .collect()
+}
+
+/// Retirement in the pipeline (doc 31 M2): with a write in flight before it and one admitted
+/// after it, the leader retires a batch of two families as one candidate. Nothing waits for it,
+/// admission is not held behind it, and every replica commits the three in the leader's order,
+/// the followers deriving the families from their own rows: the same rows everywhere, each
+/// family gone behind its continuation. A restarted replica keeps it.
+#[test]
+fn a_retirement_batch_commits_among_the_writes_around_it_on_every_replica() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    let offers = finished_offers(&mut cluster, 1, &[1, 2]);
+    let before = cluster.creation(3);
+    let before_request = before.request;
+    assert!(matches!(
+        cluster.propose(1, PARTIES.issuer, before),
+        NativeSubmission::Pending { .. }
+    ));
+    let (batch, submission) = cluster.node(1).retire(&offers).unwrap();
+    assert_eq!(batch.families.len(), 2);
+    assert!(batch.deferred.is_empty() && batch.refused.is_empty());
+    let Some(NativeSubmission::Pending {
+        outcome: retired, ..
+    }) = submission
+    else {
+        panic!("a pending retirement: {submission:?}");
+    };
+    let after = cluster.creation(4);
+    let after_request = after.request;
+    assert!(
+        matches!(
+            cluster.propose(1, PARTIES.issuer, after),
+            NativeSubmission::Pending { .. }
+        ),
+        "admission is not held behind a retirement"
+    );
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    for id in [1, 2, 3] {
+        let node = cluster.node(id);
+        let before = node.outcome(before_request).unwrap().unwrap();
+        let after = node.outcome(after_request).unwrap().unwrap();
+        assert_eq!(before.sequence.0 + 1, retired.sequence.0, "node {id}");
+        assert_eq!(retired.sequence.0 + 1, after.sequence.0, "node {id}");
+        let core = node.committed_core().unwrap();
+        for claim in [1u128, 2] {
+            assert!(core.native_claim(ClaimId::from_u128(claim)).is_none());
+            let continuation = core.native_retired(ClaimId::from_u128(claim)).unwrap();
+            assert_eq!(continuation.retired_at, retired.sequence, "node {id}");
+        }
+    }
+    assert_same_digest(&mut cluster, &[3, 4]);
+    cluster.stop(3);
+    cluster.reopen(3).unwrap();
+    cluster.settle(&[]);
+    assert!(
+        cluster
+            .node(3)
+            .committed_core()
+            .unwrap()
+            .native_retired(ClaimId::from_u128(1))
+            .is_some()
+    );
+    assert_same_digest(&mut cluster, &[3, 4]);
+}
+
+/// Below the upgrade fence (`RetireRule::Exact`) an authority retires a family at a time: a batch
+/// is refused by name before anything is proposed, since a binary in its cluster may not read
+/// one, and the family retires alone at the prefix it was derived at, on every replica.
+#[test]
+fn below_the_fence_a_batch_is_refused_and_a_family_retires_alone() {
+    let exact = |_| {
+        let mut limits = limits();
+        limits.retire_rule = crate::RetireRule::Exact;
+        limits
+    };
+    let mut cluster = Cluster::with_limits(exact);
+    cluster.elect(1, &[]);
+    let offers = finished_offers(&mut cluster, 1, &[1]);
+    let before = cluster.sequence(1);
+    assert!(matches!(
+        cluster.node(1).retire(&offers),
+        Err(NativeSessionError::RetireExact)
+    ));
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(1), before, "nothing was proposed");
+    let (root, bundle, length, through) = {
+        let core = cluster.node(1).committed_core().unwrap();
+        let family = core.retirement_family(ClaimId::from_u128(1)).unwrap();
+        let through = core.native_sequence();
+        let quote = core
+            .archive_family_quote(&family, through, limits().encoding)
+            .unwrap();
+        (family.root, quote.hash, quote.bytes as u64, through)
+    };
+    cluster
+        .node(1)
+        .propose_retirement(root, bundle, length, through)
+        .unwrap();
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(1), SessionSeq(before.0 + 1));
+    assert_same_digest(&mut cluster, &[1, 2, 3]);
+    for id in 1..=3u64 {
+        let core = cluster.node(id).committed_core().unwrap();
+        assert!(core.native_claim(root).is_none(), "node {id}");
+        assert_eq!(
+            core.native_retired(root).unwrap().bundle,
+            bundle,
+            "node {id}"
+        );
+    }
+}

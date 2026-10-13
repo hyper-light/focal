@@ -16,14 +16,15 @@ use crate::measurements::{
 };
 use crate::native;
 use crate::report::{self, Latency, Report};
-use crate::shape::{Profile, Transport, WorkloadShape};
+use crate::shape::{Lifecycle, Profile, Transport, WorkloadShape};
+use focal_client::operations::NativeAuthoredOperation;
 use focal_client::{
     Client, ClientError, EmbeddedTransport, LocalTransport, QuicTransport, RetryPolicy,
 };
 use focal_ledger::NativeContentProfile;
 use focal_model::{
     ClaimId, LedgerId, ParticipantId, RequestEpoch, RequestId, RequestKey, RootCommandId,
-    RouteEpoch,
+    RouteEpoch, SessionSeq,
 };
 use focal_node::{
     config::Settings,
@@ -32,9 +33,9 @@ use focal_node::{
 };
 use focal_wire::{
     AccessError, AuthenticatedPeer, NativeClaimExpand, NativeErrorCode, NativeMutationReply,
-    NativeObject, NativeReadQuery, NativeReadRequest, NativeRefusalKind, Operation, PeerGrant,
-    PeerRole, QuicConnector, ReadConsistency, RequestEnvelope, Response, ResponseEnvelope,
-    WireLimits,
+    NativeObject, NativeObjectRef, NativeReadQuery, NativeReadRequest, NativeRefusalKind,
+    Operation, PeerGrant, PeerRole, QuicConnector, ReadConsistency, ReadToken, RequestEnvelope,
+    Response, ResponseEnvelope, WireLimits,
 };
 use hyper_rt::combine::{Either, race2};
 use std::{
@@ -178,6 +179,10 @@ struct Job {
     limits: WireLimits,
     /// Read phase: the claims this worker created, cycled through.
     created: Vec<u128>,
+    /// Write phase: what becomes of each claim after its creation.
+    lifecycle: Lifecycle,
+    /// Write phase: the most of this worker's lifecycle reads under way at once.
+    lifecycle_reads: u16,
     /// Write phase, paced (the shape's `rate`): the interval between this
     /// worker's intended starts.
     pace: Option<Duration>,
@@ -201,6 +206,11 @@ struct Outcome {
     hits: u64,
     created: Vec<u128>,
     refusals: Vec<(String, u64)>,
+    /// Claims whose every lifecycle step committed.
+    lifecycles: u64,
+    /// Lifecycle steps never sent: the read of the claim they bind to
+    /// failed.
+    abandoned: u64,
 }
 
 /// Counts one refusal of `reason`: a reason already seen counts once more,
@@ -270,7 +280,8 @@ fn read_hit(result: &Result<ResponseEnvelope, ClientError>) -> bool {
 
 /// How the owner answered a write.
 enum Reply {
-    Committed,
+    /// Committed at this native sequence.
+    Committed(SessionSeq),
     /// Refused by name: the request's generation is closed, or not admitted
     /// yet (the audit's F12); never executed.
     Expired,
@@ -290,7 +301,9 @@ fn access(error: &AccessError) -> RefusalCause {
 fn classify(result: Result<ResponseEnvelope, ClientError>) -> Reply {
     match result {
         Ok(envelope) => match envelope.result {
-            Response::Native(NativeMutationReply::Committed(_)) => Reply::Committed,
+            Response::Native(NativeMutationReply::Committed(receipt)) => {
+                Reply::Committed(receipt.sequence)
+            }
             Response::Native(NativeMutationReply::Refused(refusal))
                 if matches!(
                     refusal.kind,
@@ -415,6 +428,8 @@ struct Shared<'a> {
     job: &'a Job,
     conn: &'a Conn,
     generations: &'a Generations,
+    /// The worker's lifecycle reads under way, at most `job.lifecycle_reads`.
+    reads: hyper_rt::sync::Semaphore,
     run_start: Instant,
     protocol: std::cell::Cell<u128>,
     outcome: std::cell::RefCell<Outcome>,
@@ -467,7 +482,7 @@ impl Shared<'_> {
         let names = &self.job.names;
         let envelope = native::advance_envelope(names.ledger, names.profile, request, minimum)?;
         match classify(self.conn.request(envelope).await) {
-            Reply::Committed => self.generations.advanced(minimum),
+            Reply::Committed(_) => self.generations.advanced(minimum),
             Reply::Expired => {
                 self.generations.advance_failed()?;
                 self.learn().await.map(|_| ())
@@ -479,16 +494,106 @@ impl Shared<'_> {
             }
         }
     }
-    /// Write `i`, from its intended start `started`: issued in the
-    /// generation the run's journal stands at; one the owner refused by name
-    /// is issued once more, with the next request id, in the generation the
-    /// owner admits — never executed twice.
+    /// Lifecycle `i`, from its intended start `started`: the claim's
+    /// creation and, as the shape asks, each later step once the step before
+    /// it committed. A later step is timed from its own send: an agent's
+    /// next step follows its last answer, not the schedule. A step that did
+    /// not commit ends the lifecycle there.
     async fn write(&self, i: u64, started: Instant) -> Result<(), LoadError> {
+        let Some((claim, mut written)) = self.step(i, 0, started, None).await? else {
+            return Ok(());
+        };
+        if self.job.lifecycle == Lifecycle::Create {
+            return Ok(());
+        }
+        let later = [
+            NativeAuthoredOperation::ClaimCancel(authored::claim_target(claim)),
+            NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim)),
+        ];
+        for (step, operation) in (1u8..).zip(later.iter()) {
+            let Some(objects) = self.read_claim(claim, written).await? else {
+                let mut outcome = self.outcome.borrow_mut();
+                outcome.abandoned = outcome.abandoned.saturating_add(1);
+                return Ok(());
+            };
+            let Some((_, sequence)) = self
+                .step(i, step, Instant::now(), Some((operation, &objects)))
+                .await?
+            else {
+                return Ok(());
+            };
+            written = sequence;
+        }
+        let mut outcome = self.outcome.borrow_mut();
+        outcome.lifecycles = outcome.lifecycles.saturating_add(1);
+        Ok(())
+    }
+    /// The claim as this caller's own last write left it, read at least at
+    /// that write's sequence (read-your-writes, no read barrier), for the
+    /// next step to bind to; `None`, with the reason noted, when it could
+    /// not be read.
+    async fn read_claim(
+        &self,
+        claim: u128,
+        written: SessionSeq,
+    ) -> Result<Option<Vec<NativeObject>>, LoadError> {
+        let Ok(_permit) = self.reads.acquire().await else {
+            return Err(LoadError::Bound("lifecycle reads"));
+        };
+        let request = self.protocol_request()?;
+        let envelope = RequestEnvelope {
+            protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
+            ledger: self.job.names.ledger,
+            route_epoch: RouteEpoch(1),
+            request_epoch: RequestEpoch(1),
+            request_id: RequestId::from_u128(request),
+            operation: Operation::NativeRead(NativeReadRequest {
+                consistency: ReadConsistency::AtLeast(ReadToken {
+                    ledger: self.job.names.ledger,
+                    sequence: written,
+                    route_epoch: RouteEpoch(1),
+                }),
+                query: NativeReadQuery::Objects(vec![NativeObjectRef::Claim(ClaimId::from_u128(
+                    claim,
+                ))]),
+                max_items: 1,
+            }),
+        };
+        match self.conn.request(envelope).await {
+            Ok(envelope) => match envelope.result {
+                Response::NativeRead(page) if !page.objects.is_empty() => Ok(Some(page.objects)),
+                other => {
+                    self.note(format!("lifecycle read: unexpected reply {other:?}"));
+                    Ok(None)
+                }
+            },
+            Err(error) => {
+                self.note(format!("lifecycle read: client: {error}"));
+                Ok(None)
+            }
+        }
+    }
+    /// Step `step` of lifecycle `i`, from `started`: its creation (`later`
+    /// none) or a later step compiled against the claim as read. Issued in
+    /// the generation the run's journal stands at; one the owner refused by
+    /// name is issued once more, with the next request id, in the generation
+    /// the owner admits — never executed twice. The claim and the sequence
+    /// it committed at, once committed.
+    async fn step(
+        &self,
+        i: u64,
+        step: u8,
+        started: Instant,
+        later: Option<(&NativeAuthoredOperation, &[NativeObject])>,
+    ) -> Result<Option<(u128, SessionSeq)>, LoadError> {
         let offset = u128::from(i);
+        let steps = u128::from(self.job.lifecycle.steps());
         let mut attempt = 0u128;
         loop {
             let request = offset
-                .checked_mul(ATTEMPTS)
+                .checked_mul(steps)
+                .and_then(|slot| slot.checked_add(u128::from(step)))
+                .and_then(|slot| slot.checked_mul(ATTEMPTS))
                 .and_then(|slot| slot.checked_add(attempt))
                 .and_then(|slot| slot.checked_add(1))
                 .filter(|slot| *slot < CLAIM_OFFSET)
@@ -500,7 +605,22 @@ impl Shared<'_> {
                 epoch: minted.epoch,
                 id: RequestId::from_u128(request),
             };
-            let (envelope, claim) = build(self.job, offset, key)?;
+            let (envelope, claim) = match later {
+                None => build(self.job, offset, key)?,
+                Some((operation, objects)) => {
+                    let names = &self.job.names;
+                    let envelope = authored::step_envelope(
+                        names.ledger,
+                        names.profile,
+                        names.issuer,
+                        names.root,
+                        key,
+                        operation,
+                        objects,
+                    )?;
+                    (envelope, 0)
+                }
+            };
             let sent = Instant::now();
             let response = self.conn.request(envelope).await;
             let finished = Instant::now();
@@ -517,7 +637,7 @@ impl Shared<'_> {
                 epoch: minted.epoch,
                 request,
                 outcome: match &reply {
-                    Reply::Committed => WriteOutcome::Committed,
+                    Reply::Committed(_) => WriteOutcome::Committed,
                     Reply::Expired => WriteOutcome::Expired,
                     Reply::Refused(..) => WriteOutcome::Refused,
                     Reply::Unknown(_) => WriteOutcome::Unknown,
@@ -526,15 +646,19 @@ impl Shared<'_> {
                     Reply::Refused(_, cause) => *cause,
                     _ => RefusalCause::None,
                 },
+                step,
             })?;
             if let Finished::Advance { epoch, minimum } = self.generations.finish(minted.epoch)? {
                 self.advance(epoch, minimum).await?;
             }
             match reply {
-                Reply::Committed => {
+                Reply::Committed(sequence) => {
                     let mut outcome = self.outcome.borrow_mut();
                     outcome.committed = outcome.committed.saturating_add(1);
-                    outcome.created.push(claim);
+                    if later.is_none() {
+                        outcome.created.push(claim);
+                    }
+                    return Ok(Some((claim, sequence)));
                 }
                 Reply::Expired => {
                     attempt = attempt.saturating_add(1);
@@ -559,7 +683,7 @@ impl Shared<'_> {
                     note(&mut outcome.refusals, reason);
                 }
             }
-            return Ok(());
+            return Ok(None);
         }
     }
 }
@@ -652,11 +776,13 @@ async fn worker(
     conn: &Conn,
 ) -> Result<Outcome, LoadError> {
     let count = usize::try_from(job.count).map_err(|_| LoadError::Bound("worker count"))?;
-    // The shape bounds logical writes at MAX_CLAIMS; each has at most
-    // ATTEMPTS samples. The complete trace is funded before sending work.
+    // The shape bounds lifecycles at MAX_CLAIMS; each takes its steps, each
+    // step at most ATTEMPTS samples. The complete trace is funded before
+    // sending work.
     let write_limit = match phase {
         Phase::Write => count
-            .checked_mul(usize::try_from(ATTEMPTS).map_err(|_| LoadError::Bound("write attempts"))?)
+            .checked_mul(usize::from(job.lifecycle.steps()))
+            .and_then(|writes| writes.checked_mul(usize::try_from(ATTEMPTS).ok()?))
             .ok_or(LoadError::Bound("write samples"))?,
         Phase::Read => 0,
     };
@@ -675,6 +801,11 @@ async fn worker(
                 job: &job,
                 conn,
                 generations,
+                reads: hyper_rt::sync::Semaphore::new(
+                    u64::from(job.lifecycle_reads),
+                    usize::from(job.inflight.max(1)),
+                )
+                .map_err(LoadError::Runtime)?,
                 run_start,
                 protocol: std::cell::Cell::new(0),
                 outcome: std::cell::RefCell::new(outcome),
@@ -1031,6 +1162,8 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             names,
             limits: limits.clone(),
             created: Vec::new(),
+            lifecycle: shape.lifecycle,
+            lifecycle_reads: shape.lifecycle_reads,
             pace,
         });
     }
@@ -1042,6 +1175,12 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     let (floors_advanced, expired) = generations.counts()?;
     let mut writes = merged(&write_outcomes);
     let (committed, refused, unknown) = (writes.committed, writes.refused, writes.unknown);
+    let lifecycles = write_outcomes.iter().fold(0u64, |total, outcome| {
+        total.saturating_add(outcome.lifecycles)
+    });
+    let abandoned = write_outcomes.iter().fold(0u64, |total, outcome| {
+        total.saturating_add(outcome.abandoned)
+    });
     // Requests whose intended start falls in the warm-up are sent, never measured.
     let warmup = u128::from(shape.warmup_ms).saturating_mul(1_000_000);
     writes.samples.retain(|(start, _)| *start >= warmup);
@@ -1085,6 +1224,8 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 names,
                 limits: limits.clone(),
                 created: outcome.created.clone(),
+                lifecycle: Lifecycle::Create,
+                lifecycle_reads: 1,
                 // Reads are not paced: they measure the read path closed-loop.
                 pace: None,
             });
@@ -1149,6 +1290,8 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         refused,
         unknown,
         expired,
+        lifecycles,
+        abandoned,
         floors_advanced,
         wall_ms: write_nanos.checked_div(1_000_000).unwrap_or(0),
         throughput_ops_per_s: report::per_second(committed, write_nanos),

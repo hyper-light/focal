@@ -19,6 +19,11 @@ pub struct Report {
     /// the generation the owner admits; counted apart from `refused`, as
     /// the protocol working, and in the samples twice.
     pub expired: u64,
+    /// Claims whose every lifecycle step committed (the shape's `lifecycle`;
+    /// a `create` run counts none).
+    pub lifecycles: u64,
+    /// Lifecycle steps never sent: the read of the claim they bind to failed.
+    pub abandoned: u64,
     /// Generation floors this run advanced, as the journal does once the
     /// generation below drained.
     pub floors_advanced: u64,
