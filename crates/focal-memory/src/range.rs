@@ -49,6 +49,9 @@ pub use hydration::{
     RangeHydrationView,
 };
 #[cfg(test)]
+#[path = "range_cut_tests.rs"]
+mod cut_tests;
+#[cfg(test)]
 #[path = "range_import_tests.rs"]
 mod import_tests;
 #[path = "range_layout.rs"]
@@ -238,15 +241,37 @@ struct PartitionFunding<'a, K, P> {
 // descriptors small while newly supplied values move directly into final pages.
 enum MergeEntry<'a, K, V> {
     Retained(&'a Entry<K, V>),
-    Incoming { heap_bytes: usize },
+    /// A put: of a key the page did not hold (`inserted`), or replacing one.
+    Incoming {
+        heap_bytes: usize,
+        inserted: bool,
+    },
 }
 
 impl<K, V> MergeEntry<'_, K, V> {
     fn heap_bytes(&self) -> usize {
         match self {
             Self::Retained(entry) => entry.heap_bytes,
-            Self::Incoming { heap_bytes } => *heap_bytes,
+            Self::Incoming { heap_bytes, .. } => *heap_bytes,
         }
+    }
+}
+
+impl<K, V, P: Eq> layout::Cell for (MergeEntry<'_, K, V>, P) {
+    fn heap(&self) -> usize {
+        self.0.heap_bytes()
+    }
+    fn origin(&self) -> layout::Origin {
+        match self.0 {
+            MergeEntry::Retained(_) => layout::Origin::Old,
+            MergeEntry::Incoming { inserted: true, .. } => layout::Origin::Inserted,
+            MergeEntry::Incoming {
+                inserted: false, ..
+            } => layout::Origin::Replacement,
+        }
+    }
+    fn parts_from(&self, next: &Self) -> bool {
+        self.1 != next.1
     }
 }
 
@@ -1039,7 +1064,7 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
                 Change::Put(entry) => Some(entry),
                 Change::Delete(_) => None,
             });
-        let mut partition = layout::LeafPartition::new::<K, V>(self.config)?;
+        let mut scratch = bounded_vec(max_entries)?;
         let mut emit = |span: layout::LeafSpan| {
             let end = checked_add(span.start, span.len)?;
             let chunk = merged.get(span.start..end).ok_or(MemoryError::MissingKey)?;
@@ -1061,13 +1086,7 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
             emit_page(Arc::new(Page::new(entries, allocation)))?;
             Ok(())
         };
-        let mut previous = None;
-        for (entry, key) in &merged {
-            let boundary = previous.is_some_and(|previous| previous != *key);
-            partition.push(entry.heap_bytes(), boundary, &mut emit)?;
-            previous = Some(*key);
-        }
-        partition.finish(&mut emit)?;
+        layout::Cutter::new::<K, V>(self.config)?.cut(&merged, &mut scratch, &mut emit)?;
         // Drain trailing deletions belonging to this page. An unplanned Put
         // would indicate an incomplete merge and must never be published.
         if incoming.next().is_some() {
@@ -1245,18 +1264,21 @@ fn visit_merged<'a, K: crate::RangeKey, V>(
             let entry = existing.next().ok_or(MemoryError::MissingKey)?;
             visit(&entry.key, MergeEntry::Retained(entry))?;
         }
+        let mut held = false;
         if existing
             .peek()
             .is_some_and(|entry| &entry.key == change.key())
             && let Some(entry) = existing.next()
         {
             replaced(&entry.key, &entry.value)?;
+            held = true;
         }
         if let Change::Put(entry) = change {
             visit(
                 &entry.key,
                 MergeEntry::Incoming {
                     heap_bytes: entry.heap_bytes,
+                    inserted: !held,
                 },
             )?;
         }
@@ -1279,13 +1301,18 @@ fn merge_layout_charge<K, V>(capacity: usize, partitioned: bool) -> Result<usize
     }
 }
 
+/// A page group's merge staging: a descriptor an entry, and the leaf cut's
+/// scratch (`layout::Cutter`), a word an entry.
 fn merge_partition_charge<K, V, P>(capacity: usize) -> Result<usize, MemoryError> {
     if capacity == 0 {
         return Ok(0);
     }
     checked_add(
-        ALLOCATOR_OVERHEAD,
-        checked_mul(capacity, size_of::<(MergeEntry<'_, K, V>, P)>())?,
+        checked_mul(2, ALLOCATOR_OVERHEAD)?,
+        checked_mul(
+            capacity,
+            checked_add(size_of::<(MergeEntry<'_, K, V>, P)>(), size_of::<usize>())?,
+        )?,
     )
 }
 
