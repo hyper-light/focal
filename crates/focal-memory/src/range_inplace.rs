@@ -601,8 +601,8 @@ enum Step {
 /// cut rule, `layout::Cutter`).
 enum Plan {
     Gone,
-    One { len: usize },
-    Many(Vec<usize>),
+    One { len: usize, held: usize },
+    Many { lengths: Vec<usize>, held: usize },
 }
 
 /// The store's leaf rule, as a publication reads it.
@@ -636,7 +636,9 @@ impl<K: crate::RangeKey + Clone> Shape<K> {
     /// one leaf where the rows left fit one (one partition, both bounds), so
     /// an edit costs its changes; otherwise the cut rule over the merged rows.
     fn plan<V>(&self, page: &Page<K, V>, group: &[Change<K, V>]) -> Result<Plan, MemoryError> {
-        let mut heap = heap_of(&page.entries)?;
+        // The heap the page's rows hold now, summed once for the plan and the merge.
+        let held = heap_of(&page.entries)?;
+        let mut heap = held;
         let label = self
             .partition
             .and_then(|classify| page.entries.first().map(|entry| classify(&entry.key)));
@@ -677,9 +679,10 @@ impl<K: crate::RangeKey + Clone> Shape<K> {
             && len <= self.config.page_entries
             && (len == 1 || page_charge::<K, V>(len, heap)? <= self.config.page_bytes)
         {
-            return Ok(Plan::One { len });
+            return Ok(Plan::One { len, held });
         }
-        self.lengths(&page.entries, group).map(Plan::Many)
+        self.lengths(&page.entries, group)
+            .map(|lengths| Plan::Many { lengths, held })
     }
 
     /// The lengths of the leaves `old` and `group` merge into, in order.
@@ -747,11 +750,11 @@ impl<K: crate::RangeKey + Clone> Shape<K> {
         let one;
         let lengths: &[usize] = match plan {
             Plan::Gone => &[],
-            Plan::One { len } => {
+            Plan::One { len, .. } => {
                 one = [*len];
                 &one
             }
-            Plan::Many(lengths) => lengths,
+            Plan::Many { lengths, .. } => lengths,
         };
         let mut rows = Copied {
             rows: &old.entries,
@@ -772,16 +775,15 @@ impl<K: crate::RangeKey + Clone> Shape<K> {
         plan: &Plan,
         funding: &mut Allocation,
     ) -> Result<Vec<Arc<Page<K, V>>>, MemoryError> {
-        let mut heap = heap_of(&page.entries)?;
-        let (first, rest): (usize, &[usize]) = match plan {
+        let (first, rest, mut heap): (usize, &[usize], usize) = match plan {
             Plan::Gone => {
                 return Err(MemoryError::InvalidConfiguration(
                     "a page left empty is removed, not edited",
                 ));
             }
-            Plan::One { len } => (*len, &[]),
-            Plan::Many(lengths) => match lengths.split_first() {
-                Some((first, rest)) => (*first, rest),
+            Plan::One { len, held } => (*len, &[], *held),
+            Plan::Many { lengths, held } => match lengths.split_first() {
+                Some((first, rest)) => (*first, rest, *held),
                 None => return Err(MemoryError::MissingKey),
             },
         };

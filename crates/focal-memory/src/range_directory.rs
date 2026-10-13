@@ -623,10 +623,9 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
         build: &mut DirectoryBuild<'_>,
         edit: impl FnOnce(&mut Arc<Page<K, V>>) -> Result<R, MemoryError>,
     ) -> Result<R, MemoryError> {
-        let route = {
-            let page = self.get(index).ok_or(MemoryError::MissingKey)?;
-            self.route(index, false, page)?
-        };
+        // The page is already where it stands among its neighbours, and an
+        // edit keeps it in its own span: nothing to check of its order.
+        let route = self.route_in_place(index)?;
         self.own(&route, false, build)?;
         let mut handle = self.root.0.as_mut().ok_or(MemoryError::MissingKey)?;
         let mut level = 0usize;
@@ -690,6 +689,18 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
             None => self.get(next),
         };
         check_between(left.map(AsRef::as_ref), page, right.map(AsRef::as_ref))?;
+        Ok(Self::route_of(&descent, rank, pages.len()))
+    }
+
+    /// Where the edit of the page at `index` goes, the page already among its
+    /// neighbours: an edit where it stands keeps it there ([`Self::edit_page`]).
+    fn route_in_place(&self, index: usize) -> Result<Route, MemoryError> {
+        let root = self.root.node().ok_or(MemoryError::MissingKey)?;
+        let (descent, pages, rank) = Descent::to_leaf(root, index, false)?;
+        Ok(Self::route_of(&descent, rank, pages.len()))
+    }
+
+    fn route_of(descent: &Descent<'_, K, V>, rank: usize, width: usize) -> Route {
         let mut children = [0usize; MAX_LEVELS];
         for (slot, &(_, child)) in children
             .iter_mut()
@@ -704,13 +715,13 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
             }
             leftmost_from = level;
         }
-        Ok(Route {
+        Route {
             children,
             depth: descent.depth,
             rank,
-            width: pages.len(),
+            width,
             leftmost_from,
-        })
+        }
     }
 
     /// Makes each node on `route` this directory's own ([`owned`]) and, with

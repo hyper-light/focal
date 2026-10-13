@@ -139,7 +139,6 @@ impl PendingIndex {
             }
         }
     }
-
 }
 
 /// The most candidates a caller's chain holds (`Core`'s chained preparation

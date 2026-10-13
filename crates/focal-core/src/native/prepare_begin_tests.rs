@@ -180,7 +180,6 @@ fn equal_bindings_and_prefixes_do_not_replace_the_exact_pending_source_or_owner(
     proof.check(&original).unwrap();
 }
 
-
 // Adversarial candidate rows still use the exact real parent Range root. This
 // isolates checked event/state completeness from the separate source check.
 fn altered(
