@@ -143,6 +143,11 @@ pub struct StreamsState {
     ///
     /// A new frame is only queued once the peer has raised the limit.
     pub(super) data_blocked_limit: Option<u64>,
+    /// The peer's stream limit, per direction, at which an open most recently failed: a
+    /// `STREAMS_BLOCKED` frame is queued once for each limit, and sent while it stands.
+    pub(super) streams_blocked_limit: PerDir<Option<u64>>,
+    /// The limit, per direction, the peer last said it was blocked at (its `STREAMS_BLOCKED`).
+    peer_streams_blocked: PerDir<Option<u64>>,
 }
 
 impl StreamsState {
@@ -188,6 +193,8 @@ impl StreamsState {
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
             data_blocked_limit: None,
+            streams_blocked_limit: PerDir::new(None, None),
+            peer_streams_blocked: PerDir::new(None, None),
         };
 
         for dir in Dir::iter() {
@@ -453,6 +460,24 @@ impl StreamsState {
         self.data_blocked_limit == Some(self.max_data)
     }
 
+    /// Whether a `STREAMS_BLOCKED` frame could be sent for `dir`: an open failed at the peer's
+    /// limit, and the peer has not raised it since.
+    pub(crate) fn can_send_streams_blocked(&self, dir: Dir) -> bool {
+        *self.streams_blocked_limit.get(dir) == Some(*self.max.get(dir))
+    }
+
+    /// The peer said it was blocked opening `dir` streams at `limit` (RFC 9000 §19.14).
+    pub(crate) fn received_streams_blocked(&mut self, dir: Dir, limit: u64) {
+        *self.peer_streams_blocked.get_mut(dir) = Some(limit);
+    }
+
+    /// Whether the peer is blocked opening `dir` streams with no more on their way: it said so at
+    /// the limit it was last sent, and no greater limit is sent or waiting to be.
+    pub(crate) fn peer_streams_blocked(&self, dir: Dir) -> bool {
+        let sent = *self.sent_max_remote.get(dir);
+        *self.peer_streams_blocked.get(dir) == Some(sent) && *self.max_remote.get(dir) == sent
+    }
+
     /// Limit to send in a `STREAM_DATA_BLOCKED` frame for stream `id`, if one could be sent
     ///
     /// `None` if the stream is no longer writable, was stopped by the peer, or the peer has raised
@@ -479,6 +504,7 @@ impl StreamsState {
         self.write_max_streams(buf, pending, retransmits, stats, max_size);
         self.write_data_blocked(buf, pending, retransmits, stats, max_size);
         self.write_stream_data_blocked(buf, pending, retransmits, stats, max_size);
+        self.write_streams_blocked(buf, pending, retransmits, stats, max_size);
     }
 
     /// RESET_STREAM
@@ -666,6 +692,41 @@ impl StreamsState {
             buf.write(frame::FrameType::DATA_BLOCKED);
             buf.write_var(self.max_data);
             stats.data_blocked = stats.data_blocked.saturating_add(1);
+        }
+    }
+
+    /// STREAMS_BLOCKED
+    fn write_streams_blocked(
+        &mut self,
+        buf: &mut Vec<u8>,
+        pending: &mut Retransmits,
+        retransmits: &mut ThinRetransmits,
+        stats: &mut FrameStats,
+        max_size: usize,
+    ) {
+        for dir in Dir::iter() {
+            if !*pending.streams_blocked.get(dir) || !fits(buf, 9, max_size) {
+                continue;
+            }
+            *pending.streams_blocked.get_mut(dir) = false;
+            // The peer may have raised the limit since the frame was queued
+            if !self.can_send_streams_blocked(dir) {
+                continue;
+            }
+            *retransmits.get_or_create().streams_blocked.get_mut(dir) = true;
+            let limit = *self.max.get(dir);
+            trace!(limit, "STREAMS_BLOCKED ({:?})", dir);
+            buf.write(match dir {
+                Dir::Uni => frame::FrameType::STREAMS_BLOCKED_UNI,
+                Dir::Bi => frame::FrameType::STREAMS_BLOCKED_BIDI,
+            });
+            buf.write_var(limit);
+            match dir {
+                Dir::Uni => stats.streams_blocked_uni = stats.streams_blocked_uni.saturating_add(1),
+                Dir::Bi => {
+                    stats.streams_blocked_bidi = stats.streams_blocked_bidi.saturating_add(1);
+                }
+            }
         }
     }
 
@@ -1207,6 +1268,93 @@ mod tests {
         )
     }
 
+    /// An open the peer's limit refuses queues one STREAMS_BLOCKED at that limit (RFC 9000 §4.6),
+    /// and another refused at the same limit queues none. The frame is written while the limit
+    /// stands and not once the peer has raised it; an open refused at the new limit says so again.
+    /// Upstream sent none, so a peer that grants streams as they are wanted never heard of a want.
+    /// A peer's STREAMS_BLOCKED says it is blocked only at the limit it was last sent.
+    #[test]
+    fn an_open_at_the_peers_limit_says_so_once_for_each_limit() {
+        let mut client = make(Side::Client);
+        client.set_params(&TransportParameters {
+            initial_max_streams_bidi: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let open = |client: &mut StreamsState, pending: &mut Retransmits| {
+            Streams {
+                state: client,
+                conn_state: &state,
+                pending,
+            }
+            .open(Dir::Bi)
+        };
+        let written = |streams: &mut StreamsState, pending: &mut Retransmits| {
+            let mut buf = Vec::new();
+            let (mut sent, mut stats) = (ThinRetransmits::default(), FrameStats::default());
+            streams.write_control_frames(&mut buf, pending, &mut sent, &mut stats, usize::MAX);
+            if buf.is_empty() {
+                return Vec::new();
+            }
+            crate::frame::Iter::new(Bytes::from(buf))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(open(&mut client, &mut pending).is_some());
+        assert!(open(&mut client, &mut pending).is_none());
+        assert!(matches!(
+            written(&mut client, &mut pending).as_slice(),
+            [frame::Frame::StreamsBlocked {
+                dir: Dir::Bi,
+                limit: 1
+            }]
+        ));
+        assert!(open(&mut client, &mut pending).is_none());
+        assert!(
+            !*pending.streams_blocked.get(Dir::Bi),
+            "one frame for each limit"
+        );
+        // Lost, and queued again after the peer raised the limit: not written.
+        client.received_max_streams(Dir::Bi, 2).unwrap();
+        *pending.streams_blocked.get_mut(Dir::Bi) = true;
+        assert!(written(&mut client, &mut pending).is_empty());
+        assert!(open(&mut client, &mut pending).is_some());
+        assert!(open(&mut client, &mut pending).is_none());
+        assert!(matches!(
+            written(&mut client, &mut pending).as_slice(),
+            [frame::Frame::StreamsBlocked {
+                dir: Dir::Bi,
+                limit: 2
+            }]
+        ));
+
+        // The other side: blocked at the limit it was last sent (128), not at an older one, and
+        // not once a greater one is on its way or sent; blocked again at that one.
+        let mut server = make(Side::Server);
+        server.received_streams_blocked(Dir::Bi, 100);
+        assert!(!server.peer_streams_blocked(Dir::Bi));
+        server.received_streams_blocked(Dir::Bi, 128);
+        assert!(server.peer_streams_blocked(Dir::Bi));
+        server.set_max_concurrent(Dir::Bi, 256u32.into());
+        assert!(
+            !server.peer_streams_blocked(Dir::Bi),
+            "a greater limit is on its way"
+        );
+        let mut server_pending = Retransmits::default();
+        assert!(server.queue_max_stream_id(&mut server_pending));
+        assert!(matches!(
+            written(&mut server, &mut server_pending).as_slice(),
+            [frame::Frame::MaxStreams {
+                dir: Dir::Bi,
+                count: 256
+            }]
+        ));
+        assert!(!server.peer_streams_blocked(Dir::Bi));
+        server.received_streams_blocked(Dir::Bi, 256);
+        assert!(server.peer_streams_blocked(Dir::Bi));
+    }
+
     #[test]
     fn send_window_retains_selectively_acked_data() {
         let mut server = make(Side::Server);
@@ -1221,6 +1369,7 @@ mod tests {
         let id = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         }
         .open(Dir::Uni)
         .unwrap();
@@ -1288,6 +1437,7 @@ mod tests {
         let id = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         }
         .open(Dir::Uni)
         .unwrap();
@@ -1641,6 +1791,7 @@ mod tests {
         let id = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         }
         .open(Dir::Uni)
         .unwrap();
@@ -1702,6 +1853,7 @@ mod tests {
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         };
 
         let id_high = streams.open(Dir::Bi).unwrap();
@@ -1758,6 +1910,7 @@ mod tests {
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         };
 
         let id_high = streams.open(Dir::Bi).unwrap();
@@ -1826,6 +1979,7 @@ mod tests {
             let mut streams = Streams {
                 state: &mut server,
                 conn_state: &state,
+                pending: &mut pending,
             };
 
             // a, b and c all have the same priority
@@ -1906,6 +2060,7 @@ mod tests {
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         };
 
         // a, and b have the same priority, c has higher priority
@@ -2010,6 +2165,7 @@ mod tests {
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         };
 
         let id = streams.open(Dir::Uni).unwrap();
@@ -2359,6 +2515,7 @@ mod tests {
         let stream_id = Streams {
             state: &mut server,
             conn_state: &conn_state,
+            pending: &mut retransmits,
         }
         .open(Dir::Uni)
         .expect("should be able to open a stream");
@@ -2434,6 +2591,7 @@ mod tests {
         let stream_id = Streams {
             state: &mut server,
             conn_state: &conn_state,
+            pending: &mut retransmits,
         }
         .open(Dir::Uni)
         .expect("should be able to open a stream");

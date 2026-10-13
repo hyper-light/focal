@@ -97,6 +97,14 @@ impl Classes for FocalClasses {
         MAX_MESSAGE_BYTES
     }
 
+    /// A participant's connections share the stream pool its node sizes (hyper-transport's
+    /// `StreamCredit::Pooled`): what the node cannot take waits at the participant rather than
+    /// being sent to be refused. A node's and a joiner's hold every stream a connection may, so a
+    /// node's replication is never held to its participants' pool.
+    fn pooled(role: Sender) -> bool {
+        matches!(role, Sender::Participant)
+    }
+
     fn kind_code(kind: Kind) -> u16 {
         match kind {
             Kind::Hello => HELLO_CODE,

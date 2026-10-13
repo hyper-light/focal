@@ -46,6 +46,9 @@ pub use peers::*;
 pub use reconcile::*;
 pub use round::*;
 pub use transport::*;
+/// RFC 9002's `kGranularity`, one millisecond: the coarsest timer the transport judges its
+/// deadlines at, and so the least a node's own periodic work on its behalf waits between turns.
+pub use hyper_transport::K_GRANULARITY as TIMER_GRANULARITY;
 pub use traversal::*;
 pub use trust::*;
 pub use validators::*;

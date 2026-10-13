@@ -178,6 +178,15 @@ impl NetworkListener {
     pub async fn io(&self) -> hyper_rt::udp::IoStats {
         self.server.io().await
     }
+    /// Size the stream pool this listener's participants share (`QuicServer::set_stream_pool`).
+    pub fn set_stream_pool(&self, streams: u32) -> Result<(), WireError> {
+        self.server.set_stream_pool(streams)
+    }
+    /// The streams one connection may hold: the least the stream pool is sized to, so a node that
+    /// leads nothing still answers its participants' redirects and reads.
+    pub fn streams_per_connection(&self) -> u32 {
+        self.limits.streams_per_connection
+    }
     pub fn close(&self) {
         // A close the shard could not queue leaves the endpoint to the service's shutdown, which
         // awaits its end.

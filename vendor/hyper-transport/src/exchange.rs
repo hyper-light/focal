@@ -255,7 +255,7 @@ pub(crate) struct Exchange<K> {
     pub(crate) incoming: Incoming,
     pub(crate) carry: Carry,
     /// For an exchange queued for a stream, the connection's last credit-queue advance its wait was last judged on
-    /// (policy C): a further advance restarts its wait; none for a whole period refuses it as stalled.
+    /// (policy C): a further advance restarts its wait; none for a whole period refuses it `Unsent`.
     pub(crate) credit_seen: Option<Instant>,
     /// Its share of its connection's sums as last counted (`tally::Table::settle`).
     pub(crate) counted: crate::tally::Counted,

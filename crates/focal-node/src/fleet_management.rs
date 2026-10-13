@@ -232,6 +232,18 @@ impl FleetManager {
     pub fn status(&self) -> FleetStatus {
         self.state.borrow().status
     }
+    /// The writes the sessions this node leads take at once, summed, and the least bound they are
+    /// counted within: each session that leads a term it is ready in gives its learned write
+    /// window (`TickPeriod::write_window`; its initial window before it has served a write) and
+    /// its delay bound. What the node's listener sizes its participants' stream pool from.
+    pub fn led_admission(&self) -> (u64, Option<std::time::Duration>) {
+        let state = self.state.borrow();
+        state
+            .entries
+            .values()
+            .filter_map(|entry| entry.host.led_admission())
+            .fold((0, None), crate::fleet::add_admission)
+    }
     /// How many installed hosts say of themselves that they stopped: a
     /// host publishes it before its stop is answered, where the fleet's
     /// `running` follows a round of the worker later. What asks whether

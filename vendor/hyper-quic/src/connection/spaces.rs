@@ -444,6 +444,8 @@ pub struct Retransmits {
     pub(super) max_data: bool,
     pub(super) data_blocked: bool,
     pub(super) max_stream_id: PerDir<bool>,
+    /// A `STREAMS_BLOCKED` frame per direction (RFC 9000 §4.6).
+    pub(super) streams_blocked: PerDir<bool>,
     pub(super) reset_stream: Vec<(StreamId, VarInt)>,
     pub(super) stop_sending: Vec<frame::StopSending>,
     pub(super) max_stream_data: FxHashSet<StreamId>,
@@ -490,6 +492,8 @@ impl Retransmits {
         !self.max_data
             && !(self.data_blocked && streams.can_send_data_blocked())
             && !self.max_stream_id.iter().any(|&x| x)
+            && !Dir::iter()
+                .any(|dir| *self.streams_blocked.get(dir) && streams.can_send_streams_blocked(dir))
             && self.reset_stream.is_empty()
             && self.stop_sending.is_empty()
             && self
@@ -522,6 +526,7 @@ impl ::std::ops::BitOrAssign for Retransmits {
         self.data_blocked |= rhs.data_blocked;
         for dir in Dir::iter() {
             *self.max_stream_id.get_mut(dir) |= *rhs.max_stream_id.get(dir);
+            *self.streams_blocked.get_mut(dir) |= *rhs.streams_blocked.get(dir);
         }
         self.reset_stream.extend_from_slice(&rhs.reset_stream);
         self.stop_sending.extend_from_slice(&rhs.stop_sending);

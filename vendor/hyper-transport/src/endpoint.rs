@@ -47,6 +47,7 @@ use crate::deadlines;
 use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push};
 use crate::frame::{PREFIX_BYTES, Prefix};
 use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
+use crate::pool::{Pool, PoolStats, Share};
 use crate::progress::{Carry, Delivered, LEAST_PROGRESS, Moved, Progress};
 use crate::receive::Receive;
 use crate::tally::{Table, Tally};
@@ -63,6 +64,11 @@ pub struct Limits {
     /// The exchanges a peer may have open on one connection at once (QUIC's bidirectional stream
     /// limit, RFC 9000 §4.6). An exchange this side opens past the peer's limit waits its turn.
     pub streams_per_connection: u32,
+    /// How a connection is given the exchanges its peer may open at once: every one from its
+    /// handshake, or as its peer wants them from a pool the owner sizes.
+    pub stream_credit: StreamCredit,
+    /// How many of the exchanges this side asks may wait for a stream on one connection.
+    pub ask_queue: AskQueue,
     /// The exchanges open on the endpoint at once, both directions.
     pub exchanges: usize,
     /// The lanes a peer may open to this node (QUIC's unidirectional stream limit).
@@ -93,6 +99,40 @@ pub struct Limits {
     pub receive_chunks: usize,
 }
 
+/// How connections are given the exchanges their peers may open at once (QUIC's bidirectional
+/// stream credit, RFC 9000 §4.6; docs/transport.md §4g).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamCredit {
+    /// Every connection holds [`Limits::streams_per_connection`] from its handshake on.
+    Fixed,
+    /// The connections of a pooled role ([`Classes::pooled`]) share a pool the owner sizes
+    /// ([`Endpoint::set_stream_pool`]): each is granted streams as its peer is blocked at its grant,
+    /// so a peer holds back what the endpoint cannot take where it sent it to be refused (admission
+    /// credit as Breakwater's, `crate::pool`). A connection's handshake grants `initial`, at most
+    /// the streams per connection: a connection that is not pooled is raised to those once its
+    /// role is known.
+    Pooled {
+        /// What every connection's handshake grants: what a new peer may open before it is heard.
+        initial: u32,
+    },
+}
+
+/// What bounds the exchanges this side asks that wait for a stream on a connection (docs/transport.md
+/// §4g).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AskQueue {
+    /// The exchange table alone ([`Limits::exchanges`]): an exchange waits for a stream as long as
+    /// its connection's credit queue moves (policy C).
+    Table,
+    /// One round of the streams the peer grants the connection: those this side holds and those
+    /// it may still open. An exchange asked while the connection already waits for that many is
+    /// refused [`Refusal::Unsent`] at once, nothing sent. A peer that grants streams as wanted
+    /// ([`StreamCredit::Pooled`]) holds back what it cannot take; past a round the asker's queue
+    /// would only wait longer, as the peer's own admission refuses a queue past what it answers in
+    /// its bound, so the wait an asked exchange meets is held to about a round of its credit.
+    Credit,
+}
+
 impl Limits {
     /// The most events the endpoint holds for its owner at once: [`EXCHANGE_EVENTS`] for every
     /// exchange the table holds, and, for every entry of the peer table (the larger of the
@@ -108,6 +148,11 @@ impl Limits {
     }
 
     fn validate(&self) -> Result<(), Refusal> {
+        if let StreamCredit::Pooled { initial } = self.stream_credit
+            && initial > self.streams_per_connection
+        {
+            return Err(Refusal::Configuration);
+        }
         let zero = self.streams_per_connection == 0
             || self.exchanges == 0
             || self.lanes_per_peer == 0
@@ -130,8 +175,12 @@ impl Limits {
         let varint = |value: u64| VarInt::from_u64(value).map_err(|_| Refusal::Configuration);
         let idle = IdleTimeout::try_from(self.idle_timeout).map_err(|_| Refusal::Configuration)?;
         let mut transport = TransportConfig::default();
+        let handshake = match self.stream_credit {
+            StreamCredit::Fixed => self.streams_per_connection,
+            StreamCredit::Pooled { initial } => initial,
+        };
         transport
-            .max_concurrent_bidi_streams(VarInt::from_u32(self.streams_per_connection))
+            .max_concurrent_bidi_streams(VarInt::from_u32(handshake))
             .max_concurrent_uni_streams(VarInt::from_u32(self.lanes_per_peer))
             .stream_receive_window(varint(stream)?)
             .receive_window(varint(window)?)
@@ -213,6 +262,8 @@ pub struct Stats {
     pub receive_chunks: usize,
     /// Datagrams copied into buffers of their own because no chunk could take them.
     pub receive_copied: u64,
+    /// The stream pool ([`StreamCredit::Pooled`]).
+    pub pool: PoolStats,
 }
 
 /// The QUIC application error code a connection closes with when it ends without a fault.
@@ -276,6 +327,10 @@ struct Conn<R> {
     grants: Vec<Reservation>,
     /// The connection was lost and its owner told.
     lost: bool,
+    /// Its part of the stream pool ([`StreamCredit::Pooled`]).
+    share: Share,
+    /// The exchanges its peer opened that are open: what a pooled connection's grant serves.
+    served: u32,
 }
 
 /// A peer's lifecycle as the owner hears it: its newest connection up, that connection closed,
@@ -448,6 +503,9 @@ struct Core<C: Classes, B, D> {
     dialing: usize,
     ids: Vec<u64>,
     stats: Stats,
+    /// The streams pooled connections share ([`StreamCredit::Pooled`]); until the owner sizes it,
+    /// one connection's streams.
+    pool: Pool,
 }
 
 /// What `conn` has moved, as the wait of an exchange of `rank` reads it.
@@ -568,6 +626,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 dialing: 0,
                 ids: Vec::new(),
                 stats: Stats::default(),
+                pool: Pool::new(u64::from(limits.streams_per_connection)),
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
@@ -702,6 +761,48 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         }
     }
 
+    /// Grants the pool's spare streams to the connections waiting for them, longest waiting first
+    /// (`crate::pool`): each granted is touched, so it sends the peer its new limit at this poll.
+    /// One gone, or whose peer is not blocked now, is passed.
+    fn grant_pool(&mut self) {
+        let most = self.core.limits.streams_per_connection;
+        loop {
+            let Some((key, serial)) = self.core.pool.next() else {
+                // Nothing spare while one waits: what an idle connection holds is taken back for
+                // it, the pool overcommitted by the streams its peer was told of (`crate::pool`).
+                let Some((key, serial)) = self.core.pool.next_idle() else {
+                    break;
+                };
+                if let Some(Some(conn)) = self.conns.get_mut(key)
+                    && conn.serial == serial
+                    && let Some(granted) = self.core.pool.reclaim(&mut conn.share, conn.served)
+                {
+                    conn.quic
+                        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+                }
+                continue;
+            };
+            let granted = match self.conns.get_mut(key) {
+                Some(Some(conn)) if conn.serial == serial => {
+                    if conn.lost || !conn.quic.peer_streams_blocked(Dir::Bi) {
+                        self.core.pool.passed(&mut conn.share);
+                        false
+                    } else {
+                        let granted = self.core.pool.grant(&mut conn.share, most);
+                        conn.quic
+                            .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+                        true
+                    }
+                }
+                // Gone, or its key now another connection's: that one waits under its own serial.
+                _ => false,
+            };
+            if granted {
+                self.touch(key);
+            }
+        }
+    }
+
     /// Connection `key` waits for its turn to transmit, once.
     fn queue_sending(&mut self, key: usize) {
         if let Some(marks) = self.marks.get_mut(key)
@@ -726,6 +827,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// Reads again the connections touched since the last poll: each is queued for its turn to
     /// transmit and placed again by its deadline, and those only to be re-armed are placed again.
     fn read_touched(&mut self) {
+        self.grant_pool();
         let mut touched = std::mem::take(&mut self.touched);
         for &key in &touched {
             if let Some(marks) = self.marks.get_mut(key) {
@@ -1197,8 +1299,21 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             events: self.core.events.len(),
             receive_chunks: self.receive.chunks(),
             receive_copied: self.receive.copied(),
+            pool: self.core.pool.stats(),
             ..self.core.stats
         }
+    }
+
+    /// Sizes the stream pool ([`StreamCredit::Pooled`]): the exchanges pooled peers may have open
+    /// at once, all connections' together. Credit it gains goes to the connections waiting at the
+    /// next poll; credit it loses comes back as their exchanges end. Refused `Configuration` under
+    /// [`StreamCredit::Fixed`].
+    pub fn set_stream_pool(&mut self, streams: u32) -> Result<(), Refusal> {
+        if self.core.limits.stream_credit == StreamCredit::Fixed {
+            return Err(Refusal::Configuration);
+        }
+        self.core.pool.resize(u64::from(streams));
+        Ok(())
     }
 
     /// The budget, for the owner's accounting.
@@ -1312,6 +1427,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             delivered: Delivered::new(C::RANKS),
             grants,
             lost: false,
+            share: Share::default(),
+            served: 0,
         };
         if self.conns.len() <= key {
             self.conns.resize_with(key.saturating_add(1), || None);
@@ -1683,6 +1800,25 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             Err(refusal) => return self.refuse_connection(now, conn, refusal),
         };
         conn.peer = Some((peer, role));
+        if let StreamCredit::Pooled { initial } = self.limits.stream_credit {
+            if C::pooled(role) {
+                self.pool
+                    .join(&mut conn.share, initial, conn.key, conn.serial);
+                if let Some(granted) = self
+                    .pool
+                    .welcome(&mut conn.share, self.limits.streams_per_connection)
+                {
+                    conn.quic
+                        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+                }
+            } else {
+                // A role outside the pool holds every stream a connection may from here on.
+                conn.quic.set_max_concurrent_streams(
+                    Dir::Bi,
+                    VarInt::from_u32(self.limits.streams_per_connection),
+                );
+            }
+        }
         let dialed = conn.dialed.is_some();
         let epoch = self.entry(peer).map_or(0, |entry| {
             entry.epoch = entry.epoch.saturating_add(1);
@@ -1747,6 +1883,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             self.finish_exchange(conn, *id, Some((Refusal::Closed, false)));
         }
         self.ids = ids;
+        self.pool.leave(&mut conn.share);
         self.release_lanes(conn);
         match (conn.peer, conn.dialed) {
             (Some((peer, _)), _) => {
@@ -1857,6 +1994,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             Ok(id) => {
                 self.exchanges.place(id, conn.exchanges.len());
                 conn.exchanges.push(id);
+                conn.served = conn.served.saturating_add(1);
                 bind_stream(&mut conn.by_stream, stream, id);
                 self.begun(now, key, peer);
                 self.read_exchange(now, conn, id);
@@ -2189,6 +2327,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if conn.peer.is_none() || conn.lost {
             return Err(Refusal::NotConnected);
         }
+        if self.limits.ask_queue == AskQueue::Credit && self.asks_past_credit(conn) {
+            return Err(Refusal::Unsent);
+        }
         let message = self.message(class, kind, header, body)?;
         let mut out = Outgoing::nothing();
         out.state = Out::Head;
@@ -2266,6 +2407,25 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         message.fill(&prefix);
         message.fill(header);
         Ok(message)
+    }
+
+    /// Whether `conn` already waits for as many streams for its asked exchanges as its peer grants
+    /// it, those this side holds and those it may still open, one at least ([`AskQueue::Credit`]).
+    fn asks_past_credit(&mut self, conn: &mut Conn<C::Role>) -> bool {
+        let (streamed, queued) = self
+            .exchanges
+            .tally(conn.key)
+            .map_or((0, 0), crate::tally::Tally::asked);
+        #[cfg(feature = "oracle")]
+        self.check(queued, |core| {
+            conn.exchanges
+                .iter()
+                .filter_map(|id| core.exchanges.get(*id))
+                .filter(|exchange| exchange.opened && exchange.stream.is_none())
+                .fold(0u64, |queued, _| queued.saturating_add(1))
+        });
+        let credit = streamed.saturating_add(conn.quic.streams().remaining(Dir::Bi));
+        queued >= credit.max(1)
     }
 
     /// What the exchanges on `conn` have to send.
@@ -2620,6 +2780,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
 
     /// End exchange `id`: with `failure`, the owner hears it was refused. A half not yet complete
     /// is reset with the refusal's code, so the peer hears it too.
+    /// An exchange on `conn` ended, this side's own if `opened`. A pooled connection's grant
+    /// serves the exchanges its peer opens, so one of those ended may give streams back to the
+    /// pool (`crate::pool`).
+    fn exchange_ended(&mut self, conn: &mut Conn<C::Role>, opened: bool) {
+        if opened {
+            return;
+        }
+        conn.served = conn.served.saturating_sub(1);
+        if let Some(granted) = self
+            .pool
+            .ended(&mut conn.share, conn.served, conn.key, conn.serial)
+        {
+            conn.quic
+                .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+        }
+    }
+
     fn finish_exchange(
         &mut self,
         conn: &mut Conn<C::Role>,
@@ -2647,6 +2824,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if exchange.stream.is_some() {
             conn.credit_moved = Some(self.now);
         }
+        self.exchange_ended(conn, exchange.opened);
         if let Some(stream) = exchange.stream
             && let Ok(at) = conn
                 .by_stream
@@ -2696,6 +2874,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     fn progress(&mut self, now: Instant, conn: &mut Conn<C::Role>) {
         if conn.peer.is_none() || conn.lost {
             return;
+        }
+        // A pooled peer blocked at its grant with none more on its way waits its turn for more,
+        // granted as the endpoint next polls (`Endpoint::grant_pool`).
+        if conn.share.pooled && !conn.share.wanting && conn.quic.peer_streams_blocked(Dir::Bi) {
+            self.pool.wants(&mut conn.share, conn.key, conn.serial);
         }
         let mut ids = std::mem::take(&mut self.ids);
         ids.clear();
@@ -2806,7 +2989,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                         exchange.carry.hold_from(advanced, at, backlog);
                         Ok(())
                     }
-                    _ => Err(Refusal::Stalled),
+                    _ => Err(Refusal::Unsent),
                 };
             }
             // A stream its peer does not read ends by its own bytes, whatever else the connection

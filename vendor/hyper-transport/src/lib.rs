@@ -42,6 +42,7 @@ mod error;
 mod exchange;
 mod frame;
 mod lane;
+mod pool;
 mod progress;
 mod receive;
 mod round;
@@ -55,7 +56,7 @@ pub use credit::{
     K_GRANULARITY, MIN_DATAGRAM, STREAM_BYTES_PER_PACKET, class_reserve, initial_window,
     stream_window_ceiling,
 };
-pub use endpoint::{Config, Endpoint, Limits, PathFacts, Stats};
+pub use endpoint::{AskQueue, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit};
 pub use error::Refusal;
 /// The congestion controllers a connection may run ([`Config::congestion`]).
 pub use hyper_quic::congestion;
@@ -63,6 +64,7 @@ pub use hyper_quic::{EcnCodepoint, Transmit};
 /// The fold an owner measures its timer granularity `G` with, for [`Endpoint::set_granularity`]
 /// and [`Endpoint::exchange_tail`].
 pub use hyper_timing::Lateness;
+pub use pool::PoolStats;
 pub use progress::{LEAST_PROGRESS, Progress};
 pub use receive::RECEIVE_CHUNK;
 pub use round::{Round, RoundEnd};
@@ -106,6 +108,13 @@ pub trait Classes {
     fn kind_code(kind: Self::Kind) -> u16;
     /// The kind a code names, or `None` for a code this side does not know.
     fn kind_of(code: u16) -> Option<Self::Kind>;
+    /// Whether a peer of `role` shares the stream pool ([`StreamCredit::Pooled`]): granted the
+    /// exchanges it may open as it wants them. A role outside it holds every stream a connection
+    /// may. None is, unless a side says so.
+    fn pooled(role: Self::Role) -> bool {
+        let _ = role;
+        false
+    }
 }
 
 /// What a connection's handshake established, for [`Directory::identify`]: everything the

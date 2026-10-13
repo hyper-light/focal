@@ -31,13 +31,23 @@ pub use state::StreamsState;
 pub struct Streams<'a> {
     pub(super) state: &'a mut StreamsState,
     pub(super) conn_state: &'a super::State,
+    /// Where an open the peer's limit refused queues its `STREAMS_BLOCKED`.
+    pub(super) pending: &'a mut Retransmits,
 }
 
 #[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
 impl<'a> Streams<'a> {
     #[cfg(fuzzing)]
-    pub fn new(state: &'a mut StreamsState, conn_state: &'a super::State) -> Self {
-        Self { state, conn_state }
+    pub fn new(
+        state: &'a mut StreamsState,
+        conn_state: &'a super::State,
+        pending: &'a mut Retransmits,
+    ) -> Self {
+        Self {
+            state,
+            conn_state,
+            pending,
+        }
     }
 
     /// Open a single stream if possible
@@ -48,8 +58,15 @@ impl<'a> Streams<'a> {
             return None;
         }
 
-        // TODO: Queue STREAM_ID_BLOCKED if this fails
-        if *self.state.next.get(dir) >= *self.state.max.get(dir) {
+        // At the peer's limit: it is told so once for each limit (RFC 9000 §4.6: a sender SHOULD
+        // send STREAMS_BLOCKED when it wishes to open a stream but cannot), which says to a peer
+        // that grants streams as they are wanted that this side wants another.
+        let max = *self.state.max.get(dir);
+        if *self.state.next.get(dir) >= max {
+            if *self.state.streams_blocked_limit.get(dir) != Some(max) {
+                *self.state.streams_blocked_limit.get_mut(dir) = Some(max);
+                *self.pending.streams_blocked.get_mut(dir) = true;
+            }
             return None;
         }
 
@@ -99,6 +116,15 @@ impl<'a> Streams<'a> {
     /// The number of streams that may have unacknowledged data.
     pub fn send_streams(&self) -> usize {
         self.state.send_streams
+    }
+
+    /// The streams of `dir` this side may still open: what the peer's limit allows past those
+    /// opened already. With those this side holds, what the peer grants it.
+    pub fn remaining(&self, dir: Dir) -> u64 {
+        self.state
+            .max
+            .get(dir)
+            .saturating_sub(*self.state.next.get(dir))
     }
 
     /// The number of remotely initiated open streams of a certain directionality.

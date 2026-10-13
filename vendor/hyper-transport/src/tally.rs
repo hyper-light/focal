@@ -42,6 +42,8 @@ pub(crate) struct Counted {
     pub(crate) pending: u64,
     /// What the peer has declared and not delivered of its message (`Incoming::owed`).
     pub(crate) owed: u64,
+    /// Whether this side asked it: what an asker's queue for streams counts.
+    pub(crate) asked: bool,
 }
 
 impl Counted {
@@ -51,6 +53,7 @@ impl Counted {
             streamed: exchange.stream.is_some(),
             pending: exchange.out.pending(),
             owed: exchange.incoming.owed(),
+            asked: exchange.opened,
         }
     }
 }
@@ -65,6 +68,10 @@ pub(crate) struct Tally {
     held: u128,
     /// What the peer owes, by rank.
     owed: Vec<u128>,
+    /// The exchanges this side asked that hold a stream.
+    asked_streamed: u128,
+    /// The exchanges this side asked that wait for a stream.
+    asked_queued: u128,
 }
 
 impl Tally {
@@ -73,6 +80,17 @@ impl Tally {
             streamed: vec![0; usize::from(ranks)],
             held: 0,
             owed: vec![0; usize::from(ranks)],
+            asked_streamed: 0,
+            asked_queued: 0,
+        }
+    }
+
+    /// The count `share` adds to: an asked exchange's, by whether it holds a stream.
+    fn asked_count(&mut self, share: Counted) -> Option<&mut u128> {
+        match (share.asked, share.streamed) {
+            (false, _) => None,
+            (true, true) => Some(&mut self.asked_streamed),
+            (true, false) => Some(&mut self.asked_queued),
         }
     }
 
@@ -87,6 +105,9 @@ impl Tally {
         if let Some(sum) = self.owed.get_mut(rank) {
             *sum = sum.saturating_add(u128::from(share.owed));
         }
+        if let Some(count) = self.asked_count(share) {
+            *count = count.saturating_add(1);
+        }
     }
 
     fn sub(&mut self, share: Counted) {
@@ -99,6 +120,9 @@ impl Tally {
         self.held = self.held.saturating_sub(u128::from(share.pending));
         if let Some(sum) = self.owed.get_mut(rank) {
             *sum = sum.saturating_sub(u128::from(share.owed));
+        }
+        if let Some(count) = self.asked_count(share) {
+            *count = count.saturating_sub(1);
         }
     }
 
@@ -115,6 +139,11 @@ impl Tally {
     /// What the peer owes of the classes of `rank` and the less urgent ones.
     pub(crate) fn owed_from(&self, rank: u8) -> u64 {
         clamp(self.owed.iter().skip(usize::from(rank)).sum())
+    }
+
+    /// The exchanges this side asked that hold a stream, and those that wait for one.
+    pub(crate) fn asked(&self) -> (u64, u64) {
+        (clamp(self.asked_streamed), clamp(self.asked_queued))
     }
 }
 
@@ -412,6 +441,7 @@ mod tests {
             streamed,
             pending,
             owed,
+            asked: false,
         }
     }
 
