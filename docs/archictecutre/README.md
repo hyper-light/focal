@@ -49,6 +49,7 @@ states or mutations are already implemented.
 | [26 — Custody, archive, retention and restore](26-custody-archive-retention-and-restore.md) | Custody receipts per verified copy and the obligation a validation phase reads, then archive and retirement, retention floors, garbage collection, backup and restore |
 | [25 — Parallel materialization, ranges and movement](25-parallel-materialization-and-ranges.md) | Deterministic parallel materialization of committed records (staged in dependency waves, read-traced, barrier-checked, installed in order), then ranges and safe movement |
 | [24 — Placement execution and fleet control](24-placement-execution-and-fleet-control.md) | Committed assignment progress, plan phases derived from signed readiness, retiring copies, bounded refusals, the measured guarantee report, and the remaining controller, agent, admission and operator batches |
+| [30 — A write path ten times better: in memory first](30-in-memory-write-path.md) | Measured cost of a write by layer against NATS, the literature by layer, the in-place state structures, capture-scoped checkpoints and the per-write budget for an order of magnitude |
 | [Hecate source snapshot](reference/README.md) | Imported architecture and supporting specs, original provenance and hashes |
 
 ## Authority and current status
