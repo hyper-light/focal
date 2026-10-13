@@ -537,6 +537,33 @@ impl NativeRanges {
         source: &MemoryBudget,
         tail: Option<&Fragments>,
         prefix: u64,
+        changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        present: impl FnMut(&Key) -> Option<usize>,
+    ) -> Result<Fragments, MemoryError> {
+        self.plan_sparse_from(source, None, tail, prefix, changes, lane, present)
+    }
+    /// [`Self::plan_sparse`] over the published members alone, each member's
+    /// part of the changes funded from `funding`, which its caller reserved
+    /// with them (a follower's replayed record): never charged twice.
+    pub(super) fn plan_sparse_funded(
+        &self,
+        source: &MemoryBudget,
+        funding: &mut Allocation,
+        prefix: u64,
+        changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        present: impl FnMut(&Key) -> Option<usize>,
+    ) -> Result<Fragments, MemoryError> {
+        self.plan_sparse_from(source, Some(funding), None, prefix, changes, lane, present)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn plan_sparse_from(
+        &self,
+        source: &MemoryBudget,
+        mut funding: Option<&mut Allocation>,
+        tail: Option<&Fragments>,
+        prefix: u64,
         mut changes: Vec<Change<Key, Row>>,
         lane: BudgetLane,
         mut present: impl FnMut(&Key) -> Option<usize>,
@@ -561,15 +588,27 @@ impl NativeRanges {
                 Some(tail) => SparseBase::After(tail.sparse(index).ok_or(MemoryError::WrongRange)?),
                 None => SparseBase::Committed,
             };
-            let value = store.plan_sparse(
-                source,
-                base,
-                prefix,
-                part,
-                lane,
-                store.max_batch_entries(),
-                &mut present,
-            )?;
+            let value = match funding.as_deref_mut() {
+                Some(funding) => store.plan_sparse_funded(
+                    source,
+                    funding,
+                    base,
+                    prefix,
+                    part,
+                    lane,
+                    store.max_batch_entries(),
+                    &mut present,
+                )?,
+                None => store.plan_sparse(
+                    source,
+                    base,
+                    prefix,
+                    part,
+                    lane,
+                    store.max_batch_entries(),
+                    &mut present,
+                )?,
+            };
             let member = RangesMember {
                 start: self
                     .layout
@@ -630,6 +669,7 @@ impl NativeRanges {
     /// group of one plans without allocating; a wider group charges one
     /// vector of further plans to `source`, the budget the write will build
     /// from, within the group bytes its envelope carries.
+    #[cfg(test)]
     pub(super) fn plan_batch<'a>(
         &'a self,
         source: &MemoryBudget,
@@ -1371,13 +1411,6 @@ impl<'a> RangesPlan<'a> {
             .map(|member| member.value.changes().len())
             .sum()
     }
-    /// The input bytes every member's plan holds, summed.
-    pub(super) fn input_pending_bytes(&self) -> usize {
-        self.plans
-            .iter()
-            .map(|member| member.value.charges().input_pending_bytes())
-            .fold(0, usize::saturating_add)
-    }
     #[cfg(test)]
     pub(super) fn check_envelope(&self, envelope: &RangeWriteEnvelope) -> Result<(), MemoryError> {
         envelope.check_plans(self.plans.iter().map(|member| &member.value))
@@ -1410,26 +1443,6 @@ impl<'a> RangesPlan<'a> {
     {
         self.build_each(source, |plan| {
             plan.build_in_replacing(source, &mut copy, &mut replaced)
-        })
-    }
-    /// Build every fragment with the input already funded by `input`, which
-    /// is divided among the members by each plan's input bytes, giving
-    /// `replaced` every committed row a change replaces or deletes
-    /// ([`Self::build_in_replacing`]).
-    pub(super) fn build_in_funded_replacing<F, R>(
-        self,
-        source: &MemoryBudget,
-        mut input: Allocation,
-        mut copy: F,
-        mut replaced: R,
-    ) -> Result<Fragments, MemoryError>
-    where
-        F: FnMut(&Row) -> Result<Row, MemoryError>,
-        R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
-    {
-        self.build_each(source, |plan| {
-            let part = input.split_off(plan.charges().input_pending_bytes())?;
-            plan.build_in_funded_replacing(source, part, &mut copy, &mut replaced)
         })
     }
     fn build_each(
@@ -1573,6 +1586,26 @@ impl Fragments {
             FragmentKind::Built(parts) => parts.get(parts.route(key))?.value.range.get_entry(key),
             FragmentKind::Sparse(_) => self.change(key)?,
         }
+    }
+    /// Visits each row a sparse set's publication copies onto `ranges` where
+    /// something else still holds a page it edits
+    /// (`RangeStore::visit_retained`), member by member: what a caller that
+    /// meters a publication's work prepays before anything changes.
+    pub(super) fn visit_retained(
+        &self,
+        ranges: &NativeRanges,
+        mut visit: impl FnMut(&Row) -> Result<(), MemoryError>,
+    ) -> Result<(), MemoryError> {
+        let FragmentKind::Sparse(parts) = &self.kind else {
+            return Err(MemoryError::WrongRange);
+        };
+        if parts.len() != ranges.stores.len() {
+            return Err(MemoryError::WrongRange);
+        }
+        for (store, part) in ranges.stores.iter().zip(parts.iter()) {
+            store.visit_retained(&part.value, &mut visit)?;
+        }
+        Ok(())
     }
     /// Where a sparse set changes `key`: its member and the change's index
     /// there.

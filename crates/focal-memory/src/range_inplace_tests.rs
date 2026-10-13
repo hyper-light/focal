@@ -239,6 +239,161 @@ fn a_publication_in_place_leaves_what_a_rebuild_leaves() {
     }
 }
 
+/// What `visit_retained` visits is what a publication copies where every
+/// page it edits is still read elsewhere (a capture taken before each
+/// publication): the same rows, under every leaf shape, partitioned or not.
+/// A replay prepays the copies by it.
+#[test]
+fn the_rows_visited_as_retained_are_the_rows_a_publication_copies() {
+    let partitions: [Classify; 2] = [None, Some(|key: &u64| key / 16)];
+    for (seed, leaves, partition) in [
+        (11u64, config(4, 4096), partitions[0]),
+        (12, config(8, 512), partitions[0]),
+        (13, config(128, 4096), partitions[0]),
+        (14, config(4, 4096), partitions[1]),
+        (15, config(8, 512), partitions[1]),
+        (16, config(128, 4096), partitions[1]),
+    ] {
+        let budget = MemoryBudget::new(64 << 20, 0).unwrap();
+        let mut store = match partition {
+            Some(classify) => RangeStore::<u64, Value>::new_partitioned(
+                RangeId(1),
+                0,
+                leaves,
+                budget.clone(),
+                classify,
+            ),
+            None => RangeStore::<u64, Value>::new(RangeId(1), 0, leaves, budget.clone()),
+        }
+        .unwrap();
+        let mut draw = Draw(seed);
+        let mut model = Model::new();
+        let oversized = leaves.page_bytes.min(8192) * 3 / 2;
+        let (mut visits, mut copies) = (0usize, 0usize);
+        for prefix in 1..=300u64 {
+            let changes = batch(&mut draw, &mut model, 400, 24, oversized);
+            let sparse = store
+                .plan_sparse(
+                    store.budget(),
+                    SparseBase::Committed,
+                    prefix,
+                    changes,
+                    BudgetLane::Ordinary,
+                    store.config.max_batch_entries,
+                    |key| store.get_entry(key).map(|entry| entry.heap_bytes),
+                )
+                .unwrap();
+            let mut visited = Vec::new();
+            store
+                .visit_retained(&sparse, |value| {
+                    visited.push(value.0);
+                    Ok(())
+                })
+                .unwrap();
+            let capture = store.freeze().unwrap();
+            let mut copied = Vec::new();
+            if let Err(refusal) = store.publish_sparse(sparse, |value: &Value| {
+                copied.push(value.0);
+                Ok(Value(value.0))
+            }) {
+                panic!(
+                    "seed {seed}: publication {prefix} refused: {:?}",
+                    refusal.error()
+                );
+            }
+            drop(capture);
+            visited.sort_unstable();
+            copied.sort_unstable();
+            assert_eq!(visited, copied, "seed {seed} prefix {prefix}");
+            visits += visited.len();
+            copies += copied.len();
+        }
+        // The walk saw real copies, not only empty batches.
+        assert!(copies > 300, "seed {seed}: {copies} copies");
+        assert_eq!(visits, copies);
+        drop(store);
+        assert_eq!(budget.stats().used, 0, "every charge given back");
+    }
+}
+
+/// A funded plan takes its changes' charge from the caller's funding, exactly
+/// what a plan reserving its own takes; a funding too small is refused and
+/// left as it was, with nothing reserved.
+#[test]
+fn a_funded_plan_takes_its_input_from_its_funding_and_no_more() {
+    let budget = MemoryBudget::new(64 << 20, 0).unwrap();
+    let store =
+        RangeStore::<u64, Value>::new(RangeId(1), 0, config(8, 4096), budget.clone()).unwrap();
+    let changes = || {
+        (0..10u64)
+            .map(|key| Change::Put(Entry::new(key, Value(key), 64)))
+            .collect::<Vec<_>>()
+    };
+    let lane = BudgetLane::Ordinary;
+    // The store's own root.
+    let base = budget.stats().used;
+    let reserving = store
+        .plan_sparse(
+            &budget,
+            SparseBase::Committed,
+            1,
+            changes(),
+            lane,
+            store.config.max_batch_entries,
+            |_| None,
+        )
+        .unwrap();
+    let reserved = budget.stats().used;
+    let input = reserving.charges().0;
+    drop(reserving);
+    assert_eq!(budget.stats().used, base);
+    // A funding with room to spare gives up the input alone.
+    let mut funding = budget
+        .reserve(BudgetKind::Pending, lane, input + 1_000)
+        .unwrap()
+        .commit();
+    let funded = store
+        .plan_sparse_funded(
+            &budget,
+            &mut funding,
+            SparseBase::Committed,
+            1,
+            changes(),
+            lane,
+            store.config.max_batch_entries,
+            |_| None,
+        )
+        .unwrap();
+    assert_eq!(funded.charges().0, input);
+    assert_eq!(funding.bytes(), 1_000);
+    assert_eq!(budget.stats().used, reserved + 1_000);
+    drop(funded);
+    drop(funding);
+    // One byte short: refused, the funding as it was, nothing reserved.
+    let mut short = budget
+        .reserve(BudgetKind::Pending, lane, input - 1)
+        .unwrap()
+        .commit();
+    let used = budget.stats().used;
+    assert!(matches!(
+        store.plan_sparse_funded(
+            &budget,
+            &mut short,
+            SparseBase::Committed,
+            1,
+            changes(),
+            lane,
+            store.config.max_batch_entries,
+            |_| None,
+        ),
+        Err(MemoryError::Capacity { .. })
+    ));
+    assert_eq!(short.bytes(), input - 1);
+    assert_eq!(budget.stats().used, used);
+    drop(short);
+    assert_eq!(budget.stats().used, base);
+}
+
 /// A chain of candidates, each planned over its unpublished predecessors'
 /// changes, publishes in order; one planned on a base already passed is
 /// refused whole and leaves the store as it was.

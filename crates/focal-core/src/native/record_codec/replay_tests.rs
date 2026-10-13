@@ -97,6 +97,116 @@ fn body_offset(bytes: &[u8], key: Key) -> usize {
         - bytes.as_ptr() as usize
 }
 
+/// A replay prepays at its plan the copies its publication may make: the work
+/// the build it replaced charged as it copied each row it kept. Given exactly
+/// that work it publishes; given one unit less it is refused before anything
+/// changes.
+#[test]
+fn a_replay_prepays_the_copies_a_build_charged_and_is_refused_whole_without_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = checkpoint::store(directory.path());
+    let mut original = f::core();
+    let mut recovered = restored(&original, 10_001, &store);
+    // Claims enough that a later write's rows land among rows it keeps.
+    for id in 1..=12u128 {
+        apply(
+            &mut original,
+            &mut recovered,
+            10 + u64::try_from(id).unwrap(),
+            f::creation(id, id, &[(ValidationMode::Required, true)], None),
+            &store,
+        );
+    }
+    let prepared = prepare_input(
+        &original,
+        100,
+        f::creation(13, 13, &[(ValidationMode::Required, true)], None),
+    );
+    let bytes = encode_mutation(&prepared);
+    let record = inspect(&bytes);
+    let staged = || {
+        stage(
+            &recovered,
+            &recovered.state.budget,
+            recovered.limits,
+            recovered.state.ledger,
+            recovered.state.profile,
+            &record,
+            original.state.rows.id(),
+            checkpoint::limits(recovered.limits),
+            &store,
+            &BuiltinNativeSchemas,
+        )
+        .unwrap()
+    };
+    // What the build charged: each row it kept, as it copied it.
+    let changes: Vec<_> = staged()
+        .changes
+        .iter()
+        .map(|change| match change {
+            Change::Put(entry) => Change::Put(Entry::new(
+                entry.key,
+                crate::native::prepare::copy(&entry.value).unwrap(),
+                entry.heap_bytes,
+            )),
+            Change::Delete(key) => Change::Delete(*key),
+        })
+        .collect();
+    let mut charged = 0usize;
+    let built = recovered
+        .state
+        .rows
+        .plan_batch(
+            &recovered.state.budget,
+            recovered.state.rows.prefix() + 1,
+            changes,
+            BudgetLane::Completion,
+            usize::MAX,
+        )
+        .unwrap()
+        .build_in_replacing(
+            &recovered.state.budget,
+            |row| {
+                charged += read_dispatch::objects::copy_work(row).unwrap();
+                crate::native::prepare::copy(row)
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap();
+    drop(built);
+    assert!(charged > 0, "the write keeps rows of the pages it edits");
+    let before = |core: &Core<NativeState>| {
+        (
+            core.native_sequence(),
+            core.state.rows.prefix(),
+            core.native_stats(),
+            core.state.budget.stats(),
+        )
+    };
+    // Refused whole: the record's own permit given back, nothing else changed.
+    let unchanged = before(&recovered);
+    let mut short = staged();
+    short.remaining.model = charged - 1;
+    assert!(install(&recovered, short).is_err());
+    assert_eq!(before(&recovered), unchanged);
+    let mut exact = staged();
+    exact.remaining.model = charged;
+    let replayed = install(&recovered, exact).unwrap();
+    // A capture still reading the pages, so the publication copies what it
+    // prepaid.
+    let capture = recovered
+        .state
+        .rows
+        .freeze(&recovered.state.budget)
+        .unwrap();
+    assert_eq!(
+        original.publish_native(prepared).unwrap(),
+        recovered.publish_native(replayed).unwrap()
+    );
+    drop(capture);
+    checkpoint::compare(&original, &recovered);
+}
+
 #[test]
 fn replay_from_genesis_matches_actual_create_post_and_begin_without_command_reexecution() {
     let directory = tempfile::tempdir().unwrap();

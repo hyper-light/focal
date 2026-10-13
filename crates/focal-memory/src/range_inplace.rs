@@ -220,6 +220,58 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
         source: &MemoryBudget,
         base: SparseBase<'_, K, V>,
         prefix: u64,
+        changes: Vec<Change<K, V>>,
+        lane: BudgetLane,
+        max_entries: usize,
+        present: impl FnMut(&K) -> Option<usize>,
+    ) -> Result<SparseRange<K, V>, MemoryError> {
+        self.plan_sparse_from(
+            source,
+            None,
+            base,
+            prefix,
+            changes,
+            lane,
+            max_entries,
+            present,
+        )
+    }
+
+    /// [`Self::plan_sparse`], the changes funded by the caller: what they
+    /// take (their vector and their heap) is split from `input`, which the
+    /// caller reserved with them (a replayed record's), never charged twice.
+    /// Refused, `input` untouched, where it holds less.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_sparse_funded(
+        &self,
+        source: &MemoryBudget,
+        input: &mut Allocation,
+        base: SparseBase<'_, K, V>,
+        prefix: u64,
+        changes: Vec<Change<K, V>>,
+        lane: BudgetLane,
+        max_entries: usize,
+        present: impl FnMut(&K) -> Option<usize>,
+    ) -> Result<SparseRange<K, V>, MemoryError> {
+        self.plan_sparse_from(
+            source,
+            Some(input),
+            base,
+            prefix,
+            changes,
+            lane,
+            max_entries,
+            present,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_sparse_from(
+        &self,
+        source: &MemoryBudget,
+        funding: Option<&mut Allocation>,
+        base: SparseBase<'_, K, V>,
+        prefix: u64,
         mut changes: Vec<Change<K, V>>,
         lane: BudgetLane,
         max_entries: usize,
@@ -305,10 +357,21 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
         input = checked_add(input, incoming_heap)?;
         let leaves = checked_add(base_leaves, checked_mul(2, changes.len())?)?;
         let (pages, nodes, staging) = self.sparse_quote(changes.len(), incoming_heap, leaves)?;
-        let input = source.reserve(BudgetKind::Pending, lane, input)?.commit();
+        if let Some(funding) = funding.as_ref()
+            && funding.bytes() < input
+        {
+            return Err(MemoryError::Capacity {
+                requested: input,
+                available: funding.bytes(),
+            });
+        }
         let pages = source.reserve(BudgetKind::Pages, lane, pages)?.commit();
         let nodes = source.reserve(BudgetKind::Roots, lane, nodes)?.commit();
         let staging = source.reserve(BudgetKind::Pending, lane, staging)?.commit();
+        let input = match funding {
+            Some(funding) => funding.split_off(input)?,
+            None => source.reserve(BudgetKind::Pending, lane, input)?.commit(),
+        };
         Ok(SparseRange {
             owner: self.root.owner,
             range: self.id(),
@@ -449,6 +512,42 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
             ));
         }
         Ok(())
+    }
+
+    /// Visits each row [`Self::publish_sparse`] copies when something else
+    /// still holds the pages `sparse` edits: every row of an edited page that
+    /// its changes neither replace nor delete, its pages grouped as the
+    /// publication groups them (a page it leaves as it is copies nothing). A
+    /// caller that meters what a publication may do pays for these here,
+    /// before anything changes: a publication is never refused once begun.
+    /// `sparse` must publish onto this store as it stands.
+    pub fn visit_retained(
+        &self,
+        sparse: &SparseRange<K, V>,
+        mut visit: impl FnMut(&V) -> Result<(), MemoryError>,
+    ) -> Result<(), MemoryError> {
+        self.check_sparse(sparse)?;
+        let shape = Shape::<K>::new::<V>(self.config, self.partition)?;
+        // Groups from the end, as the publication takes them: its edits lie
+        // past every group left, so the groups read here off the root as it
+        // stands are the ones it edits.
+        let mut end = sparse.changes.len();
+        loop {
+            let remaining = sparse.changes.get(..end).ok_or(MemoryError::MissingKey)?;
+            let Some(group) = groups::last(&self.root, remaining)? else {
+                return Ok(());
+            };
+            let floor = end
+                .checked_sub(group.count)
+                .ok_or(MemoryError::MissingKey)?;
+            let changes = remaining.get(floor..).ok_or(MemoryError::MissingKey)?;
+            if let Some(page) = group.page
+                && layout::reusable_page(page, changes, shape.config, shape.partition)?.is_none()
+            {
+                retained(page, changes, &mut visit)?;
+            }
+            end = floor;
+        }
     }
 
     fn apply_sparse<F>(
@@ -1129,6 +1228,23 @@ fn insert_all<K: crate::RangeKey, V>(
     for leaf in leaves {
         pages.insert_owned(at, leaf, build)?;
         at = checked_add(at, 1)?;
+    }
+    Ok(())
+}
+
+/// Each row of `page` that `group`, its changes in key order, neither
+/// replaces nor deletes.
+fn retained<K: crate::RangeKey, V>(
+    page: &Page<K, V>,
+    group: &[Change<K, V>],
+    visit: &mut impl FnMut(&V) -> Result<(), MemoryError>,
+) -> Result<(), MemoryError> {
+    let mut changes = group.iter().peekable();
+    for row in &page.entries {
+        while changes.next_if(|change| change.key() < &row.key).is_some() {}
+        if changes.next_if(|change| change.key() == &row.key).is_none() {
+            visit(&row.value)?;
+        }
     }
     Ok(())
 }

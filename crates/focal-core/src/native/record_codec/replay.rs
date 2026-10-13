@@ -620,49 +620,55 @@ pub(super) fn install(
             .commit();
         allocation.absorb(&mut extra_allocation)?;
     }
-    let plan = core.state.rows.plan_batch(
-        &core.state.budget,
-        header.outcome.sequence.0,
-        changes,
-        BudgetLane::Completion,
-        usize::MAX,
-    )?;
-    let failure = std::cell::Cell::new(None);
-    let input_bytes = plan.input_pending_bytes();
+    // The changes alone, planned over the published members as the leader
+    // planned its write (doc 30 §9), funded from the record's own permit and
+    // never admitted a second time; each committed row a change replaces or
+    // deletes is counted out of a checkpoint's size as the plan reads it.
     let available = allocation
         .bytes()
         .checked_sub(slots_bytes)
         .ok_or(ContractError::Capacity)?;
-    prepare::within(input_bytes, available)?;
-    // The plan takes the existing exact input permit. Its drop-ordered owner
-    // retains that charge through every refusal and through destination-page
-    // construction; the incoming vector/payloads are not admitted a second time.
-    let input = allocation.split_off(input_bytes)?;
+    let mut funding = allocation.split_off(available)?;
     let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
-    let fragments = plan
-        .build_in_funded_replacing(
-            &core.state.budget,
-            input,
-            |row| {
-                let work = match read_dispatch::objects::copy_work(row) {
-                    Ok(work) => work,
-                    Err(error) => {
-                        failure.set(Some(error));
-                        return Err(MemoryError::InvalidConfiguration(
-                            "native replay copy work exhausted",
-                        ));
-                    }
-                };
-                if let Err(error) = meters.model.charge(work) {
-                    failure.set(Some(read_evidence::codec(error)));
+    let mut counted = Ok(());
+    let fragments = core.state.rows.plan_sparse_funded(
+        &core.state.budget,
+        &mut funding,
+        header.outcome.sequence.0,
+        changes,
+        BudgetLane::Completion,
+        |key| {
+            let entry = core.state.rows.get_entry(key)?;
+            if counted.is_ok() {
+                counted = removed.count(key, &entry.value);
+            }
+            Some(entry.heap_bytes)
+        },
+    )?;
+    counted?;
+    // A page something else still reads (a capture, a lease) is copied as
+    // the record publishes: every row it would copy is metered here, before
+    // anything changes, as the build that copied them metered each copy.
+    let failure = std::cell::Cell::new(None);
+    fragments
+        .visit_retained(&core.state.rows, |row| {
+            let work = match read_dispatch::objects::copy_work(row) {
+                Ok(work) => work,
+                Err(error) => {
+                    failure.set(Some(error));
                     return Err(MemoryError::InvalidConfiguration(
                         "native replay copy work exhausted",
                     ));
                 }
-                prepare::copy(row)
-            },
-            |key, row| removed.count(key, row),
-        )
+            };
+            if let Err(error) = meters.model.charge(work) {
+                failure.set(Some(read_evidence::codec(error)));
+                return Err(MemoryError::InvalidConfiguration(
+                    "native replay copy work exhausted",
+                ));
+            }
+            Ok(())
+        })
         .map_err(|error| failure.take().unwrap_or_else(|| error.into()))?;
     writes.check(&fragments)?;
     Ok(NativePrepared {
