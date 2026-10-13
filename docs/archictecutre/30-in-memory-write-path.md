@@ -343,6 +343,69 @@ Each step is measured before and after:
 - `structbench`'s shapes, moved into focal-memory's benches;
 - the CI comparison's A/B (one runner, `compare-ab.yml`).
 
+## 9. Stage 1 of the store: sparse candidates, in-place publication, copies only where shared
+
+**What a write copies today (measured, the isolated harness with a counter in the row copier,
+4 KiB leaves, 5,000 claims).** About 148 rows a claim are copied:
+
+| Row family | Copies a claim |
+|---|---|
+| Secondary-index unit rows | 121 |
+| Outcomes | 7.5 |
+| Events | 7 |
+| Creation results | 6.5 |
+| Definitions | 2.5 |
+| Identity rows | 3.3 |
+
+Each of a claim's nine index rows lands in a different index page. Each such page is rebuilt with
+its ~14 neighbours copied. The rest is page 0's control rows and the claim's own page.
+
+**Why the copies exist.** A candidate is prepared against the committed root while that root stays
+readable: readers, a checkpoint's frozen image, a lease. Earlier candidates are still on their way
+through consensus. So a candidate builds new pages beside the old ones, and a `PreparedRange`
+holds a whole new root and the base root by `Arc`.
+
+**The design.** It keeps every reader's semantics.
+- **A candidate holds its changes alone.** That is the sorted puts and deletes of its batch, plus
+  the generation of the committed state it was prepared on, where today it holds a built root.
+  Holding no `Arc` on the committed root leaves that root unshared.
+- **Reads during preparation go through the pending changes.** These are one ordered map of every
+  unpublished candidate's changes, the newest per key winning, over the committed root. A point
+  read is one probe of the map, then the root. A range read merges the two. The map holds at most
+  the write window's candidates' changes, its bound.
+- **Publication applies the changes in place.** The root, its directory nodes and its pages are
+  edited where uniquely owned (`Arc` strong count 1), and copied first where shared: a frozen image
+  or a lease holds them. A page touched during a checkpoint's capture is copied once; outside one,
+  nothing is copied. This is FASTER's division (in place where mutable, read-copy-update where
+  something else still reads), decided by reference counts rather than a log region (§4.1). It is
+  the copy-on-update of Cao et al. and CALC, confined to captures (§4.2).
+- **Publication cannot fail.** Today "publication allocates nothing". It becomes "publication
+  allocates only what preparation set aside". Pages are allocated at full capacity, so an insert
+  never grows one. Each change that may split a page has a spare page reserved. Each page a capture
+  could share has a copy's worth reserved. All of it is charged at preparation, and what is not used
+  is given back at publication.
+- **A refused candidate is dropped.** Nothing was applied. Candidates after it in the chain are
+  dropped with it, as today.
+- **Chain validation uses a generation.** The owner's identity and a generation advanced by every
+  publication replace `Arc::ptr_eq` on the base root.
+- **A follower's replay** prepares and publishes at once.
+
+**Tests, each failing before the change where it can:**
+- a differential test: random batch sequences published in place and by rebuild must leave
+  identical entries, prefixes and charges, with freezes and leases interleaved, and every frozen
+  image unchanged by later publications;
+- a counting allocator: publication allocates nothing past what its preparation reserved;
+- the memory bound: every reservation is given back on publication and on refusal;
+- `RangeStore`'s existing suites, adapted where they assert copies that are no longer made.
+
+**Measured before and after:**
+- the isolated harness's prepare and publish (macOS 4 KiB leaves: 37.5 + 4.2 µs, 53.8 + 4.3 µs with
+  32 MiB of interference);
+- the copies-per-claim counter (target: about 0 outside captures);
+- the CI comparison's A/B on the leader's and followers' CPU per write.
+
+Stage 2 (doc 30 §6.1's per-family structures with compact keys) follows once Stage 1 is measured.
+
 ## Sources
 
 - [FASTER] Chandramouli et al., *FASTER: An Embedded Concurrent Key-Value Store for State
