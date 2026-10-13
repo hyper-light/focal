@@ -11,12 +11,15 @@ pub const MAX_SESSIONS: usize = 1024;
 pub struct ManagedFleetConfig {
     pub max_sessions: usize,
     pub management_queue: usize,
+    /// The owner shards the fleet's sessions are spread over, one thread each (doc 31 §4.1).
+    pub owner_shards: usize,
 }
 impl Default for ManagedFleetConfig {
     fn default() -> Self {
         Self {
             max_sessions: MAX_SESSIONS,
             management_queue: 64,
+            owner_shards: super::default_owner_shards(),
         }
     }
 }
@@ -211,6 +214,8 @@ pub(crate) struct ManagementState {
     // This is the same physical queue lease held by grouped hosts and egress.
     // A removed session's watch cannot own storage shared by other sessions.
     _backing: std::sync::Arc<Allocation>,
+    /// Each owner shard's running count, which the fleet's status sums as it is read.
+    running: Vec<watch::Receiver<usize>>,
 }
 #[derive(Clone)]
 pub struct FleetManager {
@@ -230,7 +235,15 @@ impl FleetManager {
         self.state.clone()
     }
     pub fn status(&self) -> FleetStatus {
-        self.state.borrow().status
+        let state = self.state.borrow();
+        FleetStatus {
+            running: state
+                .running
+                .iter()
+                .map(|running| *running.borrow())
+                .fold(0usize, usize::saturating_add),
+            ..state.status
+        }
     }
     /// The writes the sessions this node leads take at once, summed, and the least bound they are
     /// counted within: each session that leads a term it is ready in gives its learned write
@@ -634,44 +647,66 @@ pub(super) struct ManagementOwner {
     sequence: u64,
     owner: OwnerId,
     max_sessions: usize,
-    sender: OwnerQueue,
+    /// Each owner shard's queue: a session is installed on the shard its ledger names
+    /// (`shard_of`), and what touches a shard's scheduler is asked of the shard.
+    shards: Vec<OwnerQueue>,
     outbound: hyper_rt::sync::Sender<ReplicationFrame>,
     /// The queue-slot allowance every tenant's per-session slots descend from.
     items: MemoryBudget,
 }
 impl ManagementOwner {
-    fn admit_tenant(
-        &mut self,
-        group: &mut GroupOwner,
-        tenant: FleetTenant,
-    ) -> Result<(), FleetError> {
+    fn admit_tenant(&mut self, tenant: FleetTenant) -> Result<(), FleetError> {
         if self.state.borrow().tenants.contains_key(&tenant.tenant) {
             return Ok(());
         }
-        group
-            .scheduler
-            .register_tenant(
-                tenant.tenant,
-                super::scheduler_quota(tenant.weight, self.max_sessions),
-            )
-            .map_err(|error| match error {
-                DirectoryError::Duplicate => FleetError::Conflict,
-                _ => FleetError::Capacity,
-            })?;
+        // Each shard's scheduler admits the tenant before any session of it reaches the shard:
+        // a shard takes its input in order.
+        for shard in &self.shards {
+            let (reply, answer) = mpsc::sync_channel(1);
+            shard
+                .send(FleetInput::Shard(super::ShardWork::AdmitTenant {
+                    tenant: tenant.tenant,
+                    quota: super::scheduler_quota(tenant.weight, self.max_sessions),
+                    reply,
+                }))
+                .map_err(|_| FleetError::Unavailable)?;
+            answer
+                .recv()
+                .map_err(|_| FleetError::Unavailable)?
+                .map_err(|error| match error {
+                    DirectoryError::Duplicate => FleetError::Conflict,
+                    _ => FleetError::Capacity,
+                })?;
+        }
         let items = super::queue_share(&self.items).map_err(|_| FleetError::Capacity)?;
         self.state.send_modify(|state| {
             state.tenants.insert(tenant.tenant, (tenant.budget, items));
         });
         Ok(())
     }
-    fn tenant_usage(
-        &self,
-        group: &GroupOwner,
-    ) -> Result<BTreeMap<TenantId, QueueUsage>, FleetError> {
-        let mut usage = BTreeMap::new();
-        for tenant in self.state.borrow().tenants.keys() {
-            if let Some(entry) = group.scheduler.usage(*tenant) {
-                usage.insert(*tenant, entry);
+    /// Every admitted tenant's queue usage, summed over the shards.
+    fn tenant_usage(&self) -> Result<BTreeMap<TenantId, QueueUsage>, FleetError> {
+        let tenants: Vec<TenantId> = self.state.borrow().tenants.keys().copied().collect();
+        let mut usage: BTreeMap<TenantId, QueueUsage> = BTreeMap::new();
+        for shard in &self.shards {
+            let (reply, answer) = mpsc::sync_channel(1);
+            shard
+                .send(FleetInput::Shard(super::ShardWork::TenantUsage {
+                    tenants: tenants.clone(),
+                    reply,
+                }))
+                .map_err(|_| FleetError::Unavailable)?;
+            for (tenant, entry) in answer.recv().map_err(|_| FleetError::Unavailable)? {
+                let sum = usage.entry(tenant).or_insert(QueueUsage {
+                    items: 0,
+                    bytes: 0,
+                    queued: 0,
+                    sessions: 0,
+                });
+                sum.items = sum.items.saturating_add(entry.items);
+                sum.bytes = sum.bytes.saturating_add(entry.bytes);
+                sum.queued = sum.queued.saturating_add(entry.queued);
+                sum.sessions = sum.sessions.saturating_add(entry.sessions);
             }
         }
         Ok(usage)
@@ -679,15 +714,46 @@ impl ManagementOwner {
     pub(super) fn has_manager(&self) -> bool {
         self.state.receiver_count() != 0
     }
-    pub(super) fn publish(&mut self, running: usize, stopped: bool) {
+    /// The fleet's status as management last changed it; its running count is the shards' own.
+    pub(super) fn publish(&mut self, stopped: bool) {
         self.state.send_modify(|state| {
             state.status = FleetStatus {
                 latest_sequence: self.sequence,
                 installed: state.entries.len(),
-                running,
+                running: 0,
                 stopped,
             }
         });
+    }
+    /// The fleet's management on its own thread: the manager's work in order, each shard's part
+    /// asked of the shard. It ends at shutdown, or once no manager is left, and stops every shard
+    /// as it ends.
+    fn run(mut self, inputs: mpsc::Receiver<FleetInput>, _allocation: Allocation) {
+        while self.has_manager() {
+            match inputs.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(FleetInput::Management(work)) => {
+                    if self.handle(work) {
+                        return;
+                    }
+                }
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        self.stop_shards();
+    }
+    /// Stops every shard: each closes its sessions and ends.
+    fn stop_shards(&mut self) {
+        for shard in &self.shards {
+            let (reply, answer) = mpsc::sync_channel(1);
+            if shard
+                .send(FleetInput::Shard(super::ShardWork::Stop { reply }))
+                .is_ok()
+            {
+                let _ = answer.recv();
+            }
+        }
+        self.publish(true);
     }
     fn next(&self, sequence: u64) -> Result<(), FleetError> {
         if sequence < self.sequence {
@@ -715,7 +781,6 @@ impl ManagementOwner {
     }
     fn install(
         &mut self,
-        group: &mut GroupOwner,
         sequence: u64,
         replica: FleetReplica,
     ) -> Result<FleetInstallation, FleetError> {
@@ -775,10 +840,15 @@ impl ManagementOwner {
             .map_err(|_| FleetError::InvalidSession)?;
         let id = replica.session.group_id();
         let config = replica.config.clone();
+        let shard = self
+            .shards
+            .get(super::shard_of(ledger, self.shards.len()))
+            .ok_or(FleetError::Unavailable)?
+            .clone();
         let sender = HostSender::Group {
             ledger,
             incarnation: sequence,
-            sender: self.sender.clone(),
+            sender: shard.clone(),
             slots,
             _backing: state._backing.clone(),
         };
@@ -800,10 +870,7 @@ impl ManagementOwner {
         session.batching = true;
         session
             .session
-            .notify_persisted(Some(self.sender.persisted(ledger)));
-        let now = Instant::now();
-        session.next_tick = now;
-        session.wake_at = now;
+            .notify_persisted(Some(shard.persisted(ledger)));
         let installed = FleetInstallation {
             ledger,
             group: id,
@@ -812,28 +879,28 @@ impl ManagementOwner {
             writer,
             host,
         };
-        group.sessions.insert(ledger, session);
-        group.deadlines.insert((now, ledger), ());
+        drop(state);
+        // The shard holds the session before the install is answered: every request through
+        // its host reaches the shard after it.
+        let (held, adopted) = mpsc::sync_channel(1);
+        shard
+            .send(FleetInput::Adopt(Box::new(session), held))
+            .map_err(|_| FleetError::Unavailable)?;
+        adopted.recv().map_err(|_| FleetError::Unavailable)?;
         self.latest = Some(Latest::Installed(Box::new(installed.clone())));
         self.sequence = sequence;
-        drop(state);
         self.state.send_modify(|state| {
             state.entries.insert(ledger, installed.clone());
             state.status = FleetStatus {
                 latest_sequence: sequence,
                 installed: state.entries.len(),
-                running: group.sessions.len(),
+                running: 0,
                 stopped: false,
             };
         });
         Ok(installed)
     }
-    fn remove(
-        &mut self,
-        group: &GroupOwner,
-        sequence: u64,
-        removal: FleetRemoval,
-    ) -> Result<FleetRemoval, FleetError> {
+    fn remove(&mut self, sequence: u64, removal: FleetRemoval) -> Result<FleetRemoval, FleetError> {
         if sequence == self.sequence {
             return match self.latest {
                 Some(Latest::Removed(previous)) if previous == removal => Ok(previous),
@@ -849,7 +916,8 @@ impl ManagementOwner {
         if entry.incarnation != removal.incarnation {
             return Err(FleetError::Conflict);
         }
-        if group.sessions.contains_key(&removal.ledger) || !entry.host.progress().stopped {
+        // A shard drops a session from its owners before its host says it stopped.
+        if !entry.host.progress().stopped {
             return Err(FleetError::Running);
         }
         drop(state);
@@ -861,7 +929,7 @@ impl ManagementOwner {
             state.status = FleetStatus {
                 latest_sequence: sequence,
                 installed: state.entries.len(),
-                running: group.sessions.len(),
+                running: 0,
                 stopped: false,
             };
         });
@@ -869,7 +937,7 @@ impl ManagementOwner {
         drop(removed);
         Ok(removal)
     }
-    pub(super) fn handle(&mut self, group: &mut GroupOwner, work: ManagementWork) -> bool {
+    pub(super) fn handle(&mut self, work: ManagementWork) -> bool {
         match work {
             ManagementWork::Install {
                 sequence,
@@ -877,7 +945,7 @@ impl ManagementOwner {
                 reply,
                 permit,
             } => {
-                let result = self.install(group, sequence, *replica);
+                let result = self.install(sequence, *replica);
                 let _ = reply.send(result.map(|value| FleetReply {
                     value: value.installed(),
                     _permit: permit,
@@ -914,7 +982,7 @@ impl ManagementOwner {
                 reply,
                 permit,
             } => {
-                let result = self.remove(group, sequence, removal);
+                let result = self.remove(sequence, removal);
                 let _ = reply.send(result.map(|value| FleetReply {
                     value,
                     _permit: permit,
@@ -925,14 +993,14 @@ impl ManagementOwner {
                 reply,
                 permit,
             } => {
-                let result = self.admit_tenant(group, tenant);
+                let result = self.admit_tenant(tenant);
                 let _ = reply.send(result.map(|value| FleetReply {
                     value,
                     _permit: permit,
                 }));
             }
             ManagementWork::TenantUsage { reply, permit } => {
-                let result = self.tenant_usage(group);
+                let result = self.tenant_usage();
                 let _ = reply.send(result.map(|value| FleetReply {
                     value,
                     _permit: permit,
@@ -943,6 +1011,7 @@ impl ManagementOwner {
                 let _ = reply.send(());
             }
             ManagementWork::Shutdown { reply, .. } => {
+                self.stop_shards();
                 let _ = reply.send(());
                 return true;
             }
@@ -1008,52 +1077,113 @@ impl ReplicaFleet {
             }
             writer_ids.push(writer.writer());
         }
+        // Never more shards than sessions it may hold: each shard's thread and queues are charged.
+        let shards = config
+            .owner_shards
+            .clamp(1, super::MAX_OWNER_SHARDS)
+            .min(config.max_sessions);
+        let shard_count = shards.checked_add(1).ok_or(LedgerError::Capacity)?;
         let shared_bytes = size_of::<FleetInput>()
             .checked_add(size_of::<ReplicationFrame>())
             .and_then(|size| size.checked_add(size_of::<Signal>()))
             .and_then(|size| size.checked_add(128))
             .and_then(|size| QUEUED.checked_mul(size))
-            .and_then(|bytes| bytes.checked_add(policy_bytes))
             .and_then(|bytes| bytes.checked_add(FRAME_CHANNEL_BYTES))
+            // Each shard's queues, and management's own.
+            .and_then(|bytes| bytes.checked_mul(shard_count))
+            .and_then(|bytes| bytes.checked_add(policy_bytes))
             .ok_or(LedgerError::Capacity)?;
         let backing = std::sync::Arc::new(
             budget
                 .reserve(BudgetKind::Control, BudgetLane::Completion, shared_bytes)?
                 .commit(),
         );
-        let mut scheduler = FairScheduler::new(
-            SchedulerConfig {
-                max_items: QUEUED,
-                reserved_items: RESERVED,
-                ..SchedulerConfig::default()
-            },
-            budget.clone(),
-        )
-        .map_err(|_| LedgerError::Capacity)?;
-        let item_budget = MemoryBudget::new(QUEUED, RESERVED)?;
+        // Each shard's stack, beyond management's.
+        let mut stacks = budget
+            .reserve(
+                BudgetKind::Control,
+                BudgetLane::Completion,
+                STACK_BYTES
+                    .checked_mul(shards)
+                    .ok_or(LedgerError::Capacity)?,
+            )?
+            .commit();
+        let item_budget = MemoryBudget::new(
+            QUEUED.checked_mul(shards).ok_or(LedgerError::Capacity)?,
+            RESERVED.checked_mul(shards).ok_or(LedgerError::Capacity)?,
+        )?;
         let slots = item_budget.child(config.management_queue, config.management_queue)?;
         let mut tenant_budgets = BTreeMap::new();
-        for tenant in tenants {
+        for tenant in &tenants {
             if tenant.tenant.is_zero()
                 || !tenant.budget.is_within(&budget)
                 || tenant_budgets.contains_key(&tenant.tenant)
             {
                 return Err(LedgerError::Capacity);
             }
-            scheduler
-                .register_tenant(
-                    tenant.tenant,
-                    super::scheduler_quota(tenant.weight, config.max_sessions),
-                )
-                .map_err(|_| LedgerError::Capacity)?;
             tenant_budgets.insert(
                 tenant.tenant,
-                (tenant.budget, super::queue_share(&item_budget)?),
+                (tenant.budget.clone(), super::queue_share(&item_budget)?),
             );
         }
-        let (sender, (receiver, frames, signals, overflows)) = OwnerQueue::new();
         let (outbound, outgoing) =
             hyper_rt::sync::channel(QUEUED).map_err(|_| LedgerError::Capacity)?;
+        // The owner shards: a thread each, empty until management installs sessions on them.
+        let mut queues = Vec::new();
+        queues
+            .try_reserve_exact(shards)
+            .map_err(|_| LedgerError::Capacity)?;
+        let mut running = Vec::new();
+        running
+            .try_reserve_exact(shards)
+            .map_err(|_| LedgerError::Capacity)?;
+        let mut built = Vec::new();
+        built
+            .try_reserve_exact(shards)
+            .map_err(|_| LedgerError::Capacity)?;
+        for _ in 0..shards {
+            let mut scheduler = FairScheduler::new(
+                SchedulerConfig {
+                    max_items: QUEUED,
+                    reserved_items: RESERVED,
+                    ..SchedulerConfig::default()
+                },
+                budget.clone(),
+            )
+            .map_err(|_| LedgerError::Capacity)?;
+            for tenant in &tenants {
+                scheduler
+                    .register_tenant(
+                        tenant.tenant,
+                        super::scheduler_quota(tenant.weight, config.max_sessions),
+                    )
+                    .map_err(|_| LedgerError::Capacity)?;
+            }
+            let (queue, (receiver, frames, signals, overflows)) = OwnerQueue::new();
+            let (published, count) = watch::channel(0usize).map_err(|_| LedgerError::Capacity)?;
+            built.push((
+                GroupOwner {
+                    sessions: BTreeMap::new(),
+                    deadlines: BTreeMap::new(),
+                    scheduler,
+                    frames,
+                    framed: BTreeMap::new(),
+                    signals,
+                    overflows,
+                    unwoken: std::collections::BTreeSet::new(),
+                    nonce: 0,
+                    shard: Some(published),
+                    _wal_owners: writers.clone(),
+                    _allocation: stacks.split_off(STACK_BYTES)?,
+                    _backing: backing.clone(),
+                },
+                receiver,
+            ));
+            queues.push(queue);
+            running.push(count);
+        }
+        // Management's own queue: the manager's work, in order, on its own thread.
+        let (sender, (inputs, _frames, _signals, _overflows)) = OwnerQueue::new();
         let (state, changes) = watch::channel(ManagementState {
             quiesced: false,
             entries: BTreeMap::new(),
@@ -1069,10 +1199,11 @@ impl ReplicaFleet {
             tenants: tenant_budgets,
             writers: writer_ids,
             _backing: backing.clone(),
+            running,
         })
         .map_err(|_| LedgerError::Capacity)?;
         let manager = FleetManager {
-            sender: sender.clone(),
+            sender,
             state: changes,
             budget,
             slots,
@@ -1083,33 +1214,33 @@ impl ReplicaFleet {
             sequence: 0,
             owner,
             max_sessions: config.max_sessions,
-            sender,
+            shards: queues,
             outbound,
             items: item_budget,
         };
-        let group = GroupOwner {
-            sessions: BTreeMap::new(),
-            deadlines: BTreeMap::new(),
-            scheduler,
-            frames,
-            framed: BTreeMap::new(),
-            signals,
-            overflows,
-            unwoken: std::collections::BTreeSet::new(),
-            nonce: 0,
-            management: Some(management),
-            _wal_owners: writers,
-            _allocation: allocation,
-            _backing: backing.clone(),
-        };
-        let thread = std::thread::Builder::new()
-            .name(format!("focal-node-sessions-{node}"))
-            .stack_size(STACK_BYTES)
-            .spawn(move || group.run(receiver))
+        let mut threads = Vec::new();
+        threads
+            .try_reserve_exact(shard_count)
             .map_err(|_| LedgerError::Capacity)?;
+        for (index, (group, receiver)) in built.into_iter().enumerate() {
+            threads.push(
+                std::thread::Builder::new()
+                    .name(format!("focal-node-sessions-{node}-{index}"))
+                    .stack_size(STACK_BYTES)
+                    .spawn(move || group.run(receiver))
+                    .map_err(|_| LedgerError::Capacity)?,
+            );
+        }
+        threads.push(
+            std::thread::Builder::new()
+                .name(format!("focal-node-management-{node}"))
+                .stack_size(STACK_BYTES)
+                .spawn(move || management.run(inputs, allocation))
+                .map_err(|_| LedgerError::Capacity)?,
+        );
         Ok((
             manager,
-            ReplicaOwner(thread),
+            ReplicaOwner::new(threads),
             FleetReplication {
                 receiver: outgoing,
                 _backing: backing,

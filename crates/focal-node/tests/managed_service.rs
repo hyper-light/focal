@@ -134,6 +134,7 @@ fn one_handler_routes_live_installations_without_management_round_trips_and_pres
             ManagedFleetConfig {
                 max_sessions: 2,
                 management_queue: 1,
+                            ..ManagedFleetConfig::default()
             },
         )
         .unwrap();

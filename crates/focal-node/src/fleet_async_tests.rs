@@ -151,6 +151,67 @@ fn fixture_with<R>(
         held,
     )
 }
+/// [`fixture`]'s `count` sessions over `shards` owner shards.
+fn fixture_on_shards(path: &std::path::Path, count: u128, shards: usize) -> Fixture {
+    let sessions = usize::try_from(count).unwrap();
+    let tenant_bytes = (256 * 1024 * 1024).max(sessions * 12 * 1024 * 1024);
+    let budget = MemoryBudget::new(tenant_bytes + 256 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
+    let tenant = budget.child(tenant_bytes, 64 * 1024 * 1024).unwrap();
+    let wal_budget = budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+    let wal = SharedWal::open_with_budget(
+        path,
+        WalOptions::new(WalIdentity {
+            cluster: CLUSTER,
+            node: 1,
+            stream: 0,
+        }),
+        WalWriterLimits::default(),
+        wal_budget.clone(),
+    )
+    .unwrap();
+    let replicas = (1..=count)
+        .map(|index| {
+            let node = DurableNode::open_on_wal_in(
+                NodeConfig::single(1, CLUSTER, ledger(index).session.0),
+                wal.clone(),
+                &tenant,
+            )
+            .unwrap();
+            let mut session =
+                Session::from_node_in(ledger(index), node, SessionLimits::default(), &tenant)
+                    .unwrap();
+            session.campaign().unwrap();
+            for _ in 0..3 {
+                session.poll().unwrap();
+            }
+            let mut config = ReplicaConfig::new(RootCommandId::from_u128(119));
+            config.tick = TICK;
+            config.request_timeout = Duration::from_millis(500);
+            FleetReplica { session, config }
+        })
+        .collect();
+    let (hosts, owner, outgoing) = ReplicaFleet::spawn_sharded(
+        1,
+        replicas,
+        vec![FleetTenant {
+            tenant: ledger(1).tenant,
+            weight: 1,
+            budget: tenant,
+        }],
+        budget.clone(),
+        ReplicaHost::wire_limits(),
+        shards,
+    )
+    .unwrap();
+    Fixture {
+        hosts,
+        owner,
+        outgoing,
+        wal,
+        wal_budget,
+        budget,
+    }
+}
 async fn settle(fixture: &Fixture) {
     for (id, host) in &fixture.hosts {
         let result = dispatch(
@@ -1555,4 +1616,146 @@ fn a_new_leader_of_three_holds_a_write_until_its_term_is_ready() {
         .await;
     })
     .unwrap()
+}
+
+/// A shard held up holds up only its own sessions (doc 31 §4.4): with one owner shard's thread
+/// held, the other shard's session commits, and the held shard's session commits once it is let
+/// go. On one owner thread a node, either session's work waited for the other's.
+#[test]
+fn a_held_shard_holds_up_only_its_own_sessions() {
+    focal_rt::block_on(async move {
+        let path = tempfile::tempdir().unwrap();
+        let fixture = fixture_on_shards(path.path(), 2, 2);
+        // Sessions 1 and 2 differ in their last bit: the shard rule puts them on different shards.
+        assert_ne!(
+            grouped::shard_of(ledger(1), 2),
+            grouped::shard_of(ledger(2), 2)
+        );
+        settle(&fixture).await;
+        let held_host = fixture.hosts[&ledger(1)].clone();
+        let HostSender::Group { sender, .. } = &held_host.sender else {
+            panic!("a fleet's host sends to its shard");
+        };
+        let (held, holding) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        sender
+            .send(grouped::FleetInput::Shard(grouped::ShardWork::Hold {
+                held,
+                release: released,
+            }))
+            .unwrap();
+        holding.recv().unwrap();
+        let write = |index: u128| {
+            envelope(
+                index,
+                Operation::OpenEpoch {
+                    epoch: RequestEpoch(1),
+                },
+            )
+        };
+        let other = fixture.hosts[&ledger(2)].clone();
+        let observed = [&other];
+        let steps = TICK * (2 * crate::test_waits::STEP);
+        let committed = crate::test_waits::within(&observed, steps, TICK, async {
+            dispatch(&other, peer(), write(2), &ReplicaHost::wire_limits()).await
+        })
+        .await
+        .expect("the other shard's session answered while this one was held");
+        assert!(
+            matches!(
+                committed.result,
+                Response::Submitted(MutationReply::Committed(_))
+            ),
+            "{committed:?}"
+        );
+        let waiting = {
+            let host = held_host.clone();
+            focal_rt::spawn(async move {
+                dispatch(&host, peer(), write(1), &ReplicaHost::wire_limits()).await
+            })
+            .unwrap()
+        };
+        release.send(()).unwrap();
+        let answered = waiting.await.unwrap();
+        assert!(
+            matches!(
+                answered.result,
+                Response::Submitted(MutationReply::Committed(_))
+            ),
+            "{answered:?}"
+        );
+        // A host's clone holds its share of the fleet's lease: these go before the fleet's
+        // charges are counted.
+        drop((held_host, other));
+        shutdown(fixture).await;
+    })
+    .unwrap()
+}
+
+/// Measurement, not a check: commits a second of `FOCAL_MEASURE_SESSIONS` sessions (16 by
+/// default) writing at once, each `FOCAL_MEASURE_WRITES` entries (200) one after another, on one
+/// owner shard and on `FOCAL_MEASURE_SHARDS` (one a core by default), over one shared log. Run
+/// with `--release --ignored --nocapture`.
+#[test]
+#[ignore = "measurement"]
+fn measure_commits_over_owner_shards() {
+    let number = |name: &str, default: u64| -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let sessions = u128::from(number("FOCAL_MEASURE_SESSIONS", 16));
+    let writes = number("FOCAL_MEASURE_WRITES", 200);
+    let many = usize::try_from(number(
+        "FOCAL_MEASURE_SHARDS",
+        u64::try_from(grouped::default_owner_shards()).unwrap(),
+    ))
+    .unwrap();
+    for shards in [1, many] {
+        focal_rt::block_on(async move {
+            let path = tempfile::tempdir().unwrap();
+            let fixture = fixture_on_shards(path.path(), sessions, shards);
+            settle(&fixture).await;
+            let started = std::time::Instant::now();
+            let mut tasks = Vec::new();
+            for index in 1..=sessions {
+                let host = fixture.hosts[&ledger(index)].clone();
+                tasks.push(
+                    focal_rt::spawn(async move {
+                        for n in 0..writes {
+                            let mut request = envelope(
+                                index,
+                                Operation::OpenEpoch {
+                                    epoch: RequestEpoch(1),
+                                },
+                            );
+                            request.request_id = RequestId::from_u128(u128::from(n) + 1_000);
+                            let answer = dispatch(&host, peer(), request, &ReplicaHost::wire_limits())
+                                .await;
+                            assert!(
+                                matches!(
+                                    answer.result,
+                                    Response::Submitted(MutationReply::Committed(_))
+                                ),
+                                "{answer:?}"
+                            );
+                        }
+                    })
+                    .unwrap(),
+                );
+            }
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let seconds = started.elapsed().as_secs_f64();
+            let commits = f64::from(u32::try_from(sessions).unwrap()) * writes as f64;
+            println!(
+                "{shards} shard(s), {sessions} sessions x {writes} writes: {commits:.0} commits in {seconds:.2} s, {:.0}/s",
+                commits / seconds
+            );
+            shutdown(fixture).await;
+        })
+        .unwrap();
+    }
 }

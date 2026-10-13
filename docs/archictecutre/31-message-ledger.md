@@ -360,6 +360,24 @@ Each stage lands on its own, measured:
 1. **M1, owner shards.**
    - K owner threads a node, sessions spread over them. The data structures do not change.
    - Measure: commits a second a node against cores.
+   - **As built.**
+     - **Shards.** A fleet runs `owner_shards` threads, by default one a core it is given (on
+       Linux, the cgroup's quota), at most 64, and never more than the sessions it may hold. A
+       session lives on the shard its ledger names (`shard_of`), and its host sends to that
+       shard's queue alone, so routing is fixed at install, never decided per message.
+     - **Management** runs on its own thread, keeping the contiguous management sequence and
+       the fleet's entries. An install builds the session and hands it to its shard as an
+       adoption, answered only once the shard holds it, so every request through the host
+       reaches the shard after it.
+     - **Fleet-wide work.** A tenant's admission and usage are asked of every shard, in order
+       behind the shard's earlier input; shutdown, or the last manager going away, stops every
+       shard.
+     - **Status.** A shard publishes its running count, and the fleet's status sums them as it
+       is read. Nothing waits on another shard's map.
+     - **Proof.** `a_held_shard_holds_up_only_its_own_sessions`: one shard's thread held, the
+       other shard's session commits, and the held one commits once let go.
+       `sessions_spread_over_owner_shards_each_commit_and_every_shard_ends_at_shutdown`: eight
+       sessions over four shards.
 2. **M2, retirement as events and a first cold store.**
    - The cold store starts as per-partition segment files with a sorted index, and moves to the
      STBε engine in M7.

@@ -50,6 +50,27 @@ fn queue_share(items: &MemoryBudget) -> Result<MemoryBudget, focal_memory::Memor
 pub(super) const PARTICIPANT_SLOTS: usize = QUEUED.saturating_sub(RESERVED);
 const STACK_BYTES: usize = 2 * 1024 * 1024;
 
+/// The most owner shards a node runs (doc 31 §4.1, stage M1).
+pub(super) const MAX_OWNER_SHARDS: usize = 64;
+
+/// The owner shards a node runs unless it is told: one a core it is given (on Linux, the cgroup's
+/// CPU quota, as the standard library reads it), at most [`MAX_OWNER_SHARDS`]. Every session's
+/// owner ran on one thread a node, so a node's commits across all its sessions were one core's.
+pub fn default_owner_shards() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, MAX_OWNER_SHARDS)
+}
+
+/// The shard whose owner holds `ledger`'s session, of `shards`: fixed by the ledger, so every
+/// input for the session (its participants' work, its peers' frames, its log's answers) reaches
+/// the one thread that owns it, and no shard waits on another's.
+pub(super) fn shard_of(ledger: LedgerId, shards: usize) -> usize {
+    let shards = u128::try_from(shards.max(1)).unwrap_or(1);
+    let id = u128::from_be_bytes(ledger.session.0) ^ u128::from_be_bytes(ledger.tenant.0);
+    usize::try_from(id.checked_rem(shards).unwrap_or(0)).unwrap_or(0)
+}
+
 pub struct FleetReplica {
     pub session: Session,
     pub config: ReplicaConfig,
@@ -116,6 +137,33 @@ const FRAME_CHANNEL_BYTES: usize = size_of::<Routed>().saturating_add(16).satura
 pub(super) enum FleetInput {
     Routed(Routed),
     Management(management::ManagementWork),
+    /// A session the fleet's management installed, for this shard to own from now on. The reply
+    /// says it is held: management answers the install only then.
+    Adopt(Box<Owner>, mpsc::SyncSender<()>),
+    /// Work every shard does for the fleet's management.
+    Shard(ShardWork),
+}
+/// What a sharded fleet's management asks of each shard: what touches a shard's own scheduler,
+/// done on the shard's thread.
+pub(super) enum ShardWork {
+    AdmitTenant {
+        tenant: TenantId,
+        quota: TenantQuota,
+        reply: mpsc::SyncSender<Result<(), DirectoryError>>,
+    },
+    TenantUsage {
+        tenants: Vec<TenantId>,
+        reply: mpsc::SyncSender<BTreeMap<TenantId, QueueUsage>>,
+    },
+    /// The fleet stops: the shard closes its sessions and ends.
+    Stop { reply: mpsc::SyncSender<()> },
+    /// Holds the shard's thread until `release`, once it has said `held`: a test's shard busy
+    /// with work.
+    #[cfg(test)]
+    Hold {
+        held: mpsc::SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    },
 }
 /// What the shared owner waits on: something was queued for it, or a write
 /// of one of its sessions was answered by the log. A signal says there is
@@ -176,6 +224,14 @@ impl OwnerQueue {
     /// (`GroupOwner::take_frames`). Refused only once the owner is gone.
     pub(super) fn send_frame(&self, routed: Routed) -> Result<(), Box<mpsc::SendError<Routed>>> {
         self.frames.send(routed).map_err(Box::new)?;
+        let _ = self.signal.try_send(Signal::Input);
+        Ok(())
+    }
+    /// Queues `input`, waiting for room: management's own sends, on its own
+    /// thread, which nothing else waits on. Refused only once the owner is
+    /// gone.
+    pub(super) fn send(&self, input: FleetInput) -> Result<(), Box<mpsc::SendError<FleetInput>>> {
+        self.input.send(input).map_err(Box::new)?;
         let _ = self.signal.try_send(Signal::Input);
         Ok(())
     }
@@ -269,13 +325,35 @@ pub(super) fn request_class(request: &VerifiedRequest) -> WorkClass {
 impl ReplicaFleet {
     /// Trusted composition installs already authorized sessions. No thread or
     /// worker pool is created per session, and every session budget is checked
-    /// against its tenant and node before any service handle is returned.
+    /// against its tenant and node before any service handle is returned. The
+    /// sessions are spread over the node's owner shards by ledger
+    /// ([`shard_of`]), each shard a thread holding its sessions alone.
     pub fn spawn(
         node: u64,
         replicas: Vec<FleetReplica>,
         tenants: Vec<FleetTenant>,
         budget: MemoryBudget,
         limits: WireLimits,
+    ) -> Result<ReplicaFleetParts, LedgerError> {
+        Self::spawn_sharded(
+            node,
+            replicas,
+            tenants,
+            budget,
+            limits,
+            default_owner_shards(),
+        )
+    }
+
+    /// [`Self::spawn`] over `shards` owner shards, never more than the
+    /// sessions or [`MAX_OWNER_SHARDS`].
+    pub fn spawn_sharded(
+        node: u64,
+        replicas: Vec<FleetReplica>,
+        tenants: Vec<FleetTenant>,
+        budget: MemoryBudget,
+        limits: WireLimits,
+        shards: usize,
     ) -> Result<ReplicaFleetParts, LedgerError> {
         if node == 0
             || replicas.is_empty()
@@ -285,6 +363,116 @@ impl ReplicaFleet {
         {
             return Err(LedgerError::Capacity);
         }
+        let shards = shards.clamp(1, MAX_OWNER_SHARDS).min(replicas.len());
+        let shared_bytes = size_of::<FleetInput>()
+            .checked_add(size_of::<ReplicationFrame>())
+            .and_then(|size| size.checked_add(size_of::<Signal>()))
+            .and_then(|size| size.checked_add(128))
+            .and_then(|size| QUEUED.checked_mul(size))
+            .and_then(|bytes| bytes.checked_add(FRAME_CHANNEL_BYTES))
+            .and_then(|bytes| bytes.checked_mul(shards))
+            .and_then(|bytes| {
+                replicas
+                    .len()
+                    .checked_mul(1024)
+                    .and_then(|handles| bytes.checked_add(handles))
+            })
+            .and_then(|bytes| bytes.checked_add(size_of::<Allocation>()))
+            .and_then(|bytes| bytes.checked_add(64))
+            .ok_or(LedgerError::Capacity)?;
+        // Host clones, the owners, and the outbound receiver can outlive one
+        // another on different threads. One shared lease covers that exact
+        // lifetime; per-request payloads and session state remain owned.
+        let backing = std::sync::Arc::new(
+            budget
+                .reserve(BudgetKind::Control, BudgetLane::Completion, shared_bytes)?
+                .commit(),
+        );
+        let (outbound, outgoing) =
+            hyper_rt::sync::channel(QUEUED).map_err(|_| LedgerError::Capacity)?;
+        let cluster = replicas
+            .first()
+            .ok_or(LedgerError::Capacity)?
+            .session
+            .cluster_id();
+        let mut placed: Vec<Vec<FleetReplica>> = Vec::new();
+        placed
+            .try_reserve_exact(shards)
+            .map_err(|_| LedgerError::Capacity)?;
+        placed.resize_with(shards, Vec::new);
+        for replica in replicas {
+            let shard = shard_of(replica.session.ledger(), shards);
+            placed
+                .get_mut(shard)
+                .ok_or(LedgerError::Capacity)?
+                .push(replica);
+        }
+        // Every shard is built before any thread starts, so a refusal leaves
+        // nothing running.
+        let mut handles = BTreeMap::new();
+        let mut built = Vec::new();
+        built
+            .try_reserve_exact(shards)
+            .map_err(|_| LedgerError::Capacity)?;
+        for replicas in placed {
+            if replicas.is_empty() {
+                continue;
+            }
+            built.push(Self::build_shard(
+                node,
+                cluster,
+                replicas,
+                &tenants,
+                &budget,
+                &limits,
+                &outbound,
+                &backing,
+                &mut handles,
+            )?);
+        }
+        let mut threads = Vec::new();
+        threads
+            .try_reserve_exact(built.len())
+            .map_err(|_| LedgerError::Capacity)?;
+        let count = built.len();
+        for (index, (owner, receiver)) in built.into_iter().enumerate() {
+            let name = if count == 1 {
+                format!("focal-node-sessions-{node}")
+            } else {
+                format!("focal-node-sessions-{node}-{index}")
+            };
+            threads.push(
+                std::thread::Builder::new()
+                    .name(name)
+                    .stack_size(STACK_BYTES)
+                    .spawn(move || owner.run(receiver))
+                    .map_err(|_| LedgerError::Capacity)?,
+            );
+        }
+        Ok((
+            handles,
+            ReplicaOwner::new(threads),
+            FleetReplication {
+                receiver: outgoing,
+                _backing: backing,
+            },
+        ))
+    }
+
+    /// One shard's owner over `replicas`, its hosts added to `handles`; its
+    /// thread not yet started.
+    #[allow(clippy::too_many_arguments)] // One shard's whole composition.
+    fn build_shard(
+        node: u64,
+        cluster: [u8; 16],
+        replicas: Vec<FleetReplica>,
+        tenants: &[FleetTenant],
+        budget: &MemoryBudget,
+        limits: &WireLimits,
+        outbound: &hyper_rt::sync::Sender<ReplicationFrame>,
+        backing: &std::sync::Arc<Allocation>,
+        handles: &mut BTreeMap<LedgerId, ReplicaHost>,
+    ) -> Result<(GroupOwner, mpsc::Receiver<FleetInput>), LedgerError> {
         let bookkeeping = size_of::<Owner>()
             .checked_add(1024)
             .and_then(|n| replicas.len().checked_mul(n))
@@ -293,29 +481,6 @@ impl ReplicaFleet {
         let allocation = budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, bookkeeping)?
             .commit();
-        let shared_bytes = size_of::<FleetInput>()
-            .checked_add(size_of::<ReplicationFrame>())
-            .and_then(|size| size.checked_add(size_of::<Signal>()))
-            .and_then(|size| size.checked_add(128))
-            .and_then(|size| QUEUED.checked_mul(size))
-            .and_then(|bytes| {
-                replicas
-                    .len()
-                    .checked_mul(1024)
-                    .and_then(|handles| bytes.checked_add(handles))
-            })
-            .and_then(|bytes| bytes.checked_add(size_of::<Allocation>()))
-            .and_then(|bytes| bytes.checked_add(FRAME_CHANNEL_BYTES))
-            .and_then(|bytes| bytes.checked_add(64))
-            .ok_or(LedgerError::Capacity)?;
-        // Host clones, the owner, and the outbound receiver can outlive one
-        // another on different threads. One shared lease covers that exact
-        // lifetime; per-request payloads and session state remain owned.
-        let backing = std::sync::Arc::new(
-            budget
-                .reserve(BudgetKind::Control, BudgetLane::Completion, shared_bytes)?
-                .commit(),
-        );
         let mut scheduler = FairScheduler::new(
             SchedulerConfig {
                 max_items: QUEUED,
@@ -329,7 +494,7 @@ impl ReplicaFleet {
         let mut tenant_budgets = BTreeMap::new();
         for tenant in tenants {
             if tenant.tenant.is_zero()
-                || !tenant.budget.is_within(&budget)
+                || !tenant.budget.is_within(budget)
                 || tenant_budgets.contains_key(&tenant.tenant)
             {
                 return Err(LedgerError::Capacity);
@@ -337,24 +502,19 @@ impl ReplicaFleet {
             scheduler
                 .register_tenant(tenant.tenant, scheduler_quota(tenant.weight, 4096))
                 .map_err(|_| LedgerError::Capacity)?;
-            tenant_budgets.insert(tenant.tenant, (tenant.budget, queue_share(&item_budget)?));
+            tenant_budgets.insert(
+                tenant.tenant,
+                (tenant.budget.clone(), queue_share(&item_budget)?),
+            );
         }
         let (sender, (receiver, frames, signals, overflows)) = OwnerQueue::new();
-        let (outbound, outgoing) =
-            hyper_rt::sync::channel(QUEUED).map_err(|_| LedgerError::Capacity)?;
         let mut sessions = BTreeMap::new();
         let mut wal_owners = Vec::new();
         wal_owners
             .try_reserve_exact(replicas.len())
             .map_err(|_| LedgerError::Capacity)?;
-        let mut handles = BTreeMap::new();
         let mut deadlines = BTreeMap::new();
         let now = Instant::now();
-        let cluster = replicas
-            .first()
-            .ok_or(LedgerError::Capacity)?
-            .session
-            .cluster_id();
         for replica in replicas {
             let incarnation = u64::try_from(handles.len())
                 .ok()
@@ -370,11 +530,11 @@ impl ReplicaFleet {
                 wal_owners.push(focal_consensus::NodeStorage::wal(writer));
             }
             let ledger = replica.session.ledger();
-            ReplicaHost::validate(&replica.config, &limits)?;
+            ReplicaHost::validate(&replica.config, limits)?;
             let (tenant, items) = tenant_budgets
                 .get(&ledger.tenant)
                 .ok_or(LedgerError::Capacity)?;
-            if sessions.contains_key(&ledger)
+            if handles.contains_key(&ledger)
                 || replica.session.status().node_id != node
                 || replica.session.cluster_id() != cluster
                 || !replica.session.is_budgeted_within(tenant)
@@ -385,7 +545,7 @@ impl ReplicaFleet {
             let ingress = tenant.child(64 * 1024 * 1024, 24 * 1024 * 1024)?;
             let slots = queue_share(items)?;
             let wake = sender.clone();
-            let sender = HostSender::Group {
+            let host_sender = HostSender::Group {
                 ledger,
                 incarnation,
                 sender: sender.clone(),
@@ -398,7 +558,7 @@ impl ReplicaFleet {
                 limits.clone(),
                 None,
                 ingress,
-                sender,
+                host_sender,
                 outbound.clone(),
             )?;
             owner.nonblocking = true;
@@ -414,33 +574,23 @@ impl ReplicaFleet {
             sessions.insert(ledger, owner);
             deadlines.insert((now, ledger), ());
         }
-        let owner = GroupOwner {
-            sessions,
-            deadlines,
-            scheduler,
-            frames,
-            framed: BTreeMap::new(),
-            signals,
-            overflows,
-            unwoken: std::collections::BTreeSet::new(),
-            nonce: 0,
-            management: None,
-            _wal_owners: wal_owners,
-            _allocation: allocation,
-            _backing: backing.clone(),
-        };
-        let thread = std::thread::Builder::new()
-            .name(format!("focal-node-sessions-{node}"))
-            .stack_size(STACK_BYTES)
-            .spawn(move || owner.run(receiver))
-            .map_err(|_| LedgerError::Capacity)?;
         Ok((
-            handles,
-            ReplicaOwner(thread),
-            FleetReplication {
-                receiver: outgoing,
-                _backing: backing,
+            GroupOwner {
+                sessions,
+                deadlines,
+                scheduler,
+                frames,
+                framed: BTreeMap::new(),
+                signals,
+                overflows,
+                unwoken: std::collections::BTreeSet::new(),
+                nonce: 0,
+                shard: None,
+                _wal_owners: wal_owners,
+                _allocation: allocation,
+                _backing: backing.clone(),
             },
+            receiver,
         ))
     }
 }
@@ -465,7 +615,10 @@ struct GroupOwner {
     /// its room given back — and each at its tick.
     unwoken: std::collections::BTreeSet<LedgerId>,
     nonce: u128,
-    management: Option<management::ManagementOwner>,
+    /// In a sharded fleet, the count of sessions this shard runs, which the fleet's status sums.
+    /// A shard waits for its sessions as they are installed, so it ends only when its input
+    /// closes or management stops it, never for being empty.
+    shard: Option<watch::Sender<usize>>,
     // Physical writers outlive every logical-session removal. A final handle
     // may join its disk thread only after the entire fleet has stopped; one
     // stalled session cannot block another by dropping the last writer handle.
@@ -544,8 +697,8 @@ impl GroupOwner {
         for owner in self.sessions.values_mut() {
             owner.close();
         }
-        if let Some(management) = &mut self.management {
-            management.publish(self.sessions.len(), true);
+        if let Some(running) = &self.shard {
+            running.send_replace(0);
         }
     }
     fn stop_session(&mut self, ledger: LedgerId) {
@@ -555,8 +708,57 @@ impl GroupOwner {
             self.unwoken.remove(&ledger);
             owner.close();
         }
-        if let Some(management) = &mut self.management {
-            management.publish(self.sessions.len(), false);
+        self.publish_running();
+    }
+    /// A shard's running count, published as its sessions change.
+    fn publish_running(&self) {
+        if let Some(running) = &self.shard {
+            running.send_replace(self.sessions.len());
+        }
+    }
+    /// Takes a session the fleet's management installed, due at once as each session is at its
+    /// start.
+    fn adopt(&mut self, mut owner: Owner) {
+        let ledger = owner.session.ledger();
+        let now = Instant::now();
+        owner.next_tick = now;
+        owner.wake_at = now;
+        self.deadlines.insert((now, ledger), ());
+        self.sessions.insert(ledger, owner);
+        self.publish_running();
+    }
+    /// A sharded fleet's work for this shard; whether the shard stops.
+    fn shard_work(&mut self, work: ShardWork) -> bool {
+        match work {
+            ShardWork::AdmitTenant {
+                tenant,
+                quota,
+                reply,
+            } => {
+                let result = self.scheduler.register_tenant(tenant, quota).map(|_| ());
+                let _ = reply.try_send(result);
+                false
+            }
+            ShardWork::TenantUsage { tenants, reply } => {
+                let mut usage = BTreeMap::new();
+                for tenant in tenants {
+                    if let Some(entry) = self.scheduler.usage(tenant) {
+                        usage.insert(tenant, entry);
+                    }
+                }
+                let _ = reply.try_send(usage);
+                false
+            }
+            ShardWork::Stop { reply } => {
+                let _ = reply.try_send(());
+                true
+            }
+            #[cfg(test)]
+            ShardWork::Hold { held, release } => {
+                let _ = held.try_send(());
+                let _ = release.recv();
+                false
+            }
         }
     }
     fn reschedule(&mut self, ledger: LedgerId) -> Result<(), LedgerError> {
@@ -777,24 +979,19 @@ impl GroupOwner {
                 self.enqueue(routed)?;
                 Ok(false)
             }
-            FleetInput::Management(work) => {
-                let Some(mut management) = self.management.take() else {
-                    return Ok(false);
-                };
-                let stop = management.handle(self, work);
-                self.management = Some(management);
-                Ok(stop)
+            // Management's work goes to its own thread, never to a shard.
+            FleetInput::Management(_) => Ok(false),
+            FleetInput::Adopt(owner, held) => {
+                self.adopt(*owner);
+                let _ = held.try_send(());
+                Ok(false)
             }
+            FleetInput::Shard(work) => Ok(self.shard_work(work)),
         }
     }
     fn run_inner(&mut self, receiver: mpsc::Receiver<FleetInput>) -> Result<(), LedgerError> {
         loop {
-            if self
-                .management
-                .as_ref()
-                .is_some_and(|owner| !owner.has_manager())
-                || (self.sessions.is_empty() && self.management.is_none())
-            {
+            if self.sessions.is_empty() && self.shard.is_none() {
                 return Ok(());
             }
             self.take_signals();

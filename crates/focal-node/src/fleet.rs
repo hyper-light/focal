@@ -767,10 +767,25 @@ struct ProgressState {
     // delayed replies. Replacing only value preserves incarnation accounting.
     _allocation: Option<Allocation>,
 }
-pub struct ReplicaOwner(JoinHandle<()>);
+/// The threads a fleet's sessions run on: one owner, or a sharded fleet's
+/// owner shards and its management.
+pub struct ReplicaOwner(Vec<JoinHandle<()>>);
 impl ReplicaOwner {
+    pub(crate) fn new(threads: Vec<JoinHandle<()>>) -> Self {
+        Self(threads)
+    }
+    fn one(thread: JoinHandle<()>) -> Self {
+        Self(std::iter::once(thread).collect())
+    }
+    /// Waits for every thread; refused if any of them panicked.
     pub fn join(self) -> Result<(), &'static str> {
-        self.0.join().map_err(|_| "replica owner panicked")
+        let mut result = Ok(());
+        for thread in self.0 {
+            if thread.join().is_err() {
+                result = Err("replica owner panicked");
+            }
+        }
+        result
     }
 }
 impl WaitingFor {
@@ -1221,7 +1236,7 @@ impl ReplicaHost {
             .name(format!("focal-replica-{node}"))
             .spawn(move || owner.run(receiver))
             .map_err(|_| LedgerError::Capacity)?;
-        Ok((host, ReplicaOwner(thread), outgoing))
+        Ok((host, ReplicaOwner::one(thread), outgoing))
     }
     fn validate(config: &ReplicaConfig, limits: &WireLimits) -> Result<(), LedgerError> {
         if config.root.is_zero()

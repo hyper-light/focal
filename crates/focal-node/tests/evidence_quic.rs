@@ -437,6 +437,7 @@ impl Fleet {
                     ManagedFleetConfig {
                         max_sessions: 4,
                         management_queue: 8,
+                        ..ManagedFleetConfig::default()
                     },
                 )
                 .unwrap();

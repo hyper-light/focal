@@ -60,6 +60,19 @@ struct Fixture {
     budget: MemoryBudget,
 }
 fn fixture(path: &std::path::Path, max_sessions: usize, management_queue: usize) -> Fixture {
+    sharded_fixture(
+        path,
+        max_sessions,
+        management_queue,
+        ManagedFleetConfig::default().owner_shards,
+    )
+}
+fn sharded_fixture(
+    path: &std::path::Path,
+    max_sessions: usize,
+    management_queue: usize,
+    owner_shards: usize,
+) -> Fixture {
     let budget = MemoryBudget::new(512 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
     let tenant = budget.child(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
     let wal = SharedWal::open_with_budget(
@@ -87,6 +100,7 @@ fn fixture(path: &std::path::Path, max_sessions: usize, management_queue: usize)
         ManagedFleetConfig {
             max_sessions,
             management_queue,
+            owner_shards,
         },
     )
     .unwrap();
@@ -596,6 +610,7 @@ fn removing_final_session_on_stalled_writer_does_not_block_live_installation() {
             ManagedFleetConfig {
                 max_sessions: 1,
                 management_queue: 8,
+                ..ManagedFleetConfig::default()
             },
         )
         .unwrap();
@@ -709,6 +724,52 @@ fn stop_all_quiesces_concurrent_installation_and_stops_every_live_incarnation() 
         drop(fleet.manager);
         drop(fleet.outgoing);
         drop(fleet.wal);
+        assert_eq!(fleet.budget.stats().used, 0);
+    })
+    .unwrap()
+}
+
+/// A managed fleet spreads its sessions over its owner shards, a thread each (doc 31 §4.1):
+/// eight sessions over four shards each commit, every one counted running once its install is
+/// answered (management answers only once the session's shard holds it), and shutdown ends every
+/// shard's thread and gives back every charge.
+#[test]
+fn sessions_spread_over_owner_shards_each_commit_and_every_shard_ends_at_shutdown() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fleet = sharded_fixture(directory.path(), 8, 8, 4);
+        let mut installed = Vec::new();
+        for index in 1..=8u128 {
+            let reply = fleet
+                .manager
+                .install(
+                    u64::try_from(index).unwrap(),
+                    candidate(&fleet.wal, &fleet.tenant, index),
+                )
+                .await
+                .unwrap();
+            installed.push(Installed::of(&fleet.manager, reply.value()));
+        }
+        let status = fleet.manager.status();
+        assert_eq!((status.installed, status.running), (8, 8));
+        for (index, session) in (1..=8u128).zip(&installed) {
+            let response = epoch(session.host(), index).await;
+            assert!(
+                matches!(
+                    response.result,
+                    Response::Submitted(MutationReply::Committed(_))
+                ),
+                "session {index}: {response:?}"
+            );
+        }
+        fleet.manager.shutdown().await.unwrap();
+        fleet.owner.join().unwrap();
+        assert!(fleet.manager.status().stopped);
+        assert_eq!(fleet.manager.status().running, 0);
+        drop(fleet.wal);
+        drop(fleet.outgoing);
+        drop(fleet.manager);
+        drop(installed);
         assert_eq!(fleet.budget.stats().used, 0);
     })
     .unwrap()
