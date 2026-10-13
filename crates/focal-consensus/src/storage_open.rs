@@ -22,6 +22,11 @@ use crate::{ConsensusError, DiskGrowth, NodeConfig, NodeStorage, ShellLog, Shell
 /// The file the node's identity is kept in: always on the data directory's volume, and there
 /// before any log is, so the device's block is read from it.
 const IDENTITY_FILE: &str = "IDENTITY";
+/// Format: present, durably, while a node founds its log, and removed once the log is durable.
+/// The node runs on its log only after this is gone, so a start that finds it knows the log
+/// beside it never served: a founding a crash cut short left it empty or half written, and the
+/// start removes it and founds again, where it would otherwise refuse a file that is not a log.
+const FOUNDING_FILE: &str = "raft/FOUNDING";
 
 /// What the node states of itself for its log: facts of its configuration, not of its load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,9 +172,18 @@ fn open_shell(
         .reserve(BudgetKind::Payload, BudgetLane::Completion, cache_bytes)?
         .commit();
     let path: PathBuf = root.join(convert::LOG_FILE);
+    let raft = root.join(convert::RAFT_DIR);
+    let founding = root.join(FOUNDING_FILE);
+    // A founding a crash cut short: the log beside its mark never served, and goes.
+    if founding.exists() {
+        remove_if_present(&path)?;
+        focal_platform::sync_dir(&raft).map_err(io_error)?;
+    }
     let exists = path.exists();
     if !exists {
-        focal_log::create_durable_directory(&root.join(convert::RAFT_DIR))?;
+        focal_log::create_durable_directory(&raft)?;
+        std::fs::File::create(&founding).map_err(io_error)?;
+        focal_platform::sync_dir(&raft).map_err(io_error)?;
     }
     let file = hyper_block::file::DeviceFile::open(
         &path,
@@ -188,10 +202,13 @@ fn open_shell(
             .map(|(log, _)| log)
             .map_err(|refused| OpenError::Log(refused.error))?
     } else {
+        // The log is durable as it is made (its first slot is synced), and its name with the
+        // directory's sync; only then does the mark go, and the node may run on it.
         let log = hyper_log::Log::create_with(file, plan.config, id, with)
             .map_err(|refused| OpenError::Log(refused.error))?;
-        focal_platform::sync_dir(&root.join(convert::RAFT_DIR))
-            .map_err(|error| OpenError::Wal(focal_log::LogError::Io(error)))?;
+        focal_platform::sync_dir(&raft).map_err(io_error)?;
+        std::fs::remove_file(&founding).map_err(io_error)?;
+        focal_platform::sync_dir(&raft).map_err(io_error)?;
         log
     };
     let shell = ShellStorage::new(root, &log, disk, identity, budget, &plan.key_file)?;
@@ -201,6 +218,19 @@ fn open_shell(
         cache: Some(cache),
         keys: Some(keys),
     })
+}
+
+fn io_error(error: std::io::Error) -> OpenError {
+    OpenError::Wal(focal_log::LogError::Io(error))
+}
+
+/// Removes `path`, which may already be gone.
+fn remove_if_present(path: &Path) -> Result<(), OpenError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(error)),
+    }
 }
 
 #[cfg(test)]

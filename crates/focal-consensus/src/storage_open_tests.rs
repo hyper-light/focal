@@ -148,3 +148,48 @@ fn the_log_plan_is_the_same_at_every_start() {
     assert_eq!(a.config, b.config);
     assert_eq!(a.align.get(), b.align.get());
 }
+
+/// A founding a crash cut short leaves its mark beside a log that never served: empty, as a kill
+/// between the file's creation and its first slot leaves it, or half written. The next start
+/// removes it and founds the log again, and the mark is gone once the log is durable.
+#[test]
+fn a_founding_cut_short_is_founded_again() {
+    for leftover in [&b""[..], &[0x5a; 6000][..]] {
+        let dir = data_dir();
+        let raft = dir.path().join(convert::RAFT_DIR);
+        std::fs::create_dir_all(&raft).unwrap();
+        std::fs::write(dir.path().join(FOUNDING_FILE), b"").unwrap();
+        std::fs::write(dir.path().join(convert::LOG_FILE), leftover).unwrap();
+        let opened = opened_in(dir.path());
+        assert!(matches!(opened.storage.backend(), StorageBackend::Shell(_)));
+        assert!(!dir.path().join(FOUNDING_FILE).exists(), "the mark goes");
+        drop(opened.log.unwrap().close().unwrap());
+        let again = opened_in(dir.path());
+        drop(again.log.unwrap().close().unwrap());
+    }
+}
+
+/// Without the mark, a file where the log should be is the node's log, whatever it holds: an
+/// empty one is refused, typed, never removed, so a log a node ran on is never founded over.
+#[test]
+fn a_log_without_its_founding_mark_is_never_founded_over() {
+    let dir = data_dir();
+    let raft = dir.path().join(convert::RAFT_DIR);
+    std::fs::create_dir_all(&raft).unwrap();
+    std::fs::write(dir.path().join(convert::LOG_FILE), b"").unwrap();
+    let refused = open_node_storage(
+        dir.path(),
+        identity(),
+        facts(),
+        envelope(),
+        disk(),
+        true,
+        &key_of(dir.path()),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(refused, OpenError::Log(hyper_log::LogError::Foreign(_))),
+        "{refused}"
+    );
+    assert!(dir.path().join(convert::LOG_FILE).exists());
+}
