@@ -1243,10 +1243,18 @@ impl SimRuntime {
                 any_work = true;
             } else {
                 sim_shard.shard.park(outcome.next_deadline_ns);
-                if let Some(deadline) = sim_shard.shared.requested_deadline() {
-                    earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
+                // Park can queue cancellation after outcome was computed. Ready
+                // ownership gets another simulation turn; a Pending cooperative
+                // finalizer stays live and idle rather than blocking or busy polling.
+                if !sim_shard.shard.exited() {
+                    any_work |= sim_shard.shard.has_inbound();
+                    if !sim_shard.shard.driver_lost() {
+                        if let Some(deadline) = sim_shard.shared.requested_deadline() {
+                            earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
+                        }
+                        any_work |= sim_shard.shared.kicked.load(Ordering::Acquire);
+                    }
                 }
-                any_work |= sim_shard.shared.kicked.load(Ordering::Acquire);
             }
             any_work |= self.pump();
         }

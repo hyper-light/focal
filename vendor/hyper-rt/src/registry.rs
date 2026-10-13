@@ -1,8 +1,8 @@
 //! The process-wide shard registry: how a wake finds its target (slates §4.3; docs/runtime.md §3.2).
 //!
 //! Each shard registers into one of [`MAX_SHARDS`] **slots** and gives it back when its runtime shuts
-//! down: a slot holds the shard's wake bitmap (for wakes from other threads), the sending end of its
-//! control channel, its kick, its parking word and its pulse, plus a `generation` word that is **even
+//! down: a slot holds the shard's wake bitmap (for wakes from other threads), its control queue, its
+//! kick, its parking word and its pulse, plus a `generation` word that is **even
 //! while live and odd while free**. The slot's memory is process-static and never freed, so a waker that
 //! outlives its shard reads a live-or-free word, never freed memory: a wake to a free slot is dropped and
 //! counted, and one to a slot a later shard reused wakes a task of that shard spuriously at most, which
@@ -19,12 +19,13 @@
 #![allow(unsafe_code)]
 
 use std::cell::Cell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::thread::Thread;
 
 use crate::mem::Encoded;
 
-use crate::control::Control;
+use crate::control::{Control, Pushed, Queue};
 use crate::driver::Kick;
 #[cfg(unix)]
 use crate::driver::KickFd;
@@ -43,29 +44,35 @@ pub const MAX_SHARDS: usize = 1024;
 #[cfg(not(target_pointer_width = "64"))]
 pub const MAX_SHARDS: usize = crate::waker::MAX_SHARDS_32;
 
-/// A registered shard: its foreign wake ring, its control channel and its kick.
+/// A registered shard: its foreign wake ring, its control queue and its kick.
 #[derive(Debug)]
 pub struct Entry {
     /// The registration that owns this entry; checked under the reader pin.
     holder: SlotHolder,
     /// The wakes other threads send this shard (docs/runtime.md §3.2).
     pub wakes: WakeBitmap,
-    /// The control channel's sending end.
-    pub control: SyncSender<Control>,
+    /// The shard's control queue, any thread pushing and the shard alone taking (`crate::control`: why it
+    /// is a ring with no waiter, and how closing it leaves nothing behind).
+    control: Queue<Control>,
     /// The task-arena generation the shard that holds this slot starts its handles from: one past the
     /// highest generation the previous holder issued, so a wake word minted for that shard can never
     /// match a task of this one (the slot-reuse safety, see the module doc). Zero for a first use.
     pub generation_base: u32,
-    /// Set by a sender, cleared by the shard once the channel is drained: the shard polls the
-    /// channel only when this says something was sent, one atomic load per step otherwise.
+    /// Set by a sender, cleared by the shard once the queue is drained: the shard polls the
+    /// queue only when this says something was sent, one atomic load per step otherwise.
     pub control_pending: crate::parking::ControlFlag,
     /// Set by the runtime's stop ([`request_stop`]), read by the shard's next control drain: a shutdown
-    /// that takes no slot of the bounded control channel, so stopping never waits for the channel to have
+    /// that takes no slot of the bounded control queue, so stopping never waits for the queue to have
     /// room (docs/runtime.md §15 item 9, closed 2026-10-06; it used to retry a full channel with
     /// `yield_now` and no bound).
     pub stop: AtomicBool,
     /// Admission is closed during owned cancellation and after shutdown begins.
     pub(crate) accepting: AtomicBool,
+    /// Published only by the owner after its native wait returned with driver loss.
+    pub(crate) cleanup_mode: AtomicBool,
+    /// The actual owning thread, bound once when its shard is built. Its one park
+    /// permit wakes driverless cleanup; the bitmap remains the actual task payload.
+    cleanup_thread: OnceLock<Thread>,
     /// The generational kick that wakes this registration's driver.
     pub kick: Kick,
     /// The kick descriptor, closed after the owning contexts and foreign borrows end (Unix).
@@ -93,7 +100,7 @@ pub struct Entry {
     /// Readiness waits of this shard dropped on another shard or off any: per wait slot, the dropped wait's
     /// generation plus one (zero: none), swept by the shard's next control drain (mantle's final review,
     /// third pass, A). A slot's generation is abandoned at most once, so a mark never overwrites one still
-    /// owed, and the marks need no room the control channel could lack: a dropped wait is never refused.
+    /// owed, and the marks need no room the control queue could lack: a dropped wait is never refused.
     pub(crate) abandoned: Box<[AtomicU64]>,
     /// One bit per wait slot, set with its mark: the sweep visits only the marked slots, O(slots / 64 +
     /// marked), not every mark (mantle's final review, fourth pass, E: tens of thousands of slots a shard at
@@ -104,6 +111,31 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// The next control message while the queue is open: the shard's drain.
+    pub(crate) fn take_control(&self) -> Option<Control> {
+        self.control.take()
+    }
+
+    /// Closes the control queue and drops what it holds: the shard's, at its exit, its driver's loss and
+    /// its drop.
+    pub(crate) fn close_control(&self) {
+        self.control.close();
+    }
+
+    /// Called inside the existing parking fence protocol, after payload publication.
+    fn kick_parked(&self) {
+        self.parking.kick_if_parked(|| {
+            if self.cleanup_mode.load(Ordering::Acquire) {
+                // An unpark retains one permit even before its owner enters park.
+                if let Some(owner) = self.cleanup_thread.get() {
+                    owner.unpark();
+                }
+            } else {
+                self.kick.kick();
+            }
+        });
+    }
+
     /// Marks the wait in `slot` at `generation` abandoned and asks the shard to sweep, as a control message
     /// would: the mark, then the flag, then the control mark and a kick. False only for a slot past the
     /// marks, which no ticket of this shard names.
@@ -126,7 +158,7 @@ impl Entry {
         summary.fetch_or(1u64 << bit, Ordering::AcqRel);
         self.abandons_marked.store(true, Ordering::Release);
         self.control_pending.publish();
-        self.parking.kick_if_parked(|| self.kick.kick());
+        self.kick_parked();
         true
     }
 }
@@ -376,22 +408,35 @@ pub fn register(
     wake_slots: usize,
     control_bound: usize,
     kick: RegisterKick,
-) -> Result<(Registration, Receiver<Control>), RtError> {
+) -> Result<Registration, RtError> {
     // A holder outside the runtime runs no desk, so no readiness waits.
-    let (holder, control) = register_slot(wake_slots, control_bound, 0, kick)?;
-    Ok((Registration { holder }, control))
+    let holder = register_slot(wake_slots, control_bound, 0, kick)?;
+    Ok(Registration { holder })
 }
 
-/// Registers a new shard with a wake bitmap for `wake_slots` task slots, a control channel bounded at
-/// `control_bound`, and its kick; returns the id and the control channel's receiving end. Takes the
-/// lowest free slot; refuses `TooManyShards` when every slot holds a live shard.
+/// Registers a new shard with a wake bitmap for `wake_slots` task slots, a control queue bounded at
+/// `control_bound`, and its kick; returns the holder (the queue is the entry's, taken from by its shard).
+/// Takes the lowest free slot; refuses `TooManyShards` when every slot holds a live shard.
 pub(crate) fn register_slot(
     wake_slots: usize,
     control_bound: usize,
     waits: usize,
     kick: RegisterKick,
-) -> Result<(SlotHolder, Receiver<Control>), RtError> {
+) -> Result<SlotHolder, RtError> {
+    register_runtime_slot(wake_slots, control_bound, waits, kick)
+}
+
+/// Registers the cold resources; the shard binds its cleanup thread at its build.
+pub(crate) fn register_runtime_slot(
+    wake_slots: usize,
+    control_bound: usize,
+    waits: usize,
+    kick: RegisterKick,
+) -> Result<SlotHolder, RtError> {
     let max = u16::try_from(MAX_SHARDS).unwrap_or(u16::MAX);
+    // The queue before the slot: a refusal leaves no slot claimed, and a registration that finds no slot
+    // drops it.
+    let mut control = Some(Queue::new(control_bound.max(1))?);
     for (index, slot) in SLOTS.iter().enumerate() {
         let free = slot.generation.load(Ordering::Acquire);
         if free & 1 == 0 {
@@ -415,7 +460,11 @@ pub(crate) fn register_slot(
             continue;
         }
         let id = u16::try_from(index).unwrap_or(u16::MAX);
-        let (control, receiver) = sync_channel(control_bound.max(1));
+        let Some(control) = control.take() else {
+            return Err(RtError::BadConfig {
+                what: "a registration's control queue taken twice",
+            });
+        };
         let wakes = WakeBitmap::new(wake_slots);
         let holder = SlotHolder {
             shard: id,
@@ -429,6 +478,8 @@ pub(crate) fn register_slot(
             control_pending: crate::parking::ControlFlag::new(),
             stop: AtomicBool::new(false),
             accepting: AtomicBool::new(true),
+            cleanup_mode: AtomicBool::new(false),
+            cleanup_thread: OnceLock::new(),
             kick: Kick::None,
             #[cfg(unix)]
             kick_fd: None,
@@ -462,9 +513,25 @@ pub(crate) fn register_slot(
         };
         // Retirement takes the pointer and frees it through its last reader before publishing a free slot.
         slot.entry.publish(entry);
-        return Ok((holder, receiver));
+        return Ok(holder);
     }
     Err(RtError::TooManyShards { max })
+}
+
+/// Binds driverless parking to the thread that actually builds this shard. Runtime
+/// seeds are registered on another thread, so registration cannot choose this owner.
+pub(crate) fn bind_cleanup_thread(holder: SlotHolder) -> Result<(), RtError> {
+    with_holder(holder, |entry| {
+        entry
+            .cleanup_thread
+            .set(std::thread::current())
+            .map_err(|_| RtError::BadConfig {
+                what: "a shard cleanup thread already bound",
+            })
+    })
+    .ok_or(RtError::ShardGone {
+        shard: holder.shard,
+    })?
 }
 
 /// What a registration hands the slot for its kick: a ready [`Kick`] (none), the simulation's shared
@@ -688,7 +755,7 @@ pub fn wake(word: Encoded) {
         if entry.exited.load(Ordering::Acquire) || !entry.wakes.set(word.slot()) {
             return false;
         }
-        entry.parking.kick_if_parked(|| entry.kick.kick());
+        entry.kick_parked();
         true
     });
     if landed != Some(true) {
@@ -705,13 +772,13 @@ pub(crate) fn count_stale(target: u16) {
 }
 
 /// Sends a control message to a shard from any thread and kicks it; refused when the shard's
-/// control channel is full or the shard is gone.
+/// control queue is full or the shard is gone.
 pub fn send_control(target: u16, message: Control) -> Result<(), RtError> {
     with_entry(target, |entry| send_control_to(entry, target, message))
         .ok_or(RtError::ShardGone { shard: target })?
 }
 
-/// Asks shard `target` to shut down without a control-channel slot: sets its stop flag, then publishes
+/// Asks shard `target` to shut down without a control-queue slot: sets its stop flag, then publishes
 /// the control mark and kicks it as a message would, so a parked shard wakes and its next drain applies
 /// the stop after the messages it drains in that batch. Never waits. `ShardGone` for a free slot.
 pub(crate) fn request_stop(target: u16) -> Result<(), RtError> {
@@ -719,7 +786,7 @@ pub(crate) fn request_stop(target: u16) -> Result<(), RtError> {
         // The flag before the mark: the drain that takes the mark (AcqRel) then sees the flag.
         entry.stop.store(true, Ordering::Release);
         entry.control_pending.publish();
-        entry.parking.kick_if_parked(|| entry.kick.kick());
+        entry.kick_parked();
     })
     .ok_or(RtError::ShardGone { shard: target })
 }
@@ -732,14 +799,17 @@ fn send_control_to(entry: &Entry, target: u16, message: Control) -> Result<(), R
     {
         return Err(RtError::ShardGone { shard: target });
     }
-    match entry.control.try_send(message) {
-        Ok(()) => {
+    // A message handed back is dropped here, which answers its receipt, if it has one.
+    match entry.control.push(message) {
+        Pushed::Queued => {
             entry.control_pending.publish();
-            entry.parking.kick_if_parked(|| entry.kick.kick());
+            entry.kick_parked();
             Ok(())
         }
-        Err(TrySendError::Full(_)) => Err(RtError::ControlFull { shard: target }),
-        Err(TrySendError::Disconnected(_)) => Err(RtError::ShardGone { shard: target }),
+        Pushed::Full(_) => Err(RtError::ControlFull { shard: target }),
+        Pushed::Closed(_) => Err(RtError::ShardGone { shard: target }),
+        // Taken as a message queued before a close is: the shard ran it, or its drop answered its receipt.
+        Pushed::Dropped => Ok(()),
     }
 }
 
@@ -789,7 +859,7 @@ pub fn holder_of(shard: u16) -> Option<SlotHolder> {
 
 /// Sends a control message to the shard `holder` names, from any thread, and kicks it; refused
 /// `ShardGone` when the slot is free or held by a later registration (see [`SlotHolder`]) and
-/// `ControlFull` when the holder's control channel is full.
+/// `ControlFull` when the holder's control queue is full.
 pub fn send_control_to_holder(holder: SlotHolder, message: Control) -> Result<(), RtError> {
     with_holder(holder, |entry| {
         send_control_to(entry, holder.shard, message)
@@ -817,7 +887,7 @@ mod tests {
         let form = Kick::Eventfd;
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         let form = Kick::Kqueue;
-        let (shard_holder, _control) =
+        let shard_holder =
             register_slot(2, 1, 0, RegisterKick::Descriptor(descriptor, form)).unwrap();
         let shard = shard_holder.shard();
         let kick = with_entry(shard, |entry| entry.kick).unwrap();
@@ -857,8 +927,7 @@ mod tests {
             );
         });
         assert_eq!(descriptor.with(|_| ()), None);
-        let (replacement_holder, _control) =
-            register_slot(2, 1, 0, RegisterKick::Kick(Kick::None)).unwrap();
+        let replacement_holder = register_slot(2, 1, 0, RegisterKick::Kick(Kick::None)).unwrap();
         assert_eq!(
             descriptor.with(|_| ()),
             None,
@@ -875,8 +944,7 @@ mod tests {
     fn a_second_retirement_under_a_reader_does_nothing() {
         use std::sync::mpsc::sync_channel;
 
-        let (shard_holder, _control) =
-            register_slot(2, 1, 0, RegisterKick::Kick(Kick::none())).unwrap();
+        let shard_holder = register_slot(2, 1, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let shard = shard_holder.shard();
         let slot = SLOTS.get(usize::from(shard)).unwrap();
         let live = slot.generation.load(Ordering::Acquire);
@@ -893,23 +961,30 @@ mod tests {
             unregister(shard_holder);
             unregister(shard_holder);
             let under_the_reader = slot.generation.load(Ordering::Acquire);
+            // No other registration takes the slot until the free is judged: a registration claims a
+            // slot (odd to even) before it publishes the slot's entry, so a test beside this one that
+            // claimed the freed slot showed the bug's state, even and no entry, for that moment (95 of
+            // 12,314 runs of these tests under eight busy loops, 2026-10-11). A slot whose arena is
+            // spent is never claimed (AUD-29-11), so the slot reads spent until then; it is claimed
+            // now, by this test, so no registration is between its checks.
+            let arena = slot
+                .arena_generation
+                .swap(Encoded::TASK_GENERATION_LIMIT + 1, Ordering::AcqRel);
             // The reader is let go before anything is judged, so a failure ends the test, not the scope.
             release.send(()).unwrap();
             assert_eq!(reader.join().unwrap(), Some(()));
+            let after = slot.generation.load(Ordering::Acquire);
+            let entry = slot.entry.unguarded().is_null();
+            slot.arena_generation.store(arena, Ordering::Release);
             assert_eq!(
                 under_the_reader, live,
                 "the slot stays claimed while its reader holds the entry"
             );
+            // Freed by the reader, once: the next odd generation, and no entry. The bug's state was a
+            // second free under the reader and the reader's free after it: even, and no entry.
+            assert_eq!(after, live + 1, "freed by the reader, once");
+            assert!(entry, "a freed slot holds no entry");
         });
-        // Freed by the reader. Another test running beside this one may claim the free slot at once, so the
-        // state is judged, not the count: an odd generation is free; an even one is a registration with its
-        // entry. The bug's state is neither: even, and no entry (a second free under the reader).
-        let after = slot.generation.load(Ordering::Acquire);
-        assert_ne!(after, live, "freed by the reader");
-        assert!(
-            after & 1 == 1 || !slot.entry.unguarded().is_null(),
-            "a claimed slot holds its entry (generation {after})"
-        );
     }
 
     /// Mantle's final review: a retirement names its registration, not only its slot. Do: retire a live
@@ -917,7 +992,7 @@ mod tests {
     /// entry stays, and its own retirement then frees the slot.
     #[test]
     fn a_stale_holder_retires_nothing() {
-        let (live, _control) = register_slot(2, 1, 0, RegisterKick::Kick(Kick::none())).unwrap();
+        let live = register_slot(2, 1, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let stale = SlotHolder {
             shard: live.shard,
             generation: live.generation.wrapping_sub(2),
@@ -936,8 +1011,7 @@ mod tests {
     /// to a shard that will not drain it.
     #[test]
     fn a_wake_to_an_exited_holder_is_counted_stale() {
-        let (id_holder, _receiver) =
-            register_slot(4, 2, 0, RegisterKick::Kick(Kick::none())).unwrap();
+        let id_holder = register_slot(4, 2, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let id = id_holder.shard();
         let stale_before = stale_wakes(id);
         note_exited(id);
@@ -952,9 +1026,9 @@ mod tests {
 
     #[test]
     fn registration_hands_out_distinct_ids_and_entries() {
-        let (a_holder, _ra) = register_slot(8, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
+        let a_holder = register_slot(8, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let a = a_holder.shard();
-        let (b_holder, _rb) = register_slot(8, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
+        let b_holder = register_slot(8, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let b = b_holder.shard();
         assert_ne!(a, b);
         assert!(entry(a).is_some());
@@ -965,8 +1039,7 @@ mod tests {
 
     #[test]
     fn a_wake_from_a_foreign_thread_lands_in_the_target_bitmap() {
-        let (id_holder, _receiver) =
-            register_slot(8, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
+        let id_holder = register_slot(8, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let id = id_holder.shard();
         let word = Encoded::pack(id, 5, 1).unwrap();
         std::thread::scope(|scope| {
@@ -983,8 +1056,7 @@ mod tests {
     /// counted stale, not delivered.
     #[test]
     fn a_wake_past_the_bitmap_is_counted_stale() {
-        let (id_holder, _receiver) =
-            register_slot(4, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
+        let id_holder = register_slot(4, 4, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let id = id_holder.shard();
         let before = stale_wakes(id);
         wake(Encoded::pack(id, 1_000, 1).unwrap());
@@ -993,16 +1065,17 @@ mod tests {
     }
 
     #[test]
-    fn control_is_refused_when_the_channel_is_full_or_the_shard_is_gone() {
-        let (id_holder, receiver) =
-            register_slot(2, 1, 0, RegisterKick::Kick(Kick::none())).unwrap();
+    fn control_is_refused_when_the_queue_is_full_or_closed_or_the_shard_is_gone() {
+        let id_holder = register_slot(2, 1, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let id = id_holder.shard();
         send_control(id, Control::Shutdown).unwrap();
         assert!(matches!(
             send_control(id, Control::Shutdown),
             Err(RtError::ControlFull { .. })
         ));
-        drop(receiver);
+        // The shard's close drops what was queued and refuses what follows.
+        with_entry(id, Entry::close_control).unwrap();
+        assert!(with_entry(id, Entry::take_control).unwrap().is_none());
         assert!(matches!(
             send_control(id, Control::Shutdown),
             Err(RtError::ShardGone { .. })
@@ -1018,8 +1091,7 @@ mod tests {
     /// a later registration holds it — never delivered to the new holder.
     #[test]
     fn a_holder_pinned_send_is_refused_once_the_slot_changes_hands() {
-        let (id_holder, _receiver) =
-            register_slot(2, 2, 0, RegisterKick::Kick(Kick::none())).unwrap();
+        let id_holder = register_slot(2, 2, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let id = id_holder.shard();
         let holder = holder_of(id).unwrap();
         assert_eq!(holder.shard(), id);
@@ -1030,8 +1102,7 @@ mod tests {
             send_control_to_holder(holder, Control::Shutdown),
             Err(RtError::ShardGone { .. })
         ));
-        let (again_holder, _receiver) =
-            register_slot(2, 2, 0, RegisterKick::Kick(Kick::none())).unwrap();
+        let again_holder = register_slot(2, 2, 0, RegisterKick::Kick(Kick::none())).unwrap();
         let again = again_holder.shard();
         if again == id {
             assert!(matches!(

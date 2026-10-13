@@ -27,7 +27,7 @@ pub const NO_LINK: u32 = u32::MAX;
 /// A spawn request that may cross threads: the future is `Send` because it may be created on any
 /// thread and run on the shard's. It may carry the answering half of an admission receipt
 /// ([`SpawnRequest::with_receipt`]): the shard answers it when it drains the request, and a request
-/// dropped undrained (queued in a control channel the shard exited behind) answers it `Terminated`
+/// dropped undrained (queued in a control queue the shard exited behind) answers it `Terminated`
 /// itself, so a submitter that holds a receipt always learns what became of its task — a submission
 /// is never mistaken for an admission (§4.3 "admission").
 pub struct SpawnRequest {
@@ -79,7 +79,7 @@ impl std::fmt::Debug for SpawnRequest {
 }
 
 /// What became of a spawn request after its submission (§4.3 "admission"): the three ends a request
-/// can meet once it is in a shard's control channel, so a submitter that must know whether its task
+/// can meet once it is in a shard's control queue, so a submitter that must know whether its task
 /// exists reads one of these and never infers it from a submission that merely landed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Admission {
@@ -128,10 +128,23 @@ impl Drop for ReceiptSlot {
 pub struct AdmissionReceipt(Receiver<Admission>);
 
 impl AdmissionReceipt {
+    /// Cold setup wait, before transferring a resource to an admitted service.
+    /// Refused inside a runtime task; admission never blocks a live shard.
+    pub fn wait_blocking(&self) -> Result<Admission, RtError> {
+        if crate::registry::with_current(|_| ()).is_some() {
+            return Err(RtError::NotOnShardThread);
+        }
+        Ok(self.0.recv().unwrap_or(Admission::Terminated))
+    }
+
     /// Waits at most `timeout` for the answer; `None` while the request is still queued undrained.
     /// The answering half dropped without answering cannot happen (its drop answers), but is read as
     /// `Terminated` all the same rather than as a lost reply.
+    /// This cold setup API refuses a runtime caller without consuming an available answer.
     pub fn wait(&self, timeout: Duration) -> Option<Admission> {
+        if crate::registry::with_current(|_| ()).is_some() {
+            return Some(Admission::Refused(RtError::NotOnShardThread));
+        }
         match self.0.recv_timeout(timeout) {
             Ok(admission) => Some(admission),
             Err(RecvTimeoutError::Timeout) => None,
@@ -165,6 +178,53 @@ mod tests {
         drop(request);
         assert_eq!(receipt.wait(Duration::ZERO), Some(Admission::Terminated));
     }
+
+    #[test]
+    fn cold_receipt_waits_refuse_a_live_task_without_consuming_ready_or_pending_answers() {
+        let (request, pending) = SpawnRequest::with_receipt(Box::pin(async {}), None);
+        let (ready_request, ready) = SpawnRequest::with_receipt(Box::pin(async {}), None);
+        drop(ready_request);
+        // One root is the only role. Timing/page fields use the existing native lifecycle fixture.
+        let roles = 1;
+        let config = crate::runtime::RuntimeConfig {
+            shards: 1,
+            tasks_per_shard: roles,
+            timers_per_shard: roles,
+            interests_per_shard: crate::runtime::interests_for(roles),
+            ring_entries: roles,
+            step_budget_ns: 1_000_000,
+            timer_tick_ns: 100_000,
+            batch: roles,
+            pin: false,
+            cores: Vec::new(),
+            page_bytes: 4096,
+            spin_ns: 0,
+            wake_tracking: None,
+        };
+        let mut runtime = crate::runtime::LocalRuntime::new(&config).unwrap();
+        let (pending_result, ready_result, pending, ready) = runtime
+            .block_on(async move {
+                (
+                    pending.wait(Duration::ZERO),
+                    ready.wait(Duration::ZERO),
+                    pending,
+                    ready,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            pending_result,
+            Some(Admission::Refused(RtError::NotOnShardThread))
+        );
+        assert_eq!(
+            ready_result,
+            Some(Admission::Refused(RtError::NotOnShardThread))
+        );
+        assert_eq!(pending.wait(Duration::ZERO), None);
+        assert_eq!(ready.wait(Duration::ZERO), Some(Admission::Terminated));
+        drop(request);
+        assert_eq!(pending.wait(Duration::ZERO), Some(Admission::Terminated));
+    }
 }
 
 /// Where a task is in its life.
@@ -190,6 +250,10 @@ pub enum Outcome {
     /// The future was dropped before returning (cancelled by request, by its parent, or by
     /// shutdown).
     Cancelled,
+    /// The future unwound while it was polled: the task's code panicked. The poll runs inside an
+    /// unwind boundary of the shard's own, so the task ends there, its future dropped inside a
+    /// boundary too, and the shard and its other tasks go on (CLAUDE.md §1).
+    Unwound,
 }
 
 /// One task slot.

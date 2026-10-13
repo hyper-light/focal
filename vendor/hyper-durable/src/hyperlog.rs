@@ -547,4 +547,20 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
         }
         Ok(())
     }
+
+    /// The handle keeps the entries the replica will read back, whatever the group's share of the
+    /// log's cache (`GroupLog::keep_after`): a leader's entries are durable at its own write and
+    /// committed at its followers' answers, and by then the core has let them go, so its apply read
+    /// each back, past the handle's share (64 KiB a group in focal: 64 MiB over 1,024 groups),
+    /// through the log's owner and to the device, queued behind its flushes. focal's session owner
+    /// spent 57% of its time waiting on those reads at 5,000 writes a second (2026-10-12). A resend
+    /// to a member that has yet to acknowledge them reads them back the same way. The handle took
+    /// each entry's bytes back with its write's answer, so nothing is copied to keep them.
+    fn keep_after(&mut self, index: u64) {
+        self.group.keep_after(index);
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        self.group.kept_bytes()
+    }
 }

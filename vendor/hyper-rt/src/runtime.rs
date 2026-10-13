@@ -5,6 +5,11 @@
 use std::future::Future;
 use std::thread::JoinHandle;
 
+mod retirement;
+pub use retirement::{
+    OriginalAdoption, OriginalFence, OriginalLease, OriginalRetirement, RetirementLease,
+};
+
 use crate::control::Control;
 use crate::derived;
 use crate::driver::{DriverSeed, Kick, Prepared, os_driver};
@@ -20,7 +25,7 @@ use crate::task::{AdmissionReceipt, SpawnRequest};
 /// Submits a detached task to the shard `holder` names, from any thread and without a runtime handle
 /// (a submitter that may outlive the runtime — an observation still pending while its daemon stops),
 /// and returns the receipt of its admission; refused `ShardGone` when the slot is free or held by a
-/// later registration, `ControlFull` when the holder's control channel is full.
+/// later registration, `ControlFull` when the holder's control queue is full.
 pub fn submit_to_holder<F: Future<Output = ()> + Send + 'static>(
     holder: registry::SlotHolder,
     future: F,
@@ -30,8 +35,19 @@ pub fn submit_to_holder<F: Future<Output = ()> + Send + 'static>(
     Ok(receipt)
 }
 
+/// Submits an opt-in service bootstrap to this exact registration. An unadmitted
+/// bootstrap must not own live I/O; transfer that ownership only after `Admitted`.
+pub fn submit_service_to_holder<F: Future<Output = ()> + Send + 'static>(
+    holder: registry::SlotHolder,
+    future: F,
+) -> Result<AdmissionReceipt, RtError> {
+    let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
+    registry::send_control_to_holder(holder, Control::SpawnService(Box::new(request)))?;
+    Ok(receipt)
+}
+
 /// Requests a task's cancellation from any thread without a runtime handle (the message
-/// [`Runtime::cancel`] sends); refused when the task's shard is gone or its control channel is full.
+/// [`Runtime::cancel`] sends); refused when the task's shard is gone or its control queue is full.
 /// A task that already ended is a stale word the shard ignores.
 pub fn cancel_task(task: TaskId) -> Result<(), RtError> {
     registry::send_control(task.0.shard(), Control::Cancel(task.0))
@@ -306,6 +322,17 @@ struct Worker {
     thread: JoinHandle<Result<Counters, RtError>>,
 }
 
+/// The opt-in retirement executor starts only on its runtime's cold owner.
+fn spawn_retirement<F: FnOnce() + Send + 'static>(body: F) -> std::io::Result<JoinHandle<()>> {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the runtime cold owner owns and joins its bounded retirement threads (docs/runtime.md §3)"
+    )]
+    std::thread::Builder::new()
+        .name("hyper-rt-retirement".into())
+        .spawn(body)
+}
+
 /// The OS runtime: one thread per shard. It owns its workers from start to a terminal state (AUD-29-12):
 /// `start` is transactional — every shard's context is built and acknowledged before it returns, and any
 /// failure stops and joins the workers that did start and gives every registry slot back before the typed
@@ -317,6 +344,8 @@ pub struct Runtime {
     workers: Vec<Worker>,
     ids: Vec<ShardId>,
     notes: Vec<String>,
+    retirement: Vec<retirement::Owner>,
+    retirement_capacity: usize,
 }
 
 impl std::fmt::Debug for Runtime {
@@ -332,11 +361,14 @@ impl Drop for Runtime {
     /// slots back, exactly as `shutdown` would; a worker's failure is reported on the error stream, the one
     /// place a drop can put it.
     fn drop(&mut self) {
-        if self.workers.is_empty() {
-            return;
-        }
-        if stop(std::mem::take(&mut self.workers)).is_err() {
+        if !self.workers.is_empty() && stop(std::mem::take(&mut self.workers)).is_err() {
             registry::note_unreported_failure();
+        }
+        // Reapers remain alive through every service-worker join, including driver failure.
+        for owner in &mut self.retirement {
+            if owner.join().is_err() {
+                registry::note_unreported_failure();
+            }
         }
     }
 }
@@ -379,13 +411,13 @@ fn run_worker(
     }
 }
 
-/// Stops every worker (a shutdown message, retried while the shard's control channel is full), joins them
+/// Stops every worker (a shutdown message, retried while the shard's control queue is full), joins them
 /// all, and then gives every slot back — after every join, never before, since a shard's pair rings are lent
 /// to its peers. The counters in shard order, or the first worker's failure (every worker is still joined
 /// and every slot still given back).
 fn stop(workers: Vec<Worker>) -> Result<Vec<Counters>, RtError> {
     for worker in &workers {
-        // The stop takes no slot of the bounded control channel, so a full channel cannot hold it back and
+        // The stop takes no slot of the bounded control queue, so a full queue cannot hold it back and
         // nothing here waits (§15 item 9: the send used to be retried with `yield_now`, unbounded). Before
         // 2026-09-17 a refused Shutdown was dropped and the join waited for good (`tests/admission.rs`).
         // `ShardGone`: the shard's slot is already free, and the join below reports how its thread ended.
@@ -401,7 +433,10 @@ fn stop(workers: Vec<Worker>) -> Result<Vec<Counters>, RtError> {
             Ok(Err(error)) => {
                 failure.get_or_insert(error);
             }
-            Err(_) => {
+            Err(payload) => {
+                // The payload is the unwound code's own (a caller's driver; a task's poll and drop
+                // unwind inside the shard's boundary), so it is dropped inside a boundary too.
+                let _ = crate::unwind::contained(move || drop(payload));
                 failure.get_or_insert(RtError::WorkerFailed { shard: id });
             }
         }
@@ -468,6 +503,12 @@ impl Runtime {
         prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
     ) -> Result<Runtime, RtError> {
         config.validate_shape()?;
+        let retirement_capacity = config
+            .tasks_per_shard
+            .checked_mul(usize::from(config.shards))
+            .ok_or(RtError::BadConfig {
+                what: "native retirement task capacity overflow",
+            })?;
         let mut notes = Vec::new();
         let seeds = register_seeds(config, prepare, &mut notes)?;
         let ids: Vec<ShardId> = seeds.iter().map(|s| ShardId(s.id)).collect();
@@ -514,7 +555,80 @@ impl Runtime {
             workers,
             ids,
             notes,
+            retirement: Vec::new(),
+            retirement_capacity,
         })
+    }
+
+    /// Prepares exactly these native worker groups on the cold caller. Their handles are
+    /// adopted before an engine enters a service; retirement only signals and awaits.
+    /// Live groups are bounded by the runtime's configured task arena. Completed owners
+    /// are joined here, so repeated cold service setup does not accumulate reaper threads.
+    pub fn prepare_retirement(
+        &mut self,
+        capacities: &[usize],
+    ) -> Result<Vec<RetirementLease>, RtError> {
+        self.retirement_room(capacities)?;
+        let (owner, leases) = retirement::Owner::new(capacities)?;
+        self.retirement.push(owner);
+        Ok(leases)
+    }
+
+    /// Reserves worker retirement and a separately receipted original resource on the
+    /// same native reaper. Cold adoption transfers the resource before service admission;
+    /// original retirement first joins this group's workers, then waits its physical fence.
+    pub fn prepare_retirement_with_original<F: Send + 'static, W: OriginalFence>(
+        &mut self,
+        capacities: &[usize],
+    ) -> Result<Vec<OriginalRetirement<F, W>>, RtError> {
+        self.retirement_room(capacities)?;
+        let (owner, leases) = retirement::Owner::new_with_original(capacities)?;
+        self.retirement.push(owner);
+        Ok(leases)
+    }
+
+    fn retirement_room(&mut self, capacities: &[usize]) -> Result<(), RtError> {
+        if registry::with_current(|_| ()).is_some() {
+            return Err(RtError::NotOnShardThread);
+        }
+        if capacities.is_empty() || capacities.contains(&0) {
+            return Err(RtError::BadConfig {
+                what: "an empty native retirement reservation",
+            });
+        }
+        let held = self
+            .retirement
+            .iter()
+            .filter(|owner| !owner.done())
+            .try_fold(0usize, |held, owner| held.checked_add(owner.groups()))
+            .ok_or(RtError::BadConfig {
+                what: "native retirement groups overflow",
+            })?;
+        if held
+            .checked_add(capacities.len())
+            .is_none_or(|total| total > self.retirement_capacity)
+        {
+            return Err(RtError::Capacity {
+                what: "native retirement groups",
+                bound: self.retirement_capacity,
+            });
+        }
+        let mut at = 0;
+        while at < self.retirement.len() {
+            if self.retirement.get(at).is_some_and(retirement::Owner::done) {
+                let mut owner = self.retirement.swap_remove(at);
+                owner.join()?;
+            } else {
+                at = at.saturating_add(1);
+            }
+        }
+        self.retirement
+            .try_reserve(1)
+            .map_err(|_| RtError::Capacity {
+                what: "native retirement owners",
+                bound: self.retirement_capacity,
+            })?;
+        Ok(())
     }
 
     /// The shard ids, in order.
@@ -529,7 +643,7 @@ impl Runtime {
 
     /// Spawns a detached task on a shard from any thread; refused when the shard's control
     /// channel is full (its admission limit) or the shard is gone. `Ok` is a **submission**: the request
-    /// is in the shard's control channel, and whether the shard admits it is answered only to a receipt
+    /// is in the shard's control queue, and whether the shard admits it is answered only to a receipt
     /// ([`Self::spawn_on_with_receipt`]).
     pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(
         &self,
@@ -541,7 +655,7 @@ impl Runtime {
     }
 
     /// Spawns a detached task on a shard from any thread and returns the receipt of its admission
-    /// ([`AdmissionReceipt`]): refused here when the shard's control channel is full or the shard is gone;
+    /// ([`AdmissionReceipt`]): refused here when the shard's control queue is full or the shard is gone;
     /// otherwise the receipt reports, once the shard drains the request, whether the task was admitted
     /// (and as which task), refused (the arena full), or terminated unadmitted (the shard shutting down).
     pub fn spawn_on_with_receipt<F: Future<Output = ()> + Send + 'static>(
@@ -551,6 +665,18 @@ impl Runtime {
     ) -> Result<AdmissionReceipt, RtError> {
         let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
         registry::send_control(shard.0, Control::Spawn(Box::new(request)))?;
+        Ok(receipt)
+    }
+
+    /// Submits an opt-in service bootstrap and returns its real admission receipt.
+    /// Cancellation keeps the admitted future alive until its cleanup returns Ready.
+    pub fn spawn_service_on_with_receipt<F: Future<Output = ()> + Send + 'static>(
+        &self,
+        shard: ShardId,
+        future: F,
+    ) -> Result<AdmissionReceipt, RtError> {
+        let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
+        registry::send_control(shard.0, Control::SpawnService(Box::new(request)))?;
         Ok(receipt)
     }
 
@@ -569,7 +695,15 @@ impl Runtime {
     /// counters in shard order, or the first worker's failure (typed; every worker is still joined and every
     /// slot still given back).
     pub fn shutdown(mut self) -> Result<Vec<Counters>, RtError> {
-        stop(std::mem::take(&mut self.workers))
+        let mut result = stop(std::mem::take(&mut self.workers));
+        for owner in &mut self.retirement {
+            if let Err(error) = owner.join()
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
     }
 }
 
@@ -694,6 +828,14 @@ impl LocalRuntime {
         self.shard.spawn_local(crate::shard::boxed(future))
     }
 
+    /// Spawns a joinable service whose future completes its cancellation cleanup.
+    pub fn spawn_service<F: Future<Output = ()> + 'static>(
+        &mut self,
+        future: F,
+    ) -> Result<TaskId, RtError> {
+        self.shard.spawn_service_local(crate::shard::boxed(future))
+    }
+
     /// Keeps `value` for the shard's life and hands back its handle.
     pub fn keep<T: 'static>(&mut self, value: T) -> Result<Kept<T>, RtError> {
         self.shard.keep(value)
@@ -706,8 +848,9 @@ impl LocalRuntime {
 
     /// Runs `future` to completion on this thread as the shard's root task and returns its output. Whatever
     /// the root spawned and left running is cancelled and joined before this returns: nothing outlives the
-    /// call. Refused when the root cannot be admitted, and `ShardGone` when the shard's driver is lost
-    /// before the root finishes.
+    /// call. Refused when the root cannot be admitted, `ShardGone` when the shard's driver is lost before
+    /// the root finishes, and `RootUnwound` when the root's future unwinds: the shard's boundary ends that
+    /// task with no output to wait for.
     pub fn block_on<T: 'static>(
         &mut self,
         future: impl Future<Output = T> + 'static,
@@ -716,9 +859,23 @@ impl LocalRuntime {
             let output = future.await;
             let _ = registry::with_current(|desk| desk.put_root_output(Box::new(output)));
         }))?;
-        self.shard.context().detach(root)?;
+        self.shard.context().begin_root(root);
+        if let Err(refused) = self.shard.context().detach(root) {
+            self.shard.context().end_root();
+            return Err(refused);
+        }
         loop {
+            if self.shard.context().root_unwound() {
+                // The root's poll unwound inside the shard's boundary and its task ended `Unwound`: no output
+                // will come. What it left running is cancelled and joined as on a return.
+                self.shard.context().end_root();
+                self.shard.cancel_everything();
+                return Err(RtError::RootUnwound {
+                    shard: self.slot.0.shard(),
+                });
+            }
             if let Some(output) = self.shard.context().take_root_output() {
+                self.shard.context().end_root();
                 self.shard.cancel_everything();
                 return output.downcast::<T>().map(|output| *output).map_err(|_| {
                     RtError::BadConfig {
@@ -728,13 +885,14 @@ impl LocalRuntime {
             }
             let outcome = self.shard.step();
             if outcome.exit {
+                self.shard.context().end_root();
                 self.shard.discard_root_output();
                 return Err(RtError::ShardGone {
                     shard: self.slot.0.shard(),
                 });
             }
             if !outcome.did_work {
-                self.shard.park(outcome.next_deadline_ns);
+                self.shard.park_owned(outcome.next_deadline_ns);
             }
         }
     }

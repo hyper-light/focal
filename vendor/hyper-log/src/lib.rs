@@ -42,6 +42,7 @@ mod seal;
 mod state;
 mod stats;
 mod ticket;
+mod unwind;
 mod writer;
 
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
@@ -594,7 +595,8 @@ impl<F: BlockFile + 'static> Log<F> {
                 Some(gate)
             }
         };
-        let state = match recover::create(&file, &config, id, sealer.as_mut()) {
+        // Formatting reads and writes the file, the caller's code, inside an unwind boundary.
+        let state = match device::guarded(|| recover::create(&file, &config, id, sealer.as_mut())) {
             Ok(state) => state,
             Err(error) => {
                 if let (Some(gate), Some(first)) = (gate.as_mut(), first) {
@@ -684,7 +686,9 @@ impl<F: BlockFile + 'static> Log<F> {
         mut sealer: Option<seal::Sealer>,
         growth: Option<Box<dyn Growth>>,
     ) -> Result<(Self, Recovery), Refused<F>> {
-        let (state, recovery, restores) = match recover::open(&file, &config, id, sealer.as_mut()) {
+        // Recovery reads the file, the caller's code, inside an unwind boundary.
+        let opened = device::guarded(|| recover::open(&file, &config, id, sealer.as_mut()));
+        let (state, recovery, restores) = match opened {
             Ok(opened) => opened,
             Err(error) => return Err(Refused::with(error, file)),
         };
@@ -730,7 +734,11 @@ impl<F: BlockFile + 'static> Log<F> {
         sealer: Option<seal::Sealer>,
         gate: Option<growth::Gate>,
     ) -> Result<(Self, Vec<Pending>), Refused<F>> {
-        match Self::prepare(file.layout_block(), config, id, restores, sealer.is_some()) {
+        let align = match device::guarded(|| Ok(file.layout_block())) {
+            Ok(align) => align,
+            Err(error) => return Err(Refused::with(error, file)),
+        };
+        match Self::prepare(align, config, id, restores, sealer.is_some()) {
             Ok(prepared) => {
                 let log = Self::spawn(
                     file,
@@ -1064,7 +1072,10 @@ impl<F: BlockFile + 'static> Log<F> {
     /// The handle through which `group` is written and read from here on (`group.rs`): the log
     /// refuses the group's submissions from anyone else, [`LogError::Claimed`], until the handle
     /// is dropped. Refused `Claimed` while another handle holds it, `Damaged` for a group whose
-    /// records are damaged, and `TooManyGroups` past the log's bound on groups.
+    /// records are damaged, and `TooManyGroups` past the log's bound on groups. A group whose
+    /// handle was dropped with writes out is given once the log has answered them, so the new
+    /// handle holds every write the log took of the group; a second claim meanwhile is refused
+    /// `Claimed`.
     pub fn group(&self, group: u128) -> Result<GroupLog<F>, LogError> {
         claim(&self.lines, self.p, group)
     }
@@ -1189,20 +1200,26 @@ impl<F: BlockFile + 'static> Log<F> {
 
     /// Runs `look` on the log's file, on the thread that holds the device, between the log's own
     /// I/O, and returns what it returns: how a simulation reaches the device the log owns, to arm
-    /// a fault or read its counts.
+    /// a fault or read its counts. A look that unwinds is answered as a failed operation on the
+    /// file ([`LogError::Disk`], "a look at the file unwound"), and the log goes on.
     pub fn with_file<R: Send + 'static>(
         &self,
         look: impl FnOnce(&F) -> R + Send + 'static,
     ) -> Result<R, LogError> {
         let (result, back) = sync_channel(1);
+        // The look is the caller's code, run on the thread that holds the device: inside an unwind
+        // boundary of its own, so one that unwinds is answered so and leaves the device working
+        // (CLAUDE.md §1).
         let boxed: device::Look<F> = Box::new(move |file: &F| {
-            let _ = result.try_send(look(file));
+            let looked = unwind::contained(|| look(file))
+                .ok_or_else(|| device::unwound("a look at the file unwound"));
+            let _ = result.try_send(looked);
         });
         self.lines
             .inbox
             .send(Message::Look(boxed))
             .map_err(|_| LogError::Closed)?;
-        back.recv().map_err(|_| LogError::Closed)
+        back.recv().map_err(|_| LogError::Closed)?
     }
 
     /// Closes the log once it has answered every submission it took, and gives back its file.

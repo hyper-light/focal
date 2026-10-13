@@ -110,30 +110,41 @@ impl WakeLatency {
     /// A coefficient of variation of six (a virtual machine's) needs about 55,000 wakes; one and a half
     /// (Apple silicon) about 3,500.
     pub fn estimate_window(&self) -> u64 {
-        let half_width_permille = u128::from(CONVERGED_WIDTH_PERMILLE / 2).max(1);
-        let spread = u128::from(self.sd_ns).saturating_mul(Z_95_PERMILLE);
-        let scale = u128::from(self.mean_ns).saturating_mul(half_width_permille);
-        let floor = u64::try_from(MIN_SAMPLES).unwrap_or(u64::MAX);
-        if scale == 0 {
-            return floor;
-        }
-        let ratio = spread.div_ceil(scale);
-        u64::try_from(ratio.saturating_mul(ratio))
-            .unwrap_or(u64::MAX)
-            .max(floor)
+        sample_window(self.mean_ns, self.sd_ns)
     }
 
     /// The exponential-weighting shift of an online estimate over [`estimate_window`](Self::estimate_window)
-    /// wakes: `⌈log₂ N⌉`, capped so the fixed-point accumulator of [`WakeEstimate`] (a mean shifted left by
-    /// it) fits 128 bits.
+    /// wakes ([`window_shift`]).
     pub fn estimate_shift(&self) -> u32 {
-        let window = self.estimate_window();
-        let shift = window
-            .saturating_sub(1)
-            .checked_ilog2()
-            .map_or(0, |bits| bits.saturating_add(1));
-        shift.min(WakeEstimate::MAX_SHIFT)
+        window_shift(self.estimate_window())
     }
+}
+
+/// How many samples a mean of a quantity with this mean and standard deviation needs to reach the probe's own
+/// precision: `N = (z · sd / (h · mean))²`, with `z` the 95 % normal quantile and `h` half the stopping-rule
+/// width ([`CONVERGED_WIDTH_PERMILLE`]). At least [`MIN_SAMPLES`]; no spread (or no mean) asks no more.
+pub fn sample_window(mean_ns: u64, sd_ns: u64) -> u64 {
+    let half_width_permille = u128::from(CONVERGED_WIDTH_PERMILLE / 2).max(1);
+    let spread = u128::from(sd_ns).saturating_mul(Z_95_PERMILLE);
+    let scale = u128::from(mean_ns).saturating_mul(half_width_permille);
+    let floor = u64::try_from(MIN_SAMPLES).unwrap_or(u64::MAX);
+    if scale == 0 {
+        return floor;
+    }
+    let ratio = spread.div_ceil(scale);
+    u64::try_from(ratio.saturating_mul(ratio))
+        .unwrap_or(u64::MAX)
+        .max(floor)
+}
+
+/// The exponential-weighting shift of an online estimate over `window` samples: `⌈log₂ N⌉`, capped so the
+/// fixed-point accumulator of [`WakeEstimate`] (a mean shifted left by it) fits 128 bits.
+pub fn window_shift(window: u64) -> u32 {
+    let shift = window
+        .saturating_sub(1)
+        .checked_ilog2()
+        .map_or(0, |bits| bits.saturating_add(1));
+    shift.min(WakeEstimate::MAX_SHIFT)
 }
 
 /// An online estimate of the mean wake (§4.1, §4.3, §4.7): an exponentially weighted mean over about
@@ -204,18 +215,34 @@ const DONE: u32 = 2;
 
 /// Measures the wake latency within `budget`, placed as `placement` places the shards (the profile's facts).
 ///
-/// The [`WAKE_ROUNDS`] rounds share the budget. A round whose setup — a fresh waiter scheduled and
-/// confirmed asleep — outlasts its share on a loaded machine keeps nothing, and five such rounds once left
-/// the probe with no sample at all, reported as a zero mean that every consumer derives from (a zero spin
-/// window, a one-nanosecond step quantum; CI run 36201648573, a 30 ms budget on a macOS runner). So while
-/// the pooled sample is under the stopping rule's floor ([`MIN_SAMPLES`]), up to [`WAKE_ROUNDS`] more rounds
-/// run, each with twice the last one's budget: a slow machine gets exponentially more time, within
-/// `2 + 4 + 8 + 16 + 32 = 62` more shares. Short of the floor even then, the probe refuses
-/// `MeasurementTimeout` rather than report a mean it did not measure.
+/// The [`WAKE_ROUNDS`] rounds share the budget. Five rounds that kept nothing once left the probe with no
+/// sample at all, reported as a zero mean that every consumer derives from (a zero spin window, a
+/// one-nanosecond step quantum; CI run 36201648573, a 30 ms budget on a macOS runner). So while the pooled
+/// sample is under the stopping rule's floor ([`MIN_SAMPLES`]), up to [`WAKE_ROUNDS`] more rounds run, each
+/// with twice the last one's share: a slow machine gets exponentially more time. Short of the floor even
+/// then, the probe refuses `MeasurementTimeout` rather than report a mean it did not measure.
+///
+/// A round's share times wakes, and begins once its fresh waiter runs. Starting a thread pinned to a busy
+/// core is the round's setup, not a wake: it is waited for within the probe's span, every share its rounds
+/// may take ([`span`]), and no round starts past it. Charged to the share, setup spent it: on windows-2025,
+/// with the machine tests' probes pinned to the same cores at once, a waiter took up to 149 ms to start
+/// where a share was 8 ms, 29 % of the rounds kept nothing, and once every round of three probes did,
+/// each refused (CI run 38021030068; the trace in diag run 38266052185).
 pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, MachineError> {
+    wake_with(budget, placement, &|| {})
+}
+
+/// [`wake`], each round's waiter running `setup` before it says it runs: nothing in production, and in
+/// tests a start made slow as a busy core makes it.
+fn wake_with(
+    budget: Duration,
+    placement: &Placement,
+    setup: &(dyn Fn() + Sync),
+) -> Result<WakeLatency, MachineError> {
     let pairs = core_pairs(placement);
     let saved = SavedAffinity::of_calling_thread();
     let mut round_budget = budget.checked_div(WAKE_ROUNDS).unwrap_or(budget);
+    let probe = Probe::starting(round_budget);
     let mut rng = Xorshift::new(Xorshift::SEED);
     let mut kept: Vec<u64> = Vec::new();
     let mut round_medians: Vec<Interval> = Vec::new();
@@ -223,8 +250,9 @@ pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, Mach
     let mut same_cpu_samples = 0u32;
     let mut asleep_confirmed = true;
     let mut rounds = 0u32;
-    while rounds < WAKE_ROUNDS
-        || (kept.len() < MIN_SAMPLES && rounds < WAKE_ROUNDS.saturating_mul(2))
+    while (rounds < WAKE_ROUNDS
+        || (kept.len() < MIN_SAMPLES && rounds < WAKE_ROUNDS.saturating_mul(2)))
+        && probe.left() > Duration::ZERO
     {
         if rounds >= WAKE_ROUNDS {
             round_budget = round_budget.saturating_mul(2);
@@ -234,7 +262,7 @@ pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, Mach
             .and_then(|round| pairs.get(round.checked_rem(pairs.len().max(1)).unwrap_or(0)))
             .copied();
         rounds = rounds.saturating_add(1);
-        let outcome = wake_round(pair, round_budget, &mut rng);
+        let outcome = wake_round(pair, round_budget, &probe, setup, &mut rng);
         placement = weaker(placement, outcome.placement);
         same_cpu_samples = same_cpu_samples.saturating_add(outcome.same_cpu);
         asleep_confirmed &= outcome.asleep_confirmed;
@@ -361,6 +389,49 @@ struct Round {
     same_cpu: u32,
     placement: Pinning,
     asleep_confirmed: bool,
+    /// What was left of the probe's span when its waiter ran; `None` when it did not run within it.
+    setup_left: Option<Duration>,
+    /// The window its wakes were timed in, from its waiter's start: its share, or what was left of the
+    /// probe's span when less; `None` when the waiter did not run within the span.
+    window: Option<Duration>,
+}
+
+/// The probe's span: every share its rounds may take, the planned [`WAKE_ROUNDS`] and as many more each
+/// twice the last, from the probe's start. A round's setup is waited for within it, and no round starts
+/// past it.
+struct Probe {
+    started: Instant,
+    span: Duration,
+}
+
+impl Probe {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the wake probe measures the host on the host clock (docs/runtime.md §10.2)"
+    )]
+    fn starting(share: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            span: span(share),
+        }
+    }
+
+    /// What is left of the span.
+    fn left(&self) -> Duration {
+        self.span.saturating_sub(self.started.elapsed())
+    }
+}
+
+/// Every share the rounds may take: [`WAKE_ROUNDS`] of `share`, then [`WAKE_ROUNDS`] more, each twice the
+/// last (`5 + 2 + 4 + 8 + 16 + 32`, 67 shares).
+fn span(share: Duration) -> Duration {
+    let mut total = share.saturating_mul(WAKE_ROUNDS);
+    let mut next = share;
+    for _ in 0..WAKE_ROUNDS {
+        next = next.saturating_mul(2);
+        total = total.saturating_add(next);
+    }
+    total
 }
 
 /// The words the waker and the waiter share for one round.
@@ -387,8 +458,13 @@ struct Shared {
     clippy::disallowed_methods,
     reason = "the wake probe measures the host: a real thread parked and woken on the host clock (docs/runtime.md §10.2)"
 )]
-fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) -> Round {
-    let started = Instant::now();
+fn wake_round(
+    pair: Option<(u32, u32)>,
+    share: Duration,
+    probe: &Probe,
+    setup: &(dyn Fn() + Sync),
+    rng: &mut Xorshift,
+) -> Round {
     let waker_pin = pair.map_or(Pinning::Scheduled, |(waker, _)| pin_current_thread(waker));
     let shared = Shared {
         stamp: AtomicU64::new(0),
@@ -406,14 +482,22 @@ fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) ->
         same_cpu: 0,
         placement: waker_pin,
         asleep_confirmed: true,
+        setup_left: None,
+        window: None,
     };
     std::thread::scope(|scope| {
-        let waiter = scope.spawn(|| waiter_loop(&shared, pair, epoch, &waker));
-        let Some(id) = await_waiter(&shared, started, budget) else {
+        let waiter = scope.spawn(|| waiter_loop(&shared, pair, epoch, &waker, setup));
+        let Some(id) = await_waiter(&shared, probe.started, probe.span) else {
             shared.stop.store(true, Ordering::Release);
             waiter.thread().unpark();
             return;
         };
+        // The waiter runs: the share times its wakes from here, cut short by the probe's span.
+        let started = Instant::now();
+        let left = probe.left();
+        let budget = share.min(left);
+        round.setup_left = Some(left);
+        round.window = Some(budget);
         let waiter_pin = pinning_from_code(shared.waiter_pin.load(Ordering::Acquire));
         round.placement = weaker(waker_pin, waiter_pin);
         // Only a pair pinned to two distinct cores defines the event as cross-CPU; unpinned (or one core),
@@ -458,8 +542,10 @@ fn waiter_loop(
     pair: Option<(u32, u32)>,
     epoch: Instant,
     waker: &std::thread::Thread,
+    setup: &(dyn Fn() + Sync),
 ) {
     let pin = pair.map_or(Pinning::Scheduled, |(_, waiter)| pin_current_thread(waiter));
+    setup();
     shared
         .waiter_pin
         .store(pinning_code(pin), Ordering::Release);
@@ -489,7 +575,7 @@ fn waiter_loop(
     }
 }
 
-/// Waits for the waiter to publish its id; `None` when the round's budget ends first.
+/// Waits for the waiter to publish its id; `None` when the probe's span ends first.
 fn await_waiter(shared: &Shared, started: Instant, budget: Duration) -> Option<u64> {
     loop {
         let id = shared.waiter.load(Ordering::Acquire);
@@ -877,5 +963,51 @@ mod tests {
         );
         let after = std::thread::available_parallelism().map_or(1, |n| n.get());
         assert_eq!(after, before);
+    }
+
+    /// A round's share times wakes from its waiter's start (CI run 38021030068: on windows-2025 a pinned
+    /// waiter took up to 149 ms to start where a share was 8 ms, and the share spent on the start kept
+    /// nothing). Do: a round whose waiter's start takes three shares, as a busy core makes it. Expect: the
+    /// waiter ran within the probe's span, after its start's three shares, and the round's window is its
+    /// whole share, or what the span had left when the start took nearly all of it; were the start charged
+    /// to the share, the round had no window at all.
+    #[test]
+    fn a_rounds_share_begins_once_its_waiter_runs() {
+        let share = Duration::from_millis(5);
+        let start = share.saturating_mul(3);
+        let probe = Probe::starting(share);
+        let setup = || std::thread::sleep(start);
+        let mut rng = Xorshift::new(Xorshift::SEED);
+        let round = wake_round(None, share, &probe, &setup, &mut rng);
+        match round.setup_left {
+            Some(left) => {
+                assert!(
+                    left <= probe.span.saturating_sub(start),
+                    "the start took its three shares first: {left:?} left of {:?}",
+                    probe.span
+                );
+                assert_eq!(round.window, Some(share.min(left)));
+            }
+            // Only a host that held the waiter past the whole span leaves a round without one: nothing
+            // was timed, and the span is spent.
+            None => {
+                assert_eq!(
+                    probe.left(),
+                    Duration::ZERO,
+                    "a waiter given up before the span ended"
+                );
+                assert_eq!(round.window, None);
+                assert!(round.samples.is_empty());
+            }
+        }
+    }
+
+    /// The span is every share the rounds may take: five planned and five more, each twice the last.
+    #[test]
+    fn the_span_is_every_share_the_rounds_may_take() {
+        let share = Duration::from_millis(1);
+        assert_eq!(span(share), share.saturating_mul(5 + 2 + 4 + 8 + 16 + 32));
+        assert_eq!(span(Duration::ZERO), Duration::ZERO);
+        assert_eq!(span(Duration::MAX), Duration::MAX);
     }
 }

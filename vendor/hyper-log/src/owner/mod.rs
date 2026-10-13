@@ -276,6 +276,9 @@ pub(crate) struct Owner<F> {
     /// in: the group's writes sent in it or before are refused [`LogError::Behind`]
     /// (`Owner::behind`). At most one entry a claimed group, gone with the claim.
     refused: HashMap<u128, u64>,
+    /// Claimed groups whose handle was dropped while writes of the group were out, each with the
+    /// claim waiting for them, if one is (`Owner::release`). At most one entry a claimed group.
+    releasing: HashMap<u128, Option<Ticket>>,
     /// What the log's I/O measured, counted as each job's completion is heard (`stats.rs`).
     tally: Box<Tally>,
     /// When the frame or confirmation on the device went to it, while one is there.
@@ -346,6 +349,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             watching: false,
             claimed: HashSet::new(),
             refused: HashMap::new(),
+            releasing: HashMap::new(),
             tally: Tally::new(),
             flushing_since: None,
         }
@@ -466,7 +470,11 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// Whether anything the owner holds waits on the job out to come back: submissions for the
-    /// next frame, I/O waiting for the device, waiters for room the job will free, or a close.
+    /// next frame, I/O waiting for the device, waiters for room the job will free, a claim
+    /// waiting for a dropped handle's writes to be answered (`Owner::release`), or a close. A
+    /// claim held while the frame carrying the last of those writes was on the device waited
+    /// for good: the job came back to the returns, which wake no one, and the claimer, its only
+    /// caller, sent nothing more while it waited.
     fn waits_on_device(&self) -> bool {
         !self.intake.is_empty()
             || !self.schedule.held.is_empty()
@@ -474,6 +482,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             || !self.waiting.is_empty()
             || !self.fetches.is_empty()
             || !self.looks.is_empty()
+            || self.releasing.values().any(Option::is_some)
             || self.closing
     }
 
@@ -547,10 +556,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                 self.look();
             }
             Message::Claim(group, ticket) => self.claim(group, ticket),
-            Message::Release(group) => {
-                self.claimed.remove(&group);
-                self.refused.remove(&group);
-            }
+            Message::Release(group) => self.release(group),
             Message::Close => self.closing = true,
         }
         None
@@ -596,7 +602,12 @@ impl<F: BlockFile + 'static> Owner<F> {
             s.ticket.answer(Err(LogError::Fenced));
             return;
         }
-        if !s.handle && self.claimed.contains(&s.group) {
+        // A group whose dropped handle's writes are still out takes anyone's writes, as a
+        // released group does, until a claim waits for it (`Owner::release`).
+        if !s.handle
+            && self.claimed.contains(&s.group)
+            && !matches!(self.releasing.get(&s.group), Some(None))
+        {
             s.ticket.answer(Err(LogError::Claimed(s.group)));
             return;
         }
@@ -653,6 +664,40 @@ impl<F: BlockFile + 'static> Owner<F> {
         self.room.release(s.group, s.bytes, &mut admitted);
         self.let_in(&mut admitted);
         self.buffers.admitted = admitted;
+        if !self.releasing.is_empty()
+            && self.releasing.contains_key(&s.group)
+            && !self.room.holds(s.group)
+        {
+            self.released(s.group);
+        }
+    }
+
+    /// A group's handle was dropped: the group is anyone's once every write the log took of it
+    /// is answered. Until then the writes may not be in the group's state, which the log changes
+    /// as it publishes their frames, and their answers go to the dropped handle, so a handle
+    /// claimed meanwhile would be given the group without them and never hear of them: it read
+    /// entries a compaction among them had let go, `Compacted` (focal, 2026-10-12: a group stopped
+    /// and opened again at once in the same process), and missed the entries and marks the others
+    /// wrote. A claim of the group waits for them (`Owner::claim`), and the log's other writers are
+    /// let in meanwhile, behind them, as they are once it is released.
+    fn release(&mut self, group: u128) {
+        if self.room.holds(group) {
+            self.releasing.insert(group, None);
+        } else {
+            self.claimed.remove(&group);
+            self.refused.remove(&group);
+        }
+    }
+
+    /// The last write of a group whose handle was dropped is answered: the group is released,
+    /// and the claim that waited for it is answered with the group as the log now holds it.
+    fn released(&mut self, group: u128) {
+        let waiting = self.releasing.remove(&group).flatten();
+        self.claimed.remove(&group);
+        self.refused.remove(&group);
+        if let Some(ticket) = waiting {
+            self.claim(group, ticket);
+        }
     }
 
     /// A handle's write was refused: every write its handle sent in the same epoch or before is
@@ -683,6 +728,19 @@ impl<F: BlockFile + 'static> Owner<F> {
     /// Hands out `group`'s handle: its state as the log holds it, with the bytes of the entries
     /// the log keeps in memory, which the handle keeps from here on.
     fn claim(&mut self, group: u128, mut ticket: Ticket) {
+        // A dropped handle's writes are still out: the claim waits for their answers
+        // (`Owner::release`), and a second claim meanwhile is refused as the first will hold it.
+        match self.releasing.get_mut(&group) {
+            Some(waiting @ None) => {
+                *waiting = Some(ticket);
+                return;
+            }
+            Some(Some(_)) => {
+                ticket.answer(Err(LogError::Claimed(group)));
+                return;
+            }
+            None => {}
+        }
         let answer = if self.state.damaged.contains_key(&group) {
             Err(LogError::Damaged(
                 "the group's acknowledged records are damaged; it recovers from its peers",
@@ -716,6 +774,16 @@ impl<F: BlockFile + 'static> Owner<F> {
             if let Some(mut s) = self.waiting.remove(&seq) {
                 s.ticket.answer(Err(LogError::Fenced));
             }
+        }
+        // The waiters' slots are gone with the fence: a dropped handle's group with no write
+        // admitted is released now, as its admitted writes' answers release the others.
+        while let Some(group) = self
+            .releasing
+            .keys()
+            .find(|group| !self.room.holds(**group))
+            .copied()
+        {
+            self.released(group);
         }
     }
 

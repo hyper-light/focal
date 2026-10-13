@@ -104,6 +104,9 @@ struct Stream {
     asked_ns: u64,
     /// The durable count the latest heartbeat carried: the next must carry more.
     proof: u64,
+    /// The flushes `E[flush]` was the mean of when the floor last gave the interval: the floor
+    /// renews it, down as well as up, once they have doubled (`Pair::interval`).
+    floor_from: u64,
     /// The latest heartbeat's number sent.
     sent: Option<u64>,
 }
@@ -335,30 +338,39 @@ impl Pair {
         }
     }
 
-    /// The interval to send at: the one the peer asked, where its floor allows it; where the floor
-    /// binds (before the peer asks, or past what it asked), the floor, which the interval follows up
-    /// and not down. A sender must keep its interval above its floor to be stable (Lindley 1952), so
-    /// a floor that rose past the interval moves it; a floor that fell is a mean that moved with a
-    /// sample, and following it would start the peer's estimator again at each
-    /// (`LinkEstimator::retime`), which is how a link at its floor could go unconfigured for as long
-    /// as its flushes kept moving their mean (`docs/timing.md` §2.9). The peer asks from what this
-    /// node's floor was, so once it asks past it the interval is the peer's again. A change smaller
-    /// than `G`, the configurator's resolution, is none.
-    fn interval(&self, sender: &Sender) -> Option<u64> {
+    /// The interval to send at, and whether the floor gave it: the one the peer asked, where its
+    /// floor allows it; where the floor binds (before the peer asks, or past what it asked), the
+    /// floor. A sender must keep its interval above its floor to be stable (Lindley 1952), so a
+    /// floor that rose past the interval moves it at once. A floor that fell moves it once the
+    /// flushes it is the mean of have doubled since the floor last gave the interval, when the
+    /// interval is as stale as the mean is uncertain (`docs/research/timing.md`, "When to renew an
+    /// estimate's configuration"). Followed down at every sample, a mean moving with its samples
+    /// started the peer's estimator again at each move (`LinkEstimator::retime`), and a link at its
+    /// floor went unconfigured for as long as its flushes kept moving it (`docs/timing.md` §2.9);
+    /// never followed down, the interval kept the first flushes of a new log, seconds on a Windows
+    /// runner whose floor then fell to 33 to 118 ms, and the links' evidence came at it for
+    /// minutes (§2.8). The peer asks from what this node's floor was, so once it asks past it the
+    /// interval is the peer's again. A change smaller than `G`, the configurator's resolution, is
+    /// none.
+    fn interval(&self, sender: &Sender) -> Option<(u64, bool)> {
         let floor = nanos(sender.floor?);
         let asked = self.stream.asked_ns;
-        let wanted = if asked >= floor {
-            asked
-        } else {
-            floor.max(self.stream.interval_ns)
-        };
         let current = self.stream.interval_ns;
+        let renewed = sender.durable_count >= self.stream.floor_from.saturating_mul(2);
+        let (wanted, from_floor) = if asked >= floor {
+            (asked, false)
+        } else if renewed || floor > current {
+            (floor, true)
+        } else {
+            (current, false)
+        };
         let resolution = sender.granularity.map_or(0, nanos);
-        Some(if current != 0 && wanted.abs_diff(current) <= resolution {
+        let interval = if current != 0 && wanted.abs_diff(current) <= resolution {
             current
         } else {
             wanted
-        })
+        };
+        Some((interval, from_floor))
     }
 
     /// Sends the heartbeat due, if a flush proves it: one made durable after the previous
@@ -375,7 +387,7 @@ impl Pair {
         if self.stream.next.is_some_and(|(_, due)| due > now_ns) {
             return Sent::Nothing;
         }
-        let Some(interval) = self.interval(sender) else {
+        let Some((interval, from_floor)) = self.interval(sender) else {
             // No flush measured yet: the first proves the first heartbeat and gives the floor.
             return Sent::NeedsFlush;
         };
@@ -461,6 +473,9 @@ impl Pair {
         self.stream.sent = Some(seq);
         self.stream.proof = sender.durable_count;
         self.stream.interval_ns = interval;
+        if from_floor {
+            self.stream.floor_from = sender.durable_count;
+        }
         self.stream.next = Some((seq.saturating_add(1), due.saturating_add(interval)));
         self.counts.sent = self.counts.sent.saturating_add(1);
         Sent::Message(length)
@@ -1050,6 +1065,51 @@ mod tests {
             Duration::from_nanos(at - due) <= bound,
             "{} ns measured, {bound:?} stated",
             at - due
+        );
+    }
+
+    /// A new log's first flushes are slow and its later ones fast (on a windows-2025 runner the
+    /// first took 0.7 to 3.1 s and the floor then fell to 33 to 118 ms): the interval the floor
+    /// gave at the first flush is renewed from the floor each time the flushes double, down as well
+    /// as up, so it comes down to the floor in one move a doubling. Never followed down, it stayed
+    /// at the first flush's two seconds.
+    #[test]
+    fn a_floor_that_fell_is_followed_down_once_its_flushes_have_doubled() {
+        let granularity = Duration::from_micros(50);
+        let (first, later) = (2_000 * MS, 50 * MS);
+        // `E[flush] + G` after `n` flushes: the first and `n - 1` later ones.
+        let floor = |n: u64| (first + later * (n - 1)) / n + nanos(granularity);
+        let mut node = pair();
+        let mut now = 10_000 * MS;
+        let (mut moves, mut last) = (0, 0);
+        let flushes = 256u64;
+        for n in 1..=flushes {
+            let sender = Sender {
+                local_run: 1,
+                floor: Some(Duration::from_nanos(floor(n))),
+                granularity: Some(granularity),
+                durable_count: n,
+                durable_ns: Some(now),
+            };
+            let mut out = [0; MAX_BYTES];
+            assert!(
+                matches!(node.send(&sender, now, &mut out), Sent::Message(_)),
+                "flush {n}: due and proven"
+            );
+            // The floor at the latest doubling of the flushes, at or before this one.
+            let renewed_at = 1u64 << (u64::BITS - 1 - n.leading_zeros());
+            let interval = node.stream.interval_ns;
+            assert_eq!(interval, floor(renewed_at), "flush {n}");
+            if interval != last {
+                moves += 1;
+                last = interval;
+            }
+            now = node.stream.next.map(|(_, due)| due).unwrap();
+        }
+        assert_eq!(
+            moves,
+            u64::BITS - flushes.leading_zeros(),
+            "one move a doubling, from the first flush"
         );
     }
 

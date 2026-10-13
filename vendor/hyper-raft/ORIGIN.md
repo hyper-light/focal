@@ -45,7 +45,7 @@ Each change below preserves behaviour. "Proof" at the end says how that was show
   `prost-codec`. raft-rs is a dev-dependency only: the differential's oracle.
 - `Cargo.lock` was seeded from focal's at `a8e95f7` and pruned to this workspace, so every package
   resolves to the version focal tested.
-- This workspace declares `rust-version = "1.98"`. focal pins 1.94.1.
+- This workspace declares `rust-version = "1.98.1"` ("Rust 1.98.1" below). focal pins 1.94.1.
 
 ### The lint wall
 
@@ -1031,3 +1031,18 @@ each now ends where it began, and what the core does is unchanged.
   pruned; two rounds of three members, 45,036, 139, 186; the read before the first commit caught
   after 13,917 rounds, the vote before durable after 11), the differential against raft-rs, and the
   gates.
+
+### Rust 1.98.1
+
+Rust 1.98.0 miscompiles some trait-object vtables: a slot that must hold a function pointer is
+left null, so a call through it jumps to address 0, in safe code. focal met it moving from 1.94.1
+to 1.98.0 (its core's tests died calling `Box<dyn Iterator>::next`) and reduced it to a 56-line
+std-only program of nested `impl Iterator + use<'a>` chains boxed as `dyn Iterator`.
+
+- **Reproduced** here (aarch64-apple-darwin, 2026-10-10): the program exits by SIGSEGV built by
+  1.98.0 at opt-level 0 and at 3, and prints its 1,200 evaluations built by 1.94.1, 1.98.1 and
+  1.99.0, each at both levels.
+- **The pin** is 1.98.1 (`rust-toolchain.toml`), and the workspace's `rust-version` is 1.98.1, so
+  cargo refuses to build these crates with 1.98.0, here and in each consumer that vendors them.
+- **The test** `tests/toolchain.rs` is the program as a test: it dies of SIGSEGV built by 1.98.0
+  (`cargo +1.98.0 test -p hyper-raft --test toolchain --ignore-rust-version`) and passes by 1.98.1.

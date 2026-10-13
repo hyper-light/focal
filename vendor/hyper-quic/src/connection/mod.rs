@@ -767,8 +767,6 @@ impl Connection {
             ack_eliciting |= self.can_send_1rtt(frame_space_1rtt);
         }
 
-        tx.pad_datagram_to_mtu |= space_id == SpaceId::Data && self.config.pad_to_mtu;
-
         // A space that can send has keys to send with (`space_can_send`); one without them has
         // nothing to send, where upstream panicked
         let Some(tag_len) = local_keys(self, space_id).map(|(_, packet)| packet.tag_len()) else {
@@ -803,6 +801,17 @@ impl Connection {
         //
         // From here on, we've determined that a packet will definitely be sent.
         //
+
+        // Padding to the MTU hides the size of what the application sends (`pad_to_mtu`), and only
+        // an ack-eliciting packet is padded to it. A padded packet is in flight and counts against
+        // the congestion window (RFC 9002 §2, §3), yet a packet of acknowledgments alone is never
+        // checked against the window (`start_datagram`), and its peer acknowledges it only along
+        // with an ack-eliciting packet of its own (RFC 9000 §13.2.1). Padded, the acknowledgments
+        // of a peer's flight went past the window (RFC 9002 §7: "MUST NOT") and held it with
+        // nothing to free it: a server's warm-up drew twelve of a client's, and the client's own
+        // datagrams waited, blocked by congestion control (windows-2025 CI, `pad_to_mtu`).
+        tx.pad_datagram_to_mtu |=
+            space_id == SpaceId::Data && self.config.pad_to_mtu && ack_eliciting;
 
         if self.spaces.get(SpaceId::Initial).crypto.is_some()
             && space_id == SpaceId::Handshake

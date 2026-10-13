@@ -43,6 +43,29 @@ pub trait BlockFile: Send {
     /// Fills `buf` from `offset`; reaching the end of the file first is an error.
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError>;
 
+    /// Fills `buf` from `offset` only if the OS holds every byte of it in memory now, without
+    /// waiting for the device: true when it read; false when the read would wait, leaving it to
+    /// a thread that may ([`crate::issuer`]). By default false: a file that cannot tell reads
+    /// nothing here.
+    fn read_resident_at(&mut self, _buf: &mut [u8], _offset: u64) -> Result<bool, DiskError> {
+        Ok(false)
+    }
+
+    /// Whether [`BlockFile::read_resident_at`] can read anything: what an issuer asks before it
+    /// keeps a submitter a duplicate to read with ([`crate::issuer::Attached::read_resident_at`]).
+    /// False by default.
+    fn reads_resident(&self) -> bool {
+        false
+    }
+
+    /// What [`BlockFile::read_resident_at`] did. Nothing counted by default.
+    fn residency(&self) -> crate::Residency {
+        crate::Residency::default()
+    }
+
+    /// Shadow mode for [`BlockFile::read_resident_at`]'s kept answers. Nothing by default.
+    fn set_residency_shadow(&mut self, _on: bool) {}
+
     /// Writes all of `buf` at `offset`, extending the file if it ends past the end.
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError>;
 
@@ -57,6 +80,44 @@ pub trait BlockFile: Send {
     /// does not. False by default: elsewhere the gain is not measured, and the zeros cost a write.
     fn fills_new_space(&self) -> bool {
         false
+    }
+
+    /// Whether the file grows by segments ([`BlockFile::grow`], `crate::segmented`) rather than
+    /// by writes past its end. False by default.
+    fn grows_by_segments(&self) -> bool {
+        false
+    }
+
+    /// Adds a segment of `len` bytes after the file's end, allocated whole and its name durable,
+    /// when the file grows by segments: the offset its first byte is at. Its blocks are written by
+    /// the caller ([`BlockFile::write_whole`]) before any other transfer uses them, so the
+    /// segments in use take no first write (`crate::segmented`). None for a file that grows by
+    /// writes past its end.
+    fn grow(&self, _len: u64) -> Result<Option<u64>, DiskError> {
+        Ok(None)
+    }
+
+    /// Writes `copies` copies of `fill` back to back from `offset`, into space no other transfer
+    /// uses yet: its blocks written once, so that every later write there is an overwrite. A
+    /// flush of the file makes them durable. By default, a write of each copy.
+    fn write_whole(&self, offset: u64, copies: u64, fill: &[u8]) -> Result<(), DiskError> {
+        let piece = u64::try_from(fill.len()).unwrap_or(u64::MAX);
+        let mut at = offset;
+        for _ in 0..copies {
+            self.write_all_at(fill, at)?;
+            at = at.checked_add(piece).ok_or_else(|| DiskError::Io {
+                op: "write whole",
+                path: std::path::PathBuf::new(),
+                source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The end of the segment holding `offset`, when the file grows by segments and one does.
+    /// None otherwise.
+    fn segment_end(&self, _offset: u64) -> Result<Option<u64>, DiskError> {
+        Ok(None)
     }
 
     /// Writes all of `buf` at `offset` and makes that write durable before it returns: at least
@@ -98,6 +159,22 @@ impl BlockFile for DeviceFile {
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
         DeviceFile::read_exact_at(self, buf, offset)
+    }
+
+    fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
+        DeviceFile::read_resident_at(self, buf, offset)
+    }
+
+    fn reads_resident(&self) -> bool {
+        DeviceFile::reads_resident(self)
+    }
+
+    fn residency(&self) -> crate::Residency {
+        DeviceFile::residency(self)
+    }
+
+    fn set_residency_shadow(&mut self, on: bool) {
+        DeviceFile::set_residency_shadow(self, on);
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {

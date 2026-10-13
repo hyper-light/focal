@@ -79,7 +79,7 @@ fn checked_transfer_uses_the_owner_configuration_and_preserves_domain_prefix() {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 192 * 1024)
             .unwrap()
             .commit();
-        let (send, receive) = hyper_rt::sync::oneshot().unwrap();
+        let (send, mut receive) = hyper_rt::sync::oneshot().unwrap();
         owner
             .accept(Work::Transfer(
                 target,
@@ -217,7 +217,7 @@ fn membership_reply_and_cancelled_intent_preserve_permit_lifetimes() {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 192 * 1024)
             .unwrap()
             .commit();
-        let (send, receive) = hyper_rt::sync::oneshot().unwrap();
+        let (send, mut receive) = hyper_rt::sync::oneshot().unwrap();
         owner.accept_membership(
             MembershipCall {
                 request: Some(request.clone()),
@@ -320,7 +320,7 @@ fn stop_with_uncommitted_membership_preserves_unknown_intent_without_checkpoint(
         .reserve(BudgetKind::Control, BudgetLane::Completion, 192 * 1024)
         .unwrap()
         .commit();
-    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
+    let (send, mut receive) = hyper_rt::sync::oneshot().unwrap();
     owner.accept_membership(
         MembershipCall {
             request: Some(request.clone()),
@@ -337,7 +337,7 @@ fn stop_with_uncommitted_membership_preserves_unknown_intent_without_checkpoint(
             .unwrap()
             .is_none()
     );
-    let (stop_send, stop_receive) = hyper_rt::sync::oneshot().unwrap();
+    let (stop_send, mut stop_receive) = hyper_rt::sync::oneshot().unwrap();
     assert!(owner.accept(Work::Stop(stop_send)).unwrap());
     stop_receive.blocking_recv().unwrap().unwrap();
     owner.close();

@@ -8,6 +8,18 @@
 //! total order or both can miss: the shard sees no message and parks, the sender sees no
 //! announcement and skips the kick, and the message waits for a wake that never comes.
 //!
+//! **One kick a park.** The announcement is a state word, not a flag: running, parked, or parked
+//! with its kick claimed. A sender that reads it parked claims the kick with one compare-and-swap
+//! (parked → kicked) and only the winner makes the system call; a sender that finds it kicked skips,
+//! because the claimer's kick ends the same wait and the woken shard drains every word published
+//! before (the argument below covers both: the claim is a read of the announcement). Until 2026-10-10
+//! every sender that read the announcement kicked, so the senders of a fan-in onto one parked shard
+//! each paid the system call: 3.2 to 4.5 kicks a park in mantle's fan-in and blocking-pool panels
+//! (`benchmark-results/hyper-rt-vs-tokio-20261010/runs/base-f5d66a8-r1`), where tokio's parker pays one
+//! (its `NOTIFIED` state, `runtime/scheduler/multi_thread/park.rs`). The word is read before it is
+//! swapped: a compare-and-swap takes its cache line exclusive even when it fails, and most wakes find
+//! the shard running.
+//!
 //! Each side therefore fences with `SeqCst` between its write and its read. That is the C++20
 //! fence rule ([B: `[atomics.order]`, the fence–fence case]: with a `SeqCst` fence after the
 //! write on one thread and a `SeqCst` fence before the read on the other, whichever fence comes
@@ -29,28 +41,42 @@
 //! which loom reports as a deadlock (AC-0.7).
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
+
+/// Format: the shard is not parked (running, spinning, or between its park's wait and its withdrawal).
+const RUNNING: u32 = 0;
+/// Format: the shard announced its park and no sender has claimed the kick.
+const PARKED: u32 = 1;
+/// Format: the shard announced its park and a sender claimed its kick.
+const KICKED: u32 = 2;
 
 /// The shard's announcement that it is parked, the count of kicks the announcement saved, and the
-/// stamp of the first kick sent to the current park (the shard's online wake estimate, §4.3).
+/// stamp of the kick sent to the current park (the shard's online wake estimate, §4.3).
 #[derive(Debug)]
 pub struct Parking {
-    parked: AtomicBool,
+    /// [`RUNNING`], [`PARKED`] or [`KICKED`].
+    state: AtomicU32,
     kicks_skipped: AtomicU64,
-    /// When the first kick of the current park was sent (host monotonic nanoseconds), 0 when none was;
-    /// the shard takes it after its wait. A measurement word, outside the protocol: its orders are
-    /// `Relaxed`, and a stamp lost to a race costs one sample, never a wake.
+    /// When the kick of the current park was sent (the shard's clock, `machine::clock::shard_clock_ns`), 0
+    /// when none was; the shard takes it after its wait. A measurement word, outside the protocol: its orders
+    /// are `Relaxed`, and a stamp lost to a race costs one sample, never a wake.
     kicked_at: AtomicU64,
+    /// The CPU the claimed kicks cost their senders, nanoseconds, and how many were measured: the sender's
+    /// half of what blocking costs, which the shard adds to its own park's (`crate::park_cost`). Counted by
+    /// the claimer of a park the shard times, read by the shard; measurement words, `Relaxed`, written once a
+    /// park at most.
+    kick_cpu_ns: AtomicU64,
+    kick_cpu_samples: AtomicU64,
     /// Whether this shard times its wakes ([`Parking::time_wakes`]): only then does a kick stamp the host
     /// clock and a park read it. A simulated shard, or one with no estimate to feed, reads no clock on
     /// either side (D-20: the simulation makes no OS call; its instruction counts are gated on that).
     timed: AtomicBool,
 }
 
-/// A shard's control-pending flag: the sender's publication marker for its control channel, so the shard
-/// learns a control message waits without polling the channel every step, and so a parking shard's re-check
+/// A shard's control-pending flag: the sender's publication marker for its control queue, so the shard
+/// learns a control message waits without polling the queue every step, and so a parking shard's re-check
 /// sees one ([`Parking::park_unless_pending`]). A sender publishes after pushing its message; the shard takes
 /// the mark before draining, and re-arms it when a batch-limited drain may have left messages behind.
 #[derive(Debug, Default)]
@@ -66,7 +92,7 @@ impl ControlFlag {
         }
     }
 
-    /// The sender's half, after its message is pushed: marks the channel pending — a read-modify-write, not a
+    /// The sender's half, after its message is pushed: marks the queue pending — a read-modify-write, not a
     /// store. Consecutive RMWs form one release sequence, so the shard's acquiring [`take`](Self::take) of the
     /// latest mark synchronizes with **every** sender whose mark it absorbs, and the drain that follows sees
     /// each of their messages. A plain store from a second sender would end the first sender's release
@@ -83,7 +109,7 @@ impl ControlFlag {
     /// which the drain that follows then finds) or that publication lands after it and stays set for the next
     /// step. Until 2026-09-28 this was a load and then a store of `false`: the load could read an earlier
     /// sender's mark, the store then overwrote a later sender's, and the drain could miss that sender's
-    /// message — a `Shutdown` stranded in the channel while the shard parked for good, since the later
+    /// message — a `Shutdown` stranded in the queue while the shard parked for good, since the later
     /// sender's kick had coalesced into the wake the shard already took (loom: the first interleaving
     /// explored; `docs/bugs/2026-09-28-a-cleared-control-flag-stranded-a-shutdown.md`).
     pub fn take(&self) -> bool {
@@ -115,7 +141,7 @@ pub enum Parked {
 /// online wake estimate).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Woken {
-    /// When the shard announced it was parking (host monotonic nanoseconds).
+    /// When the shard announced it was parking (the shard's clock, `machine::clock::shard_clock_ns`).
     pub announced_ns: u64,
     /// When it entered the driver's blocking wait, after the re-check.
     pub waiting_ns: u64,
@@ -164,9 +190,11 @@ impl Parking {
     /// Not parked, nothing saved yet, wakes untimed.
     pub fn new() -> Self {
         Self {
-            parked: AtomicBool::new(false),
+            state: AtomicU32::new(RUNNING),
             kicks_skipped: AtomicU64::new(0),
             kicked_at: AtomicU64::new(0),
+            kick_cpu_ns: AtomicU64::new(0),
+            kick_cpu_samples: AtomicU64::new(0),
             timed: AtomicBool::new(false),
         }
     }
@@ -178,22 +206,33 @@ impl Parking {
     }
 
     /// The sender's half, called after the message is published (a word in the ring, the control
-    /// flag set): kicks the shard when it has announced parking, else counts the kick saved. The
-    /// fence orders the publication before the read of the announcement (the module doc). When the
-    /// shard times its wakes, the first kick of a park stamps when it was sent, so the woken shard can
-    /// time its own wake.
+    /// flag set): kicks the shard when it has announced parking and no other sender has claimed that
+    /// park's kick, else counts the kick saved. The fence orders the publication before the read of the
+    /// announcement (the module doc); the claim is that read's compare-and-swap, made only when the read
+    /// found the park unclaimed. When the shard times its wakes, the claimer stamps when it kicked, so the
+    /// woken shard can time its own wake.
     pub fn kick_if_parked(&self, kick: impl FnOnce()) {
         fence(Ordering::SeqCst);
-        if self.parked.load(Ordering::SeqCst) {
+        if self.state.load(Ordering::SeqCst) == PARKED
+            && self
+                .state
+                .compare_exchange(PARKED, KICKED, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
             if self.timed.load(Ordering::Relaxed) {
-                let _ = self.kicked_at.compare_exchange(
-                    0,
-                    crate::machine::clock::monotonic_ns(),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
+                self.kicked_at
+                    .store(crate::machine::clock::shard_clock_ns(), Ordering::Relaxed);
+                let before = crate::attribution::thread_cpu_now();
+                kick();
+                if let (Some(before), Some(after)) = (before, crate::attribution::thread_cpu_now())
+                {
+                    self.kick_cpu_ns
+                        .fetch_add(after.saturating_sub(before), Ordering::Relaxed);
+                    self.kick_cpu_samples.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                kick();
             }
-            kick();
         } else {
             self.kicks_skipped.fetch_add(1, Ordering::Relaxed);
         }
@@ -213,12 +252,12 @@ impl Parking {
         wait: impl FnOnce(),
     ) -> Parked {
         let timed = self.timed.load(Ordering::Relaxed);
-        let now = || timed.then(crate::machine::clock::monotonic_ns);
+        let now = || timed.then(crate::machine::clock::shard_clock_ns);
         let announced_ns = now();
-        self.parked.store(true, Ordering::SeqCst);
+        self.state.store(PARKED, Ordering::SeqCst);
         fence(Ordering::SeqCst);
         if pending() {
-            self.parked.store(false, Ordering::SeqCst);
+            self.state.store(RUNNING, Ordering::SeqCst);
             return Parked::Pending;
         }
         let waiting_ns = now();
@@ -229,7 +268,7 @@ impl Parking {
         } else {
             0
         };
-        self.parked.store(false, Ordering::SeqCst);
+        self.state.store(RUNNING, Ordering::SeqCst);
         Parked::Waited(match (announced_ns, waiting_ns, returned_ns) {
             (Some(announced_ns), Some(waiting_ns), Some(returned_ns)) => Some(Woken {
                 announced_ns,
@@ -246,12 +285,21 @@ impl Parking {
         self.kicks_skipped.load(Ordering::Relaxed)
     }
 
+    /// The CPU the measured kicks cost their senders, nanoseconds, and how many were measured: running sums,
+    /// which the shard differences between its reads.
+    pub(crate) fn kick_cpu(&self) -> (u64, u64) {
+        (
+            self.kick_cpu_ns.load(Ordering::Relaxed),
+            self.kick_cpu_samples.load(Ordering::Relaxed),
+        )
+    }
+
     /// Whether the shard is announcing itself parked right now — an **observer's snapshot** (a stall
     /// diagnosis reading it beside the shard's pulse, `registry::Pulse`), never part of the protocol above:
     /// a sender must go through [`kick_if_parked`](Self::kick_if_parked), whose fence is what makes the
     /// answer safe to act on. `Relaxed`: a snapshot that may be a moment stale is what an observer wants.
     pub fn parked(&self) -> bool {
-        self.parked.load(Ordering::Relaxed)
+        self.state.load(Ordering::Relaxed) != RUNNING
     }
 }
 
@@ -348,12 +396,61 @@ mod loom_tests {
         );
     }
 
+    /// Kicks sent across every explored interleaving of the two-sender model.
+    static CLAIMED: AtomicU64 = AtomicU64::new(0);
+
+    /// One kick a park (the module doc): two senders each publish a word into the shard's bitmap and kick it
+    /// if it is parked, while the shard drains and parks. In every interleaving both words arrive — a sender
+    /// that found the park's kick claimed relied on the claimer's kick, and loom reports a word stranded
+    /// behind a skipped kick as a deadlock — and no park is kicked twice: a run never sends more kicks than
+    /// the parks it announced. Some interleaving kicked, so the claim's path is not vacuous.
+    #[test]
+    fn two_senders_never_lose_a_word_and_a_park_takes_one_kick() {
+        loom_bounds::explore("parking: two senders against one parking shard", || {
+            let bitmap: &'static WakeBitmap = Box::leak(Box::new(WakeBitmap::new(SLOTS)));
+            let parking: &'static Parking = Box::leak(Box::new(Parking::new()));
+            let kick: &'static Notify = Box::leak(Box::new(Notify::new()));
+            let kicks: &'static loom::sync::atomic::AtomicU64 =
+                Box::leak(Box::new(loom::sync::atomic::AtomicU64::new(0)));
+            let send = move |slot: u32| {
+                assert!(bitmap.set(slot));
+                parking.kick_if_parked(|| {
+                    kicks.fetch_add(1, Ordering::Relaxed);
+                    kick.notify();
+                });
+            };
+            let first = loom::thread::spawn(move || send(WORD));
+            let second = loom::thread::spawn(move || send(WORD + 1));
+            let mut seen = [false; SLOTS];
+            let mut parks = 0u64;
+            loop {
+                for slot in take_wakes(bitmap) {
+                    seen[usize::try_from(slot).unwrap()] = true;
+                }
+                if seen.iter().all(|word| *word) {
+                    break;
+                }
+                parks += 1;
+                let _ = parking.park_unless_pending(|| bitmap.is_pending(), || kick.wait());
+            }
+            first.join().unwrap();
+            second.join().unwrap();
+            let sent = kicks.load(Ordering::Relaxed);
+            assert!(sent <= parks, "{sent} kicks for {parks} parks");
+            CLAIMED.fetch_add(sent, StdOrdering::Relaxed);
+        });
+        assert!(
+            CLAIMED.load(StdOrdering::Relaxed) > 0,
+            "some interleaving kicked"
+        );
+    }
+
     /// Delivered control messages, across every explored interleaving of the control model.
     static CONTROL_WAITS: AtomicU64 = AtomicU64::new(0);
 
     /// AC-0.7 (the control path of `registry::send_control_to` and `shard::drain_control`): two senders each
     /// push one control message into the shard's channel, publish the [`ControlFlag`], and kick the shard if
-    /// it announced parking; the shard takes the flag and drains the channel, and parks unless the flag is
+    /// it announced parking; the shard takes the flag and drains the queue, and parks unless the flag is
     /// pending. In every interleaving both messages are drained: a message whose publication the shard's
     /// take cleared is either drained by that same drain or re-marked. A lost message leaves the shard parked
     /// with nothing left to run, which loom reports as a deadlock. Some interleaving made the shard wait.

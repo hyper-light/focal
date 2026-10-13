@@ -205,6 +205,14 @@ impl Room {
         self.admit(admitted);
     }
 
+    /// Whether a submission of `group` holds room or waits for it: one the writer has yet to
+    /// answer.
+    pub(crate) fn holds(&self, group: u128) -> bool {
+        self.groups
+            .get(&group)
+            .is_some_and(|g| g.admitted > 0 || !g.waiting.is_empty())
+    }
+
     /// Fences the queue: nothing more is admitted, and every waiter's slot is completed: each
     /// arrival number goes to `fenced` once.
     pub(crate) fn fence(&mut self, fenced: &mut Vec<u64>) {

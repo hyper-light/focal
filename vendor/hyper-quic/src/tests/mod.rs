@@ -4318,6 +4318,62 @@ fn pad_to_mtu() {
     );
 }
 
+/// A client padding to the MTU pads what carries its application data, never a packet of
+/// acknowledgments alone: a padded packet is in flight against the window (RFC 9002 §2, §3), and
+/// the server acknowledges one of acknowledgments only along with an ack-eliciting packet of its
+/// own (RFC 9000 §13.2.1). Padded, the client's acknowledgments of the server's pings stayed in
+/// flight, past its window, and its own datagrams waited behind them (`pad_to_mtu` on windows-2025
+/// CI, where the server's warm-up and its skipped packet numbers drew twelve of them).
+#[test]
+fn padding_to_the_mtu_leaves_acknowledgments_unpadded_and_out_of_flight() {
+    let _guard = subscribe();
+    const MTU: u16 = 1333;
+    let client_config = {
+        let mut c_config = client_config();
+        let t_config = TransportConfig {
+            initial_mtu: MTU,
+            mtu_discovery_config: None,
+            pad_to_mtu: true,
+            ..TransportConfig::default()
+        };
+        c_config.transport_config(t_config);
+        c_config
+    };
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect_with(client_config);
+    pair.server.capture_inbound_packets = true;
+    // More pings than the window holds padded datagrams, each acknowledged in a packet of its own.
+    let window = pair.client_conn_mut(client_ch).congestion_window();
+    let pings = window / u64::from(MTU) + 1;
+    for _ in 0..pings {
+        pair.server_conn_mut(server_ch).ping();
+        pair.drive();
+    }
+    assert_eq!(pair.client_conn_mut(client_ch).bytes_in_flight(), 0);
+    let acknowledgments = pair
+        .server
+        .captured_packets
+        .drain(..)
+        .map(|packet| {
+            frame::Iter::new(packet.into())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        acknowledgments.len() as u64 >= pings,
+        "each ping was acknowledged: {} packets for {pings} pings",
+        acknowledgments.len()
+    );
+    for frames in &acknowledgments {
+        assert!(
+            frames.iter().all(|frame| matches!(frame, Frame::Ack(_))),
+            "a packet of acknowledgments alone: {frames:?}"
+        );
+    }
+}
+
 /// Verify that a large application datagram is sent successfully when an ACK frame too large to fit
 /// alongside it is also queued, in exactly 2 UDP datagrams.
 #[test]

@@ -98,6 +98,75 @@ caller hands in the alignment, queue and measured depth it found.
    held a queue of answers and its drop ran its own (mantle `CLAUDE.md` §10, no runtime
    recursion). The handles and the device's answers are as before.
 
+11. **Reusable asynchronous device completion and terminal retirement** (`issuer.rs`,
+    local development repair): each actual attachment owns a submission lane and reusable
+    numbered answer channel bounded by its declared batches. Output credit includes queued,
+    in-flight and unanswered batches; in-credit submission does not block on a shared data
+    inbox. Retirement follows out0 on the same empty lane. A capacity-one dirty doorbell
+    coalesces submissions/retirements, and publication wakes the existing dispatcher thread.
+    There is no workers+batches cap on cold attachments. A canceled borrowed completion or
+    retirement wait keeps its number and owner; foreign context refuses before publication.
+    Completion closure follows all native worker duplicate Drops/joins even during concurrent
+    issuer Stop. Pre-Stop accepted batches are answered with numbered refusal; owning Drop
+    retains its blocking plain-thread contract.
+    The warm allocation oracle (`tests/issuer_allocs.rs`) and its hyper-measure dev-dependency
+    came with it. Made in mantle's copy (`6f05bd8`) and taken here (2026-10-12).
+
+12. **Terminal ownership and typed lifecycle failures** (`issuer.rs`, development):
+    each completion channel holds its declared B numbered results plus one physical
+    terminal role; batch/data admission remains B. The slot/ticket and array layouts
+    are checked before channel construction or file duplication, and cold batch storage
+    is fallibly reserved. Retirement publication reserves its worker news and receipt
+    storage before transferring Client ownership. Any entered-shard owning Drop closes
+    its sole lane and notifies without a success acknowledgement; the broker retains
+    accepted batches and completion senders through actual duplicate retirement and
+    abnormal native joins. Guarded duplicate Drop and worker/broker lifecycle failures
+    become terminal errors, never successful Detached. `is_retired` follows actual
+    Detached or post-join completion closure, including error; context/admission and
+    numbered I/O errors are not terminal facts. `retire_async` checks the actual task
+    waker before each receive poll; canceled borrowed waits retain the same receipt.
+    Cold `retire_blocking` shares that terminal state and returns lifecycle failures,
+    while refusing any entered shard before mutation. Raw Drop remains unacknowledged
+    cleanup. Made in mantle's copy (`6f05bd8`) and taken here (2026-10-12); in the merge with
+    `main`, an unwound payload the issuer does not keep for a later disposal is dropped inside a
+    boundary of its own (`unwind::contained`): a duplicate's drop that unwinds with a payload
+    that unwinds again costs that drop alone, and the worker lives on
+    (`tests/attachment_watch_native.rs`).
+
+13. **A probe's answer kept while the kernel reclaims nothing** (`resident`, `file.rs`,
+    `block.rs`, `issuer.rs`): on macOS a read from memory keeps, one bit an OS page, that
+    `mincore(2)` found its pages resident, and reads them again without probing while the pageout
+    scan's file-backed reclamation counts (`vm.pageout_freed_*`) stay unchanged; they are read
+    again before free memory could reach the kernel's free target at the fastest fill a Mac has.
+    `Residency` counts probes, reads on kept answers, epochs and changes, and in shadow mode the
+    kept answers a probe found wrong (`BlockFile::residency`, `BlockFile::set_residency_shadow`,
+    `Attached::residency`, `Attached::set_residency_shadow`). Mantle
+    `docs/research/46-reclaim-epochs.md`. Made in mantle's copy (`a5f5cf3`) and taken here
+    (2026-10-12).
+
+14. **A file kept as segments** (`segmented.rs`, `gather.rs`, `block.rs`, `file.rs`, `resident`): a
+    base file and `<base>.1`, `<base>.2` and on, read and written at offsets into their
+    concatenation (`SegmentedFile`). A segment is created whole at its final length, allocated and
+    its name made durable, and never changes length, so every handle finds the layout from names
+    and lengths alone; a duplicate made before a segment was added opens it when a transfer first
+    reaches it, and a handle holds slots for the segments it has, found by a binary search over the
+    filled ones, not for its bound. A transfer lies within one segment; a flush covers the segments
+    written since the last; the segments are at most a bound given at open.
+    `BlockFile::grows_by_segments`, `BlockFile::grow` and `BlockFile::segment_end` let a store add
+    one and find where one ends (a plain file grows by its writes, as before), and
+    `BlockFile::write_whole` writes a new segment's blocks once, through a handle past the OS's
+    cache (from a buffer aligned to the VM page, which macOS's cluster layer needs to write past its
+    cache), so its zeros take no memory a read wants: in as few calls as the kernel takes, by
+    vectored writes of one buffer (`DeviceFile::write_copies_at`, pwritev(2) on Linux and macOS) and
+    by gather writes on Windows (`WriteFileGather`, `gather.rs`). Reads made from memory keep one
+    reclaim epoch for the whole file (`resident::Epoch`, split from `Resident`, its generation 64
+    bits so it never comes round again), and `Residency::plus` sums segments' counts. A file's own
+    first writes hold up its other reads and writes, another file's do not: mantle
+    `docs/research/48-first-writes.md`. Made in mantle's copy (`0d9dfb4`, `0906dfe`, `8dcf196`,
+    `e44d9e5`, `f2f6a57`, `abe99c8`, `8384354`; mantle's `ORIGIN.md` change 14) and taken here
+    (2026-10-12), with `gather.rs` listed among the files whose `unsafe` binds an OS interface
+    (`scripts/check-contracts.py`).
+
 ## Planned
 
 - The log's frame writes and flushes through the device's issuer, and the issuer's own reads (mantle

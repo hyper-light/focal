@@ -55,7 +55,7 @@ pub struct IocpDriver {
     port: HANDLE,
     /// The registry's kick over this driver's port.
     kick: KickPort,
-    /// The host monotonic reading the driver counts its clock from.
+    /// The shard-clock reading the driver counts its clock from (`machine::clock::shard_clock_ns`).
     epoch: u64,
     entries: Vec<OVERLAPPED_ENTRY>,
     /// The AFD readiness device, opened and associated with `port` on the first socket registration
@@ -125,7 +125,7 @@ impl IocpDriver {
         Ok(IocpDriver {
             port: std::ptr::with_exposed_provenance_mut(port),
             kick,
-            epoch: crate::machine::clock::monotonic_ns(),
+            epoch: crate::machine::clock::shard_clock_ns(),
             entries,
             afd: None,
             outstanding: HashMap::new(),

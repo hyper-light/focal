@@ -227,7 +227,11 @@ impl TransportConfig {
 
     /// Pad UDP datagrams carrying application data to current maximum UDP payload size
     ///
-    /// Disabled by default. UDP datagrams containing loss probes are exempt from padding.
+    /// Disabled by default. UDP datagrams containing loss probes are exempt from padding, and so
+    /// are those carrying acknowledgments alone: a padded packet counts against the congestion
+    /// window (RFC 9002 §3), and the peer acknowledges one of acknowledgments only along with an
+    /// ack-eliciting packet of its own (RFC 9000 §13.2.1), so padded acknowledgments of a peer's
+    /// flight would hold the window with nothing to free it.
     ///
     /// Enabling this helps mitigate traffic analysis by network observers, but it increases
     /// bandwidth usage. Without this mitigation precise plain text size of application datagrams as

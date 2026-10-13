@@ -109,6 +109,22 @@ pub(crate) fn thread_account() -> Option<ThreadAccount> {
     None
 }
 
+/// The calling thread's CPU time now, nanoseconds, where the OS keeps a fine per-thread clock (Linux and
+/// macOS): what a park and a kick are charged in (the shard's online cost of blocking, `crate::park_cost`).
+/// One read is a system call or a Mach trap, 107 ns on Apple silicon under load (`clockcost`,
+/// `benchmark-results/hyper-rt-vs-tokio-20261010/os-parkcost`).
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+pub(crate) fn thread_cpu_now() -> Option<u64> {
+    thread_cpu_ns()
+}
+
+/// No fine per-thread clock here: Windows charges thread times a scheduler tick (about 15.6 ms) at a time,
+/// and its cycle count is documented as not convertible to time (Microsoft Learn, "QueryThreadCycleTime").
+#[cfg(any(miri, not(any(target_os = "linux", target_os = "macos"))))]
+pub(crate) fn thread_cpu_now() -> Option<u64> {
+    None
+}
+
 /// What held a poll that ran past the quantum by the wall clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Attribution {

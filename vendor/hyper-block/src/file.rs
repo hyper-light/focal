@@ -50,6 +50,11 @@ pub struct DeviceFile {
     layout: Alignment,
     /// A device node rather than a regular file.
     node: bool,
+    /// What this handle needs to read from memory alone ([`DeviceFile::read_resident_at`]).
+    resident: crate::resident::Resident,
+    /// The epoch its kept answers hold in, unless a caller reading through several files
+    /// passes its own ([`DeviceFile::read_resident_with`]).
+    epoch: crate::resident::Epoch,
 }
 
 impl DeviceFile {
@@ -97,6 +102,8 @@ impl DeviceFile {
             align,
             layout,
             node,
+            resident: crate::resident::Resident::new(),
+            epoch: crate::resident::Epoch::new(),
         })
     }
 
@@ -121,6 +128,9 @@ impl DeviceFile {
             align: self.align,
             layout: self.layout,
             node: self.node,
+            // A duplicate maps its own window when it first reads from memory.
+            resident: crate::resident::Resident::new(),
+            epoch: crate::resident::Epoch::new(),
         })
     }
 
@@ -197,6 +207,99 @@ impl DeviceFile {
             }
         }
         Ok(())
+    }
+
+    /// Writes `copies` copies of `fill` back to back from `offset`. On Linux and macOS each call
+    /// hands the kernel as many copies as it takes at once (pwritev(2), as many vectors as
+    /// `IOV_MAX`, every one the same buffer), so a direct file's device has them all in flight
+    /// rather than one at a time: a 256 MiB file written whole with 128 KiB copies beside another
+    /// process's `F_FULLFSYNC` writes took 61-66 ms so, and 7.5-9.9 s a copy at a time (mantle
+    /// `docs/research/48-first-writes.md` §6). On Windows a file past the cache takes gather writes
+    /// of the same kind (`crate::gather`); a buffered one there, a write a copy.
+    pub fn write_copies_at(&self, fill: &[u8], offset: u64, copies: u64) -> Result<(), DiskError> {
+        self.check_alignment(offset, fill.len())?;
+        self.check_address(fill.as_ptr().addr(), offset, fill.len())?;
+        let piece = u64::try_from(fill.len()).map_err(|_| self.overflow(offset))?;
+        piece
+            .checked_mul(copies)
+            .and_then(|total| offset.checked_add(total))
+            .ok_or_else(|| self.overflow(offset))?;
+        #[cfg(unix)]
+        {
+            sys::write_copies_at(&self.file, fill, offset, copies)
+                .map_err(|e| self.io_error("write copies", e))
+        }
+        #[cfg(windows)]
+        if self.caching == Caching::Direct && !self.node {
+            return crate::gather::write_copies(&self.path, fill, offset, copies)
+                .map_err(|e| self.io_error("write copies", e));
+        }
+        #[cfg(not(unix))]
+        {
+            let mut at = offset;
+            for _ in 0..copies {
+                self.write_all_at(fill, at)?;
+                at = at.checked_add(piece).ok_or_else(|| self.overflow(offset))?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Fills `buf` from `offset` only if the OS holds every byte of it in memory now, without
+    /// waiting for the device (`crate::resident`): true when it read, false when the read would
+    /// wait, the file ends first, or the platform cannot tell, leaving the read to a thread that
+    /// may wait ([`crate::issuer`]). A direct file has no OS cache to read from, so it never reads
+    /// here.
+    pub fn read_resident_at(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, DiskError> {
+        self.read_resident(buf, offset, None)
+    }
+
+    /// [`Self::read_resident_at`], its answers kept in `epoch` rather than this handle's own: one
+    /// epoch for the files a caller reads as one (`crate::segmented`).
+    pub(crate) fn read_resident_with(
+        &mut self,
+        buf: &mut [u8],
+        offset: u64,
+        epoch: &mut crate::resident::Epoch,
+    ) -> Result<bool, DiskError> {
+        self.read_resident(buf, offset, Some(epoch))
+    }
+
+    fn read_resident(
+        &mut self,
+        buf: &mut [u8],
+        offset: u64,
+        shared: Option<&mut crate::resident::Epoch>,
+    ) -> Result<bool, DiskError> {
+        if self.caching == Caching::Direct {
+            return Ok(false);
+        }
+        self.check_alignment(offset, buf.len())?;
+        let epoch = match shared {
+            Some(epoch) => epoch,
+            None => &mut self.epoch,
+        };
+        match self.resident.read(&self.file, buf, offset, epoch) {
+            Ok(read) => Ok(read),
+            Err(e) => Err(self.io_error("read from memory", e)),
+        }
+    }
+
+    /// What [`Self::read_resident_at`] did: probes, reads on kept answers, epochs.
+    pub fn residency(&self) -> crate::Residency {
+        self.resident.residency().plus(self.epoch.residency())
+    }
+
+    /// Shadow mode, for measurement: a read made on a kept answer probes anyway and counts the
+    /// answer wrong when the probe disagrees.
+    pub fn set_residency_shadow(&mut self, on: bool) {
+        self.resident.set_shadow(on);
+    }
+
+    /// Whether [`Self::read_resident_at`] can read anything: a buffered file, where the platform
+    /// can tell what the OS holds (`crate::resident`).
+    pub fn reads_resident(&self) -> bool {
+        self.caching == Caching::Buffered && cfg!(any(target_os = "linux", target_vendor = "apple"))
     }
 
     /// Fills `buf` from `offset`; reaching the end of the file first is an error.
@@ -504,6 +607,56 @@ mod sys {
 
     pub(super) fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
         file.write_at(buf, offset)
+    }
+
+    /// `copies` copies of `fill` from `offset` (the caller checked the span fits a file offset),
+    /// by pwritev(2) with a vector a copy, all the one buffer: rustix passes at most `IOV_MAX` of
+    /// them a call. A call that ends inside a copy has the rest of that copy written alone.
+    pub(super) fn write_copies_at(
+        file: &File,
+        fill: &[u8],
+        offset: u64,
+        copies: u64,
+    ) -> io::Result<()> {
+        let invalid = || io::Error::from(io::ErrorKind::InvalidInput);
+        let piece = u64::try_from(fill.len()).map_err(|_| invalid())?;
+        let count = usize::try_from(copies).map_err(|_| invalid())?;
+        if fill.is_empty() {
+            return Ok(());
+        }
+        let mut vectors: Vec<io::IoSlice<'_>> = Vec::new();
+        vectors
+            .try_reserve_exact(count)
+            .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        vectors.extend((0..count).map(|_| io::IoSlice::new(fill)));
+        let at = |copy: usize| {
+            u64::try_from(copy)
+                .ok()
+                .and_then(|c| c.checked_mul(piece))
+                .and_then(|b| offset.checked_add(b))
+                .ok_or_else(invalid)
+        };
+        let mut next = 0usize;
+        while let Some(rest) = vectors.get(next..).filter(|r| !r.is_empty()) {
+            let wrote = match rustix::io::pwritev(file, rest, at(next)?) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => n,
+                Err(e) if e == rustix::io::Errno::INTR => continue,
+                Err(e) => return Err(e.into()),
+            };
+            let whole = wrote.checked_div(fill.len()).ok_or_else(invalid)?;
+            let part = wrote.checked_rem(fill.len()).ok_or_else(invalid)?;
+            next = next.checked_add(whole).ok_or_else(invalid)?;
+            if part > 0 {
+                let tail = fill.get(part..).ok_or_else(invalid)?;
+                let start = at(next)?
+                    .checked_add(u64::try_from(part).map_err(|_| invalid())?)
+                    .ok_or_else(invalid)?;
+                file.write_all_at(tail, start)?;
+                next = next.checked_add(1).ok_or_else(invalid)?;
+            }
+        }
+        Ok(())
     }
 
     /// All of `buf` at `offset` with `RWF_DSYNC`: each part durable before the call returns.
@@ -840,6 +993,150 @@ mod tests {
                 assert_eq!(source.kind(), io::ErrorKind::NotFound);
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Do: write pages through the cache; read one from memory twice with the kernel's epoch
+    /// held; again in shadow mode; then once after the epoch moves. Expect: the first read probes,
+    /// the second is made on its kept answer, the shadow read probes anyway and finds the answer
+    /// right, and after the move the read probes again; every read returns the page's bytes.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_page_found_in_memory_is_read_again_without_asking_until_the_epoch_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = DeviceFile::open(
+            &dir.path().join("answers"),
+            true,
+            CachingRequest::Buffered,
+            align(),
+        )
+        .unwrap();
+        let page = 4096usize;
+        let bytes: Vec<u8> = (0..4 * page).map(|i| (i % 251) as u8).collect();
+        file.write_all_at(&bytes, 0).unwrap();
+        file.epoch.hold();
+        let mut buf = vec![0u8; page];
+        let mut read = |file: &mut DeviceFile| {
+            buf.fill(0);
+            assert!(file.read_resident_at(&mut buf, page as u64).unwrap());
+            assert_eq!(buf, &bytes[page..2 * page]);
+            let r = file.residency();
+            (r.probes, r.skips, r.wrong)
+        };
+        assert_eq!(read(&mut file), (1, 0, 0));
+        assert_eq!(read(&mut file), (1, 1, 0));
+        file.set_residency_shadow(true);
+        assert_eq!(read(&mut file), (2, 2, 0));
+        file.set_residency_shadow(false);
+        file.epoch.move_on();
+        assert_eq!(read(&mut file), (3, 2, 0));
+        assert_eq!(read(&mut file), (3, 3, 0));
+    }
+
+    /// Do: refresh a reader against the kernel's reclamation counters, then again with its epoch
+    /// held one off them. Expect: the second refresh counts a change and starts a new generation,
+    /// and each sets when the epoch is next read.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_refresh_that_finds_the_epoch_moved_forgets_every_answer() {
+        let mut epoch = crate::resident::Epoch::new();
+        let (before, after) = epoch.refresh_from_off();
+        assert_eq!(after, before + 1);
+    }
+
+    /// Do: write pages through the cache, then read them only from memory: one the write left
+    /// there, one past the file's end, one written far past the window the first read mapped, and
+    /// one through a duplicate. Expect: where the platform can tell, each page in memory is read
+    /// here with the file's bytes and the one past the end is not; where it cannot (or the file
+    /// system refuses `RWF_NOWAIT`), none is, and the handle says so.
+    #[test]
+    fn a_buffered_file_reads_what_memory_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = DeviceFile::open(
+            &dir.path().join("resident"),
+            true,
+            CachingRequest::Buffered,
+            align(),
+        )
+        .unwrap();
+        let page = 4096usize;
+        let bytes: Vec<u8> = (0..4 * page).map(|i| (i % 251) as u8).collect();
+        file.write_all_at(&bytes, 0).unwrap();
+        let mut buf = vec![0u8; page];
+        let read = file.read_resident_at(&mut buf, page as u64).unwrap();
+        // A regular file on macOS is always mapped: its probes never refuse.
+        assert!(!(cfg!(target_vendor = "apple") && file.resident.refused()));
+        assert_eq!(read, !file.resident.refused());
+        if read {
+            assert_eq!(buf, &bytes[page..2 * page]);
+        }
+        assert!(!file.read_resident_at(&mut buf, 8 * page as u64).unwrap());
+        // Far past any window mapped so far: the mapping grows to reach it.
+        let far = 1u64 << 22;
+        file.write_all_at(&bytes[..page], far).unwrap();
+        buf.fill(0);
+        assert_eq!(
+            file.read_resident_at(&mut buf, far).unwrap(),
+            !file.resident.refused()
+        );
+        if !file.resident.refused() {
+            assert_eq!(buf, &bytes[..page]);
+        }
+        let mut twin = file.try_clone().unwrap();
+        buf.fill(0);
+        assert_eq!(
+            twin.read_resident_at(&mut buf, 0).unwrap(),
+            !twin.resident.refused()
+        );
+        if !twin.resident.refused() {
+            assert_eq!(buf, &bytes[..page]);
+        }
+    }
+
+    /// Do: write more copies of a page than one vectored call takes (1024 is `IOV_MAX` on Linux
+    /// and macOS) from past a hole, through a buffered handle and one past the cache. Expect:
+    /// every copy lands back to back, and the file ends with the last.
+    #[test]
+    fn copies_of_a_page_land_back_to_back_past_a_calls_vectors() {
+        for caching in [CachingRequest::Buffered, CachingRequest::PreferDirect] {
+            let dir = tempfile::tempdir().unwrap();
+            let file =
+                DeviceFile::open(&dir.path().join("copies"), true, caching, align()).unwrap();
+            let mut fill = AlignedBuf::zeroed(4096, align()).unwrap();
+            fill.extend_from_slice(&[0xa5; 4096]).unwrap();
+            let copies = 1500u64;
+            file.write_copies_at(fill.as_slice(), 4096, copies).unwrap();
+            assert_eq!(file.len().unwrap(), 4096 * (copies + 1));
+            let mut back = AlignedBuf::zeroed(4096, align()).unwrap();
+            back.extend_from_slice(&[0; 4096]).unwrap();
+            for k in 1..=copies {
+                back.as_mut_slice().fill(0);
+                file.read_exact_at(back.as_mut_slice(), 4096 * k).unwrap();
+                assert_eq!(back.as_slice(), fill.as_slice(), "copy {k}");
+            }
+            // A direct handle refuses copies at an offset off its alignment.
+            assert!(
+                file.write_copies_at(fill.as_slice(), 1, 1).is_err()
+                    || file.caching() == Caching::Buffered
+            );
+        }
+    }
+
+    /// Do: read a direct file only from memory. Expect: nothing read, without a transfer: a
+    /// direct file has no OS cache to read from.
+    #[test]
+    fn a_direct_file_reads_nothing_from_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = DeviceFile::open(
+            &dir.path().join("direct"),
+            true,
+            CachingRequest::PreferDirect,
+            align(),
+        )
+        .unwrap();
+        if file.caching() == Caching::Direct {
+            let mut buf = vec![0u8; 4096];
+            assert!(!file.read_resident_at(&mut buf, 0).unwrap());
         }
     }
 }

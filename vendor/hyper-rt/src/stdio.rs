@@ -51,11 +51,9 @@ fn pool(depth: usize, chunk: usize) -> Result<Pool, RtError> {
                 what: "stdio buffer bytes",
                 bound: chunk,
             })?;
-        empty_tx
-            .blocking_send(buffer)
-            .map_err(|_| RtError::BadConfig {
-                what: "the stdio buffer pool closed while filling",
-            })?;
+        empty_tx.try_send(buffer).map_err(|_| RtError::BadConfig {
+            what: "the stdio buffer pool closed while filling",
+        })?;
     }
     Ok((empty_tx, empty_rx))
 }

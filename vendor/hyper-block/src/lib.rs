@@ -15,7 +15,8 @@
         clippy::arithmetic_side_effects,
         clippy::disallowed_macros,
         clippy::cognitive_complexity,
-        clippy::cast_possible_truncation
+        clippy::cast_possible_truncation,
+        clippy::panic_in_result_fn
     )
 )]
 
@@ -26,15 +27,21 @@ pub mod block;
 pub mod buf;
 pub mod commit;
 pub mod file;
+#[cfg(windows)]
+mod gather;
 #[cfg(all(target_vendor = "apple", any(test, feature = "sim")))]
 pub mod image;
 pub mod issuer;
 mod node;
 pub mod record;
+mod resident;
+pub use resident::Residency;
 pub mod scratch;
+pub mod segmented;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
 pub mod threads;
+mod unwind;
 
 /// What a device operation fails with.
 #[derive(Debug, thiserror::Error)]
