@@ -543,12 +543,25 @@ impl Owner {
                 // The registry is gone: its revision is read as the owner moves, as before.
                 Either3::Third(hyper_rt::combine::Either::Second(false)) => revocations = None,
             }
-            // The rest of what is ready, a bounded turn of it, before the next wait.
+            // The rest of what is ready, a bounded turn of it, before the next wait: the endpoint's
+            // events and the answers this owner's tasks have ready, so that the flush below sends
+            // what they all made at once, a connection's answers in as few packets as they fit and
+            // every connection's in as few calls. Each answer was flushed alone: a 1000/s leader
+            // sent 1.07 datagrams a call to its clients (profile run 38287539180), its group
+            // commit's answers one call each. Nothing ready waits for what is not.
             for _ in 0..hyper_rt_transport::TURNS {
-                let Some(event) = self.driver.endpoint().poll_event() else {
+                let event = self.driver.endpoint().poll_event();
+                // The owner holds a sender of its own: never closed while it runs.
+                let answered = answers.try_recv().unwrap_or_default();
+                if event.is_none() && answered.is_none() {
                     break;
-                };
-                self.on_event(event);
+                }
+                if let Some(event) = event {
+                    self.on_event(event);
+                }
+                if let Some((exchange, reply)) = answered {
+                    self.answer(exchange, reply);
+                }
             }
             // A withdrawal whose wake this owner missed (its queue was full) is seen here.
             let revision = self.driver.endpoint().directory().revision();
