@@ -429,7 +429,7 @@ Stage 2 (doc 30 §6.1's per-family structures with compact keys) follows once St
 The occupancy-independent envelope bound cost 1 MB a candidate in a 128-deep burst; this bound costs about 230 KB. The envelope states the members' staging summed, since each candidate holds its own from plan to publication.
 
 **The engine (focal-core).**
-- A leader's candidate is a sparse `Fragments`; a follower's replay still builds (next step: its copy work prepaid at plan).
+- A leader's candidate is a sparse `Fragments`, and so is a follower's replay. The replay's plan is funded from the record's own permit (`plan_sparse_funded`). It counts each replaced or deleted row out of a checkpoint's size as it reads the row. It prepays the copies its publication makes where a capture or a lease still holds a page: `RangeStore::visit_retained` visits exactly the rows a copied publication copies, and each is charged to the recovery work meter before anything changes. The charge is the one the build made for the same rows, so a record's allowance is unchanged.
 - The owner keeps a pending index: each changed key's newest pending version (serial, member, change), charged per change with the candidate.
 - A `View` reads the candidate being prepared, then the chain as of a serial, then the committed rows; range scans merge the three without allocating.
 - A caller's chain (`Core`'s chained API, `Core::native_chain`) is held inline, at most 16 candidates.
@@ -445,6 +445,19 @@ The occupancy-independent envelope bound cost 1 MB a candidate in a 128-deep bur
 | Total | 47–56 µs | 31–41 µs |
 
 Preparation halved. Publication now carries the merge where the rows are; at about 0.6 µs a change it is the next to profile.
+
+**Measured since (2026-10-13).** Interleaved A/B on the same harness, 10,000 claims, six rounds a side, medians, under load from other work on the machine:
+
+| Change | Measure | Before | After |
+|---|---|---|---|
+| An edit routes by position; the plan's heap is handed to the merge | Publish | 10.7 µs | 7.85 µs |
+| A follower's replay planned sparse, copies prepaid | Replay of a claim | 71.2 µs | 57.0 µs |
+
+Next, from the replay's profile (§6.3):
+- About a quarter of the replay re-validates the claims a record touches (`affected_claims`: each claim and its graph proofs).
+- The claim's index rows are derived twice (`derives` and `claim_complete`).
+- Committed-row lookups are about a quarter of validation.
+- The prepay walk is about 4 µs a claim. It is mostly a directory descent a group, which the publication repeats.
 
 
 ## Sources
