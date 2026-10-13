@@ -51,6 +51,15 @@ impl TransferManifest {
             .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
             .ok_or(ContentError::Capacity)
     }
+    /// The most a manifest of `encoded` bytes holds read and decoded: its
+    /// encoding, the chunk list it names, and the descriptor
+    /// ([`Self::resident_bytes`] is never more).
+    pub fn resident_for(encoded: usize) -> Result<usize, ContentError> {
+        chunk_list_bound(encoded)
+            .and_then(|n| n.checked_add(encoded))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(ContentError::Capacity)
+    }
 }
 
 impl ContentStore {
@@ -59,13 +68,22 @@ impl ContentStore {
         &self,
         reference: &ContentRef,
     ) -> Result<TransferManifest, ContentError> {
+        self.export_manifest_within(reference, MAX_TRANSFER_MANIFEST_BYTES)
+    }
+    /// [`Self::export_manifest`] of a manifest at most `encoded` bytes (as
+    /// [`Self::manifest_length`] found it, and its holder charged
+    /// [`TransferManifest::resident_for`] it): a longer one is refused before
+    /// it is read.
+    pub fn export_manifest_within(
+        &self,
+        reference: &ContentRef,
+        encoded: usize,
+    ) -> Result<TransferManifest, ContentError> {
         self.check()?;
-        let path = self
-            .root
-            .join("objects")
-            .join(hex(&reference.domain.0))
-            .join(format!("{}.manifest", reference.root));
-        let encoded = read_bounded(&path, MAX_TRANSFER_MANIFEST_BYTES)?;
+        let encoded = read_bounded(
+            &manifest_path(&self.root, reference),
+            encoded.min(MAX_TRANSFER_MANIFEST_BYTES),
+        )?;
         self.prepare_import(reference.clone(), encoded)
     }
 
@@ -834,6 +852,85 @@ mod tests {
         store.append(upload, 4, b"efgh").unwrap();
         store.append(upload, 8, b"ij").unwrap();
         store.seal(upload).unwrap()
+    }
+    /// A manifest is charged by its length before it is read
+    /// (`manifest_length`): decoded for an export or a verification it holds
+    /// no more than `resident_for` that length, at one chunk or at many, and
+    /// read within less than its length it is refused before it is read. A
+    /// seal holds no more than its chunks charge, and the chunks are read by
+    /// the names the manifest gives them.
+    #[test]
+    fn a_manifest_holds_no_more_than_its_length_charges() {
+        for (chunk_bytes, object) in [
+            (4, &b"ab"[..]),
+            (4, &b"abcdefghij"[..]),
+            (1, &b"abcdefghijklmnopqrst"[..]),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut store = ContentStore::open(root.path(), limits(chunk_bytes)).unwrap();
+            let upload = UploadId([1; 16]);
+            let domain = ContentDomainId([2; 16]);
+            store
+                .begin(
+                    upload,
+                    domain,
+                    ContentClass::Evidence,
+                    object.len() as u64,
+                    None,
+                )
+                .unwrap();
+            for (index, part) in object.chunks(chunk_bytes).enumerate() {
+                store
+                    .append(upload, (index * chunk_bytes) as u64, part)
+                    .unwrap();
+            }
+            let charge = store.seal_charge(upload).unwrap();
+            let sealing = store.begin_seal(upload).unwrap();
+            assert!(sealing.resident_bytes().unwrap() <= charge);
+            drop(sealing);
+            let reference = store.seal(upload).unwrap();
+            let encoded = store.manifest_length(&reference).unwrap();
+            assert_eq!(
+                encoded as u64,
+                fs::metadata(manifest_path(root.path(), &reference))
+                    .unwrap()
+                    .len()
+            );
+            let manifest = store.export_manifest_within(&reference, encoded).unwrap();
+            assert_eq!(manifest.chunks(), object.len().div_ceil(chunk_bytes));
+            assert!(
+                manifest.resident_bytes().unwrap()
+                    <= TransferManifest::resident_for(encoded).unwrap()
+            );
+            let verification = store.begin_verify_within(&reference, encoded).unwrap();
+            assert!(
+                verification.resident_bytes().unwrap()
+                    <= ObjectVerification::resident_for(encoded).unwrap()
+            );
+            assert!(matches!(
+                store.export_manifest_within(&reference, encoded - 1),
+                Err(ContentError::Capacity)
+            ));
+            assert!(matches!(
+                store.begin_verify_within(&reference, encoded - 1),
+                Err(ContentError::Capacity)
+            ));
+            let mut read = Vec::new();
+            for index in 0..manifest.chunks() {
+                let (hash, length) = manifest.chunk(index).unwrap();
+                read.extend(store.read_chunk(domain, hash, length as usize).unwrap());
+            }
+            assert_eq!(read, object);
+            // A name read at another length, or under another domain, is
+            // refused.
+            let (hash, length) = manifest.chunk(0).unwrap();
+            assert!(store.read_chunk(domain, hash, length as usize + 1).is_err());
+            assert!(
+                store
+                    .read_chunk(ContentDomainId([3; 16]), hash, length as usize)
+                    .is_err()
+            );
+        }
     }
     #[test]
     fn interrupted_transfer_reuses_durable_chunks_and_preserves_the_original_root() {

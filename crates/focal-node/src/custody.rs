@@ -261,7 +261,6 @@ pub struct CustodyStore {
     policies: BTreeMap<LedgerId, Installed>,
     pending: BTreeMap<LedgerId, PendingPeers>,
     transfers: BTreeMap<TransferKey, Transfer>,
-    exports: BTreeMap<(CustodyScope, ContentHash), Transfer>,
     /// As many as transfers at most (`max_transfers`).
     verifications: BTreeMap<(CustodyScope, ContentHash), Verifying>,
     /// As many as the store stages uploads at most.
@@ -293,7 +292,6 @@ impl CustodyStore {
             policies: BTreeMap::new(),
             pending: BTreeMap::new(),
             transfers: BTreeMap::new(),
-            exports: BTreeMap::new(),
             verifications: BTreeMap::new(),
             seals: BTreeMap::new(),
             restore: None,
@@ -311,10 +309,7 @@ impl CustodyStore {
         &mut self.store
     }
     pub fn retained(&self) -> (usize, u64) {
-        (
-            self.transfers.len().saturating_add(self.exports.len()),
-            self.transfer_bytes,
-        )
+        (self.transfers.len(), self.transfer_bytes)
     }
     pub fn installed(&self, ledger: LedgerId) -> Option<&CustodyPolicy> {
         self.policies.get(&ledger).map(|row| &row.policy)
@@ -592,13 +587,6 @@ impl CustodyStore {
             return Err(AccessError::Capacity);
         }
         Ok(total)
-    }
-    fn manifest_allowance(&self) -> Result<usize, AccessError> {
-        self.store
-            .max_manifest_bytes()
-            .checked_mul(4)
-            .and_then(|n| n.checked_add(4096))
-            .ok_or(AccessError::Capacity)
     }
     fn descriptor(
         &self,
@@ -995,16 +983,18 @@ impl CustodyStore {
                         |entry| entry.expires,
                     )?;
                     // The object's chunk list, decoded from its manifest, is
-                    // held while the verification runs.
-                    let allocation = self.reserve(
-                        BudgetKind::Payload,
-                        BudgetLane::Completion,
-                        self.manifest_allowance()?,
-                    )?;
-                    let verification = self.store.begin_verify(content).map_err(content_error)?;
-                    if verification.resident_bytes().map_err(content_error)?
-                        > self.manifest_allowance()?
-                    {
+                    // held while the verification runs: charged at what a
+                    // manifest of its length holds, never the bound.
+                    let encoded = self.store.manifest_length(content).map_err(content_error)?;
+                    let charge =
+                        ObjectVerification::resident_for(encoded).map_err(content_error)?;
+                    let allocation =
+                        self.reserve(BudgetKind::Payload, BudgetLane::Completion, charge)?;
+                    let verification = self
+                        .store
+                        .begin_verify_within(content, encoded)
+                        .map_err(content_error)?;
+                    if verification.resident_bytes().map_err(content_error)? > charge {
                         return Err(AccessError::Capacity);
                     }
                     self.verifications.insert(
@@ -1037,15 +1027,19 @@ impl CustodyStore {
                     },
                     content,
                 )?;
+                let encoded = self.store.manifest_length(content).map_err(content_error)?;
+                if encoded > *max_bytes as usize {
+                    return Err(AccessError::Capacity);
+                }
                 let _scan = self.reserve(
                     BudgetKind::Payload,
                     BudgetLane::Ordinary,
-                    self.manifest_allowance()?,
+                    TransferManifest::resident_for(encoded).map_err(content_error)?,
                 )?;
-                let descriptor = self.store.export_manifest(content).map_err(content_error)?;
-                if descriptor.encoded().len() > *max_bytes as usize {
-                    return Err(AccessError::Capacity);
-                }
+                let descriptor = self
+                    .store
+                    .export_manifest_within(content, encoded)
+                    .map_err(content_error)?;
                 CustodyReply::Manifest {
                     content: content.clone(),
                     manifest: descriptor.encoded().to_vec(),
@@ -1140,14 +1134,9 @@ impl CustodyStore {
                 |entry| entry.expires,
             )?;
             // The seal's chunk list and its manifest's encoding, held while
-            // it goes a chunk a slice; the chunks are read into the owner's
-            // scratch.
-            let amount = self
-                .store
-                .max_manifest_bytes()
-                .checked_mul(4)
-                .and_then(|n| n.checked_add(4096))
-                .ok_or(AccessError::Capacity)?;
+            // it goes a chunk a slice, charged at what a seal of the upload's
+            // chunks holds; the chunks are read into the owner's scratch.
+            let amount = self.store.seal_charge(id).map_err(content_error)?;
             let charge = self.reserve(BudgetKind::Payload, BudgetLane::Completion, amount)?;
             let sealing = self.store.begin_seal(id).map_err(content_error)?;
             if sealing.resident_bytes().map_err(content_error)? > amount {
@@ -1464,8 +1453,11 @@ impl CustodyStore {
         }
         panic!("a pass that never ended")
     }
-    /// Caches the parsed tree once per installed scope/root. Chunk reads below
-    /// use that descriptor until expiry; they never parse the manifest per chunk.
+    /// The object's manifest, read and decoded for one push and held by it,
+    /// charged at what a manifest of its length holds
+    /// ([`TransferManifest::resident_for`]), never the bound. The push names
+    /// each chunk it moves by it ([`Self::read_chunk`]), so nothing of it is
+    /// kept here: what a push holds goes when the push ends.
     pub fn export_manifest(
         &mut self,
         scope: CustodyScope,
@@ -1473,67 +1465,41 @@ impl CustodyStore {
     ) -> Result<Accounted<TransferManifest>, AccessError> {
         self.expire(Instant::now())?;
         self.check_scope(scope, &content)?;
-        let key = (scope, content.root);
-        let amount = self.manifest_allowance()?;
-        let output = self.reserve(BudgetKind::Query, BudgetLane::Ordinary, amount)?;
-        if !self.exports.contains_key(&key) {
-            let total = self.room(&content)?;
-            let allocation = self.reserve(BudgetKind::Control, BudgetLane::Ordinary, amount)?;
-            let descriptor = self
-                .store
-                .export_manifest(&content)
-                .map_err(content_error)?;
-            if descriptor.resident_bytes().map_err(content_error)? > amount {
-                return Err(AccessError::Capacity);
-            }
-            let retained = self.descriptor(descriptor, 0, Vec::new(), allocation)?;
-            self.exports.insert(key, retained);
-            self.transfer_bytes = total;
-        }
-        let deadline = self.deadline()?;
-        let cached = self.exports.get_mut(&key).ok_or(AccessError::Unavailable)?;
-        if cached.manifest.reference() != &content {
-            return Err(AccessError::InvalidRequest);
-        }
-        cached.expires = deadline;
+        let encoded = self
+            .store
+            .manifest_length(&content)
+            .map_err(content_error)?;
+        let charge = TransferManifest::resident_for(encoded).map_err(content_error)?;
+        let allocation = self.reserve(BudgetKind::Query, BudgetLane::Ordinary, charge)?;
         let value = self
             .store
-            .prepare_import(content, cached.manifest.encoded().to_vec())
+            .export_manifest_within(&content, encoded)
             .map_err(content_error)?;
+        if value.resident_bytes().map_err(content_error)? > charge {
+            return Err(AccessError::Capacity);
+        }
         Ok(Accounted {
             value,
-            _allocation: output,
+            _allocation: allocation,
         })
     }
-    pub fn read_transfer_chunk(
-        &mut self,
+    /// The chunk of `content` named `hash`, of `length` bytes, as the
+    /// object's manifest names it ([`Self::export_manifest`]): read and
+    /// checked against its name, and charged at its length.
+    pub fn read_chunk(
+        &self,
         scope: CustodyScope,
         content: ContentRef,
-        index: usize,
+        hash: ContentHash,
+        length: usize,
     ) -> Result<Accounted<Vec<u8>>, AccessError> {
-        self.expire(Instant::now())?;
         self.check_scope(scope, &content)?;
-        let key = (scope, content.root);
-        let cached = self.exports.get(&key).ok_or(AccessError::Unavailable)?;
-        if cached.manifest.reference() != &content {
-            return Err(AccessError::InvalidRequest);
-        }
-        let amount = cached
-            .manifest
-            .chunk_length(index)
-            .map_err(content_error)?
-            .checked_add(4096)
-            .ok_or(AccessError::Capacity)?;
+        let amount = length.checked_add(4096).ok_or(AccessError::Capacity)?;
         let allocation = self.reserve(BudgetKind::Query, BudgetLane::Ordinary, amount)?;
         let value = self
             .store
-            .read_transfer_chunk(&cached.manifest, index)
+            .read_chunk(content.domain, hash, length)
             .map_err(content_error)?;
-        let deadline = self.deadline()?;
-        self.exports
-            .get_mut(&key)
-            .ok_or(AccessError::Unavailable)?
-            .expires = deadline;
         Ok(Accounted {
             value,
             _allocation: allocation,
@@ -1550,15 +1516,21 @@ impl CustodyStore {
         if length > max_bytes {
             return Err(AccessError::Capacity);
         }
-        let amount = length
-            .checked_add(self.store.max_chunk_bytes())
-            .and_then(|n| {
-                self.manifest_allowance()
-                    .ok()
-                    .and_then(|m| n.checked_add(m))
-            })
-            .ok_or(AccessError::Capacity)?;
-        let allocation = self.reserve(BudgetKind::Query, BudgetLane::Ordinary, amount)?;
+        // While it is read, the manifest decoded and a chunk at a time; then
+        // only the bytes, which the answer holds.
+        let encoded = self
+            .store
+            .manifest_length(&content)
+            .map_err(content_error)?;
+        let _scan = self.reserve(
+            BudgetKind::Query,
+            BudgetLane::Ordinary,
+            ObjectVerification::resident_for(encoded)
+                .map_err(content_error)?
+                .checked_add(self.store.max_chunk_bytes())
+                .ok_or(AccessError::Capacity)?,
+        )?;
+        let allocation = self.reserve(BudgetKind::Query, BudgetLane::Ordinary, length)?;
         let value = self
             .store
             .read_bytes(&content, max_bytes)
@@ -1598,7 +1570,6 @@ impl CustodyStore {
                     .map_err(content_error)?;
             }
         }
-        self.exports.retain(|_, transfer| transfer.expires > now);
         // A verification, a seal or a restore no ask advanced for a lease is
         // given up, what it held released (the audit's F51); nothing of it
         // was published.
@@ -1617,7 +1588,6 @@ impl CustodyStore {
         self.transfer_bytes = self
             .transfers
             .values()
-            .chain(self.exports.values())
             .try_fold(0u64, |sum, entry| {
                 sum.checked_add(entry.manifest.reference().length)
             })

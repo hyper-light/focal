@@ -11,6 +11,10 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 const MANIFEST_MAGIC: &[u8] = b"focal.evidence.manifest\0\x01\0";
+/// The most a manifest's magic and header take before its chunk list: the
+/// magic, the schema, domain, class, length and stream digest, and the
+/// chunk count, each varint at its widest.
+const MANIFEST_HEADER_BOUND: usize = 256;
 const UPLOAD_SCHEMA: u16 = 1;
 #[path = "upload_terminal.rs"]
 mod terminal;
@@ -184,6 +188,21 @@ impl UploadSealing {
     pub fn done(&self) -> (u64, u64) {
         (self.done, self.length)
     }
+    /// The most a seal of `count` chunks holds: its chunk list, and at its
+    /// end the manifest's encoding (at most forty bytes a chunk and its
+    /// header) twice over, as the encoding is written and then framed, each
+    /// buffer at most twice what it holds.
+    pub fn resident_for(count: usize) -> Result<usize, ContentError> {
+        let encoded = count
+            .checked_mul(40)
+            .and_then(|n| n.checked_add(MANIFEST_HEADER_BOUND))
+            .ok_or(ContentError::Capacity)?;
+        count
+            .checked_mul(std::mem::size_of::<Chunk>())
+            .and_then(|n| n.checked_add(encoded.checked_mul(4)?))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
+            .ok_or(ContentError::Capacity)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,15 +253,24 @@ impl ObjectVerification {
             .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
             .ok_or(ContentError::Capacity)
     }
-    /// The most a verification can hold: the chunks a manifest may name,
-    /// each at least 33 encoded bytes.
-    pub fn resident_bound() -> Result<usize, ContentError> {
-        MAX_TRANSFER_MANIFEST_BYTES
-            .checked_div(33)
-            .and_then(|count| count.checked_mul(std::mem::size_of::<Chunk>()))
+    /// The most a verification of an object whose manifest is `encoded`
+    /// bytes holds as it begins: the encoding while it is decoded, and the
+    /// chunk list it names ([`Self::resident_bytes`] is never more).
+    pub fn resident_for(encoded: usize) -> Result<usize, ContentError> {
+        chunk_list_bound(encoded)
+            .and_then(|n| n.checked_add(encoded))
             .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
             .ok_or(ContentError::Capacity)
     }
+}
+
+/// The most the chunk list of a manifest of `encoded` bytes holds decoded:
+/// an entry for every 33 bytes of the encoding, as each names a 32-byte hash
+/// and at least a byte of length (as the decoder checks before it reserves).
+pub(crate) fn chunk_list_bound(encoded: usize) -> Option<usize> {
+    encoded
+        .checked_div(33)?
+        .checked_mul(std::mem::size_of::<Chunk>())
 }
 
 /// The fixed header contains no allocating fields. Validate the sequence count
@@ -407,6 +435,37 @@ impl ContentStore {
     }
     pub fn max_manifest_bytes(&self) -> usize {
         MAX_TRANSFER_MANIFEST_BYTES
+    }
+    /// The length of an installed object's manifest, from its file's
+    /// metadata, nothing read: what a holder charges reading it at
+    /// ([`TransferManifest::resident_for`], [`ObjectVerification::resident_for`]).
+    pub fn manifest_length(&self, reference: &ContentRef) -> Result<usize, ContentError> {
+        self.check()?;
+        let length = usize::try_from(fs::metadata(manifest_path(&self.root, reference))?.len())
+            .map_err(|_| ContentError::Capacity)?;
+        if length > MAX_TRANSFER_MANIFEST_BYTES {
+            return Err(ContentError::Capacity);
+        }
+        Ok(length)
+    }
+    /// The chunk of `domain` named `hash`, of `length` bytes, read and
+    /// checked against its name: what a sender that holds the object's
+    /// manifest moves, naming each chunk by it, the manifest never read
+    /// again.
+    pub fn read_chunk(
+        &self,
+        domain: ContentDomainId,
+        hash: ContentHash,
+        length: usize,
+    ) -> Result<Vec<u8>, ContentError> {
+        self.check()?;
+        if length > MAX_TRANSFER_CHUNK_BYTES {
+            return Err(ContentError::Capacity);
+        }
+        let directory = self.root.join("objects").join(hex(&domain.0));
+        let mut bytes = zeroed_buffer(length)?;
+        verify_chunk_into(&directory, hash, length, &mut bytes)?;
+        Ok(bytes)
     }
     /// The uploads the store stages at once at most.
     pub fn max_uploads(&self) -> usize {
@@ -790,33 +849,44 @@ impl ContentStore {
         self.mark_failure(&result);
         result
     }
-    fn begin_seal_inner(&mut self, id: UploadId) -> Result<UploadSealing, ContentError> {
+    /// The most the seal of upload `id` holds ([`UploadSealing::resident_for`]
+    /// of its chunks): what its holder charges before it begins it.
+    pub fn seal_charge(&self, id: UploadId) -> Result<usize, ContentError> {
+        self.check()?;
+        UploadSealing::resident_for(self.seal_chunks(id)?)
+    }
+    /// The chunks a seal of upload `id` installs, known from the object's
+    /// size and the chunk length; the manifest is bounded at forty bytes a
+    /// chunk (as each slice checks): a seal of more chunks than it can name
+    /// fails at its last anyway, so it is refused before anything is synced,
+    /// promised or read.
+    fn seal_chunks(&self, id: UploadId) -> Result<usize, ContentError> {
         let chunk_bytes = self.limits.chunk_bytes as u64;
-        let max_manifest_bytes = self.limits.max_manifest_bytes;
-        let upload = self
-            .uploads
-            .get_mut(&id)
-            .ok_or(ContentError::MissingUpload)?;
+        let upload = self.uploads.get(&id).ok_or(ContentError::MissingUpload)?;
         if upload.offset != upload.meta.expected_length {
             return Err(ContentError::Incomplete {
                 received: upload.offset,
                 expected: upload.meta.expected_length,
             });
         }
-        // The chunk count is known from the object size and chunk length;
-        // the list is reserved once instead of growing a chunk at a time. The
-        // manifest is bounded at forty bytes a chunk (as each slice checks):
-        // a seal of more chunks than it can name fails at its last anyway, so
-        // it is refused before anything is synced, promised or read.
         let count = usize::try_from(
             upload
                 .offset
                 .div_ceil(upload.offset.min(chunk_bytes).max(1)),
         )
         .map_err(|_| ContentError::Capacity)?;
-        if count.checked_mul(40).ok_or(ContentError::Capacity)? > max_manifest_bytes {
+        if count.checked_mul(40).ok_or(ContentError::Capacity)? > self.limits.max_manifest_bytes {
             return Err(ContentError::Capacity);
         }
+        Ok(count)
+    }
+    fn begin_seal_inner(&mut self, id: UploadId) -> Result<UploadSealing, ContentError> {
+        // The list is reserved once instead of growing a chunk at a time.
+        let count = self.seal_chunks(id)?;
+        let upload = self
+            .uploads
+            .get_mut(&id)
+            .ok_or(ContentError::MissingUpload)?;
         upload.file.sync_all()?;
         let directory = self.root.join("objects").join(hex(&upload.meta.domain.0));
         // The sealed object is a second copy of the staged bytes until the
@@ -1022,8 +1092,18 @@ impl ContentStore {
     /// Begin `verify` in slices ([`ObjectVerification`]): the object's
     /// manifest read and validated once, nothing else read yet.
     pub fn begin_verify(&self, reference: &ContentRef) -> Result<ObjectVerification, ContentError> {
+        self.begin_verify_within(reference, MAX_TRANSFER_MANIFEST_BYTES)
+    }
+    /// [`Self::begin_verify`] of an object whose manifest is at most
+    /// `encoded` bytes (as [`Self::manifest_length`] found it, and its holder
+    /// charged): a longer one is refused before it is read.
+    pub fn begin_verify_within(
+        &self,
+        reference: &ContentRef,
+        encoded: usize,
+    ) -> Result<ObjectVerification, ContentError> {
         self.check()?;
-        let manifest = manifest_at(&self.root, reference)?;
+        let manifest = manifest_within(&self.root, reference, encoded)?;
         Ok(ObjectVerification {
             reference: reference.clone(),
             chunks: manifest.chunks,
@@ -1311,11 +1391,22 @@ fn zeroed_buffer(length: usize) -> Result<Vec<u8>, ContentError> {
 }
 
 fn manifest_at(root: &Path, reference: &ContentRef) -> Result<Manifest, ContentError> {
-    let path = root
-        .join("objects")
+    manifest_within(root, reference, MAX_TRANSFER_MANIFEST_BYTES)
+}
+/// Where the manifest of `reference` is installed under `root`.
+pub(crate) fn manifest_path(root: &Path, reference: &ContentRef) -> PathBuf {
+    root.join("objects")
         .join(hex(&reference.domain.0))
-        .join(format!("{}.manifest", reference.root));
-    let bytes = read_bounded(&path, MAX_TRANSFER_MANIFEST_BYTES)?;
+        .join(format!("{}.manifest", reference.root))
+}
+/// [`manifest_at`] of a manifest at most `limit` bytes, nothing more read.
+fn manifest_within(
+    root: &Path,
+    reference: &ContentRef,
+    limit: usize,
+) -> Result<Manifest, ContentError> {
+    let path = manifest_path(root, reference);
+    let bytes = read_bounded(&path, limit.min(MAX_TRANSFER_MANIFEST_BYTES))?;
     if ContentHash(*blake3::hash(&bytes).as_bytes()) != reference.root
         || !bytes.starts_with(MANIFEST_MAGIC)
     {

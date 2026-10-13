@@ -223,8 +223,12 @@ fn session_transfer_namespaces_policy_fences_and_expiry_share_one_budget() {
     assert_eq!(budget.stats().used, 0);
 }
 
+/// A push's manifest is charged at what a manifest of its length holds,
+/// never the bound, and nothing of it stays once the push lets it go. Its
+/// chunks are read by the names it gives them, the manifest never read again,
+/// each checked against its name and charged at its length.
 #[test]
-fn export_cache_reuses_parsed_tree_and_accounts_detached_results() {
+fn an_export_is_charged_at_its_manifest_and_its_chunks_are_read_by_name() {
     let root = tempfile::tempdir().unwrap();
     let mut store = ContentStore::open(root.path(), limits()).unwrap();
     let content = stored(&mut store, 1, 1, b"abcdefgh");
@@ -233,10 +237,23 @@ fn export_cache_reuses_parsed_tree_and_accounts_detached_results() {
     let policy = policy(ledger(1, 1));
     let scope = policy.scope();
     custody.install_policy(policy).unwrap();
+    let installed = budget.stats().used;
     let exported = custody.export_manifest(scope, content.clone()).unwrap();
     assert_eq!(exported.value().chunks(), 2);
-    // Losing the manifest after export does not trigger a read/parse per chunk;
-    // each chunk still authenticates against the retained immutable descriptor.
+    let charged = budget.stats().used - installed;
+    assert_eq!(
+        charged,
+        TransferManifest::resident_for(exported.value().encoded().len()).unwrap()
+    );
+    assert!(
+        charged < 4096,
+        "a manifest of two chunks is charged {charged} bytes, not the bound's megabytes"
+    );
+    let names = [
+        exported.value().chunk(0).unwrap(),
+        exported.value().chunk(1).unwrap(),
+    ];
+    // The manifest gone, the chunks are still read by their names.
     let domain = content
         .domain
         .0
@@ -250,19 +267,42 @@ fn export_cache_reuses_parsed_tree_and_accounts_detached_results() {
             .join(format!("{}.manifest", content.root)),
     )
     .unwrap();
+    let before = budget.stats().used;
     let first = custody
-        .read_transfer_chunk(scope, content.clone(), 0)
+        .read_chunk(scope, content.clone(), names[0].0, names[0].1 as usize)
         .unwrap();
+    assert_eq!(budget.stats().used - before, names[0].1 as usize + 4096);
     let second = custody
-        .read_transfer_chunk(scope, content.clone(), 1)
+        .read_chunk(scope, content.clone(), names[1].0, names[1].1 as usize)
         .unwrap();
     assert_eq!(first.value(), b"abcd");
     assert_eq!(second.value(), b"efgh");
+    // A name read at another length, or one the domain does not hold, is
+    // refused, and so is a chunk past the bound.
     assert!(
         custody
-            .read_transfer_chunk(scope, content, usize::MAX)
+            .read_chunk(scope, content.clone(), names[0].0, 3)
             .is_err()
     );
+    assert!(
+        custody
+            .read_chunk(scope, content.clone(), ContentHash([7; 32]), 4)
+            .is_err()
+    );
+    assert!(
+        custody
+            .read_chunk(
+                scope,
+                content,
+                names[0].0,
+                focal_evidence::MAX_TRANSFER_CHUNK_BYTES + 1
+            )
+            .is_err()
+    );
+    // The export let go, nothing of it stays.
+    let held = budget.stats().used;
+    drop(exported);
+    assert_eq!(held - budget.stats().used, charged);
     drop(custody);
     assert!(budget.stats().used > 0);
     let mapped = first.map(|bytes| ContentChunk {
@@ -271,7 +311,6 @@ fn export_cache_reuses_parsed_tree_and_accounts_detached_results() {
         eof: false,
     });
     drop(second);
-    drop(exported);
     assert!(budget.stats().used > 0);
     assert_eq!(mapped.value().bytes, b"abcd");
     drop(mapped);
@@ -548,9 +587,10 @@ fn one_actor_hosts_multiple_ledgers_and_external_seal_never_attests_custody() {
             .export_manifest(policy(a).scope(), a_ref.clone())
             .await
             .unwrap();
+        let (hash, length) = descriptor.value().chunk(1).unwrap();
         let chunk = host
             .clone()
-            .read_transfer_chunk(policy(a).scope(), a_ref.clone(), 1)
+            .read_chunk(policy(a).scope(), a_ref.clone(), hash, length as usize)
             .await
             .unwrap();
         assert_eq!(chunk.value(), b"efgh");

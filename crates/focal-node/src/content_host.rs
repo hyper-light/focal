@@ -47,7 +47,7 @@ enum Command {
     Replace(Option<CustodyScope>, CustodyPolicy),
     Check(CustodyScope),
     Export(CustodyScope, ContentRef),
-    Chunk(CustodyScope, ContentRef, usize),
+    Chunk(CustodyScope, ContentRef, focal_model::ContentHash, usize),
     Read(CustodyScope, ContentRef, usize),
     Seal(CustodyScope, Box<VerifiedRequest>),
     /// Seal an inline legacy payload with the canonical import chunking.
@@ -408,16 +408,17 @@ impl ContentHost {
             _ => Err(AccessError::Unavailable),
         }
     }
-    /// Export the manifest first. An expired/invalidated cache returns unavailable
-    /// and requires an explicit re-export; no hidden per-chunk manifest parsing.
-    pub async fn read_transfer_chunk(
+    /// One chunk of `content` by the name and length its manifest gives it
+    /// ([`Self::export_manifest`]): the manifest is never read per chunk.
+    pub async fn read_chunk(
         &self,
         scope: CustodyScope,
         content: ContentRef,
-        index: usize,
+        hash: ContentHash,
+        length: usize,
     ) -> Result<Accounted<Vec<u8>>, AccessError> {
         match self
-            .call(Command::Chunk(scope, content, index), 0, false)
+            .call(Command::Chunk(scope, content, hash, length), 0, false)
             .await?
         {
             Output::Bytes(value) => Ok(value),
@@ -810,8 +811,8 @@ fn execute(
         Command::Export(scope, content) => {
             owner.export_manifest(scope, content).map(Output::Manifest)
         }
-        Command::Chunk(scope, content, index) => owner
-            .read_transfer_chunk(scope, content, index)
+        Command::Chunk(scope, content, hash, length) => owner
+            .read_chunk(scope, content, hash, length)
             .map(Output::Bytes),
         Command::Read(scope, content, limit) => {
             owner.read_bytes(scope, content, limit).map(Output::Bytes)

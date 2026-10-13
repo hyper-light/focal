@@ -1417,7 +1417,7 @@ async fn send_chunks(
     peer: u64,
     scope: CustodyScope,
     transfer: [u8; 16],
-    reference: &ContentRef,
+    manifest: &focal_evidence::TransferManifest,
     lacked: &Lacked,
 ) -> Result<(), AccessError> {
     striped(
@@ -1426,11 +1426,16 @@ async fn send_chunks(
         lacked.range.clone(),
         |index| lacked.held.holds(index),
         async |index: u32| {
+            // Each chunk by the name and length the manifest gives it.
+            let (hash, length) = manifest
+                .chunk(usize::try_from(index).map_err(|_| AccessError::Capacity)?)
+                .map_err(|_| AccessError::InvalidRequest)?;
             let bytes = content
-                .read_transfer_chunk(
+                .read_chunk(
                     scope,
-                    reference.clone(),
-                    usize::try_from(index).map_err(|_| AccessError::Capacity)?,
+                    manifest.reference().clone(),
+                    hash,
+                    usize::try_from(length).map_err(|_| AccessError::Capacity)?,
                 )
                 .await?;
             let chunk = bytes.value();
@@ -1569,7 +1574,16 @@ async fn push(
             held: Held::none(),
         }
     };
-    send_chunks(content, pool, peer, scope, transfer, reference, &lacked).await?;
+    send_chunks(
+        content,
+        pool,
+        peer,
+        scope,
+        transfer,
+        manifest.value(),
+        &lacked,
+    )
+    .await?;
     let reply = remote(
         pool,
         peer,
