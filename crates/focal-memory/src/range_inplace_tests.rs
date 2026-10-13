@@ -197,8 +197,16 @@ fn a_publication_in_place_leaves_what_a_rebuild_leaves() {
                 shape(&in_place),
                 "seed {seed} prefix {prefix}"
             );
-            // Every page's charge is what its capacity and rows' heap take, which
-            // an in-place merge reads its heap from.
+            // Every page holds exactly its rows, as a rebuilt leaf does, so the
+            // two stores are charged alike; and its charge is what its capacity
+            // and rows' heap take, which an in-place merge reads its heap from.
+            for page in rebuilt.root.pages.iter().chain(in_place.root.pages.iter()) {
+                assert_eq!(
+                    page.entries.capacity(),
+                    page.entries.len(),
+                    "seed {seed} prefix {prefix}: room past a page's rows"
+                );
+            }
             for page in in_place.root.pages.iter() {
                 let heap: usize = page.entries.iter().map(|entry| entry.heap_bytes).sum();
                 assert_eq!(

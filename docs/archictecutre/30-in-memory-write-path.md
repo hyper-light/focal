@@ -417,7 +417,7 @@ Stage 2 (doc 30 §6.1's per-family structures with compact keys) follows once St
 **The store (focal-memory).**
 - `RangeStore::plan_sparse` checks a candidate's changes against the base state its caller describes: the published state, or the state a pending predecessor makes (`SparseBase`). It reserves what publication may spend from the caller's funding source.
 - `publish_sparse` merges each page group where it stands when the store alone holds the page, and copies only pages a capture or a lease shares.
-- Groups are taken from the end of the batch, and a group's new leaves from the end of its page. Each new leaf is exactly its rows' size. An edited page grows by a quarter within its leaf and gives back what it holds past twice its rows.
+- Groups are taken from the end of the batch, and a group's new leaves from the end of its page. Every leaf holds exactly its rows, as a rebuilt one does: a new leaf is built to its size, and an edited page grows by its inserts and gives back what its deletions and the rows moved off it freed.
 - An unchanged isolated page (an oversized singleton, or a partition's page the changes only border) stays as it is, whoever holds it. So an oversized row is never moved or charged to a write that does not change it.
 - A page or directory node that an earlier write charged under another lane or pool moves its whole charge to the write that edits it, held to its rows.
 - Publication checks the candidate before it changes anything and returns it whole on refusal. Past that point a failure poisons the store, fail closed.
@@ -452,6 +452,19 @@ Preparation halved. Publication now carries the merge where the rows are; at abo
 |---|---|---|---|
 | An edit routes by position; the plan's heap is handed to the merge | Publish | 10.7 µs | 7.85 µs |
 | A follower's replay planned sparse, copies prepaid | Replay of a claim | 71.2 µs | 57.0 µs |
+
+**Memory a claim: the cluster A/B's finding (2026-10-13).** The CI comparison of the sparse store against land-16 ended both sides with the native allowance full (about 350 MB of pages on every node), the sparse side holding fewer claims: 35,284 against 28,180 committed at 1000/s, 27,316 against 19,772 at 4000/s. An edited page used to grow by a quarter and give back only what it held past twice its rows, and a split page kept its whole vector. The room past the rows was charged as rows are, so the allowance held fewer claims.
+
+The isolated harness, 5,000 authored claims, budget bytes a claim (pages and directory):
+
+| Leaf bytes | Rebuild (land-16) | Sparse, growth by a quarter | Sparse, exact |
+|---|---|---|---|
+| 4 KiB (Linux) | 7,272 B | 7,940 B: 19% of the slots empty | 7,298 B |
+| 16 KiB (macOS) | 7,162 B | 7,832 B | 7,163 B |
+
+- Every page now holds exactly its rows. The differential test asserts it for every page of both stores after every publication, and fails on the quarter rule at its second batch.
+- What is left at 4 KiB, 26 B a claim, is the cut rule's even split (808 more pages, of 13 rows where the greedy rule kept 26). With exact pages a half-full leaf costs a page header, not empty slots.
+- Exact growth reallocates an insert-bearing page at each merge: 12.9 growths a claim at 4 KiB, against 7.3. On macOS most grow in place: 7.4 moved a claim, against 7.0. If every growth moved, it would copy 23.5 KB a claim, about 2 µs, against the leader's ~1,200 µs of CPU a write in the cluster.
 
 Next, from the replay's profile (§6.3):
 - About a quarter of the replay re-validates the claims a record touches (`affected_claims`: each claim and its graph proofs).

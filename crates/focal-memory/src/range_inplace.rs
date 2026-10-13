@@ -17,8 +17,11 @@
 //! leaves from the end of its page: a page the store alone holds keeps its
 //! first leaf where it stands, the rows past it moved off its end into leaves
 //! of exactly their size; a page something else reads is copied leaf by leaf.
-//! Every new leaf is exactly its rows' size; an edited page grows by a quarter
-//! within its leaf and gives back what it holds past twice its rows.
+//! Every leaf holds exactly its rows, as a rebuilt one does: a new leaf is
+//! built to its size, and an edited page grows by its inserts and gives back
+//! what its deletions and the rows moved off it freed. Room held past a page's
+//! rows is memory the budget's allowance cannot give to rows: at 4 KiB pages,
+//! growth by a quarter left a fifth of the slots empty (doc 30 §9.1).
 //!
 //! Publication spends only what [`RangeStore::plan_sparse`] reserved: every
 //! page it grows, splits or copies, every directory node and root it makes,
@@ -709,9 +712,6 @@ struct Shape<K> {
     config: super::RangeConfig,
     partition: Option<fn(&K) -> u64>,
     cutter: layout::Cutter,
-    /// The most rows a leaf holds: the entry bound, and the byte bound's
-    /// payload over an entry's inline bytes.
-    room: usize,
 }
 
 impl<K: crate::RangeKey + Clone> Shape<K> {
@@ -719,15 +719,10 @@ impl<K: crate::RangeKey + Clone> Shape<K> {
         config: super::RangeConfig,
         partition: Option<fn(&K) -> u64>,
     ) -> Result<Self, MemoryError> {
-        let payload = config.page_bytes.saturating_sub(page_charge::<K, V>(0, 0)?);
-        let fit = payload.checked_div(size_of::<Entry<K, V>>()).ok_or(
-            MemoryError::InvalidConfiguration("a range entry must have a nonzero charge"),
-        )?;
         Ok(Self {
             config,
             partition,
             cutter: layout::Cutter::new::<K, V>(config)?,
-            room: config.page_entries.min(fit).max(1),
         })
     }
 
@@ -910,14 +905,10 @@ impl<K: crate::RangeKey + Clone> Shape<K> {
                 "an in-place merge left other than its leaf",
             ));
         }
-        // A page left with more than twice the room its rows take gives the
-        // rest back, keeping a quarter of them to grow into.
-        if page.entries.capacity() > len.saturating_mul(2) {
-            let keep = len
-                .saturating_add(len.checked_div(4).unwrap_or(0))
-                .min(self.room)
-                .max(len);
-            page.entries.shrink_to(keep);
+        // The page holds exactly its rows: what its deletions and the rows
+        // moved off it freed goes back.
+        if page.entries.capacity() > len {
+            page.entries.shrink_to_fit();
         }
         page.first = page
             .entries
@@ -931,7 +922,7 @@ impl<K: crate::RangeKey + Clone> Shape<K> {
     /// first, so the page never holds more rows than its leaf; up to
     /// [`IN_PLACE_INSERTS`] inserts each where it goes, more by one pass that
     /// moves the rows into a vector of the leaf's size. A page that grows
-    /// grows by a quarter, within its leaf. `heap` follows the rows.
+    /// grows by its inserts alone. `heap` follows the rows.
     fn merge_rest<V>(
         &self,
         page: &mut Page<K, V>,
@@ -962,19 +953,10 @@ impl<K: crate::RangeKey + Clone> Shape<K> {
             }
         }
         let wanted = checked_add(page.entries.len(), inserts)?;
-        let capacity = page.entries.capacity();
-        let grown = if wanted > capacity {
-            capacity
-                .saturating_add(capacity.checked_div(4).unwrap_or(0))
-                .min(self.room)
-                .max(wanted)
-        } else {
-            capacity
-        };
         if inserts <= IN_PLACE_INSERTS {
-            if grown > capacity {
+            if wanted > page.entries.capacity() {
                 page.entries
-                    .try_reserve_exact(grown.saturating_sub(page.entries.len()))
+                    .try_reserve_exact(wanted.saturating_sub(page.entries.len()))
                     .map_err(|_| MemoryError::AllocationFailed)?;
             }
             for change in changes.drain(floor..) {
@@ -1004,8 +986,8 @@ impl<K: crate::RangeKey + Clone> Shape<K> {
             return Ok(());
         }
         // The new vector is charged while the old one is moved into it.
-        let mut transient = funding.split_off(staging_bytes::<K, V>(grown)?)?;
-        let fresh = bounded_vec(grown)?;
+        let mut transient = funding.split_off(staging_bytes::<K, V>(wanted)?)?;
+        let fresh = bounded_vec(wanted)?;
         let mut old = std::mem::replace(&mut page.entries, fresh)
             .into_iter()
             .peekable();
@@ -1014,7 +996,7 @@ impl<K: crate::RangeKey + Clone> Shape<K> {
                 continue;
             };
             while let Some(row) = old.next_if(|row| row.key < entry.key) {
-                bounded_push(&mut page.entries, row, grown)?;
+                bounded_push(&mut page.entries, row, wanted)?;
             }
             if old.peek().is_some_and(|row| row.key == entry.key)
                 && let Some(gone) = old.next()
@@ -1024,10 +1006,10 @@ impl<K: crate::RangeKey + Clone> Shape<K> {
                     .ok_or(MemoryError::MissingKey)?;
             }
             *heap = checked_add(*heap, entry.heap_bytes)?;
-            bounded_push(&mut page.entries, entry, grown)?;
+            bounded_push(&mut page.entries, entry, wanted)?;
         }
         for row in old {
-            bounded_push(&mut page.entries, row, grown)?;
+            bounded_push(&mut page.entries, row, wanted)?;
         }
         funding.absorb(&mut transient)
     }
