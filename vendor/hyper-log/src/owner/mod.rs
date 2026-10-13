@@ -272,6 +272,10 @@ pub(crate) struct Owner<F> {
     watching: bool,
     /// Groups written through their handles: at most `max_groups`.
     claimed: HashSet<u128>,
+    /// Claims that wait for writes of their group admitted before them, each answered once the
+    /// writer has answered the last of those (`Owner::claim`). A waiting claim's group is claimed,
+    /// so there is one a group at most, within `max_groups`.
+    claims_waiting: HashMap<u128, Ticket>,
     /// For each claimed group whose handle had a write refused, the epoch that write was sent
     /// in: the group's writes sent in it or before are refused [`LogError::Behind`]
     /// (`Owner::behind`). At most one entry a claimed group, gone with the claim.
@@ -345,6 +349,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             closing: false,
             watching: false,
             claimed: HashSet::new(),
+            claims_waiting: HashMap::new(),
             refused: HashMap::new(),
             tally: Tally::new(),
             flushing_since: None,
@@ -466,12 +471,14 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// Whether anything the owner holds waits on the job out to come back: submissions for the
-    /// next frame, I/O waiting for the device, waiters for room the job will free, or a close.
+    /// next frame, I/O waiting for the device, waiters for room the job will free, a claim
+    /// waiting for its group's writes to be answered, or a close.
     fn waits_on_device(&self) -> bool {
         !self.intake.is_empty()
             || !self.schedule.held.is_empty()
             || !self.io.is_empty()
             || !self.waiting.is_empty()
+            || !self.claims_waiting.is_empty()
             || !self.fetches.is_empty()
             || !self.looks.is_empty()
             || self.closing
@@ -653,6 +660,9 @@ impl<F: BlockFile + 'static> Owner<F> {
         self.room.release(s.group, s.bytes, &mut admitted);
         self.let_in(&mut admitted);
         self.buffers.admitted = admitted;
+        if !self.claims_waiting.is_empty() {
+            self.claim_waited(s.group);
+        }
     }
 
     /// A handle's write was refused: every write its handle sent in the same epoch or before is
@@ -681,25 +691,62 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// Hands out `group`'s handle: its state as the log holds it, with the bytes of the entries
-    /// the log keeps in memory, which the handle keeps from here on.
+    /// the log keeps in memory, which the handle keeps from here on. A write of the group admitted
+    /// before the claim and not yet answered is waited for, the group claimed meanwhile so that
+    /// nothing else writes it: applied after the handle was handed out, it would leave the
+    /// handle's state other than the log's, and nothing would tell the handle. A handle let go
+    /// with its compaction on the device left the next handle reading below a start the log had
+    /// moved, refused `Compacted` (focal's in-process reopen, 2026-10-13).
     fn claim(&mut self, group: u128, mut ticket: Ticket) {
-        let answer = if self.state.damaged.contains_key(&group) {
-            Err(LogError::Damaged(
-                "the group's acknowledged records are damaged; it recovers from its peers",
-            ))
+        let refusal = if self.state.damaged.contains_key(&group) {
+            Some(damaged())
         } else if self.claimed.contains(&group) {
-            Err(LogError::Claimed(group))
+            Some(LogError::Claimed(group))
         } else if self.claimed.len() >= self.p.config.max_groups {
-            Err(LogError::TooManyGroups(self.p.config.max_groups))
+            Some(LogError::TooManyGroups(self.p.config.max_groups))
         } else {
-            self.claimed.insert(group);
-            let mirror = match self.state.groups.get_mut(&group) {
-                Some(g) => crate::group::Mirror::of(g),
-                None => crate::group::Mirror::none(),
-            };
-            Ok(Answer::Claimed(Box::new(mirror)))
+            None
         };
-        ticket.answer(answer);
+        if let Some(refusal) = refusal {
+            ticket.answer(Err(refusal));
+            return;
+        }
+        self.claimed.insert(group);
+        if self.room.holds(group) {
+            self.claims_waiting.insert(group, ticket);
+            return;
+        }
+        self.hand_out(group, ticket);
+    }
+
+    /// Answers the claim of `group` that waits for its group's writes once the writer has
+    /// answered the last of them. A write it waited for that damaged the group refuses it, as a
+    /// claim made now would be.
+    fn claim_waited(&mut self, group: u128) {
+        if self.room.holds(group) {
+            return;
+        }
+        let Some(mut ticket) = self.claims_waiting.remove(&group) else {
+            return;
+        };
+        if self.state.damaged.contains_key(&group) {
+            self.claimed.remove(&group);
+            ticket.answer(Err(damaged()));
+            return;
+        }
+        self.hand_out(group, ticket);
+    }
+
+    /// Answers a claim of `group` with the handle's state as the log holds it. Every write of the
+    /// group sent before it has been answered, so a refusal heard of those is no refusal of the
+    /// new handle's (`Owner::behind`): its writes are of epochs of its own, from the first.
+    fn hand_out(&mut self, group: u128, mut ticket: Ticket) {
+        self.refused.remove(&group);
+        let mirror = match self.state.groups.get_mut(&group) {
+            Some(g) => crate::group::Mirror::of(g),
+            None => crate::group::Mirror::none(),
+        };
+        ticket.answer(Ok(Answer::Claimed(Box::new(mirror))));
     }
 
     /// Fences the log: no submission is taken from here on, and every waiter hears it. What
@@ -716,6 +763,12 @@ impl<F: BlockFile + 'static> Owner<F> {
             if let Some(mut s) = self.waiting.remove(&seq) {
                 s.ticket.answer(Err(LogError::Fenced));
             }
+        }
+        // A claim that waited only for writes waiting for room is answered now; one that waits
+        // for admitted writes is answered as the writer answers them, `Fenced`.
+        let waited: Vec<u128> = self.claims_waiting.keys().copied().collect();
+        for group in waited {
+            self.claim_waited(group);
         }
     }
 
@@ -839,4 +892,9 @@ impl<F> Buffers<F> {
             lens: Vec::new(),
         }
     }
+}
+
+/// A damaged group's refusal of its claim: its peers hold what it acknowledged.
+fn damaged() -> LogError {
+    LogError::Damaged("the group's acknowledged records are damaged; it recovers from its peers")
 }
