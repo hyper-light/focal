@@ -200,7 +200,7 @@ fn failed_funded_report_returns_scratch_and_pages_without_losing_custody_or_exac
     let before = pool.stats();
     let parent = owner.stats();
     let sequence = core.native_sequence();
-    let failed = super::prepare::fail_copies_after(0, || {
+    let failed = super::prepare::fail_range_after(0, || {
         core.prepare_native_in(
             &pool,
             context(EVALUATOR, 100),

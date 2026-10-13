@@ -380,8 +380,9 @@ fn at_binding(
     seals: &SealIndex<'_>,
     visits: &mut usize,
 ) -> Result<EvaluationState, NativeError> {
+    // Every evaluation event a candidate records comes with its row.
     let final_state = *prepared
-        .evaluation(key)
+        .written_evaluation(key)
         .ok_or(ContractError::InvalidTarget)?;
     if final_state.binding() == binding {
         return Ok(final_state);
@@ -562,7 +563,7 @@ fn check_report(
     let attempt = previous.bind(definition)?.current_attempt()?;
     let result = next.last_result().ok_or(ContractError::MissingEvidence)?;
     let accepted = prepared
-        .result(NativeResultKey::of(result))
+        .written_result(NativeResultKey::of(result))
         .ok_or(ContractError::MissingEvidence)?;
     if previous.fence().is_some()
         || previous.state().is_terminal()
@@ -751,8 +752,11 @@ impl CompletionBook {
                 NativeEvaluationEventKind::Sealed => {
                     let seal = seals.token(key, event.before, current.target(), visits)?;
                     seal.check(&current, &next)?;
+                    // The claim as the candidate leaves it: sealed by an
+                    // earlier candidate, it is the source's row.
                     let claim = prepared
-                        .claim(key.claim)
+                        .written_claim(key.claim)
+                        .or_else(|| source.claim(key.claim))
                         .ok_or(ContractError::InvalidTarget)?;
                     if claim
                         .local_sealed_at()
@@ -804,7 +808,7 @@ impl CompletionBook {
             }
             current = next;
         }
-        if prepared.evaluation(key) != Some(&current)
+        if prepared.written_evaluation(key) != Some(&current)
             || (report.is_some_and(|report| report.key == key) && !reported)
             || (starting.is_some() && !begun)
         {

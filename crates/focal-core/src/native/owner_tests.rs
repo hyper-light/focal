@@ -434,7 +434,7 @@ fn failed_domain_admission_preserves_tail_clock_requests_and_ability_to_publish(
 }
 
 #[test]
-fn retained_neighbor_copy_failure_keeps_the_entire_existing_chain_and_refunds_candidate_memory() {
+fn range_failure_keeps_the_entire_existing_chain_and_refunds_candidate_memory() {
     let mut core = core();
     super::super::report_tests::publish(&mut core, 10, creation(1, 1, &[], None));
     super::super::report_tests::publish(&mut core, 20, creation(2, 2, &[], None));
@@ -442,9 +442,9 @@ fn retained_neighbor_copy_failure_keeps_the_entire_existing_chain_and_refunds_ca
     let mut owner = NativeOwner::new(core).unwrap();
     let (first, first_outcome) = stage(&mut owner, 30, creation(3, 3, &[], None));
     let before = budget.stats();
-    // The first retained neighbor this write copies fails: how many it copies depends on
-    // the page layout (the entry width), the rollback it must leave does not.
-    let failed = super::super::prepare::fail_copies_after(0, || {
+    // The write's range step fails, its last before it is a candidate: whatever it did
+    // before must leave no trace.
+    let failed = super::super::prepare::fail_range_after(0, || {
         owner.prepare(context(ISSUER, 900), creation(4, 4, &[], None), None)
     });
     assert!(matches!(

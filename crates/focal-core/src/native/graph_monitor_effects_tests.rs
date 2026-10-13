@@ -33,24 +33,12 @@ fn register(
             },
         },
     };
-    let time = View {
-        state: &core.state,
-        tail: None,
-    }
-    .meta()
-    .logical_time
-        + 1;
+    let time = View::committed(&core.state).meta().logical_time + 1;
     f::publish(core, time, input)
 }
 fn cancel(core: &mut Core<NativeState>, id: u128) -> NativeOutcome {
     let expected = core.native_claim(ClaimId::from_u128(id)).unwrap().binding();
-    let time = View {
-        state: &core.state,
-        tail: None,
-    }
-    .meta()
-    .logical_time
-        + 1;
+    let time = View::committed(&core.state).meta().logical_time + 1;
     f::publish(
         core,
         time,
@@ -102,10 +90,7 @@ fn actual_registration_settles_in_same_prefix_after_its_original_registered_even
     assert_eq!(events[1].before, Some(events[0].after));
     assert_eq!(events[1].after, events[0].after.next().unwrap());
     assert!(released(&core, 1, 10));
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     assert_eq!(
         crate::native::monitor_index::subscribers(&view, ClaimId::from_u128(2), core.limits)
             .count(),
@@ -190,10 +175,7 @@ fn multiple_same_owner_and_shared_chain_releases_have_exact_intermediate_revisio
     for (id, monitor) in [(1, 10), (1, 11), (3, 12)] {
         assert!(released(&core, id, monitor));
     }
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     assert_eq!(
         crate::native::monitor_index::subscribers(&view, ClaimId::from_u128(2), core.limits)
             .count(),
@@ -215,10 +197,7 @@ fn held_original_union_survives_disposition_shrink_and_quote_refusal_is_read_onl
         vec![WaitPredicate::Terminal(ClaimId::from_u128(2))],
     );
     let (budget, ids) = {
-        let view = View {
-            state: &core.state,
-            tail: None,
-        };
+        let view = View::committed(&core.state);
         let root = view.claim(ClaimId::from_u128(2)).unwrap();
         let plan = preflight(
             &view,
@@ -262,10 +241,7 @@ fn held_original_union_survives_disposition_shrink_and_quote_refusal_is_read_onl
         )
     };
     cancel(&mut core, 2);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let root = view.claim(ClaimId::from_u128(2)).unwrap();
     assert!(
         preflight(

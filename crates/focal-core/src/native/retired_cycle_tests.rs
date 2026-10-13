@@ -84,10 +84,9 @@ fn pending_adoption_exposes_retired_work_and_drop_preserves_original_prefix() {
     let before = rows.core.native_sequence();
     let statistics = rows.core.native_budget();
     let candidate = rows.prepare(ISSUER, adoption(&rows, 1511));
-    let view = View {
-        state: &rows.core.state,
-        tail: Some(&candidate),
-    };
+    let view = View::committed(&rows.core.state)
+        .with_own(&candidate)
+        .unwrap();
     let works =
         crate::native::projection_work::works(&view, ClaimId::from_u128(1), rows.core.limits)
             .map(|work| work.unwrap().reference())

@@ -59,10 +59,14 @@ impl NativeOwner {
         let Some(request) = header.request else {
             return Ok(());
         };
-        let view = View {
+        let view = View::over(
             state,
-            tail: self.pending.back().map(|row| &row.prepared),
-        };
+            Some(super::pending_index::Chain::indexed(
+                &self.index,
+                &self.pending,
+                u64::MAX,
+            )),
+        );
         if view.outcome(request.into()).is_some() {
             return Ok(());
         }
@@ -229,7 +233,11 @@ impl NativeOwner {
             context,
             request,
             input.intent_fingerprint(),
-            self.pending.iter().map(|row| &row.prepared),
+            Some(super::pending_index::Chain::indexed(
+                &self.index,
+                &self.pending,
+                u64::MAX,
+            )),
         )?;
         let view = match checked {
             prepare::RequestCheck::Existing { outcome, committed } => {

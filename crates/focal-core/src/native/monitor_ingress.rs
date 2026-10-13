@@ -7,16 +7,16 @@ impl Core<NativeState> {
         &'a self,
         input: NativeMonitorDeadlineInput,
         logical_time: u64,
-        mut pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'p>>,
     ) -> Result<Checked<'a>, NativeError> {
-        self.state
-            .rows
-            .validate_chain(pending.clone().take(1).map(|item| &item.fragments))?;
+        self.state.rows.validate_chain(
+            pending
+                .and_then(|chain| chain.head())
+                .map(|item| &item.fragments)
+                .into_iter(),
+        )?;
         let intent = intent::monitor_deadline_fingerprint(self.state.ledger, input)?;
-        let view = View {
-            state: &self.state,
-            tail: pending.next_back(),
-        };
+        let view = View::over(&self.state, pending);
         if let Some(outcome) = view.outcome(input.key().into()) {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {

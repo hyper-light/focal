@@ -96,10 +96,7 @@ impl Rows {
             .unwrap()
     }
     fn view(&self) -> View<'_> {
-        View {
-            state: &self.core.state,
-            tail: None,
-        }
+        View::committed(&self.core.state)
     }
     fn prepare(&mut self, actor: ParticipantId, command: NativeCommand) -> NativePrepared {
         self.serial += 1;
@@ -268,10 +265,9 @@ fn work_iteration_includes_pending_open_and_reverse_closed_cycles_at_authored_li
         },
     );
     let before = rows.core.state.budget.stats();
-    let view = View {
-        state: &rows.core.state,
-        tail: Some(&pending),
-    };
+    let view = View::committed(&rows.core.state)
+        .with_own(&pending)
+        .unwrap();
     let found: Vec<_> =
         super::super::projection_work::works(&view, ClaimId::from_u128(1), rows.core.limits)
             .map(|row| row.unwrap().reference().id)

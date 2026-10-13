@@ -52,25 +52,25 @@ pub(super) fn as_response_record(row: Option<&Row>) -> Option<&NativeResponseRec
 }
 
 impl NativePrepared {
-    pub fn missing_result(&self, key: NativeResultKey) -> Option<&NativeMissingResult> {
+    pub fn written_missing_result(&self, key: NativeResultKey) -> Option<&NativeMissingResult> {
         as_missing(self.fragments.get(&Key::MissingResult(key)))
     }
-    pub fn response_record(&self, id: TestamentId) -> Option<&NativeResponseRecord> {
+    pub fn written_response_record(&self, id: TestamentId) -> Option<&NativeResponseRecord> {
         as_response_record(self.fragments.get(&Key::Response(id)))
     }
-    pub fn registrations(&self, id: ClaimId) -> Option<&RegistrationSet> {
+    pub fn written_registrations(&self, id: ClaimId) -> Option<&RegistrationSet> {
         as_registrations(self.fragments.get(&Key::Claim(id)))
     }
-    pub fn delivery_result(&self, key: NativeResultKey) -> Option<&NativeDeliveryResult> {
+    pub fn written_delivery_result(&self, key: NativeResultKey) -> Option<&NativeDeliveryResult> {
         as_delivery(self.fragments.get(&Key::DeliveryResult(key)))
     }
-    pub fn work(&self, id: ArtifactId) -> Option<&NativeWork> {
+    pub fn written_work(&self, id: ArtifactId) -> Option<&NativeWork> {
         as_work(self.fragments.get(&Key::Work(id)))
     }
-    pub fn diagnostic(&self, id: ArtifactId) -> Option<&NativeDiagnostic> {
+    pub fn written_diagnostic(&self, id: ArtifactId) -> Option<&NativeDiagnostic> {
         as_diagnostic(self.fragments.get(&Key::Diagnostic(id)))
     }
-    pub fn response(&self, id: TestamentId) -> Option<&Response> {
+    pub fn written_response(&self, id: TestamentId) -> Option<&Response> {
         as_response(self.fragments.get(&Key::Response(id)))
     }
 }

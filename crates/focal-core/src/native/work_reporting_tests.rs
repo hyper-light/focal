@@ -315,7 +315,7 @@ fn reconstructed_work_owner_funds_remaining_attempt_after_recorded_retryable_err
     };
     let Checked::Fresh(fresh) = fixture
         .core
-        .check_native_chain(f::context(EVALUATOR, 100), input, std::iter::empty())
+        .check_native_chain(f::context(EVALUATOR, 100), input, None)
         .unwrap()
     else {
         panic!("fresh recorded Begin")
@@ -350,7 +350,7 @@ fn reconstructed_work_owner_funds_remaining_attempt_after_recorded_retryable_err
     };
     let Checked::Fresh(fresh) = fixture
         .core
-        .check_native_chain(f::context(EVALUATOR, 100), input, std::iter::empty())
+        .check_native_chain(f::context(EVALUATOR, 100), input, None)
         .unwrap()
     else {
         panic!("fresh recorded Error")

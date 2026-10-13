@@ -463,8 +463,20 @@ fn completed_core() -> (Core<NativeState>, fixture::Custody, Vec<NativeAccepted>
         );
         let evidence = fixture::verified(&mut custody, &input);
         let prepared = fixture::report(&core, input, &[], &evidence);
-        let result = prepared.evaluation(index).unwrap().last_result().unwrap();
-        history.push(*prepared.result(NativeResultKey::of(result)).unwrap());
+        let result = core
+            .native_chain(&[&prepared])
+            .unwrap()
+            .evaluation(index)
+            .unwrap()
+            .last_result()
+            .unwrap();
+        history.push(
+            *core
+                .native_chain(&[&prepared])
+                .unwrap()
+                .result(NativeResultKey::of(result))
+                .unwrap(),
+        );
         core.publish_native(prepared).unwrap();
     }
     (core, custody, history)

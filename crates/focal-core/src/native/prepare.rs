@@ -23,7 +23,7 @@ impl View<'_> {
     /// Tie a candidate to this exact immutable source root. The comparison
     /// borrows existing handles; it does not copy roots or reserve resources.
     pub(super) fn check_successor(&self, prepared: &NativePrepared) -> Result<(), NativeError> {
-        match self.tail {
+        match self.tail() {
             Some(previous) => previous.fragments.validate_successor(&prepared.fragments)?,
             None => self
                 .state
@@ -225,7 +225,7 @@ std::thread_local! {
     static COPIES_REMAINING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 #[cfg(test)]
-fn copy_failure() -> Result<(), MemoryError> {
+pub(super) fn copy_failure() -> Result<(), MemoryError> {
     COPIES_REMAINING.with(|remaining| match remaining.get() {
         Some(0) => Err(MemoryError::AllocationFailed),
         Some(count) => {
@@ -235,8 +235,12 @@ fn copy_failure() -> Result<(), MemoryError> {
         None => Ok(()),
     })
 }
+/// Fails the `count + 1`th range step of `action`: a leader's write plans its
+/// range once, its last step before it is a candidate (`NativeRanges::plan_sparse`),
+/// and a built range copies each retained row (`copy`). What a write did before
+/// the failing step must leave no trace.
 #[cfg(test)]
-pub(super) fn fail_copies_after<T>(count: usize, action: impl FnOnce() -> T) -> T {
+pub(super) fn fail_range_after<T>(count: usize, action: impl FnOnce() -> T) -> T {
     struct Restore(Option<usize>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -474,7 +478,8 @@ impl Core<NativeState> {
         pending: &[&NativePrepared],
         evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
     ) -> Result<NativePreparation, NativeError> {
-        self.prepare_native_chain(source, context, input, pending.iter().copied(), evidence)
+        let chain = pending_index::Chain::listed(pending)?;
+        self.prepare_native_chain(source, context, input, chain, evidence)
     }
 
     /// The managed owner supplies its borrowed queue iterator directly. No
@@ -484,7 +489,7 @@ impl Core<NativeState> {
         source: &MemoryBudget,
         context: NativeContext,
         input: NativeInput,
-        pending: impl DoubleEndedIterator<Item = &'a NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'a>>,
         evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
     ) -> Result<NativePreparation, NativeError> {
         if !source.is_within(&self.state.budget) {
@@ -510,7 +515,7 @@ impl Core<NativeState> {
         &'a self,
         context: NativeContext,
         input: NativeInput,
-        pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'p>>,
     ) -> Result<Checked<'a>, NativeError> {
         context.principal.require_actor(input.request.principal)?;
         if input.request.principal.is_zero()
@@ -598,16 +603,16 @@ impl Core<NativeState> {
         &'a self,
         input: NativeDeadlineInput,
         logical_time: u64,
-        mut pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'p>>,
     ) -> Result<Checked<'a>, NativeError> {
-        self.state
-            .rows
-            .validate_chain(pending.clone().take(1).map(|item| &item.fragments))?;
+        self.state.rows.validate_chain(
+            pending
+                .and_then(|chain| chain.head())
+                .map(|item| &item.fragments)
+                .into_iter(),
+        )?;
         let intent = intent::deadline_fingerprint(self.state.ledger, input)?;
-        let view = View {
-            state: &self.state,
-            tail: pending.next_back(),
-        };
+        let view = View::over(&self.state, pending);
         if let Some(outcome) = view.outcome(input.key().into()) {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {
@@ -682,19 +687,19 @@ impl Core<NativeState> {
         context: NativeContext,
         request: RequestKey,
         intent: ContentHash,
-        mut pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'p>>,
     ) -> Result<RequestCheck<'a>, NativeError> {
-        self.state
-            .rows
-            .validate_chain(pending.clone().take(1).map(|item| &item.fragments))?;
+        self.state.rows.validate_chain(
+            pending
+                .and_then(|chain| chain.head())
+                .map(|item| &item.fragments)
+                .into_iter(),
+        )?;
         context.principal.require_actor(request.principal)?;
         if request.principal.is_zero() || request.id.is_zero() || request.epoch.0 == 0 {
             return Err(ContractError::InvalidTarget.into());
         }
-        let view = View {
-            state: &self.state,
-            tail: pending.next_back(),
-        };
+        let view = View::over(&self.state, pending);
         if let Some(outcome) = view.outcome(request.into()) {
             return if outcome.intent == intent {
                 Ok(RequestCheck::Existing {
@@ -750,16 +755,16 @@ impl Core<NativeState> {
         &'a self,
         input: NativeClaimDeadlineInput,
         logical_time: u64,
-        mut pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'p>>,
     ) -> Result<Checked<'a>, NativeError> {
-        self.state
-            .rows
-            .validate_chain(pending.clone().take(1).map(|item| &item.fragments))?;
+        self.state.rows.validate_chain(
+            pending
+                .and_then(|chain| chain.head())
+                .map(|item| &item.fragments)
+                .into_iter(),
+        )?;
         let intent = intent::claim_deadline_fingerprint(self.state.ledger, input)?;
-        let view = View {
-            state: &self.state,
-            tail: pending.next_back(),
-        };
+        let view = View::over(&self.state, pending);
         if let Some(outcome) = view.outcome(input.key().into()) {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {
@@ -1151,10 +1156,7 @@ impl<'a> Fresh<'a> {
     /// Borrow the same immutable effective prefix across construction. This
     /// copies only the two references, never a root, row, grant or authority.
     pub(super) fn publication_source(&self) -> View<'a> {
-        View {
-            state: self.view.state,
-            tail: self.view.tail,
-        }
+        self.view
     }
     pub(super) fn lane(&self) -> BudgetLane {
         self.lane
@@ -1622,57 +1624,65 @@ impl<'a> Fresh<'a> {
         if final_meta.events != add(view.meta().events, events)? {
             return Err(ContractError::InvalidManifest.into());
         }
-        let range_plan = match view.tail {
-            Some(tail) => view.state.rows.plan_after(
-                source,
-                &tail.fragments,
-                sequence.0,
-                changes,
-                lane,
-                usize::MAX,
-            )?,
-            None => view
-                .state
-                .rows
-                .plan_batch(source, sequence.0, changes, lane, usize::MAX)?,
-        };
+        // The candidate's changes alone, each checked against the state it is
+        // prepared on, its publication's spending reserved (doc 30 §9): no
+        // page is built until it publishes, where the rows are.
+        let fragments = view.state.rows.plan_sparse(
+            source,
+            view.tail().map(|tail| &tail.fragments),
+            sequence.0,
+            changes,
+            lane,
+            |key| view.get_entry(key).map(|entry| entry.heap_bytes),
+        )?;
         if let Some(envelope) = envelope {
-            range_plan.check_envelope(&envelope)?;
+            fragments.check_envelope(&envelope)?;
         }
         if let Some(completion) = completion
             && operation != NativeOperation::BeginWork
         {
-            range_plan.check_envelope(&completion.report_storage(completion_use)?)?;
+            fragments.check_envelope(&completion.report_storage(completion_use)?)?;
         }
         if let Some(envelope) = deadline_envelope {
-            range_plan.check_envelope(&envelope)?;
+            fragments.check_envelope(&envelope)?;
         }
         if let Some(respondent) = respondent {
-            range_plan.check_envelope(&respondent.storage(operation)?)?;
+            fragments.check_envelope(&respondent.storage(operation)?)?;
         }
         // The actual shape is now fixed. Charging the maximum shape here would
         // exceed a regular report's smaller retained promise (e.g. 9 vs 11 rows).
-        let mutation_bytes = super::mutation::bytes(range_plan.changes_len())?;
+        let changed = fragments.changes().count();
+        let mutation_bytes = super::mutation::bytes(changed)?;
         within(mutation_bytes, construction.mutation_bytes()?)?;
         let writes = super::mutation::WriteSet::capture(
             view.state.profile,
-            range_plan.changes_len(),
-            range_plan.changes(),
+            changed,
+            fragments.changes().map(|(_, _, change)| change),
             construction.mutation_bytes()?,
             source
                 .reserve(BudgetKind::Pending, lane, mutation_bytes)?
                 .commit(),
         )?;
-        let encoded_added = super::encoded_added(range_plan.changes(), view.state.ledger)?;
-        // What the rows this mutation replaces or deletes took in a checkpoint, summed as the
-        // build takes each out of its page: published, the mutation takes them away without
-        // looking each up again from the range's root (publication's lookups were a quarter of
-        // the leader's owner's range lookups on 1-CPU CI nodes, profile run 38287539180).
+        let encoded_added = super::encoded_added(
+            fragments.changes().map(|(_, _, change)| change),
+            view.state.ledger,
+        )?;
+        // What the rows this mutation replaces or deletes take in a checkpoint, as the state it
+        // is prepared on holds them, which is the root it publishes onto: published, it takes
+        // them away without looking each up again.
         let mut removed = super::EncodedRemoved::new(view.state.ledger);
-        let fragments =
-            range_plan.build_in_replacing(source, copy, |key, row| removed.count(key, row))?;
+        for (_, _, change) in fragments.changes() {
+            if let Some(old) = view.get_entry(change.key()) {
+                removed.count(change.key(), &old.value)?;
+            }
+        }
         let encoded_removed = removed.bytes();
         writes.check(&fragments)?;
+        // Its changes' place in an owner's pending index, funded as the rest of it is.
+        let index = super::pending_index::entry_charge()
+            .checked_mul(changed)
+            .ok_or(NativeError::Capacity("pending index charge"))?;
+        let index = source.reserve(BudgetKind::Pending, lane, index)?.commit();
         BuiltNative::new(
             NativePrepared {
                 fragments,
@@ -1680,6 +1690,7 @@ impl<'a> Fresh<'a> {
                 writes,
                 encoded_added,
                 encoded_removed,
+                _index: Some(index),
             },
             seals,
             allocation,

@@ -292,11 +292,10 @@ pub(super) fn attach(
             return Err(error);
         }
     };
-    let view = View {
-        state: source.state,
-        tail: Some(&prepared),
-    };
-    let install = match install_new(&view, &prepared, book, limits, schemas) {
+    let install = match source
+        .with_own(&prepared)
+        .and_then(|view| install_new(&view, &prepared, book, limits, schemas))
+    {
         Ok(install) => install,
         Err(error) => {
             drop(prepared);

@@ -1,12 +1,12 @@
 use super::*;
 
 impl NativePrepared {
-    pub fn result_testament(&self, id: TestamentId) -> Option<&NativeResultTestament> {
+    pub fn written_result_testament(&self, id: TestamentId) -> Option<&NativeResultTestament> {
         as_result_testament(self.fragments.get(&Key::ResultTestament(id)))
     }
-    pub fn claim_result_testament(&self, claim: ClaimId) -> Option<&NativeResultTestament> {
+    pub fn written_claim_result_testament(&self, claim: ClaimId) -> Option<&NativeResultTestament> {
         let id = index(self.fragments.get(&Key::ClaimResultTestament(claim)))?;
-        self.result_testament(id)
+        self.written_result_testament(id)
             .filter(|row| row.testament().claim() == claim)
     }
 }

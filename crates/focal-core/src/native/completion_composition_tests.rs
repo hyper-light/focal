@@ -54,10 +54,7 @@ fn begin_and_mixed_update_rollback_restore_the_exact_pre_begin_pool_and_index() 
     let request = input(&core, None, 951, 1, VerdictValue::Fail);
     let verified = fixture::verified(&mut custody, &request);
     let (prepared, report, seals) = with_seals(&core, None, request, &verified, &[2, 3]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let update = book
         .apply_prepared(
             &view,
@@ -113,10 +110,7 @@ fn composed_head_commit_preserves_the_new_grants_younger_pending_report() {
     let request = input(&core, None, 952, 1, VerdictValue::Fail);
     let verified = fixture::verified(&mut custody, &request);
     let (prepared, report, seals) = with_seals(&core, None, request, &verified, &[2, 3]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let update = book
         .apply_prepared(
             &view,
@@ -136,10 +130,7 @@ fn composed_head_commit_preserves_the_new_grants_younger_pending_report() {
     let request = input(&core, Some(&prepared), 953, 2, VerdictValue::Error);
     let verified = fixture::verified(&mut custody, &request);
     let later = fixture::report(&core, request, &[&prepared], &verified);
-    let view = View {
-        state: &core.state,
-        tail: Some(&prepared),
-    };
+    let view = View::committed(&core.state).with_own(&prepared).unwrap();
     let later_journal = book
         .apply_prepared(
             &view,

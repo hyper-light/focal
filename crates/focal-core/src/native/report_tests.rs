@@ -421,6 +421,8 @@ fn report_input(
         },
     }
 }
+/// A report of `index` against the state `tail` leaves, `tail` prepared on
+/// the published rows (or none: the published rows themselves).
 pub(super) fn report_for(
     core: &Core<NativeState>,
     tail: Option<&NativePrepared>,
@@ -429,24 +431,22 @@ pub(super) fn report_for(
     value: VerdictValue,
     artifact: ArtifactDescriptor,
 ) -> NativeInput {
-    let claim = tail
-        .map_or_else(
-            || core.native_claim(key(index).claim),
-            |tail| tail.claim(key(index).claim),
-        )
-        .unwrap();
-    let state = tail
-        .map_or_else(
-            || core.native_evaluation(key(index)),
-            |tail| tail.evaluation(key(index)),
-        )
-        .unwrap();
-    let definition = tail
-        .map_or_else(
-            || core.native_definition(key(index).validation),
-            |tail| tail.definition(key(index).validation),
-        )
-        .unwrap();
+    let chain: Vec<&NativePrepared> = tail.into_iter().collect();
+    report_for_chain(core, &chain, id, index, value, artifact)
+}
+/// A report of `index` against the state the last of `chain` leaves.
+pub(super) fn report_for_chain(
+    core: &Core<NativeState>,
+    chain: &[&NativePrepared],
+    id: u128,
+    index: u32,
+    value: VerdictValue,
+    artifact: ArtifactDescriptor,
+) -> NativeInput {
+    let view = core.native_chain(chain).unwrap();
+    let claim = view.claim(key(index).claim).unwrap();
+    let state = view.evaluation(key(index)).unwrap();
+    let definition = view.definition(key(index).validation).unwrap();
     report_input(
         id,
         claim.binding(),
@@ -572,15 +572,31 @@ fn complete_pending_creation_begin_and_report_publish_atomically_with_real_custo
     ));
     let posted =
         prepared(core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[&created]));
-    let claim = posted.claim(key(1).claim).unwrap().binding();
-    let begun = prepared(core.prepare_native(
-        context(EVALUATOR, 30),
-        begin(3, claim, 1, posted.evaluation(key(1)).unwrap().binding()),
-        &[&created, &posted],
-    ));
-    let input = report_for(
+    let claim = core
+        .native_chain(&[&created, &posted])
+        .unwrap()
+        .claim(key(1).claim)
+        .unwrap()
+        .binding();
+    let begun = prepared(
+        core.prepare_native(
+            context(EVALUATOR, 30),
+            begin(
+                3,
+                claim,
+                1,
+                core.native_chain(&[&created, &posted])
+                    .unwrap()
+                    .evaluation(key(1))
+                    .unwrap()
+                    .binding(),
+            ),
+            &[&created, &posted],
+        ),
+    );
+    let input = report_for_chain(
         &core,
-        Some(&begun),
+        &[&created, &posted, &begun],
         4,
         1,
         VerdictValue::Pass,
@@ -588,25 +604,55 @@ fn complete_pending_creation_begin_and_report_publish_atomically_with_real_custo
     );
     let token = verified(&mut custody, &input);
     let next = report(&core, input, &[&created, &posted, &begun], &token);
-    let accepted = next.evaluation(key(1)).unwrap().last_result().unwrap();
+    let accepted = core
+        .native_chain(&[&created, &posted, &begun, &next])
+        .unwrap()
+        .evaluation(key(1))
+        .unwrap()
+        .last_result()
+        .unwrap();
     let result_key = NativeResultKey::of(accepted);
-    assert_eq!(next.result(result_key).unwrap().result(), accepted);
     assert_eq!(
-        next.artifact(ArtifactId::from_u128(401))
+        core.native_chain(&[&created, &posted, &begun, &next])
+            .unwrap()
+            .result(result_key)
+            .unwrap()
+            .result(),
+        accepted
+    );
+    assert_eq!(
+        core.native_chain(&[&created, &posted, &begun, &next])
+            .unwrap()
+            .artifact(ArtifactId::from_u128(401))
             .unwrap()
             .descriptor()
             .content_hash(),
         accepted.evidence().unwrap().hash
     );
     assert_eq!(
-        next.evaluation(key(1)).unwrap().state(),
+        core.native_chain(&[&created, &posted, &begun, &next])
+            .unwrap()
+            .evaluation(key(1))
+            .unwrap()
+            .state(),
         validation::State::Validated
     );
     assert_eq!(
-        next.claim(key(1).claim).unwrap().status(),
+        core.native_chain(&[&created, &posted, &begun, &next])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .status(),
         ClaimStatus::Posted
     );
-    assert_eq!(next.claim(key(1).claim).unwrap().response_count(), 0);
+    assert_eq!(
+        core.native_chain(&[&created, &posted, &begun, &next])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .response_count(),
+        0
+    );
     assert_eq!(core.native_sequence(), SessionSeq(0));
     assert!(core.native_evaluation(key(1)).is_none());
     assert!(core.native_claim(key(1).claim).is_none());
@@ -616,7 +662,7 @@ fn complete_pending_creation_begin_and_report_publish_atomically_with_real_custo
     for candidate in [created, posted, begun] {
         core.publish_native(candidate).unwrap();
     }
-    let outcome = core.publish_native(refused.prepared).unwrap();
+    let outcome = core.publish_native(refused.prepared.unwrap()).unwrap();
     assert_eq!(outcome.sequence, SessionSeq(4));
     assert_eq!(
         core.native_evaluation(key(1)).unwrap().last_result(),
@@ -678,17 +724,41 @@ fn first_failure_and_original_evidence_survive_later_pending_sibling_report() {
     );
     let token = verified(&mut custody, &input);
     let first = report(&core, input, &[], &token);
-    let original = first.claim(key(1).claim).unwrap().terminal_cut().unwrap();
+    let original = core
+        .native_chain(&[&first])
+        .unwrap()
+        .claim(key(1).claim)
+        .unwrap()
+        .terminal_cut()
+        .unwrap();
     assert_eq!(first.outcome().evaluations, 2);
-    assert!(first.evaluation(key(1)).unwrap().sealed().is_some());
-    assert!(first.evaluation(key(1)).unwrap().last_result().is_none());
+    assert!(
+        core.native_chain(&[&first])
+            .unwrap()
+            .evaluation(key(1))
+            .unwrap()
+            .sealed()
+            .is_some()
+    );
+    assert!(
+        core.native_chain(&[&first])
+            .unwrap()
+            .evaluation(key(1))
+            .unwrap()
+            .last_result()
+            .is_none()
+    );
     let ClaimTerminalCut::Required(cut) = original else {
         panic!("expected required cause")
     };
     assert_eq!(cut.cause().kind(), aggregation::BlockingKind::Incomplete);
     assert_eq!(cut.sequence(), first.outcome().sequence);
     assert_eq!(
-        first.claim(key(1).claim).unwrap().status(),
+        core.native_chain(&[&first])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .status(),
         ClaimStatus::PostFailed
     );
     let input = report_for(
@@ -701,22 +771,50 @@ fn first_failure_and_original_evidence_survive_later_pending_sibling_report() {
     );
     let token = verified(&mut custody, &input);
     let second = report(&core, input, &[&first], &token);
-    let result1 = first.evaluation(key(2)).unwrap().last_result().unwrap();
-    let result2 = second.evaluation(key(1)).unwrap().last_result().unwrap();
+    let result1 = core
+        .native_chain(&[&first])
+        .unwrap()
+        .evaluation(key(2))
+        .unwrap()
+        .last_result()
+        .unwrap();
+    let result2 = core
+        .native_chain(&[&first, &second])
+        .unwrap()
+        .evaluation(key(1))
+        .unwrap()
+        .last_result()
+        .unwrap();
     assert_eq!(
-        second.claim(key(1).claim).unwrap().terminal_cut(),
+        core.native_chain(&[&first, &second])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .terminal_cut(),
         Some(original)
     );
     assert_eq!(
-        second.claim(key(1).claim).unwrap().local_sealed_at(),
+        core.native_chain(&[&first, &second])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .local_sealed_at(),
         Some(cut.sequence())
     );
     assert_eq!(
-        second.evaluation(key(1)).unwrap().state(),
+        core.native_chain(&[&first, &second])
+            .unwrap()
+            .evaluation(key(1))
+            .unwrap()
+            .state(),
         validation::State::ValidationFailed
     );
     assert_eq!(
-        second.evaluation(key(2)).unwrap().state(),
+        core.native_chain(&[&first, &second])
+            .unwrap()
+            .evaluation(key(2))
+            .unwrap()
+            .state(),
         validation::State::ValidationIncomplete
     );
     let first_outcome = core.publish_native(first).unwrap();
@@ -761,7 +859,13 @@ fn observe_failure_is_retained_without_blocking_required_pass_or_creating_testim
         );
         let token = verified(&mut custody, &input);
         let next = report(&core, input, &[], &token);
-        let result = next.evaluation(key(index)).unwrap().last_result().unwrap();
+        let result = core
+            .native_chain(&[&next])
+            .unwrap()
+            .evaluation(key(index))
+            .unwrap()
+            .last_result()
+            .unwrap();
         let outcome = core.publish_native(next).unwrap();
         check_stored(&core, outcome, result);
     }
@@ -863,7 +967,11 @@ fn error_retry_and_quality_followup_keep_each_real_attempt_and_no_early_acceptan
         );
         let token = verified(&mut custody, &input);
         let next = report(&core, input, &[], &token);
-        let state = next.evaluation(key(1)).unwrap();
+        let state = core
+            .native_chain(&[&next])
+            .unwrap()
+            .evaluation(key(1))
+            .unwrap();
         assert_eq!(state.state(), resulting);
         let result = state.last_result().unwrap();
         assert_eq!(
@@ -1145,7 +1253,11 @@ fn pending_control_fences_reports_while_amends_preserves_live_authority() {
         if correction == Some(CorrectionKind::Amends) {
             let next = prepared(result);
             assert_eq!(
-                next.evaluation(key(1)).unwrap().state(),
+                core.native_chain(&[&control, &next])
+                    .unwrap()
+                    .evaluation(key(1))
+                    .unwrap()
+                    .state(),
                 validation::State::Validated
             );
             core.publish_native(control).unwrap();
@@ -1228,10 +1340,19 @@ fn artifact_inputs_and_inherited_visibility_resolve_the_effective_pending_owner(
         );
         assert_eq!(core.native_budget(), before);
         assert_eq!(
-            first.evaluation(key(1)).unwrap().state(),
+            core.native_chain(&[&first])
+                .unwrap()
+                .evaluation(key(1))
+                .unwrap()
+                .state(),
             validation::State::ValidatingQualityBar
         );
-        assert!(first.artifact(ArtifactId::from_u128(522)).is_none());
+        assert!(
+            core.native_chain(&[&first])
+                .unwrap()
+                .artifact(ArtifactId::from_u128(522))
+                .is_none()
+        );
     }
     let mut spec = artifact_spec(522, QUALITY, VerdictValue::Pass);
     spec.inputs = &source;
@@ -1282,7 +1403,13 @@ fn original_result_is_immutable_and_artifact_address_collision_never_overwrites_
     let mut replacement = copy_report(&input);
     let token = verified(&mut custody, &input);
     let next = report(&core, input, &[], &token);
-    let original = next.evaluation(key(1)).unwrap().last_result().unwrap();
+    let original = core
+        .native_chain(&[&next])
+        .unwrap()
+        .evaluation(key(1))
+        .unwrap()
+        .last_result()
+        .unwrap();
     let outcome = core.publish_native(next).unwrap();
     replacement.request.id = RequestId::from_u128(132);
     let NativeCommand::ReportAdmission {
@@ -1337,7 +1464,7 @@ fn original_result_is_immutable_and_artifact_address_collision_never_overwrites_
 }
 
 #[test]
-fn reports_use_completion_reserve_publish_without_capacity_and_rollback_failed_neighbor_copy() {
+fn reports_use_completion_reserve_publish_without_capacity_and_rollback_a_failed_range_step() {
     let mut core = running(&[(ValidationMode::Required, false)]);
     let mut custody = Custody::new();
     let budget = core.state.budget.clone();
@@ -1351,7 +1478,7 @@ fn reports_use_completion_reserve_publish_without_capacity_and_rollback_failed_n
     );
     let token = verified(&mut custody, &input);
     let before = budget.stats();
-    let failed = super::prepare::fail_copies_after(0, || {
+    let failed = super::prepare::fail_range_after(0, || {
         core.prepare_native_evidenced(
             context(EVALUATOR, 100),
             copy_report(&input),
@@ -1377,7 +1504,13 @@ fn reports_use_completion_reserve_publish_without_capacity_and_rollback_failed_n
         )
         .unwrap();
     let next = report(&core, input, &[], &token);
-    let result = next.evaluation(key(1)).unwrap().last_result().unwrap();
+    let result = core
+        .native_chain(&[&next])
+        .unwrap()
+        .evaluation(key(1))
+        .unwrap()
+        .last_result()
+        .unwrap();
     let now = budget.stats();
     let rest = budget
         .reserve(
@@ -1482,7 +1615,13 @@ fn content_pointer_report_verifies_actual_reopened_payload_before_owner_admissio
     let token = verified(&mut custody, &input);
     assert_eq!(token.custody().payload(), pointer);
     let next = report(&core, input, &[], &token);
-    let result = next.evaluation(key(1)).unwrap().last_result().unwrap();
+    let result = core
+        .native_chain(&[&next])
+        .unwrap()
+        .evaluation(key(1))
+        .unwrap()
+        .last_result()
+        .unwrap();
     let outcome = core.publish_native(next).unwrap();
     check_stored(&core, outcome, result);
     assert_eq!(

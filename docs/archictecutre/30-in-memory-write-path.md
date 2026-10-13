@@ -406,6 +406,47 @@ holds a whole new root and the base root by `Arc`.
 
 Stage 2 (doc 30 §6.1's per-family structures with compact keys) follows once Stage 1 is measured.
 
+
+### 9.1 As built (2026-10-13)
+
+**What the work found first: leaves filled to 5%.** The leaf rule packed each leaf full and put the rest in a new leaf after it. When an insert landed in a full leaf, its last row went alone into a new leaf that covered only the gap after it, while the full leaf took the next insert and split again.
+- Measured on 120,000 random inserts: 6 rows a leaf of 128; at 100,000 rows, 16,413 pages and 5.07 MB.
+- The cut rule (`layout::Cutter`, every builder's) keeps the least number of leaves, the greedy count that every quote already counts. Rows inserted among a page's rows are cut evenly by bytes: B-tree halving, which fills to ln 2 (Yao 1978). Appended, prepended and fresh runs are packed, as PostgreSQL's rightmost split and InnoDB's sequential split point do.
+- Result: 85–90 rows a leaf, 1,112 pages and 2.58 MB at 100,000 rows. A rebuild publication of 18 random keys dropped from 31.7 µs to 24 µs.
+
+**The store (focal-memory).**
+- `RangeStore::plan_sparse` checks a candidate's changes against the base state its caller describes: the published state, or the state a pending predecessor makes (`SparseBase`). It reserves what publication may spend from the caller's funding source.
+- `publish_sparse` merges each page group where it stands when the store alone holds the page, and copies only pages a capture or a lease shares.
+- Groups are taken from the end of the batch, and a group's new leaves from the end of its page. Each new leaf is exactly its rows' size. An edited page grows by a quarter within its leaf and gives back what it holds past twice its rows.
+- An unchanged isolated page (an oversized singleton, or a partition's page the changes only border) stays as it is, whoever holds it. So an oversized row is never moved or charged to a write that does not change it.
+- A page or directory node that an earlier write charged under another lane or pool moves its whole charge to the write that edits it, held to its rows.
+- Publication checks the candidate before it changes anything and returns it whole on refusal. Past that point a failure poisons the store, fail closed.
+
+**The quotes.** A sparse candidate reserves:
+- per change: three leaf headers, a leaf's payload (the copy a capture can force), an entry, and its incoming heap;
+- directory nodes for the tree it can see at publication: its base's pages plus two a change for it and every predecessor (`SparseRange::leaves`, chained). Its page's path is owned (a node a level). Up to two pages are inserted (a path copy and its splits) and one removed (four a level).
+
+The occupancy-independent envelope bound cost 1 MB a candidate in a 128-deep burst; this bound costs about 230 KB. The envelope states the members' staging summed, since each candidate holds its own from plan to publication.
+
+**The engine (focal-core).**
+- A leader's candidate is a sparse `Fragments`; a follower's replay still builds (next step: its copy work prepaid at plan).
+- The owner keeps a pending index: each changed key's newest pending version (serial, member, change), charged per change with the candidate.
+- A `View` reads the candidate being prepared, then the chain as of a serial, then the committed rows; range scans merge the three without allocating.
+- A caller's chain (`Core`'s chained API, `Core::native_chain`) is held inline, at most 16 candidates.
+- Chain identity is the store's state generation. Every published state has a unique identity, a candidate names the one it was planned on, and a fork's child is refused at chain check and at publication.
+- `NativePrepared`'s getters became `written_*`, the rows a candidate writes. Every caller was checked: production reads its own writes, except a seal's claim, which falls back to the source.
+
+**Measured.** The owner's CPU per authored claim creation, from the isolated harness (`measure_time_per_authored_claim`): 10,000 claims, 4 KiB leaves, release, macOS, three interleaved rounds of the rebuild tree and the sparse one, last 1,000 claims.
+
+| | Rebuild | Sparse |
+|---|---|---|
+| Prepare | 41.5–50.2 µs | 20.1–25.5 µs |
+| Publish | 4.7–5.5 µs | 11.2–15.1 µs |
+| Total | 47–56 µs | 31–41 µs |
+
+Preparation halved. Publication now carries the merge where the rows are; at about 0.6 µs a change it is the next to profile.
+
+
 ## Sources
 
 - [FASTER] Chandramouli et al., *FASTER: An Embedded Concurrent Key-Value Store for State

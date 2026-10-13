@@ -64,10 +64,7 @@ fn descriptor_limits() -> ArtifactLimits {
 }
 
 fn envelope(core: &Core<NativeState>) -> RespondentEnvelope {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     RespondentEnvelope::derive(
         &view,
         view.claim(ClaimId::from_u128(1)).unwrap(),
@@ -260,10 +257,7 @@ fn authored_buffer_capacity_cannot_spend_unreserved_construction_space() {
 #[test]
 fn impossible_diagnostic_or_complete_close_capacity_refuses_before_reservation() {
     let core = core();
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let claim = view.claim(ClaimId::from_u128(1)).unwrap();
     for limits in [
         NativeLimits {

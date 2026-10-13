@@ -17,7 +17,7 @@ use super::{ContractError, Key, NativeError, Row, layout};
 use focal_memory::{
     Allocation, BudgetKind, BudgetLane, Change, Entry, FrozenRange, MemoryBudget, MemoryError,
     PreparedRange, RangeConfig, RangeId, RangePreparationPlan, RangeStats, RangeStore,
-    RangeWriteEnvelope, RangeWriteLimits, SnapshotLease,
+    RangeWriteEnvelope, RangeWriteLimits, SnapshotLease, SparseBase, SparseRange,
 };
 
 #[cfg(test)]
@@ -487,15 +487,35 @@ impl NativeRanges {
         }
         stats
     }
-    /// Audit an ordered chain of fragment sets against every member.
+    /// Audit an ordered chain of fragment sets against every member: the
+    /// first on the published prefix, each after on the one before it.
     pub(super) fn validate_chain<'a>(
         &self,
-        pending: impl Iterator<Item = &'a Fragments> + Clone,
+        mut pending: impl Iterator<Item = &'a Fragments> + Clone,
     ) -> Result<(), MemoryError> {
+        let Some(first) = pending.clone().next() else {
+            return Ok(());
+        };
+        if let FragmentKind::Sparse(parts) = &first.kind {
+            if parts.len() != self.stores.len() {
+                return Err(MemoryError::WrongRange);
+            }
+            for (store, part) in self.stores.iter().zip(parts.iter()) {
+                store.check_sparse(&part.value)?;
+            }
+            let mut previous = pending.next();
+            for next in pending {
+                if let Some(previous) = previous {
+                    previous.validate_successor(next)?;
+                }
+                previous = Some(next);
+            }
+            return Ok(());
+        }
         for (index, store) in self.stores.iter().enumerate() {
             let mut missing = false;
             store.validate_chain(pending.clone().filter_map(|fragments| {
-                let part = fragments.part(index);
+                let part = fragments.built(index);
                 missing |= part.is_none();
                 part
             }))?;
@@ -504,6 +524,107 @@ impl NativeRanges {
             }
         }
         Ok(())
+    }
+    /// Plan one write at the next prefix as its changes alone (doc 30 §9),
+    /// over the base state its caller reads: the published members with the
+    /// pending candidates' changes over them, `tail` the newest of those,
+    /// `present` the heap of the row that state holds at a key. Each member's
+    /// part holds its changes and what its publication may spend; nothing of
+    /// the members' pages. A wider group charges one vector of further parts
+    /// to `source`.
+    pub(super) fn plan_sparse(
+        &self,
+        source: &MemoryBudget,
+        tail: Option<&Fragments>,
+        prefix: u64,
+        mut changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        mut present: impl FnMut(&Key) -> Option<usize>,
+    ) -> Result<Fragments, MemoryError> {
+        #[cfg(test)]
+        prepare::copy_failure()?;
+        changes.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+        let members = self.stores.len();
+        if tail.is_some_and(|tail| tail.members() != members) {
+            return Err(MemoryError::WrongRange);
+        }
+        let (mut rest, allocation) = Parts::reserve_rest(members, source, lane)?;
+        let mut stack = self.divide(&mut changes)?;
+        let mut first = None;
+        for (index, store) in self.stores.iter().enumerate() {
+            let part = if index == 0 {
+                std::mem::take(&mut changes)
+            } else {
+                stack.pop().unwrap_or_default()
+            };
+            let base = match tail {
+                Some(tail) => SparseBase::After(tail.sparse(index).ok_or(MemoryError::WrongRange)?),
+                None => SparseBase::Committed,
+            };
+            let value = store.plan_sparse(
+                source,
+                base,
+                prefix,
+                part,
+                lane,
+                store.max_batch_entries(),
+                &mut present,
+            )?;
+            let member = RangesMember {
+                start: self
+                    .layout
+                    .members
+                    .get(index)
+                    .ok_or(MemoryError::WrongRange)?
+                    .start,
+                value,
+            };
+            if index == 0 {
+                first = Some(member);
+            } else {
+                if rest.len() >= rest.capacity() {
+                    return Err(MemoryError::WrongRange);
+                }
+                rest.push(member);
+            }
+        }
+        let first = first.ok_or(MemoryError::InvalidConfiguration("empty range group"))?;
+        Ok(Fragments {
+            producer: self.producer,
+            kind: FragmentKind::Sparse(Parts {
+                first,
+                rest,
+                _allocation: allocation,
+            }),
+        })
+    }
+    /// Divides sorted `changes` at every member boundary from the last down:
+    /// `changes` keeps the first member's, and the stack the rest's, the
+    /// second member's on top.
+    fn divide(
+        &self,
+        changes: &mut Vec<Change<Key, Row>>,
+    ) -> Result<Vec<Vec<Change<Key, Row>>>, MemoryError> {
+        let members = self.stores.len();
+        let mut stack: Vec<Vec<Change<Key, Row>>> = Vec::new();
+        if members > 1 {
+            stack
+                .try_reserve_exact(members.saturating_sub(1))
+                .map_err(|_| MemoryError::AllocationFailed)?;
+        }
+        for boundary in self.layout.members.iter().skip(1).rev() {
+            let start = boundary
+                .start
+                .ok_or(MemoryError::InvalidConfiguration("unbounded range member"))?;
+            let at = changes.partition_point(|change| layout::affinity(change.key()) < start);
+            let part = if at == changes.len() {
+                Vec::new()
+            } else {
+                changes.split_off(at)
+            };
+            stack.push(part);
+        }
+        Ok(stack)
     }
     /// Plan one write at the next prefix over the published members. A
     /// group of one plans without allocating; a wider group charges one
@@ -518,29 +639,6 @@ impl NativeRanges {
         max_bytes: usize,
     ) -> Result<RangesPlan<'a>, MemoryError> {
         self.plan(source, None, prefix, changes, lane, max_bytes, None)
-    }
-    /// Plan one write against an unpublished predecessor's fragments.
-    pub(super) fn plan_after<'a>(
-        &'a self,
-        source: &MemoryBudget,
-        predecessor: &'a Fragments,
-        prefix: u64,
-        changes: Vec<Change<Key, Row>>,
-        lane: BudgetLane,
-        max_bytes: usize,
-    ) -> Result<RangesPlan<'a>, MemoryError> {
-        if predecessor.parts.len() != self.stores.len() {
-            return Err(MemoryError::WrongRange);
-        }
-        self.plan(
-            source,
-            Some(predecessor),
-            prefix,
-            changes,
-            lane,
-            max_bytes,
-            None,
-        )
     }
     /// `max_entries`: a decision's own bound on its batch, where a write is
     /// held to the members' `max_batch_entries`.
@@ -561,24 +659,7 @@ impl NativeRanges {
         // Divide the sorted input at every boundary from the last member
         // down, so every member's part is one split of the same vector; the
         // parts are planned in member order as they come off the stack.
-        let mut stack: Vec<Vec<Change<Key, Row>>> = Vec::new();
-        if members > 1 {
-            stack
-                .try_reserve_exact(members.saturating_sub(1))
-                .map_err(|_| MemoryError::AllocationFailed)?;
-        }
-        for boundary in self.layout.members.iter().skip(1).rev() {
-            let start = boundary
-                .start
-                .ok_or(MemoryError::InvalidConfiguration("unbounded range member"))?;
-            let at = changes.partition_point(|change| layout::affinity(change.key()) < start);
-            let part = if at == changes.len() {
-                Vec::new()
-            } else {
-                changes.split_off(at)
-            };
-            stack.push(part);
-        }
+        let mut stack = self.divide(&mut changes)?;
         let mut remaining = max_bytes;
         let mut first = None;
         for (index, store) in self.stores.iter().enumerate() {
@@ -589,7 +670,7 @@ impl NativeRanges {
             };
             let plan = match (predecessor, max_entries) {
                 (Some(predecessor), _) => {
-                    let base = predecessor.part(index).ok_or(MemoryError::WrongRange)?;
+                    let base = predecessor.built(index).ok_or(MemoryError::WrongRange)?;
                     store.plan_after(base, prefix, part, lane, remaining)?
                 }
                 (None, Some(bound)) => store.plan_bounded(prefix, part, lane, remaining, bound)?,
@@ -679,6 +760,45 @@ impl NativeRanges {
     {
         self.prepare_batch_replacing(prefix, changes, lane, copy, |_, _| Ok(()))
     }
+    /// A fixture's write of `changes` over `predecessor` (or the published
+    /// members), planned as a leader's is: its changes alone, checked against
+    /// the base state, `replaced` given every row of that state a change
+    /// replaces or deletes.
+    #[cfg(test)]
+    pub(super) fn forge<R>(
+        &self,
+        predecessor: Option<&Fragments>,
+        prefix: u64,
+        changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        mut replaced: R,
+    ) -> Result<Fragments, MemoryError>
+    where
+        R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
+    {
+        let budget = self
+            .stores
+            .first()
+            .ok_or(MemoryError::InvalidConfiguration("empty range group"))?
+            .budget()
+            .clone();
+        let base = |key: &Key| match predecessor {
+            Some(previous) if previous.is_sparse() => match previous.change(key) {
+                Some(change) => change,
+                None => self.get_entry(key),
+            },
+            Some(previous) => previous.get_entry(key),
+            None => self.get_entry(key),
+        };
+        for change in &changes {
+            if let Some(old) = base(change.key()) {
+                replaced(change.key(), &old.value)?;
+            }
+        }
+        self.plan_sparse(&budget, predecessor, prefix, changes, lane, |key| {
+            base(key).map(|entry| entry.heap_bytes)
+        })
+    }
     /// [`Self::prepare_batch_with`], giving `replaced` every committed row a change replaces or
     /// deletes ([`RangesPlan::build_in_replacing`]).
     #[cfg(test)]
@@ -694,14 +814,8 @@ impl NativeRanges {
         F: FnMut(&Row) -> Result<Row, MemoryError>,
         R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
     {
-        let budget = self
-            .stores
-            .first()
-            .ok_or(MemoryError::InvalidConfiguration("empty range group"))?
-            .budget()
-            .clone();
-        self.plan_batch(&budget, prefix, changes, lane, usize::MAX)?
-            .build_in_replacing(&budget, copy, replaced)
+        drop(copy);
+        self.forge(None, prefix, changes, lane, replaced)
     }
     /// Prepare one write against an unpublished predecessor's fragments, giving `replaced` every
     /// row of the predecessor's a change replaces or deletes ([`RangesPlan::build_in_replacing`]).
@@ -719,16 +833,9 @@ impl NativeRanges {
         F: FnMut(&Row) -> Result<Row, MemoryError>,
         R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
     {
-        let budget = self
-            .stores
-            .first()
-            .ok_or(MemoryError::InvalidConfiguration("empty range group"))?
-            .budget()
-            .clone();
-        self.plan_after(&budget, predecessor, prefix, changes, lane, usize::MAX)?
-            .build_in_replacing(&budget, copy, replaced)
+        drop(copy);
+        self.forge(Some(predecessor), prefix, changes, lane, replaced)
     }
-    #[cfg(test)]
     pub(super) fn get_entry(&self, key: &Key) -> Option<&Entry<Key, Row>> {
         self.member(key)?.get_entry(key)
     }
@@ -755,39 +862,74 @@ impl NativeRanges {
             .map_err(|(error, _)| error)
     }
     /// Publish every fragment or none: each is checked against its member
-    /// before any root moves.
+    /// before any root moves, and a set refused there is returned whole. A
+    /// member that refuses past that check broke an invariant: a built set
+    /// returns the refused fragment and those after it, the ones before it
+    /// staying published; a sparse set is gone, its member's store poisoned,
+    /// and no set comes back.
     #[allow(clippy::result_large_err)] // A refused set is returned whole, never dropped.
     pub(super) fn publish_recoverable(
         &mut self,
         fragments: Fragments,
-    ) -> Result<(), (MemoryError, Fragments)> {
-        if fragments.parts.len() != self.stores.len() {
-            return Err((MemoryError::WrongRange, fragments));
+    ) -> Result<(), (MemoryError, Option<Fragments>)> {
+        if fragments.members() != self.stores.len() {
+            return Err((MemoryError::WrongRange, Some(fragments)));
         }
-        let refusal =
-            self.stores
+        let refusal = match &fragments.kind {
+            FragmentKind::Built(parts) => {
+                self.stores
+                    .iter()
+                    .zip(parts.iter())
+                    .find_map(|(store, fragment)| {
+                        store
+                            .validate_chain(std::iter::once(&fragment.value.range))
+                            .err()
+                    })
+            }
+            FragmentKind::Sparse(parts) => self
+                .stores
                 .iter()
-                .zip(fragments.parts.iter())
-                .find_map(|(store, fragment)| {
-                    store.validate_chain(std::iter::once(&fragment.value)).err()
-                });
+                .zip(parts.iter())
+                .find_map(|(store, fragment)| store.check_sparse(&fragment.value).err()),
+        };
         if let Some(error) = refusal {
-            return Err((error, fragments));
+            return Err((error, Some(fragments)));
         }
-        // Every fragment passed the check publication repeats, so every root
-        // moves. Should a member still refuse (an invariant failure), the
-        // refused fragment and the unpublished ones after it are returned;
-        // the ones before it stay published, as their stores now hold them.
-        let Fragments { producer, parts } = fragments;
+        let Fragments { producer, kind } = fragments;
+        match kind {
+            FragmentKind::Built(parts) => self
+                .publish_built(producer, parts)
+                .map_err(|(error, fragments)| (error, Some(fragments))),
+            FragmentKind::Sparse(parts) => {
+                for (store, fragment) in self.stores.iter_mut().zip(parts.into_iter()) {
+                    store
+                        .publish_sparse(fragment.value, prepare::copy)
+                        .map_err(|refusal| (refusal.into_parts().0, None))?;
+                }
+                Ok(())
+            }
+        }
+    }
+    /// Every fragment passed the check publication repeats, so every root
+    /// moves. Should a member still refuse (an invariant failure), the
+    /// refused fragment and the unpublished ones after it are returned; the
+    /// ones before it stay published, as their stores now hold them.
+    #[allow(clippy::result_large_err)] // A refused set is returned whole, never dropped.
+    fn publish_built(
+        &mut self,
+        producer: RangeId,
+        parts: Parts<Built>,
+    ) -> Result<(), (MemoryError, Fragments)> {
         let mut remaining = parts.into_iter();
         for store in self.stores.iter_mut() {
             let Some(fragment) = remaining.next() else {
                 break;
             };
-            if let Err((error, range)) = store.publish_recoverable(fragment.value) {
+            let touched = fragment.value.touched;
+            if let Err((error, range)) = store.publish_recoverable(fragment.value.range) {
                 let refused = RangesMember {
                     start: fragment.start,
-                    value: range,
+                    value: Built { range, touched },
                 };
                 let mut rest = Vec::new();
                 if rest.try_reserve_exact(remaining.rest.len()).is_ok() {
@@ -797,11 +939,11 @@ impl NativeRanges {
                     error,
                     Fragments {
                         producer,
-                        parts: Parts {
+                        kind: FragmentKind::Built(Parts {
                             first: refused,
                             rest,
                             _allocation: remaining._allocation.take(),
-                        },
+                        }),
                     },
                 ));
             }
@@ -1216,11 +1358,13 @@ pub(super) struct RangesPlan<'a> {
 
 impl<'a> RangesPlan<'a> {
     /// The changed keys in key order across members.
+    #[cfg(test)]
     pub(super) fn changes(&self) -> impl Iterator<Item = &Change<Key, Row>> {
         self.plans
             .iter()
             .flat_map(|member| member.value.changes().iter())
     }
+    #[cfg(test)]
     pub(super) fn changes_len(&self) -> usize {
         self.plans
             .iter()
@@ -1234,6 +1378,7 @@ impl<'a> RangesPlan<'a> {
             .map(|member| member.value.charges().input_pending_bytes())
             .fold(0, usize::saturating_add)
     }
+    #[cfg(test)]
     pub(super) fn check_envelope(&self, envelope: &RangeWriteEnvelope) -> Result<(), MemoryError> {
         envelope.check_plans(self.plans.iter().map(|member| &member.value))
     }
@@ -1252,6 +1397,7 @@ impl<'a> RangesPlan<'a> {
     /// [`Self::build_in_with`], giving `replaced` every committed row a change replaces or
     /// deletes as the build takes it out of its page
     /// (`RangePreparationPlan::build_in_replacing`).
+    #[cfg(test)]
     pub(super) fn build_in_replacing<F, R>(
         self,
         source: &MemoryBudget,
@@ -1296,12 +1442,16 @@ impl<'a> RangesPlan<'a> {
         let members = self.plans.len();
         let (mut rest, allocation) = Parts::reserve_rest(members, source, self.lane)?;
         let mut plans = self.plans.into_iter();
+        let mut built = |plan: RangePreparationPlan<'a, Key, Row>| {
+            let touched = !plan.changes().is_empty();
+            build(plan).map(|range| Built { range, touched })
+        };
         let first = plans
             .next()
             .ok_or(MemoryError::InvalidConfiguration("empty range group"))?;
         let first = RangesMember {
             start: first.start,
-            value: build(first.value)?,
+            value: built(first.value)?,
         };
         for member in plans {
             if rest.len() >= rest.capacity() {
@@ -1309,32 +1459,50 @@ impl<'a> RangesPlan<'a> {
             }
             rest.push(RangesMember {
                 start: member.start,
-                value: build(member.value)?,
+                value: built(member.value)?,
             });
         }
         Ok(Fragments {
             producer: self.producer,
-            parts: Parts {
+            kind: FragmentKind::Built(Parts {
                 first,
                 rest,
                 _allocation: allocation,
-            },
+            }),
         })
     }
 }
 
 /// One unpublished write over every member: a fragment per member at the
-/// next prefix, published together or not at all.
+/// next prefix, published together or not at all. A leader's write holds its
+/// changes alone and is read through its view's pending chain (doc 30 §9); a
+/// follower's replay builds its pages beside the committed root.
 pub struct Fragments {
     producer: RangeId,
-    parts: Parts<PreparedRange<Key, Row>>,
+    kind: FragmentKind,
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a leader's sparse set holds its first member inline so a group of one allocates \
+              nothing; a replay's built set is published at once"
+)]
+enum FragmentKind {
+    Built(Parts<Built>),
+    Sparse(Parts<SparseRange<Key, Row>>),
+}
+
+/// A member's built fragment, and whether the write changes the member.
+struct Built {
+    range: PreparedRange<Key, Row>,
+    touched: bool,
 }
 
 impl std::fmt::Debug for Fragments {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Fragments")
             .field("producer", &self.producer)
-            .field("members", &self.parts.len())
+            .field("members", &self.members())
             .field("base", &self.base_prefix())
             .finish_non_exhaustive()
     }
@@ -1345,57 +1513,239 @@ impl Fragments {
         self.producer
     }
     pub(super) fn prefix(&self) -> u64 {
-        self.parts.first.value.prefix()
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.first.value.range.prefix(),
+            FragmentKind::Sparse(parts) => parts.first.value.prefix(),
+        }
     }
     pub(super) fn base_prefix(&self) -> u64 {
-        self.parts.first.value.base_prefix()
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.first.value.range.base_prefix(),
+            FragmentKind::Sparse(parts) => parts.first.value.base_prefix(),
+        }
     }
+    fn members(&self) -> usize {
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.len(),
+            FragmentKind::Sparse(parts) => parts.len(),
+        }
+    }
+    /// The rows the members hold once this set publishes.
     pub(super) fn len(&self) -> usize {
-        self.parts.iter().map(|part| part.value.len()).sum()
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.iter().map(|part| part.value.range.len()).sum(),
+            FragmentKind::Sparse(parts) => parts.iter().map(|part| part.value.len()).sum(),
+        }
+    }
+    /// Member `index`'s part of a sparse set.
+    fn sparse(&self, index: usize) -> Option<&SparseRange<Key, Row>> {
+        match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => parts.get(index).map(|part| &part.value),
+        }
     }
     /// The positions (in layout order) of the members this set writes.
     pub(super) fn touched_members(&self) -> impl Iterator<Item = usize> + '_ {
-        self.parts
-            .iter()
-            .enumerate()
-            .filter(|(_, part)| !part.value.is_empty())
-            .map(|(index, _)| index)
+        (0..self.members()).filter(|index| match &self.kind {
+            FragmentKind::Built(parts) => parts.get(*index).is_some_and(|part| part.value.touched),
+            FragmentKind::Sparse(parts) => parts
+                .get(*index)
+                .is_some_and(|part| !part.value.changes().is_empty()),
+        })
     }
-    fn part(&self, index: usize) -> Option<&PreparedRange<Key, Row>> {
-        self.parts.get(index).map(|part| &part.value)
+    fn built(&self, index: usize) -> Option<&PreparedRange<Key, Row>> {
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.get(index).map(|part| &part.value.range),
+            FragmentKind::Sparse(_) => None,
+        }
     }
+    /// The row this set leaves at `key`: a built set's whole state, a sparse
+    /// set's own puts alone (a view reads the rest through its chain).
     pub(super) fn get(&self, key: &Key) -> Option<&Row> {
-        self.part(self.parts.route(key))?.get(key)
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.get(parts.route(key))?.value.range.get(key),
+            FragmentKind::Sparse(_) => self.change(key)?.map(|entry| &entry.value),
+        }
     }
+    /// A built set's row at `key`, whole; a sparse set's own put.
+    pub(super) fn get_entry(&self, key: &Key) -> Option<&Entry<Key, Row>> {
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.get(parts.route(key))?.value.range.get_entry(key),
+            FragmentKind::Sparse(_) => self.change(key)?,
+        }
+    }
+    /// Where a sparse set changes `key`: its member and the change's index
+    /// there.
+    pub(super) fn position(&self, key: &Key) -> Option<(usize, usize)> {
+        match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => {
+                let member = parts.route(key);
+                parts
+                    .get(member)?
+                    .value
+                    .position(key)
+                    .map(|index| (member, index))
+            }
+        }
+    }
+    /// This set's own change of `key`: `Some(Some(entry))` where it puts one,
+    /// `Some(None)` where it deletes the key, `None` where it leaves the key
+    /// (and for a built set, which holds its state rather than its changes).
+    pub(super) fn change(&self, key: &Key) -> Option<Option<&Entry<Key, Row>>> {
+        match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => parts.get(parts.route(key))?.value.change(key),
+        }
+    }
+    /// Member `member`'s `index`th change, by key order (a pending index's
+    /// version).
+    pub(super) fn change_at(&self, member: usize, index: usize) -> Option<&Change<Key, Row>> {
+        match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => parts.get(member)?.value.changes().get(index),
+        }
+    }
+    /// Every change of a sparse set, with its member and its index there, in
+    /// key order; none for a built set.
+    pub(super) fn changes(&self) -> impl Iterator<Item = (usize, usize, &Change<Key, Row>)> + '_ {
+        let parts = match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => Some(parts),
+        };
+        parts.into_iter().flat_map(|parts| {
+            parts.iter().enumerate().flat_map(|(member, part)| {
+                part.value
+                    .changes()
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, change)| (member, index, change))
+            })
+        })
+    }
+    /// The changes of a sparse set at or after `key` in key order (`exclusive`:
+    /// after it); none for a built set.
+    pub(super) fn changes_from<'a>(
+        &'a self,
+        key: &Key,
+        exclusive: bool,
+    ) -> impl Iterator<Item = &'a Change<Key, Row>> + use<'a> {
+        let parts = match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => Some(parts),
+        };
+        let start = parts.map_or(0, |parts| parts.route(key));
+        let key = *key;
+        parts.into_iter().flat_map(move |parts| {
+            parts.iter().skip(start).flat_map(move |part| {
+                let changes = part.value.changes();
+                let at = changes.partition_point(|change| {
+                    if exclusive {
+                        change.key() <= &key
+                    } else {
+                        change.key() < &key
+                    }
+                });
+                changes.get(at..).unwrap_or(&[]).iter()
+            })
+        })
+    }
+    /// What a sparse set's parts hold as pending input and staging.
+    #[cfg(test)]
+    pub(super) fn pending_bytes(&self) -> usize {
+        match &self.kind {
+            FragmentKind::Built(_) => 0,
+            FragmentKind::Sparse(parts) => parts
+                .iter()
+                .map(|part| part.value.input_bytes() + part.value.staging_bytes())
+                .sum(),
+        }
+    }
+    pub(super) fn is_sparse(&self) -> bool {
+        matches!(self.kind, FragmentKind::Sparse(_))
+    }
+    /// Check a sparse set's parts against one write's envelope.
+    pub(super) fn check_envelope(&self, envelope: &RangeWriteEnvelope) -> Result<(), MemoryError> {
+        match &self.kind {
+            FragmentKind::Built(_) => Err(MemoryError::InvalidConfiguration(
+                "a built set's envelope is its plan's",
+            )),
+            FragmentKind::Sparse(parts) => {
+                envelope.check_sparse(parts.iter().map(|part| &part.value))
+            }
+        }
+    }
+    /// A built set's whole state; a sparse set's own puts.
     #[cfg(test)]
     pub(super) fn entries(&self) -> impl Iterator<Item = &Entry<Key, Row>> {
-        self.parts.iter().flat_map(|part| part.value.entries())
+        let parts = match &self.kind {
+            FragmentKind::Built(parts) => Some(parts),
+            FragmentKind::Sparse(_) => None,
+        };
+        let built = parts
+            .into_iter()
+            .flat_map(|parts| parts.iter().flat_map(|part| part.value.range.entries()));
+        let puts = self.changes().filter_map(|(_, _, change)| match change {
+            Change::Put(entry) => Some(entry),
+            Change::Delete(_) => None,
+        });
+        built.chain(puts)
     }
+    /// A built set's rows at or after `key`; none for a sparse set, which a
+    /// view reads through its chain.
     pub(super) fn entries_from<'a>(
         &'a self,
         key: &Key,
         exclusive: bool,
     ) -> impl Iterator<Item = &'a Entry<Key, Row>> + use<'a> {
-        let index = self.parts.route(key);
-        let first = self
-            .part(index)
-            .map(|part| part.entries_from(key, exclusive));
-        let rest = self
-            .parts
-            .iter()
-            .skip(index.saturating_add(1))
-            .flat_map(|part| part.value.entries());
+        let parts = match &self.kind {
+            FragmentKind::Built(parts) => Some(parts),
+            FragmentKind::Sparse(_) => None,
+        };
+        let index = parts.map_or(0, |parts| parts.route(key));
+        let first = parts
+            .and_then(|parts| parts.get(index))
+            .map(|part| part.value.range.entries_from(key, exclusive));
+        let rest = parts.into_iter().flat_map(move |parts| {
+            parts
+                .iter()
+                .skip(index.saturating_add(1))
+                .flat_map(|part| part.value.range.entries())
+        });
         first.into_iter().flatten().chain(rest)
     }
     /// Check `next` is the exact successor of this set on every member.
     pub(super) fn validate_successor(&self, next: &Self) -> Result<(), MemoryError> {
-        if self.parts.len() != next.parts.len() {
-            return Err(MemoryError::WrongRange);
+        match (&self.kind, &next.kind) {
+            (FragmentKind::Built(mine), FragmentKind::Built(theirs)) => {
+                if mine.len() != theirs.len() {
+                    return Err(MemoryError::WrongRange);
+                }
+                for (mine, theirs) in mine.iter().zip(theirs.iter()) {
+                    mine.value.range.validate_successor(&theirs.value.range)?;
+                }
+                Ok(())
+            }
+            (FragmentKind::Sparse(mine), FragmentKind::Sparse(theirs)) => {
+                if mine.len() != theirs.len() || self.producer != next.producer {
+                    return Err(MemoryError::WrongRange);
+                }
+                for (mine, theirs) in mine.iter().zip(theirs.iter()) {
+                    if theirs.value.base_prefix() != mine.value.prefix() {
+                        return Err(MemoryError::StalePreparation {
+                            prepared_at: theirs.value.base_prefix(),
+                            current_prefix: mine.value.prefix(),
+                        });
+                    }
+                    // Planned on another state at this prefix: a fork.
+                    if !theirs.value.follows(&mine.value) {
+                        return Err(MemoryError::WrongRange);
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(MemoryError::WrongRange),
         }
-        for (mine, theirs) in self.parts.iter().zip(next.parts.iter()) {
-            mine.value.validate_successor(&theirs.value)?;
-        }
-        Ok(())
     }
 }
 

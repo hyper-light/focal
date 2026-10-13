@@ -92,12 +92,22 @@ fn cancellation_propagates_pure_dependencies_without_monitors_and_replays_atomic
     );
     let outcome = prepared.outcome();
     assert_eq!(
-        prepared.claim(ClaimId::from_u128(1)).unwrap().status(),
+        original
+            .native_chain(&[&prepared])
+            .unwrap()
+            .claim(ClaimId::from_u128(1))
+            .unwrap()
+            .status(),
         ClaimStatus::Cancelled
     );
     for id in [2, 3] {
         assert_eq!(
-            prepared.claim(ClaimId::from_u128(id)).unwrap().status(),
+            original
+                .native_chain(&[&prepared])
+                .unwrap()
+                .claim(ClaimId::from_u128(id))
+                .unwrap()
+                .status(),
             ClaimStatus::DependencyFailed
         );
     }

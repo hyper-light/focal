@@ -128,10 +128,21 @@ fn locally_complete_claim_releases_against_full_disjoint_correction_capture_on_r
     };
     let prepared = f.owner.prepared_candidate(candidate).unwrap();
     assert_eq!(
-        prepared.claim(CLAIM).unwrap().status(),
+        f.owner
+            .candidate(candidate)
+            .unwrap()
+            .claim(CLAIM)
+            .unwrap()
+            .status(),
         ClaimStatus::Satisfied
     );
-    let Some(ClaimTerminalCut::Explicit(cut)) = prepared.claim(CLAIM).unwrap().terminal_cut()
+    let Some(ClaimTerminalCut::Explicit(cut)) = f
+        .owner
+        .candidate(candidate)
+        .unwrap()
+        .claim(CLAIM)
+        .unwrap()
+        .terminal_cut()
     else {
         panic!("release cut")
     };

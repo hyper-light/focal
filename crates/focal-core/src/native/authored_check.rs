@@ -387,10 +387,7 @@ pub(in crate::native) fn check_plan(
 /// Reconstruction checks actual rows and both directions of identity membership;
 /// an enum flag or matching counters cannot turn omitted text into authored data.
 pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), NativeError> {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let strict = core.state.profile == NativeContentProfile::AuthoredV1;
     let limits = core.limits;
     let meta = view.meta();

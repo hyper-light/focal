@@ -719,7 +719,7 @@ impl CompletionBook {
             return Err(ContractError::InvalidCut.into());
         };
         let parent = prepared
-            .claim(ClaimId(event.after.object.0))
+            .written_claim(ClaimId(event.after.object.0))
             .ok_or(ContractError::InvalidTarget)?;
         if publication.sequence != prepared.outcome.sequence
             || publication.ordinal != 3
@@ -742,7 +742,7 @@ impl CompletionBook {
         prepared: &NativePrepared,
     ) -> Result<(), NativeError> {
         self.check_health()?;
-        if view.tail.is_none_or(|tail| !std::ptr::eq(tail, prepared)) {
+        if view.tail().is_none_or(|tail| !std::ptr::eq(tail, prepared)) {
             return Err(MemoryError::WrongRange.into());
         }
         let mut previous = None;
@@ -752,7 +752,7 @@ impl CompletionBook {
                 NativeFact::Registrations { claim } => claim,
                 NativeFact::Evaluation { key, .. } => {
                     let state = prepared
-                        .evaluation(key)
+                        .written_evaluation(key)
                         .ok_or(ContractError::InvalidTarget)?;
                     // Complete source cohorts were checked before accepting a
                     // responsibility. Every later evaluation mutation has a
@@ -772,7 +772,9 @@ impl CompletionBook {
             let Some(Row::Claim(owned)) = prepared.fragments.get(&Key::Claim(id)) else {
                 return Err(ContractError::InvalidTarget.into());
             };
-            let parent = prepared.claim(id).ok_or(ContractError::InvalidTarget)?;
+            let parent = prepared
+                .written_claim(id)
+                .ok_or(ContractError::InvalidTarget)?;
             // One batch may append several child facts for the same parent.
             // Only its final revision matches the actual retained row; every
             // changed claim emits that final event before candidate creation.

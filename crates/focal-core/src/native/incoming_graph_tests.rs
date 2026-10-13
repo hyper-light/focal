@@ -60,10 +60,7 @@ fn create(request: u128, definitions: &[(u128, &[(Kind, u128)])]) -> NativeInput
 }
 
 fn view(core: &Core<NativeState>) -> View<'_> {
-    View {
-        state: &core.state,
-        tail: None,
-    }
+    View::committed(&core.state)
 }
 fn members(core: &Core<NativeState>, target: u128) -> Vec<ClaimId> {
     incoming(&view(core), id(target), core.limits)
@@ -164,10 +161,7 @@ fn pending_append_and_discard_preserve_committed_membership_and_budget() {
         2,
         create(2, &[(5, &[(Kind::DependsOn, 1), (Kind::Awaits, 1)])]),
     );
-    let tail = View {
-        state: &core.state,
-        tail: Some(&candidate),
-    };
+    let tail = View::committed(&core.state).with_own(&candidate).unwrap();
     let discovered: Vec<_> = incoming(&tail, id(1), core.limits)
         .map(|row| ClaimId(row.unwrap().binding().object.0))
         .collect();

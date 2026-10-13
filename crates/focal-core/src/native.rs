@@ -61,6 +61,7 @@ mod owned;
 mod owner;
 #[cfg(test)]
 mod owner_record_buffer_tests;
+mod pending_index;
 mod prepare;
 mod prepare_budget;
 mod projection;
@@ -1454,6 +1455,9 @@ pub struct NativePrepared {
     /// build took them out of their pages: what its publication takes away. Built on the root
     /// its predecessors leave, which is the root it publishes onto.
     encoded_removed: usize,
+    /// What its changes may take in an owner's pending index
+    /// ([`pending_index::entry_charge`]), funded with the rest of it.
+    _index: Option<focal_memory::Allocation>,
 }
 impl std::fmt::Debug for NativePrepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1476,25 +1480,35 @@ impl NativePrepared {
     pub fn mutation_heap_bytes(&self) -> usize {
         self.writes.heap_bytes()
     }
+    /// What it holds of the `Pending` kind besides its write set: its batch,
+    /// its merge staging and its place in an owner's pending index.
+    #[cfg(test)]
+    pub(crate) fn held_pending_bytes(&self) -> usize {
+        self.fragments.pending_bytes()
+            + self
+                ._index
+                .as_ref()
+                .map_or(0, focal_memory::Allocation::bytes)
+    }
     pub fn content_profile(&self) -> NativeContentProfile {
         self.writes.profile()
     }
     pub fn outcome(&self) -> NativeOutcome {
         self.outcome
     }
-    pub fn claim(&self, id: ClaimId) -> Option<&ClaimState> {
+    pub fn written_claim(&self, id: ClaimId) -> Option<&ClaimState> {
         as_claim(self.fragments.get(&Key::Claim(id)))
     }
-    pub fn receipt(&self, id: ReceiptId) -> Option<NativeReceipt> {
+    pub fn written_receipt(&self, id: ReceiptId) -> Option<NativeReceipt> {
         as_receipt(self.fragments.get(&Key::Receipt(id)))
     }
-    pub fn artifact(&self, id: ArtifactId) -> Option<&NativeArtifact> {
+    pub fn written_artifact(&self, id: ArtifactId) -> Option<&NativeArtifact> {
         as_artifact(self.fragments.get(&Key::Artifact(id)))
     }
-    pub fn result(&self, key: NativeResultKey) -> Option<&NativeAccepted> {
+    pub fn written_result(&self, key: NativeResultKey) -> Option<&NativeAccepted> {
         as_result(self.fragments.get(&Key::Accepted(key)))
     }
-    pub fn recorded(&self, key: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
+    pub fn written_recorded(&self, key: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
         let invocation = key.into();
         as_outcome(
             self.fragments.get(&Key::Outcome(invocation)),
@@ -1502,14 +1516,18 @@ impl NativePrepared {
             invocation,
         )
     }
-    pub fn definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
+    pub fn written_definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
         as_definition(self.fragments.get(&Key::Definition(id)))
     }
-    pub fn evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
+    pub fn written_evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
         as_evaluation(self.fragments.get(&Key::Evaluation(key)))
     }
 }
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "moved once, from a preparation into its owner's chain or a publication"
+)]
 pub enum NativePreparation {
     Prepared(NativePrepared),
     /// A pending match must await the original candidate's durability barrier.
@@ -1531,11 +1549,13 @@ pub enum NativeError {
     #[error("native owner bound exceeded: {0}")]
     Capacity(&'static str),
 }
-/// Publication refusal retains ownership of the entire prepared candidate.
+/// A refused publication. Refused before any row moved, the candidate is
+/// returned whole; failed past that point (an invariant broken, its store
+/// poisoned), it is gone and the owner must be reconstructed.
 #[derive(Debug)]
 pub struct NativePublishError {
     pub error: MemoryError,
-    pub prepared: NativePrepared,
+    pub prepared: Option<NativePrepared>,
 }
 impl std::fmt::Display for NativePublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1949,6 +1969,20 @@ impl Core<NativeState> {
     pub fn native_stats(&self) -> RangeStats {
         self.state.rows.stats()
     }
+    /// The state as of the last of `pending`, candidates prepared on this core
+    /// in order ([`Self::prepare_native`]'s chain): each one's changes over
+    /// the ones before it over the published rows. A candidate holds its
+    /// changes alone, so what it leaves of a row it does not write is read
+    /// here.
+    pub fn native_chain<'a>(
+        &'a self,
+        pending: &[&'a NativePrepared],
+    ) -> Result<NativeView<'a>, NativeError> {
+        Ok(NativeView(View::over(
+            &self.state,
+            pending_index::Chain::listed(pending)?,
+        )))
+    }
     /// Audits a chain of candidates a caller holds, every link: each built on the one before it,
     /// the first on the published prefix. An owner's own preparations check only its chain's head
     /// (`check_native_chain`): it builds each candidate on its tail, so the head's link is the one
@@ -1980,7 +2014,7 @@ impl Core<NativeState> {
             None => {
                 return Err(NativePublishError {
                     error: MemoryError::CounterExhausted("checkpoint bytes"),
-                    prepared,
+                    prepared: Some(prepared),
                 });
             }
         };
@@ -1990,19 +2024,21 @@ impl Core<NativeState> {
             writes,
             encoded_added,
             encoded_removed,
+            _index,
         } = prepared;
         self.state
             .rows
             .publish_recoverable(fragments)
             .map_err(|(error, fragments)| NativePublishError {
                 error,
-                prepared: NativePrepared {
+                prepared: fragments.map(|fragments| NativePrepared {
                     fragments,
                     outcome,
                     writes,
                     encoded_added,
                     encoded_removed,
-                },
+                    _index,
+                }),
             })?;
         self.state.encoded_rows = encoded;
         Ok(outcome)
@@ -2173,16 +2209,82 @@ fn as_evaluation(row: Option<&Row>) -> Option<&validation::EvaluationState> {
         _ => None,
     }
 }
+/// A state as a read sees it: the committed rows, the pending chain's changes
+/// over them as of one candidate, and over those a candidate being prepared
+/// (doc 30 §9). A candidate holds its changes alone, so a key's row is its
+/// newest change here, else the committed row.
+#[derive(Clone, Copy)]
 struct View<'a> {
     state: &'a NativeState,
-    tail: Option<&'a NativePrepared>,
+    chain: Option<pending_index::Chain<'a>>,
+    own: Option<&'a NativePrepared>,
 }
 impl<'a> View<'a> {
-    fn get(&self, key: Key) -> Option<&'a Row> {
-        match self.tail {
-            Some(tail) => tail.fragments.get(&key),
-            None => self.state.rows.get(&key),
+    /// The committed rows alone.
+    fn committed(state: &'a NativeState) -> Self {
+        Self {
+            state,
+            chain: None,
+            own: None,
         }
+    }
+    /// The committed rows under `chain`.
+    fn over(state: &'a NativeState, chain: Option<pending_index::Chain<'a>>) -> Self {
+        Self {
+            state,
+            chain,
+            own: None,
+        }
+    }
+    /// The committed rows with `tail`, a candidate prepared on them, over
+    /// them: a fixture's view.
+    #[cfg(test)]
+    fn with_tail(state: &'a NativeState, tail: Option<&'a NativePrepared>) -> Self {
+        Self {
+            state,
+            chain: None,
+            own: tail,
+        }
+    }
+    /// This view with `own`, a candidate prepared on it, over it. A view that
+    /// already has its own candidate takes it into its chain first: a caller's
+    /// chain holds it as its newest; an owner's chain, which holds only its
+    /// pending candidates, and a full caller's chain refuse.
+    fn with_own(self, own: &'a NativePrepared) -> Result<Self, NativeError> {
+        let chain = match (self.own, self.chain) {
+            (None, chain) => chain,
+            (Some(previous), None) => pending_index::Chain::listed(&[previous])?,
+            (Some(previous), Some(chain)) => Some(chain.then(previous)?),
+        };
+        Ok(Self {
+            state: self.state,
+            chain,
+            own: Some(own),
+        })
+    }
+    /// The newest candidate this view reads: its own, else its chain's.
+    fn tail(&self) -> Option<&'a NativePrepared> {
+        self.own
+            .or_else(|| self.chain.and_then(|chain| chain.tail()))
+    }
+    fn get(&self, key: Key) -> Option<&'a Row> {
+        self.get_entry(&key).map(|entry| &entry.value)
+    }
+    /// The row this view holds at `key`, whole.
+    fn get_entry(&self, key: &Key) -> Option<&'a focal_memory::Entry<Key, Row>> {
+        if let Some(own) = self.own {
+            if !own.fragments.is_sparse() {
+                // A built candidate holds its whole state.
+                return own.fragments.get_entry(key);
+            }
+            if let Some(change) = own.fragments.change(key) {
+                return change;
+            }
+        }
+        if let Some(change) = self.chain.and_then(|chain| chain.get(key)) {
+            return change;
+        }
+        self.state.rows.get_entry(key)
     }
     /// The outcome recorded for `invocation`, whole.
     fn outcome(&self, invocation: NativeInvocation) -> Option<NativeOutcome> {
@@ -2210,20 +2312,40 @@ impl<'a> View<'a> {
     fn evaluation(&self, key: EvaluationKey) -> Result<&validation::EvaluationState, NativeError> {
         as_evaluation(self.get(Key::Evaluation(key))).ok_or(ContractError::InvalidTarget.into())
     }
-    /// Ordered rows of the effective prefix at or after `start`. The caller
-    /// bounds what it consumes; nothing is allocated per row.
+    /// Ordered rows of the effective prefix at or after `start`: its own
+    /// changes over the chain's over the committed rows, merged as they are
+    /// walked. The caller bounds what it consumes; nothing is allocated.
     fn entries_from(
         &self,
         start: Key,
     ) -> impl Iterator<Item = &'a focal_memory::Entry<Key, Row>> + use<'a> {
-        let (committed, tail) = match self.tail {
-            Some(tail) => (None, Some(tail.fragments.entries_from(&start, false))),
-            None => (Some(self.state.rows.entries_from(&start, false)), None),
-        };
-        committed
+        let built = self.own.filter(|own| !own.fragments.is_sparse());
+        let whole = built.map(|own| own.fragments.entries_from(&start, false));
+        let merged = built.is_none().then(|| {
+            let own = self
+                .own
+                .into_iter()
+                .flat_map(move |own| own.fragments.changes_from(&start, false))
+                .map(|change| match change {
+                    focal_memory::Change::Put(entry) => (&entry.key, Some(entry)),
+                    focal_memory::Change::Delete(key) => (key, None),
+                });
+            let chain = self
+                .chain
+                .into_iter()
+                .flat_map(move |chain| chain.changes_from(&start, false));
+            let committed = self
+                .state
+                .rows
+                .entries_from(&start, false)
+                .map(|entry| (&entry.key, Some(entry)));
+            pending_index::Overlay::new(own, pending_index::Overlay::new(chain, committed))
+                .filter_map(|(_, entry)| entry)
+        });
+        whole
             .into_iter()
             .flatten()
-            .chain(tail.into_iter().flatten())
+            .chain(merged.into_iter().flatten())
     }
     /// Committed claims whose authored `kind` relation targets `target`
     /// (the relation index of 22 §7), in identity order.
@@ -2266,7 +2388,7 @@ impl EffectiveClaims for View<'_> {
         self.state.ledger
     }
     fn prefix(&self) -> SessionSeq {
-        self.tail
+        self.tail()
             .map_or(SessionSeq(self.state.rows.prefix()), |tail| {
                 SessionSeq(tail.fragments.prefix())
             })

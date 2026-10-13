@@ -126,7 +126,11 @@ fn real_records_preserve_exact_mutations_and_do_not_serialize_unchanged_rows() {
     );
     // A failed publication retains an identical record, ready to propose/retry.
     let mut foreign = fixture::core();
-    let refused = foreign.publish_native(posted).unwrap_err().prepared;
+    let refused = foreign
+        .publish_native(posted)
+        .unwrap_err()
+        .prepared
+        .unwrap();
     assert_eq!(encode(&refused), bytes);
     core.publish_native(refused).unwrap();
 }
@@ -430,6 +434,7 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
         writes,
         encoded_added,
         encoded_removed: taken.bytes(),
+        _index: None,
     };
     let bytes = encode(&prepared);
     let record = StructuralRecord::inspect(&bytes, inspection(bytes.len())).unwrap();

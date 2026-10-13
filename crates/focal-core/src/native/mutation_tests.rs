@@ -83,7 +83,11 @@ fn real_mutations_capture_every_write_and_leave_unchanged_content_out() {
     // A wrong-root publication returns the same funded write set for retry.
     let charge = posted.mutation_heap_bytes();
     let mut foreign = fixture::core();
-    let refused = foreign.publish_native(posted).unwrap_err().prepared;
+    let refused = foreign
+        .publish_native(posted)
+        .unwrap_err()
+        .prepared
+        .unwrap();
     assert_eq!(refused.mutation_heap_bytes(), charge);
     refused.writes.check(&refused.fragments).unwrap();
     core.publish_native(refused).unwrap();

@@ -8,6 +8,7 @@ use super::completion_envelope::{
     CompletionEnvelope, EvidenceBounds, ReportParent, descriptor_limits,
 };
 use super::completion_schemas::SchemaSet;
+use super::pending_index::{self, Chain, PendingIndex};
 use super::*;
 use focal_evidence::{
     BuiltinNativeSchemas, ContentStore, NativeSchemaVerifier, VerifiedNativeArtifact,
@@ -411,11 +412,20 @@ impl std::fmt::Display for NativeOwnerIntoCoreError {
 impl std::error::Error for NativeOwnerIntoCoreError {}
 
 #[derive(Debug)]
-struct Pending {
+pub(super) struct Pending {
     candidate: NativeCandidate,
     record: record_codec::PendingRecord,
     prepared: NativePrepared,
     journal: CandidateJournal,
+}
+
+impl Pending {
+    pub(super) fn serial(&self) -> u64 {
+        self.candidate.serial
+    }
+    pub(super) fn prepared(&self) -> &NativePrepared {
+        &self.prepared
+    }
 }
 
 /// Owns the Core and every unpublished candidate in exactly one ordered chain.
@@ -437,6 +447,11 @@ pub struct CheckpointProjection {
 pub struct NativeOwner {
     // Drop buffers and retained pages before releasing their queue allowance.
     pending: VecDeque<Pending>,
+    /// Every pending candidate's changes by key: what a read during
+    /// preparation finds before the committed rows (doc 30 §9).
+    index: PendingIndex,
+    /// The index's root node, which its candidates' charges do not cover.
+    _index_root: Allocation,
     core: Core<NativeState>,
     book: CompletionBook,
     record_buffers: Option<record_codec::EncodingLimits>,
@@ -509,14 +524,20 @@ impl NativeOwner {
         let resources = (|| {
             super::authored::check_storage(&core)?;
             let (incarnation, pending, allocation) = Self::allocate_queue(&core)?;
+            let index_root = core
+                .state
+                .budget
+                .reserve(
+                    BudgetKind::Pending,
+                    BudgetLane::Ordinary,
+                    pending_index::root_charge(),
+                )?
+                .commit();
             let mut book = CompletionBook::new(&core.state.budget, core.limits)?;
             if let Some(limits) = record_buffers {
                 book = book.with_record_buffers(limits);
             }
-            let view = View {
-                state: &core.state,
-                tail: None,
-            };
+            let view = View::committed(&core.state);
             for entry in core.state.rows.entries() {
                 let Key::Evaluation(key) = entry.key else {
                     continue;
@@ -564,11 +585,13 @@ impl NativeOwner {
                 }
             }
             book.check_slots(view.meta(), view.prefix(), core.state.rows.len())?;
-            Ok::<_, NativeError>((incarnation, pending, allocation, book))
+            Ok::<_, NativeError>((incarnation, pending, allocation, index_root, book))
         })();
         match resources {
-            Ok((incarnation, pending, allocation, book)) => Ok(Self {
+            Ok((incarnation, pending, allocation, index_root, book)) => Ok(Self {
                 pending,
+                index: PendingIndex::default(),
+                _index_root: index_root,
                 core,
                 book,
                 record_buffers,
@@ -788,7 +811,7 @@ impl NativeOwner {
         // Room for the candidate, made before its chain is borrowed: a retry is answered whatever
         // the memory says, a fresh request is refused only where no room could be funded.
         let room = self.reserve_pending().is_ok();
-        let pending = self.pending.iter().map(|row| &row.prepared);
+        let pending = Some(Chain::indexed(&self.index, &self.pending, u64::MAX));
         let preparation = match input {
             OwnerInput::Request(context, input) => {
                 self.core.check_native_chain(context, input, pending)?
@@ -839,10 +862,10 @@ impl NativeOwner {
                 let lane = fresh.lane();
                 let (prepared, journal, held_record) =
                     build_funded(fresh, &mut self.book, evidence, custody, schemas)?;
-                let source = View {
-                    state: &self.core.state,
-                    tail: self.pending.back().map(|row| &row.prepared),
-                };
+                let source = View::over(
+                    &self.core.state,
+                    Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),
+                );
                 let (prepared, journal) = respondent::attach(
                     &source,
                     prepared,
@@ -851,16 +874,13 @@ impl NativeOwner {
                     self.core.limits,
                     schemas,
                 )?;
-                let view = View {
-                    state: &self.core.state,
-                    tail: Some(&prepared),
-                };
-                let checked = self
-                    .book
-                    .check_slots(view.meta(), view.prefix(), prepared.fragments.len())
-                    .and_then(|()| self.book.check_serial(serial))
-                    .and_then(|()| self.book.check_parents(&view, &prepared))
-                    .and_then(|()| self.book.check_graph_growth(&view, &prepared));
+                let checked = source.with_own(&prepared).and_then(|view| {
+                    self.book
+                        .check_slots(view.meta(), view.prefix(), prepared.fragments.len())
+                        .and_then(|()| self.book.check_serial(serial))
+                        .and_then(|()| self.book.check_parents(&view, &prepared))
+                        .and_then(|()| self.book.check_graph_growth(&view, &prepared))
+                });
                 if let Err(error) = checked {
                     drop(prepared);
                     if let Err(rollback) = self.book.rollback_candidate(journal) {
@@ -899,6 +919,7 @@ impl NativeOwner {
                     serial,
                 };
                 let outcome = prepared.outcome();
+                self.index.add(serial, &prepared.fragments);
                 self.count_pending(&prepared);
                 self.pending.push_back(Pending {
                     candidate,
@@ -929,6 +950,9 @@ impl NativeOwner {
             .pending
             .pop_front()
             .ok_or(NativeOwnerError::UnknownCandidate)?;
+        // Its changes are about to be the committed rows.
+        self.index
+            .remove_published(head.candidate.serial, &head.prepared.fragments);
         self.uncount_pending(&head.prepared);
         match self.core.publish_native(head.prepared) {
             Ok(outcome) => {
@@ -947,13 +971,22 @@ impl NativeOwner {
                 Ok(outcome)
             }
             Err(refused) => {
+                let Some(prepared) = refused.prepared else {
+                    // Refused past its checks: a store is poisoned and the
+                    // candidate is gone. Nothing published can be trusted.
+                    self.faulted = true;
+                    let _ = self.book.rollback_candidate(head.journal);
+                    return Err(refused.error.into());
+                };
                 // pop_front retained this exact slot: restoration cannot grow
                 // the buffer, allocate, change the ticket, or reorder the chain.
-                self.count_pending(&refused.prepared);
+                self.index
+                    .restore_oldest(head.candidate.serial, &prepared.fragments);
+                self.count_pending(&prepared);
                 self.pending.push_front(Pending {
                     candidate: head.candidate,
                     record: head.record,
-                    prepared: refused.prepared,
+                    prepared,
                     journal: head.journal,
                 });
                 Err(refused.error.into())
@@ -974,6 +1007,11 @@ impl NativeOwner {
             .ok_or(NativeOwnerError::UnknownCandidate)?;
         while self.pending.len() > position {
             if let Some(row) = self.pending.pop_back() {
+                let pending = &self.pending;
+                self.index
+                    .remove_discarded(row.candidate.serial, &row.prepared.fragments, |key| {
+                        pending_index::newest_among(pending, key)
+                    });
                 self.uncount_pending(&row.prepared);
                 drop(row.record);
                 drop(row.prepared);
@@ -997,6 +1035,11 @@ impl NativeOwner {
     pub fn discard_all(&mut self) -> usize {
         let count = self.pending.len();
         while let Some(row) = self.pending.pop_back() {
+            let pending = &self.pending;
+            self.index
+                .remove_discarded(row.candidate.serial, &row.prepared.fragments, |key| {
+                    pending_index::newest_among(pending, key)
+                });
             self.uncount_pending(&row.prepared);
             drop(row.record);
             drop(row.prepared);
@@ -1029,10 +1072,7 @@ impl NativeOwner {
     }
 
     pub fn committed(&self) -> NativeView<'_> {
-        NativeView(View {
-            state: &self.core.state,
-            tail: None,
-        })
+        NativeView(View::committed(&self.core.state))
     }
 
     /// Borrow the actual committed root for streaming checkpoint encoding.
@@ -1132,10 +1172,7 @@ impl NativeOwner {
     /// owner refuses the same way, as it refuses every fresh candidate.
     pub fn check_retirement(&self) -> Result<(), NativeOwnerError> {
         self.check_layout_change()?;
-        let view = View {
-            state: &self.core.state,
-            tail: None,
-        };
+        let view = View::committed(&self.core.state);
         let mut meta = view.meta();
         meta.outcomes = meta
             .outcomes
@@ -1222,21 +1259,23 @@ impl NativeOwner {
     /// Includes all unpublished work. These observations are provisional and
     /// must not be returned as durable participant acknowledgments.
     pub fn effective(&self) -> NativeView<'_> {
-        NativeView(View {
-            state: &self.core.state,
-            tail: self.pending.back().map(|row| &row.prepared),
-        })
+        NativeView(View::over(
+            &self.core.state,
+            Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),
+        ))
     }
 
+    /// The state as of `candidate`: the committed rows and every pending
+    /// candidate up to and including it.
     pub fn candidate(
         &self,
         candidate: NativeCandidate,
     ) -> Result<NativeView<'_>, NativeOwnerError> {
-        let prepared = self.prepared_candidate(candidate)?;
-        Ok(NativeView(View {
-            state: &self.core.state,
-            tail: Some(prepared),
-        }))
+        self.position(candidate)?;
+        Ok(NativeView(View::over(
+            &self.core.state,
+            Some(Chain::indexed(&self.index, &self.pending, candidate.serial)),
+        )))
     }
 
     /// Borrow the exact unpublished mutation owned by this ticket. A future

@@ -251,10 +251,7 @@ fn adoption_rejects_native_missing_target_substitution_when_actual_response_cont
     let mut fixture = checked_slot_fixture_with_visits(ValidationMode::Required, 65_536);
     complete_response(&mut fixture, 900, 801);
     let mut core = copy_actual_core(&fixture);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let claim = view.claim(CLAIM).unwrap();
     let actual = view.owned_claim(CLAIM).unwrap().registrations().unwrap();
     let response = response_reads::as_response_record(view.get(Key::Response(RESPONSE)))

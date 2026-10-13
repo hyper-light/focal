@@ -17,10 +17,7 @@ fn id(n: u128) -> ClaimId {
     ClaimId::from_u128(n)
 }
 fn view(core: &Core<NativeState>) -> View<'_> {
-    View {
-        state: &core.state,
-        tail: None,
-    }
+    View::committed(&core.state)
 }
 fn scratch() -> Scratch {
     Scratch {

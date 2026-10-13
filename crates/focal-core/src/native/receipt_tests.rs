@@ -1,7 +1,7 @@
 use super::report_tests::{
     Custody, EVALUATOR, ISSUER, SUBJECT, artifact_spec, begin, binding, context, core, creation,
-    descriptor, events, key, post, prepared, publish, report, report_for, request, running,
-    verified,
+    descriptor, events, key, post, prepared, publish, report, report_for, report_for_chain,
+    request, running, verified,
 };
 use super::*;
 use focal_model::lifecycle::{creation::Owner, graph, succession::Lineage};
@@ -126,24 +126,39 @@ fn pending_empty_admission_create_post_receive_publishes_entitlement_without_tes
     let mut core = core();
     let create = prepared(core.prepare_native(context(ISSUER, 10), creation(1, 1, &[], None), &[]));
     let post = prepared(core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[&create]));
-    let expected = post.claim(claim_id(1)).unwrap().binding();
+    let expected = core
+        .native_chain(&[&create, &post])
+        .unwrap()
+        .claim(claim_id(1))
+        .unwrap()
+        .binding();
     let received = prepared(core.prepare_native(
         context(SUBJECT, 30),
         acquire(3, expected, 601),
         &[&create, &post],
     ));
-    let next = received.claim(claim_id(1)).unwrap();
+    let next = core
+        .native_chain(&[&create, &post, &received])
+        .unwrap()
+        .claim(claim_id(1))
+        .unwrap();
     assert_eq!(next.status(), ClaimStatus::Received);
     assert_eq!(next.receipt().unwrap().fence.epoch, 1);
     assert_eq!(next.response_count(), 0);
     assert_eq!(
-        received
+        core.native_chain(&[&create, &post, &received])
+            .unwrap()
             .receipt(ReceiptId::from_u128(601))
             .unwrap()
             .acquired,
         received.outcome().sequence
     );
-    assert!(received.evaluation(key(1)).is_none());
+    assert!(
+        core.native_chain(&[&create, &post, &received])
+            .unwrap()
+            .evaluation(key(1))
+            .is_none()
+    );
     assert_eq!(core.native_sequence(), SessionSeq(0));
     assert!(core.native_claim(claim_id(1)).is_none());
     let pinned = core.pin_native(0, 100).unwrap();
@@ -151,7 +166,7 @@ fn pending_empty_admission_create_post_receive_publishes_entitlement_without_tes
     assert_eq!(core.native_sequence(), SessionSeq(0));
     core.publish_native(create).unwrap();
     core.publish_native(post).unwrap();
-    let outcome = core.publish_native(rejected.prepared).unwrap();
+    let outcome = core.publish_native(rejected.prepared.unwrap()).unwrap();
     check_received(&core, outcome, expected, 601);
     assert_eq!(
         pinned
@@ -257,7 +272,14 @@ fn receipt_ids_are_ledger_unique_across_pending_claims_and_survive_cancellation(
         .is_err()
     );
     assert_eq!(core.native_budget(), before);
-    assert_eq!(first.claim(claim_id(2)).unwrap().receipt(), None);
+    assert_eq!(
+        core.native_chain(&[&first])
+            .unwrap()
+            .claim(claim_id(2))
+            .unwrap()
+            .receipt(),
+        None
+    );
     let first_outcome = core.publish_native(first).unwrap();
     check_received(&core, first_outcome, first_expected, 621);
     let current_first = current(&core, 1);
@@ -300,18 +322,29 @@ fn required_admission_results_are_resolved_from_pending_rows_before_receipt() {
     );
     let token = verified(&mut custody, &input);
     let passed = report(&core, input, &[], &token);
-    let result = passed.evaluation(key(1)).unwrap().last_result().unwrap();
+    let result = core
+        .native_chain(&[&passed])
+        .unwrap()
+        .evaluation(key(1))
+        .unwrap()
+        .last_result()
+        .unwrap();
     let receipt = prepared(core.prepare_native(
         context(SUBJECT, 110),
         acquire(31, expected, 631),
         &[&passed],
     ));
     assert_eq!(
-        receipt.evaluation(key(1)).unwrap().last_result(),
+        core.native_chain(&[&passed, &receipt])
+            .unwrap()
+            .evaluation(key(1))
+            .unwrap()
+            .last_result(),
         Some(result)
     );
     assert_eq!(
-        receipt
+        core.native_chain(&[&passed, &receipt])
+            .unwrap()
             .result(NativeResultKey::of(result))
             .unwrap()
             .result(),
@@ -340,8 +373,18 @@ fn required_failure_is_not_bypassed_by_fresh_receipt_or_observe_pass() {
     );
     let token = verified(&mut custody, &input);
     let failed = report(&core, input, &[], &token);
-    let expected = failed.claim(claim_id(1)).unwrap().binding();
-    let cut = failed.claim(claim_id(1)).unwrap().terminal_cut();
+    let expected = core
+        .native_chain(&[&failed])
+        .unwrap()
+        .claim(claim_id(1))
+        .unwrap()
+        .binding();
+    let cut = core
+        .native_chain(&[&failed])
+        .unwrap()
+        .claim(claim_id(1))
+        .unwrap()
+        .terminal_cut();
     assert!(
         core.prepare_native(
             context(SUBJECT, 110),
@@ -392,14 +435,29 @@ fn begun_observe_report_after_receipt_keeps_entitlement_and_never_authors_testim
     );
     let token = verified(&mut custody, &input);
     let passed = report(&core, input, &[], &token);
-    let expected = passed.claim(claim_id(1)).unwrap().binding();
+    let expected = core
+        .native_chain(&[&passed])
+        .unwrap()
+        .claim(claim_id(1))
+        .unwrap()
+        .binding();
     let receipt = prepared(core.prepare_native(
         context(SUBJECT, 110),
         acquire(52, expected, 652),
         &[&passed],
     ));
-    let acquired = receipt.claim(claim_id(1)).unwrap().receipt().unwrap();
-    let before = *receipt.evaluation(key(2)).unwrap();
+    let acquired = core
+        .native_chain(&[&passed, &receipt])
+        .unwrap()
+        .claim(claim_id(1))
+        .unwrap()
+        .receipt()
+        .unwrap();
+    let before = *core
+        .native_chain(&[&passed, &receipt])
+        .unwrap()
+        .evaluation(key(2))
+        .unwrap();
     assert_eq!(before.receipt(), None);
     assert_eq!(before.fence(), None);
     let input = report_for(
@@ -417,17 +475,45 @@ fn begun_observe_report_after_receipt_keeps_entitlement_and_never_authors_testim
         &[&passed, &receipt],
         Some(&token),
     ));
-    let result = late.evaluation(key(2)).unwrap().last_result().unwrap();
+    let result = core
+        .native_chain(&[&passed, &receipt, &late])
+        .unwrap()
+        .evaluation(key(2))
+        .unwrap()
+        .last_result()
+        .unwrap();
     assert_eq!(
-        late.evaluation(key(2)).unwrap().state(),
+        core.native_chain(&[&passed, &receipt, &late])
+            .unwrap()
+            .evaluation(key(2))
+            .unwrap()
+            .state(),
         validation::State::ValidationFailedNotRequired
     );
-    assert_eq!(late.claim(claim_id(1)).unwrap().receipt(), Some(acquired));
     assert_eq!(
-        late.claim(claim_id(1)).unwrap().status(),
+        core.native_chain(&[&passed, &receipt, &late])
+            .unwrap()
+            .claim(claim_id(1))
+            .unwrap()
+            .receipt(),
+        Some(acquired)
+    );
+    assert_eq!(
+        core.native_chain(&[&passed, &receipt, &late])
+            .unwrap()
+            .claim(claim_id(1))
+            .unwrap()
+            .status(),
         ClaimStatus::Received
     );
-    assert_eq!(late.claim(claim_id(1)).unwrap().response_count(), 0);
+    assert_eq!(
+        core.native_chain(&[&passed, &receipt, &late])
+            .unwrap()
+            .claim(claim_id(1))
+            .unwrap()
+            .response_count(),
+        0
+    );
     core.publish_native(passed).unwrap();
     let receipt_outcome = core.publish_native(receipt).unwrap();
     check_received(&core, receipt_outcome, expected, 652);
@@ -546,7 +632,11 @@ fn dependency_and_await_receipt_gates_use_actual_pending_target_settlement() {
         if kind == graph::Kind::Awaits {
             let receipt = prepared(candidate);
             assert_eq!(
-                receipt.claim(claim_id(2)).unwrap().status(),
+                core.native_chain(&[&target, &receipt])
+                    .unwrap()
+                    .claim(claim_id(2))
+                    .unwrap()
+                    .status(),
                 ClaimStatus::Cancelled
             );
             core.publish_native(target).unwrap();
@@ -589,10 +679,20 @@ fn receipt_graph_gathers_complete_owned_descendants_without_caller_selected_peer
         });
     }
     let created = prepared(core.prepare_native(context(ISSUER, 10), input, &[]));
-    let generated = created.claim(claim_id(1)).unwrap().binding();
+    let generated = core
+        .native_chain(&[&created])
+        .unwrap()
+        .claim(claim_id(1))
+        .unwrap()
+        .binding();
     let posted =
         prepared(core.prepare_native(context(ISSUER, 20), post(2, generated), &[&created]));
-    let expected = posted.claim(claim_id(1)).unwrap().binding();
+    let expected = core
+        .native_chain(&[&created, &posted])
+        .unwrap()
+        .claim(claim_id(1))
+        .unwrap()
+        .binding();
     let received = prepared(core.prepare_native(
         context(SUBJECT, 30),
         acquire(91, expected, 691),
@@ -600,14 +700,33 @@ fn receipt_graph_gathers_complete_owned_descendants_without_caller_selected_peer
     ));
     for id in [2, 3] {
         assert_eq!(
-            received.claim(claim_id(id)).unwrap().binding(),
-            created.claim(claim_id(id)).unwrap().binding()
+            core.native_chain(&[&created, &posted, &received])
+                .unwrap()
+                .claim(claim_id(id))
+                .unwrap()
+                .binding(),
+            core.native_chain(&[&created])
+                .unwrap()
+                .claim(claim_id(id))
+                .unwrap()
+                .binding()
         );
         assert_eq!(
-            received.claim(claim_id(id)).unwrap().status(),
+            core.native_chain(&[&created, &posted, &received])
+                .unwrap()
+                .claim(claim_id(id))
+                .unwrap()
+                .status(),
             ClaimStatus::Generated
         );
-        assert_eq!(received.claim(claim_id(id)).unwrap().receipt(), None);
+        assert_eq!(
+            core.native_chain(&[&created, &posted, &received])
+                .unwrap()
+                .claim(claim_id(id))
+                .unwrap()
+                .receipt(),
+            None
+        );
     }
     core.publish_native(created).unwrap();
     core.publish_native(posted).unwrap();
@@ -616,12 +735,12 @@ fn receipt_graph_gathers_complete_owned_descendants_without_caller_selected_peer
 }
 
 #[test]
-fn receipt_candidate_copy_failure_rolls_back_entitlement_history_and_unique_id_reservation() {
+fn receipt_candidate_range_failure_rolls_back_entitlement_history_and_unique_id_reservation() {
     let mut core = running(&[]);
     let expected = current(&core, 1);
     let before = core.native_budget();
     let prefix = core.native_sequence();
-    let failed = super::prepare::fail_copies_after(0, || {
+    let failed = super::prepare::fail_range_after(0, || {
         core.prepare_native(context(SUBJECT, 30), acquire(101, expected, 701), &[])
     });
     assert!(
@@ -721,13 +840,22 @@ fn required_programmatic_pass_waits_for_authorized_quality_pass_before_receipt()
     );
     let token = verified(&mut custody, &input);
     let program = report(&core, input, &[], &token);
-    let state = program.evaluation(key(1)).unwrap();
+    let state = core
+        .native_chain(&[&program])
+        .unwrap()
+        .evaluation(key(1))
+        .unwrap();
     assert_eq!(state.state(), validation::State::ValidatingQualityBar);
     let program_result = state.last_result().unwrap();
     assert_eq!(program_result.verdict(), VerdictValue::Pass);
     assert!(!program_result.is_terminal());
     let quality_attempt = state
-        .bind(program.definition(key(1).validation).unwrap())
+        .bind(
+            core.native_chain(&[&program])
+                .unwrap()
+                .definition(key(1).validation)
+                .unwrap(),
+        )
         .unwrap()
         .current_attempt()
         .unwrap();
@@ -743,8 +871,20 @@ fn required_programmatic_pass_waits_for_authorized_quality_pass_before_receipt()
         .is_err()
     );
     assert_eq!(core.native_budget(), before);
-    assert_eq!(program.claim(claim_id(1)).unwrap().receipt(), None);
-    assert!(program.recorded(request(SUBJECT, 402)).is_none());
+    assert_eq!(
+        core.native_chain(&[&program])
+            .unwrap()
+            .claim(claim_id(1))
+            .unwrap()
+            .receipt(),
+        None
+    );
+    assert!(
+        core.native_chain(&[&program])
+            .unwrap()
+            .recorded(request(SUBJECT, 402))
+            .is_none()
+    );
     let input = report_for(
         &core,
         Some(&program),
@@ -764,7 +904,13 @@ fn required_programmatic_pass_waits_for_authorized_quality_pass_before_receipt()
         &[&program],
         Some(&token),
     ));
-    let quality_result = quality.evaluation(key(1)).unwrap().last_result().unwrap();
+    let quality_result = core
+        .native_chain(&[&program, &quality])
+        .unwrap()
+        .evaluation(key(1))
+        .unwrap()
+        .last_result()
+        .unwrap();
     assert_eq!(quality_result.phase(), validation::Phase::Quality);
     assert_eq!(quality_result.reporter(), Some(quality_attempt.evaluator));
     assert!(quality_result.is_terminal());
@@ -828,14 +974,28 @@ fn authored_deadline_blocks_new_receipt_without_expiring_claim_and_preserves_exa
     );
     assert_eq!(core.native_budget(), before);
     assert_eq!(core.native_sequence(), prefix);
-    let untouched = received.claim(claim_id(2)).unwrap();
+    let untouched = core
+        .native_chain(&[&received])
+        .unwrap()
+        .claim(claim_id(2))
+        .unwrap();
     assert_eq!(untouched.binding(), second);
     assert_eq!(untouched.status(), ClaimStatus::Posted);
     assert_eq!(untouched.receipt(), None);
     assert_eq!(untouched.terminal_cut(), None);
     assert_eq!(untouched.local_sealed_at(), None);
-    assert!(received.receipt(ReceiptId::from_u128(812)).is_none());
-    assert!(received.recorded(request(SUBJECT, 412)).is_none());
+    assert!(
+        core.native_chain(&[&received])
+            .unwrap()
+            .receipt(ReceiptId::from_u128(812))
+            .is_none()
+    );
+    assert!(
+        core.native_chain(&[&received])
+            .unwrap()
+            .recorded(request(SUBJECT, 412))
+            .is_none()
+    );
     assert!(
         matches!(core.prepare_native(context(SUBJECT, 50), pending_retry, &[&received]).unwrap(),
         NativePreparation::Existing { outcome, committed: false } if outcome == original)
@@ -871,8 +1031,19 @@ fn begun_observe_error_retry_and_quality_chain_after_receipt_retains_every_attem
     let expected = current(&core, 1);
     let received =
         prepared(core.prepare_native(context(SUBJECT, 40), acquire(421, expected, 821), &[]));
-    let original = received.claim(claim_id(1)).unwrap().receipt().unwrap();
-    let receipt_binding = received.claim(claim_id(1)).unwrap().binding();
+    let original = core
+        .native_chain(&[&received])
+        .unwrap()
+        .claim(claim_id(1))
+        .unwrap()
+        .receipt()
+        .unwrap();
+    let receipt_binding = core
+        .native_chain(&[&received])
+        .unwrap()
+        .claim(claim_id(1))
+        .unwrap()
+        .binding();
     let receipt_outcome = received.outcome();
     let mut candidates = vec![received];
     let mut accepted = Vec::new();
@@ -896,7 +1067,8 @@ fn begun_observe_error_retry_and_quality_chain_after_receipt_retains_every_attem
             validation::State::Validated,
         ),
     ] {
-        let tail = candidates.last().unwrap();
+        let pending = candidates.iter().collect::<Vec<_>>();
+        let tail = core.native_chain(&pending).unwrap();
         let attempt = tail
             .evaluation(key(1))
             .unwrap()
@@ -905,9 +1077,9 @@ fn begun_observe_error_retry_and_quality_chain_after_receipt_retains_every_attem
             .current_attempt()
             .unwrap();
         assert_eq!((attempt.index, attempt.phase), (index, phase));
-        let input = report_for(
+        let input = report_for_chain(
             &core,
-            Some(tail),
+            &pending,
             422 + u128::from(index),
             1,
             value,
@@ -918,14 +1090,16 @@ fn begun_observe_error_retry_and_quality_chain_after_receipt_retains_every_attem
             )),
         );
         let token = verified(&mut custody, &input);
-        let pending = candidates.iter().collect::<Vec<_>>();
         let next = prepared(core.prepare_native_evidenced(
             context(attempt.evaluator, 50 + u64::from(index) * 10),
             input,
             &pending,
             Some(&token),
         ));
-        let state = next.evaluation(key(1)).unwrap();
+        let mut through = pending.clone();
+        through.push(&next);
+        let view = core.native_chain(&through).unwrap();
+        let state = view.evaluation(key(1)).unwrap();
         let result = state.last_result().unwrap();
         assert_eq!(state.state(), resulting);
         assert_eq!(state.receipt(), None);
@@ -935,15 +1109,15 @@ fn begun_observe_error_retry_and_quality_chain_after_receipt_retains_every_attem
             (Some(index), phase, Some(attempt.evaluator))
         );
         assert_eq!(result.is_terminal(), index == 2);
-        assert_eq!(next.claim(claim_id(1)).unwrap().binding(), receipt_binding);
-        assert_eq!(next.claim(claim_id(1)).unwrap().receipt(), Some(original));
+        assert_eq!(view.claim(claim_id(1)).unwrap().binding(), receipt_binding);
+        assert_eq!(view.claim(claim_id(1)).unwrap().receipt(), Some(original));
         assert_eq!(
-            next.claim(claim_id(1)).unwrap().status(),
+            view.claim(claim_id(1)).unwrap().status(),
             ClaimStatus::Received
         );
-        assert_eq!(next.claim(claim_id(1)).unwrap().response_count(), 0);
+        assert_eq!(view.claim(claim_id(1)).unwrap().response_count(), 0);
         assert_eq!(
-            next.receipt(original.fence.receipt).unwrap().acquired,
+            view.receipt(original.fence.receipt).unwrap().acquired,
             receipt_outcome.sequence
         );
         accepted.push((result, attempt, next.outcome()));

@@ -112,19 +112,13 @@ fn source_guard_requires_complete_actual_pending_members_and_finite_semantic_wor
         fixture::post(2, fixture::binding(1)),
         &[&created],
     ));
-    let effective = View {
-        state: &core.state,
-        tail: Some(&posted),
-    };
+    let effective = core.native_chain(&[&created, &posted]).unwrap().0;
     let row = effective.owned_claim(fixture::key(1).claim).unwrap();
     let claim = row.claim().unwrap();
     let registry = row.registrations().unwrap();
     let before = core.native_budget();
     check_source(&effective, claim, registry, core.limits).unwrap();
-    let committed = View {
-        state: &core.state,
-        tail: None,
-    };
+    let committed = View::committed(&core.state);
     assert!(check_source(&committed, claim, registry, core.limits).is_err());
     assert!(
         check_source(

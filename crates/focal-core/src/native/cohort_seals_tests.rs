@@ -20,10 +20,7 @@ fn stage(
     operation: NativeOperation,
     evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
 ) -> Staged {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let intent = intent::fingerprint(view.ledger(), &input).unwrap();
     let sequence = SessionSeq(view.prefix().0 + 1);
     let mut meta = view.meta();
@@ -98,10 +95,7 @@ fn stage(
 }
 
 fn original_history(core: &Core<NativeState>, staged: &Staged) -> Vec<NativeFact> {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let mut workspace = Vec::with_capacity(staged.plan.rows.len());
     let mut facts = Vec::with_capacity(usize::try_from(staged.outcome.events).unwrap());
     let count = claim_changes::visit_history(
@@ -130,10 +124,7 @@ fn assemble(core: &Core<NativeState>, staged: Staged) -> SealedChanges {
         outcome,
         mut scratch,
     } = staged;
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let window = crate::native::epochs::staged(&view, &mut meta, outcome, core.limits);
     OriginalPlan::check(
         plan,
@@ -176,6 +167,7 @@ fn publish(core: &mut Core<NativeState>, changes: SealedChanges) -> NativeOutcom
         writes: mutation::WriteSet::unrecorded(),
         encoded_added,
         encoded_removed: removed.bytes(),
+        _index: None,
     })
     .unwrap()
 }
@@ -541,10 +533,7 @@ fn suffix_refusal_for_bytes_or_visits_leaves_the_actual_source_reusable() {
             NativeOperation::ReportAdmission,
             Some(&evidence),
         );
-        let view = View {
-            state: &core.state,
-            tail: None,
-        };
+        let view = View::committed(&core.state);
         let mut limits = core.limits;
         if !short_bytes {
             // The original Admission failure now has a real checked journal.

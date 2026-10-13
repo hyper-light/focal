@@ -63,10 +63,7 @@ const DIMENSIONS: [Dimension; 8] = [
 #[test]
 fn each_metadata_ceiling_protects_held_slots_and_restores_them_on_rollback() {
     let core = fixture::running(&[(ValidationMode::Observe, false)]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     for dimension in &DIMENSIONS {
         let source = source();
         let (binding, envelope, schemas) = parts(&core, &source, 1);

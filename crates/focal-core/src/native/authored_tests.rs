@@ -251,23 +251,41 @@ fn authored_bodies_policy_and_resolution_move_into_one_atomic_prefix() {
     assert_eq!(core.native_sequence(), SessionSeq(0));
     assert!(core.native_claim_content(ClaimId::from_u128(1)).is_none());
     assert!(core.native_creation_result(key(1)).is_none());
-    let body = prepared.claim_content(ClaimId::from_u128(1)).unwrap();
-    let descriptor = prepared
+    let body = core
+        .native_chain(&[&prepared])
+        .unwrap()
+        .claim_content(ClaimId::from_u128(1))
+        .unwrap();
+    let descriptor = core
+        .native_chain(&[&prepared])
+        .unwrap()
         .validation_descriptor(ValidationId::from_u128(1))
         .unwrap();
     assert_eq!(body.description().as_ptr(), claim_pointer);
     assert_eq!(descriptor.description().as_ptr(), definition_pointer);
-    let state = prepared.claim(ClaimId::from_u128(1)).unwrap();
+    let state = core
+        .native_chain(&[&prepared])
+        .unwrap()
+        .claim(ClaimId::from_u128(1))
+        .unwrap();
     assert_eq!(state.binding(), binding);
     state
         .acceptance()
         .check_declaration(descriptor.declaration())
         .unwrap();
     assert!(std::ptr::eq(
-        prepared.definition(ValidationId::from_u128(1)).unwrap(),
+        core.native_chain(&[&prepared])
+            .unwrap()
+            .definition(ValidationId::from_u128(1))
+            .unwrap(),
         descriptor.declaration(),
     ));
-    let mapping = prepared.creation_result(key(1)).unwrap().entries();
+    let mapping = core
+        .native_chain(&[&prepared])
+        .unwrap()
+        .creation_result(key(1))
+        .unwrap()
+        .entries();
     assert_eq!(mapping.len(), 2);
     assert_eq!(mapping[0].family, NativeCreatedFamily::Claim);
     assert_eq!(mapping[1].family, NativeCreatedFamily::Validation);
@@ -339,8 +357,16 @@ fn pending_authored_identity_retry_and_discard_preserve_atomicity() {
     let duplicate = prepare(&core, create(11, vec![proposal(1, 101)]), &[&prepared]);
     assert_eq!(duplicate.outcome().created, 0);
     assert_eq!(
-        duplicate.creation_result(key(11)).unwrap().entries(),
-        prepared.creation_result(key(10)).unwrap().entries()
+        core.native_chain(&[&prepared, &duplicate])
+            .unwrap()
+            .creation_result(key(11))
+            .unwrap()
+            .entries(),
+        core.native_chain(&[&prepared])
+            .unwrap()
+            .creation_result(key(10))
+            .unwrap()
+            .entries()
     );
     drop(duplicate);
     drop(prepared);
@@ -436,7 +462,12 @@ fn contextual_references_use_the_complete_batch_and_pending_prefix() {
         ),
         &[&pending],
     );
-    assert!(reviews.claim_content(ClaimId::from_u128(2)).is_some());
+    assert!(
+        core.native_chain(&[&pending, &reviews])
+            .unwrap()
+            .claim_content(ClaimId::from_u128(2))
+            .is_some()
+    );
     core.publish_native(pending).unwrap();
     core.publish_native(reviews).unwrap();
     let cyclic = [

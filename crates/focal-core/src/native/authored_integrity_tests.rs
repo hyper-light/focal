@@ -99,10 +99,7 @@ fn reconstruction_does_not_promote_projection_only_state() {
 #[test]
 fn retained_proof_detects_changed_original_owner_and_result_positions() {
     let core = core();
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let supplied = proposal(1, 1);
     let mut meta = view.meta();
     let mut extras = Extras::new(128, 1024 * 1024).unwrap();

@@ -546,7 +546,9 @@ fn actual_peer_report_result_keeps_attempt_artifact_and_accepted_ordinal() {
     );
     let token = f::verified(&mut custody, &input);
     let prepared = f::report(&core, input, &[], &token);
-    let result = prepared
+    let result = core
+        .native_chain(&[&prepared])
+        .unwrap()
         .evaluation(f::key(1))
         .unwrap()
         .last_result()

@@ -24,7 +24,7 @@ fn build(core: &Core<NativeState>) -> prepare::BuiltNative {
                 core.native_claim(CLAIM).unwrap().binding(),
                 core.native_response(RESPONSE).unwrap().identity().binding,
             ),
-            std::iter::empty(),
+            None,
         )
         .unwrap();
     let prepare::Checked::Fresh(fresh) = checked else {
@@ -107,6 +107,7 @@ fn altered(
         writes: crate::native::mutation::WriteSet::unrecorded(),
         encoded_added,
         encoded_removed: removed.bytes(),
+        _index: None,
     }
 }
 
@@ -258,10 +259,7 @@ fn collector_requires_the_structural_fact_and_entry_order_without_creating_repor
     let core = work_authority::history_fixture(false, true);
     let built = build(&core);
     let prepared = built.prepared();
-    let source = View {
-        state: &core.state,
-        tail: None,
-    };
+    let source = View::committed(&core.state);
     let mut book = CompletionBook::new(&core.state.budget, core.limits).unwrap();
     let before = core.native_budget();
     let original = events(prepared);
@@ -285,7 +283,12 @@ fn collector_requires_the_structural_fact_and_entry_order_without_creating_repor
         match mutation {
             0 => {
                 changed[missing].fact = NativeFact::Registrations {
-                    claim: prepared.claim(CLAIM).unwrap().binding(),
+                    claim: core
+                        .native_chain(&[prepared])
+                        .unwrap()
+                        .claim(CLAIM)
+                        .unwrap()
+                        .binding(),
                 }
             }
             1..=5 => {
@@ -303,7 +306,15 @@ fn collector_requires_the_structural_fact_and_entry_order_without_creating_repor
                     2 => *kind = NativeEvaluationEventKind::Begun,
                     3 => *kind = NativeEvaluationEventKind::Reported,
                     4 => *before = None,
-                    5 => *before = Some(prepared.evaluation(key).unwrap().binding()),
+                    5 => {
+                        *before = Some(
+                            core.native_chain(&[prepared])
+                                .unwrap()
+                                .evaluation(key)
+                                .unwrap()
+                                .binding(),
+                        )
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -358,10 +369,7 @@ fn structural_entry_checks_charge_visits_before_reads_and_preserve_state_phase()
     let core = work_authority::history_fixture(false, true);
     let built = build(&core);
     let prepared = built.prepared();
-    let source = View {
-        state: &core.state,
-        tail: None,
-    };
+    let source = View::committed(&core.state);
     let history = events(prepared);
     let (ordinal, key) = observer(&history);
     let event = frame(prepared, u32::try_from(ordinal).unwrap(), None)

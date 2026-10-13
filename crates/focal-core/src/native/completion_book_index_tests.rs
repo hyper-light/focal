@@ -212,10 +212,7 @@ fn wrong_pinned_registration_ordinal_refuses_report_and_changed_parent_without_s
         &BuiltinNativeSchemas,
     )
     .unwrap();
-    let changed_view = View {
-        state: &core.state,
-        tail: Some(&changed),
-    };
+    let changed_view = View::committed(&core.state).with_own(&changed).unwrap();
     book.check_parents(&changed_view, &changed).unwrap();
     book.entries
         .replace_weight(key, weight, |grant| grant.registration_index = other)
@@ -316,27 +313,24 @@ fn child_registration_batch_checks_the_final_parent_cohort_once() {
     assert_eq!(
         registrations
             .iter()
-            .filter(|event| event.after == many.claim(fixture::key(1).claim).unwrap().binding())
+            .filter(|event| event.after
+                == core
+                    .native_chain(&[&many])
+                    .unwrap()
+                    .claim(fixture::key(1).claim)
+                    .unwrap()
+                    .binding())
             .count(),
         1
     );
     let budget = source.stats();
     book.entries.reset_visits();
-    book.check_parents(
-        &View {
-            state: &core.state,
-            tail: Some(&one),
-        },
-        &one,
-    )
-    .unwrap();
+    book.check_parents(&View::committed(&core.state).with_own(&one).unwrap(), &one)
+        .unwrap();
     let one_visits = book.entries.visits();
     book.entries.reset_visits();
     book.check_parents(
-        &View {
-            state: &core.state,
-            tail: Some(&many),
-        },
+        &View::committed(&core.state).with_own(&many).unwrap(),
         &many,
     )
     .unwrap();

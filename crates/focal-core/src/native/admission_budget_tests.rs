@@ -172,20 +172,14 @@ fn begin(core: &Core<NativeState>, index: u32, id: u128) -> NativeInput {
 }
 
 fn bound(core: &Core<NativeState>) -> usize {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let claim = view.owned_claim(ClaimId::from_u128(1)).unwrap();
     aggregation::admission_completion_visits(claim.claim().unwrap(), claim.registrations().unwrap())
         .unwrap()
 }
 
 fn project(core: &Core<NativeState>, visits: usize) -> Result<(), ContractError> {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let claim = view.owned_claim(ClaimId::from_u128(1)).unwrap();
     aggregation::project_admission(
         claim.claim().unwrap(),
@@ -358,9 +352,17 @@ fn pending_post_cohort_is_checked_without_consuming_or_dropping_the_predecessor(
     ));
     let input = fixture::begin(
         3,
-        post.claim(ClaimId::from_u128(1)).unwrap().binding(),
+        core.native_chain(&[&post])
+            .unwrap()
+            .claim(ClaimId::from_u128(1))
+            .unwrap()
+            .binding(),
         1,
-        post.evaluation(fixture::key(1)).unwrap().binding(),
+        core.native_chain(&[&post])
+            .unwrap()
+            .evaluation(fixture::key(1))
+            .unwrap()
+            .binding(),
     );
     let budget = core.state.budget.stats();
     assert!(matches!(
@@ -409,10 +411,7 @@ fn numeric_bound_never_substitutes_for_complete_definition_resolution() {
         }
     }
     let core = posted(1, 256, 1, false);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let row = view.owned_claim(ClaimId::from_u128(1)).unwrap();
     let missing = MissingReceipt(crate::native::admission_view::AdmissionRows {
         view: &view,

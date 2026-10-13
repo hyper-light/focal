@@ -3,18 +3,12 @@ use crate::native::report_tests as fixture;
 use focal_memory::{BudgetKind, BudgetLane, Change, Entry};
 use focal_model::{ValidationMode, VerdictValue};
 
-fn meta(core: &Core<NativeState>, tail: Option<&NativePrepared>) -> Meta {
-    View {
-        state: &core.state,
-        tail,
-    }
-    .meta()
+/// The metadata the last of `chain` leaves (the published rows' for none).
+fn meta(core: &Core<NativeState>, chain: &[&NativePrepared]) -> Meta {
+    core.native_chain(chain).unwrap().0.meta()
 }
-fn begin_input(core: &Core<NativeState>, tail: Option<&NativePrepared>) -> NativeInput {
-    let view = View {
-        state: &core.state,
-        tail,
-    };
+fn begin_input(core: &Core<NativeState>, chain: &[&NativePrepared]) -> NativeInput {
+    let view = core.native_chain(chain).unwrap();
     fixture::begin(
         3,
         view.claim(ClaimId::from_u128(1)).unwrap().binding(),
@@ -30,10 +24,9 @@ fn assert_refused_without_change(
 ) {
     let stats = core.native_stats();
     let budget = core.state.budget.stats();
-    let events = meta(core, None).events;
-    let pending_events: Vec<_> = pending
-        .iter()
-        .map(|tail| (tail.outcome(), meta(core, Some(tail)).events))
+    let events = meta(core, &[]).events;
+    let pending_events: Vec<_> = (0..pending.len())
+        .map(|at| (pending[at].outcome(), meta(core, &pending[..=at]).events))
         .collect();
     let request = input.request;
     assert!(matches!(
@@ -47,11 +40,19 @@ fn assert_refused_without_change(
     ));
     assert_eq!(core.native_stats(), stats);
     assert_eq!(core.state.budget.stats(), budget);
-    assert_eq!(meta(core, None).events, events);
+    assert_eq!(meta(core, &[]).events, events);
     assert!(core.native_outcome(request).is_none());
-    for (tail, before) in pending.iter().zip(pending_events) {
-        assert_eq!((tail.outcome(), meta(core, Some(tail)).events), before);
-        assert!(tail.recorded(request).is_none());
+    for (at, before) in pending_events.into_iter().enumerate() {
+        assert_eq!(
+            (pending[at].outcome(), meta(core, &pending[..=at]).events),
+            before
+        );
+        assert!(
+            core.native_chain(&pending[..=at])
+                .unwrap()
+                .recorded(request)
+                .is_none()
+        );
     }
 }
 fn counted_events(core: &Core<NativeState>, outcomes: &[NativeOutcome]) -> usize {
@@ -79,7 +80,7 @@ fn cumulative_create_post_begin_limits_refuse_one_short_and_accept_exact_totals(
         fixture::creation(1, 1, &[(ValidationMode::Required, false)], None),
     );
     assert_eq!(created.events, 3);
-    assert_eq!(meta(&core, None).events, 3);
+    assert_eq!(meta(&core, &[]).events, 3);
 
     core.limits.events = 4;
     assert_refused_without_change(&core, fixture::post(2, fixture::binding(1)), &[], None);
@@ -90,22 +91,22 @@ fn cumulative_create_post_begin_limits_refuse_one_short_and_accept_exact_totals(
     core.limits.events = 5;
     let posted = fixture::publish(&mut core, 20, fixture::post(2, fixture::binding(1)));
     assert_eq!(posted.events, 2);
-    assert_eq!(meta(&core, None).events, 5);
+    assert_eq!(meta(&core, &[]).events, 5);
 
-    assert_refused_without_change(&core, begin_input(&core, None), &[], None);
+    assert_refused_without_change(&core, begin_input(&core, &[]), &[], None);
     assert!(!core.native_evaluation(fixture::key(1)).unwrap().has_begun());
     core.limits.events = 6;
-    let input = begin_input(&core, None);
+    let input = begin_input(&core, &[]);
     let began = fixture::publish(&mut core, 30, input);
     assert_eq!(began.events, 1);
-    assert_eq!(meta(&core, None).events, 6);
+    assert_eq!(meta(&core, &[]).events, 6);
     assert_eq!(counted_events(&core, &[created, posted, began]), 6);
 }
 
 #[test]
 fn verified_required_failure_counts_history_and_registry_seal_and_retry_needs_no_capacity() {
     let mut core = fixture::running(&[(ValidationMode::Required, false)]);
-    assert_eq!(meta(&core, None).events, 6);
+    assert_eq!(meta(&core, &[]).events, 6);
     let old = *core.native_evaluation(fixture::key(1)).unwrap();
     let mut store = fixture::Custody::new();
     let artifact = fixture::descriptor(fixture::artifact_spec(
@@ -129,10 +130,10 @@ fn verified_required_failure_counts_history_and_registry_seal_and_retry_needs_no
     let prepared = fixture::report(&core, input, &[], &evidence);
     let outcome = prepared.outcome();
     assert_eq!(outcome.events, 5);
-    assert_eq!(meta(&core, Some(&prepared)).events, 11);
-    assert_eq!(meta(&core, None).events, 6);
+    assert_eq!(meta(&core, &[&prepared]).events, 11);
+    assert_eq!(meta(&core, &[]).events, 6);
     core.publish_native(prepared).unwrap();
-    assert_eq!(meta(&core, None).events, 11);
+    assert_eq!(meta(&core, &[]).events, 11);
     assert_eq!(fixture::events(&core, outcome).len(), 5);
     assert!(matches!(
         core.native_event(outcome.sequence, 3).unwrap().fact,
@@ -156,7 +157,7 @@ fn verified_required_failure_counts_history_and_registry_seal_and_retry_needs_no
     .into_iter()
     .map(|request| core.native_outcome(request).unwrap())
     .collect();
-    assert_eq!(counted_events(&core, &outcomes), meta(&core, None).events);
+    assert_eq!(counted_events(&core, &outcomes), meta(&core, &[]).events);
 
     let budget = core.state.budget.clone();
     let pressure = budget
@@ -176,14 +177,14 @@ fn verified_required_failure_counts_history_and_registry_seal_and_retry_needs_no
         matches!(existing, NativePreparation::Existing { outcome: old, committed: true } if old == outcome)
     );
     assert_eq!(budget.stats(), occupied);
-    assert_eq!(meta(&core, None).events, 11);
+    assert_eq!(meta(&core, &[]).events, 11);
     drop(pressure);
 }
 
 #[test]
 fn observe_report_counts_three_events_and_does_not_reserve_a_nonexistent_claim_transition() {
     let mut core = fixture::running(&[(ValidationMode::Observe, false)]);
-    let before = meta(&core, None).events;
+    let before = meta(&core, &[]).events;
     let mut store = fixture::Custody::new();
     let input = fixture::report_for(
         &core,
@@ -205,7 +206,7 @@ fn observe_report_counts_three_events_and_does_not_reserve_a_nonexistent_claim_t
     let outcome = prepared.outcome();
     assert_eq!((outcome.events, outcome.changed), (3, 0));
     core.publish_native(prepared).unwrap();
-    assert_eq!(meta(&core, None).events, before + 3);
+    assert_eq!(meta(&core, &[]).events, before + 3);
     assert_eq!(fixture::events(&core, outcome).len(), 3);
     assert_eq!(
         core.native_claim(ClaimId::from_u128(1)).unwrap().status(),
@@ -227,17 +228,17 @@ fn pending_chain_event_totals_are_effective_and_pending_exact_retry_is_free() {
         fixture::post(2, fixture::binding(1)),
         &[],
     ));
-    assert_eq!(meta(&core, Some(&posted)).events, 5);
-    assert_refused_without_change(&core, begin_input(&core, Some(&posted)), &[&posted], None);
+    assert_eq!(meta(&core, &[&posted]).events, 5);
+    assert_refused_without_change(&core, begin_input(&core, &[&posted]), &[&posted], None);
     core.limits.events = 6;
-    let retry = begin_input(&core, Some(&posted));
+    let retry = begin_input(&core, &[&posted]);
     let began = fixture::prepared(core.prepare_native(
         fixture::context(fixture::EVALUATOR, 30),
-        begin_input(&core, Some(&posted)),
+        begin_input(&core, &[&posted]),
         &[&posted],
     ));
-    assert_eq!(meta(&core, None).events, 3);
-    assert_eq!(meta(&core, Some(&began)).events, 6);
+    assert_eq!(meta(&core, &[]).events, 3);
+    assert_eq!(meta(&core, &[&began]).events, 6);
     let before = core.state.budget.stats();
     let existing = core
         .prepare_native(
@@ -253,8 +254,8 @@ fn pending_chain_event_totals_are_effective_and_pending_exact_retry_is_free() {
     let outcomes = [created, posted.outcome(), began.outcome()];
     core.publish_native(posted).unwrap();
     core.publish_native(began).unwrap();
-    assert_eq!(meta(&core, None).events, counted_events(&core, &outcomes));
-    assert_eq!(meta(&core, None).events, 6);
+    assert_eq!(meta(&core, &[]).events, counted_events(&core, &outcomes));
+    assert_eq!(meta(&core, &[]).events, 6);
 }
 
 #[test]
@@ -306,7 +307,7 @@ fn zero_event_configuration_and_counter_overflow_fail_closed() {
         Err(NativeError::Capacity(_))
     ));
     assert_eq!((core.native_stats(), core.state.budget.stats()), before);
-    assert_eq!(meta(&core, None).events, usize::MAX);
+    assert_eq!(meta(&core, &[]).events, usize::MAX);
     assert!(core.native_claim(ClaimId::from_u128(1)).is_none());
     assert!(
         core.native_outcome(fixture::request(fixture::ISSUER, 1))

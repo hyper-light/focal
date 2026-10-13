@@ -52,7 +52,7 @@ fn cancel(core: &Core<NativeState>, id: u128) -> NativePrepared {
     ))
 }
 fn changed_root(prepared: &NativePrepared, id: u128) -> ClaimState {
-    let source = prepared.claim(ClaimId::from_u128(id)).unwrap();
+    let source = prepared.written_claim(ClaimId::from_u128(id)).unwrap();
     source.try_copy(source.copy_charge().unwrap()).unwrap()
 }
 fn cut(view: &View<'_>) -> ClaimCut {
@@ -72,10 +72,7 @@ fn future_heap_ceiling_prices_peer_history_and_registry_copies_without_repricing
     let mut core = core();
     create(&mut core, 1, &[]);
     create(&mut core, 2, &[(Kind::DependsOn, 1)]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let root = view.claim(ClaimId::from_u128(1)).unwrap();
     let plan = preflight(
         &view,
@@ -122,10 +119,7 @@ fn terminal_peer_keeps_its_source_identity_without_a_future_copy_obligation() {
     create(&mut core, 1, &[]);
     create(&mut core, 2, &[(Kind::DependsOn, 1)]);
     core.publish_native(cancel(&core, 2)).unwrap();
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let root = view.claim(ClaimId::from_u128(1)).unwrap();
     let plan = preflight(
         &view,
@@ -173,10 +167,7 @@ fn reverse_transitive_dependencies_fail_from_original_root_without_repainting_te
     let root = changed_root(&candidate, 1);
     let root_binding = root.binding();
     let root_created = root.created();
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let mut scratch = Scratch {
         used: 0,
         max: core.limits.preparation_bytes,
@@ -259,10 +250,7 @@ fn incomplete_reverse_links_and_closure_limits_refuse_without_partial_publicatio
         create(&mut core, 2, &[(Kind::DependsOn, 1)]);
         if malformed == 0 {
             let id = ClaimId::from_u128(1);
-            let view = View {
-                state: &core.state,
-                tail: None,
-            };
+            let view = View::committed(&core.state);
             let Some(Row::IncomingHead(head)) = view.get(Key::IncomingHead(id)) else {
                 panic!("head")
             };
@@ -313,10 +301,7 @@ fn incomplete_reverse_links_and_closure_limits_refuse_without_partial_publicatio
         }
         let candidate = cancel(&core, 1);
         let root = changed_root(&candidate, 1);
-        let view = View {
-            state: &core.state,
-            tail: None,
-        };
+        let view = View::committed(&core.state);
         let mut limits = core.limits;
         match malformed {
             1 => limits.plan_nodes = 1,
@@ -347,10 +332,7 @@ fn construction_budget_and_publication_cut_are_checked_before_graph_mutation() {
     create(&mut core, 1, &[]);
     create(&mut core, 2, &[(Kind::DependsOn, 1)]);
     let candidate = cancel(&core, 1);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     for bad in 0..3 {
         let mut scratch = Scratch {
             used: 0,
@@ -391,10 +373,7 @@ fn already_terminal_connected_rows_keep_their_exact_original_cuts() {
     let old = core.native_claim(ClaimId::from_u128(2)).unwrap();
     let old = old.try_copy(old.copy_charge().unwrap()).unwrap();
     let candidate = cancel(&core, 1);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let mut scratch = Scratch {
         used: 0,
         max: core.limits.preparation_bytes,
@@ -430,10 +409,7 @@ fn preflight_pins_complete_sources_and_bounds_the_actual_consequence_rows() {
     create(&mut core, 2, &[(Kind::DependsOn, 1)]);
     create(&mut core, 3, &[(Kind::Awaits, 1)]);
     create(&mut core, 4, &[]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let root = view.claim(ClaimId::from_u128(1)).unwrap();
     let mut staged = scratch(&core);
     let plan = preflight(&view, root, core.limits, None, &mut staged).unwrap();
@@ -491,10 +467,7 @@ fn proposed_reverse_link_growth_is_detected_even_when_target_row_is_unchanged() 
     create(&mut core, 1, &[]);
     let original = core.native_claim(ClaimId::from_u128(1)).unwrap().binding();
     let budget = {
-        let view = View {
-            state: &core.state,
-            tail: None,
-        };
+        let view = View::committed(&core.state);
         preflight(
             &view,
             view.claim(ClaimId::from_u128(1)).unwrap(),
@@ -518,10 +491,7 @@ fn proposed_reverse_link_growth_is_detected_even_when_target_row_is_unchanged() 
     )
     .unwrap();
     let candidate = f::prepared(core.prepare_native(f::context(ISSUER, 2), input, &[]));
-    let view = View {
-        state: &core.state,
-        tail: Some(&candidate),
-    };
+    let view = View::committed(&core.state).with_own(&candidate).unwrap();
     let root = view.claim(ClaimId::from_u128(1)).unwrap();
     assert_eq!(root.binding(), original);
     let before = core.native_budget();
@@ -533,7 +503,11 @@ fn proposed_reverse_link_growth_is_detected_even_when_target_row_is_unchanged() 
     assert_eq!(replacement.members().len(), 2);
     assert_eq!(
         replacement.members()[1].binding(),
-        candidate.claim(ClaimId::from_u128(2)).unwrap().binding()
+        core.native_chain(&[&candidate])
+            .unwrap()
+            .claim(ClaimId::from_u128(2))
+            .unwrap()
+            .binding()
     );
     assert_eq!(core.native_budget(), before);
     assert!(core.native_claim(ClaimId::from_u128(2)).is_none());
@@ -547,10 +521,7 @@ fn registry_growth_and_prefix_rewind_cannot_reuse_a_cheaper_graph_quote() {
         1,
         f::creation(1, 1, &[(focal_model::ValidationMode::Observe, false)], None),
     );
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let root = view.claim(ClaimId::from_u128(1)).unwrap();
     let original = preflight(&view, root, core.limits, None, &mut scratch(&core))
         .unwrap()
@@ -558,10 +529,7 @@ fn registry_growth_and_prefix_rewind_cannot_reuse_a_cheaper_graph_quote() {
     assert_eq!(original.charges().registry_heap_bytes, 0);
     let candidate =
         f::prepared(core.prepare_native(f::context(ISSUER, 2), f::post(2, root.binding()), &[]));
-    let pending = View {
-        state: &core.state,
-        tail: Some(&candidate),
-    };
+    let pending = View::committed(&core.state).with_own(&candidate).unwrap();
     let changed = pending.claim(ClaimId::from_u128(1)).unwrap();
     assert!(matches!(
         preflight(
@@ -593,10 +561,7 @@ fn graph_quote_checks_remaining_stage_bytes_before_copying_or_mutating_sources()
     let mut core = core();
     create(&mut core, 1, &[]);
     create(&mut core, 2, &[(Kind::DependsOn, 1)]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let root = view.claim(ClaimId::from_u128(1)).unwrap();
     let budget = preflight(&view, root, core.limits, None, &mut scratch(&core))
         .unwrap()
@@ -644,10 +609,7 @@ fn retained_active_scope_without_its_actual_subscription_refuses_graph_preflight
     let mut core = core();
     create(&mut core, 1, &[]);
     create(&mut core, 2, &[]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let original = view.claim(ClaimId::from_u128(1)).unwrap();
     let target = view.claim(ClaimId::from_u128(2)).unwrap();
     let mut changed = original
@@ -713,10 +675,7 @@ fn retained_active_scope_without_its_actual_subscription_refuses_graph_preflight
         )
         .unwrap();
     core.state.rows.publish(replacement).unwrap();
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     assert!(matches!(
         preflight(
             &view,

@@ -117,12 +117,9 @@ fn fail_required(core: &mut Core<NativeState>, custody: &mut f::Custody) -> Nati
     );
     let evidence = f::verified(custody, &input);
     let prepared = f::report(core, input, &[], &evidence);
-    let result = prepared
-        .evaluation(f::key(1))
-        .unwrap()
-        .last_result()
-        .unwrap();
-    let accepted = *prepared.result(NativeResultKey::of(result)).unwrap();
+    let view = core.native_chain(&[&prepared]).unwrap();
+    let result = view.evaluation(f::key(1)).unwrap().last_result().unwrap();
+    let accepted = *view.result(NativeResultKey::of(result)).unwrap();
     core.publish_native(prepared).unwrap();
     accepted
 }
@@ -781,7 +778,7 @@ fn structural_bundle_preserves_respondent_response_and_testament_ids_cannot_cros
 }
 
 #[test]
-fn insufficient_batch_capacity_and_copy_failure_leave_no_partial_bundle_or_consumed_request() {
+fn insufficient_batch_capacity_and_range_failure_leave_no_partial_bundle_or_consumed_request() {
     let (mut core, _custody, _) = completed_core();
     let claim = core.native_claim(CLAIM).unwrap().binding();
     let before_budget = core.native_budget();
@@ -802,7 +799,7 @@ fn insufficient_batch_capacity_and_copy_failure_leave_no_partial_bundle_or_consu
     assert!(core.native_outcome(f::request(f::ISSUER, 1300)).is_none());
 
     core.limits.range.max_batch_entries = 6;
-    let failed = crate::native::prepare::fail_copies_after(0, || {
+    let failed = crate::native::prepare::fail_range_after(0, || {
         core.prepare_native(
             f::context(f::ISSUER, 100),
             generate(claim, BUNDLE, f::ISSUER, 1300),
@@ -867,13 +864,16 @@ fn retained_native_bundle_survives_ram_owner_reconstruction_then_posts_and_retri
     let captured = core.native_sequence();
     let input = generate(claim, BUNDLE, f::ISSUER, 1200);
     let prepared = f::prepared(core.prepare_native(f::context(f::ISSUER, 100), input, &[]));
-    let binding = prepared
+    let binding = core
+        .native_chain(&[&prepared])
+        .unwrap()
         .result_testament(BUNDLE)
         .unwrap()
         .testament()
         .binding();
     assert_eq!(
-        prepared
+        core.native_chain(&[&prepared])
+            .unwrap()
             .claim_result_testament(CLAIM)
             .unwrap()
             .testament()

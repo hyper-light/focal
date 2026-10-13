@@ -1,6 +1,6 @@
 use super::report_tests::{
     Custody, EVALUATOR, ISSUER, artifact_spec, begin, binding, context, creation, descriptor, key,
-    post, prepared, publish, report_for, request, verified,
+    post, prepared, publish, report_for, report_for_chain, request, verified,
 };
 use super::*;
 use focal_memory::{Entry, MemoryError};
@@ -92,16 +92,26 @@ fn real_pending_claim_admission_and_custody_report_publish_with_small_byte_bound
         ));
         let posted =
             prepared(core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[&created]));
-        let claim = posted.claim(key(1).claim).unwrap().binding();
-        let evaluation = posted.evaluation(key(1)).unwrap().binding();
+        let claim = core
+            .native_chain(&[&created, &posted])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .binding();
+        let evaluation = core
+            .native_chain(&[&created, &posted])
+            .unwrap()
+            .evaluation(key(1))
+            .unwrap()
+            .binding();
         let begun = prepared(core.prepare_native(
             context(EVALUATOR, 30),
             begin(3, claim, 1, evaluation),
             &[&created, &posted],
         ));
-        let input = report_for(
+        let input = report_for_chain(
             &core,
-            Some(&begun),
+            &[&created, &posted, &begun],
             4,
             1,
             VerdictValue::Pass,
@@ -122,17 +132,29 @@ fn real_pending_claim_admission_and_custody_report_publish_with_small_byte_bound
         assert_eq!(core.native_sequence(), SessionSeq(0));
         assert!(core.native_artifact(artifact.id).is_none());
         assert_eq!(
-            reported
+            core.native_chain(&[&created, &posted, &begun, &reported])
+                .unwrap()
                 .artifact(artifact.id)
                 .unwrap()
                 .descriptor()
                 .content_hash(),
             artifact.hash
         );
-        let result_key =
-            NativeResultKey::of(reported.evaluation(key(1)).unwrap().last_result().unwrap());
+        let result_key = NativeResultKey::of(
+            core.native_chain(&[&created, &posted, &begun, &reported])
+                .unwrap()
+                .evaluation(key(1))
+                .unwrap()
+                .last_result()
+                .unwrap(),
+        );
         assert_eq!(
-            reported.result(result_key).unwrap().result().verdict(),
+            core.native_chain(&[&created, &posted, &begun, &reported])
+                .unwrap()
+                .result(result_key)
+                .unwrap()
+                .result()
+                .verdict(),
             VerdictValue::Pass
         );
         let outcomes = [
@@ -197,15 +219,28 @@ fn large_native_claim_remains_at_the_same_owned_address_when_an_adjacent_claim_i
     let candidate =
         prepared(core.prepare_native(context(ISSUER, 20), creation(2, 2, &[], None), &[]));
     assert_eq!(
-        std::ptr::from_ref(candidate.claim(key(1).claim).unwrap()),
+        std::ptr::from_ref(
+            core.native_chain(&[&candidate])
+                .unwrap()
+                .claim(key(1).claim)
+                .unwrap()
+        ),
         pointer
     );
     assert_eq!(
-        candidate.definition(key(1).validation).unwrap().binding(),
+        core.native_chain(&[&candidate])
+            .unwrap()
+            .definition(key(1).validation)
+            .unwrap()
+            .binding(),
         definition
     );
     assert_eq!(
-        candidate.claim(key(1).claim).unwrap().status(),
+        core.native_chain(&[&candidate])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .status(),
         ClaimStatus::Generated
     );
     core.publish_native(candidate).unwrap();
@@ -238,17 +273,47 @@ fn small_immutable_definitions_keep_their_owned_addresses_through_pending_lifecy
     let pinned = core.pin_native(0, 1000).unwrap();
     let before = core.state.budget.stats();
     let posted = prepared(core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[]));
-    assert_eq!(std::ptr::from_ref(posted.definition(id).unwrap()), original);
-    let claim = posted.claim(key(1).claim).unwrap().binding();
-    let evaluation = posted.evaluation(key(1)).unwrap().binding();
+    assert_eq!(
+        std::ptr::from_ref(
+            core.native_chain(&[&posted])
+                .unwrap()
+                .definition(id)
+                .unwrap()
+        ),
+        original
+    );
+    let claim = core
+        .native_chain(&[&posted])
+        .unwrap()
+        .claim(key(1).claim)
+        .unwrap()
+        .binding();
+    let evaluation = core
+        .native_chain(&[&posted])
+        .unwrap()
+        .evaluation(key(1))
+        .unwrap()
+        .binding();
     let begun = prepared(core.prepare_native(
         context(EVALUATOR, 30),
         begin(3, claim, 1, evaluation),
         &[&posted],
     ));
-    assert_eq!(std::ptr::from_ref(begun.definition(id).unwrap()), original);
     assert_eq!(
-        begun.definition(id).unwrap().intent_fingerprint(),
+        std::ptr::from_ref(
+            core.native_chain(&[&posted, &begun])
+                .unwrap()
+                .definition(id)
+                .unwrap()
+        ),
+        original
+    );
+    assert_eq!(
+        core.native_chain(&[&posted, &begun])
+            .unwrap()
+            .definition(id)
+            .unwrap()
+            .intent_fingerprint(),
         original_intent
     );
     assert_eq!(
@@ -321,15 +386,29 @@ fn small_immutable_artifact_descriptor_survives_control_writes_without_copying()
     };
     let cancelled = prepared(core.prepare_native(context(ISSUER, 50), cancel(), &[]));
     assert_eq!(
-        std::ptr::from_ref(cancelled.artifact(artifact.id).unwrap()),
+        std::ptr::from_ref(
+            core.native_chain(&[&cancelled])
+                .unwrap()
+                .artifact(artifact.id)
+                .unwrap()
+        ),
         original
     );
     assert_eq!(
-        std::ptr::from_ref(cancelled.definition(key(1).validation).unwrap()),
+        std::ptr::from_ref(
+            core.native_chain(&[&cancelled])
+                .unwrap()
+                .definition(key(1).validation)
+                .unwrap()
+        ),
         definition
     );
     assert_eq!(
-        cancelled.claim(key(1).claim).unwrap().status(),
+        core.native_chain(&[&cancelled])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .status(),
         ClaimStatus::Cancelled
     );
     drop(cancelled);

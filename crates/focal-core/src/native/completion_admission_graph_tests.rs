@@ -12,10 +12,7 @@ fn quote(
     ),
     NativeError,
 > {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let registered = crate::native::admission_authority::registered_any(
         &view,
         core.native_claim(key(1).claim).unwrap().binding(),
@@ -86,10 +83,7 @@ fn isolated_required_parent_is_protected_and_failure_credit_is_still_one_time() 
                 .per_report_retained_bytes(CompletionUse::AdmissionFailure)
                 .unwrap()
     );
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     envelope
         .check_graph_with_members(
             &view,
@@ -129,7 +123,7 @@ fn actual_dependency_failure_and_automatic_seals_fit_held_range_and_construction
     let verified = f::verified(&mut custody, &input);
     let before = ReportParent::capture(core.native_claim(key(1).claim).unwrap());
     let prepare::Checked::Fresh(fresh) = core
-        .check_native_chain(context(EVALUATOR, 100), input, std::iter::empty())
+        .check_native_chain(context(EVALUATOR, 100), input, None)
         .unwrap()
     else {
         panic!("fresh")
@@ -138,11 +132,19 @@ fn actual_dependency_failure_and_automatic_seals_fit_held_range_and_construction
         .build_with_completion(&core.state.budget, Some(&verified), Some(&envelope))
         .unwrap();
     assert_eq!(
-        candidate.claim(key(1).claim).unwrap().status(),
+        core.native_chain(&[&candidate])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .status(),
         ClaimStatus::PostFailed
     );
     assert_eq!(
-        candidate.claim(ClaimId::from_u128(2)).unwrap().status(),
+        core.native_chain(&[&candidate])
+            .unwrap()
+            .claim(ClaimId::from_u128(2))
+            .unwrap()
+            .status(),
         ClaimStatus::DependencyFailed
     );
     let Some(Row::Event(event)) = candidate
@@ -158,7 +160,7 @@ fn actual_dependency_failure_and_automatic_seals_fit_held_range_and_construction
         before
             .completion_use_prepared(
                 candidate.outcome().operation,
-                candidate.claim(key(1).claim),
+                candidate.written_claim(key(1).claim),
                 Some(event)
             )
             .unwrap(),
@@ -170,7 +172,7 @@ fn actual_dependency_failure_and_automatic_seals_fit_held_range_and_construction
         before
             .completion_use_prepared(
                 candidate.outcome().operation,
-                candidate.claim(key(1).claim),
+                candidate.written_claim(key(1).claim),
                 Some(wrong)
             )
             .is_err()
@@ -184,10 +186,7 @@ fn new_incoming_member_and_insufficient_failure_shape_refuse_without_changing_bu
     let (envelope, members) = quote(&core, core.limits).unwrap();
     peer(&mut core, 2, 1);
     let baseline = core.state.budget.stats();
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     assert!(
         envelope
             .check_graph_with_members(

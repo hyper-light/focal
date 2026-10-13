@@ -43,17 +43,7 @@ fn entries_from<'a>(
     view: &'a View<'_>,
     key: &Key,
 ) -> impl Iterator<Item = &'a focal_memory::Entry<Key, Row>> {
-    let committed = view
-        .tail
-        .is_none()
-        .then(|| view.state.rows.entries_from(key, false));
-    let pending = view
-        .tail
-        .map(|tail| tail.fragments.entries_from(key, false));
-    pending
-        .into_iter()
-        .flatten()
-        .chain(committed.into_iter().flatten())
+    view.entries_from(*key)
 }
 
 fn published(

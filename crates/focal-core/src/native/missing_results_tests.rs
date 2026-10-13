@@ -219,10 +219,7 @@ impl Fixture {
         }
     }
     fn view(&self) -> View<'_> {
-        View {
-            state: &self.core.state,
-            tail: None,
-        }
+        View::committed(&self.core.state)
     }
     fn registry(&self) -> &RegistrationSet {
         match self.core.state.rows.get(&Key::Claim(ClaimId::from_u128(1))) {

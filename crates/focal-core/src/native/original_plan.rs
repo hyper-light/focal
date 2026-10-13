@@ -160,10 +160,7 @@ impl<'source> OriginalPlan<'source> {
         Ok(Self {
             plan,
             extras,
-            source: View {
-                state: view.state,
-                tail: view.tail,
-            },
+            source: *view,
             meta,
             outcome,
             limits,

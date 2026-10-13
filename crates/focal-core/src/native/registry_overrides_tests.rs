@@ -422,10 +422,7 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         },
         &[],
     ));
-    let view = View {
-        state: &core.state,
-        tail: Some(&receipt),
-    };
+    let view = View::committed(&core.state).with_own(&receipt).unwrap();
     let mut allowance = Scratch {
         used: 0,
         max: core.limits.preparation_bytes,
@@ -522,6 +519,7 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         writes: mutation::WriteSet::unrecorded(),
         encoded_added,
         encoded_removed: removed.bytes(),
+        _index: None,
     };
     assert_eq!(core.native_sequence(), original_sequence);
     for (id, members) in &original {
@@ -533,20 +531,25 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
                 .increment_targets_sealed()
         );
         assert!(
-            !receipt
+            !core
+                .native_chain(&[&receipt])
+                .unwrap()
                 .registrations(*id)
                 .unwrap()
                 .increment_targets_sealed()
         );
-        assert_eq!(receipt.registrations(*id).unwrap().rows(), members);
-        assert!(
-            sealed
+        assert_eq!(
+            core.native_chain(&[&receipt])
+                .unwrap()
                 .registrations(*id)
                 .unwrap()
-                .increment_targets_sealed()
+                .rows(),
+            members
         );
-        assert!(!sealed.registrations(*id).unwrap().is_sealed());
-        assert_eq!(sealed.registrations(*id).unwrap().rows(), members);
+        let after = core.native_chain(&[&receipt, &sealed]).unwrap();
+        assert!(after.registrations(*id).unwrap().increment_targets_sealed());
+        assert!(!after.registrations(*id).unwrap().is_sealed());
+        assert_eq!(after.registrations(*id).unwrap().rows(), members);
     }
     core.publish_native(receipt).unwrap();
     assert!(original.iter().all(|(id, _)| {

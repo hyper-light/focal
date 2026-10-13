@@ -34,10 +34,7 @@ fn input(
     index: u32,
     verdict: VerdictValue,
 ) -> NativeInput {
-    let view = View {
-        state: &core.state,
-        tail,
-    };
+    let view = View::with_tail(&core.state, tail);
     let key = fixture::key(index);
     let actor = view
         .evaluation(key)
@@ -72,10 +69,7 @@ fn with_seals(
     let ordinary = fixture::report(core, fixture::copy_report(&input), &pending, custody);
     let mut base_outcome = ordinary.outcome();
     drop(ordinary);
-    let view = View {
-        state: &core.state,
-        tail,
-    };
+    let view = View::with_tail(&core.state, tail);
     let NativeCommand::ReportAdmission { key, expected, .. } = &input.command else {
         panic!("Admission fixture")
     };
@@ -237,28 +231,17 @@ fn with_seals(
     }
     let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
     let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
-    let range = match tail {
-        Some(tail) => core.state.rows.plan_after(
-            &core.state.budget,
-            &tail.fragments,
+    let range = core
+        .state
+        .rows
+        .forge(
+            tail.map(|tail| &tail.fragments),
             outcome.sequence.0,
             changes,
             BudgetLane::Completion,
-            usize::MAX,
-        ),
-        None => core.state.rows.plan_batch(
-            &core.state.budget,
-            outcome.sequence.0,
-            changes,
-            BudgetLane::Completion,
-            usize::MAX,
-        ),
-    }
-    .unwrap()
-    .build_in_replacing(&core.state.budget, copy_row, |key, row| {
-        removed.count(key, row)
-    })
-    .unwrap();
+            |key, row| removed.count(key, row),
+        )
+        .unwrap();
     // Events above retain their original member order. This fixture has distinct
     // Admission definitions, so the complete before binding orders its tokens.
     assert!(seals.iter().all(|seal| matches!(
@@ -286,6 +269,7 @@ fn with_seals(
             writes: crate::native::mutation::WriteSet::unrecorded(),
             encoded_added,
             encoded_removed: removed.bytes(),
+            _index: None,
         },
         ReportAdvance { key, before, usage },
         seals,
@@ -319,13 +303,14 @@ fn mixed_retirement_and_live_seals_commit_after_a_younger_report_and_rollback_ex
     let verified = fixture::verified(&mut custody, &request);
     let (prepared, report, seals) = with_seals(&core, None, request, &verified, &[2, 3]);
     assert_eq!(
-        prepared.claim(fixture::key(1).claim).unwrap().status(),
+        core.native_chain(&[&prepared])
+            .unwrap()
+            .claim(fixture::key(1).claim)
+            .unwrap()
+            .status(),
         ClaimStatus::PostFailed
     );
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let journal = book
         .apply_prepared(
             &view,
@@ -352,10 +337,7 @@ fn mixed_retirement_and_live_seals_commit_after_a_younger_report_and_rollback_ex
     let request = input(&core, Some(&prepared), 902, 2, VerdictValue::Error);
     let verified = fixture::verified(&mut custody, &request);
     let later = fixture::report(&core, request, &[&prepared], &verified);
-    let view = View {
-        state: &core.state,
-        tail: Some(&prepared),
-    };
+    let view = View::committed(&core.state).with_own(&prepared).unwrap();
     let later_journal = book
         .apply_prepared(
             &view,
@@ -391,10 +373,7 @@ fn mixed_retirement_and_live_seals_commit_after_a_younger_report_and_rollback_ex
     let request = input(&core, None, 903, 1, VerdictValue::Fail);
     let verified = fixture::verified(&mut custody, &request);
     let (prepared, report, seals) = with_seals(&core, None, request, &verified, &[2, 3]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let journal = book
         .apply_prepared(
             &view,
@@ -411,11 +390,13 @@ fn mixed_retirement_and_live_seals_commit_after_a_younger_report_and_rollback_ex
     let request = input(&core, Some(&prepared), 904, 2, VerdictValue::Pass);
     let verified = fixture::verified(&mut custody, &request);
     let later = fixture::report(&core, request, &[&prepared], &verified);
-    let sealed = prepared.evaluation(fixture::key(2)).unwrap().binding();
-    let view = View {
-        state: &core.state,
-        tail: Some(&prepared),
-    };
+    let sealed = core
+        .native_chain(&[&prepared])
+        .unwrap()
+        .evaluation(fixture::key(2))
+        .unwrap()
+        .binding();
+    let view = View::committed(&core.state).with_own(&prepared).unwrap();
     let later_journal = book
         .apply_prepared(
             &view,
@@ -468,10 +449,7 @@ fn same_report_and_seal_debit_once_and_preserve_the_accepted_revision() {
     let request = input(&core, None, 911, 1, VerdictValue::Fail);
     let verified = fixture::verified(&mut custody, &request);
     let (failed, _, _) = with_seals(&core, None, request, &verified, &[]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let journal = book
         .apply_prepared(
             &view,
@@ -497,7 +475,9 @@ fn same_report_and_seal_debit_once_and_preserve_the_accepted_revision() {
     let request = input(&core, None, 912, 2, VerdictValue::Pass);
     let verified = fixture::verified(&mut custody, &request);
     let (prepared, report, seals) = with_seals(&core, None, request, &verified, &[2]);
-    let accepted = prepared
+    let accepted = core
+        .native_chain(&[&prepared])
+        .unwrap()
         .evaluation(fixture::key(2))
         .unwrap()
         .last_result()
@@ -508,20 +488,22 @@ fn same_report_and_seal_debit_once_and_preserve_the_accepted_revision() {
     );
     assert_eq!(accepted.binding(), before.binding.next().unwrap());
     assert_eq!(
-        prepared.evaluation(fixture::key(2)).unwrap().binding(),
+        core.native_chain(&[&prepared])
+            .unwrap()
+            .evaluation(fixture::key(2))
+            .unwrap()
+            .binding(),
         accepted.binding().next().unwrap()
     );
     assert_eq!(
-        prepared
+        core.native_chain(&[&prepared])
+            .unwrap()
             .result(NativeResultKey::of(accepted))
             .unwrap()
             .ordinal(),
         2
     );
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let journal = book
         .apply_prepared(
             &view,
@@ -573,10 +555,7 @@ fn incomplete_duplicate_or_reversed_seal_proofs_and_refused_funding_leave_book_e
     let request = input(&core, None, 921, 1, VerdictValue::Fail);
     let verified = fixture::verified(&mut custody, &request);
     let (prepared, report, seals) = with_seals(&core, None, request, &verified, &[2, 3]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     for supplied in [
         &[][..],
         &seals[..1],
@@ -699,10 +678,7 @@ fn a_valid_ready_seal_cannot_authorize_an_evaluation_omitted_from_the_source_reg
     let request = input(&core, None, 931, 1, VerdictValue::Fail);
     let verified = fixture::verified(&mut custody, &request);
     let (failed, _, _) = with_seals(&core, None, request, &verified, &[]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let retired = book
         .apply_prepared(
             &view,
@@ -736,10 +712,7 @@ fn a_valid_ready_seal_cannot_authorize_an_evaluation_omitted_from_the_source_reg
     let request = input(&core, None, 932, 2, VerdictValue::Error);
     let verified = fixture::verified(&mut custody, &request);
     let (prepared, report, seals) = with_seals(&core, None, request, &verified, &[3]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let journal = book
         .apply_prepared(
             &view,
@@ -790,10 +763,7 @@ fn a_valid_ready_seal_cannot_authorize_an_evaluation_omitted_from_the_source_reg
     let verified = fixture::verified(&mut custody, &request);
     let (prepared, report, seals) = with_seals(&core, None, request, &verified, &[3]);
     seals[0].check(&before_state, &seals[0].next()).unwrap();
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     assert!(
         book.apply_prepared(
             &view,
@@ -852,10 +822,7 @@ fn mixed_journal_sort_and_group_validation_share_one_nonrenewable_visit_budget()
             .collect::<Vec<_>>(),
         [fixture::key(2), fixture::key(3)]
     );
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let generous = book.limits.plan_edges;
     let mut minimum = None;
     for allowed in 0..=generous {

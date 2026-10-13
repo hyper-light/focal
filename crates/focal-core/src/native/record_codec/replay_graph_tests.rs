@@ -113,7 +113,9 @@ fn original_shared_dependency_snapshot_survives_replay_and_refuses_stale_capture
     }
     checksum(&mut changed);
     refused_graph(&recovered, &changed, source, &store);
-    let Some(ClaimTerminalCut::Graph(cut)) = candidate
+    let Some(ClaimTerminalCut::Graph(cut)) = original
+        .native_chain(&[&candidate])
+        .unwrap()
         .claim(ClaimId::from_u128(3))
         .unwrap()
         .terminal_cut()

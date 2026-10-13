@@ -224,7 +224,9 @@ fn actual_report_artifact_origin_preserves_request_binding_and_original_ordinal(
     let mut custody = f::Custody::new();
     let token = f::verified(&mut custody, &input);
     let candidate = f::report(&core, input, &[], &token);
-    let descriptor = candidate
+    let descriptor = core
+        .native_chain(&[&candidate])
+        .unwrap()
         .artifact(ArtifactId::from_u128(401))
         .unwrap()
         .descriptor();

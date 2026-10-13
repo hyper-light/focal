@@ -259,10 +259,7 @@ impl Fixture {
             .unwrap()
     }
     fn view(&self) -> View<'_> {
-        View {
-            state: &self.core.state,
-            tail: None,
-        }
+        View::committed(&self.core.state)
     }
     fn key(&self, index: u32) -> EvaluationKey {
         let target = if self.response().manifest().is_empty() {

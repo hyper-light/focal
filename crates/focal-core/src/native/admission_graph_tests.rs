@@ -29,10 +29,7 @@ fn source() -> Core<NativeState> {
     core
 }
 fn view(core: &Core<NativeState>) -> View<'_> {
-    View {
-        state: &core.state,
-        tail: None,
-    }
+    View::committed(&core.state)
 }
 fn stage(core: &Core<NativeState>) -> Staged {
     let mut custody = f::Custody::new();

@@ -271,7 +271,11 @@ fn completion_use_follows_actual_admission_transition_not_changed_row_count() {
         );
         let verified = fixture::verified(&mut custody, &report);
         let prepared = fixture::report(&core, report, &[], &verified);
-        let after = prepared.claim(key(1).claim).unwrap();
+        let after = core
+            .native_chain(&[&prepared])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap();
         assert_eq!(
             captured
                 .completion_use(prepared.outcome().operation, Some(after))
@@ -329,7 +333,9 @@ fn admission_surcharge_refuses_other_control_and_foreign_changed_claims() {
         captured
             .completion_use(
                 NativeOperation::ReportAdmission,
-                cancelled.claim(key(1).claim)
+                core.native_chain(&[&cancelled])
+                    .unwrap()
+                    .claim(key(1).claim)
             )
             .is_err()
     );
@@ -670,7 +676,7 @@ fn admitted_scope_growth_and_actual_failed_report_fit_the_original_pinned_envelo
         panic!("actual registry seal fact")
     };
     assert!(matches!(event.get(core.state.ledger).unwrap().fact,
-        NativeFact::Registrations { claim } if claim == candidate.claim(key(1).claim).unwrap().binding()));
+        NativeFact::Registrations { claim } if claim == core.native_chain(&[&candidate]).unwrap().claim(key(1).claim).unwrap().binding()));
     let plan = core
         .state
         .rows

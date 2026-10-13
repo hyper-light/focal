@@ -310,14 +310,16 @@ fn facts(core: &Core<NativeState>, outcome: NativeOutcome) -> Vec<NativeFact> {
         })
         .collect()
 }
+/// `view` is the state `candidate` leaves.
 fn assert_fence_then_seal(
+    view: NativeView<'_>,
     candidate: &NativePrepared,
     key: EvaluationKey,
     previous: validation::EvaluationState,
     reason: validation::FenceReason,
 ) {
-    let next = candidate.evaluation(key).unwrap();
-    let definition = candidate.definition(key.validation).unwrap();
+    let next = view.evaluation(key).unwrap();
+    let definition = view.definition(key.validation).unwrap();
     let outcome = candidate.outcome();
     let fenced_binding = previous.binding().next().unwrap();
     assert_eq!(next.binding(), fenced_binding.next().unwrap());
@@ -409,17 +411,37 @@ fn pending_create_post_begin_publish_full_definitions_and_correct_programmatic_o
             &[],
         );
         assert_eq!(creation.outcome().definitions, 2);
-        assert!(creation.definition(declaration_id(1, 1)).is_some());
-        assert!(creation.definition(declaration_id(1, 2)).is_some());
+        assert!(
+            core.native_chain(&[&creation])
+                .unwrap()
+                .definition(declaration_id(1, 1))
+                .is_some()
+        );
+        assert!(
+            core.native_chain(&[&creation])
+                .unwrap()
+                .definition(declaration_id(1, 2))
+                .is_some()
+        );
         let posting = prepare(&core, ISSUER, 20, post(2, binding(1)), &[&creation]);
-        let claim = posting.claim(ClaimId::from_u128(1)).unwrap().binding();
-        let ready = *posting.evaluation(evaluation_key(1)).unwrap();
+        let claim = core
+            .native_chain(&[&creation, &posting])
+            .unwrap()
+            .claim(ClaimId::from_u128(1))
+            .unwrap()
+            .binding();
+        let ready = *core
+            .native_chain(&[&creation, &posting])
+            .unwrap()
+            .evaluation(evaluation_key(1))
+            .unwrap();
         assert_eq!(ready.state(), validation::State::Ready);
         assert_eq!(ready.target(), validation::Target::Admission { claim });
         assert_eq!(ready.receipt(), None);
         assert!(!ready.has_begun());
         assert!(
-            posting
+            core.native_chain(&[&creation, &posting])
+                .unwrap()
                 .evaluation(EvaluationKey {
                     validation: declaration_id(1, 1),
                     ..evaluation_key(1)
@@ -433,7 +455,11 @@ fn pending_create_post_begin_publish_full_definitions_and_correct_programmatic_o
             begin(3, claim, ready.binding()),
             &[&creation, &posting],
         );
-        let running = beginning.evaluation(evaluation_key(1)).unwrap();
+        let running = core
+            .native_chain(&[&creation, &posting, &beginning])
+            .unwrap()
+            .evaluation(evaluation_key(1))
+            .unwrap();
         let expected_state = if agentic {
             validation::State::ValidatingQualityBar
         } else {
@@ -443,7 +469,11 @@ fn pending_create_post_begin_publish_full_definitions_and_correct_programmatic_o
         assert!(running.has_begun());
         assert!(running.last_result().is_none());
         assert_eq!(
-            beginning.claim(ClaimId::from_u128(1)).unwrap().status(),
+            core.native_chain(&[&creation, &posting, &beginning])
+                .unwrap()
+                .claim(ClaimId::from_u128(1))
+                .unwrap()
+                .status(),
             ClaimStatus::Posted
         );
         assert!(core.native_claim(ClaimId::from_u128(1)).is_none());
@@ -673,7 +703,12 @@ fn cancellation_fences_pending_begun_evaluation_and_preserves_unrelated_claim() 
         &[],
     );
     let posting = prepare(&core, ISSUER, 20, post(2, binding(1)), &[&creation]);
-    let claim = posting.claim(ClaimId::from_u128(1)).unwrap().binding();
+    let claim = core
+        .native_chain(&[&creation, &posting])
+        .unwrap()
+        .claim(ClaimId::from_u128(1))
+        .unwrap()
+        .binding();
     let beginning = prepare(
         &core,
         EVALUATOR,
@@ -681,7 +716,11 @@ fn cancellation_fences_pending_begun_evaluation_and_preserves_unrelated_claim() 
         begin(3, claim, binding(102)),
         &[&creation, &posting],
     );
-    let before = *beginning.evaluation(evaluation_key(1)).unwrap();
+    let before = *core
+        .native_chain(&[&creation, &posting, &beginning])
+        .unwrap()
+        .evaluation(evaluation_key(1))
+        .unwrap();
     let cancellation = prepare(
         &core,
         ISSUER,
@@ -689,9 +728,15 @@ fn cancellation_fences_pending_begun_evaluation_and_preserves_unrelated_claim() 
         cancel(4, claim),
         &[&creation, &posting, &beginning],
     );
-    let value = cancellation.evaluation(evaluation_key(1)).unwrap();
+    let value = core
+        .native_chain(&[&creation, &posting, &beginning, &cancellation])
+        .unwrap()
+        .evaluation(evaluation_key(1))
+        .unwrap();
     assert_eq!(value.state(), validation::State::Validating);
     assert_fence_then_seal(
+        core.native_chain(&[&creation, &posting, &beginning, &cancellation])
+            .unwrap(),
         &cancellation,
         evaluation_key(1),
         before,
@@ -703,7 +748,11 @@ fn cancellation_fences_pending_begun_evaluation_and_preserves_unrelated_claim() 
     );
     assert!(value.last_result().is_none());
     assert_eq!(
-        cancellation.claim(ClaimId::from_u128(2)).unwrap().status(),
+        core.native_chain(&[&creation, &posting, &beginning, &cancellation])
+            .unwrap()
+            .claim(ClaimId::from_u128(2))
+            .unwrap()
+            .status(),
         ClaimStatus::Generated
     );
     for candidate in [creation, posting, beginning] {
@@ -787,7 +836,11 @@ fn pending_supersession_fences_actual_predecessor_but_amends_does_not() {
         let mut core = core();
         let claim = posted(&mut core, 1, false, false);
         let beginning = prepare(&core, EVALUATOR, 30, begin(3, claim, binding(102)), &[]);
-        let before = *beginning.evaluation(evaluation_key(1)).unwrap();
+        let before = *core
+            .native_chain(&[&beginning])
+            .unwrap()
+            .evaluation(evaluation_key(1))
+            .unwrap();
         let correction = prepare(
             &core,
             ISSUER,
@@ -795,7 +848,11 @@ fn pending_supersession_fences_actual_predecessor_but_amends_does_not() {
             create(4, vec![successor(2, 1, kind)]),
             &[&beginning],
         );
-        let value = correction.evaluation(evaluation_key(1)).unwrap();
+        let value = core
+            .native_chain(&[&beginning, &correction])
+            .unwrap()
+            .evaluation(evaluation_key(1))
+            .unwrap();
         let supersedes = kind == CorrectionKind::Supersedes;
         assert_eq!(
             value.fence().map(|fence| fence.reason),
@@ -803,6 +860,7 @@ fn pending_supersession_fences_actual_predecessor_but_amends_does_not() {
         );
         if supersedes {
             assert_fence_then_seal(
+                core.native_chain(&[&beginning, &correction]).unwrap(),
                 &correction,
                 evaluation_key(1),
                 before,
@@ -815,7 +873,11 @@ fn pending_supersession_fences_actual_predecessor_but_amends_does_not() {
         assert_eq!(value.state(), validation::State::Validating);
         assert!(value.last_result().is_none());
         assert_eq!(
-            correction.claim(ClaimId::from_u128(1)).unwrap().status(),
+            core.native_chain(&[&beginning, &correction])
+                .unwrap()
+                .claim(ClaimId::from_u128(1))
+                .unwrap()
+                .status(),
             if supersedes {
                 ClaimStatus::Superseded
             } else {
@@ -1020,7 +1082,7 @@ fn ordinary_pressure_refuses_begin_but_completion_fences_and_prepared_publish_ne
 }
 
 #[test]
-fn retained_neighbor_copy_failure_rolls_back_post_definitions_and_ready_registry() {
+fn range_failure_rolls_back_post_definitions_and_ready_registry() {
     let mut core = core();
     publish(
         &mut core,
@@ -1029,7 +1091,7 @@ fn retained_neighbor_copy_failure_rolls_back_post_definitions_and_ready_registry
         create(1, vec![cohort(1, false, false, 1)]),
     );
     let before = core.native_budget();
-    let result = super::prepare::fail_copies_after(0, || {
+    let result = super::prepare::fail_range_after(0, || {
         core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[])
     });
     assert!(
@@ -1066,12 +1128,21 @@ fn child_registration_preserves_posted_parent_begun_registry_for_pending_cancell
     publish(&mut core, EVALUATOR, 30, begin(30, parent, binding(102)));
     let before = *core.native_evaluation(evaluation_key(1)).unwrap();
     let child = prepare(&core, ISSUER, 40, create(40, vec![owned(2, parent)]), &[]);
-    let changed_parent = child.claim(ClaimId::from_u128(1)).unwrap();
+    let changed_parent = core
+        .native_chain(&[&child])
+        .unwrap()
+        .claim(ClaimId::from_u128(1))
+        .unwrap();
     assert_eq!(changed_parent.status(), ClaimStatus::Posted);
     assert_eq!(changed_parent.binding(), parent.next().unwrap());
     assert_eq!(changed_parent.scopes().children().len(), 1);
     assert_eq!(changed_parent.scopes().children()[0].binding(), binding(2));
-    assert_eq!(child.evaluation(evaluation_key(1)), Some(&before));
+    assert_eq!(
+        core.native_chain(&[&child])
+            .unwrap()
+            .evaluation(evaluation_key(1)),
+        Some(&before)
+    );
     let cancellation = prepare(
         &core,
         ISSUER,
@@ -1079,8 +1150,13 @@ fn child_registration_preserves_posted_parent_begun_registry_for_pending_cancell
         cancel(50, changed_parent.binding()),
         &[&child],
     );
-    let fenced = cancellation.evaluation(evaluation_key(1)).unwrap();
+    let fenced = core
+        .native_chain(&[&child, &cancellation])
+        .unwrap()
+        .evaluation(evaluation_key(1))
+        .unwrap();
     assert_fence_then_seal(
+        core.native_chain(&[&child, &cancellation]).unwrap(),
         &cancellation,
         evaluation_key(1),
         before,
@@ -1094,7 +1170,11 @@ fn child_registration_preserves_posted_parent_begun_registry_for_pending_cancell
     assert!(fenced.last_result().is_none());
     for id in [1, 2] {
         assert_eq!(
-            cancellation.claim(ClaimId::from_u128(id)).unwrap().status(),
+            core.native_chain(&[&child, &cancellation])
+                .unwrap()
+                .claim(ClaimId::from_u128(id))
+                .unwrap()
+                .status(),
             ClaimStatus::Cancelled
         );
     }
@@ -1128,14 +1208,23 @@ fn all_required_and_observe_admission_members_survive_pending_begins_and_are_fen
     publish(&mut core, ISSUER, 10, create(1, vec![(claim, definitions)]));
     let posting = prepare(&core, ISSUER, 20, post(2, binding(1)), &[]);
     assert_eq!(posting.outcome().evaluations, 2);
-    let parent = posting.claim(ClaimId::from_u128(1)).unwrap().binding();
+    let parent = core
+        .native_chain(&[&posting])
+        .unwrap()
+        .claim(ClaimId::from_u128(1))
+        .unwrap()
+        .binding();
     let observe = EvaluationKey {
         validation: declaration_id(1, 3),
         ..evaluation_key(1)
     };
     for key in [evaluation_key(1), observe] {
         assert_eq!(
-            posting.evaluation(key).unwrap().state(),
+            core.native_chain(&[&posting])
+                .unwrap()
+                .evaluation(key)
+                .unwrap()
+                .state(),
             validation::State::Ready
         );
     }
@@ -1153,11 +1242,19 @@ fn all_required_and_observe_admission_members_survive_pending_begins_and_are_fen
     *key = observe;
     let second = prepare(&core, EVALUATOR, 40, second_input, &[&posting, &first]);
     assert_eq!(
-        second.evaluation(evaluation_key(1)).unwrap().state(),
+        core.native_chain(&[&posting, &first, &second])
+            .unwrap()
+            .evaluation(evaluation_key(1))
+            .unwrap()
+            .state(),
         validation::State::Validating
     );
     assert_eq!(
-        second.evaluation(observe).unwrap().state(),
+        core.native_chain(&[&posting, &first, &second])
+            .unwrap()
+            .evaluation(observe)
+            .unwrap()
+            .state(),
         validation::State::ValidatingQualityBar
     );
     let cancellation = prepare(
@@ -1168,9 +1265,19 @@ fn all_required_and_observe_admission_members_survive_pending_begins_and_are_fen
         &[&posting, &first, &second],
     );
     for key in [evaluation_key(1), observe] {
-        let prior = second.evaluation(key).unwrap();
-        let next = cancellation.evaluation(key).unwrap();
+        let prior = core
+            .native_chain(&[&posting, &first, &second])
+            .unwrap()
+            .evaluation(key)
+            .unwrap();
+        let next = core
+            .native_chain(&[&posting, &first, &second, &cancellation])
+            .unwrap()
+            .evaluation(key)
+            .unwrap();
         assert_fence_then_seal(
+            core.native_chain(&[&posting, &first, &second, &cancellation])
+                .unwrap(),
             &cancellation,
             key,
             *prior,

@@ -69,7 +69,7 @@ impl ReportParent {
         prepared: &NativePrepared,
     ) -> Result<CompletionUse, NativeError> {
         let operation = prepared.outcome.operation;
-        let changed = prepared.claim(self.claim_id());
+        let changed = prepared.written_claim(self.claim_id());
         if operation != NativeOperation::ReportAdmission
             || self.status != ClaimStatus::Posted
             || changed.is_none_or(|row| row.status() != ClaimStatus::PostFailed)

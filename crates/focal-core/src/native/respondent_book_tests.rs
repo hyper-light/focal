@@ -62,10 +62,7 @@ fn source() -> MemoryBudget {
     MemoryBudget::new(usize::MAX / 16, 0).unwrap()
 }
 fn view(core: &Core<NativeState>) -> View<'_> {
-    View {
-        state: &core.state,
-        tail: None,
-    }
+    View::committed(&core.state)
 }
 fn quote(
     view: &View<'_>,
@@ -218,10 +215,7 @@ fn generated_post_credit_survives_older_close_commit_and_younger_tail_rollback()
             posts: 4
         }
     );
-    let tail = View {
-        state: &core.state,
-        tail: Some(&close),
-    };
+    let tail = View::committed(&core.state).with_own(&close).unwrap();
     let response = super::super::super::response_reads::as_response(
         tail.get(Key::Response(TestamentId::from_u128(900))),
     )
@@ -300,10 +294,7 @@ fn adoption_composes_retirement_with_exact_new_receipt_install_and_refunds_tail(
         )
         .unwrap();
     assert_eq!(credit(&book, old), RespondentCredit::default());
-    let candidate = View {
-        state: &core.state,
-        tail: Some(&adopted),
-    };
+    let candidate = View::committed(&core.state).with_own(&adopted).unwrap();
     let new = key(candidate.claim(old.claim).unwrap()).unwrap();
     let install = install(&mut book, &candidate, 1);
     assert_eq!(book.respondents.len(), 2);
@@ -385,7 +376,11 @@ fn actual_batch_supersession_retires_multiple_receipts_with_a_refundable_held_jo
     );
     for id in [1, 2] {
         assert_eq!(
-            candidate.claim(ClaimId::from_u128(id)).unwrap().status(),
+            core.native_chain(&[&candidate])
+                .unwrap()
+                .claim(ClaimId::from_u128(id))
+                .unwrap()
+                .status(),
             ClaimStatus::Superseded
         );
     }

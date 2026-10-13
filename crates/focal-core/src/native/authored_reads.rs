@@ -40,33 +40,33 @@ impl Core<NativeState> {
     }
 }
 impl NativePrepared {
-    pub fn claim_content(&self, id: ClaimId) -> Option<&ClaimDescriptor> {
+    pub fn written_claim_content(&self, id: ClaimId) -> Option<&ClaimDescriptor> {
         content(self.fragments.get(&Key::ClaimContent(id)))
     }
-    pub fn validation_descriptor(&self, id: ValidationId) -> Option<&ValidationDescriptor> {
+    pub fn written_validation_descriptor(&self, id: ValidationId) -> Option<&ValidationDescriptor> {
         descriptor(self.fragments.get(&Key::Definition(id)))
     }
-    pub fn creation_result(
+    pub fn written_creation_result(
         &self,
         key: impl Into<NativeInvocation>,
     ) -> Option<&NativeCreationResult> {
         result(self.fragments.get(&Key::CreationResult(key.into())))
     }
 }
-impl NativeView<'_> {
+impl<'a> NativeView<'a> {
     pub fn content_profile(&self) -> NativeContentProfile {
         self.0.state.profile
     }
-    pub fn claim_content(&self, id: ClaimId) -> Option<&ClaimDescriptor> {
+    pub fn claim_content(&self, id: ClaimId) -> Option<&'a ClaimDescriptor> {
         content(self.0.get(Key::ClaimContent(id)))
     }
-    pub fn validation_descriptor(&self, id: ValidationId) -> Option<&ValidationDescriptor> {
+    pub fn validation_descriptor(&self, id: ValidationId) -> Option<&'a ValidationDescriptor> {
         descriptor(self.0.get(Key::Definition(id)))
     }
     pub fn creation_result(
         &self,
         key: impl Into<NativeInvocation>,
-    ) -> Option<&NativeCreationResult> {
+    ) -> Option<&'a NativeCreationResult> {
         result(self.0.get(Key::CreationResult(key.into())))
     }
 }

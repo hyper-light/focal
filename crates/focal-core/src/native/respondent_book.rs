@@ -339,10 +339,7 @@ impl CompletionBook {
         if self.respondents.len() == 0 {
             return Ok(Journal::empty());
         }
-        let candidate = View {
-            state: source.state,
-            tail: Some(prepared),
-        };
+        let candidate = source.with_own(prepared)?;
         let mut visits = self.limits.plan_edges;
         self.affected_respondents(source, prepared, &mut visits, |_, grant| {
             grant.seen.set(false);
