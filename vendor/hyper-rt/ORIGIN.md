@@ -74,3 +74,18 @@ Also made here with it, each found on CI or by widening a window the scheduler o
   not parked yet, and its first yield, in a random measured round, ran kernel32!SwitchToThread for the
   first time in the process, which Windows counts as a page fault (8 runs in 40 on windows-2025, the
   page named by Windows' working-set watch and cdb; 0 in 80 with the yield).
+
+## Made here: long polls judged by step (2026-10-12)
+
+- mantle's ranges bench found the shard reading its thread's CPU clock once at the end of every poll past
+  the quantum and once at every step's start: a seek's poll ran a little past the 2.1–4.0 µs quantum, so
+  727,739 reads in a million seeks, 2.9% of the shard's time in `__thread_selfusage`. From a long poll
+  judged a run on the CPU, a step's long polls are judged together at one reading at its end
+  (`attribution::Tracker::by_step`, `judge_in_window`): an overrun past the window's off-CPU time was
+  spent on the CPU, the per-poll rule's verdict, and a window that leaves one undecided judges one at a
+  time again. Reads fell to about one a step (8–9 times fewer), 0.5% of the shard's time
+  (`docs/benchmarks.md`, "hyper-rt: long polls judged by step"). Tests: `tests/attribution_by_step.rs`
+  (the reads beyond one a step paid for by undecided verdicts; it fails on the per-poll reading, 41
+  reads for 32 long polls), two unit tests of the window and the modes; `tests/wake_estimate.rs`'s
+  attribution counts unchanged.
+

@@ -233,3 +233,21 @@ slates by the rule inside its own core (`crates/cluster/src/fold.rs`).
   a leader of three whose third voter answers a round behind sends it an image at each of the
   rule's three compactions when it compacts the moment the majority holds the round, and none by
   the rule; the schedules of `sim.rs` unchanged.
+
+## The quiet commit's deadline (2026-10-12)
+
+- **The defect.** A commit no write has stated while the applied index ran past `C_d` for a whole
+  quiet period is written at the replica's next drive past the period's end (`quiet_commit`), but
+  `Replica::deadline`, which `Driven::wake` reports, was the core's timers alone. A follower's commit
+  moves alone, with no write, and electing by suspicion a group with nothing in flight has no timer:
+  `benches/quiet.rs` (`docs/durable.md` §14 item 3), driving its group only at the replicas'
+  deadlines, their logs' answers and their messages, found three members after a one-entry burst at
+  applied 2 against durable commits 0, 1 and 1, nothing out and nothing timed, so no drive would
+  ever come. An owner that ticks its replicas (mantle's range replica, focal's shell) or wakes them
+  on its liveness stream drove them anyway.
+- **The fix.** `Replica::deadline` is the earlier of the core's and the quiet period's end, while
+  the log has room for the write: without room the write could not be made, and a deadline in the
+  past would have its owner drive the replica again and again for nothing.
+- **Tests** (`tests/shell.rs`): `a_follower_past_its_durable_commit_asks_to_be_driven_when_its_quiet_period_ends`,
+  which fails without the fix at the deadline it asks for.
+

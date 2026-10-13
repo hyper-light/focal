@@ -143,6 +143,11 @@ pub struct StreamsState {
     ///
     /// A new frame is only queued once the peer has raised the limit.
     pub(super) data_blocked_limit: Option<u64>,
+    /// The peer's stream limit, per direction, at which an open most recently failed: a
+    /// `STREAMS_BLOCKED` frame is queued once for each limit, and sent while it stands.
+    pub(super) streams_blocked_limit: PerDir<Option<u64>>,
+    /// The limit, per direction, the peer last said it was blocked at (its `STREAMS_BLOCKED`).
+    peer_streams_blocked: PerDir<Option<u64>>,
 }
 
 impl StreamsState {
@@ -188,6 +193,8 @@ impl StreamsState {
             initial_max_stream_data_bidi_remote: 0u32.into(),
             receive_window_shrink_debt: 0,
             data_blocked_limit: None,
+            streams_blocked_limit: PerDir::new(None, None),
+            peer_streams_blocked: PerDir::new(None, None),
         };
 
         for dir in Dir::iter() {
@@ -405,8 +412,9 @@ impl StreamsState {
             hash_map::Entry::Vacant(_) => {}
             hash_map::Entry::Occupied(e) => {
                 if let Some(SendState::ResetSent) = e.get().as_ref().map(|s| s.state) {
+                    let credit_returned = e.get().as_ref().is_some_and(|s| s.credit_returned);
                     e.remove_entry();
-                    self.stream_freed(id, StreamHalf::Send);
+                    self.stream_freed(id, StreamHalf::Send, credit_returned);
                 }
             }
         }
@@ -453,6 +461,24 @@ impl StreamsState {
         self.data_blocked_limit == Some(self.max_data)
     }
 
+    /// Whether a `STREAMS_BLOCKED` frame could be sent for `dir`: an open failed at the peer's
+    /// limit, and the peer has not raised it since.
+    pub(crate) fn can_send_streams_blocked(&self, dir: Dir) -> bool {
+        *self.streams_blocked_limit.get(dir) == Some(*self.max.get(dir))
+    }
+
+    /// The peer said it was blocked opening `dir` streams at `limit` (RFC 9000 §19.14).
+    pub(crate) fn received_streams_blocked(&mut self, dir: Dir, limit: u64) {
+        *self.peer_streams_blocked.get_mut(dir) = Some(limit);
+    }
+
+    /// Whether the peer is blocked opening `dir` streams with no more on their way: it said so at
+    /// the limit it was last sent, and no greater limit is sent or waiting to be.
+    pub(crate) fn peer_streams_blocked(&self, dir: Dir) -> bool {
+        let sent = *self.sent_max_remote.get(dir);
+        *self.peer_streams_blocked.get(dir) == Some(sent) && *self.max_remote.get(dir) == sent
+    }
+
     /// Limit to send in a `STREAM_DATA_BLOCKED` frame for stream `id`, if one could be sent
     ///
     /// `None` if the stream is no longer writable, was stopped by the peer, or the peer has raised
@@ -479,6 +505,7 @@ impl StreamsState {
         self.write_max_streams(buf, pending, retransmits, stats, max_size);
         self.write_data_blocked(buf, pending, retransmits, stats, max_size);
         self.write_stream_data_blocked(buf, pending, retransmits, stats, max_size);
+        self.write_streams_blocked(buf, pending, retransmits, stats, max_size);
     }
 
     /// RESET_STREAM
@@ -669,6 +696,41 @@ impl StreamsState {
         }
     }
 
+    /// STREAMS_BLOCKED
+    fn write_streams_blocked(
+        &mut self,
+        buf: &mut Vec<u8>,
+        pending: &mut Retransmits,
+        retransmits: &mut ThinRetransmits,
+        stats: &mut FrameStats,
+        max_size: usize,
+    ) {
+        for dir in Dir::iter() {
+            if !*pending.streams_blocked.get(dir) || !fits(buf, 9, max_size) {
+                continue;
+            }
+            *pending.streams_blocked.get_mut(dir) = false;
+            // The peer may have raised the limit since the frame was queued
+            if !self.can_send_streams_blocked(dir) {
+                continue;
+            }
+            *retransmits.get_or_create().streams_blocked.get_mut(dir) = true;
+            let limit = *self.max.get(dir);
+            trace!(limit, "STREAMS_BLOCKED ({:?})", dir);
+            buf.write(match dir {
+                Dir::Uni => frame::FrameType::STREAMS_BLOCKED_UNI,
+                Dir::Bi => frame::FrameType::STREAMS_BLOCKED_BIDI,
+            });
+            buf.write_var(limit);
+            match dir {
+                Dir::Uni => stats.streams_blocked_uni = stats.streams_blocked_uni.saturating_add(1),
+                Dir::Bi => {
+                    stats.streams_blocked_bidi = stats.streams_blocked_bidi.saturating_add(1);
+                }
+            }
+        }
+    }
+
     /// STREAM_DATA_BLOCKED
     fn write_stream_data_blocked(
         &mut self,
@@ -814,8 +876,9 @@ impl StreamsState {
             return;
         }
 
+        let credit_returned = stream.credit_returned;
         entry.remove_entry();
-        self.stream_freed(id, StreamHalf::Send);
+        self.stream_freed(id, StreamHalf::Send, credit_returned);
         self.events.push_back(StreamEvent::Finished { id });
     }
 
@@ -1102,9 +1165,10 @@ impl StreamsState {
         ShouldTransmit(diff >= (self.receive_window / 8))
     }
 
-    /// Update counters for removal of a stream
-    pub(super) fn stream_freed(&mut self, id: StreamId, half: StreamHalf) {
-        if id.initiator() != self.side {
+    /// Update counters for removal of a stream. `credit_returned`: the stream's credit already
+    /// went back to its peer (`return_credit_early`), so its freeing gives none.
+    pub(super) fn stream_freed(&mut self, id: StreamId, half: StreamHalf, credit_returned: bool) {
+        if id.initiator() != self.side && !credit_returned {
             let fully_free = id.dir() == Dir::Uni
                 || match half {
                     StreamHalf::Send => !self.recv.contains_key(&id),
@@ -1124,7 +1188,31 @@ impl StreamsState {
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
         self.free_recv.push(recv.free(self.stream_receive_window));
-        self.stream_freed(id, StreamHalf::Recv);
+        self.stream_freed(id, StreamHalf::Recv, false);
+        self.return_credit_early(id);
+    }
+
+    /// Gives a peer-initiated bidirectional stream's credit back to its peer once its request is
+    /// read whole (its receive half freed) and its response finished, without waiting for the
+    /// acknowledgement of the response's last frames, which frees it (`VENDORED.md` §27): the
+    /// raised limit then goes out with those frames, where it went alone a round trip later.
+    /// Once for each stream; whether it gave the credit back now.
+    pub(super) fn return_credit_early(&mut self, id: StreamId) -> bool {
+        if id.initiator() == self.side || id.dir() != Dir::Bi || self.recv.contains_key(&id) {
+            return false;
+        }
+        let Some(stream) = self.send.get_mut(&id).and_then(|s| s.as_mut()) else {
+            return false;
+        };
+        if stream.credit_returned || !matches!(stream.state, SendState::DataSent { .. }) {
+            return false;
+        }
+        stream.credit_returned = true;
+        // A stream counted when allocated is counted out once, here or as it is freed.
+        let allocated = self.allocated_remote_count.get_mut(Dir::Bi);
+        *allocated = allocated.saturating_sub(1);
+        self.ensure_remote_streams(Dir::Bi);
+        true
     }
 
     pub(super) fn max_send_data(&self, id: StreamId) -> VarInt {
@@ -1207,6 +1295,93 @@ mod tests {
         )
     }
 
+    /// An open the peer's limit refuses queues one STREAMS_BLOCKED at that limit (RFC 9000 §4.6),
+    /// and another refused at the same limit queues none. The frame is written while the limit
+    /// stands and not once the peer has raised it; an open refused at the new limit says so again.
+    /// Upstream sent none, so a peer that grants streams as they are wanted never heard of a want.
+    /// A peer's STREAMS_BLOCKED says it is blocked only at the limit it was last sent.
+    #[test]
+    fn an_open_at_the_peers_limit_says_so_once_for_each_limit() {
+        let mut client = make(Side::Client);
+        client.set_params(&TransportParameters {
+            initial_max_streams_bidi: 1u32.into(),
+            ..TransportParameters::default()
+        });
+        let (mut pending, state) = (Retransmits::default(), ConnState::Established);
+        let open = |client: &mut StreamsState, pending: &mut Retransmits| {
+            Streams {
+                state: client,
+                conn_state: &state,
+                pending,
+            }
+            .open(Dir::Bi)
+        };
+        let written = |streams: &mut StreamsState, pending: &mut Retransmits| {
+            let mut buf = Vec::new();
+            let (mut sent, mut stats) = (ThinRetransmits::default(), FrameStats::default());
+            streams.write_control_frames(&mut buf, pending, &mut sent, &mut stats, usize::MAX);
+            if buf.is_empty() {
+                return Vec::new();
+            }
+            crate::frame::Iter::new(Bytes::from(buf))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(open(&mut client, &mut pending).is_some());
+        assert!(open(&mut client, &mut pending).is_none());
+        assert!(matches!(
+            written(&mut client, &mut pending).as_slice(),
+            [frame::Frame::StreamsBlocked {
+                dir: Dir::Bi,
+                limit: 1
+            }]
+        ));
+        assert!(open(&mut client, &mut pending).is_none());
+        assert!(
+            !*pending.streams_blocked.get(Dir::Bi),
+            "one frame for each limit"
+        );
+        // Lost, and queued again after the peer raised the limit: not written.
+        client.received_max_streams(Dir::Bi, 2).unwrap();
+        *pending.streams_blocked.get_mut(Dir::Bi) = true;
+        assert!(written(&mut client, &mut pending).is_empty());
+        assert!(open(&mut client, &mut pending).is_some());
+        assert!(open(&mut client, &mut pending).is_none());
+        assert!(matches!(
+            written(&mut client, &mut pending).as_slice(),
+            [frame::Frame::StreamsBlocked {
+                dir: Dir::Bi,
+                limit: 2
+            }]
+        ));
+
+        // The other side: blocked at the limit it was last sent (128), not at an older one, and
+        // not once a greater one is on its way or sent; blocked again at that one.
+        let mut server = make(Side::Server);
+        server.received_streams_blocked(Dir::Bi, 100);
+        assert!(!server.peer_streams_blocked(Dir::Bi));
+        server.received_streams_blocked(Dir::Bi, 128);
+        assert!(server.peer_streams_blocked(Dir::Bi));
+        server.set_max_concurrent(Dir::Bi, 256u32.into());
+        assert!(
+            !server.peer_streams_blocked(Dir::Bi),
+            "a greater limit is on its way"
+        );
+        let mut server_pending = Retransmits::default();
+        assert!(server.queue_max_stream_id(&mut server_pending));
+        assert!(matches!(
+            written(&mut server, &mut server_pending).as_slice(),
+            [frame::Frame::MaxStreams {
+                dir: Dir::Bi,
+                count: 256
+            }]
+        ));
+        assert!(!server.peer_streams_blocked(Dir::Bi));
+        server.received_streams_blocked(Dir::Bi, 256);
+        assert!(server.peer_streams_blocked(Dir::Bi));
+    }
+
     #[test]
     fn send_window_retains_selectively_acked_data() {
         let mut server = make(Side::Server);
@@ -1221,6 +1396,7 @@ mod tests {
         let id = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         }
         .open(Dir::Uni)
         .unwrap();
@@ -1288,6 +1464,7 @@ mod tests {
         let id = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         }
         .open(Dir::Uni)
         .unwrap();
@@ -1641,6 +1818,7 @@ mod tests {
         let id = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         }
         .open(Dir::Uni)
         .unwrap();
@@ -1702,6 +1880,7 @@ mod tests {
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         };
 
         let id_high = streams.open(Dir::Bi).unwrap();
@@ -1758,6 +1937,7 @@ mod tests {
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         };
 
         let id_high = streams.open(Dir::Bi).unwrap();
@@ -1826,6 +2006,7 @@ mod tests {
             let mut streams = Streams {
                 state: &mut server,
                 conn_state: &state,
+                pending: &mut pending,
             };
 
             // a, b and c all have the same priority
@@ -1906,6 +2087,7 @@ mod tests {
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         };
 
         // a, and b have the same priority, c has higher priority
@@ -2010,6 +2192,7 @@ mod tests {
         let mut streams = Streams {
             state: &mut server,
             conn_state: &state,
+            pending: &mut pending,
         };
 
         let id = streams.open(Dir::Uni).unwrap();
@@ -2125,6 +2308,147 @@ mod tests {
         assert!(
             free(&mut client, 127),
             "the peer's credit is spent: the freed stream is announced"
+        );
+    }
+
+    /// A peer's request read whole and its response finished gives the stream's credit back at
+    /// once, so the raised limit goes out with the response (`VENDORED.md` §27): before, it went
+    /// once the response's last frames were acknowledged, alone, a round trip later. The
+    /// acknowledgement that frees the stream gives none back again. In the other order, the
+    /// response finished before the request is read, the credit goes back as the request is, and
+    /// a stream reset after its credit went back gives none again either.
+    #[test]
+    fn a_finished_response_gives_its_streams_credit_back_once_before_its_acknowledgement() {
+        // A window of two, as a pooled peer's fair share: an eighth of it is nothing, so any freed
+        // credit is announced at once (§16).
+        let mut server = StreamsState::new(
+            Side::Server,
+            0u32.into(),
+            2u32.into(),
+            1024 * 1024,
+            (1024 * 1024u32).into(),
+            (1024 * 1024u32).into(),
+        );
+        server.set_params(&TransportParameters {
+            initial_max_data: 1000u32.into(),
+            initial_max_stream_data_bidi_local: 1000u32.into(),
+            ..TransportParameters::default()
+        });
+        let state = ConnState::Established;
+        let stream = |index| StreamId::new(Side::Client, Dir::Bi, index).unwrap();
+        let ask = |server: &mut StreamsState, id| {
+            let _ = server
+                .received(
+                    frame::Stream {
+                        id,
+                        offset: 0,
+                        fin: true,
+                        data: Bytes::from_static(b"ask"),
+                    },
+                    3,
+                )
+                .unwrap();
+        };
+        // The request read whole: its end is known, so stopping frees its receive half, as reading
+        // it to its end does.
+        let read = |server: &mut StreamsState, id| {
+            let mut pending = Retransmits::default();
+            RecvStream {
+                id,
+                state: server,
+                pending: &mut pending,
+            }
+            .stop(0u32.into())
+            .unwrap();
+            // What the connection does on its next poll (`Connection::poll_transmit`).
+            server.queue_max_stream_id(&mut pending);
+            *pending.max_stream_id.get(Dir::Bi)
+        };
+        let answer = |server: &mut StreamsState, id| {
+            let mut pending = Retransmits::default();
+            let mut send = SendStream {
+                id,
+                state: server,
+                pending: &mut pending,
+                conn_state: &state,
+            };
+            send.write(b"answer").unwrap();
+            send.finish().unwrap();
+            *pending.max_stream_id.get(Dir::Bi)
+        };
+        let acknowledged = |server: &mut StreamsState, id| {
+            let send = server.send.get_mut(&id).unwrap().as_mut().unwrap();
+            assert_eq!(send.pending.poll_transmit(64).0, 0..6);
+            server.received_ack_of(frame::StreamMeta {
+                id,
+                offsets: 0..6,
+                fin: true,
+            });
+        };
+        let limit = |server: &StreamsState| *server.max_remote.get(Dir::Bi);
+        let start = limit(&server);
+
+        // Request read, then response finished: the credit goes back as the response finishes.
+        ask(&mut server, stream(0));
+        assert!(
+            !read(&mut server, stream(0)),
+            "no credit yet: the response is not finished"
+        );
+        assert!(
+            answer(&mut server, stream(0)),
+            "announced with the response"
+        );
+        assert_eq!(limit(&server), start + 1);
+        acknowledged(&mut server, stream(0));
+        assert!(
+            !server.send.contains_key(&stream(0)),
+            "the acknowledgement frees it"
+        );
+        assert_eq!(limit(&server), start + 1, "and gives no credit again");
+
+        // Response finished, then request read: the credit goes back as the request is read.
+        ask(&mut server, stream(1));
+        assert!(
+            !answer(&mut server, stream(1)),
+            "no credit yet: the request is not read"
+        );
+        assert_eq!(limit(&server), start + 1);
+        assert!(
+            read(&mut server, stream(1)),
+            "announced as the request is read"
+        );
+        assert_eq!(limit(&server), start + 2);
+        acknowledged(&mut server, stream(1));
+        assert_eq!(
+            limit(&server),
+            start + 2,
+            "the acknowledgement gives no credit again"
+        );
+
+        // A stream reset after its credit went back gives none again as its reset is acknowledged.
+        ask(&mut server, stream(2));
+        read(&mut server, stream(2));
+        assert!(answer(&mut server, stream(2)));
+        assert_eq!(limit(&server), start + 3);
+        let mut pending = Retransmits::default();
+        SendStream {
+            id: stream(2),
+            state: &mut server,
+            pending: &mut pending,
+            conn_state: &state,
+        }
+        .reset(0u32.into())
+        .unwrap();
+        server.reset_acked(stream(2));
+        assert!(
+            !server.send.contains_key(&stream(2)),
+            "the reset's acknowledgement frees it"
+        );
+        assert_eq!(limit(&server), start + 3, "and gives no credit again");
+        assert_eq!(
+            *server.allocated_remote_count.get(Dir::Bi),
+            2,
+            "the window is whole"
         );
     }
 
@@ -2359,6 +2683,7 @@ mod tests {
         let stream_id = Streams {
             state: &mut server,
             conn_state: &conn_state,
+            pending: &mut retransmits,
         }
         .open(Dir::Uni)
         .expect("should be able to open a stream");
@@ -2434,6 +2759,7 @@ mod tests {
         let stream_id = Streams {
             state: &mut server,
             conn_state: &conn_state,
+            pending: &mut retransmits,
         }
         .open(Dir::Uni)
         .expect("should be able to open a stream");

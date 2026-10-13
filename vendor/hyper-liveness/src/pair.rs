@@ -164,17 +164,6 @@ struct Received {
     /// configured again at its new interval.
     configured_interval: Option<Duration>,
     round_trip: ExchangeRtt,
-    /// The interval the link's own evidence needs before its first configuration, nanoseconds: the
-    /// longest its estimator has said its heartbeats would be independent at, at an interval too
-    /// correlated to measure (`LinkEstimator::independent_interval`); zero while it has said none,
-    /// and from the first configuration on. Asked of the peer while it stands, so a link with no
-    /// configuration moves to where its history can measure itself (`docs/timing.md` §2.8). A
-    /// configured link keeps its configuration through a refusal and follows its best: held past
-    /// the first configuration, the longest estimate every later refusal drew, a maximum of noisy
-    /// estimates that grows with the refusals sampled, held a link at 31 s against its best of
-    /// 0.57 s in a simulated world whose host freezes begin once its links configure
-    /// (`docs/benchmarks.md`, "The detector model, at its causes").
-    evidence_ns: u64,
     /// While the pair has no configuration of its own: the arrivals its margin was imposed from,
     /// the node's evidence scaled to the link's window and widened by the link's own, and the
     /// heartbeats taken then.
@@ -442,7 +431,6 @@ impl Pair {
             .received
             .configuration
             .map_or(0, |configured| nanos(configured.best.interval))
-            .max(self.received.evidence_ns)
             .max(self.received.pooled_ask_ns);
         if let Some(link) = self.received.link.as_mut() {
             // The peer moves to what this heartbeat asks, never below its floor, from its next
@@ -835,25 +823,13 @@ impl Pair {
         let Some(link) = self.received.link.as_mut() else {
             return false;
         };
-        // The evidence is asked for only where it is wanting: refused for want of `τ_int`, or no
-        // cost to configure by yet. The estimator says what it wants before any cost is read, as
-        // its `configure` would refuse: a link that moved is configured again at each heartbeat
-        // until its levels measure `τ_int` at the new interval, and the costs and floors were
-        // built for every one of those refusals. Only a link with no configuration is moved for
-        // its evidence (`evidence_ns`); a configured one is judged by its configuration meanwhile.
-        match link.estimator.arrivals() {
-            Err(hyper_timing::Refusal::CorrelationUnmeasured) => {
-                if self.received.configuration.is_none()
-                    && let Some(next) = link.estimator.independent_interval()
-                {
-                    self.received.evidence_ns = self.received.evidence_ns.max(nanos(next));
-                }
-                return false;
-            }
-            Err(_) => return false,
-            Ok(_) => {}
+        // The arrivals are asked for before any cost is read, as the estimator's `configure` would
+        // refuse without them: a link refused for want of `τ_int` waits at its interval until a longer
+        // Allan level measures it (`docs/timing.md` §2.8, "The interval the evidence needs"), judged
+        // by its node's evidence meanwhile, and a configured one by its configuration.
+        if link.estimator.arrivals().is_err() {
+            return false;
         }
-        // Measured, so no interval is wanting for evidence (`independent_interval` says none).
         let Some(costs) = self
             .election
             .zip(context.exposure.mtbf())
@@ -864,7 +840,6 @@ impl Pair {
         let floor = Duration::from_nanos(floor_ns).max(granularity);
         match link.estimator.configure(&costs, granularity, floor) {
             Ok(configured) => {
-                self.received.evidence_ns = 0;
                 self.received.pooled_ask_ns = 0;
                 self.received.configuration = Some(configured);
                 self.received.configured_interval = Some(link.estimator.interval());

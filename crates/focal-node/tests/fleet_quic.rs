@@ -1111,6 +1111,13 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
                         Some((dial, actor)) => match actor.request(&envelope).await {
                             Ok(answer) => answer.result,
                             Err(WireError::Timeout) => Response::Error(AccessError::OutcomeUnknown),
+                            // Refused at the client before it was sent, for want of the
+                            // server's stream credit (`Refusal::Unsent`): without effect, and
+                            // asked again as a refusal in a reply is, as the product's client
+                            // does (`Client::submit`'s resend of a `Capacity` refusal).
+                            Err(WireError::Access(AccessError::Capacity)) => {
+                                Response::Error(AccessError::Capacity)
+                            }
                             // A connection lost is opened again for the next
                             // attempt, which waits as for a leader not there.
                             // A loss ends the exchange under way with the

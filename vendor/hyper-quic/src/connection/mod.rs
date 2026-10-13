@@ -489,6 +489,7 @@ impl Connection {
         Streams {
             state: &mut self.streams,
             conn_state: &self.state,
+            pending: &mut self.spaces.get_mut(SpaceId::Data).pending,
         }
     }
 
@@ -1955,6 +1956,14 @@ impl Connection {
         // now be significant.
         let pending = &mut self.spaces.get_mut(SpaceId::Data).pending;
         self.streams.queue_max_stream_id(pending);
+    }
+
+    /// Whether the peer is blocked opening `dir` streams with no more on their way: it sent
+    /// `STREAMS_BLOCKED` at the limit it was last sent (RFC 9000 §4.6), and no greater limit is
+    /// sent or waiting to be. What a side that grants streams as they are wanted reads as a want
+    /// of more.
+    pub fn peer_streams_blocked(&self, dir: Dir) -> bool {
+        self.streams.peer_streams_blocked(dir)
     }
 
     /// Current number of remotely initiated streams that may be concurrently open
@@ -3963,6 +3972,7 @@ impl Connection {
                     "peer claims to be blocked opening more than {} {} streams",
                     limit, dir
                 );
+                self.streams.received_streams_blocked(dir, limit);
             }
             Frame::StopSending(frame::StopSending { id, error_code }) => {
                 self.on_stop_sending(id, error_code)?;

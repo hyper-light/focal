@@ -166,6 +166,20 @@ caller hands in the alignment, queue and measured depth it found.
     `e44d9e5`, `f2f6a57`, `abe99c8`, `8384354`; mantle's `ORIGIN.md` change 14) and taken here
     (2026-10-12), with `gather.rs` listed among the files whose `unsafe` binds an OS interface
     (`scripts/check-contracts.py`).
+15. **What a segment written whole leaves in memory, asked of the page cache** (`resident/linux.rs`,
+    new, tests only; `segmented.rs`'s `a_segment_written_whole_holds_its_fill_and_takes_no_memory`).
+    On Linux a resident read is no probe: `preadv2(2)` with `RWF_NOWAIT` on a page not in memory
+    starts read-ahead of it and of the window after it before it answers, and reads what that
+    brought in by the time it looks (Linux 6.8 `mm/filemap.c`, `filemap_get_pages` and
+    `filemap_update_page`). The test read each piece of the segments it had written past the cache
+    that way, so a piece's own read-ahead, or the one before it in the same segment, could leave it
+    resident: once on ubuntu-24.04-arm (CI run 38348043505), and in Docker's Linux 6.12 under busy
+    loops in 1 run of 300, where `mincore(2)` before and after each read showed both (a piece not in
+    memory read by its own probe; the next piece in memory before its probe). On Linux the test now
+    asks `mincore(2)` over a mapping of each piece, which starts no I/O; elsewhere the resident read
+    stays its probe (`mincore(2)` on macOS; no read off Linux and macOS).
+    `DeviceFile::read_resident_at` states what a true answer means on Linux: read without waiting,
+    not in memory before.
 
 ## Planned
 

@@ -1407,6 +1407,22 @@ impl ReplicaHost {
     /// a view over every hosted session reads each round (the audit's F26).
     /// The progress is held for `read`'s length only, so `read` asks
     /// nothing of the replica.
+    /// While the replica leads a term it is ready in: the writes its session takes at once (its
+    /// learned write window, `TickPeriod::write_window`, or the initial one before it has served
+    /// a write) and the bound they are counted within, once measured.
+    pub(crate) fn led_admission(&self) -> Option<(u64, Option<Duration>)> {
+        if !self.observe(|progress| progress.authoritative && !progress.stopped) {
+            return None;
+        }
+        let window = self
+            .pace
+            .write_window()
+            .unwrap_or(crate::pace::INITIAL_WINDOW);
+        Some((
+            u64::try_from(window).unwrap_or(u64::MAX),
+            self.pace.delay_bound(),
+        ))
+    }
     pub fn observe<R>(&self, read: impl FnOnce(&ReplicaProgress) -> R) -> R {
         read(&self.progress.borrow().value)
     }
@@ -5358,4 +5374,17 @@ fn retryable(result: Result<bool, LedgerError>) -> Result<bool, LedgerError> {
         }
         Err(error) => Err(error),
     }
+}
+
+/// Two sessions' admissions as one: their windows summed and the lesser of their bounds
+/// (`ReplicaHost::led_admission`).
+pub(crate) fn add_admission(
+    (windows, least): (u64, Option<Duration>),
+    (window, bound): (u64, Option<Duration>),
+) -> (u64, Option<Duration>) {
+    let least = match (least, bound) {
+        (Some(least), Some(bound)) => Some(least.min(bound)),
+        (least, bound) => least.or(bound),
+    };
+    (windows.saturating_add(window), least)
 }

@@ -17,9 +17,13 @@
 //! yields to the window is gone. Measured in a Linux container on this Mac (Docker,
 //! four CPUs, 2026-09-25, best of five rounds of 200,000 calls): the CPU clock 155–161 ns and `getrusage`
 //! 130–134 ns; on Apple silicon the CPU clock 107–129 ns (2026-09-22). That is too dear for every poll,
-//! so the shard reads only at the end of a poll that already ran long, and — while a long poll went
-//! unattributed for want of a window — at each step's start and each wait's end ([`Tracker`]); a busy
-//! period that runs no long poll stops the readings. macOS counts no per-thread voluntary switches, so a
+//! so the shard reads only where a poll already ran long, and — while a long poll went unattributed for
+//! want of a window — at each wait's end and at a step's start with no window open ([`Tracker`]); a busy
+//! period that runs no long poll stops the readings. Nor is it cheap once per long poll where every poll
+//! runs a little long: mantle's seeks ran 4–7 µs against a 2.5–3.3 µs quantum, and a reading at each long
+//! poll's end and each step's start was 727,739 readings in a million seeks, 1.6–2.9% of the shard's time.
+//! So from a long poll judged a run on the CPU, a step's long polls are judged together at one reading
+//! at its end ([`judge_in_window`]), which also opens the next step's window. macOS counts no per-thread voluntary switches, so a
 //! poll off the CPU there is unattributed. A virtual machine's
 //! guest may count time its virtual CPU was stolen while the thread ran as the thread's CPU; such a poll
 //! then reads as a long run and is the task's by this rule (the macOS CI runner, run 36289513559,
@@ -190,11 +194,19 @@ pub(crate) fn attribute(window: &Window, quantum_ns: u64) -> Attribution {
     }
 }
 
-/// The shard's windows and when it reads. A window opens at the end reading of every long poll, and —
-/// while armed — at each step's start and each wait's end. A wait closes the window, so a park's own
-/// block is never charged to a poll. The shard arms when a long poll found no window, or one that did not
-/// decide it; a busy period (from one wait to the next, having done work) that runs no long poll disarms,
-/// so a healthy shard reads nothing.
+/// The shard's windows and when it reads. A window opens at every reading the attribution takes, and —
+/// while armed — at each wait's end, and at a step's start where no window is open or polls are judged
+/// one at a time. A wait closes the window, so a park's own block is never charged to a poll. The shard
+/// arms when a long poll found no window, or one that did not decide it; a busy period (from one wait to
+/// the next, having done work) that runs no long poll disarms, so a healthy shard reads nothing.
+///
+/// Long polls are judged one at a time, each at a reading of its own end, until one is judged a run on
+/// the CPU; from then they are judged by step ([`Tracker::by_step`]): the step's long polls wait for one
+/// reading at its end, which judges them all at once ([`judge_in_window`]) and opens the next step's
+/// window, so a shard whose every poll runs a little past the quantum on the CPU (mantle's seeks, 4–7 µs
+/// against a 2.5 µs quantum) reads once a step where it read twice a long poll. A step whose window
+/// leaves a long poll undecided (the thread was off the CPU for as long as that poll ran over) judges
+/// one at a time again, which tells a block from a preemption where the platform can.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Tracker {
     /// The open window's start: the thread's account and the shard clock then.
@@ -205,20 +217,78 @@ pub(crate) struct Tracker {
     period_worked: bool,
     /// Whether the busy period since the last wait ran a long poll.
     period_long: bool,
+    /// Whether long polls are judged by step, at one reading at the step's end (true), or each at a
+    /// reading of its own end (false): one at a time from a long poll whose window was missing or did not
+    /// decide it, by step from one judged a run on the CPU.
+    by_step: bool,
+}
+
+/// What the overruns of a window's long polls show (the step's, judged at one reading at its end): a poll
+/// that ran past the quantum by `overrun_ns` on the wall clock ran past it on the CPU unless the thread was
+/// off the CPU for at least that long within the poll, and it cannot have been off the CPU for longer than
+/// the whole window was (`off_cpu_ns`, the window's wall time less its CPU). So an overrun past the
+/// window's off-CPU time is the task's run on the CPU, exactly as a window of the poll's own would judge
+/// it; an overrun within it is not decided by this window.
+pub(crate) fn judge_in_window(overrun_ns: u64, off_cpu_ns: u64) -> Attribution {
+    if overrun_ns > off_cpu_ns {
+        Attribution::Long
+    } else {
+        Attribution::Ambiguous
+    }
 }
 
 impl Tracker {
-    /// Whether the shard is reading at step starts and wait ends: the loop asks before it reads.
+    /// Whether the shard is reading at wait ends: the loop asks before it reads.
     pub(crate) fn armed(&self) -> bool {
         self.armed
     }
 
-    /// A step begins: while armed, a window opens at what `read` returns — the thread's account and the
-    /// shard clock — called only then, so an unarmed shard reads neither.
+    /// Whether a step's start opens a window: while armed, where no window is open or long polls are judged
+    /// one at a time. The loop asks before it reads.
+    pub(crate) fn reads_at_step_start(&self) -> bool {
+        self.armed && (!self.by_step || self.window_start.is_none())
+    }
+
+    /// Whether a long poll ending now waits for the step's end to be judged: judging by step, in an open
+    /// window.
+    pub(crate) fn defers(&self) -> bool {
+        self.by_step && self.window_start.is_some()
+    }
+
+    /// A step begins: a window opens at what `read` returns — the thread's account and the shard clock —
+    /// called only where [`Tracker::reads_at_step_start`], so an unarmed shard reads neither.
     pub(crate) fn step_began(&mut self, read: impl FnOnce() -> Option<(ThreadAccount, u64)>) {
-        if self.armed {
+        if self.reads_at_step_start() {
             self.window_start = read();
         }
+    }
+
+    /// A long poll was left for the step's end ([`Tracker::defers`]): the busy period ran one.
+    pub(crate) fn long_poll_deferred(&mut self) {
+        self.period_long = true;
+    }
+
+    /// The step's end, at a reading `end` taken at `now_ns`: the off-CPU time of the window its long polls
+    /// were left for ([`Tracker::defers`]), the window's wall time less its CPU, which judges each of them
+    /// ([`judge_in_window`]); `None` with no window or no clock. The next window opens at `end`.
+    pub(crate) fn close_step(&mut self, now_ns: u64, end: Option<ThreadAccount>) -> Option<u64> {
+        let off_cpu_ns = match (self.window_start, end) {
+            (Some((start, start_ns)), Some(end)) => Some(
+                now_ns
+                    .saturating_sub(start_ns)
+                    .saturating_sub(end.cpu_ns.saturating_sub(start.cpu_ns)),
+            ),
+            _ => None,
+        };
+        self.open(now_ns, end);
+        off_cpu_ns
+    }
+
+    /// A step's window left a long poll undecided: the shard arms, and judges long polls one at a time
+    /// again.
+    pub(crate) fn undecided(&mut self) {
+        self.armed = true;
+        self.by_step = false;
     }
 
     /// A step ended; `did_work` marks the busy period as one.
@@ -270,6 +340,12 @@ impl Tracker {
         };
         if matches!(attribution, Attribution::NoWindow | Attribution::Ambiguous) {
             self.armed = true;
+            self.by_step = false;
+        }
+        // A poll judged a run on the CPU in a window of its own is one a step's window judges the same way
+        // while nothing holds the thread off the CPU: from here, by step.
+        if attribution == Attribution::Long {
+            self.by_step = true;
         }
         self.open(now_ns, end);
         attribution
@@ -428,5 +504,73 @@ mod tests {
             tracker.long_poll(QUANTUM_NS * 110, QUANTUM_NS * 113, None, QUANTUM_NS),
             Attribution::NoClock
         );
+    }
+
+    /// A step's window judges each of its long polls by the window's off-CPU time: an overrun past it ran
+    /// on the CPU, the task's; one within it is not decided, as a window of the poll's own would not be
+    /// either where the thread was off the CPU that long within the poll.
+    #[test]
+    fn a_steps_window_judges_an_overrun_past_its_off_cpu_time_as_a_run() {
+        assert_eq!(
+            judge_in_window(QUANTUM_NS + 1, QUANTUM_NS),
+            Attribution::Long
+        );
+        assert_eq!(
+            judge_in_window(QUANTUM_NS, QUANTUM_NS),
+            Attribution::Ambiguous
+        );
+        assert_eq!(judge_in_window(1, QUANTUM_NS), Attribution::Ambiguous);
+        assert_eq!(judge_in_window(1, 0), Attribution::Long);
+    }
+
+    /// Long polls are judged one at a time until one is a run on the CPU in a window of its own, then by
+    /// step: no reading at a step's start while a window is open, the step's long polls left for its end,
+    /// and that reading the next window. A step's window that leaves one undecided judges one at a time
+    /// again, as does a wait's end, which opens a window only while armed.
+    #[test]
+    fn long_polls_are_judged_by_step_from_one_judged_a_run_on_the_cpu() {
+        let mut tracker = Tracker::default();
+        assert!(!tracker.reads_at_step_start() && !tracker.defers());
+        // The first long poll: no window. It arms, opens one at its end, and judges one at a time.
+        assert_eq!(
+            tracker.long_poll(0, 2 * QUANTUM_NS, account(2 * QUANTUM_NS, None), QUANTUM_NS),
+            Attribution::NoWindow
+        );
+        assert!(tracker.reads_at_step_start() && !tracker.defers());
+        // A step's start reads; its long poll runs three quanta on the CPU: a run, and by step from here.
+        tracker.step_began(|| at(3 * QUANTUM_NS, account(3 * QUANTUM_NS, None)));
+        assert_eq!(
+            tracker.long_poll(
+                3 * QUANTUM_NS,
+                6 * QUANTUM_NS,
+                account(6 * QUANTUM_NS, None),
+                QUANTUM_NS
+            ),
+            Attribution::Long
+        );
+        assert!(tracker.defers() && !tracker.reads_at_step_start());
+        // The next step reads nothing at its start; its end reads once: two quanta of wall, two of CPU,
+        // so no time off the CPU, and every overrun is a run.
+        tracker.step_began(|| panic!("no reading at a step's start with a window open"));
+        tracker.long_poll_deferred();
+        assert_eq!(
+            tracker.close_step(8 * QUANTUM_NS, account(8 * QUANTUM_NS, None)),
+            Some(0)
+        );
+        // Three quanta of wall and one of CPU: two off the CPU, which an overrun of one does not pass.
+        assert_eq!(
+            tracker.close_step(11 * QUANTUM_NS, account(9 * QUANTUM_NS, None)),
+            Some(2 * QUANTUM_NS)
+        );
+        assert_eq!(
+            judge_in_window(QUANTUM_NS, 2 * QUANTUM_NS),
+            Attribution::Ambiguous
+        );
+        tracker.undecided();
+        assert!(tracker.reads_at_step_start() && !tracker.defers());
+        // A wait closes the window; while armed, its end opens one, and judging stays one at a time.
+        tracker.wait_began();
+        tracker.wait_ended(|| at(20 * QUANTUM_NS, account(10 * QUANTUM_NS, None)));
+        assert!(!tracker.defers());
     }
 }

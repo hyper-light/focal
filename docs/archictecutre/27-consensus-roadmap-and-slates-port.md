@@ -1943,3 +1943,41 @@ taken from the schedule, carries the generator's own lag) and a refusal's 20–2
 70–85. At 100 a second neither side refused anything: a p99 of 3.5 ms against 4.0. A refusal
 at 12,000 a second still waits behind the leader's saturated network threads; a refusal by
 credit at the transport (QUIC's stream credit, as Breakwater's credits) would spare it that.
+
+## 17. What a participant holds back: admission credit (2026-10-13)
+
+A write refused at a session's door (§16) is still a request the leader received, decrypted,
+read and answered. On three 1-CPU CI nodes at 12,000 writes a second offered, the leader spent
+about 19 µs of CPU on each refusal and committed a fifth fewer than at 1,000 (A/B #8). Refusals
+grow with the load offered, so at 50,000 to 100,000 a second they alone would take more than a
+core: a collapse §16's door cannot prevent, because each refusal is the cost. Breakwater (Cho et
+al., OSDI 2020) gives the server credits to hand out, and a client sends only what it holds a
+credit for. focal's transport already carries such a credit: the streams a QUIC peer may open
+(MAX_STREAMS, RFC 9000 §4.6), one an exchange.
+
+- *The mechanism is the transport's* (hyper-transport's `StreamCredit::Pooled`, docs/transport.md
+  §4g in hyper-raft; hyper-quic now sends STREAMS_BLOCKED, its VENDORED.md §25). A participant's
+  connection (`FocalClasses::pooled`) is granted from a pool the node sizes. A node's and a
+  joiner's connection holds every stream a connection may, so replication is never held to the
+  participants' pool. A handshake grants one stream, its greeting's. A connection that joins
+  while credit is spare is raised to its fair share at once; a blocked one waits its turn and is
+  granted; one with nothing open gives its credit to one waiting.
+- *The pool is twice what the node's led sessions take at once* (`NetworkService::size_stream_pool`):
+  the sum of each authoritative leader's learned write window (`FleetManager::led_admission`,
+  each host's `TickPeriod::write_window`), doubled, and never under one connection's streams, so
+  a node that leads nothing still answers redirects and reads. A session holds about its window
+  queued and as many in its pipeline before its door refuses, so participants granted twice it
+  send nothing the door would refuse. A window is the most writes answered in one bound, so twice
+  it leaves room to grow: the pool grows a doubling a bound, as a slow start's. It is sized again
+  each least bound of the led sessions, which is the span a window is counted over.
+- *The door stays* (§16). Credit is a commitment QUIC cannot take back: a connection holds what
+  it was told until it uses it. So the pool overcommits by its idle connections' credit, and by
+  their handshake grants, and the door refuses what an overload sends past it, as Breakwater's
+  AQM does past its credits.
+- *Where a participant waits, and how long.* An exchange waiting for a stream waits at its
+  participant: nothing is sent, so nothing is refused at the node. A participant's endpoint bounds
+  that wait (`AskQueue::Credit`): asked while its connection already waits for a round of what it
+  was granted, an exchange is refused `Unsent` at once, which focal reads as `Capacity`, the
+  request known not taken. Its wait is held to about a round of its credit, as the door holds a
+  session's queue to what it answers in its bound; a request that waited a whole period for a
+  stream never granted is refused `Unsent` too, never left unknown.
