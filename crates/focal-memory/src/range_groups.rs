@@ -49,3 +49,52 @@ pub(super) fn next<'a, K: crate::RangeKey, V>(
         page: Some(located.page),
     }))
 }
+
+/// The changes that go in the page of the last remaining change, which are
+/// the last `count` of `remaining`: groups taken from the end, so a
+/// publication takes each group's changes off the end of its batch and
+/// edits pages from the last, never moving a change or a page it has yet to
+/// reach.
+pub(super) fn last<'a, K: crate::RangeKey, V>(
+    base: &'a Root<K, V>,
+    remaining: &[Change<K, V>],
+) -> Result<Option<LeafGroup<'a, K, V>>, MemoryError> {
+    let Some(last) = remaining.last() else {
+        return Ok(None);
+    };
+    if base.pages.is_empty() {
+        return Ok(Some(LeafGroup {
+            rank: 0,
+            count: remaining.len(),
+            page: None,
+        }));
+    }
+    let located = base
+        .pages
+        .locate(last.key())
+        .ok_or(MemoryError::MissingKey)?;
+    // The first page also takes every key before its own first.
+    let count = if located.rank == 0 {
+        remaining.len()
+    } else {
+        let first = located
+            .page
+            .entries
+            .first()
+            .map(|entry| &entry.key)
+            .ok_or(MemoryError::MissingKey)?;
+        remaining
+            .len()
+            .saturating_sub(remaining.partition_point(|change| change.key() < first))
+    };
+    if count == 0 {
+        return Err(MemoryError::InvalidConfiguration(
+            "range directory did not select a nonempty change group",
+        ));
+    }
+    Ok(Some(LeafGroup {
+        rank: located.rank,
+        count,
+        page: Some(located.page),
+    }))
+}

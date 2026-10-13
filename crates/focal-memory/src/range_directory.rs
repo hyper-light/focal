@@ -209,17 +209,35 @@ fn release<K, V>(node: Arc<Node<K, V>>) {
 /// One preparation's cumulative issued-allocation bound. Dropped intermediate
 /// nodes refund the source, but do not replenish this conservative quote.
 pub(super) struct DirectoryBuild<'a> {
-    source: &'a MemoryBudget,
+    source: BuildSource<'a>,
     lane: BudgetLane,
     remaining: usize,
+}
+
+/// Where a build's nodes are charged: reserved from a budget as they are made,
+/// or taken from a charge already held (a publication in place spends what its
+/// preparation reserved, so it never asks the budget, doc 30 §9).
+enum BuildSource<'a> {
+    Budget(&'a MemoryBudget),
+    Held(&'a mut Allocation),
 }
 
 impl<'a> DirectoryBuild<'a> {
     pub(super) fn new(source: &'a MemoryBudget, lane: BudgetLane, byte_bound: usize) -> Self {
         Self {
-            source,
+            source: BuildSource::Budget(source),
             lane,
             remaining: byte_bound,
+        }
+    }
+
+    /// A build that spends `held`, a `Roots` charge, and nothing past it.
+    pub(super) fn held(held: &'a mut Allocation, lane: BudgetLane) -> Self {
+        let remaining = held.bytes();
+        Self {
+            source: BuildSource::Held(held),
+            lane,
+            remaining,
         }
     }
 
@@ -231,12 +249,25 @@ impl<'a> DirectoryBuild<'a> {
                 requested: bytes,
                 available: self.remaining,
             })?;
-        let allocation = self
-            .source
-            .reserve(BudgetKind::Roots, self.lane, bytes)?
-            .commit();
+        let allocation = match &mut self.source {
+            BuildSource::Budget(source) => source
+                .reserve(BudgetKind::Roots, self.lane, bytes)?
+                .commit(),
+            BuildSource::Held(held) => held.split_off(bytes)?,
+        };
         self.remaining = remaining;
         Ok(allocation)
+    }
+
+    /// A build's temporary workspace, charged where its nodes are and outside
+    /// their bound.
+    fn staging(&mut self, bytes: usize) -> Result<Allocation, MemoryError> {
+        match &mut self.source {
+            BuildSource::Budget(source) => Ok(source
+                .reserve(BudgetKind::Roots, self.lane, bytes)?
+                .commit()),
+            BuildSource::Held(held) => held.split_off(bytes),
+        }
     }
 }
 
@@ -302,8 +333,37 @@ impl<K, V> PageDirectory<K, V> {
         if edits == 0 {
             return Ok(0);
         }
-        // Internal occupancy is at least MIN. An extra level accounts for the
-        // smaller root and for a split during an edit.
+        let levels = Self::levels(max_leaf_count)?;
+        let nodes = checked_add(checked_mul(6, levels)?, 2)?;
+        checked_mul(edits, checked_mul(nodes, node_charge::<K, V>(MAX)?)?)
+    }
+
+    /// What a publication in place of `changed` changes may spend on nodes,
+    /// the directory holding at most `max_leaf_count` pages as it publishes
+    /// (doc 30 §9). A change's page has its path made the directory's own, a
+    /// node a level where a capture still shares it; a change inserts at most
+    /// two pages (`insert_owned`: a path a level and its splits, and a root,
+    /// where its leaf is full) and removes at most one (`remove_owned`: four a
+    /// level and two roots). Every other edit is made where it stands.
+    pub(super) fn sparse_bound(
+        changed: usize,
+        max_leaf_count: usize,
+    ) -> Result<usize, MemoryError> {
+        if changed == 0 {
+            return Ok(0);
+        }
+        let levels = Self::levels(max_leaf_count)?;
+        let owned = levels;
+        let inserted = checked_mul(2, checked_add(checked_mul(2, levels)?, 1)?)?;
+        let removed = checked_add(checked_mul(4, levels)?, 2)?;
+        let nodes = checked_add(owned, checked_add(inserted, removed)?)?;
+        checked_mul(changed, checked_mul(nodes, node_charge::<K, V>(MAX)?)?)
+    }
+
+    /// The most levels a directory of `max_leaf_count` pages has: internal
+    /// occupancy is at least MIN, and an extra level accounts for the smaller
+    /// root and for a split during an edit.
+    fn levels(max_leaf_count: usize) -> Result<usize, MemoryError> {
         let mut pages = max_leaf_count.max(1);
         let mut levels = 2usize;
         while pages > 1 {
@@ -313,8 +373,7 @@ impl<K, V> PageDirectory<K, V> {
         if levels > MAX_LEVELS {
             return Err(invalid("directory height exceeds supported bound"));
         }
-        let nodes = checked_add(checked_mul(6, levels)?, 2)?;
-        checked_mul(edits, checked_mul(nodes, node_charge::<K, V>(MAX)?)?)
+        Ok(levels)
     }
 
     #[cfg(test)]
@@ -552,6 +611,48 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
         })
     }
 
+    /// Edits the page at `index` where it stands (doc 30 §9): the nodes on its
+    /// path become this directory's own ([`Self::own`]), `edit` is given the
+    /// page's handle (the page itself is the edit's to make its own or leave),
+    /// and each node whose first page this is takes the page's first prefix
+    /// as the edit left it. The page count is unchanged; an edit that splits a
+    /// page inserts its new pages after it ([`Self::insert_owned`]).
+    pub(super) fn edit_page<R>(
+        &mut self,
+        index: usize,
+        build: &mut DirectoryBuild<'_>,
+        edit: impl FnOnce(&mut Arc<Page<K, V>>) -> Result<R, MemoryError>,
+    ) -> Result<R, MemoryError> {
+        let route = {
+            let page = self.get(index).ok_or(MemoryError::MissingKey)?;
+            self.route(index, false, page)?
+        };
+        self.own(&route, false, build)?;
+        let mut handle = self.root.0.as_mut().ok_or(MemoryError::MissingKey)?;
+        let mut level = 0usize;
+        let (result, first) = loop {
+            let node = Arc::get_mut(handle).ok_or(invalid("an edited directory node is shared"))?;
+            match &mut node.links {
+                Links::Branches(children) => {
+                    let child = *route
+                        .children
+                        .get(level)
+                        .filter(|_| level < route.depth)
+                        .ok_or(invalid("directory deeper than an edit's route"))?;
+                    handle = children.get_mut(child).ok_or(MemoryError::MissingKey)?;
+                    level = level.saturating_add(1);
+                }
+                Links::Leaves(pages) => {
+                    let slot = pages.get_mut(route.rank).ok_or(MemoryError::MissingKey)?;
+                    let result = edit(slot)?;
+                    break (result, slot.first);
+                }
+            }
+        };
+        self.apply(&route, false, first, |_, _| Ok(()))?;
+        Ok(result)
+    }
+
     /// Removes the page at `index`, by the edit that copies its path
     /// ([`Self::remove`]): a removal can merge leaves, and one is rare.
     pub(super) fn remove_owned(
@@ -780,17 +881,13 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
             return Ok(Self::new());
         }
         let groups = count.div_ceil(MAX);
-        let _staging = build.source.reserve(
-            BudgetKind::Roots,
-            build.lane,
-            checked_mul(
-                2,
-                checked_add(
-                    ALLOCATOR_OVERHEAD,
-                    checked_mul(groups, size_of::<Arc<Node<K, V>>>())?,
-                )?,
+        let _staging = build.staging(checked_mul(
+            2,
+            checked_add(
+                ALLOCATOR_OVERHEAD,
+                checked_mul(groups, size_of::<Arc<Node<K, V>>>())?,
             )?,
-        )?;
+        )?)?;
         let mut level = Gathered::with_capacity(groups)?;
         let mut offset = 0usize;
         for group in 0..groups {
@@ -965,7 +1062,10 @@ fn shadow<K, V>(
     }))
 }
 
-/// Room in a leaf for one more page, its handle charged to the node.
+/// Room in a leaf for one more page, its handle charged to the node. A node
+/// an earlier write charged under another lane or pool (a publication in
+/// place keeps the nodes the directory owns) moves its whole charge to this
+/// build, as a copy of it would: its old charge goes back where it came from.
 fn make_room<K, V>(
     pages: &mut Vec<Arc<Page<K, V>>>,
     allocation: &mut Allocation,
@@ -973,7 +1073,11 @@ fn make_room<K, V>(
 ) -> Result<(), MemoryError> {
     let before = pages.capacity();
     let mut handle = build.allocate(size_of::<Arc<Page<K, V>>>())?;
-    allocation.absorb(&mut handle)?;
+    if allocation.absorb(&mut handle).is_err() {
+        let mut whole = build.allocate(allocation.bytes())?;
+        whole.absorb(&mut handle)?;
+        drop(std::mem::replace(allocation, whole));
+    }
     #[cfg(test)]
     let additional = super::preflight_tests::allocation_capacity(1)?;
     #[cfg(not(test))]

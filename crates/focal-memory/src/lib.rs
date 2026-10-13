@@ -61,7 +61,7 @@ pub use range::{
     Change, Entry, FrozenRange, PreparedRange, RangeConfig, RangeHydration, RangeHydrationLimits,
     RangeHydrationLookup, RangeHydrationSource, RangeHydrationView, RangeId,
     RangePreparationCharges, RangePreparationPlan, RangeStats, RangeStore, RangeWriteEnvelope,
-    RangeWriteLimits,
+    RangeWriteLimits, SparseBase, SparseRange, SparseRefusal,
 };
 pub use range_map::{KeySpan, RangeDescriptor, RangeMap, RangeMapError, RangeMapLimits};
 pub use snapshot::{ReadBudget, ReadPage, ScanContinuation, ScanQuery, SnapshotLease};

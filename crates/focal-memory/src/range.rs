@@ -49,11 +49,17 @@ pub use hydration::{
     RangeHydrationView,
 };
 #[cfg(test)]
+#[path = "range_import_tests.rs"]
+mod import_tests;
+#[path = "range_inplace.rs"]
+mod inplace;
+pub use inplace::{SparseBase, SparseRange, SparseRefusal};
+#[cfg(test)]
 #[path = "range_cut_tests.rs"]
 mod cut_tests;
 #[cfg(test)]
-#[path = "range_import_tests.rs"]
-mod import_tests;
+#[path = "range_inplace_tests.rs"]
+mod inplace_tests;
 #[path = "range_layout.rs"]
 mod layout;
 #[cfg(test)]
@@ -343,6 +349,16 @@ pub struct RangeStore<K, V> {
     pins: BTreeMap<u64, Arc<LeaseState<K, V>>>,
     next_lease: u64,
     clock: Arc<AtomicU64>,
+    /// Set by a publication in place that failed past its checks: the store
+    /// may hold part of it and refuses every plan and publication after
+    /// (`range_inplace.rs`).
+    poisoned: bool,
+    /// The identity of the state the store holds, new at every publication:
+    /// a candidate planned on it names it, so one planned on another state at
+    /// the same prefix (a fork) is refused (doc 30 §9).
+    state: u64,
+    /// The next state identity to hand out.
+    states: AtomicU64,
 }
 
 /// A committed prefix held by a strong root (see [`RangeStore::freeze`]):
@@ -401,6 +417,9 @@ impl<K: crate::RangeKey, V> PreparedRange<K, V> {
     }
     pub fn get(&self, key: &K) -> Option<&V> {
         self.root.get(key).map(|entry| &entry.value)
+    }
+    pub fn get_entry(&self, key: &K) -> Option<&Entry<K, V>> {
+        self.root.get(key)
     }
     /// Complete ordered view of this unpublished prefix. Entries remain owned
     /// by the candidate and cannot be modified through the view.
@@ -526,6 +545,9 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
             pins: BTreeMap::new(),
             next_lease: 1,
             clock: Arc::new(AtomicU64::new(0)),
+            poisoned: false,
+            state: 0,
+            states: AtomicU64::new(1),
         })
     }
 
@@ -533,6 +555,10 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
         self.root.range
     }
     /// The budget every page and root of this store is charged to.
+    /// The most changes one write may carry ([`RangeConfig::max_batch_entries`]).
+    pub fn max_batch_entries(&self) -> usize {
+        self.config.max_batch_entries
+    }
     pub fn budget(&self) -> &MemoryBudget {
         &self.budget
     }
@@ -968,7 +994,13 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
             return Err((MemoryError::WrongRange, prepared));
         }
         self.root = prepared.root;
+        self.state = self.fresh_state();
         Ok(())
+    }
+
+    /// A state identity no state of this store has had.
+    fn fresh_state(&self) -> u64 {
+        self.states.fetch_add(1, Ordering::Relaxed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1302,16 +1334,19 @@ fn merge_layout_charge<K, V>(capacity: usize, partitioned: bool) -> Result<usize
 }
 
 /// A page group's merge staging: a descriptor an entry, and the leaf cut's
-/// scratch (`layout::Cutter`), a word an entry.
+/// scratch (`layout::Cutter`) and leaf lengths, a word an entry each.
 fn merge_partition_charge<K, V, P>(capacity: usize) -> Result<usize, MemoryError> {
     if capacity == 0 {
         return Ok(0);
     }
     checked_add(
-        checked_mul(2, ALLOCATOR_OVERHEAD)?,
+        checked_mul(3, ALLOCATOR_OVERHEAD)?,
         checked_mul(
             capacity,
-            checked_add(size_of::<(MergeEntry<'_, K, V>, P)>(), size_of::<usize>())?,
+            checked_add(
+                size_of::<(MergeEntry<'_, K, V>, P)>(),
+                checked_mul(2, size_of::<usize>())?,
+            )?,
         )?,
     )
 }
