@@ -1885,17 +1885,24 @@ of the controller on three local nodes at 16,000 writes a second offered:
   own, and the scheduler (`FairScheduler::schedule_where`) holds a session's writes while
   it answers its reads. Reads that were scheduled as appends (native reads and lists,
   summaries, monitors, selections, traversals) are queries.
-- *The cycle only falls within a term.* The least write cycle taken alone stands for the
-  session's term (`TickPeriod::reset_base` at a new one): a shorter sample replaces it, a
-  longer one never does. A probe of it under load (BBR's ProbeRTT, the pipeline drained)
-  read 91 ms where the session's cycle was 22: its followers were still replaying the
-  batch before.
-- *The bound is ten cycles.* A cycle carrying `n` writes takes about the uncongested cycle
-  `b` and a cost `c` for each write, so it answers `n / (b + c·n)` a second, approaching
-  `1/c`; a batch of `k·b/c` writes takes `(k + 1)·b` and answers `k / (k + 1)` of that
-  most. A bound of `m` cycles buys `1 - 1/m` of the session's greatest throughput whatever
-  its costs: ten cycles, nine tenths. Two (Breakwater's AQM at twice its target) bought
-  half: 2,000 writes a second locally where the pipeline unbounded held 4,500.
+- *The cycle is the least any write took, and only falls within a term.* Any write's time
+  from its taking to its answer is at least its batch's cycle, which is at least the
+  uncongested cycle, so the least of all of them is that cycle from above; it stands for
+  the session's term (`TickPeriod::reset_base` at a new one): a shorter sample replaces
+  it, a longer one never does. A least that expired rose with the load it bounded (22 ms
+  to 124 ms within seconds), a probe of it under load (BBR's ProbeRTT) read 91 ms where
+  the session's cycle was 22, and a least of the writes taken alone was what the first
+  such write took: an overload never empties the pipeline, and a slow start held a bound
+  of 3 s for a whole run.
+- *The bound is four cycles.* A cycle carrying `n` writes takes about the uncongested
+  cycle `b` and a cost `c` for each write, so it answers `n / (b + c·n)` a second,
+  approaching `1/c`; a bound of `m` cycles buys `1 - 1/m` of the session's greatest
+  throughput whatever its costs, and doubling the pipeline from `m` cycles takes it to
+  `2m - 1`: from 2.5 cycles a doubling buys a quarter more, from four a seventh, at twice
+  the latency. A quarter is where BBR judges a pipe full (Cardwell et al., ACM Queue
+  2016), so the bound is four cycles. Ten bought about a tenth more committed at three
+  times the latency on 1-CPU CI nodes; two (Breakwater's AQM at twice its target) bought
+  half locally.
 - *The window is what the session answers in one bound* (`TickPeriod::write_window`,
   Little's law read as a count): the most writes answered within one bound over 10 s,
   and at least ten (RFC 6928). Counted, not derived from a rate: a rate sampled over a
@@ -1910,17 +1917,29 @@ of the controller on three local nodes at 16,000 writes a second offered:
   cycle, so the window grows with the batches until the cycle reaches the bound. Only
   an answer that is not an error is counted or measured: a refused write was never
   served the cycle a committed one takes.
-- *A write is refused at the door once its queue holds its window* (`delay_exceeded`):
-  taken in at most a window a bound, the next would wait past the bound to be taken, and
-  no interval need pass to know it. A write taken after waiting past the bound is dropped
-  at the head unserved (`head_drop`; CoDel's drop at dequeue, RFC 8289 §5, and Facebook's
-  "Fail at Scale", ACM Queue 2015), at the cost of its dequeue. Both are counted at
-  `bound="delay"`.
+- *A write is refused at the door once its queue holds its window, at once*
+  (`delay_exceeded`, counted at `bound="delay"`): taken in at most a window a bound, the
+  next would wait past the bound to be taken, and no interval need pass to know it. The
+  door is asked as the request reaches the session's host, before it is routed
+  (`ReplicaHost::refuses_for_delay`). Nothing is dropped at the head: a write the door let
+  in is served however long it waited. Dropped once past the bound, the writes a stall
+  queued at 100 a second were refused after 100-200 ms where they would have been
+  served, and under an overload a refusal that had waited held its client's slot as long
+  as an answer. Gating the door on a standing queue (CoDel's interval, Facebook's adaptive
+  CoDel) made refusals wait in turn, and its interval, the slowest write of the window,
+  grew with the load it judged.
 - The rest keep CoDel's test, past the bound for two bounds.
 
-**Measured** on three local nodes (macOS, 16,000 writes a second offered, 400,000 claims, the
-client holding at most 1,024 in flight; 2026-10-12): 361,927 committed, 38,073 refused, none of
-unknown outcome. Each 5 s committed about 20,000 (4,000 a second), at a client p50 of 210–385 ms
-and p99 of 335–827 ms against a bound of 234 ms (ten of the 23 ms cycle macOS's flush gives). A
-refusal at the door was answered in 15–19 ms, a head drop at about the bound. Before, on CI at
-4,000 a second (A/B #3's B): a p99 of 8.6 s.
+**Measured** on CI (three 1-CPU nodes, A/B run 38318336336, two rounds a side, 2026-10-12)
+against land-14's fixed bounds (24 queued, 32 pending), over each run's phase before its
+session filled. Every run at 1,000 a second or more fills the session's native allowance at
+about 50,000 claims, after which every write is refused for memory, so a run's committed
+count says how soon it filled, not how fast it committed. At 1,000 a second offered: 926–930
+committed a second against 884–906, 6.3–6.7% refused against 8.7–10.9%, a p99 of 54–62 ms
+against 87.5. At 4,000: 1,167–1,227 a second against 862–889, a p99 of 136–157 ms against
+162–168. At 12,000: 739–743 a second against 570–587, a committed write's client p50 of
+48–55 ms against 125–138 (its p99 within 0.1–0.5 s every 5 s on both sides; the run's p99,
+taken from the schedule, carries the generator's own lag) and a refusal's 20–28 ms against
+70–85. At 100 a second neither side refused anything: a p99 of 3.5 ms against 4.0. A refusal
+at 12,000 a second still waits behind the leader's saturated network threads; a refusal by
+credit at the transport (QUIC's stream credit, as Breakwater's credits) would spare it that.
