@@ -1228,6 +1228,27 @@ impl Allocation {
         other.bytes = 0;
         Ok(())
     }
+    /// Grow this permit by `bytes`, admitted against its own budget, kind and
+    /// lane as a fresh reservation of them is (every ancestor's bound and
+    /// lane): refused, the permit is unchanged. What a value funded for what it
+    /// holds while it waits takes when it is about to hold more, and gives back
+    /// with `shrink_to` once it holds less.
+    pub fn grow(&mut self, bytes: usize) -> Result<(), MemoryError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.bytes
+            .checked_add(bytes)
+            .ok_or(MemoryError::InvalidConfiguration("allocation sum overflow"))?;
+        reserve_tree(self.level, self.kind, self.lane, bytes)?;
+        let mut more = Self {
+            level: self.level,
+            bytes,
+            kind: self.kind,
+            lane: self.lane,
+        };
+        self.absorb(&mut more)
+    }
     /// Transfer part of an existing allowance to another owned value. Counters
     /// at every ancestor remain unchanged; each resulting owner releases only
     /// its part. This performs no new admission or heap allocation.
@@ -1297,6 +1318,40 @@ impl Drop for Allocation {
 #[cfg(test)]
 mod resizing_tests {
     use super::*;
+    /// A permit grows only as its budget admits, in its own kind and lane, and gives the growth
+    /// back as it shrinks and drops: from bytes and from none, refused at the bound without a
+    /// change, the level's usage exact after each.
+    #[test]
+    fn a_permit_grows_as_its_budget_admits_and_gives_it_back() {
+        let budget = MemoryBudget::new(1000, 0).unwrap();
+        let mut permit = budget
+            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 100)
+            .unwrap()
+            .commit();
+        permit.grow(400).unwrap();
+        assert_eq!(permit.bytes(), 500);
+        assert_eq!(budget.stats().used, 500);
+        assert!(matches!(
+            permit.grow(501).unwrap_err(),
+            MemoryError::Capacity { .. }
+        ));
+        assert_eq!(permit.bytes(), 500, "a refused growth changes nothing");
+        assert_eq!(budget.stats().used, 500);
+        permit.shrink_to(50).unwrap();
+        assert_eq!(budget.stats().used, 50);
+        drop(permit);
+        assert_eq!(budget.stats().used, 0);
+        // An empty permit grows from nothing and gives everything back.
+        let mut empty = budget
+            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 0)
+            .unwrap()
+            .commit();
+        empty.grow(300).unwrap();
+        assert_eq!(budget.stats().used, 300);
+        drop(empty);
+        assert_eq!(budget.stats().used, 0);
+        drop(budget);
+    }
     /// A budget handle is one pointer and an allocation three words (its
     /// level, its bytes, and its kind and lane a byte each): every charged
     /// page, node and buffer carries one. A word-wide kind made it 32 bytes.

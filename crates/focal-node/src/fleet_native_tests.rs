@@ -612,3 +612,120 @@ fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizable_rea
         drop(wal);
     }).unwrap()
 }
+
+/// Many native reads wait at once within a small session's memory: each waits as its request
+/// and a place, and the room its page may take is funded only as the owner builds it, one page
+/// at a time. Reserved for every read as it waited (32 times the client's frame, 32 MiB), 64
+/// reads at once took 2 GiB of a 64 MiB session and all but two were refused.
+#[test]
+fn many_reads_wait_at_once_within_a_small_sessions_memory() {
+    focal_rt::block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = MemoryBudget::new(512 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
+        let tenant = budget.child(160 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+        let content_dir = dir.path().join("content");
+        let wal = SharedWal::open_with_budget(
+            dir.path().join("wal"),
+            WalOptions::new(WalIdentity {
+                cluster: CLUSTER,
+                node: 1,
+                stream: 1,
+            }),
+            WalWriterLimits::default(),
+            budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        let _store = ContentStore::open(
+            &content_dir,
+            StoreLimits {
+                max_content_bytes: 64 << 20,
+                max_staging_bytes: 128 << 20,
+                max_uploads: 16,
+                chunk_bytes: 4096,
+                max_manifest_bytes: 1 << 20,
+            },
+        )
+        .unwrap();
+        let node = DurableNode::open_on_wal_in(
+            NodeConfig::single(1, CLUSTER, ledger().session.0),
+            wal.clone(),
+            &tenant,
+        )
+        .unwrap();
+        let mut session = Session::from_node_in_hosted(
+            ledger(),
+            node,
+            SessionLimits::default(),
+            &tenant,
+            NativeHosting {
+                limits: NativeSessionLimits::standard(domain()),
+                reader: ContentReader::open(&content_dir).unwrap(),
+                seeds: focal_evidence::SeedStore::open(
+                    content_dir.join("seeds"),
+                    focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
+                        .unwrap(),
+                )
+                .unwrap(),
+                range: RangeId(1),
+            },
+        )
+        .unwrap();
+        session.campaign().unwrap();
+        for _ in 0..8 {
+            session.poll().unwrap();
+        }
+        let mut config = ReplicaConfig::new(RootCommandId::from_u128(152));
+        config.tick = Duration::from_millis(20);
+        config.request_timeout = Duration::from_millis(10_000);
+        // The queue holds every read at once: memory is the bound under test.
+        config.queue_items = 128;
+        let (host, owner, _outgoing) =
+            ReplicaHost::spawn(session, config, ReplicaHost::wire_limits()).unwrap();
+        host.activate_native(ActivateNativeCall {
+            profile: focal_ledger::NativeContentProfile::AuthoredV1,
+            chunk_bytes: 4096,
+            max_manifest_bytes: 1 << 20,
+        })
+        .await
+        .unwrap();
+        let mut active = false;
+        for _ in 0..200 {
+            focal_rt::time::sleep(Duration::from_millis(25))
+                .await
+                .unwrap();
+            let diagnostics = host.diagnostics().await.unwrap();
+            if diagnostics.value().native_active && diagnostics.value().native_authoritative {
+                active = true;
+                break;
+            }
+        }
+        assert!(active, "the fresh ledger never became native");
+        // What the session's memory has left for what waits on it.
+        let free = tenant.stats().limit - tenant.stats().used;
+        assert!(free < 64 * 32 * 1024 * 1024, "{free}");
+        let mut reads = focal_rt::Concurrent::new(64).unwrap();
+        for request in 0..64u128 {
+            let host = &host;
+            reads
+                .push(async move {
+                    call(
+                        host,
+                        ISSUER,
+                        envelope(1000 + request, read(NativeReadQuery::Standing)),
+                    )
+                    .await
+                })
+                .unwrap();
+        }
+        let mut served = 0;
+        while let Some(reply) = reads.join_next().await {
+            assert!(matches!(reply, Response::NativeRead(_)), "{reply:?}");
+            served += 1;
+        }
+        assert_eq!(served, 64);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        drop(wal);
+    })
+    .unwrap()
+}
