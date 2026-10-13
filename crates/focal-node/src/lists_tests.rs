@@ -334,7 +334,8 @@ fn zero_match_pages_advance_and_cursors_bind_query_principal_role_route_and_pref
         page(&mut fresh, &mut node, &original),
         Err(AccessError::SnapshotExpired)
     );
-    views.started -= std::time::Duration::from_secs(31);
+    node.session
+        .move_read_clock_ahead(std::time::Duration::from_secs(31));
     assert_eq!(
         page(&mut views, &mut node, &original),
         Err(AccessError::SnapshotExpired)
@@ -503,7 +504,8 @@ fn validator_contract_pages_bind_filters_and_preserve_empty_prefix_continuations
     assert!(done);
     assert_eq!(matches, 1);
     assert_eq!(visits, 8);
-    views.expire_test_views();
+    node.session
+        .move_read_clock_ahead(std::time::Duration::from_secs(31));
     query.query.cursor = first.next;
     assert_eq!(
         read(&mut views, &mut node, &query, &actor),

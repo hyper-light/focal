@@ -302,12 +302,41 @@ pub(crate) fn micros(elapsed: std::time::Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
+/// The clock a session's reads are timed by, in milliseconds since the session
+/// opened: its graph's snapshot leases, and each reader's views and saved
+/// traversals by the time [`Session::advance_read_clock`] hands back. One
+/// origin whichever reader asks, so no reader takes the graph's clock back
+/// from where another left it. Each reader timed from its own start until
+/// 2026-10-13: one made after another had served for a few milliseconds was
+/// refused (`ClockRegression`, a reply's `OutcomeUnknown`), on Linux CI.
+#[derive(Debug, Clone, Copy)]
+struct ReadClock {
+    origin: std::time::Instant,
+    /// How far the clock was moved past the time that passed (tests only).
+    ahead: u64,
+}
+impl ReadClock {
+    fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            ahead: 0,
+        }
+    }
+    /// Milliseconds since the session opened, never less than before.
+    fn now(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_add(self.ahead)
+    }
+}
+
 /// One owner per session. Proposals may be pipelined, but speculative outcomes are
 /// never returned as committed. Both retries and effective admission include pending work.
 pub struct Session {
     ledger: LedgerId,
     core: Core,
     graph: GraphStore,
+    read_clock: ReadClock,
     budget: MemoryBudget,
     core_charge: Allocation,
     core_completion_charge: Allocation,
@@ -553,6 +582,7 @@ impl Session {
             ledger,
             core,
             graph,
+            read_clock: ReadClock::new(),
             budget: budget.clone(),
             core_charge,
             core_completion_charge: budget
@@ -946,24 +976,38 @@ impl Session {
         self.graph.audit(self.core.snapshot())?;
         Ok(())
     }
+    /// The committed graph at `minimum` or later, pinned for `ttl`
+    /// milliseconds of the read clock ([`ReadClock`]).
     pub fn graph_snapshot(
         &mut self,
         minimum: SessionSeq,
-        now: u64,
         ttl: u64,
     ) -> Result<GraphSnapshot, LedgerError> {
         self.check()?;
         if self.sequence() < minimum {
             return Err(LedgerError::Behind);
         }
+        let now = self.read_clock.now();
         Ok(self.graph.snapshot(now, ttl)?)
     }
     pub fn release_graph_snapshot(&mut self, snapshot: &GraphSnapshot) -> Result<(), LedgerError> {
         self.graph.release_snapshot(snapshot)?;
         Ok(())
     }
-    pub fn advance_read_clock(&mut self, now: u64) -> Result<usize, LedgerError> {
-        Ok(self.graph.advance_clock(now)?)
+    /// Moves the read clock to now, expiring the snapshot leases it passed,
+    /// and hands back the time: what a reader times its own views and saved
+    /// traversals by ([`ReadClock`]).
+    pub fn advance_read_clock(&mut self) -> Result<u64, LedgerError> {
+        let now = self.read_clock.now();
+        self.graph.advance_clock(now)?;
+        Ok(now)
+    }
+    /// Moves the read clock `by` past the time that passed, for every reader of
+    /// the session: what each would see that much later.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn move_read_clock_ahead(&mut self, by: std::time::Duration) {
+        let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        self.read_clock.ahead = self.read_clock.ahead.saturating_add(by);
     }
     fn staging_bytes(&self) -> usize {
         // The stage and its apply audit coexist. Their combined fixed ceilings

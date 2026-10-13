@@ -168,10 +168,14 @@ fn local_reconciliation_reads_committed_core_without_writes_and_preserves_floor_
     );
     opening.request_epoch = RequestEpoch(2);
     let opened = response(&mut node, actor.clone(), opening);
-    assert!(matches!(
-        opened.result,
-        Response::Submitted(MutationReply::Committed(_))
-    ));
+    assert!(
+        matches!(
+            opened.result,
+            Response::Submitted(MutationReply::Committed(_))
+        ),
+        "{:?}",
+        opened.result
+    );
     let mut floor = envelope(
         ledger,
         31,

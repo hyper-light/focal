@@ -109,10 +109,9 @@ impl Session {
     /// replication continues to use the separate nonblocking Ready path.
     pub fn checkpoint_evidence(
         &mut self,
-        now: u64,
         ttl: u64,
     ) -> Result<DurableEvidenceSnapshot, LedgerError> {
-        self.begin_checkpoint_evidence(now, ttl)?;
+        self.begin_checkpoint_evidence(ttl)?;
         if let Err(error) = self.consensus.finish_checkpoint() {
             self.cancel_checkpoint_evidence()?;
             return Err(error.into());
@@ -122,7 +121,8 @@ impl Session {
     }
     /// Prepare an immutable export while the existing disk owner performs the
     /// checkpoint rewrite. No witness escapes until its exact receipt completes.
-    pub fn begin_checkpoint_evidence(&mut self, now: u64, ttl: u64) -> Result<(), LedgerError> {
+    /// Its capture is pinned for `ttl` milliseconds of the read clock.
+    pub fn begin_checkpoint_evidence(&mut self, ttl: u64) -> Result<(), LedgerError> {
         self.check()?;
         // One checkpoint at a time: a deferred one is finished first.
         self.settle_deferred_checkpoint()?;
@@ -181,6 +181,7 @@ impl Session {
         } else {
             None
         };
+        let now = self.read_clock.now();
         let captured_at = std::time::Instant::now();
         let graph = self.graph.snapshot(now, ttl)?;
         let encoded = match self.encode_checkpoint(true) {

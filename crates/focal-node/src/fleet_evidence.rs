@@ -93,11 +93,10 @@ impl Owner {
         if !self.nonblocking {
             // The compatibility owner serves only this one session. The shared
             // worker always takes the staged path below, including checkpoint IO.
-            let now = self
-                .views
+            self.views
                 .advance(&mut self.session)
                 .map_err(|_| LedgerError::Failed)?;
-            let result = self.session.checkpoint_evidence(now, call.ttl);
+            let result = self.session.checkpoint_evidence(call.ttl);
             PendingEvidenceCall {
                 call,
                 started: true,
@@ -135,14 +134,10 @@ impl Owner {
                 self.evidence = Some(pending);
                 return Ok(());
             }
-            let now = self
-                .views
+            self.views
                 .advance(&mut self.session)
                 .map_err(|_| LedgerError::Failed)?;
-            if let Err(error) = self
-                .session
-                .begin_checkpoint_evidence(now, pending.call.ttl)
-            {
+            if let Err(error) = self.session.begin_checkpoint_evidence(pending.call.ttl) {
                 pending.finish(Err(error));
                 return Ok(());
             }

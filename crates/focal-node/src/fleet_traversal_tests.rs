@@ -175,7 +175,9 @@ fn traversal_cursor_rejects_tamper_query_principal_route_and_expiry() {
         Response::Error(AccessError::InvalidRequest)
     ));
     let retained = fixture.owners[0].session.memory_stats().used;
-    fixture.owners[0].views.expire_test_views();
+    fixture.owners[0]
+        .session
+        .move_read_clock_ahead(std::time::Duration::from_secs(31));
     assert!(matches!(
         request(&mut fixture, actor(), exact)
             .try_recv()
