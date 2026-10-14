@@ -69,7 +69,7 @@ fn generated_parent_with_owned_child_posts_against_its_current_revision() {
         .unwrap();
     let expected = parent.binding();
     assert_eq!(expected.revision, ObjectRevision(2));
-    assert_eq!(parent.lineage().binding().revision, ObjectRevision(1));
+    assert_eq!(parent.creation_binding().revision, ObjectRevision(1));
     let registry = parent.scopes().clone();
     parent
         .post_owned(Principal::Actor(ISSUER), expected)
@@ -192,29 +192,44 @@ fn retained_identity_and_impossible_generated_facts_are_checked_before_mutation(
                 ContractError::ContentConflict
             }
             5 => {
-                value.lineage = succession::Lineage::root(
-                    Binding {
-                        ledger: crate::LedgerId {
-                            session: SessionId::from_u128(77),
-                            ..value.binding().ledger
-                        },
-                        ..value.binding()
+                // A lineage holds no binding of its own (doc 31 M3): one built for another
+                // ledger names its corrections there, and the claim's refuses them.
+                let elsewhere = Binding {
+                    ledger: crate::LedgerId {
+                        session: SessionId::from_u128(77),
+                        ..value.binding().ledger
                     },
-                    RootCommandId::from_u128(1),
+                    ..value.binding()
+                };
+                value.lineage = succession::Lineage::new(
+                    elsewhere,
+                    Cause::Root(RootCommandId::from_u128(1)),
+                    &[succession::Correction {
+                        kind: succession::CorrectionKind::Amends,
+                        predecessor: crate::ObjectRef {
+                            ledger: elsewhere.ledger,
+                            kind: crate::ObjectKind::Claim,
+                            id: ObjectId::from_u128(55),
+                        },
+                    }],
+                    1,
                 )
                 .unwrap();
                 ContractError::WrongLedger
             }
             _ => {
-                value.lineage = succession::Lineage::root(
+                // One built for another claim may name this one as its cause.
+                value.lineage = succession::Lineage::new(
                     Binding {
-                        content: ContentHash([9; 32]),
+                        object: ObjectId::from_u128(56),
                         ..value.binding()
                     },
-                    RootCommandId::from_u128(1),
+                    Cause::Claim(ClaimId(value.binding().object.0)),
+                    &[],
+                    0,
                 )
                 .unwrap();
-                ContractError::ContentConflict
+                ContractError::InvalidTarget
             }
         };
         let before = value.clone();

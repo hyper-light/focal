@@ -223,6 +223,9 @@ pub struct ClaimState {
     deadline: Option<Deadline>,
     local_complete: bool,
     local_sealed_at: Option<SessionSeq>,
+    /// The revision the claim was created at: with its binding, the creation binding its
+    /// lineage was built for, held here once rather than in each part (doc 31 M3).
+    created_revision: crate::ObjectRevision,
     /// Behind its own allocation, made when the claim becomes terminal: an open claim holds a
     /// pointer's width for it, where its widest form (208 bytes) took room in every claim row
     /// (doc 31 M3).
@@ -309,6 +312,7 @@ impl ClaimState {
             deadline,
             local_complete: false,
             local_sealed_at: None,
+            created_revision: binding.revision,
             terminal_cut: None,
             origin: ClaimOrigin::Native,
         })
@@ -375,6 +379,14 @@ impl ClaimState {
     }
     pub fn lineage(&self) -> &succession::Lineage {
         &self.lineage
+    }
+    /// The binding the claim was created with: its object and content at the revision it began
+    /// at, which its lineage was built for.
+    pub fn creation_binding(&self) -> Binding {
+        Binding {
+            revision: self.created_revision,
+            ..self.binding
+        }
     }
     pub fn acceptance(&self) -> &aggregation::AcceptancePolicy {
         &self.acceptance

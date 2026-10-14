@@ -58,7 +58,7 @@ pub(super) fn claim(sink: &mut impl Sink, row: &OwnedClaim) -> Result<(), Error>
         },
     )?;
     graph(sink, value.graph())?;
-    lineage(sink, value.lineage())?;
+    lineage(sink, value.lineage(), value.creation_binding())?;
     acceptance(sink, value.acceptance())?;
     count(sink, snapshot.responses)?;
     let mut responses = value.response_snapshots_v1();
@@ -111,8 +111,12 @@ fn object_ref(sink: &mut impl Sink, value: ObjectRef) -> Result<(), Error> {
     )?;
     raw(sink, &value.id.0)
 }
-fn lineage(sink: &mut impl Sink, value: &succession::Lineage) -> Result<(), Error> {
-    types::binding(sink, value.binding())?;
+fn lineage(
+    sink: &mut impl Sink,
+    value: &succession::Lineage,
+    binding: focal_model::lifecycle::Binding,
+) -> Result<(), Error> {
+    types::binding(sink, binding)?;
     match value.cause() {
         Cause::Root(id) => {
             write_u8(sink, 0)?;

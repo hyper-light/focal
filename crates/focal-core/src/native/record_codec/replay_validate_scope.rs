@@ -59,7 +59,7 @@ pub(super) fn validate<O: Overlay>(
             require(fields.released == Some(released))?;
         }
     } else {
-        require(fields.owner == next.lineage().binding())?;
+        require(fields.owner == next.creation_binding())?;
     }
     read.charge(mul(add(fields.children, 1)?, 128)?)?;
     for child in registry.children() {

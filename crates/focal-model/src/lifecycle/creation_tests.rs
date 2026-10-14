@@ -582,14 +582,8 @@ fn fingerprint_covers_semantics_and_owner_fences_but_not_assigned_metadata() {
     p.definition.binding.content = ContentHash([8; 32]);
     changes.push(p);
     let mut p = proposal(1, 1);
-    p.definition.lineage = Lineage::root(
-        Binding {
-            content: ContentHash([9; 32]),
-            ..p.definition.binding
-        },
-        RootCommandId::from_u128(1),
-    )
-    .unwrap();
+    p.definition.lineage =
+        Lineage::root(p.definition.binding, RootCommandId::from_u128(2)).unwrap();
     changes.push(p);
     let mut p = proposal(1, 1);
     p.definition.graph = graph::Declaration::new(

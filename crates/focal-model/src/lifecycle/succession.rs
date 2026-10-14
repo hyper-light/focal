@@ -18,12 +18,12 @@ pub struct Correction {
     pub predecessor: ObjectRef,
 }
 
-/// Frozen alongside the claim. The binding pins its owner and immutable content;
-/// this module does not allocate successor wire numbers or canonical hash rules.
+/// Frozen alongside the claim. It is built for the claim's creation binding and checked
+/// against it, which the claim holds (doc 31 M3): the lineage does not keep a copy of it. This
+/// module does not allocate successor wire numbers or canonical hash rules.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(test, derive(Clone))]
 pub struct Lineage {
-    binding: Binding,
     cause: Cause,
     corrections: Vec<Correction>,
 }
@@ -79,16 +79,38 @@ impl Lineage {
             }
         }
         Ok(Self {
-            binding,
             cause,
             corrections: stored,
         })
     }
+    /// Whether this lineage is one built for `binding`, a claim's creation binding: its cause and
+    /// corrections name other claims of the binding's ledger, never the claim itself.
     pub fn check_binding(&self, binding: &Binding) -> Result<(), ContractError> {
-        self.binding.check(binding)
-    }
-    pub fn binding(&self) -> Binding {
-        self.binding
+        if binding.ledger.tenant.is_zero()
+            || binding.ledger.session.is_zero()
+            || binding.object.is_zero()
+        {
+            return Err(ContractError::InvalidTarget);
+        }
+        match self.cause {
+            Cause::Root(root) if root.is_zero() => return Err(ContractError::InvalidTarget),
+            Cause::Claim(claim) if claim.is_zero() || claim.0 == binding.object.0 => {
+                return Err(ContractError::InvalidTarget);
+            }
+            _ => {}
+        }
+        for correction in &self.corrections {
+            if correction.predecessor.ledger != binding.ledger {
+                return Err(ContractError::WrongLedger);
+            }
+            if correction.predecessor.kind != ObjectKind::Claim
+                || correction.predecessor.id.is_zero()
+                || correction.predecessor.id == binding.object
+            {
+                return Err(ContractError::InvalidTarget);
+            }
+        }
+        Ok(())
     }
     pub fn cause(&self) -> &Cause {
         &self.cause
@@ -166,11 +188,7 @@ impl Lineage {
             max_relations,
             visits,
         )?;
-        Ok(Self {
-            binding,
-            cause,
-            corrections,
-        })
+        Ok(Self { cause, corrections })
     }
     fn target(&self, edge: usize) -> Option<ClaimId> {
         let offset = match self.cause {

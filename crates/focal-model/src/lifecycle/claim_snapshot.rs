@@ -193,6 +193,13 @@ impl ClaimState {
         {
             return Err(ContractError::Capacity);
         }
+        // The claim holds one binding: its definition's is the same but for the revision the
+        // claim was created at, which the claim keeps beside it (doc 31 M3).
+        Binding {
+            revision: definition.binding.revision,
+            ..fields.binding
+        }
+        .check(&definition.binding)?;
         definition.lineage.check_binding(&definition.binding)?;
         definition
             .acceptance
@@ -328,6 +335,7 @@ impl<R: ClaimResponseSource + ?Sized, S: scope::RegistrySnapshotSource + ?Sized>
         // duplicate scan. Recheck the actual final array, without callbacks.
         check_records(self.fields, &responses, self.response_visits)?;
         let definition = self.definition;
+        let definition_binding = definition.binding;
         let restored = ClaimState {
             binding: self.fields.binding,
             issuer: self.fields.issuer,
@@ -344,6 +352,7 @@ impl<R: ClaimResponseSource + ?Sized, S: scope::RegistrySnapshotSource + ?Sized>
             deadline: self.fields.deadline,
             local_complete: self.fields.local_complete,
             local_sealed_at: self.fields.local_sealed_at,
+            created_revision: definition_binding.revision,
             terminal_cut: self.terminal.map(held_cut).transpose()?,
             origin: self.fields.origin,
         };

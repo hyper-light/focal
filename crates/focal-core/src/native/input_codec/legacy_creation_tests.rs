@@ -511,7 +511,7 @@ fn streaming_creation_writer_refuses_incomplete_or_extra_values_without_changing
         subject: value.subject,
         deadline: value.deadline,
         max_responses: value.max_responses,
-        lineage_binding: value.lineage.binding(),
+        lineage_binding: value.binding,
         cause: value.lineage.cause(),
         acceptance: value.acceptance.intent_fingerprint(),
         scope_limits: value.scope_limits,

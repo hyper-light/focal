@@ -178,6 +178,7 @@ impl ClaimState {
             deadline: self.deadline,
             local_complete: self.local_complete,
             local_sealed_at: self.local_sealed_at,
+            created_revision: self.created_revision,
             terminal_cut: self
                 .terminal_cut
                 .as_deref()

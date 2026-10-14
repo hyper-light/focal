@@ -48,7 +48,7 @@ fn immutable<O: Overlay>(
     read.charge(mul(add(add(graph.len(), corrections.len())?, 1)?, 256)?)?;
     require(
         graph == next.graph().obligations()
-            && old.lineage().binding() == next.lineage().binding()
+            && old.creation_binding() == next.creation_binding()
             && old.lineage().cause() == next.lineage().cause()
             && corrections == next.lineage().corrections(),
     )?;

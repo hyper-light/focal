@@ -67,7 +67,7 @@ pub fn intent_fingerprint(proposals: &[Proposal]) -> Result<ContentHash, Contrac
                 subject: definition.subject,
                 deadline: definition.deadline,
                 max_responses: definition.max_responses,
-                lineage_binding: definition.lineage.binding(),
+                lineage_binding: definition.binding,
                 cause: definition.lineage.cause(),
                 acceptance: definition.acceptance.intent_fingerprint(),
                 scope_limits: definition.scope_limits,

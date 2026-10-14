@@ -119,7 +119,7 @@ fn response(claim: &mut ClaimState, id: u128, delivered: bool) -> Response {
         e::ResponseIdentity {
             binding: Binding {
                 object: ObjectId::from_u128(id),
-                ..claim.lineage().binding()
+                ..claim.creation_binding()
             },
             claim: parent.claim,
             receipt: parent.receipt,
@@ -258,7 +258,7 @@ fn finish(
 }
 fn definition(claim: &ClaimState) -> ClaimDefinition {
     ClaimDefinition {
-        binding: claim.lineage().binding(),
+        binding: claim.creation_binding(),
         issuer: claim.issuer(),
         subject: claim.subject(),
         created: claim.created(),
@@ -833,3 +833,56 @@ fn malformed_claim_fields_and_substituted_response_source_do_not_create_rows() {
 
 #[path = "registration_snapshot_tests.rs"]
 mod registration_tests;
+#[test]
+fn a_claim_hydrates_its_creation_revision_and_refuses_a_definition_bound_elsewhere() {
+    // The claim holds one binding and the revision it was created at (doc 31 M3): a definition
+    // bound to another object or content is refused, one at the creation revision restores it.
+    let (mut claim, _) = fixture(9, None, false);
+    receive(&mut claim);
+    assert!(claim.binding().revision > claim.creation_binding().revision);
+    let source = claim.scopes().snapshot_v1();
+    let scope_plan = || {
+        scope::Registry::prepare_hydration_v1(
+            claim.binding(),
+            claim.created(),
+            claim.scopes().limits(),
+            &source,
+            usize::MAX,
+        )
+        .unwrap()
+    };
+    let rows = values(&claim, &[]);
+    for (elsewhere, error) in [
+        (
+            Binding {
+                content: ContentHash([9; 32]),
+                ..claim.creation_binding()
+            },
+            ContractError::ContentConflict,
+        ),
+        (
+            Binding {
+                object: ObjectId::from_u128(77),
+                ..claim.creation_binding()
+            },
+            ContractError::WrongObject,
+        ),
+    ] {
+        let mut owned = definition(&claim);
+        owned.binding = elsewhere;
+        assert_eq!(
+            ClaimState::prepare_hydration_v1(
+                owned,
+                claim.snapshot_v1(),
+                rows.as_slice(),
+                scope_plan(),
+                usize::MAX
+            )
+            .err(),
+            Some(error)
+        );
+    }
+    let restored = restore(&claim, &[]);
+    assert_eq!(restored.creation_binding(), claim.creation_binding());
+    assert_eq!(restored.binding(), claim.binding());
+}
