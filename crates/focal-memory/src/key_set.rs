@@ -317,7 +317,7 @@ impl Block {
             entries: self.entries(),
             offset,
             key: SetKey::empty(),
-            pending: None,
+            pending: false,
         }
     }
     /// A cursor whose next key is the first at or after `key` (after it, `exclusive`).
@@ -348,23 +348,22 @@ impl Block {
             .unwrap_or(0);
         let mut cursor = self.cursor_at(start);
         // At most a restart interval's entries lie between the restart and the key.
-        while let Some(next) = cursor.next_key() {
+        while cursor.advance() {
             let past = if exclusive {
-                next.as_bytes() > key
+                cursor.key() > key
             } else {
-                next.as_bytes() >= key
+                cursor.key() >= key
             };
             if past {
-                cursor.pending = Some(next);
+                cursor.pending = true;
                 break;
             }
         }
         cursor
     }
     fn contains(&self, key: &[u8]) -> bool {
-        self.seek(key, false)
-            .next_key()
-            .is_some_and(|found| found.as_bytes() == key)
+        let mut cursor = self.seek(key, false);
+        cursor.advance() && cursor.key() == key
     }
     fn last(&self) -> Option<SetKey> {
         let start = self
@@ -373,11 +372,12 @@ impl Block {
             .and_then(|restart| self.restart(restart))
             .unwrap_or(0);
         let mut cursor = self.cursor_at(start);
-        let mut last = None;
-        while let Some(key) = cursor.next_key() {
-            last = Some(key);
+        let mut any = false;
+        while cursor.advance() {
+            any = true;
         }
-        last
+        // The walk's end leaves its buffer at the last key it read.
+        any.then_some(cursor.key)
     }
     fn small(&self) -> bool {
         self.entries().len() < BLOCK_MIN && self.count() < BLOCK_KEYS / 2
@@ -394,27 +394,42 @@ impl Child for Block {
     }
 }
 
-/// A walk of one block's keys.
+/// A walk of one block's keys, each decoded in place into the walk's own buffer and lent from it
+/// ([`Cursor::key`]) until the walk moves. Handed out whole, a key was copied a hundred and
+/// thirty bytes at a time, four or five times as a block was merged with its edits: on 1-CPU
+/// x86 nodes a key set's publication took 160 µs of every claim's 624 on its leader's owner, 58%
+/// of it in memcpy, and its followers' membership checks 71 µs more (cluster profile run
+/// 38586796329, 1,000 writes a second).
 struct Cursor<'b> {
     entries: &'b [u8],
     offset: usize,
     key: SetKey,
-    /// A key a seek read past and gives back first.
-    pending: Option<SetKey>,
+    /// Whether `key` is one a seek read past, which the next move gives back first.
+    pending: bool,
 }
 
 impl Cursor<'_> {
-    fn next_key(&mut self) -> Option<SetKey> {
-        if let Some(pending) = self.pending.take() {
-            return Some(pending);
+    /// Moves to the next key; false at the block's end, or at an entry that cannot be read.
+    fn advance(&mut self) -> bool {
+        if self.pending {
+            self.pending = false;
+            return true;
         }
         if self.offset >= self.entries.len() {
-            return None;
+            return false;
         }
-        let (shared, suffix, next) = entry_at(self.entries, self.offset)?;
-        self.key.assign(shared, suffix)?;
+        let Some((shared, suffix, next)) = entry_at(self.entries, self.offset) else {
+            return false;
+        };
+        if self.key.assign(shared, suffix).is_none() {
+            return false;
+        }
         self.offset = next;
-        Some(self.key)
+        true
+    }
+    /// The key the walk is at.
+    fn key(&self) -> &[u8] {
+        self.key.as_bytes()
     }
 }
 
@@ -855,8 +870,10 @@ impl Iterator for KeyIter<'_> {
     fn next(&mut self) -> Option<SetKey> {
         // Each turn moves to a later block; the blocks are finite.
         loop {
-            if let Some(key) = self.cursor.as_mut().and_then(Cursor::next_key) {
-                return Some(key);
+            if let Some(cursor) = self.cursor.as_mut()
+                && cursor.advance()
+            {
+                return Some(cursor.key);
             }
             let mid = self.mids.get(self.mid)?;
             let chunk = mid.children.get(self.chunk)?;
@@ -1607,64 +1624,112 @@ fn build_blocks<'k>(
     Ok(blocks)
 }
 
-/// The keys of a block with edits applied, in order.
+/// Keys lent one at a time in ascending order, each until the next is asked for.
+trait LentKeys {
+    fn next_key(&mut self) -> Result<Option<&[u8]>, MemoryError>;
+}
+
+/// The keys of a block with edits applied, in order, each lent from the block's walk or the edit
+/// that puts it.
 struct Merged<'b, 'e, E> {
     cursor: Cursor<'b>,
-    held: Option<SetKey>,
+    /// Whether the walk is at a key not yet given.
+    held: bool,
+    /// Whether the walk's key was given last: the walk moves past it before the next.
+    given: bool,
     edits: std::iter::Peekable<std::slice::Iter<'e, E>>,
 }
 
 impl<'b, 'e, E: SetEdit> Merged<'b, 'e, E> {
     fn new(block: &'b Block, edits: &'e [E]) -> Self {
         let mut cursor = block.cursor();
-        let held = cursor.next_key();
+        let held = cursor.advance();
         Self {
             cursor,
             held,
+            given: false,
             edits: edits.iter().peekable(),
         }
     }
+}
+
+impl<E: SetEdit> LentKeys for Merged<'_, '_, E> {
     /// The next key; a deletion of a key the block does not hold is refused.
-    fn next_key(&mut self) -> Result<Option<SetKey>, MemoryError> {
+    fn next_key(&mut self) -> Result<Option<&[u8]>, MemoryError> {
+        if self.given {
+            self.given = false;
+            self.held = self.cursor.advance();
+        }
         // Each turn takes a held key or an edit, and returns but where a deletion removes one:
         // the turns are at most the block's keys and its edits.
         loop {
             match (self.held, self.edits.peek().copied()) {
-                (None, None) => return Ok(None),
-                (Some(key), None) => {
-                    self.held = self.cursor.next_key();
-                    return Ok(Some(key));
+                (false, None) => return Ok(None),
+                (true, None) => {
+                    self.given = true;
+                    return Ok(Some(self.cursor.key()));
                 }
-                (None, Some(edit)) => {
+                (false, Some(edit)) => {
                     self.edits.next();
                     if edit.deletes() {
                         return Err(MemoryError::MissingKey);
                     }
-                    return Ok(Some(SetKey::new(edit.edit_key())?));
+                    return set_key(edit.edit_key()).map(Some);
                 }
-                (Some(key), Some(edit)) => match key.as_bytes().cmp(edit.edit_key()) {
+                (true, Some(edit)) => match self.cursor.key().cmp(edit.edit_key()) {
                     Ordering::Less => {
-                        self.held = self.cursor.next_key();
-                        return Ok(Some(key));
+                        self.given = true;
+                        return Ok(Some(self.cursor.key()));
                     }
                     Ordering::Equal => {
-                        self.held = self.cursor.next_key();
                         self.edits.next();
                         if !edit.deletes() {
-                            return Ok(Some(key));
+                            self.given = true;
+                            return Ok(Some(self.cursor.key()));
                         }
+                        self.held = self.cursor.advance();
                     }
                     Ordering::Greater => {
                         self.edits.next();
                         if edit.deletes() {
                             return Err(MemoryError::MissingKey);
                         }
-                        return Ok(Some(SetKey::new(edit.edit_key())?));
+                        return set_key(edit.edit_key()).map(Some);
                     }
                 },
             }
         }
     }
+}
+
+/// Two blocks' keys in turn, the first's then the second's.
+struct Joined<'b> {
+    first: Cursor<'b>,
+    second: Cursor<'b>,
+    on_second: bool,
+}
+
+impl LentKeys for Joined<'_> {
+    fn next_key(&mut self) -> Result<Option<&[u8]>, MemoryError> {
+        if !self.on_second {
+            if self.first.advance() {
+                return Ok(Some(self.first.key()));
+            }
+            self.on_second = true;
+        }
+        Ok(self.second.advance().then(|| self.second.key()))
+    }
+}
+
+/// `key` as a set holds it, checked as [`SetKey::new`] checks it: one to [`MAX_KEY`] bytes.
+fn set_key(key: &[u8]) -> Result<&[u8], MemoryError> {
+    if key.is_empty() {
+        return Err(broken("a set key must hold at least one byte"));
+    }
+    if key.len() > MAX_KEY {
+        return Err(broken("a set key must hold at most MAX_KEY bytes"));
+    }
+    Ok(key)
 }
 
 /// How many keys each block of an output of `count` keys, about `bytes` bytes of entries,
@@ -1682,20 +1747,20 @@ fn per_block(count: usize, bytes: usize) -> usize {
 /// Encodes `next`'s keys into blocks of `per` keys each, cut sooner where a block's bytes pass
 /// its bound, appended to `out`.
 fn encode_cut(
-    mut next: impl FnMut() -> Result<Option<SetKey>, MemoryError>,
+    keys: &mut impl LentKeys,
     per: usize,
     encoder: &mut Encoder,
     source: &mut Source<'_>,
     out: &mut Vec<Seat<Block>>,
 ) -> Result<(), MemoryError> {
     // Each turn takes one key; the keys are the caller's finite output.
-    while let Some(key) = next()? {
+    while let Some(key) = keys.next_key()? {
         if encoder.count >= per || encoder.full() {
             out.try_reserve(1)
                 .map_err(|_| MemoryError::AllocationFailed)?;
             out.push(encoder.finish(source)?);
         }
-        encoder.push(key.as_bytes())?;
+        encoder.push(key)?;
     }
     if !encoder.is_empty() {
         out.try_reserve(1)
@@ -1743,7 +1808,7 @@ fn rebuild_block<E: SetEdit>(
     };
     let mut merged = Merged::new(block, edits);
     encode_cut(
-        || merged.next_key(),
+        &mut merged,
         per_block(count, bytes),
         encoder,
         source,
@@ -1789,10 +1854,13 @@ fn join_small(
                 .1;
             let count = checked_add(first.count(), second.count())?;
             let bytes = checked_add(first.entries().len(), second.entries().len())?;
-            let mut keys = first.cursor();
-            let mut more = second.cursor();
+            let mut keys = Joined {
+                first: first.cursor(),
+                second: second.cursor(),
+                on_second: false,
+            };
             encode_cut(
-                || Ok(keys.next_key().or_else(|| more.next_key())),
+                &mut keys,
                 per_block(count, bytes),
                 encoder,
                 source,
@@ -1867,14 +1935,14 @@ fn split_chunk(
             Ordering::Equal => {
                 let mut cursor = seat.1.cursor();
                 let mut upper = false;
-                while let Some(key) = cursor.next_key() {
-                    if !upper && key.as_bytes() >= at {
+                while cursor.advance() {
+                    if !upper && cursor.key() >= at {
                         if !encoder.is_empty() {
                             below.push(encoder.finish(source)?);
                         }
                         upper = true;
                     }
-                    encoder.push(key.as_bytes())?;
+                    encoder.push(cursor.key())?;
                 }
                 if !encoder.is_empty() {
                     let built = encoder.finish(source)?;

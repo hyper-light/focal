@@ -375,3 +375,66 @@ fn an_index_key_costs_a_fraction_of_a_row_entry() {
     assert!(per_published < 30.0, "published {per_published}");
     drop(built);
 }
+
+/// What one published key costs a large set fed as the native engine feeds an index family:
+/// sixteen streams of ascending identities under a shared prefix (each caller's claims), one new
+/// key a stream each round, the set frozen between rounds as a read pins it. Release, with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore = "measurement: run with --ignored --nocapture"]
+fn measure_publication_per_key_on_interleaved_streams() {
+    const STREAMS: u64 = 16;
+    const HELD: u64 = 200_000;
+    const ROUNDS: u64 = 4_000;
+    let key = |stream: u64, sequence: u64| {
+        let mut key = vec![0xb0, 0x24, 0x00, 0x00, 0x24];
+        key.resize(18, 0);
+        key.extend_from_slice(&stream.to_be_bytes());
+        key.extend_from_slice(&sequence.to_be_bytes());
+        key
+    };
+    let budget = MemoryBudget::new(1 << 32, 1 << 20).unwrap();
+    let mut set = KeySet::new(&budget, BudgetLane::Ordinary).unwrap();
+    let per_stream = HELD / STREAMS;
+    let mut held: Vec<Vec<u8>> = (0..STREAMS)
+        .flat_map(|stream| (0..per_stream).map(move |sequence| (stream, sequence)))
+        .map(|(stream, sequence)| key(stream, sequence))
+        .collect();
+    held.sort();
+    let puts: Vec<KeyEdit<'_>> = held.iter().map(|key| KeyEdit::Put(key)).collect();
+    let mut funding = set.fund(&budget, BudgetLane::Ordinary, puts.len()).unwrap();
+    set.publish(&puts, &mut funding).unwrap();
+    drop(funding);
+    let rounds: Vec<Vec<Vec<u8>>> = (0..ROUNDS)
+        .map(|round| {
+            (0..STREAMS)
+                .map(|stream| key(stream, per_stream + round))
+                .collect()
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    for round in &rounds {
+        let frozen = set.freeze(BudgetLane::Ordinary).unwrap();
+        let edits: Vec<KeyEdit<'_>> = round.iter().map(|key| KeyEdit::Put(key)).collect();
+        let mut funding = set.fund(&budget, BudgetLane::Ordinary, edits.len()).unwrap();
+        set.publish(&edits, &mut funding).unwrap();
+        drop(frozen);
+    }
+    let elapsed = started.elapsed();
+    let keys = ROUNDS * STREAMS;
+    let started = std::time::Instant::now();
+    let mut found = 0u64;
+    for round in &rounds {
+        for key in round {
+            found += u64::from(set.contains(key));
+        }
+    }
+    let contains = started.elapsed();
+    assert_eq!(found, keys);
+    println!(
+        "{} keys held, {keys} published in rounds of {STREAMS}: {:.0} ns a published key; contains {:.0} ns a key",
+        set.len(),
+        elapsed.as_nanos() as f64 / keys as f64,
+        contains.as_nanos() as f64 / keys as f64,
+    );
+}
