@@ -121,6 +121,16 @@ impl Owner {
                 })
                 .collect(),
             sealing: self.sealing(),
+            memory: self.session.native_memory_stats().map(|native| {
+                let session = self.session.memory_stats();
+                let width = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+                focal_client::admin::AdminSessionMemory {
+                    used: width(session.used),
+                    limit: width(session.limit),
+                    native_used: width(native.used),
+                    native_limit: width(native.limit),
+                }
+            }),
         };
         ReplicaDiagnosticsReply {
             value,

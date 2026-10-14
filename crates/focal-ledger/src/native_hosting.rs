@@ -711,6 +711,11 @@ impl Session {
             .as_ref()
             .or_else(|| self.native.as_deref().and_then(|engine| engine.pending_custody()))
     }
+    /// What the native engine uses of its share of the session's memory, and the share: none
+    /// before the session hosts one (doc 31 M3).
+    pub fn native_memory_stats(&self) -> Option<focal_memory::BudgetStats> {
+        self.native.as_deref().map(|engine| engine.memory_stats())
+    }
     pub fn pending_seed(&self) -> Option<&crate::PendingSeed> {
         self.seed_pending
             .as_ref()

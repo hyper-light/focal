@@ -168,6 +168,8 @@ pub struct SessionMetrics {
     pub longest_period_ms: u64,
     pub broadcast_tail_us: u64,
     pub pace_samples: u64,
+    /// The session's memory and its native engine's share (doc 31 M3).
+    pub memory: Option<focal_client::admin::AdminSessionMemory>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentMetrics {
@@ -1654,7 +1656,7 @@ impl MetricsSnapshot {
                 text.labeled(name, &[("bound", bound)], count);
             }
         }
-        let series: [(&str, &str, &str); 32] = [
+        let series: [(&str, &str, &str); 36] = [
             (
                 "focal_session_observed",
                 "gauge",
@@ -1811,6 +1813,26 @@ impl MetricsSnapshot {
                 "gauge",
                 "Conditions blocking the desired durability.",
             ),
+            (
+                "focal_session_memory_used_bytes",
+                "gauge",
+                "Bytes the session uses of its memory allowance, its native engine's included.",
+            ),
+            (
+                "focal_session_memory_limit_bytes",
+                "gauge",
+                "The session's memory allowance.",
+            ),
+            (
+                "focal_session_native_memory_used_bytes",
+                "gauge",
+                "Bytes the session's native engine uses of its share: what fills first.",
+            ),
+            (
+                "focal_session_native_memory_limit_bytes",
+                "gauge",
+                "The native engine's share of the session's allowance.",
+            ),
         ];
         for (name, kind, help) in series {
             text.header(name, kind, help);
@@ -1876,6 +1898,14 @@ impl MetricsSnapshot {
                         session.achieved_max_failures.map(u64::from)
                     }
                     "focal_session_blocked" => session.blocked,
+                    "focal_session_memory_used_bytes" => session.memory.map(|m| m.used),
+                    "focal_session_memory_limit_bytes" => session.memory.map(|m| m.limit),
+                    "focal_session_native_memory_used_bytes" => {
+                        session.memory.map(|m| m.native_used)
+                    }
+                    "focal_session_native_memory_limit_bytes" => {
+                        session.memory.map(|m| m.native_limit)
+                    }
                     _ => None,
                 };
                 if let Some(value) = value {
@@ -1907,6 +1937,10 @@ fn owner_side(name: &str) -> bool {
             | "focal_session_cursor_lag"
             | "focal_session_seed_chunks_missing"
             | "focal_session_custody_objects_missing"
+            | "focal_session_memory_used_bytes"
+            | "focal_session_memory_limit_bytes"
+            | "focal_session_native_memory_used_bytes"
+            | "focal_session_native_memory_limit_bytes"
     )
 }
 
@@ -2230,6 +2264,50 @@ mod tests {
             MetricsPage::new(sample.clone(), &budget).unwrap().text,
             text
         );
+    }
+    /// A session's memory is exported beside its native engine's share of
+    /// it (doc 31 M3): where a session fills, and against which bound. A
+    /// session with no native engine carries none, and one whose owner did
+    /// not answer carries none either — never a stale or a zero reading.
+    #[test]
+    fn a_session_exports_its_memory_beside_its_native_share() {
+        let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
+        let mut sample = snapshot(budget.stats());
+        sample.sessions[0].memory = Some(focal_client::admin::AdminSessionMemory {
+            used: 9_000,
+            limit: 800_000,
+            native_used: 8_000,
+            native_limit: 400_000,
+        });
+        let mut managed = sample.sessions[0].clone();
+        managed.session = "m".into();
+        managed.memory = None;
+        let mut silent = sample.sessions[0].clone();
+        silent.session = "u".into();
+        silent.observed = false;
+        sample.sessions.extend([managed, silent]);
+        let text = sample.render();
+        for line in [
+            "# TYPE focal_session_memory_used_bytes gauge\n",
+            "focal_session_memory_used_bytes{tenant=\"t\",session=\"s\"} 9000\n",
+            "focal_session_memory_limit_bytes{tenant=\"t\",session=\"s\"} 800000\n",
+            "focal_session_native_memory_used_bytes{tenant=\"t\",session=\"s\"} 8000\n",
+            "focal_session_native_memory_limit_bytes{tenant=\"t\",session=\"s\"} 400000\n",
+        ] {
+            assert!(text.contains(line), "missing {line}");
+        }
+        for session in ["m", "u"] {
+            let labels = format!("{{tenant=\"t\",session=\"{session}\"}}");
+            assert!(text.contains(&format!("focal_session_observed{labels}")));
+            for name in [
+                "focal_session_memory_used_bytes",
+                "focal_session_memory_limit_bytes",
+                "focal_session_native_memory_used_bytes",
+                "focal_session_native_memory_limit_bytes",
+            ] {
+                assert!(!text.contains(&format!("{name}{labels}")), "{name}{labels}");
+            }
+        }
     }
     /// A round takes every answer that comes and closes at its deadline:
     /// the late and the failed stay unobserved, in their places. On the

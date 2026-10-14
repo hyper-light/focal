@@ -1116,6 +1116,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn configuration_index(&self) -> u64 {
         self.configuration_index
     }
+    /// What the engine uses of its share of the session's memory, and the share.
+    pub(crate) fn memory_stats(&self) -> focal_memory::BudgetStats {
+        self.budget.stats()
+    }
     /// The seeded checkpoint waiting for its chunks, if any.
     pub(crate) fn pending_seed(&self) -> Option<&PendingSeed> {
         self.pending_seed.as_ref()

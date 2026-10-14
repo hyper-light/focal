@@ -1578,6 +1578,7 @@ impl NetworkService {
                 peer_reports_dropped,
                 longest_period_ms: u64::try_from(host.longest_period().as_millis())
                     .unwrap_or(u64::MAX),
+                memory: diagnostics.and_then(|d| d.memory),
             });
         }
         rounds.answered(&asked);

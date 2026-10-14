@@ -575,6 +575,12 @@ impl SessionMetrics {
             longest_period_ms: wide,
             broadcast_tail_us: wide,
             pace_samples: wide,
+            memory: Some(focal_client::admin::AdminSessionMemory {
+                used: wide,
+                limit: wide,
+                native_used: wide,
+                native_limit: wide,
+            }),
         }
     }
 }

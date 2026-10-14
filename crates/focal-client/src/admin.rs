@@ -246,6 +246,24 @@ pub struct AdminReplicaDiagnostics {
     /// this replica holds them. Absent for a session that is not native.
     #[serde(default)]
     pub sealing: Option<Box<AdminSealing>>,
+    /// The session's memory on this replica: what it uses of its allowance, and what its
+    /// native engine uses of its own share (doc 31 M3). Where a session fills, and against which
+    /// bound. Absent before the session has a native engine's share to report.
+    #[serde(default)]
+    pub memory: Option<AdminSessionMemory>,
+}
+/// A session's memory on one replica, in bytes (doc 31 M3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminSessionMemory {
+    /// What the session uses of its allowance, its native engine's use included.
+    pub used: u64,
+    /// The session's allowance.
+    pub limit: u64,
+    /// What its native engine uses of its share.
+    pub native_used: u64,
+    /// The native engine's share of the allowance: the bound open claims reach first.
+    pub native_limit: u64,
 }
 /// A native session's live outcome window and its seals on one replica
 /// (F12, 26 §4a).
