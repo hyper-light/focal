@@ -44,7 +44,8 @@ permissions:
 jobs:
   image:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # The build, and the mirror's copies waiting out a registry's rate limit.
+    timeout-minutes: 150
     outputs:
       registry: ${{ steps.mirror.outputs.BENCH_REGISTRY }}
     steps:

@@ -31,7 +31,18 @@ for line in "${images[@]}"; do
     echo "mirror: $name@$digest already there" >&2
     continue
   fi
-  if ! timeout 900 docker buildx imagetools create --tag "$target:$tag" "$source@$digest" >&2; then
+  # A public registry's rate limit answers `toomanyrequests` for a while: the copy is asked
+  # again, the pause doubling from 15 s, five times at most (about 8 minutes), each bounded.
+  copied=0; pause=15
+  for attempt in 1 2 3 4 5 6; do
+    if timeout 900 docker buildx imagetools create --tag "$target:$tag" "$source@$digest" >&2; then
+      copied=1; break
+    fi
+    [ "$attempt" -lt 6 ] || break
+    echo "mirror: $name not copied (attempt $attempt); again in ${pause}s" >&2
+    sleep "$pause"; pause=$((pause * 2))
+  done
+  if [ "$copied" -ne 1 ]; then
     echo "mirror: $name could not be copied; the public sources stay in use" >&2
     exit 0
   fi
