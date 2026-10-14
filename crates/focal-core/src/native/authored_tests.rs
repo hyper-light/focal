@@ -847,7 +847,7 @@ fn measure_memory_per_authored_claim_by_family() {
         let prepared = prepare(&core, create(id, vec![proposal(id, 10_000 + id)]), &[]);
         core.publish_native(prepared).unwrap();
     }
-    let mut families: std::collections::BTreeMap<String, (usize, usize, usize)> =
+    let mut families: std::collections::BTreeMap<String, (usize, usize, usize, usize)> =
         Default::default();
     let entry = std::mem::size_of::<focal_memory::Entry<crate::native::layout::PackedKey, Row>>();
     let ledger = core.state.ledger;
@@ -859,10 +859,12 @@ fn measure_memory_per_authored_claim_by_family() {
             .unwrap_or("?")
             .to_string();
         let encoded = record_codec::checkpoint::row_bytes(item.key, item.value, ledger).unwrap();
+        let packed = crate::native::layout::PackedKey::pack(&item.key).unwrap();
         let slot = families.entry(family).or_default();
         slot.0 += 1;
         slot.1 += item.heap_bytes;
         slot.2 += encoded;
+        slot.3 += packed.as_bytes().len();
     }
     let claims = CLAIMS as f64;
     let mut total_rows = 0;
@@ -873,20 +875,21 @@ fn measure_memory_per_authored_claim_by_family() {
         std::mem::size_of::<Row>()
     );
     println!(
-        "{:<22} {:>9} {:>12} {:>12} {:>12}",
-        "family", "rows/claim", "inline B/cl", "heap B/cl", "encoded B/cl"
+        "{:<22} {:>9} {:>12} {:>12} {:>12} {:>10}",
+        "family", "rows/claim", "inline B/cl", "heap B/cl", "encoded B/cl", "key B/row"
     );
     let mut total_encoded = 0;
-    for (family, (rows, heap, encoded)) in &families {
+    for (family, (rows, heap, encoded, key)) in &families {
         total_rows += rows;
         total_heap += heap;
         total_encoded += encoded;
         println!(
-            "{family:<22} {:>9.2} {:>12.0} {:>12.0} {:>12.0}",
+            "{family:<22} {:>9.2} {:>12.0} {:>12.0} {:>12.0} {:>10.1}",
             *rows as f64 / claims,
             (*rows * entry) as f64 / claims,
             *heap as f64 / claims,
-            *encoded as f64 / claims
+            *encoded as f64 / claims,
+            *key as f64 / *rows as f64
         );
     }
     println!(

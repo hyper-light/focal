@@ -32,6 +32,7 @@ mod disk_tests;
 #[cfg(test)]
 mod funded_budget_tests;
 mod index;
+mod key_set;
 #[cfg(test)]
 mod owned_range_tests;
 mod owner;
@@ -57,6 +58,10 @@ pub use disk::{
     DISK_KIND_COUNT, DiskBudget, DiskBudgetConfig, DiskKind, DiskReservation, DiskStats,
 };
 pub use index::StableIndex;
+pub use key_set::{
+    FrozenKeySet, KeyEdit, KeyIter, KeySet, KeySetBuilder, KeySetFunding, KeySetStats,
+    MAX_KEY as MAX_SET_KEY, SetKey,
+};
 pub use owner::OwnerId;
 pub use range::{
     Change, Entry, FrozenRange, PreparedRange, RangeConfig, RangeHydration, RangeHydrationLimits,
