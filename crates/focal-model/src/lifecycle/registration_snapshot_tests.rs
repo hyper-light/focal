@@ -319,12 +319,12 @@ impl scope::ScopeSnapshotSource for ChangingScope<'_> {
     }
 }
 struct ChangingScopes<'a> {
-    registry: &'a scope::Registry,
+    claim: &'a ClaimState,
     target: Cell<ClaimId>,
 }
 impl scope::RegistrySnapshotSource for ChangingScopes<'_> {
     fn fields(&self) -> scope::RegistrySnapshotV1 {
-        scope::RegistrySnapshotSource::fields(&self.registry.snapshot_v1())
+        scope::RegistrySnapshotSource::fields(&self.claim.scope_snapshot_v1())
     }
     type Scope<'a>
         = ChangingScope<'a>
@@ -340,7 +340,7 @@ impl scope::RegistrySnapshotSource for ChangingScopes<'_> {
         Self: 'a;
     fn scopes(&self) -> Self::Scopes<'_> {
         std::iter::once(Ok(ChangingScope {
-            scope: self.registry.iter().next().unwrap(),
+            scope: self.claim.scopes().iter().next().unwrap(),
             target: &self.target,
         }))
     }
@@ -354,7 +354,7 @@ fn scope_changed_root_refuses_after_quoted_build_and_original_source_retries() {
     let (peer, _) = fixture(10, None, false);
     monitor(&mut claim, &peer, 2);
     let source = ChangingScopes {
-        registry: claim.scopes(),
+        claim: &claim,
         target: Cell::new(ClaimId::from_u128(10)),
     };
     let prepare = || {

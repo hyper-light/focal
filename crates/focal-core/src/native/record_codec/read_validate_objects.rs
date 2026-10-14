@@ -304,7 +304,7 @@ pub(super) fn claim(
         Ok(())
     })?;
     read.charge(1)?;
-    let scopes = claim.scopes().snapshot_v1().fields();
+    let scopes = claim.scope_snapshot_v1().fields();
     if last != Some(binding)
         || status != Some(claim.status())
         || children != claim.scopes().children().len()

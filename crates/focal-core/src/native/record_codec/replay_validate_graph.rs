@@ -131,7 +131,7 @@ impl<O: Overlay> Prefix<'_, '_, '_, O> {
         };
         let mut deadline = next.deadline();
         self.read
-            .charge(add(next.scopes().snapshot_v1().fields().scopes, 1)?)?;
+            .charge(add(next.scope_snapshot_v1().fields().scopes, 1)?)?;
         for scope in next.scopes().iter() {
             if let Some(scope) = self.scope(id, scope)?
                 && scope.active
@@ -316,7 +316,7 @@ impl<O: Overlay> Prefix<'_, '_, '_, O> {
             // after release/rebinding disconnects it inside this transaction.
             if let Some(old) = self.original(id)? {
                 self.read
-                    .charge(add(old.scopes().snapshot_v1().fields().scopes, 1)?)?;
+                    .charge(add(old.scope_snapshot_v1().fields().scopes, 1)?)?;
                 for scope in old.scopes().iter() {
                     if scope.active() {
                         self.read.charge(add(scope.roots().len(), 1)?)?;
@@ -327,7 +327,7 @@ impl<O: Overlay> Prefix<'_, '_, '_, O> {
                 }
             }
             self.read
-                .charge(add(next.scopes().snapshot_v1().fields().scopes, 1)?)?;
+                .charge(add(next.scope_snapshot_v1().fields().scopes, 1)?)?;
             for scope in next.scopes().iter() {
                 if let Some(scope) = self.scope(id, scope)?
                     && scope.active
@@ -378,7 +378,7 @@ impl<O: Overlay> Prefix<'_, '_, '_, O> {
             )?;
         }
         self.read
-            .charge(add(next.scopes().snapshot_v1().fields().scopes, 1)?)?;
+            .charge(add(next.scope_snapshot_v1().fields().scopes, 1)?)?;
         for scope in next.scopes().iter() {
             if let Some(scope) = self.scope(id, scope)?
                 && scope.active
@@ -403,7 +403,7 @@ impl<O: Overlay> Prefix<'_, '_, '_, O> {
         let next = self.claim(id)?;
         let mut count = next.graph().obligations().len();
         self.read
-            .charge(add(next.scopes().snapshot_v1().fields().scopes, 1)?)?;
+            .charge(add(next.scope_snapshot_v1().fields().scopes, 1)?)?;
         for scope in next.scopes().iter() {
             if let Some(scope) = self.scope(id, scope)?
                 && scope.active

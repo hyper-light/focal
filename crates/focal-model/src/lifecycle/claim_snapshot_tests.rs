@@ -288,7 +288,7 @@ fn values<'a>(claim: &ClaimState, responses: &[&'a Response]) -> Vec<ClaimRespon
         .collect()
 }
 fn restore(claim: &ClaimState, responses: &[&Response]) -> ClaimState {
-    let source = claim.scopes().snapshot_v1();
+    let source = claim.scope_snapshot_v1();
     let scopes = scope::Registry::prepare_hydration_v1(
         claim.binding(),
         claim.created(),
@@ -472,7 +472,7 @@ fn required_structural_and_graph_failure_provenance_roundtrips_without_reduction
         terminal_cut: Some(ClaimTerminalSnapshotV1::Required(wrong_target)),
         ..claim.snapshot_v1()
     };
-    let scopes = claim.scopes().snapshot_v1();
+    let scopes = claim.scope_snapshot_v1();
     let scopes = scope::Registry::prepare_hydration_v1(
         claim.binding(),
         claim.created(),
@@ -660,7 +660,7 @@ fn claim_and_scope_quotes_refuse_before_build_and_each_allocation_retries_exactl
     receive(&mut claim);
     monitor(&mut claim, &peer, 2);
     let response = response(&mut claim, 500, true);
-    let source = claim.scopes().snapshot_v1();
+    let source = claim.scope_snapshot_v1();
     let rows = values(&claim, &[&response]);
     let scope_plan = || {
         scope::Registry::prepare_hydration_v1(
@@ -749,7 +749,7 @@ fn malformed_claim_fields_and_substituted_response_source_do_not_create_rows() {
     let (mut claim, _) = fixture(9, None, false);
     receive(&mut claim);
     let response = response(&mut claim, 500, true);
-    let source = claim.scopes().snapshot_v1();
+    let source = claim.scope_snapshot_v1();
     let rows = values(&claim, &[&response]);
     let fields = claim.snapshot_v1();
     let scope_plan = || {
@@ -840,7 +840,7 @@ fn a_claim_hydrates_its_creation_revision_and_refuses_a_definition_bound_elsewhe
     let (mut claim, _) = fixture(9, None, false);
     receive(&mut claim);
     assert!(claim.binding().revision > claim.creation_binding().revision);
-    let source = claim.scopes().snapshot_v1();
+    let source = claim.scope_snapshot_v1();
     let scope_plan = || {
         scope::Registry::prepare_hydration_v1(
             claim.binding(),

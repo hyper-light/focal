@@ -391,6 +391,10 @@ impl ClaimState {
     pub fn acceptance(&self) -> &aggregation::AcceptancePolicy {
         &self.acceptance
     }
+    /// Its scope registry's snapshot, owned by the claim's creation binding.
+    pub fn scope_snapshot_v1(&self) -> scope::RegistrySnapshotView<'_> {
+        self.scopes.snapshot_v1(self.creation_binding())
+    }
     pub fn scopes(&self) -> &scope::Registry {
         &self.scopes
     }

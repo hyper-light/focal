@@ -132,8 +132,9 @@ impl OwnedChild {
 
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(test, derive(Clone))]
+/// The claim that holds it is its owner: it keeps no copy of the claim's binding (doc 31 M3),
+/// and its snapshot is taken with the claim's creation binding ([`ClaimState::scope_snapshot_v1`]).
 pub struct Registry {
-    owner: Binding,
     limits: ScopeLimits,
     scopes: Vec<Scope>,
     children: Vec<OwnedChild>,
@@ -296,13 +297,13 @@ fn same_content(actual: Binding, expected: Binding) -> Result<(), ContractError>
 }
 
 impl Registry {
+    /// The registry of the claim bound to `owner`, which is checked, not kept.
     pub fn new(owner: Binding, limits: ScopeLimits) -> Result<Self, ContractError> {
         if owner.object.is_zero() || owner.ledger.tenant.is_zero() || owner.ledger.session.is_zero()
         {
             return Err(ContractError::InvalidTarget);
         }
         Ok(Self {
-            owner,
             limits,
             scopes: Vec::new(),
             children: Vec::new(),
@@ -334,7 +335,6 @@ impl Registry {
 
     fn check_cut(owner: &ClaimState, cut: ClaimCut) -> Result<(), ContractError> {
         let registry = owner.scopes();
-        same_content(owner.binding(), registry.owner)?;
         if cut.position.0 == 0 || cut.position < owner.created() || cut.position < registry.last_cut
         {
             return Err(ContractError::InvalidCut);
@@ -367,7 +367,6 @@ impl Registry {
             return Err(ContractError::Capacity);
         }
         let mut copied = Self {
-            owner: self.owner,
             limits: self.limits,
             scopes: reserve(scopes)?,
             children: reserve(children)?,

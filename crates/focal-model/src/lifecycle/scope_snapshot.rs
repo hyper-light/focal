@@ -75,17 +75,21 @@ impl ScopeSnapshotSource for &Scope {
         self.roots.iter().copied().map(Ok)
     }
 }
+/// A registry's snapshot with its owner's creation binding, which the claim holds.
 #[derive(Debug, Clone, Copy)]
-pub struct RegistrySnapshotView<'a>(&'a Registry);
+pub struct RegistrySnapshotView<'a> {
+    registry: &'a Registry,
+    owner: Binding,
+}
 impl RegistrySnapshotSource for RegistrySnapshotView<'_> {
     fn fields(&self) -> RegistrySnapshotV1 {
         RegistrySnapshotV1 {
-            owner: self.0.owner,
-            limits: self.0.limits,
-            scopes: self.0.scopes.len(),
-            children: self.0.children.len(),
-            released: self.0.released,
-            last_cut: self.0.last_cut,
+            owner: self.owner,
+            limits: self.registry.limits,
+            scopes: self.registry.scopes.len(),
+            children: self.registry.children.len(),
+            released: self.registry.released,
+            last_cut: self.registry.last_cut,
         }
     }
     type Scope<'a>
@@ -107,10 +111,10 @@ impl RegistrySnapshotSource for RegistrySnapshotView<'_> {
     where
         Self: 'a;
     fn scopes(&self) -> Self::Scopes<'_> {
-        self.0.scopes.iter().map(Ok)
+        self.registry.scopes.iter().map(Ok)
     }
     fn children(&self) -> Self::Children<'_> {
-        self.0.children.iter().map(|child| {
+        self.registry.children.iter().map(|child| {
             Ok(OwnedChildSnapshotV1 {
                 binding: child.binding,
                 registered: child.registered,
@@ -136,8 +140,12 @@ struct Shape {
     fingerprint: ContentHash,
 }
 impl Registry {
-    pub fn snapshot_v1(&self) -> RegistrySnapshotView<'_> {
-        RegistrySnapshotView(self)
+    /// Its snapshot as the registry of the claim created with `owner`.
+    pub fn snapshot_v1(&self, owner: Binding) -> RegistrySnapshotView<'_> {
+        RegistrySnapshotView {
+            registry: self,
+            owner,
+        }
     }
     pub fn prepare_hydration_v1<'a, S: RegistrySnapshotSource + ?Sized>(
         current: Binding,
@@ -258,7 +266,6 @@ impl<S: RegistrySnapshotSource + ?Sized> RegistryHydrationPlan<'_, S> {
             return Err(ContractError::InvalidManifest);
         }
         let restored = Registry {
-            owner: fields.owner,
             limits: fields.limits,
             scopes,
             children,
@@ -269,7 +276,7 @@ impl<S: RegistrySnapshotSource + ?Sized> RegistryHydrationPlan<'_, S> {
             self.current,
             self.created,
             fields.limits,
-            &restored.snapshot_v1(),
+            &restored.snapshot_v1(fields.owner),
             self.shape.visits,
         )?;
         if actual.fingerprint != self.shape.fingerprint {

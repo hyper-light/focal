@@ -79,7 +79,7 @@ pub(super) fn claim(sink: &mut impl Sink, row: &OwnedClaim) -> Result<(), Error>
     if responses.next().is_some() {
         return Err(Error::InvalidTag("claim response count"));
     }
-    scopes(sink, value.scopes())?;
+    scopes(sink, value.scope_snapshot_v1())?;
     registration(sink, registrations)
 }
 
@@ -188,9 +188,8 @@ fn predicate(sink: &mut impl Sink, value: WaitPredicate) -> Result<(), Error> {
     write_u8(sink, tag)?;
     raw(sink, &id.0)
 }
-fn scopes(sink: &mut impl Sink, value: &scope::Registry) -> Result<(), Error> {
+fn scopes(sink: &mut impl Sink, source: scope::RegistrySnapshotView<'_>) -> Result<(), Error> {
     sink.visit(1)?;
-    let source = value.snapshot_v1();
     let snapshot = source.fields();
     types::binding(sink, snapshot.owner)?;
     types::scope_limits(sink, snapshot.limits)?;
