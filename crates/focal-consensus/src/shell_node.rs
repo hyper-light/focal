@@ -713,7 +713,7 @@ impl ShellNode {
         &mut self,
         peer_node_id: u64,
         encoded: &[u8],
-    ) -> Result<(), ConsensusError> {
+    ) -> Result<crate::Stepped, ConsensusError> {
         self.check()?;
         let scratch = decode_message_charge(encoded)?;
         let _decode = memory::reserve(
@@ -728,7 +728,9 @@ impl ShellNode {
                 "Raft sender does not match authenticated peer",
             ));
         }
-        self.step(message)
+        let stepped = crate::Stepped::of(&message);
+        self.step(message)?;
+        Ok(stepped)
     }
     pub fn bootstrap_membership(&self) -> (&[u64], &[u64]) {
         (&self.config.voters, &self.config.learners)

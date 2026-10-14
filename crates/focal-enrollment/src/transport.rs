@@ -215,8 +215,11 @@ impl Drop for Handling {
     }
 }
 impl<S: Serve, H: JoinHandler + Clone> Serve for EnrollmentService<S, H> {
-    fn capabilities(&self) -> [bool; 4] {
+    fn capabilities(&self) -> [bool; 5] {
         self.data.capabilities()
+    }
+    fn frame(&self, framed: focal_wire::net::Framed) {
+        self.data.frame(framed);
     }
     fn serve(&self, request: Served) -> ServeFuture {
         match (request.kind, &request.from) {
@@ -251,8 +254,8 @@ impl<S: Serve, H: JoinHandler + Clone> Serve for EnrollmentService<S, H> {
 /// The data protocol of a listener that serves enrollment alone: nothing.
 struct NoData;
 impl Serve for NoData {
-    fn capabilities(&self) -> [bool; 4] {
-        [false; 4]
+    fn capabilities(&self) -> [bool; 5] {
+        [false; 5]
     }
     fn serve(&self, _request: Served) -> ServeFuture {
         Box::pin(async { None })

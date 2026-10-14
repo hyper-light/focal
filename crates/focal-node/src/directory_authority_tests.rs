@@ -262,6 +262,7 @@ fn owner(
         frames_held: 0,
         frames_let_go: 0,
         frames_stale: 0,
+        acks: crate::ack_clock::AckClock::default(),
         took_turn: false,
         unreachable: 0,
         lost_sender: lost.0,

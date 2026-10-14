@@ -141,6 +141,14 @@ impl ControlReplicationFrame {
     pub(crate) fn report_snapshot(&mut self, accepted: bool) {
         crate::snapshot_feedback::complete(&mut self.snapshot, accepted);
     }
+    /// How the frame is carried (`ReplicationFrame::delivery`).
+    pub(crate) fn delivery(&self) -> focal_wire::Delivery {
+        if self.snapshot.is_some() {
+            focal_wire::Delivery::Answered
+        } else {
+            focal_wire::Delivery::Queued
+        }
+    }
 }
 #[path = "directory_bootstrap_owner.rs"]
 mod directory_bootstrap_owner;
@@ -403,6 +411,9 @@ struct Owner<V> {
     frames_held: u64,
     frames_let_go: u64,
     frames_stale: u64,
+    /// How late each peer answers this replica's appends and heartbeats (27 §8.4): its
+    /// quorum's patience, published at each tick.
+    acks: crate::ack_clock::AckClock,
     /// Whether a request took its turn for the proposal in the drain under
     /// way: the next drain proposes it.
     took_turn: bool,
@@ -720,6 +731,7 @@ impl ControlHost {
             frames_held: 0,
             frames_let_go: 0,
             frames_stale: 0,
+            acks: crate::ack_clock::AckClock::default(),
             took_turn: false,
             unreachable: 0,
             failure: None,
@@ -762,14 +774,6 @@ impl ControlHost {
         );
         self.pace.publish(pace);
         pace
-    }
-    /// The exchange tail a commit of the root waits on among its voters,
-    /// from the tails measured with the other voters
-    /// (`PeerConnectionPool::exchange_tail`) and how many voters there are,
-    /// this node among them; given beyond a request's time (27 §8.4).
-    pub fn quorum(&self, tails: Vec<Duration>, voters: usize) {
-        self.pace
-            .publish_quorum_tail(crate::pace::quorum_tail(tails, voters));
     }
     /// The periods the owner has run; what a wait on it is charged in
     /// (27 §3.1 P8).
@@ -1006,6 +1010,15 @@ impl<V: AuthorityVerifier> Owner<V> {
                     // And what its voters' answers take beyond its own periods, which a
                     // follower whose owner stalls stretches, is its patience before it asks
                     // whether a quorum heard it (27 §8.4): the same ticks a request is given.
+                    // How late they answer is what this owner timed of their answers.
+                    let scalars = self.replica.scalars();
+                    let tail = self.acks.quorum_tail(
+                        self.replica.membership().voters,
+                        scalars.node_id,
+                        scalars.term,
+                        Instant::now(),
+                    );
+                    self.pace.publish_quorum_tail(tail);
                     self.replica.set_quorum_patience(
                         self.pace
                             .quorum_ticks(self.config.tick, self.config.tick_ceiling),
@@ -1461,6 +1474,9 @@ impl<V: AuthorityVerifier> Owner<V> {
             charge,
         } = held;
         let stepped = self.replica.step_authenticated(source, &message);
+        if let Ok(answer) = stepped {
+            self.acks.stepped(answer, Instant::now());
+        }
         if stepped.is_ok() && self.stepped.try_reserve(1).is_ok() {
             self.stepped.push((header, response, charge));
             return;
@@ -1595,9 +1611,11 @@ impl<V: AuthorityVerifier> Owner<V> {
                     waits = Some((node_id, order.is_some()));
                     return Err(ControlFailure::Invalid);
                 }
-                self.replica
+                let answer = self
+                    .replica
                     .step_authenticated(node_id, message)
                     .map_err(ControlFailure::from)?;
+                self.acks.stepped(answer, Instant::now());
                 if order.is_some() {
                     self.step_ready(node_id);
                 }
@@ -2007,6 +2025,7 @@ impl<V: AuthorityVerifier> Owner<V> {
         }
         self.ordered
             .retain(|peer, _| self.replica.accepts_peer(*peer));
+        self.acks.retain(|peer| self.replica.accepts_peer(peer));
         let drained = self.drain_turns();
         self.answer_stepped(drained.is_ok());
         drained
@@ -2317,6 +2336,7 @@ impl<V: AuthorityVerifier> Owner<V> {
         messages: Vec<focal_consensus::Message>,
         node: u64,
     ) -> Result<(), ControlError> {
+        let now = Instant::now();
         for message in messages {
             if message.msg_type == focal_consensus::MessageType::MsgAppendResponse && message.reject
             {
@@ -2434,6 +2454,8 @@ impl<V: AuthorityVerifier> Owner<V> {
             {
                 self.dropped = self.dropped.saturating_add(1);
                 let _ = self.lost_sender.try_send(target);
+            } else {
+                self.acks.sent(&message, now);
             }
         }
         Ok(())

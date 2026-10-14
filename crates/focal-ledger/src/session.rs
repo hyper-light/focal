@@ -742,18 +742,18 @@ impl Session {
         self.consensus.report_unreachable(node)?;
         Ok(())
     }
+    /// Steps a peer's encoded message, and says what it was (`focal_consensus::Stepped`).
     pub fn step_authenticated(
         &mut self,
         peer_node_id: u64,
         encoded: &[u8],
-    ) -> Result<(), LedgerError> {
+    ) -> Result<focal_consensus::Stepped, LedgerError> {
         self.check()?;
         // Without the successor floor, every packet is inspected before Raft
         // persists it: native history must not reach a replica that has not
         // promised to decode it.
         if self.consensus.decoder_floor_ready(native_format_hash()) {
-            self.consensus.step_authenticated(peer_node_id, encoded)?;
-            return Ok(());
+            return Ok(self.consensus.step_authenticated(peer_node_id, encoded)?);
         }
         if self.consensus.persistence_pending() {
             return Err(ConsensusError::PersistencePending.into());
@@ -772,7 +772,9 @@ impl Session {
             )
             .into());
         }
-        self.step(message)
+        let stepped = focal_consensus::Stepped::of(&message);
+        self.step(message)?;
+        Ok(stepped)
     }
     /// This replica's election priority (27 §5); see
     /// `DurableNode::set_priority`.

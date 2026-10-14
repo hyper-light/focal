@@ -1457,6 +1457,148 @@ fn a_sockets_datagrams_and_calls_are_counted() {
     .unwrap()
 }
 
+/// A replication handler that steps a peer's frames in their order (so it takes the laned
+/// profile), recording each message it is handed.
+#[derive(Clone, Default)]
+struct Recorded {
+    seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+}
+/// A message a [`Recorded`] handler was handed: its operation's tag and its Raft message.
+type Seen = (u16, Vec<u8>);
+impl RequestHandler for Recorded {
+    fn supports_managed_requests(&self) -> bool {
+        true
+    }
+    fn supports_participant_requests(&self) -> bool {
+        true
+    }
+    fn supports_native_requests(&self) -> bool {
+        true
+    }
+    fn supports_ordered_replication(&self) -> bool {
+        true
+    }
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
+        let message = match &request.request().operation {
+            Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. } => {
+                message.clone()
+            }
+            _ => Vec::new(),
+        };
+        self.seen
+            .lock()
+            .unwrap()
+            .push((request.request().operation.registered_tag(), message));
+        Box::pin(async move { request.request().reply(Response::PeerAccepted) })
+    }
+}
+
+/// A node's replication goes on its lanes once both sides speak the laned profile: every frame
+/// is handed to the handler once, each lane's in the order they were queued — a group's plain
+/// frames on the urgent lane, its ordered ones on the bulk lane — and none is answered: past the
+/// greeting the pool asks the server nothing.
+#[test]
+fn a_nodes_replication_goes_on_its_lanes_once_each_and_in_order() {
+    focal_rt::block_on(async move {
+        use std::collections::BTreeMap;
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        let mut node_grant = grant();
+        node_grant.role = PeerRole::Node { node_id: 7 };
+        registry
+            .register_certificate(&certificate, node_grant)
+            .unwrap();
+        let handler = Recorded::default();
+        let (server, task) = server(&pki, registry, Arc::new(handler.clone())).await;
+        let pool = PeerConnectionPool::new(
+            node_connector(&pki, certificate, key),
+            PeerPoolLimits {
+                retry_backoff: Duration::ZERO,
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap();
+        pool.replace_routes(
+            1,
+            BTreeMap::from([(
+                2,
+                PeerEndpoint {
+                    address: server.local_addr().unwrap(),
+                    server_name: "localhost".into(),
+                    name: None,
+                },
+            )]),
+        )
+        .unwrap();
+        const FRAMES: u8 = 40;
+        for index in 0..FRAMES {
+            let mut packet = request(1_000 + u128::from(index));
+            if index % 2 == 0 {
+                packet.operation = Operation::Raft {
+                    group: [5; 16],
+                    message: vec![index],
+                };
+            } else {
+                packet.protocol = ORDERED_PROTOCOL_VERSION;
+                packet.operation = Operation::RaftOrdered {
+                    group: [5; 16],
+                    epoch: 1,
+                    sequence: u64::from(index),
+                    message: vec![index],
+                };
+            }
+            pool.send(2, &packet).await.unwrap();
+        }
+        settles("every frame handed to the handler", || {
+            handler.seen.lock().unwrap().len() == usize::from(FRAMES)
+        })
+        .await;
+        let plain_tag = Operation::Raft {
+            group: [5; 16],
+            message: vec![0],
+        }
+        .registered_tag();
+        let seen = handler.seen.lock().unwrap().clone();
+        let lane = |tag_is_plain: bool| -> Vec<u8> {
+            seen.iter()
+                .filter(|(tag, _)| (*tag == plain_tag) == tag_is_plain)
+                .map(|(_, message)| message[0])
+                .collect()
+        };
+        assert_eq!(lane(true), (0..FRAMES).step_by(2).collect::<Vec<_>>());
+        assert_eq!(lane(false), (1..FRAMES).step_by(2).collect::<Vec<_>>());
+        let served = server.stats().await;
+        assert_eq!(served.lane_frames_received, u64::from(FRAMES), "{served:?}");
+        assert_eq!(served.lane_frames_dropped, 0, "{served:?}");
+        let sent = pool.net_stats().await;
+        assert_eq!(sent.lane_frames_sent, u64::from(FRAMES), "{sent:?}");
+        assert_eq!(sent.lane_frames_refused, 0, "{sent:?}");
+        // No frame was asked as an exchange (the greeting is the connection's own, uncounted).
+        assert_eq!(sent.answered, 0, "{sent:?}");
+        // A snapshot is answered once its member took it: asked as an exchange beside the
+        // lanes, never queued on one.
+        let mut snapshot = request(2_000);
+        snapshot.protocol = ORDERED_PROTOCOL_VERSION;
+        snapshot.operation = Operation::RaftOrdered {
+            group: [5; 16],
+            epoch: 1,
+            sequence: u64::from(FRAMES),
+            message: vec![FRAMES],
+        };
+        pool.send_as(2, &snapshot, Delivery::Answered)
+            .await
+            .unwrap();
+        let sent = pool.net_stats().await;
+        assert_eq!(sent.answered, 1, "{sent:?}");
+        assert_eq!(sent.lane_frames_sent, u64::from(FRAMES), "{sent:?}");
+        assert_eq!(handler.seen.lock().unwrap().len(), usize::from(FRAMES) + 1);
+        server.close().unwrap();
+        task.join().await.unwrap();
+    })
+    .unwrap()
+}
+
 #[test]
 fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_routes() {
     focal_rt::block_on(async move {
@@ -5659,6 +5801,33 @@ fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it() {
                 .protocol,
             ORDERED_PROTOCOL_VERSION
         );
+        // The laned profile tops the ladder where both sides take lanes, and implies the
+        // ordered one; a handler that takes no lanes, or an offer without it, stays ordered.
+        let laned = limits.negotiate_laned(&all, [true; 5]).unwrap();
+        assert_eq!(laned.protocol, LANED_PROTOCOL_VERSION);
+        assert!(laned.laned());
+        assert_eq!(
+            limits
+                .negotiate_laned(&all, [true, true, true, true, false])
+                .unwrap()
+                .protocol,
+            ORDERED_PROTOCOL_VERSION
+        );
+        let unlaned = hello(&[
+            ORDERED_PROTOCOL_VERSION,
+            NATIVE_PROTOCOL_VERSION,
+            PEER_PROTOCOL_VERSION,
+            MANAGED_PROTOCOL_VERSION,
+            PROTOCOL_VERSION,
+        ]);
+        assert_eq!(
+            limits
+                .negotiate_laned(&unlaned, [true; 5])
+                .unwrap()
+                .protocol,
+            ORDERED_PROTOCOL_VERSION
+        );
+        assert!(!limits.negotiate_laned(&unlaned, [true; 5]).unwrap().laned());
         // A handler that does not step frames in order, or a connector that
         // does not ask for it, stays at the native profile.
         assert_eq!(
@@ -5693,10 +5862,18 @@ fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it() {
             max_frame_bytes: 1024,
             max_items: 1,
         };
-        for requested in OFFERED_PROTOCOLS {
+        // A request's protocol is at most the ordered profile's: the laned profile is a
+        // connection's, and no request names it.
+        for requested in OFFERED_PROTOCOLS
+            .into_iter()
+            .filter(|requested| *requested != LANED_PROTOCOL_VERSION)
+        {
             assert!(ordered.accepts_protocol(requested), "{requested}");
+            assert!(laned.accepts_protocol(requested), "{requested}");
         }
-        assert!(!ordered.accepts_protocol(6));
+        assert!(!ordered.accepts_protocol(LANED_PROTOCOL_VERSION));
+        assert!(!laned.accepts_protocol(LANED_PROTOCOL_VERSION));
+        assert!(!laned.accepts_protocol(7));
         let native = Negotiated {
             protocol: NATIVE_PROTOCOL_VERSION,
             ..ordered
@@ -5740,7 +5917,12 @@ fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it() {
         );
         assert!(connector().offering(&[]).is_err());
         assert!(connector().offering(&[MANAGED_PROTOCOL_VERSION]).is_err());
-        assert!(connector().offering(&[PROTOCOL_VERSION, 6]).is_err());
+        assert!(
+            connector()
+                .offering(&[PROTOCOL_VERSION, LANED_PROTOCOL_VERSION])
+                .is_ok()
+        );
+        assert!(connector().offering(&[PROTOCOL_VERSION, 7]).is_err());
         // A receiver holds an ordered frame to the ordered profile, and a
         // plain frame to the base one; a node sends either.
         let node = || {
@@ -6027,106 +6209,6 @@ fn a_peer_offering_only_a_classical_key_exchange_is_refused_both_ways() {
             "a focal client accepted a classical exchange"
         );
         accepting.abort();
-        server.close().unwrap();
-        task.join().await.unwrap();
-    })
-    .unwrap()
-}
-
-/// How late a peer answers a group's message (27 §8.4): the tail of the ones it answered, and,
-/// while one is still out, at least that one's age, so a peer whose owner stalls is seen late
-/// while the stall lasts. An exchange that ends unanswered leaves nothing behind.
-#[test]
-fn a_group_message_still_out_makes_its_peer_late_while_it_lasts() {
-    focal_rt::block_on(async move {
-        use std::collections::BTreeMap;
-        let pki = Pki::new();
-        let (certificate, key) = pki.issue(false);
-        let registry = PeerRegistry::new(16).unwrap();
-        let mut node_grant = grant();
-        node_grant.role = PeerRole::Node { node_id: 7 };
-        registry
-            .register_certificate(&certificate, node_grant)
-            .unwrap();
-        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let holding = held.clone();
-        let started = Arc::new(hyper_rt::sync::Notify::new().unwrap());
-        let gated = started.clone();
-        let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
-            let holding = holding.clone();
-            let gated = gated.clone();
-            async move {
-                if holding.load(Ordering::SeqCst) {
-                    gated.notify_one();
-                    std::future::pending::<()>().await;
-                }
-                verified.request().reply(Response::PeerAccepted)
-            }
-        });
-        let (server, task) = server(&pki, registry, handler).await;
-        let pool = Rc::new(
-            PeerConnectionPool::new(
-                node_connector(&pki, certificate, key),
-                PeerPoolLimits {
-                    timeout: Duration::from_secs(30),
-                    ..PeerPoolLimits::default()
-                },
-            )
-            .unwrap(),
-        );
-        pool.replace_routes(
-            1,
-            BTreeMap::from([(
-                2,
-                PeerEndpoint {
-                    address: server.local_addr().unwrap(),
-                    server_name: "localhost".into(),
-                    name: None,
-                },
-            )]),
-        )
-        .unwrap();
-        let message = |id: u128| {
-            let mut packet = request(id);
-            packet.operation = Operation::Raft {
-                group: [2; 16],
-                message: vec![7],
-            };
-            packet
-        };
-        assert_eq!(
-            pool.replication_lateness(2),
-            None,
-            "nothing measured or out"
-        );
-        for id in 0..4 {
-            pool.send(2, &message(800 + id)).await.unwrap();
-        }
-        let answered = pool.replication_lateness(2).unwrap();
-        // Not what the exchanges a round waits on take: those are other requests.
-        assert_eq!(pool.exchange_tail(2), None);
-        held.store(true, Ordering::SeqCst);
-        let sending = pool.clone();
-        let packet = message(810);
-        let pending = spawn(async move { sending.send(2, &packet).await });
-        unfrozen("the message never reached the peer", started.notified())
-            .await
-            .unwrap();
-        // The one still out grows the lateness past what the answered ones took, as it lasts.
-        unfrozen("the message still out never made its peer late", async {
-            while pool.replication_lateness(2).unwrap() <= answered {
-                pause(Duration::from_millis(1)).await;
-            }
-        })
-        .await;
-        pending.abort();
-        let _ = pending.await;
-        assert_eq!(
-            pool.replication_lateness(2),
-            Some(answered),
-            "the exchange ended unanswered, and nothing of it is left"
-        );
-        pool.close();
         server.close().unwrap();
         task.join().await.unwrap();
     })

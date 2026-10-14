@@ -91,6 +91,8 @@ struct Paths {
     gates: BTreeMap<u64, Gate>,
     refusing: BTreeMap<u64, PeerSendError>,
     carried: std::sync::Mutex<Vec<(u64, u128)>>,
+    /// How each frame carried was asked to be carried, by its request id.
+    deliveries: std::sync::Mutex<Vec<(u128, focal_wire::Delivery)>>,
     progress: focal_rt::watch::Sender<usize>,
 }
 impl Paths {
@@ -100,6 +102,7 @@ impl Paths {
             gates: gated.iter().map(|peer| (*peer, Gate::new())).collect(),
             refusing: refusing.iter().cloned().collect(),
             carried: std::sync::Mutex::new(Vec::new()),
+            deliveries: std::sync::Mutex::new(Vec::new()),
             progress: focal_rt::watch::channel(0).unwrap().0,
         }
     }
@@ -155,10 +158,19 @@ impl Carrier for Paths {
     fn lane(&self) -> usize {
         self.lane
     }
-    async fn carry(&self, target: u64, request: &RequestEnvelope) -> Result<(), PeerSendError> {
+    async fn carry(
+        &self,
+        target: u64,
+        request: &RequestEnvelope,
+        delivery: focal_wire::Delivery,
+    ) -> Result<(), PeerSendError> {
         if let Some(gate) = self.gates.get(&target) {
             gate.pass().await;
         }
+        self.deliveries
+            .lock()
+            .unwrap()
+            .push((u128::from_be_bytes(request.request_id.0), delivery));
         if let Some(refusal) = self.refusing.get(&target) {
             return Err(refusal.clone());
         }
@@ -364,6 +376,49 @@ fn what_a_group_cannot_do_without_goes_before_the_entries_that_wait() {
 /// A frame its peer refuses is told to its owner as a lost one is: a lane
 /// that was full and a peer that had no room were dropped untold, and the
 /// group took the frame to be on its way.
+/// A snapshot is carried to be answered once its member installed it, which its sender is
+/// told; every other frame is queued on its lane, answered by nothing but its group.
+#[test]
+fn a_snapshot_is_answered_and_every_other_frame_queued() {
+    focal_rt::block_on(async move {
+        let paths = Paths::new(2, &[], &[]);
+        let budget = MemoryBudget::new(1024 * 1024, 0).unwrap();
+        let (lost_sender, _lost) = std::sync::mpsc::sync_channel(8);
+        let (told, outcome) = hyper_rt::sync::oneshot().unwrap();
+        let (sender, receiver) = hyper_rt::sync::channel(8).unwrap();
+        sender
+            .send(frame(7, 1, &lost_sender, &budget))
+            .await
+            .unwrap();
+        sender
+            .send(frame(7, 2, &lost_sender, &budget).snapshot_for_test(told))
+            .await
+            .unwrap();
+        sender
+            .send(frame(7, 3, &lost_sender, &budget))
+            .await
+            .unwrap();
+        drop(sender);
+        let report = drive(Receiver::Single(receiver), &paths, 4).await.unwrap();
+        assert_eq!(report.accepted, 3);
+        let mut deliveries = paths.deliveries.lock().unwrap().clone();
+        deliveries.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            deliveries,
+            [
+                (1, focal_wire::Delivery::Queued),
+                (2, focal_wire::Delivery::Answered),
+                (3, focal_wire::Delivery::Queued),
+            ]
+        );
+        assert_eq!(
+            outcome.await.ok(),
+            Some(focal_consensus::SnapshotStatus::Finish)
+        );
+    })
+    .unwrap()
+}
+
 #[test]
 fn a_frame_its_peer_refuses_is_told_to_its_owner() {
     focal_rt::block_on(async move {

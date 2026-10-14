@@ -118,6 +118,11 @@ impl RequestHandler for std::sync::Arc<dyn RequestHandler> {
     fn supports_native_requests(&self) -> bool {
         self.as_ref().supports_native_requests()
     }
+    // A shared handler is offered every profile its handler takes: without this the ordered
+    // profile (and the laned one above it) was never negotiated for one.
+    fn supports_ordered_replication(&self) -> bool {
+        self.as_ref().supports_ordered_replication()
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         self.as_ref().handle(request)
     }

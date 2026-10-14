@@ -1128,10 +1128,9 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         &mut self,
         peer: u64,
         bytes: &[u8],
-    ) -> Result<(), NativeSessionError> {
+    ) -> Result<focal_consensus::Stepped, NativeSessionError> {
         self.engine.check()?;
-        self.consensus.step_authenticated(peer, bytes)?;
-        Ok(())
+        Ok(self.consensus.step_authenticated(peer, bytes)?)
     }
     pub fn step(&mut self, message: Message) -> Result<(), NativeSessionError> {
         self.engine.check()?;

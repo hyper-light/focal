@@ -385,7 +385,7 @@ impl DurableNode {
         &mut self,
         peer_node_id: u64,
         encoded: &[u8],
-    ) -> Result<(), ConsensusError> {
+    ) -> Result<crate::Stepped, ConsensusError> {
         dispatch!(inner = &mut self.backend => inner.step_authenticated(peer_node_id, encoded))
     }
     /// Immutable bootstrap membership validated against the durable identity

@@ -41,6 +41,12 @@ pub struct PeerEndpoint {
 /// ([`Operation::RaftOrdered`]), and the receiver steps them in it. It
 /// implies every earlier profile.
 pub const ORDERED_PROTOCOL_VERSION: u16 = 5;
+/// The laned profile: a connection that negotiated it carries a group's replication frames on
+/// replication lanes (hyper-transport's lanes: one long-lived unidirectional stream to the peer
+/// for the frames a group cannot do without, one for its bulk appends), each frame answered by
+/// nothing, where an exchange of a request and a reply carried each. It implies every earlier
+/// profile.
+pub const LANED_PROTOCOL_VERSION: u16 = 6;
 #[derive(Debug, Clone)]
 pub struct PeerPoolLimits {
     pub max_routes: usize,
@@ -110,6 +116,17 @@ impl PeerPoolLimits {
         }
         Ok(())
     }
+}
+/// How a group's message is carried to its peer ([`PeerConnectionPool::send_as`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// On its lane where its connection speaks the laned profile
+    /// ([`crate::LANED_PROTOCOL_VERSION`]): `Ok` once it is queued, answered by nothing but its
+    /// group's own answer. As an exchange on a connection that does not.
+    Queued,
+    /// As an exchange, answered once the peer has taken it and persisted it: a snapshot, whose
+    /// sender is told it was installed and moves its member on from there.
+    Answered,
 }
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PeerSendError {
@@ -324,11 +341,6 @@ struct Exchange {
     /// nanoseconds it took — the rate the path showed, which sizes the
     /// next part sent it ([`PeerConnectionPool::part_bytes`]).
     delivered: Option<(u64, u64)>,
-    /// What the peer takes to answer a group's message (`Operation::Raft`,
-    /// `RaftOrdered`): answered once the peer's owner has taken it and
-    /// persisted it, so a peer whose owner stalls answers late here and
-    /// nowhere else (27 §8.4). Not the path, which probes alone measure.
-    replicated: focal_timing::ExchangeRtt,
 }
 /// The most doublings an estimate takes.
 const MAX_BACKOFF: u32 = 6;
@@ -393,52 +405,17 @@ struct Asked<'a> {
     /// exchange says the path delivered in the time it took.
     bytes: u64,
     bulk: bool,
-    /// Whether it is a group's message, and the serial its attempt in
-    /// flight is registered under (`State::outstanding`).
+    /// Whether it is a group's message: one that goes on its lane where its connection has one.
     replication: bool,
-    serial: Option<u64>,
 }
 impl Asked<'_> {
-    /// An attempt leaves at `sent`: a group message's is registered, in
-    /// place of an earlier attempt's.
-    fn sent(&mut self, sent: u64) {
-        if !self.replication {
-            return;
-        }
-        if let Ok(mut state) = self.pool.state.lock() {
-            if let Some(serial) = self.serial.take() {
-                state.outstanding.remove(&(self.target, serial));
-            }
-            let serial = state.serial;
-            state.serial = serial.wrapping_add(1);
-            state.outstanding.insert((self.target, serial), sent);
-            self.serial = Some(serial);
-        }
-    }
-    /// The attempt in flight ended: its registration goes.
-    fn settled(&mut self) {
-        if let Some(serial) = self.serial.take()
-            && let Ok(mut state) = self.pool.state.lock()
-        {
-            state.outstanding.remove(&(self.target, serial));
-        }
+    /// A group's message queued on its peer's lane: answered by nothing but its group's own
+    /// answer, which its owner times (27 §8.4).
+    fn queued(&mut self) {
+        self.answered = true;
     }
     fn answered(&mut self, taken: Duration) {
         self.answered = true;
-        if self.replication {
-            self.settled();
-            if let Ok(mut state) = self.pool.state.lock()
-                && state.routes.contains_key(&self.target)
-            {
-                let nanos = u64::try_from(taken.as_nanos()).unwrap_or(u64::MAX);
-                state
-                    .exchanges
-                    .entry(self.target)
-                    .or_default()
-                    .replicated
-                    .on_sample(nanos);
-            }
-        }
         if !self.measured {
             return;
         }
@@ -462,7 +439,6 @@ impl Asked<'_> {
 }
 impl Drop for Asked<'_> {
     fn drop(&mut self) {
-        self.settled();
         if self.answered || !self.measured {
             return;
         }
@@ -491,13 +467,6 @@ struct State {
     /// answered, and how many in a row were given up on. Dropped with the
     /// peer's route.
     exchanges: BTreeMap<u64, Exchange>,
-    /// When each group message out to a peer was sent, by peer and serial, by the shard's
-    /// clock: an exchange still unanswered has taken at least its age, which a stall in progress
-    /// shows before its answer can. One entry an exchange in flight, which the pool's permits
-    /// bound, removed when the exchange ends, however it ends.
-    outstanding: BTreeMap<(u64, u64), u64>,
-    /// The serial the next group message out is registered under.
-    serial: u64,
     clock: u64,
     closed: bool,
 }
@@ -566,8 +535,6 @@ impl PeerConnectionPool {
                 cached: BTreeMap::new(),
                 paths: BTreeMap::new(),
                 exchanges: BTreeMap::new(),
-                outstanding: BTreeMap::new(),
-                serial: 0,
                 clock: 0,
                 closed: false,
             }),
@@ -745,29 +712,6 @@ impl PeerConnectionPool {
         let factor = 1u64.checked_shl(exchange.abandoned.min(MAX_BACKOFF))?;
         Some(Duration::from_nanos(tail.saturating_mul(factor)))
     }
-    /// How late `target` answers a group's message, at least: the tail of
-    /// the ones it answered, or the age of the oldest still unanswered where
-    /// that is more, so a peer whose owner stalls is seen late while the
-    /// stall lasts and not only once it ends (27 §8.4). `None` while
-    /// nothing was measured or is out.
-    pub fn replication_lateness(&self, target: u64) -> Option<Duration> {
-        let state = self.state.lock().ok()?;
-        let completed = state
-            .exchanges
-            .get(&target)
-            .and_then(|exchange| exchange.replicated.tail_ns())
-            .map(Duration::from_nanos);
-        let now = now_ns();
-        let outstanding = state
-            .outstanding
-            .range((target, 0)..=(target, u64::MAX))
-            .map(|(_, sent)| Duration::from_nanos(now.saturating_sub(*sent)))
-            .max();
-        match (completed, outstanding) {
-            (Some(completed), Some(age)) => Some(completed.max(age)),
-            (completed, age) => completed.or(age),
-        }
-    }
     /// How long one of `asked` peers that are asked one after another
     /// within `round` is waited for: its share of the round, so that each
     /// of them can be asked, and what an exchange with it is expected to
@@ -836,14 +780,27 @@ impl PeerConnectionPool {
     /// There is no internal packet queue. Global/per-peer permits reject excess
     /// work immediately; the FleetHost owns its separate bounded egress queue.
     /// Ok means ingress accepted this packet, never a quorum/durability signal.
+    /// Queued on its lane where the connection has one ([`Delivery::Queued`]).
     pub async fn send(&self, target: u64, request: &RequestEnvelope) -> Result<(), PeerSendError> {
+        self.send_as(target, request, Delivery::Queued).await
+    }
+    /// A group's message, carried as `delivery` says.
+    pub async fn send_as(
+        &self,
+        target: u64,
+        request: &RequestEnvelope,
+        delivery: Delivery,
+    ) -> Result<(), PeerSendError> {
         if !matches!(
             request.operation,
             Operation::Raft { .. } | Operation::RaftOrdered { .. }
         ) {
             return Err(PeerSendError::InvalidRequest);
         }
-        match self.exchange(target, request).await? {
+        match self
+            .exchange_as(target, request, delivery == Delivery::Queued)
+            .await?
+        {
             Response::PeerAccepted => Ok(()),
             _ => Err(PeerSendError::InvalidRequest),
         }
@@ -1022,10 +979,20 @@ impl PeerConnectionPool {
         target: u64,
         request: &RequestEnvelope,
     ) -> Result<Response, PeerSendError> {
+        self.exchange_as(target, request, false).await
+    }
+    /// An exchange with `target`, or a group's message queued on its lane where `laned` and its
+    /// connection has one.
+    async fn exchange_as(
+        &self,
+        target: u64,
+        request: &RequestEnvelope,
+        laned: bool,
+    ) -> Result<Response, PeerSendError> {
         if hyper_rt::futures::shard_id().is_none() {
             return Err(PeerSendError::Lost);
         }
-        let result = self.send_bounded(target, request).await;
+        let result = self.send_bounded(target, request, laned).await;
         match &result {
             Ok(_) => {
                 increment(&self.counters.delivered);
@@ -1056,6 +1023,7 @@ impl PeerConnectionPool {
         &self,
         target: u64,
         request: &RequestEnvelope,
+        laned: bool,
     ) -> Result<Response, PeerSendError> {
         let valid_operation = match &request.operation {
             Operation::Raft { group, message } => *group != [0; 16] && !message.is_empty(),
@@ -1143,7 +1111,6 @@ impl PeerConnectionPool {
                 request.operation,
                 Operation::Raft { .. } | Operation::RaftOrdered { .. }
             ),
-            serial: None,
         };
         let _inflight = if probe {
             &self.probe_inflight
@@ -1219,7 +1186,6 @@ impl PeerConnectionPool {
                     }
                 };
                 let sent = now_ns();
-                asked.sent(sent);
                 let before = slot.answered.load(Ordering::Acquire);
                 // An ordered frame goes as it is on a connection that admits
                 // the ordered profile, and as a plain frame on one that does
@@ -1249,6 +1215,36 @@ impl PeerConnectionPool {
                     }
                     _ => None,
                 };
+                // A group's message to a peer that speaks the laned profile goes on its lane,
+                // queued behind the lane's earlier frames and answered by nothing: what a group
+                // cannot do without on the urgent lane, its bulk appends on the bulk lane, in
+                // the order they left. Queued is all its sender hears; a frame its connection
+                // took down with it is a message lost, which its group finds and asks again.
+                if laned && asked.replication && remote.negotiated().laned() {
+                    let lane = if matches!(request.operation, Operation::RaftOrdered { .. }) {
+                        crate::transport::BULK_LANE
+                    } else {
+                        crate::transport::URGENT_LANE
+                    };
+                    match remote.send_lane(lane, request).await {
+                        Ok(()) => {
+                            asked.queued();
+                            return Ok(Response::PeerAccepted);
+                        }
+                        Err(WireError::Access(AccessError::Capacity)) => {
+                            asked.refused();
+                            return Err(PeerSendError::Busy);
+                        }
+                        Err(_) => {
+                            asked.refused();
+                            if attempt.saturating_add(1) == self.limits.attempts {
+                                return Err(PeerSendError::Lost);
+                            }
+                            pause(spread(self.limits.retry_backoff, entropy())).await;
+                            continue;
+                        }
+                    }
+                }
                 let answered = remote
                     .exchange_within(plain.as_ref().unwrap_or(request), self.limits.timeout)
                     .await;
@@ -1588,6 +1584,10 @@ impl PeerConnectionPool {
         Ok(waiting)
     }
     /// What the pool's socket did ([`crate::net::NetStats::io`]).
+    /// What the pool's endpoint holds, refused and carried, its lanes' frames among it.
+    pub async fn net_stats(&self) -> crate::net::NetStats {
+        self.connector.stats().await
+    }
     pub async fn io(&self) -> hyper_rt::udp::IoStats {
         self.connector.stats().await.io
     }

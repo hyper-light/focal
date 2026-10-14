@@ -894,7 +894,19 @@ impl Negotiated {
                         | crate::NATIVE_PROTOCOL_VERSION
                         | crate::ORDERED_PROTOCOL_VERSION
                 )
+                | (
+                    crate::LANED_PROTOCOL_VERSION,
+                    PROTOCOL_VERSION
+                        | MANAGED_PROTOCOL_VERSION
+                        | PEER_PROTOCOL_VERSION
+                        | crate::NATIVE_PROTOCOL_VERSION
+                        | crate::ORDERED_PROTOCOL_VERSION
+                )
         )
+    }
+    /// Whether a connection that negotiated this profile carries replication frames on lanes.
+    pub fn laned(self) -> bool {
+        self.protocol >= crate::LANED_PROTOCOL_VERSION
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1006,10 +1018,30 @@ impl WireLimits {
         native: bool,
         ordered: bool,
     ) -> Result<Negotiated, AccessError> {
+        self.negotiate_laned(hello, [managed, participant, native, ordered, false])
+    }
+    /// The laned profile is offered by a handler that takes a peer's replication frames from
+    /// its lanes, each answered by nothing ([`crate::LANED_PROTOCOL_VERSION`]); it implies every
+    /// earlier profile. `capabilities` are the handler's: managed, participant, native, ordered
+    /// and laned.
+    pub fn negotiate_laned(
+        &self,
+        hello: &Hello,
+        capabilities: [bool; 5],
+    ) -> Result<Negotiated, AccessError> {
+        let [managed, participant, native, ordered, laned] = capabilities;
         if hello.versions.len() > 16 {
             return Err(AccessError::UnsupportedProtocol);
         }
         let protocol = if managed
+            && participant
+            && native
+            && ordered
+            && laned
+            && hello.versions.contains(&crate::LANED_PROTOCOL_VERSION)
+        {
+            crate::LANED_PROTOCOL_VERSION
+        } else if managed
             && participant
             && native
             && ordered

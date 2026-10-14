@@ -4,7 +4,7 @@
 //! slow work on one exchange does not hold up another, and the connection's credit is taken in the
 //! order of the classes' urgency.
 use crate::net::{
-    Answer, Asked, Command, Driver, Failed, FocalClasses, Inbound, Kind, LeafPins, Linked,
+    Answer, Asked, Command, Driver, Failed, FocalClasses, Framed, Inbound, Kind, LeafPins, Linked,
     NetBudget, NetDirectory, Network, Reply, Sender, Serve, ServeFuture, Served,
 };
 use crate::*;
@@ -108,6 +108,17 @@ fn endpoint_exchanges(limits: &WireLimits) -> usize {
         .clamp(1, MAX_ENDPOINT_EXCHANGES)
 }
 
+/// The replication lanes a node opens to a peer that speaks the laned profile
+/// ([`crate::LANED_PROTOCOL_VERSION`]): the urgent lane and the bulk lane.
+pub const REPLICATION_LANES: u32 = 2;
+/// The lane that carries what a group cannot do without: a heartbeat, a vote, an answer.
+pub const URGENT_LANE: hyper_transport::LaneId = 0;
+/// The lane that carries a group's bulk appends, in the order they left their sender.
+pub const BULK_LANE: hyper_transport::LaneId = 1;
+/// A lane's window, in consensus windows: the frames one group may have in flight to the peer,
+/// for a few groups at once.
+const LANE_WINDOW_ROUNDS: usize = 4;
+
 /// The bounds of an endpoint carrying focal's traffic under `limits`, admitting by `admission`.
 pub fn endpoint_limits(
     limits: &WireLimits,
@@ -152,9 +163,15 @@ pub fn endpoint_limits(
         // be the one refusal left, of a request the node would have served.
         ask_queue: hyper_transport::AskQueue::Table,
         exchanges: endpoint_exchanges(limits),
-        // focal's traffic is exchanges; no lane is opened.
-        lanes_per_peer: 1,
-        lane_window: 1,
+        // Replication frames to a peer that speaks the laned profile go on two lanes: what a
+        // group cannot do without (a heartbeat, a vote, an answer) on one, its bulk appends on
+        // the other, so neither waits behind the other. A lane holds the consensus window's
+        // frames for each of the groups a connection carries at once, a few times over.
+        lanes_per_peer: REPLICATION_LANES,
+        lane_window: usize::try_from(limits.control_streams)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(LANE_WINDOW_ROUNDS)
+            .max(1),
         // focal's messages are their bodies: a head is refused from its prefix.
         max_head: 0,
         window_ceiling,
@@ -543,6 +560,13 @@ impl QuicServer {
     pub(crate) fn network(&self) -> &Network {
         &self.network
     }
+    /// What this server's endpoint holds, refused and carried ([`crate::net::NetStats`]).
+    pub async fn stats(&self) -> crate::net::NetStats {
+        self.network
+            .call(|reply| Command::Stats { reply })
+            .await
+            .unwrap_or_default()
+    }
     /// What this server's socket did ([`crate::net::NetStats::io`]).
     pub async fn io(&self) -> hyper_rt::udp::IoStats {
         self.network
@@ -649,6 +673,56 @@ impl<H: RequestHandler + Clone> DataService<H> {
             limits,
         }
     }
+    /// A replication frame from a peer's lane: checked as the same request is — its kind the
+    /// operation's, its class the one its sender's role carries it in, its profile negotiated, its
+    /// sender authenticated by the grant current now — then dispatched as that request, on a task
+    /// of its own, its answer let go: a lane's frame is answered by nothing. Only a node's
+    /// replication may come on a lane; anything else is let go.
+    pub fn take_frame(&self, framed: Framed) {
+        let Inbound::Data {
+            fingerprint,
+            peer: authenticated,
+        } = framed.from
+        else {
+            return;
+        };
+        let (Kind::Operation(tag), Some(negotiated)) = (framed.kind, framed.negotiated) else {
+            return;
+        };
+        if !negotiated.laned() || !matches!(Sender::of(authenticated.role()), Sender::Node) {
+            return;
+        }
+        let Ok(request) = decode_payload::<RequestEnvelope>(&framed.body) else {
+            return;
+        };
+        let carried = FocalClasses::class_of(
+            Kind::Operation(request.operation.registered_tag()),
+            Sender::Node,
+        );
+        if request.operation.registered_tag() != tag
+            || carried != Some(framed.class)
+            || !matches!(
+                request.operation,
+                Operation::Raft { .. } | Operation::RaftOrdered { .. }
+            )
+            || !negotiated.accepts_protocol(request.protocol)
+        {
+            return;
+        }
+        let Ok(peer) = self.registry.authenticate(fingerprint) else {
+            return;
+        };
+        let mut limits = self.limits.clone();
+        limits.max_frame_bytes = negotiated.max_frame_bytes;
+        limits.max_items = negotiated.max_items;
+        let handler = self.handler.clone();
+        let arrived = (framed.path, framed.arrived_ns);
+        // A shard with no task left for it loses the frame, as a peer's frame refused for room
+        // is lost: its group asks again.
+        let _ = hyper_rt::futures::spawn_detached(async move {
+            let _ = dispatch_accounted_by(&handler, peer, request, &limits, arrived).await;
+        });
+    }
     /// The answer to `served`, a request of the data protocol: `None` resets the exchange.
     pub fn answer(&self, served: Served) -> ServeFuture {
         let this = self.clone();
@@ -703,16 +777,23 @@ impl<H: RequestHandler + Clone> DataService<H> {
     }
 }
 impl<H: RequestHandler + Clone> Serve for DataService<H> {
-    fn capabilities(&self) -> [bool; 4] {
+    fn capabilities(&self) -> [bool; 5] {
+        // A handler that steps a peer's frames in the order they left it takes them from its
+        // lanes as well: a lane's frame is dispatched as the same request would be.
+        let ordered = self.handler.supports_ordered_replication();
         [
             self.handler.supports_managed_requests(),
             self.handler.supports_participant_requests(),
             self.handler.supports_native_requests(),
-            self.handler.supports_ordered_replication(),
+            ordered,
+            ordered,
         ]
     }
     fn serve(&self, request: Served) -> ServeFuture {
         self.answer(request)
+    }
+    fn frame(&self, framed: Framed) {
+        self.take_frame(framed);
     }
 }
 
@@ -727,7 +808,8 @@ pub struct QuicConnector {
 }
 /// Every profile this binary speaks, the newest first: what a connector
 /// offers in its Hello.
-pub const OFFERED_PROTOCOLS: [u16; 5] = [
+pub const OFFERED_PROTOCOLS: [u16; 6] = [
+    crate::LANED_PROTOCOL_VERSION,
     crate::ORDERED_PROTOCOL_VERSION,
     crate::NATIVE_PROTOCOL_VERSION,
     PEER_PROTOCOL_VERSION,
@@ -1022,6 +1104,7 @@ async fn open_remote(
             | PEER_PROTOCOL_VERSION
             | crate::NATIVE_PROTOCOL_VERSION
             | crate::ORDERED_PROTOCOL_VERSION
+            | crate::LANED_PROTOCOL_VERSION
     ) {
         return Err(WireError::InvalidFrame);
     }
@@ -1059,6 +1142,30 @@ pub struct QuicRemote {
 impl QuicRemote {
     pub fn negotiated(&self) -> Negotiated {
         self.negotiated
+    }
+    /// Queues `request`, a replication frame, on lane `lane` of this connection, behind the
+    /// lane's earlier frames: answered by nothing, `Ok` once it is queued. Refused when the
+    /// connection does not speak the laned profile, is gone, or its lane is full.
+    pub async fn send_lane(
+        &self,
+        lane: hyper_transport::LaneId,
+        request: &RequestEnvelope,
+    ) -> Result<(), WireError> {
+        if !self.negotiated.laned() || !self.negotiated.accepts_protocol(request.protocol) {
+            return Err(WireError::Access(AccessError::UnsupportedProtocol));
+        }
+        let body = encode_payload(request, self.negotiated.max_frame_bytes)?;
+        let kind = Kind::Operation(request.operation.registered_tag());
+        self.network
+            .call(|reply| Command::Lane {
+                peer: self.peer,
+                epoch: self.epoch,
+                lane,
+                kind,
+                body,
+                reply,
+            })
+            .await?
     }
     /// Closes the connection; exchanges under way on it are refused. Refused only when the shard
     /// has no task left to queue it (`Limit`); a connection already gone is closed.

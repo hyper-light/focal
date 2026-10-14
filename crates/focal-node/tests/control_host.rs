@@ -233,15 +233,6 @@ impl Rig {
                     // runner at a load of sixty, tens of the leader's periods
                     // before its heartbeats reached a follower (2026-10-04).
                     let mut sampled: Option<std::time::Instant> = None;
-                    // What each frame took to be handled by its target, the
-                    // target's owner taking it among it: the exchange a node's
-                    // pool times (`PeerConnectionPool::exchange_tail`), whose
-                    // tail the sender gives its commits beyond its own periods
-                    // (27 §8.4). The last 64 a target, the tail their longest.
-                    let mut exchanges: std::collections::BTreeMap<
-                        u64,
-                        std::collections::VecDeque<Duration>,
-                    > = std::collections::BTreeMap::new();
                     while let Ok(frame) = channel.recv().await {
                         let excluded = isolated.load(Ordering::SeqCst);
                         if excluded == from || excluded == frame.target {
@@ -285,64 +276,9 @@ impl Rig {
                             &ControlHost::wire_limits(),
                         )
                         .unwrap();
-                        // While the target takes the frame, its lateness is at least the
-                        // frame's age, published each tick as the pool's
-                        // `replication_lateness` reads it: a stall in progress is seen while
-                        // it lasts.
-                        let handled = std::time::Instant::now();
-                        let publish =
-                            |exchanges: &std::collections::BTreeMap<
-                                u64,
-                                std::collections::VecDeque<Duration>,
-                            >,
-                             out: Option<(u64, Duration)>| {
-                                if let Some(sender) = hosts.get(from.saturating_sub(1) as usize) {
-                                    let tails = exchanges
-                                        .iter()
-                                        .map(|(target, window)| {
-                                            let answered = window.iter().max().copied();
-                                            match out {
-                                                Some((late, age)) if late == *target => {
-                                                    Some(answered.map_or(age, |tail| tail.max(age)))
-                                                }
-                                                _ => answered,
-                                            }
-                                        })
-                                        .chain(
-                                            out.filter(|(late, _)| !exchanges.contains_key(late))
-                                                .map(|(_, age)| Some(age)),
-                                        )
-                                        .flatten()
-                                        .collect();
-                                    sender.quorum(tails, hosts.len());
-                                }
-                            };
-                        {
-                            let mut handling = std::pin::pin!(target.handle(&verified));
-                            loop {
-                                match hyper_rt::combine::race2(
-                                    &mut handling,
-                                    focal_rt::time::sleep(RIG_TICK),
-                                )
-                                .await
-                                {
-                                    hyper_rt::combine::Either::First(_) => break,
-                                    hyper_rt::combine::Either::Second(slept) => {
-                                        slept.unwrap();
-                                        publish(
-                                            &exchanges,
-                                            Some((frame.target, handled.elapsed())),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        let window = exchanges.entry(frame.target).or_default();
-                        if window.len() == 64 {
-                            window.pop_front();
-                        }
-                        window.push_back(handled.elapsed());
-                        publish(&exchanges, None);
+                        // Delivered as a node's transport hands a frame to its owner; each
+                        // owner times its peers' answers itself (27 §8.4).
+                        let _ = target.handle(&verified).await;
                         if sampled.is_none_or(|at| at.elapsed() >= RIG_TICK) {
                             let asked = std::time::Instant::now();
                             focal_rt::time::sleep(Duration::from_millis(1))

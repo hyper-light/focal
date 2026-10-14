@@ -11,6 +11,7 @@
     )
 )]
 //! Node composition and user-facing deployment intent.
+mod ack_clock;
 pub mod admission;
 pub mod archive_agent;
 mod archive_derive;

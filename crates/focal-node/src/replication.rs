@@ -1,7 +1,7 @@
 //! Bounded egress from the session owner to authenticated peer connections.
 use crate::control_host::{ControlReplicationFrame, DirectoryReplication};
 use crate::fleet::{FleetReplication, ReplicationFrame};
-use focal_wire::{PeerConnectionPool, PeerSendError};
+use focal_wire::{Delivery, PeerConnectionPool, PeerSendError};
 use futures_util::FutureExt;
 use hyper_rt::sync::ChannelReceiver;
 use std::collections::{BTreeMap, VecDeque};
@@ -117,6 +117,7 @@ trait Carrier {
         &'a self,
         target: u64,
         request: &'a focal_wire::RequestEnvelope,
+        delivery: Delivery,
     ) -> impl Future<Output = Result<(), PeerSendError>> + 'a;
 }
 impl Carrier for PeerConnectionPool {
@@ -127,8 +128,9 @@ impl Carrier for PeerConnectionPool {
         &'a self,
         target: u64,
         request: &'a focal_wire::RequestEnvelope,
+        delivery: Delivery,
     ) -> impl Future<Output = Result<(), PeerSendError>> + 'a {
-        self.send(target, request)
+        self.send_as(target, request, delivery)
     }
 }
 
@@ -159,6 +161,12 @@ impl Frame {
         match self {
             Self::Session(frame) => &frame.request,
             Self::Control(frame) => &frame.request,
+        }
+    }
+    fn delivery(&self) -> Delivery {
+        match self {
+            Self::Session(frame) => frame.delivery(),
+            Self::Control(frame) => frame.delivery(),
         }
     }
     fn urgent(&self) -> bool {
@@ -278,7 +286,7 @@ async fn drive<C: Carrier>(
     let send = |mut frame: Frame| {
         AssertUnwindSafe(async move {
             let target = frame.target();
-            let result = pool.carry(target, frame.request()).await;
+            let result = pool.carry(target, frame.request(), frame.delivery()).await;
             frame.complete(result.is_ok());
             // Whatever kept it from the peer, the frame's owner is told,
             // and its core probes the member instead of streaming into a

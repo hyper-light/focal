@@ -75,6 +75,29 @@ pub use hyper_raft::proto::{
 pub use hyper_raft::proto::{snapshot_index, snapshot_is_empty};
 pub use hyper_raft::{SnapshotStatus, StateRole};
 
+/// What a peer's message stepped was, for its owner's clocks (27 §8.4): its kind, its sender,
+/// the term it was sent in, the index it names and whether it refuses. Read off the message
+/// decoded for the step, so an owner times its peers' answers without decoding them again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stepped {
+    pub msg_type: MessageType,
+    pub from: u64,
+    pub term: u64,
+    pub index: u64,
+    pub reject: bool,
+}
+impl Stepped {
+    pub fn of(message: &Message) -> Self {
+        Self {
+            msg_type: message.msg_type,
+            from: message.from,
+            term: message.term,
+            index: message.index,
+            reject: message.reject,
+        }
+    }
+}
+
 /// The image a restored logical log begins with (26 §6): the application
 /// snapshot at one index and term, and the decoder floor (with its
 /// transition, when the log had one) the application requires.
@@ -1315,7 +1338,7 @@ impl LogNode {
         &mut self,
         peer_node_id: u64,
         encoded: &[u8],
-    ) -> Result<(), ConsensusError> {
+    ) -> Result<Stepped, ConsensusError> {
         self.check()?;
         if self.persistence_pending() {
             return Err(ConsensusError::PersistencePending);
@@ -1333,7 +1356,9 @@ impl LogNode {
                 "Raft sender does not match authenticated peer",
             ));
         }
-        self.step(message)
+        let stepped = Stepped::of(&message);
+        self.step(message)?;
+        Ok(stepped)
     }
     fn tick_inner(&mut self) -> Result<(), ConsensusError> {
         self.check()?;

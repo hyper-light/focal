@@ -359,6 +359,14 @@ impl ControlReplica {
     pub fn status(&self) -> NodeStatus {
         self.node.status()
     }
+    /// The status's scalars, copied: nothing allocated.
+    pub fn scalars(&self) -> focal_consensus::NodeScalars {
+        self.node.scalars()
+    }
+    /// The voters and learners of the configuration in force, borrowed.
+    pub fn membership(&self) -> focal_consensus::MembershipView<'_> {
+        self.node.membership()
+    }
     pub fn peer_progress(&self) -> Vec<focal_consensus::PeerProgress> {
         self.node.peer_progress()
     }
@@ -795,10 +803,9 @@ impl ControlReplica {
         &mut self,
         peer_node: u64,
         encoded: &[u8],
-    ) -> Result<(), ControlError> {
+    ) -> Result<focal_consensus::Stepped, ControlError> {
         self.check()?;
-        self.node.step_authenticated(peer_node, encoded)?;
-        Ok(())
+        Ok(self.node.step_authenticated(peer_node, encoded)?)
     }
     /// A read asked here waits for a round that leaves with the next drain
     /// (`DurableNode::reads_unasked`): an owner takes what else is queued

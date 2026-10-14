@@ -706,7 +706,7 @@ fn pump_learner_floor(
             }
             let result = sessions[to as usize - 1].step_authenticated(from, &encoded);
             let status = match result {
-                Ok(()) => SnapshotStatus::Finish,
+                Ok(_) => SnapshotStatus::Finish,
                 Err(LedgerError::Consensus(ConsensusError::PersistencePending)) => {
                     *rejected += 1;
                     assert!(!sessions[to as usize - 1].managed_protocol_active());

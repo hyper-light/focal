@@ -85,14 +85,39 @@ impl Reply {
     }
 }
 
-/// What an endpoint serves: its peers' greetings and requests. Installed on a listening endpoint's
-/// owner once ([`Command::Serve`]); until then every request is refused.
+/// A frame a peer sent on one of its replication lanes (hyper-transport's lanes): one-way, in the
+/// order its lane carries, answered by nothing ([`crate::LANED_PROTOCOL_VERSION`]).
+pub struct Framed {
+    /// The frame's kind.
+    pub kind: Kind,
+    /// Its class, as its kind and its sender's role gave it.
+    pub class: TrafficClass,
+    /// Its bytes, read whole.
+    pub body: Vec<u8>,
+    /// What its sender authenticated as.
+    pub from: Inbound,
+    /// The profile its sender's connection negotiated, once its greeting was answered.
+    pub negotiated: Option<Negotiated>,
+    /// The round trip its connection measures now.
+    pub path: Duration,
+    /// When it arrived, on the shard's clock (nanoseconds).
+    pub arrived_ns: u64,
+}
+
+/// What an endpoint serves: its peers' greetings, requests and lane frames. Installed on a
+/// listening endpoint's owner once ([`Command::Serve`]); until then every request is refused and
+/// every frame let go.
 pub trait Serve: Send + 'static {
-    /// The profiles this side answers a greeting with ([`WireLimits::negotiate_ordered`]'s
-    /// capabilities: managed, participant, native, ordered).
-    fn capabilities(&self) -> [bool; 4];
+    /// The profiles this side answers a greeting with ([`WireLimits::negotiate_laned`]'s
+    /// capabilities: managed, participant, native, ordered, laned).
+    fn capabilities(&self) -> [bool; 5];
     /// The answer to one request, on a task of its own.
     fn serve(&self, request: Served) -> ServeFuture;
+    /// One frame a peer sent on a lane, taken at once: what serves no lanes lets it go (it
+    /// answers no greeting with the laned profile, so no peer sends it one).
+    fn frame(&self, framed: Framed) {
+        let _ = framed;
+    }
 }
 
 /// A connection this side dialed: up, and greeted when its dial greets.
@@ -133,6 +158,13 @@ pub struct NetStats {
     pub refused_unnegotiated: u64,
     /// Exchanges asked and answered.
     pub answered: u64,
+    /// Frames queued on a peer's lane, frames a lane refused (full, or its connection gone), and
+    /// frames taken from peers' lanes and handed to what serves them.
+    pub lane_frames_sent: u64,
+    pub lane_frames_refused: u64,
+    pub lane_frames_received: u64,
+    /// Frames from peers' lanes let go: nothing served them, or their sender is not known.
+    pub lane_frames_dropped: u64,
     /// Dials started: a route's first, and each after its connection went. A caller that joins a
     /// dial in flight, or finds the route's connection up, starts none.
     pub dials: u64,
@@ -170,6 +202,16 @@ pub(crate) enum Command {
         body: Asked,
         period: Duration,
         reply: OneshotSender<Result<Answer, Failed>>,
+    },
+    /// Queue `body`, a message of `kind`, on `peer`'s lane `lane` of the connection of `epoch`:
+    /// after the lane's earlier frames, answered by nothing. Told once it is queued, or why not.
+    Lane {
+        peer: PeerId,
+        epoch: Epoch,
+        lane: hyper_transport::LaneId,
+        kind: Kind,
+        body: Vec<u8>,
+        reply: OneshotSender<Result<(), WireError>>,
     },
     /// Close every connection to `peer`.
     Disconnect { peer: PeerId },
@@ -636,6 +678,17 @@ impl Owner {
                 period,
                 reply,
             } => self.ask(peer, epoch, kind, body, period, reply),
+            Command::Lane {
+                peer,
+                epoch,
+                lane,
+                kind,
+                body,
+                reply,
+            } => {
+                let queued = self.lane(peer, epoch, lane, kind, &body);
+                let _ = reply.send(queued);
+            }
             Command::Disconnect { peer } => {
                 let now = self.now();
                 self.driver.endpoint().disconnect(now, peer);
@@ -1109,7 +1162,9 @@ impl Owner {
                     self.write_answer(exchange);
                 }
             }
-            Event::Frame { frame, .. } => self.driver.endpoint().release(frame),
+            Event::Frame {
+                peer, kind, frame, ..
+            } => self.frame(peer, kind, frame),
             Event::Refused {
                 exchange, refusal, ..
             } => {
@@ -1162,6 +1217,81 @@ impl Owner {
                 }
             }
         }
+    }
+
+    /// Queues a frame on `peer`'s lane on the connection of `epoch`: refused when that connection
+    /// is gone (its lanes' frames went with it, and a frame queued on its successor would be
+    /// taken for one of them) or the lane is full.
+    fn lane(
+        &mut self,
+        peer: PeerId,
+        epoch: Epoch,
+        lane: hyper_transport::LaneId,
+        kind: Kind,
+        body: &[u8],
+    ) -> Result<(), WireError> {
+        let queued = if self.closing || !self.driver.endpoint().connection_live(peer, epoch) {
+            Err(WireError::Connection)
+        } else {
+            self.driver
+                .endpoint()
+                .send_frame(peer, lane, kind, body)
+                .map_err(refused)
+        };
+        match queued {
+            Ok(()) => {
+                self.stats.lane_frames_sent = self.stats.lane_frames_sent.saturating_add(1);
+            }
+            Err(_) => {
+                self.stats.lane_frames_refused = self.stats.lane_frames_refused.saturating_add(1);
+            }
+        }
+        queued
+    }
+
+    /// A frame from `peer`'s lane: its bytes copied out and its reservation given back, then
+    /// handed to what serves frames, with what its sender authenticated as.
+    fn frame(&mut self, peer: PeerId, kind: Kind, frame: Reservation) {
+        let arrived_ns = hyper_rt::futures::now_ns();
+        let mut body = Vec::new();
+        let copied = body.try_reserve_exact(frame.bytes().len()).is_ok();
+        if copied {
+            body.extend_from_slice(frame.bytes());
+        }
+        self.driver.endpoint().release(frame);
+        let from = self.driver.endpoint().directory().inbound(peer).cloned();
+        let sender = match &from {
+            Some(Inbound::Data { peer, .. }) => Some(Sender::of(peer.role())),
+            Some(Inbound::Joiner) | None => None,
+        };
+        let class = sender
+            .and_then(|sender| <super::classes::FocalClasses as Classes>::class_of(kind, sender));
+        let (true, Some(from), Some(class), Some(serve)) =
+            (copied, from, class, self.serve.as_ref())
+        else {
+            self.stats.lane_frames_dropped = self.stats.lane_frames_dropped.saturating_add(1);
+            return;
+        };
+        // The peer's newest connection is the one its lanes come on.
+        let negotiated = self
+            .peers
+            .get(&peer)
+            .and_then(|state| state.connections.values().next_back().copied().flatten());
+        let path = self
+            .driver
+            .endpoint()
+            .path(peer)
+            .map_or(Duration::ZERO, |facts| facts.rtt);
+        serve.frame(Framed {
+            kind,
+            class,
+            body,
+            from,
+            negotiated,
+            path,
+            arrived_ns,
+        });
+        self.stats.lane_frames_received = self.stats.lane_frames_received.saturating_add(1);
     }
 
     fn connected(&mut self, peer: PeerId, _role: Sender, epoch: Epoch) {
@@ -1442,14 +1572,11 @@ impl Owner {
     fn greet(&mut self, exchange: ExchangeId, (peer, epoch): (PeerId, Epoch), body: &[u8]) {
         let reply = match decode_payload::<Hello>(body) {
             Ok(hello) => {
-                let [managed, participant, native, ordered] = self
+                let capabilities = self
                     .serve
                     .as_ref()
-                    .map_or([false; 4], |serve| serve.capabilities());
-                match self
-                    .limits
-                    .negotiate_ordered(&hello, managed, participant, native, ordered)
-                {
+                    .map_or([false; 5], |serve| serve.capabilities());
+                match self.limits.negotiate_laned(&hello, capabilities) {
                     Ok(negotiated) => {
                         // The connection it came on is greeted, told or not: a peer's lifecycle
                         // tells its current connection alone, and waits behind the requests

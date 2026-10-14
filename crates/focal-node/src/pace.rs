@@ -983,7 +983,7 @@ impl TickPeriod {
 /// first, so the tail is the `voters / 2`-th smallest. None where fewer of
 /// the others are measured, or where this voter is a majority alone: then
 /// nothing is known, or nothing waited on.
-pub(crate) fn quorum_tail(mut tails: Vec<Duration>, voters: usize) -> Option<Duration> {
+pub(crate) fn quorum_tail(tails: &mut [Duration], voters: usize) -> Option<Duration> {
     let needed = voters.checked_div(2)?;
     if needed == 0 {
         return None;
@@ -1029,22 +1029,22 @@ mod quorum_tests {
     /// second fastest of three (a majority of four is three).
     #[test]
     fn a_commit_waits_on_the_majority_that_answers_first() {
-        assert_eq!(quorum_tail(vec![ms(30), ms(5)], 3), Some(ms(5)));
+        assert_eq!(quorum_tail(&mut [ms(30), ms(5)], 3), Some(ms(5)));
         assert_eq!(
-            quorum_tail(vec![ms(40), ms(9), ms(700), ms(3)], 5),
+            quorum_tail(&mut [ms(40), ms(9), ms(700), ms(3)], 5),
             Some(ms(9))
         );
-        assert_eq!(quorum_tail(vec![ms(40), ms(9), ms(700)], 4), Some(ms(40)));
+        assert_eq!(quorum_tail(&mut [ms(40), ms(9), ms(700)], 4), Some(ms(40)));
     }
 
     /// Too few others measured says nothing, and a voter that is a
     /// majority alone waits on no one.
     #[test]
     fn too_few_measured_or_a_lone_voter_waits_on_nothing() {
-        assert_eq!(quorum_tail(vec![], 3), None);
-        assert_eq!(quorum_tail(vec![ms(5)], 5), None);
-        assert_eq!(quorum_tail(vec![], 1), None);
-        assert_eq!(quorum_tail(vec![ms(5)], 0), None);
+        assert_eq!(quorum_tail(&mut [], 3), None);
+        assert_eq!(quorum_tail(&mut [ms(5)], 5), None);
+        assert_eq!(quorum_tail(&mut [], 1), None);
+        assert_eq!(quorum_tail(&mut [ms(5)], 0), None);
     }
 
     /// The tail in ticks of the pace in force, rounded up, never past an

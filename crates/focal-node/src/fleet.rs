@@ -276,8 +276,26 @@ impl ReplicationFrame {
         self.urgent = true;
         self
     }
+    /// The frame carries a snapshot whose sender waits to be told what became of it.
+    #[cfg(test)]
+    pub(crate) fn snapshot_for_test(
+        mut self,
+        snapshot: OneshotSender<focal_consensus::SnapshotStatus>,
+    ) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
     pub(crate) fn report_snapshot(&mut self, accepted: bool) {
         crate::snapshot_feedback::complete(&mut self.snapshot, accepted);
+    }
+    /// How the frame is carried: a snapshot is answered once its member installed it, which
+    /// its sender is told (`report_snapshot`); any other frame is queued on its lane.
+    pub(crate) fn delivery(&self) -> focal_wire::Delivery {
+        if self.snapshot.is_some() {
+            focal_wire::Delivery::Answered
+        } else {
+            focal_wire::Delivery::Queued
+        }
     }
 }
 /// A stopping leader's hand-off of its log (27 §5): the voter it asked to
@@ -1166,6 +1184,9 @@ struct Owner {
     /// What became of each leader's appends here (`AppendStream`), for as
     /// many peers as the order is kept for, pruned with the configuration.
     append_streams: std::collections::BTreeMap<u64, AppendStream>,
+    /// How late each peer answers this replica's appends and heartbeats (27 §8.4): its
+    /// quorum's patience, published at each tick.
+    acks: crate::ack_clock::AckClock,
     /// `ReplicaProgress::frames_held`, `frames_let_go` and `frames_stale`.
     frames_held: u64,
     frames_let_go: u64,
@@ -1400,6 +1421,7 @@ impl ReplicaHost {
             appends_rejected: 0,
             appends_rejected_in_order: 0,
             append_streams: std::collections::BTreeMap::new(),
+            acks: crate::ack_clock::AckClock::default(),
             frames_held: 0,
             frames_let_go: 0,
             frames_stale: 0,
@@ -1483,15 +1505,6 @@ impl ReplicaHost {
         );
         self.pace.publish(pace);
         pace
-    }
-    /// How late the session's commits are answered among its voters, from
-    /// how late each other voter answers its messages
-    /// (`PeerConnectionPool::replication_lateness`) and how many voters there
-    /// are, this node among them: its leader's quorum patience and what a
-    /// request is given beyond its time (27 §8.4).
-    pub fn quorum(&self, tails: Vec<std::time::Duration>, voters: usize) {
-        self.pace
-            .publish_quorum_tail(crate::pace::quorum_tail(tails, voters));
     }
     /// The pace in force: the last derivation, or the configured period
     /// with no samples before any.
@@ -2451,7 +2464,16 @@ impl Owner {
                 .patience(self.config.tick, self.config.tick_ceiling),
         )?;
         // And what its voters' answers take beyond its own periods is its
-        // patience before it asks whether a quorum heard it (27 §8.4).
+        // patience before it asks whether a quorum heard it (27 §8.4): how late
+        // they answer this replica's messages, as it stepped their answers.
+        let scalars = self.session.scalars();
+        let tail = self.acks.quorum_tail(
+            self.session.members().voters,
+            scalars.node_id,
+            scalars.term,
+            Instant::now(),
+        );
+        self.pace.publish_quorum_tail(tail);
         self.session.set_quorum_patience(
             self.pace
                 .quorum_ticks(self.config.tick, self.config.tick_ceiling),
@@ -3395,6 +3417,7 @@ impl Owner {
         }
         self.ordered.retain(|peer, _| member(*peer));
         self.append_streams.retain(|peer, _| member(*peer));
+        self.acks.retain(member);
     }
     /// Step the frames the resequencer let go, in their order. Each is a
     /// loss, noted once the frame is stepped (`Owner::lost_to`): a frame let
@@ -3419,6 +3442,11 @@ impl Owner {
                 lost: false,
             });
         }
+    }
+    /// A peer's message was stepped: an answer to one of this replica's is timed
+    /// (`crate::ack_clock`).
+    fn answered(&mut self, stepped: focal_consensus::Stepped) {
+        self.acks.stepped(stepped, Instant::now());
     }
     /// Whether a frame due now waits: the replica's write is in flight, or
     /// frames that came before it wait already and it may not pass them.
@@ -3520,13 +3548,16 @@ impl Owner {
                 deadline,
             });
         }
-        if let Err(error) = self.session.step_authenticated(node_id, message) {
-            // An ordered frame not stepped is lost to this log as much as
-            // one that never came: the appends behind it are refused.
-            if order.is_some() {
-                self.lost_to(node_id);
+        match self.session.step_authenticated(node_id, message) {
+            Ok(stepped) => self.answered(stepped),
+            Err(error) => {
+                // An ordered frame not stepped is lost to this log as much as
+                // one that never came: the appends behind it are refused.
+                if order.is_some() {
+                    self.lost_to(node_id);
+                }
+                return Err(access(error));
             }
-            return Err(access(error));
         }
         if late {
             // A frame found stale is a loss, noted once it is stepped: one
@@ -3559,7 +3590,8 @@ impl Owner {
             lost,
         } = frame;
         match self.session.step_authenticated(source, &message) {
-            Ok(()) => {
+            Ok(stepped) => {
+                self.answered(stepped);
                 pending.waiting = WaitingFor::PeerPersistence;
                 self.queue_pending(pending);
                 if lost {
@@ -4597,6 +4629,7 @@ impl Owner {
     /// (`report_lost`): the member is probed, and nothing is taken to be on
     /// its way that is not.
     fn send(&mut self, messages: &[focal_consensus::Message]) -> Result<(), LedgerError> {
+        let now = Instant::now();
         for message in messages {
             if message.msg_type == focal_consensus::MessageType::MsgAppendResponse {
                 self.judge_append_answer(message);
@@ -4720,6 +4753,8 @@ impl Owner {
             if self.outbound.try_send(frame).is_err() {
                 self.dropped = self.dropped.saturating_add(1);
                 let _ = self.lost_sender.try_send(message.to);
+            } else {
+                self.acks.sent(message, now);
             }
         }
         Ok(())
