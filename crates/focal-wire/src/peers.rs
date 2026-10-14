@@ -1226,7 +1226,19 @@ impl PeerConnectionPool {
                     } else {
                         crate::transport::URGENT_LANE
                     };
-                    match remote.send_lane(lane, request).await {
+                    // A full lane holds the frame until it has room, no longer than an exchange
+                    // is given: past it the lane's peer takes nothing, and the frame is given up
+                    // as an unanswered exchange is.
+                    let queued = match hyper_rt::futures::within(
+                        nanos(self.limits.timeout),
+                        remote.send_lane(lane, request),
+                    )
+                    .await
+                    {
+                        Ok(Some(queued)) => queued,
+                        Ok(None) | Err(_) => Err(WireError::Timeout),
+                    };
+                    match queued {
                         Ok(path) => {
                             // What the path measures comes with it, as with an answer: the
                             // window a leader sends its member ahead of its answers follows it

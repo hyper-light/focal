@@ -1614,6 +1614,95 @@ fn a_nodes_replication_goes_on_its_lanes_once_each_and_in_order() {
     .unwrap()
 }
 
+/// A lane that is full holds what comes for it until it has room, instead of refusing it: a burst
+/// of frames near the frame bound on a lane of four frames, as many as it queues and as many
+/// again, all arrive, once each and in the order they were queued, and some of them waited for
+/// room (the endpoint's `LaneRoom` woke them).
+#[test]
+fn a_full_lane_holds_its_frames_until_it_has_room() {
+    focal_rt::block_on(async move {
+        const FRAMES: u8 = 8;
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        let mut node_grant = grant();
+        node_grant.role = PeerRole::Node { node_id: 7 };
+        registry
+            .register_certificate(&certificate, node_grant)
+            .unwrap();
+        let handler = Recorded::default();
+        let (server, task) = server(&pki, registry, Arc::new(handler.clone())).await;
+        // One consensus window of one: each lane queues four frames, and as many wait beside it.
+        let narrow = WireLimits {
+            control_streams: 1,
+            ..limits()
+        };
+        let connector = QuicConnector::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            client_tls(
+                TlsIdentity::from_pkcs8(vec![certificate], key),
+                vec![pki.ca.der().to_vec()],
+                &narrow,
+                Sender::Node,
+            )
+            .unwrap(),
+            narrow,
+            budget(),
+        )
+        .unwrap();
+        let remote = Rc::new(
+            connector
+                .connect(server.local_addr().unwrap(), "localhost")
+                .await
+                .unwrap(),
+        );
+        assert!(remote.negotiated().laned());
+        let sends: Vec<_> = (0..FRAMES)
+            .map(|index| {
+                let remote = remote.clone();
+                spawn(async move {
+                    let mut packet = request(4_000 + u128::from(index));
+                    packet.protocol = ORDERED_PROTOCOL_VERSION;
+                    let mut message = vec![index; 900 * 1024];
+                    message[0] = index;
+                    packet.operation = Operation::RaftOrdered {
+                        group: [5; 16],
+                        epoch: 1,
+                        sequence: u64::from(index),
+                        message,
+                    };
+                    remote
+                        .send_lane(crate::transport::BULK_LANE, &packet)
+                        .await
+                        .map(|_| ())
+                })
+            })
+            .collect();
+        for send in sends {
+            send.join().await.unwrap();
+        }
+        settles("every frame handed to the handler", || {
+            handler.seen.lock().unwrap().len() == usize::from(FRAMES)
+        })
+        .await;
+        let order: Vec<u8> = handler
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, message)| message[0])
+            .collect();
+        assert_eq!(order, (0..FRAMES).collect::<Vec<_>>());
+        let sent = connector.stats().await;
+        assert_eq!(sent.lane_frames_sent, u64::from(FRAMES), "{sent:?}");
+        assert_eq!(sent.lane_frames_refused, 0, "{sent:?}");
+        assert!(sent.lane_frames_parked > 0, "{sent:?}");
+        server.close().unwrap();
+        task.join().await.unwrap();
+    })
+    .unwrap()
+}
+
 /// A lane frame its handler refuses (its owner has no room) is let go and counted dropped,
 /// never received: nothing answers it, and the sender hears only that it was queued.
 #[test]

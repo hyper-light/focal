@@ -192,6 +192,18 @@ pub enum Event<C: Classes> {
         /// The exchange.
         exchange: ExchangeId,
     },
+    /// A lane that refused a frame for being full ([`Refusal::LaneFull`]) has room again: what
+    /// waited for it may be queued. Said once a refusal, and not again while it waits to be
+    /// polled. A core within its window never finds its lane full; an owner whose lane carries
+    /// many groups' frames waits for this instead of losing what found it full.
+    LaneRoom {
+        /// The peer.
+        peer: PeerId,
+        /// The connection the lane is on.
+        epoch: Epoch,
+        /// The lane.
+        lane: LaneId,
+    },
     /// A frame arrived on a peer's lane; give the reservation back with [`Endpoint::release`].
     Frame {
         /// The peer.
@@ -271,6 +283,12 @@ impl<C: Classes> Debug for Event<C> {
             }
             Self::Writable { exchange } => {
                 write!(formatter, "Writable {{ exchange: {exchange:?} }}")
+            }
+            Self::LaneRoom { peer, epoch, lane } => {
+                write!(
+                    formatter,
+                    "LaneRoom {{ peer: {peer:?}, epoch: {epoch:?}, lane: {lane:?} }}"
+                )
             }
             Self::Frame {
                 peer,

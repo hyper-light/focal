@@ -48,6 +48,11 @@ pub(crate) struct LaneOut {
     pub(crate) queue: VecDeque<(u8, Reservation)>,
     /// What of the front frame was written.
     pub(crate) written: usize,
+    /// A frame was refused for the queue being full since it last had room: once it has, the
+    /// endpoint says so ([`crate::Event::LaneRoom`]).
+    pub(crate) refused: bool,
+    /// A [`crate::Event::LaneRoom`] of this lane waits to be polled: another says nothing more.
+    pub(crate) room_waiting: bool,
 }
 
 impl LaneOut {
@@ -58,6 +63,8 @@ impl LaneOut {
             opener_written: 0,
             queue: VecDeque::with_capacity(window),
             written: 0,
+            refused: false,
+            room_waiting: false,
         }
     }
 }

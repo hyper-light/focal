@@ -14,7 +14,7 @@
 //! admitted against its sender's share of the ingress before any of its body is reserved (the
 //! audit's F03): the lane's bytes among the peers with a connection up, one frame at least.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -119,6 +119,20 @@ pub trait Serve: Send + 'static {
     }
 }
 
+/// What a frame queued on a lane is told: queued, with what its path measures then; or why not.
+pub(crate) type LaneReply = OneshotSender<Result<Option<PathFacts>, WireError>>;
+
+/// A frame that found its lane full: it waits, behind the frames of its lane that came before it,
+/// until the lane has room (`Owner::flush_parked`), as an exchange waits for a stream; its sender
+/// waits with it, and with it the frame's charge. Refused when its connection goes, when its
+/// sender gives up waiting, or when as many wait as the lane itself holds.
+struct Parked {
+    epoch: Epoch,
+    kind: Kind,
+    body: Vec<u8>,
+    reply: LaneReply,
+}
+
 /// A connection this side dialed: up, and greeted when its dial greets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Linked {
@@ -157,6 +171,8 @@ pub struct NetStats {
     pub refused_unnegotiated: u64,
     /// Exchanges asked and answered.
     pub answered: u64,
+    /// Frames that found their lane full and waited for room on it.
+    pub lane_frames_parked: u64,
     /// Frames queued on a peer's lane, frames a lane refused (full, or its connection gone), and
     /// frames taken from peers' lanes and handed to what serves them.
     pub lane_frames_sent: u64,
@@ -205,14 +221,15 @@ pub(crate) enum Command {
     },
     /// Queue `body`, a message of `kind`, on `peer`'s lane `lane` of the connection of `epoch`:
     /// after the lane's earlier frames, answered by nothing. Told once it is queued, with what the
-    /// path to `peer` measures then, as an answer brings it; or why not.
+    /// path to `peer` measures then, as an answer brings it; or why not. A lane that is full
+    /// holds the frame until it has room (`Parked`).
     Lane {
         peer: PeerId,
         epoch: Epoch,
         lane: hyper_transport::LaneId,
         kind: Kind,
         body: Vec<u8>,
-        reply: OneshotSender<Result<Option<PathFacts>, WireError>>,
+        reply: LaneReply,
     },
     /// Close every connection to `peer`.
     Disconnect { peer: PeerId },
@@ -455,6 +472,9 @@ struct Owner {
     /// Each peer's share of the ingress in use, by lane: ordinary and completion.
     ingress: BTreeMap<PeerId, [u64; 2]>,
     stats: NetStats,
+    /// Frames that wait for room on their lanes, by peer and lane, each lane's in the order they
+    /// came (`Parked`): at most a lane's window of them a lane.
+    parked: BTreeMap<(PeerId, hyper_transport::LaneId), VecDeque<Parked>>,
     closing: bool,
     /// The registry revision last acted on: a withdrawal since closes what it no longer grants.
     revision: Option<u64>,
@@ -531,6 +551,7 @@ impl Owner {
             serving: BTreeMap::new(),
             ingress: BTreeMap::new(),
             stats: NetStats::default(),
+            parked: BTreeMap::new(),
             closing: false,
             revision: None,
             enrollment: enrollment.map(u64::from),
@@ -604,6 +625,8 @@ impl Owner {
                 self.revision = revision;
                 self.revoked();
             }
+            // What waited for room on a lane takes what the turn freed.
+            self.flush_parked();
             let _ = self.driver.flush();
             if self.closing && self.asking.is_empty() && self.serving.is_empty() {
                 break;
@@ -622,6 +645,11 @@ impl Owner {
     /// owner's own end is handed back, to be told once it has gone.
     fn shut(&mut self) -> Vec<OneshotSender<()>> {
         let now = self.now();
+        for (_, waiting) in std::mem::take(&mut self.parked) {
+            for frame in waiting {
+                let _ = frame.reply.send(Err(WireError::Connection));
+            }
+        }
         for (_, asking) in std::mem::take(&mut self.asking) {
             if let Some(reply) = asking.reply {
                 let _ = reply.send(Err(Failed {
@@ -686,12 +714,16 @@ impl Owner {
                 kind,
                 body,
                 reply,
-            } => {
-                let queued = self
-                    .lane(peer, epoch, lane, kind, &body)
-                    .map(|()| self.driver.endpoint().path(peer));
-                let _ = reply.send(queued);
-            }
+            } => self.lane(
+                peer,
+                Parked {
+                    epoch,
+                    kind,
+                    body,
+                    reply,
+                },
+                lane,
+            ),
             Command::Disconnect { peer } => {
                 let now = self.now();
                 self.driver.endpoint().disconnect(now, peer);
@@ -1168,6 +1200,8 @@ impl Owner {
             Event::Frame {
                 peer, kind, frame, ..
             } => self.frame(peer, kind, frame),
+            // A lane that refused a frame has room: what waits for it goes now.
+            Event::LaneRoom { .. } => self.flush_parked(),
             Event::Refused {
                 exchange, refusal, ..
             } => {
@@ -1222,34 +1256,100 @@ impl Owner {
         }
     }
 
-    /// Queues a frame on `peer`'s lane on the connection of `epoch`: refused when that connection
-    /// is gone (its lanes' frames went with it, and a frame queued on its successor would be
-    /// taken for one of them) or the lane is full.
-    fn lane(
-        &mut self,
-        peer: PeerId,
-        epoch: Epoch,
-        lane: hyper_transport::LaneId,
-        kind: Kind,
-        body: &[u8],
-    ) -> Result<(), WireError> {
-        let queued = if self.closing || !self.driver.endpoint().connection_live(peer, epoch) {
-            Err(WireError::Connection)
-        } else {
-            self.driver
-                .endpoint()
-                .send_frame(peer, lane, kind, body)
-                .map_err(refused)
-        };
-        match queued {
-            Ok(()) => {
-                self.stats.lane_frames_sent = self.stats.lane_frames_sent.saturating_add(1);
-            }
-            Err(_) => {
-                self.stats.lane_frames_refused = self.stats.lane_frames_refused.saturating_add(1);
+    /// Queues a frame on `peer`'s lane on the connection of its epoch, behind the lane's earlier
+    /// frames, those that wait for room among them: refused when that connection is gone (its
+    /// lanes' frames went with it, and a frame queued on its successor would be taken for one of
+    /// them); held while the lane is full.
+    fn lane(&mut self, peer: PeerId, frame: Parked, lane: hyper_transport::LaneId) {
+        if self.closing || !self.driver.endpoint().connection_live(peer, frame.epoch) {
+            self.lane_refused(frame.reply, WireError::Connection);
+            return;
+        }
+        if self
+            .parked
+            .get(&(peer, lane))
+            .is_some_and(|waiting| !waiting.is_empty())
+        {
+            self.park(peer, lane, frame);
+            return;
+        }
+        match self
+            .driver
+            .endpoint()
+            .send_frame(peer, lane, frame.kind, &frame.body)
+        {
+            Ok(()) => self.lane_queued(peer, frame.reply),
+            Err(Refusal::LaneFull) => self.park(peer, lane, frame),
+            Err(refusal) => self.lane_refused(frame.reply, refused(refusal)),
+        }
+    }
+
+    /// `frame` waits for room on `peer`'s lane, or is refused for the room where as many wait as
+    /// the lane itself holds.
+    fn park(&mut self, peer: PeerId, lane: hyper_transport::LaneId, frame: Parked) {
+        let bound = crate::transport::lane_window(&self.limits);
+        let waiting = self.parked.entry((peer, lane)).or_default();
+        if waiting.len() >= bound || waiting.try_reserve(1).is_err() {
+            self.lane_refused(frame.reply, WireError::Access(AccessError::Capacity));
+            return;
+        }
+        waiting.push_back(frame);
+        self.stats.lane_frames_parked = self.stats.lane_frames_parked.saturating_add(1);
+    }
+
+    /// The frames that wait for room on their lanes, in each lane's order, while it has room;
+    /// those whose connection went, or whose sender stopped waiting, go.
+    fn flush_parked(&mut self) {
+        if self.parked.is_empty() {
+            return;
+        }
+        let mut parked = std::mem::take(&mut self.parked);
+        for ((peer, lane), waiting) in &mut parked {
+            // Each turn one frame leaves, or the lane is full and the rest wait.
+            for _ in 0..waiting.len() {
+                let Some(front) = waiting.front() else {
+                    break;
+                };
+                let outcome = if front.reply.is_closed() {
+                    None
+                } else if self.closing
+                    || !self.driver.endpoint().connection_live(*peer, front.epoch)
+                {
+                    Some(Err(WireError::Connection))
+                } else {
+                    match self
+                        .driver
+                        .endpoint()
+                        .send_frame(*peer, *lane, front.kind, &front.body)
+                    {
+                        Ok(()) => Some(Ok(())),
+                        Err(Refusal::LaneFull) => break,
+                        Err(refusal) => Some(Err(refused(refusal))),
+                    }
+                };
+                let Some(frame) = waiting.pop_front() else {
+                    break;
+                };
+                match outcome {
+                    Some(Ok(())) => self.lane_queued(*peer, frame.reply),
+                    Some(Err(error)) => self.lane_refused(frame.reply, error),
+                    // Its sender gave up waiting: nothing to tell.
+                    None => {}
+                }
             }
         }
-        queued
+        parked.retain(|_, waiting| !waiting.is_empty());
+        self.parked = parked;
+    }
+
+    fn lane_queued(&mut self, peer: PeerId, reply: LaneReply) {
+        self.stats.lane_frames_sent = self.stats.lane_frames_sent.saturating_add(1);
+        let _ = reply.send(Ok(self.driver.endpoint().path(peer)));
+    }
+
+    fn lane_refused(&mut self, reply: LaneReply, error: WireError) {
+        self.stats.lane_frames_refused = self.stats.lane_frames_refused.saturating_add(1);
+        let _ = reply.send(Err(error));
     }
 
     /// A frame from `peer`'s lane: its bytes taken whole and its grant given back, as an answer's

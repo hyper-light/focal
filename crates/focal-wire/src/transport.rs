@@ -118,6 +118,14 @@ pub const BULK_LANE: hyper_transport::LaneId = 1;
 /// A lane's window, in consensus windows: the frames one group may have in flight to the peer,
 /// for a few groups at once.
 const LANE_WINDOW_ROUNDS: usize = 4;
+/// The frames one replication lane queues under `limits` ([`LANE_WINDOW_ROUNDS`] consensus
+/// windows), and the frames that may wait for room on it beside them (`net::owner`).
+pub(crate) fn lane_window(limits: &WireLimits) -> usize {
+    usize::try_from(limits.control_streams)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(LANE_WINDOW_ROUNDS)
+        .max(1)
+}
 
 /// The bounds of an endpoint carrying focal's traffic under `limits`, admitting by `admission`.
 pub fn endpoint_limits(
@@ -168,10 +176,7 @@ pub fn endpoint_limits(
         // the other, so neither waits behind the other. A lane holds the consensus window's
         // frames for each of the groups a connection carries at once, a few times over.
         lanes_per_peer: REPLICATION_LANES,
-        lane_window: usize::try_from(limits.control_streams)
-            .unwrap_or(usize::MAX)
-            .saturating_mul(LANE_WINDOW_ROUNDS)
-            .max(1),
+        lane_window: lane_window(limits),
         // focal's messages are their bodies: a head is refused from its prefix.
         max_head: 0,
         window_ceiling,

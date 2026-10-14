@@ -923,8 +923,9 @@ struct HeldFrame {
 }
 /// What a peer's frame is answered by once it is stepped.
 enum FrameAnswer {
-    /// Its exchange's reply, at the Ready fence.
-    Reply(Pending),
+    /// Its exchange's reply, at the Ready fence: boxed, so a frame that waits from a lane holds
+    /// its charge and no reply's room.
+    Reply(Box<Pending>),
     /// Nothing: a frame from its peer's lane, whose answer is its group's own. Its charge is
     /// held while it waits here, and the owner's period at which it is given up bounds the
     /// wait, as an exchange's deadline does.
@@ -3691,7 +3692,7 @@ impl Owner {
                 // A lane's frame is answered by nothing: its charge goes with it here.
                 if let FrameAnswer::Reply(mut pending) = answer {
                     pending.waiting = WaitingFor::PeerPersistence;
-                    self.queue_pending(pending);
+                    self.queue_pending(*pending);
                 }
                 if lost {
                     self.lost_to(source);
@@ -3833,7 +3834,7 @@ impl Owner {
                     let frame = HeldFrame {
                         source,
                         message,
-                        answer: FrameAnswer::Reply(Pending {
+                        answer: FrameAnswer::Reply(Box::new(Pending {
                             header,
                             response,
                             waiting: WaitingFor::PeerPersistence,
@@ -3841,7 +3842,7 @@ impl Owner {
                             deadline,
                             served: None,
                             _charge: charge,
-                        }),
+                        })),
                     };
                     if let Err(frame) = self.resequencer.hold(source, sequence, frame, until) {
                         frame
@@ -3872,7 +3873,7 @@ impl Owner {
                         frame: HeldFrame {
                             source,
                             message,
-                            answer: FrameAnswer::Reply(Pending {
+                            answer: FrameAnswer::Reply(Box::new(Pending {
                                 header,
                                 response,
                                 waiting: WaitingFor::PeerPersistence,
@@ -3880,7 +3881,7 @@ impl Owner {
                                 deadline,
                                 served: None,
                                 _charge: charge,
-                            }),
+                            })),
                         },
                         ordered,
                         lost,

@@ -136,15 +136,17 @@ pub enum AskQueue {
 impl Limits {
     /// The most events the endpoint holds for its owner at once: [`EXCHANGE_EVENTS`] for every
     /// exchange the table holds, and, for every entry of the peer table (the larger of the
-    /// identity and connection bounds), its one lifecycle event and its lanes' windows of frames.
+    /// identity and connection bounds), its one lifecycle event, its lanes' windows of frames and
+    /// one [`Event::LaneRoom`] a lane.
     /// The queue never holds more (the module's documentation says how).
     pub fn event_bound(&self) -> usize {
         let peers = self.admission.identities.max(self.admission.connections);
         let lanes = usize::try_from(self.lanes_per_peer).unwrap_or(usize::MAX);
         let frames = lanes.saturating_mul(self.lane_window);
+        // A peer's lifecycle event, its lanes' frames, and a room event of each lane to it.
         EXCHANGE_EVENTS
             .saturating_mul(self.exchanges)
-            .saturating_add(peers.saturating_mul(frames.saturating_add(1)))
+            .saturating_add(peers.saturating_mul(frames.saturating_add(lanes).saturating_add(1)))
     }
 
     fn validate(&self) -> Result<(), Refusal> {
@@ -925,6 +927,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             Event::Frame { peer, .. } => {
                 if let Some((key, serial, stream)) = lane {
                     self.frame_polled(peer, (key, serial), stream);
+                }
+            }
+            Event::LaneRoom { .. } => {
+                if let Some((key, serial, stream)) = lane
+                    && let Some(Some(conn)) = self.conns.get_mut(key)
+                    && conn.serial == serial
+                    && let Some(out) = conn
+                        .lanes_out
+                        .iter_mut()
+                        .find(|out| out.stream == Some(stream))
+                {
+                    out.room_waiting = false;
                 }
             }
         }
@@ -3136,6 +3150,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             .get(at)
             .is_none_or(|out| out.queue.len() >= self.limits.lane_window);
         if full {
+            // Said once the lane has room again (`flush_frames`).
+            if let Some(out) = conn.lanes_out.get_mut(at) {
+                out.refused = true;
+            }
             return Err(Refusal::LaneFull);
         }
         let prefix = Prefix::encode(kind, frame, None)?;
@@ -3197,6 +3215,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// Write lane `at`'s frames in order while credit allows; each step writes a frame whole or
     /// stops, so the steps are bounded by the lane's window.
     fn flush_frames(&mut self, conn: &mut Conn<C::Role>, at: usize, stream: StreamId) {
+        let (peer, epoch, key, serial) = (
+            conn.peer.map(|(peer, _)| peer),
+            conn.epoch,
+            conn.key,
+            conn.serial,
+        );
         for _ in 0..self.limits.lane_window {
             let front = conn
                 .lanes_out
@@ -3228,6 +3252,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             out.written = 0;
             if let Some((_, frame)) = out.queue.pop_front() {
                 self.budget.release(frame);
+            }
+            // A lane that refused a frame has room again: its owner is told, once.
+            if out.refused
+                && !out.room_waiting
+                && out.queue.len() < self.limits.lane_window
+                && let Some(peer) = peer
+            {
+                out.refused = false;
+                out.room_waiting = true;
+                self.events.push_back(Waiting {
+                    event: Event::LaneRoom {
+                        peer,
+                        epoch,
+                        lane: out.lane,
+                    },
+                    lane: Some((key, serial, stream)),
+                });
             }
         }
     }

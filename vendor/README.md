@@ -45,7 +45,7 @@ targets; a change to it is made there first and taken here by a new snapshot, ne
 | `hyper-seal` | 0.1.0 | `5007f44a47220c2674d19ecf933f547567f58d77` | 2026-10-13 | Sealing at rest: the log's per-session keys, MACs and tags (hyper-log's sealed log), whole files sealed by STREAM (`sealed_file`), keys wrapped by AES-256-KW and sent to another machine by ML-KEM-1024 |
 | `hyper-timing` | 0.1.0 | `5007f44a47220c2674d19ecf933f547567f58d77` | 2026-10-13 | The election law's draw the core takes its delays from |
 | `hyper-tls` | 0.1.0 | `5007f44a47220c2674d19ecf933f547567f58d77` | 2026-10-13 | TLS for QUIC and TCP (rustls conformed: configuration owned and lent per call, hybrid post-quantum groups between nodes) |
-| `hyper-transport` | 0.1.0 | `5007f44a47220c2674d19ecf933f547567f58d77` | 2026-10-13 | Exchanges over QUIC: admission by identity, lanes, credit and the peer's measured timing (it replaced quinn) |
+| `hyper-transport` | 0.1.0 | `81af6b3cd20525bc60ee905806987060471ac994` | 2026-10-14 | Exchanges over QUIC: admission by identity, lanes, credit and the peer's measured timing (it replaced quinn). At the shared repository's branch `focal-lane-room` (5007f44 and a lane's `LaneRoom` event, which focal's replication lanes wait on) until it is taken into main |
 
 A new snapshot: `git archive <revision> crates/<name>/src crates/<name>/ORIGIN.md
 crates/<name>/README.md LICENSE` from the shared repository into `vendor/<name>`, `SNAPSHOT` set to
