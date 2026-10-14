@@ -689,52 +689,81 @@ Each stage lands on its own, measured:
        - the deadline copies;
        - supersession in the creation plan;
        - claim recovery's quote for a recorded terminal row.
-   - **The immutable payloads off the heap** (as built for events).
-     - **The model, borrowed from Kafka and NATS.** Rows written once and read rarely hold
-       where their bytes are in a log, sixteen bytes and a check over the bytes, instead of the
-       bytes.
+   - **One binding a claim** (in part). A claim's binding (88 bytes) was held five times: its
+     state, its lineage, its scope registry, its acceptance policy and its registration set.
+     - **As built.** The claim keeps the revision it was created at beside its one binding; its
+       creation binding (what its lineage was built for, and what records and checkpoints
+       encode as its lineage's and its registry's owner) is that binding at that revision. The
+       lineage is checked against it by what it carries, its cause and corrections, and the
+       registry's snapshot is taken with it (`ClaimState::scope_snapshot_v1`). Hydration
+       refuses a definition bound to anything but the claim's binding at another revision. The
+       encodings are unchanged. ClaimState 800 → 632 bytes; a claim 3,776 → 3,554 bytes.
+     - **Not yet.** The acceptance policy's claim and issuer are what prove which claim its
+       declarations were checked for, and the registration set tracks its own revision of the
+       binding; taking them out needs the policy split into what the claim holds and what it is
+       checked with, which the claim table makes (about 180 bytes).
+   - **The payloads written once and read rarely off the heap.**
+     - **The model, borrowed from Kafka and NATS.** A claim's events, its content, its creation
+       result and its outcome hold where their bytes are in a log, sixteen or twenty-four bytes,
+       instead of the bytes.
      - **The log.**
-       - Each replica keeps its own log, in segment files under the session's directory,
-         appended without a sync and read by position.
+       - Each replica keeps its own log, in segment files under the session's directory, read
+         by position.
        - It is a cache of what the replica's records and checkpoints hold, so it is emptied
          whenever the replica opens and refilled as they apply.
-     - **Where a row is spilled: where it is built,** encoded on the stack and appended.
-       - A leader's candidate as its events are recorded, a follower's as replay decodes them, a
-         restore's as it hydrates.
-       - Publication stays without I/O.
-       - Every quote and charge is the spilled row's from the start, with nothing on the heap.
-       - Spilling where rows are published would have left a candidate's charges counting
-         bytes it no longer holds.
-     - **Who reads it.** Every reader of an event reads through the log it was spilled to: the
-       outcome expansion, the event index, retirement's derivation and bundles, audits, the
-       completion books, replay's checks, and record and checkpoint encoding. A frozen image's
-       encoder holds a reader with handles of its own.
+       - **Written behind.** An append is a copy into a 64 KiB tail held in memory, charged to
+         the session; the tail is written to its segment a run at a time (when it fills, when
+         the segment seals, before a reader is handed to another thread). The newest payloads,
+         those a candidate's record and the steps after it read, are read from memory.
+       - **Checked.** A reference keeps the payload's CRC-32, and a read that returns other
+         bytes is refused. The log is the replica's own, never a peer's input: the check
+         guards against accident, not adversaries. Measured here: an append 1.4–2.1 µs → 29–132
+         ns, a read 0.4–0.9 → 0.3 µs, the check (BLAKE3's prefix before) 0.1–0.6 µs → 5–43 ns.
+     - **What a spilled row holds.** Its record encoding (a content row its own bytes, whose
+       tail is that encoding): a record or a checkpoint copies the bytes and never decodes
+       them, and a measuring pass counts a spilled row by its length (`Sink::measures`), so a
+       record's size, a checkpoint's and the running total read nothing back. A spilled
+       outcome keeps beside where it is the sequence and event count that seals and
+       retirements walk across many outcomes, in twenty-four bytes, so a row is no wider for it
+       and no walk reads one back. A content row wider than 1 KiB (a long description) stays
+       held, as does any row the log refuses (its bound, an I/O error).
+     - **Where a row is spilled: once every check has read it.** A leader's plan and a replay's
+       record build their rows held, check them (the authored checks, the fingerprint, index
+       derivation, replay's validation), and only then spill their events, contents, creation
+       results and outcomes together (`payloads::spill_changes`), each entry charged as it is
+       spilled. Spilling where rows were built read each back up to five times a creation. A
+       restore spills as it builds. Publication stays without I/O.
+     - **Who reads it.** Every reader of a spilled row reads through the log: exact retries,
+       the outcome expansion, the event index, retirement's derivation and bundles, audits,
+       the completion books, peer and posting checks, replay's checks, reads, and record and
+       checkpoint encoding. A frozen image's encoder, and a read lease, hold a reader with
+       handles of its own.
+     - **Failure is typed, never an absence.** A row that cannot be read back is
+       `NativeError::Payload`: an outcome read returns it rather than none (an exact retry
+       would run again), a retirement refuses (`PayloadUnavailable`), and the session fails
+       closed until reopening rebuilds the log.
      - **Its bounds.**
-       - A segment (64 MiB) is charged to the volume in the ordinary lane before it is made.
+       - A segment (64 MiB, at most 256) is charged to the volume in the ordinary lane before
+         it is made.
        - A log that cannot have one refuses the payload, and the row keeps its bytes. The log
          never takes the completion reserve or the headroom.
        - One that cannot open is tried again, and its refusals are counted
-         (`focal_session_payload_open_refusals_total`).
+         (`focal_session_payload_open_refusals_total`); `focal_session_payload_segments` and
+         `focal_session_payload_bytes` say what it holds.
      - **Collection.**
        - A sealed segment no committed or pending row references is removed once retirements
          let it go, a sweep at most once a segment.
        - A restore sweeps everything the core it replaced spilled.
        - A reader made before a sweep keeps its handles, so its reads finish.
-     - **Measured.** A claim's two events 534 → 192 bytes (their entries alone); a claim
-       4,138 → 3,776 bytes charged.
-     - **Next on it:** a claim's content, its creation result and its outcome.
-       - The content, about 340 bytes, is read where steps are admitted.
-       - The creation result and the outcome, about 300 bytes together, are read on exact
-         retries and by seals.
-       - Each will spill its checkpoint encoding itself, so a checkpoint, a seal or an archive
-         copies the bytes without decoding them, and a row's size needs no read.
+     - **Measured.** A claim's events, content, creation result and outcome 1,481 → 480 bytes
+       (their entries alone); a claim 4,138 → 2,826 bytes charged, its held rows (2,379 bytes)
+       now fewer than their encoding (2,429).
    - **Next on this path.**
-     - **One binding a claim.** A claim's binding (88 bytes) is held five times: its state, its
-       lineage, its scope registry, its acceptance policy and its registration set. The last
-       four can hold none or its revision alone, read from the claim's (about 350 bytes).
-     - **Content, creation results and outcomes in the payload log** (about 650 bytes).
+     - **The claim's own row** (1,104 bytes: its state 632 inline, the acceptance policy's
+       heap, the registration set): its cold parts behind their own allocations, the policy
+       split from its witness.
      - **Leaves of encoded keys:** a key front-coded against its neighbour in its leaf, where a
-       fixed 56-byte packed key now takes each entry (about 340 bytes).
+       fixed 56-byte packed key now takes each entry (about 300 bytes).
      - Then the claim table proper.
    - **The session's share of its allowance, beside the stages.**
      - **Measured first.** The per-session memory gauges (`focal_session_memory_*`,
