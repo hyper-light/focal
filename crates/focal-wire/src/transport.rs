@@ -1144,13 +1144,14 @@ impl QuicRemote {
         self.negotiated
     }
     /// Queues `request`, a replication frame, on lane `lane` of this connection, behind the
-    /// lane's earlier frames: answered by nothing, `Ok` once it is queued. Refused when the
-    /// connection does not speak the laned profile, is gone, or its lane is full.
+    /// lane's earlier frames: answered by nothing, `Ok` once it is queued, with what the path
+    /// measures then. Refused when the connection does not speak the laned profile, is gone, or
+    /// its lane is full.
     pub async fn send_lane(
         &self,
         lane: hyper_transport::LaneId,
         request: &RequestEnvelope,
-    ) -> Result<(), WireError> {
+    ) -> Result<Option<PathFacts>, WireError> {
         if !self.negotiated.laned() || !self.negotiated.accepts_protocol(request.protocol) {
             return Err(WireError::Access(AccessError::UnsupportedProtocol));
         }

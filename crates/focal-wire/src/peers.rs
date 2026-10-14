@@ -1227,7 +1227,15 @@ impl PeerConnectionPool {
                         crate::transport::URGENT_LANE
                     };
                     match remote.send_lane(lane, request).await {
-                        Ok(()) => {
+                        Ok(path) => {
+                            // What the path measures comes with it, as with an answer: the
+                            // window a leader sends its member ahead of its answers follows it
+                            // (27 §11). A frame queued is no evidence its peer answers.
+                            if path.is_some()
+                                && let Ok(mut facts) = slot.facts.lock()
+                            {
+                                *facts = path;
+                            }
                             asked.queued();
                             return Ok(Response::PeerAccepted);
                         }

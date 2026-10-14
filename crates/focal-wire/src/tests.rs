@@ -1588,6 +1588,9 @@ fn a_nodes_replication_goes_on_its_lanes_once_each_and_in_order() {
         assert_eq!(sent.lane_frames_refused, 0, "{sent:?}");
         // No frame was asked as an exchange (the greeting is the connection's own, uncounted).
         assert_eq!(sent.answered, 0, "{sent:?}");
+        // What the path measures came back with the frames, as with answers: a leader's window
+        // to its member follows it (27 §11).
+        assert!(pool.window(2).is_some_and(|window| window > 0));
         // A snapshot is answered once its member took it: asked as an exchange beside the
         // lanes, never queued on one.
         let mut snapshot = request(2_000);

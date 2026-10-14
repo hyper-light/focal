@@ -204,14 +204,15 @@ pub(crate) enum Command {
         reply: OneshotSender<Result<Answer, Failed>>,
     },
     /// Queue `body`, a message of `kind`, on `peer`'s lane `lane` of the connection of `epoch`:
-    /// after the lane's earlier frames, answered by nothing. Told once it is queued, or why not.
+    /// after the lane's earlier frames, answered by nothing. Told once it is queued, with what the
+    /// path to `peer` measures then, as an answer brings it; or why not.
     Lane {
         peer: PeerId,
         epoch: Epoch,
         lane: hyper_transport::LaneId,
         kind: Kind,
         body: Vec<u8>,
-        reply: OneshotSender<Result<(), WireError>>,
+        reply: OneshotSender<Result<Option<PathFacts>, WireError>>,
     },
     /// Close every connection to `peer`.
     Disconnect { peer: PeerId },
@@ -686,7 +687,9 @@ impl Owner {
                 body,
                 reply,
             } => {
-                let queued = self.lane(peer, epoch, lane, kind, &body);
+                let queued = self
+                    .lane(peer, epoch, lane, kind, &body)
+                    .map(|()| self.driver.endpoint().path(peer));
                 let _ = reply.send(queued);
             }
             Command::Disconnect { peer } => {
