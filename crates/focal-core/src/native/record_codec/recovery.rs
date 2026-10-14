@@ -231,6 +231,8 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader> read_evidence::Custody for
 
 struct Shared<'a, 'bytes, C> {
     index: &'a read_index::Index<'bytes>,
+    /// The index keys phase 0 diverts, in key order (doc 31 M3).
+    keys: std::cell::RefCell<Option<focal_memory::KeySetBuilder>>,
     header: checkpoint::CheckpointHeader,
     limits: read_dispatch::Limits,
     meters: &'a Meters,
@@ -385,6 +387,8 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
 /// member.
 pub(super) struct Hydrated {
     rows: RangeStore<crate::native::layout::PackedKey, Row>,
+    /// Every index key, beside the rows (doc 31 M3).
+    index: focal_memory::KeySet,
     meters: Meters,
     allowed: Work,
 }
@@ -397,8 +401,14 @@ impl Hydrated {
         lane: BudgetLane,
     ) -> Result<(ranges::NativeRanges, Envelope), NativeError> {
         let meters = self.meters;
-        let rows =
-            ranges::NativeRanges::from_store(range, layout, self.rows, budget, lane, |row| {
+        let rows = ranges::NativeRanges::from_store(
+            range,
+            layout,
+            self.rows,
+            self.index,
+            budget,
+            lane,
+            |row| {
                 let work = read_dispatch::objects::copy_work(row)
                     .map_err(|_| MemoryError::InvalidConfiguration("native row copy"))?;
                 meters
@@ -406,7 +416,8 @@ impl Hydrated {
                     .charge(work)
                     .map_err(|_| MemoryError::InvalidConfiguration("native row copy work"))?;
                 prepare::copy(row)
-            })?;
+            },
+        )?;
         let used = self.allowed.used(&meters);
         Ok((
             rows,
@@ -432,11 +443,7 @@ pub(super) fn hydrate_frame<'a, F, S, R>(
     schemas: &S,
     lane: BudgetLane,
     work: Work,
-    validate: impl FnOnce(
-        focal_memory::RangeHydrationView<'_, crate::native::layout::PackedKey, Row>,
-        &Meter,
-        &MemoryBudget,
-    ) -> Result<(), NativeError>,
+    validate: impl FnOnce(ranges::HydratedRows<'_>, &Meter, &MemoryBudget) -> Result<(), NativeError>,
 ) -> Result<Hydrated, NativeError>
 where
     F: inspect::RowFrame<'a>,
@@ -474,6 +481,7 @@ where
         .extend(allowed.model.saturating_sub(work.model));
     let shared = Shared {
         index: &index,
+        keys: std::cell::RefCell::new(Some(focal_memory::KeySetBuilder::new(budget, lane)?)),
         header,
         limits: limits.dispatch(),
         meters: &meters,
@@ -481,8 +489,11 @@ where
         custody: &custody,
         failure: Cell::new(None),
     };
-    let expected_entries =
-        usize::try_from(header.rows).map_err(|_| NativeError::Capacity("checkpoint row count"))?;
+    // The index families' rows go to the key sets, not the store.
+    let expected_entries = usize::try_from(header.rows)
+        .map_err(|_| NativeError::Capacity("checkpoint row count"))?
+        .checked_sub(index.indexed)
+        .ok_or(ContractError::InvalidManifest)?;
     let mut owner = RangeStore::begin_hydration_partitioned_in(
         store_id,
         limits.native.range,
@@ -495,11 +506,16 @@ where
         lane,
     )?;
     for phase in 0..read_index::PHASES {
-        let count = *index
+        let mut count = *index
             .counts
             .get(phase)
             .ok_or(ContractError::InvalidManifest)?;
-        if count == 0 {
+        if phase == 0 {
+            count = count
+                .checked_sub(index.indexed)
+                .ok_or(ContractError::InvalidManifest)?;
+        }
+        if count == 0 && !(phase == 0 && index.indexed != 0) {
             continue;
         }
         let scan_work = frame.quote().visits;
@@ -524,9 +540,24 @@ where
             })
             .map_err(|error| shared.error(error))?;
     }
+    let keys = shared
+        .keys
+        .try_borrow_mut()
+        .map_err(|_| MemoryError::InvalidConfiguration("index keys borrowed at a restore's end"))?
+        .take()
+        .ok_or(MemoryError::InvalidConfiguration("index keys taken twice"))?
+        .finish()?;
+    if keys.len() != index.indexed {
+        return Err(ContractError::InvalidManifest.into());
+    }
     let rows = owner
         .finish(header.prefix.0, |view| {
-            validate(view, &meters.model, budget).map_err(|error| shared.refuse(error))
+            validate(
+                ranges::HydratedRows::new(&view, &keys),
+                &meters.model,
+                budget,
+            )
+            .map_err(|error| shared.refuse(error))
         })
         .map_err(|error| shared.error(error))?;
     // All decoder/index/workspace borrows end before exposing the sole owner.
@@ -534,6 +565,7 @@ where
     drop(index);
     Ok(Hydrated {
         rows,
+        index: keys,
         meters,
         allowed,
     })

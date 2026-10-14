@@ -169,6 +169,28 @@ impl<'a, 'bytes, C> Iterator for Sources<'a, 'bytes, C> {
                     return Ok(None);
                 }
                 let key = PackedKey::pack(&row.key)?;
+                if crate::native::ranges::indexed(&key) {
+                    // Its member's key set holds it (doc 31 M3): checked as
+                    // every fixed row is, its key given to the set in order.
+                    read_dispatch::index_row(
+                        &row,
+                        &self.shared.meters.parsing,
+                        &self.shared.meters.model,
+                        self.shared.header.ledger,
+                    )?;
+                    self.shared
+                        .keys
+                        .try_borrow_mut()
+                        .map_err(|_| {
+                            MemoryError::InvalidConfiguration("index keys borrowed twice")
+                        })?
+                        .as_mut()
+                        .ok_or(MemoryError::InvalidConfiguration(
+                            "index keys finished early",
+                        ))?
+                        .push(key.as_bytes())?;
+                    return Ok(None);
+                }
                 Ok(Some(Source {
                     row,
                     key,

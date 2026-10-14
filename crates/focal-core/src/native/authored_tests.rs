@@ -842,63 +842,88 @@ fn measure_time_per_authored_claim() {
 #[ignore = "measurement: run with --ignored --nocapture"]
 fn measure_memory_per_authored_claim_by_family() {
     let mut core = core();
-    const CLAIMS: u128 = 200;
+    const CLAIMS: u128 = 2_000;
+    let before = core.state.budget.stats().used;
     for id in 1..=CLAIMS {
         let prepared = prepare(&core, create(id, vec![proposal(id, 10_000 + id)]), &[]);
         core.publish_native(prepared).unwrap();
     }
+    // What the native engine's budget holds a claim, every structure included: the row
+    // stores' pages and directories, the key sets' blocks, the rows' heap.
+    let charged = core.state.budget.stats().used.saturating_sub(before);
+    println!(
+        "charged {:.0} B a claim ({} claims, the native budget's use)",
+        charged as f64 / CLAIMS as f64,
+        CLAIMS
+    );
     let mut families: std::collections::BTreeMap<String, (usize, usize, usize, usize)> =
         Default::default();
     let entry = std::mem::size_of::<focal_memory::Entry<crate::native::layout::PackedKey, Row>>();
     let ledger = core.state.ledger;
     for item in core.state.rows.entries() {
-        let name = format!("{:?}", item.key);
+        // A key set's key takes its share of its blocks (doc 31 M3), not an entry.
+        let in_set = crate::native::ranges::indexed(
+            &crate::native::layout::PackedKey::pack(&item.key).unwrap(),
+        );
+        let name = format!("{}{:?}", if in_set { "~" } else { "" }, item.key);
         let family = name
             .split(['(', ' ', '{'])
             .next()
             .unwrap_or("?")
             .to_string();
+        let slot_entry = if in_set { 0 } else { entry };
         let encoded = record_codec::checkpoint::row_bytes(item.key, item.value, ledger).unwrap();
         let packed = crate::native::layout::PackedKey::pack(&item.key).unwrap();
         let slot = families.entry(family).or_default();
         slot.0 += 1;
-        slot.1 += item.heap_bytes;
+        slot.1 += item.heap_bytes + slot_entry;
         slot.2 += encoded;
         slot.3 += packed.as_bytes().len();
     }
     let claims = CLAIMS as f64;
-    let mut total_rows = 0;
-    let mut total_heap = 0;
     println!(
-        "entry={entry} B (packed key {} B, Row {} B)",
+        "entry={entry} B (packed key {} B, Row {} B); ~ marks a family a key set holds",
         std::mem::size_of::<crate::native::layout::PackedKey>(),
         std::mem::size_of::<Row>()
     );
     println!(
-        "{:<22} {:>9} {:>12} {:>12} {:>12} {:>10}",
-        "family", "rows/claim", "inline B/cl", "heap B/cl", "encoded B/cl", "key B/row"
+        "{:<22} {:>9} {:>12} {:>12} {:>10}",
+        "family", "rows/claim", "held B/cl", "encoded B/cl", "key B/row"
     );
-    let mut total_encoded = 0;
-    for (family, (rows, heap, encoded, key)) in &families {
+    let (mut total_rows, mut total_held, mut total_encoded) = (0, 0, 0);
+    for (family, (rows, held, encoded, key)) in &families {
         total_rows += rows;
-        total_heap += heap;
+        total_held += held;
         total_encoded += encoded;
         println!(
-            "{family:<22} {:>9.2} {:>12.0} {:>12.0} {:>12.0} {:>10.1}",
+            "{family:<22} {:>9.2} {:>12.0} {:>12.0} {:>10.1}",
             *rows as f64 / claims,
-            (*rows * entry) as f64 / claims,
-            *heap as f64 / claims,
+            *held as f64 / claims,
             *encoded as f64 / claims,
             *key as f64 / *rows as f64
         );
     }
     println!(
-        "{:<22} {:>9.2} {:>12.0} {:>12.0} {:>12.0}",
-        "TOTAL",
+        "{:<22} {:>9.2} {:>12.0} {:>12.0}",
+        "TOTAL (row store)",
         total_rows as f64 / claims,
-        (total_rows * entry) as f64 / claims,
-        total_heap as f64 / claims,
+        total_held as f64 / claims,
         total_encoded as f64 / claims
+    );
+    let sets = core
+        .state
+        .rows
+        .indexes()
+        .iter()
+        .map(|set| set.stats())
+        .fold((0, 0), |(keys, bytes), stats| {
+            (keys + stats.keys, bytes + stats.block_bytes)
+        });
+    println!(
+        "key sets: {:.2} keys a claim, {:.0} block bytes a claim ({:.1} a key)",
+        sets.0 as f64 / claims,
+        sets.1 as f64 / claims,
+        sets.1 as f64 / sets.0.max(1) as f64
     );
 }
 

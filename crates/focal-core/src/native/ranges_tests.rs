@@ -109,9 +109,16 @@ fn one_versus_many_ranges_hold_identical_state_and_serve_identical_reads() {
     assert_eq!(many.native_sequence(), single.native_sequence());
     assert_eq!(many.native_stats().entries, single.native_stats().entries);
     assert_eq!(layout(&many), expected_layout);
-    // Every member holds rows: the write sets were divided among them and
-    // published as one; every member sits at the group's prefix.
-    assert!(many.state.rows.stores.iter().all(|store| !store.is_empty()));
+    // Every member holds rows or index keys: the write sets were divided among
+    // them and published as one; every member sits at the group's prefix.
+    assert!(
+        many.state
+            .rows
+            .stores
+            .iter()
+            .zip(&many.state.rows.indexes)
+            .all(|(store, index)| !store.is_empty() || !index.is_empty())
+    );
     assert!(
         many.state
             .rows

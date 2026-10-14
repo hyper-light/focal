@@ -3,6 +3,10 @@ use crate::native::layout::PackedKey;
 use crate::native::report_tests as fixture;
 use focal_memory::{Entry, RangeHydrationLimits};
 
+fn owner_budget_keys() -> MemoryBudget {
+    MemoryBudget::new(1 << 20, 0).unwrap()
+}
+
 fn with_read<T>(
     budget: &MemoryBudget,
     visits: usize,
@@ -21,9 +25,12 @@ fn with_read<T>(
     )
     .unwrap();
     let meter = read_source::Meter::new(visits);
+    // The view's key set is charged apart from the budget the read is measured against.
+    let keys = focal_memory::KeySet::new(&owner_budget_keys(), BudgetLane::Ordinary).unwrap();
     let mut result = None;
     let owner = detached
         .finish(0, |root| {
+            let root = crate::native::ranges::HydratedRows::new(&root, &keys);
             let read = ValidationRead {
                 root: &root,
                 ledger: fixture::binding(1).ledger,
@@ -175,9 +182,10 @@ fn zero_prefix_rejects_a_fabricated_meta_row_and_discards_detached_state() {
         prepare::copy,
     )
     .unwrap();
+    let keys = focal_memory::KeySet::new(&owner_budget_keys(), BudgetLane::Ordinary).unwrap();
     let result = root.finish(0, |root| {
         let result = validate(
-            root,
+            crate::native::ranges::HydratedRows::new(&root, &keys),
             fixture::binding(1).ledger,
             NativeContentProfile::ProjectionOnly,
             SessionSeq(0),

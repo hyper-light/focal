@@ -93,6 +93,28 @@ fn parse<'a, T>(
     cursor.finish().map_err(evidence::codec)?;
     Ok(value)
 }
+/// Checks a secondary index family's or a due timer's row as a checkpoint
+/// carries it, read as every fixed row is: the unit row its member's key set
+/// holds (doc 31 M3), which a restore gives the set rather than the store.
+pub(super) fn index_row(
+    encoded: &EncodedRow<'_>,
+    parsing: &Meter,
+    model: &Meter,
+    ledger: LedgerId,
+) -> Result<(), NativeError> {
+    debit(model, 16)?;
+    if encoded.deleted() || !crate::native::index_rows::is_index(encoded.key) {
+        return Err(invalid());
+    }
+    let row = parse(encoded.body(), parsing, |c| {
+        read_rows::read_fixed(encoded.key, c, ledger)
+    })?
+    .ok_or_else(invalid)?;
+    if !matches!(row, Row::Index) {
+        return Err(invalid());
+    }
+    Ok(())
+}
 fn quoted(
     heap_bytes: usize,
     workspace_bytes: usize,

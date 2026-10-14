@@ -3,7 +3,6 @@
 //! the checkpoint checksum. All reads and scratch use the enclosing allowance.
 use super::*;
 use crate::native::ranges::KeyedRows as _;
-use focal_memory::RangeHydrationView;
 use focal_memory::{Allocation, BudgetKind, BudgetLane};
 
 #[path = "read_validate_admission.rs"]
@@ -30,7 +29,7 @@ pub(super) fn invalid() -> NativeError {
 }
 
 pub(super) struct ValidationRead<'v, 'r> {
-    pub(super) root: &'v RangeHydrationView<'r, crate::native::layout::PackedKey, Row>,
+    pub(super) root: &'v crate::native::ranges::HydratedRows<'r>,
     pub(super) ledger: LedgerId,
     pub(super) profile: NativeContentProfile,
     pub(super) prefix: SessionSeq,
@@ -264,7 +263,7 @@ impl Counts {
 /// before the caller receives a publishable owner. Prefix zero is empty genesis.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate(
-    root: RangeHydrationView<'_, crate::native::layout::PackedKey, Row>,
+    root: crate::native::ranges::HydratedRows<'_>,
     ledger: LedgerId,
     profile: NativeContentProfile,
     prefix: SessionSeq,

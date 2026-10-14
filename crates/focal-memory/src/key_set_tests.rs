@@ -293,7 +293,6 @@ fn a_publication_short_of_its_funding_poisons_the_set() {
             .reserve(BudgetKind::Pages, BudgetLane::Ordinary, 8)
             .unwrap()
             .commit(),
-        lane: BudgetLane::Ordinary,
     };
     assert!(set.publish(&[KeyEdit::Put(b"a")], &mut short).is_err());
     assert!(set.is_poisoned());

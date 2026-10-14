@@ -64,6 +64,11 @@ pub struct RangeWriteEnvelope {
     /// What a write's sparse candidates stage (doc 30 §9): each touched
     /// member's holds its own group's staging from plan to publication.
     sparse_staging_bytes: usize,
+    /// What a write's index parts hold from plan to publication (doc 31 M3):
+    /// the funding of the key sets beside the stores and their changes'
+    /// vectors. None unless a group keeps key sets
+    /// ([`Self::with_key_set_bytes`]).
+    key_set_bytes: usize,
 }
 
 impl RangeWriteEnvelope {
@@ -81,6 +86,24 @@ impl RangeWriteEnvelope {
         self.additional_retained_bytes = checked_add(self.additional_retained_bytes, bytes)?;
         self.additional_peak_bytes = checked_add(self.additional_peak_bytes, bytes)?;
         Ok(self)
+    }
+    /// The same envelope with `bytes` more retained per write for what the
+    /// key sets beside a group's stores may take and hold (doc 31 M3): the
+    /// sets' blocks are retained once published, and their funding is held
+    /// from plan to publication.
+    pub fn with_key_set_bytes(mut self, bytes: usize) -> Result<Self, MemoryError> {
+        self.key_set_bytes = checked_add(self.key_set_bytes, bytes)?;
+        self.additional_retained_bytes = checked_add(self.additional_retained_bytes, bytes)?;
+        self.additional_peak_bytes = checked_add(self.additional_peak_bytes, bytes)?;
+        Ok(self)
+    }
+    pub fn key_set_bytes(self) -> usize {
+        self.key_set_bytes
+    }
+    /// Checks what a write's index parts hold against what the envelope
+    /// promised them.
+    pub fn check_key_sets(&self, bytes: usize) -> Result<(), MemoryError> {
+        fits(bytes, self.key_set_bytes)
     }
     pub fn max_base_pages(self) -> usize {
         self.max_base_pages
@@ -426,6 +449,7 @@ impl<K, V> RangeStore<K, V> {
             additional_retained_bytes,
             additional_peak_bytes,
             sparse_staging_bytes,
+            key_set_bytes: 0,
         })
     }
 }

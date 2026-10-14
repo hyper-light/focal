@@ -60,7 +60,7 @@ pub use disk::{
 pub use index::StableIndex;
 pub use key_set::{
     FrozenKeySet, KeyEdit, KeyIter, KeySet, KeySetBuilder, KeySetFunding, KeySetStats,
-    MAX_KEY as MAX_SET_KEY, SetKey,
+    MAX_KEY as MAX_SET_KEY, SetEdit, SetKey, WeakKeySet,
 };
 pub use owner::OwnerId;
 pub use range::{

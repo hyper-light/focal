@@ -18,10 +18,10 @@
 //! spend is bounded by its edits alone, whatever the set holds: the bound a write's envelope
 //! promises before the write is planned.
 //!
-//! A publication spends only what its plan reserved ([`KeySet::fund`]): every block, chunk and
-//! mid it makes is charged to that funding, its scratch is covered by what the funding holds while
-//! it runs, and the root's growth comes from a reservation of its own in the set's budget, which
-//! the root's charge absorbs. It checks its edits before it changes anything; past that point a
+//! A publication spends only what its plan reserved ([`KeySet::fund`]), from the write's own
+//! source: every block, chunk and mid it makes is charged to that funding, its scratch is covered
+//! by what the funding holds while it runs, and the root's growth comes from a reservation of its
+//! own, which the root keeps beside its other charges. It checks its edits before it changes anything; past that point a
 //! failure is an invariant broken, and the set is poisoned and refuses every publication after it.
 
 use crate::{
@@ -66,8 +66,11 @@ const CHILD_SLOT: usize = size_of::<Fence>() + size_of::<Arc<Block>>();
 /// A node's fixed charge: its value behind its counts and three allocations (itself and its two
 /// vectors). Every node is the same size whatever its children are.
 const NODE_FIXED: usize = size_of::<Chunk>() + ARC_COUNTS + 3 * ALLOCATOR_OVERHEAD;
-/// A root's fixed charge: its value and its two vectors.
-const ROOT_FIXED: usize = size_of::<Root>() + 2 * ALLOCATOR_OVERHEAD;
+/// A root's fixed charge: its value, its two vectors, and its charges' vector at its least room.
+const ROOT_FIXED: usize = size_of::<Root>() + 3 * ALLOCATOR_OVERHEAD + 4 * size_of::<Allocation>();
+/// What one growth of a root may add beside its slots: a place in its charges' vector, twice
+/// over for the vector's doubling.
+const GROWTH_FIXED: usize = 2 * size_of::<Allocation>();
 
 type Fence = [u8; FENCE];
 /// A child as its parent places it: its first key's fence and the child.
@@ -92,14 +95,6 @@ fn common_prefix(left: &[u8], right: &[u8]) -> usize {
 
 fn broken(what: &'static str) -> MemoryError {
     MemoryError::InvalidConfiguration(what)
-}
-
-fn lane_slot(lane: BudgetLane) -> usize {
-    match lane {
-        BudgetLane::Ordinary => 0,
-        BudgetLane::Completion => 1,
-        BudgetLane::Committed => 2,
-    }
 }
 
 /// A key read from a set, held inline: keys are short.
@@ -182,6 +177,32 @@ impl<'k> KeyEdit<'k> {
         match self {
             Self::Put(key) | Self::Delete(key) => key,
         }
+    }
+}
+
+/// An edit a set publishes, in whatever form its caller holds it: its key, and whether it
+/// deletes the key (a put otherwise).
+pub trait SetEdit {
+    fn edit_key(&self) -> &[u8];
+    fn deletes(&self) -> bool;
+}
+
+impl SetEdit for KeyEdit<'_> {
+    fn edit_key(&self) -> &[u8] {
+        self.key()
+    }
+    fn deletes(&self) -> bool {
+        matches!(self, Self::Delete(_))
+    }
+}
+
+/// A row store's change of a key held as bytes: a put of any value is a put of its key.
+impl<K: AsRef<[u8]>, V> SetEdit for crate::Change<K, V> {
+    fn edit_key(&self) -> &[u8] {
+        self.key().as_ref()
+    }
+    fn deletes(&self) -> bool {
+        matches!(self, crate::Change::Delete(_))
     }
 }
 
@@ -621,28 +642,29 @@ fn last_at_or_before<'a>(
     low.saturating_sub(1)
 }
 
-/// The set's top level: its mids, held by the set alone, its vectors' room charged a lane at a
-/// time as publications grow it.
+/// The set's top level: its mids, held by the set alone, its vectors' room charged as
+/// publications grow it.
 struct Root {
     fences: Vec<Fence>,
     mids: Vec<Arc<Mid>>,
     len: usize,
     /// The room the vectors were charged for, in slots.
     room: usize,
-    /// That room's charges, one a lane, each grown by absorbing a publication's own.
-    charges: [Option<Allocation>; 3],
+    /// That room's charges: the root's own, and each publication's growth, absorbed into one of
+    /// the same budget, kind and lane where one is and kept beside them where none is. One a
+    /// growth at most, and a growth adds a mid, so they are bounded by the mids the root held.
+    charges: Vec<Allocation>,
 }
 
 impl Root {
-    /// A root of `mids`, its room charged from `budget` in `lane`.
-    fn of(
-        mids: &[Seat<Mid>],
-        budget: &MemoryBudget,
-        lane: BudgetLane,
-    ) -> Result<Self, MemoryError> {
-        let charge = budget
-            .reserve(BudgetKind::Pages, lane, root_charge(mids.len())?)?
-            .commit();
+    /// A root of `mids`, its room charged from `source`.
+    fn of(mids: &[Seat<Mid>], source: &mut Source<'_>) -> Result<Self, MemoryError> {
+        let charge = source.take(root_charge(mids.len())?)?;
+        let mut charges = Vec::new();
+        charges
+            .try_reserve_exact(4)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        charges.push(charge);
         let mut fences = Vec::new();
         fences
             .try_reserve_exact(mids.len())
@@ -655,10 +677,6 @@ impl Root {
             fences.push(*first);
             len = checked_add(len, mid.len)?;
             arcs.push(Arc::clone(mid));
-        }
-        let mut charges = [None, None, None];
-        if let Some(slot) = charges.get_mut(lane_slot(lane)) {
-            *slot = Some(charge);
         }
         Ok(Self {
             fences,
@@ -685,7 +703,6 @@ impl Root {
         old: usize,
         seats: Vec<Seat<Mid>>,
         growth: &mut Allocation,
-        lane: BudgetLane,
     ) -> Result<(), MemoryError> {
         let end = checked_add(at, remove)?;
         if end > self.mids.len() {
@@ -709,15 +726,23 @@ impl Root {
                 .try_reserve_exact(more)
                 .map_err(|_| MemoryError::AllocationFailed)?;
             let room = self.fences.capacity().max(self.mids.capacity());
-            let mut grown = growth.split_off(checked_mul(
-                room.checked_sub(self.room)
-                    .ok_or(broken("a root's room shrank as it grew"))?,
-                CHILD_SLOT,
+            let mut grown = growth.split_off(checked_add(
+                checked_mul(
+                    room.checked_sub(self.room)
+                        .ok_or(broken("a root's room shrank as it grew"))?,
+                    CHILD_SLOT,
+                )?,
+                GROWTH_FIXED,
             )?)?;
-            match self.charges.get_mut(lane_slot(lane)) {
-                Some(Some(charge)) => charge.absorb(&mut grown)?,
-                Some(slot) => *slot = Some(grown),
-                None => return Err(broken("a lane passes the root's charges")),
+            if !self
+                .charges
+                .iter_mut()
+                .any(|charge| charge.absorb(&mut grown).is_ok())
+            {
+                self.charges
+                    .try_reserve(1)
+                    .map_err(|_| MemoryError::AllocationFailed)?;
+                self.charges.push(grown);
             }
             self.room = room;
         }
@@ -899,12 +924,35 @@ impl FrozenKeySet {
     }
 }
 
-/// What a publication of a plan's edits may spend: the funding its blocks, chunks, mids and
-/// scratch are charged to, and the root's growth (in the set's own budget).
+/// A frozen image's handle that retains nothing: whoever holds the image itself (a lease
+/// registry) decides how long it lives, and a read through a handle whose image is gone finds
+/// nothing to read.
+#[derive(Clone)]
+pub struct WeakKeySet {
+    root: std::sync::Weak<FrozenRoot>,
+}
+
+impl WeakKeySet {
+    /// The image, while its holder keeps it.
+    pub fn upgrade(&self) -> Option<FrozenKeySet> {
+        self.root.upgrade().map(|root| FrozenKeySet { root })
+    }
+}
+
+impl FrozenKeySet {
+    /// A handle on this image that retains nothing.
+    pub fn downgrade(&self) -> WeakKeySet {
+        WeakKeySet {
+            root: Arc::downgrade(&self.root),
+        }
+    }
+}
+
+/// What a publication of a plan's edits may spend, from the write's own source: the funding its
+/// blocks, chunks, mids and scratch are charged to, and the root's growth.
 pub struct KeySetFunding {
     funding: Allocation,
     growth: Allocation,
-    lane: BudgetLane,
 }
 
 impl KeySetFunding {
@@ -935,7 +983,7 @@ impl KeySet {
     /// An empty set whose root is charged to `budget` in `lane`.
     pub fn new(budget: &MemoryBudget, lane: BudgetLane) -> Result<Self, MemoryError> {
         Ok(Self {
-            root: Root::of(&[], budget, lane)?,
+            root: Root::of(&[], &mut Source::Budget(budget, lane))?,
             budget: budget.clone(),
             poisoned: false,
         })
@@ -993,15 +1041,23 @@ impl KeySet {
     /// The most a publication of `edits` edits may spend beside the root's growth, whatever its
     /// keys, whatever the set holds and whatever frozen images share (`quote_for`).
     pub fn quote(edits: usize) -> Result<usize, MemoryError> {
-        quote_for(edits)
+        quote_for(edits, 1)
     }
-    /// The most a publication of `edits` edits may grow the root by: two mids an edit.
+    /// What `edits` edits divided among `parts` sets' publications may spend beside their roots'
+    /// growth, all together: each part's quote, whatever the division.
+    pub fn quote_parts(edits: usize, parts: usize) -> Result<usize, MemoryError> {
+        quote_for(edits, parts.min(edits))
+    }
+    /// The most a publication of `edits` edits may grow the root by: two mids an edit, and a
+    /// place in its charges an edit (each reshaped mid grows it once at most).
     pub fn growth(edits: usize) -> Result<usize, MemoryError> {
-        checked_mul(checked_mul(2, edits)?, CHILD_SLOT)
+        checked_mul(
+            edits,
+            checked_add(checked_mul(2, CHILD_SLOT)?, GROWTH_FIXED)?,
+        )
     }
-    /// What a publication of `edits` edits may spend, reserved: its quote from `source` in
-    /// `lane` (a write's own budget, within the set's) and the root's growth from the set's
-    /// budget in the same lane.
+    /// What a publication of `edits` edits may spend, reserved from `source` in `lane` (a write's
+    /// own budget, within the set's): its quote and the root's growth.
     pub fn fund(
         &self,
         source: &MemoryBudget,
@@ -1014,49 +1070,25 @@ impl KeySet {
         let funding = source
             .reserve(BudgetKind::Pages, lane, Self::quote(edits)?)?
             .commit();
-        let growth = self
-            .budget
+        let growth = source
             .reserve(BudgetKind::Pages, lane, Self::growth(edits)?)?
             .commit();
-        Ok(KeySetFunding {
-            funding,
-            growth,
-            lane,
-        })
-    }
-    /// [`Self::fund`], the quote split from `input` (a caller's own reservation of it, in the
-    /// set's budget and `lane`), the growth reserved.
-    pub fn fund_from(
-        &self,
-        input: &mut Allocation,
-        lane: BudgetLane,
-        edits: usize,
-    ) -> Result<KeySetFunding, MemoryError> {
-        let funding = input.split_off(Self::quote(edits)?)?;
-        let growth = self
-            .budget
-            .reserve(BudgetKind::Pages, lane, Self::growth(edits)?)?
-            .commit();
-        Ok(KeySetFunding {
-            funding,
-            growth,
-            lane,
-        })
+        Ok(KeySetFunding { funding, growth })
     }
     /// Checks `edits` (strictly ascending keys, deletions of keys the set holds) against the set
     /// as it stands, changing nothing.
-    pub fn check(&self, edits: &[KeyEdit<'_>]) -> Result<(), MemoryError> {
+    pub fn check<E: SetEdit>(&self, edits: &[E]) -> Result<(), MemoryError> {
         self.check_live()?;
         let mut previous: Option<&[u8]> = None;
         for edit in edits {
-            let key = edit.key();
+            let key = edit.edit_key();
             if key.is_empty() || key.len() > MAX_KEY {
                 return Err(broken("a set key must hold 1 to MAX_KEY bytes"));
             }
             if previous.is_some_and(|previous| previous >= key) {
                 return Err(MemoryError::DuplicateKey);
             }
-            if matches!(edit, KeyEdit::Delete(_)) && !self.contains(key) {
+            if edit.deletes() && !self.contains(key) {
                 return Err(MemoryError::MissingKey);
             }
             previous = Some(key);
@@ -1066,9 +1098,9 @@ impl KeySet {
     /// Publishes `edits` (strictly ascending keys), spending `funding` (what [`Self::fund`]
     /// reserved for at least as many edits). Refused, nothing changed, where [`Self::check`]
     /// refuses; a failure past it poisons the set.
-    pub fn publish(
+    pub fn publish<E: SetEdit>(
         &mut self,
-        edits: &[KeyEdit<'_>],
+        edits: &[E],
         funding: &mut KeySetFunding,
     ) -> Result<(), MemoryError> {
         self.check(edits)?;
@@ -1087,27 +1119,26 @@ impl KeySet {
         }
         Ok(())
     }
-    fn apply(
+    fn apply<E: SetEdit>(
         &mut self,
-        edits: &[KeyEdit<'_>],
+        edits: &[E],
         funding: &mut KeySetFunding,
     ) -> Result<(), MemoryError> {
-        let KeySetFunding {
-            funding,
-            growth,
-            lane,
-        } = funding;
-        let lane = *lane;
+        let KeySetFunding { funding, growth } = funding;
         let mut source = Source::Funding(funding);
         let mut encoder = Encoder::new()?;
         let mut join = Encoder::new()?;
         let root = &mut self.root;
         if root.mids.is_empty() {
             // Every edit is a put: a deletion was checked against what the set holds.
-            let blocks = build_blocks(edits.iter().map(KeyEdit::key), &mut encoder, &mut source)?;
+            let blocks = build_blocks(
+                edits.iter().map(SetEdit::edit_key),
+                &mut encoder,
+                &mut source,
+            )?;
             let chunks = group(&blocks, CHUNK_BLOCKS, &mut source)?;
             let mids = group(&chunks, MID_CHUNKS, &mut source)?;
-            return root.splice(0, 0, 0, mids, growth, lane);
+            return root.splice(0, 0, 0, mids, growth);
         }
         // Mids an edit cut or emptied, with the keys each held before, applied from the last so
         // earlier positions stand.
@@ -1118,7 +1149,7 @@ impl KeySet {
             let key = edits
                 .get(start)
                 .ok_or(broken("an edit index passes the edits"))?
-                .key();
+                .edit_key();
             let index = root.view().mid_for(key);
             let end = group_end(
                 edits,
@@ -1167,7 +1198,7 @@ impl KeySet {
             start = end;
         }
         for (index, before, seats) in reshapes.into_iter().rev() {
-            root.splice(index, 1, before, seats, growth, lane)?;
+            root.splice(index, 1, before, seats, growth)?;
         }
         Ok(())
     }
@@ -1207,12 +1238,12 @@ impl KeySet {
         }
         Ok((
             Self {
-                root: Root::of(&below, &self.budget, lane)?,
+                root: Root::of(&below, &mut source)?,
                 budget: self.budget.clone(),
                 poisoned: false,
             },
             Self {
-                root: Root::of(&above, &self.budget, lane)?,
+                root: Root::of(&above, &mut source)?,
                 budget: self.budget.clone(),
                 poisoned: false,
             },
@@ -1240,7 +1271,7 @@ impl KeySet {
             );
         }
         Ok(Self {
-            root: Root::of(&mids, &self.budget, lane)?,
+            root: Root::of(&mids, &mut Source::Budget(&self.budget, lane))?,
             budget: self.budget.clone(),
             poisoned: false,
         })
@@ -1258,10 +1289,11 @@ impl KeySet {
 /// keys, so its blocks are bounded by both. The chunk and the mid an edit lands in are copied
 /// where an image shares them, and cut in two where they pass their bound, each with a slot for
 /// every child the edit adds; and the publication's scratch is held while it runs.
-fn quote_for(edits: usize) -> Result<usize, MemoryError> {
+fn quote_for(edits: usize, parts: usize) -> Result<usize, MemoryError> {
     if edits == 0 {
         return Ok(0);
     }
+    let parts = parts.max(1);
     // Restarts an output may hold: its keys over the interval, and one a block it is cut into.
     const OUTPUT_BLOCKS: usize = 8;
     const REBUILT_RESTARTS: usize = (BLOCK_KEYS + 1).div_ceil(RESTART) + OUTPUT_BLOCKS;
@@ -1284,13 +1316,17 @@ fn quote_for(edits: usize) -> Result<usize, MemoryError> {
     // Scratch: two encoders, and a node's rebuilt lists and the reshapes, each a slot a child
     // and the vectors' allocations.
     const SCRATCH_FIXED: usize = 2 * Encoder::SCRATCH + 8 * ALLOCATOR_OVERHEAD;
+    // Every part holds its own scratch; the edits' slots are divided among them.
     let slots = checked_add(
-        checked_add(CHUNK_BLOCKS, MID_CHUNKS)?,
+        checked_mul(parts, CHUNK_BLOCKS + MID_CHUNKS)?,
         checked_mul(BLOCKS, edits)?,
     )?;
     const SCRATCH_SLOT: usize =
         2 * size_of::<Seat<Block>>() + size_of::<(usize, usize, Vec<Seat<Mid>>)>() + 1;
-    let scratch = checked_add(SCRATCH_FIXED, checked_mul(slots, SCRATCH_SLOT)?)?;
+    let scratch = checked_add(
+        checked_mul(parts, SCRATCH_FIXED)?,
+        checked_mul(slots, SCRATCH_SLOT)?,
+    )?;
     checked_add(checked_mul(edits, PER_EDIT)?, scratch)
 }
 
@@ -1304,12 +1340,12 @@ enum Edited<C> {
 
 /// Where the edits of the child that begins at the current one end: at the first edit at or
 /// after the next child's first key, or at the end.
-fn group_end(edits: &[KeyEdit<'_>], start: usize, next_first: Option<&[u8]>) -> usize {
+fn group_end<E: SetEdit>(edits: &[E], start: usize, next_first: Option<&[u8]>) -> usize {
     let Some(next_first) = next_first else {
         return edits.len();
     };
     let rest = edits.get(start..).unwrap_or(&[]);
-    start.saturating_add(rest.partition_point(|edit| edit.key() < next_first))
+    start.saturating_add(rest.partition_point(|edit| edit.edit_key() < next_first))
 }
 
 /// Groups `children` into nodes of at most `bound` children, evenly.
@@ -1340,16 +1376,12 @@ fn group<C: Child>(
 /// the copy; where each child stood or became one, the node is edited where it stands, and
 /// otherwise replaced by nodes of at most `bound` children of what it became (none where it
 /// emptied).
-fn edit_node<C: Child>(
+fn edit_node<C: Child, E: SetEdit>(
     slot: &mut Arc<Node<C>>,
-    edits: &[KeyEdit<'_>],
+    edits: &[E],
     bound: usize,
     source: &mut Source<'_>,
-    mut edit_child: impl FnMut(
-        &mut Arc<C>,
-        &[KeyEdit<'_>],
-        &mut Source<'_>,
-    ) -> Result<Edited<C>, MemoryError>,
+    mut edit_child: impl FnMut(&mut Arc<C>, &[E], &mut Source<'_>) -> Result<Edited<C>, MemoryError>,
 ) -> Result<Edited<Node<C>>, MemoryError> {
     if Arc::get_mut(slot).is_none() {
         let copy = slot.copy(source)?;
@@ -1363,7 +1395,7 @@ fn edit_node<C: Child>(
         let key = edits
             .get(start)
             .ok_or(broken("an edit index passes the edits"))?
-            .key();
+            .edit_key();
         let index = node.child_for(key);
         let end = group_end(
             edits,
@@ -1445,9 +1477,9 @@ fn edit_node<C: Child>(
 /// edits, a rebuilt block left small joined with a neighbour, the rest shared. Edited where it
 /// stands when the set alone holds it and every rebuilt block became one block that is not
 /// small; otherwise replaced by chunks of its blocks.
-fn edit_chunk(
+fn edit_chunk<E: SetEdit>(
     slot: &mut Arc<Chunk>,
-    edits: &[KeyEdit<'_>],
+    edits: &[E],
     encoder: &mut Encoder,
     join: &mut Encoder,
     source: &mut Source<'_>,
@@ -1466,7 +1498,7 @@ fn edit_chunk(
             let key = edits
                 .get(start)
                 .ok_or(broken("an edit index passes the edits"))?
-                .key();
+                .edit_key();
             let index = chunk.child_for(key);
             let end = group_end(
                 edits,
@@ -1576,14 +1608,14 @@ fn build_blocks<'k>(
 }
 
 /// The keys of a block with edits applied, in order.
-struct Merged<'b, 'e, 'k> {
+struct Merged<'b, 'e, E> {
     cursor: Cursor<'b>,
     held: Option<SetKey>,
-    edits: std::iter::Peekable<std::slice::Iter<'e, KeyEdit<'k>>>,
+    edits: std::iter::Peekable<std::slice::Iter<'e, E>>,
 }
 
-impl<'b, 'e, 'k> Merged<'b, 'e, 'k> {
-    fn new(block: &'b Block, edits: &'e [KeyEdit<'k>]) -> Self {
+impl<'b, 'e, E: SetEdit> Merged<'b, 'e, E> {
+    fn new(block: &'b Block, edits: &'e [E]) -> Self {
         let mut cursor = block.cursor();
         let held = cursor.next_key();
         Self {
@@ -1597,7 +1629,7 @@ impl<'b, 'e, 'k> Merged<'b, 'e, 'k> {
         // Each turn takes a held key or an edit, and returns but where a deletion removes one:
         // the turns are at most the block's keys and its edits.
         loop {
-            match (self.held, self.edits.peek().copied().copied()) {
+            match (self.held, self.edits.peek().copied()) {
                 (None, None) => return Ok(None),
                 (Some(key), None) => {
                     self.held = self.cursor.next_key();
@@ -1605,12 +1637,12 @@ impl<'b, 'e, 'k> Merged<'b, 'e, 'k> {
                 }
                 (None, Some(edit)) => {
                     self.edits.next();
-                    return match edit {
-                        KeyEdit::Put(key) => Ok(Some(SetKey::new(key)?)),
-                        KeyEdit::Delete(_) => Err(MemoryError::MissingKey),
-                    };
+                    if edit.deletes() {
+                        return Err(MemoryError::MissingKey);
+                    }
+                    return Ok(Some(SetKey::new(edit.edit_key())?));
                 }
-                (Some(key), Some(edit)) => match key.as_bytes().cmp(edit.key()) {
+                (Some(key), Some(edit)) => match key.as_bytes().cmp(edit.edit_key()) {
                     Ordering::Less => {
                         self.held = self.cursor.next_key();
                         return Ok(Some(key));
@@ -1618,16 +1650,16 @@ impl<'b, 'e, 'k> Merged<'b, 'e, 'k> {
                     Ordering::Equal => {
                         self.held = self.cursor.next_key();
                         self.edits.next();
-                        if let KeyEdit::Put(_) = edit {
+                        if !edit.deletes() {
                             return Ok(Some(key));
                         }
                     }
                     Ordering::Greater => {
                         self.edits.next();
-                        return match edit {
-                            KeyEdit::Put(put) => Ok(Some(SetKey::new(put)?)),
-                            KeyEdit::Delete(_) => Err(MemoryError::MissingKey),
-                        };
+                        if edit.deletes() {
+                            return Err(MemoryError::MissingKey);
+                        }
+                        return Ok(Some(SetKey::new(edit.edit_key())?));
                     }
                 },
             }
@@ -1684,9 +1716,9 @@ fn scaled(bytes: usize, held: usize, count: usize) -> usize {
 }
 
 /// `block`'s keys with `edits` applied, encoded and cut evenly into blocks appended to `out`.
-fn rebuild_block(
+fn rebuild_block<E: SetEdit>(
     block: &Block,
-    edits: &[KeyEdit<'_>],
+    edits: &[E],
     encoder: &mut Encoder,
     source: &mut Source<'_>,
     out: &mut Vec<Seat<Block>>,
@@ -1701,8 +1733,8 @@ fn rebuild_block(
     let bytes = if held == 0 {
         let mut put_bytes = 0usize;
         for edit in edits {
-            if let KeyEdit::Put(key) = edit {
-                put_bytes = checked_add(put_bytes, checked_add(2, key.len())?)?;
+            if !edit.deletes() {
+                put_bytes = checked_add(put_bytes, checked_add(2, edit.edit_key().len())?)?;
             }
         }
         put_bytes
@@ -1954,8 +1986,9 @@ impl KeySetBuilder {
         }
         self.seal_chunk()?;
         self.seal_mid()?;
+        let root = Root::of(&self.mids, &mut Source::Budget(&self.budget, self.lane))?;
         Ok(KeySet {
-            root: Root::of(&self.mids, &self.budget, self.lane)?,
+            root,
             budget: self.budget,
             poisoned: false,
         })

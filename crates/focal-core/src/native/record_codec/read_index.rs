@@ -50,6 +50,9 @@ pub(super) struct Origin {
 pub(super) struct Index<'a> {
     rows: RangeStore<IndexKey, Value<'a>>,
     pub(super) counts: [usize; PHASES],
+    /// The secondary index families' and due timers' rows, all of phase 0:
+    /// a restore gives them to the key sets, not the store (doc 31 M3).
+    pub(super) indexed: usize,
 }
 fn invalid() -> NativeError {
     ContractError::InvalidManifest.into()
@@ -158,6 +161,7 @@ impl<'a> Index<'a> {
             return Err(NativeError::Capacity("recovery index capacity"));
         }
         let mut counts = [0usize; PHASES];
+        let mut indexed = 0usize;
         let maximum = limits
             .claims
             .checked_add(limits.artifacts)
@@ -175,6 +179,11 @@ impl<'a> Index<'a> {
             *slot = slot
                 .checked_add(1)
                 .ok_or(NativeError::Capacity("recovery phase count"))?;
+            if crate::native::index_rows::is_index(encoded.key) {
+                indexed = indexed
+                    .checked_add(1)
+                    .ok_or(NativeError::Capacity("recovery phase count"))?;
+            }
             let entry = match encoded.key {
                 Key::Claim(id) => Some(Entry::new(
                     IndexKey::Claim(id),
@@ -250,7 +259,11 @@ impl<'a> Index<'a> {
         if rows.len() > maximum {
             return Err(NativeError::Capacity("recovery index size"));
         }
-        Ok(Self { rows, counts })
+        Ok(Self {
+            rows,
+            counts,
+            indexed,
+        })
     }
     pub(super) fn claim(&self, id: ClaimId, meter: &Meter) -> Result<&'a [u8], NativeError> {
         meter.charge(lookup_work()?).map_err(model_error)?;

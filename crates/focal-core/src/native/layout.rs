@@ -673,109 +673,7 @@ impl PackedKey {
     /// every family's fields are read back as they were written (a byte string no key packs to
     /// reads as the end sentinel).
     pub(super) fn unpack(&self) -> Key {
-        let mut reader = Unpacker {
-            bytes: self.as_bytes(),
-        };
-        let affinity = reader.id();
-        let family = reader.u16();
-        let code = u16::from_le_bytes([
-            affinity.get(3).copied().unwrap_or(0),
-            affinity.get(4).copied().unwrap_or(0),
-        ]);
-        match family {
-            0 => Key::IncomingHead(ClaimId(affinity)),
-            1 => Key::IncomingLink(ClaimId(affinity), ClaimId(reader.id())),
-            2 => Key::Monitor(focal_model::MonitorId(affinity)),
-            3 => Key::MonitorHead(ClaimId(affinity)),
-            4 => Key::MonitorLink(ClaimId(affinity), focal_model::MonitorId(reader.id())),
-            5 => Key::MissingResult(reader.result_past_claim(affinity)),
-            6 => Key::Meta,
-            7 => Key::Claim(ClaimId(affinity)),
-            8 => Key::Definition(ValidationId(affinity)),
-            9 => Key::Evaluation(reader.evaluation_past_claim(affinity)),
-            10 => Key::Artifact(ArtifactId(affinity)),
-            11 => Key::ArtifactIdentity(joined(&affinity, &reader.id())),
-            12 => Key::Accepted(reader.result_past_claim(affinity)),
-            13 => Key::DeliveryResult(reader.result_past_claim(affinity)),
-            14 => Key::Receipt(ReceiptId(reader.id())),
-            15 => Key::Cycle(reader.cycle_past_claim(affinity)),
-            16 => Key::RetiredCycleHead(ClaimId(affinity)),
-            17 => Key::RetiredCycle(reader.cycle_past_claim(affinity)),
-            18 => Key::Work(ArtifactId(affinity)),
-            19 => {
-                let cycle = reader.cycle_past_claim(affinity);
-                Key::WorkSlot(cycle, reader.u32())
-            }
-            20 => Key::Diagnostic(ArtifactId(affinity)),
-            21 => Key::Response(TestamentId(affinity)),
-            22 => Key::ResultTestament(TestamentId(affinity)),
-            23 => Key::ClaimResultTestament(ClaimId(affinity)),
-            24 => Key::Outcome(reader.invocation_past_affinity(affinity)),
-            25 => {
-                let sequence = SessionSeq(reader.u64());
-                Key::Event(sequence, reader.u32())
-            }
-            26 => Key::ClaimContent(ClaimId(affinity)),
-            27 => {
-                let kind = reader.u16();
-                Key::ClaimIdentity(kind, joined(&affinity, &reader.id()))
-            }
-            28 => {
-                let kind = reader.u16();
-                Key::DefinitionIdentity(kind, joined(&affinity, &reader.id()))
-            }
-            29 => Key::CreationResult(reader.invocation_past_affinity(affinity)),
-            30 => Key::LegacyTestament(TestamentId(affinity)),
-            31 => Key::LegacyEvidenceSet(focal_model::EvidenceSetId(affinity)),
-            32 => Key::LegacyRun(ValidationId(affinity), reader.u32()),
-            33 => Key::LegacyDefinition(ValidationId(affinity)),
-            34 => Key::ByIssuer(ParticipantId(affinity), ClaimId(reader.id())),
-            35 => Key::BySubject(ParticipantId(affinity), ClaimId(reader.id())),
-            36 => Key::ByStatus(code, ClaimId(reader.id())),
-            37 => Key::ByAction(code, ClaimId(reader.id())),
-            38 => {
-                let mut hash = [0u8; 32];
-                copy_into(&mut hash, 0, affinity.get(5..).unwrap_or(&[]));
-                copy_into(
-                    &mut hash,
-                    SCOPE_HASH_IN_BUCKET,
-                    reader.take(SCOPE_HASH_PAST_BUCKET),
-                );
-                Key::ByScope(code, ContentHash(hash), ClaimId(reader.id()))
-            }
-            39 => {
-                let kind = reader.u16();
-                Key::ByRelation(kind, ClaimId(affinity), ClaimId(reader.id()))
-            }
-            40 => Key::ByProducer(ParticipantId(affinity), ArtifactId(reader.id())),
-            41 | 42 => {
-                let mut hash = [0u8; 32];
-                copy_into(&mut hash, 0, affinity.get(3..).unwrap_or(&[]));
-                copy_into(&mut hash, HASH_IN_BUCKET, reader.take(HASH_PAST_BUCKET));
-                let artifact = ArtifactId(reader.id());
-                if family == 41 {
-                    Key::ByArtifactKind(ContentHash(hash), artifact)
-                } else {
-                    Key::BySchema(ContentHash(hash), artifact)
-                }
-            }
-            43 => Key::ArtifactInput(focal_model::ObjectId(affinity), ArtifactId(reader.id())),
-            44 => Key::ByEvaluator(ParticipantId(affinity), ValidationId(reader.id())),
-            45 => Key::ByVerdict(code, reader.result()),
-            46 => {
-                let sequence = SessionSeq(reader.u64());
-                Key::ByCreated(code, sequence, focal_model::ObjectId(reader.id()))
-            }
-            47 => {
-                let time = reader.u64();
-                Key::DueTimer(time, reader.timer())
-            }
-            48 => Key::ByObject(code, focal_model::ObjectId(reader.id())),
-            49 => Key::Retired(ClaimId(affinity)),
-            50 => Key::Epochs(ParticipantId(reader.id())),
-            51 => Key::Seal(reader.u64()),
-            _ => Key::End,
-        }
+        unpack_bytes(self.as_bytes())
     }
     /// `key` as its bytes, for a lookup: never refused, a wide key's bytes taken from the heap
     /// for as long as the lookup holds them (a validation family's key, past
@@ -783,10 +681,14 @@ impl PackedKey {
     pub(super) fn probe(key: &Key) -> Self {
         let mut packer = Packer::new(key);
         packer.fields(key);
-        let bytes = packer.bytes.get(..packer.len).unwrap_or(&[]);
-        match u8::try_from(packer.len)
+        Self::of_bytes(packer.bytes.get(..packer.len).unwrap_or(&[]))
+    }
+    /// The packed key `bytes` are, held as [`Self::probe`] holds one: what a member's key set
+    /// gives back is the bytes of a key that was packed.
+    pub(super) fn of_bytes(bytes: &[u8]) -> Self {
+        match u8::try_from(bytes.len())
             .ok()
-            .filter(|_| packer.len <= PACKED_INLINE)
+            .filter(|_| bytes.len() <= PACKED_INLINE)
             .and_then(std::num::NonZeroU8::new)
         {
             Some(len) => {
@@ -824,6 +726,118 @@ impl PackedKey {
         let mut affinity = [0u8; 16];
         copy_into(&mut affinity, 0, self.as_bytes().get(..16).unwrap_or(&[]));
         affinity
+    }
+}
+/// The key `bytes` are ([`PackedKey::unpack`]). Total over any bytes: only
+/// [`PackedKey::pack`] makes a packed key, and every family's fields are read back as they were
+/// written (a byte string no key packs to reads as the end sentinel).
+pub(super) fn unpack_bytes(bytes: &[u8]) -> Key {
+    let mut reader = Unpacker { bytes };
+    let affinity = reader.id();
+    let family = reader.u16();
+    let code = u16::from_le_bytes([
+        affinity.get(3).copied().unwrap_or(0),
+        affinity.get(4).copied().unwrap_or(0),
+    ]);
+    match family {
+        0 => Key::IncomingHead(ClaimId(affinity)),
+        1 => Key::IncomingLink(ClaimId(affinity), ClaimId(reader.id())),
+        2 => Key::Monitor(focal_model::MonitorId(affinity)),
+        3 => Key::MonitorHead(ClaimId(affinity)),
+        4 => Key::MonitorLink(ClaimId(affinity), focal_model::MonitorId(reader.id())),
+        5 => Key::MissingResult(reader.result_past_claim(affinity)),
+        6 => Key::Meta,
+        7 => Key::Claim(ClaimId(affinity)),
+        8 => Key::Definition(ValidationId(affinity)),
+        9 => Key::Evaluation(reader.evaluation_past_claim(affinity)),
+        10 => Key::Artifact(ArtifactId(affinity)),
+        11 => Key::ArtifactIdentity(joined(&affinity, &reader.id())),
+        12 => Key::Accepted(reader.result_past_claim(affinity)),
+        13 => Key::DeliveryResult(reader.result_past_claim(affinity)),
+        14 => Key::Receipt(ReceiptId(reader.id())),
+        15 => Key::Cycle(reader.cycle_past_claim(affinity)),
+        16 => Key::RetiredCycleHead(ClaimId(affinity)),
+        17 => Key::RetiredCycle(reader.cycle_past_claim(affinity)),
+        18 => Key::Work(ArtifactId(affinity)),
+        19 => {
+            let cycle = reader.cycle_past_claim(affinity);
+            Key::WorkSlot(cycle, reader.u32())
+        }
+        20 => Key::Diagnostic(ArtifactId(affinity)),
+        21 => Key::Response(TestamentId(affinity)),
+        22 => Key::ResultTestament(TestamentId(affinity)),
+        23 => Key::ClaimResultTestament(ClaimId(affinity)),
+        24 => Key::Outcome(reader.invocation_past_affinity(affinity)),
+        25 => {
+            let sequence = SessionSeq(reader.u64());
+            Key::Event(sequence, reader.u32())
+        }
+        26 => Key::ClaimContent(ClaimId(affinity)),
+        27 => {
+            let kind = reader.u16();
+            Key::ClaimIdentity(kind, joined(&affinity, &reader.id()))
+        }
+        28 => {
+            let kind = reader.u16();
+            Key::DefinitionIdentity(kind, joined(&affinity, &reader.id()))
+        }
+        29 => Key::CreationResult(reader.invocation_past_affinity(affinity)),
+        30 => Key::LegacyTestament(TestamentId(affinity)),
+        31 => Key::LegacyEvidenceSet(focal_model::EvidenceSetId(affinity)),
+        32 => Key::LegacyRun(ValidationId(affinity), reader.u32()),
+        33 => Key::LegacyDefinition(ValidationId(affinity)),
+        34 => Key::ByIssuer(ParticipantId(affinity), ClaimId(reader.id())),
+        35 => Key::BySubject(ParticipantId(affinity), ClaimId(reader.id())),
+        36 => Key::ByStatus(code, ClaimId(reader.id())),
+        37 => Key::ByAction(code, ClaimId(reader.id())),
+        38 => {
+            let mut hash = [0u8; 32];
+            copy_into(&mut hash, 0, affinity.get(5..).unwrap_or(&[]));
+            copy_into(
+                &mut hash,
+                SCOPE_HASH_IN_BUCKET,
+                reader.take(SCOPE_HASH_PAST_BUCKET),
+            );
+            Key::ByScope(code, ContentHash(hash), ClaimId(reader.id()))
+        }
+        39 => {
+            let kind = reader.u16();
+            Key::ByRelation(kind, ClaimId(affinity), ClaimId(reader.id()))
+        }
+        40 => Key::ByProducer(ParticipantId(affinity), ArtifactId(reader.id())),
+        41 | 42 => {
+            let mut hash = [0u8; 32];
+            copy_into(&mut hash, 0, affinity.get(3..).unwrap_or(&[]));
+            copy_into(&mut hash, HASH_IN_BUCKET, reader.take(HASH_PAST_BUCKET));
+            let artifact = ArtifactId(reader.id());
+            if family == 41 {
+                Key::ByArtifactKind(ContentHash(hash), artifact)
+            } else {
+                Key::BySchema(ContentHash(hash), artifact)
+            }
+        }
+        43 => Key::ArtifactInput(focal_model::ObjectId(affinity), ArtifactId(reader.id())),
+        44 => Key::ByEvaluator(ParticipantId(affinity), ValidationId(reader.id())),
+        45 => Key::ByVerdict(code, reader.result()),
+        46 => {
+            let sequence = SessionSeq(reader.u64());
+            Key::ByCreated(code, sequence, focal_model::ObjectId(reader.id()))
+        }
+        47 => {
+            let time = reader.u64();
+            Key::DueTimer(time, reader.timer())
+        }
+        48 => Key::ByObject(code, focal_model::ObjectId(reader.id())),
+        49 => Key::Retired(ClaimId(affinity)),
+        50 => Key::Epochs(ParticipantId(reader.id())),
+        51 => Key::Seal(reader.u64()),
+        _ => Key::End,
+    }
+}
+
+impl AsRef<[u8]> for PackedKey {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 /// The bytes of a scope's content hash its bucket already holds: the bucket's discriminator
