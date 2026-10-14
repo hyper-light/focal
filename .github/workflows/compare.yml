@@ -11,7 +11,8 @@ name: Competitive tail latency
 # measured the disks and not the systems.
 on:
   # A branch named compare/<anything> runs it with the defaults below, which
-  # starts a run without the workflow on the default branch.
+  # starts a run without the workflow on the default branch; one named
+  # compare/deliver-<anything> runs the deliver mode at its own rates.
   push:
     branches: ["compare/**"]
   workflow_dispatch:
@@ -31,6 +32,9 @@ on:
       systems:
         description: "Systems measured, space-separated, on one runner in turn"
         default: "focal kafka nats redis"
+      mode:
+        description: "append (each record stored) or deliver (each also consumed and acknowledged durably, a work queue's message end to end)"
+        default: "append"
 
 permissions:
   contents: read
@@ -111,13 +115,14 @@ jobs:
       - name: Runs
         env:
           NODE_CPUS: "1"
+          MODE: ${{ github.event.inputs.mode || (startsWith(github.ref_name, 'compare/deliver') && 'deliver' || 'append') }}
           # The competitors' images from the repository's registry where the image
           # job copied them (compose.yaml's defaults are the public sources).
           BENCH_LIBRARY: ${{ needs.image.outputs.registry || 'public.ecr.aws/docker/library' }}
           BENCH_KAFKA: ${{ needs.image.outputs.registry && format('{0}/kafka', needs.image.outputs.registry) || 'apache/kafka' }}
         run: |
           for system in ${{ github.event.inputs.systems || 'focal kafka nats redis' }}; do
-            for rate in ${{ github.event.inputs.rates || '100 200 1000 4000' }}; do
+            for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'compare/deliver') && '50 100 200 400' || '100 200 1000 4000') }}; do
               bash tools/compare/compose/run.sh "$system" "$rate" \
                 "${{ github.event.inputs.seconds || '60' }}" \
                 "${{ github.event.inputs.warmup || '15' }}" \
@@ -183,6 +188,32 @@ jobs:
               print("| " + " | ".join(f"{v:,.0f}" if isinstance(v, float) else str(v) for v in row) + " |")
           if legacy_focal:
               print("\nOlder focal reports contain all-attempt latency and whole-phase counts; refusals and warm-up can skew those rows.")
+          # Deliver mode: each message from its intended send time to its consumer's
+          # acknowledgement confirmed (focal: the testament posted; satisfied as well).
+          delivered = []
+          for path in sorted(glob.glob("tools/compare/compose/reports/*-deliver.json")):
+              r = json.load(open(path))
+              d = r.get("deliver")
+              if not d:
+                  continue
+              name = os.path.basename(path)[:-5]
+              if "latency_ns" in r:  # focal-load
+                  h, f = d["handled_latency_ns"], d["satisfied_latency_ns"]
+                  ms = lambda v: v / 1e6
+                  delivered.append((name, r["shape"].get("rate"), d["delivered"], d["undelivered"] + r["refused"] + r["unknown"] + r["abandoned"],
+                                    ms(h["p50"]), ms(h["p99"]), ms(h["p999"]), ms(f["p50"]), ms(f["p99"]), ms(f["p999"]))
+                                   + cpu(path, max(r["lifecycles"], 1))[:2])
+              else:  # focal-compare
+                  ms = lambda v: v / 1e3
+                  delivered.append((name, r["offered_per_second"], d["delivered"], d["undelivered"] + d["failed"],
+                                    ms(d["p50_us"]), ms(d["p99_us"]), ms(d["p999_us"]), "–", "–", "–")
+                                   + cpu(path, max(r["sent"], 1))[:2])
+          if delivered:
+              print("\n### Delivered end to end (deliver mode)\n")
+              print("| run | offered msg/s | delivered | undelivered or failed | acked p50 ms | p99 ms | p99.9 ms | focal satisfied p50 ms | p99 ms | p99.9 ms | busiest node CPU µs/msg | all nodes CPU µs/msg |")
+              print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+              for row in delivered:
+                  print("| " + " | ".join(f"{v:,.1f}" if isinstance(v, float) else str(v) for v in row) + " |")
           PY
       - uses: actions/upload-artifact@v4
         if: always()

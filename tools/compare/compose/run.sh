@@ -7,9 +7,19 @@
 #
 #   run.sh SYSTEM RATE SECONDS WARMUP PAYLOAD OUT
 #   SYSTEM: focal | kafka | nats | redis
+#   MODE (environment): append (default), each record stored; or deliver,
+#   each record also taken by a consumer and acknowledged by it durably, a
+#   work queue's message end to end (focal: its seven-write lifecycle, the
+#   consumer an enrolled client of its own; RATE is messages a second).
 set -euo pipefail
 cd "$(dirname "$0")"
 system="$1"; rate="$2"; seconds="$3"; warmup="$4"; payload="$5"; out="$6"
+mode="${MODE:-append}"
+case "$mode" in
+  append) suffix="" ;;
+  deliver) suffix="-deliver" ;;
+  *) echo "unknown mode $mode" >&2; exit 2 ;;
+esac
 mkdir -p "$out"
 export NATS_SYNC=always KAFKA_FLUSH=1 REDIS_AOF=yes REDIS_FSYNC=always
 dc() { docker compose -f compose.yaml --profile "$system" "$@"; }
@@ -104,7 +114,7 @@ trap cleanup EXIT
 cleanup
 pull_images
 dc up -d
-report="$system-$rate-$payload.json"
+report="$system-$rate-$payload$suffix.json"
 
 case "$system" in
   focal)
@@ -127,11 +137,19 @@ print(w if isinstance(w, str) else bytes(w).hex())')
     callers=16
     connections=16
     inflight=64
+    # Append: every claim targets the node's worker. Deliver: every claim targets the
+    # consumer, a client of its own that completes it.
+    if [ "$mode" = deliver ]; then
+      lifecycle="lifecycle: deliver
+consumer_enrollment: /client/CLIENT.contexts/enrollment-consumer"
+    else
+      lifecycle="worker: \"$worker\""
+    fi
     dc exec -T focal-load sh -c "cat > /reports/shape.yaml" <<EOF
 claims: $total
 transport: enrolled
 enrollment: /client/CLIENT.contexts/enrollment-bench
-worker: "$worker"
+$lifecycle
 profile: authored_v1
 concurrency: $callers
 connections: $connections
@@ -175,7 +193,7 @@ if [ "$system" != focal ]; then
   # The cluster forms its quorum on its own clock: the generator's first
   # connection is asked again until it succeeds, as an operator's client would.
   generate() {
-    dc exec -T generator focal-compare --system "$system" --durable \
+    dc exec -T generator focal-compare --system "$system" --durable --mode "$mode" \
       --endpoints "$endpoints" --rate "$rate" --payload "$payload" \
       --seconds "$seconds" --warmup "$warmup" --out "/reports/$report"
   }

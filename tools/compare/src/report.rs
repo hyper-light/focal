@@ -1,11 +1,12 @@
 //! One run's report: its terms, its percentiles and its counts, as JSON.
-use crate::{Args, CompareError, System, Tally};
+use crate::{Args, CompareError, Mode, System, Tally};
 use hdrhistogram::Histogram;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 pub struct Report {
     system: System,
+    mode: Mode,
     durable: bool,
     offered_per_second: u32,
     payload_bytes: usize,
@@ -25,14 +26,39 @@ pub struct Report {
     p99_us: f64,
     p999_us: f64,
     max_us: f64,
+    /// `deliver`: each record from its intended send time to its consumer's
+    /// acknowledgement confirmed.
+    deliver: Option<Delivery>,
+}
+
+#[derive(Debug, Serialize)]
+struct Delivery {
+    /// Records acknowledged by the consumer whose intended send time falls
+    /// after the warm-up.
+    delivered: u64,
+    /// Records the producers stored that the consumer never acknowledged
+    /// within its drain.
+    undelivered: u64,
+    failed: u64,
+    first_error: Option<String>,
+    p50_us: f64,
+    p99_us: f64,
+    p999_us: f64,
+    max_us: f64,
 }
 
 impl Report {
-    pub fn new(args: &Args, histogram: &Histogram<u64>, tally: &Tally) -> Self {
+    pub fn new(
+        args: &Args,
+        histogram: &Histogram<u64>,
+        tally: &Tally,
+        delivered: Option<&crate::deliver::Delivered>,
+    ) -> Self {
         let micros = |nanos: u64| nanos as f64 / 1_000.0;
         let acknowledged = histogram.len();
         Self {
             system: args.system,
+            mode: args.mode,
             durable: args.durable,
             offered_per_second: args.rate,
             payload_bytes: args.payload,
@@ -51,6 +77,16 @@ impl Report {
             p99_us: micros(histogram.value_at_quantile(0.99)),
             p999_us: micros(histogram.value_at_quantile(0.999)),
             max_us: micros(histogram.max()),
+            deliver: delivered.map(|delivered| Delivery {
+                delivered: delivered.histogram.len(),
+                undelivered: tally.produced.saturating_sub(delivered.acknowledged),
+                failed: delivered.failed,
+                first_error: delivered.first_error.clone(),
+                p50_us: micros(delivered.histogram.value_at_quantile(0.50)),
+                p99_us: micros(delivered.histogram.value_at_quantile(0.99)),
+                p999_us: micros(delivered.histogram.value_at_quantile(0.999)),
+                max_us: micros(delivered.histogram.max()),
+            }),
         }
     }
 

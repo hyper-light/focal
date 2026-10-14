@@ -5,7 +5,7 @@ use crate::{CompareError, System};
 use std::time::Duration;
 
 /// The stream, topic or key space every run writes.
-const NAME: &str = "focal-compare";
+pub const NAME: &str = "focal-compare";
 /// How long setup (creating the stream or topic) may take.
 const SETUP: Duration = Duration::from_secs(30);
 
@@ -19,23 +19,30 @@ pub enum Target {
         /// writes over connections, as applications at volume do.
         connections: Vec<redis::aio::MultiplexedConnection>,
         durable: bool,
+        /// Records appended to a stream a consumer group reads (`deliver`),
+        /// not set as keys.
+        stream: bool,
     },
     /// One request's share of a Redis pool: the connection its sequence
     /// picks.
     RedisLane {
         connection: redis::aio::MultiplexedConnection,
         durable: bool,
+        stream: bool,
     },
 }
 
 impl Target {
     /// `lanes`: the connections a Redis run spreads its writes over, a
     /// parameter of the experiment that every report records.
+    /// `stream`: Redis appends each record to a stream (`deliver`), where it
+    /// otherwise sets it as a key.
     pub async fn connect(
         system: System,
         durable: bool,
         endpoints: &[String],
         lanes: usize,
+        stream: bool,
     ) -> Result<Self, CompareError> {
         let fail = |error: String| CompareError::Target(error);
         match system {
@@ -160,6 +167,7 @@ impl Target {
                 Ok(Self::Redis {
                     connections,
                     durable,
+                    stream,
                 })
             }
         }
@@ -172,6 +180,7 @@ impl Target {
             Self::Redis {
                 connections,
                 durable,
+                stream,
             } => {
                 let index = usize::try_from(sequence)
                     .unwrap_or(0)
@@ -181,6 +190,7 @@ impl Target {
                     Some(connection) => Self::RedisLane {
                         connection: connection.clone(),
                         durable: *durable,
+                        stream: *stream,
                     },
                     None => self.clone(),
                 }
@@ -214,6 +224,38 @@ impl Target {
             Self::RedisLane {
                 mut connection,
                 durable,
+                stream: true,
+            } => {
+                // An entry of the stream the consumer group reads, made durable as a set key is.
+                let mut pipe = redis::pipe();
+                pipe.cmd("XADD")
+                    .arg(NAME)
+                    .arg("*")
+                    .arg("d")
+                    .arg(payload)
+                    .ignore();
+                if durable {
+                    pipe.cmd("WAITAOF").arg(1).arg(2).arg(0);
+                    let ((local, replicas),): ((u64, u64),) = pipe
+                        .query_async(&mut connection)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if local < 1 || replicas < 2 {
+                        return Err(format!(
+                            "WAITAOF answered {local} local, {replicas} replicas"
+                        ));
+                    }
+                    Ok(())
+                } else {
+                    pipe.query_async::<()>(&mut connection)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            }
+            Self::RedisLane {
+                mut connection,
+                durable,
+                stream: false,
             } => {
                 let key = format!("{NAME}:{sequence}");
                 if durable {

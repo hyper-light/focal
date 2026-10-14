@@ -53,7 +53,10 @@ applied() {
 retry 60 applied
 retry 30 f1 activate native
 
-# The generator's client, enrolled over QUIC like every competitor's client.
+# The generator's client, enrolled over QUIC like every competitor's client, and the
+# deliver mode's consumer, a client of its own that completes what the first issues.
 f1 invite client --name bench --output /invite/client.invite
 $DC exec -T focal-load focal --data-dir /client enroll context --invite-file /invite/client.invite bench
+f1 invite client --name consumer --output /invite/consumer.invite
+$DC exec -T focal-load focal --data-dir /client enroll context --invite-file /invite/consumer.invite consumer
 f1 inspect identity

@@ -4,7 +4,10 @@
 //! schedule; each latency counts from the request's intended send time, so a
 //! stall is charged to every request it delays (coordinated omission is
 //! corrected by construction, not after the fact). Results are one JSON
-//! report per run.
+//! report per run. In `deliver` mode each record is also taken by a
+//! consumer and acknowledged durably, and timed from its intended send time
+//! to that acknowledgement (`deliver.rs`).
+mod deliver;
 mod report;
 mod target;
 
@@ -31,6 +34,18 @@ pub enum System {
     Kafka,
     Nats,
     Redis,
+}
+
+/// What becomes of each record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Appended and acknowledged as stored: the durable append alone.
+    #[default]
+    Append,
+    /// Appended, then taken by a consumer and acknowledged by it durably: a
+    /// work queue's message end to end, focal's `deliver` lifecycle.
+    Deliver,
 }
 
 #[derive(Debug, Parser)]
@@ -65,6 +80,10 @@ pub struct Args {
     /// connection it is sent on until the replicas answer).
     #[arg(long, default_value_t = 64)]
     pub lanes: usize,
+    /// What becomes of each record: `append` (stored), or `deliver`
+    /// (consumed and acknowledged as well).
+    #[arg(long, value_enum, default_value_t = Mode::Append)]
+    pub mode: Mode,
     /// Where the JSON report goes.
     #[arg(long)]
     pub out: std::path::PathBuf,
@@ -81,9 +100,29 @@ async fn main() -> Result<(), CompareError> {
             "rate, payload, inflight and seconds must be positive",
         ));
     }
+    let deliver = args.mode == Mode::Deliver;
+    if deliver && args.payload < deliver::HEADER {
+        return Err(CompareError::Argument(
+            "deliver needs a payload of 16 bytes or more",
+        ));
+    }
     let endpoints: Vec<String> = args.endpoints.split(',').map(str::to_owned).collect();
-    let target =
-        target::Target::connect(args.system, args.durable, &endpoints, args.lanes.max(1)).await?;
+    let target = target::Target::connect(
+        args.system,
+        args.durable,
+        &endpoints,
+        args.lanes.max(1),
+        deliver,
+    )
+    .await?;
+    // The consumer is placed before the first record is sent, so it takes every one.
+    let consumer = match args.mode {
+        Mode::Deliver => {
+            Some(deliver::Consumer::connect(args.system, args.durable, &endpoints, &target).await?)
+        }
+        Mode::Append => None,
+    };
+    let (produced, stop) = tokio::sync::watch::channel(None);
     let interval = Duration::from_secs(1)
         .checked_div(args.rate)
         .ok_or(CompareError::Argument("rate"))?;
@@ -99,6 +138,8 @@ async fn main() -> Result<(), CompareError> {
     // request due while it is full is refused, never queued.
     let mut flying = JoinSet::new();
     let started = Instant::now();
+    let consuming = consumer
+        .map(|consumer| tokio::spawn(consumer.run(started, warmup, deliver::Stop::new(stop))));
     let mut next = started;
     // When the schedule closed and when its last answer came: a system that
     // answers long after the window is charged the time it took.
@@ -125,8 +166,15 @@ async fn main() -> Result<(), CompareError> {
                 }
                 tally.sent = tally.sent.saturating_add(1);
                 let target = target.lane(tally.sent);
-                let payload = payload.clone();
+                let mut payload = payload.clone();
                 let sequence = tally.sent;
+                if deliver {
+                    let intended_ns = u64::try_from(
+                        intended.saturating_duration_since(started).as_nanos(),
+                    )
+                    .map_err(|_| CompareError::Argument("schedule"))?;
+                    deliver::stamp(&mut payload, intended_ns, sequence)?;
+                }
                 flying.spawn(async move {
                     let result = target.append(sequence, payload).await;
                     (intended.elapsed(), measured, result)
@@ -136,6 +184,9 @@ async fn main() -> Result<(), CompareError> {
                 let (latency, measured, result) =
                     joined.map_err(|error| CompareError::Target(error.to_string()))?;
                 last_answer = Instant::now();
+                if result.is_ok() {
+                    tally.produced = tally.produced.saturating_add(1);
+                }
                 if measured {
                     tally.record(&mut histogram, latency, result)?;
                 }
@@ -145,13 +196,25 @@ async fn main() -> Result<(), CompareError> {
     tally.drain = closed.map_or(Duration::ZERO, |closed| {
         last_answer.saturating_duration_since(closed)
     });
-    report::Report::new(&args, &histogram, &tally).write(&args.out)
+    // Every record the producers stored is the consumer's to acknowledge before it stops.
+    let _ = produced.send(Some(tally.produced));
+    let delivered = match consuming {
+        Some(consuming) => Some(
+            consuming
+                .await
+                .map_err(|error| CompareError::Target(error.to_string()))??,
+        ),
+        None => None,
+    };
+    report::Report::new(&args, &histogram, &tally, delivered.as_ref()).write(&args.out)
 }
 
 /// What a run counts beside the histogram.
 #[derive(Debug, Default)]
 pub struct Tally {
     pub sent: u64,
+    /// Records stored, the warm-up's included: what a consumer takes.
+    pub produced: u64,
     pub refused: u64,
     pub failed: u64,
     pub clamped: u64,

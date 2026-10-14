@@ -21,6 +21,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 hdrhistogram = { version = "7.6", default-features = false }
+# The NATS consumer's message stream (`deliver`).
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 # One cryptographic provider (F57): aws-lc-rs, never ring.
 async-nats = { version = "0.50", default-features = false, features = ["aws-lc-rs", "jetstream", "server_2_12"] }
 redis = { version = "1.7", default-features = false, features = ["tokio-comp"] }
