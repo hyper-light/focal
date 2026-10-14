@@ -438,6 +438,7 @@ impl Work {
             Self::Diagnostics(..) => "diagnostics",
             Self::Registration(..) => "registration",
             Self::Request(..) => "request",
+            Self::Frame(..) => "frame",
             Self::Probe(..) => "probe",
             Self::Transfer(..) => "transfer",
             Self::Membership(..) => "membership",
@@ -479,6 +480,9 @@ enum Work {
         OneshotSender<Result<ReceiptProbe, AccessError>>,
         Allocation,
     ),
+    /// A peer's frame from its lane (`ReplicaHost::take_frame`): stepped as the same request
+    /// is, answered by nothing but its group's own answer.
+    Frame(Box<VerifiedRequest>, Allocation),
     Transfer(
         u64,
         Option<Box<CheckedTransfer>>,
@@ -915,7 +919,39 @@ enum WaitingFor {
 struct HeldFrame {
     source: u64,
     message: Vec<u8>,
-    pending: Pending,
+    answer: FrameAnswer,
+}
+/// What a peer's frame is answered by once it is stepped.
+enum FrameAnswer {
+    /// Its exchange's reply, at the Ready fence.
+    Reply(Pending),
+    /// Nothing: a frame from its peer's lane, whose answer is its group's own. Its charge is
+    /// held while it waits here, and the owner's period at which it is given up bounds the
+    /// wait, as an exchange's deadline does.
+    Lane { _charge: Allocation, deadline: u64 },
+}
+impl FrameAnswer {
+    fn deadline(&self) -> u64 {
+        match self {
+            Self::Reply(pending) => pending.deadline,
+            Self::Lane { deadline, .. } => *deadline,
+        }
+    }
+    /// Nothing waits for the answer any more: the exchange's asker went.
+    fn abandoned(&self) -> bool {
+        match self {
+            Self::Reply(pending) => pending.response.is_closed(),
+            Self::Lane { .. } => false,
+        }
+    }
+    /// The frame was refused or given up: an exchange is told why; a lane's frame is let go,
+    /// a loss its group finds as it finds any other, counted as a frame its owner dropped.
+    fn refuse(self, response: Response, pace: &crate::pace::TickPeriod) {
+        match self {
+            Self::Reply(pending) => pending.finish(response),
+            Self::Lane { .. } => pace.drop_input(true),
+        }
+    }
 }
 /// A peer's frame due to be stepped while the replica's write was in flight
 /// (`Owner::waiting_frames`). Consensus takes no input until that write is
@@ -1941,7 +1977,50 @@ impl RequestHandler for ReplicaHost {
     fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(self.submit_inner(request.clone(), None, None))
     }
+    fn supports_lane_frames(&self) -> bool {
+        true
+    }
+    /// A peer's frame from its lane, queued for the owner in the peers' frame room beside the
+    /// participants' queue (`TickPeriod::queue_frame`), answered by nothing: no reply's cell, no
+    /// task and no copy of the request wait on it. It is charged its bytes and its place until
+    /// the owner has stepped it, where an exchange's frame was charged twice its bytes (the
+    /// copy its answer waited with) and its reply's.
+    fn take_frame(&self, request: VerifiedRequest) -> Result<(), AccessError> {
+        if !matches!(
+            request.request().operation,
+            Operation::Raft { .. } | Operation::RaftOrdered { .. }
+        ) {
+            return Err(AccessError::InvalidRequest);
+        }
+        let amount = postcard::experimental::serialized_size(request.request())
+            .ok()
+            .and_then(|n| n.checked_add(FRAME_PLACE_BYTES))
+            .and_then(|n| n.checked_add(grouped::FRAME_QUEUE_BYTES))
+            .ok_or(AccessError::Capacity)?;
+        let Ok(charge) = self
+            .budget
+            .reserve(BudgetKind::Pending, BudgetLane::Completion, amount)
+        else {
+            self.pace
+                .refuse_input(true, crate::pace::InputBound::Memory);
+            return Err(AccessError::Capacity);
+        };
+        match self
+            .sender
+            .try_send_frame(Work::Frame(Box::new(request), charge.commit()), &self.pace)
+        {
+            Ok(()) => Ok(()),
+            Err(HostQueueError::Full) => {
+                self.pace.refuse_input(true, crate::pace::InputBound::Queue);
+                Err(AccessError::Capacity)
+            }
+            Err(HostQueueError::Disconnected) => Err(AccessError::Unavailable),
+        }
+    }
 }
+/// What a peer's frame from its lane holds beside its bytes while it waits for its owner: its
+/// verified request's envelope and its place in the owner's queue.
+const FRAME_PLACE_BYTES: usize = 4096;
 impl ReplicaHost {
     pub(crate) async fn submit_with_evidence(
         &self,
@@ -2843,6 +2922,9 @@ impl Owner {
             Work::Request(request, response, charge) => {
                 self.accept_request(request, response, charge)?;
             }
+            Work::Frame(request, charge) => {
+                self.accept_frame(*request, charge)?;
+            }
             Work::Probe(request, response, charge) => {
                 let result = self.probe_receipt(&request).map(|known| ReceiptProbe {
                     known,
@@ -3104,6 +3186,20 @@ impl Owner {
         }
         Ok(())
     }
+    /// A peer's frame from its lane, drained for as a request is (`accept_request`).
+    fn accept_frame(
+        &mut self,
+        verified: VerifiedRequest,
+        charge: Allocation,
+    ) -> Result<(), LedgerError> {
+        self.frame(verified, charge);
+        if self.batching {
+            self.drain_owed = true;
+        } else {
+            self.drain()?;
+        }
+        Ok(())
+    }
     fn accept_activation(
         &mut self,
         call: &ActivateNativeCall,
@@ -3228,8 +3324,8 @@ impl Owner {
         while let Some(waiting) = self.waiting_frames.pop_front() {
             waiting
                 .frame
-                .pending
-                .finish(Response::Error(AccessError::OutcomeUnknown));
+                .answer
+                .refuse(Response::Error(AccessError::OutcomeUnknown), &self.pace);
         }
         while let Some(pending) = self.pending.pop_front() {
             let error = if matches!(
@@ -3397,8 +3493,8 @@ impl Owner {
         let mut gone = Vec::new();
         if self.resequencer.prune(&member, &mut gone).is_ok() {
             for held in gone {
-                held.pending
-                    .finish(Response::Error(AccessError::Unauthorized));
+                held.answer
+                    .refuse(Response::Error(AccessError::Unauthorized), &self.pace);
             }
         }
         let count = self.waiting_frames.len();
@@ -3411,8 +3507,8 @@ impl Owner {
             } else {
                 waiting
                     .frame
-                    .pending
-                    .finish(Response::Error(AccessError::Unauthorized));
+                    .answer
+                    .refuse(Response::Error(AccessError::Unauthorized), &self.pace);
             }
         }
         self.ordered.retain(|peer, _| member(*peer));
@@ -3584,7 +3680,7 @@ impl Owner {
                 HeldFrame {
                     source,
                     message,
-                    mut pending,
+                    answer,
                 },
             ordered,
             lost,
@@ -3592,8 +3688,11 @@ impl Owner {
         match self.session.step_authenticated(source, &message) {
             Ok(stepped) => {
                 self.answered(stepped);
-                pending.waiting = WaitingFor::PeerPersistence;
-                self.queue_pending(pending);
+                // A lane's frame is answered by nothing: its charge goes with it here.
+                if let FrameAnswer::Reply(mut pending) = answer {
+                    pending.waiting = WaitingFor::PeerPersistence;
+                    self.queue_pending(pending);
+                }
                 if lost {
                     self.lost_to(source);
                 }
@@ -3602,7 +3701,80 @@ impl Owner {
                 if ordered {
                     self.lost_to(source);
                 }
-                pending.finish(Response::Error(access(error)));
+                answer.refuse(Response::Error(access(error)), &self.pace);
+            }
+        }
+    }
+    /// A peer's frame from its lane: admitted as one asked as an exchange is
+    /// (`admit_replication`) — stepped now, held for the frame it overtook, or kept for the
+    /// replica's write in flight — and answered by nothing but its group's own answer. One
+    /// refused (not a member, no room) is lost, as a refused exchange's frame is.
+    fn frame(&mut self, verified: VerifiedRequest, charge: Allocation) {
+        let (group, order) = match &verified.request().operation {
+            Operation::Raft { group, .. } => (*group, None),
+            Operation::RaftOrdered {
+                group,
+                epoch,
+                sequence,
+                ..
+            } => (*group, Some((*epoch, *sequence))),
+            _ => return,
+        };
+        match self.admit_replication(&verified, group, order) {
+            Ok(Replication::Stepped(_)) => {}
+            Err(_) => self.pace.drop_input(true),
+            Ok(Replication::Held {
+                source,
+                sequence,
+                until,
+                deadline,
+            }) => {
+                let (_, request) = verified.into_parts();
+                let Operation::RaftOrdered { message, .. } = request.operation else {
+                    return;
+                };
+                let frame = HeldFrame {
+                    source,
+                    message,
+                    answer: FrameAnswer::Lane {
+                        _charge: charge,
+                        deadline,
+                    },
+                };
+                // A lane that holds all it may lets the frame go: lost, as one refused for room.
+                if let Err(frame) = self.resequencer.hold(source, sequence, frame, until) {
+                    frame
+                        .answer
+                        .refuse(Response::Error(AccessError::Capacity), &self.pace);
+                }
+                // A lane that was full let what it held go, this frame with it.
+                self.step_due();
+            }
+            Ok(Replication::Waiting {
+                source,
+                ordered,
+                lost,
+                deadline,
+            }) => {
+                let (_, request) = verified.into_parts();
+                let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+                    request.operation
+                else {
+                    return;
+                };
+                self.frames_waited = self.frames_waited.saturating_add(1);
+                self.waiting_frames.push_back(WaitingFrame {
+                    frame: HeldFrame {
+                        source,
+                        message,
+                        answer: FrameAnswer::Lane {
+                            _charge: charge,
+                            deadline,
+                        },
+                    },
+                    ordered,
+                    lost,
+                });
             }
         }
     }
@@ -3661,7 +3833,7 @@ impl Owner {
                     let frame = HeldFrame {
                         source,
                         message,
-                        pending: Pending {
+                        answer: FrameAnswer::Reply(Pending {
                             header,
                             response,
                             waiting: WaitingFor::PeerPersistence,
@@ -3669,10 +3841,12 @@ impl Owner {
                             deadline,
                             served: None,
                             _charge: charge,
-                        },
+                        }),
                     };
                     if let Err(frame) = self.resequencer.hold(source, sequence, frame, until) {
-                        frame.pending.finish(Response::Error(AccessError::Capacity));
+                        frame
+                            .answer
+                            .refuse(Response::Error(AccessError::Capacity), &self.pace);
                     }
                     // A lane that was full let what it held go, this frame
                     // with it.
@@ -3698,7 +3872,7 @@ impl Owner {
                         frame: HeldFrame {
                             source,
                             message,
-                            pending: Pending {
+                            answer: FrameAnswer::Reply(Pending {
                                 header,
                                 response,
                                 waiting: WaitingFor::PeerPersistence,
@@ -3706,7 +3880,7 @@ impl Owner {
                                 deadline,
                                 served: None,
                                 _charge: charge,
-                            },
+                            }),
                         },
                         ordered,
                         lost,
@@ -5291,7 +5465,7 @@ impl Owner {
             let Some(waiting) = self.waiting_frames.pop_front() else {
                 break;
             };
-            if now < waiting.frame.pending.deadline && !waiting.frame.pending.response.is_closed() {
+            if now < waiting.frame.answer.deadline() && !waiting.frame.answer.abandoned() {
                 self.waiting_frames.push_back(waiting);
                 continue;
             }
@@ -5300,8 +5474,8 @@ impl Owner {
             }
             waiting
                 .frame
-                .pending
-                .finish(Response::Error(AccessError::OutcomeUnknown));
+                .answer
+                .refuse(Response::Error(AccessError::OutcomeUnknown), &self.pace);
         }
     }
 }

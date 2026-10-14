@@ -87,6 +87,21 @@ pub trait RequestHandler: Send + Sync + 'static {
     fn supports_ordered_replication(&self) -> bool {
         false
     }
+    /// The handler takes a peer's replication frames from its lanes, each answered by nothing
+    /// ([`crate::LANED_PROTOCOL_VERSION`], [`Self::take_frame`]): the node's replication
+    /// handlers, which step a frame in its order and answer by Raft alone.
+    fn supports_lane_frames(&self) -> bool {
+        false
+    }
+    /// A replication frame from a peer's lane, verified as the same request is: handed to its
+    /// owner at once, with no task, no reply and nothing that waits for one; its answer is its
+    /// group's own. Refused where the owner has no room for it (`Capacity`), as a frame its
+    /// owner refused when it was asked as an exchange: the frame is lost, and its group asks
+    /// again. A handler that takes no lane frames refuses every one.
+    fn take_frame(&self, request: VerifiedRequest) -> Result<(), AccessError> {
+        let _ = request;
+        Err(AccessError::UnsupportedProtocol)
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a>;
     fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(async move { OwnedResponse::new(self.handle(request).await) })
@@ -122,6 +137,12 @@ impl RequestHandler for std::sync::Arc<dyn RequestHandler> {
     // profile (and the laned one above it) was never negotiated for one.
     fn supports_ordered_replication(&self) -> bool {
         self.as_ref().supports_ordered_replication()
+    }
+    fn supports_lane_frames(&self) -> bool {
+        self.as_ref().supports_lane_frames()
+    }
+    fn take_frame(&self, request: VerifiedRequest) -> Result<(), AccessError> {
+        self.as_ref().take_frame(request)
     }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         self.as_ref().handle(request)

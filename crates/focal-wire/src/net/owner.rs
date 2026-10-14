@@ -100,8 +100,6 @@ pub struct Framed {
     pub negotiated: Option<Negotiated>,
     /// The round trip its connection measures now.
     pub path: Duration,
-    /// When it arrived, on the shard's clock (nanoseconds).
-    pub arrived_ns: u64,
 }
 
 /// What an endpoint serves: its peers' greetings, requests and lane frames. Installed on a
@@ -113,10 +111,11 @@ pub trait Serve: Send + 'static {
     fn capabilities(&self) -> [bool; 5];
     /// The answer to one request, on a task of its own.
     fn serve(&self, request: Served) -> ServeFuture;
-    /// One frame a peer sent on a lane, taken at once: what serves no lanes lets it go (it
-    /// answers no greeting with the laned profile, so no peer sends it one).
-    fn frame(&self, framed: Framed) {
+    /// One frame a peer sent on a lane, taken at once; whether it was. What serves no lanes
+    /// lets it go (it answers no greeting with the laned profile, so no peer sends it one).
+    fn frame(&self, framed: Framed) -> bool {
         let _ = framed;
+        false
     }
 }
 
@@ -163,7 +162,8 @@ pub struct NetStats {
     pub lane_frames_sent: u64,
     pub lane_frames_refused: u64,
     pub lane_frames_received: u64,
-    /// Frames from peers' lanes let go: nothing served them, or their sender is not known.
+    /// Frames from peers' lanes let go: nothing served them, their sender is not known, or what
+    /// serves them refused them (no room, not a node's replication, not verified).
     pub lane_frames_dropped: u64,
     /// Dials started: a route's first, and each after its connection went. A caller that joins a
     /// dial in flight, or finds the route's connection up, starts none.
@@ -1249,16 +1249,14 @@ impl Owner {
         queued
     }
 
-    /// A frame from `peer`'s lane: its bytes copied out and its reservation given back, then
-    /// handed to what serves frames, with what its sender authenticated as.
+    /// A frame from `peer`'s lane: its bytes taken whole and its grant given back, as an answer's
+    /// are, then handed to what serves frames, with what its sender authenticated as.
     fn frame(&mut self, peer: PeerId, kind: Kind, frame: Reservation) {
-        let arrived_ns = hyper_rt::futures::now_ns();
-        let mut body = Vec::new();
-        let copied = body.try_reserve_exact(frame.bytes().len()).is_ok();
-        if copied {
-            body.extend_from_slice(frame.bytes());
-        }
-        self.driver.endpoint().release(frame);
+        let (granted, tag) = (frame.granted(), frame.tag());
+        let body = frame.into_buffer();
+        self.driver
+            .endpoint()
+            .release(Reservation::tagged(granted, Vec::new(), tag));
         let from = self.driver.endpoint().directory().inbound(peer).cloned();
         let sender = match &from {
             Some(Inbound::Data { peer, .. }) => Some(Sender::of(peer.role())),
@@ -1266,9 +1264,7 @@ impl Owner {
         };
         let class = sender
             .and_then(|sender| <super::classes::FocalClasses as Classes>::class_of(kind, sender));
-        let (true, Some(from), Some(class), Some(serve)) =
-            (copied, from, class, self.serve.as_ref())
-        else {
+        let (Some(from), Some(class), Some(serve)) = (from, class, self.serve.as_ref()) else {
             self.stats.lane_frames_dropped = self.stats.lane_frames_dropped.saturating_add(1);
             return;
         };
@@ -1282,16 +1278,19 @@ impl Owner {
             .endpoint()
             .path(peer)
             .map_or(Duration::ZERO, |facts| facts.rtt);
-        serve.frame(Framed {
+        let taken = serve.frame(Framed {
             kind,
             class,
             body,
             from,
             negotiated,
             path,
-            arrived_ns,
         });
-        self.stats.lane_frames_received = self.stats.lane_frames_received.saturating_add(1);
+        if taken {
+            self.stats.lane_frames_received = self.stats.lane_frames_received.saturating_add(1);
+        } else {
+            self.stats.lane_frames_dropped = self.stats.lane_frames_dropped.saturating_add(1);
+        }
     }
 
     fn connected(&mut self, peer: PeerId, _role: Sender, epoch: Epoch) {

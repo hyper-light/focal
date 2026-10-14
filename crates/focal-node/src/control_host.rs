@@ -168,6 +168,9 @@ pub(crate) use local_intent_host::{LocalIntentError, save_local_intent};
 enum Work {
     PersistLocalIntent(Box<LocalIntentWrite>),
     Request(Box<VerifiedRequest>, OneshotSender<Completed>, Allocation),
+    /// A peer's frame from its lane (`ControlHost::take_frame`): stepped as the same request is,
+    /// answered by nothing but its group's own answer.
+    Frame(Box<VerifiedRequest>, Allocation),
     ObserveRoot(
         OneshotSender<Result<RootObservation, ControlFailure>>,
         Allocation,
@@ -339,9 +342,40 @@ enum Turn {
 struct HeldControlFrame {
     source: u64,
     message: Vec<u8>,
-    header: ResponseEnvelope,
-    response: OneshotSender<Completed>,
+    /// Its exchange's header and reply, answered once the drain after its step has run; none
+    /// for a frame from its peer's lane, answered by nothing but its group's own answer.
+    reply: Option<(ResponseEnvelope, OneshotSender<Completed>)>,
     charge: Allocation,
+}
+impl HeldControlFrame {
+    /// The frame was refused: its exchange is told `error`; a lane's frame is let go, a loss its
+    /// group finds as it finds any other, counted as a frame its owner dropped.
+    fn refuse(self, error: AccessError, pace: &TickPeriod) {
+        match self.reply {
+            Some((mut header, response)) => {
+                header.result = Response::Error(error);
+                let _ = response.send(Completed {
+                    response: header,
+                    _input: self.charge,
+                    _output: None,
+                });
+            }
+            None => pace.drop_input(true),
+        }
+    }
+}
+/// What became of a peer's replication frame as it was admitted (`Owner::admit_frame`).
+enum FrameAdmission {
+    /// Stepped, and the drain after it run.
+    Stepped,
+    /// Held for the frame it overtook (27 §12), until the owner's period `until`.
+    Held {
+        source: u64,
+        sequence: u64,
+        until: u64,
+    },
+    /// Kept for the write in flight, in its order; `ordered` where it is an ordered frame.
+    Waits { source: u64, ordered: bool },
 }
 /// The most frames that wait for a write in flight (`waiting_frames`): what
 /// the resequencer may hold, every source's whole window.
@@ -911,6 +945,34 @@ impl ControlHost {
     }
 }
 impl RequestHandler for ControlHost {
+    fn supports_lane_frames(&self) -> bool {
+        true
+    }
+    /// A peer's frame from its lane, queued for the owner on the peers' queue, answered by
+    /// nothing: no reply's cell and no task wait on it, and it is charged its bytes and its place
+    /// until the owner has stepped it.
+    fn take_frame(&self, request: VerifiedRequest) -> Result<(), AccessError> {
+        if !matches!(
+            request.request().operation,
+            Operation::Raft { .. } | Operation::RaftOrdered { .. }
+        ) {
+            return Err(AccessError::InvalidRequest);
+        }
+        let bytes = postcard::experimental::serialized_size(request.request())
+            .ok()
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(AccessError::Capacity)?;
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)
+            .map_err(|_| AccessError::Capacity)?;
+        self.peers
+            .try_send(Work::Frame(Box::new(request), charge.commit()))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => AccessError::Capacity,
+                mpsc::TrySendError::Disconnected(_) => AccessError::Unavailable,
+            })
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
@@ -1265,6 +1327,9 @@ impl<V: AuthorityVerifier> Owner<V> {
                     self.drain()?;
                 }
             }
+            Work::Frame(request, charge) => {
+                self.take_frame(*request, None, charge);
+            }
             Work::Campaign(response) => {
                 let result = self
                     .replica
@@ -1443,13 +1508,7 @@ impl<V: AuthorityVerifier> Owner<V> {
         } else if self.waiting_frames.len() < WAITING_FRAMES {
             self.waiting_frames.push_back(held);
         } else {
-            let mut header = held.header;
-            header.result = Response::Error(AccessError::Capacity);
-            let _ = held.response.send(Completed {
-                response: header,
-                _input: held.charge,
-                _output: None,
-            });
+            held.refuse(AccessError::Capacity, &self.pace);
         }
     }
     /// Step the frames that waited for the write, in the order they came,
@@ -1466,31 +1525,28 @@ impl<V: AuthorityVerifier> Owner<V> {
     /// Step a frame; it is answered once the drain that follows has run
     /// (`answer_stepped`), or refused now as its step was.
     fn step_frame(&mut self, held: HeldControlFrame) {
-        let HeldControlFrame {
-            source,
-            message,
-            mut header,
-            response,
-            charge,
-        } = held;
-        let stepped = self.replica.step_authenticated(source, &message);
-        if let Ok(answer) = stepped {
-            self.acks.stepped(answer, Instant::now());
-        }
-        if stepped.is_ok() && self.stepped.try_reserve(1).is_ok() {
-            self.stepped.push((header, response, charge));
+        let stepped = self.replica.step_authenticated(held.source, &held.message);
+        let Ok(answer) = stepped else {
+            held.refuse(AccessError::Unavailable, &self.pace);
             return;
-        }
-        header.result = Response::Error(if stepped.is_ok() {
-            AccessError::Capacity
+        };
+        self.acks.stepped(answer, Instant::now());
+        let HeldControlFrame { reply, charge, .. } = held;
+        // A lane's frame is answered by nothing: its charge goes with it here.
+        let Some((header, response)) = reply else {
+            return;
+        };
+        if self.stepped.try_reserve(1).is_ok() {
+            self.stepped.push((header, response, charge));
         } else {
-            AccessError::Unavailable
-        });
-        let _ = response.send(Completed {
-            response: header,
-            _input: charge,
-            _output: None,
-        });
+            HeldControlFrame {
+                source: 0,
+                message: Vec::new(),
+                reply: Some((header, response)),
+                charge,
+            }
+            .refuse(AccessError::Capacity, &self.pace);
+        }
     }
     /// Answer the held frames stepped since the last drain: accepted once
     /// the drain ran, unavailable if it failed.
@@ -1508,6 +1564,184 @@ impl<V: AuthorityVerifier> Owner<V> {
             });
         }
     }
+    /// A peer's replication frame, asked as an exchange (`reply`: answered once its step and the
+    /// drain after it have run) or taken from its peer's lane (`None`: answered by nothing but
+    /// its group's own answer): admitted (`admit_frame`), then held for the frame it overtook or
+    /// kept for the write in flight where it was not stepped.
+    fn take_frame(
+        &mut self,
+        verified: VerifiedRequest,
+        reply: Option<(ResponseEnvelope, OneshotSender<Completed>)>,
+        charge: Allocation,
+    ) {
+        let admitted = match self.admit_frame(&verified) {
+            Ok(FrameAdmission::Stepped) => {
+                if let Some((mut header, response)) = reply {
+                    header.result = Response::PeerAccepted;
+                    let _ = response.send(Completed {
+                        response: header,
+                        _input: charge,
+                        _output: None,
+                    });
+                }
+                return;
+            }
+            Ok(kept) => kept,
+            Err(failure) => {
+                let error = if matches!(
+                    failure,
+                    ControlFailure::Unauthorized | ControlFailure::WrongOwner
+                ) {
+                    AccessError::Unauthorized
+                } else {
+                    AccessError::Unavailable
+                };
+                HeldControlFrame {
+                    source: 0,
+                    message: Vec::new(),
+                    reply,
+                    charge,
+                }
+                .refuse(error, &self.pace);
+                return;
+            }
+        };
+        let (_, request) = verified.into_parts();
+        let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
+            request.operation
+        else {
+            HeldControlFrame {
+                source: 0,
+                message: Vec::new(),
+                reply,
+                charge,
+            }
+            .refuse(AccessError::Unavailable, &self.pace);
+            return;
+        };
+        match admitted {
+            FrameAdmission::Held {
+                source,
+                sequence,
+                until,
+            } => {
+                // Held for the frame it overtook: answered once it is stepped and the drain
+                // that follows has run.
+                let frame = HeldControlFrame {
+                    source,
+                    message,
+                    reply,
+                    charge,
+                };
+                if let Err(frame) = self.resequencer.hold(source, sequence, frame, until) {
+                    frame.refuse(AccessError::Capacity, &self.pace);
+                }
+                // A lane that was full let what it held go, this frame with it.
+                self.step_due();
+            }
+            FrameAdmission::Waits { source, ordered } => {
+                self.step_held(HeldControlFrame {
+                    source,
+                    message,
+                    reply,
+                    charge,
+                });
+                // What the resequencer held behind it follows it, in its order.
+                if ordered {
+                    self.step_ready(source);
+                }
+            }
+            FrameAdmission::Stepped => {}
+        }
+        if self.drain().is_err() {
+            self.answer_stepped(false);
+        }
+    }
+    /// Admits a peer's replication frame: its namespace, the root's enrollment of its sender,
+    /// its group and the member it comes from, then its order (27 §12). Stepped now, and the
+    /// drain after it run, unless it is held for the frame it overtook or kept for the write in
+    /// flight, which the caller does with it.
+    fn admit_frame(
+        &mut self,
+        verified: &VerifiedRequest,
+    ) -> Result<FrameAdmission, ControlFailure> {
+        let request = verified.request();
+        if request.ledger != self.config.namespace {
+            return Err(ControlFailure::Unauthorized);
+        }
+        if self.replica.identity().scope == ControlScope::Root
+            && let (PeerRole::Node { node_id }, Some(fingerprint)) = (
+                verified.peer().role(),
+                verified.peer().certificate_fingerprint(),
+            )
+        {
+            // A request can outlive the transport grant that admitted it.
+            // Publish available durable state before checking its enrollment.
+            self.drain().map_err(ControlFailure::from)?;
+            self.authorize_root_peer(RootPeer {
+                node: node_id,
+                principal: verified.peer().principal().0,
+                fingerprint,
+                key: verified.peer().renewal_of(),
+            })?;
+        }
+        let (group, order, message) = match &request.operation {
+            Operation::Raft { group, message } => (*group, None, message),
+            Operation::RaftOrdered {
+                group,
+                epoch,
+                sequence,
+                message,
+            } => (*group, Some((*epoch, *sequence)), message),
+            _ => return Err(ControlFailure::Invalid),
+        };
+        let PeerRole::Node { node_id } = verified.peer().role() else {
+            return Err(ControlFailure::Unauthorized);
+        };
+        if group != self.replica.identity().group || !self.replica.accepts_peer(node_id) {
+            return Err(ControlFailure::Unauthorized);
+        }
+        // A bulk frame is stepped in the order it left its sender
+        // (27 §12): one that overtook the frame before it is held
+        // for it, for its patience at most.
+        if let Some((epoch, sequence)) = order {
+            match self.resequencer.admit(node_id, epoch, sequence) {
+                Err(crate::resequence::Capacity) => return Err(ControlFailure::Capacity),
+                Ok(crate::resequence::Admission::Hold) => {
+                    self.frames_held = self.frames_held.saturating_add(1);
+                    return Ok(FrameAdmission::Held {
+                        source: node_id,
+                        sequence,
+                        until: self.patience_until(verified.path_round_trip()),
+                    });
+                }
+                Ok(crate::resequence::Admission::Stale) => {
+                    self.frames_stale = self.frames_stale.saturating_add(1);
+                }
+                Ok(crate::resequence::Admission::Step) => {}
+            }
+            self.step_due();
+        }
+        // Consensus takes no input while the replica's write or
+        // checkpoint is in flight: the frame waits for it, behind any
+        // that wait already, and is never refused for it.
+        if self.must_wait() {
+            return Ok(FrameAdmission::Waits {
+                source: node_id,
+                ordered: order.is_some(),
+            });
+        }
+        let answer = self
+            .replica
+            .step_authenticated(node_id, message)
+            .map_err(ControlFailure::from)?;
+        self.acks.stepped(answer, Instant::now());
+        if order.is_some() {
+            self.step_ready(node_id);
+        }
+        self.drain().map_err(ControlFailure::from)?;
+        Ok(FrameAdmission::Stepped)
+    }
     fn request(
         &mut self,
         verified: VerifiedRequest,
@@ -1517,25 +1751,24 @@ impl<V: AuthorityVerifier> Owner<V> {
         let header = verified
             .request()
             .reply(Response::Error(AccessError::OutcomeUnknown));
+        // A peer's replication frame is admitted as one from its lane is, and answered once its
+        // step and the drain after it have run.
+        if matches!(
+            verified.request().operation,
+            Operation::Raft { .. } | Operation::RaftOrdered { .. }
+        ) {
+            self.take_frame(verified, Some((header, response)), charge);
+            return;
+        }
         let mut waiting = None;
         let enrollment = matches!(
             verified.request().operation,
             Operation::EnrollmentControl { .. }
         );
-        let mut peer_accepted = false;
-        let mut held: Option<(u64, u64, u64)> = None;
-        let mut waits: Option<(u64, bool)> = None;
-        let peer_rpc = matches!(
-            verified.request().operation,
-            Operation::Raft { .. } | Operation::RaftOrdered { .. }
-        );
         let root_peer = if self.replica.identity().scope == ControlScope::Root
             && matches!(
                 verified.request().operation,
-                Operation::Raft { .. }
-                    | Operation::RaftOrdered { .. }
-                    | Operation::PeerControl { .. }
-                    | Operation::EnrollmentControl { .. }
+                Operation::PeerControl { .. } | Operation::EnrollmentControl { .. }
             ) {
             match (
                 verified.peer().role(),
@@ -1564,64 +1797,6 @@ impl<V: AuthorityVerifier> Owner<V> {
                 // and check again when a queued read completes.
                 self.drain().map_err(ControlFailure::from)?;
                 self.authorize_root_peer(peer)?;
-            }
-            let replication = match &request.operation {
-                Operation::Raft { group, message } => Some((*group, None, message)),
-                Operation::RaftOrdered {
-                    group,
-                    epoch,
-                    sequence,
-                    message,
-                } => Some((*group, Some((*epoch, *sequence)), message)),
-                _ => None,
-            };
-            if let Some((group, order, message)) = replication {
-                let PeerRole::Node { node_id } = verified.peer().role() else {
-                    return Err(ControlFailure::Unauthorized);
-                };
-                if group != self.replica.identity().group || !self.replica.accepts_peer(node_id) {
-                    return Err(ControlFailure::Unauthorized);
-                }
-                // A bulk frame is stepped in the order it left its sender
-                // (27 §12): one that overtook the frame before it is held
-                // for it, for its patience at most.
-                if let Some((epoch, sequence)) = order {
-                    match self.resequencer.admit(node_id, epoch, sequence) {
-                        Err(crate::resequence::Capacity) => return Err(ControlFailure::Capacity),
-                        Ok(crate::resequence::Admission::Hold) => {
-                            self.frames_held = self.frames_held.saturating_add(1);
-                            held = Some((
-                                node_id,
-                                sequence,
-                                self.patience_until(verified.path_round_trip()),
-                            ));
-                            return Err(ControlFailure::Invalid);
-                        }
-                        Ok(crate::resequence::Admission::Stale) => {
-                            self.frames_stale = self.frames_stale.saturating_add(1);
-                        }
-                        Ok(crate::resequence::Admission::Step) => {}
-                    }
-                    self.step_due();
-                }
-                // Consensus takes no input while the replica's write or
-                // checkpoint is in flight: the frame waits for it, behind any
-                // that wait already, and is never refused for it.
-                if self.must_wait() {
-                    waits = Some((node_id, order.is_some()));
-                    return Err(ControlFailure::Invalid);
-                }
-                let answer = self
-                    .replica
-                    .step_authenticated(node_id, message)
-                    .map_err(ControlFailure::from)?;
-                self.acks.stepped(answer, Instant::now());
-                if order.is_some() {
-                    self.step_ready(node_id);
-                }
-                self.drain().map_err(ControlFailure::from)?;
-                peer_accepted = true;
-                return Err(ControlFailure::Invalid);
             }
             let contact = matches!(request.operation, Operation::NodeContact { .. });
             let placement = matches!(request.operation, Operation::PlacementControl { .. });
@@ -1835,102 +2010,6 @@ impl<V: AuthorityVerifier> Owner<V> {
                 }
             }
         })();
-        if let Some((source, ordered)) = waits {
-            let (_, request) = verified.into_parts();
-            let (Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. }) =
-                request.operation
-            else {
-                let mut header = header;
-                header.result = Response::Error(AccessError::Unavailable);
-                let _ = response.send(Completed {
-                    response: header,
-                    _input: charge,
-                    _output: None,
-                });
-                return;
-            };
-            self.step_held(HeldControlFrame {
-                source,
-                message,
-                header,
-                response,
-                charge,
-            });
-            // What the resequencer held behind it follows it, in its order.
-            if ordered {
-                self.step_ready(source);
-            }
-            if self.drain().is_err() {
-                self.answer_stepped(false);
-            }
-            return;
-        }
-        if let Some((source, sequence, until)) = held {
-            // Held for the frame it overtook: answered once it is stepped
-            // and the drain that follows has run.
-            let (_, request) = verified.into_parts();
-            let Operation::RaftOrdered { message, .. } = request.operation else {
-                let mut header = header;
-                header.result = Response::Error(AccessError::Unavailable);
-                let _ = response.send(Completed {
-                    response: header,
-                    _input: charge,
-                    _output: None,
-                });
-                return;
-            };
-            let frame = HeldControlFrame {
-                source,
-                message,
-                header,
-                response,
-                charge,
-            };
-            if let Err(frame) = self.resequencer.hold(source, sequence, frame, until) {
-                let mut header = frame.header;
-                header.result = Response::Error(AccessError::Capacity);
-                let _ = frame.response.send(Completed {
-                    response: header,
-                    _input: frame.charge,
-                    _output: None,
-                });
-            }
-            // A lane that was full let what it held go, this frame with it.
-            self.step_due();
-            if self.drain().is_err() {
-                self.answer_stepped(false);
-            }
-            return;
-        }
-        if peer_accepted {
-            let mut header = header;
-            header.result = Response::PeerAccepted;
-            let _ = response.send(Completed {
-                response: header,
-                _input: charge,
-                _output: None,
-            });
-            return;
-        }
-        if peer_rpc {
-            let mut header = header;
-            header.result = Response::Error(
-                if matches!(
-                    result,
-                    Err(ControlFailure::Unauthorized | ControlFailure::WrongOwner)
-                ) {
-                    AccessError::Unauthorized
-                } else {
-                    AccessError::Unavailable
-                },
-            );
-            let _ = response.send(Completed {
-                response: header,
-                _input: charge,
-                _output: None,
-            });
-            return;
-        }
         let deadline = self.request_deadline();
         if let (Some(waiting), Some(deadline)) = (waiting, deadline) {
             self.pending.push_back(Pending {
@@ -1999,13 +2078,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                 self.waiting_frames.push_back(frame);
                 continue;
             }
-            let mut header = frame.header;
-            header.result = Response::Error(AccessError::Unauthorized);
-            let _ = frame.response.send(Completed {
-                response: header,
-                _input: frame.charge,
-                _output: None,
-            });
+            frame.refuse(AccessError::Unauthorized, &self.pace);
         }
         let mut gone = Vec::new();
         if self
@@ -2014,13 +2087,7 @@ impl<V: AuthorityVerifier> Owner<V> {
             .is_ok()
         {
             for frame in gone {
-                let mut header = frame.header;
-                header.result = Response::Error(AccessError::Unauthorized);
-                let _ = frame.response.send(Completed {
-                    response: header,
-                    _input: frame.charge,
-                    _output: None,
-                });
+                frame.refuse(AccessError::Unauthorized, &self.pace);
             }
         }
         self.ordered

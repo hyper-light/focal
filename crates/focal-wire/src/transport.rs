@@ -675,25 +675,26 @@ impl<H: RequestHandler + Clone> DataService<H> {
     }
     /// A replication frame from a peer's lane: checked as the same request is — its kind the
     /// operation's, its class the one its sender's role carries it in, its profile negotiated, its
-    /// sender authenticated by the grant current now — then dispatched as that request, on a task
-    /// of its own, its answer let go: a lane's frame is answered by nothing. Only a node's
-    /// replication may come on a lane; anything else is let go.
-    pub fn take_frame(&self, framed: Framed) {
+    /// sender authenticated by the grant current now, the request verified — then handed to the
+    /// handler at once ([`RequestHandler::take_frame`]): no task, no reply, nothing that waits for
+    /// one. Only a node's replication may come on a lane; anything else is let go. Whether the
+    /// handler took it.
+    pub fn take_frame(&self, framed: Framed) -> bool {
         let Inbound::Data {
             fingerprint,
             peer: authenticated,
         } = framed.from
         else {
-            return;
+            return false;
         };
         let (Kind::Operation(tag), Some(negotiated)) = (framed.kind, framed.negotiated) else {
-            return;
+            return false;
         };
         if !negotiated.laned() || !matches!(Sender::of(authenticated.role()), Sender::Node) {
-            return;
+            return false;
         }
         let Ok(request) = decode_payload::<RequestEnvelope>(&framed.body) else {
-            return;
+            return false;
         };
         let carried = FocalClasses::class_of(
             Kind::Operation(request.operation.registered_tag()),
@@ -707,21 +708,20 @@ impl<H: RequestHandler + Clone> DataService<H> {
             )
             || !negotiated.accepts_protocol(request.protocol)
         {
-            return;
+            return false;
         }
         let Ok(peer) = self.registry.authenticate(fingerprint) else {
-            return;
+            return false;
         };
         let mut limits = self.limits.clone();
         limits.max_frame_bytes = negotiated.max_frame_bytes;
         limits.max_items = negotiated.max_items;
-        let handler = self.handler.clone();
-        let arrived = (framed.path, framed.arrived_ns);
-        // A shard with no task left for it loses the frame, as a peer's frame refused for room
-        // is lost: its group asks again.
-        let _ = hyper_rt::futures::spawn_detached(async move {
-            let _ = dispatch_accounted_by(&handler, peer, request, &limits, arrived).await;
-        });
+        let Ok(verified) = crate::verify_request(peer, request, &limits) else {
+            return false;
+        };
+        self.handler
+            .take_frame(verified.with_path(framed.path))
+            .is_ok()
     }
     /// The answer to `served`, a request of the data protocol: `None` resets the exchange.
     pub fn answer(&self, served: Served) -> ServeFuture {
@@ -778,22 +778,22 @@ impl<H: RequestHandler + Clone> DataService<H> {
 }
 impl<H: RequestHandler + Clone> Serve for DataService<H> {
     fn capabilities(&self) -> [bool; 5] {
-        // A handler that steps a peer's frames in the order they left it takes them from its
-        // lanes as well: a lane's frame is dispatched as the same request would be.
+        // Lanes carry frames that left in order and are stepped in it: only a handler that takes
+        // the ordered profile is offered them.
         let ordered = self.handler.supports_ordered_replication();
         [
             self.handler.supports_managed_requests(),
             self.handler.supports_participant_requests(),
             self.handler.supports_native_requests(),
             ordered,
-            ordered,
+            ordered && self.handler.supports_lane_frames(),
         ]
     }
     fn serve(&self, request: Served) -> ServeFuture {
         self.answer(request)
     }
-    fn frame(&self, framed: Framed) {
-        self.take_frame(framed);
+    fn frame(&self, framed: Framed) -> bool {
+        self.take_frame(framed)
     }
 }
 

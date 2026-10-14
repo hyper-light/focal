@@ -1478,7 +1478,20 @@ impl RequestHandler for Recorded {
     fn supports_ordered_replication(&self) -> bool {
         true
     }
+    fn supports_lane_frames(&self) -> bool {
+        true
+    }
+    fn take_frame(&self, request: VerifiedRequest) -> Result<(), AccessError> {
+        self.record(&request);
+        Ok(())
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
+        self.record(request);
+        Box::pin(async move { request.request().reply(Response::PeerAccepted) })
+    }
+}
+impl Recorded {
+    fn record(&self, request: &VerifiedRequest) {
         let message = match &request.request().operation {
             Operation::Raft { message, .. } | Operation::RaftOrdered { message, .. } => {
                 message.clone()
@@ -1489,7 +1502,6 @@ impl RequestHandler for Recorded {
             .lock()
             .unwrap()
             .push((request.request().operation.registered_tag(), message));
-        Box::pin(async move { request.request().reply(Response::PeerAccepted) })
     }
 }
 
@@ -1593,6 +1605,89 @@ fn a_nodes_replication_goes_on_its_lanes_once_each_and_in_order() {
         assert_eq!(sent.answered, 1, "{sent:?}");
         assert_eq!(sent.lane_frames_sent, u64::from(FRAMES), "{sent:?}");
         assert_eq!(handler.seen.lock().unwrap().len(), usize::from(FRAMES) + 1);
+        server.close().unwrap();
+        task.join().await.unwrap();
+    })
+    .unwrap()
+}
+
+/// A lane frame its handler refuses (its owner has no room) is let go and counted dropped,
+/// never received: nothing answers it, and the sender hears only that it was queued.
+#[test]
+fn a_lane_frame_its_handler_refuses_is_counted_dropped() {
+    #[derive(Clone, Default)]
+    struct Refusing;
+    impl RequestHandler for Refusing {
+        fn supports_managed_requests(&self) -> bool {
+            true
+        }
+        fn supports_participant_requests(&self) -> bool {
+            true
+        }
+        fn supports_native_requests(&self) -> bool {
+            true
+        }
+        fn supports_ordered_replication(&self) -> bool {
+            true
+        }
+        fn supports_lane_frames(&self) -> bool {
+            true
+        }
+        fn take_frame(&self, _request: VerifiedRequest) -> Result<(), AccessError> {
+            Err(AccessError::Capacity)
+        }
+        fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
+            Box::pin(async move { request.request().reply(Response::PeerAccepted) })
+        }
+    }
+    focal_rt::block_on(async move {
+        use std::collections::BTreeMap;
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        let mut node_grant = grant();
+        node_grant.role = PeerRole::Node { node_id: 7 };
+        registry
+            .register_certificate(&certificate, node_grant)
+            .unwrap();
+        let (server, task) = server(&pki, registry, Arc::new(Refusing)).await;
+        let pool = PeerConnectionPool::new(
+            node_connector(&pki, certificate, key),
+            PeerPoolLimits {
+                retry_backoff: Duration::ZERO,
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap();
+        pool.replace_routes(
+            1,
+            BTreeMap::from([(
+                2,
+                PeerEndpoint {
+                    address: server.local_addr().unwrap(),
+                    server_name: "localhost".into(),
+                    name: None,
+                },
+            )]),
+        )
+        .unwrap();
+        for index in 0..3u8 {
+            let mut packet = request(3_000 + u128::from(index));
+            packet.operation = Operation::Raft {
+                group: [5; 16],
+                message: vec![index],
+            };
+            pool.send(2, &packet).await.unwrap();
+        }
+        unfrozen("every frame let go", async {
+            while server.stats().await.lane_frames_dropped < 3 {
+                pause(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let served = server.stats().await;
+        assert_eq!(served.lane_frames_received, 0, "{served:?}");
+        assert_eq!(pool.net_stats().await.answered, 0);
         server.close().unwrap();
         task.join().await.unwrap();
     })

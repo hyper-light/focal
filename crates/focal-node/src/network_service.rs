@@ -274,6 +274,27 @@ impl RequestHandler for DataService {
     fn supports_ordered_replication(&self) -> bool {
         true
     }
+    fn supports_lane_frames(&self) -> bool {
+        true
+    }
+    /// A peer's frame from its lane, to the host of its group as its request would go: the
+    /// root's, a directory group's, or a session's.
+    fn take_frame(&self, request: VerifiedRequest) -> Result<(), AccessError> {
+        let group = match &request.request().operation {
+            Operation::Raft { group, .. } | Operation::RaftOrdered { group, .. } => *group,
+            _ => return Err(AccessError::InvalidRequest),
+        };
+        if group == self.root_group {
+            return self.control.take_frame(request);
+        }
+        if let Some(directory) = self.directory.host_of_group(group) {
+            return directory.take_frame(request);
+        }
+        if group == self.directory.group() {
+            return Err(AccessError::Unavailable);
+        }
+        self.ledger.take_frame(request)
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }

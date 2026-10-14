@@ -1235,13 +1235,30 @@ impl PeerConnectionPool {
                             asked.refused();
                             return Err(PeerSendError::Busy);
                         }
-                        Err(_) => {
+                        // The connection is gone, and its lanes with it: it is closed and
+                        // forgotten as an exchange's failed connection is, so the next attempt
+                        // dials its successor.
+                        Err(WireError::Connection) => {
                             asked.refused();
+                            close(&remote, &slot.counters);
+                            if let Ok(mut cached) = slot.connection.lock()
+                                && cached
+                                    .as_ref()
+                                    .is_some_and(|entry| entry.generation == generation)
+                            {
+                                *cached = None;
+                            }
                             if attempt.saturating_add(1) == self.limits.attempts {
                                 return Err(PeerSendError::Lost);
                             }
                             pause(spread(self.limits.retry_backoff, entropy())).await;
                             continue;
+                        }
+                        // The frame itself could not be queued (its encoding, its size): asked
+                        // again it could not be either.
+                        Err(_) => {
+                            asked.refused();
+                            return Err(PeerSendError::Lost);
                         }
                     }
                 }

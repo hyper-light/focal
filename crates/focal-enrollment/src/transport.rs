@@ -218,8 +218,8 @@ impl<S: Serve, H: JoinHandler + Clone> Serve for EnrollmentService<S, H> {
     fn capabilities(&self) -> [bool; 5] {
         self.data.capabilities()
     }
-    fn frame(&self, framed: focal_wire::net::Framed) {
-        self.data.frame(framed);
+    fn frame(&self, framed: focal_wire::net::Framed) -> bool {
+        self.data.frame(framed)
     }
     fn serve(&self, request: Served) -> ServeFuture {
         match (request.kind, &request.from) {

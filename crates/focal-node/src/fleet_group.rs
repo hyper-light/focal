@@ -296,6 +296,7 @@ fn class(work: &Work) -> WorkClass {
         Work::Probe(request, ..) if completion_request(request) => WorkClass::Completion,
         Work::Probe(..) => WorkClass::Query,
         Work::Request(request, ..) => request_class(&request.verified),
+        Work::Frame(request, ..) => request_class(request),
     }
 }
 /// The class a participant's or a peer's request is scheduled in: a peer's

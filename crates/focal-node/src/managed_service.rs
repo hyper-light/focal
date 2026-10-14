@@ -297,6 +297,24 @@ impl RequestHandler for ManagedService {
     fn supports_native_requests(&self) -> bool {
         true
     }
+    fn supports_lane_frames(&self) -> bool {
+        true
+    }
+    /// A peer's frame from its lane, to the session's current host: nodes address replicas
+    /// directly, so no route is consulted, as for its request.
+    fn take_frame(&self, request: VerifiedRequest) -> Result<(), AccessError> {
+        if !request
+            .peer()
+            .permits_tenant(request.request().ledger.tenant)
+        {
+            return Err(AccessError::Unauthorized);
+        }
+        let replica = self
+            .fleet
+            .current_host(request.request().ledger)
+            .map_err(|_| AccessError::Unavailable)?;
+        replica.take_frame(request)
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
