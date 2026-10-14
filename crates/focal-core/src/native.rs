@@ -126,7 +126,9 @@ pub use audit_bundle::NativeResultTestament;
 use audit_bundle::OwnedResultTestament;
 pub use authored::{NativeAuthoredProposal, NativeContentProfile};
 use creation_result::OwnedCreationResult;
-pub use creation_result::{NativeCreatedFamily, NativeCreatedObject, NativeCreationResult};
+pub use creation_result::{
+    NativeCreatedFamily, NativeCreatedObject, NativeCreationRead, NativeCreationResult,
+};
 pub use delivery_owned::NativeDeliveryResult;
 use delivery_owned::OwnedDeliveryResult;
 pub use event_record::delta as native_delta;
@@ -716,7 +718,11 @@ impl OutcomeRow {
         })
     }
     /// The whole outcome, from the store's ledger and the row's key.
-    pub(super) fn expand(&self, ledger: LedgerId, invocation: NativeInvocation) -> NativeOutcome {
+    pub(super) fn expand_held(
+        &self,
+        ledger: LedgerId,
+        invocation: NativeInvocation,
+    ) -> NativeOutcome {
         NativeOutcome {
             ledger,
             invocation,
@@ -734,6 +740,151 @@ impl OutcomeRow {
             responses: self.responses,
             result_testaments: self.result_testaments,
             events: self.events,
+        }
+    }
+}
+/// An outcome as its row holds it (doc 31 M3): boxed, or spilled to the replica's payload log as
+/// its record encoding. A spilled one keeps beside where it is the two fields walks across many
+/// outcomes read (a seal's sequence and events, a retirement's events), so no walk reads one back,
+/// in twenty-four bytes: a row is no wider for it.
+#[derive(Debug)]
+pub(super) enum OwnedOutcome {
+    Held(Box<OutcomeRow>),
+    Logged(LoggedOutcome),
+}
+/// Where a spilled outcome's record encoding is, and the fields its walks read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LoggedOutcome {
+    sequence: SessionSeq,
+    segment: u32,
+    offset: u32,
+    len: u16,
+    events: u16,
+    check: std::num::NonZeroU32,
+}
+impl LoggedOutcome {
+    pub(super) fn at(self) -> payloads::PayloadRef {
+        payloads::PayloadRef::from_parts(
+            self.segment,
+            self.offset,
+            u32::from(self.len),
+            self.check.get(),
+        )
+    }
+}
+impl OwnedOutcome {
+    /// `outcome`'s row in a store of `ledger`, held.
+    pub(super) fn stored(outcome: &NativeOutcome, ledger: LedgerId) -> Result<Self, ContractError> {
+        Ok(Self::Held(Box::new(OutcomeRow::stored(outcome, ledger)?)))
+    }
+    pub(super) fn sequence(&self) -> SessionSeq {
+        match self {
+            Self::Held(row) => row.sequence,
+            Self::Logged(at) => at.sequence,
+        }
+    }
+    pub(super) fn events(&self) -> u32 {
+        match self {
+            Self::Held(row) => row.events,
+            Self::Logged(at) => u32::from(at.events),
+        }
+    }
+    /// The whole outcome, from the store's ledger and the row's key, a spilled one read back
+    /// through `payloads` and refused unless it is the outcome of that ledger and invocation.
+    pub(super) fn expand(
+        &self,
+        ledger: LedgerId,
+        invocation: NativeInvocation,
+        payloads: Option<&dyn payloads::PayloadRead>,
+    ) -> Result<NativeOutcome, NativeError> {
+        match self {
+            Self::Held(row) => Ok(row.expand_held(ledger, invocation)),
+            Self::Logged(logged) => {
+                let at = logged.at();
+                let mut buffer = [0u8; payloads::SPILLED_BYTES];
+                let bytes = buffer
+                    .get_mut(..at.len())
+                    .ok_or(payloads::PayloadError::Corrupt)?;
+                payloads
+                    .ok_or(payloads::PayloadError::Unavailable)?
+                    .read(at, bytes)?;
+                let outcome = record_codec::decode_outcome(bytes)
+                    .map_err(|_| payloads::PayloadError::Corrupt)?;
+                if outcome.ledger != ledger
+                    || outcome.invocation != invocation
+                    || outcome.sequence != logged.sequence
+                    || outcome.events != u32::from(logged.events)
+                {
+                    return Err(payloads::PayloadError::Corrupt.into());
+                }
+                Ok(outcome)
+            }
+        }
+    }
+    /// A held row's fields: none for a spilled one.
+    pub(super) fn held(&self) -> Option<&OutcomeRow> {
+        match self {
+            Self::Held(row) => Some(row),
+            Self::Logged(_) => None,
+        }
+    }
+    /// The row's fields, a spilled one read back through `payloads`.
+    pub(super) fn row(
+        &self,
+        ledger: LedgerId,
+        invocation: NativeInvocation,
+        payloads: Option<&dyn payloads::PayloadRead>,
+    ) -> Result<OutcomeRow, NativeError> {
+        match self {
+            Self::Held(row) => Ok(**row),
+            Self::Logged(_) => Ok(OutcomeRow::stored(
+                &self.expand(ledger, invocation, payloads)?,
+                ledger,
+            )?),
+        }
+    }
+    /// This row spilled to `log` as its record encoding, where it is held, the log takes it and
+    /// its events fit the spilled row's count: what a candidate's rows become once every check
+    /// has read them.
+    pub(super) fn spill(
+        &self,
+        ledger: LedgerId,
+        invocation: NativeInvocation,
+        log: &dyn payloads::PayloadLog,
+    ) -> Result<Option<Self>, NativeError> {
+        let Self::Held(row) = self else {
+            return Ok(None);
+        };
+        let Ok(events) = u16::try_from(row.events) else {
+            return Ok(None);
+        };
+        let mut buffer = [0u8; payloads::SPILLED_BYTES];
+        let len = record_codec::encode_outcome(row.expand_held(ledger, invocation), &mut buffer)
+            .map_err(|_| NativeError::Capacity("outcome row"))?;
+        let (Ok(short), Some(bytes)) = (u16::try_from(len), buffer.get(..len)) else {
+            return Ok(None);
+        };
+        let Some(at) = log.append(bytes) else {
+            return Ok(None);
+        };
+        let Some(check) = std::num::NonZeroU32::new(at.check()) else {
+            // A check of zero has no spilled form: the row stays held.
+            return Ok(None);
+        };
+        Ok(Some(Self::Logged(LoggedOutcome {
+            sequence: row.sequence,
+            segment: at.segment(),
+            offset: at.offset(),
+            len: short,
+            events,
+            check,
+        })))
+    }
+    /// A copy of the row: a held one's box, a spilled one's place.
+    pub(super) fn copy(&self) -> Self {
+        match self {
+            Self::Held(row) => Self::Held(Box::new(**row)),
+            Self::Logged(at) => Self::Logged(*at),
         }
     }
 }
@@ -1355,7 +1506,7 @@ enum Row {
     Response(OwnedResponse),
     ResultTestament(OwnedResultTestament),
     ClaimResultTestament(TestamentId),
-    Outcome(Box<OutcomeRow>),
+    Outcome(OwnedOutcome),
     Event(OwnedEvent),
     ClaimContent(OwnedClaimContent),
     ClaimIdentity(ClaimId),
@@ -1438,7 +1589,7 @@ impl Row {
             Row::Cycle(_) => wide_heap::<NativeCycle>(),
             Row::RetiredCycleHead(_) => wide_heap::<RetiredCycleHead>(),
             Row::RetiredCycle(_) => wide_heap::<RetiredCycle>(),
-            Row::Outcome(_) => wide_heap::<OutcomeRow>(),
+            Row::Outcome(OwnedOutcome::Held(_)) => wide_heap::<OutcomeRow>(),
             Row::Retired(_) => wide_heap::<RetiredClaim>(),
             Row::Epochs(_) => wide_heap::<EpochWindow>(),
             Row::Seal(_) => wide_heap::<SealRow>(),
@@ -1527,12 +1678,19 @@ impl NativePrepared {
     pub fn written_result(&self, key: NativeResultKey) -> Option<&NativeAccepted> {
         as_result(self.fragments.get(&Key::Accepted(key)))
     }
-    pub fn written_recorded(&self, key: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
+    /// The outcome this candidate records for `key`, read back through `payloads` (its core's,
+    /// [`Core::native_payloads`]) where it is spilled.
+    pub fn written_recorded(
+        &self,
+        key: impl Into<NativeInvocation>,
+        payloads: Option<&dyn payloads::PayloadRead>,
+    ) -> Result<Option<NativeOutcome>, NativeError> {
         let invocation = key.into();
         as_outcome(
             self.fragments.get(&Key::Outcome(invocation)),
             self.outcome.ledger,
             invocation,
+            payloads,
         )
     }
     pub fn written_definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
@@ -1653,16 +1811,23 @@ impl NativeRead {
         &self,
         request: impl Into<NativeInvocation>,
         now: u64,
-    ) -> Result<Option<NativeOutcome>, MemoryError> {
+    ) -> Result<Option<NativeOutcome>, NativeError> {
         let invocation = request.into();
         let key = Key::Outcome(invocation);
-        self.lease
+        let payloads = self
+            .payloads
+            .as_deref()
+            .map(|read| -> &dyn payloads::PayloadRead { read });
+        let projected = self
+            .lease
             .project_next(&key, false, &Key::End, now, |entry| {
-                (entry.key == key)
-                    .then(|| as_outcome(Some(entry.value), self.ledger, invocation))
-                    .flatten()
-            })
-            .map(Option::flatten)
+                if entry.key == key {
+                    as_outcome(Some(entry.value), self.ledger, invocation, payloads)
+                } else {
+                    Ok(None)
+                }
+            })?;
+        projected.transpose().map(Option::flatten)
     }
     pub fn with_definition<T>(
         &self,
@@ -1894,12 +2059,18 @@ impl Core<NativeState> {
     pub fn native_claim(&self, id: ClaimId) -> Option<&ClaimState> {
         as_claim(self.state.rows.get(&Key::Claim(id)))
     }
-    pub fn native_outcome(&self, request: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
+    /// The outcome recorded for `request`, a spilled one read back (doc 31 M3): an outcome that
+    /// cannot be read is an error, never taken for none.
+    pub fn native_outcome(
+        &self,
+        request: impl Into<NativeInvocation>,
+    ) -> Result<Option<NativeOutcome>, NativeError> {
         let invocation = request.into();
         as_outcome(
             self.state.rows.get(&Key::Outcome(invocation)),
             self.state.ledger,
             invocation,
+            self.state.payloads(),
         )
     }
     /// Every committed native outcome (the retry-dedup records that survive a
@@ -1907,20 +2078,20 @@ impl Core<NativeState> {
     /// offline publications reader projects these to the linearizability
     /// checker's receipts; each carries its `invocation`, `sequence` and
     /// `intent`.
-    pub fn native_outcomes(&self) -> Vec<NativeOutcome> {
+    pub fn native_outcomes(&self) -> Result<Vec<NativeOutcome>, NativeError> {
         let mut outcomes: Vec<NativeOutcome> = self
             .state
             .rows
             .entries()
             .filter_map(|entry| match (&entry.key, &entry.value) {
                 (Key::Outcome(invocation), Row::Outcome(outcome)) => {
-                    Some(outcome.expand(self.state.ledger, *invocation))
+                    Some(outcome.expand(self.state.ledger, *invocation, self.state.payloads()))
                 }
                 _ => None,
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         outcomes.sort_by_key(|outcome| outcome.sequence.0);
-        outcomes
+        Ok(outcomes)
     }
     /// The continuation of a claim that retired to the archive (26 §4).
     pub fn native_retired(&self, id: ClaimId) -> Option<&RetiredClaim> {
@@ -2399,14 +2570,17 @@ fn as_claim(row: Option<&Row>) -> Option<&ClaimState> {
         _ => None,
     }
 }
+/// The outcome `row` holds, a spilled one read back through `payloads`: one that cannot be read
+/// is an error, never taken for none (an exact retry would run again).
 fn as_outcome(
     row: Option<&Row>,
     ledger: LedgerId,
     invocation: NativeInvocation,
-) -> Option<NativeOutcome> {
+    payloads: Option<&dyn payloads::PayloadRead>,
+) -> Result<Option<NativeOutcome>, NativeError> {
     match row {
-        Some(Row::Outcome(outcome)) => Some(outcome.expand(ledger, invocation)),
-        _ => None,
+        Some(Row::Outcome(outcome)) => outcome.expand(ledger, invocation, payloads).map(Some),
+        _ => Ok(None),
     }
 }
 fn as_definition(row: Option<&Row>) -> Option<&validation::Declaration> {
@@ -2507,13 +2681,18 @@ impl<'a> View<'a> {
         }
         self.state.rows.get_entry(key)
     }
-    /// The outcome recorded for `invocation`, whole.
-    fn outcome(&self, invocation: NativeInvocation) -> Option<NativeOutcome> {
+    /// The outcome recorded for `invocation`, whole: one that cannot be read back is an error.
+    fn outcome(&self, invocation: NativeInvocation) -> Result<Option<NativeOutcome>, NativeError> {
         as_outcome(
             self.get(Key::Outcome(invocation)),
             self.state.ledger,
             invocation,
+            self.payloads(),
         )
+    }
+    /// Whether an outcome is recorded for `invocation`, its row's key alone: nothing read back.
+    fn has_outcome(&self, invocation: NativeInvocation) -> bool {
+        self.get(Key::Outcome(invocation)).is_some()
     }
     fn meta(&self) -> Meta {
         match self.get(Key::Meta) {

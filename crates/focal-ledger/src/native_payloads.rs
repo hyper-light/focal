@@ -8,9 +8,17 @@
 //! bytes in memory, so the log never takes the completion reserve or the headroom. A sealed
 //! segment no row references any longer is removed ([`FilePayloads::sweep`]). A reader handed
 //! to another thread holds its own handles, so removing a segment never breaks a read it began.
+//!
+//! Appends are written behind: each is copied into a tail of [`TAIL_BYTES`] held in memory,
+//! charged to the session's memory budget, and the tail is written to its segment a run at a
+//! time (when it fills, when the segment seals, before a reader is handed out). An append is a
+//! copy, not a system call, and the newest payloads, the ones a candidate's record and the steps
+//! after it read, are read from memory.
 
 use focal_core::native::payloads::{PayloadError, PayloadLog, PayloadRead, PayloadRef};
-use focal_memory::{BudgetLane, DiskBudget, DiskKind, DiskReservation};
+use focal_memory::{
+    Allocation, BudgetKind, BudgetLane, DiskBudget, DiskKind, DiskReservation, MemoryBudget,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -21,6 +29,9 @@ pub(crate) const SEGMENT_BYTES: u64 = 64 << 20;
 /// The segments the log holds at once, sealed and current: what bounds its files, its handles and
 /// its volume (16 GiB at most).
 pub(crate) const MAX_SEGMENTS: usize = 256;
+/// The appended bytes held in memory before they are written to their segment (see the module):
+/// a few hundred spilled rows, written in one call.
+pub(crate) const TAIL_BYTES: usize = 64 << 10;
 
 /// Where a session keeps its payload log, and the volume it is charged to.
 #[derive(Clone)]
@@ -41,13 +52,38 @@ struct Segment {
     file: File,
     /// The volume it holds: outstanding while it fills, committed once it is sealed.
     disk: Option<DiskReservation>,
+    /// The bytes appended to it, once it is sealed: the current segment's are the writer's tail.
+    len: u64,
 }
 
 struct Writer {
     segments: BTreeMap<u32, Segment>,
-    /// The segment appends go to, and how many bytes it holds.
+    /// The segment appends go to, and how many bytes were appended to it.
     current: u32,
     tail: u64,
+    /// How many of them are in its file: the rest, from `written` to `tail`, are in `pending`.
+    written: u64,
+    /// The unwritten bytes, at most [`TAIL_BYTES`]: its capacity, reserved and charged when the
+    /// log opens, never grows.
+    pending: Vec<u8>,
+}
+
+impl Writer {
+    /// Write the pending bytes to the current segment's file. On failure they stay pending, and
+    /// the log refuses appends until a later write succeeds.
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let segment = self
+            .segments
+            .get(&self.current)
+            .ok_or(std::io::ErrorKind::NotFound)?;
+        write_at(&segment.file, &self.pending, self.written)?;
+        self.written = self.tail;
+        self.pending.clear();
+        Ok(())
+    }
 }
 
 /// A replica's payload log in segment files (see the module).
@@ -57,6 +93,8 @@ pub struct FilePayloads {
     /// A segment's bytes at most ([`SEGMENT_BYTES`] but in tests).
     segment_bytes: u64,
     writer: Mutex<Writer>,
+    /// The pending tail's memory, charged while the log is open.
+    _tail: Allocation,
 }
 
 impl std::fmt::Debug for FilePayloads {
@@ -134,15 +172,28 @@ fn write_at(file: &File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
 }
 
 impl FilePayloads {
-    /// The log at `source.root`, emptied (see the module), its first segment made and charged.
-    pub fn open(source: &PayloadSource) -> std::io::Result<Self> {
-        Self::open_with(source, SEGMENT_BYTES)
+    /// The log at `source.root`, emptied (see the module), its first segment made and charged to
+    /// the volume, its tail to `memory`.
+    pub fn open(source: &PayloadSource, memory: &MemoryBudget) -> std::io::Result<Self> {
+        Self::open_with(source, memory, SEGMENT_BYTES)
     }
     /// As [`Self::open`], segments of `segment_bytes` at most.
-    pub(crate) fn open_with(source: &PayloadSource, segment_bytes: u64) -> std::io::Result<Self> {
+    pub(crate) fn open_with(
+        source: &PayloadSource,
+        memory: &MemoryBudget,
+        segment_bytes: u64,
+    ) -> std::io::Result<Self> {
         if segment_bytes == 0 || segment_bytes > SEGMENT_BYTES {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
+        let tail = memory
+            .reserve(BudgetKind::Payload, BudgetLane::Ordinary, TAIL_BYTES)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?
+            .commit();
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(TAIL_BYTES)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
         match std::fs::symlink_metadata(&source.root) {
             Ok(_) => {
                 // A cache: whatever an earlier run left is let go, a bounded number of files.
@@ -171,7 +222,10 @@ impl FilePayloads {
                 segments: BTreeMap::new(),
                 current: 0,
                 tail: 0,
+                written: 0,
+                pending,
             }),
+            _tail: tail,
         };
         {
             let mut writer = log
@@ -198,6 +252,7 @@ impl FilePayloads {
         Ok(Segment {
             file,
             disk: Some(disk),
+            len: 0,
         })
     }
 
@@ -231,6 +286,18 @@ impl FilePayloads {
     pub fn segments(&self) -> usize {
         self.writer.lock().map_or(0, |writer| writer.segments.len())
     }
+    /// The payload bytes appended to the segments the log holds, written or in its tail.
+    pub fn bytes(&self) -> u64 {
+        self.writer.lock().map_or(0, |writer| {
+            writer.segments.iter().fold(0u64, |sum, (id, segment)| {
+                sum.saturating_add(if *id == writer.current {
+                    writer.tail
+                } else {
+                    segment.len
+                })
+            })
+        })
+    }
 }
 
 impl PayloadRead for FilePayloads {
@@ -239,12 +306,26 @@ impl PayloadRead for FilePayloads {
             return Err(PayloadError::Corrupt);
         }
         let writer = self.writer.lock().map_err(|_| PayloadError::Unavailable)?;
-        let segment = writer
-            .segments
-            .get(&at.segment())
-            .ok_or(PayloadError::Unavailable)?;
-        read_at(&segment.file, into, u64::from(at.offset()))
-            .map_err(|_| PayloadError::Unavailable)?;
+        let offset = u64::from(at.offset());
+        // A payload is written with its whole tail: one at or past what was written is in it.
+        if at.segment() == writer.current && offset >= writer.written {
+            let start = offset
+                .checked_sub(writer.written)
+                .and_then(|start| usize::try_from(start).ok())
+                .ok_or(PayloadError::Corrupt)?;
+            let end = start.checked_add(into.len()).ok_or(PayloadError::Corrupt)?;
+            let held = writer
+                .pending
+                .get(start..end)
+                .ok_or(PayloadError::Corrupt)?;
+            into.copy_from_slice(held);
+        } else {
+            let segment = writer
+                .segments
+                .get(&at.segment())
+                .ok_or(PayloadError::Unavailable)?;
+            read_at(&segment.file, into, offset).map_err(|_| PayloadError::Unavailable)?;
+        }
         if at.holds(into) {
             Ok(())
         } else {
@@ -256,7 +337,7 @@ impl PayloadRead for FilePayloads {
 impl PayloadLog for FilePayloads {
     fn append(&self, bytes: &[u8]) -> Option<PayloadRef> {
         let len = u64::try_from(bytes.len()).ok()?;
-        if len > self.segment_bytes {
+        if len > self.segment_bytes || bytes.len() > TAIL_BYTES {
             return None;
         }
         let mut writer = self.writer.lock().ok()?;
@@ -264,24 +345,30 @@ impl PayloadLog for FilePayloads {
             if writer.segments.len() >= MAX_SEGMENTS {
                 return None;
             }
+            // The current segment's tail is written before it seals.
+            writer.flush().ok()?;
             let next = writer.current.checked_add(1)?;
             let segment = self.segment(next).ok()?;
             // The sealed segment's bytes are on the volume: its charge is spent.
-            let current = writer.current;
-            if let Some(sealed) = writer.segments.get_mut(&current)
-                && let Some(disk) = sealed.disk.take()
-            {
-                disk.commit();
+            let (current, tail) = (writer.current, writer.tail);
+            if let Some(sealed) = writer.segments.get_mut(&current) {
+                sealed.len = tail;
+                if let Some(disk) = sealed.disk.take() {
+                    disk.commit();
+                }
             }
             writer.segments.insert(next, segment);
             writer.current = next;
             writer.tail = 0;
+            writer.written = 0;
         }
-        let current = writer.current;
+        if writer.pending.len().checked_add(bytes.len())? > TAIL_BYTES {
+            writer.flush().ok()?;
+        }
         let offset = writer.tail;
-        let segment = writer.segments.get(&current)?;
-        write_at(&segment.file, bytes, offset).ok()?;
-        let at = PayloadRef::at(current, u32::try_from(offset).ok()?, bytes).ok()?;
+        let at = PayloadRef::at(writer.current, u32::try_from(offset).ok()?, bytes).ok()?;
+        // Within the tail's reserved capacity: no reallocation.
+        writer.pending.extend_from_slice(bytes);
         writer.tail = offset.checked_add(len)?;
         Some(at)
     }
@@ -292,8 +379,13 @@ impl PayloadLog for FilePayloads {
     fn held_segments(&self) -> usize {
         self.segments()
     }
+    fn held_bytes(&self) -> u64 {
+        self.bytes()
+    }
     fn reader(&self) -> Result<Box<dyn PayloadRead + Send>, PayloadError> {
-        let writer = self.writer.lock().map_err(|_| PayloadError::Unavailable)?;
+        let mut writer = self.writer.lock().map_err(|_| PayloadError::Unavailable)?;
+        // A reader on another thread reads the files alone: the tail is written to them first.
+        writer.flush().map_err(|_| PayloadError::Unavailable)?;
         let mut segments = BTreeMap::new();
         for (id, segment) in &writer.segments {
             let file = segment

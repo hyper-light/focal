@@ -718,6 +718,7 @@ fn pending_work_begin_and_report_discard_restore_full_registry_and_reserved_cred
         f.owner
             .effective()
             .recorded(report_outcome.invocation)
+            .unwrap()
             .is_none()
     );
     assert_eq!(f.owner.discard_from(work).unwrap(), 1);
@@ -734,6 +735,7 @@ fn pending_work_begin_and_report_discard_restore_full_registry_and_reserved_cred
         f.owner
             .effective()
             .recorded(work_outcome.invocation)
+            .unwrap()
             .is_none()
     );
     assert_eq!(
@@ -1144,7 +1146,7 @@ fn submission_refuses_unreportable_visibility_before_custody_or_required_evaluat
             .work(ArtifactId::from_u128(801))
             .is_none()
     );
-    assert!(f.owner.effective().recorded(request_key).is_none());
+    assert!(f.owner.effective().recorded(request_key).unwrap().is_none());
     assert!(
         f.owner
             .effective()

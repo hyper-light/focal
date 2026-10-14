@@ -135,7 +135,13 @@ fn checkpoint_owner_restores_begun_retry_and_quality_reports_under_exhausted_par
         held.push(pressure(&budget));
         assert_eq!(budget.stats().used, budget.limit());
         let (candidate, outcome) = stage(&mut owner, input, &mut store);
-        assert!(owner.committed().recorded(outcome.invocation).is_none());
+        assert!(
+            owner
+                .committed()
+                .recorded(outcome.invocation)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(owner.pending_len(), 1);
         let before = budget.stats();
         assert!(
@@ -147,7 +153,7 @@ fn checkpoint_owner_restores_begun_retry_and_quality_reports_under_exhausted_par
         assert_eq!(budget.stats(), before);
         owner.publish_after_durable(candidate).unwrap();
         assert_eq!(
-            owner.committed().recorded(outcome.invocation),
+            owner.committed().recorded(outcome.invocation).unwrap(),
             Some(outcome)
         );
         assert!(
@@ -276,7 +282,7 @@ fn checkpoint_owner_recovers_pending_post_then_diagnostic_failed_close_and_post_
     );
     assert!(owner.committed().artifact(diagnostic.id).is_some());
     assert_eq!(
-        owner.committed().recorded(outcome.invocation),
+        owner.committed().recorded(outcome.invocation).unwrap(),
         Some(outcome)
     );
     assert_eq!(owner.committed().claim(claim).unwrap().response_count(), 2);

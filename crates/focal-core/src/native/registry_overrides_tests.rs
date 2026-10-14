@@ -565,7 +565,8 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
     core.publish_native(sealed).unwrap();
     assert_eq!(core.native_sequence(), sequence);
     assert_eq!(
-        core.native_outcome(fixture::request(fixture::ISSUER, 103)),
+        core.native_outcome(fixture::request(fixture::ISSUER, 103))
+            .unwrap(),
         Some(outcome)
     );
     for (ordinal, (id, members)) in original.iter().enumerate() {

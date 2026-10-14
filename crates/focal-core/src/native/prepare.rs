@@ -197,7 +197,7 @@ pub(super) fn copy(row: &Row) -> Result<Row, MemoryError> {
             // A box is an allocation, as an owned payload's copy is.
             #[cfg(test)]
             copy_failure()?;
-            Ok(Row::Outcome(Box::new(**outcome)))
+            Ok(Row::Outcome(outcome.copy()))
         }
         Row::Event(event) => {
             #[cfg(test)]
@@ -627,7 +627,7 @@ impl Core<NativeState> {
         )?;
         let intent = intent::deadline_fingerprint(self.state.ledger, input)?;
         let view = View::over(&self.state, pending);
-        if let Some(outcome) = view.outcome(input.key().into()) {
+        if let Some(outcome) = view.outcome(input.key().into())? {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {
                     outcome,
@@ -714,7 +714,7 @@ impl Core<NativeState> {
             return Err(ContractError::InvalidTarget.into());
         }
         let view = View::over(&self.state, pending);
-        if let Some(outcome) = view.outcome(request.into()) {
+        if let Some(outcome) = view.outcome(request.into())? {
             return if outcome.intent == intent {
                 Ok(RequestCheck::Existing {
                     outcome,
@@ -779,7 +779,7 @@ impl Core<NativeState> {
         )?;
         let intent = intent::claim_deadline_fingerprint(self.state.ledger, input)?;
         let view = View::over(&self.state, pending);
-        if let Some(outcome) = view.outcome(input.key().into()) {
+        if let Some(outcome) = view.outcome(input.key().into())? {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {
                     outcome,

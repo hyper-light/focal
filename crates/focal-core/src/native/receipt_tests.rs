@@ -241,7 +241,7 @@ fn receipt_checks_actual_subject_actor_current_revision_valid_id_and_posted_stat
                 .is_err()
         );
         assert_eq!(current(&core, 1), original);
-        assert!(core.native_outcome(request(SUBJECT, 13)).is_none());
+        assert!(core.native_outcome(request(SUBJECT, 13)).unwrap().is_none());
     }
 }
 
@@ -595,7 +595,10 @@ fn exact_receipt_retry_returns_original_pending_or_committed_outcome_after_contr
         core.native_claim(claim_id(1)).unwrap().status(),
         ClaimStatus::Cancelled
     );
-    assert_eq!(core.native_outcome(request(SUBJECT, 71)), Some(expected));
+    assert_eq!(
+        core.native_outcome(request(SUBJECT, 71)).unwrap(),
+        Some(expected)
+    );
 }
 
 #[test]
@@ -753,7 +756,11 @@ fn receipt_candidate_range_failure_rolls_back_entitlement_history_and_unique_id_
     assert_eq!(core.native_budget(), before);
     assert_eq!(core.native_sequence(), prefix);
     assert_eq!(core.native_claim(claim_id(1)).unwrap().receipt(), None);
-    assert!(core.native_outcome(request(SUBJECT, 101)).is_none());
+    assert!(
+        core.native_outcome(request(SUBJECT, 101))
+            .unwrap()
+            .is_none()
+    );
     assert!(core.native_event(SessionSeq(prefix.0 + 1), 0).is_none());
     let outcome = publish(&mut core, 30, acquire(101, expected, 701));
     check_received(&core, outcome, expected, 701);
@@ -795,7 +802,11 @@ fn receipt_capacity_refusal_preserves_target_and_does_not_allocate_a_receipt_ide
     assert_eq!(current(&core, 2), second);
     assert_eq!(core.native_claim(claim_id(2)).unwrap().receipt(), None);
     assert_eq!(core.native_receipt(ReceiptId::from_u128(712)), None);
-    assert!(core.native_outcome(request(SUBJECT, 112)).is_none());
+    assert!(
+        core.native_outcome(request(SUBJECT, 112))
+            .unwrap()
+            .is_none()
+    );
     // Failure cannot advance the trusted clock past a subsequent valid control.
     publish(&mut core, 31, cancel(113, second));
     assert_eq!(
@@ -883,6 +894,7 @@ fn required_programmatic_pass_waits_for_authorized_quality_pass_before_receipt()
         core.native_chain(&[&program])
             .unwrap()
             .recorded(request(SUBJECT, 402))
+            .unwrap()
             .is_none()
     );
     let input = report_for(
@@ -994,6 +1006,7 @@ fn authored_deadline_blocks_new_receipt_without_expiring_claim_and_preserves_exa
         core.native_chain(&[&received])
             .unwrap()
             .recorded(request(SUBJECT, 412))
+            .unwrap()
             .is_none()
     );
     assert!(

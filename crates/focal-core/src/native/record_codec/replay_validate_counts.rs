@@ -146,7 +146,8 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
             (Key::Outcome(invocation), Row::Outcome(value)) => {
                 require(
                     invocation == read.outcome.invocation
-                        && value.expand(read.ledger, invocation) == read.outcome,
+                        && value.expand(read.ledger, invocation, read.overlay.payloads())?
+                            == read.outcome,
                 )?;
                 counts.outcome = true;
             }

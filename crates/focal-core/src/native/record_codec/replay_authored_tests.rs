@@ -155,14 +155,16 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         Row::Meta(meta) => assert_eq!(meta.events, original_event_count),
         _ => panic!("missing metadata"),
     }
-    let original_mapping = recovered
+    let original_read = recovered
         .native_creation_result(creation_request)
         .unwrap()
-        .entries();
-    let reused_mapping = recovered
+        .unwrap();
+    let original_mapping = original_read.entries();
+    let reused_read = recovered
         .native_creation_result(reuse_request)
         .unwrap()
-        .entries();
+        .unwrap();
+    let reused_mapping = reused_read.entries();
     assert_eq!(original_mapping, reused_mapping);
     assert_eq!(reused_mapping.len(), 2);
     assert_eq!(reused_mapping[0].family, NativeCreatedFamily::Claim);

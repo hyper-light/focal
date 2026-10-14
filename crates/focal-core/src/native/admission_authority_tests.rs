@@ -147,7 +147,7 @@ fn refused_before_custody(
     assert_eq!(owner.effective().sequence(), sequence);
     assert_eq!(owner.pending_len(), pending);
     assert_eq!(*owner.effective().evaluation(key(1)).unwrap(), evaluation);
-    assert!(owner.effective().recorded(request).is_none());
+    assert!(owner.effective().recorded(request).unwrap().is_none());
 }
 
 #[test]
@@ -547,6 +547,7 @@ fn schema_refusal_does_not_seal_content_or_consume_the_report_request() {
         owner
             .effective()
             .recorded(request(EVALUATOR, 951))
+            .unwrap()
             .is_none()
     );
     assert_eq!(owner.pending_len(), 0);

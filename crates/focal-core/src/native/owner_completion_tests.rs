@@ -528,7 +528,13 @@ fn begin_refusal_under_pressure_leaves_no_responsibility_or_grant_and_can_retry(
     assert_eq!(owner.book.len(), 0);
     assert_eq!(owner.pending_len(), 0);
     assert!(!owner.effective().evaluation(key(1)).unwrap().has_begun());
-    assert!(owner.effective().recorded(request(EVALUATOR, 3)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(EVALUATOR, 3))
+            .unwrap()
+            .is_none()
+    );
     drop(pressure);
     let candidate = start(&mut owner, 1, 3);
     assert_eq!(owner.book.remaining_reports(key(1)), Some(2));
@@ -760,7 +766,13 @@ fn ordinary_mutation_cannot_spend_candidate_serials_promised_to_the_live_report_
     assert_eq!(*owner.effective().evaluation(key(1)).unwrap(), evaluation);
     assert_eq!(owner.pending_len(), 0);
     assert!(owner.effective().claim(ClaimId::from_u128(2)).is_none());
-    assert!(owner.effective().recorded(request(ISSUER, 601)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 601))
+            .unwrap()
+            .is_none()
+    );
 
     let pressure = exhaust(&parent);
     let mut store = Store::new();

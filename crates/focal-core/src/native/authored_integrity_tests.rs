@@ -198,7 +198,7 @@ fn retained_proof_detects_changed_original_owner_and_result_positions() {
     let Row::CreationResult(old) = &result.row else {
         unreachable!()
     };
-    let mut mappings = old.get().entries().to_vec();
+    let mut mappings = old.held().unwrap().entries().to_vec();
     mappings.reverse();
     for (index, object) in mappings.iter_mut().enumerate() {
         object.ordinal = index as u32;

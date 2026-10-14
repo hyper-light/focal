@@ -268,8 +268,10 @@ fn retained_fingerprint(extras: &Extras) -> Result<ContentHash, NativeError> {
             }
             Row::CreationResult(row) => {
                 hash.update(&[2]);
-                count(&mut hash, row.get().entries().len())?;
-                for object in row.get().entries() {
+                // A candidate's rows are held until every check has read them (doc 31 M3).
+                let entries = row.held().ok_or(ContractError::InvalidPolicy)?.entries();
+                count(&mut hash, entries.len())?;
+                for object in entries {
                     hash.update(&object.ordinal.to_le_bytes());
                     hash.update(&[match object.family {
                         NativeCreatedFamily::Claim => 0,

@@ -218,7 +218,7 @@ fn begin_refuses_currently_valid_cohort_whose_later_results_exceed_visit_limit()
     assert_eq!(core.native_evaluation(fixture::key(1)), Some(&state));
     assert_eq!(core.native_stats(), stats);
     assert_eq!(core.state.budget.stats(), budget);
-    assert!(core.native_outcome(request).is_none());
+    assert!(core.native_outcome(request).unwrap().is_none());
 }
 
 #[test]
@@ -470,5 +470,5 @@ fn native_begin_refuses_unavailable_future_quality_policy_before_publication() {
     assert_eq!(core.native_evaluation(fixture::key(1)), Some(&old));
     assert_eq!(core.native_stats(), stats);
     assert_eq!(core.state.budget.stats(), budget);
-    assert!(core.native_outcome(request).is_none());
+    assert!(core.native_outcome(request).unwrap().is_none());
 }

@@ -331,19 +331,19 @@ fn inline_owner_moves_without_a_singleton_and_copies_independently() {
             size_of::<OwnedCreationResult>(),
             size_of::<NativeCreationResult>()
         );
-        assert_eq!(owned.get().entries().as_ptr(), pointer);
-        assert_eq!(owned.get().entries(), expected);
+        assert_eq!(owned.held().unwrap().entries().as_ptr(), pointer);
+        assert_eq!(owned.held().unwrap().entries(), expected);
         assert_eq!(owned.heap_charge().unwrap(), charge);
         assert_eq!(ALLOCATION_ATTEMPTS.get(), 0);
         assert!(matches!(owned.copy(), Err(MemoryError::AllocationFailed)));
         assert_eq!(ALLOCATION_ATTEMPTS.get(), 1);
-        assert_eq!(owned.get().entries().as_ptr(), pointer);
-        assert_eq!(owned.get().entries(), expected);
+        assert_eq!(owned.held().unwrap().entries().as_ptr(), pointer);
+        assert_eq!(owned.held().unwrap().entries(), expected);
         owned
     });
     let copied = owned.copy().unwrap();
-    assert_ne!(copied.get().entries().as_ptr(), pointer);
+    assert_ne!(copied.held().unwrap().entries().as_ptr(), pointer);
     assert_eq!(copied.heap_charge().unwrap(), charge);
     drop(owned);
-    assert_eq!(copied.get().entries(), expected);
+    assert_eq!(copied.held().unwrap().entries(), expected);
 }

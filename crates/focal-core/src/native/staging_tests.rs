@@ -357,7 +357,7 @@ fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
     ));
     assert_eq!(budget.stats(), constrained);
     assert_eq!(core.native_sequence(), SessionSeq(0));
-    assert!(core.native_outcome(request).is_none());
+    assert!(core.native_outcome(request).unwrap().is_none());
     drop(pressure);
     // Adequate reservation reaches the real absent-target check. Its refusal
     // releases the entire temporary permit and retains no request outcome.
@@ -366,5 +366,5 @@ fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
         Err(NativeError::Contract(ContractError::InvalidTarget))
     ));
     assert_eq!(budget.stats(), initial);
-    assert!(core.native_outcome(request).is_none());
+    assert!(core.native_outcome(request).unwrap().is_none());
 }

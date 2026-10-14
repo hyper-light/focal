@@ -89,9 +89,13 @@ fn eligible_in(
     }
     // The family's last event was published by the outcome at its
     // sequence; the outcome carries the logical time it settled at.
-    let settled = core
+    let event = core
         .native_event(family.through, 0)
-        .and_then(|event| core.native_outcome(event.invocation))
+        .ok_or(LedgerError::Corrupt)?;
+    // An outcome that cannot be read back is the payload log's failure, not an absence.
+    let settled = core
+        .native_outcome(event.invocation)
+        .map_err(focal_ledger::NativeSessionError::from)?
         .map(|outcome| outcome.logical_time)
         .ok_or(LedgerError::Corrupt)?;
     if now.saturating_sub(settled) < min_age_ms {

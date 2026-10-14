@@ -11,6 +11,11 @@ use focal_model::{
     ArtifactRef, ContentDomainId, ObjectRevision, ReceiptId, ValidationMode, VerdictValue,
 };
 
+/// A held creation result's encoding: it reads no payload log.
+fn held_creation(sink: &mut impl Sink, row: &OwnedCreationResult) -> Result<(), Error> {
+    creation(sink, row, None)
+}
+
 /// A held content row's encoding: it reads no payload log.
 fn held_content(sink: &mut impl Sink, row: &OwnedClaimContent) -> Result<(), Error> {
     claim_content(sink, row, None)
@@ -877,7 +882,7 @@ fn creation_mapping_vector_retains_order_family_schema_requested_and_resolved_id
     }
     let value = NativeCreationResult::from_owned(entries, 2, 3, usize::MAX).unwrap();
     let row = OwnedCreationResult::new(value).unwrap();
-    assert_eq!(encoded!(creation, &row), expected);
+    assert_eq!(encoded!(held_creation, &row), expected);
 }
 
 #[test]

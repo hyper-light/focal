@@ -205,9 +205,7 @@ fn altered(
         Change::Put(Entry::new(Key::Meta, Row::Meta(Box::new(meta)), 0)),
         Change::Put(Entry::new(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(Box::new(
-                OutcomeRow::stored(&outcome, outcome.ledger).unwrap(),
-            )),
+            Row::Outcome(OwnedOutcome::stored(&outcome, outcome.ledger).unwrap()),
             0,
         )),
         Change::Put(Entry::new(

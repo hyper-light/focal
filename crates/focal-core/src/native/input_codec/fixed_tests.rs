@@ -407,7 +407,7 @@ fn typed_fixed_decoding_does_not_grant_missing_claim_authority_or_accept_invalid
     assert_eq!(owner.pending_len(), 0);
     assert_eq!(owner.budget_stats(), budget);
     assert_eq!(owner.range_stats(), range);
-    assert!(owner.effective().recorded(key).is_none());
+    assert!(owner.effective().recorded(key).unwrap().is_none());
     assert!(owner.effective().claim(ClaimId::from_u128(10)).is_none());
 
     let invalid = NativeDeadlineInput {

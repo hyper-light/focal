@@ -866,7 +866,10 @@ impl Session {
         &self,
     ) -> Result<Vec<focal_core::native::NativeOutcome>, LedgerError> {
         match self.native.as_deref() {
-            Some(engine) => Ok(engine.committed_core()?.native_outcomes()),
+            Some(engine) => Ok(engine
+                .committed_core()?
+                .native_outcomes()
+                .map_err(NativeSessionError::from)?),
             None => Ok(Vec::new()),
         }
     }

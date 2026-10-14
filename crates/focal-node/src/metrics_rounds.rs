@@ -581,6 +581,7 @@ impl SessionMetrics {
                 native_used: wide,
                 native_limit: wide,
                 payload_segments: wide,
+                payload_bytes: wide,
                 payload_open_refusals: wide,
             }),
         }

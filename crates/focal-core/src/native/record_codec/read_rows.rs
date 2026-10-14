@@ -74,7 +74,7 @@ fn outcome_row(
     if outcome.invocation != invocation {
         return Err(invalid());
     }
-    Ok(Row::Outcome(Box::new(row)))
+    Ok(Row::Outcome(OwnedOutcome::Held(Box::new(row))))
 }
 
 fn decode_fixed(key: Key, c: &mut Cursor<'_>) -> Result<Option<Row>, CodecError> {
@@ -351,39 +351,9 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
         (Key::ClaimResultTestament(claim), Row::ClaimResultTestament(id)) => {
             !claim.is_zero() && !id.is_zero()
         }
+        // A decoded outcome is held; a spilled one is checked as it is read back (`check_outcome`).
         (Key::Outcome(key), Row::Outcome(row)) => {
-            // The row's ledger is its store's and its invocation is `key` (`OutcomeRow`); bytes naming
-            // another were refused by `outcome_row`.
-            let namespace = match key {
-                NativeInvocation::Request(_) => !matches!(
-                    row.operation,
-                    NativeOperation::EvaluationDeadline
-                        | NativeOperation::ClaimDeadline
-                        | NativeOperation::MonitorDeadline
-                        | NativeOperation::Import
-                        | NativeOperation::Retire
-                        | NativeOperation::Seal
-                ),
-                NativeInvocation::EvaluationDeadline(_) => {
-                    row.operation == NativeOperation::EvaluationDeadline
-                }
-                NativeInvocation::ClaimDeadline(_) => {
-                    row.operation == NativeOperation::ClaimDeadline
-                }
-                NativeInvocation::MonitorDeadline(_) => {
-                    row.operation == NativeOperation::MonitorDeadline
-                }
-                NativeInvocation::Import => {
-                    row.operation == NativeOperation::Import && row.sequence == SessionSeq(1)
-                }
-                NativeInvocation::Retirement(_) => {
-                    row.operation == NativeOperation::Retire && row.events == 0
-                }
-                NativeInvocation::Seal(_) => {
-                    row.operation == NativeOperation::Seal && row.events == 0
-                }
-            };
-            invocation(key) && row.sequence.0 != 0 && row.intent.0 != [0; 32] && namespace
+            row.held().is_some_and(|row| check_outcome(key, row))
         }
         (Key::ClaimIdentity(schema, hash), Row::ClaimIdentity(id)) => {
             schema != 0 && hash.0 != [0; 32] && !id.is_zero()
@@ -701,4 +671,33 @@ fn check_event(event: NativeEvent, ledger: LedgerId) -> Result<(), NativeError> 
         }
     };
     if valid { Ok(()) } else { Err(invalid()) }
+}
+
+/// An outcome row's own checks: its ledger is its store's and its invocation `key` (`OutcomeRow`),
+/// and its operation is one `key`'s namespace records.
+pub(super) fn check_outcome(key: NativeInvocation, row: &OutcomeRow) -> bool {
+    let namespace = match key {
+        NativeInvocation::Request(_) => !matches!(
+            row.operation,
+            NativeOperation::EvaluationDeadline
+                | NativeOperation::ClaimDeadline
+                | NativeOperation::MonitorDeadline
+                | NativeOperation::Import
+                | NativeOperation::Retire
+                | NativeOperation::Seal
+        ),
+        NativeInvocation::EvaluationDeadline(_) => {
+            row.operation == NativeOperation::EvaluationDeadline
+        }
+        NativeInvocation::ClaimDeadline(_) => row.operation == NativeOperation::ClaimDeadline,
+        NativeInvocation::MonitorDeadline(_) => row.operation == NativeOperation::MonitorDeadline,
+        NativeInvocation::Import => {
+            row.operation == NativeOperation::Import && row.sequence == SessionSeq(1)
+        }
+        NativeInvocation::Retirement(_) => {
+            row.operation == NativeOperation::Retire && row.events == 0
+        }
+        NativeInvocation::Seal(_) => row.operation == NativeOperation::Seal && row.events == 0,
+    };
+    invocation(key) && row.sequence.0 != 0 && row.intent.0 != [0; 32] && namespace
 }

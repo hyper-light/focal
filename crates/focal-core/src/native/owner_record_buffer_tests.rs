@@ -167,7 +167,10 @@ fn extraction_refuses_while_candidates_are_pending_and_returns_the_identical_own
     );
     let outcome = owner.publish_after_durable(created).unwrap();
     let core = owner.into_committed_core().unwrap();
-    assert_eq!(core.native_outcome(outcome.invocation), Some(outcome));
+    assert_eq!(
+        core.native_outcome(outcome.invocation).unwrap(),
+        Some(outcome)
+    );
     drop(core);
     assert_eq!(budget.stats().used, 0);
 }

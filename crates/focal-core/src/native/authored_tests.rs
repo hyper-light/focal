@@ -257,7 +257,7 @@ fn authored_bodies_policy_and_resolution_move_into_one_atomic_prefix() {
             .unwrap()
             .is_none()
     );
-    assert!(core.native_creation_result(key(1)).is_none());
+    assert!(core.native_creation_result(key(1)).unwrap().is_none());
     let body = core
         .native_chain(&[&prepared])
         .unwrap()
@@ -289,12 +289,9 @@ fn authored_bodies_policy_and_resolution_move_into_one_atomic_prefix() {
             .unwrap(),
         descriptor.declaration(),
     ));
-    let mapping = core
-        .native_chain(&[&prepared])
-        .unwrap()
-        .creation_result(key(1))
-        .unwrap()
-        .entries();
+    let chain = core.native_chain(&[&prepared]).unwrap();
+    let read = chain.creation_result(key(1)).unwrap().unwrap();
+    let mapping = read.entries();
     assert_eq!(mapping.len(), 2);
     assert_eq!(mapping[0].family, NativeCreatedFamily::Claim);
     assert_eq!(mapping[1].family, NativeCreatedFamily::Validation);
@@ -324,7 +321,11 @@ fn authored_bodies_policy_and_resolution_move_into_one_atomic_prefix() {
         definition_pointer
     );
     assert_eq!(
-        core.native_creation_result(key(1)).unwrap().entries().len(),
+        core.native_creation_result(key(1))
+            .unwrap()
+            .unwrap()
+            .entries()
+            .len(),
         2
     );
     assert!(matches!(
@@ -370,10 +371,12 @@ fn pending_authored_identity_retry_and_discard_preserve_atomicity() {
             .unwrap()
             .creation_result(key(11))
             .unwrap()
+            .unwrap()
             .entries(),
         core.native_chain(&[&prepared])
             .unwrap()
             .creation_result(key(10))
+            .unwrap()
             .unwrap()
             .entries()
     );
@@ -385,7 +388,7 @@ fn pending_authored_identity_retry_and_discard_preserve_atomicity() {
         core.native_validation_descriptor(ValidationId::from_u128(101))
             .is_none()
     );
-    assert!(core.native_creation_result(key(10)).is_none());
+    assert!(core.native_creation_result(key(10)).unwrap().is_none());
     assert_eq!(core.native_budget().used, baseline.used);
     let accepted = publish(&mut core, create(10, vec![proposal(1, 101)]));
     assert!(matches!(
@@ -407,6 +410,7 @@ fn all_existing_results_stay_frozen_and_partial_batches_refuse() {
     let old = core
         .native_creation_result(key(1))
         .unwrap()
+        .unwrap()
         .entries()
         .to_vec();
     let duplicate = publish(&mut core, create(3, vec![proposal(1, 101)]));
@@ -423,7 +427,13 @@ fn all_existing_results_stay_frozen_and_partial_batches_refuse() {
         core.native_claim(ClaimId::from_u128(1)).unwrap().binding(),
         posted
     );
-    assert_eq!(core.native_creation_result(key(3)).unwrap().entries(), old);
+    assert_eq!(
+        core.native_creation_result(key(3))
+            .unwrap()
+            .unwrap()
+            .entries(),
+        old
+    );
     let before = core.native_budget().used;
     assert!(matches!(
         core.prepare_native(
@@ -436,13 +446,25 @@ fn all_existing_results_stay_frozen_and_partial_batches_refuse() {
     assert_eq!(core.native_sequence(), duplicate.sequence);
     assert_eq!(core.native_budget().used, before);
     assert!(core.native_claim(ClaimId::from_u128(2)).is_none());
-    assert!(core.native_creation_result(key(4)).is_none());
+    assert!(core.native_creation_result(key(4)).unwrap().is_none());
     publish(
         &mut core,
         input(5, NativeCommand::Cancel { expected: posted }),
     );
-    assert_eq!(core.native_creation_result(key(1)).unwrap().entries(), old);
-    assert_eq!(core.native_creation_result(key(3)).unwrap().entries(), old);
+    assert_eq!(
+        core.native_creation_result(key(1))
+            .unwrap()
+            .unwrap()
+            .entries(),
+        old
+    );
+    assert_eq!(
+        core.native_creation_result(key(3))
+            .unwrap()
+            .unwrap()
+            .entries(),
+        old
+    );
 }
 
 #[test]

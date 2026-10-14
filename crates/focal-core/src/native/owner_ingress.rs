@@ -131,7 +131,7 @@ impl NativeOwner {
                 u64::MAX,
             )),
         );
-        if view.outcome(request.into()).is_some() {
+        if view.has_outcome(request.into()) {
             return Ok(());
         }
         if queue_full {

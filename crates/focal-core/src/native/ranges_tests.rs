@@ -141,8 +141,8 @@ fn one_versus_many_ranges_hold_identical_state_and_serve_identical_reads() {
         single.native_evaluation(f::key(2)).unwrap().binding()
     );
     assert_eq!(
-        many.native_outcome(f::request(f::ISSUER, 2)),
-        single.native_outcome(f::request(f::ISSUER, 2))
+        many.native_outcome(f::request(f::ISSUER, 2)).unwrap(),
+        single.native_outcome(f::request(f::ISSUER, 2)).unwrap()
     );
     for sequence in 1..=many.native_sequence().0 {
         assert_eq!(
@@ -160,7 +160,7 @@ fn one_versus_many_ranges_hold_identical_state_and_serve_identical_reads() {
     );
     assert_eq!(
         read.recorded(f::request(f::ISSUER, 2), 0).unwrap(),
-        single.native_outcome(f::request(f::ISSUER, 2))
+        single.native_outcome(f::request(f::ISSUER, 2)).unwrap()
     );
     assert_eq!(
         read.with_definition(f::key(1).validation, 0, |definition| definition.binding())

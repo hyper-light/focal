@@ -1106,7 +1106,11 @@ fn custody_is_required_for_new_requests_and_cannot_be_rebound_to_other_inputs() 
         assert_eq!(core.native_evaluation(key(1)), Some(&old));
         assert_eq!(core.native_budget(), budget);
         assert!(core.native_artifact(ArtifactId::from_u128(481)).is_none());
-        assert!(core.native_outcome(request(EVALUATOR, 81)).is_none());
+        assert!(
+            core.native_outcome(request(EVALUATOR, 81))
+                .unwrap()
+                .is_none()
+        );
     }
     let next = report(&core, input, &[], &token);
     core.publish_native(next).unwrap();
@@ -1163,7 +1167,11 @@ fn actor_attempt_revision_target_and_deadline_must_match_actual_owner_rows() {
         assert_eq!(core.native_evaluation(key(1)), Some(&old));
         assert_eq!(core.native_budget(), budget);
         assert!(core.native_artifact(ArtifactId::from_u128(491)).is_none());
-        assert!(core.native_outcome(request(EVALUATOR, 91)).is_none());
+        assert!(
+            core.native_outcome(request(EVALUATOR, 91))
+                .unwrap()
+                .is_none()
+        );
     }
 }
 
@@ -1495,7 +1503,11 @@ fn reports_use_completion_reserve_publish_without_capacity_and_rollback_a_failed
     );
     assert_eq!(budget.stats(), before);
     assert!(core.native_artifact(ArtifactId::from_u128(541)).is_none());
-    assert!(core.native_outcome(request(EVALUATOR, 141)).is_none());
+    assert!(
+        core.native_outcome(request(EVALUATOR, 141))
+            .unwrap()
+            .is_none()
+    );
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
@@ -1577,7 +1589,11 @@ fn artifact_and_result_capacity_refuse_atomic_report_without_consuming_request_o
         assert_eq!(core.native_budget(), before);
         assert_eq!(core.native_sequence(), outcome.sequence);
         assert!(core.native_artifact(ArtifactId::from_u128(552)).is_none());
-        assert!(core.native_outcome(request(EVALUATOR, 152)).is_none());
+        assert!(
+            core.native_outcome(request(EVALUATOR, 152))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             core.native_evaluation(key(1)).unwrap().state(),
             validation::State::Validating
@@ -1684,7 +1700,7 @@ fn actual_custody_cannot_authorize_missing_or_substituted_result_provenance() {
         ));
         assert_eq!(core.native_budget(), before);
         assert_eq!(core.native_sequence(), prefix);
-        assert!(core.native_outcome(original.request).is_none());
+        assert!(core.native_outcome(original.request).unwrap().is_none());
         assert!(core.native_artifact(ArtifactId::from_u128(561)).is_none());
     }
 }

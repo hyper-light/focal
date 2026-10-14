@@ -401,9 +401,7 @@ pub fn import<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     out.meta.outcomes = 1;
     out.push(
         Key::Outcome(outcome.invocation),
-        Row::Outcome(Box::new(
-            OutcomeRow::stored(&outcome, request.ledger).map_err(NativeError::from)?,
-        )),
+        Row::Outcome(OwnedOutcome::stored(&outcome, request.ledger).map_err(NativeError::from)?),
     )?;
     let meta = out.meta;
     out.push(Key::Meta, Row::Meta(Box::new(meta)))?;

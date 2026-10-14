@@ -612,10 +612,20 @@ fn process<O: Objects, C: evidence::Custody>(
         | Key::DueTimer(..)
         | Key::ByObject(..)
         | Key::Seal(_) => {
-            let row = parse(body, context.parsing, |c| {
+            let mut row = parse(body, context.parsing, |c| {
                 read_rows::read_fixed(encoded.key, c, ledger)
             })?
             .ok_or_else(invalid)?;
+            // A restored outcome spills as it is built (doc 31 M3); a replayed one, with the rest of
+            // its record once that is validated.
+            if build.is_some()
+                && let (Key::Outcome(invocation), Some(log)) =
+                    (encoded.key, context.objects.payload_log())
+                && let Row::Outcome(outcome) = &row
+                && let Some(spilled) = outcome.spill(ledger, invocation, log)?
+            {
+                row = Row::Outcome(spilled);
+            }
             let quote = quoted(0, 0, build)?;
             Ok((quote, build.map(|_| row)))
         }

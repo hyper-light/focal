@@ -268,6 +268,10 @@ pub struct AdminSessionMemory {
     /// heap (doc 31 M3): none where it has no log.
     #[serde(default)]
     pub payload_segments: u64,
+    /// The payload bytes the log holds, on the volume or in its tail: what the replica has
+    /// spilled off its heap.
+    #[serde(default)]
+    pub payload_bytes: u64,
     /// How many times the replica's payload log could not be opened (a full volume): a replica
     /// without one holds its rows' payloads in memory until it opens.
     #[serde(default)]
@@ -771,7 +775,7 @@ pub enum AdminResult {
         configuration: AdminNodeConfiguration,
     },
     ReplicaDiagnostics {
-        diagnostics: AdminReplicaDiagnostics,
+        diagnostics: Box<AdminReplicaDiagnostics>,
     },
     /// A native session's retention floor and archive counts (26 §3, §4).
     Retention {

@@ -1052,7 +1052,7 @@ impl Core<NativeState> {
                     meta.sealed_events = meta
                         .sealed_events
                         .checked_add(
-                            usize::try_from(outcome.events)
+                            usize::try_from(outcome.events())
                                 .map_err(|_| NativeError::Capacity("sealed events"))?,
                         )
                         .ok_or(NativeError::Capacity("sealed events"))?;
@@ -1116,7 +1116,7 @@ impl Core<NativeState> {
         changes.push(Change::Put(entry(Key::Meta, Row::Meta(Box::new(meta)), 0)));
         changes.push(Change::Put(entry(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(Box::new(OutcomeRow::stored(&outcome, self.state.ledger)?)),
+            Row::Outcome(OwnedOutcome::stored(&outcome, self.state.ledger)?),
             0,
         )));
         // One publication of what a family's bound allows: its rows, a

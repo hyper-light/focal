@@ -220,7 +220,7 @@ fn root_parent_child_history_and_outcome_share_one_publication() {
     );
     assert_eq!(core.native_sequence(), SessionSeq(0));
     assert!(core.native_claim(ClaimId::from_u128(1)).is_none());
-    assert!(core.native_outcome(key(1)).is_none());
+    assert!(core.native_outcome(key(1)).unwrap().is_none());
     assert_eq!(
         core.native_chain(&[&prepared])
             .unwrap()
@@ -233,7 +233,10 @@ fn root_parent_child_history_and_outcome_share_one_publication() {
     );
     assert_eq!(prepared.outcome().created, 2);
     assert_eq!(
-        core.native_chain(&[&prepared]).unwrap().recorded(key(1)),
+        core.native_chain(&[&prepared])
+            .unwrap()
+            .recorded(key(1))
+            .unwrap(),
         Some(prepared.outcome())
     );
     let outcome = core.publish_native(prepared).unwrap();
@@ -242,7 +245,7 @@ fn root_parent_child_history_and_outcome_share_one_publication() {
     assert_eq!(row(&core, 2).created(), SessionSeq(1));
     assert_eq!(row(&core, 1).binding().revision, ObjectRevision(2));
     assert_eq!(row(&core, 2).status(), ClaimStatus::Generated);
-    assert_eq!(core.native_outcome(key(1)), Some(outcome));
+    assert_eq!(core.native_outcome(key(1)).unwrap(), Some(outcome));
     assert_eq!(
         core.native_event(SessionSeq(1), 0)
             .unwrap()
@@ -505,7 +508,7 @@ fn dropping_suffix_reclaims_charges_and_cannot_publish_orphaned_roots() {
     assert_eq!(core.native_budget(), base);
     drop(root);
     assert_eq!(core.native_budget(), initial);
-    assert!(core.native_outcome(key(1)).is_none());
+    assert!(core.native_outcome(key(1)).unwrap().is_none());
 }
 
 #[test]
@@ -602,7 +605,7 @@ fn late_batch_capacity_refusal_rolls_back_all_private_parent_changes() {
     assert_eq!(core.native_budget(), before);
     assert_eq!(row(&core, 1).binding(), binding);
     assert!(row(&core, 1).scopes().children().is_empty());
-    assert!(core.native_outcome(key(2)).is_none());
+    assert!(core.native_outcome(key(2)).unwrap().is_none());
     assert!(core.native_event(SessionSeq(2), 0).is_none());
 }
 
@@ -632,7 +635,10 @@ fn leases_keep_fixed_prefix_then_release_all_obsolete_pages() {
     );
     assert_eq!(core.advance_native_clock(10).unwrap(), 1);
     assert!(core.native_budget().used < pinned);
-    assert_eq!(read.recorded(key(1), 0), Err(MemoryError::LeaseExpired));
+    assert!(matches!(
+        read.recorded(key(1), 0),
+        Err(NativeError::Memory(MemoryError::LeaseExpired))
+    ));
 }
 
 #[test]
@@ -668,7 +674,7 @@ fn range_failure_discards_partial_candidate_and_keeps_pinned_facts() {
     ));
     assert_eq!(core.native_budget(), before);
     assert_eq!(core.native_sequence(), SessionSeq(1));
-    assert!(core.native_outcome(key(2)).is_none());
+    assert!(core.native_outcome(key(2)).unwrap().is_none());
     assert!(core.native_event(SessionSeq(2), 0).is_none());
     assert_eq!(
         old.with_claim(ClaimId::from_u128(1), 1, ClaimState::binding)

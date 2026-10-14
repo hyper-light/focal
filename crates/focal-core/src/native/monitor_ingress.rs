@@ -17,7 +17,7 @@ impl Core<NativeState> {
         )?;
         let intent = intent::monitor_deadline_fingerprint(self.state.ledger, input)?;
         let view = View::over(&self.state, pending);
-        if let Some(outcome) = view.outcome(input.key().into()) {
+        if let Some(outcome) = view.outcome(input.key().into())? {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {
                     outcome,

@@ -136,12 +136,14 @@ pub(super) fn value(
         Row::Response(v) => evidence::response(s, v),
         Row::ResultTestament(v) => lifecycle::result_testament(s, v),
         Row::ClaimResultTestament(id) => raw(s, &id.0),
-        // The record carries the whole outcome; the row keeps neither its ledger nor its invocation.
-        Row::Outcome(v) => {
+        // The record carries the whole outcome; the row keeps neither its ledger nor its invocation,
+        // and a spilled one holds its record encoding (doc 31 M3).
+        Row::Outcome(crate::native::OwnedOutcome::Logged(at)) => spilled(s, at.at(), 0, payloads),
+        Row::Outcome(crate::native::OwnedOutcome::Held(v)) => {
             let Key::Outcome(invocation) = key else {
                 return Err(Error::InvalidTag("outcome row key"));
             };
-            fixed::outcome(s, v.expand(ledger, invocation))
+            fixed::outcome(s, v.expand_held(ledger, invocation))
         }
         // A spilled event holds its record encoding (doc 31 M3).
         Row::Event(crate::native::OwnedEvent::Logged(at)) => spilled(s, *at, 0, payloads),
@@ -152,7 +154,7 @@ pub(super) fn value(
         Row::ClaimContent(v) => evidence::claim_content(s, v, payloads),
         Row::ClaimIdentity(id) => raw(s, &id.0),
         Row::DefinitionIdentity(id) => raw(s, &id.0),
-        Row::CreationResult(v) => evidence::creation(s, v),
+        Row::CreationResult(v) => evidence::creation(s, v, payloads),
         Row::LegacyTestament(v)
         | Row::LegacyEvidenceSet(v)
         | Row::LegacyRun(v)

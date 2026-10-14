@@ -192,7 +192,7 @@ fn one_owner_chain_exposes_distinct_candidate_and_committed_facts_until_ordered_
         validation::State::Validating
     );
     assert_eq!(
-        owner.effective().recorded(request(ISSUER, 1)),
+        owner.effective().recorded(request(ISSUER, 1)).unwrap(),
         Some(created_outcome)
     );
     let before = budget.stats();
@@ -264,8 +264,20 @@ fn discarded_suffix_rewinds_owned_registry_and_reused_request_prefix_cannot_revi
     assert_eq!(current.binding(), binding(1));
     assert!(current.scopes().children().is_empty());
     assert!(owner.effective().claim(ClaimId::from_u128(2)).is_none());
-    assert!(owner.effective().recorded(request(ISSUER, 2)).is_none());
-    assert!(owner.effective().recorded(request(ISSUER, 3)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 2))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 3))
+            .unwrap()
+            .is_none()
+    );
     // The discarded clock 30 also disappears. Reusing the exact request at 20
     // recreates identical logical history but must never recreate its capability.
     let (new_child, replay) = stage(&mut owner, 20, child(2, 2, binding(1)));
@@ -340,8 +352,14 @@ fn identical_ledgers_ranges_requests_and_sequences_do_not_share_owner_tickets() 
         Err(NativeOwnerError::UnknownCandidate)
     ));
     right.publish_after_durable(b).unwrap();
-    assert_eq!(left.committed().recorded(first.invocation), Some(first));
-    assert_eq!(right.committed().recorded(second.invocation), Some(second));
+    assert_eq!(
+        left.committed().recorded(first.invocation).unwrap(),
+        Some(first)
+    );
+    assert_eq!(
+        right.committed().recorded(second.invocation).unwrap(),
+        Some(second)
+    );
     drop(left);
     let mut replacement = NativeOwner::new(core()).unwrap();
     let (c, _) = stage(&mut replacement, 10, creation(1, 1, &[], None));
@@ -420,10 +438,17 @@ fn failed_domain_admission_preserves_tail_clock_requests_and_ability_to_publish(
         owner
             .candidate(first)
             .unwrap()
-            .recorded(original.invocation),
+            .recorded(original.invocation)
+            .unwrap(),
         Some(original)
     );
-    assert!(owner.effective().recorded(request(ISSUER, 2)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 2))
+            .unwrap()
+            .is_none()
+    );
     let (valid, _) = stage(&mut owner, 20, post(2, binding(1)));
     owner.publish_after_durable(first).unwrap();
     owner.publish_after_durable(valid).unwrap();
@@ -458,7 +483,13 @@ fn range_failure_keeps_the_entire_existing_chain_and_refunds_candidate_memory() 
     assert_eq!(owner.oldest(), Some(first));
     assert_eq!(owner.effective().sequence(), first_outcome.sequence);
     assert!(owner.effective().claim(ClaimId::from_u128(4)).is_none());
-    assert!(owner.effective().recorded(request(ISSUER, 4)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 4))
+            .unwrap()
+            .is_none()
+    );
     let (retried, _) = stage(&mut owner, 40, creation(4, 4, &[], None));
     owner.publish_after_durable(first).unwrap();
     owner.publish_after_durable(retried).unwrap();
@@ -584,10 +615,16 @@ fn discard_all_is_idempotent_and_never_erases_committed_requests_or_reuses_ticke
     assert_eq!(owner.oldest(), None);
     assert_eq!(owner.effective().sequence(), original.sequence);
     assert_eq!(
-        owner.effective().recorded(original.invocation),
+        owner.effective().recorded(original.invocation).unwrap(),
         Some(original)
     );
-    assert!(owner.effective().recorded(request(ISSUER, 2)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 2))
+            .unwrap()
+            .is_none()
+    );
     let (replacement, _) = stage(&mut owner, 20, creation(2, 2, &[], None));
     assert_ne!(replacement, second);
     assert_ne!(replacement, third);
@@ -629,7 +666,7 @@ fn owner_construction_refuses_unfunded_queue_storage_and_returns_original_core_f
     assert_eq!(budget.stats(), before);
     assert_eq!(refused.core.native_sequence(), outcome.sequence);
     assert_eq!(
-        refused.core.native_outcome(outcome.invocation),
+        refused.core.native_outcome(outcome.invocation).unwrap(),
         Some(outcome)
     );
     assert_eq!(
@@ -639,7 +676,7 @@ fn owner_construction_refuses_unfunded_queue_storage_and_returns_original_core_f
     drop(pressure);
     let owner = NativeOwner::new(refused.core).unwrap();
     assert_eq!(
-        owner.committed().recorded(outcome.invocation),
+        owner.committed().recorded(outcome.invocation).unwrap(),
         Some(outcome)
     );
     assert_eq!(owner.pending_len(), 0);
@@ -707,10 +744,13 @@ fn lower_level_publication_refusal_restores_the_exact_head_ticket_and_successors
     owner.publish_after_durable(first).unwrap();
     owner.publish_after_durable(second).unwrap();
     assert_eq!(
-        owner.committed().recorded(original.invocation),
+        owner.committed().recorded(original.invocation).unwrap(),
         Some(original)
     );
-    assert_eq!(owner.committed().recorded(later.invocation), Some(later));
+    assert_eq!(
+        owner.committed().recorded(later.invocation).unwrap(),
+        Some(later)
+    );
     drop(pressure);
 }
 
@@ -749,10 +789,10 @@ fn owner_snapshot_facade_pins_only_committed_facts_and_expires_retained_pages() 
         generated.with_claim(key(1).claim, 100, |row| row.status()),
         Err(MemoryError::LeaseExpired)
     );
-    assert_eq!(
+    assert!(matches!(
         empty.recorded(request(ISSUER, 1), 100),
-        Err(MemoryError::LeaseExpired)
-    );
+        Err(NativeError::Memory(MemoryError::LeaseExpired))
+    ));
     assert_eq!(owner.pending_len(), 0);
 }
 

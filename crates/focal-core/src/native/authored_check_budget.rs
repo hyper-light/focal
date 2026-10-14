@@ -130,8 +130,10 @@ pub(super) fn quote(
             Row::ClaimIdentity(_) => claim_indices = add(claim_indices, 1)?,
             Row::DefinitionIdentity(_) => definition_indices = add(definition_indices, 1)?,
             Row::CreationResult(result) => {
-                within(result.get().entries().len(), limits.range.max_batch_entries)?;
-                objects = add(objects, result.get().entries().len())?;
+                // A candidate's rows are held until every check has read them (doc 31 M3).
+                let entries = result.held().ok_or(ContractError::InvalidPolicy)?.entries();
+                within(entries.len(), limits.range.max_batch_entries)?;
+                objects = add(objects, entries.len())?;
             }
             _ => {}
         }

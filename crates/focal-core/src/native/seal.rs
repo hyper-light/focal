@@ -1026,7 +1026,7 @@ impl Core<NativeState> {
                 let Row::Outcome(outcome) = &entry.value else {
                     return Err(SealRefusal::Corrupt);
                 };
-                if outcome.sequence <= through {
+                if outcome.sequence() <= through {
                     keys.push(entry.key);
                 }
             }
@@ -1146,7 +1146,8 @@ impl Core<NativeState> {
             if let Some(Row::Outcome(outcome)) = self.state.rows.get(key) {
                 sealed_events = add(
                     sealed_events,
-                    usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("events"))?,
+                    usize::try_from(outcome.events())
+                        .map_err(|_| NativeError::Capacity("events"))?,
                 )?;
             }
             changes.push(Change::Delete(*key));
@@ -1235,7 +1236,7 @@ impl Core<NativeState> {
         changes.push(Change::Put(entry(Key::Meta, Row::Meta(Box::new(meta)), 0)));
         changes.push(Change::Put(entry(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(Box::new(OutcomeRow::stored(&outcome, self.state.ledger)?)),
+            Row::Outcome(OwnedOutcome::stored(&outcome, self.state.ledger)?),
             0,
         )));
         let left = plan.keys.len();

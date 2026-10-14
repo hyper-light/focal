@@ -24,6 +24,7 @@ mod response;
 mod scalar;
 pub(super) use content::{Custody, artifact, claim_content, definition};
 pub(super) use creation::creation;
+pub(in crate::native) use creation::{creation_decode_bound, decode_creation};
 pub(super) use response::response;
 pub(super) use scalar::{ScalarInput, accepted, delivery, diagnostic, missing, work};
 

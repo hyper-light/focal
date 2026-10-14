@@ -32,8 +32,21 @@ impl PayloadRef {
             check: check(bytes),
         })
     }
+    /// A reference from its parts, as a spilled row that keeps them apart holds them.
+    pub(crate) fn from_parts(segment: u32, offset: u32, len: u32, check: u32) -> Self {
+        Self {
+            segment,
+            offset,
+            len,
+            check,
+        }
+    }
     pub fn segment(self) -> u32 {
         self.segment
+    }
+    /// The check over the payload's bytes.
+    pub(crate) fn check(self) -> u32 {
+        self.check
     }
     pub fn offset(self) -> u32 {
         self.offset
@@ -50,11 +63,12 @@ impl PayloadRef {
     }
 }
 
-/// The check a reference keeps over its bytes: the first four bytes of their BLAKE3 hash.
+/// The check a reference keeps over its bytes: their CRC-32, which refuses a read that returned
+/// other bytes (a torn or misdirected write, a reused offset) at a few nanoseconds a row, where a
+/// cryptographic hash took a hundred or more. The log is a replica's own cache, never a peer's
+/// input, so the check guards against accident, not adversaries.
 fn check(bytes: &[u8]) -> u32 {
-    let hash = blake3::hash(bytes);
-    let [a, b, c, d, ..] = *hash.as_bytes();
-    u32::from_le_bytes([a, b, c, d])
+    crc32fast::hash(bytes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -97,6 +111,11 @@ pub trait PayloadLog: PayloadRead + Send + Sync {
     fn held_segments(&self) -> usize {
         0
     }
+    /// The payload bytes appended to the parts the log holds now, written and not yet written:
+    /// what the replica has spilled off its heap.
+    fn held_bytes(&self) -> u64 {
+        0
+    }
 }
 
 /// The segment of every spilled row among `rows`, added to `live`. Bounded by the segments a log
@@ -109,6 +128,12 @@ pub(super) fn segments_of<'a>(
         match row {
             super::Row::Event(super::OwnedEvent::Logged(at))
             | super::Row::ClaimContent(super::OwnedClaimContent::Logged(at)) => {
+                live.insert(at.segment());
+            }
+            super::Row::Outcome(super::OwnedOutcome::Logged(at)) => {
+                live.insert(at.at().segment());
+            }
+            super::Row::CreationResult(super::creation_result::OwnedCreationResult::Logged(at)) => {
                 live.insert(at.segment());
             }
             _ => {}
@@ -133,16 +158,26 @@ pub(super) fn spill_changes(
         let focal_memory::Change::Put(entry) = change else {
             continue;
         };
-        let spilled = match &entry.value {
-            super::Row::Event(event) => event.spill(ledger, log)?.map(super::Row::Event),
-            super::Row::ClaimContent(content) => content.spill(log).map(super::Row::ClaimContent),
+        let spilled = match (&entry.key, &entry.value) {
+            (_, super::Row::Event(event)) => event.spill(ledger, log)?.map(super::Row::Event),
+            (_, super::Row::ClaimContent(content)) => {
+                content.spill(log).map(super::Row::ClaimContent)
+            }
+            (super::Key::Outcome(invocation), super::Row::Outcome(outcome)) => outcome
+                .spill(ledger, *invocation, log)?
+                .map(super::Row::Outcome),
+            (_, super::Row::CreationResult(result)) => {
+                result.spill(log)?.map(super::Row::CreationResult)
+            }
             _ => None,
         };
         if let Some(row) = spilled {
+            // A spilled row holds nothing on the heap, its box's included.
             entry.heap_bytes = match &row {
                 super::Row::Event(event) => event.heap_charge()?,
                 super::Row::ClaimContent(content) => content.heap_charge()?,
-                _ => entry.heap_bytes,
+                super::Row::CreationResult(result) => result.heap_charge()?,
+                _ => row.boxed_heap(),
             };
             entry.value = row;
         }

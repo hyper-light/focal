@@ -283,9 +283,17 @@ pub(in crate::native) fn content_profile(
     types::scope_limits(sink, profile.scope_limits)?;
     types::owner(sink, profile.owner)
 }
-pub(super) fn creation(sink: &mut impl Sink, owned: &OwnedCreationResult) -> Result<(), Error> {
+pub(super) fn creation(
+    sink: &mut impl Sink,
+    owned: &OwnedCreationResult,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), Error> {
     sink.visit(1)?;
-    let entries = owned.get().entries();
+    // A spilled one holds its record encoding (doc 31 M3).
+    let entries = match owned {
+        OwnedCreationResult::Logged(at) => return super::rows::spilled(sink, *at, 0, payloads),
+        OwnedCreationResult::Held(result) => result.entries(),
+    };
     sink.visit(entries.len().checked_add(1).ok_or(Error::Capacity)?)?;
     count(sink, entries.len())?;
     for entry in entries {

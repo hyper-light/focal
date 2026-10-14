@@ -139,21 +139,27 @@ fn authored_descriptors_identity_indices_and_zero_event_reuse_survive_full_recov
             restored
                 .native_creation_result(request(id))
                 .unwrap()
+                .unwrap()
                 .entries(),
-            core.native_creation_result(request(id)).unwrap().entries()
+            core.native_creation_result(request(id))
+                .unwrap()
+                .unwrap()
+                .entries()
         );
     }
     assert_eq!(
         restored
             .native_creation_result(request(1))
             .unwrap()
+            .unwrap()
             .entries(),
         restored
             .native_creation_result(request(3))
             .unwrap()
+            .unwrap()
             .entries()
     );
-    let reused = restored.native_outcome(request(3)).unwrap();
+    let reused = restored.native_outcome(request(3)).unwrap().unwrap();
     assert_eq!(
         (
             reused.created,
@@ -219,6 +225,7 @@ fn altered_authored_body_profile_identity_and_creation_mapping_refuse_and_refund
     );
     let mut mappings = core
         .native_creation_result(request(3))
+        .unwrap()
         .unwrap()
         .entries()
         .to_vec();

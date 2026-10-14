@@ -262,8 +262,9 @@ fn a_family_leaves_the_core_only_when_terminal_released_and_unreferenced() {
         core.state
             .rows
             .get(&Key::Outcome(NativeInvocation::Retirement(id(1)))),
-        Some(Row::Outcome(outcome)) if outcome.operation == NativeOperation::Retire
-            && outcome.sequence == SessionSeq(through.0 + 1)
+        Some(Row::Outcome(outcome))
+            if outcome.held().is_some_and(|row| row.operation == NativeOperation::Retire)
+                && outcome.sequence() == SessionSeq(through.0 + 1)
     ));
     assert!(
         core.state
@@ -824,7 +825,11 @@ fn a_bundle_hydrates_into_a_core_of_the_family_read_as_the_live_one_was() {
         view.native_definition(ValidationId::from_u128(12))
             .is_none()
     );
-    assert!(view.native_outcome(f::request(f::ISSUER, 1)).is_none());
+    assert!(
+        view.native_outcome(f::request(f::ISSUER, 1))
+            .unwrap()
+            .is_none()
+    );
     // The family leaves the live core behind its continuation; the bundle
     // still answers for it.
     core.retire_native_family(&family, hash, bytes_len, through)

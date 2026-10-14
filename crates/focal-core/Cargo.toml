@@ -11,6 +11,7 @@ focal-memory = { version = "0.1.0", path = "../focal-memory" }
 focal-evidence = { version = "0.1.0", path = "../focal-evidence" }
 serde.workspace = true
 blake3.workspace = true
+crc32fast.workspace = true
 thiserror.workspace = true
 postcard.workspace = true
 

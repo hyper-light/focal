@@ -330,8 +330,10 @@ fn authored<O: Overlay>(
                 invocation == read.outcome.invocation
                     && read.outcome.operation == NativeOperation::Create,
             )?;
-            read.charge(add(value.get().entries().len(), 1)?)?;
-            for object in value.get().entries() {
+            // A record's rows are held while it is validated (doc 31 M3).
+            let entries = value.held().ok_or_else(invalid)?.entries();
+            read.charge(add(entries.len(), 1)?)?;
+            for object in entries {
                 let actual = match object.family {
                     NativeCreatedFamily::Claim => {
                         match read.require(Key::ClaimIdentity(object.schema, object.content))? {

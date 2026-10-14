@@ -41,7 +41,7 @@ fn assert_refused_without_change(
     assert_eq!(core.native_stats(), stats);
     assert_eq!(core.state.budget.stats(), budget);
     assert_eq!(meta(core, &[]).events, events);
-    assert!(core.native_outcome(request).is_none());
+    assert!(core.native_outcome(request).unwrap().is_none());
     for (at, before) in pending_events.into_iter().enumerate() {
         assert_eq!(
             (pending[at].outcome(), meta(core, &pending[..=at]).events),
@@ -51,6 +51,7 @@ fn assert_refused_without_change(
             core.native_chain(&pending[..=at])
                 .unwrap()
                 .recorded(request)
+                .unwrap()
                 .is_none()
         );
     }
@@ -155,7 +156,7 @@ fn verified_required_failure_counts_history_and_registry_seal_and_retry_needs_no
         outcome.invocation,
     ]
     .into_iter()
-    .map(|request| core.native_outcome(request).unwrap())
+    .map(|request| core.native_outcome(request).unwrap().unwrap())
     .collect();
     assert_eq!(counted_events(&core, &outcomes), meta(&core, &[]).events);
 
@@ -311,6 +312,7 @@ fn zero_event_configuration_and_counter_overflow_fail_closed() {
     assert!(core.native_claim(ClaimId::from_u128(1)).is_none());
     assert!(
         core.native_outcome(fixture::request(fixture::ISSUER, 1))
+            .unwrap()
             .is_none()
     );
 }

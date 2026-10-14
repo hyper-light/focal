@@ -1657,7 +1657,7 @@ impl MetricsSnapshot {
                 text.labeled(name, &[("bound", bound)], count);
             }
         }
-        let series: [(&str, &str, &str); 38] = [
+        let series: [(&str, &str, &str); 39] = [
             (
                 "focal_session_observed",
                 "gauge",
@@ -1840,6 +1840,11 @@ impl MetricsSnapshot {
                 "Segments of the replica's payload log, where its rows' payloads are spilled.",
             ),
             (
+                "focal_session_payload_bytes",
+                "gauge",
+                "Payload bytes the replica's payload log holds: what it spilled off its heap.",
+            ),
+            (
                 "focal_session_payload_open_refusals_total",
                 "counter",
                 "Times the replica's payload log could not be opened.",
@@ -1918,6 +1923,7 @@ impl MetricsSnapshot {
                         session.memory.map(|m| m.native_limit)
                     }
                     "focal_session_payload_segments" => session.memory.map(|m| m.payload_segments),
+                    "focal_session_payload_bytes" => session.memory.map(|m| m.payload_bytes),
                     "focal_session_payload_open_refusals_total" => {
                         session.memory.map(|m| m.payload_open_refusals)
                     }
@@ -2294,6 +2300,7 @@ mod tests {
             native_used: 8_000,
             native_limit: 400_000,
             payload_segments: 3,
+            payload_bytes: 4_096,
             payload_open_refusals: 0,
         });
         let mut managed = sample.sessions[0].clone();

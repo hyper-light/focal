@@ -50,7 +50,10 @@ fn checked_pending_input_builds_from_selected_funding_after_parent_exhaustion() 
         .unwrap();
     core.publish_native(first).unwrap();
     let outcome = core.publish_native(second).unwrap();
-    assert_eq!(core.native_outcome(request(ISSUER, 2)), Some(outcome));
+    assert_eq!(
+        core.native_outcome(request(ISSUER, 2)).unwrap(),
+        Some(outcome)
+    );
     assert_eq!(
         core.native_claim(ClaimId::from_u128(1)).unwrap().status(),
         ClaimStatus::Posted

@@ -113,7 +113,10 @@ impl AuthoredSnapshot {
             view.definition(self.validation()).unwrap()
         ));
         assert_eq!(
-            view.creation_result(key(request)).unwrap().entries(),
+            view.creation_result(key(request))
+                .unwrap()
+                .unwrap()
+                .entries(),
             self.resolution
         );
     }
@@ -137,7 +140,7 @@ impl AuthoredSnapshot {
             Some(self.descriptor.content_hash())
         );
         assert_eq!(
-            read.with_creation_result(key(request), 0, |result| {
+            read.with_creation_result(key(request), 0, &read_budget(), |result| {
                 assert_eq!(result.entries(), self.resolution);
                 result.entries().len()
             })
@@ -175,7 +178,7 @@ fn authored_owner_keeps_full_bodies_and_pinned_creation_through_post_and_cancel(
             .validation_descriptor(snapshot.validation())
             .is_none()
     );
-    assert!(owner.committed().creation_result(key(1)).is_none());
+    assert!(owner.committed().creation_result(key(1)).unwrap().is_none());
     assert_eq!(owner.effective().sequence(), creation.sequence);
     snapshot.check_view(&owner.effective(), 1, ClaimStatus::Generated);
     snapshot.check_view(
@@ -247,8 +250,14 @@ fn self_work_draft_is_retained_but_post_refuses_without_mutating_the_owner() {
         owner.effective().claim(snapshot.claim()).unwrap().binding(),
         expected
     );
-    assert!(owner.effective().recorded(key(11)).is_none());
-    assert!(owner.effective().creation_result(key(11)).is_none());
+    assert!(owner.effective().recorded(key(11)).unwrap().is_none());
+    assert!(
+        owner
+            .effective()
+            .creation_result(key(11))
+            .unwrap()
+            .is_none()
+    );
     snapshot.check_view(&owner.effective(), 10, ClaimStatus::Generated);
     snapshot.check_view(&owner.committed(), 10, ClaimStatus::Generated);
 }

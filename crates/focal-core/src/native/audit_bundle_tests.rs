@@ -796,7 +796,11 @@ fn insufficient_batch_capacity_and_range_failure_leave_no_partial_bundle_or_cons
     assert_eq!(core.native_sequence(), before_sequence);
     assert!(core.native_result_testament(BUNDLE).is_none());
     assert!(core.native_claim_result_testament(CLAIM).is_none());
-    assert!(core.native_outcome(f::request(f::ISSUER, 1300)).is_none());
+    assert!(
+        core.native_outcome(f::request(f::ISSUER, 1300))
+            .unwrap()
+            .is_none()
+    );
 
     core.limits.range.max_batch_entries = 6;
     let failed = crate::native::prepare::fail_range_after(0, || {
@@ -817,7 +821,11 @@ fn insufficient_batch_capacity_and_range_failure_leave_no_partial_bundle_or_cons
     assert_eq!(core.native_sequence(), before_sequence);
     assert!(core.native_result_testament(BUNDLE).is_none());
     assert!(core.native_claim_result_testament(CLAIM).is_none());
-    assert!(core.native_outcome(f::request(f::ISSUER, 1300)).is_none());
+    assert!(
+        core.native_outcome(f::request(f::ISSUER, 1300))
+            .unwrap()
+            .is_none()
+    );
 
     f::publish(&mut core, 100, generate(claim, BUNDLE, f::ISSUER, 1300));
     let binding = core
@@ -845,7 +853,11 @@ fn insufficient_batch_capacity_and_range_failure_leave_no_partial_bundle_or_cons
             .state(),
         ResultTestamentState::Generated
     );
-    assert!(core.native_outcome(f::request(f::ISSUER, 1301)).is_none());
+    assert!(
+        core.native_outcome(f::request(f::ISSUER, 1301))
+            .unwrap()
+            .is_none()
+    );
     core.limits.range.max_batch_entries = 5;
     f::publish(&mut core, 100, post(binding, f::ISSUER, 1301));
     assert_eq!(

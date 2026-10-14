@@ -590,7 +590,7 @@ fn report_changes(
             Row::Artifact(row) => Row::Artifact(row.copy().unwrap()),
             Row::ArtifactIdentity(row) => Row::ArtifactIdentity(*row),
             Row::Accepted(row) => Row::Accepted(row.copy().unwrap()),
-            Row::Outcome(row) => Row::Outcome(Box::new(**row)),
+            Row::Outcome(row) => Row::Outcome(row.copy()),
             Row::Event(row) => Row::Event(row.copy().unwrap()),
             _ => panic!("unexpected report row"),
         };

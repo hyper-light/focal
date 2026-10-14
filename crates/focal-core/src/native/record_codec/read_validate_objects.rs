@@ -440,6 +440,7 @@ pub(super) fn legacy(
     let Row::Outcome(outcome) = read.require(Key::Outcome(NativeInvocation::Import))? else {
         return Err(invalid());
     };
+    let outcome = outcome.row(read.ledger, NativeInvocation::Import, read.payloads)?;
     // The row's ledger is the store's (`OutcomeRow`).
     if outcome.operation != NativeOperation::Import {
         return Err(invalid());
@@ -556,15 +557,22 @@ pub(super) fn authored(
             let Row::Outcome(outcome) = read.require(Key::Outcome(invocation))? else {
                 return Err(invalid());
             };
+            let outcome = outcome.row(read.ledger, invocation, read.payloads)?;
             if outcome.operation != NativeOperation::Create {
                 return Err(invalid());
             }
-            read.charge(sum(value.get().entries().len(), 1)?)?;
+            // A spilled result is read back, decoded and charged while it is checked (doc 31 M3).
+            let value = value.read(
+                read.payloads,
+                read.budget,
+                focal_memory::BudgetLane::Committed,
+            )?;
+            read.charge(sum(value.entries().len(), 1)?)?;
             // A created claim that retired (26 §4) left its identity with
             // the family; its continuation vouches for the entry, and the
             // definitions created beside it left with their claim.
             let mut retired = false;
-            for object in value.get().entries() {
+            for object in value.entries() {
                 if object.family == NativeCreatedFamily::Claim
                     && matches!(
                         read.get(Key::Retired(ClaimId(object.resolved.0)))?,
@@ -574,7 +582,7 @@ pub(super) fn authored(
                     retired = true;
                 }
             }
-            for object in value.get().entries() {
+            for object in value.entries() {
                 let resolved = match object.family {
                     NativeCreatedFamily::Claim => {
                         match read.get(Key::ClaimIdentity(object.schema, object.content))? {
@@ -969,6 +977,7 @@ fn terminal(
                 let Row::Outcome(outcome) = read.require(Key::Outcome(event.invocation))? else {
                     return Err(invalid());
                 };
+                let outcome = outcome.row(read.ledger, event.invocation, read.payloads)?;
                 if actual != deadline || outcome.logical_time != fired || fired < deadline.at {
                     return Err(invalid());
                 }

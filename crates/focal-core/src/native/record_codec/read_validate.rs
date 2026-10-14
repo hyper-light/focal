@@ -263,7 +263,6 @@ impl Counts {
 /// The complete detached owner remains borrowed until counts, object references,
 /// publication history and derived indices all agree. Scratch permits disappear
 /// before the caller receives a publishable owner. Prefix zero is empty genesis.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)] // A restore's root and what it is checked against.
 pub(super) fn validate(
     root: crate::native::ranges::HydratedRows<'_>,
@@ -325,8 +324,12 @@ pub(super) fn validate(
         let row = entry.value;
         read.charge(1024)?;
         match (key, row) {
-            (Key::Outcome(invocation), Row::Outcome(value)) => {
-                read_rows::check_fixed(key, row, ledger)?;
+            (Key::Outcome(invocation), Row::Outcome(stored)) => {
+                // A spilled outcome is read back and checked as a decoded one is (doc 31 M3).
+                let value = &stored.row(ledger, invocation, read.payloads)?;
+                if !read_rows::check_outcome(invocation, value) {
+                    return Err(invalid());
+                }
                 sequences.mark(value.sequence, value.logical_time, prefix, &read)?;
                 if value.sequence > prefix || value.logical_time > expected.logical_time {
                     return Err(invalid());
@@ -401,7 +404,7 @@ pub(super) fn validate(
                 }
                 match read.get(Key::Outcome(event.invocation))? {
                     Some(Row::Outcome(outcome)) => {
-                        if outcome.sequence != sequence || ordinal >= outcome.events {
+                        if outcome.sequence() != sequence || ordinal >= outcome.events() {
                             return Err(invalid());
                         }
                     }

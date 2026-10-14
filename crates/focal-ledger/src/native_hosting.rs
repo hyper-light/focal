@@ -720,10 +720,13 @@ impl Session {
     }
     /// The segments of the native engine's payload log and how many times it could not be
     /// opened (doc 31 M3): none before the session hosts one.
-    pub fn native_payload_log(&self) -> Option<(usize, u64)> {
-        self.native
-            .as_deref()
-            .map(|engine| (engine.payload_segments(), engine.payload_open_refusals()))
+    /// The replica's payload log (doc 31 M3): none without a native engine.
+    pub fn native_payload_log(&self) -> Option<NativePayloadLog> {
+        self.native.as_deref().map(|engine| NativePayloadLog {
+            segments: engine.payload_segments(),
+            bytes: engine.payload_bytes(),
+            open_refusals: engine.payload_open_refusals(),
+        })
     }
     pub fn pending_seed(&self) -> Option<&crate::PendingSeed> {
         self.seed_pending
@@ -1412,4 +1415,15 @@ impl Session {
         engine.read_index(&mut self.consensus, correlation)?;
         Ok(())
     }
+}
+
+/// A replica's payload log, where its rows' payloads are spilled off the heap (doc 31 M3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativePayloadLog {
+    /// The segments it holds.
+    pub segments: usize,
+    /// The payload bytes appended to them, on the volume or in the log's tail.
+    pub bytes: u64,
+    /// Times it could not be opened.
+    pub open_refusals: u64,
 }

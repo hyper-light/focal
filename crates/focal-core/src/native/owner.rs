@@ -1611,7 +1611,12 @@ impl<'a> NativeView<'a> {
             _ => None,
         }
     }
-    pub fn recorded(&self, invocation: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
+    /// The outcome recorded for `invocation`, a spilled one read back: one that cannot be read
+    /// is an error, never taken for none.
+    pub fn recorded(
+        &self,
+        invocation: impl Into<NativeInvocation>,
+    ) -> Result<Option<NativeOutcome>, NativeError> {
         self.0.outcome(invocation.into())
     }
     pub fn definition(&self, id: ValidationId) -> Option<&'a validation::Declaration> {

@@ -47,9 +47,7 @@ fn outcome(invocation: NativeInvocation, operation: NativeOperation) -> NativeOu
     }
 }
 fn outcome_row(invocation: NativeInvocation, operation: NativeOperation) -> Row {
-    Row::Outcome(Box::new(
-        OutcomeRow::stored(&outcome(invocation, operation), ledger()).unwrap(),
-    ))
+    Row::Outcome(OwnedOutcome::stored(&outcome(invocation, operation), ledger()).unwrap())
 }
 fn encode(key: Key, row: &Row) -> Vec<u8> {
     let mut size = CountingSink::new(usize::MAX, usize::MAX);
@@ -409,7 +407,7 @@ fn all_outcome_namespaces_and_large_scalar_counters_preserve_their_complete_widt
         else {
             panic!("expected an outcome");
         };
-        assert_eq!(actual.expand(ledger(), invocation), expected);
+        assert_eq!(actual.expand(ledger(), invocation, None).unwrap(), expected);
         // The row keeps neither its invocation nor its ledger, so bytes naming another invocation than the
         // key are refused, not taken as the key's.
         let other = NativeInvocation::Seal(77);

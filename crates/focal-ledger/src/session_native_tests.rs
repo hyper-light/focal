@@ -3348,15 +3348,12 @@ fn writes_admitted_while_deferred_reach_each_follower_as_one_append() {
 }
 
 /// The bytes a replica's payload log holds on its volume.
-fn payload_bytes(dir: &Path, id: u64) -> u64 {
-    std::fs::read_dir(dir.join(format!("payloads-{id}")))
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok()?.metadata().ok())
-                .map(|metadata| metadata.len())
-                .sum()
-        })
-        .unwrap_or(0)
+/// The payload bytes replica `id`'s log holds, on its volume or in its tail.
+fn payload_bytes(cluster: &mut Cluster, id: u64) -> u64 {
+    cluster
+        .node(id)
+        .native_payload_log()
+        .map_or(0, |log| log.bytes)
 }
 
 /// A hosted replica spills its events to its payload log as it applies them (doc 31 M3): the
@@ -3375,14 +3372,14 @@ fn a_hosted_replica_spills_its_events_and_a_restart_respills_them_from_its_check
         let created = cluster.commit(1, PARTIES.issuer, create, &[]);
         first.get_or_insert((key, created));
     }
-    let spilled = payload_bytes(cluster.dir.path(), 1);
+    let spilled = payload_bytes(&mut cluster, 1);
     assert!(spilled > 0, "the replica's events are in its payload log");
     cluster.node(1).checkpoint().unwrap();
     let sequence = cluster.node(1).native_sequence().unwrap();
     cluster.stop(1);
     cluster.reopen(1, true);
     assert_eq!(cluster.node(1).native_sequence().unwrap(), sequence);
-    let restored = payload_bytes(cluster.dir.path(), 1);
+    let restored = payload_bytes(&mut cluster, 1);
     assert!(restored > 0, "the restore spilled the checkpoint's events");
     assert!(
         restored <= spilled,

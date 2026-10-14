@@ -324,11 +324,13 @@ pub(crate) fn object(
             .map(|scope| NativeObject::Monitor(Box::new(docs::monitor(claim, scope)))),
         NativeObjectRef::Outcome(invocation) => core
             .native_outcome(docs::invocation_of(invocation))
+            .map_err(docs::content_error)?
             .map(|outcome| NativeObject::Outcome(Box::new(docs::outcome(outcome)))),
         NativeObjectRef::CreationResult(invocation) => {
             let key = docs::invocation_of(invocation);
             core.native_creation_result(key)
-                .map(|result| NativeObject::CreationResult(docs::creation_result(key, result)))
+                .map_err(docs::content_error)?
+                .map(|result| NativeObject::CreationResult(docs::creation_result(key, &result)))
         }
         NativeObjectRef::Event { sequence, ordinal } => core
             .native_event(sequence, ordinal)

@@ -382,7 +382,7 @@ impl<'source> OriginalPlan<'source> {
         changes.push(Change::Put(entry(Key::Meta, Row::Meta(Box::new(meta)), 0)));
         changes.push(Change::Put(entry(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(Box::new(OutcomeRow::stored(&outcome, view.ledger())?)),
+            Row::Outcome(OwnedOutcome::stored(&outcome, view.ledger())?),
             0,
         )));
         if let Some((principal, window)) = window {

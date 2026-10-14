@@ -45,10 +45,18 @@ pub(super) fn descriptor(row: Option<&Row>) -> Option<&ValidationDescriptor> {
         _ => None,
     }
 }
-fn result(row: Option<&Row>) -> Option<&NativeCreationResult> {
+/// The creation result `row` holds, a spilled one read back through `payloads`, decoded and
+/// charged to `budget` while it is held (doc 31 M3).
+fn result<'a>(
+    row: Option<&'a Row>,
+    payloads: Option<&dyn PayloadRead>,
+    budget: &MemoryBudget,
+) -> Result<Option<NativeCreationRead<'a>>, NativeError> {
     match row {
-        Some(Row::CreationResult(row)) => Some(row.get()),
-        _ => None,
+        Some(Row::CreationResult(row)) => {
+            row.read(payloads, budget, BudgetLane::Ordinary).map(Some)
+        }
+        _ => Ok(None),
     }
 }
 impl Core<NativeState> {
@@ -85,11 +93,17 @@ impl Core<NativeState> {
     pub fn native_validation_descriptor(&self, id: ValidationId) -> Option<&ValidationDescriptor> {
         descriptor(self.state.rows.get(&Key::Definition(id)))
     }
+    /// The result of the creation `key` made, a spilled one read back, decoded and charged to
+    /// the core's budget while it is held.
     pub fn native_creation_result(
         &self,
         key: impl Into<NativeInvocation>,
-    ) -> Option<&NativeCreationResult> {
-        result(self.state.rows.get(&Key::CreationResult(key.into())))
+    ) -> Result<Option<NativeCreationRead<'_>>, NativeError> {
+        result(
+            self.state.rows.get(&Key::CreationResult(key.into())),
+            self.state.payloads(),
+            &self.state.budget,
+        )
     }
 }
 impl NativePrepared {
@@ -111,11 +125,19 @@ impl NativePrepared {
     pub fn written_validation_descriptor(&self, id: ValidationId) -> Option<&ValidationDescriptor> {
         descriptor(self.fragments.get(&Key::Definition(id)))
     }
+    /// The creation result this candidate writes for `key`, read through `payloads` (its core's,
+    /// [`Core::native_payloads`]) where it is spilled and charged to `budget` while it is held.
     pub fn written_creation_result(
         &self,
         key: impl Into<NativeInvocation>,
-    ) -> Option<&NativeCreationResult> {
-        result(self.fragments.get(&Key::CreationResult(key.into())))
+        payloads: Option<&dyn PayloadRead>,
+        budget: &MemoryBudget,
+    ) -> Result<Option<NativeCreationRead<'_>>, NativeError> {
+        result(
+            self.fragments.get(&Key::CreationResult(key.into())),
+            payloads,
+            budget,
+        )
     }
 }
 impl<'a> NativeView<'a> {
@@ -135,11 +157,17 @@ impl<'a> NativeView<'a> {
     pub fn validation_descriptor(&self, id: ValidationId) -> Option<&'a ValidationDescriptor> {
         descriptor(self.0.get(Key::Definition(id)))
     }
+    /// The result of the creation `key` made as this view sees it, a spilled one read back,
+    /// decoded and charged to the core's budget while it is held.
     pub fn creation_result(
         &self,
         key: impl Into<NativeInvocation>,
-    ) -> Option<&'a NativeCreationResult> {
-        result(self.0.get(Key::CreationResult(key.into())))
+    ) -> Result<Option<NativeCreationRead<'a>>, NativeError> {
+        result(
+            self.0.get(Key::CreationResult(key.into())),
+            self.0.payloads(),
+            &self.0.state.budget,
+        )
     }
 }
 impl NativeRead {
@@ -207,21 +235,30 @@ impl NativeRead {
             })
             .map(Option::flatten)
     }
+    /// Project the result of the creation `key` made, a spilled one read back, decoded and
+    /// charged to `budget` while it is projected.
     pub fn with_creation_result<T>(
         &self,
         key: impl Into<NativeInvocation>,
         now: u64,
+        budget: &MemoryBudget,
         project: impl FnOnce(&NativeCreationResult) -> T,
-    ) -> Result<Option<T>, MemoryError> {
+    ) -> Result<Option<T>, NativeError> {
         let key = Key::CreationResult(key.into());
-        self.lease
+        let payloads = self
+            .payloads
+            .as_deref()
+            .map(|read| -> &dyn PayloadRead { read });
+        let projected = self
+            .lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    result(Some(entry.value)).map(project)
+                    result(Some(entry.value), payloads, budget)
+                        .map(|read| read.map(|read| project(&read)))
                 } else {
-                    None
+                    Ok(None)
                 }
-            })
-            .map(Option::flatten)
+            })?;
+        projected.transpose().map(Option::flatten)
     }
 }

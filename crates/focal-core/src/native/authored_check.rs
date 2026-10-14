@@ -191,7 +191,9 @@ pub(in crate::native) fn check_plan(
     visits.charge(extras.rows.len())?;
     for extra in &extras.rows {
         if let Row::CreationResult(result) = &extra.row {
-            fingerprint_visits = add(fingerprint_visits, result.get().entries().len())?;
+            // A candidate's rows are held until every check has read them (doc 31 M3).
+            let entries = result.held().ok_or(ContractError::InvalidPolicy)?.entries();
+            fingerprint_visits = add(fingerprint_visits, entries.len())?;
         }
     }
     visits.charge(fingerprint_visits)?;
@@ -211,10 +213,13 @@ pub(in crate::native) fn check_plan(
     }
     let result_key = Key::CreationResult(proof.request.into());
     let result = find(extras, result_key, &mut visits)?.ok_or(ContractError::InvalidPolicy)?;
-    let Row::CreationResult(result) = &result.row else {
+    let Some(result) = (match &result.row {
+        Row::CreationResult(result) => result.held(),
+        _ => None,
+    }) else {
         return Err(ContractError::InvalidPolicy.into());
     };
-    if result.get().entries().len() != proof.objects || view.get(result_key).is_some() {
+    if result.entries().len() != proof.objects || view.get(result_key).is_some() {
         return Err(ContractError::InvalidPolicy.into());
     }
     let (mut claims, mut definitions, mut claim_indices, mut definition_indices, mut results) =
@@ -378,7 +383,7 @@ pub(in crate::native) fn check_plan(
     ) {
         return Err(ContractError::InvalidPolicy.into());
     }
-    for object in result.get().entries() {
+    for object in result.entries() {
         visits.charge(1)?;
         let key = match object.family {
             NativeCreatedFamily::Claim => Key::ClaimIdentity(object.schema, object.content),
@@ -536,13 +541,18 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
                     return Err(ContractError::ContentConflict.into());
                 }
             }
-            (Key::CreationResult(key), Row::CreationResult(result)) if strict => {
+            (Key::CreationResult(key), Row::CreationResult(stored)) if strict => {
                 results = add(results, 1)?;
-                within(result.get().entries().len(), limits.range.max_batch_entries)?;
-                if entry.heap_bytes != result.heap_charge()? {
+                if entry.heap_bytes != stored.heap_charge()? {
                     return Err(ContractError::InvalidPolicy.into());
                 }
-                let outcome = view.outcome(*key).ok_or(ContractError::InvalidPolicy)?;
+                let result = stored.read(
+                    view.payloads(),
+                    &core.state.budget,
+                    focal_memory::BudgetLane::Completion,
+                )?;
+                within(result.entries().len(), limits.range.max_batch_entries)?;
+                let outcome = view.outcome(*key)?.ok_or(ContractError::InvalidPolicy)?;
                 if outcome.operation != NativeOperation::Create || outcome.invocation != *key {
                     return Err(ContractError::InvalidPolicy.into());
                 }
@@ -550,14 +560,14 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
                 // its identity with it; its continuation vouches for the
                 // entry, and the definitions created beside it left with
                 // their claim.
-                let retired = result.get().entries().iter().any(|object| {
+                let retired = result.entries().iter().any(|object| {
                     object.family == NativeCreatedFamily::Claim
                         && matches!(
                             view.get(Key::Retired(ClaimId(object.resolved.0))),
                             Some(Row::Retired(_))
                         )
                 });
-                for object in result.get().entries() {
+                for object in result.entries() {
                     visits.charge(1)?;
                     let matches = match object.family {
                         NativeCreatedFamily::Claim => {
@@ -580,13 +590,14 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
                     }
                 }
             }
-            (Key::Outcome(key), Row::Outcome(outcome))
-                if strict && outcome.operation == NativeOperation::Create =>
-            {
-                if !matches!(
-                    view.get(Key::CreationResult(*key)),
-                    Some(Row::CreationResult(_))
-                ) {
+            (Key::Outcome(key), Row::Outcome(outcome)) if strict => {
+                let operation = outcome.row(view.ledger(), *key, view.payloads())?.operation;
+                if operation == NativeOperation::Create
+                    && !matches!(
+                        view.get(Key::CreationResult(*key)),
+                        Some(Row::CreationResult(_))
+                    )
+                {
                     return Err(ContractError::InvalidPolicy.into());
                 }
             }

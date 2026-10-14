@@ -19,7 +19,7 @@ fn copy_row(row: &Row) -> Result<Row, MemoryError> {
         Row::Artifact(value) => value.copy().map(Row::Artifact),
         Row::ArtifactIdentity(value) => Ok(Row::ArtifactIdentity(*value)),
         Row::Accepted(value) => value.copy().map(Row::Accepted),
-        Row::Outcome(value) => Ok(Row::Outcome(Box::new(**value))),
+        Row::Outcome(value) => Ok(Row::Outcome(value.copy())),
         Row::Event(value) => value.copy().map(Row::Event),
         Row::Index => Ok(Row::Index),
         Row::Epochs(value) => value.copy().map(|row| Row::Epochs(Box::new(row))),
@@ -222,7 +222,7 @@ fn with_seals(
         if let RangeChange::Put(entry) = change {
             match &mut entry.value {
                 Row::Outcome(value) => {
-                    **value = OutcomeRow::stored(&outcome, outcome.ledger).unwrap()
+                    *value = OwnedOutcome::stored(&outcome, outcome.ledger).unwrap()
                 }
                 Row::Meta(value) => **value = meta,
                 _ => {}

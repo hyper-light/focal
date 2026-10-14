@@ -462,8 +462,8 @@ fn encoding_refuses_non_genesis_empty_roots_and_missing_meta_or_outcome() {
     for row in [
         None,
         Some(Row::Meta(Box::default())),
-        Some(Row::Outcome(Box::new(
-            OutcomeRow::stored(
+        Some(Row::Outcome(
+            OwnedOutcome::stored(
                 &NativeOutcome {
                     ledger: fixture::binding(1).ledger,
                     invocation: fixture::request(fixture::ISSUER, 1).into(),
@@ -485,7 +485,7 @@ fn encoding_refuses_non_genesis_empty_roots_and_missing_meta_or_outcome() {
                 fixture::binding(1).ledger,
             )
             .unwrap(),
-        ))),
+        )),
     ] {
         let mut core = fixture::core();
         let initial = if row.is_none() { 1 } else { 0 };

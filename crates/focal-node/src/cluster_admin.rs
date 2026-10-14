@@ -278,9 +278,7 @@ impl ClusterAdmin {
                         .as_ref()
                         .is_none_or(|hash| focal_client::input::parse_hash(hash).is_ok()) =>
             {
-                Ok(AdminResult::ReplicaDiagnostics {
-                    diagnostics: *value,
-                })
+                Ok(AdminResult::ReplicaDiagnostics { diagnostics: value })
             }
             (OperatorRead::Storage, OperatorReply::Storage(value))
                 if value.node == self.identity.node =>

@@ -2247,6 +2247,7 @@ fn committed_retirements_apply_on_every_replica_and_fence_proposals() {
         assert_eq!(continuation.retired_at, SessionSeq(before.0 + 1));
         assert!(
             core.native_outcome(focal_core::native::NativeInvocation::Retirement(root))
+                .unwrap()
                 .is_some()
         );
     }
@@ -2515,8 +2516,16 @@ fn committed_seals_apply_on_every_replica_fence_proposals_and_close_the_generati
             (row.through, row.sealed_at, row.first),
             (before, SessionSeq(before.0 + 1), 1)
         );
-        assert_eq!(core.native_outcome(NativeInvocation::Request(first)), None);
-        assert!(core.native_outcome(NativeInvocation::Seal(1)).is_some());
+        assert_eq!(
+            core.native_outcome(NativeInvocation::Request(first))
+                .unwrap(),
+            None
+        );
+        assert!(
+            core.native_outcome(NativeInvocation::Seal(1))
+                .unwrap()
+                .is_some()
+        );
         let window = core.native_epochs(PARTIES.issuer).unwrap();
         assert_eq!(
             (window.floor, window.sealed),

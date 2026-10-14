@@ -186,7 +186,10 @@ fn real_pending_claim_admission_and_custody_report_publish_with_small_byte_bound
             None
         );
         for outcome in outcomes {
-            assert_eq!(core.native_outcome(outcome.invocation), Some(outcome));
+            assert_eq!(
+                core.native_outcome(outcome.invocation).unwrap(),
+                Some(outcome)
+            );
             for ordinal in 0..outcome.events {
                 assert_eq!(
                     core.native_event(outcome.sequence, ordinal)
@@ -324,7 +327,7 @@ fn small_immutable_definitions_keep_their_owned_addresses_through_pending_lifecy
     drop(posted);
     assert_eq!(core.state.budget.stats(), before);
     assert_eq!(core.native_sequence(), SessionSeq(1));
-    assert!(core.native_outcome(request(ISSUER, 2)).is_none());
+    assert!(core.native_outcome(request(ISSUER, 2)).unwrap().is_none());
     let posted = prepared(core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[]));
     core.publish_native(posted).unwrap();
     // The pinned read keeps the definition it read. Every family but the counters shares one
@@ -477,7 +480,7 @@ fn inline_only_entry_allowance_refuses_claim_heap_without_publishing_any_partial
         core.native_definition(focal_model::ValidationId::from_u128(100))
             .is_none()
     );
-    assert!(core.native_outcome(request(ISSUER, 1)).is_none());
+    assert!(core.native_outcome(request(ISSUER, 1)).unwrap().is_none());
     assert!(core.native_event(SessionSeq(1), 0).is_none());
 }
 
@@ -512,7 +515,7 @@ fn strict_entry_rejection_preserves_existing_rows_and_allows_smaller_same_reques
     assert_eq!(core.native_sequence(), SessionSeq(1));
     assert_eq!(core.native_claim(key(1).claim).unwrap().binding(), original);
     assert!(core.native_claim(ClaimId::from_u128(2)).is_none());
-    assert!(core.native_outcome(request(ISSUER, 2)).is_none());
+    assert!(core.native_outcome(request(ISSUER, 2)).unwrap().is_none());
     assert!(core.native_event(SessionSeq(2), 0).is_none());
     let accepted = publish(&mut core, 20, creation(2, 2, &[], None));
     assert_eq!(accepted.sequence, SessionSeq(2));
@@ -522,6 +525,9 @@ fn strict_entry_rejection_preserves_existing_rows_and_allows_smaller_same_reques
             .unwrap(),
         None
     );
-    assert_eq!(core.native_outcome(request(ISSUER, 2)), Some(accepted));
+    assert_eq!(
+        core.native_outcome(request(ISSUER, 2)).unwrap(),
+        Some(accepted)
+    );
     check_entries(&core);
 }

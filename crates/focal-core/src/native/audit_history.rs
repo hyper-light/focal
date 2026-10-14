@@ -116,7 +116,7 @@ fn published(
     }
     .ok_or(ContractError::MissingEvidence)?;
     let outcome = view
-        .outcome(event.invocation)
+        .outcome(event.invocation)?
         .ok_or(ContractError::MissingEvidence)?;
     if event.fact != fact
         || event.sequence != sequence

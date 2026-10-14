@@ -264,7 +264,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         // row's bytes, as one without a log does, until it opens (`open_payload_log`).
         let mut payload_open_refusals = 0u64;
         if let Some(source) = payloads.as_ref() {
-            match super::payloads::FilePayloads::open(source) {
+            match super::payloads::FilePayloads::open(source, &budget) {
                 Ok(log) => core.attach_payload_log(Box::new(log)),
                 Err(_) => payload_open_refusals = 1,
             }
@@ -569,7 +569,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if has_log {
             return;
         }
-        let log = match super::payloads::FilePayloads::open(source) {
+        let log = match super::payloads::FilePayloads::open(source, &self.budget) {
             Ok(log) => log,
             Err(_) => {
                 self.payload_open_refusals = self.payload_open_refusals.saturating_add(1);
@@ -595,6 +595,16 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         };
         core.payload_log()
             .map_or(0, focal_core::native::payloads::PayloadLog::held_segments)
+    }
+    /// The payload bytes the replica's payload log holds: none without one.
+    pub(crate) fn payload_bytes(&self) -> u64 {
+        let core = match self.domain.as_ref() {
+            Some(Domain::Passive(core)) => core,
+            Some(Domain::Active(owner, _)) => owner.committed_core(),
+            None => return 0,
+        };
+        core.payload_log()
+            .map_or(0, focal_core::native::payloads::PayloadLog::held_bytes)
     }
     /// Let go of the payload log's segments retired rows left unreferenced (doc 31 M3), once
     /// the log has sealed another segment since the last sweep: a sweep walks every spilled
@@ -1262,7 +1272,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         &self,
         request: impl Into<NativeInvocation>,
     ) -> Result<Option<NativeOutcome>, NativeSessionError> {
-        Ok(self.committed_core()?.native_outcome(request))
+        Ok(self.committed_core()?.native_outcome(request)?)
     }
     pub(crate) fn read_at_least(
         &self,

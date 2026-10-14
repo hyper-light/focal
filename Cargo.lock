@@ -726,6 +726,7 @@ name = "focal-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "crc32fast",
  "focal-evidence",
  "focal-memory",
  "focal-model",

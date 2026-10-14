@@ -196,7 +196,8 @@ fn a_principals_generations_open_in_order_and_close_at_the_floor() {
     let outcome = f::publish(&mut core, 13, advance(f::ISSUER, 2, 3, 2));
     assert_eq!(outcome.operation, NativeOperation::AdvanceEpochFloor);
     assert_eq!(
-        core.native_outcome(NativeInvocation::Request(key(f::ISSUER, 2, 3))),
+        core.native_outcome(NativeInvocation::Request(key(f::ISSUER, 2, 3)))
+            .unwrap(),
         Some(outcome)
     );
     let advanced = window(&core, f::ISSUER);
@@ -338,6 +339,7 @@ fn a_closed_generation_seals_into_a_bundle_the_live_core_points_to() {
     let first = key(f::ISSUER, 1, 1);
     let before = core
         .native_outcome(NativeInvocation::Request(first))
+        .unwrap()
         .unwrap();
     // Nothing is closed: nothing to seal, no pressure.
     assert_eq!(
@@ -403,7 +405,11 @@ fn a_closed_generation_seals_into_a_bundle_the_live_core_points_to() {
     // The live core: the rows left, the window records where they went,
     // the seal's row and its own outcome are published at the next prefix.
     assert_eq!(core.native_sequence(), SessionSeq(5));
-    assert_eq!(core.native_outcome(NativeInvocation::Request(first)), None);
+    assert_eq!(
+        core.native_outcome(NativeInvocation::Request(first))
+            .unwrap(),
+        None
+    );
     let after = meta(&core);
     assert_eq!((after.sealed, after.seals, after.outcomes), (3, 1, 5));
     assert_eq!(core.resident_outcomes(), 2);
@@ -433,7 +439,10 @@ fn a_closed_generation_seals_into_a_bundle_the_live_core_points_to() {
         }
     );
     assert!(!row.is_fold(1));
-    let outcome = core.native_outcome(NativeInvocation::Seal(1)).unwrap();
+    let outcome = core
+        .native_outcome(NativeInvocation::Seal(1))
+        .unwrap()
+        .unwrap();
     assert_eq!(outcome.operation, NativeOperation::Seal);
     assert_eq!(outcome.sequence, SessionSeq(5));
     assert_eq!(outcome.changed, plan.rows() as u32);
@@ -518,7 +527,8 @@ fn pressure_closes_the_least_recent_generations_and_the_index_folds_at_its_bound
         (RequestEpoch(2), RequestEpoch(2), 0)
     );
     assert_eq!(
-        core.native_outcome(NativeInvocation::Request(issuer_first)),
+        core.native_outcome(NativeInvocation::Request(issuer_first))
+            .unwrap(),
         None
     );
     assert_eq!(window(&core, f::EVALUATOR).floor, RequestEpoch(1));
@@ -867,11 +877,13 @@ fn an_anchored_seal_applies_after_the_writes_its_custody_took() {
         Some((RequestEpoch(2), RequestEpoch(3)))
     );
     assert_eq!(
-        core.native_outcome(NativeInvocation::Request(key(f::ISSUER, 1, 1))),
+        core.native_outcome(NativeInvocation::Request(key(f::ISSUER, 1, 1)))
+            .unwrap(),
         None
     );
     assert!(
         core.native_outcome(NativeInvocation::Request(key(f::ISSUER, 2, 5)))
+            .unwrap()
             .is_some()
     );
     let (_, row) = core.native_seal(1).unwrap();
@@ -896,8 +908,15 @@ fn an_anchored_seal_applies_after_the_writes_its_custody_took() {
     core.apply_anchored(anchored_record(&next, next_hash, next_bytes, &[]))
         .unwrap();
     assert_eq!(window(&core, f::ISSUER).sealed, RequestEpoch(3));
-    assert_eq!(core.native_outcome(NativeInvocation::Seal(1)), None);
-    assert!(core.native_outcome(NativeInvocation::Seal(2)).is_some());
+    assert_eq!(
+        core.native_outcome(NativeInvocation::Seal(1)).unwrap(),
+        None
+    );
+    assert!(
+        core.native_outcome(NativeInvocation::Seal(2))
+            .unwrap()
+            .is_some()
+    );
     let restored = restore_with(&core, &store);
     assert_eq!(window(&restored, f::ISSUER), window(&core, f::ISSUER));
 }
@@ -960,6 +979,7 @@ fn pressure_closes_in_band_and_a_later_seal_takes_what_closed() {
     assert!(row.is_closing(1) && row.valid(1));
     assert_eq!(
         core.native_outcome(NativeInvocation::Seal(1))
+            .unwrap()
             .unwrap()
             .changed,
         0

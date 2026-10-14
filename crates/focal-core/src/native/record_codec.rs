@@ -76,7 +76,47 @@ pub(in crate::native) use evidence::content_profile;
 pub use fixed::RowFamily;
 pub(in crate::native) use read_events::event_in as decode_event;
 pub(in crate::native) use read_evidence::content_profile as read_content_profile;
+pub(in crate::native) use read_evidence::{creation_decode_bound, decode_creation};
 pub(in crate::native) use read_history::event_object;
+/// Codec work an outcome's record encoding takes at most: a fixed-width row's.
+const OUTCOME_VISITS: usize = 4096;
+/// `outcome`'s record encoding written into the front of `into`: its length (a spilled outcome's
+/// bytes, doc 31 M3).
+pub(in crate::native) fn encode_outcome(
+    outcome: NativeOutcome,
+    into: &mut [u8],
+) -> Result<usize, CodecError> {
+    let mut count = CountingSink::new(into.len(), OUTCOME_VISITS);
+    fixed::outcome(&mut count, outcome)?;
+    let len = count.len();
+    let bytes = into.get_mut(..len).ok_or(CodecError::Capacity)?;
+    let mut sink = SliceSink::new(bytes, OUTCOME_VISITS);
+    fixed::outcome(&mut sink, outcome)?;
+    sink.finish()?;
+    Ok(len)
+}
+/// The outcome whose record encoding `bytes` are, exactly.
+pub(in crate::native) fn decode_outcome(bytes: &[u8]) -> Result<NativeOutcome, CodecError> {
+    let mut cursor = bytes::Cursor::new(bytes, bytes.len(), OUTCOME_VISITS)?;
+    let outcome = fixed::read_outcome(&mut cursor)?;
+    cursor.finish()?;
+    Ok(outcome)
+}
+/// A held creation result's record encoding written into the front of `into`: its length, or none
+/// where it does not fit (a spilled row's bytes, doc 31 M3).
+pub(in crate::native) fn encode_creation(
+    row: &crate::native::creation_result::OwnedCreationResult,
+    into: &mut [u8],
+) -> Option<usize> {
+    let visits = into.len().checked_mul(4)?.checked_add(4096)?;
+    let mut count = CountingSink::new(into.len(), visits);
+    evidence::creation(&mut count, row, None).ok()?;
+    let len = count.len();
+    let mut sink = SliceSink::new(into.get_mut(..len)?, visits);
+    evidence::creation(&mut sink, row, None).ok()?;
+    sink.finish().ok()?;
+    Some(len)
+}
 /// A measuring sink for a two-pass encoding.
 pub(in crate::native) fn counting_sink(max_bytes: usize, max_visits: usize) -> CountingSink {
     CountingSink::new(max_bytes, max_visits)
@@ -180,7 +220,7 @@ impl<'a> EncodingPlan<'a> {
             return Err(CodecError::Capacity);
         }
         let mut sink = CountingSink::new(limits.bytes, limits.visits);
-        frame(&mut sink, prepared, |sink, key, value, ledger| {
+        frame(&mut sink, prepared, payloads, |sink, key, value, ledger| {
             // Each row's length precedes it: measured once here, and its
             // write's visits charged as it is measured.
             let mut measure = RowSize { sink, bytes: 0 };
@@ -231,17 +271,22 @@ impl<'a> EncodingPlan<'a> {
             sink.finish()?;
             return Ok(hash);
         }
-        frame(&mut sink, self.prepared, |sink, key, value, ledger| {
-            let at = sink.len();
-            write_count(sink, 0)?;
-            rows::value(sink, key, value, ledger, self.payloads)?;
-            let size = sink
-                .len()
-                .checked_sub(at)
-                .and_then(|written| written.checked_sub(4))
-                .ok_or(CodecError::Capacity)?;
-            sink.patch_u32(at, u32::try_from(size).map_err(|_| CodecError::Capacity)?)
-        })?;
+        frame(
+            &mut sink,
+            self.prepared,
+            self.payloads,
+            |sink, key, value, ledger| {
+                let at = sink.len();
+                write_count(sink, 0)?;
+                rows::value(sink, key, value, ledger, self.payloads)?;
+                let size = sink
+                    .len()
+                    .checked_sub(at)
+                    .and_then(|written| written.checked_sub(4))
+                    .ok_or(CodecError::Capacity)?;
+                sink.patch_u32(at, u32::try_from(size).map_err(|_| CodecError::Capacity)?)
+            },
+        )?;
         let hashed = sink.len();
         digest_visits(&mut sink, hashed)?;
         let mut hash = blake3::Hasher::new_derive_key(HASH_DOMAIN);
@@ -406,6 +451,7 @@ pub(in crate::native) fn row_bytes(
 fn frame<S: Sink>(
     sink: &mut S,
     prepared: &NativePrepared,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
     mut row: impl FnMut(&mut S, Key, &Row, LedgerId) -> Result<(), CodecError>,
 ) -> Result<(), CodecError> {
     let outcome = prepared.outcome;
@@ -459,7 +505,7 @@ fn frame<S: Sink>(
                     meta = true;
                 }
                 if key == Key::Outcome(outcome.invocation) {
-                    if !matches!(value, Row::Outcome(row) if row.expand(outcome.ledger, outcome.invocation) == outcome)
+                    if !matches!(value, Row::Outcome(row) if row.expand(outcome.ledger, outcome.invocation, payloads).is_ok_and(|recorded| recorded == outcome))
                     {
                         return Err(CodecError::InvalidTag("record outcome"));
                     }

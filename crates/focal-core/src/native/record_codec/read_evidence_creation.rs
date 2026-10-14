@@ -23,6 +23,35 @@ pub(in crate::native::record_codec) fn creation<'a>(
         meter: Meter::new(max_source_visits),
     })
 }
+/// The most a decode of a `len`-byte creation result's record encoding takes on the heap: its
+/// entries, fewer than its bytes over their 71 each.
+pub(in crate::native) fn creation_decode_bound(len: usize) -> Result<usize, MemoryError> {
+    let entries = len
+        .checked_div(71)
+        .and_then(|entries| entries.checked_add(1))
+        .ok_or(MemoryError::CounterExhausted("creation result decode"))?;
+    NativeCreationResult::construction_heap(entries)
+}
+/// The creation result whose record encoding `bytes` are (a spilled row's, doc 31 M3), checked as
+/// a replayed one is.
+pub(in crate::native) fn decode_creation(
+    bytes: &[u8],
+) -> Result<NativeCreationResult, NativeError> {
+    let visits = bytes
+        .len()
+        .checked_mul(256)
+        .and_then(|n| n.checked_add(4096))
+        .ok_or(NativeError::Capacity("creation result decode"))?;
+    let mut cursor = Cursor::new(bytes, bytes.len(), visits).map_err(codec)?;
+    let input = creation(&mut cursor, visits)?;
+    cursor.finish().map_err(codec)?;
+    let plan = input.prepare(input.entries.count, visits)?;
+    let quote = plan.quote();
+    match plan.build(quote.heap_bytes, quote.model_build_visits)? {
+        Row::CreationResult(OwnedCreationResult::Held(result)) => Ok(result),
+        _ => Err(ContractError::InvalidManifest.into()),
+    }
+}
 fn entry(cursor: &mut Cursor<'_>) -> Result<NativeCreatedObject, Error> {
     Ok(NativeCreatedObject {
         ordinal: cursor.u32()?,

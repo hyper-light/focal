@@ -601,7 +601,11 @@ fn admission_post_requires_issuer_and_begin_requires_actual_posted_designated_ac
         core.native_evaluation(evaluation_key(1)).unwrap().state(),
         validation::State::Ready
     );
-    assert!(core.native_outcome(request(EVALUATOR, 5)).is_none());
+    assert!(
+        core.native_outcome(request(EVALUATOR, 5))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -644,6 +648,7 @@ fn begin_rejects_stale_or_substituted_claim_evaluation_target_and_generation() {
         );
         assert!(
             core.native_outcome(request(EVALUATOR, 100 + case))
+                .unwrap()
                 .is_none()
         );
     }
@@ -917,7 +922,7 @@ fn incomplete_extra_duplicate_and_substituted_definition_cohorts_refuse_atomical
         assert!(core.native_claim(ClaimId::from_u128(1)).is_none());
         assert!(core.native_definition(declaration_id(1, 1)).is_none());
         assert!(core.native_definition(declaration_id(1, 2)).is_none());
-        assert!(core.native_outcome(request(ISSUER, 1)).is_none());
+        assert!(core.native_outcome(request(ISSUER, 1)).unwrap().is_none());
         assert!(core.native_event(SessionSeq(1), 0).is_none());
     }
 }
@@ -1035,7 +1040,7 @@ fn late_admission_registration_capacity_rolls_back_post_and_every_evaluation() {
         })
         .is_none()
     );
-    assert!(core.native_outcome(request(ISSUER, 2)).is_none());
+    assert!(core.native_outcome(request(ISSUER, 2)).unwrap().is_none());
     assert!(core.native_event(SessionSeq(2), 0).is_none());
 }
 
@@ -1113,7 +1118,7 @@ fn range_failure_rolls_back_post_definitions_and_ready_registry() {
         binding(102)
     );
     assert!(core.native_evaluation(evaluation_key(1)).is_none());
-    assert!(core.native_outcome(request(ISSUER, 2)).is_none());
+    assert!(core.native_outcome(request(ISSUER, 2)).unwrap().is_none());
     publish(&mut core, ISSUER, 20, post(2, binding(1)));
     assert_eq!(
         core.native_evaluation(evaluation_key(1)).unwrap().state(),
@@ -1345,7 +1350,7 @@ fn global_definition_and_evaluation_limits_roll_back_counts_time_and_request_out
     assert_eq!(core.native_sequence(), SessionSeq(1));
     assert!(core.native_claim(ClaimId::from_u128(2)).is_none());
     assert!(core.native_definition(declaration_id(2, 1)).is_none());
-    assert!(core.native_outcome(request(ISSUER, 50)).is_none());
+    assert!(core.native_outcome(request(ISSUER, 50)).unwrap().is_none());
     assert!(core.native_event(SessionSeq(2), 0).is_none());
     let definitions = vec![declaration(2, 1, false, false, 1)];
     let claim = proposal(2, &definitions);
@@ -1411,7 +1416,7 @@ fn global_definition_and_evaluation_limits_roll_back_counts_time_and_request_out
             .is_none()
         );
     }
-    assert!(core.native_outcome(request(ISSUER, 50)).is_none());
+    assert!(core.native_outcome(request(ISSUER, 50)).unwrap().is_none());
     assert!(core.native_event(SessionSeq(3), 0).is_none());
     let outcome = publish(&mut core, ISSUER, 21, post(50, binding(3)));
     assert_eq!(
