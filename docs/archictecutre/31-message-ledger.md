@@ -573,9 +573,106 @@ Each stage lands on its own, measured:
      2. The claim's own row: its hot state kept, its cold parts held encoded.
      3. Keys held as their order-preserving encoding (25–57 bytes for these families), so an
         entry stops paying for the widest key. About 0.9 KB a claim.
+        - **As built (`PackedKey`).** A member stores each key as its order in bytes: the
+          affinity, the family big-endian, then the fields the affinity does not fix,
+          fixed-width and big-endian, nested enums by their tag. Keys of up to 55 bytes are held
+          inline, and longer ones (the evaluation and monitor-timer families') are boxed.
+          Two keys compare as their bytes do; the order test checks this against `Key` for every
+          family, and `unpack` is total. Reads, scans and plans still speak `Key`. An entry
+          went from 152 to 96 bytes.
      4. Pages of encoded entries: what replay, recovery and a checkpoint move become copies of
         bytes the record already carries.
      - Then the claim table proper, where it beats the encoded store on the measures above.
+   - **Index rows are keys, and are held as keys** (`focal_memory::KeySet`, as built).
+     - **What the others do.** Nine of a claim's eighteen rows are secondary index rows and due
+       timers (families 34–48): a key and nothing else. A row store paid a fixed key slot, a value
+       and a heap count for each (96 bytes for a 34-byte key). The systems the comparison runs
+       against keep keys contiguous and delta-coded, not a node a key:
+       - Redis keeps a stream's entries in listpacks, contiguous and delta-coded against a master
+         entry, in a radix tree of them.
+       - LevelDB and RocksDB blocks prefix-compress their keys with a restart every sixteen, and
+         a search halves the restarts and decodes forward [LevelDB table format].
+       - WiredTiger prefix-compresses its leaf pages the same way.
+       - NATS keeps per-subject state in a compact radix tree (`stree`), not a map a message.
+     - **The structure.** Keys of an index bucket share their affinity and family (18 bytes),
+       so focal keeps them that way:
+       - Each key is front-coded against the one before it, every sixteenth stored whole.
+       - Keys sit in blocks of at most 1 KiB or 64 keys. Blocks sit in chunks of 32, chunks in
+         mids of 32, and mids in a root the set alone holds.
+       - An edited block is cut evenly, as a B-tree splits a node. Cut greedily, a full block
+         plus one key left one-key blocks, and a set filled at random kept a third of its room
+         empty: 30.5 against 23.1 bytes a key.
+     - **Copy on write without an occupancy term.**
+       - Freezing or pinning the set copies its root, one slot a mid, and shares everything
+         below it.
+       - A publication edits a mid, chunk or block in place where the set alone holds it, and
+         copies it where an image still reads it. This is FASTER's division between in-place and
+         read-copy-update, decided by reference counts, as the row store's sparse publication
+         decides it for pages.
+       - The root is never shared, so no publication copies it. What a publication may spend is
+         therefore bounded by its edits alone, whatever the set holds: the bound a write's
+         envelope promises before the write is planned (`with_key_set_bytes`).
+       - A publication spends only what its plan reserved from the write's own source (`fund`).
+         The root's growth is absorbed into the root's charges.
+     - **In the range group.** Each member keeps its index keys in a set beside its rows. Every
+       read merges the two in key order (`get`, scans, frozen images, leases, a restore's
+       validation view), and an index key reads back as the unit row.
+       - A write's index changes leave its rows' vector before it is divided among members. Each
+         member's part is checked against the state the write is planned on, through the
+         pending chain as before. Its changes take positions after the member's row changes, so
+         the pending index addresses them as it does any change.
+       - A read pins each member's set with its leases. The group retains the frozen sets in a
+         bounded registry (1,024 reads) until the read is released or expires or the group
+         goes, as a store's lease registry retains its pinned roots; the read holds weak handles
+         alone.
+       - A split or merge divides or joins the sets with the stores. A restore streams phase 0's
+         index rows into a set builder, each checked as every fixed row is.
+     - **Measured.** 100,000 keys of one bucket shape (16-byte affinity, 2-byte family, 16-byte
+       identity) take 21.5 bytes a key built and 23.1 published in random batches of nine,
+       against 96 as row entries.
+   - **One page class.**
+     - **The defect.** Page classes kept the immutable payloads (definitions, artifacts,
+       content, creation results) off the pages lifecycle writes copy. But a leaf cut at every
+       change of class in the key order, and a claim's own rows sit together there: its state
+       beside its content, an outcome beside its creation result. The classes alternated row by
+       row, so at the node's 4 KiB leaves the store held 2.3 rows a page, a page's fixed charge
+       each.
+     - **The fix.** Every family now shares one class except the session's counters, which
+       every mutation rewrites (the 2026-09-29 audit's R4). A leaf is bounded by its bytes, heap
+       included, so a copy-on-write copies a page's worth whichever rows share it. Publication
+       copies a page only where a capture or a lease still reads it; otherwise it edits in
+       place.
+   - **Measured** (`measure_memory_per_authored_claim_by_family`, release, 2,000 authored
+     claims, at the node's range configuration of 128-entry leaves within 4 KiB, counting what
+     the native budget charges):
+
+     | Step | Bytes a claim | Pages |
+     |---|---|---|
+     | Index rows as row entries, eight page classes | 6,184 (fixture leaves) | — |
+     | Index keys in key sets, eight classes | 4,982 | 7,731 |
+     | One page class | 4,578 | 2,760 |
+
+     The rest of a claim's 4.6 KB is its rows:
+     - its state, 1.47 KB (`ClaimState` is 1,000 bytes inline, 136 of heap);
+     - its definition, 0.91 KB, decoded;
+     - its content, 0.44 KB, held encoded since stage 1;
+     - two events, 0.53 KB, encoded;
+     - its creation result and outcome, 0.5 KB;
+     - two identity rows;
+     - the event index, 192 bytes.
+   - **Next on this path.**
+     - **A definition held as its record encoding** (232 bytes against 811 decoded). Readers
+       take a charged decode, as content does since stage 1.
+     - **The immutable payloads off the heap: log-resident, as Kafka and NATS keep messages.**
+       - Each replica appends the encodings to a local append-only file, unsynced; the page
+         cache serves recent reads.
+       - Rows hold a handle. Checkpoints copy bytes, and recovery rebuilds the file from the
+         checkpoint.
+       - About 1.8 KB a claim leaves the heap.
+     - **A claim state that does not carry an absent terminal cut inline** (208 bytes).
+       Terminal transitions now promise no heap growth, so this must wait for their quotes to
+       count it.
+     - Then the claim table proper.
    - **The session's share of its allowance, beside the stages.**
      - **Measured first.** The per-session memory gauges (`focal_session_memory_*`,
        `focal_session_native_memory_*`) put the fill at the native engine's share, not at the
@@ -685,6 +782,10 @@ Each stage lands on its own, measured:
   specification. https://redis.io/docs/
 - mantle: `docs/design/engine-structure.md` and research notes 33–34 (on mantle's branches,
   2026-10-06/08).
+- [LevelDB table format] LevelDB, `doc/table_format.md`: data blocks of prefix-compressed keys
+  with a restart point every sixteen entries. https://github.com/google/leveldb/blob/main/doc/table_format.md
+- Redis streams: `t_stream.c` and `listpack.c` (a stream's entries delta-coded in listpacks
+  under a radix tree). https://github.com/redis/redis
 - [Conway et al. 2020] *SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value Stores*,
   USENIX ATC 2020. https://www.usenix.org/system/files/atc20-conway.pdf
 - [Conway et al. 2023] *SplinterDB and Maplets*, SIGMOD 2023.
