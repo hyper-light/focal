@@ -58,14 +58,20 @@ cleanup() { dc down -v --remove-orphans >/dev/null 2>&1 || true; }
 # each line `PHASE CONTAINER KEY VALUE`: a system's CPU per acknowledged write
 # is the difference over the writes it acknowledged. Prints nothing where the
 # host has no cgroup v2 hierarchy (a run on macOS).
+# Where the host cannot read a container's process (Docker Desktop's VM on macOS), each is read
+# inside its container instead: its cgroup's own `cpu.stat`, its namespace's `/proc/net`.
 cpu_stat() {
   local phase=$1 c pid group
-  echo "$phase - wall_usec $(date +%s%6N)"
+  echo "$phase - wall_usec $(perl -MTime::HiRes=time -e 'printf "%d", time() * 1e6')"
   for c in $(dc ps --format '{{.Name}}'); do
     pid=$(docker inspect --format '{{.State.Pid}}' "$c" 2>/dev/null) || continue
-    group=$(awk -F: '$1 == "0" && $2 == "" { print $3 }' "/proc/$pid/cgroup" 2>/dev/null) || continue
-    [ -n "$group" ] && [ -r "/sys/fs/cgroup$group/cpu.stat" ] || continue
-    awk -v p="$phase" -v c="$c" '{ print p, c, $1, $2 }' "/sys/fs/cgroup$group/cpu.stat"
+    group=$(awk -F: '$1 == "0" && $2 == "" { print $3 }' "/proc/$pid/cgroup" 2>/dev/null) || group=""
+    if [ -n "$group" ] && [ -r "/sys/fs/cgroup$group/cpu.stat" ]; then
+      awk -v p="$phase" -v c="$c" '{ print p, c, $1, $2 }' "/sys/fs/cgroup$group/cpu.stat"
+    else
+      docker exec "$c" cat /sys/fs/cgroup/cpu.stat 2>/dev/null \
+        | awk -v p="$phase" -v c="$c" '{ print p, c, $1, $2 }' || true
+    fi
   done
 }
 # Each of the run's containers' network as its own namespace counts it, read
@@ -74,23 +80,28 @@ cpu_stat() {
 # the load, each line `PHASE CONTAINER KEY VALUE`, for what a write costs the
 # network: datagrams or segments, and bytes. Prints nothing off Linux.
 net_stat() {
-  local phase=$1 c pid
+  local phase=$1 c pid snmp dev
   for c in $(dc ps --format '{{.Name}}'); do
     pid=$(docker inspect --format '{{.State.Pid}}' "$c" 2>/dev/null) || continue
-    [ -r "/proc/$pid/net/snmp" ] && [ -r "/proc/$pid/net/dev" ] || continue
-    awk -v p="$phase" -v c="$c" '
+    if [ -r "/proc/$pid/net/snmp" ] && [ -r "/proc/$pid/net/dev" ]; then
+      snmp=$(cat "/proc/$pid/net/snmp"); dev=$(cat "/proc/$pid/net/dev")
+    else
+      snmp=$(docker exec "$c" cat /proc/net/snmp 2>/dev/null) || continue
+      dev=$(docker exec "$c" cat /proc/net/dev 2>/dev/null) || continue
+    fi
+    printf '%s\n' "$snmp" | awk -v p="$phase" -v c="$c" '
       $1 == "Udp:" || $1 == "Tcp:" {
         if (!($1 in names)) { names[$1] = $0; next }
         n = split(names[$1], k); split($0, v)
         for (i = 2; i <= n; i++) print p, c, substr($1, 1, length($1) - 1) "." k[i], v[i]
-      }' "/proc/$pid/net/snmp"
-    awk -v p="$phase" -v c="$c" '
+      }'
+    printf '%s\n' "$dev" | awk -v p="$phase" -v c="$c" '
       { sub(/^[ \t]+/, "") }
       /^eth0:/ {
         sub(/^eth0:[ \t]*/, ""); split($0, f, /[ \t]+/)
         print p, c, "eth0.rx_bytes", f[1]; print p, c, "eth0.rx_packets", f[2]
         print p, c, "eth0.tx_bytes", f[9]; print p, c, "eth0.tx_packets", f[10]
-      }' "/proc/$pid/net/dev"
+      }'
   done
 }
 # Each image the profile runs, pulled once and one at a time before the cluster
