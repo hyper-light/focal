@@ -136,6 +136,16 @@ pub(super) fn segments_of<'a>(
             super::Row::CreationResult(super::creation_result::OwnedCreationResult::Logged(at)) => {
                 live.insert(at.segment());
             }
+            super::Row::Claim(claim) => {
+                if let Some(at) = claim.logged() {
+                    live.insert(at.segment());
+                }
+            }
+            super::Row::Definition(definition) => {
+                if let Some(at) = definition.logged() {
+                    live.insert(at.segment());
+                }
+            }
             _ => {}
         }
     }
@@ -145,7 +155,9 @@ pub(super) fn segments_of<'a>(
 /// `log`, each entry's heap charge the spilled row's: what a candidate's rows become once every
 /// check has read them held, the leader's at the end of its plan and a replay's once it is
 /// validated, so no check reads back what was just written. A row the log refuses keeps its
-/// bytes and its charge.
+/// bytes and its charge. A claim and its definitions stay held while their candidate is pending
+/// (the owner's checks of a candidate read them where they are) and are spilled where their
+/// publication leaves them (`Core::spill_published`).
 pub(super) fn spill_changes(
     changes: &mut [focal_memory::Change<super::Key, super::Row>],
     log: Option<&dyn PayloadLog>,

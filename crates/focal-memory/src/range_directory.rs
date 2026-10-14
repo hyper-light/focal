@@ -655,6 +655,39 @@ impl<K: crate::RangeKey, V> PageDirectory<K, V> {
         Ok(result)
     }
 
+    /// The handle of the page at `index` where every node on its path is this
+    /// directory's own, nothing copied or changed; none where something else
+    /// still holds one of them (a frozen image, a lease).
+    pub(super) fn page_owned_mut(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<&mut Arc<Page<K, V>>>, MemoryError> {
+        let route = self.route_in_place(index)?;
+        let mut handle = self.root.0.as_mut().ok_or(MemoryError::MissingKey)?;
+        for level in 0..=MAX_LEVELS {
+            let Some(node) = Arc::get_mut(handle) else {
+                return Ok(None);
+            };
+            match &mut node.links {
+                Links::Branches(children) => {
+                    let child = *route
+                        .children
+                        .get(level)
+                        .filter(|_| level < route.depth)
+                        .ok_or(invalid("directory deeper than an edit's route"))?;
+                    handle = children.get_mut(child).ok_or(MemoryError::MissingKey)?;
+                }
+                Links::Leaves(pages) => {
+                    return pages
+                        .get_mut(route.rank)
+                        .map(Some)
+                        .ok_or(MemoryError::MissingKey);
+                }
+            }
+        }
+        Err(invalid("directory deeper than its levels"))
+    }
+
     /// Removes the page at `index`, by the edit that copies its path
     /// ([`Self::remove`]): a removal can merge leaves, and one is rare.
     pub(super) fn remove_owned(

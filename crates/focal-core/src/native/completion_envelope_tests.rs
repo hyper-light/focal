@@ -22,7 +22,7 @@ mod admission_graph_tests;
 mod pending_journal_tests;
 
 fn parts(core: &Core<NativeState>) -> (&ClaimState, &RegistrationSet, &validation::Declaration) {
-    let Row::Claim(owner) = core.state.rows.get(&Key::Claim(key(1).claim)).unwrap() else {
+    let Row::Claim(owner) = core.state.row(&Key::Claim(key(1).claim)).unwrap() else {
         panic!("claim row");
     };
     (

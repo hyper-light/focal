@@ -71,6 +71,7 @@ mod projection_quote;
 mod projection_visits;
 mod projection_work;
 pub mod ranges;
+mod read_back;
 mod receipt;
 #[cfg(test)]
 mod receipt_tests;
@@ -281,6 +282,9 @@ pub struct NativeState {
     /// The replica's payload log, where a row written once and read rarely is spilled where it
     /// is built (doc 31 M3). A core without one keeps every row's bytes.
     payloads: Option<Box<dyn payloads::PayloadLog>>,
+    /// The spilled claims and definitions reads have taken back since the state last changed
+    /// (doc 31 M3).
+    reads: read_back::ReadBack,
 }
 impl NativeState {
     /// Where a spilled row's bytes are read from.
@@ -288,6 +292,203 @@ impl NativeState {
         self.payloads
             .as_deref()
             .map(|log| -> &dyn payloads::PayloadRead { log })
+    }
+    /// The committed row at `key` as a read takes it: a spilled claim or definition read back
+    /// (doc 31 M3).
+    fn row(&self, key: &Key) -> Option<&Row> {
+        let stored = self.rows.get(key)?;
+        Some(self.read_back(&self.reads, key, stored, &StateRows(self, &self.reads)))
+    }
+    /// `stored`, the row at `key` of a state `rows` reads, as a read takes it into `reads`: a
+    /// spilled claim or definition read back, else itself. One that cannot be read back is lent
+    /// as it is stored, which holds nothing a reader can take, and its failure kept in `reads`
+    /// for the operation ([`read_back::ReadBack::failure`]).
+    fn read_back<'s, R: record_codec::ClaimRows + ?Sized>(
+        &'s self,
+        reads: &'s read_back::ReadBack,
+        key: &Key,
+        stored: &'s Row,
+        rows: &R,
+    ) -> &'s Row {
+        let read = match stored {
+            Row::Claim(claim) => match (key, claim.logged()) {
+                (Key::Claim(id), Some(at)) => self.read_back_claim(reads, *id, at, rows),
+                (_, Some(_)) => Err(ContractError::InvalidManifest.into()),
+                (_, None) => return stored,
+            },
+            Row::Definition(definition) => match definition.logged() {
+                Some(at) => self.read_back_definition(reads, at),
+                None => return stored,
+            },
+            _ => return stored,
+        };
+        match read {
+            Ok(row) => row,
+            Err(error) => {
+                reads.fail(error);
+                stored
+            }
+        }
+    }
+    fn read_back_claim<'s, R: record_codec::ClaimRows + ?Sized>(
+        &'s self,
+        reads: &'s read_back::ReadBack,
+        id: ClaimId,
+        at: payloads::PayloadRef,
+        rows: &R,
+    ) -> Result<&'s Row, NativeError> {
+        if let Some(row) = reads.find(at) {
+            return Ok(row);
+        }
+        let fund = |bytes| reads.fund(&self.budget, bytes);
+        let (claim, charge) = self.with_spilled(at, |bytes| {
+            record_codec::decode_claim(id, bytes, self.ledger, rows, reads.limits(), &fund)
+        })?;
+        reads.hold(&self.budget, at, Row::Claim(claim), charge)
+    }
+    fn read_back_definition<'s>(
+        &'s self,
+        reads: &'s read_back::ReadBack,
+        at: payloads::PayloadRef,
+    ) -> Result<&'s Row, NativeError> {
+        read_back_definition(reads, self.payloads(), &self.budget, at)
+    }
+    /// The spilled bytes at `at`, read into a stack buffer and handed to `read`.
+    fn with_spilled<T>(
+        &self,
+        at: payloads::PayloadRef,
+        read: impl FnOnce(&[u8]) -> Result<T, NativeError>,
+    ) -> Result<T, NativeError> {
+        with_spilled(self.payloads(), at, read)
+    }
+    /// A definition at `key` of the committed rows, a spilled one read back into `reads`.
+    fn stored_definition<'s>(
+        &'s self,
+        reads: &'s read_back::ReadBack,
+        id: ValidationId,
+    ) -> Option<&'s validation::Declaration> {
+        let stored = self.rows.get(&Key::Definition(id))?;
+        as_definition(Some(self.read_back_held_definition(reads, stored)))
+    }
+    /// `stored` a definition's row as a read takes it into `reads`, without reading a claim back.
+    fn read_back_held_definition<'s>(
+        &'s self,
+        reads: &'s read_back::ReadBack,
+        stored: &'s Row,
+    ) -> &'s Row {
+        let Row::Definition(definition) = stored else {
+            return stored;
+        };
+        let Some(at) = definition.logged() else {
+            return stored;
+        };
+        match self.read_back_definition(reads, at) {
+            Ok(row) => row,
+            Err(error) => {
+                reads.fail(error);
+                stored
+            }
+        }
+    }
+}
+/// The spilled bytes at `at` in `payloads`, read into a stack buffer and handed to `read`.
+fn with_spilled<T>(
+    payloads: Option<&dyn payloads::PayloadRead>,
+    at: payloads::PayloadRef,
+    read: impl FnOnce(&[u8]) -> Result<T, NativeError>,
+) -> Result<T, NativeError> {
+    let mut buffer = [0u8; payloads::SPILLED_BYTES];
+    let bytes = buffer
+        .get_mut(..at.len())
+        .ok_or(payloads::PayloadError::Corrupt)?;
+    payloads
+        .ok_or(payloads::PayloadError::Unavailable)?
+        .read(at, bytes)?;
+    read(bytes)
+}
+/// The definition spilled at `at` in `payloads`, read back into `reads` and charged to `budget`.
+fn read_back_definition<'s>(
+    reads: &'s read_back::ReadBack,
+    payloads: Option<&dyn payloads::PayloadRead>,
+    budget: &MemoryBudget,
+    at: payloads::PayloadRef,
+) -> Result<&'s Row, NativeError> {
+    if let Some(row) = reads.find(at) {
+        return Ok(row);
+    }
+    let fund = |bytes| reads.fund(budget, bytes);
+    let (definition, charge) = with_spilled(payloads, at, |bytes| {
+        record_codec::decode_definition(bytes, &fund)
+    })?;
+    reads.hold(budget, at, Row::Definition(definition), charge)
+}
+/// A read back through a lease that failed: its memory refusal, or a row that could not be.
+fn lease_read_back(error: NativeError) -> MemoryError {
+    match error {
+        NativeError::Memory(error) => error,
+        _ => MemoryError::InvalidConfiguration("a spilled row could not be read back"),
+    }
+}
+/// The rows a spilled claim read through a lease names, read in the same leased prefix, a
+/// spilled definition read back into the read's own arena.
+struct LeaseRows<'r> {
+    rows: &'r ranges::LeasedRows<'r>,
+    reads: &'r read_back::ReadBack,
+    payloads: Option<&'r dyn payloads::PayloadRead>,
+    budget: &'r MemoryBudget,
+}
+impl LeaseRows<'_> {
+    fn definition(&self, id: ValidationId) -> Option<&Row> {
+        let stored = self.rows.get(&Key::Definition(id))?;
+        match stored {
+            Row::Definition(definition) => match definition.logged() {
+                Some(at) => read_back_definition(self.reads, self.payloads, self.budget, at).ok(),
+                None => Some(stored),
+            },
+            _ => Some(stored),
+        }
+    }
+}
+impl record_codec::ClaimRows for LeaseRows<'_> {
+    fn declaration(&self, id: ValidationId) -> Option<&validation::Declaration> {
+        as_definition(self.definition(id))
+    }
+    fn response(&self, id: TestamentId) -> Option<&focal_model::lifecycle::evidence::Response> {
+        match self.rows.get(&Key::Response(id)) {
+            Some(Row::Response(row)) => row.get(),
+            _ => None,
+        }
+    }
+    fn evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
+        as_evaluation(self.rows.get(&Key::Evaluation(key)))
+    }
+}
+/// A new core's payload log: none, but in tests run with `FOCAL_TEST_SPILL` set, where every
+/// core spills to one held in memory, so every reader meets the rows spilled (doc 31 M3).
+#[cfg(not(test))]
+fn test_payloads() -> Option<Box<dyn payloads::PayloadLog>> {
+    None
+}
+#[cfg(test)]
+fn test_payloads() -> Option<Box<dyn payloads::PayloadLog>> {
+    std::env::var_os("FOCAL_TEST_SPILL")
+        .map(|_| -> Box<dyn payloads::PayloadLog> { Box::new(payloads::MemoryPayloads::default()) })
+}
+/// The rows a spilled claim of the committed rows names, read there, a spilled definition read
+/// back into the same reads.
+struct StateRows<'s>(&'s NativeState, &'s read_back::ReadBack);
+impl record_codec::ClaimRows for StateRows<'_> {
+    fn declaration(&self, id: ValidationId) -> Option<&validation::Declaration> {
+        self.0.stored_definition(self.1, id)
+    }
+    fn response(&self, id: TestamentId) -> Option<&focal_model::lifecycle::evidence::Response> {
+        match self.0.rows.get(&Key::Response(id)) {
+            Some(Row::Response(row)) => row.get(),
+            _ => None,
+        }
+    }
+    fn evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
+        as_evaluation(self.0.rows.get(&Key::Evaluation(key)))
     }
 }
 impl std::fmt::Debug for NativeState {
@@ -1785,8 +1986,69 @@ pub struct NativeRead {
     /// A reader of the payload log the leased rows' spilled bytes are in, with handles of its
     /// own: a sweep after the lease was taken never breaks its reads (doc 31 M3).
     payloads: Option<Box<dyn payloads::PayloadRead + Send>>,
+    /// The bounds a spilled claim read back through the lease is built under, and the budget
+    /// what it reads back is charged to while its projection runs (doc 31 M3).
+    limits: NativeLimits,
+    budget: MemoryBudget,
 }
 impl NativeRead {
+    fn payload_source(&self) -> Option<&dyn payloads::PayloadRead> {
+        self.payloads
+            .as_deref()
+            .map(|read| -> &dyn payloads::PayloadRead { read })
+    }
+    /// The row the lease holds at `key`, projected; a spilled claim or definition read back for
+    /// the projection (doc 31 M3): the leased prefix held while it is decoded and projected, what
+    /// it names read there, and everything read back let go with the call.
+    fn project_row<T>(
+        &self,
+        key: Key,
+        now: u64,
+        project: impl FnOnce(&Row) -> T,
+    ) -> Result<Option<T>, NativeError> {
+        let mut project = Some(project);
+        let found = self
+            .lease
+            .project_next(&key, false, &Key::End, now, |entry| {
+                if entry.key != key {
+                    return Ok(None);
+                }
+                let spilled = match entry.value {
+                    Row::Claim(claim) => claim.logged(),
+                    Row::Definition(definition) => definition.logged(),
+                    _ => None,
+                };
+                match spilled {
+                    Some(at) => Err(at),
+                    None => Ok(project.take().map(|project| project(entry.value))),
+                }
+            })?;
+        let (at, project) = match (found, project) {
+            (Some(Err(at)), Some(project)) => (at, project),
+            (Some(Ok(projected)), _) => return Ok(projected),
+            _ => return Ok(None),
+        };
+        let rows = self.lease.hold(now, &self.budget)?;
+        let reads = read_back::ReadBack::new(self.limits);
+        let names = LeaseRows {
+            rows: &rows,
+            reads: &reads,
+            payloads: self.payload_source(),
+            budget: &self.budget,
+        };
+        let row = match key {
+            Key::Claim(id) => {
+                let fund = |bytes| reads.fund(&self.budget, bytes);
+                let (claim, charge) = with_spilled(self.payload_source(), at, |bytes| {
+                    record_codec::decode_claim(id, bytes, self.ledger, &names, self.limits, &fund)
+                })?;
+                reads.hold(&self.budget, at, Row::Claim(claim), charge)?
+            }
+            _ => read_back_definition(&reads, self.payload_source(), &self.budget, at)?,
+        };
+        reads.failure()?;
+        Ok(Some(project(row)))
+    }
     pub fn sequence(&self) -> SessionSeq {
         SessionSeq(self.lease.prefix())
     }
@@ -1796,16 +2058,9 @@ impl NativeRead {
         now: u64,
         project: impl FnOnce(&ClaimState) -> T,
     ) -> Result<Option<T>, MemoryError> {
-        let key = Key::Claim(id);
-        self.lease
-            .project_next(&key, false, &Key::End, now, |entry| {
-                if entry.key == key {
-                    as_claim(Some(entry.value)).map(project)
-                } else {
-                    None
-                }
-            })
+        self.project_row(Key::Claim(id), now, |row| as_claim(Some(row)).map(project))
             .map(Option::flatten)
+            .map_err(lease_read_back)
     }
     pub fn recorded(
         &self,
@@ -1835,16 +2090,11 @@ impl NativeRead {
         now: u64,
         project: impl FnOnce(&validation::Declaration) -> T,
     ) -> Result<Option<T>, MemoryError> {
-        let key = Key::Definition(id);
-        self.lease
-            .project_next(&key, false, &Key::End, now, |entry| {
-                if entry.key == key {
-                    as_definition(Some(entry.value)).map(project)
-                } else {
-                    None
-                }
-            })
-            .map(Option::flatten)
+        self.project_row(Key::Definition(id), now, |row| {
+            as_definition(Some(row)).map(project)
+        })
+        .map(Option::flatten)
+        .map_err(lease_read_back)
     }
     pub fn with_evaluation<T>(
         &self,
@@ -1962,6 +2212,11 @@ impl Core<NativeState> {
         limits = checked_native_limits(ledger, limits)?;
         let rows = ranges::NativeRanges::new(range, limits.range, &budget, page_partition)?;
         let events = event_index::EventIndex::empty(&budget)?;
+        let payloads = test_payloads();
+        let mut reads = read_back::ReadBack::new(limits);
+        if payloads.is_some() {
+            reads.hold_floor(&budget);
+        }
         Ok(Self {
             state: NativeState {
                 ledger,
@@ -1970,7 +2225,8 @@ impl Core<NativeState> {
                 budget,
                 encoded_rows: 0,
                 events,
-                payloads: None,
+                payloads,
+                reads,
             },
             limits,
         })
@@ -1978,11 +2234,29 @@ impl Core<NativeState> {
     /// Spill the rows this core builds from now on to `log` (doc 31 M3), where the replica keeps
     /// its payloads. Rows already held keep their bytes.
     pub fn attach_payload_log(&mut self, log: Box<dyn payloads::PayloadLog>) {
+        self.state.reads.release();
+        self.state.reads.hold_floor(&self.state.budget);
         self.state.payloads = Some(log);
     }
     /// The payload log this core spills to, given back (for the core that replaces this one).
     pub fn detach_payload_log(&mut self) -> Option<Box<dyn payloads::PayloadLog>> {
+        self.state.reads.release();
         self.state.payloads.take()
+    }
+    /// Lets go of the spilled rows reads have taken back since the core last changed (doc 31
+    /// M3), and what they were charged: what a session does between its operations when it is
+    /// not publishing, so reads alone never keep them.
+    pub fn release_native_reads(&mut self) {
+        self.state.reads.release();
+    }
+    /// The first spilled row reads failed to take back since this was last asked (doc 31 M3),
+    /// which the operation that read fails with: a read that met one was lent no row.
+    pub fn native_read_failure(&self) -> Result<(), NativeError> {
+        self.state.reads.failure()
+    }
+    /// Rows reads have taken back since the core last changed, and the bytes they hold.
+    pub fn native_read_backs(&self) -> (usize, usize) {
+        (self.state.reads.rows(), self.state.reads.bytes())
     }
     /// The payload log this core spills to, lent (to a restore that spills to it as well).
     pub fn payload_log(&self) -> Option<&dyn payloads::PayloadLog> {
@@ -2057,7 +2331,7 @@ impl Core<NativeState> {
         }
     }
     pub fn native_claim(&self, id: ClaimId) -> Option<&ClaimState> {
-        as_claim(self.state.rows.get(&Key::Claim(id)))
+        as_claim(self.state.row(&Key::Claim(id)))
     }
     /// The outcome recorded for `request`, a spilled one read back (doc 31 M3): an outcome that
     /// cannot be read is an error, never taken for none.
@@ -2204,7 +2478,7 @@ impl Core<NativeState> {
         })
     }
     pub fn native_definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
-        as_definition(self.state.rows.get(&Key::Definition(id)))
+        as_definition(self.state.row(&Key::Definition(id)))
     }
     pub fn native_evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
         as_evaluation(self.state.rows.get(&Key::Evaluation(key)))
@@ -2255,16 +2529,20 @@ impl Core<NativeState> {
             .validate_chain(pending.iter().map(|item| &item.fragments))?;
         Ok(())
     }
-    /// The external log owner calls this only after durability. This method has
-    /// no codec or IO; the publication performs no allocation, including producing
-    /// its result. Once it stands, the events it published are filed in the event
+    /// The external log owner calls this only after durability. The publication
+    /// has no codec or IO and performs no allocation, including producing its
+    /// result. Once it stands, the events it published are filed in the event
     /// index (doc 31 M2), which may grow; a refusal there drops the index, never
-    /// the publication.
+    /// the publication. Then the claims it left waiting to be delivered and the
+    /// definitions it wrote are spilled where it left them (doc 31 M3,
+    /// `spill_published`), which never undoes it either.
     #[allow(clippy::result_large_err)] // Return the owned candidate without allocating on refusal.
     pub fn publish_native(
         &mut self,
         prepared: NativePrepared,
     ) -> Result<NativeOutcome, NativePublishError> {
+        // The rows change: nothing borrows what reads took back (doc 31 M3).
+        self.state.reads.release();
         // What the rows take in a checkpoint after this mutation: what it puts, less what it
         // replaces or deletes as the committed root holds it now, every predecessor published.
         // Computed before anything is published, so a refusal leaves the root as it was.
@@ -2317,7 +2595,53 @@ impl Core<NativeState> {
         }
         self.state.encoded_rows = encoded;
         self.file_events(outcome, events);
+        self.spill_published(&writes);
         Ok(outcome)
+    }
+    /// Spills the claims a publication left waiting to be delivered, and the authored
+    /// definitions it wrote, where it left them (doc 31 M3): each row's record encoding goes to
+    /// the payload log and the row is rewritten where it stands to hold where its bytes are, its
+    /// page's charge let go by the heap it held. A read takes one back where it touches it
+    /// (`read_back`). The publication has stood, and its pages are the store's own: a row the log
+    /// refuses, or one that cannot be rewritten, keeps its bytes, and nothing here undoes it. How
+    /// many rows it spilled.
+    fn spill_published(&mut self, writes: &mutation::WriteSet) -> usize {
+        // A measurement's control: the same core with its claims held.
+        #[cfg(test)]
+        if std::env::var_os("FOCAL_MEASURE_HELD_CLAIMS").is_some() {
+            return 0;
+        }
+        let NativeState { rows, payloads, .. } = &mut self.state;
+        let Some(log) = payloads.as_deref() else {
+            return 0;
+        };
+        let mut spilled = 0usize;
+        for (key, deleted) in writes.entries() {
+            if deleted || !matches!(key, Key::Claim(_) | Key::Definition(_)) {
+                continue;
+            }
+            let row = match rows.get(&key) {
+                // A claim another depends on is reached by work on that one: it stays held.
+                Some(Row::Claim(_)) if matches!(key, Key::Claim(id) if rows.get(&Key::IncomingHead(id)).is_some()) => {
+                    None
+                }
+                Some(Row::Claim(claim)) => claim.spill(log).ok().flatten().map(Row::Claim),
+                Some(Row::Definition(definition)) => {
+                    definition.spill(log).ok().flatten().map(Row::Definition)
+                }
+                _ => None,
+            };
+            let Some(row) = row else {
+                continue;
+            };
+            if matches!(
+                rows.rewrite(&key, move |_| Ok(Some((row, 0)))),
+                Ok(focal_memory::Rewrite::Rewritten)
+            ) {
+                spilled = spilled.saturating_add(1);
+            }
+        }
+        spilled
     }
     /// Unfile every event `fragments` deletes from the event index (doc 31 M2).
     fn unfile_deleted_events(&mut self, fragments: &ranges::Fragments) {
@@ -2492,6 +2816,8 @@ impl Core<NativeState> {
             lease,
             ledger: self.state.ledger,
             payloads,
+            limits: self.limits,
+            budget: self.state.budget.clone(),
         })
     }
     pub fn release_native(&mut self, read: &NativeRead) -> Result<(), MemoryError> {
@@ -2538,6 +2864,7 @@ impl Core<NativeState> {
         at: ranges::Affinity,
         id: RangeId,
     ) -> Result<(), NativeError> {
+        self.state.reads.release();
         self.state.rows.split(
             at,
             id,
@@ -2553,17 +2880,43 @@ impl Core<NativeState> {
     /// does once its genesis is known, so every replica names its origin
     /// member alike.
     pub fn rename_native_member(&mut self, index: usize, id: RangeId) -> Result<(), NativeError> {
+        self.state.reads.release();
         self.state.rows.rename_member(index, id)
     }
     /// Remove the boundary after member `index`, joining it with the next
     /// under its identity.
     pub fn merge_native_range(&mut self, index: usize) -> Result<(), NativeError> {
+        self.state.reads.release();
         self.state
             .rows
             .merge(index, focal_memory::BudgetLane::Committed)
     }
 }
 
+/// The rows a spilled claim a view reads names, read in the same view.
+struct ViewRows<'a>(View<'a>);
+impl record_codec::ClaimRows for ViewRows<'_> {
+    fn declaration(&self, id: ValidationId) -> Option<&validation::Declaration> {
+        self.0.stored_definition(id)
+    }
+    fn response(&self, id: TestamentId) -> Option<&focal_model::lifecycle::evidence::Response> {
+        match self
+            .0
+            .stored_entry(&Key::Response(id))
+            .map(|entry| entry.value)
+        {
+            Some(Row::Response(row)) => row.get(),
+            _ => None,
+        }
+    }
+    fn evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
+        as_evaluation(
+            self.0
+                .stored_entry(&Key::Evaluation(key))
+                .map(|entry| entry.value),
+        )
+    }
+}
 fn as_claim(row: Option<&Row>) -> Option<&ClaimState> {
     match row {
         Some(Row::Claim(claim)) => claim.claim(),
@@ -2604,8 +2957,24 @@ struct View<'a> {
     state: &'a NativeState,
     chain: Option<pending_index::Chain<'a>>,
     own: Option<&'a NativePrepared>,
+    /// Where this view's reads take spilled rows back: the state's own, or one a walk lets go of
+    /// row by row (doc 31 M3).
+    reads: Option<&'a read_back::ReadBack>,
 }
 impl<'a> View<'a> {
+    /// This view, its spilled rows read back into `reads`, which the caller lets go of (and asks
+    /// for its failures) where it is done with what was read: a walk of every row does so a row
+    /// at a time, so what it reads back never outgrows one row's.
+    fn with_reads(self, reads: &'a read_back::ReadBack) -> Self {
+        Self {
+            reads: Some(reads),
+            ..self
+        }
+    }
+    /// Where this view's reads take spilled rows back.
+    fn arena(&self) -> &'a read_back::ReadBack {
+        self.reads.unwrap_or(&self.state.reads)
+    }
     /// Where a spilled row's bytes are read from: the committed rows' log, which every row of
     /// the chain is spilled to as well.
     pub(super) fn payloads(&self) -> Option<&'a dyn payloads::PayloadRead> {
@@ -2621,6 +2990,7 @@ impl<'a> View<'a> {
             state,
             chain: None,
             own: None,
+            reads: None,
         }
     }
     /// The committed rows under `chain`.
@@ -2629,6 +2999,7 @@ impl<'a> View<'a> {
             state,
             chain,
             own: None,
+            reads: None,
         }
     }
     /// The committed rows with `tail`, a candidate prepared on them, over
@@ -2639,6 +3010,7 @@ impl<'a> View<'a> {
             state,
             chain: None,
             own: tail,
+            reads: None,
         }
     }
     /// This view with `own`, a candidate prepared on it, over it. A view that
@@ -2655,6 +3027,7 @@ impl<'a> View<'a> {
             state: self.state,
             chain,
             own: Some(own),
+            reads: self.reads,
         })
     }
     /// The newest candidate this view reads: its own, else its chain's.
@@ -2665,8 +3038,29 @@ impl<'a> View<'a> {
     fn get(&self, key: Key) -> Option<&'a Row> {
         self.get_entry(&key).map(|entry| entry.value)
     }
-    /// The row this view holds at `key`, whole.
+    /// The row this view holds at `key`, whole: a spilled claim or definition read back (doc 31
+    /// M3).
     fn get_entry(&self, key: &Key) -> Option<ranges::RowEntry<'a>> {
+        self.stored_entry(key).map(|entry| self.read_back(entry))
+    }
+    /// `entry` as a read takes it: a spilled claim or definition read back, the rows a claim's
+    /// encoding names read in this view.
+    fn read_back(&self, entry: ranges::RowEntry<'a>) -> ranges::RowEntry<'a> {
+        let value = self
+            .state
+            .read_back(self.arena(), &entry.key, entry.value, &ViewRows(*self));
+        ranges::RowEntry { value, ..entry }
+    }
+    /// A definition this view holds, a spilled one read back.
+    fn stored_definition(&self, id: ValidationId) -> Option<&'a validation::Declaration> {
+        let entry = self.stored_entry(&Key::Definition(id))?;
+        as_definition(Some(
+            self.state
+                .read_back_held_definition(self.arena(), entry.value),
+        ))
+    }
+    /// The row this view holds at `key` as it is stored: a spilled one as it is spilled.
+    fn stored_entry(&self, key: &Key) -> Option<ranges::RowEntry<'a>> {
         if let Some(own) = self.own {
             if !own.fragments.is_sparse() {
                 // A built candidate holds its whole state.
@@ -2739,10 +3133,12 @@ impl<'a> View<'a> {
             pending_index::Overlay::new(own, pending_index::Overlay::new(chain, committed))
                 .filter_map(|(_, entry)| entry)
         });
+        let view = *self;
         whole
             .into_iter()
             .flatten()
             .chain(merged.into_iter().flatten())
+            .map(move |entry| view.read_back(entry))
     }
     /// Committed claims whose authored `kind` relation targets `target`
     /// (the relation index of 22 §7), in identity order.

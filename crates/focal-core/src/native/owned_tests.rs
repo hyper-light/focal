@@ -134,7 +134,11 @@ fn copied_claim_and_registration_seals_are_independent_and_fully_charged() {
     let copied = original.copy().unwrap();
     assert_eq!(copied.claim(), original.claim());
     assert_eq!(copied.registrations(), original.registrations());
-    assert_ne!(copied.0.as_ptr(), original.0.as_ptr());
+    let held = |row: &OwnedClaim| match &row.0 {
+        ClaimStorage::Held(rows) => rows.as_ptr(),
+        ClaimStorage::Logged(_) => std::ptr::null(),
+    };
+    assert_ne!(held(&copied), held(&original));
     assert_ne!(
         copied.claim().unwrap().acceptance().declarations().as_ptr(),
         original
@@ -215,7 +219,7 @@ fn owned_definition_and_evaluation_copy_outlive_sources_and_rebind_exactly() {
 
 #[test]
 fn invalid_containers_and_charge_overflow_are_errors() {
-    let mut invalid = OwnedClaim(Vec::new());
+    let mut invalid = OwnedClaim(ClaimStorage::Held(Vec::new()));
     assert!(invalid.claim().is_none());
     assert!(invalid.registrations().is_none());
     assert!(invalid.parts_mut().is_none());

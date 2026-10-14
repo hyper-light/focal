@@ -161,7 +161,11 @@ fn stage(owner: &mut NativeOwner, input: NativeInput) -> (NativeCandidate, Nativ
 fn authored_owner_keeps_full_bodies_and_pinned_creation_through_post_and_cancel() {
     let proposed = proposal(100, 200);
     let snapshot = AuthoredSnapshot::capture(&proposed);
-    let mut owner = NativeOwner::new(core()).unwrap();
+    // Bodies kept where they were moved are what held rows show: rows spilled to a log (doc 31
+    // M3) are read back, decoded where they are read.
+    let mut held = core();
+    drop(held.detach_payload_log());
+    let mut owner = NativeOwner::new(held).unwrap();
     let (created, creation) = stage(&mut owner, create(1, vec![proposed]));
     assert_eq!(owner.committed().sequence(), SessionSeq(0));
     assert!(owner.committed().claim(snapshot.claim()).is_none());
@@ -222,7 +226,10 @@ fn authored_owner_keeps_full_bodies_and_pinned_creation_through_post_and_cancel(
 fn self_work_draft_is_retained_but_post_refuses_without_mutating_the_owner() {
     let proposed = proposal_with(300, 400, ISSUER, ActionType::Work, &[]);
     let snapshot = AuthoredSnapshot::capture(&proposed);
-    let mut owner = NativeOwner::new(core()).unwrap();
+    // Bodies kept where they were moved are what held rows show (doc 31 M3).
+    let mut held = core();
+    drop(held.detach_payload_log());
+    let mut owner = NativeOwner::new(held).unwrap();
     let (candidate, creation) = stage(&mut owner, create(10, vec![proposed]));
     snapshot.check_view(&owner.effective(), 10, ClaimStatus::Generated);
     assert_eq!(owner.publish_after_durable(candidate).unwrap(), creation);

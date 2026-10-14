@@ -90,8 +90,12 @@ pub(super) fn value(
             }
             write_u64(s, v.logical_time)
         }
-        Row::Claim(v) => lifecycle::claim(s, v),
-        Row::Definition(v) => evidence::definition(s, v),
+        // A spilled claim or definition holds its record encoding (doc 31 M3).
+        Row::Claim(v) => match v.logged() {
+            Some(at) => spilled(s, at, 0, payloads),
+            None => lifecycle::claim(s, v),
+        },
+        Row::Definition(v) => evidence::definition(s, v, payloads),
         Row::Evaluation(v) => lifecycle::evaluation(s, v),
         Row::Artifact(v) => evidence::artifact(s, v),
         Row::ArtifactIdentity(id) | Row::WorkSlot(id) => raw(s, &id.0),

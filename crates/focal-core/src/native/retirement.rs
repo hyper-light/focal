@@ -469,7 +469,7 @@ impl Core<NativeState> {
             if closure.members.len() >= MAX_FAMILY_MEMBERS {
                 return Err(RetirementRefusal::TooLarge);
             }
-            let claim = as_claim(self.state.rows.get(&Key::Claim(member)))
+            let claim = as_claim(self.state.row(&Key::Claim(member)))
                 .ok_or(RetirementRefusal::Unknown(member))?;
             if !claim.is_terminal() {
                 return Err(RetirementRefusal::NotTerminal(member));
@@ -534,8 +534,7 @@ impl Core<NativeState> {
         }
         for definition in closure.definitions.clone() {
             closure.scan_affinity(Key::Definition(definition), definition.0)?;
-            if let Some(Row::Definition(owned)) = self.state.rows.get(&Key::Definition(definition))
-            {
+            if let Some(Row::Definition(owned)) = self.state.row(&Key::Definition(definition)) {
                 if let Some(declaration) = owned.get() {
                     closure.index_keys(|sink| index_rows::definition(declaration, sink))?;
                 }
@@ -558,7 +557,7 @@ impl Core<NativeState> {
         // Index rows of the claims and their results.
         let mut buffer = crate::native::owned::ContentBuffer::new();
         for member in closure.members.clone() {
-            let (claim, content) = match self.state.rows.get(&Key::Claim(member)) {
+            let (claim, content) = match self.state.row(&Key::Claim(member)) {
                 Some(Row::Claim(owned)) => {
                     let claim = owned.claim().ok_or(RetirementRefusal::Corrupt)?;
                     let content = match self.state.rows.get(&Key::ClaimContent(member)) {
@@ -740,7 +739,7 @@ impl Core<NativeState> {
                 }
                 visited = visited.saturating_add(1);
                 last = Some(id);
-                if as_claim(self.state.rows.get(&Key::Claim(id)))
+                if as_claim(self.state.row(&Key::Claim(id)))
                     .is_some_and(|claim| claim.is_terminal() && claim.released())
                 {
                     claims
@@ -1097,7 +1096,7 @@ impl Core<NativeState> {
             events: 0,
         };
         for (member, events) in family.members.iter().zip(family.events.iter()) {
-            let claim = as_claim(self.state.rows.get(&Key::Claim(*member)))
+            let claim = as_claim(self.state.row(&Key::Claim(*member)))
                 .ok_or(NativeError::Contract(ContractError::InvalidManifest))?;
             changes.push(Change::Put(entry(
                 Key::Retired(*member),

@@ -49,6 +49,7 @@ mod replay_projection;
 mod replay_validate;
 mod replay_validate_index;
 mod rows;
+mod spilled;
 
 #[cfg(test)]
 mod bound_tests;
@@ -76,8 +77,11 @@ pub(in crate::native) use evidence::content_profile;
 pub use fixed::RowFamily;
 pub(in crate::native) use read_events::event_in as decode_event;
 pub(in crate::native) use read_evidence::content_profile as read_content_profile;
-pub(in crate::native) use read_evidence::{creation_decode_bound, decode_creation};
+pub(in crate::native) use read_evidence::{
+    creation_decode_bound, decode_creation, decode_definition,
+};
 pub(in crate::native) use read_history::event_object;
+pub(in crate::native) use spilled::{ClaimRows, decode_claim};
 /// Codec work an outcome's record encoding takes at most: a fixed-width row's.
 const OUTCOME_VISITS: usize = 4096;
 /// `outcome`'s record encoding written into the front of `into`: its length (a spilled outcome's
@@ -114,6 +118,36 @@ pub(in crate::native) fn encode_creation(
     let len = count.len();
     let mut sink = SliceSink::new(into.get_mut(..len)?, visits);
     evidence::creation(&mut sink, row, None).ok()?;
+    sink.finish().ok()?;
+    Some(len)
+}
+/// A held claim row's record encoding written into the front of `into`: its length, or none where
+/// it does not fit (a spilled row's bytes, doc 31 M3).
+pub(in crate::native) fn encode_claim(
+    row: &crate::native::OwnedClaim,
+    into: &mut [u8],
+) -> Option<usize> {
+    let visits = into.len().checked_mul(4)?.checked_add(4096)?;
+    let mut count = CountingSink::new(into.len(), visits);
+    lifecycle::claim(&mut count, row).ok()?;
+    let len = count.len();
+    let mut sink = SliceSink::new(into.get_mut(..len)?, visits);
+    lifecycle::claim(&mut sink, row).ok()?;
+    sink.finish().ok()?;
+    Some(len)
+}
+/// A held authored definition's record encoding written into the front of `into`: its length, or
+/// none where it does not fit (a spilled row's bytes, doc 31 M3).
+pub(in crate::native) fn encode_definition(
+    row: &crate::native::owned::OwnedDeclaration,
+    into: &mut [u8],
+) -> Option<usize> {
+    let visits = into.len().checked_mul(4)?.checked_add(4096)?;
+    let mut count = CountingSink::new(into.len(), visits);
+    evidence::definition(&mut count, row, None).ok()?;
+    let len = count.len();
+    let mut sink = SliceSink::new(into.get_mut(..len)?, visits);
+    evidence::definition(&mut sink, row, None).ok()?;
     sink.finish().ok()?;
     Some(len)
 }

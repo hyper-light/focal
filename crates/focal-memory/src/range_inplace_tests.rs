@@ -707,3 +707,75 @@ fn measure_publication_in_place_against_rebuild() {
         plan_ns as f64 / batches as f64 / 1e3,
     );
 }
+
+/// A row rewritten where it stands keeps its key, its page and the store's prefix and state: a
+/// plan made before the rewrite publishes after it, and the page gives back the heap the row no
+/// longer holds. While an image still reads the page, nothing is rewritten.
+#[test]
+fn a_row_rewritten_where_it_stands_gives_back_its_heap_and_leaves_a_pending_plan_valid() {
+    let budget = MemoryBudget::new(8 << 20, 0).unwrap();
+    let mut store =
+        RangeStore::<u64, Value>::new(RangeId(7), 0, config(4, 4096), budget.clone()).unwrap();
+    let put = |key: u64, heap: usize| Change::Put(Entry::new(key, Value(key * 10), heap));
+    let first = store
+        .plan_sparse(
+            store.budget(),
+            SparseBase::Committed,
+            1,
+            (0..10).map(|key| put(key, 256)).collect(),
+            BudgetLane::Ordinary,
+            16,
+            |_| None,
+        )
+        .unwrap();
+    assert!(store.publish_sparse(first, copy).is_ok());
+    // A plan on the committed state, made before any rewrite.
+    let pending = store
+        .plan_sparse(
+            store.budget(),
+            SparseBase::Committed,
+            2,
+            vec![put(20, 0)],
+            BudgetLane::Ordinary,
+            16,
+            |_| None,
+        )
+        .unwrap();
+    let held = budget.stats().used;
+    let rewritten = store.rewrite(&5, |value| Ok(Some((Value(value.0 + 1), 16))));
+    assert_eq!(rewritten.unwrap(), Rewrite::Rewritten);
+    assert_eq!(budget.stats().used, held - 240);
+    let row = |store: &RangeStore<u64, Value>, key| {
+        store
+            .entries()
+            .find(|entry| entry.key == key)
+            .map(|entry| (entry.value.0, entry.heap_bytes))
+    };
+    assert_eq!(row(&store, 5), Some((51, 16)));
+    assert_eq!(store.prefix(), 1);
+    let absent = store.rewrite(&99, |_| Ok(Some((Value(0), 0))));
+    assert_eq!(absent.unwrap(), Rewrite::Absent);
+    assert_eq!(store.rewrite(&6, |_| Ok(None)).unwrap(), Rewrite::Unchanged);
+    // A row is never grown where it stands: refused, nothing changed.
+    assert!(
+        store
+            .rewrite(&6, |value| Ok(Some((Value(value.0), 512))))
+            .is_err()
+    );
+    assert_eq!(row(&store, 6), Some((60, 256)));
+    assert_eq!(budget.stats().used, held - 240);
+    // An image of the state reads every page: nothing is rewritten while it is held.
+    let frozen = store.freeze().unwrap();
+    let shared = store.rewrite(&7, |_| Ok(Some((Value(0), 0))));
+    assert_eq!(shared.unwrap(), Rewrite::Shared);
+    assert_eq!(row(&store, 7), Some((70, 256)));
+    drop(frozen);
+    let rewritten = store.rewrite(&7, |_| Ok(Some((Value(0), 0))));
+    assert_eq!(rewritten.unwrap(), Rewrite::Rewritten);
+    assert_eq!(row(&store, 7), Some((0, 0)));
+    // The plan made before the rewrites publishes after them.
+    assert!(store.publish_sparse(pending, copy).is_ok());
+    assert_eq!((store.prefix(), store.len()), (2, 11));
+    drop(store);
+    assert_eq!(budget.stats().used, 0);
+}

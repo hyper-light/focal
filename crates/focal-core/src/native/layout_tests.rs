@@ -486,7 +486,10 @@ fn inline_only_entry_allowance_refuses_claim_heap_without_publishing_any_partial
 
 #[test]
 fn strict_entry_rejection_preserves_existing_rows_and_allows_smaller_same_request_retry() {
+    // Entry sizes as rows are held: a spilled row's entry is not what its candidate's was
+    // (doc 31 M3).
     let mut reference = new_core(limits(2048));
+    drop(reference.detach_payload_log());
     publish(&mut reference, 10, creation(1, 1, &[], None));
     let accepted_maximum = reference
         .state
@@ -498,6 +501,7 @@ fn strict_entry_rejection_preserves_existing_rows_and_allows_smaller_same_reques
     let mut config = limits(2048);
     config.range.max_entry_bytes = accepted_maximum;
     let mut core = new_core(config);
+    drop(core.detach_payload_log());
     publish(&mut core, 10, creation(1, 1, &[], None));
     let read = core.pin_native(0, 1000).unwrap();
     let before = core.native_budget();

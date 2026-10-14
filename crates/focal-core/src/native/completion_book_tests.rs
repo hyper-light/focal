@@ -20,7 +20,7 @@ fn parts(
     index: u32,
 ) -> (Binding, CompletionEnvelope, SchemaSet) {
     let key = fixture::key(index);
-    let Some(Row::Claim(owner)) = core.state.rows.get(&Key::Claim(key.claim)) else {
+    let Some(Row::Claim(owner)) = core.state.row(&Key::Claim(key.claim)) else {
         panic!("actual owner claim");
     };
     let parent = owner.claim().unwrap();
@@ -70,7 +70,7 @@ fn install(
 
 fn registration(core: &Core<NativeState>, index: u32) -> usize {
     let key = fixture::key(index);
-    let Some(Row::Claim(claim)) = core.state.rows.get(&Key::Claim(key.claim)) else {
+    let Some(Row::Claim(claim)) = core.state.row(&Key::Claim(key.claim)) else {
         panic!("claim")
     };
     claim

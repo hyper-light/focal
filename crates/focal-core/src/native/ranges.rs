@@ -18,8 +18,8 @@ use super::{ContractError, Key, NativeError, Row};
 use focal_memory::{
     Allocation, BudgetKind, BudgetLane, Change, Entry, FrozenKeySet, FrozenRange, KeyIter, KeySet,
     KeySetFunding, MemoryBudget, MemoryError, PreparedRange, RangeConfig, RangeId,
-    RangePreparationPlan, RangeStats, RangeStore, RangeWriteEnvelope, RangeWriteLimits, SetKey,
-    SnapshotLease, SparseBase, SparseRange, WeakKeySet,
+    RangePreparationPlan, RangeStats, RangeStore, RangeWriteEnvelope, RangeWriteLimits, Rewrite,
+    SetKey, SnapshotLease, SparseBase, SparseRange, WeakKeySet,
 };
 
 /// The most reads a group keeps its members' key sets pinned for at once, beside what each
@@ -880,6 +880,23 @@ impl NativeRanges {
                 .then_some(&INDEX_ROW);
         }
         self.stores.get(member)?.get(&key)
+    }
+    /// Rewrites the row at `key` where it stands ([`RangeStore::rewrite`]): a held row's value
+    /// moved off the heap. An index family's key has no value to rewrite.
+    pub(super) fn rewrite(
+        &mut self,
+        key: &Key,
+        rewrite: impl FnOnce(&Row) -> Result<Option<(Row, usize)>, MemoryError>,
+    ) -> Result<Rewrite, MemoryError> {
+        let key = PackedKey::probe(key);
+        if indexed(&key) {
+            return Ok(Rewrite::Unchanged);
+        }
+        let member = self.layout.route_packed(&key);
+        match self.stores.get_mut(member) {
+            Some(store) => store.rewrite(&key, rewrite),
+            None => Ok(Rewrite::Absent),
+        }
     }
     /// Every row in key order.
     pub(super) fn entries(&self) -> impl Iterator<Item = RowEntry<'_>> {
@@ -2784,6 +2801,28 @@ pub struct RangeLeases {
     _indexes_charge: Allocation,
 }
 
+/// Every member of a group's leased prefix held for one read ([`RangeLeases::hold`]).
+pub(super) struct LeasedRows<'l> {
+    leases: &'l Parts<SnapshotLease<PackedKey, Row>>,
+    holds: Vec<focal_memory::LeaseHold<PackedKey, Row>>,
+    _charge: Allocation,
+}
+
+impl LeasedRows<'_> {
+    /// The row the leased prefix holds at `key`; an index family's key, which a member's key set
+    /// holds, is not read here.
+    pub(super) fn get(&self, key: &Key) -> Option<&Row> {
+        let packed = PackedKey::probe(key);
+        if indexed(&packed) {
+            return None;
+        }
+        self.holds
+            .get(self.leases.route(&packed))?
+            .get(&packed)
+            .map(|entry| &entry.value)
+    }
+}
+
 impl std::fmt::Debug for RangeLeases {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RangeLeases")
@@ -2796,6 +2835,35 @@ impl std::fmt::Debug for RangeLeases {
 impl RangeLeases {
     pub(super) fn prefix(&self) -> u64 {
         self.prefix
+    }
+    /// Every member's leased prefix held for one read, its holds charged to `budget` while they
+    /// are (doc 31 M3: a spilled row read back through a lease reads the rows it names here).
+    pub(super) fn hold(
+        &self,
+        now: u64,
+        budget: &MemoryBudget,
+    ) -> Result<LeasedRows<'_>, MemoryError> {
+        let members = self.leases.len();
+        let charge = budget
+            .reserve(
+                BudgetKind::Query,
+                BudgetLane::Committed,
+                array::<focal_memory::LeaseHold<PackedKey, Row>>(members)
+                    .map_err(|_| MemoryError::CounterExhausted("lease holds"))?,
+            )?
+            .commit();
+        let mut holds = Vec::new();
+        holds
+            .try_reserve_exact(members)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        for member in self.leases.iter() {
+            holds.push(member.value.hold(now)?);
+        }
+        Ok(LeasedRows {
+            leases: &self.leases,
+            holds,
+            _charge: charge,
+        })
     }
     /// Project the first row at or after `start` (after it when
     /// `exclusive`) below `end`, wherever it lives: the member holding

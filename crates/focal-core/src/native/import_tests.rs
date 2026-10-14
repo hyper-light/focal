@@ -407,7 +407,7 @@ fn seal_inline(store: &mut ContentStore, core: &LegacyCore) {
     }
 }
 fn claim(core: &Core<NativeState>, id: ClaimId) -> &ClaimState {
-    match core.state.rows.get(&Key::Claim(id)) {
+    match core.state.row(&Key::Claim(id)) {
         Some(Row::Claim(owned)) => owned.claim().unwrap(),
         other => panic!("claim row {id:?}: {other:?}"),
     }

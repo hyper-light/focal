@@ -91,7 +91,7 @@ impl Core<NativeState> {
         )
     }
     pub fn native_validation_descriptor(&self, id: ValidationId) -> Option<&ValidationDescriptor> {
-        descriptor(self.state.rows.get(&Key::Definition(id)))
+        descriptor(self.state.row(&Key::Definition(id)))
     }
     /// The result of the creation `key` made, a spilled one read back, decoded and charged to
     /// the core's budget while it is held.
@@ -180,42 +180,37 @@ impl NativeRead {
         budget: &MemoryBudget,
         project: impl FnOnce(&ClaimDescriptor, &ClaimState) -> T,
     ) -> Result<Option<T>, NativeError> {
-        let key = Key::Claim(id);
-        let projected = self
-            .lease
-            .project_next(&key, false, &Key::End, now, |entry| {
-                if entry.key != key {
-                    return Ok(None);
-                }
-                let state = as_claim(Some(entry.value)).ok_or(ContractError::InvalidPolicy)?;
-                let key = Key::ClaimContent(id);
-                let body = self
-                    .lease
-                    .project_next(&key, false, &Key::End, now, |entry| {
-                        let body = if entry.key == key {
-                            content(
-                                Some(entry.value),
-                                self.payloads
-                                    .as_deref()
-                                    .map(|read| -> &dyn PayloadRead { read }),
-                                budget,
-                                BudgetLane::Ordinary,
-                            )?
-                        } else {
-                            None
-                        }
-                        .ok_or(ContractError::InvalidPolicy)?;
-                        if state.binding().content != body.content_hash()
-                            || state.binding().ledger != body.ledger()
-                            || state.binding().object.0 != body.id().0
-                        {
-                            return Err(NativeError::Contract(ContractError::ContentConflict));
-                        }
-                        Ok(project(&body, state))
-                    })?
-                    .ok_or(ContractError::InvalidPolicy)??;
-                Ok(Some(body))
-            })?;
+        // A spilled claim is read back for the projection (doc 31 M3).
+        let projected = self.project_row(Key::Claim(id), now, |row| {
+            let state = as_claim(Some(row)).ok_or(ContractError::InvalidPolicy)?;
+            let key = Key::ClaimContent(id);
+            let body = self
+                .lease
+                .project_next(&key, false, &Key::End, now, |entry| {
+                    let body = if entry.key == key {
+                        content(
+                            Some(entry.value),
+                            self.payloads
+                                .as_deref()
+                                .map(|read| -> &dyn PayloadRead { read }),
+                            budget,
+                            BudgetLane::Ordinary,
+                        )?
+                    } else {
+                        None
+                    }
+                    .ok_or(ContractError::InvalidPolicy)?;
+                    if state.binding().content != body.content_hash()
+                        || state.binding().ledger != body.ledger()
+                        || state.binding().object.0 != body.id().0
+                    {
+                        return Err(NativeError::Contract(ContractError::ContentConflict));
+                    }
+                    Ok(project(&body, state))
+                })?
+                .ok_or(ContractError::InvalidPolicy)??;
+            Ok(Some(body))
+        })?;
         projected.transpose().map(Option::flatten)
     }
     pub fn with_validation_descriptor<T>(
@@ -224,16 +219,12 @@ impl NativeRead {
         now: u64,
         project: impl FnOnce(&ValidationDescriptor) -> T,
     ) -> Result<Option<T>, MemoryError> {
-        let key = Key::Definition(id);
-        self.lease
-            .project_next(&key, false, &Key::End, now, |entry| {
-                if entry.key == key {
-                    descriptor(Some(entry.value)).map(project)
-                } else {
-                    None
-                }
-            })
-            .map(Option::flatten)
+        // A spilled definition is read back for the projection (doc 31 M3).
+        self.project_row(Key::Definition(id), now, |row| {
+            descriptor(Some(row)).map(project)
+        })
+        .map(Option::flatten)
+        .map_err(super::lease_read_back)
     }
     /// Project the result of the creation `key` made, a spilled one read back, decoded and
     /// charged to `budget` while it is projected.

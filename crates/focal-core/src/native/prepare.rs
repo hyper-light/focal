@@ -512,14 +512,16 @@ impl Core<NativeState> {
             )
             .into());
         }
-        match self.check_native_chain(context, input, pending)? {
+        let prepared = match self.check_native_chain(context, input, pending)? {
             Checked::Existing { outcome, committed } => {
-                Ok(NativePreparation::Existing { outcome, committed })
+                NativePreparation::Existing { outcome, committed }
             }
-            Checked::Fresh(fresh) => fresh
-                .build(source, evidence)
-                .map(NativePreparation::Prepared),
-        }
+            Checked::Fresh(fresh) => NativePreparation::Prepared(fresh.build(source, evidence)?),
+        };
+        // A spilled row its reads could not take back was lent as it is stored: the preparation
+        // stands only where none failed (doc 31 M3).
+        self.state.reads.failure()?;
+        Ok(prepared)
     }
 
     /// Resolve identity and the exact effective base before selecting resource
