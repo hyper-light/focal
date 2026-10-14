@@ -101,8 +101,8 @@ fn authored_descriptors_identity_indices_and_zero_event_reuse_survive_full_recov
     for id in [1, 2] {
         let claim = ClaimId::from_u128(id);
         let validation = ValidationId::from_u128(id);
-        let old_claim = core.native_claim_content(claim).unwrap();
-        let new_claim = restored.native_claim_content(claim).unwrap();
+        let old_claim = core.native_claim_content(claim).unwrap().unwrap();
+        let new_claim = restored.native_claim_content(claim).unwrap().unwrap();
         assert_eq!(new_claim, old_claim);
         assert!(!std::ptr::eq(
             new_claim.description().as_ptr(),
@@ -166,6 +166,7 @@ fn authored_descriptors_identity_indices_and_zero_event_reuse_survive_full_recov
     assert!(restored.native_event(reused.sequence, 0).is_none());
     let claim = restored
         .native_claim_content(ClaimId::from_u128(1))
+        .unwrap()
         .unwrap();
     let declaration = restored
         .native_validation_descriptor(ValidationId::from_u128(1))
@@ -196,6 +197,8 @@ fn authored_descriptors_identity_indices_and_zero_event_reuse_survive_full_recov
     );
     assert_eq!(core.native_budget(), original_budget);
     assert!(memory.stats().used > before);
+    // The decoded body read above is charged while it is held (doc 31 M3).
+    drop(claim);
     drop(restored);
     assert_eq!(memory.stats().used, before);
 }
@@ -231,11 +234,11 @@ fn altered_authored_body_profile_identity_and_creation_mapping_refuse_and_refund
                 let key = Key::ClaimContent(ClaimId::from_u128(1));
                 let range = body_range(&bytes, key);
                 let mut body = bytes[range].to_vec();
-                let description = core
+                let held = core
                     .native_claim_content(ClaimId::from_u128(1))
                     .unwrap()
-                    .description()
-                    .as_bytes();
+                    .unwrap();
+                let description = held.description().as_bytes();
                 let at = body
                     .windows(description.len())
                     .position(|value| value == description)
@@ -264,6 +267,7 @@ fn altered_authored_body_profile_identity_and_creation_mapping_refuse_and_refund
                 Key::ClaimIdentity(
                     1,
                     core.native_claim_content(ClaimId::from_u128(1))
+                        .unwrap()
                         .unwrap()
                         .content_hash(),
                 ),

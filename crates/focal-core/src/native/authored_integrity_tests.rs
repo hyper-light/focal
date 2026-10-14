@@ -1,4 +1,9 @@
 use super::*;
+
+/// A budget a test's reads of a claim's content are charged to while they hold it.
+fn read_budget() -> focal_memory::MemoryBudget {
+    focal_memory::MemoryBudget::new(1 << 26, 1 << 24).unwrap()
+}
 use focal_memory::{BudgetLane, Change, Entry};
 
 fn corrupt(core: &mut Core<NativeState>, change: Change<Key, Row>) {
@@ -56,7 +61,7 @@ fn reconstruction_requires_actual_bodies_indices_and_authored_definition_variant
         assert_eq!(core.native_budget(), before, "defect {defect}");
         assert_eq!(
             lease
-                .with_authored_claim(ClaimId::from_u128(1), 0, |body, state| (
+                .with_authored_claim(ClaimId::from_u128(1), 0, &read_budget(), |body, state| (
                     body.content_hash(),
                     state.status()
                 ))
@@ -77,12 +82,12 @@ fn pinned_authored_read_refuses_a_live_claim_with_missing_body() {
     let lease = core.pin_native(0, 100).unwrap();
     assert!(
         lease
-            .with_authored_claim(ClaimId::from_u128(1), 0, |_, _| ())
+            .with_authored_claim(ClaimId::from_u128(1), 0, &read_budget(), |_, _| ())
             .is_err()
     );
     assert_eq!(
         lease
-            .with_authored_claim(ClaimId::from_u128(99), 0, |_, _| ())
+            .with_authored_claim(ClaimId::from_u128(99), 0, &read_budget(), |_, _| ())
             .unwrap(),
         None
     );
@@ -148,13 +153,15 @@ fn retained_proof_detects_changed_original_owner_and_result_positions() {
         .position(|row| matches!(row.row, Row::ClaimContent(_)))
         .unwrap();
     let (descriptor, profile) = match &extras.rows[content_index].row {
-        Row::ClaimContent(row) => (
-            row.get()
-                .unwrap()
-                .try_copy(row.get().unwrap().copy_charge().unwrap())
-                .unwrap(),
-            row.profile().unwrap(),
-        ),
+        Row::ClaimContent(row) => {
+            let body = row
+                .body(&read_budget(), focal_memory::BudgetLane::Ordinary)
+                .unwrap();
+            (
+                body.try_copy(body.copy_charge().unwrap()).unwrap(),
+                row.profile().unwrap(),
+            )
+        }
         _ => unreachable!(),
     };
     let changed = OwnedClaimContent::new(
@@ -215,7 +222,7 @@ fn binding_from(extras: &Extras) -> Binding {
         .rows
         .iter()
         .find_map(|extra| match &extra.row {
-            Row::ClaimContent(row) => row.get().map(ClaimDescriptor::binding),
+            Row::ClaimContent(row) => row.binding(),
             _ => None,
         })
         .unwrap()

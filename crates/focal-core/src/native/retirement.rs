@@ -559,19 +559,32 @@ impl Core<NativeState> {
                 Some(Row::Claim(owned)) => {
                     let claim = owned.claim().ok_or(RetirementRefusal::Corrupt)?;
                     let content = match self.state.rows.get(&Key::ClaimContent(member)) {
-                        Some(Row::ClaimContent(content)) => content.get(),
+                        Some(Row::ClaimContent(content)) => Some(content),
                         _ => None,
                     };
                     (claim, content)
                 }
                 _ => return Err(RetirementRefusal::Corrupt),
             };
+            // The content read in place from its encoding (doc 31 M3).
+            let view = content
+                .map(|content| content.view())
+                .transpose()
+                .map_err(|_| RetirementRefusal::Corrupt)?;
             closure.index_keys(|sink| {
-                index_rows::claim(None, claim, content, &index_rows::NeverConsumed, sink)
+                index_rows::claim(
+                    None,
+                    claim,
+                    view.as_ref()
+                        .map(|view| view as &dyn index_rows::ContentSource),
+                    &index_rows::NeverConsumed,
+                    sink,
+                )
             })?;
             if let Some(content) = content {
-                closure
-                    .keep_existing(Key::ClaimIdentity(content.schema(), content.content_hash()))?;
+                let schema = content.schema().ok_or(RetirementRefusal::Corrupt)?;
+                let hash = content.content_hash().ok_or(RetirementRefusal::Corrupt)?;
+                closure.keep_existing(Key::ClaimIdentity(schema, hash))?;
             }
             let first = Key::Accepted(NativeResultKey {
                 evaluation: EvaluationKey {

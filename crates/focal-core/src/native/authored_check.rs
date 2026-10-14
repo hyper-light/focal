@@ -163,7 +163,7 @@ pub(in crate::native) fn check_plan(
         }
         return Ok(());
     };
-    let mut visits = VisitBudget::new(budget::quote(plan, extras, limits)?);
+    let mut visits = VisitBudget::new(budget::quote(plan, extras, limits, &view.state.budget)?);
     for (position, extra) in extras.rows.iter().enumerate() {
         visits.charge(add(position, 1)?)?;
         if extras
@@ -223,7 +223,8 @@ pub(in crate::native) fn check_plan(
         match (&extra.key, &extra.row) {
             (Key::ClaimContent(id), Row::ClaimContent(owned)) => {
                 claims = add(claims, 1)?;
-                let body = owned.get().ok_or(ContractError::InvalidPolicy)?;
+                let held = owned.body(&view.state.budget, focal_memory::BudgetLane::Ordinary)?;
+                let body: &ClaimDescriptor = &held;
                 let profile = owned.profile().ok_or(ContractError::InvalidPolicy)?;
                 visits.charge(plan.rows.len())?;
                 let state = plan
@@ -244,8 +245,9 @@ pub(in crate::native) fn check_plan(
                 super::peer::check_one(
                     Principal::Actor(proof.request.principal),
                     body,
-                    extras.rows.iter().filter_map(|extra| {
-                        super::super::authored_reads::content(Some(&extra.row))
+                    extras.rows.iter().filter_map(|extra| match &extra.row {
+                        Row::ClaimContent(content) => Some(content.view()),
+                        _ => None,
                     }),
                     view,
                     &mut VisitBudget::new(limits.plan_edges),
@@ -278,7 +280,7 @@ pub(in crate::native) fn check_plan(
                 let Row::ClaimContent(owner) = &owner.row else {
                     return Err(ContractError::InvalidPolicy.into());
                 };
-                let owner = owner.get().ok_or(ContractError::InvalidPolicy)?;
+                let owner = owner.body(&view.state.budget, focal_memory::BudgetLane::Ordinary)?;
                 visits.charge(owner.requirements().len())?;
                 if !owner.requirements().iter().any(|pin| pin.id == *id) {
                     return Err(ContractError::InvalidPolicy.into());
@@ -305,11 +307,14 @@ pub(in crate::native) fn check_plan(
             }
             (Key::ClaimIdentity(schema, content), Row::ClaimIdentity(id)) => {
                 claim_indices = add(claim_indices, 1)?;
-                let body = find(extras, Key::ClaimContent(*id), &mut visits)?
-                    .and_then(|row| super::super::authored_reads::content(Some(&row.row)))
-                    .ok_or(ContractError::InvalidPolicy)?;
-                if body.schema() != *schema
-                    || body.content_hash() != *content
+                // The content's schema and hash, read in place.
+                let Some(Row::ClaimContent(body)) =
+                    find(extras, Key::ClaimContent(*id), &mut visits)?.map(|row| &row.row)
+                else {
+                    return Err(ContractError::InvalidPolicy.into());
+                };
+                if body.schema() != Some(*schema)
+                    || body.content_hash() != Some(*content)
                     || view.get(extra.key).is_some()
                     || extra.heap != 0
                     || extra.fact.is_some()
@@ -415,7 +420,8 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
                 let Some(Row::ClaimContent(owned)) = view.get(Key::ClaimContent(*id)) else {
                     return Err(ContractError::InvalidPolicy.into());
                 };
-                let body = owned.get().ok_or(ContractError::InvalidPolicy)?;
+                let held = owned.body(&core.state.budget, focal_memory::BudgetLane::Completion)?;
+                let body: &ClaimDescriptor = &held;
                 let state = view.claim(*id).ok_or(ContractError::InvalidTarget)?;
                 budget::body_shape(body, limits, &mut visits)?;
                 budget::state_shape(state, limits, &mut visits)?;
@@ -452,7 +458,8 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
             }
             (Key::ClaimContent(id), Row::ClaimContent(owned)) if strict => {
                 contents = add(contents, 1)?;
-                let body = owned.get().ok_or(ContractError::InvalidPolicy)?;
+                let held = owned.body(&core.state.budget, focal_memory::BudgetLane::Completion)?;
+                let body: &ClaimDescriptor = &held;
                 budget::body_shape(body, limits, &mut visits)?;
                 visits.charge(budget::claim_heap_visits(body)?)?;
                 owner_shape(body, owned.profile().ok_or(ContractError::InvalidPolicy)?)?;
@@ -467,18 +474,19 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
             (Key::Definition(id), Row::Definition(owned)) if strict => {
                 definitions = add(definitions, 1)?;
                 let body = owned.descriptor().ok_or(ContractError::InvalidPolicy)?;
-                let claim = super::super::authored_reads::content(
+                // The owning claim's requirements, read in place.
+                let claim = super::super::authored_reads::content_view(
                     view.get(Key::ClaimContent(body.declaration().claim())),
-                )
+                )?
                 .ok_or(ContractError::InvalidTarget)?;
                 within(
-                    claim.requirements().len(),
+                    claim.requirement_count(),
                     limits.definitions.min(limits.range.max_batch_entries),
                 )?;
-                visits.charge(claim.requirements().len())?;
+                visits.charge(claim.requirement_count())?;
                 if entry.heap_bytes != add(owned.heap_charge()?, entry.value.boxed_heap())?
                     || body.binding().object.0 != id.0
-                    || !claim.requirements().iter().any(|pin| pin.id == *id)
+                    || !claim.requires(*id)?
                     || !matches!(view.get(Key::DefinitionIdentity(body.schema(), body.content_hash())), Some(Row::DefinitionIdentity(found)) if found == id)
                 {
                     return Err(ContractError::InvalidPolicy.into());
@@ -486,9 +494,12 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
             }
             (Key::ClaimIdentity(schema, hash), Row::ClaimIdentity(id)) if strict => {
                 claim_indices = add(claim_indices, 1)?;
-                let body = super::super::authored_reads::content(view.get(Key::ClaimContent(*id)))
-                    .ok_or(ContractError::InvalidPolicy)?;
-                if entry.heap_bytes != 0 || body.schema() != *schema || body.content_hash() != *hash
+                let Some(Row::ClaimContent(body)) = view.get(Key::ClaimContent(*id)) else {
+                    return Err(ContractError::InvalidPolicy.into());
+                };
+                if entry.heap_bytes != 0
+                    || body.schema() != Some(*schema)
+                    || body.content_hash() != Some(*hash)
                 {
                     return Err(ContractError::ContentConflict.into());
                 }

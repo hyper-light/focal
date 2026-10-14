@@ -634,7 +634,8 @@ pub(super) fn validate<O: Overlay>(
         let Row::ClaimContent(content) = read.require(Key::ClaimContent(id))? else {
             return Err(invalid());
         };
-        let body = content.get().ok_or_else(invalid)?;
+        let held = content.body(read.budget, focal_memory::BudgetLane::Completion)?;
+        let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
         let profile = content.profile().ok_or_else(invalid)?;
         // This checker has no lookup callbacks. The exclusive model loan
         // therefore cannot overlap the source/lookup meter's allowance.

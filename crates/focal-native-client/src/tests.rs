@@ -352,7 +352,7 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
     );
     {
         let view = h.view();
-        let content = view.claim_content(claim).unwrap();
+        let content = view.claim_content(claim).unwrap().unwrap();
         assert_eq!(content.issuer(), ISSUER);
         assert_eq!(content.subject(), SUBJECT);
         assert_eq!(content.scopes().len(), 2);
@@ -1372,7 +1372,7 @@ fn a_challenge_cites_exact_committed_evidence_and_carries_its_policy_through_the
     let challenge_id = ClaimId(compiled.created[0].id);
     {
         let view = h.view();
-        let content = view.claim_content(challenge_id).unwrap();
+        let content = view.claim_content(challenge_id).unwrap().unwrap();
         assert_eq!(content.schema(), 2);
         assert_eq!(
             content.policy(),
@@ -1392,7 +1392,7 @@ fn a_challenge_cites_exact_committed_evidence_and_carries_its_policy_through_the
                     })
         }));
         // An ordinary claim keeps schema 1.
-        assert_eq!(view.claim_content(claim).unwrap().schema(), 1);
+        assert_eq!(view.claim_content(claim).unwrap().unwrap().schema(), 1);
     }
 
     // The wrong hash and an unknown artifact are refused by the owner; a
@@ -1695,7 +1695,7 @@ fn a_correction_rests_on_the_challenge_s_failed_verdict_under_its_authored_polic
     let correction = ClaimId(compiled.created[0].id);
     {
         let view = h.view();
-        let content = view.claim_content(correction).unwrap();
+        let content = view.claim_content(correction).unwrap().unwrap();
         assert_eq!(content.schema(), 2);
         assert_eq!(content.action(), ActionType::Correction);
         assert_eq!(content.issuer(), EVALUATOR);
@@ -1758,7 +1758,7 @@ fn consult_follow_ups_refine_their_parent_within_its_authored_policy() {
         .unwrap();
     let first = ClaimId(compiled.created[0].id);
     assert_eq!(
-        h.view().claim_content(first).unwrap().action(),
+        h.view().claim_content(first).unwrap().unwrap().action(),
         ActionType::Consultation
     );
     // `max_follow_ups: 1` is exhausted; the refusal cites the policy.
@@ -1815,7 +1815,7 @@ fn peer_verbs_are_authored_shapes_of_claim_submit_with_derived_identities() {
     let disputing = ClaimId(compiled.created[0].id);
     {
         let view = h.view();
-        let content = view.claim_content(disputing).unwrap();
+        let content = view.claim_content(disputing).unwrap().unwrap();
         assert_eq!(content.action(), ActionType::Challenge);
         assert_eq!(content.schema(), 2);
         assert!(content.relations().iter().any(|relation| {
@@ -1860,7 +1860,7 @@ fn peer_verbs_are_authored_shapes_of_claim_submit_with_derived_identities() {
     let corrected = ClaimId(compiled.created[0].id);
     {
         let view = h.view();
-        let content = view.claim_content(corrected).unwrap();
+        let content = view.claim_content(corrected).unwrap().unwrap();
         assert_eq!(content.action(), ActionType::Correction);
         assert_eq!(content.subject(), SUBJECT);
         assert!(content.relations().iter().any(|relation| {
@@ -1928,7 +1928,7 @@ fn peer_verbs_are_authored_shapes_of_claim_submit_with_derived_identities() {
     let followed = ClaimId(compiled.created[0].id);
     {
         let view = h.view();
-        let content = view.claim_content(followed).unwrap();
+        let content = view.claim_content(followed).unwrap().unwrap();
         assert_eq!(content.action(), ActionType::Consultation);
         assert_eq!(content.subject(), SUBJECT);
         assert!(content.relations().iter().any(|relation| {

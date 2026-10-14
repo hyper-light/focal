@@ -231,19 +231,16 @@ pub(crate) fn object(
 ) -> Result<NativeObject, AccessError> {
     let core = reader.core;
     let found = match reference {
-        NativeObjectRef::Claim(id) => core
-            .native_claim(id)
-            .map(|state| {
-                NativeObject::Claim(Box::new(docs::claim(
-                    core,
-                    state,
-                    NativeClaimExpand::default(),
-                )))
-            })
-            .or_else(|| {
-                core.native_retired(id)
-                    .map(|value| NativeObject::Retired(docs::retired(id, value)))
-            }),
+        NativeObjectRef::Claim(id) => match core.native_claim(id) {
+            Some(state) => Some(NativeObject::Claim(Box::new(docs::claim(
+                core,
+                state,
+                NativeClaimExpand::default(),
+            )?))),
+            None => core
+                .native_retired(id)
+                .map(|value| NativeObject::Retired(docs::retired(id, value))),
+        },
         NativeObjectRef::Definition(id) => core.native_definition(id).map(|declaration| {
             NativeObject::Definition(Box::new(docs::definition(core, declaration)))
         }),
@@ -456,7 +453,7 @@ pub(crate) fn page(
             if !resumed {
                 objects.push(NativeObject::Claim(Box::new(docs::claim(
                     core, state, *expand,
-                ))));
+                )?)));
             }
             let mut visited = 1usize;
             let mut next = None;
@@ -1011,7 +1008,7 @@ fn validation_context(
         }
     };
     let context = NativeValidationContext {
-        claim: docs::claim(core, claim, NativeClaimExpand::default()),
+        claim: docs::claim(core, claim, NativeClaimExpand::default())?,
         definition: docs::definition(core, declaration),
         registration,
         evaluation,

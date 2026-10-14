@@ -6,6 +6,7 @@ use super::input_codec::bytes::{CountingSink, Cursor, Error as CodecError, Slice
 use super::record_codec::{EventBindings, decode_event, encode_event};
 use super::{ContractError, LedgerId, NativeError, NativeEvent, NativeFact};
 use focal_memory::MemoryError;
+use focal_model::lifecycle::Binding;
 use focal_model::lifecycle::{
     aggregation::RegistrationSet,
     claim::ClaimState,
@@ -15,12 +16,17 @@ use focal_model::lifecycle::{
     validation::{Declaration, EvaluationState},
     validation_descriptor::ValidationDescriptor,
 };
+use focal_model::{ClaimId, ContentHash, ObjectId, ObjectRevision};
 
 const ALLOCATION: usize = 4 * size_of::<usize>();
 const CLAIM_CONTAINER: usize = size_of::<ClaimRow>() + ALLOCATION;
 const DECLARATION_CONTAINER: usize = size_of::<Declaration>() + ALLOCATION;
 const AUTHORED_DECLARATION_CONTAINER: usize = size_of::<ValidationDescriptor>() + ALLOCATION;
-const CLAIM_CONTENT_CONTAINER: usize = size_of::<ClaimContentRow>() + ALLOCATION;
+/// The bytes before a content row's descriptor: the content's hash, and the descriptor's length
+/// (u32, little-endian).
+const CONTENT_HEAD: usize = 36;
+/// Codec work a content row's own bytes take to write or read, beyond one a byte.
+const CONTENT_VISITS: usize = 64;
 const EVALUATION_CONTAINER: usize = size_of::<EvaluationState>() + ALLOCATION;
 /// The widest retained event's encoding with its ledger implied (every fact
 /// field is fixed-width, so the bound is finite; `owned_tests` proves each
@@ -49,13 +55,32 @@ pub(super) struct ClaimContentProfile {
     pub(super) scope_limits: ScopeLimits,
     pub(super) owner: Option<Owner>,
 }
+/// A claim's content as its row holds it (doc 31 M3, stage 1): one allocation, exactly its own
+/// length, of the content's hash, the descriptor's record encoding and the creation profile's, so
+/// a live claim holds the few hundred bytes of the encoding where the decoded descriptor took a
+/// kilobyte of nested heap. What admission reads on its common paths (the hash, the ledger, id and
+/// schema, the profile) is read in place; the body is decoded only where a check needs it
+/// ([`OwnedClaimContent::body`]), charged while it is held. A record and a checkpoint write the
+/// row's encoding as it is held, and a page's copy-on-write copies bytes.
 #[derive(Debug)]
-struct ClaimContentRow {
+pub(super) struct OwnedClaimContent(Vec<u8>);
+/// A claim's descriptor decoded from its content row, charged while it is held.
+#[derive(Debug)]
+pub struct HeldClaimBody {
     descriptor: ClaimDescriptor,
-    profile: ClaimContentProfile,
+    _charge: focal_memory::Allocation,
 }
-#[derive(Debug)]
-pub(super) struct OwnedClaimContent(Vec<ClaimContentRow>);
+impl PartialEq for HeldClaimBody {
+    fn eq(&self, other: &Self) -> bool {
+        self.descriptor == other.descriptor
+    }
+}
+impl std::ops::Deref for HeldClaimBody {
+    type Target = ClaimDescriptor;
+    fn deref(&self) -> &ClaimDescriptor {
+        &self.descriptor
+    }
+}
 #[derive(Debug)]
 pub(super) struct OwnedEvaluation(Vec<EvaluationState>);
 #[derive(Debug)]
@@ -146,17 +171,6 @@ fn declaration_heap(declaration: &Declaration) -> Result<usize, MemoryError> {
 }
 
 fn authored_declaration_heap(descriptor: &ValidationDescriptor) -> Result<usize, MemoryError> {
-    nested_heap(
-        descriptor
-            .retained_heap_bytes()
-            .map_err(|_| MemoryError::AllocationFailed)?,
-        descriptor
-            .heap_allocations()
-            .map_err(|_| MemoryError::AllocationFailed)?,
-    )
-}
-
-fn claim_content_heap(descriptor: &ClaimDescriptor) -> Result<usize, MemoryError> {
     nested_heap(
         descriptor
             .retained_heap_bytes()
@@ -322,64 +336,250 @@ impl OwnedDeclaration {
 }
 
 impl OwnedClaimContent {
-    pub(super) const fn container_charge() -> usize {
-        CLAIM_CONTENT_CONTAINER
-    }
+    /// Hold `descriptor` with its creation profile, as its encoding.
     pub(super) fn new(
         descriptor: ClaimDescriptor,
         max_responses: u32,
         scope_limits: ScopeLimits,
         owner: Option<Owner>,
     ) -> Result<Self, MemoryError> {
-        add(Self::container_charge(), claim_content_heap(&descriptor)?)?;
-        Ok(Self(singleton(
-            ClaimContentRow {
-                descriptor,
-                profile: ClaimContentProfile {
-                    max_responses,
-                    scope_limits,
-                    owner,
-                },
-            },
-            Self::container_charge(),
-        )?))
+        let profile = ClaimContentProfile {
+            max_responses,
+            scope_limits,
+            owner,
+        };
+        let body = Self::body_len(&descriptor)?;
+        Self::write(body, descriptor.content_hash(), &profile, |sink| {
+            super::input_codec::descriptors::claim(sink, &descriptor)
+        })
     }
-    pub(super) fn get(&self) -> Option<&ClaimDescriptor> {
-        get(&self.0).map(|row| &row.descriptor)
+    /// Hold a descriptor's encoding `body`, as a record carries it once replay has checked it,
+    /// with its content's hash and its creation profile.
+    pub(super) fn from_encoded(
+        body: &[u8],
+        content_hash: ContentHash,
+        profile: &ClaimContentProfile,
+    ) -> Result<Self, MemoryError> {
+        Self::write(body.len(), content_hash, profile, |sink| {
+            super::input_codec::bytes::write_raw(sink, body)
+        })
     }
-    pub(super) fn descriptor(&self) -> Option<&ClaimDescriptor> {
-        self.get()
+    /// Exactly what [`Self::new`] charges for `descriptor` under `profile`, without allocating:
+    /// what admission charges before it is built.
+    pub(super) fn charge_for(
+        descriptor: &ClaimDescriptor,
+        profile: &ClaimContentProfile,
+    ) -> Result<usize, MemoryError> {
+        Self::charge_for_body(Self::body_len(descriptor)?, profile)
+    }
+    /// Exactly what a row of a `body`-byte descriptor encoding charges under `profile`: what a
+    /// recovery plan quotes before it is built.
+    pub(super) fn charge_for_body(
+        body: usize,
+        profile: &ClaimContentProfile,
+    ) -> Result<usize, MemoryError> {
+        container_heap::<u8>(Self::held_len(body, profile)?)
+    }
+    fn body_len(descriptor: &ClaimDescriptor) -> Result<usize, MemoryError> {
+        let mut count = CountingSink::new(usize::MAX, usize::MAX);
+        super::input_codec::descriptors::claim(&mut count, descriptor)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        Ok(count.len())
+    }
+    fn held_len(body: usize, profile: &ClaimContentProfile) -> Result<usize, MemoryError> {
+        let mut count = CountingSink::new(usize::MAX, usize::MAX);
+        super::record_codec::content_profile(&mut count, profile)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        add(add(CONTENT_HEAD, body)?, count.len())
+    }
+    fn write(
+        body: usize,
+        content_hash: ContentHash,
+        profile: &ClaimContentProfile,
+        write_body: impl FnOnce(&mut SliceSink<'_>) -> Result<(), CodecError>,
+    ) -> Result<Self, MemoryError> {
+        let len = Self::held_len(body, profile)?;
+        let charge = container_heap::<u8>(len)?;
+        let mut bytes = Vec::new();
+        #[cfg(test)]
+        let requested = tests::allocation_capacity(len)?;
+        #[cfg(not(test))]
+        let requested = len;
+        bytes
+            .try_reserve_exact(requested)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        within(container_heap::<u8>(bytes.capacity())?, charge)?;
+        // Within the reserved capacity: no reallocation.
+        bytes.resize(len, 0);
+        let visits = add(add(len, len)?, CONTENT_VISITS)?;
+        let mut sink = SliceSink::new(&mut bytes, visits);
+        let written = super::input_codec::bytes::write_raw(&mut sink, &content_hash.0)
+            .and_then(|()| {
+                super::input_codec::bytes::write_u32(
+                    &mut sink,
+                    u32::try_from(body).map_err(|_| CodecError::Capacity)?,
+                )
+            })
+            .and_then(|()| write_body(&mut sink))
+            .and_then(|()| super::record_codec::content_profile(&mut sink, profile))
+            .and_then(|()| sink.finish());
+        written.map_err(|_| MemoryError::AllocationFailed)?;
+        Ok(Self(bytes))
+    }
+    /// The row's encoding as a record and a checkpoint write it: the descriptor, then the profile.
+    pub(super) fn encoded(&self) -> &[u8] {
+        self.0.get(CONTENT_HEAD..).unwrap_or(&[])
+    }
+    /// The descriptor's encoding.
+    fn body_bytes(&self) -> Option<&[u8]> {
+        let length = self.0.get(32..CONTENT_HEAD)?;
+        let length = usize::try_from(u32::from_le_bytes(length.try_into().ok()?)).ok()?;
+        self.0.get(CONTENT_HEAD..CONTENT_HEAD.checked_add(length)?)
+    }
+    /// The content's hash.
+    pub(super) fn content_hash(&self) -> Option<ContentHash> {
+        Some(ContentHash(self.0.get(..32)?.try_into().ok()?))
+    }
+    /// The descriptor's ledger, id and schema, read in place.
+    fn head(&self) -> Option<(LedgerId, ClaimId, u16)> {
+        let body = self.body_bytes()?;
+        let mut cursor = Cursor::new(body, body.len(), CONTENT_VISITS).ok()?;
+        let ledger = LedgerId {
+            tenant: focal_model::TenantId(cursor.fixed().ok()?),
+            session: focal_model::SessionId(cursor.fixed().ok()?),
+        };
+        let id = ClaimId(cursor.fixed().ok()?);
+        let schema = cursor.u16().ok()?;
+        Some((ledger, id, schema))
+    }
+    /// The descriptor's schema.
+    pub(super) fn schema(&self) -> Option<u16> {
+        self.head().map(|(_, _, schema)| schema)
+    }
+    /// The content's binding: its ledger, its claim, its hash, at its one revision.
+    pub(super) fn binding(&self) -> Option<Binding> {
+        let (ledger, id, _) = self.head()?;
+        Some(Binding {
+            ledger,
+            object: ObjectId(id.0),
+            content: self.content_hash()?,
+            revision: ObjectRevision(1),
+        })
+    }
+    /// The content's intent fingerprint, as the descriptor's.
+    pub(super) fn intent_fingerprint(&self) -> Option<ContentHash> {
+        let (_, id, _) = self.head()?;
+        Some(focal_model::lifecycle::claim_descriptor::intent_of(
+            id,
+            self.content_hash()?,
+        ))
     }
     pub(super) fn profile(&self) -> Option<ClaimContentProfile> {
-        get(&self.0).map(|row| row.profile)
+        let body = self.body_bytes()?.len();
+        let profile = self.0.get(CONTENT_HEAD.checked_add(body)?..)?;
+        let visits = Self::read_visits(profile.len()).ok()?;
+        let mut cursor = Cursor::new(profile, profile.len(), visits).ok()?;
+        let read = super::record_codec::read_content_profile(&mut cursor).ok()?;
+        cursor.finish().ok()?;
+        Some(read)
+    }
+    /// The codec work reading a `len`-byte encoding takes, every collection in it walked a few
+    /// times over.
+    fn read_visits(len: usize) -> Result<usize, MemoryError> {
+        add(
+            len.checked_mul(4)
+                .ok_or(MemoryError::CounterExhausted("content visits"))?,
+            CONTENT_VISITS,
+        )
+    }
+    /// The descriptor as a view over its encoding: its fields, roles, scopes, relations and
+    /// requirements read in place, nothing built and nothing allocated.
+    pub(super) fn view(&self) -> Result<super::input_codec::ClaimBodyInput<'_>, NativeError> {
+        let body = self.body_bytes().ok_or(ContractError::InvalidPolicy)?;
+        let visits = Self::read_visits(body.len())?;
+        super::input_codec::ClaimBodyInput::inspect(
+            body,
+            super::input_codec::BodyInspectionLimits {
+                bytes: body.len(),
+                parse_visits: visits,
+                source_visits: visits,
+            },
+        )
+        .map_err(|_| ContractError::InvalidPolicy.into())
+    }
+    /// The descriptor, decoded from its encoding within `limits`, its heap charged to `budget`
+    /// in `lane` before it is built and while it is held. The encoding was checked when the row
+    /// was written; what bounds this decode is the encoding's own length.
+    pub(super) fn body(
+        &self,
+        budget: &focal_memory::MemoryBudget,
+        lane: focal_memory::BudgetLane,
+    ) -> Result<HeldClaimBody, NativeError> {
+        let body = self.body_bytes().ok_or(ContractError::InvalidPolicy)?;
+        let len = body.len();
+        // Bounds of a body that was checked when it was written, each from its own length: the
+        // model checks an element at a few hundred visits at most (its fixed fields 512, a
+        // relation 256, a slot or check 128) and the source walks each nested one at a few dozen,
+        // while every element takes several bytes; a decoded body is no more than tens of times
+        // its encoding.
+        let visits = len
+            .checked_mul(64)
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(MemoryError::CounterExhausted("content visits"))?;
+        let mut input = super::input_codec::ClaimBodyInput::inspect(
+            body,
+            super::input_codec::BodyInspectionLimits {
+                bytes: len,
+                parse_visits: visits,
+                source_visits: visits,
+            },
+        )
+        .map_err(|_| ContractError::InvalidPolicy)?;
+        let limits = focal_model::lifecycle::claim_descriptor::Limits {
+            description_bytes: len,
+            relations: len,
+            scopes: len,
+            scope_key_bytes: len,
+            requirements: len,
+            slots: len,
+            checks: len,
+            construction_bytes: visits,
+        };
+        let model = visits;
+        let plan = input
+            .prepare(limits, model, visits)
+            .map_err(|_| ContractError::InvalidPolicy)?;
+        let quote = plan.quote();
+        let charge = budget
+            .reserve(focal_memory::BudgetKind::Query, lane, quote.bytes)?
+            .commit();
+        let descriptor = plan
+            .build(quote.bytes, quote.model_build_visits)
+            .map_err(|_| ContractError::InvalidPolicy)?;
+        Ok(HeldClaimBody {
+            descriptor,
+            _charge: charge,
+        })
     }
     pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
-        let descriptor = self.get().ok_or(MemoryError::MissingKey)?;
-        add(
-            container_heap::<ClaimContentRow>(self.0.capacity())?,
-            claim_content_heap(descriptor)?,
-        )
+        if self.0.len() < CONTENT_HEAD {
+            return Err(MemoryError::MissingKey);
+        }
+        container_heap::<u8>(self.0.capacity())
     }
     pub(super) fn copy(&self) -> Result<Self, MemoryError> {
         let old = self.heap_charge()?;
-        let row = get(&self.0).ok_or(MemoryError::MissingKey)?;
-        let charge = row
-            .descriptor
-            .copy_charge()
+        let mut bytes = Vec::new();
+        #[cfg(test)]
+        let requested = tests::allocation_capacity(self.0.len())?;
+        #[cfg(not(test))]
+        let requested = self.0.len();
+        bytes
+            .try_reserve_exact(requested)
             .map_err(|_| MemoryError::AllocationFailed)?;
-        let descriptor = row
-            .descriptor
-            .try_copy(charge)
-            .map_err(|_| MemoryError::AllocationFailed)?;
-        let profile = row.profile;
-        let copied = Self::new(
-            descriptor,
-            profile.max_responses,
-            profile.scope_limits,
-            profile.owner,
-        )?;
-        within(copied.heap_charge()?, old)?;
-        Ok(copied)
+        within(container_heap::<u8>(bytes.capacity())?, old)?;
+        bytes.extend_from_slice(&self.0);
+        Ok(Self(bytes))
     }
 }
 

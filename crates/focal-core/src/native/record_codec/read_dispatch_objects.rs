@@ -378,7 +378,7 @@ pub(super) fn check(key: Key, row: &Row, ledger: LedgerId) -> Result<(), NativeE
             id.0,
         )?,
         (Key::ClaimContent(id), Row::ClaimContent(value)) => {
-            binding(value.get().ok_or_else(invalid)?.binding(), ledger, id.0)?
+            binding(value.binding().ok_or_else(invalid)?, ledger, id.0)?
         }
         (Key::Diagnostic(id), Row::Diagnostic(value)) => {
             let snapshot = value.get().ok_or_else(invalid)?.diagnostic.snapshot_v1();

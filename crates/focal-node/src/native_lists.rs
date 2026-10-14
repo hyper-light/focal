@@ -214,9 +214,9 @@ struct ClaimPredicates<'a> {
     created_after: Option<SessionSeq>,
 }
 impl ClaimPredicates<'_> {
-    fn holds(&self, core: &Core<NativeState>, id: ClaimId) -> bool {
+    fn holds(&self, core: &Core<NativeState>, id: ClaimId) -> Result<bool, AccessError> {
         let Some(state) = core.native_claim(id) else {
-            return false;
+            return Ok(false);
         };
         if self.issuer.is_some_and(|issuer| state.issuer() != issuer)
             || self
@@ -227,34 +227,52 @@ impl ClaimPredicates<'_> {
                 .created_after
                 .is_some_and(|after| state.created() <= after)
         {
-            return false;
+            return Ok(false);
         }
         if self.action.is_none() && self.scope.is_none() && self.relation.is_none() {
-            return true;
+            return Ok(true);
         }
-        let Some(content) = core.native_claim_content(id) else {
-            return false;
-        };
-        !(self.action.is_some_and(|action| content.action() != action)
-            || self.scope.is_some_and(|scope| {
-                !content
-                    .scopes()
-                    .any(|found| found.kind == scope.kind && found.key == scope.key)
+        // The content read in place from its encoding (doc 31 M3).
+        let held = core
+            .with_native_claim_content(id, |content| {
+                if self
+                    .action
+                    .map(|action| content.action().map(|found| found == action))
+                    .transpose()?
+                    == Some(false)
+                {
+                    return Ok(false);
+                }
+                let mut scope = self.scope.is_none();
+                if let Some(wanted) = self.scope {
+                    content.each_scope(&mut |kind, key| {
+                        scope |= kind == wanted.kind && key == wanted.key;
+                        Ok(())
+                    })?;
+                }
+                let mut related = self.relation.is_none();
+                if let Some(relation) = self.relation {
+                    content.each_relation(&mut |found| {
+                        related |= found.kind == relation.kind
+                            && match (&found.target, &relation.target) {
+                                // A filter on evidence names the artifact; a zero
+                                // hash matches any committed hash of it.
+                                (
+                                    RelationTarget::Evidence(found),
+                                    RelationTarget::Evidence(wanted),
+                                ) => {
+                                    found.id == wanted.id
+                                        && (wanted.hash.0 == [0; 32] || found.hash == wanted.hash)
+                                }
+                                (found, wanted) => found == wanted,
+                            };
+                        Ok(())
+                    })?;
+                }
+                Ok(scope && related)
             })
-            || self.relation.is_some_and(|relation| {
-                !content.relations().iter().any(|found| {
-                    found.kind == relation.kind
-                        && match (&found.target, &relation.target) {
-                            // A filter on evidence names the artifact; a zero
-                            // hash matches any committed hash of it.
-                            (RelationTarget::Evidence(found), RelationTarget::Evidence(wanted)) => {
-                                found.id == wanted.id
-                                    && (wanted.hash.0 == [0; 32] || found.hash == wanted.hash)
-                            }
-                            (found, wanted) => found == wanted,
-                        }
-                })
-            }))
+            .map_err(docs::content_error)?;
+        Ok(held.unwrap_or(false))
     }
     /// The most selective indexed predicate: an exact relation or scope, then
     /// a participant, then the action or status family, then creation order.
@@ -301,7 +319,7 @@ fn claims(
 ) -> Result<(), AccessError> {
     let core = reader.core;
     let accept = |id: ClaimId| -> Result<Option<NativeObject>, AccessError> {
-        if !predicates.holds(core, id) {
+        if !predicates.holds(core, id)? {
             return Ok(None);
         }
         let Some(state) = core.native_claim(id) else {
@@ -311,7 +329,7 @@ fn claims(
             core,
             state,
             NativeClaimExpand::default(),
-        )))))
+        )?))))
     };
     match predicates.scan()? {
         Some(scan @ NativeIndexScan::Created { .. }) => {

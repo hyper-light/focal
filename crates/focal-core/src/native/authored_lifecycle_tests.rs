@@ -1,14 +1,8 @@
 use super::*;
 
-fn claim_buffers(content: &ClaimDescriptor) -> Vec<*const ()> {
-    let mut buffers = vec![
-        content.description().as_ptr().cast(),
-        content.relations().as_ptr().cast(),
-        content.requirements().as_ptr().cast(),
-    ];
-    buffers.extend(content.scopes().map(|scope| scope.key.as_ptr().cast()));
-    buffers.extend(content.slots().map(|slot| slot.checks.as_ptr().cast()));
-    buffers
+/// A budget a test's reads of a claim's content are charged to while they hold it.
+fn read_budget() -> focal_memory::MemoryBudget {
+    focal_memory::MemoryBudget::new(1 << 26, 1 << 24).unwrap()
 }
 
 fn validation_buffers(descriptor: &ValidationDescriptor) -> Vec<*const ()> {
@@ -25,7 +19,6 @@ fn validation_buffers(descriptor: &ValidationDescriptor) -> Vec<*const ()> {
 struct AuthoredSnapshot {
     content: ClaimDescriptor,
     descriptor: ValidationDescriptor,
-    claim_buffers: Vec<*const ()>,
     validation_buffers: Vec<*const ()>,
     resolution: [NativeCreatedObject; 2],
 }
@@ -46,7 +39,6 @@ impl AuthoredSnapshot {
             descriptor: descriptor
                 .try_copy(descriptor.retained_bytes().unwrap())
                 .unwrap(),
-            claim_buffers: claim_buffers(&proposal.content),
             validation_buffers: validation_buffers(descriptor),
             resolution: [
                 NativeCreatedObject {
@@ -77,9 +69,10 @@ impl AuthoredSnapshot {
         ValidationId(self.descriptor.binding().object.0)
     }
 
+    // A claim's content is held as its encoding (doc 31 M3): it reads back equal, decoded
+    // afresh, where a declaration's body is still the buffers it moved in with.
     fn check_claim(&self, content: &ClaimDescriptor) {
         assert_eq!(content, &self.content);
-        assert_eq!(claim_buffers(content), self.claim_buffers);
     }
 
     fn check_validation(&self, descriptor: &ValidationDescriptor) {
@@ -112,7 +105,7 @@ impl AuthoredSnapshot {
         let claim = view.claim(self.claim()).unwrap();
         assert_eq!(claim.status(), status);
         assert_eq!(claim.binding().content, self.content.content_hash());
-        self.check_claim(view.claim_content(self.claim()).unwrap());
+        self.check_claim(&view.claim_content(self.claim()).unwrap().unwrap());
         let descriptor = view.validation_descriptor(self.validation()).unwrap();
         self.check_validation(descriptor);
         assert!(std::ptr::eq(
@@ -127,7 +120,7 @@ impl AuthoredSnapshot {
 
     fn check_pinned(&self, read: &NativeRead, request: u128) {
         assert_eq!(
-            read.with_authored_claim(self.claim(), 0, |content, state| {
+            read.with_authored_claim(self.claim(), 0, &read_budget(), |content, state| {
                 self.check_claim(content);
                 assert_eq!(state.binding(), self.content.binding());
                 state.status()
@@ -169,7 +162,13 @@ fn authored_owner_keeps_full_bodies_and_pinned_creation_through_post_and_cancel(
     let (created, creation) = stage(&mut owner, create(1, vec![proposed]));
     assert_eq!(owner.committed().sequence(), SessionSeq(0));
     assert!(owner.committed().claim(snapshot.claim()).is_none());
-    assert!(owner.committed().claim_content(snapshot.claim()).is_none());
+    assert!(
+        owner
+            .committed()
+            .claim_content(snapshot.claim())
+            .unwrap()
+            .is_none()
+    );
     assert!(
         owner
             .committed()

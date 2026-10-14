@@ -461,17 +461,23 @@ fn authored_declaration_moves_existing_buffers_once_and_legacy_heap_stays_compac
     );
 }
 
+fn read_budget() -> focal_memory::MemoryBudget {
+    focal_memory::MemoryBudget::new(1 << 26, 1 << 24).unwrap()
+}
+fn lane() -> focal_memory::BudgetLane {
+    focal_memory::BudgetLane::Ordinary
+}
+
+/// A claim's content is held as its encoding (doc 31 M3), in one allocation exactly its own
+/// length, charged exactly: what admission reads on its common paths (the hash, schema, binding,
+/// intent and profile) is read in place, and the body decodes to the descriptor it was, its heap
+/// charged while it is held.
 #[test]
-fn authored_claim_content_preserves_all_buffers_and_original_responsibility_profile() {
+fn authored_claim_content_is_held_encoded_and_reads_back_whole() {
     use focal_model::{ReceiptFence, ReceiptId};
     let claim = crate::native::tests::owned_claim_fixture();
     let descriptor = authored_content(&claim);
-    let fingerprint = descriptor.intent_fingerprint();
-    let description = descriptor.description().as_ptr();
-    let relations = descriptor.relations().as_ptr();
-    let requirements = descriptor.requirements().as_ptr();
-    let checks = descriptor.slots().next().unwrap().checks.as_ptr();
-    let nested = claim_content_heap(&descriptor).unwrap();
+    let expected = authored_content(&claim);
     let scope_limits = ScopeLimits {
         scopes: 2,
         roots: 4,
@@ -484,28 +490,54 @@ fn authored_claim_content_preserves_all_buffers_and_original_responsibility_prof
             epoch: 7,
         }),
     });
+    let profile = ClaimContentProfile {
+        max_responses: 4,
+        scope_limits,
+        owner,
+    };
+    let charge = OwnedClaimContent::charge_for(&descriptor, &profile).unwrap();
     let before = ALLOCATION_ATTEMPTS.get();
     let owned = OwnedClaimContent::new(descriptor, 4, scope_limits, owner).unwrap();
-    assert_eq!(ALLOCATION_ATTEMPTS.get() - before, 1);
-    let descriptor = owned.get().unwrap();
-    assert!(std::ptr::eq(descriptor, owned.descriptor().unwrap()));
-    assert_eq!(descriptor.intent_fingerprint(), fingerprint);
-    assert_eq!(descriptor.description().as_ptr(), description);
-    assert_eq!(descriptor.relations().as_ptr(), relations);
-    assert_eq!(descriptor.requirements().as_ptr(), requirements);
-    assert_eq!(descriptor.slots().next().unwrap().checks.as_ptr(), checks);
-    assert_eq!(
-        owned.profile(),
-        Some(ClaimContentProfile {
-            max_responses: 4,
-            scope_limits,
-            owner
-        })
+    assert_eq!(ALLOCATION_ATTEMPTS.get() - before, 1, "one allocation");
+    assert_eq!(owned.heap_charge().unwrap(), charge, "charged as quoted");
+    assert!(
+        charge < claim_heap_of(&expected),
+        "the encoding is held in less than the decoded descriptor took"
     );
+    assert_eq!(owned.content_hash(), Some(expected.content_hash()));
+    assert_eq!(owned.schema(), Some(expected.schema()));
+    assert_eq!(owned.binding(), Some(expected.binding()));
     assert_eq!(
-        owned.heap_charge().unwrap(),
-        OwnedClaimContent::container_charge() + nested
+        owned.intent_fingerprint(),
+        Some(expected.intent_fingerprint())
     );
+    assert_eq!(owned.profile(), Some(profile));
+    let budget = read_budget();
+    let held = owned.body(&budget, lane()).unwrap();
+    assert_eq!(*held, expected);
+    assert!(
+        budget.stats().used > 0,
+        "the decoded body is charged while held"
+    );
+    drop(held);
+    assert_eq!(budget.stats().used, 0);
+    let view = owned.view().unwrap();
+    assert_eq!(view.fields().id, expected.id());
+    assert_eq!(view.roles().unwrap().action, expected.action());
+    assert_eq!(view.requirement_count(), expected.requirements().len());
+    for pin in expected.requirements() {
+        assert!(view.requires(pin.id).unwrap());
+    }
+    // A record carries the row's encoding as it is held: the descriptor, then the profile.
+    let mut sink = super::super::input_codec::bytes::CountingSink::new(usize::MAX, usize::MAX);
+    super::super::input_codec::descriptors::claim(&mut sink, &expected).unwrap();
+    assert!(owned.encoded().len() > sink.len());
+}
+
+fn claim_heap_of(descriptor: &ClaimDescriptor) -> usize {
+    descriptor.retained_heap_bytes().unwrap()
+        + descriptor.heap_allocations().unwrap() * ALLOCATION
+        + size_of::<ClaimDescriptor>()
 }
 
 #[test]
@@ -562,39 +594,16 @@ fn authored_copies_compact_container_capacity_preserve_profiles_and_outlive_sour
     .unwrap();
     original.0.reserve_exact(4);
     let old_heap = original.heap_charge().unwrap();
-    let fingerprint = original.get().unwrap().intent_fingerprint();
+    let fingerprint = original.intent_fingerprint().unwrap();
     let copied = original.copy().unwrap();
     assert!(copied.heap_charge().unwrap() < old_heap);
-    assert_eq!(copied.get(), original.get());
+    assert_eq!(copied.encoded(), original.encoded());
     assert_eq!(copied.profile(), original.profile());
-    assert_ne!(
-        copied.get().unwrap().description().as_ptr(),
-        original.get().unwrap().description().as_ptr()
-    );
-    assert_ne!(
-        copied.get().unwrap().relations().as_ptr(),
-        original.get().unwrap().relations().as_ptr()
-    );
-    assert_ne!(
-        copied
-            .get()
-            .unwrap()
-            .slots()
-            .next()
-            .unwrap()
-            .checks
-            .as_ptr(),
-        original
-            .get()
-            .unwrap()
-            .slots()
-            .next()
-            .unwrap()
-            .checks
-            .as_ptr()
-    );
+    let budget = read_budget();
+    let expected = original.body(&budget, lane()).unwrap();
     drop(original);
-    assert_eq!(copied.get().unwrap().intent_fingerprint(), fingerprint);
+    assert_eq!(*copied.body(&budget, lane()).unwrap(), *expected);
+    assert_eq!(copied.intent_fingerprint(), Some(fingerprint));
     assert_eq!(copied.profile(), Some(profile));
 }
 
@@ -614,9 +623,9 @@ fn authored_container_allocation_refusal_preserves_copy_sources_and_allows_retry
     )
     .unwrap();
     let fingerprint = original.descriptor().unwrap().intent_fingerprint();
-    let content_fingerprint = content.get().unwrap().intent_fingerprint();
+    let content_fingerprint = content.intent_fingerprint().unwrap();
     let handler = handler_address(original.get().unwrap());
-    let description = content.get().unwrap().description().as_ptr();
+    let encoded = content.encoded().to_vec();
     for fault in [AllocationFault::Fail, AllocationFault::Excess] {
         assert_fault(fault, with_fault(fault, || original.copy()));
         assert_fault(fault, with_fault(fault, || content.copy()));
@@ -646,14 +655,11 @@ fn authored_container_allocation_refusal_preserves_copy_sources_and_allows_retry
             fingerprint
         );
         assert_eq!(handler_address(original.get().unwrap()), handler);
-        assert_eq!(
-            content.get().unwrap().intent_fingerprint(),
-            content_fingerprint
-        );
-        assert_eq!(content.get().unwrap().description().as_ptr(), description);
+        assert_eq!(content.intent_fingerprint(), Some(content_fingerprint));
+        assert_eq!(content.encoded(), encoded);
         same_authored(&original.copy().unwrap(), &original);
         let retry = content.copy().unwrap();
-        assert_eq!(retry.get(), content.get());
+        assert_eq!(retry.encoded(), content.encoded());
         assert_eq!(retry.profile(), content.profile());
     }
     for invalid in [
@@ -669,15 +675,17 @@ fn authored_container_allocation_refusal_preserves_copy_sources_and_allows_retry
         assert!(matches!(invalid.copy(), Err(MemoryError::MissingKey)));
     }
     let invalid = OwnedClaimContent(Vec::new());
-    assert!(invalid.get().is_none());
+    assert!(invalid.content_hash().is_none());
     assert!(invalid.profile().is_none());
+    assert!(invalid.view().is_err());
+    assert!(invalid.body(&read_budget(), lane()).is_err());
     assert!(matches!(
         invalid.heap_charge(),
         Err(MemoryError::MissingKey)
     ));
     assert!(matches!(invalid.copy(), Err(MemoryError::MissingKey)));
     assert!(matches!(
-        container_heap::<ClaimContentRow>(usize::MAX),
+        container_heap::<u8>(usize::MAX),
         Err(MemoryError::CounterExhausted(_))
     ));
     assert!(matches!(
@@ -742,7 +750,7 @@ fn measure_owned_row_widths() {
         ("ClaimRow", size_of::<ClaimRow>()),
         ("ClaimState", size_of::<ClaimState>()),
         ("RegistrationSet", size_of::<RegistrationSet>()),
-        ("ClaimContentRow", size_of::<ClaimContentRow>()),
+        ("OwnedClaimContent", size_of::<OwnedClaimContent>()),
         ("ClaimDescriptor", size_of::<ClaimDescriptor>()),
         ("ClaimContentProfile", size_of::<ClaimContentProfile>()),
         ("ValidationDescriptor", size_of::<ValidationDescriptor>()),

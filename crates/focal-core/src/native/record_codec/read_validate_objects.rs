@@ -330,7 +330,8 @@ pub(super) fn claim(
         let Row::ClaimContent(content) = read.require(Key::ClaimContent(id))? else {
             return Err(invalid());
         };
-        let body = content.get().ok_or_else(invalid)?;
+        let held = content.body(read.budget, focal_memory::BudgetLane::Completion)?;
+        let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
         read.meter.budget(|visits| {
             authored::check_recorded_claim(
                 body,
@@ -394,7 +395,8 @@ pub(super) fn definition(
             else {
                 return Err(invalid());
             };
-            let body = body.get().ok_or_else(invalid)?;
+            let held = body.body(read.budget, focal_memory::BudgetLane::Completion)?;
+            let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
             read.meter.budget(|visits| {
                 authored::check_recorded_declaration(body, claim, descriptor, visits).map_err(model)
             })?;
@@ -493,21 +495,29 @@ pub(super) fn authored(
     }
     match (key, row) {
         (Key::ClaimContent(id), Row::ClaimContent(value)) => {
-            let body = value.get().ok_or_else(invalid)?;
-            if body.id() != id || body.ledger() != read.ledger {
+            use focal_model::lifecycle::claim_descriptor::ClaimSource;
+            // Read in place from the content's encoding (doc 31 M3).
+            let body = value.view()?;
+            let fields = body.fields();
+            let hash = value.content_hash().ok_or_else(invalid)?;
+            if fields.id != id || fields.ledger != read.ledger {
                 return Err(invalid());
             }
-            pinned(body.binding(), read.claim(id)?.binding())?;
-            if !matches!(read.require(Key::ClaimIdentity(body.schema(), body.content_hash()))?, Row::ClaimIdentity(actual) if *actual == id)
+            pinned(
+                value.binding().ok_or_else(invalid)?,
+                read.claim(id)?.binding(),
+            )?;
+            if !matches!(read.require(Key::ClaimIdentity(fields.schema, hash))?, Row::ClaimIdentity(actual) if *actual == id)
             {
                 return Err(invalid());
             }
-            read.charge(sum(body.requirements().len(), 1)?)?;
-            for requirement in body.requirements() {
-                read.definition(requirement.id)?;
+            read.charge(sum(body.requirement_count(), 1)?)?;
+            for requirement in body.view().requirements() {
+                read.definition(requirement?.id)?;
             }
-            read.charge(sum(body.relations().len(), 1)?)?;
-            for relation in body.relations() {
+            read.charge(sum(body.view().relation_count(), 1)?)?;
+            for relation in body.view().relations() {
+                let relation = relation?;
                 if let RelationTarget::Object(target) = relation.target {
                     if target.ledger != read.ledger || target.kind != ObjectKind::Claim {
                         return Err(invalid());
@@ -520,8 +530,7 @@ pub(super) fn authored(
             let Row::ClaimContent(value) = read.require(Key::ClaimContent(*id))? else {
                 return Err(invalid());
             };
-            let body = value.get().ok_or_else(invalid)?;
-            if body.schema() != schema || body.content_hash() != hash {
+            if value.schema() != Some(schema) || value.content_hash() != Some(hash) {
                 return Err(invalid());
             }
         }

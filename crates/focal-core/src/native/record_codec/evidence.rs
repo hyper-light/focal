@@ -252,13 +252,17 @@ pub(super) fn definition(sink: &mut impl Sink, owned: &OwnedDeclaration) -> Resu
         }
     }
 }
+/// A claim content row as a record and a checkpoint write it: the descriptor's encoding, which
+/// the row holds as it was written (doc 31 M3), then its creation profile.
 pub(super) fn claim_content(sink: &mut impl Sink, owned: &OwnedClaimContent) -> Result<(), Error> {
     sink.visit(2)?;
-    let value = owned.get().ok_or(Error::InvalidTag("claim content row"))?;
-    let profile = owned
-        .profile()
-        .ok_or(Error::InvalidTag("claim content profile"))?;
-    descriptors::claim(sink, value)?;
+    raw(sink, owned.encoded())
+}
+/// A claim content row's creation profile, after its descriptor in the row's encoding.
+pub(in crate::native) fn content_profile(
+    sink: &mut impl Sink,
+    profile: &crate::native::owned::ClaimContentProfile,
+) -> Result<(), Error> {
     write_u32(sink, profile.max_responses)?;
     types::scope_limits(sink, profile.scope_limits)?;
     types::owner(sink, profile.owner)

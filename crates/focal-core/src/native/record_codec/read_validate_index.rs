@@ -34,8 +34,16 @@ fn derives(key: Key, read: &ValidationRead<'_, '_>) -> Result<bool, NativeError>
     match index_rows::primary(key).ok_or_else(invalid)? {
         Primary::Claim(id) => {
             let claim = read.claim(id)?;
-            let content = authored_reads::content(read.get(Key::ClaimContent(id))?);
-            index_rows::claim(None, claim, content, &outcomes, &mut sink)?;
+            let content = authored_reads::content_view(read.get(Key::ClaimContent(id))?)?;
+            index_rows::claim(
+                None,
+                claim,
+                content
+                    .as_ref()
+                    .map(|content| content as &dyn crate::native::index_rows::ContentSource),
+                &outcomes,
+                &mut sink,
+            )?;
         }
         Primary::Evaluation(key) => {
             let Row::Evaluation(owned) = read.require(Key::Evaluation(key))? else {
@@ -91,10 +99,18 @@ pub(super) fn require_claim(
     claim: &ClaimState,
     read: &ValidationRead<'_, '_>,
 ) -> Result<(), NativeError> {
-    let content = authored_reads::content(read.get(Key::ClaimContent(id))?);
+    let content = authored_reads::content_view(read.get(Key::ClaimContent(id))?)?;
     let outcomes = Outcomes(read);
     complete(read, |sink| {
-        index_rows::claim(None, claim, content, &outcomes, sink)
+        index_rows::claim(
+            None,
+            claim,
+            content
+                .as_ref()
+                .map(|content| content as &dyn crate::native::index_rows::ContentSource),
+            &outcomes,
+            sink,
+        )
     })
 }
 pub(super) fn require_evaluation(

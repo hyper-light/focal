@@ -536,6 +536,46 @@ Each stage lands on its own, measured:
    - SwissTable index, slot chunks and log-resident payloads for the claim families, replacing
      the row store for live claims.
    - Measure: µs, cache misses, allocations and page faults a message; memory a claim.
+   - **Measured first (2026-10-14).** Today one authored claim with one declaration holds 18
+     rows: 6,579 bytes in memory, of which 2,738 are the entries themselves (152 bytes each,
+     the key alone 112 because the enum is as wide as its widest variant) and 3,841 their
+     decoded payloads. Its rows' own encoding, the bytes a checkpoint or a record carries, is
+     2,430 bytes, 2.7 times smaller:
+
+     | Family | In memory (B) | Encoded (B) |
+     |---|---|---|
+     | 11 index rows | 1,672 | 420 |
+     | Claim | 1,528 | 701 |
+     | ClaimContent | 1,159 | 297 |
+     | Definition | 963 | 232 |
+     | 2 events | 646 | 378 |
+     | CreationResult, Outcome | 608 | 402 |
+
+     With pages and their slack a claim is about 7.2 KB, so a 2 GiB container's native
+     allowance (384 MiB) holds about 50,000 open claims: where the comparison's runs fill.
+   - **Staged, so every stage is a measured reduction that stands on its own.**
+     1. The immutable payloads (a claim's descriptor, a declaration's) are held as their record
+        encodings, as events already are, beside the few fields admission reads on its common
+        paths (the content's hash, schema and profile); the body is decoded where a check needs
+        it, charged while held. A page's copy-on-write then copies bytes, not a descriptor's
+        nested heap. About 1.3 KB a claim.
+        - **As built.** The content row is one allocation exactly its own length: the
+          content's hash, the descriptor's encoding, the profile's. Hash, schema, binding,
+          intent and profile are read in place; a zero-copy view of the encoding answers its
+          roles, scopes, relations and requirements, which index derivation, retirement, peer
+          checks, list filters and replay's reference checks read; a full decode, charged while
+          it is held, is made only where a model check needs the descriptor whole. Replay keeps
+          the record's checked bytes. A declaration's body stays decoded for now: the model's
+          views lend it by reference deep into evaluation.
+        - **Measured.** The content row 1,007 → 343 heap bytes; a claim 6,579 → 5,915 bytes.
+          Three local nodes at the comparison's 1.5 GiB node budget, 1,000 creations a second
+          for 60 s: 48,248 → 52,742 committed before the session filled, p99 314 → 262 ms.
+     2. The claim's own row: its hot state kept, its cold parts held encoded.
+     3. Keys held as their order-preserving encoding (25–57 bytes for these families), so an
+        entry stops paying for the widest key. About 0.9 KB a claim.
+     4. Pages of encoded entries: what replay, recovery and a checkpoint move become copies of
+        bytes the record already carries.
+     - Then the claim table proper, where it beats the encoded store on the measures above.
 4. **M4, durability classes.**
    - Memory-quorum acknowledgement with a bounded background flush; the disk class kept.
    - Measure: p99 at 1k, 4k and 12k/s against Kafka, NATS and Redis.

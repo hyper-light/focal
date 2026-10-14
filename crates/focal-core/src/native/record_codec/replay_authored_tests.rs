@@ -25,9 +25,10 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         ),
         (1, 1)
     );
-    let claim_body = recovered.native_claim_content(claim).unwrap();
+    // A claim's content is held as its encoding (doc 31 M3): every read decodes the same body.
+    let claim_body = recovered.native_claim_content(claim).unwrap().unwrap();
     let claim_hash = claim_body.content_hash();
-    let claim_pointer = claim_body.description().as_ptr();
+    let claim_description = claim_body.description().to_string();
     let definition = recovered.native_validation_descriptor(validation).unwrap();
     let definition_hash = definition.content_hash();
     let definition_pointer = definition.description().as_ptr();
@@ -51,9 +52,9 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         recovered
             .native_claim_content(claim)
             .unwrap()
-            .description()
-            .as_ptr(),
-        claim_pointer
+            .unwrap()
+            .description(),
+        claim_description
     );
     assert_eq!(
         recovered
@@ -121,6 +122,7 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         recovered
             .native_claim_content(claim)
             .unwrap()
+            .unwrap()
             .content_hash(),
         claim_hash
     );
@@ -135,9 +137,9 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         recovered
             .native_claim_content(claim)
             .unwrap()
-            .description()
-            .as_ptr(),
-        claim_pointer
+            .unwrap()
+            .description(),
+        claim_description
     );
     assert_eq!(
         recovered

@@ -243,25 +243,34 @@ pub(in crate::native) fn publish(
 fn authored_bodies_policy_and_resolution_move_into_one_atomic_prefix() {
     let mut core = core();
     let authored = proposal(1, 1); // Numeric IDs intentionally repeat across families.
-    let claim_pointer = authored.content.description().as_ptr();
+    // A claim's content is held as its encoding (doc 31 M3): read back, it is the same
+    // descriptor, decoded; a declaration's body still moves in without a copy.
+    let claim_description = authored.content.description().to_string();
+    let claim_hash = authored.content.content_hash();
     let definition_pointer = authored.declarations[0].description().as_ptr();
     let binding = authored.content.binding();
     let definition_binding = authored.declarations[0].binding();
     let prepared = prepare(&core, create(1, vec![authored]), &[]);
     assert_eq!(core.native_sequence(), SessionSeq(0));
-    assert!(core.native_claim_content(ClaimId::from_u128(1)).is_none());
+    assert!(
+        core.native_claim_content(ClaimId::from_u128(1))
+            .unwrap()
+            .is_none()
+    );
     assert!(core.native_creation_result(key(1)).is_none());
     let body = core
         .native_chain(&[&prepared])
         .unwrap()
         .claim_content(ClaimId::from_u128(1))
+        .unwrap()
         .unwrap();
     let descriptor = core
         .native_chain(&[&prepared])
         .unwrap()
         .validation_descriptor(ValidationId::from_u128(1))
         .unwrap();
-    assert_eq!(body.description().as_ptr(), claim_pointer);
+    assert_eq!(body.description(), claim_description);
+    assert_eq!(body.content_hash(), claim_hash);
     assert_eq!(descriptor.description().as_ptr(), definition_pointer);
     let state = core
         .native_chain(&[&prepared])
@@ -303,9 +312,9 @@ fn authored_bodies_policy_and_resolution_move_into_one_atomic_prefix() {
     assert_eq!(
         core.native_claim_content(ClaimId::from_u128(1))
             .unwrap()
-            .description()
-            .as_ptr(),
-        claim_pointer
+            .unwrap()
+            .description(),
+        claim_description
     );
     assert_eq!(
         core.native_validation_descriptor(ValidationId::from_u128(1))
@@ -446,7 +455,11 @@ fn contextual_references_use_the_complete_batch_and_pending_prefix() {
         Err(NativeError::Contract(ContractError::InvalidTarget))
     ));
     assert_eq!(core.native_sequence(), SessionSeq(0));
-    assert!(core.native_claim_content(ClaimId::from_u128(1)).is_none());
+    assert!(
+        core.native_claim_content(ClaimId::from_u128(1))
+            .unwrap()
+            .is_none()
+    );
     let pending = prepare(&core, create(2, vec![proposal(2, 102)]), &[]);
     let reviews = prepare(
         &core,
@@ -466,6 +479,7 @@ fn contextual_references_use_the_complete_batch_and_pending_prefix() {
         core.native_chain(&[&pending, &reviews])
             .unwrap()
             .claim_content(ClaimId::from_u128(2))
+            .unwrap()
             .is_some()
     );
     core.publish_native(pending).unwrap();
@@ -545,7 +559,11 @@ fn malformed_pins_parent_and_issuer_refuse_without_retained_objects() {
         }
         assert_eq!(core.native_sequence(), SessionSeq(0));
         assert_eq!(core.native_budget().used, baseline);
-        assert!(core.native_claim_content(ClaimId::from_u128(1)).is_none());
+        assert!(
+            core.native_claim_content(ClaimId::from_u128(1))
+                .unwrap()
+                .is_none()
+        );
         assert!(
             core.native_validation_descriptor(ValidationId::from_u128(101))
                 .is_none()
@@ -829,8 +847,10 @@ fn measure_memory_per_authored_claim_by_family() {
         let prepared = prepare(&core, create(id, vec![proposal(id, 10_000 + id)]), &[]);
         core.publish_native(prepared).unwrap();
     }
-    let mut families: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    let mut families: std::collections::BTreeMap<String, (usize, usize, usize)> =
+        Default::default();
     let entry = std::mem::size_of::<focal_memory::Entry<Key, Row>>();
+    let ledger = core.state.ledger;
     for item in core.state.rows.entries() {
         let name = format!("{:?}", item.key);
         let family = name
@@ -838,9 +858,11 @@ fn measure_memory_per_authored_claim_by_family() {
             .next()
             .unwrap_or("?")
             .to_string();
+        let encoded = record_codec::checkpoint::row_bytes(item.key, &item.value, ledger).unwrap();
         let slot = families.entry(family).or_default();
         slot.0 += 1;
         slot.1 += item.heap_bytes;
+        slot.2 += encoded;
     }
     let claims = CLAIMS as f64;
     let mut total_rows = 0;
@@ -851,25 +873,29 @@ fn measure_memory_per_authored_claim_by_family() {
         std::mem::size_of::<Row>()
     );
     println!(
-        "{:<22} {:>9} {:>12} {:>12}",
-        "family", "rows/claim", "inline B/cl", "heap B/cl"
+        "{:<22} {:>9} {:>12} {:>12} {:>12}",
+        "family", "rows/claim", "inline B/cl", "heap B/cl", "encoded B/cl"
     );
-    for (family, (rows, heap)) in &families {
+    let mut total_encoded = 0;
+    for (family, (rows, heap, encoded)) in &families {
         total_rows += rows;
         total_heap += heap;
+        total_encoded += encoded;
         println!(
-            "{family:<22} {:>9.2} {:>12.0} {:>12.0}",
+            "{family:<22} {:>9.2} {:>12.0} {:>12.0} {:>12.0}",
             *rows as f64 / claims,
             (*rows * entry) as f64 / claims,
-            *heap as f64 / claims
+            *heap as f64 / claims,
+            *encoded as f64 / claims
         );
     }
     println!(
-        "{:<22} {:>9.2} {:>12.0} {:>12.0}",
+        "{:<22} {:>9.2} {:>12.0} {:>12.0} {:>12.0}",
         "TOTAL",
         total_rows as f64 / claims,
         (total_rows * entry) as f64 / claims,
-        total_heap as f64 / claims
+        total_heap as f64 / claims,
+        total_encoded as f64 / claims
     );
 }
 

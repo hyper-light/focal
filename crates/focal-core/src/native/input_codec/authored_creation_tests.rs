@@ -491,6 +491,7 @@ fn decoded_authored_creation_enters_the_real_ram_owner_without_extra_testimony()
     assert_eq!(
         core.native_claim_content(ClaimId::from_u128(1))
             .unwrap()
+            .unwrap()
             .description(),
         "Fix the regression; report failures as evidence."
     );

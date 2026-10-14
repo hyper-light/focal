@@ -89,6 +89,7 @@ pub(super) fn quote(
     plan: &super::super::super::transactions::Plan,
     extras: &Extras,
     limits: NativeLimits,
+    memory: &focal_memory::MemoryBudget,
 ) -> Result<usize, NativeError> {
     let e = extras.rows.len();
     let r = plan.rows.len();
@@ -109,7 +110,8 @@ pub(super) fn quote(
         match &extra.row {
             Row::ClaimContent(owned) => {
                 claims = add(claims, 1)?;
-                let body = owned.get().ok_or(ContractError::InvalidPolicy)?;
+                let held = owned.body(memory, focal_memory::BudgetLane::Ordinary)?;
+                let body: &ClaimDescriptor = &held;
                 let shape = body_shape(body, limits, &mut inspection)?;
                 pins = add(pins, shape.pins)?;
                 pin_pairs = add(pin_pairs, mul(shape.pins, shape.pins)?)?;

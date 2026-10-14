@@ -165,6 +165,8 @@ pub use projection_quote::NativeProjectionQuote;
 /// `n / NATIVE_ENTRY_BYTES` rows, which is the most a session's checkpoint
 /// must be able to carry.
 pub const NATIVE_ENTRY_BYTES: usize = size_of::<(Key, Row)>();
+pub use index_rows::ContentSource as NativeClaimContentRead;
+pub use owned::HeldClaimBody;
 pub use response_input::{
     NativeMonitorSource, NativeMonitorSourcePlan, NativeResponseInput, NativeResponsePlan,
     NativeResponseSource, NativeResponseSourcePlan, NativeResponseSpec, NativeSourceQuote,
@@ -2535,14 +2537,24 @@ impl EffectiveClaims for View<'_> {
     fn claim(&self, id: ClaimId) -> Option<&ClaimState> {
         as_claim(self.get(Key::Claim(id)))
     }
+    // Both read the parent's content in place (doc 31 M3). Its encoding was checked when it was
+    // written, so a read cannot fail but on corruption, where each answers what refuses: the
+    // holder's escalation, and no designation.
     fn cause_escalation(&self, parent: ClaimId) -> focal_model::Escalation {
-        authored_reads::content(self.get(Key::ClaimContent(parent)))
-            .and_then(|content| content.policy())
+        authored_reads::content_view(self.get(Key::ClaimContent(parent)))
+            .ok()
+            .flatten()
+            .and_then(|content| content.fields().policy)
             .map_or(focal_model::Escalation::Holder, |policy| policy.escalation)
     }
     fn is_designated_evaluator(&self, parent: ClaimId, actor: ParticipantId) -> bool {
-        authored_reads::content(self.get(Key::ClaimContent(parent))).is_some_and(|content| {
-            content.requirements().iter().any(|pin| {
+        use focal_model::lifecycle::claim_descriptor::ClaimSource;
+        let Ok(Some(content)) = authored_reads::content_view(self.get(Key::ClaimContent(parent)))
+        else {
+            return false;
+        };
+        content.view().requirements().any(|pin| {
+            pin.is_ok_and(|pin| {
                 as_definition(self.get(Key::Definition(pin.id)))
                     .is_some_and(|definition| definition.designates(actor))
             })

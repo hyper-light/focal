@@ -425,12 +425,11 @@ fn an_authored_family_leaves_with_its_identities_and_the_owner_reconstructs() {
         else {
             return None;
         };
-        let content = content.get()?;
         core.state
             .rows
             .get(&Key::ClaimIdentity(
-                content.schema(),
-                content.content_hash(),
+                content.schema()?,
+                content.content_hash()?,
             ))
             .map(|_| ())
     };
@@ -778,7 +777,7 @@ fn a_bundle_hydrates_into_a_core_of_the_family_read_as_the_live_one_was() {
         .native_definition(ValidationId::from_u128(11))
         .unwrap()
         .binding();
-    assert!(core.native_claim_content(id(1)).is_some());
+    assert!(core.native_claim_content(id(1)).unwrap().is_some());
     let archive = StructuralArchive::inspect(
         &bytes,
         record_codec::InspectionLimits {
@@ -812,7 +811,7 @@ fn a_bundle_hydrates_into_a_core_of_the_family_read_as_the_live_one_was() {
             .binding(),
         live_definition
     );
-    assert!(view.native_claim_content(id(1)).is_some());
+    assert!(view.native_claim_content(id(1)).unwrap().is_some());
     // Nothing of the sibling family, and no accounting.
     assert!(view.native_claim(id(2)).is_none());
     assert!(

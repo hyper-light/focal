@@ -72,8 +72,10 @@ use bytes::{
 };
 pub(in crate::native) use checkpoint::{ArchiveFrame, archive_frame, seal_frame};
 pub(in crate::native) use events::{Bindings as EventBindings, event_in as encode_event};
+pub(in crate::native) use evidence::content_profile;
 pub use fixed::RowFamily;
 pub(in crate::native) use read_events::event_in as decode_event;
+pub(in crate::native) use read_evidence::content_profile as read_content_profile;
 pub(in crate::native) use read_history::event_object;
 /// A measuring sink for a two-pass encoding.
 pub(in crate::native) fn counting_sink(max_bytes: usize, max_visits: usize) -> CountingSink {

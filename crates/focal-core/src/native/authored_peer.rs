@@ -42,10 +42,13 @@ fn citation(content: &ClaimDescriptor, visits: &mut VisitBudget) -> Result<Citat
     Ok(cited)
 }
 
-/// The committed follow-up policy of `claim`, if it was authored with one.
-fn policy(view: &View<'_>, claim: ClaimId) -> Option<PeerPolicy> {
-    super::super::authored_reads::content(view.get(Key::ClaimContent(claim)))
-        .and_then(|content| content.policy())
+/// The committed follow-up policy of `claim`, if it was authored with one: read in place from
+/// its content's encoding (doc 31 M3).
+fn policy(view: &View<'_>, claim: ClaimId) -> Result<Option<PeerPolicy>, NativeError> {
+    Ok(
+        super::super::authored_reads::content_view(view.get(Key::ClaimContent(claim)))?
+            .and_then(|content| content.fields().policy),
+    )
 }
 
 /// Committed claims of `action` that relate to `target` through `kind`,
@@ -60,9 +63,10 @@ fn related_count(
     let mut count = 0usize;
     for child in view.relation_sources(kind, target) {
         visits.charge(1)?;
-        let related = super::super::authored_reads::content(view.get(Key::ClaimContent(child)))
-            .ok_or(ContractError::InvalidPolicy)?;
-        if related.action() == action {
+        let related =
+            super::super::authored_reads::content_view(view.get(Key::ClaimContent(child)))?
+                .ok_or(ContractError::InvalidPolicy)?;
+        if related.roles()?.action == action {
             count = add(count, 1)?;
         }
     }
@@ -71,8 +75,8 @@ fn related_count(
 
 /// Claims of `action` in the same batch that relate to `target` through
 /// `kind`, `content` itself included.
-fn batch_count<'a>(
-    batch: impl Iterator<Item = &'a ClaimDescriptor>,
+fn batch_count<S: super::super::index_rows::ContentSource>(
+    batch: impl Iterator<Item = Result<S, NativeError>>,
     kind: RelationKind,
     target: ClaimId,
     action: ActionType,
@@ -81,17 +85,23 @@ fn batch_count<'a>(
     let mut count = 0usize;
     for sibling in batch {
         visits.charge(1)?;
-        if sibling.action() != action {
+        // A sibling built, or read in place from its encoding (doc 31 M3).
+        let sibling = sibling?;
+        if sibling.action()? != action {
             continue;
         }
-        for relation in sibling.relations() {
-            visits.charge(1)?;
-            if relation.kind == kind
-                && matches!(&relation.target, RelationTarget::Object(object) if object.id.0 == target.0)
-            {
-                count = add(count, 1)?;
-                break;
+        let mut found = false;
+        sibling.each_relation(&mut |relation| {
+            if found {
+                return Ok(());
             }
+            visits.charge(1)?;
+            found = relation.kind == kind
+                && matches!(&relation.target, RelationTarget::Object(object) if object.id.0 == target.0);
+            Ok(())
+        })?;
+        if found {
+            count = add(count, 1)?;
         }
     }
     Ok(count)
@@ -168,10 +178,10 @@ fn cited_verdict(
 /// Checks one created claim's peer rules against the committed prefix and
 /// its batch siblings. `batch` yields every claim of the batch, `content`
 /// included.
-pub(super) fn check_one<'a>(
+pub(super) fn check_one<S: super::super::index_rows::ContentSource>(
     principal: Principal,
     content: &ClaimDescriptor,
-    batch: impl Iterator<Item = &'a ClaimDescriptor> + Clone,
+    batch: impl Iterator<Item = Result<S, NativeError>> + Clone,
     view: &View<'_>,
     visits: &mut VisitBudget,
 ) -> Result<(), NativeError> {
@@ -187,13 +197,14 @@ pub(super) fn check_one<'a>(
             let challenge = cited.challenge.ok_or(ContractError::InvalidTarget)?;
             let state = view.claim(challenge).ok_or(ContractError::InvalidTarget)?;
             let challenged =
-                super::super::authored_reads::content(view.get(Key::ClaimContent(challenge)))
+                super::super::authored_reads::content_view(view.get(Key::ClaimContent(challenge)))?
                     .ok_or(ContractError::InvalidTarget)?;
-            if challenged.action() != ActionType::Challenge {
+            if challenged.roles()?.action != ActionType::Challenge {
                 return Err(ContractError::InvalidTarget.into());
             }
             let policy = challenged
-                .policy()
+                .fields()
+                .policy
                 .filter(|policy| policy.corrective_allowed)
                 .ok_or(ContractError::InvalidPolicy)?;
             let evidence = cited.evidence.ok_or(ContractError::MissingEvidence)?;
@@ -239,7 +250,7 @@ pub(super) fn check_one<'a>(
                 continue;
             };
             let parent = ClaimId(target.id.0);
-            let Some(policy) = policy(view, parent) else {
+            let Some(policy) = policy(view, parent)? else {
                 continue;
             };
             let state = view.claim(parent).ok_or(ContractError::InvalidTarget)?;
@@ -283,7 +294,7 @@ pub(super) fn check_batch(
         check_one(
             principal,
             &claim.content,
-            claims.iter().map(|claim| &claim.content),
+            claims.iter().map(|claim| Ok(&claim.content)),
             view,
             &mut visits,
         )?;

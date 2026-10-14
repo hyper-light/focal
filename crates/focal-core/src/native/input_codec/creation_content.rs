@@ -99,6 +99,35 @@ pub struct ClaimBodyPlan<'s, 'a> {
     quote: BodyConstructionQuote,
 }
 impl<'a> ClaimBodyInput<'a> {
+    /// The descriptor's fields, read without building it (doc 31 M3).
+    pub(in crate::native) fn fields(&self) -> claim::ClaimFields<'a> {
+        use claim::ClaimSource;
+        self.source.fields()
+    }
+    /// The descriptor's encoding read as a [`claim::ClaimSource`]: its relations, scopes and
+    /// requirements, each read in place.
+    pub(in crate::native) fn view(&self) -> &impl claim::ClaimSource<'a> {
+        &self.source
+    }
+    /// The roles the descriptor's relations name, read without building it.
+    pub(in crate::native) fn roles(&self) -> Result<claim::ClaimRoles, ContractError> {
+        claim::roles_of(&self.source)
+    }
+    /// Whether the descriptor requires the declaration `id`, read without building it.
+    pub(in crate::native) fn requires(&self, id: ValidationId) -> Result<bool, ContractError> {
+        use claim::ClaimSource;
+        for requirement in self.source.requirements() {
+            if requirement?.id == id {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    /// How many declarations the descriptor requires.
+    pub(in crate::native) fn requirement_count(&self) -> usize {
+        use claim::ClaimSource;
+        self.source.requirement_count()
+    }
     pub(in crate::native) fn ownership_visits(&self) -> Result<usize, DecodeError> {
         use claim::ClaimSource;
         self.source
