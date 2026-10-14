@@ -1061,6 +1061,9 @@ impl GroupDue {
     }
 }
 struct Owner {
+    /// Declared first, so dropped first: `progress` goes after it, and its
+    /// closing is how `ReplicaHost::closed` knows the session's log, files
+    /// and memory are released.
     session: Session,
     /// The owner's slowest recent steps, for the replica's diagnostics.
     slow: crate::owner_steps::SlowSteps,
@@ -1523,11 +1526,24 @@ impl ReplicaHost {
     pub fn memory_stats(&self) -> focal_memory::BudgetStats {
         self.budget.stats()
     }
-    pub async fn closed(&self) {
+    /// Completes once the owner has let the session go: what it held (its
+    /// log's lease on a shared WAL, its files, its memory) is free for a
+    /// session opened in its place. `stopped` is published before that, as
+    /// the stop completes, for those that route to the replica; a session
+    /// opened on `stopped` alone could find the old log still leased
+    /// (`LogicalLocked`) while the owner was still dropping it. Capacity when
+    /// no wait could be kept (every waiting place taken, or the wait is off a
+    /// shard): the session may still be held.
+    pub async fn closed(&self) -> Result<(), LedgerError> {
         let mut changes = self.progress.clone();
-        while !changes.borrow().value.stopped {
-            if changes.changed().await.is_err() {
-                break;
+        // The progress sender is the owner's, and goes after its session
+        // (`Owner::session`): the channel closes once the session is gone.
+        // Each turn waits for the owner's next publication.
+        loop {
+            match changes.changed().await {
+                Ok(()) => {}
+                Err(watch::RecvError::Closed) => return Ok(()),
+                Err(watch::RecvError::Refused) => return Err(LedgerError::Capacity),
             }
         }
     }

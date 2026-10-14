@@ -160,7 +160,8 @@ async fn stopped(host: &ReplicaHost) {
     // frozen window alone.
     owners::within(&[host], Duration::from_secs(2), TICK, host.closed())
         .await
-        .expect("the stopped host closed");
+        .expect("the stopped host closed")
+        .unwrap();
 }
 
 #[test]

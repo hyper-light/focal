@@ -224,7 +224,9 @@ fn one_handler_routes_live_installations_without_management_round_trips_and_pres
             foreign.result
         );
         original.host().stop().await.unwrap();
-        original.host().closed().await;
+        // Closed once the owner let the session go: its log is free for the
+        // replacement opened below.
+        original.host().closed().await.unwrap();
         assert_eq!(
             dispatch(&service, actor(1), request(1), &ReplicaHost::wire_limits())
                 .await
