@@ -146,8 +146,10 @@ pub fn endpoint_limits(
         // more from the node's pool as it is blocked (`FocalClasses::pooled`), and any other
         // peer every stream once its role is known (docs/archictecutre/27 §17).
         stream_credit: hyper_transport::StreamCredit::Pooled { initial: 1 },
-        // A node's own asks wait for streams as long as their queue moves; a participant's are
-        // bounded where it runs ([`endpoint_driver`]).
+        // Every ask waits for a stream as long as its connection's queue moves: a participant's
+        // as a node's own. A node holds what it cannot take yet at its sessions' doors rather
+        // than refusing it, so an ask refused here for a queue past a round of its credit would
+        // be the one refusal left, of a request the node would have served.
         ask_queue: hyper_transport::AskQueue::Table,
         exchanges: endpoint_exchanges(limits),
         // focal's traffic is exchanges; no lane is opened.
@@ -437,13 +439,7 @@ pub(crate) fn endpoint_driver(
     admission: &AdmissionLimits,
     budget: MemoryBudget,
 ) -> Result<Driver, WireError> {
-    let mut endpoint_limits = endpoint_limits(limits, admission)?;
-    // A participant asks of nodes that grant it streams from their pools (`FocalClasses::pooled`):
-    // what it would queue past a round of what it is granted is refused where it is asked, nothing
-    // sent, as the node's door would refuse it there (docs/archictecutre/27 §17).
-    if role == Sender::Participant {
-        endpoint_limits.ask_queue = hyper_transport::AskQueue::Credit;
-    }
+    let endpoint_limits = endpoint_limits(limits, admission)?;
     let config = Config {
         tls,
         role,

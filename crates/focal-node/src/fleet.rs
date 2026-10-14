@@ -1975,9 +1975,6 @@ impl ReplicaHost {
             request.request().operation,
             Operation::Raft { .. } | Operation::RaftOrdered { .. }
         );
-        if self.refuses_for_delay(&request) {
-            return OwnedResponse::new(full);
-        }
         let appends = grouped::request_class(&request) == focal_directory::WorkClass::Append;
         let response_bytes = match &request.request().operation {
             Operation::Monitor { .. } => crate::monitor_reads::RESPONSE_BYTES,
@@ -2093,7 +2090,41 @@ impl ReplicaHost {
                 .refuse_input(replication, crate::pace::InputBound::Reply);
             return OwnedResponse::new(full);
         };
-        let queued = (!replication).then(|| self.pace.queue_request(appends));
+        let queued = if replication {
+            None
+        } else if completion_request(&request) {
+            // Progress or termination of work already admitted is what lets the queue drain:
+            // never held at the door.
+            Some(self.pace.queue_request(appends))
+        } else {
+            // The session's door: past what the session takes in, a request waits here, its
+            // place charged, in the order it came, until the owner takes one of its kind before
+            // it and the door admits it (`TickPeriod::hold`). Held, not refused: a refused write
+            // is one its participant sees, and asks again, while the session pays for the
+            // refusal what it lacks for serving (A/B #8: 19 us of the 1-CPU leader for each at
+            // 12,000 writes a second), where a held one waits the delay and is served, as
+            // Kafka stops reading while its request queue is full. The transport's stream pool
+            // bounds what participants have here at once (docs/archictecutre/27 §17), and the
+            // request time, what the session gives a request it has taken, each wait.
+            let deadline = focal_rt::time::Instant::now().saturating_add(self.request_timeout);
+            match self.pace.hold(appends, deadline).await {
+                Ok(ticket) => Some(ticket),
+                Err(refusal) => {
+                    let (bound, answer) = match refusal {
+                        crate::pace::DoorRefusal::Delay => (crate::pace::InputBound::Delay, full),
+                        crate::pace::DoorRefusal::Reply => (crate::pace::InputBound::Reply, full),
+                        crate::pace::DoorRefusal::Memory => {
+                            (crate::pace::InputBound::Memory, full)
+                        }
+                        crate::pace::DoorRefusal::Broken | crate::pace::DoorRefusal::Closed => {
+                            return OwnedResponse::new(closed);
+                        }
+                    };
+                    self.pace.refuse_input(false, bound);
+                    return OwnedResponse::new(answer);
+                }
+            }
+        };
         let work = Work::Request(
             Box::new(AdmittedRequest {
                 verified: request,
@@ -2120,30 +2151,6 @@ impl ReplicaHost {
             }
             Err(HostQueueError::Disconnected) => OwnedResponse::new(closed),
         }
-    }
-    /// Whether the session turns `request` away for the delay it would be queued behind, counted
-    /// at the delay. New work waits no longer than the session's own service time bounds it to:
-    /// past that bound it is refused before it is charged or queued, so a session past its
-    /// capacity spends nothing on what it cannot serve (Breakwater's AQM, Cho et al., OSDI '20,
-    /// §3.2.3); a write's queue and the rest's are judged apart, a session holding its writes
-    /// for its pipeline while it answers its reads (`grouped::takes_class`). A peer's frame has
-    /// its own room, and progress or termination of work already admitted is what lets the queue
-    /// drain: neither is refused for the delay. Asked as early as the request reaches the
-    /// session's host, before it is routed: a refused write cost the 1-CPU leader about 40 µs
-    /// at 12,000 writes a second offered, its route resolved and its evidence path entered
-    /// first (profile run 38310063216).
-    pub(crate) fn refuses_for_delay(&self, request: &VerifiedRequest) -> bool {
-        let replication = matches!(
-            request.request().operation,
-            Operation::Raft { .. } | Operation::RaftOrdered { .. }
-        );
-        let appends = grouped::request_class(request) == focal_directory::WorkClass::Append;
-        if !replication && !completion_request(request) && self.pace.delay_exceeded(appends) {
-            self.pace
-                .refuse_input(false, crate::pace::InputBound::Delay);
-            return true;
-        }
-        false
     }
     /// Only checks the locally published immutable receipt. A miss never grants
     /// authority to propose and cannot bypass fresh custody or quorum checks.

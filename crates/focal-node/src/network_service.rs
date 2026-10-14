@@ -2082,9 +2082,10 @@ impl NetworkService {
     /// `StreamCredit::Pooled`, docs/archictecutre/27 §17) to twice the writes the sessions this
     /// node leads take at once, and never under one connection's streams, so a node that leads
     /// nothing still answers redirects and reads. A session holds about its write window queued
-    /// and as many in its pipeline before its door refuses, so participants granted twice it send
-    /// no write the door would refuse; and a window is the most writes answered in one bound, so
-    /// twice it leaves it room to grow, a doubling a bound as a slow start's. It is sized again
+    /// and as many in its pipeline before its door holds the rest, so participants granted twice
+    /// it send little the door must hold, and what they would send past it waits for a stream on
+    /// their side; and a window is the most writes answered in one bound, so twice it leaves it
+    /// room to grow, a doubling a bound as a slow start's. It is sized again
     /// each least bound of those sessions, what a window is counted within, and never more often
     /// than the transport's timer granularity; with none led, at the metrics cadence.
     async fn size_stream_pool(&self) {

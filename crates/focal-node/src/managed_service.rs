@@ -354,11 +354,6 @@ impl RequestHandler for ManagedService {
                     };
                 }
             };
-            // The session's door first: a write it turns away costs it no route, no redirect and
-            // no evidence path (`ReplicaHost::refuses_for_delay`; the ingress asks again).
-            if replica.refuses_for_delay(request) {
-                return fail(AccessError::Capacity);
-            }
             if client
                 && let Some(hint) = self
                     .redirect(ledger, claimed, mutation, Some(&replica))

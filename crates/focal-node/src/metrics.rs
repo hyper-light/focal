@@ -200,6 +200,9 @@ pub struct SessionCounters {
     pub requests_refused: RefusedBy,
     pub frames_dropped: u64,
     pub requests_dropped: u64,
+    /// Participants' requests held at a session's door until it admitted them, or until their
+    /// deadline (`pace::TickPeriod::hold`).
+    pub requests_held: u64,
     pub replication_dropped: u64,
     pub peer_reports_coalesced: u64,
     pub peer_reports_dropped: u64,
@@ -265,6 +268,7 @@ impl SessionCounters {
             requests_refused: input.requests_refused,
             frames_dropped: input.frames_dropped,
             requests_dropped: input.requests_dropped,
+            requests_held: input.requests_held,
             replication_dropped: progress.dropped_replication,
             peer_reports_coalesced: progress.peer_reports_coalesced,
             peer_reports_dropped: progress.peer_reports_dropped,
@@ -275,7 +279,7 @@ impl SessionCounters {
             refused_periods,
         }
     }
-    fn fields(&self) -> [u64; 25] {
+    fn fields(&self) -> [u64; 26] {
         [
             self.peers_unreachable,
             self.appends_rejected,
@@ -294,6 +298,7 @@ impl SessionCounters {
             self.requests_refused.delay,
             self.frames_dropped,
             self.requests_dropped,
+            self.requests_held,
             self.replication_dropped,
             self.peer_reports_coalesced,
             self.peer_reports_dropped,
@@ -329,6 +334,7 @@ impl SessionCounters {
         self.requests_refused.add(&other.requests_refused);
         self.frames_dropped = sum(self.frames_dropped, other.frames_dropped);
         self.requests_dropped = sum(self.requests_dropped, other.requests_dropped);
+        self.requests_held = sum(self.requests_held, other.requests_held);
         self.replication_dropped = sum(self.replication_dropped, other.replication_dropped);
         self.peer_reports_coalesced =
             sum(self.peer_reports_coalesced, other.peer_reports_coalesced);
@@ -1598,6 +1604,11 @@ impl MetricsSnapshot {
                 totals.requests_dropped,
             ),
             (
+                "focal_sessions_requests_held_total",
+                "Participants' requests a hosted session held at its door while its queue held what it takes in, each until the owner took one before it and the door admitted it, never refused for the wait within its request time.",
+                totals.requests_held,
+            ),
+            (
                 "focal_sessions_replication_dropped_total",
                 "Replication messages dropped beyond a peer's bound.",
                 totals.replication_dropped,
@@ -1648,7 +1659,7 @@ impl MetricsSnapshot {
             ),
             (
                 "focal_sessions_requests_refused_total",
-                "Participants' requests a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue, queueing delay past what its service time bounds it to).",
+                "Participants' requests a hosted session refused for room before it queued them, by the bound that refused them (memory, reply cell, queue, held at its door its whole request time).",
                 totals.requests_refused,
             ),
         ] {

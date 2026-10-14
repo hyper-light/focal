@@ -71,6 +71,11 @@ struct TickShared {
     /// reads, so each kind's delay is its own.
     writes: QueueMarks,
     others: QueueMarks,
+    /// The participants' requests held at each kind's door while it is shut ([`Door`]), and
+    /// how many requests have been held there at all.
+    write_door: Door,
+    other_door: Door,
+    requests_held: AtomicU64,
     /// The least time a write took from its taking to its answer with no
     /// other write in its pipeline, in the term the session leads in: its
     /// write cycle uncongested, what every delay is judged by
@@ -121,7 +126,30 @@ impl QueueMarks {
     /// starts its busy spell: the sojourn the last spell ended with says
     /// nothing of this one.
     fn enter(&self, now: u64) {
-        if self.queued.fetch_add(1, Ordering::AcqRel) == 0 {
+        let was = self.queued.fetch_add(1, Ordering::AcqRel);
+        self.entered(was, now);
+    }
+    /// One more is queued at `now` while fewer than `room` are, the place taken in the same
+    /// step as the count is read: requests admitted together never pass the room between them.
+    /// Whether it was.
+    fn enter_within(&self, room: u64, now: u64) -> bool {
+        let Ok(was) = self
+            .queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                if queued < room {
+                    queued.checked_add(1)
+                } else {
+                    None
+                }
+            })
+        else {
+            return false;
+        };
+        self.entered(was, now);
+        true
+    }
+    fn entered(&self, was: u64, now: u64) {
+        if was == 0 {
             self.sojourn_ns.store(0, Ordering::Relaxed);
             self.busy_since_ns.store(now, Ordering::Relaxed);
         }
@@ -196,12 +224,74 @@ pub(crate) enum InputBound {
     /// Its queue was full: the participants' queue for a request, the room
     /// the owner's peer reserve gives for a peer's frame.
     Queue,
-    /// Its session's queueing delay was past the bound the session's own
-    /// service time gives it ([`TickPeriod::delay_bound`]): a request
-    /// queued then would wait beyond what the session serves in, so it is
-    /// refused before it is charged or queued, as Breakwater's AQM drops
-    /// one (Cho et al., OSDI '20, §3.2.3).
+    /// It was held at its session's door ([`TickPeriod::hold`]) the whole
+    /// request time and the door never admitted it: the session took
+    /// nothing of its kind in all that time that would have let it in.
     Delay,
+}
+/// Why a participant's request held at its session's door ([`TickPeriod::hold`]) was not
+/// admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DoorRefusal {
+    /// Its deadline passed while it was held ([`InputBound::Delay`]).
+    Delay,
+    /// The runtime had no word to wake it by ([`InputBound::Reply`]).
+    Reply,
+    /// The door's place for it could not be made ([`InputBound::Memory`]).
+    Memory,
+    /// The door's lock was poisoned: nothing can be held there.
+    Broken,
+    /// The word that would have woken it went unsent: the session is gone.
+    Closed,
+}
+/// The participants' requests of one kind held at a session's door while it is shut
+/// ([`TickPeriod::delay_exceeded`]), each by the word that admits it, oldest first. The owner
+/// wakes the oldest as it takes a request of the kind from the queue (a [`QueueTicket`] given
+/// back), and each one admitted wakes the next while the door stays open. Held, not refused: a
+/// request turned away for the delay it would wait is a refusal its participant sees and asks
+/// again, costing the session what it then lacks, where one held waits that delay and is
+/// served, as Kafka's network threads stop reading while its request queue is full
+/// (`queued.max.requests`) rather than refusing. What bounds the held is what each holds: its
+/// request's place, charged to the session's memory before it is held
+/// (`ReplicaHost::submit_inner`), within what the transport lets participants open at once
+/// (the stream pool, docs/archictecutre/27 §17); and each wait is bounded by its deadline.
+#[derive(Default)]
+struct Door {
+    held: Mutex<std::collections::VecDeque<hyper_rt::sync::OneshotSender<()>>>,
+    /// How many words `held` holds, read without its lock: the owner wakes one as it takes
+    /// each request, and a door that holds none is passed by its lock.
+    count: AtomicUsize,
+}
+impl Door {
+    /// Holds `word` last, or first for one woken to a door shut again: it was the oldest.
+    fn hold(&self, word: hyper_rt::sync::OneshotSender<()>, first: bool) -> Result<(), DoorRefusal> {
+        let mut held = self.held.lock().map_err(|_| DoorRefusal::Broken)?;
+        held.try_reserve(1).map_err(|_| DoorRefusal::Memory)?;
+        if first {
+            held.push_front(word);
+        } else {
+            held.push_back(word);
+        }
+        self.count.store(held.len(), Ordering::Release);
+        Ok(())
+    }
+    /// Wakes the oldest request still held, if any is: the words of those that stopped waiting
+    /// (their deadlines passed, their exchanges gone) are let go on the way, each once. A
+    /// poisoned lock wakes none, and those held end at their deadlines.
+    fn wake_one(&self) {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let Ok(mut held) = self.held.lock() else {
+            return;
+        };
+        while let Some(word) = held.pop_front() {
+            if word.send(()).is_ok() {
+                break;
+            }
+        }
+        self.count.store(held.len(), Ordering::Release);
+    }
 }
 /// One kind of input's refusals, a count for each bound.
 #[derive(Default)]
@@ -267,6 +357,8 @@ impl QueueTicket {
 impl Drop for QueueTicket {
     fn drop(&mut self) {
         self.pace.marks(self.write).leave();
+        // Its place is free: the oldest request held at its kind's door is woken to take it.
+        self.pace.door(self.write).wake_one();
     }
 }
 /// When the owner took a participant's request and how long it had waited to
@@ -348,6 +440,8 @@ pub(crate) struct InputRefusals {
     pub(crate) requests_refused: crate::metrics::RefusedBy,
     pub(crate) frames_dropped: u64,
     pub(crate) requests_dropped: u64,
+    /// Participants' requests held at the session's doors ([`TickPeriod::hold`]).
+    pub(crate) requests_held: u64,
 }
 /// When this process began, for the owners' periods to be timed against.
 fn began() -> std::time::Instant {
@@ -508,15 +602,109 @@ impl TickPeriod {
         }
     }
     /// A place in the queue to the owner for a participant's request
-    /// admitted now, a `write` or not.
+    /// admitted now, a `write` or not, whatever the door: progress or
+    /// termination of work already admitted, which is what lets the queue
+    /// drain.
     pub(crate) fn queue_request(&self, write: bool) -> QueueTicket {
         let admitted_ns = now_ns();
         self.marks(write).enter(admitted_ns);
+        self.ticket(write, admitted_ns)
+    }
+    fn ticket(&self, write: bool, admitted_ns: u64) -> QueueTicket {
         QueueTicket {
             pace: self.clone(),
             admitted_ns,
             write,
         }
+    }
+    /// The door a participant's request of its kind waits at while it is shut.
+    fn door(&self, write: bool) -> &Door {
+        if write {
+            &self.0.write_door
+        } else {
+            &self.0.other_door
+        }
+    }
+    /// A place in the queue to the owner for a participant's request (a `write` or not) if its
+    /// kind's door is open now: a write while fewer than its window are queued
+    /// ([`Self::write_window`]), the place taken as the count is read, so writes admitted at
+    /// once never pass the window between them; the rest while their delay does not stand past
+    /// its bound ([`Self::delay_exceeded`]).
+    fn admit(&self, write: bool) -> Option<QueueTicket> {
+        let now = now_ns();
+        if write {
+            let Some(window) = self.write_window() else {
+                self.0.writes.enter(now);
+                return Some(self.ticket(true, now));
+            };
+            let room = u64::try_from(window).unwrap_or(u64::MAX);
+            return self
+                .0
+                .writes
+                .enter_within(room, now)
+                .then(|| self.ticket(true, now));
+        }
+        if self.delay_exceeded_at(false, now) {
+            return None;
+        }
+        self.0.others.enter(now);
+        Some(self.ticket(false, now))
+    }
+    /// A place in the queue to the owner for a participant's request (a `write` or not), taken
+    /// as its kind's door admits it: at once while the door is open and none is held before
+    /// it; otherwise held, in the order it came, until the owner takes a request of its kind
+    /// from the queue and the door, open again, admits it ([`Door`]). Held, a request waits
+    /// the delay a refusal would have spared it and is served; it is refused only once
+    /// `deadline` passes held, and then only for the time it was given.
+    pub(crate) async fn hold(
+        &self,
+        write: bool,
+        deadline: focal_rt::time::Instant,
+    ) -> Result<QueueTicket, DoorRefusal> {
+        let door = self.door(write);
+        if door.count.load(Ordering::Acquire) == 0
+            && let Some(ticket) = self.admit(write)
+        {
+            return Ok(ticket);
+        }
+        self.0.requests_held.fetch_add(1, Ordering::Relaxed);
+        let mut first = false;
+        // Each turn is a wake: the loop ends when the door admits the request or its deadline
+        // passes.
+        loop {
+            // A wake that found the door shut again may come as the deadline passes, and a
+            // word sent before it is read as soon as it is waited on.
+            if deadline.remaining().is_zero() {
+                return Err(DoorRefusal::Delay);
+            }
+            let (word, woken) = hyper_rt::sync::oneshot().map_err(|_| DoorRefusal::Reply)?;
+            door.hold(word, first)?;
+            // The owner may have taken a request between the door found shut and the word
+            // held, and woken none: open now, it wakes the oldest held, this one or one before.
+            if !self.delay_exceeded(write) {
+                door.wake_one();
+            }
+            match focal_rt::time::timeout_at(deadline, woken).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(DoorRefusal::Closed),
+                Err(_) => return Err(DoorRefusal::Delay),
+            }
+            if let Some(ticket) = self.admit(write) {
+                // Admitted with room still open (its window grew, the owner took several at
+                // once): the next held is woken to take it.
+                if !self.delay_exceeded(write) {
+                    door.wake_one();
+                }
+                return Ok(ticket);
+            }
+            // Woken to a door shut again, another request let in between: it was the oldest
+            // held, and is held first.
+            first = true;
+        }
+    }
+    /// How many participants' requests have been held at the session's doors.
+    pub(crate) fn requests_held(&self) -> u64 {
+        self.0.requests_held.load(Ordering::Relaxed)
     }
     /// How long the oldest queued request of its kind has waited
     /// ([`QueueMarks::delay_at`]).
@@ -713,22 +901,22 @@ impl TickPeriod {
         self.delay_bound()
             .map(|bound| bound.saturating_mul(STANDING_BOUNDS))
     }
-    /// Whether a participant's request (a `write` or not) is to be refused now
-    /// for the delay it would be queued behind: CoDel's test (Nichols and
-    /// Jacobson, RFC 8289 §5.5; Facebook's server queues refuse so, Maurer,
-    /// "Fail at Scale", ACM Queue 2015) on its kind's queue. The delay past
+    /// Whether the door of a participant's request (a `write` or not) is shut
+    /// now for the delay it would be queued behind, so the request is held
+    /// there ([`Self::hold`]): CoDel's test (Nichols and Jacobson, RFC 8289
+    /// §5.5) on its kind's queue. The delay past
     /// its bound ([`Self::delay_bound`]) is a standing queue once it has
     /// stayed there a whole interval ([`Self::standing_interval`]) without a
     /// break; a delay that falls to the bound even once starts the interval
     /// again. Judged at once, a single write the disk was slow to flush
-    /// refused what came behind it: at 100 writes a second on macOS, whose
-    /// flush time varies several-fold, a quarter of all writes were refused
-    /// with nothing queued (2026-10-12).
+    /// shut the door on what came behind it: at 100 writes a second on macOS,
+    /// whose flush time varies several-fold, a quarter of all writes were
+    /// refused with nothing queued (2026-10-12), when the door refused.
     pub(crate) fn delay_exceeded(&self, write: bool) -> bool {
         self.delay_exceeded_at(write, now_ns())
     }
-    /// [`Self::delay_exceeded`] as of `now`, in nanoseconds since the process began. A write is
-    /// refused once its queue holds its window: taken in at most a window a bound
+    /// [`Self::delay_exceeded`] as of `now`, in nanoseconds since the process began. A write's
+    /// door is shut once its queue holds its window: taken in at most a window a bound
     /// ([`Self::write_window`]), the next would wait past the bound to be taken — Little's law
     /// read forward, as no interval need pass to know it.
     fn delay_exceeded_at(&self, write: bool, now: u64) -> bool {
@@ -767,6 +955,7 @@ impl TickPeriod {
             requests_refused: self.0.requests_refused.read(),
             frames_dropped: self.0.frames_dropped.load(Ordering::Relaxed),
             requests_dropped: self.0.requests_dropped.load(Ordering::Relaxed),
+            requests_held: self.requests_held(),
         }
     }
     pub(crate) fn refused(&self) -> u64 {
@@ -1065,10 +1254,10 @@ mod admission_tests {
         assert!(pace.pipeline_open_at(100, now));
     }
 
-    /// A write is refused at the door once its queue holds its window; the rest's queue is judged
-    /// apart, so writes held for the pipeline never refuse a read.
+    /// A write's door shuts once its queue holds its window; the rest's queue is judged apart, so
+    /// writes held for the pipeline never shut a read's door.
     #[test]
-    fn writes_are_refused_at_their_window() {
+    fn a_writes_door_shuts_at_its_window() {
         let pace = measured(CYCLE, 100);
         let mut queued: Vec<QueueTicket> = (0..99).map(|_| pace.queue_request(true)).collect();
         assert!(!pace.delay_exceeded(true));
@@ -1085,9 +1274,9 @@ mod admission_tests {
 
     /// The rest's queue is CoDel's: a delay past its bound is a standing queue only once it
     /// has stayed past it a whole interval, two bounds; one that falls to the bound once starts
-    /// the interval again, and one that stands is refused for until it falls.
+    /// the interval again, and one that stands shuts its door until it falls.
     #[test]
-    fn the_rests_delay_is_refused_for_only_once_it_stands_an_interval() {
+    fn the_rests_door_shuts_only_once_its_delay_stands_an_interval() {
         running_for(ms(2_000));
         let pace = measured(CYCLE, 0);
         assert_eq!(pace.delay_bound(), Some(ms(50)));
@@ -1123,6 +1312,177 @@ mod admission_tests {
         );
         assert!(!pace.delay_exceeded_at(false, at(551)));
         assert!(pace.delay_exceeded_at(false, at(552)));
+    }
+
+    /// Yields to the shard's other tasks until `done` holds, at most `turns` times: what a
+    /// spawned hold needs to reach its next wait. Whether it held.
+    async fn until(turns: usize, done: impl Fn() -> bool) -> bool {
+        for _ in 0..turns {
+            if done() {
+                return true;
+            }
+            hyper_rt::futures::yield_now().await;
+        }
+        done()
+    }
+    /// Spawns a write held at `pace`'s door until `deadline`, and yields until it is held there,
+    /// the `held`-th.
+    async fn held_write(
+        pace: &TickPeriod,
+        deadline: focal_rt::time::Instant,
+        held: usize,
+    ) -> focal_rt::JoinHandle<Result<QueueTicket, DoorRefusal>> {
+        let holding = pace.clone();
+        let handle = focal_rt::spawn(async move { holding.hold(true, deadline).await }).unwrap();
+        assert!(
+            until(64, || pace.0.write_door.count.load(Ordering::Acquire) == held).await,
+            "held at the door"
+        );
+        handle
+    }
+    fn far() -> focal_rt::time::Instant {
+        focal_rt::time::Instant::now().saturating_add(Duration::from_secs(600))
+    }
+
+    /// An open door with none held before it admits a write at once, its place taken in the
+    /// queue as it is admitted; it holds none.
+    #[test]
+    fn an_open_door_admits_at_once() {
+        focal_rt::block_on(async move {
+            let pace = measured(CYCLE, 10);
+            let _queued: Vec<QueueTicket> = (0..9).map(|_| pace.queue_request(true)).collect();
+            let ticket = pace.hold(true, far()).await.unwrap();
+            assert_eq!(pace.queued(true), 10, "its place taken");
+            assert_eq!(pace.requests_held(), 0);
+            assert!(pace.delay_exceeded(true));
+            drop(ticket);
+            assert_eq!(pace.queued(true), 9);
+        })
+        .unwrap();
+    }
+
+    /// A write whose door is shut is held, not refused: held in the order it came, each one
+    /// admitted as the owner takes a request before it, its place in the queue taken as it is
+    /// admitted, so the queue never holds more than its window.
+    #[test]
+    fn held_writes_are_admitted_in_the_order_they_came_as_the_owner_takes_one_before_each() {
+        focal_rt::block_on(async move {
+            let pace = measured(CYCLE, 10);
+            let mut queued: Vec<QueueTicket> = (0..10).map(|_| pace.queue_request(true)).collect();
+            assert!(pace.delay_exceeded(true), "its window queued");
+            let first = held_write(&pace, far(), 1).await;
+            let second = held_write(&pace, far(), 2).await;
+            let third = held_write(&pace, far(), 3).await;
+            assert_eq!(pace.requests_held(), 3);
+            assert_eq!(pace.input_refusals().requests_refused, Default::default());
+            for (taken, (admitted, waiting)) in [
+                (&first, vec![&second, &third]),
+                (&second, vec![&third]),
+                (&third, vec![]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // The owner takes one: the oldest held takes its place, and only it.
+                drop(queued.remove(0));
+                assert!(
+                    until(64, || admitted.is_finished()).await,
+                    "the oldest held, {taken}, admitted"
+                );
+                assert!(waiting.iter().all(|handle| !handle.is_finished()));
+                assert_eq!(pace.queued(true), 10, "the window, never past it");
+            }
+            for handle in [first, second, third] {
+                queued.push(handle.await.unwrap().unwrap());
+            }
+            assert_eq!(pace.0.write_door.count.load(Ordering::Acquire), 0);
+            assert_eq!(pace.input_refusals().requests_refused, Default::default());
+        })
+        .unwrap();
+    }
+
+    /// A held write whose deadline passes is refused for the delay, and its word left at the
+    /// door wakes nothing: the next one held is admitted past it.
+    #[test]
+    fn a_write_held_past_its_deadline_is_refused_and_the_next_is_admitted_past_its_word() {
+        focal_rt::block_on(async move {
+            let pace = measured(CYCLE, 10);
+            let mut queued: Vec<QueueTicket> = (0..10).map(|_| pace.queue_request(true)).collect();
+            let soon = focal_rt::time::Instant::now().saturating_add(ms(20));
+            let expiring = held_write(&pace, soon, 1).await;
+            let next = held_write(&pace, far(), 2).await;
+            assert!(matches!(expiring.await.unwrap(), Err(DoorRefusal::Delay)));
+            assert!(!next.is_finished());
+            drop(queued.remove(0));
+            assert!(until(64, || next.is_finished()).await);
+            queued.push(next.await.unwrap().unwrap());
+            assert_eq!(pace.queued(true), 10);
+            assert_eq!(pace.0.write_door.count.load(Ordering::Acquire), 0);
+        })
+        .unwrap();
+    }
+
+    /// An admitted write that finds its door still open wakes the next held: a window that grew
+    /// while writes were held admits as many as it has room for, each as the one before it
+    /// takes its place.
+    #[test]
+    fn a_window_grown_while_writes_are_held_admits_them_to_its_room() {
+        focal_rt::block_on(async move {
+            let pace = measured(CYCLE, 10);
+            let mut queued: Vec<QueueTicket> = (0..10).map(|_| pace.queue_request(true)).collect();
+            let first = held_write(&pace, far(), 1).await;
+            let second = held_write(&pace, far(), 2).await;
+            let third = held_write(&pace, far(), 3).await;
+            // The session answered more in a bound: its window is eleven, and with one taken
+            // it has room for two.
+            pace.0.answered_most.store(11, Ordering::Relaxed);
+            drop(queued.remove(0));
+            assert!(until(64, || first.is_finished() && second.is_finished()).await);
+            assert!(
+                !until(16, || third.is_finished()).await,
+                "the window's room taken: the third waits"
+            );
+            assert_eq!(pace.queued(true), 11);
+            queued.push(first.await.unwrap().unwrap());
+            queued.push(second.await.unwrap().unwrap());
+            drop(queued.remove(0));
+            assert!(until(64, || third.is_finished()).await);
+            queued.push(third.await.unwrap().unwrap());
+        })
+        .unwrap();
+    }
+
+    /// The rest's door holds a read while its queue's delay stands, and admits it once the
+    /// owner takes the one it stood behind.
+    #[test]
+    fn a_read_is_held_while_its_queues_delay_stands() {
+        running_for(ms(2_000));
+        focal_rt::block_on(async move {
+            let pace = measured(CYCLE, 0);
+            let first = pace.queue_request(false);
+            // The queue has stood past its bound longer than an interval.
+            let busy = now_ns() - ns(ms(1_000));
+            pace.0.others.busy_since_ns.store(busy, Ordering::Relaxed);
+            pace.0
+                .others
+                .above_since_ns
+                .store(busy + ns(ms(51)), Ordering::Relaxed);
+            assert!(pace.delay_exceeded(false));
+            let holding = pace.clone();
+            let read = focal_rt::spawn(async move { holding.hold(false, far()).await }).unwrap();
+            assert!(
+                until(64, || pace.0.other_door.count.load(Ordering::Acquire) == 1).await,
+                "held at the door"
+            );
+            assert!(!read.is_finished());
+            drop(first);
+            assert!(until(64, || read.is_finished()).await);
+            let ticket = read.await.unwrap().unwrap();
+            assert_eq!(pace.queued(false), 1);
+            drop(ticket);
+            assert_eq!(pace.requests_held(), 1);
+        })
+        .unwrap();
     }
 
     /// The queueing delay is none while nothing is queued; while the queue holds a request it
