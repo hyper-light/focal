@@ -28,6 +28,19 @@ fn construction_buffer<T>(count: usize) -> Result<Vec<T>, ContractError> {
     }
     Ok(values)
 }
+/// `phases` in one allocation of exactly their length (a full buffer converts without moving).
+fn boxed<const N: usize>(
+    phases: [OwnedPhasePolicy; N],
+) -> Result<Box<[OwnedPhasePolicy; N]>, ContractError> {
+    let mut held = construction_buffer::<OwnedPhasePolicy>(N)?;
+    held.extend(phases);
+    if held.len() != held.capacity() {
+        return Err(ContractError::Capacity);
+    }
+    held.into_boxed_slice()
+        .try_into()
+        .map_err(|_| ContractError::Capacity)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::lifecycle) struct DefinitionStamp([u8; 32]);
@@ -111,36 +124,59 @@ impl OwnedPhasePolicy {
             .ok_or(ContractError::Capacity)
     }
 }
+/// A program's phases behind one allocation, the check first: a delivery declaration has
+/// none and holds no room for them, where two phases held inline took 224 bytes of every
+/// declaration (doc 31 M3).
 #[derive(Debug)]
 pub(super) enum OwnedProgram {
     Delivery,
-    Programmatic {
-        check: OwnedPhasePolicy,
-        quality: Option<OwnedPhasePolicy>,
-    },
-    Agentic {
-        check: OwnedPhasePolicy,
-    },
+    /// A programmatic check without a quality phase.
+    Programmatic(Box<[OwnedPhasePolicy; 1]>),
+    /// A programmatic check, then its quality phase.
+    ProgrammaticQuality(Box<[OwnedPhasePolicy; 2]>),
+    Agentic(Box<[OwnedPhasePolicy; 1]>),
 }
 impl OwnedProgram {
-    fn retained_bytes(&self) -> Result<usize, ContractError> {
+    /// The phases in order: the check, then the quality phase where there is one.
+    pub(super) fn phases(&self) -> &[OwnedPhasePolicy] {
         match self {
-            Self::Delivery => Ok(0),
-            Self::Programmatic { check, quality } => add(
-                check.retained_bytes()?,
-                quality
-                    .as_ref()
-                    .map(OwnedPhasePolicy::retained_bytes)
-                    .transpose()?
-                    .unwrap_or(0),
-            ),
-            Self::Agentic { check } => check.retained_bytes(),
+            Self::Delivery => &[],
+            Self::Programmatic(phases) | Self::Agentic(phases) => phases.as_slice(),
+            Self::ProgrammaticQuality(phases) => phases.as_slice(),
         }
+    }
+    /// The check phase: a programmatic program's check, or an agentic program's one phase.
+    pub(super) fn check(&self) -> Option<&OwnedPhasePolicy> {
+        self.phases().first()
+    }
+    /// A programmatic program's quality phase.
+    pub(super) fn quality(&self) -> Option<&OwnedPhasePolicy> {
+        match self {
+            Self::ProgrammaticQuality(phases) => {
+                let [_, quality] = &**phases;
+                Some(quality)
+            }
+            Self::Delivery | Self::Programmatic(_) | Self::Agentic(_) => None,
+        }
+    }
+    /// Whether a phase names a required policy.
+    pub(super) fn requires_policy(&self) -> bool {
+        self.phases()
+            .iter()
+            .any(|phase| phase.required_policy.is_some())
+    }
+    fn retained_bytes(&self) -> Result<usize, ContractError> {
+        let phases = self.phases();
+        let mut total = crate::lifecycle::memory::array::<OwnedPhasePolicy>(phases.len())?;
+        for phase in phases {
+            total = add(total, phase.retained_bytes()?)?;
+        }
+        Ok(total)
     }
 }
 #[derive(Debug)]
 enum OwnedTarget {
-    WholeWorkSlot { index: u32, name: String },
+    WholeWorkSlot { index: u32, name: Box<str> },
     Delivery,
     Admission,
     Increment,
@@ -154,7 +190,14 @@ impl OwnedTarget {
                 // Consumes the checked byte buffer without a second allocation;
                 // the borrowed str already supplies valid UTF-8.
                 let owned = String::from_utf8(bytes).map_err(|_| ContractError::InvalidManifest)?;
-                Self::WholeWorkSlot { index, name: owned }
+                // Exactly its length, so the conversion keeps the buffer.
+                if owned.len() != owned.capacity() {
+                    return Err(ContractError::Capacity);
+                }
+                Self::WholeWorkSlot {
+                    index,
+                    name: owned.into_boxed_str(),
+                }
             }
             TargetDeclaration::Delivery => Self::Delivery,
             TargetDeclaration::Admission => Self::Admission,
@@ -174,7 +217,7 @@ impl OwnedTarget {
     }
     fn retained_bytes(&self) -> usize {
         match self {
-            Self::WholeWorkSlot { name, .. } => name.capacity(),
+            Self::WholeWorkSlot { name, .. } => name.len(),
             _ => 0,
         }
     }
@@ -297,13 +340,26 @@ impl Declaration {
     pub fn program(&self) -> ProgramView<'_> {
         match &self.spec.program {
             OwnedProgram::Delivery => ProgramView::Delivery,
-            OwnedProgram::Programmatic { check, quality } => ProgramView::Programmatic {
-                check: PhasePolicyView { policy: check },
-                quality: quality.as_ref().map(|policy| PhasePolicyView { policy }),
-            },
-            OwnedProgram::Agentic { check } => ProgramView::Agentic {
-                check: PhasePolicyView { policy: check },
-            },
+            OwnedProgram::Programmatic(phases) => {
+                let [check] = &**phases;
+                ProgramView::Programmatic {
+                    check: PhasePolicyView { policy: check },
+                    quality: None,
+                }
+            }
+            OwnedProgram::ProgrammaticQuality(phases) => {
+                let [check, quality] = &**phases;
+                ProgramView::Programmatic {
+                    check: PhasePolicyView { policy: check },
+                    quality: Some(PhasePolicyView { policy: quality }),
+                }
+            }
+            OwnedProgram::Agentic(phases) => {
+                let [check] = &**phases;
+                ProgramView::Agentic {
+                    check: PhasePolicyView { policy: check },
+                }
+            }
         }
     }
     pub fn attempt_bound(&self) -> u32 {
@@ -326,41 +382,33 @@ impl Declaration {
     /// delivery has none. Repeated schemas remain repeated; an owner may perform
     /// its own bounded deduplication when pinning verification contracts.
     pub fn evidence_schemas(&self) -> impl Iterator<Item = ContentHash> + '_ {
-        let (check, quality): (&[OwnedHandlerPolicy], &[OwnedHandlerPolicy]) =
-            match &self.spec.program {
-                OwnedProgram::Delivery => (&[], &[]),
-                OwnedProgram::Programmatic { check, quality } => (
-                    &check.handlers,
-                    quality
-                        .as_ref()
-                        .map_or(&[], |quality| quality.handlers.as_slice()),
-                ),
-                OwnedProgram::Agentic { check } => (&check.handlers, &[]),
-            };
-        check
+        self.spec
+            .program
+            .phases()
             .iter()
-            .chain(quality)
+            .flat_map(|phase| phase.handlers.iter())
             .flat_map(|step| [step.proof_schema, step.diagnostic_schema])
     }
     pub(super) fn policy(&self, phase: Phase) -> Result<&OwnedPhasePolicy, ContractError> {
-        match (&self.spec.program, phase) {
-            (OwnedProgram::Programmatic { check, .. }, Phase::Programmatic)
-            | (OwnedProgram::Agentic { check }, Phase::Quality)
-            | (
-                OwnedProgram::Programmatic {
-                    quality: Some(check),
-                    ..
-                },
-                Phase::Quality,
-            ) => Ok(check),
-            _ => Err(ContractError::InvalidTransition),
+        let program = &self.spec.program;
+        match (program, phase) {
+            (
+                OwnedProgram::Programmatic(_) | OwnedProgram::ProgrammaticQuality(_),
+                Phase::Programmatic,
+            )
+            | (OwnedProgram::Agentic(_), Phase::Quality) => program.check(),
+            (OwnedProgram::ProgrammaticQuality(_), Phase::Quality) => program.quality(),
+            _ => None,
         }
+        .ok_or(ContractError::InvalidTransition)
     }
     pub(super) fn first_phase(&self) -> Phase {
         match &self.spec.program {
             OwnedProgram::Delivery => Phase::Delivery,
-            OwnedProgram::Programmatic { .. } => Phase::Programmatic,
-            OwnedProgram::Agentic { .. } => Phase::Quality,
+            OwnedProgram::Programmatic(_) | OwnedProgram::ProgrammaticQuality(_) => {
+                Phase::Programmatic
+            }
+            OwnedProgram::Agentic(_) => Phase::Quality,
         }
     }
 }

@@ -33,22 +33,23 @@ fn prepare_allocates_nothing_and_each_build_buffer_failure_preserves_exact_retry
     });
     let fingerprint = plan.intent_fingerprint();
     let charge = plan.construction_charge();
-    assert_eq!(plan.construction_heap_allocations().unwrap(), 3);
+    assert_eq!(plan.construction_heap_allocations().unwrap(), 4);
     let original = plan.build().unwrap();
     assert_eq!(original.intent_fingerprint(), fingerprint);
     assert_eq!(original.retained_bytes().unwrap(), charge);
 
-    // The slot text, check handlers and quality handlers each own one buffer.
+    // The slot text, check handlers and quality handlers each own one buffer, and the phases
+    // share one.
     // A refusal after any successful prefix yields no candidate; the same
     // borrowed input can be retried without changing its identity or policy.
-    for allowed in 0..3 {
+    for allowed in 0..4 {
         bytes::fail_after(allowed, || {
             let plan = prepare();
             assert_eq!(plan.intent_fingerprint(), fingerprint);
             assert!(matches!(plan.build(), Err(ContractError::Capacity)));
             assert_eq!(bytes::remaining_allocations(), Some(0));
         });
-        let retry = bytes::fail_after(3, || {
+        let retry = bytes::fail_after(4, || {
             let retry = prepare().build().unwrap();
             assert_eq!(bytes::remaining_allocations(), Some(0));
             retry
@@ -58,7 +59,7 @@ fn prepare_allocates_nothing_and_each_build_buffer_failure_preserves_exact_retry
         assert_eq!(retry.target(), spec.target);
         assert_eq!(retry.deadline(), spec.deadline);
         assert_eq!(retry.retained_bytes().unwrap(), charge);
-        assert_eq!(retry.heap_allocations().unwrap(), 3);
+        assert_eq!(retry.heap_allocations().unwrap(), 4);
 
         bytes::fail_after(allowed, || {
             assert!(matches!(
@@ -68,7 +69,7 @@ fn prepare_allocates_nothing_and_each_build_buffer_failure_preserves_exact_retry
             assert_eq!(bytes::remaining_allocations(), Some(0));
         });
         assert_eq!(retry.intent_fingerprint(), fingerprint);
-        let copied = bytes::fail_after(3, || {
+        let copied = bytes::fail_after(4, || {
             let copied = retry.try_copy(charge).unwrap();
             assert_eq!(bytes::remaining_allocations(), Some(0));
             copied

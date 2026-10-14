@@ -42,12 +42,14 @@ struct ClaimRow {
 }
 #[derive(Debug)]
 pub(super) struct OwnedClaim(Vec<ClaimRow>);
+/// A definition in one allocation of exactly its body, held in the row itself: a boxed slice of
+/// one is narrow enough that no box around the row is needed (doc 31 M3).
 #[derive(Debug)]
 pub(super) struct OwnedDeclaration(DeclarationStorage);
 #[derive(Debug)]
 enum DeclarationStorage {
-    Legacy(Vec<Declaration>),
-    Authored(Vec<ValidationDescriptor>),
+    Legacy(Box<[Declaration]>),
+    Authored(Box<[ValidationDescriptor]>),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ClaimContentProfile {
@@ -124,6 +126,13 @@ fn singleton<T>(value: T, allowance: usize) -> Result<Vec<T>, MemoryError> {
     within(container_heap::<T>(rows.capacity())?, allowance)?;
     rows.push(value);
     Ok(rows)
+}
+/// `rows` as a boxed slice in the buffer they fill (a full buffer converts without moving).
+fn exact<T>(rows: Vec<T>) -> Result<Box<[T]>, MemoryError> {
+    if rows.len() != rows.capacity() {
+        return Err(MemoryError::AllocationFailed);
+    }
+    Ok(rows.into_boxed_slice())
 }
 fn get<T>(rows: &[T]) -> Option<&T> {
     match rows {
@@ -260,10 +269,10 @@ impl OwnedDeclaration {
     }
     pub(super) fn new(declaration: Declaration) -> Result<Self, MemoryError> {
         add(Self::container_charge(), declaration_heap(&declaration)?)?;
-        Ok(Self(DeclarationStorage::Legacy(singleton(
+        Ok(Self(DeclarationStorage::Legacy(exact(singleton(
             declaration,
             Self::container_charge(),
-        )?)))
+        )?)?)))
     }
     pub(super) const fn authored_container_charge() -> usize {
         AUTHORED_DECLARATION_CONTAINER
@@ -275,10 +284,10 @@ impl OwnedDeclaration {
             Self::authored_container_charge(),
             authored_declaration_heap(&descriptor)?,
         )?;
-        Ok(Self(DeclarationStorage::Authored(singleton(
+        Ok(Self(DeclarationStorage::Authored(exact(singleton(
             descriptor,
             Self::authored_container_charge(),
-        )?)))
+        )?)?)))
     }
     pub(super) fn get(&self) -> Option<&Declaration> {
         match &self.0 {
@@ -295,11 +304,11 @@ impl OwnedDeclaration {
     pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
         match &self.0 {
             DeclarationStorage::Legacy(rows) => add(
-                container_heap::<Declaration>(rows.capacity())?,
+                container_heap::<Declaration>(rows.len())?,
                 declaration_heap(get(rows).ok_or(MemoryError::MissingKey)?)?,
             ),
             DeclarationStorage::Authored(rows) => add(
-                container_heap::<ValidationDescriptor>(rows.capacity())?,
+                container_heap::<ValidationDescriptor>(rows.len())?,
                 authored_declaration_heap(get(rows).ok_or(MemoryError::MissingKey)?)?,
             ),
         }

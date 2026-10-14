@@ -347,7 +347,7 @@ fn checked_source_matches_slice_identity_and_exact_quotes_without_scratch_alloca
         plan.construction_heap_bytes(),
         original_plan.construction_heap_bytes()
     );
-    assert_eq!(plan.construction_heap_allocations(), 6);
+    assert_eq!(plan.construction_heap_allocations(), 7);
     assert_eq!(plan.attempt_bound(), 5);
     let charge = plan.construction_charge();
     let inspection = plan.inspection_visits();
@@ -389,17 +389,17 @@ fn checked_source_matches_slice_identity_and_exact_quotes_without_scratch_alloca
         let plan = prepare(&source);
         source.checks.set(0);
         source.contributor_passes.set(0);
-        bytes::fail_after(6, || {
+        bytes::fail_after(7, || {
             assert!(matches!(
                 plan.build(bytes_limit, visits_limit),
                 Err(ContractError::Capacity)
             ));
-            assert_eq!(bytes::remaining_allocations(), Some(6));
+            assert_eq!(bytes::remaining_allocations(), Some(7));
         });
         assert_eq!(source.checks.get(), 0);
         assert_eq!(source.contributor_passes.get(), 0);
     }
-    let built = bytes::fail_after(6, || plan.build(charge, visits)).unwrap();
+    let built = bytes::fail_after(7, || plan.build(charge, visits)).unwrap();
     assert_same(&built, &original);
     assert_eq!(built.retained_bytes().unwrap(), charge);
     assert_ne!(
@@ -410,7 +410,7 @@ fn checked_source_matches_slice_identity_and_exact_quotes_without_scratch_alloca
         built.contributed_by().as_ptr(),
         source.spec.contributed_by.as_ptr()
     );
-    for after in 0..6 {
+    for after in 0..7 {
         let plan = bytes::fail_after(0, || prepare(&source));
         bytes::fail_after(after, || {
             assert!(matches!(
@@ -419,7 +419,7 @@ fn checked_source_matches_slice_identity_and_exact_quotes_without_scratch_alloca
             ));
             assert_eq!(bytes::remaining_allocations(), Some(0));
         });
-        let retry = bytes::fail_after(6, || prepare(&source).build(charge, visits)).unwrap();
+        let retry = bytes::fail_after(7, || prepare(&source).build(charge, visits)).unwrap();
         assert_same(&retry, &original);
     }
 }

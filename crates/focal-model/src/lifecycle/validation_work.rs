@@ -302,17 +302,11 @@ impl<'a> Evaluation<'a> {
         self.work_target(claim, response, work)?;
         open_claim(claim)?;
         let source = ResponseReadiness::from_received(response, self.target, claim, acceptance)?;
-        let requires_policy = match &self.declaration.spec.program {
-            OwnedProgram::Delivery => return Err(ContractError::InvalidPolicy),
-            OwnedProgram::Programmatic { check, quality } => {
-                check.required_policy.is_some()
-                    || quality
-                        .as_ref()
-                        .is_some_and(|policy| policy.required_policy.is_some())
-            }
-            OwnedProgram::Agentic { check } => check.required_policy.is_some(),
-        };
-        if requires_policy {
+        let program = &self.declaration.spec.program;
+        if matches!(program, OwnedProgram::Delivery) {
+            return Err(ContractError::InvalidPolicy);
+        }
+        if program.requires_policy() {
             return Err(ContractError::InvalidPolicy);
         }
         let readiness = match work {

@@ -575,6 +575,7 @@ pub(super) fn build<'a, S: ValidationSource<'a>>(
         Some(Err(error)) => return Err(error),
         Some(Ok(_)) => return Err(ContractError::InvalidManifest),
     }
+    let contributed_by = memory::exact(contributed_by)?;
     let descriptor = ValidationDescriptor {
         schema: fields.schema,
         declaration,

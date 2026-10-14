@@ -224,7 +224,7 @@ fn invalid_containers_and_charge_overflow_are_errors() {
         invalid.heap_charge(),
         Err(MemoryError::MissingKey)
     ));
-    let invalid = OwnedDeclaration(DeclarationStorage::Legacy(Vec::new()));
+    let invalid = OwnedDeclaration(DeclarationStorage::Legacy(Box::new([])));
     assert!(matches!(invalid.copy(), Err(MemoryError::MissingKey)));
     assert!(matches!(
         invalid.heap_charge(),
@@ -543,17 +543,14 @@ fn claim_heap_of(descriptor: &ClaimDescriptor) -> usize {
 #[test]
 fn authored_copies_compact_container_capacity_preserve_profiles_and_outlive_sources() {
     let claim = crate::native::tests::owned_claim_fixture();
-    let mut original = OwnedDeclaration::new_authored(authored_definition(&claim)).unwrap();
-    let DeclarationStorage::Authored(rows) = &mut original.0 else {
-        panic!("authored fixture");
-    };
-    rows.reserve_exact(4);
+    let original = OwnedDeclaration::new_authored(authored_definition(&claim)).unwrap();
+    // The container is exactly one descriptor: a copy holds what the original does.
     let old_heap = original.heap_charge().unwrap();
     let original_descriptor = original.descriptor().unwrap();
     let fingerprint = original_descriptor.intent_fingerprint();
     let specification = original_descriptor.specification_hash();
     let copied = original.copy().unwrap();
-    assert!(copied.heap_charge().unwrap() < old_heap);
+    assert_eq!(copied.heap_charge().unwrap(), old_heap);
     same_authored(&copied, &original);
     assert_ne!(
         copied.descriptor().unwrap().description().as_ptr(),
@@ -663,8 +660,8 @@ fn authored_container_allocation_refusal_preserves_copy_sources_and_allows_retry
         assert_eq!(retry.profile(), content.profile());
     }
     for invalid in [
-        OwnedDeclaration(DeclarationStorage::Legacy(Vec::new())),
-        OwnedDeclaration(DeclarationStorage::Authored(Vec::new())),
+        OwnedDeclaration(DeclarationStorage::Legacy(Box::new([]))),
+        OwnedDeclaration(DeclarationStorage::Authored(Box::new([]))),
     ] {
         assert!(invalid.get().is_none());
         assert!(invalid.descriptor().is_none());
@@ -757,4 +754,68 @@ fn measure_owned_row_widths() {
     ] {
         println!("{name:<22} {width}");
     }
+}
+
+/// Measurement, not a check: a definition's held and encoded sizes, and what one checked decode
+/// of its encoding costs. Lifecycle steps read a claim's definition several times each, which is
+/// why the row holds it decoded and compact rather than as its encoding (doc 31 M3). Run with
+/// `--release --ignored --nocapture`.
+#[test]
+#[ignore = "measurement"]
+fn measure_definition_decode_cost() {
+    use crate::native::input_codec::{BodyInspectionLimits, ValidationBodyInput};
+    let claim = crate::native::tests::owned_claim_fixture();
+    let descriptor = authored_definition(&claim);
+    let issuer = descriptor.declaration().issuer();
+    println!(
+        "size_of Declaration {} ValidationDescriptor {} heap {}",
+        size_of::<Declaration>(),
+        size_of::<ValidationDescriptor>(),
+        authored_declaration_heap(&descriptor).unwrap()
+    );
+    let mut count = CountingSink::new(usize::MAX, usize::MAX);
+    crate::native::input_codec::descriptors::validation(&mut count, &descriptor).unwrap();
+    let (len, visits) = (count.len(), count.visits_used());
+    let mut bytes = vec![0u8; len];
+    let mut sink = SliceSink::new(&mut bytes, visits);
+    crate::native::input_codec::descriptors::validation(&mut sink, &descriptor).unwrap();
+    sink.finish().unwrap();
+    println!("encoded {len} bytes");
+    let limits = authored_validation::Limits {
+        declaration: v::Limits {
+            handlers: u32::try_from(len).unwrap(),
+            attempts: u32::MAX,
+            slot_bytes: len,
+        },
+        description_bytes: len,
+        quality_bar_bytes: len,
+        contributors: len,
+        construction_bytes: len * 64 + 4096,
+    };
+    let rounds = 200_000u32;
+    let start = std::time::Instant::now();
+    let mut held = 0usize;
+    for _ in 0..rounds {
+        let budget = len * 64 + 4096;
+        let mut input = ValidationBodyInput::inspect(
+            &bytes,
+            BodyInspectionLimits {
+                bytes: len,
+                parse_visits: budget,
+                source_visits: budget,
+            },
+        )
+        .unwrap();
+        let plan = input
+            .prepare(Principal::Actor(issuer), limits, budget, budget)
+            .unwrap();
+        let quote = plan.quote();
+        let built = plan.build(quote.bytes, quote.model_build_visits).unwrap();
+        held += std::hint::black_box(&built).schema() as usize;
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "decode {:.0} ns a definition ({rounds} rounds, {held})",
+        elapsed.as_nanos() as f64 / f64::from(rounds)
+    );
 }

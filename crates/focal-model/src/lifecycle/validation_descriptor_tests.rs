@@ -1035,11 +1035,11 @@ fn every_actual_build_and_copy_allocation_can_fail_without_changing_retry_identi
     let content = prepared.content_hash();
     let intent = prepared.intent_fingerprint();
     let charge = prepared.construction_charge();
-    // Named target, check/fallback buffer, quality buffer, description, rubric,
-    // contributor set: all six actual owned buffers share the failure injector.
-    assert_eq!(prepared.construction_heap_allocations(), 6);
+    // Named target, check/fallback buffer, quality buffer, the phases' buffer, description,
+    // rubric, contributor set: all seven actual owned buffers share the failure injector.
+    assert_eq!(prepared.construction_heap_allocations(), 7);
     let original = prepared.build(charge).unwrap();
-    for allowed in 0..6 {
+    for allowed in 0..7 {
         allocation::fail_after(allowed, || {
             assert!(matches!(
                 plan(spec).build(charge),
@@ -1047,7 +1047,7 @@ fn every_actual_build_and_copy_allocation_can_fail_without_changing_retry_identi
             ));
             assert_eq!(allocation::remaining_allocations(), Some(0));
         });
-        let retry = allocation::fail_after(6, || {
+        let retry = allocation::fail_after(7, || {
             let retry = plan(spec).build(charge).unwrap();
             assert_eq!(allocation::remaining_allocations(), Some(0));
             retry
@@ -1063,7 +1063,7 @@ fn every_actual_build_and_copy_allocation_can_fail_without_changing_retry_identi
             ));
             assert_eq!(allocation::remaining_allocations(), Some(0));
         });
-        let copied = allocation::fail_after(6, || {
+        let copied = allocation::fail_after(7, || {
             let copied = original.try_copy(charge).unwrap();
             assert_eq!(allocation::remaining_allocations(), Some(0));
             copied
@@ -1071,7 +1071,7 @@ fn every_actual_build_and_copy_allocation_can_fail_without_changing_retry_identi
         descriptor_matches(&copied, spec);
         assert_eq!(copied.intent_fingerprint(), intent);
         assert_eq!(copied.copy_charge().unwrap(), charge);
-        assert_eq!(copied.copy_heap_allocations().unwrap(), 6);
+        assert_eq!(copied.copy_heap_allocations().unwrap(), 7);
         assert_ne!(
             copied.description().as_ptr(),
             original.description().as_ptr()

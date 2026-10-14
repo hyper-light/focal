@@ -8,17 +8,11 @@ fn definition() -> Declaration {
 
 fn retained() -> Declaration {
     let mut definition = definition();
-    let OwnedTarget::WholeWorkSlot { name, .. } = &mut definition.spec.target else {
-        panic!("slot fixture")
-    };
-    name.reserve_exact(32);
-    let OwnedProgram::Programmatic {
-        check,
-        quality: Some(quality),
-    } = &mut definition.spec.program
-    else {
+    // The slot's name is held at exactly its length; the handlers' buffers may hold room.
+    let OwnedProgram::ProgrammaticQuality(phases) = &mut definition.spec.program else {
         panic!("two-phase fixture")
     };
+    let [check, quality] = &mut **phases;
     check.handlers.reserve_exact(8);
     quality.handlers.reserve_exact(8);
     definition
@@ -82,8 +76,8 @@ fn declaration_copy_preflights_before_allocation_and_recovers_from_each_partial_
     let original = retained();
     let fingerprint = original.intent_fingerprint();
     let charge = original.copy_charge().unwrap();
-    assert_eq!(original.copy_heap_allocations().unwrap(), 3);
-    assert_eq!(original.heap_allocations().unwrap(), 3);
+    assert_eq!(original.copy_heap_allocations().unwrap(), 4);
+    assert_eq!(original.heap_allocations().unwrap(), 4);
     bytes::fail_after(9, || {
         assert!(matches!(
             original.try_copy(charge - 1),
@@ -91,7 +85,7 @@ fn declaration_copy_preflights_before_allocation_and_recovers_from_each_partial_
         ));
         assert_eq!(bytes::remaining_allocations(), Some(9));
     });
-    for after in 0..3 {
+    for after in 0..4 {
         assert!(
             matches!(
                 bytes::fail_after(after, || original.try_copy(charge)),
@@ -103,7 +97,7 @@ fn declaration_copy_preflights_before_allocation_and_recovers_from_each_partial_
         let copied = original.try_copy(charge).unwrap();
         assert_eq!(copied.intent_fingerprint(), fingerprint);
         assert_eq!(copied.retained_bytes().unwrap(), charge);
-        assert_eq!(copied.heap_allocations().unwrap(), 3);
+        assert_eq!(copied.heap_allocations().unwrap(), 4);
     }
 }
 
@@ -134,7 +128,7 @@ fn construction_and_copy_charges_cover_delivery_admission_increment_and_agentic_
                 program: fixture::programmatic(false),
                 ..base
             },
-            1,
+            2,
         ),
         (
             DeclarationSpec {
@@ -142,16 +136,16 @@ fn construction_and_copy_charges_cover_delivery_admission_increment_and_agentic_
                 phase: ValidationPhase::Increment,
                 ..base
             },
-            2,
+            3,
         ),
         (
             DeclarationSpec {
                 program: Program::Agentic { check: quality },
                 ..base
             },
-            2,
+            3,
         ),
-        (base, 3),
+        (base, 4),
     ];
     for (spec, allocations) in cases {
         let plan =

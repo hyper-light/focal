@@ -193,7 +193,7 @@ pub(super) fn copy(row: &Row) -> Result<Row, MemoryError> {
         Row::Definition(row) => {
             #[cfg(test)]
             copy_failure()?;
-            row.copy().map(|row| Row::Definition(Box::new(row)))
+            row.copy().map(Row::Definition)
         }
         Row::Evaluation(row) => {
             #[cfg(test)]

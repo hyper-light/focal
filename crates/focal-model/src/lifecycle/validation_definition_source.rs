@@ -255,6 +255,7 @@ fn program_shape(program: ProgramFields, limits: Limits) -> Result<ProgramShape,
     let (check, quality) = phases(program);
     let mut handlers = 0;
     let mut allocations = 0;
+    let mut held = 0;
     for policy in [check.map(|(fields, _)| fields), quality]
         .into_iter()
         .flatten()
@@ -268,10 +269,15 @@ fn program_shape(program: ProgramFields, limits: Limits) -> Result<ProgramShape,
         }
         handlers = bytes::add(handlers, policy.handlers)?;
         allocations = bytes::add(allocations, 1)?;
+        held = bytes::add(held, 1)?;
     }
+    // Each phase's handlers, and the phases' own allocation.
     Ok(ProgramShape {
-        heap: bytes::array::<OwnedHandlerPolicy>(handlers)?,
-        allocations,
+        heap: bytes::add(
+            bytes::array::<OwnedHandlerPolicy>(handlers)?,
+            bytes::array::<OwnedPhasePolicy>(held)?,
+        )?,
+        allocations: bytes::add(allocations, bytes::allocation::<OwnedPhasePolicy>(held))?,
         attempts: 0,
         handlers,
     })
@@ -406,13 +412,17 @@ fn empty_phase(fields: PhaseFields) -> Result<OwnedPhasePolicy, ContractError> {
 fn empty_program(fields: ProgramFields) -> Result<OwnedProgram, ContractError> {
     Ok(match fields {
         ProgramFields::Delivery => OwnedProgram::Delivery,
-        ProgramFields::Programmatic { check, quality } => OwnedProgram::Programmatic {
-            check: empty_phase(check)?,
-            quality: quality.map(empty_phase).transpose()?,
-        },
-        ProgramFields::Agentic { check } => OwnedProgram::Agentic {
-            check: empty_phase(check)?,
-        },
+        ProgramFields::Programmatic {
+            check,
+            quality: None,
+        } => OwnedProgram::Programmatic(boxed([empty_phase(check)?])?),
+        ProgramFields::Programmatic {
+            check,
+            quality: Some(quality),
+        } => {
+            OwnedProgram::ProgrammaticQuality(boxed([empty_phase(check)?, empty_phase(quality)?])?)
+        }
+        ProgramFields::Agentic { check } => OwnedProgram::Agentic(boxed([empty_phase(check)?])?),
     })
 }
 fn append(
@@ -422,16 +432,20 @@ fn append(
 ) -> Result<(), ContractError> {
     let policy = match (program, phase) {
         (
-            OwnedProgram::Programmatic { check, .. } | OwnedProgram::Agentic { check },
+            OwnedProgram::Programmatic(phases) | OwnedProgram::Agentic(phases),
             PolicyPhase::Check,
-        ) => check,
-        (
-            OwnedProgram::Programmatic {
-                quality: Some(quality),
-                ..
-            },
-            PolicyPhase::Quality,
-        ) => quality,
+        ) => {
+            let [check] = &mut **phases;
+            check
+        }
+        (OwnedProgram::ProgrammaticQuality(phases), PolicyPhase::Check) => {
+            let [check, _] = &mut **phases;
+            check
+        }
+        (OwnedProgram::ProgrammaticQuality(phases), PolicyPhase::Quality) => {
+            let [_, quality] = &mut **phases;
+            quality
+        }
         _ => return Err(ContractError::InvalidPolicy),
     };
     if policy.handlers.len() == policy.handlers.capacity() {
@@ -587,22 +601,16 @@ impl PolicySource for &Declaration {
     where
         Self: 's;
     fn handlers(&self, phase: PolicyPhase) -> Self::Handlers<'_> {
-        let values = match (&self.spec.program, phase) {
-            (
-                OwnedProgram::Programmatic { check, .. } | OwnedProgram::Agentic { check },
-                PolicyPhase::Check,
-            ) => check.handlers.as_slice(),
-            (
-                OwnedProgram::Programmatic {
-                    quality: Some(quality),
-                    ..
-                },
-                PolicyPhase::Quality,
-            ) => quality.handlers.as_slice(),
-            _ => &[],
+        let program = &self.spec.program;
+        let policy = match phase {
+            PolicyPhase::Check => program.check(),
+            PolicyPhase::Quality => program.quality(),
         };
+        let none: &[OwnedHandlerPolicy] = &[];
         DeclarationHandlers {
-            values: values.iter(),
+            values: policy
+                .map_or(none, |policy| policy.handlers.as_slice())
+                .iter(),
         }
     }
 }
@@ -621,13 +629,26 @@ impl<'a> DeclarationSource<'a> for &'a Declaration {
             deadline: value.deadline(),
             program: match &value.spec.program {
                 OwnedProgram::Delivery => ProgramFields::Delivery,
-                OwnedProgram::Programmatic { check, quality } => ProgramFields::Programmatic {
-                    check: phase_fields(check),
-                    quality: quality.as_ref().map(phase_fields),
-                },
-                OwnedProgram::Agentic { check } => ProgramFields::Agentic {
-                    check: phase_fields(check),
-                },
+                OwnedProgram::Programmatic(phases) => {
+                    let [check] = &**phases;
+                    ProgramFields::Programmatic {
+                        check: phase_fields(check),
+                        quality: None,
+                    }
+                }
+                OwnedProgram::ProgrammaticQuality(phases) => {
+                    let [check, quality] = &**phases;
+                    ProgramFields::Programmatic {
+                        check: phase_fields(check),
+                        quality: Some(phase_fields(quality)),
+                    }
+                }
+                OwnedProgram::Agentic(phases) => {
+                    let [check] = &**phases;
+                    ProgramFields::Agentic {
+                        check: phase_fields(check),
+                    }
+                }
             },
         }
     }

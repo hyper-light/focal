@@ -752,17 +752,7 @@ impl<'a> Evaluation<'a> {
         // Qualify every reachable phase before responsibility begins: accepting
         // a grant-free programmatic phase must not strand its required quality
         // continuation. Explicit owner frames still check actual phase grants.
-        let requires_policy = match &self.declaration.spec.program {
-            OwnedProgram::Delivery => false,
-            OwnedProgram::Programmatic { check, quality } => {
-                check.required_policy.is_some()
-                    || quality
-                        .as_ref()
-                        .is_some_and(|quality| quality.required_policy.is_some())
-            }
-            OwnedProgram::Agentic { check } => check.required_policy.is_some(),
-        };
-        if requires_policy {
+        if self.declaration.spec.program.requires_policy() {
             return Err(ContractError::InvalidPolicy);
         }
         let policy = self.declaration.policy(self.phase)?;
@@ -1189,10 +1179,7 @@ impl<'a> Evaluation<'a> {
                     next.stored.programmatic_evidence = Some(report.evidence);
                     if matches!(
                         self.declaration.spec.program,
-                        OwnedProgram::Programmatic {
-                            quality: Some(_),
-                            ..
-                        }
+                        OwnedProgram::ProgrammaticQuality(_)
                     ) {
                         next.stored.phase = Phase::Quality;
                         next.stored.handler = 0;

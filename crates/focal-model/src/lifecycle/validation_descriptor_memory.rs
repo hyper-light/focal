@@ -25,56 +25,63 @@ pub(super) fn authored_allocations(
     )
 }
 
-pub(super) fn copy<T: Copy>(values: &[T]) -> Result<Vec<T>, ContractError> {
+pub(super) fn copy<T: Copy>(values: &[T]) -> Result<Box<[T]>, ContractError> {
     let mut owned = bytes::reserve::<T>(values.len())?;
     bytes::fits(owned.capacity(), values.len())?;
     owned.extend_from_slice(values);
-    Ok(owned)
+    exact(owned)
 }
 
-pub(super) fn string(value: &str) -> Result<String, ContractError> {
-    String::from_utf8(copy(value.as_bytes())?).map_err(|_| ContractError::InvalidPolicy)
+/// `values` as a boxed slice in the buffer they fill (a full buffer converts without moving).
+pub(super) fn exact<T>(values: Vec<T>) -> Result<Box<[T]>, ContractError> {
+    if values.len() != values.capacity() {
+        return Err(ContractError::Capacity);
+    }
+    Ok(values.into_boxed_slice())
+}
+
+pub(super) fn string(value: &str) -> Result<Box<str>, ContractError> {
+    let bytes = copy(value.as_bytes())?;
+    String::from_utf8(bytes.into_vec())
+        .map(String::into_boxed_str)
+        .map_err(|_| ContractError::InvalidPolicy)
 }
 
 impl ValidationDescriptor {
     pub fn copy_heap_bytes(&self) -> Result<usize, ContractError> {
-        bytes::add(
-            self.declaration.copy_heap_bytes()?,
-            authored_heap(
-                self.description.len(),
-                self.quality_bar.as_ref().map_or(0, String::len),
-                self.contributed_by.len(),
-            )?,
-        )
+        bytes::add(self.declaration.copy_heap_bytes()?, self.authored_heap()?)
     }
+    /// Held exactly: what a copy requests is what the descriptor holds.
     pub fn retained_heap_bytes(&self) -> Result<usize, ContractError> {
         bytes::add(
             self.declaration.retained_heap_bytes()?,
-            authored_heap(
-                self.description.capacity(),
-                self.quality_bar.as_ref().map_or(0, String::capacity),
-                self.contributed_by.capacity(),
-            )?,
+            self.authored_heap()?,
         )
     }
     pub fn copy_heap_allocations(&self) -> Result<usize, ContractError> {
         bytes::add(
             self.declaration.copy_heap_allocations()?,
-            authored_allocations(
-                self.description.len(),
-                self.quality_bar.as_ref().map_or(0, String::len),
-                self.contributed_by.len(),
-            )?,
+            self.authored_allocations()?,
         )
     }
     pub fn heap_allocations(&self) -> Result<usize, ContractError> {
         bytes::add(
             self.declaration.heap_allocations()?,
-            authored_allocations(
-                self.description.capacity(),
-                self.quality_bar.as_ref().map_or(0, String::capacity),
-                self.contributed_by.capacity(),
-            )?,
+            self.authored_allocations()?,
+        )
+    }
+    fn authored_heap(&self) -> Result<usize, ContractError> {
+        authored_heap(
+            self.description.len(),
+            self.quality_bar.as_deref().map_or(0, str::len),
+            self.contributed_by.len(),
+        )
+    }
+    fn authored_allocations(&self) -> Result<usize, ContractError> {
+        authored_allocations(
+            self.description.len(),
+            self.quality_bar.as_deref().map_or(0, str::len),
+            self.contributed_by.len(),
         )
     }
     pub fn copy_charge(&self) -> Result<usize, ContractError> {

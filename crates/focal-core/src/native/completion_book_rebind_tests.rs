@@ -14,7 +14,7 @@ fn copy_row(row: &Row) -> Result<Row, MemoryError> {
     match row {
         Row::Meta(value) => Ok(Row::Meta(Box::new(**value))),
         Row::Claim(value) => value.copy().map(Row::Claim),
-        Row::Definition(value) => value.copy().map(|row| Row::Definition(Box::new(row))),
+        Row::Definition(value) => value.copy().map(Row::Definition),
         Row::Evaluation(value) => value.copy().map(Row::Evaluation),
         Row::Artifact(value) => value.copy().map(Row::Artifact),
         Row::ArtifactIdentity(value) => Ok(Row::ArtifactIdentity(*value)),

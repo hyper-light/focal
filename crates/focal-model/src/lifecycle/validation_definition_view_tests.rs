@@ -231,13 +231,10 @@ fn phase_views_borrow_original_handlers_in_fallback_order() {
     else {
         panic!("two-phase view")
     };
-    let OwnedProgram::Programmatic {
-        check: owned_check,
-        quality: Some(owned_quality),
-    } = &original.spec.program
-    else {
+    let OwnedProgram::ProgrammaticQuality(phases) = &original.spec.program else {
         panic!("two-phase source")
     };
+    let [owned_check, owned_quality] = &**phases;
     for (view, owned) in [(check, owned_check), (quality, owned_quality)] {
         assert_eq!(view.handlers().len(), owned.handlers.len());
         for (borrowed, retained) in view.handlers().rev().zip(owned.handlers.iter().rev()) {
