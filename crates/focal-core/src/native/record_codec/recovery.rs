@@ -239,6 +239,8 @@ struct Shared<'a, 'bytes, C> {
     budget: &'a MemoryBudget,
     custody: &'a C,
     failure: Cell<Option<NativeError>>,
+    /// Where the rows a restore builds are spilled (doc 31 M3).
+    log: Option<&'a dyn crate::native::payloads::PayloadLog>,
 }
 impl<C> Shared<'_, '_, C> {
     fn refuse(&self, error: NativeError) -> MemoryError {
@@ -277,7 +279,23 @@ pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     store: &R,
     schemas: &S,
 ) -> Result<Core<NativeState>, NativeError> {
-    restore_in(
+    restore_spilling(checkpoint, range, limits, budget, store, schemas, None)
+}
+/// [`restore`], the rows that a replica spills spilled to `log` as they are built (doc 31 M3),
+/// and read back from it as the restore validates them. The caller attaches `log` to the
+/// restored core.
+pub fn restore_spilling<S: NativeSchemaVerifier, R: NativeCustodyReader>(
+    checkpoint: &checkpoint::StructuralCheckpoint<'_>,
+    range: RangeId,
+    limits: Limits,
+    budget: MemoryBudget,
+    store: &R,
+    schemas: &S,
+    log: Option<&dyn crate::native::payloads::PayloadLog>,
+) -> Result<Core<NativeState>, NativeError> {
+    let quote = checkpoint.quote();
+    let work = Work::for_shape(quote.visits, quote.bytes, quote.rows).min(limits.work);
+    restore_with_work(
         checkpoint,
         range,
         limits,
@@ -285,7 +303,10 @@ pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
         store,
         schemas,
         BudgetLane::Committed,
+        work,
+        log,
     )
+    .map(|(core, _)| core)
 }
 /// [`restore`] with every root, index, layout, hydration page and assembled
 /// member charged to `lane`.
@@ -316,7 +337,7 @@ pub(crate) fn restore_measured<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     let quote = checkpoint.quote();
     let work = Work::for_shape(quote.visits, quote.bytes, quote.rows).min(limits.work);
     restore_with_work(
-        checkpoint, range, limits, budget, store, schemas, lane, work,
+        checkpoint, range, limits, budget, store, schemas, lane, work, None,
     )
 }
 /// The restore under an explicit allowance, spending reported.
@@ -330,8 +351,10 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
     schemas: &S,
     lane: BudgetLane,
     work: Work,
+    log: Option<&dyn crate::native::payloads::PayloadLog>,
 ) -> Result<(Core<NativeState>, Envelope), NativeError> {
     let header = checkpoint.header();
+    let payloads = log.map(|log| -> &dyn crate::native::payloads::PayloadRead { log });
     limits.native = checked_native_limits(header.ledger, limits.native)?;
     // The rows are restored into one store, validated as a whole, then laid
     // out per the recorded layout (25 §4): members keep their durable
@@ -352,6 +375,7 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
         schemas,
         lane,
         work,
+        log,
         |view, meter, budget| {
             read_validate::validate(
                 view,
@@ -361,6 +385,7 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
                 limits.native,
                 meter,
                 budget,
+                payloads,
             )
         },
     )?;
@@ -369,8 +394,7 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
         state: NativeState {
             ledger: header.ledger,
             profile: header.profile,
-            // A restore's rows hold their bytes as they are laid out here.
-            encoded_rows: crate::native::encoded_rows_of(&rows, header.ledger, None)?,
+            encoded_rows: crate::native::encoded_rows_of(&rows, header.ledger, payloads)?,
             rows,
             budget,
             events: crate::native::event_index::EventIndex::unbuilt(),
@@ -445,6 +469,7 @@ pub(super) fn hydrate_frame<'a, F, S, R>(
     schemas: &S,
     lane: BudgetLane,
     work: Work,
+    log: Option<&dyn crate::native::payloads::PayloadLog>,
     validate: impl FnOnce(ranges::HydratedRows<'_>, &Meter, &MemoryBudget) -> Result<(), NativeError>,
 ) -> Result<Hydrated, NativeError>
 where
@@ -490,6 +515,7 @@ where
         budget,
         custody: &custody,
         failure: Cell::new(None),
+        log,
     };
     // The index families' rows go to the key sets, not the store.
     let expected_entries = usize::try_from(header.rows)

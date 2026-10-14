@@ -456,6 +456,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             Err(_) => return Err(NativeSessionError::Corrupt),
         }
         self.retired_families = self.retired_families.saturating_add(1);
+        self.sweep_payloads_if_due();
         Ok(())
     }
     /// Apply a committed seal record (F12): inert when the prefix it named
@@ -1052,6 +1053,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.retired_families = self
             .retired_families
             .saturating_add(u64::try_from(record.retired().len()).unwrap_or(u64::MAX));
+        self.sweep_payloads_if_due();
         self.applied_raft = entry.index;
         self.recording_range = Some(header.range);
         self.recording_term = entry.term;

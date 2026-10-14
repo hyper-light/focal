@@ -660,18 +660,81 @@ Each stage lands on its own, measured:
      - its creation result and outcome, 0.5 KB;
      - two identity rows;
      - the event index, 192 bytes.
+   - **A definition held compact, decoded** (as built).
+     - **Measured first.** Held as its record encoding, a definition would cost every read a
+       checked decode: 4.9 µs for a programmatic definition (`measure_definition_decode_cost`),
+       and lifecycle steps read a claim's definition several times each. So it stays decoded,
+       and is made compact instead.
+     - **As built.**
+       - A declaration's phases sit behind one allocation, the check then any quality phase. A
+         delivery declaration has none, so it no longer carries two 112-byte phase slots inline.
+       - The slot name, a descriptor's description, its quality bar and its contributors are
+         exact boxed slices.
+       - The row holds its one-descriptor container itself, narrow enough that no box is
+         needed around it.
+       - `Declaration` 464 → 248 bytes, `ValidationDescriptor` 584 → 344.
+     - **Measured.** The definition row 907 → 603 bytes a claim.
+   - **A claim state without an absent terminal cut inline** (as built).
+     - An open claim held the cut's widest form (208 bytes) inline. The cut now sits behind its
+       own allocation, made when the claim becomes terminal. `ClaimState` 1,000 → 800 bytes.
+     - **Every terminal transition** allocates the cut before it changes anything, so a refusal
+       leaves the claim as it was. The transitions are cancellation, expiry, supersession,
+       admission and aggregate failure, graph failure and deadlock, and graph and receipt
+       release.
+     - **Every quote that promised such a transition no growth now counts the cut**, at its
+       source:
+       - the graph consequence quote: each member that may become terminal, and the root's cut
+         in its own stage;
+       - the completion envelopes' parent bound;
+       - the deadline copies;
+       - supersession in the creation plan;
+       - claim recovery's quote for a recorded terminal row.
+   - **The immutable payloads off the heap** (as built for events).
+     - **The model, borrowed from Kafka and NATS.** Rows written once and read rarely hold
+       where their bytes are in a log, sixteen bytes and a check over the bytes, instead of the
+       bytes.
+     - **The log.**
+       - Each replica keeps its own log, in segment files under the session's directory,
+         appended without a sync and read by position.
+       - It is a cache of what the replica's records and checkpoints hold, so it is emptied
+         whenever the replica opens and refilled as they apply.
+     - **Where a row is spilled: where it is built,** encoded on the stack and appended.
+       - A leader's candidate as its events are recorded, a follower's as replay decodes them, a
+         restore's as it hydrates.
+       - Publication stays without I/O.
+       - Every quote and charge is the spilled row's from the start, with nothing on the heap.
+       - Spilling where rows are published would have left a candidate's charges counting
+         bytes it no longer holds.
+     - **Who reads it.** Every reader of an event reads through the log it was spilled to: the
+       outcome expansion, the event index, retirement's derivation and bundles, audits, the
+       completion books, replay's checks, and record and checkpoint encoding. A frozen image's
+       encoder holds a reader with handles of its own.
+     - **Its bounds.**
+       - A segment (64 MiB) is charged to the volume in the ordinary lane before it is made.
+       - A log that cannot have one refuses the payload, and the row keeps its bytes. The log
+         never takes the completion reserve or the headroom.
+       - One that cannot open is tried again, and its refusals are counted
+         (`focal_session_payload_open_refusals_total`).
+     - **Collection.**
+       - A sealed segment no committed or pending row references is removed once retirements
+         let it go, a sweep at most once a segment.
+       - A restore sweeps everything the core it replaced spilled.
+       - A reader made before a sweep keeps its handles, so its reads finish.
+     - **Measured.** A claim's two events 534 → 192 bytes (their entries alone); a claim
+       4,138 → 3,776 bytes charged.
+     - **Next on it:** a claim's content, its creation result and its outcome.
+       - The content, about 340 bytes, is read where steps are admitted.
+       - The creation result and the outcome, about 300 bytes together, are read on exact
+         retries and by seals.
+       - Each will spill its checkpoint encoding itself, so a checkpoint, a seal or an archive
+         copies the bytes without decoding them, and a row's size needs no read.
    - **Next on this path.**
-     - **A definition held as its record encoding** (232 bytes against 811 decoded). Readers
-       take a charged decode, as content does since stage 1.
-     - **The immutable payloads off the heap: log-resident, as Kafka and NATS keep messages.**
-       - Each replica appends the encodings to a local append-only file, unsynced; the page
-         cache serves recent reads.
-       - Rows hold a handle. Checkpoints copy bytes, and recovery rebuilds the file from the
-         checkpoint.
-       - About 1.8 KB a claim leaves the heap.
-     - **A claim state that does not carry an absent terminal cut inline** (208 bytes).
-       Terminal transitions now promise no heap growth, so this must wait for their quotes to
-       count it.
+     - **One binding a claim.** A claim's binding (88 bytes) is held five times: its state, its
+       lineage, its scope registry, its acceptance policy and its registration set. The last
+       four can hold none or its revision alone, read from the claim's (about 350 bytes).
+     - **Content, creation results and outcomes in the payload log** (about 650 bytes).
+     - **Leaves of encoded keys:** a key front-coded against its neighbour in its leaf, where a
+       fixed 56-byte packed key now takes each entry (about 340 bytes).
      - Then the claim table proper.
    - **The session's share of its allowance, beside the stages.**
      - **Measured first.** The per-session memory gauges (`focal_session_memory_*`,

@@ -95,6 +95,13 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// Committed retirement records this replica applied nothing for since
     /// it opened; a diagnostic, never an input to state.
     pub(super) retirements_inert: u64,
+    /// The segments the payload log held after its last sweep (doc 31 M3): a retirement sweeps
+    /// again once the log has sealed another past them.
+    pub(super) payload_segments_swept: usize,
+    /// Where the replica keeps its payload log, and how many times it could not be opened
+    /// there: a replica without one holds every row's bytes until it opens.
+    pub(super) payload_source: Option<super::payloads::PayloadSource>,
+    pub(super) payload_open_refusals: u64,
     /// The seal record this authority proposed and has not seen applied
     /// (F12); native admission waits for it, and a term change lets it go.
     pub(super) seal: Option<super::seal::SealRecord>,
@@ -194,6 +201,9 @@ pub(crate) struct NativeSources {
     /// Where the session keeps its cold streams (doc 31 M2, A2): every replica that can apply a
     /// cold retirement has them.
     pub(crate) cold: Option<super::cold::ColdSource>,
+    /// Where the replica keeps its payload log (doc 31 M3): a replica without one holds every
+    /// row's bytes.
+    pub(crate) payloads: Option<super::payloads::PayloadSource>,
 }
 
 impl<S: NativeSchemaVerifier> NativeEngine<S> {
@@ -212,6 +222,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             reader,
             seeds,
             cold: cold_source,
+            payloads,
         } = sources;
         if range.0 == 0
             || limits.content_domain.is_zero()
@@ -241,7 +252,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if pending.capacity() > count {
             return Err(NativeSessionError::Capacity("pending candidates"));
         }
-        let core = match profile {
+        let mut core = match profile {
             NativeContentProfile::ProjectionOnly => {
                 Core::new_native(ledger, range, limits.recovery.native, budget.clone())?
             }
@@ -249,6 +260,15 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 Core::new_native_authored(ledger, range, limits.recovery.native, budget.clone())?
             }
         };
+        // A log that cannot open (its directory, the volume) leaves the replica holding every
+        // row's bytes, as one without a log does, until it opens (`open_payload_log`).
+        let mut payload_open_refusals = 0u64;
+        if let Some(source) = payloads.as_ref() {
+            match super::payloads::FilePayloads::open(source) {
+                Ok(log) => core.attach_payload_log(Box::new(log)),
+                Err(_) => payload_open_refusals = 1,
+            }
+        }
         Ok(Self {
             delivery: None,
             pending,
@@ -286,6 +306,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             retirement: None,
             retired_families: 0,
             retirements_inert: 0,
+            payload_segments_swept: 0,
+            payload_source: payloads,
+            payload_open_refusals,
             seal: None,
             seals_applied: 0,
             seals_inert: 0,
@@ -506,6 +529,97 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// record beyond this replica's outcome bound among them.
     pub(crate) fn retirements_inert(&self) -> u64 {
         self.retirements_inert
+    }
+    /// The payload log, taken from the core that holds it (doc 31 M3).
+    pub(super) fn take_payload_log(
+        &mut self,
+    ) -> Option<Box<dyn focal_core::native::payloads::PayloadLog>> {
+        match self.domain.as_mut() {
+            Some(Domain::Passive(core)) => core.detach_payload_log(),
+            Some(Domain::Active(owner, _)) => owner.detach_payload_log(),
+            None => None,
+        }
+    }
+    /// The payload log given back to the core it was taken from, whose spilled rows it holds.
+    pub(super) fn give_back_payload_log(
+        &mut self,
+        log: Option<Box<dyn focal_core::native::payloads::PayloadLog>>,
+    ) {
+        let Some(log) = log else {
+            return;
+        };
+        match self.domain.as_mut() {
+            Some(Domain::Passive(core)) => core.attach_payload_log(log),
+            Some(Domain::Active(owner, _)) => owner.attach_payload_log(log),
+            None => {}
+        }
+    }
+    /// Open the replica's payload log where its core has none: one that could not open before
+    /// (the volume was full) is tried again. Never while a core holds spilled rows of another
+    /// log: opening empties the directory, so only a core with no log at all takes one.
+    pub(super) fn open_payload_log(&mut self) {
+        let Some(source) = self.payload_source.as_ref() else {
+            return;
+        };
+        let has_log = match self.domain.as_ref() {
+            Some(Domain::Passive(core)) => core.payload_log().is_some(),
+            Some(Domain::Active(owner, _)) => owner.committed_core().payload_log().is_some(),
+            None => true,
+        };
+        if has_log {
+            return;
+        }
+        let log = match super::payloads::FilePayloads::open(source) {
+            Ok(log) => log,
+            Err(_) => {
+                self.payload_open_refusals = self.payload_open_refusals.saturating_add(1);
+                return;
+            }
+        };
+        match self.domain.as_mut() {
+            Some(Domain::Passive(core)) => core.attach_payload_log(Box::new(log)),
+            Some(Domain::Active(owner, _)) => owner.attach_payload_log(Box::new(log)),
+            None => {}
+        }
+    }
+    /// How many times the replica's payload log could not be opened.
+    pub(crate) fn payload_open_refusals(&self) -> u64 {
+        self.payload_open_refusals
+    }
+    /// The segments the replica's payload log holds: none without one.
+    pub(crate) fn payload_segments(&self) -> usize {
+        let core = match self.domain.as_ref() {
+            Some(Domain::Passive(core)) => core,
+            Some(Domain::Active(owner, _)) => owner.committed_core(),
+            None => return 0,
+        };
+        core.payload_log()
+            .map_or(0, focal_core::native::payloads::PayloadLog::held_segments)
+    }
+    /// Let go of the payload log's segments retired rows left unreferenced (doc 31 M3), once
+    /// the log has sealed another segment since the last sweep: a sweep walks every spilled
+    /// row, so it comes at most once a segment's worth of payloads.
+    pub(super) fn sweep_payloads_if_due(&mut self) {
+        self.open_payload_log();
+        let held = |core: &Core<NativeState>| {
+            core.payload_log()
+                .map_or(0, focal_core::native::payloads::PayloadLog::held_segments)
+        };
+        let swept = self.payload_segments_swept;
+        let after = match self.domain.as_ref() {
+            Some(Domain::Passive(core)) if held(core) > swept.saturating_add(1) => {
+                core.sweep_payloads();
+                held(core)
+            }
+            Some(Domain::Active(owner, _))
+                if held(owner.committed_core()) > swept.saturating_add(1) =>
+            {
+                owner.sweep_payloads();
+                held(owner.committed_core())
+            }
+            _ => return,
+        };
+        self.payload_segments_swept = after;
     }
     /// The chunks of the latest checkpoint seed, sorted.
     pub(crate) fn seed_chunks(&self) -> &[ContentHash] {

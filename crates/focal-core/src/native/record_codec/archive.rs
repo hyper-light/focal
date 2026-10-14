@@ -233,6 +233,8 @@ impl<'a> StructuralArchive<'a> {
             schemas,
             lane,
             work,
+            // An archive read holds its rows' bytes.
+            None,
             |view, meter, _| {
                 // A family: its root and every member claim present, and
                 // no row of another family or of the accounting.

@@ -124,11 +124,15 @@ impl Owner {
             memory: self.session.native_memory_stats().map(|native| {
                 let session = self.session.memory_stats();
                 let width = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+                let (payload_segments, payload_open_refusals) =
+                    self.session.native_payload_log().unwrap_or((0, 0));
                 focal_client::admin::AdminSessionMemory {
                     used: width(session.used),
                     limit: width(session.limit),
                     native_used: width(native.used),
                     native_limit: width(native.limit),
+                    payload_segments: width(payload_segments),
+                    payload_open_refusals,
                 }
             }),
         };

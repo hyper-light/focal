@@ -416,67 +416,89 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             index,
             term,
         )?;
-        let reader = RecordingReader::new(&self.reader);
-        let restored = recovery::restore(
-            checkpoint.core(),
-            range,
-            self.limits.recovery,
-            self.budget.clone(),
-            &reader,
-            &self.schemas,
-        );
-        let missing = reader.take_missing();
-        self.pending_custody = if missing.is_empty() {
-            None
-        } else {
-            Some(PendingCustody::new(missing, &self.budget)?)
-        };
-        let restored = restored?;
-        if restored.native_sequence() != header.prefix {
-            return Err(NativeSessionError::Corrupt);
-        }
-        // The movement coordinator resumes from the checkpoint's section, or
-        // starts fresh from the restored layout when the checkpoint carried
-        // none (25 §6). Built before the domain is replaced.
-        let movement = if checkpoint.movement().is_empty() {
-            let map = super::movement::map_from_layout(
-                self.ledger,
-                restored.native_layout().boundaries(),
-                self.limits.ranges,
-            )?;
-            super::movement::Movement::new(
-                meta.activation.genesis,
-                map,
-                self.limits.ranges,
+        // The payload log moves to the restored core (doc 31 M3): the restore spills its rows to
+        // it, and every refusal past this point gives it back to the core it was taken from,
+        // whose spilled rows it holds.
+        let log = self.take_payload_log();
+        let finished = (|| -> Result<_, NativeSessionError> {
+            let reader = RecordingReader::new(&self.reader);
+            let restored = recovery::restore_spilling(
+                checkpoint.core(),
+                range,
+                self.limits.recovery,
                 self.budget.clone(),
-            )?
-        } else {
-            let _permit = self.budget.reserve(
-                BudgetKind::Recovery,
-                BudgetLane::Committed,
-                array::<u8>(checkpoint.movement().len().saturating_mul(4))?,
-            )?;
-            super::movement::Movement::restore(
-                meta.activation.genesis,
-                checkpoint.movement(),
-                self.limits.ranges,
-                self.budget.clone(),
-            )?
+                &reader,
+                &self.schemas,
+                log.as_deref(),
+            );
+            let missing = reader.take_missing();
+            self.pending_custody = if missing.is_empty() {
+                None
+            } else {
+                Some(PendingCustody::new(missing, &self.budget)?)
+            };
+            let restored = restored?;
+            if restored.native_sequence() != header.prefix {
+                return Err(NativeSessionError::Corrupt);
+            }
+            // The movement coordinator resumes from the checkpoint's section, or
+            // starts fresh from the restored layout when the checkpoint carried
+            // none (25 §6). Built before the domain is replaced.
+            let movement = if checkpoint.movement().is_empty() {
+                let map = super::movement::map_from_layout(
+                    self.ledger,
+                    restored.native_layout().boundaries(),
+                    self.limits.ranges,
+                )?;
+                super::movement::Movement::new(
+                    meta.activation.genesis,
+                    map,
+                    self.limits.ranges,
+                    self.budget.clone(),
+                )?
+            } else {
+                let _permit = self.budget.reserve(
+                    BudgetKind::Recovery,
+                    BudgetLane::Committed,
+                    array::<u8>(checkpoint.movement().len().saturating_mul(4))?,
+                )?;
+                super::movement::Movement::restore(
+                    meta.activation.genesis,
+                    checkpoint.movement(),
+                    self.limits.ranges,
+                    self.budget.clone(),
+                )?
+            };
+            // The archive's report resumes from the checkpoint's section (26 §3),
+            // never regressing what this replica already recorded.
+            if let Some(section) = checkpoint.retention() {
+                self.archived_through = self.archived_through.max(section.archived_through);
+                // The count is the checkpoint's: it names the families retired
+                // through the prefix installed here (26 §4).
+                self.retired_families = section.retired_families;
+            }
+            // An installed authoritative snapshot resolves every speculative candidate.
+            self.resolve_suffix(super::apply::SuffixEvidence::InstalledSnapshot)?;
+            self.readiness_requested = None;
+            self.reconstruction_needed = true;
+            Ok((restored, movement))
+        })();
+        let (mut restored, movement) = match finished {
+            Ok(finished) => finished,
+            Err(error) => {
+                self.give_back_payload_log(log);
+                return Err(error);
+            }
         };
-        // The archive's report resumes from the checkpoint's section (26 §3),
-        // never regressing what this replica already recorded.
-        if let Some(section) = checkpoint.retention() {
-            self.archived_through = self.archived_through.max(section.archived_through);
-            // The count is the checkpoint's: it names the families retired
-            // through the prefix installed here (26 §4).
-            self.retired_families = section.retired_families;
+        if let Some(log) = log {
+            restored.attach_payload_log(log);
         }
-        // An installed authoritative snapshot resolves every speculative candidate.
-        self.resolve_suffix(super::apply::SuffixEvidence::InstalledSnapshot)?;
-        self.readiness_requested = None;
-        self.reconstruction_needed = true;
         self.domain = Some(Domain::Passive(restored));
         self.movement = Some(movement);
+        // The restore spilled its rows afresh: what the core it replaced spilled is referenced
+        // by nothing now, and goes.
+        self.payload_segments_swept = 0;
+        self.sweep_payloads_if_due();
         // The cold streams resume from what the checkpoint names, fresh when it names none:
         // replay appends the batches of every cold record after it alike on every replica.
         if self.cold_source.is_some() {

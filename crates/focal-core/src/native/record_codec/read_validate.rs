@@ -30,6 +30,8 @@ pub(super) fn invalid() -> NativeError {
 
 pub(super) struct ValidationRead<'v, 'r> {
     pub(super) root: &'v crate::native::ranges::HydratedRows<'r>,
+    /// Where a row the restore spilled is read back from (doc 31 M3).
+    pub(super) payloads: Option<&'v dyn crate::native::payloads::PayloadRead>,
     pub(super) ledger: LedgerId,
     pub(super) profile: NativeContentProfile,
     pub(super) prefix: SessionSeq,
@@ -262,6 +264,7 @@ impl Counts {
 /// publication history and derived indices all agree. Scratch permits disappear
 /// before the caller receives a publishable owner. Prefix zero is empty genesis.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // A restore's root and what it is checked against.
 pub(super) fn validate(
     root: crate::native::ranges::HydratedRows<'_>,
     ledger: LedgerId,
@@ -270,9 +273,11 @@ pub(super) fn validate(
     limits: NativeLimits,
     meter: &read_source::Meter,
     budget: &MemoryBudget,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
 ) -> Result<(), NativeError> {
     let read = ValidationRead {
         root: &root,
+        payloads,
         ledger,
         profile,
         prefix,
@@ -367,7 +372,7 @@ pub(super) fn validate(
                 for ordinal in 0..value.events {
                     match read.get(Key::Event(value.sequence, ordinal))? {
                         Some(Row::Event(row)) => {
-                            let event = row.get(ledger, None).ok_or_else(invalid)?;
+                            let event = row.get(ledger, read.payloads).ok_or_else(invalid)?;
                             if event.invocation != invocation
                                 || event.sequence != value.sequence
                                 || event.ordinal != ordinal
@@ -390,7 +395,7 @@ pub(super) fn validate(
                 }
             }
             (Key::Event(sequence, ordinal), Row::Event(value)) => {
-                let event = value.get(ledger, None).ok_or_else(invalid)?;
+                let event = value.get(ledger, read.payloads).ok_or_else(invalid)?;
                 if event.sequence != sequence || event.ordinal != ordinal {
                     return Err(invalid());
                 }
@@ -650,7 +655,7 @@ impl ValidationRead<'_, '_> {
         ordinal: u32,
     ) -> Result<NativeEvent, NativeError> {
         match self.require(Key::Event(sequence, ordinal))? {
-            Row::Event(row) => Ok(row.get(self.ledger, None).ok_or_else(invalid)?),
+            Row::Event(row) => Ok(row.get(self.ledger, self.payloads).ok_or_else(invalid)?),
             _ => Err(invalid()),
         }
     }

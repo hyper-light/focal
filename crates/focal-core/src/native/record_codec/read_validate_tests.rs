@@ -32,6 +32,7 @@ fn with_read<T>(
         .finish(0, |root| {
             let root = crate::native::ranges::HydratedRows::new(&root, &keys);
             let read = ValidationRead {
+                payloads: None,
                 root: &root,
                 ledger: fixture::binding(1).ledger,
                 profile: NativeContentProfile::ProjectionOnly,
@@ -192,6 +193,7 @@ fn zero_prefix_rejects_a_fabricated_meta_row_and_discards_detached_state() {
             NativeLimits::default(),
             &meter,
             &budget,
+            None,
         );
         assert!(matches!(
             result,

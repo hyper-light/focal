@@ -326,6 +326,11 @@ fn a_populated_ledger_is_imported_through_the_node_after_its_host_seals_the_payl
                         .unwrap(),
                     geometry: focal_evidence::ColdGeometry::STANDARD,
                 }),
+                payloads: Some(focal_ledger::PayloadSource {
+                    root: content_dir.join("payloads"),
+                    disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
+                        .unwrap(),
+                }),
                 range: RangeId(1),
             },
         )

@@ -408,6 +408,13 @@ impl Fleet {
                                 .unwrap(),
                                 geometry: focal_evidence::ColdGeometry::STANDARD,
                             }),
+                            payloads: Some(focal_ledger::PayloadSource {
+                                root: content_dir.join("payloads"),
+                                disk: focal_memory::DiskBudget::new(
+                                    focal_memory::DiskBudgetConfig::default(),
+                                )
+                                .unwrap(),
+                            }),
                             range: focal_memory::RangeId(1),
                         },
                     )

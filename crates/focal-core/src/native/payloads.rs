@@ -82,6 +82,30 @@ pub trait PayloadLog: PayloadRead + Send + Sync {
     fn append(&self, bytes: &[u8]) -> Option<PayloadRef>;
     /// A reader of what the log holds now, for another thread (a frozen image's encoder).
     fn reader(&self) -> Result<Box<dyn PayloadRead + Send>, PayloadError>;
+    /// Let go of every sealed part of the log no row references, `live` naming the segments
+    /// that some row does (every committed and pending row's, [`segments_of`]). How many parts
+    /// it let go.
+    fn sweep(&self, live: &std::collections::BTreeSet<u32>) -> usize {
+        let _ = live;
+        0
+    }
+    /// The parts (segments) the log holds now: what a sweep's schedule follows.
+    fn held_segments(&self) -> usize {
+        0
+    }
+}
+
+/// The segment of every spilled row among `rows`, added to `live`. Bounded by the segments a log
+/// holds: a set of `u32`.
+pub(super) fn segments_of<'a>(
+    rows: impl Iterator<Item = &'a super::Row>,
+    live: &mut std::collections::BTreeSet<u32>,
+) {
+    for row in rows {
+        if let super::Row::Event(super::OwnedEvent::Logged(at)) = row {
+            live.insert(at.segment());
+        }
+    }
 }
 
 /// The read side of a held log.

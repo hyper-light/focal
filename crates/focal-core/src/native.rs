@@ -1813,6 +1813,31 @@ impl Core<NativeState> {
     pub fn detach_payload_log(&mut self) -> Option<Box<dyn payloads::PayloadLog>> {
         self.state.payloads.take()
     }
+    /// The payload log this core spills to, lent (to a restore that spills to it as well).
+    pub fn payload_log(&self) -> Option<&dyn payloads::PayloadLog> {
+        self.state.payloads.as_deref()
+    }
+    /// The segments of the payload log a committed row references, added to `live`.
+    pub(crate) fn live_payload_segments(&self, live: &mut std::collections::BTreeSet<u32>) {
+        payloads::segments_of(
+            self.state
+                .rows
+                .entries_from(&Key::Event(SessionSeq(0), 0), false)
+                .take_while(|entry| matches!(entry.key, Key::Event(..)))
+                .map(|entry| entry.value),
+            live,
+        );
+    }
+    /// Let go of the payload log's sealed segments no committed row references (doc 31 M3):
+    /// for a core with no candidates pending. How many it let go.
+    pub fn sweep_payloads(&self) -> usize {
+        let Some(log) = self.state.payloads.as_deref() else {
+            return 0;
+        };
+        let mut live = std::collections::BTreeSet::new();
+        self.live_payload_segments(&mut live);
+        log.sweep(&live)
+    }
     pub fn native_sequence(&self) -> SessionSeq {
         SessionSeq(self.state.rows.prefix())
     }

@@ -31,6 +31,10 @@ fn hosting_with(dir: &Path, id: u64, limits: NativeSessionLimits) -> NativeHosti
             disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
             geometry: focal_evidence::ColdGeometry::STANDARD,
         }),
+        payloads: Some(crate::PayloadSource {
+            root: dir.join(format!("payloads-{id}")),
+            disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+        }),
         range: RangeId(u128::from(id)),
     }
 }
@@ -3340,5 +3344,53 @@ fn writes_admitted_while_deferred_reach_each_follower_as_one_append() {
                 "replica {id}"
             );
         }
+    }
+}
+
+/// The bytes a replica's payload log holds on its volume.
+fn payload_bytes(dir: &Path, id: u64) -> u64 {
+    std::fs::read_dir(dir.join(format!("payloads-{id}")))
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok()?.metadata().ok())
+                .map(|metadata| metadata.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// A hosted replica spills its events to its payload log as it applies them (doc 31 M3): the
+/// log holds their bytes on the volume. A restart lets the earlier run's log go, the restore
+/// spills the checkpoint's events to a fresh one, and the restored replica answers an exact
+/// retry with the outcome its events make, read back from the log.
+#[test]
+fn a_hosted_replica_spills_its_events_and_a_restart_respills_them_from_its_checkpoint() {
+    let mut cluster = Cluster::new(1, &[true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let mut first = None;
+    for claim in 1..=4 {
+        let create = creation(cluster.next(PARTIES.issuer), claim);
+        let key = create.request;
+        let created = cluster.commit(1, PARTIES.issuer, create, &[]);
+        first.get_or_insert((key, created));
+    }
+    let spilled = payload_bytes(cluster.dir.path(), 1);
+    assert!(spilled > 0, "the replica's events are in its payload log");
+    cluster.node(1).checkpoint().unwrap();
+    let sequence = cluster.node(1).native_sequence().unwrap();
+    cluster.stop(1);
+    cluster.reopen(1, true);
+    assert_eq!(cluster.node(1).native_sequence().unwrap(), sequence);
+    let restored = payload_bytes(cluster.dir.path(), 1);
+    assert!(restored > 0, "the restore spilled the checkpoint's events");
+    assert!(
+        restored <= spilled,
+        "the earlier run's log is let go, not added to"
+    );
+    let (key, created) = first.unwrap();
+    assert_eq!(cluster.node(1).native_outcome(key).unwrap(), Some(created));
+    for claim in 1..=4 {
+        assert!(cluster.status(1, claim).is_some());
     }
 }

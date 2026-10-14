@@ -19,6 +19,7 @@ pub use request_streams::{ManagedError, RequestStreamLimits, RequestStreamReadVi
 pub mod native_checkpoint;
 pub mod native_session;
 pub use native_session::cold::{ColdContent, ColdFrame, ColdSource};
+pub use native_session::payloads::{FilePayloads, PayloadSource};
 pub use native_session::retention::{RetentionBlocker, RetentionReport};
 pub use native_session::{
     FailureClass, LayoutOperation, LedgerRangeVerifier, MovementRecord, NativeCommit,

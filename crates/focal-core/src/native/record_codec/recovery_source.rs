@@ -10,6 +10,14 @@ impl<C> read_dispatch::Objects for Objects<'_, '_, '_, C> {
     fn ledger(&self) -> LedgerId {
         self.shared.header.ledger
     }
+    fn payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        self.shared
+            .log
+            .map(|log| -> &dyn crate::native::payloads::PayloadRead { log })
+    }
+    fn payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog> {
+        self.shared.log
+    }
     fn prefix(&self) -> SessionSeq {
         self.shared.header.prefix
     }

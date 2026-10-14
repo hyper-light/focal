@@ -861,6 +861,7 @@ impl MetricsSnapshot {
                     2 => "content",
                     3 => "archive",
                     4 => "staging",
+                    5 => "payload",
                     _ => "other",
                 };
                 text.labeled(
@@ -1656,7 +1657,7 @@ impl MetricsSnapshot {
                 text.labeled(name, &[("bound", bound)], count);
             }
         }
-        let series: [(&str, &str, &str); 36] = [
+        let series: [(&str, &str, &str); 38] = [
             (
                 "focal_session_observed",
                 "gauge",
@@ -1833,6 +1834,16 @@ impl MetricsSnapshot {
                 "gauge",
                 "The native engine's share of the session's allowance.",
             ),
+            (
+                "focal_session_payload_segments",
+                "gauge",
+                "Segments of the replica's payload log, where its rows' payloads are spilled.",
+            ),
+            (
+                "focal_session_payload_open_refusals_total",
+                "counter",
+                "Times the replica's payload log could not be opened.",
+            ),
         ];
         for (name, kind, help) in series {
             text.header(name, kind, help);
@@ -1905,6 +1916,10 @@ impl MetricsSnapshot {
                     }
                     "focal_session_native_memory_limit_bytes" => {
                         session.memory.map(|m| m.native_limit)
+                    }
+                    "focal_session_payload_segments" => session.memory.map(|m| m.payload_segments),
+                    "focal_session_payload_open_refusals_total" => {
+                        session.memory.map(|m| m.payload_open_refusals)
                     }
                     _ => None,
                 };
@@ -2278,6 +2293,8 @@ mod tests {
             limit: 800_000,
             native_used: 8_000,
             native_limit: 400_000,
+            payload_segments: 3,
+            payload_open_refusals: 0,
         });
         let mut managed = sample.sessions[0].clone();
         managed.session = "m".into();

@@ -44,6 +44,9 @@ pub struct NativeHosting {
     pub seeds: focal_evidence::SeedStore,
     /// Where this ledger's cold streams live on this node (doc 31 M2, A2).
     pub cold: Option<crate::ColdSource>,
+    /// Where this ledger's payload log lives on this node (doc 31 M3); none holds every row's
+    /// bytes in memory.
+    pub payloads: Option<crate::PayloadSource>,
     pub range: RangeId,
 }
 
@@ -596,6 +599,7 @@ impl Session {
                 reader: hosting.reader.clone(),
                 seeds: hosting.seeds.reader(),
                 cold: hosting.cold.clone(),
+                payloads: hosting.payloads.clone(),
             },
             BuiltinNativeSchemas,
         )?;
@@ -713,6 +717,13 @@ impl Session {
     /// before the session hosts one (doc 31 M3).
     pub fn native_memory_stats(&self) -> Option<focal_memory::BudgetStats> {
         self.native.as_deref().map(|engine| engine.memory_stats())
+    }
+    /// The segments of the native engine's payload log and how many times it could not be
+    /// opened (doc 31 M3): none before the session hosts one.
+    pub fn native_payload_log(&self) -> Option<(usize, u64)> {
+        self.native
+            .as_deref()
+            .map(|engine| (engine.payload_segments(), engine.payload_open_refusals()))
     }
     pub fn pending_seed(&self) -> Option<&crate::PendingSeed> {
         self.seed_pending
@@ -900,6 +911,7 @@ impl Session {
                 reader: hosting.reader.clone(),
                 seeds: hosting.seeds.reader(),
                 cold: hosting.cold.clone(),
+                payloads: hosting.payloads.clone(),
             },
             BuiltinNativeSchemas,
         )?;

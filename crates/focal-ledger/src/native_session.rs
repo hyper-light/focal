@@ -35,6 +35,8 @@ pub(crate) mod cold;
 pub(crate) mod engine;
 #[path = "native_session_genesis.rs"]
 pub mod genesis;
+#[path = "native_payloads.rs"]
+pub mod payloads;
 #[path = "native_session_range.rs"]
 pub mod range;
 #[path = "native_session_retention.rs"]
@@ -856,6 +858,10 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
                     root: store.root().join("cold"),
                     disk: consensus.disk_budget(),
                     geometry: limits.cold_geometry,
+                }),
+                payloads: Some(payloads::PayloadSource {
+                    root: store.root().join("payloads"),
+                    disk: consensus.disk_budget(),
                 }),
             },
             schemas,

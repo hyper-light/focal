@@ -944,6 +944,7 @@ fn a_restore_s_work_stays_within_the_envelope_its_checkpoint_declares() {
             &BuiltinNativeSchemas,
             focal_memory::BudgetLane::Completion,
             ample,
+            None,
         )
         .unwrap_or_else(|error| panic!("{name}: {error:?}"));
         checkpoint::compare(core, &restored);

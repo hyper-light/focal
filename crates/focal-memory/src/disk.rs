@@ -28,8 +28,10 @@ pub enum DiskKind {
     Content,
     Archive,
     Staging,
+    /// A replica's payload log (doc 31 M3).
+    Payload,
 }
-pub const DISK_KIND_COUNT: usize = 5;
+pub const DISK_KIND_COUNT: usize = 6;
 
 /// The volume policy: `headroom` is never spent (the watermark below which
 /// the node refuses fresh work), `completion_reserve` is spendable only by
@@ -256,13 +258,14 @@ impl DiskBudget {
         }
     }
     fn kind_counter(&self, kind: DiskKind) -> &AtomicU64 {
-        let [wal, checkpoint, content, archive, staging] = &self.0.kinds;
+        let [wal, checkpoint, content, archive, staging, payload] = &self.0.kinds;
         match kind {
             DiskKind::Wal => wal,
             DiskKind::Checkpoint => checkpoint,
             DiskKind::Content => content,
             DiskKind::Archive => archive,
             DiskKind::Staging => staging,
+            DiskKind::Payload => payload,
         }
     }
     fn release(&self, kind: DiskKind, lane: BudgetLane, bytes: u64, committed: bool) {

@@ -2329,8 +2329,13 @@ pub(crate) fn native_hosting(
         // it follows a leader that retires cold (doc 31 M2, A2).
         cold: Some(focal_ledger::ColdSource {
             root: crate::custody::seed_directory(&root.join("cold"), identity.ledger),
-            disk,
+            disk: disk.clone(),
             geometry: focal_evidence::ColdGeometry::STANDARD,
+        }),
+        // The replica's payload log (doc 31 M3): its rows' payloads off the heap.
+        payloads: Some(focal_ledger::PayloadSource {
+            root: crate::custody::seed_directory(&root.join("payloads"), identity.ledger),
+            disk,
         }),
         range: focal_memory::RangeId(u128::from(identity.node)),
     })

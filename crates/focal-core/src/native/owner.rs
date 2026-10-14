@@ -1256,6 +1256,38 @@ impl NativeOwner {
         &self.core
     }
 
+    /// The payload log the committed core spills to, given back (for a restored core).
+    pub fn detach_payload_log(&mut self) -> Option<Box<dyn super::payloads::PayloadLog>> {
+        self.core.detach_payload_log()
+    }
+    /// Spill to `log` again, given back by a refused restore.
+    pub fn attach_payload_log(&mut self, log: Box<dyn super::payloads::PayloadLog>) {
+        self.core.attach_payload_log(log);
+    }
+    /// Let go of the payload log's sealed segments no committed or pending row references (doc
+    /// 31 M3). How many it let go.
+    pub fn sweep_payloads(&self) -> usize {
+        let Some(log) = self.core.payload_log() else {
+            return 0;
+        };
+        let mut live = std::collections::BTreeSet::new();
+        self.core.live_payload_segments(&mut live);
+        for pending in &self.pending {
+            super::payloads::segments_of(
+                pending
+                    .prepared
+                    .fragments
+                    .changes()
+                    .filter_map(|(_, _, change)| match change {
+                        super::ranges::RowChange::Put(entry) => Some(entry.value),
+                        super::ranges::RowChange::Delete(_) => None,
+                    }),
+                &mut live,
+            );
+        }
+        log.sweep(&live)
+    }
+
     /// The most a checkpoint of the committed root, with every pending
     /// candidate published, could take: its rows (the committed rows and
     /// every pending candidate's writes, each at most one new row) and an

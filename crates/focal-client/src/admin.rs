@@ -264,6 +264,14 @@ pub struct AdminSessionMemory {
     pub native_used: u64,
     /// The native engine's share of the allowance: the bound open claims reach first.
     pub native_limit: u64,
+    /// The segments of the replica's payload log, where its rows' payloads are spilled off the
+    /// heap (doc 31 M3): none where it has no log.
+    #[serde(default)]
+    pub payload_segments: u64,
+    /// How many times the replica's payload log could not be opened (a full volume): a replica
+    /// without one holds its rows' payloads in memory until it opens.
+    #[serde(default)]
+    pub payload_open_refusals: u64,
 }
 /// A native session's live outcome window and its seals on one replica
 /// (F12, 26 §4a).
