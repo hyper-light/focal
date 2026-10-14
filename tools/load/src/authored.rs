@@ -6,7 +6,7 @@
 //! only faithful write there.
 use crate::error::LoadError;
 use focal_client::input::{BuildContext, InputError};
-use focal_client::native_store::NativeIdentityKind;
+use focal_client::native_store::{NativeIdentity, NativeIdentityKind};
 use focal_client::operations::{NativeAuthoredOperation, NativeClaimDocument};
 use focal_core::native::input_codec::EncodingLimits;
 use focal_model::{LedgerId, ParticipantId, RequestKey, RootCommandId, RouteEpoch};
@@ -116,9 +116,11 @@ pub fn create_envelope(
     })
 }
 
-/// A later step of a claim's lifecycle (`claim.cancel`, `claim.release_scope`),
-/// compiled against the claim as it was just read (`objects`), as the CLI
-/// compiles it after resolving what it binds to. It mints no identity.
+/// A later step of a claim's lifecycle (`claim.cancel`, `receipt.acquire`,
+/// `testament.submit`, ...), compiled against the objects it binds to as they
+/// were just read (`objects`), as the CLI compiles it after resolving them.
+/// It mints the identities it creates (a receipt, a testament) from `ids`, a
+/// span of the run's id space, none past its end; and returns them.
 #[allow(clippy::too_many_arguments)] // One frame's identities, each its own.
 pub fn step_envelope(
     ledger: LedgerId,
@@ -128,7 +130,8 @@ pub fn step_envelope(
     request: RequestKey,
     operation: &NativeAuthoredOperation,
     objects: &[focal_wire::NativeObject],
-) -> Result<RequestEnvelope, LoadError> {
+    ids: std::ops::Range<u128>,
+) -> Result<(RequestEnvelope, Vec<NativeIdentity>), LoadError> {
     let context = BuildContext {
         ledger,
         actor,
@@ -136,7 +139,15 @@ pub fn step_envelope(
         policy_revision: 1,
     };
     let resolved = Resolved::from_objects(ledger, objects).map_err(fixture("resolved objects"))?;
-    let mut ids = || -> Result<[u8; 16], InputError> { Err(InputError::Capacity) };
+    let mut next = ids.start;
+    let mut ids = move || -> Result<[u8; 16], InputError> {
+        if next >= ids.end {
+            return Err(InputError::Capacity);
+        }
+        let id = next.to_be_bytes();
+        next = next.checked_add(1).ok_or(InputError::Capacity)?;
+        Ok(id)
+    };
     let compiled = compile(
         operation,
         &context,
@@ -156,19 +167,55 @@ pub fn step_envelope(
         },
     )
     .map_err(fixture("frame"))?;
-    Ok(RequestEnvelope {
-        protocol: NATIVE_PROTOCOL_VERSION,
-        ledger,
-        route_epoch: RouteEpoch(1),
-        request_epoch: request.epoch,
-        request_id: request.id,
-        operation: Operation::Native { frame },
-    })
+    Ok((
+        RequestEnvelope {
+            protocol: NATIVE_PROTOCOL_VERSION,
+            ledger,
+            route_epoch: RouteEpoch(1),
+            request_epoch: request.epoch,
+            request_id: request.id,
+            operation: Operation::Native { frame },
+        },
+        compiled.created,
+    ))
 }
 
 /// The document a lifecycle step names its claim by.
 pub fn claim_target(claim: u128) -> focal_client::operations::NativeClaimTargetDocument {
     focal_client::operations::NativeClaimTargetDocument {
         claim: hex(claim.to_be_bytes()),
+    }
+}
+
+/// The document a step names its claim's testament by.
+pub fn testament_target(
+    claim: u128,
+    testament: u128,
+) -> focal_client::operations::NativeResponseTargetDocument {
+    focal_client::operations::NativeResponseTargetDocument {
+        claim: hex(claim.to_be_bytes()),
+        testament: hex(testament.to_be_bytes()),
+    }
+}
+
+/// The consumer's receipt for its claim, its identity minted.
+pub fn receipt(claim: u128) -> focal_client::operations::NativeReceiptDocument {
+    focal_client::operations::NativeReceiptDocument {
+        claim: hex(claim.to_be_bytes()),
+        id: None,
+    }
+}
+
+/// The consumer's closing testament for its claim: the work done, at the confidence a receipt
+/// claim asks, its identity minted.
+pub fn testament(claim: u128) -> focal_client::operations::NativeResponseDocument {
+    focal_client::operations::NativeResponseDocument {
+        claim: hex(claim.to_be_bytes()),
+        id: None,
+        summary: "Delivered.".to_owned(),
+        confidence: "committed".to_owned(),
+        outcome: "complete".to_owned(),
+        manifest: Vec::new(),
+        diagnostics: Vec::new(),
     }
 }

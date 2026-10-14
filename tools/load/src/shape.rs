@@ -46,6 +46,15 @@ pub enum Lifecycle {
     /// reads the claim first, as an agent resolves what it binds to, and is
     /// sent once the step before it committed.
     CancelRelease,
+    /// Delivered as a work queue delivers a message, end to end (the comparison's `deliver`
+    /// mode): the issuer creates the claim for its consumer and posts it; the consumer, a
+    /// principal of its own, finds it in the ledger's events, acquires its receipt, submits its
+    /// testament and posts it; the issuer finds the testament in the events, receives it and
+    /// enters its whole-work validation, which satisfies a receipt claim. Seven writes, each
+    /// compiled against the objects it binds to as read just before it (`requirements`), as an
+    /// agent's client compiles them; neither side is told of the other's step but through the
+    /// events it polls, as a consumer learns of a message only by fetching it.
+    Deliver,
 }
 impl Lifecycle {
     /// The writes one claim's lifecycle takes.
@@ -53,6 +62,7 @@ impl Lifecycle {
         match self {
             Self::Create => 1,
             Self::CancelRelease => 3,
+            Self::Deliver => 7,
         }
     }
 }
@@ -116,9 +126,20 @@ pub struct WorkloadShape {
     #[serde(default)]
     pub enrollment: Option<PathBuf>,
     /// `enrolled`: the participant every claim targets, as 32 hex digits (a
-    /// remote client cannot read the node's `IDENTITY`).
+    /// remote client cannot read the node's `IDENTITY`). Not with `deliver`, whose claims target
+    /// the consumer.
     #[serde(default)]
     pub worker: Option<String>,
+    /// `deliver` over `enrolled`: the consumer's client directory, a second enrolled client
+    /// whose principal every claim targets and who completes them. Over `embedded`, the
+    /// consumer is the node's worker identity.
+    #[serde(default)]
+    pub consumer_enrollment: Option<PathBuf>,
+    /// `deliver`: how long a side waits before it asks for the ledger's events again after
+    /// finding none new, in milliseconds (1..=1000, default 2): its polling interval, as a
+    /// consumer that fetches has one.
+    #[serde(default = "default_poll_ms")]
+    pub poll_ms: u16,
     /// Offered creations a second over all callers. Set, the writes are
     /// paced on a fixed schedule and each latency counts from its request's
     /// intended start (wrk2's constant-throughput method), so a stall is
@@ -159,6 +180,9 @@ fn default_inflight() -> u16 {
 }
 fn default_lifecycle_reads() -> u16 {
     1
+}
+fn default_poll_ms() -> u16 {
+    2
 }
 
 impl WorkloadShape {
@@ -201,13 +225,41 @@ impl WorkloadShape {
             Transport::Unix | Transport::Enrolled if self.reopen => {
                 return Err("reopen applies to the embedded transport only".to_string());
             }
-            Transport::Enrolled if self.enrollment.is_none() || self.worker.is_none() => {
+            Transport::Enrolled
+                if self.enrollment.is_none()
+                    || (self.lifecycle != Lifecycle::Deliver && self.worker.is_none()) =>
+            {
                 return Err(
                     "transport enrolled needs enrollment (the client's directory) and worker"
                         .to_string(),
                 );
             }
             _ => {}
+        }
+        if self.lifecycle == Lifecycle::Deliver {
+            // The consumer is a second principal, and its steps are authored operations.
+            if self.profile() != Profile::AuthoredV1 {
+                return Err("deliver compiles authored operations: profile authored_v1".into());
+            }
+            match self.transport {
+                Transport::Unix => {
+                    return Err(
+                        "deliver needs a second principal: transport embedded or enrolled".into(),
+                    );
+                }
+                Transport::Enrolled if self.consumer_enrollment.is_none() => {
+                    return Err("deliver over enrolled needs consumer_enrollment".into());
+                }
+                Transport::Enrolled if self.worker.is_some() => {
+                    return Err("deliver's claims target the consumer, never worker".into());
+                }
+                _ => {}
+            }
+            if self.poll_ms == 0 || self.poll_ms > 1000 {
+                return Err("poll_ms must be 1..=1000".into());
+            }
+        } else if self.consumer_enrollment.is_some() {
+            return Err("consumer_enrollment applies to the deliver lifecycle".into());
         }
         if self.rate == Some(0) {
             return Err("rate must be greater than zero".to_string());

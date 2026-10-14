@@ -4,7 +4,7 @@
 //! session size shows), the read phase, and — when the shape asked for it —
 //! the reopen time of the node and its first read afterwards.
 use crate::error::LoadError;
-use crate::measurements::WriteMeasurements;
+use crate::measurements::{DeliveryMeasurements, WriteMeasurements};
 use crate::shape::WorkloadShape;
 use serde::Serialize;
 
@@ -64,6 +64,8 @@ pub struct Report {
     pub reopen_read_hit: Option<bool>,
     /// Bytes under the node's data directory when the run ended (embedded).
     pub data_dir_bytes: Option<u64>,
+    /// `deliver`: each message end to end, from its place on the schedule.
+    pub deliver: Option<DeliveryMeasurements>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]

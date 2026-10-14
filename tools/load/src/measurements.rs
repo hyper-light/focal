@@ -148,6 +148,68 @@ impl WriteSamples {
     }
 }
 
+/// One delivered message (`deliver`), from the phase's start: its place on the schedule, when
+/// its consumer's testament was posted (the message handled), and when its claim was satisfied.
+#[derive(Clone, Copy)]
+pub struct Delivery {
+    pub start_ns: u128,
+    pub handled_ns: u128,
+    pub satisfied_ns: u128,
+}
+
+/// A worker's delivered messages, at most its lifecycles, funded before the run.
+#[derive(Default)]
+pub struct Deliveries(FundedVec<Delivery>);
+impl Deliveries {
+    pub fn reserve(limit: usize) -> Result<Self, LoadError> {
+        FundedVec::reserve(limit).map(Self)
+    }
+    pub fn push(&mut self, delivery: Delivery) -> Result<(), LoadError> {
+        self.0.push(delivery)
+    }
+    pub fn iter(&self) -> std::slice::Iter<'_, Delivery> {
+        self.0.values.iter()
+    }
+}
+
+/// What a `deliver` run measured of the messages whose places fall after the warm-up: each
+/// from its place on the schedule to its consumer's testament posted (handled), and to its
+/// claim satisfied; with what the two sides' event tails read.
+#[derive(Debug, Default, Serialize)]
+pub struct DeliveryMeasurements {
+    pub delivered: u64,
+    pub handled_latency_ns: Latency,
+    pub satisfied_latency_ns: Latency,
+    /// Messages whose other side never showed its step in the events within the wait's bound.
+    pub undelivered: u64,
+    pub consumer_polls: u64,
+    pub consumer_events: u64,
+    pub issuer_polls: u64,
+    pub issuer_events: u64,
+    /// Tail pages refused or failed, both sides.
+    pub tail_failures: u64,
+}
+impl DeliveryMeasurements {
+    pub fn measure<'a>(
+        deliveries: impl Iterator<Item = &'a Delivery> + Clone,
+        warmup_ns: u128,
+    ) -> Result<Self, LoadError> {
+        let measured = deliveries.filter(|delivery| delivery.start_ns >= warmup_ns);
+        Ok(Self {
+            delivered: count(measured.clone())?,
+            handled_latency_ns: latency(
+                measured
+                    .clone()
+                    .map(|delivery| delivery.handled_ns.saturating_sub(delivery.start_ns)),
+            )?,
+            satisfied_latency_ns: latency(
+                measured.map(|delivery| delivery.satisfied_ns.saturating_sub(delivery.start_ns)),
+            )?,
+            ..Self::default()
+        })
+    }
+}
+
 /// Attempts whose intended starts fall after the warm-up. Counts and
 /// percentiles cover the same population; original whole-phase counts stay
 /// on Report for compatibility. An expired request remains an attempt of

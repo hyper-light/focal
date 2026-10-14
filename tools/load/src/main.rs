@@ -25,6 +25,7 @@ mod measurements;
 mod native;
 mod report;
 mod shape;
+mod watch;
 
 use clap::Parser;
 use error::LoadError;
@@ -151,6 +152,31 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deliver shape names two principals and the authored profile, checked before any work.
+    #[test]
+    fn a_deliver_shape_is_checked_before_any_work() {
+        let shape = |text: &str| parse_shape(text).unwrap().validate();
+        let deliver = "claims: 4\nlifecycle: deliver\nprofile: authored_v1\n";
+        assert!(shape(deliver).is_ok());
+        // The embedded node's own profile is projection_only: deliver compiles authored steps.
+        assert!(shape("claims: 4\nlifecycle: deliver\n").is_err());
+        assert!(shape(&format!("{deliver}transport: unix\ndata_dir: /tmp/x\n")).is_err());
+        let enrolled = format!("{deliver}transport: enrolled\nenrollment: /c\n");
+        assert!(shape(&enrolled).is_err(), "no consumer");
+        assert!(shape(&format!("{enrolled}consumer_enrollment: /d\n")).is_ok());
+        assert!(
+            shape(&format!(
+                "{enrolled}consumer_enrollment: /d\nworker: \"{}\"\n",
+                "1".repeat(32)
+            ))
+            .is_err(),
+            "a deliver run's claims target its consumer"
+        );
+        assert!(shape(&format!("{deliver}poll_ms: 0\n")).is_err());
+        assert!(shape(&format!("{deliver}poll_ms: 1001\n")).is_err());
+        assert!(shape("claims: 4\nconsumer_enrollment: /d\n").is_err());
+    }
 
     #[test]
     fn a_shape_that_expands_by_aliases_is_refused() {

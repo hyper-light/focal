@@ -12,11 +12,14 @@ use crate::authored;
 use crate::error::LoadError;
 use crate::generations::{Finished, Generations};
 use crate::measurements::{
-    self, RefusalCause, WriteMeasurements, WriteOutcome, WriteSample, WriteSamples,
+    self, Deliveries, Delivery, DeliveryMeasurements, RefusalCause, WriteMeasurements,
+    WriteOutcome, WriteSample, WriteSamples,
 };
 use crate::native;
 use crate::report::{self, Latency, Report};
 use crate::shape::{Lifecycle, Profile, Transport, WorkloadShape};
+use crate::watch::{self, Side, Watch};
+use focal_client::native_store::{NativeIdentity, NativeIdentityKind};
 use focal_client::operations::NativeAuthoredOperation;
 use focal_client::{
     Client, ClientError, EmbeddedTransport, LocalTransport, QuicTransport, RetryPolicy,
@@ -33,9 +36,9 @@ use focal_node::{
 };
 use focal_wire::{
     AccessError, AuthenticatedPeer, NativeClaimExpand, NativeErrorCode, NativeMutationReply,
-    NativeObject, NativeObjectRef, NativeReadQuery, NativeReadRequest, NativeRefusalKind,
-    Operation, PeerGrant, PeerRole, QuicConnector, ReadConsistency, ReadToken, RequestEnvelope,
-    Response, ResponseEnvelope, WireLimits,
+    NativeObject, NativeReadQuery, NativeReadRequest, NativeRefusalKind, Operation, PeerGrant,
+    PeerRole, QuicConnector, ReadConsistency, ReadToken, RequestEnvelope, Response,
+    ResponseEnvelope, WireLimits,
 };
 use hyper_rt::combine::{Either, race2};
 use std::{
@@ -60,6 +63,10 @@ const PROTOCOL_OFFSET: u128 = 0xC000_0000;
 const ATTEMPTS: u128 = 2;
 /// The worker index the reopen probe uses; above every real worker.
 const PROBE_WORKER: u128 = 0xFF;
+/// The worker indexes a `deliver` run's event tails number their pages under; above every real
+/// worker, below the probe.
+const CONSUMER_TAIL_WORKER: u128 = 0xFE;
+const ISSUER_TAIL_WORKER: u128 = 0xFD;
 /// Distinct refusal reasons kept per run, the last place for those past the others
 /// ([`OTHER_REASONS`]).
 const MAX_REFUSALS: usize = 8;
@@ -98,17 +105,24 @@ struct Names {
     profile: NativeContentProfile,
 }
 
-enum Conn {
+pub(crate) enum Conn {
     Embedded(Client<EmbeddedTransport<LocalHost>>),
     Unix(Client<LocalTransport>),
     Enrolled(Client<QuicTransport>),
 }
 impl Conn {
-    fn open(connector: &Connector, names: &Names, limits: &WireLimits) -> Result<Self, LoadError> {
+    /// A connection through `connector`; on the embedded transport, as `principal` (an
+    /// enrolled client is the principal its credential names).
+    fn open(
+        connector: &Connector,
+        principal: ParticipantId,
+        names: &Names,
+        limits: &WireLimits,
+    ) -> Result<Self, LoadError> {
         match connector {
             Connector::Embedded(host) => {
                 let peer = AuthenticatedPeer::local(PeerGrant {
-                    principal: names.issuer,
+                    principal,
                     tenants: BTreeSet::from([names.ledger.tenant]),
                     role: PeerRole::Runtime,
                 })
@@ -155,7 +169,10 @@ impl Conn {
             }
         }
     }
-    async fn request(&self, envelope: RequestEnvelope) -> Result<ResponseEnvelope, ClientError> {
+    pub(crate) async fn request(
+        &self,
+        envelope: RequestEnvelope,
+    ) -> Result<ResponseEnvelope, ClientError> {
         match self {
             Self::Embedded(client) => client.request(envelope).await,
             Self::Unix(client) => client.request(envelope).await,
@@ -211,6 +228,11 @@ struct Outcome {
     /// Lifecycle steps never sent: the read of the claim they bind to
     /// failed.
     abandoned: u64,
+    /// `deliver`: the messages delivered end to end.
+    deliveries: Deliveries,
+    /// `deliver`: messages whose other side never showed its step in the
+    /// events within the wait's bound.
+    undelivered: u64,
 }
 
 /// Counts one refusal of `reason`: a reason already seen counts once more,
@@ -343,7 +365,7 @@ fn classify(result: Result<ResponseEnvelope, ClientError>) -> Reply {
     }
 }
 
-fn window_envelope(names: &Names, request: u128) -> RequestEnvelope {
+fn window_envelope(names: &Names, principal: ParticipantId, request: u128) -> RequestEnvelope {
     RequestEnvelope {
         protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
         ledger: names.ledger,
@@ -352,7 +374,7 @@ fn window_envelope(names: &Names, request: u128) -> RequestEnvelope {
         request_id: RequestId::from_u128(request),
         operation: Operation::NativeRead(NativeReadRequest {
             consistency: ReadConsistency::Linearizable,
-            query: NativeReadQuery::Epochs(names.issuer),
+            query: NativeReadQuery::Epochs(principal),
             max_items: 1,
         }),
     }
@@ -421,38 +443,49 @@ impl Protocol {
     }
 }
 
-/// What one worker's writes under way share on its thread: its job, client
-/// and the run's generations, its protocol request ids and its outcome.
-/// Nothing is held across a wait.
-struct Shared<'a> {
-    job: &'a Job,
+/// One principal's side of a worker: who it is, the client it sends on, the journal
+/// generations every worker of it shares (one participant's, as N processes of one participant
+/// share one), and its protocol request ids. The issuer creates every claim; a `deliver` run's
+/// consumer completes them.
+struct Actor<'a> {
+    principal: ParticipantId,
     conn: &'a Conn,
     generations: &'a Generations,
+    protocol: std::cell::Cell<u128>,
+}
+
+/// What one worker's writes under way share on its thread: its job, its
+/// principals' clients and generations, its protocol request ids and its
+/// outcome. Nothing is held across a wait.
+struct Shared<'a> {
+    job: &'a Job,
+    issuer: Actor<'a>,
+    /// A `deliver` run's consumer, and what both sides watch for.
+    consumer: Option<(Actor<'a>, &'a Watch)>,
     /// The worker's lifecycle reads under way, at most `job.lifecycle_reads`.
     reads: hyper_rt::sync::Semaphore,
     run_start: Instant,
-    protocol: std::cell::Cell<u128>,
     outcome: std::cell::RefCell<Outcome>,
 }
 impl Shared<'_> {
-    fn protocol_request(&self) -> Result<u128, LoadError> {
+    fn protocol_request(&self, actor: &Actor<'_>) -> Result<u128, LoadError> {
         let mut protocol = Protocol {
-            next: self.protocol.get(),
+            next: actor.protocol.get(),
         };
         let id = protocol.request(self.job)?;
-        self.protocol.set(protocol.next);
+        actor.protocol.set(protocol.next);
         Ok(id)
     }
     fn note(&self, reason: String) {
         note(&mut self.outcome.borrow_mut().refusals, reason);
     }
-    /// The owner's window, read after a refusal by name: the run issues
-    /// where the owner admits. `false` when the window could not be read.
-    async fn learn(&self) -> Result<bool, LoadError> {
-        let request = self.protocol_request()?;
-        match self
+    /// The owner's window for `actor`, read after a refusal by name: the run
+    /// issues where the owner admits. `false` when the window could not be read.
+    async fn learn(&self, actor: &Actor<'_>) -> Result<bool, LoadError> {
+        let request = self.protocol_request(actor)?;
+        match actor
             .conn
-            .request(window_envelope(&self.job.names, request))
+            .request(window_envelope(&self.job.names, actor.principal, request))
             .await
         {
             Ok(envelope) => {
@@ -461,7 +494,7 @@ impl Shared<'_> {
                 {
                     let open: Vec<RequestEpoch> =
                         window.open.iter().map(|open| open.epoch).collect();
-                    self.generations.learn(window.floor, &open)?;
+                    actor.generations.learn(window.floor, &open)?;
                     return Ok(true);
                 }
                 self.note(format!("window: unexpected reply {:?}", envelope.result));
@@ -470,25 +503,30 @@ impl Shared<'_> {
         }
         Ok(false)
     }
-    /// The floor advance the journal sends once the generation below
+    /// The floor advance `actor`'s journal sends once the generation below
     /// drained: committed, the floor stands at `minimum`; refused by name,
     /// the window is learned; otherwise the next reply sends it again.
-    async fn advance(&self, epoch: RequestEpoch, minimum: RequestEpoch) -> Result<(), LoadError> {
+    async fn advance(
+        &self,
+        actor: &Actor<'_>,
+        epoch: RequestEpoch,
+        minimum: RequestEpoch,
+    ) -> Result<(), LoadError> {
         let request = RequestKey {
-            principal: self.job.names.issuer,
+            principal: actor.principal,
             epoch,
-            id: RequestId::from_u128(self.protocol_request()?),
+            id: RequestId::from_u128(self.protocol_request(actor)?),
         };
         let names = &self.job.names;
         let envelope = native::advance_envelope(names.ledger, names.profile, request, minimum)?;
-        match classify(self.conn.request(envelope).await) {
-            Reply::Committed(_) => self.generations.advanced(minimum),
+        match classify(actor.conn.request(envelope).await) {
+            Reply::Committed(_) => actor.generations.advanced(minimum),
             Reply::Expired => {
-                self.generations.advance_failed()?;
-                self.learn().await.map(|_| ())
+                actor.generations.advance_failed()?;
+                self.learn(actor).await.map(|_| ())
             }
             Reply::Refused(reason, _) | Reply::Unknown(reason) => {
-                self.generations.advance_failed()?;
+                actor.generations.advance_failed()?;
                 self.note(format!("floor advance: {reason}"));
                 Ok(())
             }
@@ -500,24 +538,29 @@ impl Shared<'_> {
     /// next step follows its last answer, not the schedule. A step that did
     /// not commit ends the lifecycle there.
     async fn write(&self, i: u64, started: Instant) -> Result<(), LoadError> {
-        let Some((claim, mut written)) = self.step(i, 0, started, None).await? else {
+        let Some((claim, written, _)) = self.step(&self.issuer, i, 0, started, None).await? else {
             return Ok(());
         };
-        if self.job.lifecycle == Lifecycle::Create {
-            return Ok(());
+        match self.job.lifecycle {
+            Lifecycle::Create => Ok(()),
+            Lifecycle::CancelRelease => self.cancel_release(i, claim, written).await,
+            Lifecycle::Deliver => self.deliver(i, claim, written, started).await,
         }
+    }
+    /// The issuer cancels the claim it created at `written`, then releases its scope.
+    async fn cancel_release(
+        &self,
+        i: u64,
+        claim: u128,
+        mut written: SessionSeq,
+    ) -> Result<(), LoadError> {
         let later = [
             NativeAuthoredOperation::ClaimCancel(authored::claim_target(claim)),
             NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim)),
         ];
         for (step, operation) in (1u8..).zip(later.iter()) {
-            let Some(objects) = self.read_claim(claim, written).await? else {
-                let mut outcome = self.outcome.borrow_mut();
-                outcome.abandoned = outcome.abandoned.saturating_add(1);
-                return Ok(());
-            };
-            let Some((_, sequence)) = self
-                .step(i, step, Instant::now(), Some((operation, &objects)))
+            let Some((sequence, _)) = self
+                .later(&self.issuer, i, step, operation, written, 0..0)
                 .await?
             else {
                 return Ok(());
@@ -528,19 +571,192 @@ impl Shared<'_> {
         outcome.lifecycles = outcome.lifecycles.saturating_add(1);
         Ok(())
     }
-    /// The claim as this caller's own last write left it, read at least at
-    /// that write's sequence (read-your-writes, no read barrier), for the
-    /// next step to bind to; `None`, with the reason noted, when it could
-    /// not be read.
-    async fn read_claim(
+    /// The claim the issuer created at `created`, delivered: posted by the issuer, found by the
+    /// consumer in the ledger's events, acquired, answered with a testament and the testament
+    /// posted; the testament found by the issuer in the events, received, and its whole-work
+    /// validation entered, which satisfies the claim. Each side waits on the events it polls
+    /// for the other's step, registered before the write that makes it is sent. Recorded: when
+    /// the consumer's testament was posted (the message handled) and when the claim was
+    /// satisfied, each from the message's place on the schedule.
+    async fn deliver(
         &self,
+        i: u64,
         claim: u128,
+        created: SessionSeq,
+        started: Instant,
+    ) -> Result<(), LoadError> {
+        let Some((consumer, watch)) = &self.consumer else {
+            return Err(LoadError::Shape("deliver without a consumer".into()));
+        };
+        // The receipt and the testament mint from the upper half of the claim's own creation
+        // span, which its creation leaves unused.
+        let span = self.creation_span(i)?;
+        let half = authored::IDS_PER_CREATION / 2;
+        let quarter = authored::IDS_PER_CREATION / 4;
+        let receipt_ids = span
+            .start
+            .checked_add(half)
+            .zip(span.start.checked_add(half + quarter))
+            .map(|(start, end)| start..end)
+            .ok_or(LoadError::Bound("receipt id space"))?;
+        let testament_ids = span
+            .start
+            .checked_add(half + quarter)
+            .map(|start| start..span.end)
+            .ok_or(LoadError::Bound("testament id space"))?;
+        let posted = watch.expect_posted(claim)?;
+        let post = NativeAuthoredOperation::ClaimPost(authored::claim_target(claim));
+        if self
+            .later(&self.issuer, i, 1, &post, created, 0..0)
+            .await?
+            .is_none()
+        {
+            watch.forget(claim);
+            return Ok(());
+        }
+        let Some(seen) = watch.wait(posted).await? else {
+            return self.undelivered(claim, watch);
+        };
+        let acquire = NativeAuthoredOperation::ReceiptAcquire(authored::receipt(claim));
+        let Some((written, _)) = self
+            .later(consumer, i, 2, &acquire, seen, receipt_ids)
+            .await?
+        else {
+            return Ok(());
+        };
+        let submit = NativeAuthoredOperation::TestamentSubmit(authored::testament(claim));
+        let Some((written, minted)) = self
+            .later(consumer, i, 3, &submit, written, testament_ids)
+            .await?
+        else {
+            return Ok(());
+        };
+        let testament = minted
+            .iter()
+            .find(|identity| identity.kind == NativeIdentityKind::Response)
+            .map(|identity| u128::from_be_bytes(identity.id))
+            .ok_or_else(|| LoadError::Fixture("the testament minted no response".into()))?;
+        let answered = watch.expect_testament(claim)?;
+        let post =
+            NativeAuthoredOperation::TestamentPost(authored::testament_target(claim, testament));
+        if self
+            .later(consumer, i, 4, &post, written, 0..0)
+            .await?
+            .is_none()
+        {
+            watch.forget(claim);
+            return Ok(());
+        }
+        let handled = Instant::now();
+        let Some((posted, seen)) = watch.wait(answered).await? else {
+            return self.undelivered(claim, watch);
+        };
+        if posted != testament {
+            self.note(format!(
+                "the testament the issuer saw posted for {claim:032x} is not the consumer's"
+            ));
+        }
+        let target = authored::testament_target(claim, testament);
+        let receive = NativeAuthoredOperation::TestamentReceive(target.clone());
+        let Some((written, _)) = self.later(&self.issuer, i, 5, &receive, seen, 0..0).await? else {
+            return Ok(());
+        };
+        let enter = NativeAuthoredOperation::ValidationEnterWholeWork(target);
+        if self
+            .later(&self.issuer, i, 6, &enter, written, 0..0)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let satisfied = Instant::now();
+        let mut outcome = self.outcome.borrow_mut();
+        outcome.lifecycles = outcome.lifecycles.saturating_add(1);
+        outcome.deliveries.push(Delivery {
+            start_ns: started.saturating_duration_since(self.run_start).as_nanos(),
+            handled_ns: handled.saturating_duration_since(self.run_start).as_nanos(),
+            satisfied_ns: satisfied
+                .saturating_duration_since(self.run_start)
+                .as_nanos(),
+        })
+    }
+    /// A step the other side never showed in the events within the wait's bound: counted, its
+    /// waiter let go.
+    fn undelivered(&self, claim: u128, watch: &Watch) -> Result<(), LoadError> {
+        watch.forget(claim);
+        let mut outcome = self.outcome.borrow_mut();
+        outcome.undelivered = outcome.undelivered.saturating_add(1);
+        Ok(())
+    }
+    /// The identities lifecycle `i`'s creation mints from.
+    fn creation_span(&self, i: u64) -> Result<std::ops::Range<u128>, LoadError> {
+        let start = u128::from(i)
+            .checked_mul(authored::IDS_PER_CREATION)
+            .and_then(|span| self.job.base.checked_add(CLAIM_OFFSET)?.checked_add(span))
+            .ok_or(LoadError::Bound("claim id space"))?;
+        let end = start
+            .checked_add(authored::IDS_PER_CREATION)
+            .ok_or(LoadError::Bound("claim id space"))?;
+        Ok(start..end)
+    }
+    /// A later step of lifecycle `i`: what `operation` binds to read by `actor` at least at
+    /// `written` (read-your-writes, no read barrier), compiled against it and sent, minting from
+    /// `ids`. The sequence it committed at and the identities it minted; `None` when the read
+    /// failed (the step abandoned, the reason noted) or the step did not commit.
+    async fn later(
+        &self,
+        actor: &Actor<'_>,
+        i: u64,
+        step: u8,
+        operation: &NativeAuthoredOperation,
+        written: SessionSeq,
+        ids: std::ops::Range<u128>,
+    ) -> Result<Option<(SessionSeq, Vec<NativeIdentity>)>, LoadError> {
+        let Some(objects) = self.read_for(actor, operation, written).await? else {
+            let mut outcome = self.outcome.borrow_mut();
+            outcome.abandoned = outcome.abandoned.saturating_add(1);
+            return Ok(None);
+        };
+        Ok(self
+            .step(
+                actor,
+                i,
+                step,
+                Instant::now(),
+                Some((operation, &objects, ids)),
+            )
+            .await?
+            .map(|(_, sequence, minted)| (sequence, minted)))
+    }
+    /// The objects `operation` binds to (`requirements`), as `actor` reads them at least at
+    /// `written`, in one page; `None`, with the reason noted, when they could not be read.
+    async fn read_for(
+        &self,
+        actor: &Actor<'_>,
+        operation: &NativeAuthoredOperation,
         written: SessionSeq,
     ) -> Result<Option<Vec<NativeObject>>, LoadError> {
+        let mut references = Vec::new();
+        for requirement in focal_native_client::requirements(operation)
+            .map_err(|error| LoadError::Fixture(format!("requirements: {error}")))?
+        {
+            match requirement {
+                focal_native_client::Requirement::Objects(objects) => {
+                    references.extend(objects);
+                }
+                focal_native_client::Requirement::Evaluation { .. } => {
+                    return Err(LoadError::Fixture(
+                        "a lifecycle step needs an evaluation selection".into(),
+                    ));
+                }
+            }
+        }
+        let wanted =
+            u32::try_from(references.len()).map_err(|_| LoadError::Bound("lifecycle read"))?;
         let Ok(_permit) = self.reads.acquire().await else {
             return Err(LoadError::Bound("lifecycle reads"));
         };
-        let request = self.protocol_request()?;
+        let request = self.protocol_request(actor)?;
         let envelope = RequestEnvelope {
             protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
             ledger: self.job.names.ledger,
@@ -553,13 +769,11 @@ impl Shared<'_> {
                     sequence: written,
                     route_epoch: RouteEpoch(1),
                 }),
-                query: NativeReadQuery::Objects(vec![NativeObjectRef::Claim(ClaimId::from_u128(
-                    claim,
-                ))]),
-                max_items: 1,
+                query: NativeReadQuery::Objects(references),
+                max_items: wanted,
             }),
         };
-        match self.conn.request(envelope).await {
+        match actor.conn.request(envelope).await {
             Ok(envelope) => match envelope.result {
                 Response::NativeRead(page) if !page.objects.is_empty() => Ok(Some(page.objects)),
                 other => {
@@ -581,11 +795,16 @@ impl Shared<'_> {
     /// it committed at, once committed.
     async fn step(
         &self,
+        actor: &Actor<'_>,
         i: u64,
         step: u8,
         started: Instant,
-        later: Option<(&NativeAuthoredOperation, &[NativeObject])>,
-    ) -> Result<Option<(u128, SessionSeq)>, LoadError> {
+        later: Option<(
+            &NativeAuthoredOperation,
+            &[NativeObject],
+            std::ops::Range<u128>,
+        )>,
+    ) -> Result<Option<(u128, SessionSeq, Vec<NativeIdentity>)>, LoadError> {
         let offset = u128::from(i);
         let steps = u128::from(self.job.lifecycle.steps());
         let mut attempt = 0u128;
@@ -599,30 +818,34 @@ impl Shared<'_> {
                 .filter(|slot| *slot < CLAIM_OFFSET)
                 .and_then(|slot| self.job.base.checked_add(slot))
                 .ok_or(LoadError::Bound("request id space"))?;
-            let minted = self.generations.mint()?;
+            let minted = actor.generations.mint()?;
             let key = RequestKey {
-                principal: self.job.names.issuer,
+                principal: actor.principal,
                 epoch: minted.epoch,
                 id: RequestId::from_u128(request),
             };
-            let (envelope, claim) = match later {
-                None => build(self.job, offset, key)?,
-                Some((operation, objects)) => {
+            let (envelope, claim, identities) = match &later {
+                None => {
+                    let (envelope, claim) = build(self.job, offset, key)?;
+                    (envelope, claim, Vec::new())
+                }
+                Some((operation, objects, ids)) => {
                     let names = &self.job.names;
-                    let envelope = authored::step_envelope(
+                    let (envelope, identities) = authored::step_envelope(
                         names.ledger,
                         names.profile,
-                        names.issuer,
+                        actor.principal,
                         names.root,
                         key,
                         operation,
                         objects,
+                        ids.clone(),
                     )?;
-                    (envelope, 0)
+                    (envelope, 0, identities)
                 }
             };
             let sent = Instant::now();
-            let response = self.conn.request(envelope).await;
+            let response = actor.conn.request(envelope).await;
             let finished = Instant::now();
             let reply = classify(response);
             self.outcome.borrow_mut().writes.record(WriteSample {
@@ -648,8 +871,8 @@ impl Shared<'_> {
                 },
                 step,
             })?;
-            if let Finished::Advance { epoch, minimum } = self.generations.finish(minted.epoch)? {
-                self.advance(epoch, minimum).await?;
+            if let Finished::Advance { epoch, minimum } = actor.generations.finish(minted.epoch)? {
+                self.advance(actor, epoch, minimum).await?;
             }
             match reply {
                 Reply::Committed(sequence) => {
@@ -658,11 +881,11 @@ impl Shared<'_> {
                     if later.is_none() {
                         outcome.created.push(claim);
                     }
-                    return Ok(Some((claim, sequence)));
+                    return Ok(Some((claim, sequence, identities)));
                 }
                 Reply::Expired => {
                     attempt = attempt.saturating_add(1);
-                    if attempt < ATTEMPTS && self.learn().await? {
+                    if attempt < ATTEMPTS && self.learn(actor).await? {
                         continue;
                     }
                     let mut outcome = self.outcome.borrow_mut();
@@ -768,12 +991,23 @@ fn place(run_start: Instant, interval: Duration, job: &Job, i: u64) -> Result<In
         .ok_or(LoadError::Bound("schedule"))
 }
 
+/// A `deliver` run's consumer as one worker sends: the client it sends on, its principal's
+/// generations, and the watch both sides wait on.
+#[derive(Clone, Copy)]
+struct ConsumerSide<'a> {
+    principal: ParticipantId,
+    conn: &'a Conn,
+    generations: &'a Generations,
+    watch: &'a Watch,
+}
+
 async fn worker(
     job: Job,
     phase: Phase,
     run_start: Instant,
     generations: &Generations,
     conn: &Conn,
+    consumer: Option<ConsumerSide<'_>>,
 ) -> Result<Outcome, LoadError> {
     let count = usize::try_from(job.count).map_err(|_| LoadError::Bound("worker count"))?;
     // The shape bounds lifecycles at MAX_CLAIMS; each takes its steps, each
@@ -786,12 +1020,17 @@ async fn worker(
             .ok_or(LoadError::Bound("write samples"))?,
         Phase::Read => 0,
     };
+    let delivered = match (phase, job.lifecycle) {
+        (Phase::Write, Lifecycle::Deliver) => count,
+        _ => 0,
+    };
     let mut outcome = Outcome {
         samples: Vec::with_capacity(match phase {
             Phase::Write => 0,
             Phase::Read => count,
         }),
         writes: WriteSamples::reserve(write_limit)?,
+        deliveries: Deliveries::reserve(delivered)?,
         ..Outcome::default()
     };
     match phase {
@@ -799,15 +1038,29 @@ async fn worker(
             outcome.created = Vec::with_capacity(count);
             let shared = Shared {
                 job: &job,
-                conn,
-                generations,
+                issuer: Actor {
+                    principal: job.names.issuer,
+                    conn,
+                    generations,
+                    protocol: std::cell::Cell::new(0),
+                },
+                consumer: consumer.map(|side| {
+                    (
+                        Actor {
+                            principal: side.principal,
+                            conn: side.conn,
+                            generations: side.generations,
+                            protocol: std::cell::Cell::new(0),
+                        },
+                        side.watch,
+                    )
+                }),
                 reads: hyper_rt::sync::Semaphore::new(
                     u64::from(job.lifecycle_reads),
                     usize::from(job.inflight.max(1)),
                 )
                 .map_err(LoadError::Runtime)?,
                 run_start,
-                protocol: std::cell::Cell::new(0),
                 outcome: std::cell::RefCell::new(outcome),
             };
             write_open_loop(&shared, job.inflight).await?;
@@ -848,19 +1101,64 @@ async fn worker(
 /// are carried on its one connection together. A wake polls each caller
 /// still running; more throughput than one shard drives comes from more
 /// processes, as the generations already model one participant's.
+/// A `deliver` run's consumer: how its connections are opened and as whom, its principal's
+/// generations, the watch both sides wait on, and how its tails poll.
+struct Consumer<'a> {
+    connector: &'a Connector,
+    principal: ParticipantId,
+    generations: &'a Generations,
+    watch: &'a Watch,
+    poll: Duration,
+    seed: u64,
+}
+
+/// Request ids of one event tail's pages: the read space of the tail's own worker index.
+fn tail_ids(seed: u64, worker: u128) -> impl FnMut() -> Result<u128, LoadError> {
+    let mut next = 0u128;
+    move || {
+        let id = worker_base(seed, worker)?
+            .checked_add(READ_OFFSET)
+            .and_then(|first| first.checked_add(next))
+            .filter(|_| next < PROTOCOL_OFFSET.saturating_sub(READ_OFFSET))
+            .ok_or(LoadError::Bound("tail request id space"))?;
+        next = next
+            .checked_add(1)
+            .ok_or(LoadError::Bound("tail request id space"))?;
+        Ok(id)
+    }
+}
+
 async fn run_phase(
     jobs: Vec<Job>,
     phase: Phase,
     generations: &Generations,
     connector: &Connector,
     connections: u16,
+    consumer: Option<&Consumer<'_>>,
 ) -> Result<(Vec<Outcome>, u128, u128), LoadError> {
     let Some(first) = jobs.first() else {
         return Err(LoadError::Bound("zero workers"));
     };
+    let names = first.names;
+    let limits = first.limits.clone();
     let conns = (0..connections.max(1))
-        .map(|_| Conn::open(connector, &first.names, &first.limits))
+        .map(|_| Conn::open(connector, names.issuer, &names, &limits))
         .collect::<Result<Vec<_>, _>>()?;
+    // A `deliver` run's consumer sends on connections of its own, as a second agent would, and
+    // each side's tail reads on one more.
+    let consumer_conns = match consumer {
+        Some(side) => (0..connections.max(1))
+            .map(|_| Conn::open(side.connector, side.principal, &names, &limits))
+            .collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
+    let tail_conns = match consumer {
+        Some(side) => Some((
+            Conn::open(side.connector, side.principal, &names, &limits)?,
+            Conn::open(connector, names.issuer, &names, &limits)?,
+        )),
+        None => None,
+    };
     let run_start_epoch_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| LoadError::Clock)?
@@ -869,27 +1167,80 @@ async fn run_phase(
     let mut callers =
         focal_rt::Concurrent::new(jobs.len()).map_err(|_| LoadError::Bound("callers"))?;
     for job in jobs {
-        let conn = conns
-            .get(
-                usize::from(job.index)
-                    .checked_rem(conns.len())
-                    .ok_or(LoadError::Bound("connections"))?,
-            )
+        let slot = usize::from(job.index)
+            .checked_rem(conns.len())
             .ok_or(LoadError::Bound("connections"))?;
+        let conn = conns.get(slot).ok_or(LoadError::Bound("connections"))?;
+        let side = match consumer {
+            Some(side) => Some(ConsumerSide {
+                principal: side.principal,
+                conn: consumer_conns
+                    .get(slot)
+                    .ok_or(LoadError::Bound("consumer connections"))?,
+                generations: side.generations,
+                watch: side.watch,
+            }),
+            None => None,
+        };
         let index = job.index;
         callers
             .push(async move {
                 (
                     index,
-                    worker(job, phase, run_start, generations, conn).await,
+                    worker(job, phase, run_start, generations, conn, side).await,
                 )
             })
             .map_err(|_| LoadError::Bound("callers"))?;
     }
-    let mut outcomes = Vec::with_capacity(callers.len());
-    while let Some((index, outcome)) = callers.join_next().await {
-        outcomes.push((index, outcome?));
-    }
+    // Every caller to its end, the first failure kept; the tails stopped either way, so none
+    // outlives the callers it serves.
+    let collect = async {
+        let mut outcomes = Vec::with_capacity(callers.len());
+        let mut failed = None;
+        while let Some((index, outcome)) = callers.join_next().await {
+            match outcome {
+                Ok(outcome) => outcomes.push((index, outcome)),
+                Err(error) => {
+                    failed.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(side) = consumer {
+            side.watch.stop();
+        }
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(outcomes),
+        }
+    };
+    let mut outcomes = match (consumer, &tail_conns) {
+        (Some(side), Some((consumer_tail, issuer_tail))) => {
+            let (outcomes, consumer_tailed, issuer_tailed) = hyper_rt::combine::join3(
+                collect,
+                watch::tail(
+                    side.watch,
+                    Side::Consumer,
+                    side.poll,
+                    consumer_tail,
+                    names.ledger,
+                    tail_ids(side.seed, CONSUMER_TAIL_WORKER),
+                ),
+                watch::tail(
+                    side.watch,
+                    Side::Issuer,
+                    side.poll,
+                    issuer_tail,
+                    names.ledger,
+                    tail_ids(side.seed, ISSUER_TAIL_WORKER),
+                ),
+            )
+            .await;
+            consumer_tailed?;
+            issuer_tailed?;
+            outcomes?
+        }
+        _ => collect.await?,
+    };
     // In the callers' order, whichever ended first.
     outcomes.sort_unstable_by_key(|(index, _)| *index);
     Ok((
@@ -1105,14 +1456,18 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 .enrollment
                 .clone()
                 .ok_or_else(|| LoadError::Shape("transport enrolled needs enrollment".into()))?;
-            let worker = shape
-                .worker
-                .as_deref()
-                .ok_or_else(|| LoadError::Shape("transport enrolled needs worker".into()))
-                .and_then(|text| {
-                    focal_client::input::parse_id(text)
-                        .map_err(|_| LoadError::Shape("worker is 32 hex digits".into()))
-                })?;
+            // A `deliver` run's claims target its consumer, named below.
+            let worker = match shape.lifecycle {
+                Lifecycle::Deliver => [0; 16],
+                _ => shape
+                    .worker
+                    .as_deref()
+                    .ok_or_else(|| LoadError::Shape("transport enrolled needs worker".into()))
+                    .and_then(|text| {
+                        focal_client::input::parse_id(text)
+                            .map_err(|_| LoadError::Shape("worker is 32 hex digits".into()))
+                    })?,
+            };
             let now = i64::try_from(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -1131,6 +1486,51 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             };
             (Connector::Enrolled(Box::new(pending)), names, None)
         }
+    };
+    // A `deliver` run's consumer: a second enrolled client, or on the embedded node its worker
+    // identity; every claim targets it.
+    let mut names = names;
+    let consumer_connector = match (shape.lifecycle, shape.transport) {
+        (Lifecycle::Deliver, Transport::Enrolled) => {
+            let directory = shape.consumer_enrollment.clone().ok_or_else(|| {
+                LoadError::Shape("deliver over enrolled needs consumer_enrollment".into())
+            })?;
+            let pending = focal_node::network_join::PendingClientJoin::resume_shared(&directory)?;
+            let client = pending.remote_client(unix_now()?, &limits)?;
+            if client.build.ledger != names.ledger {
+                return Err(LoadError::Shape(
+                    "the consumer is enrolled with another ledger".into(),
+                ));
+            }
+            names.worker = client.build.actor;
+            Some(Connector::Enrolled(Box::new(pending)))
+        }
+        (Lifecycle::Deliver, Transport::Embedded) => match &connector {
+            Connector::Embedded(host) => Some(Connector::Embedded(host.clone())),
+            _ => None,
+        },
+        _ => None,
+    };
+    if shape.lifecycle == Lifecycle::Deliver && names.worker == names.issuer {
+        return Err(LoadError::Shape(
+            "deliver's consumer must be a principal of its own".into(),
+        ));
+    }
+    let consumer_generations = Generations::new();
+    let watch_bound = usize::from(shape.inflight)
+        .checked_mul(usize::from(shape.concurrency))
+        .ok_or(LoadError::Bound("messages under way"))?;
+    let watch = Watch::new(watch_bound);
+    let consumer = match &consumer_connector {
+        Some(consumer_connector) => Some(Consumer {
+            connector: consumer_connector,
+            principal: names.worker,
+            generations: &consumer_generations,
+            watch: &watch,
+            poll: Duration::from_millis(u64::from(shape.poll_ms)),
+            seed: shape.seed,
+        }),
+        None => None,
     };
     // Paced writes: each worker's share of the offered rate, as a fixed
     // interval between its intended starts.
@@ -1170,8 +1570,15 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     // One journal's generations for every caller, as N processes of one
     // participant share one (the audit's F12).
     let generations = Generations::new();
-    let (write_outcomes, write_nanos, write_phase_start_epoch_ns) =
-        run_phase(jobs, Phase::Write, &generations, &connector, connections).await?;
+    let (write_outcomes, write_nanos, write_phase_start_epoch_ns) = run_phase(
+        jobs,
+        Phase::Write,
+        &generations,
+        &connector,
+        connections,
+        consumer.as_ref(),
+    )
+    .await?;
     let (floors_advanced, expired) = generations.counts()?;
     let mut writes = merged(&write_outcomes);
     let (committed, refused, unknown) = (writes.committed, writes.refused, writes.unknown);
@@ -1198,6 +1605,28 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         warmup,
         write_phase_start_epoch_ns,
     )?;
+    let deliver = match consumer.as_ref() {
+        Some(side) => {
+            let mut measured = DeliveryMeasurements::measure(
+                write_outcomes
+                    .iter()
+                    .flat_map(|outcome| outcome.deliveries.iter()),
+                warmup,
+            )?;
+            measured.undelivered = write_outcomes.iter().fold(0u64, |total, outcome| {
+                total.saturating_add(outcome.undelivered)
+            });
+            let consumer_tail = side.watch.counts(Side::Consumer);
+            let issuer_tail = side.watch.counts(Side::Issuer);
+            measured.consumer_polls = consumer_tail.polls;
+            measured.consumer_events = consumer_tail.events;
+            measured.issuer_polls = issuer_tail.polls;
+            measured.issuer_events = issuer_tail.events;
+            measured.tail_failures = consumer_tail.failed.saturating_add(issuer_tail.failed);
+            Some(measured)
+        }
+        None => None,
+    };
     let mut refusals = Vec::new();
     for outcome in &write_outcomes {
         for (reason, count) in &outcome.refusals {
@@ -1236,6 +1665,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             &generations,
             &connector,
             reader_count.min(connections),
+            None,
         )
         .await?;
         let reads = merged(&read_outcomes);
@@ -1250,6 +1680,8 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     } else {
         (0, 0, 0, Latency::default())
     };
+    // Every handle to the embedded host goes before it closes: its owner joins once the last does.
+    drop(consumer_connector);
     drop(connector);
 
     // The embedded node: its size on disk, and its recovery when asked.
@@ -1268,7 +1700,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 .find_map(|outcome| outcome.created.last().copied())
             {
                 let probe = Connector::Embedded(hosted.host.clone());
-                let conn = Conn::open(&probe, &names, &limits)?;
+                let conn = Conn::open(&probe, names.issuer, &names, &limits)?;
                 let request = worker_base(shape.seed, PROBE_WORKER)?
                     .checked_add(READ_OFFSET)
                     .ok_or(LoadError::Bound("probe id space"))?;
@@ -1311,6 +1743,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         first_read_after_reopen_ns,
         reopen_read_hit,
         data_dir_bytes,
+        deliver,
         shape,
     })
 }
