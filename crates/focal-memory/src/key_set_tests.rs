@@ -376,6 +376,104 @@ fn an_index_key_costs_a_fraction_of_a_row_entry() {
     drop(built);
 }
 
+/// A block rebuilt with its edits by splicing (its keys before the first edit copied as encoded,
+/// the rest encoded again) is byte for byte the block encoding all its keys makes: for blocks of
+/// every size and shape, index-shaped and hostile, under edits of every kind (puts of new keys and
+/// of keys it holds, deletions) and position (before, inside and after its keys).
+#[test]
+fn a_spliced_block_is_the_block_encoding_every_key_makes() {
+    let budget = budget();
+    let mut rng = Rng(0x5eed_b10c);
+    let mut spliced_any = 0usize;
+    for round in 0..4_000 {
+        let hostile = round % 3 == 0;
+        let mut keys = BTreeSet::new();
+        let size = 1 + rng.below(BLOCK_KEYS as u64) as usize;
+        while keys.len() < size {
+            let key = if hostile {
+                hostile_key(&mut rng)
+            } else {
+                index_key(&mut rng, 4)
+            };
+            keys.insert(key);
+        }
+        // One block of the keys, as many as one block takes.
+        let mut encoder = Encoder::new().unwrap();
+        let mut source = Source::Budget(&budget, BudgetLane::Ordinary);
+        let mut taken = Vec::new();
+        for key in &keys {
+            if encoder.full() {
+                break;
+            }
+            encoder.push(key).unwrap();
+            taken.push(key.clone());
+        }
+        let (_, block) = encoder.finish(&mut source).unwrap();
+        // Edits: new keys, held keys put again, held keys deleted, each kept once and sorted.
+        let mut edits: std::collections::BTreeMap<Vec<u8>, bool> = Default::default();
+        for _ in 0..(1 + rng.below(4)) {
+            match rng.below(3) {
+                0 => {
+                    let key = if hostile {
+                        hostile_key(&mut rng)
+                    } else {
+                        index_key(&mut rng, 4)
+                    };
+                    if !taken.contains(&key) {
+                        edits.insert(key, false);
+                    }
+                }
+                1 => {
+                    let key = taken[rng.below(taken.len() as u64) as usize].clone();
+                    edits.insert(key, false);
+                }
+                _ => {
+                    let key = taken[rng.below(taken.len() as u64) as usize].clone();
+                    edits.insert(key, true);
+                }
+            }
+        }
+        if edits.is_empty() {
+            continue;
+        }
+        let edits: Vec<KeyEdit<'_>> = edits
+            .iter()
+            .map(|(key, delete)| {
+                if *delete {
+                    KeyEdit::Delete(key)
+                } else {
+                    KeyEdit::Put(key)
+                }
+            })
+            .collect();
+        // Rebuilt as a publication rebuilds it.
+        let mut out = Vec::new();
+        let mut encoder = Encoder::new().unwrap();
+        rebuild_block(&block, &edits, &mut encoder, &mut source, &mut out).unwrap();
+        // Every key of the output encoded afresh, cut as the rebuild cuts it.
+        let mut count = 0usize;
+        let mut counting = Merged::new(&block, &edits);
+        while counting.next_key().unwrap().is_some() {
+            count += 1;
+        }
+        let bytes = scaled(block.entries().len(), block.count(), count);
+        let per = per_block(count, bytes);
+        if per >= count {
+            spliced_any += 1;
+        }
+        let mut whole = Vec::new();
+        let mut encoder = Encoder::new().unwrap();
+        let mut merged = Merged::new(&block, &edits);
+        encode_cut(&mut merged, per, &mut encoder, &mut source, &mut whole).unwrap();
+        assert_eq!(out.len(), whole.len(), "round {round}: blocks out");
+        for ((first, block), (whole_first, whole_block)) in out.iter().zip(&whole) {
+            assert_eq!(first, whole_first, "round {round}: fences");
+            assert_eq!(block.bytes, whole_block.bytes, "round {round}: bytes");
+        }
+    }
+    assert!(spliced_any > 1_000, "the splice ran {spliced_any} times");
+}
+
 /// What one published key costs a large set fed as the native engine feeds an index family:
 /// sixteen streams of ascending identities under a shared prefix (each caller's claims), one new
 /// key a stream each round, the set frozen between rounds as a read pins it. Release, with
@@ -416,7 +514,9 @@ fn measure_publication_per_key_on_interleaved_streams() {
     for round in &rounds {
         let frozen = set.freeze(BudgetLane::Ordinary).unwrap();
         let edits: Vec<KeyEdit<'_>> = round.iter().map(|key| KeyEdit::Put(key)).collect();
-        let mut funding = set.fund(&budget, BudgetLane::Ordinary, edits.len()).unwrap();
+        let mut funding = set
+            .fund(&budget, BudgetLane::Ordinary, edits.len())
+            .unwrap();
         set.publish(&edits, &mut funding).unwrap();
         drop(frozen);
     }
