@@ -4,6 +4,7 @@
 //! rather than changing an earlier response, artifact or claimant outcome.
 use super::read_validate::{ValidationRead, invalid};
 use super::*;
+use crate::native::ranges::KeyedRows as _;
 use focal_memory::{BudgetKind, BudgetLane};
 use focal_model::lifecycle::aggregation::{
     self, AggregateOutcome, ArtifactOutcome, ProjectionLimits, ProjectionShape,
@@ -152,7 +153,7 @@ impl WholeWorkView for Rows<'_, '_, '_> {
         })();
         let mut failed = seek.err().map(model);
         let mut cycles = if failed.is_none() {
-            Some(self.read.root.entries_from(&start, false))
+            Some(self.read.root.rows_from(&start, false))
         } else {
             None
         };

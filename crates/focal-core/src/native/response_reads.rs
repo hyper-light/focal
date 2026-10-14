@@ -110,7 +110,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_missing(Some(&entry.value)).map(project)
+                    as_missing(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -127,7 +127,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_response_record(Some(&entry.value)).map(project)
+                    as_response_record(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -144,7 +144,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_registrations(Some(&entry.value)).map(project)
+                    as_registrations(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -161,7 +161,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_delivery(Some(&entry.value)).map(project)
+                    as_delivery(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -178,7 +178,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_work(Some(&entry.value)).map(project)
+                    as_work(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -196,7 +196,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_diagnostic(Some(&entry.value)).map(project)
+                    as_diagnostic(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -214,7 +214,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_response(Some(&entry.value)).map(project)
+                    as_response(Some(entry.value)).map(project)
                 } else {
                     None
                 }

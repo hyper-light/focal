@@ -42,7 +42,7 @@ impl Family {
 fn entries_from<'a>(
     view: &'a View<'_>,
     key: &Key,
-) -> impl Iterator<Item = &'a focal_memory::Entry<Key, Row>> {
+) -> impl Iterator<Item = super::ranges::RowEntry<'a>> {
     view.entries_from(*key)
 }
 
@@ -180,7 +180,7 @@ pub(super) fn scan<'a>(
                 {
                     return Err(ContractError::InvalidManifest.into());
                 }
-                let (accepted, position) = published(view, family, address, &entry.value, visits)?;
+                let (accepted, position) = published(view, family, address, entry.value, visits)?;
                 if let Some((revision, prior)) = previous
                     && (address.revision <= revision || position <= prior)
                 {

@@ -518,7 +518,7 @@ fn copied(f: &Fixture, configured: NativeLimits) -> Core<NativeState> {
         .map(|entry| {
             Change::Put(Entry::new(
                 entry.key,
-                crate::native::prepare::copy(&entry.value).unwrap(),
+                crate::native::prepare::copy(entry.value).unwrap(),
                 entry.heap_bytes,
             ))
         })

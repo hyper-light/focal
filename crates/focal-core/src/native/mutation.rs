@@ -2,7 +2,7 @@
 //! storage plan supplies keys; final values remain in its one candidate root.
 //! This is not a WAL encoding, an imported root or an activation promise.
 use super::*;
-use focal_memory::{Allocation, Change, RangeWriteEnvelope};
+use focal_memory::{Allocation, RangeWriteEnvelope};
 use prepare::{add, array, within};
 
 #[cfg(test)]
@@ -42,7 +42,7 @@ impl WriteSet {
     pub(super) fn capture<'a>(
         profile: NativeContentProfile,
         count: usize,
-        changes: impl Iterator<Item = &'a Change<Key, Row>>,
+        changes: impl Iterator<Item = impl super::ranges::ChangeRead + 'a>,
         allowance: usize,
         funding: Allocation,
     ) -> Result<Self, NativeError> {
@@ -61,16 +61,16 @@ impl WriteSet {
         within(bytes(keys.capacity())?, required)?;
         let mut previous = None;
         for change in changes {
-            let key = *change.key();
+            let key = change.changed();
             if previous.is_some_and(|last| last >= key) || key == Key::End {
                 return Err(ContractError::InvalidManifest.into());
             }
-            let deleted = match change {
-                Change::Put(entry) => {
-                    check_family(key, &entry.value)?;
+            let deleted = match change.row() {
+                Some(row) => {
+                    check_family(key, row)?;
                     false
                 }
-                Change::Delete(_) => true,
+                None => true,
             };
             if keys.len() == keys.capacity() {
                 return Err(ContractError::Capacity.into());

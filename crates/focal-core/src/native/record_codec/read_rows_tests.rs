@@ -461,7 +461,7 @@ fn actual_native_events_prepare_without_allocation_then_build_under_exact_precha
         .entries()
         .filter(|entry| matches!(entry.key, Key::Event(..)))
     {
-        let bytes = encode(entry.key, &entry.value);
+        let bytes = encode(entry.key, entry.value);
         let before = budget.stats();
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let plan = EventPlan::read(entry.key, &mut cursor, ledger()).unwrap();

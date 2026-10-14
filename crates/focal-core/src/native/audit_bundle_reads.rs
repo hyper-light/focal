@@ -31,7 +31,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_result_testament(Some(&entry.value)).map(project)
+                    as_result_testament(Some(entry.value)).map(project)
                 } else {
                     None
                 }

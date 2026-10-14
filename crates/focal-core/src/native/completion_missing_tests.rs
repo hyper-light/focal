@@ -82,7 +82,7 @@ fn altered(
                     let heap = row.heap_charge().unwrap();
                     (Row::Event(row), heap)
                 }
-                _ => (prepare::copy(&entry.value).unwrap(), entry.heap_bytes),
+                _ => (prepare::copy(entry.value).unwrap(), entry.heap_bytes),
             };
             RangeChange::Put(Entry::new(entry.key, row, heap))
         })

@@ -1191,36 +1191,26 @@ impl TimerTarget {
 /// lifecycle rows. This is an owner-local storage layout, not a wire partition
 /// or placement choice. Creating another immutable object may rewrite its own
 /// namespace; a lifecycle-only mutation must share those retained pages.
-fn page_partition(key: &Key) -> u64 {
-    match key {
-        Key::Definition(_) | Key::DefinitionIdentity(..) => 1,
-        Key::Artifact(_) | Key::ArtifactIdentity(_) => 2,
-        Key::ClaimContent(_) | Key::ClaimIdentity(..) => 3,
-        Key::CreationResult(_) => 4,
-        Key::LegacyTestament(_)
-        | Key::LegacyEvidenceSet(_)
-        | Key::LegacyRun(..)
-        | Key::LegacyDefinition(_) => 5,
-        Key::ByIssuer(..)
-        | Key::BySubject(..)
-        | Key::ByStatus(..)
-        | Key::ByAction(..)
-        | Key::ByScope(..)
-        | Key::ByRelation(..)
-        | Key::ByProducer(..)
-        | Key::ByArtifactKind(..)
-        | Key::BySchema(..)
-        | Key::ArtifactInput(..)
-        | Key::ByEvaluator(..)
-        | Key::ByVerdict(..)
-        | Key::ByCreated(..)
-        | Key::DueTimer(..)
-        | Key::ByObject(..) => 6,
+fn page_partition(key: &layout::PackedKey) -> u64 {
+    // By the key's family (its bytes after the affinity), as the store places every key.
+    match key.family() {
+        // Definition, DefinitionIdentity.
+        8 | 28 => 1,
+        // Artifact, ArtifactIdentity.
+        10 | 11 => 2,
+        // ClaimContent, ClaimIdentity.
+        26 | 27 => 3,
+        // CreationResult.
+        29 => 4,
+        // The legacy families.
+        30..=33 => 5,
+        // The secondary index families and the due timers (ByIssuer through ByObject).
+        34..=48 => 6,
         // The session's counters are rewritten by every mutation. Sharing class 0 with the events put them on
         // the oldest events' page, so every mutation deep-copied that page's rows (the 2026-09-29 allocation
         // audit's R4: about a hundred 504-byte event copies a claim). On a page of their own a rewrite copies
         // one row.
-        Key::Meta => 7,
+        6 => 7,
         _ => 0,
     }
 }
@@ -1636,7 +1626,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_claim(Some(&entry.value)).map(project)
+                    as_claim(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -1653,7 +1643,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 (entry.key == key)
-                    .then(|| as_outcome(Some(&entry.value), self.ledger, invocation))
+                    .then(|| as_outcome(Some(entry.value), self.ledger, invocation))
                     .flatten()
             })
             .map(Option::flatten)
@@ -1668,7 +1658,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_definition(Some(&entry.value)).map(project)
+                    as_definition(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -1685,7 +1675,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_evaluation(Some(&entry.value)).map(project)
+                    as_evaluation(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -1898,13 +1888,13 @@ impl Core<NativeState> {
             roots.push(root);
             Ok(())
         };
-        let mut walk = |entry: &focal_memory::Entry<Key, Row>| -> Result<bool, NativeError> {
+        let mut walk = |entry: ranges::RowEntry<'_>| -> Result<bool, NativeError> {
             if visited >= max_visits {
                 return Ok(false);
             }
             visited = visited.saturating_add(1);
             last = Some(entry.key);
-            match (&entry.key, &entry.value) {
+            match (&entry.key, entry.value) {
                 (Key::Artifact(id), Row::Artifact(owned)) => {
                     use focal_model::lifecycle::artifact_descriptor::PayloadSpec;
                     if let Some(artifact) = owned.get() {
@@ -2106,16 +2096,16 @@ impl Core<NativeState> {
             ..
         } = &mut self.state;
         for (_, _, change) in fragments.changes() {
-            let focal_memory::Change::Delete(key) = change else {
+            let ranges::RowChange::Delete(key) = change else {
                 continue;
             };
-            let Key::Event(sequence, ordinal) = *key else {
+            let Key::Event(sequence, ordinal) = key else {
                 continue;
             };
             if !events.complete() {
                 return;
             }
-            let event = match rows.get(key) {
+            let event = match rows.get(&key) {
                 Some(Row::Event(stored)) => stored.get(*ledger),
                 _ => None,
             };
@@ -2409,10 +2399,10 @@ impl<'a> View<'a> {
             .or_else(|| self.chain.and_then(|chain| chain.tail()))
     }
     fn get(&self, key: Key) -> Option<&'a Row> {
-        self.get_entry(&key).map(|entry| &entry.value)
+        self.get_entry(&key).map(|entry| entry.value)
     }
     /// The row this view holds at `key`, whole.
-    fn get_entry(&self, key: &Key) -> Option<&'a focal_memory::Entry<Key, Row>> {
+    fn get_entry(&self, key: &Key) -> Option<ranges::RowEntry<'a>> {
         if let Some(own) = self.own {
             if !own.fragments.is_sparse() {
                 // A built candidate holds its whole state.
@@ -2456,10 +2446,7 @@ impl<'a> View<'a> {
     /// Ordered rows of the effective prefix at or after `start`: its own
     /// changes over the chain's over the committed rows, merged as they are
     /// walked. The caller bounds what it consumes; nothing is allocated.
-    fn entries_from(
-        &self,
-        start: Key,
-    ) -> impl Iterator<Item = &'a focal_memory::Entry<Key, Row>> + use<'a> {
+    fn entries_from(&self, start: Key) -> impl Iterator<Item = ranges::RowEntry<'a>> + use<'a> {
         let built = self.own.filter(|own| !own.fragments.is_sparse());
         let whole = built.map(|own| own.fragments.entries_from(&start, false));
         let merged = built.is_none().then(|| {
@@ -2468,8 +2455,8 @@ impl<'a> View<'a> {
                 .into_iter()
                 .flat_map(move |own| own.fragments.changes_from(&start, false))
                 .map(|change| match change {
-                    focal_memory::Change::Put(entry) => (&entry.key, Some(entry)),
-                    focal_memory::Change::Delete(key) => (key, None),
+                    ranges::RowChange::Put(entry) => (entry.key, Some(entry)),
+                    ranges::RowChange::Delete(key) => (key, None),
                 });
             let chain = self
                 .chain
@@ -2479,7 +2466,7 @@ impl<'a> View<'a> {
                 .state
                 .rows
                 .entries_from(&start, false)
-                .map(|entry| (&entry.key, Some(entry)));
+                .map(|entry| (entry.key, Some(entry)));
             pending_index::Overlay::new(own, pending_index::Overlay::new(chain, committed))
                 .filter_map(|(_, entry)| entry)
         });
@@ -2585,7 +2572,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_artifact(Some(&entry.value)).map(project)
+                    as_artifact(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -2602,7 +2589,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_result(Some(&entry.value)).map(project)
+                    as_result(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -2623,7 +2610,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_receipt(Some(&entry.value))
+                    as_receipt(Some(entry.value))
                 } else {
                     None
                 }
@@ -2639,7 +2626,7 @@ pub(in crate::native) fn encoded_rows_of(
     ledger: LedgerId,
 ) -> Result<usize, NativeError> {
     rows.entries().try_fold(0usize, |sum, entry| {
-        let bytes = record_codec::checkpoint::row_bytes(entry.key, &entry.value, ledger)
+        let bytes = record_codec::checkpoint::row_bytes(entry.key, entry.value, ledger)
             .map_err(|_| NativeError::Capacity("a restored row does not encode"))?;
         sum.checked_add(bytes)
             .ok_or(NativeError::Capacity("checkpoint bytes"))
@@ -2674,17 +2661,17 @@ impl EncodedRemoved {
 }
 
 /// What the rows `changes` put take in a checkpoint: each put's row, as it will be written.
-pub(in crate::native) fn encoded_added<'a>(
-    mut changes: impl Iterator<Item = &'a focal_memory::Change<Key, Row>>,
+pub(in crate::native) fn encoded_added(
+    mut changes: impl Iterator<Item = impl ranges::ChangeRead>,
     ledger: LedgerId,
 ) -> Result<usize, NativeError> {
-    changes.try_fold(0usize, |sum, change| match change {
-        focal_memory::Change::Put(entry) => {
-            let bytes = record_codec::checkpoint::row_bytes(entry.key, &entry.value, ledger)
+    changes.try_fold(0usize, |sum, change| match change.row() {
+        Some(row) => {
+            let bytes = record_codec::checkpoint::row_bytes(change.changed(), row, ledger)
                 .map_err(|_| NativeError::Capacity("a row that does not encode"))?;
             sum.checked_add(bytes)
                 .ok_or(NativeError::Capacity("checkpoint bytes"))
         }
-        focal_memory::Change::Delete(_) => Ok(sum),
+        None => Ok(sum),
     })
 }

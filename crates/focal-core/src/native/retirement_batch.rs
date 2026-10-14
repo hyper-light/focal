@@ -222,7 +222,7 @@ fn touched(chain: &Chain<'_>, family: &RetirementFamily) -> bool {
         if chain
             .changes_from(&first_under(home), false)
             .next()
-            .is_some_and(|(key, _)| layout::affinity(key) == home)
+            .is_some_and(|(key, _)| layout::affinity(&key) == home)
         {
             return true;
         }
@@ -541,8 +541,9 @@ impl Core<NativeState> {
         )?;
         let mut removed = super::EncodedRemoved::new(view.state.ledger);
         for (_, _, change) in fragments.changes() {
-            if let Some(old) = view.get_entry(change.key()) {
-                removed.count(change.key(), &old.value)?;
+            let key = change.key();
+            if let Some(old) = view.get_entry(&key) {
+                removed.count(&key, old.value)?;
             }
         }
         writes.check(&fragments)?;

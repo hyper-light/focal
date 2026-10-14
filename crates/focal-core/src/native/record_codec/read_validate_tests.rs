@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::layout::PackedKey;
 use crate::native::report_tests as fixture;
 use focal_memory::{Entry, RangeHydrationLimits};
 
@@ -8,7 +9,7 @@ fn with_read<T>(
     run: impl FnOnce(&ValidationRead<'_, '_>) -> T,
 ) -> T {
     let owner_budget = MemoryBudget::new(4 << 20, 0).unwrap();
-    let detached = RangeStore::<Key, Row>::begin_hydration_partitioned(
+    let detached = RangeStore::<PackedKey, Row>::begin_hydration_partitioned(
         RangeId(50),
         RangeConfig::default(),
         owner_budget,
@@ -152,7 +153,7 @@ fn zero_prefix_rejects_a_fabricated_meta_row_and_discards_detached_state() {
     let budget = MemoryBudget::new(4 << 20, 0).unwrap();
     let baseline = budget.stats();
     let meter = read_source::Meter::new(100_000);
-    let root = RangeStore::<Key, Row>::begin_hydration_partitioned(
+    let root = RangeStore::<PackedKey, Row>::begin_hydration_partitioned(
         RangeId(50),
         RangeConfig::default(),
         budget.clone(),
@@ -165,7 +166,11 @@ fn zero_prefix_rejects_a_fabricated_meta_row_and_discards_detached_state() {
     .unwrap()
     .insert_phase(
         1,
-        std::iter::once(Ok(Entry::new(Key::Meta, Meta::default(), 0))),
+        std::iter::once(Ok(Entry::new(
+            PackedKey::pack(&Key::Meta).unwrap(),
+            Meta::default(),
+            0,
+        ))),
         |_, _, meta, _| Ok((Row::Meta(Box::new(meta)), 0)),
         prepare::copy,
     )

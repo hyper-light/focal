@@ -11,9 +11,8 @@
 //! bounded by what the pending chain's memory funds.
 
 use super::owner::Pending;
-use super::ranges::Fragments;
-use super::{Key, NativeError, NativePrepared, Row};
-use focal_memory::{Change, Entry};
+use super::ranges::{Fragments, RowChange, RowEntry};
+use super::{Key, NativeError, NativePrepared};
 use std::collections::{BTreeMap, VecDeque};
 
 /// A key's newest pending change: its candidate's serial, and the member and
@@ -74,7 +73,7 @@ impl PendingIndex {
     pub(super) fn add(&mut self, serial: u64, fragments: &Fragments) {
         for (member, change, entry) in fragments.changes() {
             self.newest.insert(
-                *entry.key(),
+                entry.key(),
                 Version {
                     serial,
                     member,
@@ -89,12 +88,13 @@ impl PendingIndex {
     /// row now that change.
     pub(super) fn remove_published(&mut self, serial: u64, fragments: &Fragments) {
         for (_, _, change) in fragments.changes() {
+            let key = change.key();
             if self
                 .newest
-                .get(change.key())
+                .get(&key)
                 .is_some_and(|version| version.serial == serial)
             {
-                self.newest.remove(change.key());
+                self.newest.remove(&key);
             }
         }
     }
@@ -104,7 +104,7 @@ impl PendingIndex {
     /// newest of every key no later candidate changes.
     pub(super) fn restore_oldest(&mut self, serial: u64, fragments: &Fragments) {
         for (member, change, entry) in fragments.changes() {
-            self.newest.entry(*entry.key()).or_insert(Version {
+            self.newest.entry(entry.key()).or_insert(Version {
                 serial,
                 member,
                 change,
@@ -125,15 +125,15 @@ impl PendingIndex {
             let key = change.key();
             if self
                 .newest
-                .get(key)
+                .get(&key)
                 .is_some_and(|version| version.serial == serial)
             {
-                match older(key) {
+                match older(&key) {
                     Some(version) => {
-                        self.newest.insert(*key, version);
+                        self.newest.insert(key, version);
                     }
                     None => {
-                        self.newest.remove(key);
+                        self.newest.remove(&key);
                     }
                 }
             }
@@ -277,19 +277,19 @@ impl<'a> Chain<'a> {
 
     /// The pending change of `key` this view sees: `Some(Some(entry))` a put,
     /// `Some(None)` a deletion, `None` none (the committed row stands).
-    pub(super) fn get(&self, key: &Key) -> Option<Option<&'a Entry<Key, Row>>> {
+    pub(super) fn get(&self, key: &Key) -> Option<Option<RowEntry<'a>>> {
         match *self {
             Self::Indexed { index, .. } => self.at(key, index.get(key)?),
             Self::Listed(_) => self.probe(key),
         }
     }
 
-    fn probe(&self, key: &Key) -> Option<Option<&'a Entry<Key, Row>>> {
+    fn probe(&self, key: &Key) -> Option<Option<RowEntry<'a>>> {
         self.newest_first()
             .find_map(|candidate| candidate.fragments.change(key))
     }
 
-    fn at(&self, key: &Key, version: Version) -> Option<Option<&'a Entry<Key, Row>>> {
+    fn at(&self, key: &Key, version: Version) -> Option<Option<RowEntry<'a>>> {
         let Self::Indexed {
             candidates, upto, ..
         } = *self
@@ -309,8 +309,8 @@ impl<'a> Chain<'a> {
             .fragments
             .change_at(version.member, version.change)?;
         Some(match change {
-            Change::Put(entry) => Some(entry),
-            Change::Delete(_) => None,
+            RowChange::Put(entry) => Some(entry),
+            RowChange::Delete(_) => None,
         })
     }
 
@@ -352,7 +352,7 @@ impl<'a> Iterator for ChainScan<'a> {
             Self::Indexed { chain, keys } => {
                 for (key, version) in keys.by_ref() {
                     if let Some(entry) = chain.at(key, *version) {
-                        return Some((key, entry));
+                        return Some((*key, entry));
                     }
                 }
                 None
@@ -364,13 +364,13 @@ impl<'a> Iterator for ChainScan<'a> {
                     .filter_map(|candidate| {
                         candidate.fragments.changes_from(&from, exclusive).next()
                     })
-                    .map(Change::key)
+                    .map(|change| change.key())
                     .min()?;
-                *bound = Some((*next, true));
+                *bound = Some((next, true));
                 let entry = candidates
                     .iter()
                     .rev()
-                    .find_map(|candidate| candidate.fragments.change(next))?;
+                    .find_map(|candidate| candidate.fragments.change(&next))?;
                 Some((next, entry))
             }
         }
@@ -393,7 +393,7 @@ pub(super) fn newest_among(candidates: &VecDeque<Pending>, key: &Key) -> Option<
 
 /// One step of a merged scan: a key and its row, or `None` where a pending
 /// change deletes it.
-pub(super) type Step<'a> = (&'a Key, Option<&'a Entry<Key, Row>>);
+pub(super) type Step<'a> = (Key, Option<RowEntry<'a>>);
 
 /// `upper`'s steps over `lower`'s, in key order: where both hold a key,
 /// `upper`'s wins; a deletion passes through, so a scan drops it at the end.
@@ -419,7 +419,7 @@ where
     type Item = Step<'a>;
     fn next(&mut self) -> Option<Step<'a>> {
         let order = match (self.upper.peek(), self.lower.peek()) {
-            (Some(upper), Some(lower)) => upper.0.cmp(lower.0),
+            (Some(upper), Some(lower)) => upper.0.cmp(&lower.0),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => return None,

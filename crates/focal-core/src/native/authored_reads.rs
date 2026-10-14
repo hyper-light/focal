@@ -138,13 +138,13 @@ impl NativeRead {
                 if entry.key != key {
                     return Ok(None);
                 }
-                let state = as_claim(Some(&entry.value)).ok_or(ContractError::InvalidPolicy)?;
+                let state = as_claim(Some(entry.value)).ok_or(ContractError::InvalidPolicy)?;
                 let key = Key::ClaimContent(id);
                 let body = self
                     .lease
                     .project_next(&key, false, &Key::End, now, |entry| {
                         let body = if entry.key == key {
-                            content(Some(&entry.value), budget, BudgetLane::Ordinary)?
+                            content(Some(entry.value), budget, BudgetLane::Ordinary)?
                         } else {
                             None
                         }
@@ -172,7 +172,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    descriptor(Some(&entry.value)).map(project)
+                    descriptor(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -189,7 +189,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    result(Some(&entry.value)).map(project)
+                    result(Some(entry.value)).map(project)
                 } else {
                     None
                 }

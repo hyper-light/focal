@@ -382,7 +382,7 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
         .map(|entry| {
             Change::Put(Entry::new(
                 entry.key,
-                prepare::copy(&entry.value).unwrap(),
+                prepare::copy(entry.value).unwrap(),
                 entry.heap_bytes,
             ))
         })

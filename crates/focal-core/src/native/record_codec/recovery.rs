@@ -384,7 +384,7 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
 /// archive bundle's hydration (`archive::ArchiveCore`) lays out as one
 /// member.
 pub(super) struct Hydrated {
-    rows: RangeStore<Key, Row>,
+    rows: RangeStore<crate::native::layout::PackedKey, Row>,
     meters: Meters,
     allowed: Work,
 }
@@ -433,7 +433,7 @@ pub(super) fn hydrate_frame<'a, F, S, R>(
     lane: BudgetLane,
     work: Work,
     validate: impl FnOnce(
-        focal_memory::RangeHydrationView<'_, Key, Row>,
+        focal_memory::RangeHydrationView<'_, crate::native::layout::PackedKey, Row>,
         &Meter,
         &MemoryBudget,
     ) -> Result<(), NativeError>,

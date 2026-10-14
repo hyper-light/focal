@@ -7,6 +7,7 @@
 use super::checkpoint::{ARCHIVE_HASH_DOMAIN, ARCHIVE_MAGIC, ARCHIVE_VERSION};
 use super::inspect::{EncodedRow, InspectionLimits, InspectionQuote, RecordRows};
 use super::*;
+use crate::native::ranges::KeyedRows as _;
 use bytes::Cursor;
 use focal_evidence::{NativeCustodyReader, NativeSchemaVerifier};
 use focal_memory::BudgetLane;
@@ -239,7 +240,7 @@ impl<'a> StructuralArchive<'a> {
                     .charge(members.len().saturating_mul(64))
                     .map_err(read_evidence::codec)?;
                 for member in members {
-                    if view.get(&Key::Claim(*member)).is_none() {
+                    if view.row(&Key::Claim(*member)).is_none() {
                         return Err(ContractError::InvalidManifest.into());
                     }
                 }

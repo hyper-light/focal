@@ -640,7 +640,7 @@ pub(super) fn install(
         |key| {
             let entry = core.state.rows.get_entry(key)?;
             if counted.is_ok() {
-                counted = removed.count(key, &entry.value);
+                counted = removed.count(key, entry.value);
             }
             Some(entry.heap_bytes)
         },

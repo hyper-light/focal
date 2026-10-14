@@ -573,12 +573,12 @@ fn frame(sink: &mut impl Sink, source: Source<'_>) -> Result<ContentHash, CodecE
         Source::Core(state) => frame_entries(
             sink,
             root,
-            state.rows.entries().map(|entry| (entry.key, &entry.value)),
+            state.rows.entries().map(|entry| (entry.key, entry.value)),
         ),
         Source::Frozen(frozen) => frame_entries(
             sink,
             root,
-            frozen.rows.entries().map(|entry| (entry.key, &entry.value)),
+            frozen.rows.entries().map(|entry| (entry.key, entry.value)),
         ),
     }
 }
@@ -611,7 +611,7 @@ pub fn rows_digest(
             layout_epoch: 0,
             seeks: store_seeks(state)?,
         },
-        state.rows.entries().map(|entry| (entry.key, &entry.value)),
+        state.rows.entries().map(|entry| (entry.key, entry.value)),
     )
 }
 
@@ -661,7 +661,7 @@ pub fn member_digest(
             // One member's pages are among the store's.
             seeks: store_seeks(state)?,
         },
-        entries.map(|entry| (entry.key, &entry.value)),
+        entries.map(|entry| (entry.key, entry.value)),
     )
 }
 

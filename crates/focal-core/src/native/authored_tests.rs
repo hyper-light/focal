@@ -849,7 +849,7 @@ fn measure_memory_per_authored_claim_by_family() {
     }
     let mut families: std::collections::BTreeMap<String, (usize, usize, usize)> =
         Default::default();
-    let entry = std::mem::size_of::<focal_memory::Entry<Key, Row>>();
+    let entry = std::mem::size_of::<focal_memory::Entry<crate::native::layout::PackedKey, Row>>();
     let ledger = core.state.ledger;
     for item in core.state.rows.entries() {
         let name = format!("{:?}", item.key);
@@ -858,7 +858,7 @@ fn measure_memory_per_authored_claim_by_family() {
             .next()
             .unwrap_or("?")
             .to_string();
-        let encoded = record_codec::checkpoint::row_bytes(item.key, &item.value, ledger).unwrap();
+        let encoded = record_codec::checkpoint::row_bytes(item.key, item.value, ledger).unwrap();
         let slot = families.entry(family).or_default();
         slot.0 += 1;
         slot.1 += item.heap_bytes;
@@ -868,8 +868,8 @@ fn measure_memory_per_authored_claim_by_family() {
     let mut total_rows = 0;
     let mut total_heap = 0;
     println!(
-        "entry={entry} B (Key {} B, Row {} B)",
-        std::mem::size_of::<Key>(),
+        "entry={entry} B (packed key {} B, Row {} B)",
+        std::mem::size_of::<crate::native::layout::PackedKey>(),
         std::mem::size_of::<Row>()
     );
     println!(

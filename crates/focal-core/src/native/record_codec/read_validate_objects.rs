@@ -1060,7 +1060,7 @@ fn blocking(
         revision: ObjectRevision(0),
     });
     read.charge(const { (usize::BITS as usize + 1) * 64 })?;
-    let mut results = read.root.entries_from(&start, false);
+    let mut results = read.root.rows_from(&start, false);
     let mut found = false;
     loop {
         read.charge(128)?;

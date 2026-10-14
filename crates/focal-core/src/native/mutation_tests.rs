@@ -1,6 +1,7 @@
 use super::*;
 use crate::native::report_tests as fixture;
 use focal_evidence::BuiltinNativeSchemas;
+use focal_memory::Change;
 use focal_memory::{BudgetKind, BudgetLane, Entry};
 use focal_model::{ValidationMode, VerdictValue};
 

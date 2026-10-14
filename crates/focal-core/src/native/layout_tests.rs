@@ -32,8 +32,8 @@ fn new_core(limits: NativeLimits) -> Core<NativeState> {
     .unwrap()
 }
 
-fn entry_bytes(entry: &Entry<Key, Row>) -> usize {
-    size_of::<Entry<Key, Row>>() + entry.heap_bytes
+fn entry_bytes(entry: crate::native::ranges::RowEntry<'_>) -> usize {
+    size_of::<Entry<crate::native::layout::PackedKey, Row>>() + entry.heap_bytes
 }
 
 fn check_entries(core: &Core<NativeState>) {

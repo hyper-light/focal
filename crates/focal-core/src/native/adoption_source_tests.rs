@@ -43,7 +43,7 @@ fn copy_actual_core(fixture: &Fixture) -> Core<NativeState> {
         .map(|entry| {
             Change::Put(Entry::new(
                 entry.key,
-                prepare::copy(&entry.value).unwrap(),
+                prepare::copy(entry.value).unwrap(),
                 entry.heap_bytes,
             ))
         })

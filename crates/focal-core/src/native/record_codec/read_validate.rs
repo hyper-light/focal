@@ -2,6 +2,7 @@
 //! Checks establish retained consistency, never participant authentication from
 //! the checkpoint checksum. All reads and scratch use the enclosing allowance.
 use super::*;
+use crate::native::ranges::KeyedRows as _;
 use focal_memory::RangeHydrationView;
 use focal_memory::{Allocation, BudgetKind, BudgetLane};
 
@@ -29,7 +30,7 @@ pub(super) fn invalid() -> NativeError {
 }
 
 pub(super) struct ValidationRead<'v, 'r> {
-    pub(super) root: &'v RangeHydrationView<'r, Key, Row>,
+    pub(super) root: &'v RangeHydrationView<'r, crate::native::layout::PackedKey, Row>,
     pub(super) ledger: LedgerId,
     pub(super) profile: NativeContentProfile,
     pub(super) prefix: SessionSeq,
@@ -263,7 +264,7 @@ impl Counts {
 /// before the caller receives a publishable owner. Prefix zero is empty genesis.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate(
-    root: RangeHydrationView<'_, Key, Row>,
+    root: RangeHydrationView<'_, crate::native::layout::PackedKey, Row>,
     ledger: LedgerId,
     profile: NativeContentProfile,
     prefix: SessionSeq,
@@ -301,9 +302,9 @@ pub(super) fn validate(
             .checked_mul(256)
             .ok_or(ContractError::Capacity)?,
     )?;
-    for entry in root.entries() {
-        mutation::check_family(entry.key, &entry.value)?;
-        counts.row(&entry.value)?;
+    for entry in root.rows() {
+        mutation::check_family(entry.key, entry.value)?;
+        counts.row(entry.value)?;
     }
     counts.check(expected, &read)?;
     let mut sequences = Sequences::new(counts.meta.outcomes, &read)?;
@@ -315,9 +316,9 @@ pub(super) fn validate(
     let expected_seals = u64::try_from(expected.seals).map_err(|_| ContractError::Capacity)?;
     let mut next_seal = 1u64;
     read.charge(sum(root.len(), 1)?)?;
-    for entry in root.entries() {
+    for entry in root.rows() {
         let key = entry.key;
-        let row = &entry.value;
+        let row = entry.value;
         read.charge(1024)?;
         match (key, row) {
             (Key::Outcome(invocation), Row::Outcome(value)) => {
@@ -450,7 +451,7 @@ pub(super) fn validate(
                     epoch: window.floor,
                     id: RequestId([0; 16]),
                 }));
-                for entry in read.root.entries_from(&first, false) {
+                for entry in read.root.rows_from(&first, false) {
                     read.charge(1)?;
                     let Key::Outcome(NativeInvocation::Request(request)) = entry.key else {
                         break;
@@ -485,8 +486,8 @@ pub(super) fn validate(
                 read_rows::check_fixed(key, row, ledger)?;
                 read.charge(2)?;
                 if value.retired_at > read.prefix
-                    || read.root.get(&Key::Claim(claim)).is_some()
-                    || read.root.get(&Key::ClaimContent(claim)).is_some()
+                    || read.root.row(&Key::Claim(claim)).is_some()
+                    || read.root.row(&Key::ClaimContent(claim)).is_some()
                 {
                     return Err(invalid());
                 }
@@ -618,7 +619,7 @@ impl ValidationRead<'_, '_> {
     pub(super) fn get(&self, key: Key) -> Result<Option<&Row>, NativeError> {
         // Fixed-width Key ordering and a bounded directory binary search.
         self.charge(const { (usize::BITS as usize + 1) * 64 })?;
-        Ok(self.root.get(&key))
+        Ok(self.root.row(&key))
     }
     pub(super) fn require(&self, key: Key) -> Result<&Row, NativeError> {
         self.get(key)?.ok_or_else(invalid)

@@ -1672,8 +1672,9 @@ impl<'a> Fresh<'a> {
         // them away without looking each up again.
         let mut removed = super::EncodedRemoved::new(view.state.ledger);
         for (_, _, change) in fragments.changes() {
-            if let Some(old) = view.get_entry(change.key()) {
-                removed.count(change.key(), &old.value)?;
+            let key = change.key();
+            if let Some(old) = view.get_entry(&key) {
+                removed.count(&key, old.value)?;
             }
         }
         let encoded_removed = removed.bytes();

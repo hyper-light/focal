@@ -3,6 +3,7 @@
 //! An in-place bounded sort enables object-local walks without repeated root scans.
 use super::read_validate::{ValidationRead, invalid};
 use super::*;
+use crate::native::ranges::KeyedRows as _;
 use focal_memory::{Allocation, BudgetKind, BudgetLane};
 use focal_model::lifecycle::aggregation::PublicationPosition;
 
@@ -204,7 +205,7 @@ impl HistoryIndex {
         }
         let mut observed = 0_usize;
         lookup(read)?;
-        for row in read.root.entries_from(&Key::Event(SessionSeq(0), 0), false) {
+        for row in read.root.rows_from(&Key::Event(SessionSeq(0), 0), false) {
             read.charge(128)?;
             let Key::Event(sequence, ordinal) = row.key else {
                 break;

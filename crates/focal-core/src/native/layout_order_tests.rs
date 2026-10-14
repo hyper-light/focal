@@ -509,3 +509,79 @@ fn the_field_comparison_reads_identities_from_their_first_byte() {
         }
     }
 }
+
+/// A packed key is its key's order as bytes (doc 31 M3): every key of the corpus and of the
+/// evaluation corpus reads back as itself, two keys' bytes compare as the keys do, and a claim's
+/// own families are held in place.
+#[test]
+fn a_packed_key_reads_back_whole_and_its_bytes_order_as_the_key_does() {
+    use super::{PACKED_INLINE, PackedKey};
+    let mut keys = corpus();
+    for evaluation in evaluation_corpus() {
+        let result = NativeResultKey {
+            evaluation,
+            revision: focal_model::ObjectRevision(7),
+        };
+        keys.extend([
+            Key::Evaluation(evaluation),
+            Key::MissingResult(result),
+            Key::Accepted(result),
+            Key::DeliveryResult(result),
+            Key::ByVerdict(3, result),
+            Key::DueTimer(11, TimerTarget::Evaluation(evaluation)),
+            Key::Outcome(NativeInvocation::EvaluationDeadline(NativeDeadlineKey {
+                evaluation,
+                timer: focal_model::TimerId([5; 16]),
+                generation: 2,
+            })),
+        ]);
+    }
+    let packed: Vec<PackedKey> = keys
+        .iter()
+        .map(|key| PackedKey::pack(key).unwrap())
+        .collect();
+    for (key, bytes) in keys.iter().zip(&packed) {
+        assert_eq!(bytes.unpack(), *key, "{key:?} reads back");
+        assert_eq!(bytes.affinity(), affinity(key), "{key:?}'s affinity leads");
+    }
+    for (a, x) in keys.iter().zip(&packed) {
+        for (b, y) in keys.iter().zip(&packed) {
+            assert_eq!(x.cmp(y), a.cmp(b), "{a:?} vs {b:?}");
+            // Past an equal prefix, the rest decides as the whole order does.
+            if affinity(a) == affinity(b) {
+                assert_eq!(
+                    focal_memory::RangeKey::cmp_past_prefix(x, y),
+                    a.cmp(b),
+                    "{a:?} vs {b:?} past the prefix"
+                );
+            }
+        }
+    }
+    // A claim's own families in place; only the validation and monitor timers' families on the
+    // heap.
+    for (key, bytes) in keys.iter().zip(&packed) {
+        let wide = matches!(bytes, PackedKey::Wide(_));
+        let validation = matches!(
+            key,
+            Key::Evaluation(_)
+                | Key::MissingResult(_)
+                | Key::Accepted(_)
+                | Key::DeliveryResult(_)
+                | Key::ByVerdict(..)
+                | Key::DueTimer(_, TimerTarget::Evaluation(_) | TimerTarget::Monitor(..))
+                | Key::Outcome(
+                    NativeInvocation::EvaluationDeadline(_) | NativeInvocation::MonitorDeadline(_)
+                )
+                | Key::CreationResult(
+                    NativeInvocation::EvaluationDeadline(_) | NativeInvocation::MonitorDeadline(_)
+                )
+        );
+        if !validation {
+            assert!(!wide, "{key:?} takes {} bytes", bytes.as_bytes().len());
+        }
+        assert_eq!(wide, bytes.as_bytes().len() > PACKED_INLINE, "{key:?}");
+        assert_eq!(bytes.heap_bytes() > 0, wide, "{key:?}");
+    }
+    // In place, a key is 56 bytes: its length is never zero, so the heap form fills that niche.
+    assert_eq!(std::mem::size_of::<PackedKey>(), 56);
+}
