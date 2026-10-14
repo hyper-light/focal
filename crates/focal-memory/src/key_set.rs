@@ -269,6 +269,16 @@ fn read_u16(bytes: &[u8], at: usize) -> Option<usize> {
     Some(usize::from(u16::from_le_bytes(word)))
 }
 
+/// The order of the key `head` then `tail` against `key`, the two parts never joined.
+fn joined_cmp(head: &[u8], tail: &[u8], key: &[u8]) -> Ordering {
+    let (key_head, key_tail) = key.split_at(head.len().min(key.len()));
+    match head.cmp(key_head) {
+        Ordering::Equal if head.len() > key.len() => Ordering::Greater,
+        Ordering::Equal => tail.cmp(key_tail),
+        unequal => unequal,
+    }
+}
+
 /// One entry at `offset`: its shared length, its suffix and the offset after it.
 fn entry_at(entries: &[u8], offset: usize) -> Option<(usize, &[u8], usize)> {
     let shared = usize::from(*entries.get(offset)?);
@@ -319,6 +329,54 @@ impl Block {
             key: SetKey::empty(),
             pending: false,
         }
+    }
+    /// A walk from the entry at `offset`, the key before it `previous` (what the entry's shared
+    /// prefix is read from).
+    fn cursor_from(&self, offset: usize, previous: SetKey) -> Cursor<'_> {
+        Cursor {
+            entries: self.entries(),
+            offset,
+            key: previous,
+            pending: false,
+        }
+    }
+    /// Where the first key at or after `key` begins: its entry's offset, its index among the
+    /// block's keys, and the key before it (empty before the first); the entries' end, the
+    /// block's count and its last key where every key is before `key`. Each entry is compared
+    /// as its shared prefix and its suffix, built into a key only once it is passed.
+    fn before(&self, key: &[u8]) -> Option<(usize, usize, SetKey)> {
+        let entries = self.entries();
+        // The last restart whose key is before `key`: restarts hold their keys whole.
+        let (mut low, mut high) = (0usize, self.restarts());
+        while low < high {
+            let middle = low.checked_add(high.checked_sub(low)?.checked_div(2)?)?;
+            let before = self
+                .restart(middle)
+                .and_then(|offset| entry_at(entries, offset))
+                .is_some_and(|(_, whole, _)| whole < key);
+            if before {
+                low = middle.checked_add(1)?;
+            } else {
+                high = middle;
+            }
+        }
+        let (mut offset, mut index) = match low.checked_sub(1) {
+            Some(restart) => (self.restart(restart)?, restart.checked_mul(RESTART)?),
+            None => (0, 0),
+        };
+        let mut previous = SetKey::empty();
+        // At most a restart interval's entries lie between the restart and the place.
+        while offset < entries.len() {
+            let (shared, suffix, next) = entry_at(entries, offset)?;
+            let head = previous.as_bytes().get(..shared)?;
+            if joined_cmp(head, suffix, key) != Ordering::Less {
+                break;
+            }
+            previous.assign(shared, suffix)?;
+            offset = next;
+            index = index.checked_add(1)?;
+        }
+        Some((offset, index, previous))
     }
     /// A cursor whose next key is the first at or after `key` (after it, `exclusive`).
     fn seek(&self, key: &[u8], exclusive: bool) -> Cursor<'_> {
@@ -507,6 +565,47 @@ impl Encoder {
             .assign(shared, suffix)
             .ok_or(broken("a set key's suffix passes its key"))?;
         self.count = checked_add(self.count, 1)?;
+        Ok(())
+    }
+    /// The encoder as it stands having pushed `block`'s first `index` keys, which end at
+    /// `offset`, the last of them `last`: their entries and their restarts as the block holds
+    /// them, copied, not encoded again. Empty encoders only.
+    fn resume(
+        &mut self,
+        block: &Block,
+        offset: usize,
+        index: usize,
+        last: &SetKey,
+    ) -> Result<(), MemoryError> {
+        if !self.is_empty() {
+            return Err(broken("an encoder resumes only empty"));
+        }
+        let prefix = block
+            .entries()
+            .get(..offset)
+            .ok_or(broken("a block's prefix passes its entries"))?;
+        if prefix.len() > self.bytes.capacity() {
+            return Err(broken("a block's prefix passes an encoder's bound"));
+        }
+        let restarts = index.div_ceil(RESTART);
+        if restarts > block.restarts() {
+            return Err(broken("a block's prefix passes its restarts"));
+        }
+        for (slot, restart) in self.restarts.iter_mut().zip(0..restarts) {
+            *slot = u16::try_from(
+                block
+                    .restart(restart)
+                    .ok_or(broken("a block's restart cannot be read"))?,
+            )
+            .map_err(|_| broken("a block's restart offset passes u16"))?;
+        }
+        if restarts > self.restarts.len() {
+            return Err(broken("a block's prefix passes an encoder's restarts"));
+        }
+        self.bytes.extend_from_slice(prefix);
+        self.restart_count = restarts;
+        self.count = index;
+        self.last = *last;
         Ok(())
     }
     /// The bytes the block of what was pushed takes.
@@ -1642,7 +1741,10 @@ struct Merged<'b, 'e, E> {
 
 impl<'b, 'e, E: SetEdit> Merged<'b, 'e, E> {
     fn new(block: &'b Block, edits: &'e [E]) -> Self {
-        let mut cursor = block.cursor();
+        Self::from(block.cursor(), edits)
+    }
+    /// The keys `cursor` walks with `edits` applied.
+    fn from(mut cursor: Cursor<'b>, edits: &'e [E]) -> Self {
         let held = cursor.advance();
         Self {
             cursor,
@@ -1788,13 +1890,35 @@ fn rebuild_block<E: SetEdit>(
     source: &mut Source<'_>,
     out: &mut Vec<Seat<Block>>,
 ) -> Result<(), MemoryError> {
-    // A first pass counts the output, so the second cuts it evenly.
-    let mut count = 0usize;
-    let mut counting = Merged::new(block, edits);
-    while counting.next_key()?.is_some() {
-        count = checked_add(count, 1)?;
-    }
     let held = block.count();
+    // The output is counted first, so it is cut evenly: few edits by finding each in the block,
+    // a seek reading at most a restart interval's entries; many by merging them with every key
+    // the block holds.
+    let count = if held > 0 && edits.len().saturating_mul(RESTART) < held {
+        let mut count = held;
+        for edit in edits {
+            let present = block.contains(edit.edit_key());
+            if edit.deletes() {
+                if !present {
+                    return Err(MemoryError::MissingKey);
+                }
+                count = count.checked_sub(1).ok_or(MemoryError::MissingKey)?;
+            } else {
+                set_key(edit.edit_key())?;
+                if !present {
+                    count = checked_add(count, 1)?;
+                }
+            }
+        }
+        count
+    } else {
+        let mut count = 0usize;
+        let mut counting = Merged::new(block, edits);
+        while counting.next_key()?.is_some() {
+            count = checked_add(count, 1)?;
+        }
+        count
+    };
     let bytes = if held == 0 {
         let mut put_bytes = 0usize;
         for edit in edits {
@@ -1806,14 +1930,24 @@ fn rebuild_block<E: SetEdit>(
     } else {
         scaled(block.entries().len(), held, count)
     };
+    let per = per_block(count, bytes);
+    // Out as one block, its keys before the first edit stand as the block encodes them: they are
+    // copied with their restarts, and only what follows is encoded again, byte for byte what
+    // encoding them all would make. A key inserted into a block re-encoded every key the block
+    // held, and counted them all first (2,078 ns a published key, `key_set::tests`).
+    if held > 0
+        && per >= count
+        && let Some(first) = edits.first()
+    {
+        let (offset, index, previous) = block
+            .before(first.edit_key())
+            .ok_or(broken("a block's entries cannot be read"))?;
+        encoder.resume(block, offset, index, &previous)?;
+        let mut merged = Merged::from(block.cursor_from(offset, previous), edits);
+        return encode_cut(&mut merged, per, encoder, source, out);
+    }
     let mut merged = Merged::new(block, edits);
-    encode_cut(
-        &mut merged,
-        per_block(count, bytes),
-        encoder,
-        source,
-        out,
-    )
+    encode_cut(&mut merged, per, encoder, source, out)
 }
 
 /// Joins each fresh block that is small (`Block::small`) with the block after it (or, the last,
