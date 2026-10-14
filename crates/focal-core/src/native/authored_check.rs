@@ -294,12 +294,13 @@ pub(in crate::native) fn check_plan(
                 let Row::ClaimContent(owner) = &owner.row else {
                     return Err(ContractError::InvalidPolicy.into());
                 };
+                // Whether its claim requires it, read in place: built whole for this alone, the
+                // claim's descriptor was decoded a second time each creation (cluster profile run
+                // 38586796329: 27 µs of the leader's 41 checking a creation's plan).
                 let mut buffer = ContentBuffer::new();
-                let owner = owner
-                    .read(view.payloads(), &mut buffer)?
-                    .body(&view.state.budget, focal_memory::BudgetLane::Ordinary)?;
-                visits.charge(owner.requirements().len())?;
-                if !owner.requirements().iter().any(|pin| pin.id == *id) {
+                let owner = owner.read(view.payloads(), &mut buffer)?.view()?;
+                visits.charge(owner.requirement_count())?;
+                if !owner.requires(*id)? {
                     return Err(ContractError::InvalidPolicy.into());
                 }
                 if !matches!(find(extras, Key::DefinitionIdentity(descriptor.schema(), descriptor.content_hash()), &mut visits)?.map(|row| &row.row), Some(Row::DefinitionIdentity(found)) if found == id)
