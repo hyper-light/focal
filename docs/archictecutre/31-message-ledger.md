@@ -776,6 +776,37 @@ Each stage lands on its own, measured:
      - **The claim's state** (536 bytes): the registry's release cut and the claim's
        optional parts behind their own allocations or in their niches (about 110 bytes).
      - **The claim table proper.**
+   - **Measured on CI (2026-10-14), and what it changed.**
+     - **The fill.** With the door holding rather than refusing (doc 27 §18), the comparison
+       refused nothing at 100, 200 and 1,000 writes a second. At 4,000 a second every node's
+       session filled at about 241,000 open claims, 617 MB native of its 705 MB allowance
+       (2,560 bytes a claim at scale), while the node used 710 MB of its 2 GB, and the 58,940
+       writes after it were refused for memory. The run writes 300,000.
+     - **CPU per claim doubled with this stage.** The leader's owner took 624 µs a claim at
+       1,000 a second (cluster profile run 38586796329). The index families' key sets cost 160
+       µs of it to publish, 58% in memcpy, and each follower 195 µs plus 71 µs in membership
+       checks. A key (`SetKey`, 130 bytes inline) was moved four or five times a key as a block
+       was merged with its edits, every edited block walked twice; on x86 each move is a call to
+       memcpy, so aarch64 runs barely showed it. A key set now lends each key from its walk, and
+       rebuilds a block from its first edit on, the keys before it copied with their restarts:
+       2,754 -> 1,133 ns a published key, every block byte for byte what it was. A creation's
+       plan check decoded its claim's descriptor a second time for each definition; it reads the
+       requirement in place.
+     - **What a claim's memory can lose and keep its readers.** Spilling the definition was
+       built and set aside. Its readers reach through the model's traits
+       (`aggregation::AdmissionView::declaration`, `object_journal::Source::definition`), which
+       hand out references, and lifecycle steps read a claim's definition several times each,
+       which is why it is held decoded. Within the readers as they are, the claim's optional
+       parts behind one allocation (about 200 bytes, the scope registry the largest), the
+       ledger its stored bindings repeat, identity rows as key-set keys and front-coded leaf
+       keys come to about 450 bytes: 292,000 claims in this envelope, short of the 300,000 a
+       4,000-a-second run writes.
+     - **So rows must leave memory, read back where they are touched.** A row of any family,
+       spilled as its record encoding, is decoded by `View::get` into an arena the operation
+       owns, charged while it is held and freed with the operation, and lent from there: no
+       reader changes. A policy spills what was not touched recently. The entries themselves
+       still take about 1,300 bytes a claim (about 470,000 claims here), so past that, cold
+       leaves leave memory as Kafka's old segments do, or the claim table takes their place.
    - **The session's share of its allowance, beside the stages.**
      - **Measured first.** The per-session memory gauges (`focal_session_memory_*`,
        `focal_session_native_memory_*`) put the fill at the native engine's share, not at the
