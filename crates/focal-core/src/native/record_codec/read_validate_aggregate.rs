@@ -361,7 +361,7 @@ pub(super) fn validate_source(
     require(plan.construction_charge() <= quote.construction_charge())?;
     let reservation = read.budget().reserve(
         BudgetKind::Recovery,
-        BudgetLane::Completion,
+        BudgetLane::Committed,
         plan.construction_charge(),
     )?;
     let projection = plan.build();

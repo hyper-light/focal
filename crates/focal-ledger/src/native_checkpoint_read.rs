@@ -443,7 +443,7 @@ impl<'a> SeedManifest<'a> {
         let allocation = budget
             .reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 add(total, ALLOCATION).map_err(|_| SeedError::Invalid("core length"))?,
             )?
             .commit();

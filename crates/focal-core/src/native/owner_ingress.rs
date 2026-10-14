@@ -251,9 +251,10 @@ impl NativeOwner {
         let Some(command) = command(bytes) else {
             return;
         };
+        // A fresh request is admitted in the ordinary or completion lane, never the committed.
         let headroom = match refused.lane {
             BudgetLane::Ordinary => before.ordinary,
-            BudgetLane::Completion => before.completion,
+            BudgetLane::Completion | BudgetLane::Committed => before.completion,
         };
         let Some(slot) = self.shortfall_slot(command) else {
             return;

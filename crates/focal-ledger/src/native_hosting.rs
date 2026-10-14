@@ -670,9 +670,7 @@ impl Session {
             encoding: hosting.limits.encoding,
             inspection: hosting.limits.inspection,
         };
-        let budget = self
-            .budget
-            .child(hosting.limits.memory_bytes, hosting.limits.completion_reserve_bytes)?;
+        let budget = hosting.limits.budget_within(&self.budget)?;
         // Objects the translation could not read are named for the host
         // (24 §20); the delivery is retained until they are local.
         let reader = crate::native_session::RecordingReader::new(&hosting.reader);

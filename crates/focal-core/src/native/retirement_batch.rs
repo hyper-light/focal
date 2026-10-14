@@ -626,7 +626,7 @@ impl Core<NativeState> {
         if let Err(error) = self.state.rows.publish_changes(
             outcome.sequence.0,
             changes,
-            BudgetLane::Completion,
+            BudgetLane::Committed,
             MAX_RETIRE_CHANGES,
         ) {
             self.state.events.drop_all();

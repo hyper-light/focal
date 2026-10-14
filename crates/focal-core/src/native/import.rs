@@ -358,7 +358,7 @@ pub fn import<S: NativeSchemaVerifier, R: NativeCustodyReader>(
         .and_then(|n| n.checked_add(request.limits.native.preparation_bytes))
         .ok_or(ImportError::Capacity("import workspace"))?;
     let _workspace = budget
-        .reserve(BudgetKind::Recovery, BudgetLane::Completion, workspace)?
+        .reserve(BudgetKind::Recovery, BudgetLane::Committed, workspace)?
         .commit();
     let mut rows = Vec::new();
     rows.try_reserve_exact(estimate)

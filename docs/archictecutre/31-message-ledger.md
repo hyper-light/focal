@@ -576,6 +576,50 @@ Each stage lands on its own, measured:
      4. Pages of encoded entries: what replay, recovery and a checkpoint move become copies of
         bytes the record already carries.
      - Then the claim table proper, where it beats the encoded store on the measures above.
+   - **The session's share of its allowance, beside the stages.**
+     - **Measured first.** The per-session memory gauges (`focal_session_memory_*`,
+       `focal_session_native_memory_*`) put the fill at the native engine's share, not at the
+       node. In the comparison's envelope (a 1.5 GiB node budget, an 805 MB session allowance),
+       the session refused at 403 MB native of a 403 MB share. About 1 MB sat beside it, and the
+       node used 491 MB. The share was a constant ratio (half) carried over from the fixed
+       budgets the allowances replaced, never derived from what the rest of a session holds.
+     - **Why not simply wider.** Every replica holds the whole session: a leader admits within
+       its share and the followers apply what it admitted. A binary that admitted within a wider
+       share than an older follower holds would leave that follower unable to apply, mid rolling
+       upgrade.
+     - **As built (`SHARE_LEVEL` 8).**
+       - A third budget lane, `Committed`: what a committed fact requires where it applies,
+         held to a level's hold limit, never less than its limit. Replay, materialization, a
+         record's publication, retirement and seal application, a layout's split or merge, the
+         movement state, the import, a checkpoint's capture, freeze, assembly and restore, and
+         the cold stream's capture reserve in it. The leader's admissions keep their lanes
+         (`Ordinary` for fresh work, `Completion` for work completing it), and so do the
+         proposals it checks.
+       - Every binary at the level holds its session's whole allowance, so it follows a leader
+         of either share. A leader admits within the wide share (the allowance less the
+         session's completion reserve, ⅞) only once the fence its node recorded as the session's
+         hosting was built opens the level; below it, half, as every older binary admits. The
+         checkpoint a mutation may project follows the share; the bounds a checkpoint is encoded
+         and read under follow the hold.
+       - The movement coordinator's command check takes the lane from its caller: committed
+         where a record applies, an admission lane where the leader checks a command before it
+         proposes it.
+     - **Found by the test that proves it.** A follower whose share was spoken for applied a
+       claim's lifecycle, a split, and (lagging) the leader's checkpoint and its tail, then took
+       its own checkpoint. Each failure named a site still charged as admission:
+       - the movement state's re-layout and restore;
+       - a phased hydration's pages, which ignored the lane they were begun in;
+       - a checkpoint's frozen image, charged as fresh work. This one was a defect of its own:
+         a leader at the fill, its ordinary lane full by definition, could take no checkpoint,
+         so its log could not compact for as long as the fill lasted. It is fixed with its own
+         test.
+     - **Measured.** Three local nodes in the comparison's envelope, open claims at 1,000/s:
+       - 94,038 committed before the session filled, against stage 1's 52,742. The fill came
+         at 616 MB, the wide share's ordinary limit, against 403 MB.
+       - At 4,000/s: 94,111 committed before the fill, the same capacity.
+       - What the session held beside its native engine peaked at 0.27 MB at both rates,
+         sampled every 5 s, against the eighth of the allowance (100 MB) the wide share leaves
+         it.
 4. **M4, durability classes.**
    - Memory-quorum acknowledgement with a bounded background flush; the disk class kept.
    - Measure: p99 at 1k, 4k and 12k/s against Kafka, NATS and Redis.

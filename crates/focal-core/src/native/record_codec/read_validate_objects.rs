@@ -330,7 +330,7 @@ pub(super) fn claim(
         let Row::ClaimContent(content) = read.require(Key::ClaimContent(id))? else {
             return Err(invalid());
         };
-        let held = content.body(read.budget, focal_memory::BudgetLane::Completion)?;
+        let held = content.body(read.budget, focal_memory::BudgetLane::Committed)?;
         let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
         read.meter.budget(|visits| {
             authored::check_recorded_claim(
@@ -395,7 +395,7 @@ pub(super) fn definition(
             else {
                 return Err(invalid());
             };
-            let held = body.body(read.budget, focal_memory::BudgetLane::Completion)?;
+            let held = body.body(read.budget, focal_memory::BudgetLane::Committed)?;
             let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
             read.meter.budget(|visits| {
                 authored::check_recorded_declaration(body, claim, descriptor, visits).map_err(model)

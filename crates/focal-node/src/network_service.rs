@@ -896,6 +896,7 @@ impl NetworkService {
                         &limits,
                         crate::storage_level::seal_rule(&root)?,
                         crate::storage_level::retire_rule(&root)?,
+                        crate::storage_level::native_share(&root)?,
                     )
                     .map_err(NodeError::Content)?;
                     Some(Session::from_node_in_hosted(
@@ -2308,10 +2309,12 @@ pub(crate) fn native_hosting(
     session: &SessionLimits,
     seal_rule: focal_ledger::SealRule,
     retire_rule: focal_ledger::RetireRule,
+    share: focal_ledger::NativeShare,
 ) -> Result<focal_ledger::NativeHosting, focal_evidence::ContentError> {
     let mut limits = native_limits(
         focal_model::ContentDomainId(identity.ledger.tenant.0),
-        session.native_memory_bytes(),
+        session.native_memory_bytes(share),
+        session.memory_bytes,
     )?;
     limits.seal_rule = seal_rule;
     limits.retire_rule = retire_rule;
@@ -2390,13 +2393,15 @@ pub(crate) fn disk_headroom_bytes() -> Result<u64, focal_evidence::ContentError>
 pub(crate) fn disk_budget() -> Result<DiskBudget, focal_evidence::ContentError> {
     DiskBudget::new(DiskBudgetConfig::default()).map_err(|_| focal_evidence::ContentError::Invalid)
 }
-/// The standard native session limits for an engine allowed `memory_bytes`,
-/// with the operator's disk headroom.
+/// The standard native session limits for an engine that admits within `memory_bytes` and holds
+/// within `hold_bytes` (its session's allowance), with the operator's disk headroom.
 pub(crate) fn native_limits(
     domain: focal_model::ContentDomainId,
     memory_bytes: usize,
+    hold_bytes: usize,
 ) -> Result<focal_ledger::NativeSessionLimits, focal_evidence::ContentError> {
-    let mut limits = focal_ledger::NativeSessionLimits::standard_within(domain, memory_bytes);
+    let mut limits =
+        focal_ledger::NativeSessionLimits::standard_within(domain, memory_bytes, hold_bytes);
     limits.disk_headroom_bytes = disk_headroom_bytes()?;
     limits.checkpoint.inline_bytes = seed_inline_bytes()?;
     // The work bound follows the inline bound it is derived from.

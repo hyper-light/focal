@@ -488,7 +488,7 @@ fn stage_all<S: NativeSchemaVerifier + Sync, R: NativeCustodyReader + Sync>(
                 .budget
                 .reserve(
                     focal_memory::BudgetKind::Recovery,
-                    focal_memory::BudgetLane::Completion,
+                    focal_memory::BudgetLane::Committed,
                     window_heap
                         .checked_mul(window_count)
                         .ok_or(NativeError::Capacity("window heap"))?,

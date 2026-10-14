@@ -24,7 +24,7 @@ impl NativeOutput {
             array::<NativeCommit>(commits)?,
             array::<NativeReadBoundary>(reads)?,
         )?;
-        let permit = budget.reserve(BudgetKind::Pending, BudgetLane::Completion, charge)?;
+        let permit = budget.reserve(BudgetKind::Pending, BudgetLane::Committed, charge)?;
         Ok(Self {
             committed: reserved(commits)?,
             reads: reserved(reads)?,
@@ -928,7 +928,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             record.header().outcome.sequence,
             self.limits.encoding,
             &self.budget,
-            BudgetLane::Completion,
+            BudgetLane::Committed,
         )?;
         let alike = batch.entries.len() == retired.len()
             && batch.entries.iter().zip(retired).all(|(entry, one)| {

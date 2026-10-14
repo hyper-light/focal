@@ -149,7 +149,7 @@ impl<'a> Index<'a> {
             .and_then(|n| n.checked_add(crate::native::prepare::ALLOCATION))
             .ok_or(NativeError::Capacity("recovery index staging"))?;
         let _staging =
-            budget.reserve(BudgetKind::Recovery, BudgetLane::Completion, staging_bytes)?;
+            budget.reserve(BudgetKind::Recovery, BudgetLane::Committed, staging_bytes)?;
         let mut changes = Vec::new();
         changes
             .try_reserve_exact(capacity)
@@ -290,7 +290,7 @@ fn install<'a>(
         .checked_add(1)
         .ok_or(NativeError::Capacity("recovery index prefix"))?;
     let prepared =
-        rows.prepare_batch_with(prefix, changes, BudgetLane::Completion, |value| Ok(*value))?;
+        rows.prepare_batch_with(prefix, changes, BudgetLane::Committed, |value| Ok(*value))?;
     rows.publish(prepared)?;
     Ok(())
 }

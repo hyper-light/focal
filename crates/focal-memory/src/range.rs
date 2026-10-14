@@ -1148,13 +1148,19 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
     /// lease it does not expire; its holder bounds its life. A checkpoint
     /// encodes from it off the owner's thread and drops it when written.
     pub fn freeze(&self) -> Result<FrozenRange<K, V>, MemoryError> {
+        self.freeze_in(BudgetLane::Ordinary)
+    }
+    /// [`Self::freeze`], its pin charged in `lane`: committed where the image keeps what was
+    /// committed (a checkpoint's), which an owner whose fresh admissions filled its ordinary
+    /// lane must still be able to take.
+    pub fn freeze_in(&self, lane: BudgetLane) -> Result<FrozenRange<K, V>, MemoryError> {
         let charge = checked_add(
             ALLOCATOR_OVERHEAD,
             checked_add(size_of::<FrozenRange<K, V>>(), size_of::<Allocation>())?,
         )?;
         let allocation = self
             .budget
-            .reserve(BudgetKind::ReadPins, BudgetLane::Ordinary, charge)?
+            .reserve(BudgetKind::ReadPins, lane, charge)?
             .commit();
         Ok(FrozenRange {
             root: Arc::clone(&self.root),

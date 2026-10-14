@@ -192,7 +192,7 @@ impl DiskBudget {
             return if config.headroom == 0 { u64::MAX } else { 0 };
         }
         let protected = match lane {
-            BudgetLane::Completion => config.headroom,
+            BudgetLane::Completion | BudgetLane::Committed => config.headroom,
             BudgetLane::Ordinary => config.headroom.saturating_add(config.completion_reserve),
         };
         free.saturating_sub(outstanding).saturating_sub(protected)

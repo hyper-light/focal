@@ -39,7 +39,7 @@ pub(super) fn check<O: Overlay>(
                     else {
                         return Err(invalid());
                     };
-                    let held = body.body(read.budget, focal_memory::BudgetLane::Completion)?;
+                    let held = body.body(read.budget, focal_memory::BudgetLane::Committed)?;
                     let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
                     let failure = std::cell::Cell::new(None);
                     let checked = read.meter.budget(|visits| {

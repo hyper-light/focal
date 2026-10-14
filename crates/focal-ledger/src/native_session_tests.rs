@@ -137,6 +137,7 @@ pub(crate) fn limits() -> NativeSessionLimits {
         },
         memory_bytes: 128 << 20,
         completion_reserve_bytes: 16 << 20,
+        hold_bytes: 128 << 20,
         content_domain: ContentDomainId::from_u128(1),
         disk_headroom_bytes: 1 << 20,
         materializer: record::materialize::MaterializerLimits::default(),
@@ -1551,4 +1552,50 @@ fn measure_time_per_claim_from_its_frame() {
             elapsed.as_secs_f64() * 1e6 / claims as f64
         );
     }
+}
+
+/// A session's native engine admits within its share and holds within the whole allowance (doc 31
+/// M3): half below the share level, the allowance less its completion reserve at it. Its
+/// checkpoints' bounds follow what it holds, what admission projects follows its share, and its
+/// budget holds each lane to its own: fresh work to the share less its reserve, completing work to
+/// the share, committed work to the allowance.
+#[test]
+fn a_native_engine_admits_within_its_share_and_holds_its_sessions_allowance() {
+    let session = crate::SessionLimits::within(800 << 20);
+    assert_eq!(session.native_memory_bytes(NativeShare::Half), 400 << 20);
+    assert_eq!(session.native_memory_bytes(NativeShare::Wide), 700 << 20);
+    let domain = ContentDomainId::from_u128(1);
+    let wide = NativeSessionLimits::standard_within(domain, 700 << 20, 800 << 20);
+    assert_eq!(
+        (
+            wide.memory_bytes,
+            wide.completion_reserve_bytes,
+            wide.hold_bytes
+        ),
+        (700 << 20, (700 << 20) / 8, 800 << 20)
+    );
+    assert_eq!(wide.checkpoint.assembled_bytes, 800 << 20);
+    assert_eq!(
+        wide.checkpoint.rows,
+        (800 << 20) / focal_core::native::NATIVE_ENTRY_BYTES
+    );
+    assert_eq!(
+        wide.admission_checkpoint(),
+        (
+            (700 << 20) / focal_core::native::NATIVE_ENTRY_BYTES,
+            700 << 20
+        )
+    );
+    // A hold below the share is the share.
+    let narrow = NativeSessionLimits::standard_within(domain, 400 << 20, 0);
+    assert_eq!(narrow.hold_bytes, 400 << 20);
+    assert_eq!(narrow.admission_checkpoint().1, 400 << 20);
+    let parent = MemoryBudget::new(1 << 30, 0).unwrap();
+    let budget = wide.budget_within(&parent).unwrap();
+    assert_eq!(
+        budget.reservation_limit(BudgetLane::Ordinary),
+        (700 << 20) - (700 << 20) / 8
+    );
+    assert_eq!(budget.reservation_limit(BudgetLane::Completion), 700 << 20);
+    assert_eq!(budget.reservation_limit(BudgetLane::Committed), 800 << 20);
 }

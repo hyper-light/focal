@@ -530,9 +530,11 @@ impl Session {
                 {
                     return Err(LedgerError::Capacity);
                 }
+                // Managed staging admits in the ordinary and completion lanes; a committed-lane
+                // growth would not join the completion charge (`absorb` keeps lanes apart).
                 match candidate.lane {
                     BudgetLane::Ordinary => self.core_charge.absorb(&mut candidate.core_growth)?,
-                    BudgetLane::Completion => self
+                    BudgetLane::Completion | BudgetLane::Committed => self
                         .core_completion_charge
                         .absorb(&mut candidate.core_growth)?,
                 };

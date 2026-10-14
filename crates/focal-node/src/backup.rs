@@ -113,7 +113,7 @@ pub async fn create(
     let domain = focal_model::ContentDomainId(ledger.tenant.0);
     // The export reads the checkpoint of a session this node hosts, which
     // its budget funds: limits sized to that budget hold it.
-    let limits = crate::network_service::native_limits(domain, budget.limit())
+    let limits = crate::network_service::native_limits(domain, budget.limit(), budget.limit())
         .map_err(|_| AccessError::Unavailable)?;
     let reader = focal_evidence::ContentReader::open(data_dir.join("content"))
         .map_err(|_| AccessError::Unavailable)?;

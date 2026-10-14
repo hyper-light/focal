@@ -1247,7 +1247,7 @@ impl Core<NativeState> {
         self.state.rows.publish_changes(
             sequence.0,
             changes,
-            focal_memory::BudgetLane::Completion,
+            focal_memory::BudgetLane::Committed,
             bound,
         )?;
         self.state.encoded_rows = encoded;

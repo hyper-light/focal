@@ -1743,6 +1743,14 @@ applies both. Sessions retire to every replica's own cold stream from level 7
 section a binary below the level cannot read, so every binary at the level
 keeps the streams whatever the fence, and the leader proposes the version-2
 records that fill them (`FCRETIRE` v2) only once the fence reaches the level.
+A session's native engine admits within the wide share of its allowance (the
+allowance less its completion reserve, where below it half) from level 8
+(`upgrade::SHARE_LEVEL`; 31 M3): a binary below the level holds half, so every
+binary at the level applies what its session committed within the whole
+allowance whatever its share (its committed work is held to the allowance,
+`BudgetLane::Committed`), and a node takes the share its leaders admit within
+from the fence it last recorded (`storage_level::native_share`) as it does the
+seal rule.
 A cluster founded by a binary holds the fence at the level
 its founder *announces* from genesis (its one node runs it; a founder
 staging a rollout at a lower level founds at that level, never at one it

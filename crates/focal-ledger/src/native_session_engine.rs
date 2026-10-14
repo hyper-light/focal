@@ -227,7 +227,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             limits.decode_work,
         )
         .map_err(NativeOwnerError::from)?;
-        let budget = parent.child(limits.memory_bytes, limits.completion_reserve_bytes)?;
+        let budget = limits.budget_within(parent)?;
         let count = limits.recovery.native.pending;
         let permit = budget.reserve(
             BudgetKind::Pending,
@@ -1017,7 +1017,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             .control_ordinal
             .checked_add(1)
             .ok_or(NativeSessionError::Capacity("control ordinal"))?;
-        let prepared = movement.coordinator.prepare(
+        // Checked as an admission: the authority's own share bounds what it proposes.
+        let prepared = movement.coordinator.prepare_in(
+            BudgetLane::Completion,
             ordinal,
             sequence,
             operation.clone(),
@@ -1520,8 +1522,8 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             return Err(NativeSessionError::Failed);
         };
         let projection = owner.checkpoint_projection()?;
-        let limits = self.limits.checkpoint;
-        Ok(projection.rows <= limits.rows && projection.bytes <= limits.assembled_bytes)
+        let (rows, bytes) = self.limits.admission_checkpoint();
+        Ok(projection.rows <= rows && projection.bytes <= bytes)
     }
     /// Discard a prepared candidate, re-borrowing the active owner. Used when a
     /// refusal is decided after a `&mut self` call has ended the owner borrow.

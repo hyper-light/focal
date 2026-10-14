@@ -36,7 +36,7 @@ fn admit<O: Overlay>(
         .budget
         .reserve(
             focal_memory::BudgetKind::Recovery,
-            focal_memory::BudgetLane::Completion,
+            focal_memory::BudgetLane::Committed,
             bytes,
         )?
         .commit())

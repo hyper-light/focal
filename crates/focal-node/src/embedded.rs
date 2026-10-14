@@ -176,6 +176,7 @@ impl EmbeddedNode {
             &limits,
             rule,
             retire,
+            crate::storage_level::native_share_at(level),
         )?;
         let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;
         session.campaign()?;

@@ -69,9 +69,11 @@ impl FocalBudget {
         let Ok(mut taken) = memory::reserve(&self.budget, BudgetKind::Pending, lane, bytes) else {
             return false;
         };
+        // A group's log holds no committed-lane permit (that lane is a replica's apply); one
+        // would not join the completion permit (`absorb` keeps lanes apart) and is refused.
         let slot = match lane {
             BudgetLane::Ordinary => &mut self.ordinary,
-            BudgetLane::Completion => &mut self.completion,
+            BudgetLane::Completion | BudgetLane::Committed => &mut self.completion,
         };
         match slot {
             Some(held) => held.absorb(&mut taken).is_ok(),

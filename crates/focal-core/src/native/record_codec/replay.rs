@@ -45,7 +45,7 @@ impl<'bytes> Entries<'bytes> {
         let bytes = prepare::array::<EntrySlot<'bytes>>(count)?;
         prepare::within(bytes, limits.preparation_bytes)?;
         let allocation = budget
-            .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?
+            .reserve(BudgetKind::Pending, BudgetLane::Committed, bytes)?
             .commit();
         let mut slots = Vec::new();
         slots
@@ -264,7 +264,7 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows> Decoder<'_, S
                 objects: &objects,
                 custody: &self.custody,
                 workspace: self.budget,
-                workspace_lane: BudgetLane::Completion,
+                workspace_lane: BudgetLane::Committed,
                 parsing: &self.meters.parsing,
                 source: &self.meters.source,
                 model: &self.meters.model,
@@ -288,7 +288,7 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows> Decoder<'_, S
             } else {
                 Some(
                     self.budget
-                        .reserve(BudgetKind::Pending, BudgetLane::Completion, heap)?
+                        .reserve(BudgetKind::Pending, BudgetLane::Committed, heap)?
                         .commit(),
                 )
             };
@@ -465,7 +465,7 @@ pub(super) fn stage<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows
         native.preparation_bytes,
     )?;
     let mut changes_allocation = budget
-        .reserve(BudgetKind::Pending, BudgetLane::Completion, change_bytes)?
+        .reserve(BudgetKind::Pending, BudgetLane::Committed, change_bytes)?
         .commit();
     let mut changes = Vec::new();
     changes
@@ -505,7 +505,7 @@ pub(super) fn stage<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows
         changes.iter(),
         write_bytes,
         budget
-            .reserve(BudgetKind::Pending, BudgetLane::Completion, write_bytes)?
+            .reserve(BudgetKind::Pending, BudgetLane::Committed, write_bytes)?
             .commit(),
     )?;
     let slots_bytes = prepare::array::<EntrySlot<'_>>(entries.slots.capacity())?;
@@ -616,7 +616,7 @@ pub(super) fn install(
         let mut extra_allocation = core
             .state
             .budget
-            .reserve(BudgetKind::Pending, BudgetLane::Completion, extra)?
+            .reserve(BudgetKind::Pending, BudgetLane::Committed, extra)?
             .commit();
         allocation.absorb(&mut extra_allocation)?;
     }
@@ -636,7 +636,7 @@ pub(super) fn install(
         &mut funding,
         header.outcome.sequence.0,
         changes,
-        BudgetLane::Completion,
+        BudgetLane::Committed,
         |key| {
             let entry = core.state.rows.get_entry(key)?;
             if counted.is_ok() {
@@ -679,7 +679,7 @@ pub(super) fn install(
                 .budget
                 .reserve(
                     BudgetKind::Index,
-                    BudgetLane::Completion,
+                    BudgetLane::Committed,
                     crate::native::event_index::charge_for(count)?,
                 )?
                 .commit(),

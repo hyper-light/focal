@@ -22,7 +22,7 @@ pub use native_session::cold::{ColdContent, ColdFrame, ColdSource};
 pub use native_session::retention::{RetentionBlocker, RetentionReport};
 pub use native_session::{
     FailureClass, LayoutOperation, LedgerRangeVerifier, MovementRecord, NativeCommit,
-    NativeReadBoundary, NativeSessionError, NativeSessionLimits, NativeSubmission,
+    NativeReadBoundary, NativeSessionError, NativeSessionLimits, NativeShare, NativeSubmission,
     NativeTimerInput, PendingCustody, PendingSeed, ReadCorrelation, RetireRule, SealRule,
 };
 mod session;

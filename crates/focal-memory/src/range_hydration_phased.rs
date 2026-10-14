@@ -24,6 +24,8 @@ pub struct RangeHydration<K, V> {
     store: RangeStore<K, V>,
     limits: RangeHydrationLimits,
     phases: usize,
+    /// The lane its phases' staging, rows and pages are charged to.
+    lane: BudgetLane,
 }
 
 /// Borrowed dependency lookup during one row's construction. It includes
@@ -110,13 +112,14 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
         partition: fn(&K) -> u64,
         limits: RangeHydrationLimits,
     ) -> Result<RangeHydration<K, V>, MemoryError> {
-        Self::begin_hydration_partitioned_in(
+        Self::begin_hydration(
             id,
             config,
             budget,
             partition,
             limits,
             crate::BudgetLane::Ordinary,
+            crate::BudgetLane::Completion,
         )
     }
     /// [`Self::begin_hydration_partitioned`] with the owner's root charged
@@ -130,15 +133,29 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
         limits: RangeHydrationLimits,
         lane: crate::BudgetLane,
     ) -> Result<RangeHydration<K, V>, MemoryError> {
+        Self::begin_hydration(id, config, budget, partition, limits, lane, lane)
+    }
+    /// A hydration whose owner's root is charged to `root` and whose phases' staging, rows and
+    /// pages to `pages`.
+    fn begin_hydration(
+        id: RangeId,
+        config: RangeConfig,
+        budget: MemoryBudget,
+        partition: fn(&K) -> u64,
+        limits: RangeHydrationLimits,
+        root: crate::BudgetLane,
+        pages: crate::BudgetLane,
+    ) -> Result<RangeHydration<K, V>, MemoryError> {
         if limits.max_phases == 0 {
             return Err(MemoryError::InvalidConfiguration(
                 "hydration phase limit must be nonzero",
             ));
         }
         Ok(RangeHydration {
-            store: Self::new_partitioned_in(id, 0, config, budget, partition, lane)?,
+            store: Self::new_partitioned_in(id, 0, config, budget, partition, root)?,
             limits,
             phases: 0,
+            lane: pages,
         })
     }
 }
@@ -199,7 +216,7 @@ impl<K: crate::RangeKey + Clone, V> RangeHydration<K, V> {
         while constructed < expected_entries {
             let _staging = self.store.budget.reserve(
                 BudgetKind::Pending,
-                BudgetLane::Completion,
+                self.lane,
                 checked_add(
                     checked_mul(2, ALLOCATOR_OVERHEAD)?,
                     checked_mul(
@@ -242,7 +259,7 @@ impl<K: crate::RangeKey + Clone, V> RangeHydration<K, V> {
                 let mut allocation = self
                     .store
                     .budget
-                    .reserve(BudgetKind::Pending, BudgetLane::Completion, allowance)?
+                    .reserve(BudgetKind::Pending, self.lane, allowance)?
                     .commit();
                 let Entry {
                     key, value: plan, ..
@@ -297,9 +314,9 @@ impl<K: crate::RangeKey + Clone, V> RangeHydration<K, V> {
                 .ok_or(MemoryError::CounterExhausted(
                     "hydration construction prefix",
                 ))?;
-            let prepared =
-                self.store
-                    .prepare_batch_with(next, chunk, BudgetLane::Completion, &mut copy)?;
+            let prepared = self
+                .store
+                .prepare_batch_with(next, chunk, self.lane, &mut copy)?;
             self.store.publish(prepared)?;
         }
         // This also checks empty phases without allocating a staging chunk.

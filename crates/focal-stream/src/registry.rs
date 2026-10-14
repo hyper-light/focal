@@ -403,9 +403,13 @@ impl CursorRegistry {
         // The charge first, so a state that publishes is a state that is
         // accounted: the arriving row joins its lane, the leaving rows
         // return theirs, ordinary first.
+        // A stream admits in the ordinary and completion lanes; a committed-lane row would not
+        // join the completion charge (`absorb` keeps lanes apart) and is refused.
         match prepared.lane {
             BudgetLane::Ordinary => self.root.ordinary.absorb(&mut prepared.arriving)?,
-            BudgetLane::Completion => self.root.completion.absorb(&mut prepared.arriving)?,
+            BudgetLane::Completion | BudgetLane::Committed => {
+                self.root.completion.absorb(&mut prepared.arriving)?
+            }
         }
         let from_ordinary = prepared.leaving.min(self.root.ordinary.bytes());
         let from_completion = prepared.leaving.saturating_sub(from_ordinary);

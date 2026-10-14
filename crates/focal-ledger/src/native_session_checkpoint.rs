@@ -273,7 +273,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         };
         let movement_permit = self.budget.reserve(
             BudgetKind::Recovery,
-            BudgetLane::Completion,
+            BudgetLane::Committed,
             array::<u8>(movement.as_ref().map_or(0, Vec::len))?,
         )?;
         // The retention section (26 §3): the archive's report this replica
@@ -453,7 +453,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         } else {
             let _permit = self.budget.reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 array::<u8>(checkpoint.movement().len().saturating_mul(4))?,
             )?;
             super::movement::Movement::restore(

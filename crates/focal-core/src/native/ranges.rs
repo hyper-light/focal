@@ -389,11 +389,14 @@ impl NativeRanges {
         self.stores.iter().flat_map(RangeStore::entries)
     }
     /// Every member frozen at the committed prefix, in the layout they lie
-    /// in: an image a checkpoint encodes from while the group goes on.
+    /// in: an image a checkpoint encodes from while the group goes on. Its
+    /// charges are committed work: a checkpoint keeps what was committed, so
+    /// an owner whose fresh admissions filled its ordinary lane, as a full
+    /// session's have, still takes one (doc 31 M3).
     pub(super) fn freeze(&self, budget: &MemoryBudget) -> Result<FrozenRanges, MemoryError> {
         let count = self.stores.len();
-        let boundaries_charge = reserve::<RangeBoundary>(budget, count, BudgetLane::Ordinary)?;
-        let stores_charge = reserve::<FrozenRange<Key, Row>>(budget, count, BudgetLane::Ordinary)?;
+        let boundaries_charge = reserve::<RangeBoundary>(budget, count, BudgetLane::Committed)?;
+        let stores_charge = reserve::<FrozenRange<Key, Row>>(budget, count, BudgetLane::Committed)?;
         let mut members = Vec::new();
         members
             .try_reserve_exact(count)
@@ -404,7 +407,7 @@ impl NativeRanges {
             .try_reserve_exact(count)
             .map_err(|_| MemoryError::AllocationFailed)?;
         for store in &self.stores {
-            stores.push(store.freeze()?);
+            stores.push(store.freeze_in(BudgetLane::Committed)?);
         }
         Ok(FrozenRanges {
             producer: self.producer,

@@ -59,7 +59,7 @@ impl Sequences {
         )?)?;
         let allocation = read
             .budget
-            .reserve(BudgetKind::Recovery, BudgetLane::Completion, quote)?
+            .reserve(BudgetKind::Recovery, BudgetLane::Committed, quote)?
             .commit();
         let mut values = Vec::new();
         values

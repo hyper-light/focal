@@ -88,6 +88,8 @@ pub fn offline_native_publications(
         .map_err(|error| PublicationsError::Storage(Box::new(error)))?;
     let retire = crate::storage_level::retire_rule(root)
         .map_err(|error| PublicationsError::Storage(Box::new(error)))?;
+    let share = crate::storage_level::native_share(root)
+        .map_err(|error| PublicationsError::Storage(Box::new(error)))?;
     let hosting = crate::network_service::native_hosting(
         root,
         identity,
@@ -95,6 +97,7 @@ pub fn offline_native_publications(
         &limits,
         rule,
         retire,
+        share,
     )?;
     let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;
     session.campaign()?;

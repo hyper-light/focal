@@ -232,7 +232,7 @@ impl ColdSlot {
                 let permit = budget
                     .reserve(
                         BudgetKind::Recovery,
-                        BudgetLane::Completion,
+                        BudgetLane::Committed,
                         held(streams).ok_or(ContentError::Capacity)?,
                     )
                     .map_err(|_| ContentError::Capacity)?
@@ -371,7 +371,7 @@ impl NativeCold {
             .checked_add(self.marks.captured_bytes()?)
             .ok_or(ContentError::Capacity)?;
         let permit = budget
-            .reserve(BudgetKind::Recovery, BudgetLane::Completion, held)
+            .reserve(BudgetKind::Recovery, BudgetLane::Committed, held)
             .map_err(|_| ContentError::Capacity)?
             .commit();
         let (data, data_pending) = self.data.capture()?;

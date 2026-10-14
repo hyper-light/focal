@@ -66,8 +66,14 @@ pub struct NativeSessionLimits {
     /// Largest borrowed native input frame and its cumulative decode work.
     pub frame_bytes: usize,
     pub decode_work: input_codec::DecodeWork,
+    /// What this engine admits within: its share of the session's allowance ([`NativeShare`]),
+    /// `completion_reserve_bytes` of it kept for completing what was admitted.
     pub memory_bytes: usize,
     pub completion_reserve_bytes: usize,
+    /// What it may hold applying what its session committed, at least `memory_bytes`: the
+    /// session's allowance, so a replica follows a leader whose share is wider than its own
+    /// (doc 31 M3). Its checkpoints' bounds follow it; what admission projects follows the share.
+    pub hold_bytes: usize,
     pub content_domain: focal_model::ContentDomainId,
     /// Free bytes the WAL filesystem must keep before a fresh candidate is
     /// admitted; zero disables the watermark. Admission reserves memory for the
@@ -107,6 +113,21 @@ pub enum SealRule {
     /// the window comes under pressure, through a closing seal; a seal waits
     /// for the pipeline to drain instead of being refused for it.
     Anchored,
+}
+/// How much of its session's allowance a native engine admits within (doc 31 M3). Every binary
+/// that knows this rule applies within the whole allowance whatever its share, so it follows a
+/// leader of either share; a leader admits within the wide share only once the fence its node
+/// knew as the session's hosting was built opens `SHARE_LEVEL`, where no binary that holds less
+/// can serve.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NativeShare {
+    /// Half the allowance: what every binary below `SHARE_LEVEL` admits and holds.
+    #[default]
+    Half,
+    /// The allowance less the session's completion reserve, which the rest of the session's
+    /// work completes within: beside its native engine a native session held at most 0.27 MB
+    /// at 1,000 and at 4,000 creations a second (the session's memory gauges, sampled every 5 s).
+    Wide,
 }
 /// How an authority retires families (doc 31 M2).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -283,6 +304,7 @@ impl NativeSessionLimits {
             },
             memory_bytes,
             completion_reserve_bytes: 16 << 20,
+            hold_bytes: memory_bytes,
             content_domain,
             disk_headroom_bytes: 64 << 20,
             materializer: record::materialize::MaterializerLimits::default(),
@@ -294,27 +316,53 @@ impl NativeSessionLimits {
     }
 }
 impl NativeSessionLimits {
-    /// The standard limits for an engine allowed `memory_bytes`: its completion
-    /// reserve an eighth of it, as the standard 16 of 128 MiB, and its
-    /// checkpoint's bounds following it. A root is charged to the engine's
-    /// budget, so it holds at most as many rows as that budget keeps resident,
-    /// and admission refuses a mutation whose projected checkpoint would pass
-    /// the assembled bound (`checkpointable`): both follow the allowance,
-    /// down as well as up, so an engine on a small node refuses at what it
-    /// can hold rather than holding what it cannot.
+    /// The standard limits for an engine that admits within `memory_bytes` and holds up to
+    /// `hold_bytes` (at least `memory_bytes`): its completion reserve an eighth of its share, as
+    /// the standard 16 of 128 MiB, and its checkpoint's bounds following what it holds. A root is
+    /// charged to the engine's budget, so it holds at most as many rows as that budget keeps
+    /// resident, and admission refuses a mutation whose projected checkpoint would pass what the
+    /// share allows (`checkpointable`): both follow the allowance, down as well as up, so an
+    /// engine on a small node refuses at what it can hold rather than holding what it cannot.
     pub fn standard_within(
         content_domain: focal_model::ContentDomainId,
         memory_bytes: usize,
+        hold_bytes: usize,
     ) -> Self {
+        let hold_bytes = hold_bytes.max(memory_bytes);
         let mut limits = Self::standard(content_domain);
         limits.memory_bytes = memory_bytes;
         limits.completion_reserve_bytes = memory_bytes / 8;
-        limits.checkpoint.rows = memory_bytes
+        limits.hold_bytes = hold_bytes;
+        limits.checkpoint.rows = hold_bytes
             .checked_div(focal_core::native::NATIVE_ENTRY_BYTES)
             .unwrap_or(0);
-        limits.checkpoint.assembled_bytes = memory_bytes;
+        limits.checkpoint.assembled_bytes = hold_bytes;
         limits.checkpoint = limits.checkpoint.derived();
         limits
+    }
+    /// The checkpoint a mutation may project as it is admitted, rows and assembled bytes: what
+    /// the share allows, within what the engine's checkpoints hold. A leader admitting within it
+    /// leaves every replica that holds as much as the share able to checkpoint what it admitted.
+    pub fn admission_checkpoint(&self) -> (usize, usize) {
+        let rows = self
+            .memory_bytes
+            .checked_div(focal_core::native::NATIVE_ENTRY_BYTES)
+            .unwrap_or(0);
+        (
+            rows.min(self.checkpoint.rows),
+            self.memory_bytes.min(self.checkpoint.assembled_bytes),
+        )
+    }
+    /// The budget this engine charges under `parent`: its share, its reserve and its hold.
+    pub(crate) fn budget_within(
+        &self,
+        parent: &focal_memory::MemoryBudget,
+    ) -> Result<focal_memory::MemoryBudget, focal_memory::MemoryError> {
+        parent.child_holding(
+            self.memory_bytes,
+            self.completion_reserve_bytes,
+            self.hold_bytes.max(self.memory_bytes),
+        )
     }
 }
 /// Fresh admissions between free-space samples while far above the watermark.
@@ -541,7 +589,7 @@ impl PendingSeed {
         let allocation = budget
             .reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 array::<ContentHash>(missing.capacity())?,
             )?
             .commit();
@@ -570,7 +618,7 @@ impl PendingSeed {
         let allocation = budget
             .reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 array::<ContentHash>(count.saturating_mul(2))?,
             )?
             .commit();
@@ -630,7 +678,7 @@ impl PendingCustody {
         let allocation = budget
             .reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 array::<focal_model::ContentRef>(missing.capacity())?,
             )?
             .commit();

@@ -15,11 +15,23 @@ mod elastic_tests;
 #[path = "budget_interleaving_tests.rs"]
 mod interleaving_tests;
 
-/// Ordinary work cannot consume the reserved completion/control allowance.
+/// The bound a reservation is held to at each level of its walk. Ordinary work cannot consume
+/// the reserved completion/control allowance.
+///
+/// - `Ordinary`: fresh work, held to a level's ordinary limit (its limit less the reserve kept for
+///   completing what was admitted) and to its limit.
+/// - `Completion`: work completing what was admitted, held to the limit.
+/// - `Committed`: what a committed fact requires where it applies, held to the level's hold limit,
+///   never less than its limit. A replica applies what its leader admitted under the leader's
+///   limits; where those are wider than its own, its hold is what lets it follow (doc 31 M3).
+///
+/// Work is funded by a pool of its own lane or of one before it: completion funding cannot pay
+/// for ordinary work, and committed work is never prepaid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BudgetLane {
     Ordinary,
     Completion,
+    Committed,
 }
 
 /// A byte: an allocation carries one ([`Allocation`]).
@@ -304,6 +316,8 @@ struct Level {
     holds: AtomicUsize,
     limit: AtomicUsize,
     ordinary_limit: AtomicUsize,
+    /// What committed work may take ([`BudgetLane::Committed`]): at least `limit`.
+    hold_limit: AtomicUsize,
     total: AtomicUsize,
     ordinary: AtomicUsize,
     kinds: KindCounters,
@@ -327,6 +341,7 @@ struct Level {
 struct Terms {
     limit: usize,
     ordinary_limit: usize,
+    hold_limit: usize,
     depth: u8,
     funding: Funding,
 }
@@ -382,9 +397,11 @@ impl Backing {
         let (form, held, available, metadata) = match *funding {
             Funding::Unfunded => (UNFUNDED, 0, 0, 0),
             Funding::Fixed { lane, bytes } => (
+                // Committed work is never prepaid (`funded_child` refuses it), so a funded
+                // level's lane is one of the other two.
                 match lane {
                     BudgetLane::Ordinary => FIXED_ORDINARY,
-                    BudgetLane::Completion => FIXED_COMPLETION,
+                    BudgetLane::Completion | BudgetLane::Committed => FIXED_COMPLETION,
                 },
                 bytes,
                 0,
@@ -398,7 +415,7 @@ impl Backing {
             } => (
                 match lane {
                     BudgetLane::Ordinary => ELASTIC_ORDINARY,
-                    BudgetLane::Completion => ELASTIC_COMPLETION,
+                    BudgetLane::Completion | BudgetLane::Committed => ELASTIC_COMPLETION,
                 },
                 held,
                 available,
@@ -487,6 +504,7 @@ impl Level {
             holds: AtomicUsize::new(0),
             limit: AtomicUsize::new(0),
             ordinary_limit: AtomicUsize::new(0),
+            hold_limit: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
             ordinary: AtomicUsize::new(0),
             kinds: KindCounters::new(),
@@ -508,6 +526,7 @@ impl Level {
         self.limit.store(terms.limit, Ordering::Relaxed);
         self.ordinary_limit
             .store(terms.ordinary_limit, Ordering::Relaxed);
+        self.hold_limit.store(terms.hold_limit, Ordering::Relaxed);
         self.total.store(0, Ordering::Relaxed);
         self.ordinary.store(0, Ordering::Relaxed);
         self.kinds.clear();
@@ -567,8 +586,11 @@ impl Level {
             }
             return Err(error);
         }
-        if let Err(error) = reserve_counter(&self.total, self.limit.load(Ordering::Relaxed), bytes)
-        {
+        let bound = match lane {
+            BudgetLane::Committed => self.hold_limit.load(Ordering::Relaxed),
+            BudgetLane::Ordinary | BudgetLane::Completion => self.limit.load(Ordering::Relaxed),
+        };
+        if let Err(error) = reserve_counter(&self.total, bound, bytes) {
             if lane == BudgetLane::Ordinary {
                 self.ordinary.fetch_sub(bytes, Ordering::AcqRel);
             }
@@ -740,6 +762,7 @@ fn reserve_tree(
                     match lane {
                         BudgetLane::Ordinary => 0,
                         BudgetLane::Completion => 1,
+                        BudgetLane::Committed => 2,
                     },
                     Ordering::Relaxed,
                 );
@@ -917,21 +940,33 @@ impl MemoryBudget {
     }
 
     pub fn new(limit: usize, completion_reserve: usize) -> Result<Self, MemoryError> {
-        Self::create(limit, completion_reserve, None)
+        Self::create(limit, completion_reserve, limit, None)
     }
     /// Reservations charge this child and its ancestors up to any funded pool;
     /// that pool's backing is already held above it. A parent's refusal rolls
     /// back the entire tentative reservation. Local allowances can be larger
     /// than a parent; the strictest live limit and funding-lane restriction win.
     pub fn child(&self, limit: usize, completion_reserve: usize) -> Result<Self, MemoryError> {
-        Self::create(limit, completion_reserve, Some(self))
+        Self::create(limit, completion_reserve, limit, Some(self))
+    }
+    /// [`Self::child`] whose committed work ([`BudgetLane::Committed`]) may take up to `hold`,
+    /// at least `limit`: a replica that admits within `limit` and applies what a leader with a
+    /// wider one admitted (doc 31 M3). Its ancestors still bound what it takes.
+    pub fn child_holding(
+        &self,
+        limit: usize,
+        completion_reserve: usize,
+        hold: usize,
+    ) -> Result<Self, MemoryError> {
+        Self::create(limit, completion_reserve, hold, Some(self))
     }
     fn create(
         limit: usize,
         completion_reserve: usize,
+        hold: usize,
         parent: Option<&Self>,
     ) -> Result<Self, MemoryError> {
-        if limit == 0 || completion_reserve > limit {
+        if limit == 0 || completion_reserve > limit || hold < limit {
             return Err(MemoryError::InvalidConfiguration(
                 "invalid memory allowance",
             ));
@@ -944,6 +979,7 @@ impl MemoryBudget {
             &Terms {
                 limit,
                 ordinary_limit: limit.saturating_sub(completion_reserve),
+                hold_limit: hold,
                 depth,
                 funding: Funding::Unfunded,
             },
@@ -995,6 +1031,11 @@ impl MemoryBudget {
         if capacity == 0 {
             return Err(MemoryError::InvalidConfiguration("empty funded pool"));
         }
+        if funding_lane == BudgetLane::Committed {
+            return Err(MemoryError::InvalidConfiguration(
+                "committed work is never prepaid",
+            ));
+        }
         let depth = self.child_depth()?;
         let bytes = crate::checked_add(capacity, child_metadata())?;
         reserve_tree(self.level, BudgetKind::Reserved, funding_lane, bytes)?;
@@ -1003,8 +1044,9 @@ impl MemoryBudget {
                 limit: capacity,
                 ordinary_limit: match funding_lane {
                     BudgetLane::Ordinary => capacity,
-                    BudgetLane::Completion => 0,
+                    BudgetLane::Completion | BudgetLane::Committed => 0,
                 },
+                hold_limit: capacity,
                 depth,
                 funding: Funding::Fixed {
                     lane: funding_lane,
@@ -1055,6 +1097,7 @@ impl MemoryBudget {
             .map(|level| match lane {
                 BudgetLane::Ordinary => level.ordinary_limit.load(Ordering::Relaxed),
                 BudgetLane::Completion => level.limit.load(Ordering::Relaxed),
+                BudgetLane::Committed => level.hold_limit.load(Ordering::Relaxed),
             })
             .min()
             .unwrap_or(usize::MAX)
@@ -1083,9 +1126,12 @@ impl MemoryBudget {
                         .saturating_sub(level.ordinary.load(Ordering::Acquire)),
                 );
             }
+            let bound = match lane {
+                BudgetLane::Committed => &level.hold_limit,
+                BudgetLane::Ordinary | BudgetLane::Completion => &level.limit,
+            };
             headroom = headroom.min(
-                level
-                    .limit
+                bound
                     .load(Ordering::Relaxed)
                     .saturating_sub(level.total.load(Ordering::Acquire)),
             );
@@ -1108,7 +1154,8 @@ impl MemoryBudget {
             count,
             lane: match level.refused_lane.load(Ordering::Relaxed) {
                 0 => BudgetLane::Ordinary,
-                _ => BudgetLane::Completion,
+                1 => BudgetLane::Completion,
+                _ => BudgetLane::Committed,
             },
             requested: level.refused_requested.load(Ordering::Relaxed),
             available: level.refused_available.load(Ordering::Relaxed),
@@ -1438,6 +1485,7 @@ mod resizing_tests {
             (stats.limit, stats.completion_reserve, stats.used),
             (512, 128, 0)
         );
+        assert_eq!(reused.reservation_limit(BudgetLane::Committed), 512);
         assert!(stats.by_kind.iter().all(|bytes| *bytes == 0));
         assert!(!reused.is_within(&root));
         assert_eq!(reused.level.backing.lane(), None);
@@ -1450,6 +1498,95 @@ mod resizing_tests {
                 .is_err()
         );
         drop(ordinary);
+    }
+    /// A replica admits within its limits and applies within its hold (doc 31 M3): fresh work
+    /// stops at the ordinary limit, completing work at the limit, and what a committed fact
+    /// requires at the hold, each refusal counted in its own lane; the ceilings and the headroom
+    /// say the same, and an ancestor still bounds what the hold allows.
+    #[test]
+    fn committed_work_takes_the_hold_and_admitted_work_its_limits() {
+        let root = MemoryBudget::new(1_000, 100).unwrap();
+        let replica = root.child_holding(400, 50, 800).unwrap();
+        assert_eq!(replica.reservation_limit(BudgetLane::Ordinary), 350);
+        assert_eq!(replica.reservation_limit(BudgetLane::Completion), 400);
+        assert_eq!(replica.reservation_limit(BudgetLane::Committed), 800);
+        let fresh = replica
+            .reserve(BudgetKind::Pages, BudgetLane::Ordinary, 350)
+            .unwrap();
+        assert!(
+            replica
+                .reserve(BudgetKind::Pages, BudgetLane::Ordinary, 1)
+                .is_err()
+        );
+        assert_eq!(replica.refusals().lane, BudgetLane::Ordinary);
+        let completing = replica
+            .reserve(BudgetKind::Pages, BudgetLane::Completion, 50)
+            .unwrap();
+        assert_eq!(replica.headroom(BudgetLane::Completion), 0);
+        assert!(
+            replica
+                .reserve(BudgetKind::Pages, BudgetLane::Completion, 1)
+                .is_err()
+        );
+        assert_eq!(replica.headroom(BudgetLane::Committed), 400);
+        let applied = replica
+            .reserve(BudgetKind::Pages, BudgetLane::Committed, 400)
+            .unwrap();
+        assert_eq!(replica.stats().used, 800);
+        assert_eq!(root.stats().used, 800);
+        let refused = replica.refusals().count;
+        assert!(
+            replica
+                .reserve(BudgetKind::Pages, BudgetLane::Committed, 1)
+                .is_err()
+        );
+        let refusal = replica.refusals();
+        assert_eq!(refusal.count, refused + 1);
+        assert_eq!(refusal.lane, BudgetLane::Committed);
+        // Committed work is never charged to the ordinary counter: what a replica applies leaves
+        // its fresh admissions where they were.
+        assert_eq!(replica.stats().ordinary_used, 350);
+        drop((fresh, completing, applied));
+        assert_eq!(root.stats().used, 0);
+        // A hold beyond an ancestor's limit is held to the ancestor's.
+        let wide = root.child_holding(400, 50, 5_000).unwrap();
+        assert_eq!(wide.reservation_limit(BudgetLane::Committed), 1_000);
+        let all = wide
+            .reserve(BudgetKind::Pages, BudgetLane::Committed, 1_000)
+            .unwrap();
+        assert!(
+            wide.reserve(BudgetKind::Pages, BudgetLane::Committed, 1)
+                .is_err()
+        );
+        drop(all);
+        // A budget made without a hold holds committed work to its limit.
+        let plain = root.child(400, 50).unwrap();
+        assert_eq!(plain.reservation_limit(BudgetLane::Committed), 400);
+    }
+    /// A hold below the limit is no allowance, and committed work is never prepaid: a pool funded
+    /// in that lane is refused, fixed or elastic.
+    #[test]
+    fn a_hold_below_the_limit_and_a_committed_prepayment_are_refused() {
+        let root = MemoryBudget::new(1_000, 0).unwrap();
+        assert!(matches!(
+            root.child_holding(400, 50, 399),
+            Err(MemoryError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            root.funded_child(BudgetLane::Committed, 64),
+            Err(MemoryError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            root.elastic_funded_child(BudgetLane::Committed, 64, 0),
+            Err(MemoryError::InvalidConfiguration(_))
+        ));
+        assert_eq!(root.stats().used, 0, "a refused pool charges nothing");
+        // Committed work spends a pool funded in either other lane.
+        let pool = root.funded_child(BudgetLane::Completion, 64).unwrap();
+        let spent = pool
+            .reserve(BudgetKind::Pages, BudgetLane::Committed, 64)
+            .unwrap();
+        drop((spent, pool));
     }
     #[test]
     fn immutable_reservation_ceiling_includes_every_ancestor_and_ignores_usage() {

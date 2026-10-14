@@ -103,6 +103,23 @@ pub fn retire_rule(root: &Path) -> Result<focal_ledger::RetireRule, NodeError> {
     Ok(retire_rule_at(known(root)?.unwrap_or(0)))
 }
 
+/// How much of a session's allowance the native engines a node hosts admit within (doc 31 M3):
+/// the wide share once the fence it last knew opens `SHARE_LEVEL`, as a node founded there does
+/// from its first start; half below it. Read as each session's hosting is built, as
+/// [`seal_rule`] is; every binary at the level applies within the whole allowance meanwhile.
+pub fn native_share(root: &Path) -> Result<focal_ledger::NativeShare, NodeError> {
+    Ok(native_share_at(known(root)?.unwrap_or(0)))
+}
+
+/// The native share a fence at `level` opens.
+pub fn native_share_at(level: u32) -> focal_ledger::NativeShare {
+    if level >= crate::upgrade::SHARE_LEVEL {
+        focal_ledger::NativeShare::Wide
+    } else {
+        focal_ledger::NativeShare::Half
+    }
+}
+
 /// The retire rule a fence at `level` opens: to the cold stream from `COLD_LEVEL`, in batches
 /// from `RETIRE_LEVEL`, a family at a time below.
 pub fn retire_rule_at(level: u32) -> focal_ledger::RetireRule {
@@ -181,5 +198,34 @@ mod tests {
         );
         std::fs::write(dir.path().join(FILE), b"short").unwrap();
         assert!(member_wire(dir.path()).is_err());
+    }
+
+    /// A node's native engines admit within half their sessions' allowances until the fence it
+    /// last knew opens `SHARE_LEVEL`, and within the wide share from there (doc 31 M3); a node
+    /// that knows no fence, or a damaged record, opens none wide.
+    #[test]
+    fn native_engines_admit_wide_once_the_recorded_fence_opens_the_share_level() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            native_share(dir.path()).unwrap(),
+            focal_ledger::NativeShare::Half
+        );
+        record(dir.path(), crate::upgrade::SHARE_LEVEL - 1).unwrap();
+        assert_eq!(
+            native_share(dir.path()).unwrap(),
+            focal_ledger::NativeShare::Half
+        );
+        record(dir.path(), crate::upgrade::SHARE_LEVEL).unwrap();
+        assert_eq!(
+            native_share(dir.path()).unwrap(),
+            focal_ledger::NativeShare::Wide
+        );
+        assert_eq!(
+            native_share_at(crate::upgrade::CAPABILITY_LEVEL),
+            focal_ledger::NativeShare::Wide
+        );
+        assert_eq!(native_share_at(0), focal_ledger::NativeShare::Half);
+        std::fs::write(dir.path().join(FILE), b"short").unwrap();
+        assert!(native_share(dir.path()).is_err());
     }
 }

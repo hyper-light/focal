@@ -2300,10 +2300,10 @@ impl Core<NativeState> {
             at,
             id,
             self.limits.max_ranges,
-            // A layout change applies a committed record: completion work,
-            // funded from the lane admission leaves for it, never refused
-            // because fresh admissions filled the ordinary lane.
-            focal_memory::BudgetLane::Completion,
+            // A layout change applies a committed record: committed work, held
+            // to what the replica holds, never refused because fresh admissions
+            // filled the ordinary lane or a leader admitted under a wider share.
+            focal_memory::BudgetLane::Committed,
             prepare::copy,
         )
     }
@@ -2318,7 +2318,7 @@ impl Core<NativeState> {
     pub fn merge_native_range(&mut self, index: usize) -> Result<(), NativeError> {
         self.state
             .rows
-            .merge(index, focal_memory::BudgetLane::Completion)
+            .merge(index, focal_memory::BudgetLane::Committed)
     }
 }
 

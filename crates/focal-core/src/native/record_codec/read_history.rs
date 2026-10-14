@@ -194,7 +194,7 @@ impl HistoryIndex {
         // uses constant stack state. The permit lasts through root validation.
         let allocation = read
             .budget
-            .reserve(BudgetKind::Recovery, BudgetLane::Completion, charge)?
+            .reserve(BudgetKind::Recovery, BudgetLane::Committed, charge)?
             .commit();
         let mut rows = Vec::new();
         rows.try_reserve_exact(capacity)

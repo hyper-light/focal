@@ -65,11 +65,11 @@ pub struct SessionLimits {
 impl SessionLimits {
     /// The standard limits for a session allowed `memory_bytes`, however
     /// small its node: its completion reserve an eighth of it, as the
-    /// standard 32 of 256 MiB. Its native engine is allowed half
-    /// ([`crate::NativeSessionLimits::standard_within`]), as the standard 128
-    /// of 256 MiB. A session refuses, typed, what its allowance cannot hold:
-    /// 48 MiB held 2,803 claims and 96 MiB 5,875 before refusing
-    /// `Capacity`, each node serving on.
+    /// standard 32 of 256 MiB. Its native engine admits within its share
+    /// ([`Self::native_memory_bytes`]) and holds within the whole allowance
+    /// ([`crate::NativeSessionLimits::standard_within`]). A session refuses,
+    /// typed, what its allowance cannot hold: 48 MiB held 2,803 claims and
+    /// 96 MiB 5,875 before refusing `Capacity` at half, each node serving on.
     pub fn within(memory_bytes: usize) -> Self {
         Self {
             memory_bytes,
@@ -77,9 +77,17 @@ impl SessionLimits {
             ..Self::default()
         }
     }
-    /// The memory a session's native engine is allowed under `self`.
-    pub fn native_memory_bytes(&self) -> usize {
-        self.memory_bytes / 2
+    /// What a session's native engine admits within under `self` and `share` (doc 31 M3): half
+    /// the allowance, or the allowance less its completion reserve, which the session's other
+    /// work completes within.
+    pub fn native_memory_bytes(&self, share: crate::NativeShare) -> usize {
+        match share {
+            crate::NativeShare::Half => self.memory_bytes / 2,
+            crate::NativeShare::Wide => self
+                .memory_bytes
+                .saturating_sub(self.completion_reserve_bytes)
+                .max(self.memory_bytes / 2),
+        }
     }
 }
 

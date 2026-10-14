@@ -249,14 +249,14 @@ impl RangeCoordinator {
         let allocation = budget
             .reserve(
                 BudgetKind::Control,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 state_charge(&state)?,
             )?
             .commit();
         let runtime = budget
             .reserve(
                 BudgetKind::Control,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 mul(limits.max_ranges, row::<RangeProgress>())?,
             )?
             .commit();
@@ -345,6 +345,25 @@ impl RangeCoordinator {
         operation: RangeOperation,
         verifier: &impl RangeVerifier,
     ) -> Result<PreparedRangeCommand, RangeError> {
+        self.prepare_in(
+            BudgetLane::Committed,
+            ordinal,
+            sequence,
+            operation,
+            verifier,
+        )
+    }
+    /// [`Self::prepare`], charged in `lane`: committed where a committed record applies, so a
+    /// replica follows a leader whose share is wider than its own (doc 31 M3); in an admission
+    /// lane where an authority checks a command before it proposes it.
+    pub fn prepare_in(
+        &self,
+        lane: BudgetLane,
+        ordinal: u64,
+        sequence: SessionSeq,
+        operation: RangeOperation,
+        verifier: &impl RangeVerifier,
+    ) -> Result<PreparedRangeCommand, RangeError> {
         let hash = range_command_hash(self.map().ledger(), ordinal, sequence, &operation)?;
         if ordinal == self.root.state.control_ordinal
             && sequence == self.root.state.control_sequence
@@ -357,11 +376,7 @@ impl RangeCoordinator {
         {
             let allocation = self
                 .budget
-                .reserve(
-                    BudgetKind::Control,
-                    BudgetLane::Completion,
-                    state_charge(&self.root.state)?,
-                )?
+                .reserve(BudgetKind::Control, lane, state_charge(&self.root.state)?)?
                 .commit();
             return Ok(PreparedRangeCommand {
                 owner: self.owner,
@@ -400,7 +415,7 @@ impl RangeCoordinator {
         )?;
         let allocation = self
             .budget
-            .reserve(BudgetKind::Control, BudgetLane::Completion, bytes)?
+            .reserve(BudgetKind::Control, lane, bytes)?
             .commit();
         let mut state = self.root.state.clone();
         match &operation {
@@ -688,7 +703,7 @@ impl RangeCoordinator {
             .budget
             .reserve(
                 BudgetKind::Control,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 state_charge(&state)?,
             )?
             .commit();

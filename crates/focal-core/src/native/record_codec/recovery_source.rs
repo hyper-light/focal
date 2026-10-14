@@ -44,7 +44,7 @@ fn context<'a, O, C>(
         objects,
         custody: shared.custody,
         workspace: shared.budget,
-        workspace_lane: BudgetLane::Completion,
+        workspace_lane: BudgetLane::Committed,
         parsing: &shared.meters.parsing,
         source: &shared.meters.source,
         model: &shared.meters.model,

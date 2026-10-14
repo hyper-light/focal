@@ -2850,6 +2850,145 @@ fn a_committed_split_applies_on_an_authority_whose_memory_is_spoken_for() {
     assert_same_digest(&mut cluster, &[1, 2, 3]);
 }
 
+/// A replica applies what its session committed within its hold, not its share (doc 31 M3): a
+/// leader whose share is wider than a follower's admits past the follower's share. A follower
+/// whose share is spoken for (as such a leader's admissions fill it) still applies every
+/// committed record at once: a claim's lifecycle, a split, and, lagging, the leader's checkpoint
+/// and the tail after it; and it takes its own checkpoint. A follower that holds no more than its
+/// share keeps the delivery and applies it only once memory returns.
+#[test]
+fn a_follower_past_its_share_applies_what_committed_within_its_hold() {
+    let share = limits().memory_bytes;
+    let mut cluster = Cluster::with_limits(move |_| NativeSessionLimits {
+        hold_bytes: share.saturating_mul(2),
+        ..limits()
+    });
+    cluster.elect(1, &[]);
+    let filled = exhaust_lane(&mut cluster, 3, focal_memory::BudgetLane::Completion);
+    assert!(!filled.is_empty());
+    let budget = cluster.node(3).engine.budget.clone();
+    assert_eq!(budget.headroom(focal_memory::BudgetLane::Completion), 0);
+    cluster.received_claim(1);
+    assert_eq!(cluster.sequence(3), cluster.sequence(1));
+    cluster
+        .node(1)
+        .propose_layout(LayoutOperation::Split {
+            at: ClaimId::from_u128(1).0,
+            id: RangeId(31),
+        })
+        .unwrap();
+    cluster.pump(&[]);
+    assert_same_layout(&mut cluster, 1);
+    let second = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, second, &[3]);
+    cluster.node(1).begin_checkpoint().unwrap();
+    cluster.pump(&[3]);
+    assert!(!cluster.node(1).checkpoint_pending());
+    let third = cluster.creation(3);
+    cluster.commit(1, PARTIES.issuer, third, &[3]);
+    cluster.settle(&[]);
+    assert_eq!(
+        cluster.sequence(3),
+        cluster.sequence(1),
+        "installed and replayed"
+    );
+    cluster.node(3).begin_checkpoint().unwrap();
+    cluster.pump(&[]);
+    assert!(!cluster.node(3).checkpoint_pending());
+    assert!(!cluster.node(3).engine.failed());
+    assert!(
+        budget.stats().used > budget.limit(),
+        "what it applied took it past its share"
+    );
+    cluster.assert_same_state(&[1, 2, 3]);
+    drop(filled);
+
+    // Holding no more than its share, the same follower waits for memory.
+    let mut plain = Cluster::new();
+    plain.elect(1, &[]);
+    let first = plain.creation(1);
+    plain.commit(1, PARTIES.issuer, first, &[]);
+    let filled = exhaust_lane(&mut plain, 3, focal_memory::BudgetLane::Completion);
+    plain.retry_ok = vec![3];
+    let second = plain.creation(2);
+    let committed = plain.commit(1, PARTIES.issuer, second, &[]);
+    plain.settle(&[]);
+    assert_eq!(plain.sequence(3), SessionSeq(1), "refused, not lost");
+    drop(filled);
+    plain.retry_ok.clear();
+    plain.settle(&[]);
+    assert_eq!(
+        plain.node(3).outcome(committed.invocation).unwrap(),
+        Some(committed)
+    );
+    plain.assert_same_state(&[1, 2]);
+}
+
+/// A full session's leader still checkpoints (doc 31 M3): fresh admissions that fill its ordinary
+/// lane leave the frozen image its checkpoint encodes from room in the committed one. The image's
+/// pins were charged as fresh work, so a session at its fill could take no checkpoint, and its log
+/// could not compact for as long as the fill lasted.
+#[test]
+fn a_leader_whose_fresh_admissions_filled_its_share_still_checkpoints() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    let ordinary = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Ordinary);
+    let budget = cluster.node(1).engine.budget.clone();
+    assert_eq!(budget.headroom(focal_memory::BudgetLane::Ordinary), 0);
+    cluster.node(1).begin_checkpoint().unwrap();
+    cluster.pump(&[]);
+    assert!(!cluster.node(1).checkpoint_pending());
+    assert!(!cluster.node(1).engine.failed());
+    drop(ordinary);
+    let second = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, second, &[]);
+    cluster.assert_same_state(&[1, 2]);
+}
+
+/// A leader admits within its share, never its hold (doc 31 M3): with its share spoken for, a
+/// fresh creation is refused for the owner's memory, typed, though its hold has room, and the
+/// session serves on.
+#[test]
+fn a_leader_admits_within_its_share_not_its_hold() {
+    let share = limits().memory_bytes;
+    let mut cluster = Cluster::with_limits(move |_| NativeSessionLimits {
+        hold_bytes: share.saturating_mul(2),
+        ..limits()
+    });
+    cluster.elect(1, &[]);
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    let ordinary = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Ordinary);
+    let completion = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Completion);
+    let budget = cluster.node(1).engine.budget.clone();
+    assert!(budget.headroom(focal_memory::BudgetLane::Committed) > 0);
+    let second = cluster.creation(2);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    let refused = cluster
+        .node(1)
+        .propose(fx::context(PARTIES.issuer, clock), second)
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            NativeSessionError::Native(focal_core::native::NativeError::Memory(_))
+                | NativeSessionError::Owner(focal_core::native::NativeOwnerError::Native(
+                    focal_core::native::NativeError::Memory(_)
+                ))
+                | NativeSessionError::Memory(_)
+        ),
+        "{refused:?}"
+    );
+    assert!(!cluster.node(1).engine.failed());
+    drop((ordinary, completion));
+    let again = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, again, &[]);
+    cluster.assert_same_state(&[1, 2]);
+}
+
 /// Under the anchored rule (F12, level 5) the seal the authority derived is
 /// put under custody while the session goes on committing: handed over
 /// with a candidate pending, it is held, admission holds behind it, and it

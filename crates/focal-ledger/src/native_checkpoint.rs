@@ -106,7 +106,7 @@ impl Sealer {
         let charge = budget
             .reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 fields::add(table_bytes, fields::add(SEED_CHUNK_BYTES, ALLOCATION)?)?,
             )?
             .commit();
@@ -772,7 +772,7 @@ impl<'a> EncodingPlan<'a> {
         let allocation = budget
             .reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 self.quote.output_charge,
             )?
             .commit();
@@ -819,7 +819,7 @@ impl<'a> EncodingPlan<'a> {
         let allocation = budget
             .reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 self.quote.output_charge,
             )?
             .commit();

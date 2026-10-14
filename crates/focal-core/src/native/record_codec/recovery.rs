@@ -282,7 +282,7 @@ pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
         budget,
         store,
         schemas,
-        BudgetLane::Completion,
+        BudgetLane::Committed,
     )
 }
 /// [`restore`] with every root, index, layout, hydration page and assembled

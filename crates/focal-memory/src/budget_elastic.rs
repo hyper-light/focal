@@ -164,6 +164,11 @@ impl MemoryBudget {
                 "invalid elastic funded allowance",
             ));
         }
+        if funding_lane == BudgetLane::Committed {
+            return Err(MemoryError::InvalidConfiguration(
+                "committed work is never prepaid",
+            ));
+        }
         let depth = self.child_depth()?;
         let metadata = child_metadata();
         let held = crate::checked_add(initial_capacity, metadata)?;
@@ -173,8 +178,9 @@ impl MemoryBudget {
                 limit: ceiling,
                 ordinary_limit: match funding_lane {
                     BudgetLane::Ordinary => ceiling,
-                    BudgetLane::Completion => 0,
+                    BudgetLane::Completion | BudgetLane::Committed => 0,
                 },
+                hold_limit: ceiling,
                 depth,
                 funding: Funding::Elastic {
                     lane: funding_lane,

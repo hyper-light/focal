@@ -1722,6 +1722,8 @@ impl PlacementAgent {
                 .map_err(|error| AgentError::Level(Box::new(error)))?,
             crate::storage_level::retire_rule(&self.root)
                 .map_err(|error| AgentError::Level(Box::new(error)))?,
+            crate::storage_level::native_share(&self.root)
+                .map_err(|error| AgentError::Level(Box::new(error)))?,
         )?;
         let session = Session::from_node_in_hosted(ledger, consensus, limits, tenant, hosting)?;
         // A reopened copy serves the route its log has committed; a fresh copy
@@ -2647,10 +2649,15 @@ impl PlacementAgent {
             .restore_content(request.input.clone(), manifest.clone())
             .await?;
         let domain = focal_model::ContentDomainId(ledger.tenant.0);
+        // The restore reads and installs the backup's checkpoint: what the restored session's
+        // replicas hold, its whole allowance, bounds it.
+        let session = SessionLimits::within(crate::memory_envelope::session_bytes(restored_memory));
+        let share = crate::storage_level::native_share(&self.root)
+            .map_err(|error| AgentError::Level(Box::new(error)))?;
         let limits = crate::network_service::native_limits(
             domain,
-            SessionLimits::within(crate::memory_envelope::session_bytes(restored_memory))
-                .native_memory_bytes(),
+            session.native_memory_bytes(share),
+            session.memory_bytes,
         )?;
         let decoder = focal_ledger::backup::decoder_pair();
         let seed_root = crate::custody::seed_directory(&self.root.join("seeds"), ledger);

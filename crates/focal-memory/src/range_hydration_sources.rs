@@ -92,7 +92,7 @@ impl<K: crate::RangeKey + Clone, V> RangeHydration<K, V> {
         while constructed < expected_entries {
             let _staging = self.store.budget.reserve(
                 BudgetKind::Pending,
-                BudgetLane::Completion,
+                self.lane,
                 checked_add(
                     checked_mul(2, ALLOCATOR_OVERHEAD)?,
                     checked_mul(
@@ -148,7 +148,7 @@ impl<K: crate::RangeKey + Clone, V> RangeHydration<K, V> {
                     let mut allocation = self
                         .store
                         .budget
-                        .reserve(BudgetKind::Pending, BudgetLane::Completion, allowance)?
+                        .reserve(BudgetKind::Pending, self.lane, allowance)?
                         .commit();
                     let Entry {
                         key,
@@ -203,9 +203,9 @@ impl<K: crate::RangeKey + Clone, V> RangeHydration<K, V> {
                 .ok_or(MemoryError::CounterExhausted(
                     "hydration construction prefix",
                 ))?;
-            let prepared =
-                self.store
-                    .prepare_batch_with(next, chunk, BudgetLane::Completion, &mut copy)?;
+            let prepared = self
+                .store
+                .prepare_batch_with(next, chunk, self.lane, &mut copy)?;
             self.store.publish(prepared)?;
         }
         match source.next() {
