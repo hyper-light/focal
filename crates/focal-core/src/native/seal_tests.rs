@@ -84,6 +84,10 @@ fn seal(
     fold: Option<(u64, u64)>,
 ) -> (SealPlan, Vec<u8>, ContentHash, Option<Vec<u8>>) {
     let plan = core.seal_plan(floors, bound(core)).unwrap();
+    // Without floors, the counters bound every plan from above.
+    if floors.is_empty() {
+        assert!(plan.rows() <= core.sealable_rows_bound());
+    }
     let quote = core.seal_quote(&plan, limits()).unwrap();
     let mut bytes = vec![0; quote.bytes];
     let hash = core.seal_into(&plan, &mut bytes, quote.visits).unwrap();
@@ -341,11 +345,12 @@ fn a_closed_generation_seals_into_a_bundle_the_live_core_points_to() {
         .native_outcome(NativeInvocation::Request(first))
         .unwrap()
         .unwrap();
-    // Nothing is closed: nothing to seal, no pressure.
+    // Nothing is closed: nothing to seal, no pressure, and the counters say so.
     assert_eq!(
         core.seal_plan(&[], bound(&core)).unwrap_err(),
         SealRefusal::Nothing
     );
+    assert_eq!(core.sealable_rows_bound(), 0);
     assert!(core.pressure_floors(8).unwrap().is_empty());
     f::publish(&mut core, 40, advance(f::ISSUER, 2, 4, 2));
     // Floors that are not the pressure floors of this state are refused.
@@ -365,6 +370,9 @@ fn a_closed_generation_seals_into_a_bundle_the_live_core_points_to() {
         }]
     );
     assert_eq!(plan.outcomes(), 3);
+    // The counters bound what the plan takes, without visiting it: the closed
+    // generation's outcomes, each with its creation result, and the advance's.
+    assert!(plan.rows() <= core.sealable_rows_bound());
     // Deriving again yields the same plan: what every replica applies.
     assert_eq!(core.seal_plan(&[], bound(&core)).unwrap(), plan);
     let (plan, bytes, hash, _) = seal(&mut core, &[], None);

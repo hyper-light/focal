@@ -212,6 +212,19 @@ impl Core<NativeState> {
         let meta = self.meta_row();
         meta.outcomes.saturating_sub(meta.sealed)
     }
+    /// The most rows a seal could take now ([`Self::seal_plan`]), read from counters alone: the
+    /// meta row's resident outcomes less those each principal's open generations hold (a window
+    /// a principal), each with a creation result. No plan's rows exceed it, so a seal short of a
+    /// threshold is known without visiting one of the rows it would take, which grow with every
+    /// write between seals.
+    pub fn sealable_rows_bound(&self) -> usize {
+        let open = self.windows().fold(0usize, |open, (_, window)| {
+            open.saturating_add(window.open_outcomes())
+        });
+        self.resident_outcomes()
+            .saturating_sub(open)
+            .saturating_mul(2)
+    }
     fn meta_row(&self) -> Meta {
         match self.state.rows.get(&Key::Meta) {
             Some(Row::Meta(meta)) => **meta,

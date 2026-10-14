@@ -237,6 +237,25 @@ pub(crate) fn sealed_outcomes(
             .min(focal_ledger::native_session::seal::MAX_PRINCIPALS),
         rows: focal_core::native::seal::DEFAULT_SEAL_ROWS_PER_BUNDLE,
     };
+    // Under the anchored rule half the window, if less, is enough: a window
+    // smaller than a bundle seals before it fills.
+    let enough = |bound: SealBound| {
+        if anchored {
+            (bound.rows / 2).min(window / 2).max(1)
+        } else {
+            (bound.rows / 2).max(1)
+        }
+    };
+    // Short of half a bundle and pressed by nothing, nothing is planned, and
+    // that is known from counters alone (`sealable_rows_bound`): deriving the
+    // plan visits every outcome awaiting a seal, which grow with every write
+    // between seals, and was done at every round of the archive agent on the
+    // owner's thread only to be dropped (a stall every five seconds that grew
+    // with them, 62 to 120 ms at 200 writes a second: run 38605001535, the
+    // leader's `range: seal bundle` slow steps).
+    if !pressed && core.sealable_rows_bound() < enough(bound) {
+        return Ok(SealOffer::Nothing);
+    }
     let (plan, quote) = loop {
         let plan = match core.seal_plan(&floors, bound) {
             Ok(plan) => plan,
@@ -244,23 +263,11 @@ pub(crate) fn sealed_outcomes(
             Err(SealRefusal::Capacity) => return Err(LedgerError::Capacity),
             Err(_) => return Err(LedgerError::Corrupt),
         };
-        // Short of half a bundle and pressed by nothing, nothing is
-        // proposed, and that is known from the plan: its bundle is not
-        // encoded to be dropped. The quote of a plan short of it was
-        // encoded at every round of the archive agent and dropped, on the
-        // owner's thread, for as long as the outcomes awaiting a seal were
-        // fewer than half a bundle (a stall every five seconds that grew
-        // with them, 70 to 153 ms at 200 writes a second). The same rule
-        // as when the quote came first: a plan short of half a bundle
-        // fits the bundle, so its quote never halved the bound. Under the
-        // anchored rule half the window, if less, is enough: a window
-        // smaller than a bundle seals before it fills.
-        let enough = if anchored {
-            (bound.rows / 2).min(window / 2).max(1)
-        } else {
-            (bound.rows / 2).max(1)
-        };
-        if !pressed && plan.rows() < enough {
+        // The counters bound the plan from above; the plan itself decides.
+        // A plan short of half a bundle is not encoded to be dropped (a
+        // plan short of it fits the bundle, so its quote never halved the
+        // bound).
+        if !pressed && plan.rows() < enough(bound) {
             return Ok(SealOffer::Nothing);
         }
         match core.seal_quote(&plan, limits) {
