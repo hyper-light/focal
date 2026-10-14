@@ -200,7 +200,23 @@ impl LocalHost {
                         continue;
                     };
                     match work {
-                        Work::Request(request, response, charge) => {
+                        Work::Request(request, response, mut charge) => {
+                            // A native read's page is funded as the owner builds it, one at a
+                            // time: one that cannot be is refused, without effect.
+                            let native_read = matches!(
+                                request.request().operation,
+                                Operation::NativeRead(_) | Operation::NativeList(_)
+                            );
+                            if native_read
+                                && crate::fleet::fund_page(&mut charge, limits.max_frame_bytes)
+                                    .is_err()
+                            {
+                                let refused = request
+                                    .request()
+                                    .reply(Response::Error(AccessError::Capacity));
+                                let _ = response.send(finish_response(refused, charge));
+                                continue;
+                            }
                             // A vanished caller cannot cancel an already admitted mutation.
                             let dispatched = dispatch(
                                 &mut node,
@@ -399,16 +415,34 @@ impl RequestHandler for LocalHost {
                         ..
                     }
             );
+            let native_read = matches!(
+                request.request().operation,
+                Operation::NativeRead(_) | Operation::NativeList(_)
+            );
             let bytes = postcard::experimental::serialized_size(request.request())
                 .ok()
-                .and_then(|n| n.checked_mul(32))
                 .and_then(|n| {
-                    payload
-                        .checked_mul(32)
-                        .and_then(|reply| n.checked_add(reply))
-                })
-                .and_then(|n| n.checked_add(if content { 8 * 1024 * 1024 } else { 0 }))
-                .and_then(|n| n.checked_add(4096));
+                    if native_read {
+                        // A native read waits as its request and a place: the room its page may
+                        // take is funded as the owner builds it, one page at a time
+                        // (`fleet::fund_page`), and given back to what the reply holds as it is
+                        // answered. Reserved for every read as it waited, 32 times the client's
+                        // frame, the host's budget took two reads at once and refused the rest
+                        // (a deliver load on one embedded node: 177 of 200 lifecycles abandoned,
+                        // every event tail's page refused).
+                        n.checked_mul(2)?
+                            .checked_add(crate::fleet::NATIVE_READ_PLACE_BYTES)
+                    } else {
+                        n.checked_mul(32)
+                            .and_then(|n| {
+                                payload
+                                    .checked_mul(32)
+                                    .and_then(|reply| n.checked_add(reply))
+                            })
+                            .and_then(|n| n.checked_add(if content { 8 * 1024 * 1024 } else { 0 }))
+                            .and_then(|n| n.checked_add(4096))
+                    }
+                });
             let Some(bytes) = bytes else {
                 return OwnedResponse::new(full);
             };
@@ -1031,6 +1065,61 @@ mod tests {
             owner.join().unwrap();
             assert_eq!(host.budget.stats().ordinary_used, held);
             drop(second);
+            assert_eq!(host.budget.stats().used, 0);
+        })
+        .unwrap()
+    }
+
+    /// Native reads waiting together are all served: each waits as its request and a place,
+    /// and its page is funded as the owner builds it. Reserved 32 times the client's frame as it
+    /// waited, the host's budget held two at once and refused the rest for capacity.
+    #[test]
+    fn native_reads_waiting_together_are_all_served() {
+        focal_rt::block_on(async move {
+            let root = tempfile::tempdir().unwrap();
+            let mut settings = crate::config::Settings::default();
+            settings.node.data_dir = Some(root.path().to_owned());
+            crate::native_activation::activate_local(
+                &settings,
+                focal_ledger::NativeContentProfile::AuthoredV1,
+            )
+            .unwrap();
+            let node = EmbeddedNode::open(&settings).unwrap();
+            let identity = node.identity.clone();
+            let limits = WireLimits::default();
+            let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
+            let peer = AuthenticatedPeer::local(PeerGrant {
+                principal: identity.issuer,
+                tenants: std::collections::BTreeSet::from([identity.ledger.tenant]),
+                role: PeerRole::Runtime,
+            })
+            .unwrap();
+            let reads = (1..=24u128).map(|id| {
+                let request = RequestEnvelope {
+                    protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
+                    ledger: identity.ledger,
+                    route_epoch: RouteEpoch(1),
+                    request_epoch: RequestEpoch(1),
+                    request_id: RequestId::from_u128(id),
+                    operation: Operation::NativeRead(focal_wire::NativeReadRequest {
+                        consistency: ReadConsistency::Linearizable,
+                        query: focal_wire::NativeReadQuery::Epochs(identity.issuer),
+                        max_items: 1,
+                    }),
+                };
+                focal_wire::dispatch_accounted(&host, peer.clone(), request, &limits)
+            });
+            let answers = futures_util::future::join_all(reads).await;
+            for answer in &answers {
+                assert!(
+                    matches!(answer.envelope().result, Response::NativeRead(_)),
+                    "{:?}",
+                    answer.envelope().result
+                );
+            }
+            drop(answers);
+            host.stop().await.unwrap();
+            owner.join().unwrap();
             assert_eq!(host.budget.stats().used, 0);
         })
         .unwrap()

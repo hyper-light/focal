@@ -989,13 +989,16 @@ impl Pending {
     }
 }
 /// What a native read holds while it waits: its place among the requests, beside its own bytes.
-const NATIVE_READ_PLACE_BYTES: usize = 4096;
+pub(crate) const NATIVE_READ_PLACE_BYTES: usize = 4096;
 /// What a native page may take as the owner builds it: its objects as they are read, at most
 /// as many as the client's frame holds once encoded, 32 times that resident, and the place
 /// the reply keeps. A read's own charge grows to it as its page is built and shrinks to what
 /// its reply holds as it is answered (`finish_response`); a page that cannot be funded is
 /// refused, without effect.
-fn fund_page(charge: &mut Allocation, client_frame_bytes: u32) -> Result<(), AccessError> {
+pub(crate) fn fund_page(
+    charge: &mut Allocation,
+    client_frame_bytes: u32,
+) -> Result<(), AccessError> {
     let room = usize::try_from(client_frame_bytes)
         .ok()
         .and_then(|frame| frame.checked_mul(32))
