@@ -322,7 +322,11 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
                 && row.bundle.0 != [0; 32]
                 && row.bytes != 0
                 && row.through.0 != 0
-                && row.retired_at > row.through
+                // A custody bundle claims no more than its family's last event, before the
+                // retirement; a cold family's frame claims the retirement's own sequence (doc 31
+                // M2, A2), and only a checkpoint with cold streams, which no older binary reads,
+                // holds one.
+                && row.retired_at >= row.through
                 && row.status.is_terminal()
         }
         (Key::RetiredCycleHead(claim), Row::RetiredCycleHead(row)) => {

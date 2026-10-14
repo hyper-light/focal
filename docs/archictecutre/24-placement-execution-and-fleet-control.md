@@ -1738,7 +1738,12 @@ a binary below the level cannot read, so a node takes the rule from the fence
 it last recorded (`storage_level::retire_rule`) as it does the seal rule, the
 engine refuses a batch under the rule below it (`RetireExact`), and the agent
 there retires a family at a time (`FOCALRT1`); every binary at the level
-applies both. A cluster founded by a binary holds the fence at the level
+applies both. Sessions retire to every replica's own cold stream from level 7
+(`upgrade::COLD_LEVEL`; 31 M2, A2): a checkpoint naming the streams carries a
+section a binary below the level cannot read, so every binary at the level
+keeps the streams whatever the fence, and the leader proposes the version-2
+records that fill them (`FCRETIRE` v2) only once the fence reaches the level.
+A cluster founded by a binary holds the fence at the level
 its founder *announces* from genesis (its one node runs it; a founder
 staging a rollout at a lower level founds at that level, never at one it
 would refuse to serve under), so what the fence gates is open to a fresh

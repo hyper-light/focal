@@ -20,11 +20,21 @@ pub(crate) struct CapturedCheckpoint {
     movement: Option<Vec<u8>>,
     _movement_permit: Allocation,
     retention: Option<enclosing::RetentionSection>,
+    /// The cold streams at the point (doc 31 M2, A2), once anything was appended to them, and
+    /// their chunks the encoding makes durable before the checkpoint names them.
+    cold: Option<super::cold::CapturedCold>,
     limits: enclosing::Limits,
     budget: MemoryBudget,
 }
 
 impl CapturedCheckpoint {
+    fn sections(&self) -> enclosing::Sections<'_> {
+        enclosing::Sections {
+            movement: self.movement.as_deref(),
+            retention: self.retention,
+            cold: self.cold.as_ref().map(|cold| &cold.streams),
+        }
+    }
     /// The enclosing checkpoint's bytes with their output permit. A root
     /// beyond the inline bound is sealed as seeds into `batch` (25 §5), the
     /// returned commit making them durable; until it has, the bytes must not
@@ -33,6 +43,11 @@ impl CapturedCheckpoint {
         &self,
         batch: Result<SeedBatch, focal_evidence::ContentError>,
     ) -> Result<(Vec<u8>, Allocation, Option<SeedCommit>), NativeSessionError> {
+        // The cold chunks the checkpoint names are durable before its bytes exist: whatever
+        // makes the bytes the recovery base then finds them so (doc 31 M2, A2).
+        if let Some(cold) = &self.cold {
+            cold.make_durable().map_err(super::cold::cold_error)?;
+        }
         // The rows are walked once: sealed into the batch as they are encoded,
         // the frame written after them. A root that fits inline after all
         // drops its batch and is encoded inline.
@@ -45,8 +60,7 @@ impl CapturedCheckpoint {
                     &self.frozen,
                     self.metadata,
                     &self.configuration,
-                    self.movement.as_deref(),
-                    self.retention,
+                    self.sections(),
                     self.limits,
                 )?;
                 if plan.seeded() {
@@ -60,8 +74,7 @@ impl CapturedCheckpoint {
             frozen: &self.frozen,
             metadata: self.metadata,
             configuration: &self.configuration,
-            movement: self.movement.as_deref(),
-            retention: self.retention,
+            sections: self.sections(),
             limits: self.limits,
         };
         if let Some((encoded, commit)) =
@@ -74,8 +87,7 @@ impl CapturedCheckpoint {
             &self.frozen,
             self.metadata,
             &self.configuration,
-            self.movement.as_deref(),
-            self.retention,
+            self.sections(),
             self.limits,
         )?;
         let (bytes, allocation) = plan.encode_in(&self.budget)?.into_parts();
@@ -272,6 +284,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 retired_families: self.retired_families,
             },
         );
+        // The cold streams (doc 31 M2, A2), named once anything was appended: before then no
+        // checkpoint carries a section a binary below the cold level could not read.
+        let cold = self
+            .cold
+            .capture(self.cold_source.as_ref(), &self.budget)
+            .map_err(super::cold::cold_error)?;
         Ok(CapturedCheckpoint {
             frozen: core.freeze_native()?,
             metadata,
@@ -279,6 +297,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             movement,
             _movement_permit: movement_permit.commit(),
             retention,
+            cold,
             limits: self.limits.checkpoint,
             budget: self.budget.clone(),
         })
@@ -355,6 +374,25 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             None => enclosing::Checkpoint::inspect(data, self.limits.checkpoint)?,
         };
         self.pending_seed = None;
+        // The cold streams it names (doc 31 M2, A2): every chunk local before they are adopted,
+        // pulled from a peer like the root's seeds; a replica that keeps none cannot install them.
+        let cold = match checkpoint.cold() {
+            Some(section) => Some(section.streams()?),
+            None => None,
+        };
+        if let Some(streams) = &cold {
+            let source = self
+                .cold_source
+                .as_ref()
+                .ok_or(NativeSessionError::Legacy)?;
+            let (data, marks) = super::cold::NativeCold::missing(&source.root, streams)
+                .map_err(super::cold::cold_error)?;
+            if !data.is_empty() || !marks.is_empty() {
+                self.pending_seed =
+                    Some(PendingSeed::cold(index, term, data, marks, &self.budget)?);
+                return Err(NativeSessionError::CustodyPending);
+            }
+        }
         let header = checkpoint.header();
         let meta = header.metadata;
         if meta.ancillary != AncillaryProfile::NativeOnlyV1 {
@@ -439,6 +477,11 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.reconstruction_needed = true;
         self.domain = Some(Domain::Passive(restored));
         self.movement = Some(movement);
+        // The cold streams resume from what the checkpoint names, fresh when it names none:
+        // replay appends the batches of every cold record after it alike on every replica.
+        if self.cold_source.is_some() {
+            self.cold = super::cold::ColdSlot::Closed(cold.map(Box::new));
+        }
         self.range = range;
         self.recording_range = meta.recording_range;
         self.recording_term = meta.recording_term;

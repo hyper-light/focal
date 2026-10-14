@@ -158,6 +158,25 @@ pub(super) enum RangeCall {
         offers: Vec<RetireOffer>,
         reply: OneshotSender<Result<RetireBatch, LedgerError>>,
     },
+    /// A cold family's frame, read from the replica's own cold stream (doc 31 M2, A2).
+    ColdFrame {
+        retired_at: focal_model::SessionSeq,
+        digest: ContentHash,
+        reply: OneshotSender<Result<Option<focal_ledger::ColdFrame>, LedgerError>>,
+    },
+    /// What a cold family's frame names of the ledger's content (doc 31 M2, A2).
+    ColdContent {
+        retired_at: focal_model::SessionSeq,
+        digest: ContentHash,
+        reply: OneshotSender<Result<Option<focal_ledger::ColdContent>, LedgerError>>,
+    },
+    /// One walk of the status index for a cold retirement, its offers retired (doc 31 M2, A2).
+    ColdWalk {
+        cursor: Option<focal_core::native::retirement::RetirementCursor>,
+        min_age_ms: u64,
+        visits: usize,
+        reply: OneshotSender<Result<crate::archive_derive::ColdWalk, LedgerError>>,
+    },
     /// How the authority retires: a family at a time below the upgrade fence, in batches at it
     /// (doc 31 M2).
     RetireRule {
@@ -210,6 +229,9 @@ impl RangeCall {
             Self::Retire { .. } => "range: retire",
             Self::RetireBatch { .. } => "range: retire batch",
             Self::RetireRule { .. } => "range: retire rule",
+            Self::ColdWalk { .. } => "range: cold walk",
+            Self::ColdContent { .. } => "range: cold content",
+            Self::ColdFrame { .. } => "range: cold frame",
             Self::Retired { .. } => "range: retired claim",
             Self::SealBundle { .. } => "range: seal bundle",
             Self::Seal { .. } => "range: seal",
@@ -400,6 +422,51 @@ impl ReplicaHost {
         self.range_call(|reply| RangeCall::RetireBatch { offers, reply })
             .await
     }
+    /// A cold family's frame from the replica's own cold stream (doc 31 M2, A2): `None` when no
+    /// cold record applied at `retired_at`.
+    pub async fn cold_frame(
+        &self,
+        retired_at: focal_model::SessionSeq,
+        digest: ContentHash,
+    ) -> Result<Option<focal_ledger::ColdFrame>, LedgerError> {
+        self.range_call(|reply| RangeCall::ColdFrame {
+            retired_at,
+            digest,
+            reply,
+        })
+        .await
+    }
+    /// What a cold family's frame names of the ledger's content (doc 31 M2, A2): `None` when no
+    /// cold record applied at `retired_at`.
+    pub async fn cold_content(
+        &self,
+        retired_at: focal_model::SessionSeq,
+        digest: ContentHash,
+    ) -> Result<Option<focal_ledger::ColdContent>, LedgerError> {
+        self.range_call(|reply| RangeCall::ColdContent {
+            retired_at,
+            digest,
+            reply,
+        })
+        .await
+    }
+    /// One walk of the status index from `cursor` for a cold retirement (doc 31 M2, A2), on the
+    /// replica's own thread: every family that may retire now offered and retired, nothing
+    /// encoded and nothing sealed, at most `visits` rows a call.
+    pub(crate) async fn cold_walk(
+        &self,
+        cursor: Option<focal_core::native::retirement::RetirementCursor>,
+        min_age_ms: u64,
+        visits: usize,
+    ) -> Result<crate::archive_derive::ColdWalk, LedgerError> {
+        self.range_call(|reply| RangeCall::ColdWalk {
+            cursor,
+            min_age_ms,
+            visits,
+            reply,
+        })
+        .await
+    }
     /// How the authority retires (doc 31 M2): what the archive agent offers it under.
     pub async fn retire_rule(&self) -> Result<focal_ledger::RetireRule, LedgerError> {
         self.range_call(|reply| RangeCall::RetireRule { reply })
@@ -568,6 +635,35 @@ impl Owner {
             }
             RangeCall::RetireBatch { offers, reply } => {
                 let result = self.session.native_retire(&offers).map(|(batch, _)| batch);
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::ColdFrame {
+                retired_at,
+                digest,
+                reply,
+            } => {
+                let result = self.session.native_cold_frame(retired_at, digest);
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::ColdContent {
+                retired_at,
+                digest,
+                reply,
+            } => {
+                let result = self.session.native_cold_content(retired_at, digest);
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::ColdWalk {
+                cursor,
+                min_age_ms,
+                visits,
+                reply,
+            } => {
+                let result =
+                    crate::archive_derive::cold_walk(&mut self.session, cursor, min_age_ms, visits);
                 drop(charge);
                 let _ = reply.send(result);
             }

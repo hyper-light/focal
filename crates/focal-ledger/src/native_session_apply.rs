@@ -835,6 +835,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 && pending.outcome == header.outcome
                 && header.range == self.range
         });
+        if output.committed.len() == output.committed.capacity() {
+            return Err(NativeSessionError::Capacity("committed output"));
+        }
         let outcome = if matches {
             self.publish_own_head()?
         } else {
@@ -885,9 +888,6 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 self.materializer.serial_micros.saturating_add(elapsed);
             outcome
         };
-        if output.committed.len() == output.committed.capacity() {
-            return Err(NativeSessionError::Capacity("committed output"));
-        }
         output.committed.push(NativeCommit {
             raft_index: entry.index,
             raft_term: entry.term,
@@ -898,6 +898,50 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.recording_range = Some(header.range);
         self.recording_term = entry.term;
         Ok(())
+    }
+    /// The cold batch of a cold retirement record (doc 31 M2, A2), from the committed rows at its
+    /// base, each family's frame the one the record names: a replica whose rows make another is
+    /// diverged, and one that keeps no cold streams cannot follow the log.
+    fn cold_batch(
+        &self,
+        record: &record::RetireRecord,
+    ) -> Result<focal_core::native::retirement::ColdBatch, NativeSessionError> {
+        if !self.cold.is_kept() {
+            return Err(NativeSessionError::Stopped(Box::from(
+                "a cold retirement on a replica that keeps no cold streams",
+            )));
+        }
+        let core = match self.domain.as_ref() {
+            Some(Domain::Active(owner, _)) => owner.committed_core(),
+            Some(Domain::Passive(core)) => core,
+            None => return Err(NativeSessionError::Failed),
+        };
+        let retired = record.retired();
+        let mut roots = Vec::new();
+        roots
+            .try_reserve_exact(retired.len())
+            .map_err(|_| NativeSessionError::Capacity("cold batch"))?;
+        roots.extend(retired.iter().map(|one| one.root));
+        // Written at the record's own sequence, the prefix every frame claims.
+        let batch = core.cold_batch(
+            &roots,
+            record.header().outcome.sequence,
+            self.limits.encoding,
+            &self.budget,
+            BudgetLane::Completion,
+        )?;
+        let alike = batch.entries.len() == retired.len()
+            && batch.entries.iter().zip(retired).all(|(entry, one)| {
+                entry.root == one.root
+                    && entry.digest == one.bundle
+                    && u64::from(entry.length) == one.bytes
+            });
+        if !alike {
+            return Err(NativeSessionError::Native(
+                focal_model::lifecycle::ContractError::InvalidManifest.into(),
+            ));
+        }
+        Ok(batch)
     }
     /// Publish this leader's own oldest candidate, which the committed entry carries.
     fn publish_own_head(&mut self) -> Result<NativeOutcome, NativeSessionError> {
@@ -949,6 +993,27 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 && pending.outcome == header.outcome
                 && header.range == self.range
         });
+        // A cold record's batch (doc 31 M2, A2): encoded here from the committed rows at the
+        // record's base, the leader's and a follower's alike, checked family by family against
+        // the record, and appended to the cold streams once the record applies. What it takes of
+        // the streams is promised first: a refusal (no room, no memory) leaves the record to be
+        // applied again, nothing changed, and once it applies its batch fails only on IO.
+        let cold = if record.version() == focal_core::native::retirement_batch::RETIRE_COLD {
+            let batch = self.cold_batch(&record)?;
+            let room = self
+                .cold
+                .writer(self.cold_source.as_ref(), &self.budget)
+                .map_err(super::cold::cold_error)?
+                .ok_or(NativeSessionError::Failed)?
+                .room(batch.bytes.len())
+                .map_err(super::cold::cold_error)?;
+            Some((batch, room))
+        } else {
+            None
+        };
+        if output.committed.len() == output.committed.capacity() {
+            return Err(NativeSessionError::Capacity("committed output"));
+        }
         let outcome = if matches {
             self.publish_own_head()?
         } else {
@@ -963,8 +1028,20 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             core.build_event_index();
             core.apply_retirement_record(&record)?
         };
-        if output.committed.len() == output.committed.capacity() {
-            return Err(NativeSessionError::Capacity("committed output"));
+        if let Some((batch, room)) = cold {
+            let appended = match self.cold.writer(self.cold_source.as_ref(), &self.budget) {
+                Ok(Some(writer)) => writer.append(outcome.sequence, &batch.bytes, room),
+                Ok(None) => Err(focal_evidence::ContentError::Failed),
+                Err(error) => Err(error),
+            };
+            // The record applied and its batch is not in the streams: this replica stops, and a
+            // reopen restores the streams from its checkpoint and appends the batch again as it
+            // replays the record.
+            if let Err(error) = appended {
+                return Err(NativeSessionError::Stopped(Box::from(format!(
+                    "a cold batch could not be appended after its record applied: {error}"
+                ))));
+            }
         }
         output.committed.push(NativeCommit {
             raft_index: entry.index,
@@ -1088,6 +1165,15 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             recording_term = entry.term;
             expected_index = Some(entry.index);
         }
+        // Room for every commit the run reports, before any record publishes.
+        if output
+            .committed
+            .capacity()
+            .saturating_sub(output.committed.len())
+            < entries.len()
+        {
+            return Err(NativeSessionError::Capacity("committed output"));
+        }
         if matches!(self.domain, Some(Domain::Active(..))) {
             self.passive_for_replay()?;
         }
@@ -1130,12 +1216,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             stats.serial_fallbacks = stats.serial_fallbacks.saturating_add(1);
         }
         let mut applied = 0usize;
-        for (outcome, entry) in batch.outcomes.into_iter().zip(entries) {
-            let record = record::StructuralRecord::inspect(&entry.data, self.limits.inspection)?;
+        // Each record as the walk above inspected it.
+        for ((outcome, entry), (record, _)) in batch.outcomes.into_iter().zip(entries).zip(&records)
+        {
             let header = record.header();
-            if output.committed.len() == output.committed.capacity() {
-                return Err(NativeSessionError::Capacity("committed output"));
-            }
             output.committed.push(NativeCommit {
                 raft_index: entry.index,
                 raft_term: entry.term,

@@ -257,6 +257,7 @@ impl GcAgent {
             let mut cursor = None;
             let mut complete = false;
             let mut bundles = Vec::new();
+            let mut colds = Vec::new();
             loop {
                 let page = match host.content_roots(cursor, PAGE).await {
                     Ok(page) => page,
@@ -280,6 +281,19 @@ impl GcAgent {
                         // A seal's bundle (F12) names no content of its own.
                         ContentRoot::Seal { root, .. } => {
                             protection.protect_object(domain, root).map_err(content)?;
+                        }
+                        // A cold family's frame is no content object; what it names of the
+                        // ledger's content is read from the replica's cold stream (doc 31 M2,
+                        // A2). Its members share one frame.
+                        ContentRoot::Cold {
+                            digest, retired_at, ..
+                        } => {
+                            if !colds.contains(&(retired_at, digest)) {
+                                colds
+                                    .try_reserve_exact(1)
+                                    .map_err(|_| AccessError::Capacity)?;
+                                colds.push((retired_at, digest));
+                            }
                         }
                     }
                 }
@@ -321,6 +335,24 @@ impl GcAgent {
                         // walk does; otherwise those payloads, now referenced only
                         // by this bundle, would be reclaimed and the archived
                         // family permanently lost.
+                        pass.bundles_unreadable = pass.bundles_unreadable.saturating_add(1);
+                        protection.opaque_domain(domain).map_err(content)?;
+                        pass.opaque_domains = pass.opaque_domains.saturating_add(1);
+                        break;
+                    }
+                }
+                hyper_rt::futures::yield_now().await;
+            }
+            for (retired_at, digest) in colds {
+                match host.cold_content(retired_at, digest).await {
+                    Ok(Some(cold)) => {
+                        for inner in cold.content.into_iter().chain(cold.inline) {
+                            protection.protect_object(domain, inner).map_err(content)?;
+                        }
+                    }
+                    // A frame not readable here leaves this domain's protection provably
+                    // incomplete: it is opaque this pass, as an unreadable bundle makes it.
+                    _ => {
                         pass.bundles_unreadable = pass.bundles_unreadable.saturating_add(1);
                         protection.opaque_domain(domain).map_err(content)?;
                         pass.opaque_domains = pass.opaque_domains.saturating_add(1);

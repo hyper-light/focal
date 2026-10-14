@@ -26,6 +26,11 @@ fn hosting_with(dir: &Path, id: u64, limits: NativeSessionLimits) -> NativeHosti
             focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
         )
         .unwrap(),
+        cold: Some(crate::ColdSource {
+            root: dir.join(format!("cold-{id}")),
+            disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+            geometry: focal_evidence::ColdGeometry::STANDARD,
+        }),
         range: RangeId(u128::from(id)),
     }
 }
@@ -3020,6 +3025,19 @@ fn a_sustained_workload_stays_within_its_budgets_and_keeps_every_outcome() {
                         }
                         ContentRoot::Bundle { root, .. } | ContentRoot::Seal { root, .. } => {
                             protection.protect_object(domain, root).unwrap();
+                        }
+                        ContentRoot::Cold {
+                            digest, retired_at, ..
+                        } => {
+                            // What a cold frame names is protected, never the frame.
+                            let cold = cluster
+                                .node(1)
+                                .native_cold_content(retired_at, digest)
+                                .unwrap()
+                                .expect("a cold frame where its stub says");
+                            for inner in cold.content.into_iter().chain(cold.inline) {
+                                protection.protect_object(domain, inner).unwrap();
+                            }
                         }
                     }
                 }

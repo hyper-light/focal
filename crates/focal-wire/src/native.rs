@@ -559,6 +559,32 @@ pub enum NativeReadQuery {
     /// reference named, and the request. The answer is the outcome, or
     /// `Missing` when the seal never held it.
     Sealed(NativeSealQuery),
+    /// One object of a retired claim's family, read where the replica's own
+    /// continuation of the claim says the family went (doc 31 M2, A2): the
+    /// replica's cold stream for a family retired there, its custody for one
+    /// retired before. The answer is an `Archived` object, `Missing` when the
+    /// family holds no such row or the claim never retired.
+    Cold(NativeColdQuery),
+}
+/// An object of a retired claim's family (doc 31 M2, A2): the claim whose
+/// continuation the client holds, and the object wanted from its family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeColdQuery {
+    pub claim: ClaimId,
+    pub object: NativeObjectRef,
+}
+impl NativeColdQuery {
+    /// Whether it names a claim and an object a family can hold.
+    pub fn valid(&self) -> bool {
+        !self.claim.is_zero()
+            && NativeArchiveQuery {
+                bundle: ContentHash([1; 32]),
+                bytes: 1,
+                object: self.object,
+            }
+            .valid()
+    }
 }
 /// The sealed outcome a read names (F12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -665,6 +691,7 @@ impl NativeReadRequest {
             NativeReadQuery::Archived(query) => query.valid(),
             NativeReadQuery::Epochs(principal) => !principal.is_zero(),
             NativeReadQuery::Sealed(query) => query.valid(),
+            NativeReadQuery::Cold(query) => query.valid(),
             NativeReadQuery::Outcome(_) | NativeReadQuery::Standing => true,
         };
         if valid {

@@ -440,12 +440,98 @@ Each stage lands on its own, measured:
          - Timed, it is 230 ms a family on an idle machine and about 1 s under the write
            load.
          - Concurrency would not change the order of magnitude: the flushes are the cost.
-     - **Next (A2).** The local cold store replaces custody bundles for retirement, and stubs
-       leave memory (the design follows).
-       - A replica applies a retirement record by writing the families to its own cold
-         stream, deterministically and in the background.
-       - Its durability joins the checkpoint the log already waits for.
-       - No seal, no transfer and no fsync is made per family.
+   - **Second step (A2), as built: the local cold stream.** Every replica writes the families
+     it retires to its own cold stream as it applies the retirement record, from its own rows,
+     deterministically. Durability rides the checkpoint, never a family.
+     - **The record decides what enters the stream.**
+       - A version-2 retirement record (`FCRETIRE` v2) carries each family's root, the digest of
+         its frame and the frame's length. Nothing is encoded to quote it: a counting pass.
+       - Every replica that applies one appends that record's frames, and only those. So the
+         stream starts and grows at the same log positions on every replica, whenever each node
+         took the rule.
+       - Every replica, the leader included, encodes the batch from its committed rows at the
+         record's base (`Core::cold_batch`) and checks each frame against the record, so a
+         difference is a detected divergence (`InvalidManifest`).
+     - **Frames.**
+       - A family's frame is its `FCNARCHV` encoding: rows in key order under a header, with a
+         digest trailer.
+       - A record's batch is a header followed by its frames. The header holds the count (at most
+         64), then each family's root, digest and length.
+     - **Stubs keep their shape.**
+       - A native session's core rows cannot change format: its decoder gate allows one
+         transition, and that one is spent from managed to native.
+       - So a stub still names its family's "bundle" by digest and length, now the frame's. A
+         cold stub claims the record's own sequence as its prefix (`through == retired_at`).
+       - A second stream, the **marks**, holds 16 bytes a record: its sequence and its batch's
+         offset. A retired claim is read as: its stub's sequence, a binary search of the marks,
+         the batch's header, then the frame. A stub whose sequence has no mark is a version-1
+         retirement, read from custody as before.
+     - **Chunks at fixed offsets.**
+       - The stream is cut into 1 MiB chunks at fixed offsets, so every replica's chunks hash
+         alike. Every 4,096 chunk names form a manifest chunk of 128 KiB, which names 4 GiB.
+       - An install takes any replica's chunks by hash, in two rounds: the manifest chunks, then
+         the chunks behind them. A chunk that differs from a peer's is a detected divergence.
+     - **Files: written through, made durable by the checkpoint** (`ColdStore`).
+       - **The open chunk** is a file appended in place and never synced on its own.
+       - **A completed chunk** is closed, then renamed under its hash as `.pending`, unsynced.
+       - **A checkpoint** names the stream: its length, its manifest chunks, the names after them
+         and the open chunk's bytes, inline. On the thread that already makes the root's seeds
+         durable, it syncs the pending chunks it names, renames them `.seed` and syncs the
+         directory once. Only then may it become the recovery base.
+       - **Why this is correct.** Until that checkpoint is the base, recovery starts from an
+         earlier one, whose image still holds the retired rows. Replay re-encodes the same frames
+         and cuts the same chunks. At open, files no checkpoint names are removed.
+       - **Room before the record applies.** What an append takes (the volume of every chunk and
+         manifest chunk it cuts, and the names, charged) is promised before the record applies
+         (`ColdStore::room`). A refusal leaves the record to be applied again with nothing
+         changed; once it applies, its batch can fail only on IO, and a replica whose stream
+         fails then stops, naming why, until a reopen restores the stream from its checkpoint and
+         the log. The first build appended after publishing, so a full volume left a published
+         record without its frames, and the retry found its sequence gone (`Corrupt`).
+       - **Cost.** One sync pass a checkpoint, never one a family. Memory is the chunk names,
+         charged as they grow; a read of a frame is charged before it reads.
+       - **Prior art.** Group commit (DeWitt et al., SIGMOD 1984), with the Raft log as the WAL
+         (mantle's engine; SplinterDB, ATC 2020). The snapshot is written while the state machine
+         goes on (Ongaro's thesis §5.1).
+     - **Its own directory, never swept.** `cold/<session>` sits beside the seed directory.
+       Retired data is kept, so no protection list can lose it. The seed transfer serves from
+       either directory, and an install puts cold chunks into this one. GC protects what a cold
+       frame names (its artifacts' objects); a backup (schema 2) carries both streams' chunks and
+       restores them in place.
+     - **Behind the fence (`COLD_LEVEL` 7).** A checkpoint's cold section is flagged by its
+       ancillary byte 2, which older readers refuse. Every binary at the level keeps the streams;
+       the fence gates only the leader's version-2 proposals.
+     - **A retirement takes every offer at once.** The owner derives each offered family once and
+       packs them into candidates, each within the store's bound on a batch's changes (256 here, a
+       latency bound on one candidate, kept), staged one after another, each a record of its own
+       whose frames claim its own sequence. The first build staged one candidate a call: 13 of
+       these lifecycle families (19 rows each), the other 51 of every 64 deferred, walked and
+       derived again.
+     - **The agent walks on the replica's thread.** A cold walk visits 64 status rows, offers
+       what may retire and retires it in one call to the replica (`cold_walk`), where a walk was
+       a call a family (66 under load, each 20–37 ms behind the writes). Each replica's walk has
+       its own pace: at once while it retires and has more to visit; else once a batch's worth is
+       likely ready at the rate it found families; through a pass with nothing found at a scan's
+       pace (100 ms); and at the interval once a pass finds nothing. A pass that ended with a
+       partial batch once waited the whole interval, five seconds, at any rate.
+     - **Measured under the lifecycle load.** Three local nodes, each lifecycle creating,
+       cancelling, releasing and reading a claim, retiring at once (`FOCAL_RETIRE_AFTER_MS=0`).
+       - 100 lifecycles a second for 40 s: 13,494 committed, p99 218 ms, 4,457 families retired
+         by the end (A1: 13,365, p99 337 ms, 26 retired). The leader's memory stays flat, about
+         157 MB with 12 MB of pages (A1: 192 and 36, growing).
+       - 300 a second (past this machine's capacity: the overload controller sheds a few
+         hundred): 40,066 committed, p99 270 ms; 13,018 retired against about 13,660 finished,
+         keeping pace through the run. The first build retired 11,629, five-second stalls and
+         thousands behind under the load, at p99 981 ms.
+     - **Then:**
+       - The walk visits every terminal claim in claim-id order, so under a grace period it
+         rescans what may not retire yet. An index of families by the time they settled, derived
+         as the event index is, makes a walk cost what is due; then the owner retires as terminal
+         events commit (§4.7), with no agent walk at all.
+       - Closed outcomes still grow until the seal's pressure (three a lifecycle here, 1,000,000
+         by default) and are sealed under custody.
+       - Stubs leave memory behind an on-disk index (sorted runs, deterministic, merged at fixed
+         points), until M7's STBε tree.
 3. **M3, the claim table.**
    - SwissTable index, slot chunks and log-resident payloads for the claim families, replacing
      the row store for live claims.

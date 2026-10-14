@@ -142,12 +142,13 @@ impl<'a> EncodingPlan<'a> {
         limits: EncodingLimits,
     ) -> Result<Self, CodecError> {
         // A retirement's record carries its families, never its rows (doc 31 M2).
-        if let Some(retired) = prepared.retire.as_deref() {
+        if let Some(body) = prepared.retire.as_ref() {
+            let retired = &body.retired;
             if retired.len() > limits.rows {
                 return Err(CodecError::Capacity);
             }
             let mut sink = CountingSink::new(limits.bytes, limits.visits);
-            retire::frame(&mut sink, prepared, retired)?;
+            retire::frame(&mut sink, prepared, body)?;
             let hashed = sink.len();
             digest_visits(&mut sink, hashed)?;
             sink.write(&[0; 32])?;
@@ -201,8 +202,8 @@ impl<'a> EncodingPlan<'a> {
             return Err(CodecError::Capacity);
         }
         let mut sink = SliceSink::new(output, self.quote.visits);
-        if let Some(retired) = self.prepared.retire.as_deref() {
-            retire::frame(&mut sink, self.prepared, retired)?;
+        if let Some(body) = self.prepared.retire.as_ref() {
+            retire::frame(&mut sink, self.prepared, body)?;
             let hashed = sink.len();
             digest_visits(&mut sink, hashed)?;
             let mut hash = retire::hasher();

@@ -1,5 +1,6 @@
 use super::*;
 use fields::{Configuration, Cursor, add, mul};
+use focal_evidence::ColdState;
 use std::cell::Cell;
 
 #[derive(Clone, Copy)]
@@ -50,7 +51,104 @@ struct Head<'a> {
     movement: &'a [u8],
     /// The retention section (26 §3), when the frame carries one.
     retention: Option<RetentionSection>,
+    /// The cold stream's section (31 M2, A2), when the frame carries one.
+    cold: Option<ColdSection<'a>>,
     remaining: usize,
+}
+
+/// One cold stream as a checkpoint's frame holds it (31 M2, A2): its length, its manifest
+/// chunks and the chunk names after them (32 bytes each), and its open chunk's bytes.
+#[derive(Debug, Clone, Copy)]
+struct ColdPart<'a> {
+    length: u64,
+    manifests: &'a [u8],
+    names: &'a [u8],
+    open: &'a [u8],
+}
+impl ColdPart<'_> {
+    fn state(&self, geometry: ColdGeometry) -> Result<ColdState, Error> {
+        let names = |bytes: &[u8]| -> Result<Vec<ContentHash>, Error> {
+            let mut names = Vec::new();
+            names
+                .try_reserve_exact(bytes.len().checked_div(32).unwrap_or(0))
+                .map_err(|_| Error::Capacity)?;
+            let (whole, rest) = bytes.as_chunks::<32>();
+            if !rest.is_empty() {
+                return Err(Error::Truncated);
+            }
+            names.extend(whole.iter().map(|name| ContentHash(*name)));
+            Ok(names)
+        };
+        let mut open = Vec::new();
+        open.try_reserve_exact(self.open.len())
+            .map_err(|_| Error::Capacity)?;
+        open.extend_from_slice(self.open);
+        let state = ColdState {
+            length: self.length,
+            manifests: names(self.manifests)?,
+            names: names(self.names)?,
+            open,
+        };
+        state.check(geometry)?;
+        Ok(state)
+    }
+}
+/// A checkpoint's cold section (31 M2, A2), as its frame holds it: the data stream's and the
+/// marks'.
+#[derive(Debug, Clone, Copy)]
+pub struct ColdSection<'a> {
+    geometry: ColdGeometry,
+    data: ColdPart<'a>,
+    marks: ColdPart<'a>,
+}
+impl ColdSection<'_> {
+    /// The streams it names, owned and checked: each one's parts add up to its length.
+    pub fn streams(&self) -> Result<ColdStreams, Error> {
+        Ok(ColdStreams {
+            geometry: self.geometry,
+            data: self.data.state(self.geometry)?,
+            marks: self.marks.state(self.geometry)?,
+        })
+    }
+}
+
+/// One cold stream of a checkpoint's cold section: its length, its manifest chunks and the names
+/// after them, each count within its bound, and its open chunk, less than a chunk.
+fn cold_part<'a>(
+    cursor: &mut Cursor<'a>,
+    geometry: ColdGeometry,
+    limits: Limits,
+) -> Result<ColdPart<'a>, Error> {
+    let length = cursor.u64()?;
+    let manifests = cold_names(cursor, limits.cold_manifests, "cold manifests")?;
+    let names = cold_names(
+        cursor,
+        geometry.manifest_names.saturating_sub(1),
+        "cold names",
+    )?;
+    let open = usize::try_from(cursor.u32()?).map_err(|_| Error::Capacity)?;
+    if open >= geometry.chunk_bytes {
+        return Err(Error::Invalid("cold open chunk"));
+    }
+    cursor.charge(open)?;
+    Ok(ColdPart {
+        length,
+        manifests,
+        names,
+        open: cursor.take(open)?,
+    })
+}
+fn cold_names<'a>(
+    cursor: &mut Cursor<'a>,
+    most: usize,
+    what: &'static str,
+) -> Result<&'a [u8], Error> {
+    let count = usize::try_from(cursor.u32()?).map_err(|_| Error::Capacity)?;
+    if count > most {
+        return Err(Error::Invalid(what));
+    }
+    cursor.charge(count)?;
+    cursor.take(mul(count, 32)?)
 }
 
 fn parse(bytes: &[u8], limits: Limits) -> Result<Head<'_>, Error> {
@@ -101,8 +199,15 @@ fn parse(bytes: &[u8], limits: Limits) -> Result<Head<'_>, Error> {
         genesis: ContentHash(cursor.fixed()?),
     };
     let ancillary_bytes = cursor.fixed::<6>()?;
-    let (with_movement, with_retention) = match ancillary_bytes {
-        [movement @ (0 | 1), retention @ (0 | 1), 0, 0, 0, 0] => (movement == 1, retention == 1),
+    let (with_movement, with_retention, with_cold) = match ancillary_bytes {
+        [
+            movement @ (0 | 1),
+            retention @ (0 | 1),
+            cold @ (0 | 1),
+            0,
+            0,
+            0,
+        ] => (movement == 1, retention == 1, cold == 1),
         _ => return Err(Error::Invalid("legacy ancillary state is unsupported")),
     };
     let ancillary = AncillaryProfile::NativeOnlyV1;
@@ -142,6 +247,23 @@ fn parse(bytes: &[u8], limits: Limits) -> Result<Head<'_>, Error> {
         Some(RetentionSection {
             archived_through: SessionSeq(cursor.u64()?),
             retired_families: cursor.u64()?,
+        })
+    } else {
+        None
+    };
+    let cold = if with_cold {
+        let geometry = ColdGeometry {
+            chunk_bytes: usize::try_from(cursor.u32()?).map_err(|_| Error::Capacity)?,
+            manifest_names: usize::try_from(cursor.u32()?).map_err(|_| Error::Capacity)?,
+        }
+        .valid()
+        .map_err(|_| Error::Invalid("cold geometry"))?;
+        let data = cold_part(&mut cursor, geometry, limits)?;
+        let marks = cold_part(&mut cursor, geometry, limits)?;
+        Some(ColdSection {
+            geometry,
+            data,
+            marks,
         })
     } else {
         None
@@ -204,6 +326,7 @@ fn parse(bytes: &[u8], limits: Limits) -> Result<Head<'_>, Error> {
         chunks,
         movement,
         retention,
+        cold,
         remaining: cursor.remaining,
     })
 }
@@ -241,6 +364,7 @@ pub struct SeedManifest<'a> {
     chunks: usize,
     movement: &'a [u8],
     retention: Option<RetentionSection>,
+    cold: Option<ColdSection<'a>>,
 }
 impl<'a> SeedManifest<'a> {
     pub fn header(&self) -> Header {
@@ -253,6 +377,10 @@ impl<'a> SeedManifest<'a> {
     /// The retention section the frame carries (26 §3), when any.
     pub fn retention(&self) -> Option<RetentionSection> {
         self.retention
+    }
+    /// The cold stream's section the frame carries (31 M2, A2), when any.
+    pub fn cold(&self) -> Option<ColdSection<'a>> {
+        self.cold
     }
     pub fn len(&self) -> usize {
         self.chunks
@@ -363,6 +491,7 @@ pub struct Checkpoint<'a> {
     configuration: ConfigurationView<'a>,
     movement: &'a [u8],
     retention: Option<RetentionSection>,
+    cold: Option<ColdSection<'a>>,
     remaining: Cell<usize>,
     initial_visits: usize,
     members: usize,
@@ -382,8 +511,30 @@ impl<'a> Checkpoint<'a> {
                 chunks: head.chunks,
                 movement: head.movement,
                 retention: head.retention,
+                cold: head.cold,
             })),
         }
+    }
+    /// [`Self::describe`], with the cold streams' section the frame carries (31 M2, A2), if any,
+    /// from the same parse.
+    pub fn describe_with_cold(
+        bytes: &'a [u8],
+        limits: Limits,
+    ) -> Result<(Option<SeedManifest<'a>>, Option<ColdSection<'a>>), Error> {
+        let head = parse(bytes, limits)?;
+        let cold = head.cold;
+        let manifest = match head.form {
+            0 => None,
+            _ => Some(SeedManifest {
+                header: head.header,
+                table: head.body,
+                chunks: head.chunks,
+                movement: head.movement,
+                retention: head.retention,
+                cold: head.cold,
+            }),
+        };
+        Ok((manifest, cold))
     }
     /// An inline frame; a seeded one is refused with `Error::Seeded`.
     pub fn inspect(bytes: &'a [u8], limits: Limits) -> Result<Self, Error> {
@@ -413,6 +564,7 @@ impl<'a> Checkpoint<'a> {
             remaining,
             movement,
             retention,
+            cold,
             ..
         } = head;
         let count = usize::try_from(header.core_bytes).map_err(|_| Error::Capacity)?;
@@ -444,6 +596,7 @@ impl<'a> Checkpoint<'a> {
             configuration,
             movement,
             retention,
+            cold,
             remaining: Cell::new(remaining),
             initial_visits: limits.visits,
             members: limits.members,
@@ -459,6 +612,10 @@ impl<'a> Checkpoint<'a> {
     /// The retention section the frame carries (26 §3), when any.
     pub fn retention(&self) -> Option<RetentionSection> {
         self.retention
+    }
+    /// The cold stream's section the frame carries (31 M2, A2), when any.
+    pub fn cold(&self) -> Option<ColdSection<'a>> {
+        self.cold
     }
     pub fn core(&self) -> &root::StructuralCheckpoint<'a> {
         &self.core

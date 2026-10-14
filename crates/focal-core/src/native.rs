@@ -1282,13 +1282,23 @@ pub enum ContentRoot {
         root: ContentHash,
         bytes: u64,
     },
+    /// A family retired to every replica's cold stream (doc 31 M2, A2), by the retired claim:
+    /// its frame's digest and length and the retirement's sequence, where the stream's marks find
+    /// it. Not a content object: what custody must keep of it is what its frame names.
+    Cold {
+        claim: ClaimId,
+        digest: ContentHash,
+        bytes: u64,
+        retired_at: SessionSeq,
+    },
 }
 impl ContentRoot {
-    /// The object's content root.
+    /// The object's content root: a cold family's frame digest, which names no content object.
     pub fn root(&self) -> ContentHash {
         match self {
             Self::Artifact { pointer, .. } | Self::Inline { pointer, .. } => pointer.root,
             Self::Bundle { root, .. } | Self::Seal { root, .. } => *root,
+            Self::Cold { digest, .. } => *digest,
         }
     }
 }
@@ -1472,7 +1482,7 @@ pub struct NativePrepared {
     events: Option<focal_memory::Allocation>,
     /// A retirement's families and their bundles (doc 31 M2): what its record
     /// carries in place of its rows, every replica deriving the rest.
-    retire: Option<Vec<retirement_batch::RetiredBundle>>,
+    retire: Option<retirement_batch::RetireBody>,
 }
 impl std::fmt::Debug for NativePrepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1913,6 +1923,16 @@ impl Core<NativeState> {
                             }
                         }
                     }
+                }
+                // A continuation claiming its own retirement's sequence is a cold family's
+                // (doc 31 M2, A2); one claiming less names a custody bundle.
+                (Key::Retired(claim), Row::Retired(value)) if value.through == value.retired_at => {
+                    push(ContentRoot::Cold {
+                        claim: *claim,
+                        digest: value.bundle,
+                        bytes: value.bytes,
+                        retired_at: value.retired_at,
+                    })?
                 }
                 (Key::Retired(claim), Row::Retired(value)) => push(ContentRoot::Bundle {
                     claim: *claim,

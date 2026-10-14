@@ -168,11 +168,7 @@ impl EmbeddedNode {
         } else {
             focal_ledger::SealRule::Derived
         };
-        let retire = if level >= crate::upgrade::RETIRE_LEVEL {
-            focal_ledger::RetireRule::Pipeline
-        } else {
-            focal_ledger::RetireRule::Exact
-        };
+        let retire = crate::storage_level::retire_rule_at(level);
         let hosting = crate::network_service::native_hosting(
             root,
             &identity,

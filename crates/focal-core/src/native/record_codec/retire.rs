@@ -5,11 +5,10 @@
 //! checks them against the outcome's intent (the batch's digest) and deletes them alike. A
 //! retirement of hundreds of rows is a record of a few dozen bytes a family.
 use super::*;
-use crate::native::retirement_batch::RetiredBundle;
+use crate::native::retirement_batch::{RETIRE_COLD, RETIRE_CUSTODY, RetireBody, RetiredBundle};
 use bytes::{Cursor, Error};
 
 pub const RETIRE_MAGIC: [u8; 8] = *b"FCRETIRE";
-pub const RETIRE_VERSION: u16 = 1;
 const RETIRE_HASH_DOMAIN: &str = "focal.native.retire-record.v1";
 
 /// Write the record of `prepared`, a retirement's candidate retiring `retired`: its header as a
@@ -17,8 +16,12 @@ const RETIRE_HASH_DOMAIN: &str = "focal.native.retire-record.v1";
 pub(super) fn frame<S: Sink>(
     sink: &mut S,
     prepared: &NativePrepared,
-    retired: &[RetiredBundle],
+    body: &RetireBody,
 ) -> Result<(), Error> {
+    let retired = &body.retired;
+    if body.version != RETIRE_CUSTODY && body.version != RETIRE_COLD {
+        return Err(Error::InvalidTag("retirement record version"));
+    }
     let outcome = prepared.outcome;
     if outcome.ledger.tenant.is_zero()
         || outcome.ledger.session.is_zero()
@@ -30,7 +33,7 @@ pub(super) fn frame<S: Sink>(
         return Err(Error::InvalidTag("retirement record frame"));
     }
     write_raw(sink, &RETIRE_MAGIC)?;
-    write_u16(sink, RETIRE_VERSION)?;
+    write_u16(sink, body.version)?;
     write_u8(
         sink,
         match prepared.content_profile() {
@@ -60,6 +63,7 @@ pub(super) fn hasher() -> blake3::Hasher {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetireRecord {
     header: RecordHeader,
+    version: u16,
     retired: Vec<RetiredBundle>,
 }
 
@@ -83,7 +87,11 @@ impl RetireRecord {
             .checked_sub(hash_visits)
             .ok_or(Error::Capacity)?;
         let mut c = Cursor::new(payload, limits.bytes, available)?;
-        if c.fixed::<8>()? != RETIRE_MAGIC || c.u16()? != RETIRE_VERSION {
+        if c.fixed::<8>()? != RETIRE_MAGIC {
+            return Err(Error::InvalidTag("retirement record format"));
+        }
+        let version = c.u16()?;
+        if version != RETIRE_CUSTODY && version != RETIRE_COLD {
             return Err(Error::InvalidTag("retirement record format"));
         }
         let profile = match c.u8()? {
@@ -148,11 +156,17 @@ impl RetireRecord {
                 outcome,
                 hash,
             },
+            version,
             retired,
         })
     }
     pub fn header(&self) -> RecordHeader {
         self.header
+    }
+    /// Whether its bundles are custody objects ([`RETIRE_CUSTODY`]) or cold frames
+    /// ([`RETIRE_COLD`]).
+    pub fn version(&self) -> u16 {
+        self.version
     }
     /// The families it retires, in its batch's order.
     pub fn retired(&self) -> &[RetiredBundle] {

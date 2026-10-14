@@ -340,29 +340,50 @@ impl LocalNetworkAdmin {
                     families: Vec::new(),
                     receipts: Vec::new(),
                 };
-                for peer in &policy.peers {
-                    if content
-                        .receipt(scope, retired.bundle, *peer)
-                        .await?
-                        .is_some_and(|receipt| receipt.length == retired.bytes)
-                    {
-                        bundle.receipts.push(*peer);
+                // A family retired to the cold stream claims the retirement's own sequence; its
+                // frame lies in this replica's stream, no custody object with receipts (doc 31 M2,
+                // A2). One retired under custody is read from the content this node holds.
+                // Either is held charged while it is inspected.
+                let mut cold = None;
+                let mut held = None;
+                if retired.through == retired.retired_at {
+                    cold = host
+                        .cold_frame(retired.retired_at, retired.bundle)
+                        .await
+                        .ok()
+                        .flatten();
+                } else {
+                    for peer in &policy.peers {
+                        if content
+                            .receipt(scope, retired.bundle, *peer)
+                            .await?
+                            .is_some_and(|receipt| receipt.length == retired.bytes)
+                        {
+                            bundle.receipts.push(*peer);
+                        }
                     }
+                    let reference = ContentRef {
+                        domain: ContentDomainId(ledger.tenant.0),
+                        root: retired.bundle,
+                        length: retired.bytes,
+                        class: ContentClass::Evidence,
+                    };
+                    held = content
+                        .read_bytes(scope, reference, MAX_ARCHIVE_BYTES)
+                        .await
+                        .ok();
                 }
-                let reference = ContentRef {
-                    domain: ContentDomainId(ledger.tenant.0),
-                    root: retired.bundle,
-                    length: retired.bytes,
-                    class: ContentClass::Evidence,
+                let bytes = match (&cold, &held) {
+                    (Some(frame), _) => Some(frame.bytes()),
+                    (None, Some(read)) => Some(read.value().as_slice()),
+                    (None, None) => None,
                 };
                 // A bundle this node does not hold, or one that fails its
                 // structural check, reports unverified; nothing is inferred.
-                if let Ok(bytes) = content
-                    .read_bytes(scope, reference, MAX_ARCHIVE_BYTES)
-                    .await
+                if let Some(bytes) = bytes
                     && let Ok(archive) =
                         focal_core::native::record_codec::StructuralArchive::inspect(
-                            bytes.value(),
+                            bytes,
                             ARCHIVE_INSPECTION,
                         )
                     && let Ok(families) = archive.family_counts()

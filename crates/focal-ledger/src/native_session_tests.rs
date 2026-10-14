@@ -143,6 +143,11 @@ pub(crate) fn limits() -> NativeSessionLimits {
         ranges: focal_ranges::RangeLimits::default(),
         seal_rule: SealRule::Derived,
         retire_rule: RetireRule::Pipeline,
+        // Chunks of 4 KiB and a manifest chunk every 4: the production cut, scaled to tests.
+        cold_geometry: focal_evidence::ColdGeometry {
+            chunk_bytes: 4096,
+            manifest_names: 4,
+        },
     }
 }
 fn definition(binding: Binding) -> validation::Declaration {

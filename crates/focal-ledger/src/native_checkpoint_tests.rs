@@ -446,8 +446,7 @@ fn a_frozen_root_encoded_in_one_walk_is_the_measured_encoding() {
         &frozen,
         metadata,
         &configuration,
-        None,
-        None,
+        Sections::default(),
         limits,
     )
     .unwrap();
@@ -460,8 +459,7 @@ fn a_frozen_root_encoded_in_one_walk_is_the_measured_encoding() {
         frozen: &frozen,
         metadata,
         configuration: &configuration,
-        movement: None,
-        retention: None,
+        sections: Sections::default(),
         limits,
     };
     let (once, commit) =
@@ -620,8 +618,11 @@ fn a_retention_section_rides_both_forms_beside_the_movement_section() {
         &core,
         metadata(NativeContentProfile::ProjectionOnly),
         &configuration,
-        Some(&section),
-        Some(retention),
+        Sections {
+            movement: Some(&section),
+            retention: Some(retention),
+            cold: None,
+        },
         Limits::default(),
     )
     .unwrap();
@@ -650,8 +651,10 @@ fn a_retention_section_rides_both_forms_beside_the_movement_section() {
         &core,
         metadata(NativeContentProfile::ProjectionOnly),
         &configuration,
-        None,
-        Some(retention),
+        Sections {
+            retention: Some(retention),
+            ..Sections::default()
+        },
         Limits::default(),
     )
     .unwrap();
@@ -667,8 +670,10 @@ fn a_retention_section_rides_both_forms_beside_the_movement_section() {
         &core,
         metadata(NativeContentProfile::ProjectionOnly),
         &configuration,
-        None,
-        Some(retention),
+        Sections {
+            retention: Some(retention),
+            ..Sections::default()
+        },
         limits,
     )
     .unwrap();

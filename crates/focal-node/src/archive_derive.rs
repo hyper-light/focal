@@ -22,30 +22,11 @@ pub(crate) fn archived_family(
     root: ClaimId,
     min_age_ms: u64,
 ) -> Result<Option<ArchivedFamily>, LedgerError> {
-    if !session.native_authoritative() {
-        return Ok(None);
-    }
-    let now = crate::native_ingress::logical_time(session)
-        .map_err(|_| LedgerError::NotReady { leader: 0 })?;
-    let report = session.native_retention()?;
-    let limits = session.native_encoding_limits()?;
-    let core = session.native_core()?;
-    let Ok(family) = core.retirement_family(root) else {
+    let Some(family) = eligible_family(session, root, min_age_ms)? else {
         return Ok(None);
     };
-    if !report.allows_family(family.through) {
-        return Ok(None);
-    }
-    // The family's last event was published by the outcome at its
-    // sequence; the outcome carries the logical time it settled at.
-    let settled = core
-        .native_event(family.through, 0)
-        .and_then(|event| core.native_outcome(event.invocation))
-        .map(|outcome| outcome.logical_time)
-        .ok_or(LedgerError::Corrupt)?;
-    if now.saturating_sub(settled) < min_age_ms {
-        return Ok(None);
-    }
+    let limits = session.native_encoding_limits()?;
+    let core = session.native_core()?;
     let through = core.native_sequence();
     let quote = core
         .archive_family_quote(&family, through, limits)
@@ -75,6 +56,134 @@ pub(crate) fn archived_family(
         _allocation: allocation,
     }))
 }
+/// The family rooted at `root` when it may retire now (26 §4): only on the authority, only when
+/// it is eligible, every registered consumer has read past its last event, and that event settled
+/// at least `min_age_ms` of the node's logical time ago.
+fn eligible_family(
+    session: &Session,
+    root: ClaimId,
+    min_age_ms: u64,
+) -> Result<Option<focal_core::native::retirement::RetirementFamily>, LedgerError> {
+    if !session.native_authoritative() {
+        return Ok(None);
+    }
+    let now = crate::native_ingress::logical_time(session)
+        .map_err(|_| LedgerError::NotReady { leader: 0 })?;
+    let report = session.native_retention()?;
+    eligible_in(session.native_core()?, &report, now, root, min_age_ms)
+}
+/// [`eligible_family`] on a core read once, under the session's retention report and logical
+/// time read once: what a walk asks of every family it visits.
+fn eligible_in(
+    core: &focal_core::Core<focal_core::native::NativeState>,
+    report: &focal_ledger::RetentionReport,
+    now: u64,
+    root: ClaimId,
+    min_age_ms: u64,
+) -> Result<Option<focal_core::native::retirement::RetirementFamily>, LedgerError> {
+    let Ok(family) = core.retirement_family(root) else {
+        return Ok(None);
+    };
+    if !report.allows_family(family.through) {
+        return Ok(None);
+    }
+    // The family's last event was published by the outcome at its
+    // sequence; the outcome carries the logical time it settled at.
+    let settled = core
+        .native_event(family.through, 0)
+        .and_then(|event| core.native_outcome(event.invocation))
+        .map(|outcome| outcome.logical_time)
+        .ok_or(LedgerError::Corrupt)?;
+    if now.saturating_sub(settled) < min_age_ms {
+        return Ok(None);
+    }
+    Ok(Some(family))
+}
+/// What one cold walk did (doc 31 M2, A2): how many families it retired, deferred and refused,
+/// whether it found more than one batch of offers, whether it submitted a candidate, and where
+/// the next walk resumes.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ColdWalk {
+    pub(crate) retired: usize,
+    pub(crate) deferred: usize,
+    pub(crate) refused: usize,
+    pub(crate) full: bool,
+    pub(crate) submitted: bool,
+    pub(crate) next: Option<focal_core::native::retirement::RetirementCursor>,
+}
+
+/// One walk of the session's status index for a cold retirement (doc 31 M2, A2), on the
+/// session's own thread: `visits` rows from `cursor`, every family that may retire now offered
+/// ([`eligible_family`]'s rule, the retention report and logical time read once), and the offers
+/// retired a batch at a time, each as consecutive candidates. A cold retirement needs nothing
+/// from the node between a family's offer and its retirement, so one call does what took a call
+/// a family; the work is bounded by `visits`. Only on the authority.
+pub(crate) fn cold_walk(
+    session: &mut Session,
+    cursor: Option<focal_core::native::retirement::RetirementCursor>,
+    min_age_ms: u64,
+    visits: usize,
+) -> Result<ColdWalk, LedgerError> {
+    use focal_core::native::retirement_batch::{MAX_RETIRE_FAMILIES, RetireOffer, family_digest};
+    if !session.native_authoritative() {
+        return Ok(ColdWalk::default());
+    }
+    let now = crate::native_ingress::logical_time(session)
+        .map_err(|_| LedgerError::NotReady { leader: 0 })?;
+    let report = session.native_retention()?;
+    let ledger = session.ledger();
+    let core = session.native_core()?;
+    let candidates = core
+        .retirement_candidates(cursor, visits)
+        .map_err(|error| LedgerError::Native(error.into()))?;
+    let mut offers = Vec::new();
+    offers
+        .try_reserve_exact(candidates.claims.len())
+        .map_err(|_| LedgerError::Capacity)?;
+    for root in &candidates.claims {
+        let Some(family) = eligible_in(core, &report, now, *root, min_age_ms)? else {
+            continue;
+        };
+        offers.push(RetireOffer {
+            root: *root,
+            family: family_digest(ledger, &family)
+                .map_err(|error| LedgerError::Native(error.into()))?,
+            bundle: focal_model::ContentHash([0; 32]),
+            bytes: 0,
+        });
+    }
+    let mut walk = ColdWalk {
+        full: offers.len() > MAX_RETIRE_FAMILIES,
+        next: candidates.next,
+        ..ColdWalk::default()
+    };
+    let mut batches = offers.chunks(MAX_RETIRE_FAMILIES);
+    for batch in batches.by_ref() {
+        match session.native_retire(batch) {
+            Ok((made, submission)) => {
+                walk.retired = walk.retired.saturating_add(made.families.len());
+                walk.deferred = walk.deferred.saturating_add(made.deferred.len());
+                walk.refused = walk.refused.saturating_add(made.refused.len());
+                walk.submitted |= submission.is_some();
+                // Deferred for room (no candidate could take them) or a pending candidate:
+                // the rest wait for the next walk as well.
+                if !made.deferred.is_empty() {
+                    break;
+                }
+            }
+            Err(error) if walk.retired == 0 && walk.deferred == 0 => return Err(error),
+            Err(_) => {
+                walk.deferred = walk.deferred.saturating_add(batch.len());
+                break;
+            }
+        }
+    }
+    walk.deferred = walk
+        .deferred
+        .saturating_add(batches.map(<[RetireOffer]>::len).sum::<usize>());
+    Ok(walk)
+}
+
 /// The seal the committed state yields now, when it is worth proposing
 /// (F12): under pressure, or when the closed outcomes fill half a bundle at
 /// the read bound — under the anchored rule, or half the window if that is

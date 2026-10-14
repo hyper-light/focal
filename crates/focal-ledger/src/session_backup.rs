@@ -9,8 +9,8 @@ pub mod backup {
     use focal_core::native::record_codec::{StructuralArchive, recovery};
     use focal_core::native::{ContentRoot, NativeError};
     use focal_evidence::{
-        BuiltinNativeSchemas, ContentError, ContentReader, NativeCustodyReader, SeedReader,
-        TransferManifest, describe_encoded,
+        BuiltinNativeSchemas, ColdGeometry, ColdReader, ColdState, ColdStreams, ContentError,
+        ContentReader, NativeCustodyReader, SeedReader, TransferManifest, describe_encoded,
     };
     use focal_memory::RangeId;
     use std::collections::BTreeSet;
@@ -19,11 +19,19 @@ pub mod backup {
     /// `FCLBKUP1`: the manifest's magic; a schema, a postcard body and a
     /// BLAKE3 trailer over both follow.
     pub const MAGIC: &[u8; 8] = b"FCLBKUP1";
-    pub const SCHEMA: u16 = 1;
+    /// Schema 2 carries the session's cold streams (doc 31 M2, A2); schema 1, written before
+    /// them, is read as one with none.
+    pub const SCHEMA: u16 = 2;
+    const SCHEMA_V1: u16 = 1;
     pub const MANIFEST_FILE: &str = "MANIFEST";
     pub const CHECKPOINT_FILE: &str = "checkpoint";
     pub const SEEDS_DIR: &str = "seeds";
     pub const CONTENT_DIR: &str = "content";
+    /// The chunks of the session's cold streams (doc 31 M2, A2): `cold/data` and `cold/marks`.
+    pub const COLD_DIR: &str = "cold";
+    fn cold_part(data: bool) -> &'static str {
+        if data { "data" } else { "marks" }
+    }
     /// The largest manifest a backup may carry.
     pub const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
     /// The largest session envelope a backup may carry (the checkpoint's own
@@ -123,6 +131,54 @@ pub mod backup {
         pub content: Vec<BackupObject>,
         pub archived_through: u64,
         pub retired_families: u64,
+        /// Every chunk of the session's cold streams the envelope names (doc 31 M2, A2), the data
+        /// stream's and the marks', manifest chunks among them: empty without cold streams.
+        pub cold_data: Vec<BackupChunk>,
+        pub cold_marks: Vec<BackupChunk>,
+    }
+    /// A manifest of schema 1, written before cold streams: read as one naming none.
+    #[derive(Deserialize)]
+    struct BackupManifestV1 {
+        schema: u16,
+        created_ms: u64,
+        prefix: EvidencePrefix,
+        native_sequence: u64,
+        native_genesis: ContentHash,
+        profile: u8,
+        domain: ContentDomainId,
+        decoder_predecessor: [u8; 32],
+        decoder_successor: [u8; 32],
+        configuration: MembershipConfiguration,
+        checkpoint_hash: ContentHash,
+        checkpoint_bytes: u64,
+        seeds: Vec<BackupChunk>,
+        content: Vec<BackupObject>,
+        archived_through: u64,
+        retired_families: u64,
+    }
+    impl From<BackupManifestV1> for BackupManifest {
+        fn from(old: BackupManifestV1) -> Self {
+            Self {
+                schema: old.schema,
+                created_ms: old.created_ms,
+                prefix: old.prefix,
+                native_sequence: old.native_sequence,
+                native_genesis: old.native_genesis,
+                profile: old.profile,
+                domain: old.domain,
+                decoder_predecessor: old.decoder_predecessor,
+                decoder_successor: old.decoder_successor,
+                configuration: old.configuration,
+                checkpoint_hash: old.checkpoint_hash,
+                checkpoint_bytes: old.checkpoint_bytes,
+                seeds: old.seeds,
+                content: old.content,
+                archived_through: old.archived_through,
+                retired_families: old.retired_families,
+                cold_data: Vec::new(),
+                cold_marks: Vec::new(),
+            }
+        }
     }
     impl BackupManifest {
         /// The heap and value storage the decoded manifest holds — its
@@ -148,10 +204,16 @@ pub mod backup {
             })?;
             std::mem::size_of::<Self>()
                 .checked_add(self.seeds.capacity().checked_mul(chunk)?)?
+                .checked_add(self.cold_data.capacity().checked_mul(chunk)?)?
+                .checked_add(self.cold_marks.capacity().checked_mul(chunk)?)?
                 .checked_add(objects)?
                 .checked_add(configuration)
         }
         pub fn encode(&self) -> Result<Vec<u8>, BackupError> {
+            // Only the current schema is written: an older one is read, never made.
+            if self.schema != SCHEMA {
+                return Err(BackupError::Corrupt("manifest schema"));
+            }
             let body = postcard::to_stdvec(self).map_err(|_| BackupError::Capacity)?;
             let length = body
                 .len()
@@ -188,9 +250,19 @@ pub mod backup {
             let body = covered
                 .strip_prefix(MAGIC.as_slice())
                 .ok_or(BackupError::Corrupt("manifest magic"))?;
-            let (manifest, rest): (Self, &[u8]) =
+            let (schema, _): (u16, &[u8]) =
                 postcard::take_from_bytes(body).map_err(|_| BackupError::Corrupt("manifest body"))?;
-            if !rest.is_empty() || manifest.schema != SCHEMA {
+            let (manifest, rest): (Self, &[u8]) = match schema {
+                SCHEMA => postcard::take_from_bytes(body)
+                    .map_err(|_| BackupError::Corrupt("manifest body"))?,
+                SCHEMA_V1 => {
+                    let (old, rest): (BackupManifestV1, &[u8]) = postcard::take_from_bytes(body)
+                        .map_err(|_| BackupError::Corrupt("manifest body"))?;
+                    (Self::from(old), rest)
+                }
+                _ => return Err(BackupError::Corrupt("manifest schema")),
+            };
+            if !rest.is_empty() {
                 return Err(BackupError::Corrupt("manifest schema"));
             }
             manifest.validate()?;
@@ -223,6 +295,11 @@ pub mod backup {
                             != Some(object.length)
                 })
                 || self.seeds.iter().any(|chunk| chunk.length == 0)
+                || self
+                    .cold_data
+                    .iter()
+                    .chain(&self.cold_marks)
+                    .any(|chunk| chunk.length == 0)
             {
                 return Err(BackupError::Corrupt("manifest fields"));
             }
@@ -232,7 +309,7 @@ pub mod backup {
         pub fn totals(&self) -> (u64, u64) {
             let mut files = 1u64;
             let mut bytes = self.checkpoint_bytes;
-            for chunk in &self.seeds {
+            for chunk in self.seeds.iter().chain(&self.cold_data).chain(&self.cold_marks) {
                 files = files.saturating_add(1);
                 bytes = bytes.saturating_add(u64::from(chunk.length));
             }
@@ -267,6 +344,36 @@ pub mod backup {
     /// store while writing, the backup's seed files while verifying.
     pub trait SeedSource {
         fn read_seed(&self, hash: ContentHash, length: usize) -> Result<Vec<u8>, ContentError>;
+        /// One chunk of the session's cold data stream (`data`) or its marks (doc 31 M2, A2),
+        /// checked against its name; a source that holds no cold streams has none.
+        fn read_cold(
+            &self,
+            _data: bool,
+            _hash: ContentHash,
+            _length: usize,
+        ) -> Result<Vec<u8>, ContentError> {
+            Err(ContentError::Invalid)
+        }
+    }
+    /// A replica's seeds and its session's cold streams, where a backup is written from.
+    pub struct SessionSeeds {
+        pub seeds: SeedReader,
+        /// The session's cold directory (`cold/<session>`), when it keeps cold streams.
+        pub cold: Option<PathBuf>,
+    }
+    impl SeedSource for SessionSeeds {
+        fn read_seed(&self, hash: ContentHash, length: usize) -> Result<Vec<u8>, ContentError> {
+            self.seeds.read(hash, length)
+        }
+        fn read_cold(
+            &self,
+            data: bool,
+            hash: ContentHash,
+            length: usize,
+        ) -> Result<Vec<u8>, ContentError> {
+            let root = self.cold.as_ref().ok_or(ContentError::Invalid)?;
+            ColdReader::open(root.join(cold_part(data)))?.read(hash, length)
+        }
     }
     impl SeedSource for SeedReader {
         fn read_seed(&self, hash: ContentHash, length: usize) -> Result<Vec<u8>, ContentError> {
@@ -297,6 +404,70 @@ pub mod backup {
             }
             Ok(bytes)
         }
+        fn read_cold(
+            &self,
+            data: bool,
+            hash: ContentHash,
+            length: usize,
+        ) -> Result<Vec<u8>, ContentError> {
+            let path = self
+                .root
+                .parent()
+                .ok_or(ContentError::Invalid)?
+                .join(COLD_DIR)
+                .join(cold_part(data))
+                .join(format!("{hash}.seed"));
+            let bytes = self.medium.read(&path, length).map_err(ContentError::Io)?;
+            if ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
+                return Err(ContentError::Corrupt);
+            }
+            Ok(bytes)
+        }
+    }
+    /// Every chunk a cold stream's `state` names, in order, with its length: each manifest chunk,
+    /// then the chunks it names, then the names after the last one.
+    fn cold_chunks(
+        state: &ColdState,
+        geometry: ColdGeometry,
+        read: &dyn Fn(ContentHash, usize) -> Result<Vec<u8>, ContentError>,
+    ) -> Result<Vec<BackupChunk>, BackupError> {
+        let chunk = u32::try_from(geometry.chunk_bytes).map_err(|_| BackupError::Capacity)?;
+        let manifest_bytes = geometry
+            .manifest_names
+            .checked_mul(32)
+            .ok_or(BackupError::Capacity)?;
+        let manifest = u32::try_from(manifest_bytes).map_err(|_| BackupError::Capacity)?;
+        let mut chunks = Vec::new();
+        for hash in &state.manifests {
+            chunks.try_reserve(1).map_err(|_| BackupError::Capacity)?;
+            chunks.push(BackupChunk {
+                hash: *hash,
+                length: manifest,
+            });
+            let listed = read(*hash, manifest_bytes)?;
+            if listed.len() != manifest_bytes {
+                return Err(BackupError::Corrupt("cold manifest chunk"));
+            }
+            chunks
+                .try_reserve(geometry.manifest_names)
+                .map_err(|_| BackupError::Capacity)?;
+            let (names, rest) = listed.as_chunks::<32>();
+            if !rest.is_empty() {
+                return Err(BackupError::Corrupt("cold manifest chunk"));
+            }
+            chunks.extend(names.iter().map(|name| BackupChunk {
+                hash: ContentHash(*name),
+                length: chunk,
+            }));
+        }
+        chunks
+            .try_reserve(state.names.len())
+            .map_err(|_| BackupError::Capacity)?;
+        chunks.extend(state.names.iter().map(|hash| BackupChunk {
+            hash: *hash,
+            length: chunk,
+        }));
+        Ok(chunks)
     }
     /// Where content objects are read from: a node's content store while
     /// writing, the backup's own files while verifying or restoring.
@@ -403,6 +574,8 @@ pub mod backup {
         pub objects: Vec<ContentHash>,
         pub retention: Option<RetentionSection>,
         pub bundles: u64,
+        /// The session's cold streams the envelope names (doc 31 M2, A2).
+        pub cold: Option<ColdStreams>,
     }
     /// A session envelope decoded and its native Core rebuilt against a
     /// content source: what a backup, a verification and a restore all
@@ -414,6 +587,8 @@ pub mod backup {
         pub retention: Option<RetentionSection>,
         pub seeds: Vec<SeedChunk>,
         pub core: Core<NativeState>,
+        /// The session's cold streams, when the envelope names them (doc 31 M2, A2).
+        pub cold: Option<ColdStreams>,
     }
     /// Decode a session envelope, assemble a seeded root from `seeds`, and
     /// rebuild the native Core through the recovery path every replica
@@ -493,6 +668,10 @@ pub mod backup {
             return Err(BackupError::Corrupt("restored prefix"));
         }
         let retention = checkpoint.retention();
+        let cold = match checkpoint.cold() {
+            Some(section) => Some(section.streams()?),
+            None => None,
+        };
         Ok(DecodedImage {
             envelope,
             profile: activation.profile,
@@ -500,6 +679,7 @@ pub mod backup {
             retention,
             seeds,
             core,
+            cold,
         })
     }
     /// Decode a session envelope, rebuild its native Core against `source`
@@ -517,13 +697,15 @@ pub mod backup {
             profile,
             header,
             retention,
-            seeds,
+            seeds: seed_chunks,
             core,
+            cold,
             ..
         } = decode_image(checkpoint, seeds, source, limits, budget)?;
         let domain = limits.content_domain;
         let mut objects = BTreeSet::new();
         let mut bundles = Vec::new();
+        let mut colds = Vec::new();
         let mut cursor = None;
         loop {
             let page = core.native_content_roots(cursor, PAGE)?;
@@ -544,6 +726,16 @@ pub mod backup {
                     ContentRoot::Seal { root, .. } => {
                         objects.insert(root);
                     }
+                    // A cold family's frame lies in the cold streams, which the backup carries
+                    // whole; what it names of the content is read from it (doc 31 M2, A2).
+                    ContentRoot::Cold {
+                        digest, retired_at, ..
+                    } => {
+                        if !colds.contains(&(retired_at, digest)) {
+                            colds.try_reserve_exact(1).map_err(|_| BackupError::Capacity)?;
+                            colds.push((retired_at, digest));
+                        }
+                    }
                 }
             }
             cursor = page.next;
@@ -558,6 +750,14 @@ pub mod backup {
                 length: *bytes,
                 class: ContentClass::Evidence,
             };
+            // Charged before it is read, as its length names it.
+            let _read = budget
+                .reserve(
+                    BudgetKind::Query,
+                    BudgetLane::Ordinary,
+                    usize::try_from(*bytes).map_err(|_| BackupError::Capacity)?,
+                )?
+                .commit();
             let read = source.read_content(&reference, MAX_BUNDLE_BYTES)?;
             let archive = StructuralArchive::inspect(&read, limits.inspection)?;
             let inner = archive.header();
@@ -568,6 +768,30 @@ pub mod backup {
                 objects.insert(*root);
             }
         }
+        if !colds.is_empty() {
+            let streams = cold.as_ref().ok_or(BackupError::Missing("cold streams"))?;
+            let data = |hash: ContentHash, length: usize| seeds.read_cold(true, hash, length);
+            let marks = |hash: ContentHash, length: usize| seeds.read_cold(false, hash, length);
+            for (retired_at, digest) in &colds {
+                let frame = crate::native_session::cold::frame_in(
+                    streams,
+                    &data,
+                    &marks,
+                    *retired_at,
+                    *digest,
+                    budget,
+                )?
+                .ok_or(BackupError::Missing("cold frame"))?;
+                let archive = StructuralArchive::inspect(frame.bytes(), limits.inspection)?;
+                let inner = archive.header();
+                if inner.ledger != header.ledger {
+                    return Err(BackupError::Corrupt("cold frame ledger"));
+                }
+                for root in inner.content.iter().chain(&inner.inline) {
+                    objects.insert(*root);
+                }
+            }
+        }
         let mut sorted = Vec::new();
         sorted
             .try_reserve_exact(objects.len())
@@ -576,10 +800,12 @@ pub mod backup {
         Ok(Inventory {
             header,
             profile,
-            seeds,
+            seeds: seed_chunks,
             objects: sorted,
             retention,
-            bundles: u64::try_from(bundles.len()).map_err(|_| BackupError::Capacity)?,
+            bundles: u64::try_from(bundles.len().saturating_add(colds.len()))
+                .map_err(|_| BackupError::Capacity)?,
+            cold,
         })
     }
 
@@ -653,8 +879,12 @@ pub mod backup {
             &decoded.core,
             metadata,
             &configuration,
-            None,
-            decoded.retention,
+            crate::native_checkpoint::Sections {
+                retention: decoded.retention,
+                movement: None,
+                // The cold streams go with the rows: the restore imports their chunks.
+                cold: decoded.cold.as_ref(),
+            },
             limits.checkpoint,
         )?;
         let encoded = plan.encode_in_seeded(budget, sink)?;
@@ -845,6 +1075,31 @@ pub mod backup {
         }
         Err(BackupError::Capacity)
     }
+    /// Install every cold chunk a backup lists into the restored session's cold directory
+    /// `target` (`cold/<session>`), each verified against its name (doc 31 M2, A2).
+    pub fn import_cold<M: BackupMedium>(
+        medium: &M,
+        root: &Path,
+        manifest: &BackupManifest,
+        target: &Path,
+        disk: &focal_memory::DiskBudget,
+    ) -> Result<u64, BackupError> {
+        let seeds = BackupSeeds::new(medium, root);
+        let mut installed = 0u64;
+        for (data, chunks) in [(true, &manifest.cold_data), (false, &manifest.cold_marks)] {
+            for chunk in chunks {
+                let bytes = seeds.read_cold(data, chunk.hash, chunk.length as usize)?;
+                focal_evidence::install_cold_chunk(
+                    &target.join(cold_part(data)),
+                    disk,
+                    chunk.hash,
+                    &bytes,
+                )?;
+                installed = installed.saturating_add(1);
+            }
+        }
+        Ok(installed)
+    }
     /// Install every seed chunk a backup lists into `sink`.
     pub fn import_seeds<M: BackupMedium>(
         medium: &M,
@@ -914,6 +1169,39 @@ pub mod backup {
         install(medium, &root.join(CHECKPOINT_FILE), &image.checkpoint)?;
         let mut files = 1u64;
         let mut bytes = image.checkpoint.len() as u64;
+        // The cold streams' chunks, every one the envelope names (doc 31 M2, A2).
+        let mut cold_lists = [Vec::new(), Vec::new()];
+        if let Some(streams) = inventory.cold.as_ref() {
+            medium.create_dir(&root.join(COLD_DIR))?;
+            for (index, (data, state)) in [(true, &streams.data), (false, &streams.marks)]
+                .into_iter()
+                .enumerate()
+            {
+                medium.create_dir(&root.join(COLD_DIR).join(cold_part(data)))?;
+                let read = |hash: ContentHash, length: usize| seeds.read_cold(data, hash, length);
+                let chunks = cold_chunks(state, streams.geometry, &read)?;
+                for chunk in &chunks {
+                    let length = usize::try_from(chunk.length).map_err(|_| BackupError::Capacity)?;
+                    let _scratch =
+                        budget.reserve(BudgetKind::Recovery, BudgetLane::Completion, length)?;
+                    let read = seeds.read_cold(data, chunk.hash, length)?;
+                    install(
+                        medium,
+                        &root
+                            .join(COLD_DIR)
+                            .join(cold_part(data))
+                            .join(format!("{}.seed", chunk.hash)),
+                        &read,
+                    )?;
+                    files = files.saturating_add(1);
+                    bytes = bytes.saturating_add(u64::from(chunk.length));
+                }
+                if let Some(list) = cold_lists.get_mut(index) {
+                    *list = chunks;
+                }
+            }
+        }
+        let [cold_data, cold_marks] = cold_lists;
         let mut seed_entries = Vec::new();
         seed_entries
             .try_reserve_exact(inventory.seeds.len())
@@ -1002,6 +1290,8 @@ pub mod backup {
             retired_families: inventory
                 .retention
                 .map_or(0, |section| section.retired_families),
+            cold_data,
+            cold_marks,
         };
         manifest.validate()?;
         install(medium, &root.join(MANIFEST_FILE), &manifest.encode()?)?;
@@ -1100,6 +1390,19 @@ pub mod backup {
                 Err(error) => problems.push(format!("seed {}: {error}", chunk.hash)),
             }
         }
+        // The cold streams' chunks (doc 31 M2, A2), each against its name.
+        let backup_seeds = BackupSeeds::new(medium, root);
+        for (data, chunks) in [(true, &manifest.cold_data), (false, &manifest.cold_marks)] {
+            for chunk in chunks {
+                match backup_seeds.read_cold(data, chunk.hash, chunk.length as usize) {
+                    Ok(bytes) if bytes.len() == chunk.length as usize => {
+                        seeds_verified = seeds_verified.saturating_add(1);
+                    }
+                    Ok(_) => problems.push(format!("cold chunk {}: length differs", chunk.hash)),
+                    Err(error) => problems.push(format!("cold chunk {}: {error}", chunk.hash)),
+                }
+            }
+        }
         let domain = manifest.domain;
         let content = BackupContent::new(medium, root);
         let mut objects_verified = 0u64;
@@ -1183,7 +1486,26 @@ pub mod backup {
                         if !coordinates {
                             problems.push("inventory: envelope coordinates differ from the manifest".to_owned());
                         }
-                        inventory.objects == listed && seeds_match && coordinates
+                        // The cold chunks the envelope names are the ones the manifest lists.
+                        let cold_match = match inventory.cold.as_ref() {
+                            None => manifest.cold_data.is_empty() && manifest.cold_marks.is_empty(),
+                            Some(streams) => [
+                                (true, &streams.data, &manifest.cold_data),
+                                (false, &streams.marks, &manifest.cold_marks),
+                            ]
+                            .into_iter()
+                            .all(|(data, state, listed)| {
+                                let read = |hash: ContentHash, length: usize| {
+                                    seeds.read_cold(data, hash, length)
+                                };
+                                cold_chunks(state, streams.geometry, &read)
+                                    .is_ok_and(|named| named == *listed)
+                            }),
+                        };
+                        if !cold_match {
+                            problems.push("inventory: cold chunks differ from the manifest".to_owned());
+                        }
+                        inventory.objects == listed && seeds_match && coordinates && cold_match
                     }
                     Err(error) => {
                         problems.push(format!("inventory: {error}"));

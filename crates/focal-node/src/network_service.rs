@@ -1046,6 +1046,7 @@ impl NetworkService {
         };
         let mut custody_config = CustodyConfig::new(identity.node);
         custody_config.seed_root = Some(root.join("seeds"));
+        custody_config.cold_root = Some(root.join("cold"));
         let (content, content_owner) = ContentHost::spawn(
             content,
             custody_config,
@@ -2318,8 +2319,15 @@ pub(crate) fn native_hosting(
         reader: focal_evidence::ContentReader::open(root.join("content"))?,
         seeds: focal_evidence::SeedStore::open(
             crate::custody::seed_directory(&root.join("seeds"), identity.ledger),
-            disk,
+            disk.clone(),
         )?,
+        // Every binary at the cold level keeps the session's cold streams, whatever the fence:
+        // it follows a leader that retires cold (doc 31 M2, A2).
+        cold: Some(focal_ledger::ColdSource {
+            root: crate::custody::seed_directory(&root.join("cold"), identity.ledger),
+            disk,
+            geometry: focal_evidence::ColdGeometry::STANDARD,
+        }),
         range: focal_memory::RangeId(u128::from(identity.node)),
     })
 }

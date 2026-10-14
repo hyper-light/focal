@@ -169,7 +169,8 @@ impl LocalHost {
                         else {
                             break;
                         };
-                        next_tick = deadline;
+                        // Sooner when the archive's next walk of the families is due.
+                        next_tick = deadline.min(archive.due());
                     }
                     // Every queued request is taken before the owner waits
                     // on the log; it blocks for a request only when no
@@ -681,6 +682,15 @@ pub(crate) fn dispatch(
                 NativeReadQuery::Sealed(query) => crate::archive_reads::sealed_page(
                     &node.content,
                     request.ledger,
+                    peer,
+                    request.route_epoch,
+                    read,
+                    query,
+                    limits,
+                ),
+                NativeReadQuery::Cold(query) => crate::archive_reads::cold_page(
+                    &mut node.session,
+                    budget,
                     peer,
                     request.route_epoch,
                     read,

@@ -54,6 +54,10 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// Where checkpoint seeds are read from on install (25 §5); the writer
     /// belongs to whoever owns the session's physical resources.
     pub(super) seeds: SeedReader,
+    /// The session's cold streams (doc 31 M2, A2), and where they live: every cold retirement
+    /// this replica applies is appended to them, and its checkpoints name them.
+    pub(super) cold: super::cold::ColdSlot,
+    pub(super) cold_source: Option<super::cold::ColdSource>,
     /// The seeded checkpoint this replica cannot install until the chunks
     /// it names are local; the host pulls them and polls again.
     pub(super) pending_seed: Option<PendingSeed>,
@@ -187,6 +191,9 @@ impl WaitingSeal {
 pub(crate) struct NativeSources {
     pub(crate) reader: ContentReader,
     pub(crate) seeds: SeedReader,
+    /// Where the session keeps its cold streams (doc 31 M2, A2): every replica that can apply a
+    /// cold retirement has them.
+    pub(crate) cold: Option<super::cold::ColdSource>,
 }
 
 impl<S: NativeSchemaVerifier> NativeEngine<S> {
@@ -201,7 +208,11 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         sources: NativeSources,
         schemas: S,
     ) -> Result<Self, NativeSessionError> {
-        let NativeSources { reader, seeds } = sources;
+        let NativeSources {
+            reader,
+            seeds,
+            cold: cold_source,
+        } = sources;
         if range.0 == 0
             || limits.content_domain.is_zero()
             || limits.recovery.native.pending == 0
@@ -248,6 +259,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             domain: Some(Domain::Passive(core)),
             reader,
             seeds,
+            cold: if cold_source.is_some() {
+                super::cold::ColdSlot::Closed(None)
+            } else {
+                super::cold::ColdSlot::None
+            },
+            cold_source,
             pending_seed: None,
             pending_custody: None,
             schemas,
@@ -507,6 +524,51 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.staged_chunks = Vec::new();
         Ok(())
     }
+    /// Take a cold chunk a peer sent for the pending seed (doc 31 M2, A2): into the data stream
+    /// (`data`) or its marks, verified against its hash and durable.
+    pub(crate) fn install_cold_chunk(
+        &mut self,
+        data: bool,
+        hash: ContentHash,
+        bytes: &[u8],
+    ) -> Result<(), NativeSessionError> {
+        let source = self
+            .cold_source
+            .as_ref()
+            .ok_or(NativeSessionError::Legacy)?;
+        super::cold::NativeCold::install(source, data, hash, bytes).map_err(super::cold::cold_error)
+    }
+    /// The frame of digest `digest` in the cold batch of the record at `sequence` (doc 31 M2,
+    /// A2): `None` when no cold record applied there, as for a family retired under custody.
+    pub(crate) fn cold_frame(
+        &mut self,
+        sequence: SessionSeq,
+        digest: ContentHash,
+    ) -> Result<Option<super::cold::ColdFrame>, NativeSessionError> {
+        match self
+            .cold
+            .writer(self.cold_source.as_ref(), &self.budget)
+            .map_err(super::cold::cold_error)?
+        {
+            Some(cold) => cold
+                .frame(sequence, digest, &self.budget)
+                .map_err(super::cold::cold_error),
+            None => Ok(None),
+        }
+    }
+    /// The cold chunks the checkpoint `streams` names are durable: its encoding made them so
+    /// before its bytes existed (doc 31 M2, A2), so they are pending no more.
+    fn note_cold(
+        &mut self,
+        streams: Option<focal_evidence::ColdStreams>,
+    ) -> Result<(), NativeSessionError> {
+        if let Some(streams) = streams {
+            self.cold
+                .made_durable(&streams)
+                .map_err(super::cold::cold_error)?;
+        }
+        Ok(())
+    }
     /// The bytes of the root the latest checkpoint keeps in seed chunks,
     /// outside its envelope: zero for one whose root travels inline.
     pub(crate) fn seed_root_bytes(&self) -> u64 {
@@ -519,13 +581,20 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.staged_chunks = self.describe_seeds(bytes)?.0;
         Ok(())
     }
-    /// The seed chunks the native section `bytes` names, sorted and distinct.
-    fn describe_seeds(&self, bytes: &[u8]) -> Result<(Vec<ContentHash>, u64), NativeSessionError> {
+    /// The seed chunks the native section `bytes` names, sorted and distinct, and the bytes of
+    /// the root they hold; the cold chunks it names are noted durable from the same parse.
+    fn describe_seeds(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(Vec<ContentHash>, u64), NativeSessionError> {
         let mut chunks = Vec::new();
         let mut root_bytes = 0;
-        if let Some(manifest) =
-            crate::native_checkpoint::Checkpoint::describe(bytes, self.limits.checkpoint)?
-        {
+        let (manifest, cold) = crate::native_checkpoint::Checkpoint::describe_with_cold(
+            bytes,
+            self.limits.checkpoint,
+        )?;
+        self.note_cold(cold.map(|section| section.streams()).transpose()?)?;
+        if let Some(manifest) = manifest {
             root_bytes = manifest.header().core_bytes;
             // Reserve the manifest's chunk count once instead of growing by one
             // per chunk (which was O(n^2) in reallocations).
@@ -1229,10 +1298,39 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         ),
         NativeSessionError,
     > {
-        if self.limits.retire_rule != super::RetireRule::Pipeline {
-            return Err(NativeSessionError::RetireExact);
+        let cold = match self.limits.retire_rule {
+            super::RetireRule::Exact => return Err(NativeSessionError::RetireExact),
+            super::RetireRule::Pipeline => None,
+            super::RetireRule::Cold => {
+                // A cold batch is appended where it applies: this replica must keep the streams.
+                if !self.cold.is_kept() {
+                    return Err(NativeSessionError::RetireExact);
+                }
+                Some(self.limits.encoding)
+            }
+        };
+        // Planned once, each offer's family derived once, then staged a candidate at a time
+        // through every gate a write meets, while the session has room: a retirement takes all
+        // its offers that may leave now, however few families one candidate holds.
+        let (mut batch, mut submission) = self.admit_with(consensus, |owner, _, _| {
+            let batch = owner.plan_retirement(offers, cold)?;
+            let staged = owner.stage_retirement(&batch, 0)?;
+            Ok((batch, staged))
+        })?;
+        let mut staged = usize::from(submission.is_some());
+        while staged > 0 && staged < batch.ends.len() {
+            let next = self.admit_with(consensus, |owner, _, _| {
+                Ok(((), owner.stage_retirement(&batch, staged)?))
+            });
+            // A candidate refused (no room, the session busy) leaves the rest to a later offer.
+            let Ok(((), Some(next))) = next else {
+                break;
+            };
+            submission = Some(next);
+            staged = staged.saturating_add(1);
         }
-        self.admit_with(consensus, |owner, _, _| owner.prepare_retirement(offers))
+        batch.keep(staged)?;
+        Ok((batch, submission))
     }
     /// Admit what `prepare` makes of the owner, a candidate or none, as a write is: every gate a
     /// write meets, the movement's fence, the session's room, and the submission.

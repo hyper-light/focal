@@ -320,6 +320,12 @@ fn a_populated_ledger_is_imported_through_the_node_after_its_host_seals_the_payl
                         .unwrap(),
                 )
                 .unwrap(),
+                cold: Some(focal_ledger::ColdSource {
+                    root: content_dir.join("cold"),
+                    disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
+                        .unwrap(),
+                    geometry: focal_evidence::ColdGeometry::STANDARD,
+                }),
                 range: RangeId(1),
             },
         )

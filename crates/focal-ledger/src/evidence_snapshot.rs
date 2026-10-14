@@ -290,6 +290,9 @@ impl Session {
                             }),
                         }
                     }
+                    // A cold family's frame is no custody object: every replica holds it in its
+                    // own cold stream, which an install takes with the checkpoint (doc 31 M2, A2).
+                    focal_core::native::ContentRoot::Cold { .. } => continue,
                     // A seal's bundle (F12) is inventoried under an identity
                     // derived from its ordinal: no claim names it.
                     focal_core::native::ContentRoot::Seal {

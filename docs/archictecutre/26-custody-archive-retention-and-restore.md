@@ -494,6 +494,19 @@ retired around. A checkpoint already encoded past its bound by the
 unchecked retirement is still refused at restore; its repair is a decision
 the remediation record leaves open.
 
+**To the cold stream (31 M2, A2, 2026-10-14).** From level 7 a family no
+longer goes under custody as a bundle of its own: every replica appends its
+`FCNARCHV` frame to the session's cold stream as it applies the retirement
+record (`FCRETIRE` v2, which quotes each frame's digest and length), from its
+own rows, and the next checkpoint makes the stream's chunks durable. The stub
+keeps its shape: its bundle is the frame's digest and length, and it claims
+the record's own sequence as its prefix (`through == retired_at`), which is
+how a reader tells a cold family from one under custody. A retired claim is
+read through the stream's marks (31 M2); the collector protects what a cold
+frame names, never the frame, which lives in its own directory
+(`cold/<session>`), never swept; a stub whose sequence has no mark is read
+from custody as before.
+
 ## 4a. Seals: the outcome history leaves the live core (F12, 2026-09-30)
 
 Retirement takes families and leaves their outcomes, so a session's lifetime
@@ -763,7 +776,11 @@ index, the chunks of that envelope's Core root when it is seeded, the exact
 authenticated tree of every content object the prefix's rows name and of
 everything the archive bundles it names name in turn, and a manifest that
 lists all of it with hashes and is written last. `focal_ledger::backup`
-owns the format; the node (`backup.rs`) drives it.
+owns the format; the node (`backup.rs`) drives it. From schema 2 (31 M2,
+A2) the manifest also lists the session's cold streams, the data's chunks and
+the marks', copied whole; a restore puts them into the restored node's cold
+directory (`import_cold`), and the inventory reads what each cold frame names
+through them. A schema-1 manifest still decodes.
 
 **Taking one.** `create backup --output DIR [--session ID]`
 (`cluster.backup.create`) asks the hosting replica for its evidence export

@@ -40,6 +40,28 @@ pub struct RetiredBundle {
     pub bytes: u64,
 }
 
+/// A retirement record whose bundles are objects sealed under custody (26 §4).
+pub const RETIRE_CUSTODY: u16 = 1;
+/// A retirement record whose bundles are its families' frames in every replica's cold stream
+/// (doc 31 M2, A2): each a frame's digest and length, which every replica appends where the
+/// record applies.
+pub const RETIRE_COLD: u16 = 2;
+
+/// What a retirement's record carries: its version and its families' places.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetireBody {
+    pub version: u16,
+    pub retired: Vec<RetiredBundle>,
+}
+
+/// Where a cold retirement's frames are written: at the sequence of its record (the prefix its
+/// frames claim, every event of each family below it), under these bounds.
+#[derive(Debug, Clone, Copy)]
+pub struct ColdPlan {
+    pub through: SessionSeq,
+    pub limits: record_codec::EncodingLimits,
+}
+
 /// The most rows one retirement's candidate changes: one family's bound, its members'
 /// continuations, the meta and the outcome. A batch of several families stays within the
 /// store's bound on a batch; a family past that retires alone.
@@ -55,13 +77,19 @@ pub struct Retiring {
     pub bytes: u64,
 }
 
-/// What a batch made of the families it was offered.
+/// What a retirement made of the families it was offered: those that retire, as candidates each
+/// within the store's bound on a batch's changes, staged one after another.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetireBatch {
     /// The families that retire, in the order they were offered.
     pub families: Vec<Retiring>,
-    /// Roots whose family a pending candidate changes, or past the batch's bound: offered
-    /// again once the candidate commits.
+    /// Where each candidate's families end in `families`, in staging order.
+    pub ends: Vec<usize>,
+    /// The sequence a cold retirement's first candidate claims, its frames quoted at it (doc 31
+    /// M2, A2), each next candidate's one more; none under custody.
+    pub through: Option<SessionSeq>,
+    /// Roots whose family a pending candidate changes, or that no candidate took: offered again
+    /// once it commits.
     pub deferred: Vec<ClaimId>,
     /// Roots that cannot retire now, and why.
     pub refused: Vec<(ClaimId, RetireRefusal)>,
@@ -77,6 +105,32 @@ pub enum RetireRefusal {
 }
 
 impl RetireBatch {
+    /// The families of candidate `index`.
+    pub fn candidate(&self, index: usize) -> Option<&[Retiring]> {
+        let start = match index.checked_sub(1) {
+            Some(before) => *self.ends.get(before)?,
+            None => 0,
+        };
+        self.families.get(start..*self.ends.get(index)?)
+    }
+    /// Keep the first `staged` candidates, those staged: every family past them is deferred,
+    /// offered again later.
+    pub fn keep(&mut self, staged: usize) -> Result<(), NativeError> {
+        let end = match staged.checked_sub(1) {
+            Some(last) => self.ends.get(last).copied().unwrap_or(self.families.len()),
+            None => 0,
+        };
+        self.deferred
+            .try_reserve(self.families.len().saturating_sub(end))
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        self.deferred.extend(
+            self.families
+                .drain(end.min(self.families.len())..)
+                .map(|retiring| retiring.family.root),
+        );
+        self.ends.truncate(staged);
+        Ok(())
+    }
     /// Rows the batch takes from the core.
     pub fn rows(&self) -> usize {
         self.families.iter().fold(0usize, |total, retiring| {
@@ -178,30 +232,41 @@ fn touched(chain: &Chain<'_>, family: &RetirementFamily) -> bool {
 
 impl Core<NativeState> {
     /// Plan the retirement of the families `offers` name on `chain` (the committed rows where
-    /// none): each derived from the committed rows and refused where it cannot leave or is not
-    /// the family its bundle holds, deferred where a pending candidate changes a row its
-    /// derivation read. The batch stops at [`MAX_RETIRE_FAMILIES`] families and at the store's
-    /// bound on a batch's changes, past which only a first family may go, alone; the offers
-    /// past either are deferred.
+    /// none): each derived once, from the committed rows, and refused where it cannot leave or
+    /// is not the family its bundle holds, deferred where a pending candidate changes a row its
+    /// derivation read. The rest are packed into candidates in the offers' order, each within
+    /// the store's bound on a batch's changes (a family past it alone in one), so a retirement
+    /// takes every offer that may leave now however small that bound, at [`MAX_RETIRE_FAMILIES`]
+    /// offers.
+    ///
+    /// A cold retirement (`cold`, doc 31 M2, A2) takes no bundle from its offers: each family's
+    /// bundle is its frame at its candidate's sequence (`cold.through` for the first, each next
+    /// one more), by its digest and length.
     pub(super) fn plan_retirement_batch(
         &self,
         offers: &[RetireOffer],
         chain: Option<Chain<'_>>,
+        cold: Option<ColdPlan>,
     ) -> Result<RetireBatch, NativeError> {
         if offers.len() > MAX_RETIRE_FAMILIES {
             return Err(NativeError::Capacity("retirement offers"));
         }
         let mut batch = RetireBatch::default();
-        // Each offer lands in one of the three, once: within these, no push reallocates.
+        // Each offer lands in one of the three, once, and closes at most one candidate: within
+        // these, no push reallocates.
         for vector_len in [
             batch.families.try_reserve_exact(offers.len()),
+            batch.ends.try_reserve_exact(offers.len()),
             batch.deferred.try_reserve_exact(offers.len()),
             batch.refused.try_reserve_exact(offers.len()),
         ] {
             vector_len.map_err(|_| MemoryError::AllocationFailed)?;
         }
         let bound = self.limits.range.max_batch_entries;
+        // The current candidate's rows: the meta and the outcome, then its families'.
         let mut rows = 2usize;
+        let mut candidate = 0u64;
+        batch.through = cold.map(|cold| cold.through);
         for offer in offers {
             if batch
                 .families
@@ -223,28 +288,69 @@ impl Core<NativeState> {
                 }
             };
             if family_digest(self.state.ledger, &family)? != offer.family
-                || offer.bundle.0 == [0; 32]
-                || offer.bytes == 0
+                || (cold.is_none() && (offer.bundle.0 == [0; 32] || offer.bytes == 0))
             {
                 batch.refused.push((offer.root, RetireRefusal::Bundle));
                 continue;
             }
-            let taken = rows
-                .checked_add(family.rows())
-                .and_then(|taken| taken.checked_add(family.members.len()));
-            let fits = taken.is_some_and(|taken| {
-                taken <= bound || (batch.families.is_empty() && taken <= MAX_RETIRE_CHANGES)
-            });
-            if !fits || chain.is_some_and(|chain| touched(&chain, &family)) {
+            if chain.is_some_and(|chain| touched(&chain, &family)) {
                 batch.deferred.push(offer.root);
                 continue;
             }
-            rows = taken.unwrap_or(rows);
+            let own = family
+                .rows()
+                .checked_add(family.members.len())
+                .ok_or(NativeError::Capacity("retirement rows"))?;
+            let started = batch.ends.last().copied().unwrap_or(0) < batch.families.len();
+            let fits = |rows: usize, alone: bool| {
+                rows.checked_add(own)
+                    .is_some_and(|taken| taken <= bound || (alone && taken <= MAX_RETIRE_CHANGES))
+            };
+            if !fits(rows, !started) {
+                if !started || !fits(2, true) {
+                    // Past what a candidate may take even alone: it can never leave in a batch.
+                    batch.deferred.push(offer.root);
+                    continue;
+                }
+                // The candidate is full: the family begins the next.
+                batch.ends.push(batch.families.len());
+                candidate = candidate
+                    .checked_add(1)
+                    .ok_or(NativeError::Capacity("retirement candidates"))?;
+                rows = 2;
+            }
+            rows = rows.saturating_add(own);
+            let (bundle, bytes) = match cold {
+                Some(cold) => {
+                    let through = cold
+                        .through
+                        .0
+                        .checked_add(candidate)
+                        .map(SessionSeq)
+                        .ok_or(NativeError::Capacity("native prefix"))?;
+                    let quote = self
+                        .archive_family_quote(&family, through, cold.limits)
+                        .map_err(|_| NativeError::Capacity("cold frame"))?;
+                    (
+                        quote.hash,
+                        u64::try_from(quote.bytes)
+                            .map_err(|_| NativeError::Capacity("cold frame"))?,
+                    )
+                }
+                None => (offer.bundle, offer.bytes),
+            };
             batch.families.push(Retiring {
                 family,
-                bundle: offer.bundle,
-                bytes: offer.bytes,
+                bundle,
+                bytes,
             });
+        }
+        if batch.ends.last().copied().unwrap_or(0) < batch.families.len() {
+            batch
+                .ends
+                .try_reserve(1)
+                .map_err(|_| MemoryError::AllocationFailed)?;
+            batch.ends.push(batch.families.len());
         }
         Ok(batch)
     }
@@ -254,10 +360,15 @@ impl Core<NativeState> {
     /// meta, and the batch's one outcome (a `Retirement` invocation of its first root, its
     /// intent the batch's digest). Guarded as admission guards an outcome: one a sequence,
     /// within the core's bound.
+    ///
+    /// A cold batch's continuations claim the retirement's own sequence as their prefix
+    /// (`through == retired_at`), as its frames do: what tells them from a custody bundle's,
+    /// which claim no more than the family's last event, without a row of their own.
     pub(super) fn retirement_batch_changes(
         &self,
         view: &View<'_>,
         families: &[Retiring],
+        cold: bool,
     ) -> Result<(Vec<Change<Key, Row>>, NativeOutcome), NativeError> {
         let first = families.first().ok_or(ContractError::InvalidManifest)?;
         let mut meta = view.meta();
@@ -346,7 +457,7 @@ impl Core<NativeState> {
                     Row::Retired(Box::new(RetiredClaim {
                         bundle: retiring.bundle,
                         bytes: retiring.bytes,
-                        through: family.through,
+                        through: if cold { sequence } else { family.through },
                         binding: claim.binding(),
                         status: claim.status(),
                         retired_at: sequence,
@@ -398,10 +509,12 @@ impl Core<NativeState> {
         &self,
         view: &View<'_>,
         families: &[Retiring],
+        version: u16,
         source: &MemoryBudget,
         lane: BudgetLane,
     ) -> Result<NativePrepared, NativeError> {
-        let (changes, outcome) = self.retirement_batch_changes(view, families)?;
+        let (changes, outcome) =
+            self.retirement_batch_changes(view, families, version == RETIRE_COLD)?;
         let fragments = view.state.rows.plan_sparse_bounded(
             source,
             view.tail().map(|tail| &tail.fragments),
@@ -454,7 +567,10 @@ impl Core<NativeState> {
             encoded_removed: removed.bytes(),
             _index: Some(index),
             events: None,
-            retire: Some(record),
+            retire: Some(RetireBody {
+                version,
+                retired: record,
+            }),
         })
     }
 
@@ -499,7 +615,8 @@ impl Core<NativeState> {
             });
         }
         let view = View::committed(&self.state);
-        let (changes, outcome) = self.retirement_batch_changes(&view, &families)?;
+        let (changes, outcome) =
+            self.retirement_batch_changes(&view, &families, record.version() == RETIRE_COLD)?;
         if outcome != header.outcome {
             return Err(ContractError::InvalidManifest.into());
         }

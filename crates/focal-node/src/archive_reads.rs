@@ -16,7 +16,7 @@ use focal_core::native::record_codec::seal::{SealHeader, StructuralSeal};
 use focal_core::native::{NativeContentProfile, NativeError};
 use focal_evidence::{BuiltinNativeSchemas, ContentStore};
 use focal_ledger::NativeSessionLimits;
-use focal_memory::{MemoryBudget, RangeId};
+use focal_memory::{BudgetKind, BudgetLane, MemoryBudget, RangeId};
 use focal_model::*;
 use focal_wire::*;
 
@@ -149,15 +149,126 @@ pub(crate) fn page(
     limits: &WireLimits,
 ) -> Result<NativeReadPage, AccessError> {
     read.validate(limits)?;
-    let role = native_reads::role(peer)?;
     let reference = reference(ledger, query);
     // Custody this node does not hold, or holds corrupt, is unavailable —
     // never an unknown object, and never the caller's fault.
     let bytes = store
         .read_bytes(&reference, MAX_ARCHIVE_BYTES)
         .map_err(|_| AccessError::Unavailable)?;
-    let session_limits = NativeSessionLimits::standard(reference.domain);
-    let archive = StructuralArchive::inspect(&bytes, session_limits.inspection)
+    page_of(
+        &bytes,
+        store,
+        budget,
+        Bundle {
+            ledger,
+            root: query.bundle,
+            bytes: query.bytes,
+        },
+        peer,
+        route,
+        read,
+        query.object,
+    )
+}
+/// The family a bundle or a cold frame holds: its ledger, and its name and length.
+#[derive(Debug, Clone, Copy)]
+struct Bundle {
+    ledger: LedgerId,
+    root: ContentHash,
+    bytes: u64,
+}
+/// One page of an object of a retired claim's family (doc 31 M2, A2), from where this replica's
+/// continuation of the claim says it went: a frame of its own cold stream for a family retired
+/// there, else the bundle its custody holds. A claim that never retired has no such object.
+#[allow(clippy::too_many_arguments)] // The read's inputs, each its own owner's.
+pub(crate) fn cold_page(
+    session: &mut focal_ledger::Session,
+    budget: &MemoryBudget,
+    peer: &AuthenticatedPeer,
+    route: RouteEpoch,
+    read: &NativeReadRequest,
+    query: &NativeColdQuery,
+    limits: &WireLimits,
+) -> Result<NativeReadPage, AccessError> {
+    read.validate(limits)?;
+    let ledger = session.ledger();
+    let retired = session
+        .native_core()
+        .map_err(crate::host::access)?
+        .native_retired(query.claim)
+        .copied();
+    let Some(retired) = retired else {
+        return Err(AccessError::InvalidRequest);
+    };
+    let custody = session
+        .native_content_reader()
+        .map_err(crate::host::access)?;
+    let frame = session
+        .native_cold_frame(retired.retired_at, retired.bundle)
+        .map_err(crate::host::access)?;
+    let mut bundle = Vec::new();
+    // A custody bundle's bytes are charged before they are read, and held while the page is
+    // made from them, as a cold frame's are.
+    let mut _charge = None;
+    let bytes = match &frame {
+        Some(frame) => frame.bytes(),
+        None => {
+            _charge = Some(
+                budget
+                    .reserve(
+                        BudgetKind::Query,
+                        BudgetLane::Ordinary,
+                        usize::try_from(retired.bytes).map_err(|_| AccessError::Capacity)?,
+                    )
+                    .map_err(|_| AccessError::Capacity)?
+                    .commit(),
+            );
+            custody
+                .read_verified(
+                    &ContentRef {
+                        domain: ContentDomainId(ledger.tenant.0),
+                        root: retired.bundle,
+                        length: retired.bytes,
+                        class: ContentClass::Evidence,
+                    },
+                    &mut bundle,
+                )
+                .map_err(|_| AccessError::Unavailable)?;
+            &bundle
+        }
+    };
+    page_of(
+        bytes,
+        &custody,
+        budget,
+        Bundle {
+            ledger,
+            root: retired.bundle,
+            bytes: retired.bytes,
+        },
+        peer,
+        route,
+        read,
+        query.object,
+    )
+}
+/// One page holding `object` of the family `bytes` hold (a bundle or a cold frame), hydrated
+/// against `custody`, or `Missing` for a row it does not hold.
+#[allow(clippy::too_many_arguments)] // The read's inputs, each its own owner's.
+fn page_of<R: focal_evidence::NativeCustodyReader>(
+    bytes: &[u8],
+    custody: &R,
+    budget: &MemoryBudget,
+    bundle: Bundle,
+    peer: &AuthenticatedPeer,
+    route: RouteEpoch,
+    read: &NativeReadRequest,
+    object: NativeObjectRef,
+) -> Result<NativeReadPage, AccessError> {
+    let ledger = bundle.ledger;
+    let role = native_reads::role(peer)?;
+    let session_limits = NativeSessionLimits::standard(ContentDomainId(ledger.tenant.0));
+    let archive = StructuralArchive::inspect(bytes, session_limits.inspection)
         .map_err(|_| AccessError::Unavailable)?;
     if archive.header().ledger != ledger {
         return Err(AccessError::Unauthorized);
@@ -167,7 +278,7 @@ pub(crate) fn page(
             RangeId(1),
             session_limits.recovery,
             budget.clone(),
-            store,
+            custody,
             &BuiltinNativeSchemas,
         )
         .map_err(hydration_error)?;
@@ -190,8 +301,8 @@ pub(crate) fn page(
         Ok(match object {
             NativeObject::Missing(reference) => NativeObject::Missing(reference),
             object => NativeObject::Archived(Box::new(NativeArchivedObject {
-                bundle: query.bundle,
-                bytes: query.bytes,
+                bundle: bundle.root,
+                bytes: bundle.bytes,
                 root: header.root,
                 through: header.through,
                 object: NativeBundledObject::try_from(object)
@@ -199,7 +310,7 @@ pub(crate) fn page(
             })),
         })
     };
-    let first = native_reads::object(&reader, query.object)?;
+    let first = native_reads::object(&reader, object)?;
     let mut objects = Vec::new();
     objects.try_reserve(1).map_err(|_| AccessError::Capacity)?;
     let mut visited = 1u32;

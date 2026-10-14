@@ -150,6 +150,12 @@ fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizable_rea
                     focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
                 )
                 .unwrap(),
+                cold: Some(focal_ledger::ColdSource {
+                    root: content_dir.join("cold"),
+                    disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
+                        .unwrap(),
+                    geometry: focal_evidence::ColdGeometry::STANDARD,
+                }),
                 range: RangeId(1),
             },
         )
@@ -666,6 +672,12 @@ fn many_reads_wait_at_once_within_a_small_sessions_memory() {
                         .unwrap(),
                 )
                 .unwrap(),
+                cold: Some(focal_ledger::ColdSource {
+                    root: content_dir.join("cold"),
+                    disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
+                        .unwrap(),
+                    geometry: focal_evidence::ColdGeometry::STANDARD,
+                }),
                 range: RangeId(1),
             },
         )

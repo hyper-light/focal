@@ -11,7 +11,7 @@
 //! Outcome and creation-result rows stay: every native sequence keeps its
 //! one outcome, and an exact retry keeps finding it.
 use super::*;
-use focal_memory::Change;
+use focal_memory::{Allocation, BudgetKind, BudgetLane, Change};
 use focal_model::Cause;
 use focal_model::lifecycle::artifact_descriptor::PayloadSpec;
 use std::collections::BTreeSet;
@@ -93,6 +93,71 @@ impl RetirementFamily {
         self.keys.len()
     }
 }
+/// The bytes of a cold batch's count, before its entries (u16, little-endian).
+pub const COLD_COUNT_BYTES: usize = 2;
+/// The bytes of one family's entry in a cold batch's header: its root, its frame's digest and
+/// its frame's length (u32, little-endian).
+pub const COLD_ENTRY_BYTES: usize = 52;
+/// One family's entry in a cold batch (doc 31 M2, A2): its root, and its frame's digest and
+/// length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColdEntry {
+    pub root: ClaimId,
+    pub digest: ContentHash,
+    pub length: u32,
+}
+/// A retirement's cold batch ([`Core::cold_batch`]): the count, each family's entry, then each
+/// family's archive frame in the entries' order: what every replica appends to its cold stream
+/// where the record applies. Charged while held.
+#[derive(Debug)]
+pub struct ColdBatch {
+    pub bytes: Vec<u8>,
+    pub entries: Vec<ColdEntry>,
+    _charge: Allocation,
+}
+/// A family's frame past what a frame may hold, or memory refused it.
+fn cold_codec(error: record_codec::CodecError) -> NativeError {
+    match error {
+        record_codec::CodecError::Allocation => NativeError::Memory(MemoryError::AllocationFailed),
+        _ => NativeError::Capacity("cold frame"),
+    }
+}
+/// A cold batch's header, read from its first bytes: its entries, and where its frames begin.
+pub fn cold_header(bytes: &[u8]) -> Result<(Vec<ColdEntry>, usize), NativeError> {
+    let count: [u8; COLD_COUNT_BYTES] = bytes
+        .get(..COLD_COUNT_BYTES)
+        .and_then(|count| count.try_into().ok())
+        .ok_or(NativeError::Capacity("cold batch header"))?;
+    let count = usize::from(u16::from_le_bytes(count));
+    let frames = count
+        .checked_mul(COLD_ENTRY_BYTES)
+        .and_then(|n| n.checked_add(COLD_COUNT_BYTES))
+        .ok_or(NativeError::Capacity("cold batch header"))?;
+    let table = bytes
+        .get(COLD_COUNT_BYTES..frames)
+        .ok_or(NativeError::Capacity("cold batch header"))?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| MemoryError::AllocationFailed)?;
+    let (table, rest) = table.as_chunks::<COLD_ENTRY_BYTES>();
+    if !rest.is_empty() {
+        return Err(NativeError::Capacity("cold batch header"));
+    }
+    for entry in table {
+        let entry_error = || NativeError::Capacity("cold batch entry");
+        let (root, entry) = entry.split_first_chunk::<16>().ok_or_else(entry_error)?;
+        let (digest, entry) = entry.split_first_chunk::<32>().ok_or_else(entry_error)?;
+        let (length, _) = entry.split_first_chunk::<4>().ok_or_else(entry_error)?;
+        entries.push(ColdEntry {
+            root: ClaimId(*root),
+            digest: ContentHash(*digest),
+            length: u32::from_le_bytes(*length),
+        });
+    }
+    Ok((entries, frames))
+}
+
 /// Where a candidate walk resumes: the status bucket and the last claim
 /// visited in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -735,6 +800,104 @@ impl Core<NativeState> {
         )?;
         sink.finish()?;
         Ok(hash)
+    }
+    /// The cold batch of the families `roots` name (doc 31 M2, A2): each derived from the
+    /// committed rows and written as its archive frame at `through`, the prefix its retirement
+    /// extends, after a header naming each family's root, frame digest and frame length, in
+    /// `roots`' order. Every replica writes the same bytes where the record applies, so its cold
+    /// stream is every replica's. Charged to `budget` in `lane` while held.
+    pub fn cold_batch(
+        &self,
+        roots: &[ClaimId],
+        through: SessionSeq,
+        limits: record_codec::EncodingLimits,
+        budget: &MemoryBudget,
+        lane: BudgetLane,
+    ) -> Result<ColdBatch, NativeError> {
+        let count = u16::try_from(roots.len()).map_err(|_| NativeError::Capacity("cold batch"))?;
+        let mut families = Vec::new();
+        families
+            .try_reserve_exact(roots.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let header = roots
+            .len()
+            .checked_mul(COLD_ENTRY_BYTES)
+            .and_then(|n| n.checked_add(COLD_COUNT_BYTES))
+            .ok_or(NativeError::Capacity("cold batch"))?;
+        let mut total = header;
+        for root in roots {
+            let family = self
+                .retirement_family(*root)
+                .map_err(|_| ContractError::InvalidManifest)?;
+            let quote = self
+                .archive_family_quote(&family, through, limits)
+                .map_err(cold_codec)?;
+            total = total
+                .checked_add(quote.bytes)
+                .ok_or(NativeError::Capacity("cold batch"))?;
+            families.push((family, quote));
+        }
+        let index = size_of::<ColdEntry>()
+            .checked_mul(roots.len())
+            .ok_or(NativeError::Capacity("cold batch"))?;
+        let charge = budget
+            .reserve(
+                BudgetKind::Payload,
+                lane,
+                total
+                    .checked_add(index)
+                    .ok_or(NativeError::Capacity("cold batch"))?,
+            )?
+            .commit();
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        bytes.resize(total, 0);
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(roots.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut offset = header;
+        for (family, quote) in &families {
+            let end = offset
+                .checked_add(quote.bytes)
+                .ok_or(NativeError::Capacity("cold batch"))?;
+            let target = bytes
+                .get_mut(offset..end)
+                .ok_or(NativeError::Capacity("cold batch"))?;
+            let digest = self
+                .archive_family_into(family, through, target, quote.visits)
+                .map_err(cold_codec)?;
+            if digest != quote.hash {
+                return Err(NativeError::Capacity("a cold frame unlike its quote"));
+            }
+            entries.push(ColdEntry {
+                root: family.root,
+                digest,
+                length: u32::try_from(quote.bytes)
+                    .map_err(|_| NativeError::Capacity("cold frame"))?,
+            });
+            offset = end;
+        }
+        let mut head = Vec::new();
+        head.try_reserve_exact(header)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        head.extend_from_slice(&count.to_le_bytes());
+        for entry in &entries {
+            head.extend_from_slice(&entry.root.0);
+            head.extend_from_slice(&entry.digest.0);
+            head.extend_from_slice(&entry.length.to_le_bytes());
+        }
+        bytes
+            .get_mut(..header)
+            .ok_or(NativeError::Capacity("cold batch"))?
+            .copy_from_slice(&head);
+        Ok(ColdBatch {
+            bytes,
+            entries,
+            _charge: charge,
+        })
     }
     /// Unfile every event of `family` from the event index (doc 31 M2).
     pub(super) fn unfile_family_events(&mut self, family: &RetirementFamily) {

@@ -775,24 +775,85 @@ impl NativeOwner {
         )
     }
 
-    /// Prepare the retirement of the families `offers` name as the next candidate
-    /// (doc 31 M2): planned on the chain as it stands and ordered with every write
-    /// before and after it, so nothing waits for it and it waits for nothing. A
-    /// family a pending candidate touches is deferred and a refused one says why;
-    /// with none to retire, no candidate is made. It publishes as any candidate does
-    /// once durable; its record carries its families' roots and bundles, and every
-    /// replica derives the rest.
+    /// Prepare the retirement of the families `offers` name (doc 31 M2): planned
+    /// ([`Self::plan_retirement`]) and its first candidate staged
+    /// ([`Self::stage_retirement`]); every family past it is deferred. What a caller that
+    /// stages one candidate at a time uses; a session stages them all while it has room.
     pub fn prepare_retirement(
         &mut self,
         offers: &[retirement_batch::RetireOffer],
+        cold: Option<record_codec::EncodingLimits>,
     ) -> Result<(retirement_batch::RetireBatch, Option<NativeStaging>), NativeOwnerError> {
-        let room = self.reserve_pending().is_ok();
-        let batch = self.core.plan_retirement_batch(
+        let mut batch = self.plan_retirement(offers, cold)?;
+        let staged = self.stage_retirement(&batch, 0)?;
+        batch.keep(usize::from(staged.is_some()))?;
+        Ok((batch, staged))
+    }
+
+    /// Plan the retirement of the families `offers` name (doc 31 M2) on the chain as it stands:
+    /// each derived once, a family a pending candidate touches deferred and a refused one saying
+    /// why, the rest packed into candidates each within the store's bound on a batch's changes.
+    /// Nothing is staged; [`Self::stage_retirement`] stages each candidate in turn, ordered with
+    /// every write before and after it, so nothing waits for it and it waits for nothing. Its
+    /// record carries its families' roots and bundles, and every replica derives the rest.
+    ///
+    /// Under `cold` (doc 31 M2, A2), each candidate's record is a cold one: each family's bundle
+    /// is its frame at its candidate's sequence (the chain's next for the first), encoded under
+    /// those bounds, by its digest and length.
+    pub fn plan_retirement(
+        &mut self,
+        offers: &[retirement_batch::RetireOffer],
+        cold: Option<record_codec::EncodingLimits>,
+    ) -> Result<retirement_batch::RetireBatch, NativeOwnerError> {
+        // The first record's own sequence, the chain's next: the prefix its frames claim.
+        let through = self.next_sequence()?;
+        let plan = cold.map(|limits| retirement_batch::ColdPlan { through, limits });
+        Ok(self.core.plan_retirement_batch(
             offers,
             Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),
-        )?;
-        if batch.families.is_empty() {
-            return Ok((batch, None));
+            plan,
+        )?)
+    }
+
+    /// The sequence the next candidate claims: one past the chain's prefix.
+    fn next_sequence(&self) -> Result<SessionSeq, NativeOwnerError> {
+        Ok(View::over(
+            &self.core.state,
+            Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),
+        )
+        .prefix()
+        .0
+        .checked_add(1)
+        .map(SessionSeq)
+        .ok_or(NativeError::Capacity("native prefix"))?)
+    }
+
+    /// Stage candidate `index` of `batch` ([`Self::plan_retirement`]) as the next candidate:
+    /// none when it holds no family. A cold candidate is staged only at the sequence its frames
+    /// were quoted at, the plan's candidates one after another with nothing between them.
+    pub fn stage_retirement(
+        &mut self,
+        batch: &retirement_batch::RetireBatch,
+        index: usize,
+    ) -> Result<Option<NativeStaging>, NativeOwnerError> {
+        let Some(families) = batch
+            .candidate(index)
+            .filter(|families| !families.is_empty())
+        else {
+            return Ok(None);
+        };
+        let room = self.reserve_pending().is_ok();
+        if let Some(through) = batch.through {
+            let quoted = u64::try_from(index)
+                .ok()
+                .and_then(|index| through.0.checked_add(index))
+                .ok_or(NativeError::Capacity("native prefix"))?;
+            if self.next_sequence()?.0 != quoted {
+                return Err(NativeError::Capacity(
+                    "a cold retirement staged at another sequence than its frames claim",
+                )
+                .into());
+            }
         }
         if self.faulted {
             return Err(NativeError::Capacity("completion owner requires reconstruction").into());
@@ -815,7 +876,12 @@ impl NativeOwner {
         );
         let prepared = self.core.prepare_retirement_batch(
             &source,
-            &batch.families,
+            families,
+            if batch.through.is_some() {
+                retirement_batch::RETIRE_COLD
+            } else {
+                retirement_batch::RETIRE_CUSTODY
+            },
             &self.core.state.budget,
             lane,
         )?;
@@ -872,7 +938,7 @@ impl NativeOwner {
             journal,
         });
         self.next_serial = serial;
-        Ok((batch, Some(NativeStaging::Prepared { candidate, outcome })))
+        Ok(Some(NativeStaging::Prepared { candidate, outcome }))
     }
 
     /// Check participant authority and the exact pending attempt before touching

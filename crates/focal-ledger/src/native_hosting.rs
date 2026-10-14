@@ -42,6 +42,8 @@ pub struct NativeHosting {
     pub reader: ContentReader,
     /// The one writer of this ledger's checkpoint seeds on this node (25 §5).
     pub seeds: focal_evidence::SeedStore,
+    /// Where this ledger's cold streams live on this node (doc 31 M2, A2).
+    pub cold: Option<crate::ColdSource>,
     pub range: RangeId,
 }
 
@@ -593,6 +595,7 @@ impl Session {
             engine::NativeSources {
                 reader: hosting.reader.clone(),
                 seeds: hosting.seeds.reader(),
+                cold: hosting.cold.clone(),
             },
             BuiltinNativeSchemas,
         )?;
@@ -741,6 +744,15 @@ impl Session {
     /// Take one chunk of a pending seed from a peer, verified against its
     /// hash and sealed in this ledger's seed store.
     pub fn install_seed_chunk(&mut self, hash: ContentHash, bytes: &[u8]) -> Result<(), LedgerError> {
+        // A chunk of the cold streams the seed names goes there (doc 31 M2, A2).
+        if let Some(data) = self.pending_seed().and_then(|pending| pending.cold_of(hash)) {
+            self.native
+                .as_deref_mut()
+                .ok_or(LedgerError::NativeUnsupported)?
+                .install_cold_chunk(data, hash, bytes)?;
+            self.seed_progress = true;
+            return Ok(());
+        }
         let hosting = self.hosting.as_mut().ok_or(LedgerError::NativeUnsupported)?;
         hosting
             .seeds
@@ -750,6 +762,56 @@ impl Session {
             )))?;
         self.seed_progress = true;
         Ok(())
+    }
+    /// What a cold family's frame names of the ledger's content (doc 31 M2, A2): the content roots
+    /// of its artifacts held as objects, and those of its inline artifacts' sealed objects, which
+    /// custody must keep for it; `None` when no cold record applied at `retired_at`.
+    pub fn native_cold_content(
+        &mut self,
+        retired_at: SessionSeq,
+        digest: ContentHash,
+    ) -> Result<Option<crate::ColdContent>, LedgerError> {
+        let Some(frame) = self.native_cold_frame(retired_at, digest)? else {
+            return Ok(None);
+        };
+        let limits = self
+            .hosting
+            .as_ref()
+            .ok_or(LedgerError::NativeUnsupported)?
+            .limits
+            .inspection;
+        let archive = focal_core::native::record_codec::archive::StructuralArchive::inspect(
+            frame.bytes(),
+            limits,
+        )
+        .map_err(|error| LedgerError::Native(NativeSessionError::Codec(error)))?;
+        let header = archive.header();
+        Ok(Some(crate::ColdContent {
+            content: header.content.clone(),
+            inline: header.inline.clone(),
+        }))
+    }
+    /// A lock-free reader of this node's content: what an archived family is hydrated against.
+    pub fn native_content_reader(&self) -> Result<ContentReader, LedgerError> {
+        Ok(self
+            .hosting
+            .as_ref()
+            .ok_or(LedgerError::NativeUnsupported)?
+            .reader
+            .clone())
+    }
+    /// The frame of a family retired cold at `sequence` (doc 31 M2, A2), by its digest: `None`
+    /// when no cold record applied there.
+    pub fn native_cold_frame(
+        &mut self,
+        sequence: SessionSeq,
+        digest: ContentHash,
+    ) -> Result<Option<crate::ColdFrame>, LedgerError> {
+        Ok(self
+            .native
+            .as_deref_mut()
+            .ok_or(LedgerError::NativeUnsupported)?
+            .cold_frame(sequence, digest)?)
     }
     /// A read-only view of this ledger's seeds, for serving peers.
     pub fn seed_reader(&self) -> Option<focal_evidence::SeedReader> {
@@ -834,6 +896,7 @@ impl Session {
             engine::NativeSources {
                 reader: hosting.reader.clone(),
                 seeds: hosting.seeds.reader(),
+                cold: hosting.cold.clone(),
             },
             BuiltinNativeSchemas,
         )?;

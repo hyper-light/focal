@@ -4252,6 +4252,22 @@ impl Owner {
                     {
                         return Err(AccessError::Unavailable);
                     }
+                    // A retired claim's family is read from this replica's own cold stream, or
+                    // its custody for a family retired before (doc 31 M2, A2): immutable once
+                    // retired, so any applied prefix holding the continuation serves it.
+                    if let NativeReadQuery::Cold(query) = &read.query {
+                        fund_page(&mut charge, self.client_limits.max_frame_bytes)?;
+                        return crate::archive_reads::cold_page(
+                            &mut self.session,
+                            &self.budget,
+                            peer,
+                            request.route_epoch,
+                            read,
+                            query,
+                            &self.client_limits,
+                        )
+                        .map(Response::NativeRead);
+                    }
                     if matches!(read.consistency, ReadConsistency::Linearizable) {
                         // A follower serves it too: its barrier goes to the
                         // leader, and the answer waits for this copy to have

@@ -3268,3 +3268,309 @@ fn below_the_fence_a_batch_is_refused_and_a_family_retires_alone() {
         );
     }
 }
+
+/// A node's cold streams as its next checkpoint would name them (doc 31 M2, A2).
+fn cold_streams(cluster: &mut Cluster, id: u64) -> Option<focal_evidence::ColdStreams> {
+    let engine = &cluster.node(id).engine;
+    engine
+        .cold
+        .capture(engine.cold_source.as_ref(), &engine.budget)
+        .unwrap()
+        .map(|captured| captured.streams)
+}
+/// Every family of `claims` reads back on node `id` from the frame its stub names.
+fn assert_cold_frames(cluster: &mut Cluster, id: u64, claims: &[u128]) {
+    for claim in claims {
+        let retired = *cluster
+            .node(id)
+            .committed_core()
+            .unwrap()
+            .native_retired(ClaimId::from_u128(*claim))
+            .unwrap();
+        let frame = cluster
+            .node(id)
+            .cold_frame(retired.retired_at, retired.bundle)
+            .unwrap()
+            .unwrap_or_else(|| panic!("node {id} holds no frame for claim {claim}"));
+        let frame = frame.bytes();
+        assert_eq!(frame.len() as u64, retired.bytes, "node {id} claim {claim}");
+        assert!(frame.starts_with(b"FCNARCHV"));
+        assert!(
+            frame.ends_with(&retired.bundle.0),
+            "the frame is the one its digest names"
+        );
+    }
+}
+fn cold_limits() -> NativeSessionLimits {
+    let mut limits = limits();
+    limits.retire_rule = crate::RetireRule::Cold;
+    limits
+}
+
+/// Retirement to the cold stream (doc 31 M2, A2): batches retire among the writes, every replica
+/// appends each batch's frames where the record applies, from its own rows, so every replica's
+/// streams are the same bytes (chunks and a manifest chunk cut at the same offsets), and every
+/// family reads back from the frame its stub names by digest. A replica restarted from its log, and
+/// one restarted from its own checkpoint, hold the same streams again.
+#[test]
+fn a_cold_retirement_writes_the_same_streams_on_every_replica() {
+    let mut cluster = Cluster::with_limits(|_| cold_limits());
+    cluster.elect(1, &[]);
+    let claims: Vec<u128> = (1..=12).collect();
+    let offers = finished_offers(&mut cluster, 1, &claims);
+    for batch in offers.chunks(5) {
+        let (retired, submission) = cluster.node(1).retire(batch).unwrap();
+        assert_eq!(retired.families.len(), batch.len());
+        assert!(submission.is_some());
+        cluster.pump(&[]);
+        cluster.settle(&[]);
+    }
+    let streams = cold_streams(&mut cluster, 1).expect("the leader keeps cold streams");
+    assert!(
+        !streams.data.manifests.is_empty(),
+        "the data stream cut a manifest chunk"
+    );
+    assert_eq!(
+        streams.marks.length,
+        3 * 16,
+        "a mark for each of three batches"
+    );
+    for id in [2, 3] {
+        assert_eq!(
+            cold_streams(&mut cluster, id).as_ref(),
+            Some(&streams),
+            "node {id}"
+        );
+    }
+    for id in [1, 2, 3] {
+        assert_cold_frames(&mut cluster, id, &claims);
+    }
+    cluster.stop(3);
+    cluster.reopen(3).unwrap();
+    cluster.settle(&[]);
+    assert_eq!(cold_streams(&mut cluster, 3).as_ref(), Some(&streams));
+    assert_cold_frames(&mut cluster, 3, &claims);
+    cluster.node(2).begin_checkpoint().unwrap();
+    cluster.pump(&[]);
+    cluster.stop(2);
+    cluster.reopen(2).unwrap();
+    cluster.settle(&[]);
+    assert_eq!(cold_streams(&mut cluster, 2).as_ref(), Some(&streams));
+    assert_cold_frames(&mut cluster, 2, &claims);
+}
+
+/// A lagging replica installs a checkpoint naming cold streams only once every chunk they name
+/// is local: it names them, a peer serves them, each verified on the way in, and the streams it
+/// then keeps are the peer's, every family readable.
+#[test]
+fn a_lagging_replica_installs_cold_streams_once_their_chunks_are_pulled() {
+    let mut cluster = Cluster::with_limits(|_| cold_limits());
+    cluster.elect(1, &[]);
+    let claims: Vec<u128> = (1..=10).collect();
+    let offers = finished_offers(&mut cluster, 1, &claims);
+    for batch in offers.chunks(5) {
+        cluster.node(1).retire(batch).unwrap();
+        cluster.pump(&[3]);
+    }
+    cluster.node(1).begin_checkpoint().unwrap();
+    cluster.pump(&[3]);
+    let last = cluster.creation(99);
+    cluster.commit(1, PARTIES.issuer, last, &[3]);
+    let streams = cold_streams(&mut cluster, 1).unwrap();
+    cluster.retry_ok = vec![3];
+    cluster.settle(&[]);
+    let root = cluster
+        .node(1)
+        .engine
+        .cold_source
+        .as_ref()
+        .unwrap()
+        .root
+        .clone();
+    // The manifest chunks are named first, then the chunks behind them once they are local.
+    let mut rounds = 0;
+    while let Some(pending) = cluster.node(3).pending_seed() {
+        let missing = pending.missing_chunks().unwrap();
+        assert!(!missing.is_empty());
+        rounds += 1;
+        assert!(
+            rounds <= 3,
+            "an install names what it lacks in at most two rounds"
+        );
+        for hash in &missing {
+            let bytes = ["data", "marks"]
+                .iter()
+                .find_map(|part| {
+                    focal_evidence::ColdReader::open(root.join(part))
+                        .unwrap()
+                        .read(*hash, focal_evidence::SEED_CHUNK_BYTES)
+                        .ok()
+                })
+                .expect("the peer holds the chunk");
+            assert!(
+                cluster
+                    .node(3)
+                    .install_seed_chunk(*hash, b"forged")
+                    .is_err()
+            );
+            cluster.node(3).install_seed_chunk(*hash, &bytes).unwrap();
+        }
+        cluster.settle(&[]);
+    }
+    assert_eq!(rounds, 2, "manifest chunks, then the chunks behind them");
+    cluster.retry_ok.clear();
+    cluster.settle(&[]);
+    assert!(cluster.node(3).pending_seed().is_none());
+    assert_eq!(cold_streams(&mut cluster, 3).as_ref(), Some(&streams));
+    assert_cold_frames(&mut cluster, 3, &claims);
+}
+
+/// A volume whose free bytes a test sets: no headroom, never sampled.
+fn set_volume(free: u64) -> focal_memory::DiskBudget {
+    let volume = focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig {
+        headroom: 0,
+        completion_reserve: 0,
+        sample_interval: u32::MAX,
+    })
+    .unwrap();
+    volume.observe(free);
+    volume
+}
+
+/// A replica without room for a cold batch does not apply its record: the record is refused,
+/// retryably, with nothing changed (no family retired, nothing appended), while the others go
+/// on, and it applies once room returns, its streams then every other replica's. First its
+/// streams cannot open (the writer refused keeps what they were), then they open and the batch's
+/// room is refused: the order that once published the record and then failed its append.
+#[test]
+fn a_replica_without_room_for_a_cold_batch_applies_it_once_room_returns() {
+    let mut cluster = Cluster::with_limits(|_| cold_limits());
+    cluster.elect(1, &[]);
+    let claims: Vec<u128> = (1..=10).collect();
+    let offers = finished_offers(&mut cluster, 1, &claims);
+    let volume = set_volume(0);
+    cluster.node(3).engine.cold_source.as_mut().unwrap().disk = volume.clone();
+    cluster.retry_ok = vec![3];
+    let before = cluster.sequence(3);
+    for batch in offers.chunks(5) {
+        cluster.node(1).retire(batch).unwrap();
+        cluster.pump(&[]);
+        cluster.settle(&[]);
+    }
+    assert_eq!(cluster.sequence(2), cluster.sequence(1), "the others go on");
+    assert_eq!(cluster.sequence(3), before, "no room to open the streams");
+    assert!(cold_streams(&mut cluster, 3).is_none());
+    // Room for the open chunk alone: the streams open, and the batch's room is refused.
+    volume.observe(cold_limits().cold_geometry.chunk_bytes as u64);
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(3), before, "no room for the batch");
+    assert!(cold_streams(&mut cluster, 3).is_none(), "nothing appended");
+    for claim in &claims {
+        let core = cluster.node(3).committed_core().unwrap();
+        assert!(
+            core.native_claim(ClaimId::from_u128(*claim)).is_some(),
+            "nothing retired"
+        );
+    }
+    volume.observe(1 << 30);
+    cluster.settle(&[]);
+    cluster.retry_ok.clear();
+    assert_eq!(cluster.sequence(3), cluster.sequence(1));
+    let streams = cold_streams(&mut cluster, 1).unwrap();
+    assert_eq!(cold_streams(&mut cluster, 3).as_ref(), Some(&streams));
+    assert_cold_frames(&mut cluster, 3, &claims);
+}
+
+/// A replica whose cold stream fails on IO once a record has applied stops, naming why: the
+/// record applied and its batch is not in the stream, so it cannot go on. Here its open chunk is
+/// taken from under its writer, so the batch's first cut cannot rename it. Reopened, it restores
+/// its streams from its log, every other replica's again.
+#[test]
+fn a_replica_whose_cold_stream_fails_stops_and_a_reopen_restores_it() {
+    let mut cluster = Cluster::with_limits(|_| cold_limits());
+    cluster.elect(1, &[]);
+    let claims: Vec<u128> = (1..=10).collect();
+    let offers = finished_offers(&mut cluster, 1, &claims);
+    let (first, second) = offers.split_at(5);
+    cluster.node(1).retire(first).unwrap();
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    let data = cluster
+        .node(3)
+        .engine
+        .cold_source
+        .as_ref()
+        .unwrap()
+        .root
+        .join("data");
+    for entry in std::fs::read_dir(&data).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("open.")
+        {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    cluster.fail_ok = vec![3];
+    cluster.node(1).retire(second).unwrap();
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    assert_eq!(cluster.failed, vec![3], "the replica stopped");
+    assert!(matches!(
+        cluster.node(3).poll(),
+        Err(NativeSessionError::Stopped(cause)) if cause.contains("cold batch")
+    ));
+    let streams = cold_streams(&mut cluster, 1).unwrap();
+    assert_eq!(cold_streams(&mut cluster, 2).as_ref(), Some(&streams));
+    cluster.stop(3);
+    cluster.fail_ok.clear();
+    cluster.failed.clear();
+    cluster.reopen_with(3, cold_limits()).unwrap();
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(3), cluster.sequence(1));
+    assert_eq!(cold_streams(&mut cluster, 3).as_ref(), Some(&streams));
+    assert_cold_frames(&mut cluster, 3, &claims);
+}
+
+/// A retirement takes every offer that may leave now in one call: twelve families, past what one
+/// candidate's changes may hold here (a batch of 128 changes holds six of these families),
+/// retire as consecutive candidates, each its own record and its own mark, alike on every
+/// replica. One candidate a call once retired six of the twelve and deferred the rest to a later
+/// walk, which derived them again.
+#[test]
+fn a_retirement_takes_every_offer_across_candidates() {
+    let mut cluster = Cluster::with_limits(|_| cold_limits());
+    cluster.elect(1, &[]);
+    let claims: Vec<u128> = (1..=12).collect();
+    let offers = finished_offers(&mut cluster, 1, &claims);
+    let before = cluster.sequence(1);
+    let (retired, submission) = cluster.node(1).retire(&offers).unwrap();
+    assert_eq!(retired.families.len(), 12, "every offer at once");
+    assert!(
+        retired.ends.len() >= 2,
+        "more than one candidate: {:?}",
+        retired.ends
+    );
+    assert!(retired.deferred.is_empty() && retired.refused.is_empty());
+    assert!(submission.is_some());
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    let records = retired.ends.len() as u64;
+    assert_eq!(cluster.sequence(1).0, before.0 + records);
+    let streams = cold_streams(&mut cluster, 1).unwrap();
+    assert_eq!(streams.marks.length, 16 * records, "a mark a record");
+    for id in [2, 3] {
+        assert_eq!(
+            cold_streams(&mut cluster, id).as_ref(),
+            Some(&streams),
+            "node {id}"
+        );
+    }
+    for id in [1, 2, 3] {
+        assert_cold_frames(&mut cluster, id, &claims);
+    }
+}

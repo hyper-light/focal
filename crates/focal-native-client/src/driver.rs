@@ -349,15 +349,27 @@ async fn read_page(
             match located.objects.first() {
                 Some(NativeObject::Retired(retired)) => {
                     let (bundle, bytes) = (retired.bundle, retired.bytes);
-                    linearizable(
+                    // The node reads the family where its continuation says it went: its own
+                    // cold stream, or its custody for a family retired before (doc 31 M2, A2). A
+                    // node that predates the cold read is asked for the bundle as before.
+                    match linearizable(
                         reads,
-                        NativeReadQuery::Archived(NativeArchiveQuery {
-                            bundle,
-                            bytes,
-                            object,
-                        }),
+                        NativeReadQuery::Cold(NativeColdQuery { claim, object }),
                     )
-                    .await?
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(cold) => linearizable(
+                            reads,
+                            NativeReadQuery::Archived(NativeArchiveQuery {
+                                bundle,
+                                bytes,
+                                object,
+                            }),
+                        )
+                        .await
+                        .map_err(|_| cold)?,
+                    }
                 }
                 Some(NativeObject::Claim(_)) => {
                     linearizable(reads, NativeReadQuery::Objects(vec![object])).await?

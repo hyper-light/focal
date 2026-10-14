@@ -2654,6 +2654,7 @@ impl PlacementAgent {
         )?;
         let decoder = focal_ledger::backup::decoder_pair();
         let seed_root = crate::custody::seed_directory(&self.root.join("seeds"), ledger);
+        let cold_root = crate::custody::seed_directory(&self.root.join("cold"), ledger);
         let disk = self.storage.disk_budget();
         let content_root = self.root.join("content");
         let input = request.input.clone();
@@ -2663,6 +2664,15 @@ impl PlacementAgent {
             use focal_ledger::backup::{
                 BackupContent, BackupMedium as _, BackupSeeds, FileMedium, Incarnation,
             };
+            // The session's cold streams, where its restored checkpoint names them (doc 31 M2,
+            // A2).
+            focal_ledger::backup::import_cold(
+                &FileMedium,
+                &input,
+                &manifest_for_rewrite,
+                &cold_root,
+                &disk,
+            )?;
             let mut sink = focal_evidence::SeedStore::open(seed_root, disk)?;
             let seeds_installed = focal_ledger::backup::import_seeds(
                 &FileMedium,

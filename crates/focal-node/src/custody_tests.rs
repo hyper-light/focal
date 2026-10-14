@@ -2067,7 +2067,7 @@ fn a_restore_is_kept_between_asks_and_answers_once_done() {
         });
     }
     let manifest = |created_ms: u64| BackupManifest {
-        schema: 1,
+        schema: focal_ledger::backup::SCHEMA,
         created_ms,
         prefix: focal_ledger::EvidencePrefix {
             cluster: [1; 16],
@@ -2105,6 +2105,8 @@ fn a_restore_is_kept_between_asks_and_answers_once_done() {
         }],
         archived_through: 0,
         retired_families: 0,
+        cold_data: Vec::new(),
+        cold_marks: Vec::new(),
     };
     let target = tempfile::tempdir().unwrap();
     let budget = memory();

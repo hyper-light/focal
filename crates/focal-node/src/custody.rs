@@ -45,6 +45,9 @@ pub struct CustodyConfig {
     /// Where this node keeps every ledger's checkpoint seeds (25 §5); unset
     /// on a node that hosts no native session, which serves no seed.
     pub seed_root: Option<std::path::PathBuf>,
+    /// Where this node keeps every ledger's cold streams (doc 31 M2, A2): their chunks are served
+    /// as seeds are, to a replica installing a checkpoint that names them.
+    pub cold_root: Option<std::path::PathBuf>,
 }
 impl CustodyConfig {
     pub fn new(node: u64) -> Self {
@@ -55,6 +58,7 @@ impl CustodyConfig {
             max_transfer_bytes: 1024 * 1024 * 1024,
             transfer_ttl: Duration::from_secs(60),
             seed_root: None,
+            cold_root: None,
         }
     }
 }
@@ -1096,13 +1100,31 @@ impl CustodyStore {
                     .map_err(|_| AccessError::Unavailable)?;
                 let limit = usize::try_from(*max_bytes).map_err(|_| AccessError::Capacity)?;
                 let _scan = self.reserve(BudgetKind::Payload, BudgetLane::Ordinary, limit)?;
+                let absent = |error: &ContentError| matches!(error, ContentError::Io(io) if io.kind() == std::io::ErrorKind::NotFound);
+                // A chunk of the ledger's cold streams is served as a seed is (doc 31 M2, A2):
+                // both are files named by their hashes.
+                let mut read = reader.read(*hash, limit);
+                if read.as_ref().is_err_and(absent)
+                    && let Some(cold) = self.config.cold_root.as_ref()
+                {
+                    let directory = seed_directory(cold, scope.ledger);
+                    for part in ["data", "marks"] {
+                        if let Ok(stream) = focal_evidence::ColdReader::open(directory.join(part)) {
+                            read = stream.read(*hash, limit);
+                            if !read.as_ref().is_err_and(absent) {
+                                break;
+                            }
+                        }
+                    }
+                }
                 // A peer that does not hold the seed says so definitely, so
                 // the puller moves to the next peer instead of retrying here.
-                let bytes = reader.read(*hash, limit).map_err(|error| match error {
-                    ContentError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                let bytes = read.map_err(|error| {
+                    if absent(&error) {
                         AccessError::InvalidRequest
+                    } else {
+                        content_error(error)
                     }
-                    other => content_error(other),
                 })?;
                 CustodyReply::SeedChunk { hash: *hash, bytes }
             }

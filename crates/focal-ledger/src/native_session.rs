@@ -29,6 +29,8 @@ mod checkpoint;
 #[cfg(test)]
 #[path = "native_session_cluster_tests.rs"]
 mod cluster_tests;
+#[path = "native_cold.rs"]
+pub(crate) mod cold;
 #[path = "native_session_engine.rs"]
 pub(crate) mod engine;
 #[path = "native_session_genesis.rs"]
@@ -87,6 +89,9 @@ pub struct NativeSessionLimits {
     /// How this session's authority retires (doc 31 M2): the node sets it from the fence it
     /// knows (`RETIRE_LEVEL`); every replica applies both records.
     pub retire_rule: RetireRule,
+    /// How fresh cold streams are cut (doc 31 M2, A2): [`focal_evidence::ColdGeometry::STANDARD`]
+    /// outside tests; restored ones keep the geometry their checkpoint names.
+    pub cold_geometry: focal_evidence::ColdGeometry,
 }
 /// How an authority seals the closed outcomes of its live window (F12).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -114,6 +119,9 @@ pub enum RetireRule {
     /// Batches of families as candidates among the writes (`FCRETIRE`), derived and checked by
     /// every replica where they apply.
     Pipeline,
+    /// Batches whose families every replica writes to its own cold stream where the record
+    /// applies (`FCRETIRE` version 2, doc 31 M2, A2): nothing is sealed under custody.
+    Cold,
 }
 /// What the materializer has done since this session opened.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -281,6 +289,7 @@ impl NativeSessionLimits {
             ranges: focal_ranges::RangeLimits::default(),
             seal_rule: SealRule::Derived,
             retire_rule: RetireRule::Exact,
+            cold_geometry: focal_evidence::ColdGeometry::STANDARD,
         }
     }
 }
@@ -514,7 +523,12 @@ pub struct NativeSession<S: NativeSchemaVerifier> {
 pub struct PendingSeed {
     pub index: u64,
     pub term: u64,
+    /// Every chunk to pull: the root's seeds, then the cold streams' (doc 31 M2, A2).
     pub missing: Vec<ContentHash>,
+    /// Of `missing`, those of the cold data stream and of its marks: what an install takes into
+    /// the cold streams rather than the seeds.
+    cold_data: Vec<ContentHash>,
+    cold_marks: Vec<ContentHash>,
     _allocation: Allocation,
 }
 impl PendingSeed {
@@ -535,8 +549,56 @@ impl PendingSeed {
             index,
             term,
             missing,
+            cold_data: Vec::new(),
+            cold_marks: Vec::new(),
             _allocation: allocation,
         })
+    }
+    /// A checkpoint whose cold streams name chunks this replica lacks (doc 31 M2, A2): those of
+    /// the data stream and those of its marks.
+    pub(crate) fn cold(
+        index: u64,
+        term: u64,
+        data: Vec<ContentHash>,
+        marks: Vec<ContentHash>,
+        budget: &MemoryBudget,
+    ) -> Result<Self, NativeSessionError> {
+        let count = data
+            .len()
+            .checked_add(marks.len())
+            .ok_or(NativeSessionError::Capacity("missing chunks"))?;
+        let allocation = budget
+            .reserve(
+                BudgetKind::Recovery,
+                BudgetLane::Completion,
+                array::<ContentHash>(count.saturating_mul(2))?,
+            )?
+            .commit();
+        let mut missing = Vec::new();
+        missing
+            .try_reserve_exact(count)
+            .map_err(|_| NativeSessionError::Capacity("missing chunks"))?;
+        missing.extend_from_slice(&data);
+        missing.extend_from_slice(&marks);
+        Ok(Self {
+            index,
+            term,
+            missing,
+            cold_data: data,
+            cold_marks: marks,
+            _allocation: allocation,
+        })
+    }
+    /// Where a pulled chunk belongs: the cold data stream (`Some(true)`), its marks
+    /// (`Some(false)`), or the seeds (`None`).
+    pub(crate) fn cold_of(&self, hash: ContentHash) -> Option<bool> {
+        if self.cold_data.contains(&hash) {
+            Some(true)
+        } else if self.cold_marks.contains(&hash) {
+            Some(false)
+        } else {
+            None
+        }
     }
     /// A copy of the missing chunks a host can carry away.
     pub fn missing_chunks(&self) -> Result<Vec<ContentHash>, NativeSessionError> {
@@ -742,6 +804,11 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
             engine::NativeSources {
                 reader,
                 seeds: seeds.reader(),
+                cold: Some(cold::ColdSource {
+                    root: store.root().join("cold"),
+                    disk: consensus.disk_budget(),
+                    geometry: limits.cold_geometry,
+                }),
             },
             schemas,
         )?;
@@ -1196,9 +1263,26 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         hash: ContentHash,
         bytes: &[u8],
     ) -> Result<(), NativeSessionError> {
+        // A chunk of the cold streams the seed names goes there (doc 31 M2, A2).
+        if let Some(data) = self
+            .engine
+            .pending_seed()
+            .and_then(|pending| pending.cold_of(hash))
+        {
+            return self.engine.install_cold_chunk(data, hash, bytes);
+        }
         self.seeds
             .install_as(hash, bytes)
             .map_err(|error| NativeSessionError::Native(NativeEvidenceError::from(error).into()))
+    }
+    /// The frame of a family retired cold at `sequence` (doc 31 M2, A2), by its digest: `None`
+    /// when no cold record applied there.
+    pub fn cold_frame(
+        &mut self,
+        sequence: SessionSeq,
+        digest: ContentHash,
+    ) -> Result<Option<cold::ColdFrame>, NativeSessionError> {
+        self.engine.cold_frame(sequence, digest)
     }
     /// A read-only view of this replica's seeds, for serving peers.
     pub fn seed_reader(&self) -> SeedReader {

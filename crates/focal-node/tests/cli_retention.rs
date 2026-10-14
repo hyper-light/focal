@@ -285,13 +285,15 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     let status = first_object(root, &a)["Claim"]["status"].clone();
     assert!(!status.is_null());
     committed(&cli(root, None, &["release", "scope", &a]));
-    // The agent seals the bundle under custody and commits the record.
+    // The agent offers the family and every replica writes its frame to its
+    // own cold stream as the record applies (doc 31 M2, A2).
     let continuation = retired(root, &a);
     assert_eq!(hex_hash(&continuation["claim"]), a);
     assert_eq!(continuation["status"], status);
     assert!(continuation["bytes"].as_u64().unwrap() > 0);
     let through = continuation["through"].as_u64().unwrap();
-    assert!(continuation["retired_at"].as_u64().unwrap() > through);
+    // A cold family's frame claims the retirement's own sequence.
+    assert_eq!(continuation["retired_at"].as_u64().unwrap(), through);
     assert!(continuation["events"].as_u64().unwrap() > 0);
     let bundle = hex_hash(&continuation["bundle"]);
     // The live claim is untouched, and the retired one refuses commands.
@@ -313,9 +315,9 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     assert!(shown["rows"].as_u64().unwrap() >= 4, "{archive}");
     assert!(!shown["families"].as_array().unwrap().is_empty());
     let identity = admin(root, &["inspect", "node", "--identity"])["result"]["identity"].clone();
-    let node = identity["node"].clone();
-    let tenant_hex = identity["tenant"].as_str().unwrap().to_owned();
-    assert_eq!(shown["receipts"], json!([node]), "{archive}");
+    let _ = identity["node"].clone();
+    // A frame of the cold stream is no custody object: no receipt names it.
+    assert_eq!(shown["receipts"], json!([]), "{archive}");
     // A live claim has no archive.
     let none = admin(root, &["inspect", "archive", "--claim", &b]);
     assert_eq!(none["result"]["archive"], Value::Null, "{none}");
@@ -328,16 +330,17 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     );
     assert_eq!(retried["condition"], "Committed", "{retried}");
     assert_eq!(retried["result"]["created"], created_outcome["created"]);
-    // A corrupted bundle is detected: its digest no longer verifies, the
+    // A corrupted frame is detected: its digest no longer verifies, the
     // continuation still names it, and the operator sees it unverified.
-    let chunk = std::fs::read_dir(root.join("content").join("objects").join(&tenant_hex))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "chunk"))
-        .unwrap();
+    let chunk = frame_file(&root.join("cold")).expect("the family's frame in the cold stream");
     let original = std::fs::read(&chunk).unwrap();
     let mut tampered = original.clone();
-    tampered[0] ^= 0xff;
+    let at = original
+        .windows(8)
+        .position(|window| window == b"FCNARCHV")
+        .unwrap()
+        + 12;
+    tampered[at] ^= 0xff;
     std::fs::write(&chunk, &tampered).unwrap();
     let archive = admin(root, &["inspect", "archive", "--claim", &a]);
     assert_eq!(archive["result"]["archive"]["verified"], false, "{archive}");
@@ -357,7 +360,30 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     assert_eq!(archive["result"]["archive"]["verified"], true, "{archive}");
     assert_eq!(
         archive["result"]["archive"]["receipts"],
-        json!([node]),
+        json!([]),
         "{archive}"
     );
+}
+
+/// The file under `directory` holding an archive frame (`FCNARCHV`).
+fn frame_file(directory: &Path) -> Option<std::path::PathBuf> {
+    let mut stack = vec![directory.to_path_buf()];
+    // At most a few hundred directories in a test's data directory.
+    for _ in 0..4096 {
+        let directory = stack.pop()?;
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if std::fs::read(&path)
+                .is_ok_and(|bytes| bytes.windows(8).any(|window| window == b"FCNARCHV"))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
 }

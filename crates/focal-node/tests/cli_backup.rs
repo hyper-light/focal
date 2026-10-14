@@ -345,8 +345,10 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
             .any(|problem| problem.as_str().unwrap().contains("chunk")),
         "{tampered}"
     );
-    // The claim retires: the next backup carries the bundle and the proof
-    // its header names.
+    // The claim retires: the next backup carries the family and the proof
+    // its frame names. The family lies in the session's cold stream (doc 31
+    // M2, A2), which the backup's envelope carries, so the only object it
+    // holds is the payload.
     committed(&cli(root, None, &["cancel", "claim", &claim]));
     committed(&cli(root, None, &["release", "scope", &claim]));
     let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
@@ -364,14 +366,14 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     let second = founder.path().join("backups").join("second");
     let backup_two = backup(root, &second);
     assert_eq!(backup_two["bundles"], 1, "{backup_two}");
-    assert_eq!(backup_two["objects"], 2, "payload and bundle: {backup_two}");
+    assert_eq!(backup_two["objects"], 1, "the payload: {backup_two}");
     assert!(
         backup_two["prefix"]["native_sequence"].as_u64().unwrap()
             > backup_one["prefix"]["native_sequence"].as_u64().unwrap()
     );
     let verified = verify(root, &second);
     assert_eq!(verified["complete"], true, "{verified}");
-    assert_eq!(verified["objects_verified"], 2);
+    assert_eq!(verified["objects_verified"], 1);
     // Verification needs no node: the killed node's backups still verify,
     // and a directory without a manifest is not a backup.
     drop(server);

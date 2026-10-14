@@ -313,7 +313,9 @@ impl ClusterAdmin {
                         && focal_client::input::parse_hash(&archive.bundle).is_ok()
                         && archive.bytes != 0
                         && archive.through != 0
-                        && archive.retired_at > archive.through
+                        // A cold family's frame claims its retirement's own sequence (doc 31 M2,
+                        // A2); a custody bundle claims less.
+                        && archive.retired_at >= archive.through
                 }) =>
             {
                 Ok(AdminResult::Archive {

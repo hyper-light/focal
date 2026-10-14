@@ -100,13 +100,19 @@ pub fn seal_rule(root: &Path) -> Result<focal_ledger::SealRule, NodeError> {
 /// it last knew opens `RETIRE_LEVEL`, as a node founded there does from its first start; a family
 /// at a time below it. Read as each session's hosting is built, as [`seal_rule`] is.
 pub fn retire_rule(root: &Path) -> Result<focal_ledger::RetireRule, NodeError> {
-    Ok(
-        if known(root)?.is_some_and(|level| level >= crate::upgrade::RETIRE_LEVEL) {
-            focal_ledger::RetireRule::Pipeline
-        } else {
-            focal_ledger::RetireRule::Exact
-        },
-    )
+    Ok(retire_rule_at(known(root)?.unwrap_or(0)))
+}
+
+/// The retire rule a fence at `level` opens: to the cold stream from `COLD_LEVEL`, in batches
+/// from `RETIRE_LEVEL`, a family at a time below.
+pub fn retire_rule_at(level: u32) -> focal_ledger::RetireRule {
+    if level >= crate::upgrade::COLD_LEVEL {
+        focal_ledger::RetireRule::Cold
+    } else if level >= crate::upgrade::RETIRE_LEVEL {
+        focal_ledger::RetireRule::Pipeline
+    } else {
+        focal_ledger::RetireRule::Exact
+    }
 }
 
 #[cfg(test)]

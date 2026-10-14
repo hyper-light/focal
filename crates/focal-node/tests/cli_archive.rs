@@ -239,6 +239,30 @@ fn archived(page: &Value, continuation: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// The file holding a retired family's archive frame: a content chunk of the
+/// bundle below the cold level, a file of the node's cold stream at it.
+fn archive_file(root: &Path) -> Option<std::path::PathBuf> {
+    let mut stack = vec![root.join("content").join("objects"), root.join("cold")];
+    // At most a few hundred directories in a test's data directory.
+    for _ in 0..4096 {
+        let directory = stack.pop()?;
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if std::fs::read(&path)
+                .is_ok_and(|bytes| bytes.windows(8).any(|window| window == b"FCNARCHV"))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 #[test]
 fn a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept() {
     retire_and_read(None);
@@ -504,27 +528,20 @@ fn retire_and_read(level: Option<&'static str>) {
         &["get", "archived", &claim, "--artifact", &"f".repeat(32)],
     );
     assert!(objects(&page)[0].get("Missing").is_some(), "{page}");
-    // Custody this node does not hold, or holds corrupt, is unavailable —
-    // a typed refusal, never a missing object.
-    let identity =
-        admin(root, None, &["inspect", "node", "--identity"])["result"]["identity"].clone();
-    let tenant_hex = identity["tenant"].as_str().unwrap().to_owned();
-    let bundle_hex = hex_hash(&continuation["bundle"]);
-    let objects_dir = root.join("content").join("objects").join(&tenant_hex);
-    let chunk = std::fs::read_dir(&objects_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.extension().is_some_and(|ext| ext == "chunk")
-                && std::fs::read(path).is_ok_and(|bytes| {
-                    format!("{}", blake3::hash(&bytes).to_hex()) == bundle_hex
-                        || bytes.starts_with(b"FCNARCHV")
-                })
-        })
-        .unwrap_or_else(|| panic!("no bundle chunk under {}", objects_dir.display()));
+    // An archive this node holds corrupt is unavailable — a typed refusal,
+    // never a missing object: below the cold level the family's bundle is a
+    // content object under custody, at it a frame of the node's own cold
+    // stream (doc 31 M2, A2). A byte inside the frame is changed either way.
+    let chunk =
+        archive_file(root).unwrap_or_else(|| panic!("no archive frame under {}", root.display()));
     let original = std::fs::read(&chunk).unwrap();
     let mut tampered = original.clone();
-    tampered[0] ^= 0xff;
+    let at = original
+        .windows(8)
+        .position(|window| window == b"FCNARCHV")
+        .unwrap()
+        + 12;
+    tampered[at] ^= 0xff;
     std::fs::write(&chunk, &tampered).unwrap();
     let refused = run(
         root,

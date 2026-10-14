@@ -94,6 +94,8 @@ pub(crate) fn locations(query: &NativeReadQuery) -> Vec<focal_core::native::Nati
         }
         // Served from custody, never from a session's core (`archive_reads`).
         NativeReadQuery::Archived(_) | NativeReadQuery::Sealed(_) => Vec::new(),
+        // The claim's continuation names where its family went (doc 31 M2, A2).
+        NativeReadQuery::Cold(query) => vec![L::Claim(query.claim)],
     }
 }
 
@@ -719,7 +721,9 @@ pub(crate) fn page(
         NativeReadQuery::ValidationContext(query) => validation_context(reader, query, max_items),
         // An archived object and a sealed outcome are read from custody by
         // the content owner (`archive_reads`), never from a session's core.
-        NativeReadQuery::Archived(_) | NativeReadQuery::Sealed(_) => {
+        // A retired family's object is read from the replica's cold stream or its custody
+        // (`archive_reads::cold_page`), never from the core's rows.
+        NativeReadQuery::Archived(_) | NativeReadQuery::Sealed(_) | NativeReadQuery::Cold(_) => {
             Err(AccessError::UnsupportedOperation)
         }
         NativeReadQuery::Events { after, limit } => {

@@ -377,9 +377,10 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
         gc_status(root)["passes"].as_u64().unwrap() > settled + 1
     });
     assert_eq!(manifests(root, &tenant), bound);
-    // The claim retires: its family's bundle is a new object, the payload's
-    // object stays because the bundle's header names it, and the bundle
-    // still verifies after the collector ran over it.
+    // The claim retires: its family's frame lies in the session's cold
+    // stream (doc 31 M2, A2), no new object; the payload's object stays
+    // because the frame names it, and the frame still verifies after the
+    // collector ran over it.
     committed(&cli(root, None, &["cancel", "claim", &claim]));
     committed(&cli(root, None, &["release", "scope", &claim]));
     let mut deadline = Deadline::after(Duration::from_secs(60));
@@ -400,16 +401,18 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     });
     assert_eq!(status["last"]["bundles_unreadable"], 0, "{status}");
     assert!(
-        status["last"]["protected_objects"].as_u64().unwrap() >= 2,
+        status["last"]["protected_objects"].as_u64().unwrap() >= 1,
         "{status}"
     );
     let retired = manifests(root, &tenant);
-    assert_eq!(retired.len(), 2, "payload and bundle: {retired:?}");
-    assert!(retired.contains(&bound[0]));
+    assert_eq!(retired, bound, "the payload alone: {retired:?}");
     let archive = admin(root, &["inspect", "archive", "--claim", &claim]);
     assert_eq!(archive["result"]["archive"]["verified"], true, "{archive}");
     let bundle = archive["result"]["archive"]["bundle"].as_str().unwrap();
-    assert!(retired.contains(&bundle.to_owned()));
+    assert!(
+        !retired.contains(&bundle.to_owned()),
+        "a frame is no object"
+    );
     let _ = artifact;
     // A kill and restart keep the quarantine: the orphan still comes back.
     drop(server);

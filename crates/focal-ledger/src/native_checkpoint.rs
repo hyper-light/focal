@@ -8,7 +8,8 @@ use focal_core::Core;
 use focal_core::native::input_codec as input;
 use focal_core::native::{NativeContentProfile, NativeFrozen, NativeState, record_codec};
 use focal_evidence::{
-    ContentError, SEED_CHUNK_BYTES, SeedBatch, SeedCommit, SeedReader, SeedStore,
+    ColdGeometry, ColdStreams, ContentError, SEED_CHUNK_BYTES, SeedBatch, SeedCommit, SeedReader,
+    SeedStore,
 };
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget, MemoryError, RangeId};
 use focal_model::{ContentHash, LedgerId, SessionSeq};
@@ -18,7 +19,7 @@ use record_codec::checkpoint as root;
 mod fields;
 #[path = "native_checkpoint_read.rs"]
 mod read;
-pub use read::{AssembledCore, Checkpoint, SeedError, SeedManifest};
+pub use read::{AssembledCore, Checkpoint, ColdSection, SeedError, SeedManifest};
 
 pub const MAGIC: [u8; 8] = *b"FCNSESS1";
 // Version 2 records the prefix that holds no native record yet (zero at
@@ -69,8 +70,7 @@ pub struct FrozenRoot<'a> {
     pub frozen: &'a NativeFrozen,
     pub metadata: Metadata,
     pub configuration: &'a MembershipConfiguration,
-    pub movement: Option<&'a [u8]>,
-    pub retention: Option<RetentionSection>,
+    pub sections: Sections<'a>,
     pub limits: Limits,
 }
 
@@ -317,6 +317,9 @@ pub struct Limits {
     pub assembled_bytes: usize,
     /// The largest movement section (25 §6) a frame may carry.
     pub movement_bytes: usize,
+    /// The most manifest chunks a cold stream's section names (31 M2, A2), 4 GiB of stream
+    /// each.
+    pub cold_manifests: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -329,6 +332,7 @@ impl Default for Limits {
             inline_bytes: 4 * 1024 * 1024,
             assembled_bytes: 256 * 1024 * 1024,
             movement_bytes: 1024 * 1024,
+            cold_manifests: 65_536,
         }
         .derived()
     }
@@ -383,14 +387,20 @@ pub struct RetentionSection {
     pub archived_through: SessionSeq,
     pub retired_families: u64,
 }
+/// The sections a checkpoint carries beside its Core root, each when the session has one: the
+/// movement (25 §6), the retention (26 §3) and the cold stream (31 M2, A2).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sections<'a> {
+    pub movement: Option<&'a [u8]>,
+    pub retention: Option<RetentionSection>,
+    pub cold: Option<&'a ColdStreams>,
+}
 pub struct EncodingPlan<'a> {
     core: root::EncodingPlan<'a>,
     metadata: Metadata,
     configuration: &'a MembershipConfiguration,
-    /// The movement section (25 §6), when the session carries one.
-    movement: Option<&'a [u8]>,
-    /// The retention section (26 §3), when the session carries one.
-    retention: Option<RetentionSection>,
+    /// The sections the session carries beside its root.
+    sections: Sections<'a>,
     limits: Limits,
     quote: Quote,
     form: Form,
@@ -445,24 +455,31 @@ impl<'a> EncodingPlan<'a> {
         movement: Option<&'a [u8]>,
         limits: Limits,
     ) -> Result<Self, Error> {
-        Self::prepare_with_sections(core, metadata, configuration, movement, None, limits)
+        Self::prepare_with_sections(
+            core,
+            metadata,
+            configuration,
+            Sections {
+                movement,
+                ..Sections::default()
+            },
+            limits,
+        )
     }
-    /// A plan carrying a movement section (25 §6) and a retention section
-    /// (26 §3) after the configuration.
+    /// A plan carrying `sections` after the configuration: a movement section (25 §6), a
+    /// retention section (26 §3) and a cold stream's (31 M2, A2).
     pub fn prepare_with_sections(
         core: &'a Core<NativeState>,
         metadata: Metadata,
         configuration: &'a MembershipConfiguration,
-        movement: Option<&'a [u8]>,
-        retention: Option<RetentionSection>,
+        sections: Sections<'a>,
         limits: Limits,
     ) -> Result<Self, Error> {
         Self::prepare_root(
             |encoding| root::EncodingPlan::prepare(core, encoding),
             metadata,
             configuration,
-            movement,
-            retention,
+            sections,
             limits,
         )
     }
@@ -472,16 +489,14 @@ impl<'a> EncodingPlan<'a> {
         frozen: &'a NativeFrozen,
         metadata: Metadata,
         configuration: &'a MembershipConfiguration,
-        movement: Option<&'a [u8]>,
-        retention: Option<RetentionSection>,
+        sections: Sections<'a>,
         limits: Limits,
     ) -> Result<Self, Error> {
         Self::prepare_root(
             |encoding| root::EncodingPlan::prepare_frozen(frozen, encoding),
             metadata,
             configuration,
-            movement,
-            retention,
+            sections,
             limits,
         )
     }
@@ -491,12 +506,22 @@ impl<'a> EncodingPlan<'a> {
         ) -> Result<root::EncodingPlan<'a>, record_codec::CodecError>,
         metadata: Metadata,
         configuration: &'a MembershipConfiguration,
-        movement: Option<&'a [u8]>,
-        retention: Option<RetentionSection>,
+        sections: Sections<'a>,
         limits: Limits,
     ) -> Result<Self, Error> {
-        if movement.is_some_and(|bytes| bytes.is_empty() || bytes.len() > limits.movement_bytes) {
+        if sections
+            .movement
+            .is_some_and(|bytes| bytes.is_empty() || bytes.len() > limits.movement_bytes)
+        {
             return Err(Error::Invalid("movement section"));
+        }
+        if let Some(cold) = sections.cold {
+            for stream in [&cold.data, &cold.marks] {
+                stream.check(cold.geometry)?;
+                if stream.manifests.len() > limits.cold_manifests {
+                    return Err(Error::Invalid("cold manifests"));
+                }
+            }
         }
         let encoding = root_limits(limits);
         let core = match measure(encoding) {
@@ -525,8 +550,7 @@ impl<'a> EncodingPlan<'a> {
         let head = FrameHead {
             metadata,
             configuration,
-            movement,
-            retention,
+            sections,
             members: limits.members,
         };
         let hash = match form {
@@ -545,8 +569,7 @@ impl<'a> EncodingPlan<'a> {
         Ok(Self {
             metadata,
             configuration,
-            movement,
-            retention,
+            sections,
             limits,
             quote: Quote {
                 bytes,
@@ -566,8 +589,7 @@ impl<'a> EncodingPlan<'a> {
         FrameHead {
             metadata: self.metadata,
             configuration: self.configuration,
-            movement: self.movement,
-            retention: self.retention,
+            sections: self.sections,
             members: self.limits.members,
         }
     }
@@ -700,8 +722,7 @@ impl<'a> EncodingPlan<'a> {
             frozen,
             metadata,
             configuration,
-            movement,
-            retention,
+            sections,
             limits,
         } = root;
         let encoding = root_limits(limits);
@@ -719,14 +740,7 @@ impl<'a> EncodingPlan<'a> {
                 Err(root::WriteError::Codec(error)) => return Err(error.into()),
             };
         let (table, commit) = sealer.finish()?;
-        let plan = Self::prepare_root(
-            |_| Ok(core),
-            metadata,
-            configuration,
-            movement,
-            retention,
-            limits,
-        )?;
+        let plan = Self::prepare_root(|_| Ok(core), metadata, configuration, sections, limits)?;
         let Form::Seeded { chunks } = plan.form else {
             // Inline after all: nothing of the batch is committed.
             return Ok(None);
@@ -898,8 +912,7 @@ fn chunk_length(core_bytes: usize, index: usize) -> u32 {
 struct FrameHead<'a> {
     metadata: Metadata,
     configuration: &'a MembershipConfiguration,
-    movement: Option<&'a [u8]>,
-    retention: Option<RetentionSection>,
+    sections: Sections<'a>,
     members: usize,
 }
 
@@ -978,8 +991,12 @@ where
     let FrameHead {
         metadata,
         configuration,
-        movement,
-        retention,
+        sections:
+            Sections {
+                movement,
+                retention,
+                cold,
+            },
         members: member_limit,
     } = head;
     sink.visit(2048)?; // Fixed fields, format/genesis hashes, digest setup/finalize.
@@ -1019,13 +1036,14 @@ where
     sink.raw(&metadata.activation.genesis.0)?;
     // Ancillary byte 0 says whether a movement section follows the
     // configuration (25 §6), byte 1 whether a retention section follows
-    // that (26 §3); the other four stay reserved.
+    // that (26 §3), byte 2 whether a cold stream's follows that (31 M2, A2);
+    // the other three stay reserved.
     match metadata.ancillary {
         AncillaryProfile::NativeOnlyV1 => {
             sink.raw(&[
                 u8::from(movement.is_some()),
                 u8::from(retention.is_some()),
-                0,
+                u8::from(cold.is_some()),
                 0,
                 0,
                 0,
@@ -1041,6 +1059,25 @@ where
     if let Some(section) = retention {
         sink.u64(section.archived_through.0)?;
         sink.u64(section.retired_families)?;
+    }
+    if let Some(cold) = cold {
+        // How both are cut, then each stream, the data's then the marks': its length, its
+        // manifest chunks and the names after them, then its open chunk's bytes.
+        sink.u32(u32::try_from(cold.geometry.chunk_bytes).map_err(|_| Error::Capacity)?)?;
+        sink.u32(u32::try_from(cold.geometry.manifest_names).map_err(|_| Error::Capacity)?)?;
+        for stream in [&cold.data, &cold.marks] {
+            sink.u64(stream.length)?;
+            for names in [&stream.manifests, &stream.names] {
+                sink.u32(u32::try_from(names.len()).map_err(|_| Error::Capacity)?)?;
+                sink.visit(names.len())?;
+                for name in names {
+                    sink.raw(&name.0)?;
+                }
+            }
+            sink.u32(u32::try_from(stream.open.len()).map_err(|_| Error::Capacity)?)?;
+            sink.visit(stream.open.len())?;
+            sink.raw(&stream.open)?;
+        }
     }
     Ok(value)
 }

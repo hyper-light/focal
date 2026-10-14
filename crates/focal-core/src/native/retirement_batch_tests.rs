@@ -3,9 +3,11 @@
 //! families from its own rows and ends in the leader's state, or refuses a record its rows
 //! cannot match.
 use super::record_codec::recovery::tests as ckpt;
-use super::record_codec::{InspectionLimits, RETIRE_MAGIC, RetireRecord, StructuralRecord};
+use super::record_codec::{
+    InspectionLimits, RETIRE_MAGIC, RetireRecord, StructuralArchive, StructuralRecord,
+};
 use super::report_tests as f;
-use super::retirement::RetirementRefusal;
+use super::retirement::{RetirementRefusal, cold_header};
 use super::retirement_batch::*;
 use super::*;
 use focal_evidence::{BuiltinNativeSchemas, ContentStore};
@@ -140,7 +142,7 @@ fn a_retirement_is_ordered_with_the_writes_around_it_and_a_follower_derives_it_a
     let mut follower = restored(&base, 802, &store);
     let mut owner = owner(leader_core);
     let first = stage(&mut owner, 80, f::creation(30, 30, &[], None));
-    let (batch, staged) = owner.prepare_retirement(&offers).unwrap();
+    let (batch, staged) = owner.prepare_retirement(&offers, None).unwrap();
     assert_eq!(batch.roots().collect::<Vec<_>>(), [id(1), id(2)]);
     assert!(batch.deferred.is_empty() && batch.refused.is_empty());
     let Some(NativeStaging::Prepared {
@@ -220,7 +222,7 @@ fn a_touched_family_waits_and_a_refused_one_says_why() {
     let base = base();
     let mut owner = owner(restored(&base, 803, &store));
     let first = [offer(&base, 1)];
-    let (batch, staged) = owner.prepare_retirement(&first).unwrap();
+    let (batch, staged) = owner.prepare_retirement(&first, None).unwrap();
     assert_eq!(batch.families.len(), 1);
     let candidate = match staged {
         Some(NativeStaging::Prepared { candidate, .. }) => candidate,
@@ -233,7 +235,7 @@ fn a_touched_family_waits_and_a_refused_one_says_why() {
         ..offer(&base, 1)
     };
     let (batch, staged) = owner
-        .prepare_retirement(&[offer(&base, 1), stale, open])
+        .prepare_retirement(&[offer(&base, 1), stale, open], None)
         .unwrap();
     assert!(staged.is_none(), "nothing to retire, no candidate");
     assert_eq!(batch.deferred, [id(1)], "taken by the pending retirement");
@@ -249,7 +251,7 @@ fn a_touched_family_waits_and_a_refused_one_says_why() {
     );
     // Published, the family is gone; the other retires on its own offer.
     owner.publish_after_durable(candidate).unwrap();
-    let (batch, staged) = owner.prepare_retirement(&[offer(&base, 2)]).unwrap();
+    let (batch, staged) = owner.prepare_retirement(&[offer(&base, 2)], None).unwrap();
     assert_eq!(batch.roots().collect::<Vec<_>>(), [id(2)]);
     assert!(staged.is_some());
 }
@@ -263,7 +265,7 @@ fn a_follower_whose_rows_differ_refuses_the_record_and_keeps_its_state() {
     let base = base();
     let offers = [offer(&base, 1), offer(&base, 2)];
     let mut owner = owner(restored(&base, 804, &store));
-    let (_, staged) = owner.prepare_retirement(&offers).unwrap();
+    let (_, staged) = owner.prepare_retirement(&offers, None).unwrap();
     let Some(NativeStaging::Prepared { candidate, .. }) = staged else {
         panic!("a retirement candidate");
     };
@@ -289,6 +291,205 @@ fn a_follower_whose_rows_differ_refuses_the_record_and_keeps_its_state() {
     let at = tampered.len() - 40;
     tampered[at] ^= 1;
     assert!(RetireRecord::inspect(&tampered, inspection(&tampered), 64).is_err());
+}
+
+/// A cold record (doc 31 M2, A2) quotes each family's frame at the record's own sequence, by
+/// digest and length, and carries no frame: the leader's committed rows and a follower's encode
+/// the same batch where it applies, byte for byte, its header naming the quotes and each frame the
+/// archive its digest names. Applied, every stub claims the record's sequence as its prefix, the
+/// mark of a cold family. A follower whose rows differ derives no such batch and refuses the
+/// record, its state kept.
+#[test]
+fn a_cold_record_quotes_the_frames_every_replica_encodes() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ckpt::store(directory.path());
+    let base = base();
+    // A cold offer carries no bundle: the record's frames are its bundles.
+    let offers = [1, 2].map(|root| RetireOffer {
+        bundle: ContentHash([0; 32]),
+        bytes: 0,
+        ..offer(&base, root)
+    });
+    let mut owner = owner(restored(&base, 805, &store));
+    let mut follower = restored(&base, 806, &store);
+    let (batch, staged) = owner.prepare_retirement(&offers, Some(encoding())).unwrap();
+    assert_eq!(batch.roots().collect::<Vec<_>>(), [id(1), id(2)]);
+    let Some(NativeStaging::Prepared { candidate, outcome }) = staged else {
+        panic!("a retirement candidate");
+    };
+    let bytes = record(&mut owner, candidate);
+    assert!(
+        bytes.len() < 512,
+        "quotes, not frames: {} bytes",
+        bytes.len()
+    );
+    let inspected = RetireRecord::inspect(&bytes, inspection(&bytes), 64).unwrap();
+    assert_eq!(inspected.version(), RETIRE_COLD);
+    let roots = [id(1), id(2)];
+    let encode = |core: &Core<NativeState>| {
+        core.cold_batch(
+            &roots,
+            outcome.sequence,
+            encoding(),
+            &base.state.budget,
+            focal_memory::BudgetLane::Completion,
+        )
+    };
+    let leader_batch = encode(owner.committed_core()).unwrap();
+    let follower_batch = encode(&follower).unwrap();
+    assert_eq!(
+        leader_batch.bytes, follower_batch.bytes,
+        "every replica's batch"
+    );
+    let quoted: Vec<_> = inspected
+        .retired()
+        .iter()
+        .map(|one| (one.root, one.bundle, one.bytes))
+        .collect();
+    let encoded: Vec<_> = follower_batch
+        .entries
+        .iter()
+        .map(|entry| (entry.root, entry.digest, u64::from(entry.length)))
+        .collect();
+    assert_eq!(encoded, quoted, "the record quotes the frames");
+    let (entries, mut at) = cold_header(&follower_batch.bytes).unwrap();
+    assert_eq!(entries, follower_batch.entries);
+    for entry in &entries {
+        let end = at + entry.length as usize;
+        let frame = &follower_batch.bytes[at..end];
+        let archive = StructuralArchive::inspect(frame, inspection(frame)).unwrap();
+        assert_eq!(archive.digest(), entry.digest);
+        assert_eq!(archive.header().root, entry.root);
+        assert_eq!(archive.header().through, outcome.sequence);
+        at = end;
+    }
+    assert_eq!(
+        at,
+        follower_batch.bytes.len(),
+        "the frames follow the header whole"
+    );
+    owner.publish_after_durable(candidate).unwrap();
+    assert_eq!(
+        follower.apply_retirement_record(&inspected).unwrap(),
+        outcome
+    );
+    ckpt::compare(owner.committed_core(), &follower);
+    for claim in [1, 2] {
+        let retired = follower.native_retired(id(claim)).unwrap();
+        assert_eq!(retired.retired_at, outcome.sequence);
+        assert_eq!(retired.through, retired.retired_at, "a cold stub");
+    }
+    // A follower that never saw family 2's release: no batch, and the record refused.
+    let mut divergent = f::core();
+    finished(&mut divergent, 1, 1, 10);
+    f::publish(&mut divergent, 40, f::creation(10, 2, &[], None));
+    cancel(&mut divergent, 11, 2, 50);
+    f::publish(&mut divergent, 60, f::creation(12, 21, &[], None));
+    f::publish(&mut divergent, 70, f::creation(20, 20, &[], None));
+    assert!(encode(&divergent).is_err());
+    let sequence = divergent.native_sequence();
+    assert!(matches!(
+        divergent.apply_retirement_record(&inspected),
+        Err(NativeError::Contract(ContractError::InvalidManifest))
+    ));
+    assert_eq!(divergent.native_sequence(), sequence);
+}
+
+/// A retirement takes every offer that may leave now, however few families one candidate may
+/// change: here the store's bound holds two of these families a candidate, and six offered are
+/// packed into three candidates, planned once and staged one after another, each a cold record
+/// whose frames claim its own sequence. A follower applying the three records ends in the
+/// leader's state. Staged one at a time, the first candidate retires and the rest are deferred;
+/// a cold candidate staged at another sequence than its frames were quoted at is refused.
+#[test]
+fn a_retirement_packs_its_families_into_candidates_within_the_bound() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ckpt::store(directory.path());
+    let mut base = f::core();
+    for claim in 1..=6u128 {
+        finished(
+            &mut base,
+            claim,
+            claim * 100,
+            u64::try_from(claim).unwrap() * 100,
+        );
+    }
+    let family = base.retirement_family(id(1)).unwrap();
+    let own = family.rows() + family.members.len();
+    let small = |core: &mut Core<NativeState>| core.limits.range.max_batch_entries = 2 + 2 * own;
+    let offers: Vec<_> = (1..=6)
+        .map(|root| RetireOffer {
+            bundle: ContentHash([0; 32]),
+            bytes: 0,
+            ..offer(&base, root)
+        })
+        .collect();
+    let mut leader = restored(&base, 807, &store);
+    small(&mut leader);
+    let mut follower = restored(&base, 808, &store);
+    let mut leading = owner(leader);
+    let first = leading.committed_core().native_sequence().0 + 1;
+    let batch = leading.plan_retirement(&offers, Some(encoding())).unwrap();
+    assert_eq!(batch.ends, [2, 4, 6], "two families a candidate");
+    assert_eq!(batch.through, Some(SessionSeq(first)));
+    assert!(batch.deferred.is_empty() && batch.refused.is_empty());
+    let mut records = Vec::new();
+    for index in 0..3 {
+        let Some(NativeStaging::Prepared { candidate, outcome }) =
+            leading.stage_retirement(&batch, index).unwrap()
+        else {
+            panic!("candidate {index}");
+        };
+        assert_eq!(outcome.sequence, SessionSeq(first + index as u64));
+        records.push((record(&mut leading, candidate), candidate));
+    }
+    assert!(
+        leading.stage_retirement(&batch, 3).unwrap().is_none(),
+        "no fourth"
+    );
+    for (bytes, candidate) in &records {
+        leading.publish_after_durable(*candidate).unwrap();
+        let inspected = RetireRecord::inspect(bytes, inspection(bytes), 64).unwrap();
+        assert_eq!(inspected.retired().len(), 2);
+        for one in inspected.retired() {
+            let frame = follower
+                .cold_batch(
+                    &[one.root],
+                    inspected.header().outcome.sequence,
+                    encoding(),
+                    &base.state.budget,
+                    focal_memory::BudgetLane::Completion,
+                )
+                .unwrap();
+            assert_eq!(
+                frame.entries[0].digest, one.bundle,
+                "quoted at its own sequence"
+            );
+        }
+        follower.apply_retirement_record(&inspected).unwrap();
+    }
+    ckpt::compare(leading.committed_core(), &follower);
+    for claim in 1..=6 {
+        assert!(follower.native_claim(id(claim)).is_none());
+    }
+    // One candidate at a time: the first retires, the rest wait for a later offer.
+    let mut single = restored(&base, 809, &store);
+    small(&mut single);
+    let mut one = owner(single);
+    let (batch, staged) = one.prepare_retirement(&offers, Some(encoding())).unwrap();
+    assert!(staged.is_some());
+    assert_eq!(batch.roots().collect::<Vec<_>>(), [id(1), id(2)]);
+    assert_eq!(batch.ends, [2]);
+    assert_eq!(batch.deferred, [id(3), id(4), id(5), id(6)]);
+    // Out of order, a cold candidate's frames would claim another sequence: refused.
+    let mut skipping = restored(&base, 810, &store);
+    small(&mut skipping);
+    let mut skipper = owner(skipping);
+    let batch = skipper.plan_retirement(&offers, Some(encoding())).unwrap();
+    assert!(matches!(
+        skipper.stage_retirement(&batch, 1),
+        Err(NativeOwnerError::Native(NativeError::Capacity(_)))
+    ));
 }
 
 /// Every key digests whole, the widest of each kind included: a result's, a verdict's, a due
