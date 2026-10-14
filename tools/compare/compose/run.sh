@@ -208,6 +208,11 @@ EOF
       echo "::endgroup::"
     done
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
+    # DIAG: every node's log, whatever the run's outcome: a session that stopped mid-run leaves
+    # nothing else (2026-10-14, a follower's session stopped at 4,000/s with no trace).
+    for n in focal1 focal2 focal3; do
+      dc logs --no-color "$n" > "$out/$report.$n.log" 2>&1 || true
+    done
     # Each write's intended start and latency, for where its tail falls in time.
     dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true
     # Each node's replicas as they report themselves, the cost of every
