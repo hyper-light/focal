@@ -236,8 +236,12 @@ fn invalid_containers_and_charge_overflow_are_errors() {
         invalid.heap_charge(),
         Err(MemoryError::MissingKey)
     ));
-    let invalid = OwnedEvent(Vec::new());
-    assert!(invalid.get(crate::native::report_tests::ledger()).is_none());
+    let invalid = OwnedEvent::Held(Vec::new());
+    assert!(
+        invalid
+            .get(crate::native::report_tests::ledger(), None)
+            .is_none()
+    );
     assert!(matches!(invalid.copy(), Err(MemoryError::MissingKey)));
     assert!(matches!(
         invalid.heap_charge(),
@@ -717,21 +721,22 @@ fn owned_event_copy_preserves_exact_history_after_original_is_dropped() {
     };
     let original = OwnedEvent::new(expected, ledger).unwrap();
     let copied = original.copy().unwrap();
+    let (OwnedEvent::Held(held), OwnedEvent::Held(copy)) = (&original, &copied) else {
+        panic!("held events");
+    };
     // Held at its own encoded width, below the widest event's reservation.
-    assert_eq!(
-        original.heap_charge().unwrap(),
-        original.0.len() + ALLOCATION
-    );
+    assert_eq!(original.heap_charge().unwrap(), held.len() + ALLOCATION);
     assert!(original.heap_charge().unwrap() < OwnedEvent::container_charge());
     assert_eq!(
         copied.heap_charge().unwrap(),
         original.heap_charge().unwrap()
     );
-    assert_ne!(original.0.as_ptr(), copied.0.as_ptr());
+    assert_ne!(held.as_ptr(), copy.as_ptr());
+    // A spilled event is no wider than a held one: it fits the row as a held one does.
     assert_eq!(size_of::<OwnedEvent>(), size_of::<Vec<u8>>());
-    assert_eq!(original.get(ledger), Some(expected));
+    assert_eq!(original.get(ledger, None), Some(expected));
     drop(original);
-    assert_eq!(copied.get(ledger), Some(expected));
+    assert_eq!(copied.get(ledger, None), Some(expected));
 }
 
 /// Measurement, not a check: inline widths of the values each heap row

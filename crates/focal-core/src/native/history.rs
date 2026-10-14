@@ -50,7 +50,7 @@ mod tests {
         let expected = event(fact);
         let ledger = binding(1).ledger;
         let stored = OwnedEvent::new(expected, ledger).unwrap();
-        assert_eq!(stored.get(ledger), Some(expected));
+        assert_eq!(stored.get(ledger, None), Some(expected));
     }
 
     #[test]

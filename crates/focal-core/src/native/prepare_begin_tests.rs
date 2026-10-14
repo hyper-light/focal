@@ -225,8 +225,10 @@ fn altered(
             heap,
         )));
     }
-    let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
-    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
+    let encoded_added =
+        crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())
+            .unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let range = core
         .state
         .rows
@@ -308,7 +310,7 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
     else {
         panic!("actual Begun event")
     };
-    let original_event = event.get(original.outcome().ledger).unwrap();
+    let original_event = event.get(original.outcome().ledger, None).unwrap();
     assert!(matches!(
         original_event.fact,
         NativeFact::Evaluation {
@@ -403,7 +405,7 @@ fn a_fake_handler_free_begun_fact_cannot_hide_behind_an_unbegun_final_row() {
     else {
         panic!("actual Begun event")
     };
-    let mut fake = event.get(original.outcome().ledger).unwrap();
+    let mut fake = event.get(original.outcome().ledger, None).unwrap();
     let NativeFact::Evaluation {
         after,
         state,

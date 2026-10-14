@@ -98,12 +98,22 @@ impl<'bytes> Entries<'bytes> {
 /// materializer can answer from earlier staged rows and record what was read.
 pub(super) trait BaseRows {
     fn base_row(&self, key: Key) -> Option<&Row>;
+    /// Where a spilled base row's bytes are read from.
+    fn base_payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead>;
+    /// Where a row the record builds is spilled.
+    fn base_payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog>;
     /// The prefix the record must extend.
     fn base_prefix(&self) -> u64;
 }
 impl BaseRows for Core<NativeState> {
     fn base_row(&self, key: Key) -> Option<&Row> {
         self.state.rows.get(&key)
+    }
+    fn base_payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        self.state.payloads()
+    }
+    fn base_payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog> {
+        self.state.payloads.as_deref()
     }
     fn base_prefix(&self) -> u64 {
         self.state.rows.prefix()
@@ -116,6 +126,9 @@ struct Overlay<'a, 'bytes, B> {
 impl<B: BaseRows> replay_validate::Overlay for Overlay<'_, '_, B> {
     fn before(&self, key: Key) -> Option<&Row> {
         self.base.base_row(key)
+    }
+    fn payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        self.base.base_payloads()
     }
     fn after(&self, key: Key) -> Option<&Row> {
         match self.entries.position(key) {
@@ -154,6 +167,12 @@ struct Objects<'a, 'bytes, B> {
 impl<B: BaseRows> read_dispatch::Objects for Objects<'_, '_, B> {
     fn ledger(&self) -> LedgerId {
         self.header.ledger
+    }
+    fn payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        self.overlay.base.base_payloads()
+    }
+    fn payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog> {
+        self.overlay.base.base_payload_log()
     }
     fn prefix(&self) -> SessionSeq {
         self.header.outcome.sequence
@@ -610,7 +629,8 @@ pub(super) fn install(
     meters.lookup.charge(work).map_err(read_evidence::codec)?;
     // Dividing the input among a group's members takes a vector per touched
     // member beyond the one the record funded (25 §4).
-    let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger)?;
+    let encoded_added =
+        crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())?;
     let extra = core.state.rows.input_extra_bytes(changes.len())?;
     if extra != 0 {
         let mut extra_allocation = core
@@ -629,7 +649,7 @@ pub(super) fn install(
         .checked_sub(slots_bytes)
         .ok_or(ContractError::Capacity)?;
     let mut funding = allocation.split_off(available)?;
-    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let mut counted = Ok(());
     let fragments = core.state.rows.plan_sparse_funded(
         &core.state.budget,

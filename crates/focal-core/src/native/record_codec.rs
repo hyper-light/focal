@@ -134,6 +134,8 @@ pub struct EncodingQuote {
 pub struct EncodingPlan<'a> {
     prepared: &'a NativePrepared,
     quote: EncodingQuote,
+    /// Where the candidate's spilled rows' bytes are read from (doc 31 M3).
+    payloads: Option<&'a dyn crate::native::payloads::PayloadRead>,
 }
 impl<'a> EncodingPlan<'a> {
     /// Measures the record: its bytes and the visits its write takes. Its
@@ -142,6 +144,15 @@ impl<'a> EncodingPlan<'a> {
     pub fn prepare(
         prepared: &'a NativePrepared,
         limits: EncodingLimits,
+    ) -> Result<Self, CodecError> {
+        Self::prepare_with(prepared, limits, None)
+    }
+    /// As [`Self::prepare`], for a candidate whose rows were spilled to the payload log
+    /// `payloads` reads (doc 31 M3).
+    pub fn prepare_with(
+        prepared: &'a NativePrepared,
+        limits: EncodingLimits,
+        payloads: Option<&'a dyn crate::native::payloads::PayloadRead>,
     ) -> Result<Self, CodecError> {
         // A retirement's record carries its families, never its rows (doc 31 M2).
         if let Some(body) = prepared.retire.as_ref() {
@@ -162,6 +173,7 @@ impl<'a> EncodingPlan<'a> {
                     rows: retired.len(),
                     hash: ContentHash([0; 32]),
                 },
+                payloads,
             });
         }
         if prepared.mutation_count() == 0 || prepared.mutation_count() > limits.rows {
@@ -172,7 +184,7 @@ impl<'a> EncodingPlan<'a> {
             // Each row's length precedes it: measured once here, and its
             // write's visits charged as it is measured.
             let mut measure = RowSize { sink, bytes: 0 };
-            rows::value(&mut measure, key, value, ledger)?;
+            rows::value(&mut measure, key, value, ledger, payloads)?;
             let size = measure.bytes;
             write_count(sink, size)?;
             sink.count(size)
@@ -188,6 +200,7 @@ impl<'a> EncodingPlan<'a> {
                 rows: prepared.mutation_count(),
                 hash: ContentHash([0; 32]),
             },
+            payloads,
         })
     }
     pub fn quote(&self) -> EncodingQuote {
@@ -221,7 +234,7 @@ impl<'a> EncodingPlan<'a> {
         frame(&mut sink, self.prepared, |sink, key, value, ledger| {
             let at = sink.len();
             write_count(sink, 0)?;
-            rows::value(sink, key, value, ledger)?;
+            rows::value(sink, key, value, ledger, self.payloads)?;
             let size = sink
                 .len()
                 .checked_sub(at)
@@ -374,7 +387,7 @@ pub(in crate::native) fn row_bytes(
         let value = match prepared.fragments.get(&key) {
             Some(row) if !deleted => {
                 let mut values = CountingSink::new(usize::MAX, usize::MAX);
-                rows::value(&mut values, key, row, ledger)?;
+                rows::value(&mut values, key, row, ledger, None)?;
                 values.len()
             }
             _ => 0,

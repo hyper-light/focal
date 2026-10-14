@@ -62,6 +62,7 @@ mod owned;
 mod owner;
 #[cfg(test)]
 mod owner_record_buffer_tests;
+pub mod payloads;
 mod pending_index;
 mod prepare;
 mod prepare_budget;
@@ -275,6 +276,17 @@ pub struct NativeState {
     /// Each object's events by where they were published (doc 31 M2): derived from the rows,
     /// never encoded, kept as each publication commits.
     events: event_index::EventIndex,
+    /// The replica's payload log, where a row written once and read rarely is spilled where it
+    /// is built (doc 31 M3). A core without one keeps every row's bytes.
+    payloads: Option<Box<dyn payloads::PayloadLog>>,
+}
+impl NativeState {
+    /// Where a spilled row's bytes are read from.
+    pub(crate) fn payloads(&self) -> Option<&dyn payloads::PayloadRead> {
+        self.payloads
+            .as_deref()
+            .map(|log| -> &dyn payloads::PayloadRead { log })
+    }
 }
 impl std::fmt::Debug for NativeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1578,6 +1590,8 @@ pub struct NativeFrozen {
     ledger: LedgerId,
     profile: NativeContentProfile,
     rows: ranges::FrozenRanges,
+    /// A reader of the payload log the frozen rows' spilled bytes are in.
+    payloads: Option<Box<dyn payloads::PayloadRead + Send>>,
 }
 impl std::fmt::Debug for NativeFrozen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1591,6 +1605,12 @@ impl std::fmt::Debug for NativeFrozen {
 impl NativeFrozen {
     pub fn native_sequence(&self) -> SessionSeq {
         SessionSeq(self.rows.prefix())
+    }
+    /// Where the frozen rows' spilled bytes are read from.
+    pub(crate) fn payloads(&self) -> Option<&dyn payloads::PayloadRead> {
+        self.payloads
+            .as_deref()
+            .map(|reader| -> &dyn payloads::PayloadRead { reader })
     }
 }
 
@@ -1779,9 +1799,19 @@ impl Core<NativeState> {
                 budget,
                 encoded_rows: 0,
                 events,
+                payloads: None,
             },
             limits,
         })
+    }
+    /// Spill the rows this core builds from now on to `log` (doc 31 M3), where the replica keeps
+    /// its payloads. Rows already held keep their bytes.
+    pub fn attach_payload_log(&mut self, log: Box<dyn payloads::PayloadLog>) {
+        self.state.payloads = Some(log);
+    }
+    /// The payload log this core spills to, given back (for the core that replaces this one).
+    pub fn detach_payload_log(&mut self) -> Option<Box<dyn payloads::PayloadLog>> {
+        self.state.payloads.take()
     }
     pub fn native_sequence(&self) -> SessionSeq {
         SessionSeq(self.state.rows.prefix())
@@ -1789,10 +1819,15 @@ impl Core<NativeState> {
     /// The committed rows frozen at this prefix, for a checkpoint to encode
     /// on another thread while this core goes on (`record_codec::checkpoint`).
     pub fn freeze_native(&self) -> Result<NativeFrozen, MemoryError> {
+        let payloads = match self.state.payloads.as_deref() {
+            Some(log) => Some(log.reader().map_err(|_| MemoryError::AllocationFailed)?),
+            None => None,
+        };
         Ok(NativeFrozen {
             ledger: self.state.ledger,
             profile: self.state.profile,
             rows: self.state.rows.freeze(&self.state.budget)?,
+            payloads,
         })
     }
     /// The trusted clock of the last committed record; zero before any record.
@@ -1978,7 +2013,7 @@ impl Core<NativeState> {
     }
     pub fn native_event(&self, sequence: SessionSeq, ordinal: u32) -> Option<NativeEvent> {
         match self.state.rows.get(&Key::Event(sequence, ordinal)) {
-            Some(Row::Event(event)) => event.get(self.state.ledger),
+            Some(Row::Event(event)) => event.get(self.state.ledger, self.state.payloads()),
             _ => None,
         }
     }
@@ -2083,6 +2118,7 @@ impl Core<NativeState> {
             rows,
             events,
             ledger,
+            payloads: log,
             ..
         } = &mut self.state;
         for (_, _, change) in fragments.changes() {
@@ -2096,7 +2132,7 @@ impl Core<NativeState> {
                 return;
             }
             let event = match rows.get(&key) {
-                Some(Row::Event(stored)) => stored.get(*ledger),
+                Some(Row::Event(stored)) => stored.get(*ledger, payloads::source(log)),
                 _ => None,
             };
             match event {
@@ -2116,6 +2152,7 @@ impl Core<NativeState> {
             rows,
             events,
             ledger,
+            payloads: log,
             ..
         } = &mut self.state;
         if outcome.events == 0 || !events.complete() {
@@ -2137,7 +2174,7 @@ impl Core<NativeState> {
         }
         for ordinal in 0..outcome.events {
             let event = match rows.get(&Key::Event(outcome.sequence, ordinal)) {
-                Some(Row::Event(stored)) => stored.get(*ledger),
+                Some(Row::Event(stored)) => stored.get(*ledger, payloads::source(log)),
                 _ => None,
             };
             let Some(event) = event else {
@@ -2160,6 +2197,7 @@ impl Core<NativeState> {
             self.state.events = event_index::EventIndex::build(
                 &self.state.rows,
                 self.state.ledger,
+                self.state.payloads(),
                 &self.state.budget,
             );
         }
@@ -2177,8 +2215,13 @@ impl Core<NativeState> {
             if let Some(row) = self.state.rows.get(&key) {
                 removed = removed
                     .checked_add(
-                        record_codec::checkpoint::row_bytes(key, row, self.state.ledger)
-                            .map_err(unencodable)?,
+                        record_codec::checkpoint::row_bytes(
+                            key,
+                            row,
+                            self.state.ledger,
+                            self.state.payloads(),
+                        )
+                        .map_err(unencodable)?,
                     )
                     .ok_or(MemoryError::CounterExhausted("checkpoint bytes"))?;
             }
@@ -2204,9 +2247,13 @@ impl Core<NativeState> {
             if let Some(row) = self.state.rows.get(&key) {
                 removed = removed
                     .checked_add(
-                        record_codec::checkpoint::row_bytes(key, row, self.state.ledger).map_err(
-                            |_| NativeError::Capacity("a committed row does not encode"),
-                        )?,
+                        record_codec::checkpoint::row_bytes(
+                            key,
+                            row,
+                            self.state.ledger,
+                            self.state.payloads(),
+                        )
+                        .map_err(|_| NativeError::Capacity("a committed row does not encode"))?,
                     )
                     .ok_or(NativeError::Capacity("checkpoint bytes"))?;
             }
@@ -2215,7 +2262,9 @@ impl Core<NativeState> {
             .encoded_rows
             .checked_sub(removed)
             .and_then(|rest| {
-                rest.checked_add(encoded_added(changes.iter(), self.state.ledger).ok()?)
+                rest.checked_add(
+                    encoded_added(changes.iter(), self.state.ledger, self.state.payloads()).ok()?,
+                )
             })
             .ok_or(NativeError::Capacity("checkpoint bytes"))
     }
@@ -2341,6 +2390,15 @@ struct View<'a> {
     own: Option<&'a NativePrepared>,
 }
 impl<'a> View<'a> {
+    /// Where a spilled row's bytes are read from: the committed rows' log, which every row of
+    /// the chain is spilled to as well.
+    pub(super) fn payloads(&self) -> Option<&'a dyn payloads::PayloadRead> {
+        self.state.payloads()
+    }
+    /// Where a row built on this view is spilled (doc 31 M3).
+    pub(super) fn payload_log(&self) -> Option<&'a dyn payloads::PayloadLog> {
+        self.state.payloads.as_deref()
+    }
     /// The committed rows alone.
     fn committed(state: &'a NativeState) -> Self {
         Self {
@@ -2614,9 +2672,10 @@ impl NativeRead {
 pub(in crate::native) fn encoded_rows_of(
     rows: &ranges::NativeRanges,
     ledger: LedgerId,
+    payloads: Option<&dyn payloads::PayloadRead>,
 ) -> Result<usize, NativeError> {
     rows.entries().try_fold(0usize, |sum, entry| {
-        let bytes = record_codec::checkpoint::row_bytes(entry.key, entry.value, ledger)
+        let bytes = record_codec::checkpoint::row_bytes(entry.key, entry.value, ledger, payloads)
             .map_err(|_| NativeError::Capacity("a restored row does not encode"))?;
         sum.checked_add(bytes)
             .ok_or(NativeError::Capacity("checkpoint bytes"))
@@ -2627,17 +2686,26 @@ pub(in crate::native) fn encoded_rows_of(
 /// takes each out of its page (`RangesPlan::build_in_replacing`): what publishing the build takes
 /// away from the running total, with no row looked up again.
 #[derive(Debug)]
-pub(in crate::native) struct EncodedRemoved {
+pub(in crate::native) struct EncodedRemoved<'a> {
     ledger: LedgerId,
+    /// Where a committed row's spilled bytes are read from.
+    payloads: Option<&'a dyn payloads::PayloadRead>,
     bytes: usize,
 }
 
-impl EncodedRemoved {
-    pub(in crate::native) fn new(ledger: LedgerId) -> Self {
-        Self { ledger, bytes: 0 }
+impl<'a> EncodedRemoved<'a> {
+    pub(in crate::native) fn new(
+        ledger: LedgerId,
+        payloads: Option<&'a dyn payloads::PayloadRead>,
+    ) -> Self {
+        Self {
+            ledger,
+            payloads,
+            bytes: 0,
+        }
     }
     pub(in crate::native) fn count(&mut self, key: &Key, row: &Row) -> Result<(), MemoryError> {
-        let bytes = record_codec::checkpoint::row_bytes(*key, row, self.ledger)
+        let bytes = record_codec::checkpoint::row_bytes(*key, row, self.ledger, self.payloads)
             .map_err(|_| MemoryError::InvalidConfiguration("a committed row does not encode"))?;
         self.bytes = self
             .bytes
@@ -2654,11 +2722,13 @@ impl EncodedRemoved {
 pub(in crate::native) fn encoded_added(
     mut changes: impl Iterator<Item = impl ranges::ChangeRead>,
     ledger: LedgerId,
+    payloads: Option<&dyn payloads::PayloadRead>,
 ) -> Result<usize, NativeError> {
     changes.try_fold(0usize, |sum, change| match change.row() {
         Some(row) => {
-            let bytes = record_codec::checkpoint::row_bytes(change.changed(), row, ledger)
-                .map_err(|_| NativeError::Capacity("a row that does not encode"))?;
+            let bytes =
+                record_codec::checkpoint::row_bytes(change.changed(), row, ledger, payloads)
+                    .map_err(|_| NativeError::Capacity("a row that does not encode"))?;
             sum.checked_add(bytes)
                 .ok_or(NativeError::Capacity("checkpoint bytes"))
         }

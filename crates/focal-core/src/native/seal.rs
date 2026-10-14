@@ -727,6 +727,7 @@ impl Core<NativeState> {
                 count: plan.keys.len(),
             },
             self.plan_entries(plan),
+            self.state.payloads(),
         )?;
         Ok(retirement::ArchiveQuote {
             bytes: sink.len(),
@@ -753,6 +754,7 @@ impl Core<NativeState> {
                 count: plan.keys.len(),
             },
             self.plan_entries(plan),
+            self.state.payloads(),
         )?;
         sink.finish()?;
         Ok(hash)
@@ -775,6 +777,7 @@ impl Core<NativeState> {
                 ranges: &plan.ranges,
             },
             std::iter::empty(),
+            self.state.payloads(),
         )?;
         Ok(retirement::ArchiveQuote {
             bytes: sink.len(),
@@ -801,6 +804,7 @@ impl Core<NativeState> {
                 ranges: &plan.ranges,
             },
             std::iter::empty(),
+            self.state.payloads(),
         )?;
         sink.finish()?;
         Ok(hash)

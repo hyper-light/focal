@@ -59,10 +59,10 @@ fn replace_body(bytes: &[u8], key: Key, replacement: &[u8]) -> Vec<u8> {
 }
 fn encode_row(key: Key, row: &Row, ledger: LedgerId) -> Vec<u8> {
     let mut count = CountingSink::new(usize::MAX, usize::MAX);
-    rows::value(&mut count, key, row, ledger).unwrap();
+    rows::value(&mut count, key, row, ledger, None).unwrap();
     let mut value = vec![0; count.len()];
     let mut sink = SliceSink::new(&mut value, count.visits_used());
-    rows::value(&mut sink, key, row, ledger).unwrap();
+    rows::value(&mut sink, key, row, ledger, None).unwrap();
     sink.finish().unwrap();
     value
 }

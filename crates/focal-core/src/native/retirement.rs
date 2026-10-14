@@ -622,7 +622,7 @@ impl Core<NativeState> {
         counts.extend(closure.members.iter().map(|_| 0u32));
         let mut consider = |key: Key, stored: &OwnedEvent| -> Result<(), RetirementRefusal> {
             let event = stored
-                .get(self.state.ledger)
+                .get(self.state.ledger, self.state.payloads())
                 .ok_or(RetirementRefusal::Corrupt)?;
             let object = record_codec::event_object(event);
             if closure.keys.contains(&object) {
@@ -789,6 +789,7 @@ impl Core<NativeState> {
             &mut sink,
             self.archive_frame(family, through),
             self.family_entries(family),
+            self.state.payloads(),
         )?;
         Ok(ArchiveQuote {
             bytes: sink.len(),
@@ -810,6 +811,7 @@ impl Core<NativeState> {
             &mut sink,
             self.archive_frame(family, through),
             self.family_entries(family),
+            self.state.payloads(),
         )?;
         sink.finish()?;
         Ok(hash)
@@ -918,6 +920,7 @@ impl Core<NativeState> {
             rows,
             events,
             ledger,
+            payloads: log,
             ..
         } = &mut self.state;
         for key in &family.keys {
@@ -928,13 +931,15 @@ impl Core<NativeState> {
                 return;
             }
             match rows.get(key) {
-                Some(Row::Event(stored)) => match stored.get(*ledger) {
-                    Some(event) => events.unfile(
-                        event_index::home(event),
-                        event_index::Position { sequence, ordinal },
-                    ),
-                    None => events.drop_all(),
-                },
+                Some(Row::Event(stored)) => {
+                    match stored.get(*ledger, crate::native::payloads::source(log)) {
+                        Some(event) => events.unfile(
+                            event_index::home(event),
+                            event_index::Position { sequence, ordinal },
+                        ),
+                        None => events.drop_all(),
+                    }
+                }
                 _ => events.drop_all(),
             }
         }

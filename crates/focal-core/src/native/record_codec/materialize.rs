@@ -271,6 +271,12 @@ impl TaskBase<'_> {
     }
 }
 impl BaseRows for TaskBase<'_> {
+    fn base_payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        self.core.state.payloads()
+    }
+    fn base_payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog> {
+        self.core.state.payloads.as_deref()
+    }
     fn base_row(&self, key: Key) -> Option<&Row> {
         if key == Key::Meta && self.meta_writer.is_some() {
             self.note(key, self.meta_writer);

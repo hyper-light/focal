@@ -1680,11 +1680,12 @@ impl<'a> Fresh<'a> {
         let encoded_added = super::encoded_added(
             fragments.changes().map(|(_, _, change)| change),
             view.state.ledger,
+            view.payloads(),
         )?;
         // What the rows this mutation replaces or deletes take in a checkpoint, as the state it
         // is prepared on holds them, which is the root it publishes onto: published, it takes
         // them away without looking each up again.
-        let mut removed = super::EncodedRemoved::new(view.state.ledger);
+        let mut removed = super::EncodedRemoved::new(view.state.ledger, view.payloads());
         for (_, _, change) in fragments.changes() {
             let key = change.key();
             if let Some(old) = view.get_entry(&key) {

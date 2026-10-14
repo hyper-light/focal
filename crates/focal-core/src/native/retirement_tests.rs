@@ -83,7 +83,9 @@ fn events_of(core: &Core<NativeState>, claim: ClaimId) -> usize {
             let Row::Event(stored) = &entry.value else {
                 return false;
             };
-            let event = stored.get(core.state.ledger).unwrap();
+            let event = stored
+                .get(core.state.ledger, core.state.payloads())
+                .unwrap();
             record_codec::event_object(event) == Key::Claim(claim)
         })
         .count()
@@ -133,7 +135,9 @@ fn a_family_leaves_the_core_only_when_terminal_released_and_unreferenced() {
             let Row::Event(stored) = &entry.value else {
                 return false;
             };
-            let event = stored.get(core.state.ledger).unwrap();
+            let event = stored
+                .get(core.state.ledger, core.state.payloads())
+                .unwrap();
             family.keys.contains(&record_codec::event_object(event))
         })
         .count();
@@ -950,5 +954,49 @@ fn the_event_index_finds_what_a_walk_of_every_event_finds() {
     assert_eq!(
         restored.retirement_family(id(2)).unwrap(),
         core.retirement_family(id(2)).unwrap()
+    );
+}
+
+/// A replica that spills its events (doc 31 M3) derives, bundles and retires a family as one
+/// that keeps them does: the same family, the same bundle, the same index, and the same root
+/// once the family has left, its spilled events with it.
+#[test]
+fn a_spilling_replica_retires_a_family_as_a_holding_one_does() {
+    let checkpoint = |core: &Core<NativeState>| {
+        let plan = record_codec::checkpoint::EncodingPlan::prepare(core, limits()).unwrap();
+        let mut bytes = vec![0; plan.quote().bytes];
+        plan.write_into(&mut bytes).unwrap();
+        bytes
+    };
+    let mut plain = f::core();
+    let mut spilled = f::core();
+    spilled.attach_payload_log(Box::new(super::payloads::MemoryPayloads::default()));
+    for core in [&mut plain, &mut spilled] {
+        for claim in 0..4 {
+            f::publish(core, 5, f::creation(500 + claim, 500 + claim, &[], None));
+        }
+        finished(core, 1, 1, 10);
+    }
+    let held = bundle_of(&plain, id(1));
+    let logged = bundle_of(&spilled, id(1));
+    assert_eq!(held, logged);
+    assert_eq!(checkpoint(&plain), checkpoint(&spilled));
+    let (family, hash, bytes, through) = logged;
+    plain
+        .retire_native_family(&family, hash, bytes, through)
+        .unwrap();
+    spilled
+        .retire_native_family(&family, hash, bytes, through)
+        .unwrap();
+    assert_eq!(checkpoint(&plain), checkpoint(&spilled));
+    assert_eq!(spilled.state.events.len(), plain.state.events.len());
+    assert_eq!(spilled.state.events.positions(id(1).0).count(), 0);
+    assert!(
+        spilled
+            .state
+            .rows
+            .entries()
+            .filter(|entry| matches!(entry.key, Key::Event(..)))
+            .all(|entry| matches!(entry.value, Row::Event(OwnedEvent::Logged(_))))
     );
 }

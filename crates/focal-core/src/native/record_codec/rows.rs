@@ -26,7 +26,13 @@ fn optional_cycle(s: &mut impl Sink, value: Option<NativeCycleKey>) -> Result<()
         }
     }
 }
-pub(super) fn value(s: &mut impl Sink, key: Key, row: &Row, ledger: LedgerId) -> Result<(), Error> {
+pub(super) fn value(
+    s: &mut impl Sink,
+    key: Key,
+    row: &Row,
+    ledger: LedgerId,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), Error> {
     // Row body schemas version independently from both input and V1 envelopes.
     // No body uses serde enum order or process-local allocation capacities.
     match row {
@@ -137,7 +143,11 @@ pub(super) fn value(s: &mut impl Sink, key: Key, row: &Row, ledger: LedgerId) ->
             };
             fixed::outcome(s, v.expand(ledger, invocation))
         }
-        Row::Event(v) => events::event(s, v.get(ledger).ok_or(Error::InvalidTag("event row"))?),
+        Row::Event(v) => events::event(
+            s,
+            v.get(ledger, payloads)
+                .ok_or(Error::InvalidTag("event row"))?,
+        ),
         Row::ClaimContent(v) => evidence::claim_content(s, v),
         Row::ClaimIdentity(id) => raw(s, &id.0),
         Row::DefinitionIdentity(id) => raw(s, &id.0),

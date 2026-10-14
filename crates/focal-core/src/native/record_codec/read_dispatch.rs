@@ -31,6 +31,15 @@ pub(super) enum ClaimDependency<'a> {
 /// never fall back to the old base row. Deleted and missing claims are errors.
 pub(super) trait Objects {
     fn ledger(&self) -> LedgerId;
+    /// Where a spilled row's bytes are read from; none where every row holds its bytes (a
+    /// restore's).
+    fn payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        None
+    }
+    /// Where a row decoded here is spilled (doc 31 M3); none where rows keep their bytes.
+    fn payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog> {
+        None
+    }
     fn prefix(&self) -> SessionSeq;
     fn get(&self, key: Key, meter: &Meter) -> Result<Option<&Row>, NativeError>;
     fn claim_dependency(
@@ -547,7 +556,10 @@ fn process<O: Objects, C: evidence::Custody>(
             let row = if build.is_some() {
                 let visits = plan.build_visits();
                 debit(context.model, visits)?;
-                Some(plan.build(quote.heap_bytes, visits)?.0)
+                Some(
+                    plan.build(quote.heap_bytes, visits, context.objects.payload_log())?
+                        .0,
+                )
             } else {
                 None
             };

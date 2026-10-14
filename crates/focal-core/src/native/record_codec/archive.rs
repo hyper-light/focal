@@ -254,10 +254,12 @@ impl<'a> StructuralArchive<'a> {
                 state: NativeState {
                     ledger: self.header.ledger,
                     profile: self.header.profile,
-                    encoded_rows: crate::native::encoded_rows_of(&rows, self.header.ledger)?,
+                    // An archive's rows hold their bytes.
+                    encoded_rows: crate::native::encoded_rows_of(&rows, self.header.ledger, None)?,
                     rows,
                     budget,
                     events: crate::native::event_index::EventIndex::unbuilt(),
+                    payloads: None,
                 },
                 limits: limits.native,
             },

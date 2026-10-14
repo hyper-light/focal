@@ -367,7 +367,7 @@ pub(super) fn validate(
                 for ordinal in 0..value.events {
                     match read.get(Key::Event(value.sequence, ordinal))? {
                         Some(Row::Event(row)) => {
-                            let event = row.get(ledger).ok_or_else(invalid)?;
+                            let event = row.get(ledger, None).ok_or_else(invalid)?;
                             if event.invocation != invocation
                                 || event.sequence != value.sequence
                                 || event.ordinal != ordinal
@@ -390,7 +390,7 @@ pub(super) fn validate(
                 }
             }
             (Key::Event(sequence, ordinal), Row::Event(value)) => {
-                let event = value.get(ledger).ok_or_else(invalid)?;
+                let event = value.get(ledger, None).ok_or_else(invalid)?;
                 if event.sequence != sequence || event.ordinal != ordinal {
                     return Err(invalid());
                 }
@@ -650,7 +650,7 @@ impl ValidationRead<'_, '_> {
         ordinal: u32,
     ) -> Result<NativeEvent, NativeError> {
         match self.require(Key::Event(sequence, ordinal))? {
-            Row::Event(row) => Ok(row.get(self.ledger).ok_or_else(invalid)?),
+            Row::Event(row) => Ok(row.get(self.ledger, None).ok_or_else(invalid)?),
             _ => Err(invalid()),
         }
     }

@@ -859,6 +859,10 @@ fn measure_memory_per_authored_claim_by_family() {
         MemoryBudget::new(512 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
     )
     .unwrap();
+    // With `FOCAL_MEASURE_SPILL` set, the replica spills its payloads to a log (doc 31 M3).
+    if std::env::var("FOCAL_MEASURE_SPILL").is_ok() {
+        core.attach_payload_log(Box::new(crate::native::payloads::MemoryPayloads::default()));
+    }
     const CLAIMS: u128 = 2_000;
     let before = core.state.budget.stats().used;
     for id in 1..=CLAIMS {
@@ -920,7 +924,13 @@ fn measure_memory_per_authored_claim_by_family() {
             .unwrap_or("?")
             .to_string();
         let slot_entry = if in_set { 0 } else { entry };
-        let encoded = record_codec::checkpoint::row_bytes(item.key, item.value, ledger).unwrap();
+        let encoded = record_codec::checkpoint::row_bytes(
+            item.key,
+            item.value,
+            ledger,
+            core.state.payloads(),
+        )
+        .unwrap();
         let packed = crate::native::layout::PackedKey::pack(&item.key).unwrap();
         let slot = families.entry(family).or_default();
         slot.0 += 1;
@@ -1120,4 +1130,118 @@ fn measure_record_bytes_by_family() {
     for (family, (count, key, value)) in by_family {
         println!("family {family:3}: {count:2} rows, keys {key:5}, values {value:6}");
     }
+}
+
+/// A replica that spills its events to a payload log (doc 31 M3) holds the rows one that keeps
+/// them does: the leader's records and checkpoints are byte-identical with and without a log, a
+/// frozen image encodes the same root, a follower that spills replays the leader's records to
+/// the same root, every event reads back whole, and the spilling replicas hold no event's bytes.
+#[test]
+fn spilled_events_encode_replay_and_checkpoint_as_held_ones() {
+    spilled_events_match_held_ones(None);
+}
+
+/// As above, with each spilling replica's log refusing appends once it holds a few events:
+/// the events past its bound stay held, and every encoding is unchanged.
+#[test]
+fn a_full_payload_log_leaves_events_held_and_every_encoding_unchanged() {
+    spilled_events_match_held_ones(Some(2_000));
+}
+
+fn spilled_events_match_held_ones(bound: Option<usize>) {
+    use crate::native::payloads::MemoryPayloads;
+    let log = || Box::new(MemoryPayloads::bounded(bound));
+    let mut plain = core();
+    let mut spilled = core();
+    spilled.attach_payload_log(log());
+    let mut follower = core();
+    follower.attach_payload_log(log());
+    let replay_dir = tempfile::tempdir().unwrap();
+    let store = crate::native::record_codec::recovery::tests::store(replay_dir.path());
+    let limits = record_codec::EncodingLimits {
+        bytes: 1 << 24,
+        visits: usize::MAX,
+        rows: 1 << 16,
+    };
+    let record = |prepared: &NativePrepared, core: &Core<NativeState>| {
+        let plan =
+            record_codec::EncodingPlan::prepare_with(prepared, limits, core.state.payloads())
+                .unwrap();
+        let mut bytes = vec![0; plan.quote().bytes];
+        plan.write_into(&mut bytes).unwrap();
+        bytes
+    };
+    let checkpoint = |core: &Core<NativeState>| {
+        let plan = record_codec::checkpoint::EncodingPlan::prepare(core, limits).unwrap();
+        let mut bytes = vec![0; plan.quote().bytes];
+        plan.write_into(&mut bytes).unwrap();
+        bytes
+    };
+    for id in 1..=12 {
+        let held = prepare(&plain, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        let logged = prepare(&spilled, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        let bytes = record(&logged, &spilled);
+        assert_eq!(record(&held, &plain), bytes);
+        let structural = record_codec::StructuralRecord::inspect(
+            &bytes,
+            record_codec::InspectionLimits {
+                bytes: bytes.len(),
+                visits: usize::MAX,
+                rows: 1 << 16,
+                row_bytes: 32 << 20,
+            },
+        )
+        .unwrap();
+        let replayed = record_codec::replay::prepare(
+            &follower,
+            &structural,
+            spilled.state.rows.id(),
+            crate::native::record_codec::recovery::tests::limits(follower.limits),
+            &store,
+            &focal_evidence::BuiltinNativeSchemas,
+        )
+        .unwrap();
+        follower.publish_native(replayed).unwrap();
+        let plain_outcome = plain.publish_native(held).unwrap();
+        let spilled_outcome = spilled.publish_native(logged).unwrap();
+        assert_eq!(plain_outcome, spilled_outcome);
+    }
+    let root = checkpoint(&plain);
+    assert_eq!(checkpoint(&spilled), root);
+    assert_eq!(checkpoint(&follower), root);
+    let frozen = spilled.freeze_native().unwrap();
+    let plan = record_codec::checkpoint::EncodingPlan::prepare_frozen(&frozen, limits).unwrap();
+    let mut frozen_root = vec![0; plan.quote().bytes];
+    plan.write_into(&mut frozen_root).unwrap();
+    assert_eq!(frozen_root, root);
+    for replica in [&spilled, &follower] {
+        let mut events = 0;
+        let mut spilled_events = 0;
+        for entry in replica.state.rows.entries() {
+            let Key::Event(sequence, ordinal) = entry.key else {
+                continue;
+            };
+            let Row::Event(event) = entry.value else {
+                panic!("event row");
+            };
+            match event {
+                OwnedEvent::Logged(_) => {
+                    assert_eq!(event.heap_charge().unwrap(), 0);
+                    spilled_events += 1;
+                }
+                OwnedEvent::Held(_) => assert!(bound.is_some(), "only a full log leaves one held"),
+            }
+            let read = event
+                .get(replica.state.ledger, replica.state.payloads())
+                .unwrap();
+            assert_eq!((read.sequence, read.ordinal), (sequence, ordinal));
+            events += 1;
+        }
+        assert!(events >= 24);
+        assert!(spilled_events > 0);
+        if bound.is_some() {
+            assert!(spilled_events < events, "the bound left some held");
+        }
+    }
+    assert!(spilled.state.budget.stats().used < plain.state.budget.stats().used);
 }

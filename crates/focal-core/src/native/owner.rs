@@ -250,7 +250,8 @@ fn build_funded(
                 Some(ReportAdvance {
                     key,
                     before,
-                    usage: parent.completion_use_recorded(prepared)?,
+                    usage: parent
+                        .completion_use_recorded(prepared, publication_source.payloads())?,
                 }),
                 None,
                 built.seals(),
@@ -910,6 +911,7 @@ impl NativeOwner {
                 &self.core.state.budget,
                 lane,
                 self.record_buffers,
+                self.core.state.payloads(),
             ),
             Err(error) => Err(error.into()),
         };
@@ -1075,6 +1077,7 @@ impl NativeOwner {
                         lane
                     },
                     self.record_buffers,
+                    self.core.state.payloads(),
                 ) {
                     Ok(record) => record,
                     Err(error) => {
@@ -1398,11 +1401,12 @@ impl NativeOwner {
         limits: record_codec::EncodingLimits,
     ) -> Result<&record_codec::FundedRecord, NativeOwnerError> {
         let position = self.position(candidate)?;
+        let payloads = self.core.state.payloads();
         let pending = self
             .pending
             .get_mut(position)
             .ok_or(NativeOwnerError::UnknownCandidate)?;
-        pending.record.encode(&pending.prepared, limits)
+        pending.record.encode(&pending.prepared, limits, payloads)
     }
 
     /// The encoded records of `candidate` and of every candidate after it,
@@ -1631,7 +1635,7 @@ impl<'a> NativeView<'a> {
     }
     pub fn event(&self, sequence: SessionSeq, ordinal: u32) -> Option<NativeEvent> {
         match self.0.get(Key::Event(sequence, ordinal)) {
-            Some(Row::Event(event)) => event.get(self.0.ledger()),
+            Some(Row::Event(event)) => event.get(self.0.ledger(), self.0.payloads()),
             _ => None,
         }
     }

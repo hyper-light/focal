@@ -69,6 +69,7 @@ impl ReportParent {
     pub(super) fn completion_use_recorded(
         self,
         prepared: &NativePrepared,
+        payloads: Option<&dyn crate::native::payloads::PayloadRead>,
     ) -> Result<CompletionUse, NativeError> {
         let operation = prepared.outcome.operation;
         let changed = prepared.written_claim(self.claim_id());
@@ -78,8 +79,9 @@ impl ReportParent {
         {
             return self.completion_use(operation, changed);
         }
-        let event = super::completion_book::CompletionBook::admission_failure_event(prepared)?
-            .ok_or(ContractError::InvalidCut)?;
+        let event =
+            super::completion_book::CompletionBook::admission_failure_event(prepared, payloads)?
+                .ok_or(ContractError::InvalidCut)?;
         self.completion_use_prepared(operation, changed, Some(event))
     }
 

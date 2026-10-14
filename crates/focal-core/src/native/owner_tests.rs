@@ -845,7 +845,7 @@ fn a_publication_takes_away_what_its_build_replaced() {
         assert_eq!(state.encoded_rows, looked_up);
         assert_eq!(
             state.encoded_rows,
-            crate::native::encoded_rows_of(&state.rows, state.ledger).unwrap()
+            crate::native::encoded_rows_of(&state.rows, state.ledger, state.payloads()).unwrap()
         );
     }
     assert_eq!(owner.pending_len(), 0);

@@ -256,7 +256,7 @@ impl CompletionBook {
     ) -> Result<(), NativeError> {
         for ordinal in 0..prepared.outcome.events {
             take(visits, 1)?; // retained event
-            let event = Self::event(prepared, ordinal)?;
+            let event = Self::event(prepared, ordinal, source.payloads())?;
             if event.sequence != prepared.outcome.sequence
                 || event.ordinal != ordinal
                 || event.invocation != prepared.outcome.invocation

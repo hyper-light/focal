@@ -85,10 +85,14 @@ impl std::ops::Deref for HeldClaimBody {
 }
 #[derive(Debug)]
 pub(super) struct OwnedEvaluation(Vec<EvaluationState>);
+/// A retained event as its record encoding with the ledger implied by the range: held at
+/// exactly its own length until it is spilled to the replica's payload log, then where it is
+/// there, with nothing on the heap (doc 31 M3).
 #[derive(Debug)]
-/// A retained event as its record encoding with the ledger implied by the
-/// range, allocated at exactly its own length.
-pub(super) struct OwnedEvent(Vec<u8>);
+pub(super) enum OwnedEvent {
+    Held(Vec<u8>),
+    Logged(super::payloads::PayloadRef),
+}
 
 fn add(left: usize, right: usize) -> Result<usize, MemoryError> {
     left.checked_add(right)
@@ -641,7 +645,38 @@ impl OwnedEvent {
         let mut sink = SliceSink::new(&mut bytes, EVENT_VISITS);
         encode_event(&mut sink, event, bindings).map_err(event_codec)?;
         sink.finish().map_err(event_codec)?;
-        Ok(Self(bytes))
+        Ok(Self::Held(bytes))
+    }
+    /// `event` under `ledger`, spilled to `log` where there is one that takes it (doc 31 M3):
+    /// encoded on the stack and appended, the row holding where it is and nothing on the heap.
+    /// Held as [`Self::new`] holds it otherwise.
+    pub(super) fn new_in(
+        event: NativeEvent,
+        ledger: LedgerId,
+        log: Option<&dyn super::payloads::PayloadLog>,
+    ) -> Result<Self, NativeError> {
+        let Some(log) = log else {
+            return Self::new(event, ledger);
+        };
+        if let NativeFact::Claim(row) = event.fact {
+            row.check_graph_capture(event.ordinal)?;
+        }
+        if !super::history::under(event, ledger) {
+            return Err(ContractError::WrongLedger.into());
+        }
+        let bindings = EventBindings::Implied(ledger);
+        let len = Self::held_len(event, bindings)?;
+        let mut buffer = [0u8; EVENT_BYTES];
+        let bytes = buffer
+            .get_mut(..len)
+            .ok_or(NativeError::Capacity("event row"))?;
+        let mut sink = SliceSink::new(bytes, EVENT_VISITS);
+        encode_event(&mut sink, event, bindings).map_err(event_codec)?;
+        sink.finish().map_err(event_codec)?;
+        match log.append(bytes) {
+            Some(at) => Ok(Self::Logged(at)),
+            None => Self::new(event, ledger),
+        }
     }
     /// Exactly what [`Self::new`] charges for `event` under `ledger`, without
     /// allocating: what a recovery plan quotes before building the row.
@@ -654,29 +689,47 @@ impl OwnedEvent {
         encode_event(&mut count, event, bindings).map_err(event_codec)?;
         Ok(count.len())
     }
-    /// The event, its bindings under `ledger`; `None` if the bytes do not
-    /// decode to exactly one event.
-    pub(super) fn get(&self, ledger: LedgerId) -> Option<NativeEvent> {
-        let mut cursor = Cursor::new(&self.0, EVENT_BYTES, EVENT_VISITS).ok()?;
-        let event = decode_event(&mut cursor, EventBindings::Implied(ledger)).ok()?;
-        cursor.finish().ok()?;
-        Some(event)
+    /// The event, its bindings under `ledger`, read from `payloads` once it is spilled; `None`
+    /// if its bytes do not decode to exactly one event, or a spilled event's cannot be read.
+    pub(super) fn get(
+        &self,
+        ledger: LedgerId,
+        payloads: Option<&dyn super::payloads::PayloadRead>,
+    ) -> Option<NativeEvent> {
+        let decode = |bytes: &[u8]| {
+            let mut cursor = Cursor::new(bytes, EVENT_BYTES, EVENT_VISITS).ok()?;
+            let event = decode_event(&mut cursor, EventBindings::Implied(ledger)).ok()?;
+            cursor.finish().ok()?;
+            Some(event)
+        };
+        match self {
+            Self::Held(bytes) => decode(bytes),
+            Self::Logged(at) => {
+                super::payloads::with_payload::<EVENT_BYTES, _>(payloads?, *at, decode)
+            }
+        }
     }
     pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
-        if self.0.is_empty() {
-            return Err(MemoryError::MissingKey);
+        match self {
+            Self::Held(bytes) if bytes.is_empty() => Err(MemoryError::MissingKey),
+            Self::Held(bytes) => container_heap::<u8>(bytes.capacity()),
+            Self::Logged(_) => Ok(0),
         }
-        container_heap::<u8>(self.0.capacity())
     }
     pub(super) fn copy(&self) -> Result<Self, MemoryError> {
         let old = self.heap_charge()?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(self.0.len())
-            .map_err(|_| MemoryError::AllocationFailed)?;
-        within(container_heap::<u8>(bytes.capacity())?, old)?;
-        bytes.extend_from_slice(&self.0);
-        Ok(Self(bytes))
+        match self {
+            Self::Held(held) => {
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(held.len())
+                    .map_err(|_| MemoryError::AllocationFailed)?;
+                within(container_heap::<u8>(bytes.capacity())?, old)?;
+                bytes.extend_from_slice(held);
+                Ok(Self::Held(bytes))
+            }
+            Self::Logged(at) => Ok(Self::Logged(*at)),
+        }
     }
 }
 fn event_codec(error: CodecError) -> NativeError {

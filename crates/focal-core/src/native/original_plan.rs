@@ -313,7 +313,15 @@ impl<'source> OriginalPlan<'source> {
             view,
             outcome.operation,
             &mut history,
-            |fact| record_fact(&mut changes, outcome, &mut ordinal, fact),
+            |fact| {
+                record_fact(
+                    &mut changes,
+                    outcome,
+                    &mut ordinal,
+                    fact,
+                    view.payload_log(),
+                )
+            },
         )?;
         if visited
             != usize::try_from(original_outcome.events)
@@ -324,7 +332,13 @@ impl<'source> OriginalPlan<'source> {
         }
         if let Some(suffix) = &mut suffix {
             suffix.emit(&self, |fact| {
-                record_fact(&mut changes, outcome, &mut ordinal, fact)
+                record_fact(
+                    &mut changes,
+                    outcome,
+                    &mut ordinal,
+                    fact,
+                    view.payload_log(),
+                )
             })?;
         }
         if ordinal != outcome.events {

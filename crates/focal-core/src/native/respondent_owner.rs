@@ -228,7 +228,7 @@ fn install_new(
     )?;
     let mut acquired = None;
     for ordinal in 0..prepared.outcome.events {
-        let event = CompletionBook::event(prepared, ordinal)?;
+        let event = CompletionBook::event(prepared, ordinal, view.payloads())?;
         let binding = match event.fact {
             NativeFact::Receipt { claim, .. } | NativeFact::ReceiptAdopted { claim, .. } => claim,
             _ => continue,

@@ -217,7 +217,8 @@ impl HistoryIndex {
             let Row::Event(stored) = &row.value else {
                 return Err(invalid());
             };
-            let event = stored.get(read.ledger).ok_or_else(invalid)?;
+            // A restore's rows hold their bytes until they are laid out.
+            let event = stored.get(read.ledger, None).ok_or_else(invalid)?;
             if event.sequence != sequence
                 || event.ordinal != ordinal
                 || sequence.0 == 0

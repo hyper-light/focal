@@ -95,6 +95,10 @@ impl<'a> Source<'a> {
                 frozen.rows.pages(),
             ),
         };
+        let payloads = match self {
+            Self::Core(state) => state.payloads(),
+            Self::Frozen(frozen) => frozen.payloads(),
+        };
         Ok(RootFrame {
             ledger: self.ledger(),
             profile: self.profile(),
@@ -104,6 +108,7 @@ impl<'a> Source<'a> {
             layout,
             layout_epoch,
             seeks: seeks(pages, layout.len())?,
+            payloads,
         })
     }
 }
@@ -610,6 +615,7 @@ pub fn rows_digest(
             }],
             layout_epoch: 0,
             seeks: store_seeks(state)?,
+            payloads: state.payloads(),
         },
         state.rows.entries().map(|entry| (entry.key, entry.value)),
     )
@@ -660,6 +666,7 @@ pub fn member_digest(
             layout_epoch: 0,
             // One member's pages are among the store's.
             seeks: store_seeks(state)?,
+            payloads: state.payloads(),
         },
         entries.map(|entry| (entry.key, entry.value)),
     )
@@ -680,6 +687,8 @@ pub(in crate::native) struct RootFrame<'l> {
     /// walk seeks once into each member and at most once more per page; a
     /// slice seeks once.
     pub(in crate::native) seeks: usize,
+    /// Where a spilled row's bytes are read from (doc 31 M3).
+    pub(in crate::native) payloads: Option<&'l dyn crate::native::payloads::PayloadRead>,
 }
 
 /// The work of parsing or writing a layout of `members`: each member's fixed
@@ -868,6 +877,7 @@ pub(in crate::native) fn archive_frame<'a>(
     sink: &mut impl Sink,
     frame: ArchiveFrame<'_>,
     mut entries: impl Iterator<Item = (Key, &'a Row)>,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
 ) -> Result<ContentHash, CodecError> {
     if frame.ledger.tenant.is_zero()
         || frame.ledger.session.is_zero()
@@ -928,7 +938,7 @@ pub(in crate::native) fn archive_frame<'a>(
         }
         rows::family(key, value)?;
         previous = Some(key);
-        put_row(&mut hashed, &mut stage, key, value, frame.ledger)?;
+        put_row(&mut hashed, &mut stage, key, value, frame.ledger, payloads)?;
     }
     if entries.next().is_some() {
         return Err(CodecError::InvalidTag("archive row count"));
@@ -972,6 +982,7 @@ pub(in crate::native) fn seal_frame<'a>(
     sink: &mut impl Sink,
     frame: SealFrame<'_>,
     mut entries: impl Iterator<Item = (Key, &'a Row)>,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
 ) -> Result<ContentHash, CodecError> {
     let mut hashed = HashSink::new(sink, blake3::Hasher::new_derive_key(SEAL_HASH_DOMAIN));
     write_raw(&mut hashed, &SEAL_MAGIC)?;
@@ -1099,7 +1110,7 @@ pub(in crate::native) fn seal_frame<'a>(
         }
         rows::family(key, value)?;
         previous = Some(key);
-        put_row(&mut hashed, &mut stage, key, value, ledger)?;
+        put_row(&mut hashed, &mut stage, key, value, ledger, payloads)?;
     }
     if entries.next().is_some() {
         return Err(CodecError::InvalidTag("seal row count"));
@@ -1164,7 +1175,14 @@ fn frame_entries<'a>(
         previous = Some(key);
         meta |= key == Key::Meta;
         outcome |= matches!(key, Key::Outcome(_));
-        put_row(&mut hashed, &mut stage, key, value, frame.ledger)?;
+        put_row(
+            &mut hashed,
+            &mut stage,
+            key,
+            value,
+            frame.ledger,
+            frame.payloads,
+        )?;
     }
     hashed.visit(iteration)?;
     if entries.next().is_some() {
@@ -1208,6 +1226,7 @@ pub(in crate::native) fn row_bytes(
     key: Key,
     row: &Row,
     ledger: LedgerId,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
 ) -> Result<usize, CodecError> {
     // The body is measured once and counted, not walked a second time to be counted again.
     let mut sink = CountingSink::new(usize::MAX, usize::MAX);
@@ -1217,7 +1236,7 @@ pub(in crate::native) fn row_bytes(
         sink: &mut sink,
         bytes: 0,
     };
-    rows::value(&mut measure, key, row, ledger)?;
+    rows::value(&mut measure, key, row, ledger, payloads)?;
     let size = measure.bytes;
     if size == 0 {
         return Err(CodecError::InvalidTag("empty checkpoint body"));
@@ -1312,6 +1331,7 @@ fn put_row(
     key: Key,
     row: &Row,
     ledger: LedgerId,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
 ) -> Result<(), CodecError> {
     write_u8(sink, 1)?;
     fixed::key(sink, key)?;
@@ -1326,13 +1346,14 @@ fn put_row(
         key,
         row,
         ledger,
+        payloads,
     )?;
     if stage.size == 0 {
         return Err(CodecError::InvalidTag("empty checkpoint body"));
     }
     write_count(sink, stage.size)?;
     if stage.spilled {
-        return rows::value(sink, key, row, ledger);
+        return rows::value(sink, key, row, ledger, payloads);
     }
     write_raw(
         sink,

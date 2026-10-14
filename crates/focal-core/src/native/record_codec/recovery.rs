@@ -369,10 +369,12 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
         state: NativeState {
             ledger: header.ledger,
             profile: header.profile,
-            encoded_rows: crate::native::encoded_rows_of(&rows, header.ledger)?,
+            // A restore's rows hold their bytes as they are laid out here.
+            encoded_rows: crate::native::encoded_rows_of(&rows, header.ledger, None)?,
             rows,
             budget,
             events: crate::native::event_index::EventIndex::unbuilt(),
+            payloads: None,
         },
         limits: limits.native,
     };

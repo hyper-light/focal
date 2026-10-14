@@ -499,8 +499,10 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         &mut allowance,
     )
     .unwrap();
-    let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
-    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
+    let encoded_added =
+        crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())
+            .unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let range = core
         .state
         .rows

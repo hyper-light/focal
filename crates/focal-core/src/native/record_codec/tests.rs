@@ -421,8 +421,10 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
         funding,
     )
     .unwrap();
-    let encoded_added = crate::native::encoded_added(plan.changes(), core.state.ledger).unwrap();
-    let mut taken = crate::native::EncodedRemoved::new(core.state.ledger);
+    let encoded_added =
+        crate::native::encoded_added(plan.changes(), core.state.ledger, core.state.payloads())
+            .unwrap();
+    let mut taken = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let fragments = plan
         .build_in_replacing(&core.state.budget, prepare::copy, |key, row| {
             taken.count(key, row)

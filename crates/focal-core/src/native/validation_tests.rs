@@ -362,7 +362,7 @@ fn assert_fence_then_seal(
             else {
                 panic!("retained event");
             };
-            event.get(outcome.ledger).unwrap().fact
+            event.get(outcome.ledger, None).unwrap().fact
         })
         .filter(|fact| matches!(fact, NativeFact::Evaluation { key: actual, .. } if *actual == key))
         .collect();

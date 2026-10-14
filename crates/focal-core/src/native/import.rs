@@ -428,6 +428,8 @@ pub fn import<S: NativeSchemaVerifier, R: NativeCustodyReader>(
             start: None,
         }],
         layout_epoch: 0,
+        // An import's rows hold their bytes.
+        payloads: None,
         // A slice of sorted rows: one seek, no directory.
         seeks: 1,
     };

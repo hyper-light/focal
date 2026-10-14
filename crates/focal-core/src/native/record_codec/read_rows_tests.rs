@@ -53,10 +53,10 @@ fn outcome_row(invocation: NativeInvocation, operation: NativeOperation) -> Row 
 }
 fn encode(key: Key, row: &Row) -> Vec<u8> {
     let mut size = CountingSink::new(usize::MAX, usize::MAX);
-    rows::value(&mut size, key, row, ledger()).unwrap();
+    rows::value(&mut size, key, row, ledger(), None).unwrap();
     let mut bytes = vec![0; size.len()];
     let mut sink = SliceSink::new(&mut bytes, usize::MAX);
-    rows::value(&mut sink, key, row, ledger()).unwrap();
+    rows::value(&mut sink, key, row, ledger(), None).unwrap();
     sink.finish().unwrap();
     bytes
 }
@@ -471,14 +471,14 @@ fn actual_native_events_prepare_without_allocation_then_build_under_exact_precha
         let heap = plan.heap_bytes();
         let work = plan.build_visits();
         assert!(matches!(
-            plan.build(heap - 1, work),
+            plan.build(heap - 1, work, None),
             Err(NativeError::Contract(ContractError::Capacity))
         ));
         assert_eq!(budget.stats(), before);
         let mut cursor = Cursor::new(&bytes, bytes.len(), reads).unwrap();
         let plan = EventPlan::read(entry.key, &mut cursor, ledger()).unwrap();
         assert!(matches!(
-            plan.build(heap, work - 1),
+            plan.build(heap, work - 1, None),
             Err(NativeError::Contract(ContractError::Capacity))
         ));
         let mut cursor = Cursor::new(&bytes, bytes.len(), reads).unwrap();
@@ -486,7 +486,7 @@ fn actual_native_events_prepare_without_allocation_then_build_under_exact_precha
         let permit = budget
             .reserve(BudgetKind::Pending, BudgetLane::Completion, heap)
             .unwrap();
-        let (restored, actual) = plan.build(heap, work).unwrap();
+        let (restored, actual) = plan.build(heap, work, None).unwrap();
         assert_eq!(actual, heap);
         assert_eq!(encode(entry.key, &restored), bytes);
         drop(restored);

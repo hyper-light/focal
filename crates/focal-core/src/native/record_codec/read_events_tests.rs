@@ -48,7 +48,7 @@ fn graph_capture_preserves_exact_exclusive_boundary_and_refuses_impossible_prove
     // Independent literal suffix: Some tag, then the exclusive u32 LE cut.
     assert_eq!(&bytes[bytes.len() - 5..], &[1, 17, 0, 0, 0]);
     let held = crate::native::OwnedEvent::new(value, f::ledger()).unwrap();
-    assert_eq!(held.get(f::ledger()), Some(value));
+    assert_eq!(held.get(f::ledger(), None), Some(value));
     let NativeFact::Claim(mut claim) = value.fact else {
         panic!("claim");
     };
@@ -465,7 +465,7 @@ fn the_widest_event_fits_the_retained_row_reservation() {
             Ok(held) => held,
             Err(error) => panic!("{error:?} holding {value:?}"),
         };
-        assert_eq!(held.get(f::ledger()), Some(value));
+        assert_eq!(held.get(f::ledger(), None), Some(value));
         assert!(held.heap_charge().unwrap() <= crate::native::OwnedEvent::container_charge());
         println!(
             "{} written, {} held",

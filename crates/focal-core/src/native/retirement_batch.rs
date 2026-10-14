@@ -538,8 +538,9 @@ impl Core<NativeState> {
         let encoded_added = super::encoded_added(
             fragments.changes().map(|(_, _, change)| change),
             view.state.ledger,
+            view.payloads(),
         )?;
-        let mut removed = super::EncodedRemoved::new(view.state.ledger);
+        let mut removed = super::EncodedRemoved::new(view.state.ledger, view.payloads());
         for (_, _, change) in fragments.changes() {
             let key = change.key();
             if let Some(old) = view.get_entry(&key) {

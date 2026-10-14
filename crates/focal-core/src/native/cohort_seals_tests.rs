@@ -147,9 +147,13 @@ fn assemble(core: &Core<NativeState>, staged: Staged) -> SealedChanges {
 
 fn publish(core: &mut Core<NativeState>, changes: SealedChanges) -> NativeOutcome {
     let outcome = changes.outcome;
-    let encoded_added =
-        crate::native::encoded_added(changes.changes.iter(), core.state.ledger).unwrap();
-    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
+    let encoded_added = crate::native::encoded_added(
+        changes.changes.iter(),
+        core.state.ledger,
+        core.state.payloads(),
+    )
+    .unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let range = core
         .state
         .rows

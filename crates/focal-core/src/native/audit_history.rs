@@ -111,7 +111,7 @@ fn published(
     }
     visits.take(2)?;
     let event = match view.get(Key::Event(sequence, ordinal)) {
-        Some(Row::Event(event)) => event.get(view.ledger()),
+        Some(Row::Event(event)) => event.get(view.ledger(), view.payloads()),
         _ => None,
     }
     .ok_or(ContractError::MissingEvidence)?;

@@ -301,7 +301,7 @@ fn child_registration_batch_checks_the_final_parent_cohort_once() {
     ));
     let registrations: Vec<_> = (0..many.outcome().events)
         .filter_map(
-            |ordinal| match CompletionBook::event(&many, ordinal).unwrap().fact {
+            |ordinal| match CompletionBook::event(&many, ordinal, None).unwrap().fact {
                 NativeFact::Claim(event) if event.kind == NativeEventKind::ChildRegistered => {
                     Some(event)
                 }

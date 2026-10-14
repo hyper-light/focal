@@ -37,7 +37,7 @@ fn build(core: &Core<NativeState>) -> prepare::BuiltNative {
 
 fn events(prepared: &NativePrepared) -> Vec<NativeEvent> {
     (0..prepared.outcome.events)
-        .map(|ordinal| CompletionBook::event(prepared, ordinal).unwrap())
+        .map(|ordinal| CompletionBook::event(prepared, ordinal, None).unwrap())
         .collect()
 }
 
@@ -88,8 +88,10 @@ fn altered(
         })
         .collect::<Vec<_>>();
     assert!(changes.len() <= core.limits.range.max_batch_entries);
-    let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
-    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
+    let encoded_added =
+        crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())
+            .unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let range = core
         .state
         .rows
@@ -374,7 +376,7 @@ fn structural_entry_checks_charge_visits_before_reads_and_preserve_state_phase()
     let source = View::committed(&core.state);
     let history = events(prepared);
     let (ordinal, key) = observer(&history);
-    let event = frame(prepared, u32::try_from(ordinal).unwrap(), None)
+    let event = frame(prepared, u32::try_from(ordinal).unwrap(), None, None)
         .unwrap()
         .unwrap();
     let old = *source.evaluation(key).unwrap();

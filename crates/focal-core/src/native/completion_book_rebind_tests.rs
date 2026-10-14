@@ -229,8 +229,10 @@ fn with_seals(
             }
         }
     }
-    let encoded_added = crate::native::encoded_added(changes.iter(), core.state.ledger).unwrap();
-    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger);
+    let encoded_added =
+        crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())
+            .unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let range = core
         .state
         .rows
@@ -805,16 +807,19 @@ fn mixed_journal_sort_and_group_validation_share_one_nonrenewable_visit_budget()
     let verified = fixture::verified(&mut custody, &request);
     let (prepared, report, seals) = with_seals(&core, None, request, &verified, &[3, 2]);
     let event_keys = (0..prepared.outcome.events)
-        .filter_map(
-            |ordinal| match CompletionBook::event(&prepared, ordinal).unwrap().fact {
+        .filter_map(|ordinal| {
+            match CompletionBook::event(&prepared, ordinal, None)
+                .unwrap()
+                .fact
+            {
                 NativeFact::Evaluation {
                     kind: NativeEvaluationEventKind::Sealed,
                     key,
                     ..
                 } => Some(key),
                 _ => None,
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
     assert_eq!(event_keys, [fixture::key(3), fixture::key(2)]);
     assert_eq!(

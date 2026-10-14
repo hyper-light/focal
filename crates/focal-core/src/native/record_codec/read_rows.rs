@@ -500,11 +500,13 @@ impl EventPlan {
         self,
         allowance: usize,
         max_visits: usize,
+        log: Option<&dyn crate::native::payloads::PayloadLog>,
     ) -> Result<(Row, usize), NativeError> {
         if self.heap_bytes() > allowance || self.build_visits() > max_visits {
             return Err(ContractError::Capacity.into());
         }
-        let row = OwnedEvent::new(self.event, self.ledger)?;
+        // Spilled as it is decoded where the replica keeps a payload log (doc 31 M3).
+        let row = OwnedEvent::new_in(self.event, self.ledger, log)?;
         let actual = row.heap_charge()?;
         if actual > allowance {
             return Err(ContractError::Capacity.into());

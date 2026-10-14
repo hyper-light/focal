@@ -124,11 +124,12 @@ impl PendingRecord {
         source: &MemoryBudget,
         lane: BudgetLane,
         limits: Option<EncodingLimits>,
+        payloads: Option<&dyn crate::native::payloads::PayloadRead>,
     ) -> Result<Self, NativeOwnerError> {
         let Some(limits) = limits else {
             return Ok(Self::Disabled);
         };
-        let quote = EncodingPlan::prepare(prepared, limits)
+        let quote = EncodingPlan::prepare_with(prepared, limits, payloads)
             .map_err(NativeOwnerError::Record)?
             .quote();
         let allocation = source
@@ -153,6 +154,7 @@ impl PendingRecord {
         &mut self,
         prepared: &NativePrepared,
         limits: EncodingLimits,
+        payloads: Option<&dyn crate::native::payloads::PayloadRead>,
     ) -> Result<&FundedRecord, NativeOwnerError> {
         let quote = match self {
             Self::Disabled => {
@@ -176,7 +178,11 @@ impl PendingRecord {
                 return Err(MemoryError::AllocationFailed.into());
             }
             bytes.resize(quote.bytes, 0);
-            let plan = EncodingPlan { prepared, quote };
+            let plan = EncodingPlan {
+                prepared,
+                quote,
+                payloads,
+            };
             // The record's hash is its write's: the measuring pass does not hash.
             let hash = plan
                 .write_into(&mut bytes)

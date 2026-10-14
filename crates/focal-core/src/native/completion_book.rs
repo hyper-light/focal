@@ -692,13 +692,15 @@ impl CompletionBook {
     pub(super) fn event(
         prepared: &NativePrepared,
         ordinal: u32,
+        payloads: Option<&dyn crate::native::payloads::PayloadRead>,
     ) -> Result<NativeEvent, NativeError> {
         match prepared
             .fragments
             .get(&Key::Event(prepared.outcome.sequence, ordinal))
         {
+            // A candidate's events are spilled as they are built (doc 31 M3).
             Some(Row::Event(event)) => event
-                .get(prepared.outcome.ledger)
+                .get(prepared.outcome.ledger, payloads)
                 .ok_or(ContractError::InvalidCut.into()),
             _ => Err(ContractError::InvalidCut.into()),
         }
@@ -708,13 +710,14 @@ impl CompletionBook {
     /// seals. Resolve that publication instead of inferring it from a final row.
     pub(super) fn admission_failure_event(
         prepared: &NativePrepared,
+        payloads: Option<&dyn crate::native::payloads::PayloadRead>,
     ) -> Result<Option<NativeClaimEvent>, NativeError> {
         if prepared.outcome.operation != NativeOperation::ReportAdmission
             || prepared.outcome.events <= 3
         {
             return Ok(None);
         }
-        let publication = Self::event(prepared, 3)?;
+        let publication = Self::event(prepared, 3, payloads)?;
         let NativeFact::Claim(event) = publication.fact else {
             return Err(ContractError::InvalidCut.into());
         };
@@ -747,7 +750,7 @@ impl CompletionBook {
         }
         let mut previous = None;
         for ordinal in 0..prepared.outcome.events {
-            let after = match Self::event(prepared, ordinal)?.fact {
+            let after = match Self::event(prepared, ordinal, view.payloads())?.fact {
                 NativeFact::Claim(event) => event.after,
                 NativeFact::Registrations { claim } => claim,
                 NativeFact::Evaluation { key, .. } => {

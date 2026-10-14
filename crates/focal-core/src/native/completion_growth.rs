@@ -64,7 +64,7 @@ impl CompletionBook {
     ) -> Result<(), NativeError> {
         let mut previous = None;
         for ordinal in 0..prepared.outcome.events {
-            let fact = Self::event(prepared, ordinal)?.fact;
+            let fact = Self::event(prepared, ordinal, view.payloads())?.fact;
             if let Some(id) = owner(fact)
                 && previous != Some(id)
             {

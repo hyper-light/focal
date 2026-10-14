@@ -202,6 +202,7 @@ impl EventIndex {
     pub(super) fn build(
         rows: &ranges::NativeRanges,
         ledger: LedgerId,
+        payloads: Option<&dyn super::payloads::PayloadRead>,
         budget: &MemoryBudget,
     ) -> Self {
         let mut count = 0u32;
@@ -231,7 +232,7 @@ impl EventIndex {
                 break;
             };
             let event = match &entry.value {
-                Row::Event(stored) => stored.get(ledger),
+                Row::Event(stored) => stored.get(ledger, payloads),
                 _ => None,
             };
             let Some(event) = event else {

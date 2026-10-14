@@ -204,8 +204,9 @@ fn frame(
     prepared: &NativePrepared,
     ordinal: u32,
     begin: Option<&prepare::BeginTransition<'_>>,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
 ) -> Result<Option<Frame>, NativeError> {
-    let event = CompletionBook::event(prepared, ordinal)?;
+    let event = CompletionBook::event(prepared, ordinal, payloads)?;
     if event.sequence != prepared.outcome.sequence
         || event.ordinal != ordinal
         || event.invocation != prepared.outcome.invocation
@@ -512,7 +513,7 @@ fn check_missing(
     {
         return Err(ContractError::InvalidTarget.into());
     }
-    let entry = CompletionBook::event(prepared, entered.ordinal)?;
+    let entry = CompletionBook::event(prepared, entered.ordinal, source.payloads())?;
     if entry.sequence != entered.sequence
         || entry.ordinal != entered.ordinal
         || entry.invocation != prepared.outcome.invocation
@@ -541,7 +542,7 @@ fn check_missing(
         {
             return Err(ContractError::InvalidCut.into());
         }
-        let publication = CompletionBook::event(prepared, missing.ordinal())?;
+        let publication = CompletionBook::event(prepared, missing.ordinal(), source.payloads())?;
         if publication.sequence != missing.sequence()
             || publication.ordinal != missing.ordinal()
             || publication.invocation != prepared.outcome.invocation
@@ -559,6 +560,7 @@ fn check_report(
     previous: EvaluationState,
     next: EvaluationState,
     definition: &validation::Declaration,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
 ) -> Result<(), NativeError> {
     let attempt = previous.bind(definition)?.current_attempt()?;
     let result = next.last_result().ok_or(ContractError::MissingEvidence)?;
@@ -586,7 +588,7 @@ fn check_report(
     {
         return Err(ContractError::InvalidManifest.into());
     }
-    let publication = CompletionBook::event(prepared, accepted.ordinal())?;
+    let publication = CompletionBook::event(prepared, accepted.ordinal(), payloads)?;
     if publication.fact
         != (NativeFact::Accepted {
             key: NativeResultKey::of(result),
@@ -685,8 +687,8 @@ impl CompletionBook {
             if record.key != key {
                 return Err(ContractError::InvalidManifest.into());
             }
-            let event =
-                frame(prepared, record.ordinal, begin)?.ok_or(ContractError::InvalidManifest)?;
+            let event = frame(prepared, record.ordinal, begin, source.payloads())?
+                .ok_or(ContractError::InvalidManifest)?;
             let next = at_binding(key, event.after, prepared, begin, seals, visits)?;
             check_frame(event, current, next, definition)?;
             match event.kind {
@@ -723,10 +725,17 @@ impl CompletionBook {
                     {
                         return Err(ContractError::StaleEvaluation.into());
                     }
-                    check_report(prepared, event, current, next, definition)?;
+                    check_report(
+                        prepared,
+                        event,
+                        current,
+                        next,
+                        definition,
+                        source.payloads(),
+                    )?;
                     let usage =
                         crate::native::completion_envelope::ReportParent::capture(source_claim)
-                            .completion_use_recorded(prepared)?;
+                            .completion_use_recorded(prepared, source.payloads())?;
                     if usage == CompletionUse::AdmissionFailure {
                         take(visits, 1)?;
                     }
@@ -872,7 +881,7 @@ impl CompletionBook {
         let mut begun = 0usize;
         for ordinal in 0..prepared.outcome.events {
             take(&mut visits, 1)?;
-            if let Some(event) = frame(prepared, ordinal, begin)? {
+            if let Some(event) = frame(prepared, ordinal, begin, source.payloads())? {
                 count = add(count, 1)?;
                 reports = add(
                     reports,
@@ -933,7 +942,7 @@ impl CompletionBook {
         within(array::<Update>(updates.capacity())?, bytes)?;
         for ordinal in 0..prepared.outcome.events {
             take(&mut visits, 1)?;
-            if let Some(event) = frame(prepared, ordinal, begin)? {
+            if let Some(event) = frame(prepared, ordinal, begin, source.payloads())? {
                 if updates.len() == updates.capacity() {
                     return Err(NativeError::Capacity("completion journal"));
                 }

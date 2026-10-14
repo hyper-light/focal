@@ -59,6 +59,7 @@ fn record_fact(
     outcome: NativeOutcome,
     ordinal: &mut u32,
     fact: NativeFact,
+    log: Option<&dyn crate::native::payloads::PayloadLog>,
 ) -> Result<(), NativeError> {
     let item = NativeEvent {
         invocation: outcome.invocation,
@@ -70,7 +71,8 @@ fn record_fact(
     if *ordinal >= outcome.events || changes.len() == changes.capacity() {
         return Err(NativeError::Capacity("event preparation"));
     }
-    let stored = OwnedEvent::new(item, outcome.ledger)?;
+    // Spilled as it is built where the replica keeps a payload log (doc 31 M3).
+    let stored = OwnedEvent::new_in(item, outcome.ledger, log)?;
     let heap = stored.heap_charge()?;
     changes.push(Change::Put(entry(
         Key::Event(outcome.sequence, *ordinal),
