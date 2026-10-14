@@ -214,7 +214,9 @@ pub struct ClaimState {
     created: SessionSeq,
     graph: graph::Declaration,
     lineage: succession::Lineage,
-    acceptance: aggregation::AcceptancePolicy,
+    /// Its acceptance manifest's slots and declarations; the manifest was checked for the claim's
+    /// binding at `acceptance_revision` and its issuer, which the claim holds (doc 31 M3).
+    acceptance: aggregation::PolicyBody,
     scopes: scope::Registry,
     status: ClaimStatus,
     receipt: Option<ReceiptEntitlement>,
@@ -226,6 +228,8 @@ pub struct ClaimState {
     /// The revision the claim was created at: with its binding, the creation binding its
     /// lineage was built for, held here once rather than in each part (doc 31 M3).
     created_revision: crate::ObjectRevision,
+    /// The revision of the claim's binding its acceptance manifest was checked for.
+    acceptance_revision: crate::ObjectRevision,
     /// Behind its own allocation, made when the claim becomes terminal: an open claim holds a
     /// pointer's width for it, where its widest form (208 bytes) took room in every claim row
     /// (doc 31 M3).
@@ -295,6 +299,7 @@ impl ClaimState {
         }
         lineage.check_binding(&binding)?;
         acceptance.check(binding, issuer)?;
+        let acceptance_revision = acceptance.claim().revision;
         let scopes = scope::Registry::new(binding, scope_limits)?;
         Ok(Self {
             binding,
@@ -303,7 +308,8 @@ impl ClaimState {
             created,
             graph,
             lineage,
-            acceptance,
+            acceptance: acceptance.into_body(),
+            acceptance_revision,
             scopes,
             status: ClaimStatus::Generated,
             receipt: None,
@@ -388,8 +394,15 @@ impl ClaimState {
             ..self.binding
         }
     }
-    pub fn acceptance(&self) -> &aggregation::AcceptancePolicy {
-        &self.acceptance
+    /// Its acceptance manifest, bound to the binding and issuer it was checked for.
+    pub fn acceptance(&self) -> aggregation::Acceptance<'_> {
+        self.acceptance.bind(
+            Binding {
+                revision: self.acceptance_revision,
+                ..self.binding
+            },
+            self.issuer,
+        )
     }
     /// Its scope registry's snapshot, owned by the claim's creation binding.
     pub fn scope_snapshot_v1(&self) -> scope::RegistrySnapshotView<'_> {
@@ -588,7 +601,7 @@ impl ClaimState {
     ) -> Result<(), ContractError> {
         self.native_only()?;
         self.binding.check(&decision.binding())?;
-        if decision.acceptance() != &self.acceptance {
+        if decision.acceptance() != self.acceptance() {
             return Err(ContractError::InvalidPolicy);
         }
         if !decision.increments_ready() {
@@ -639,7 +652,7 @@ impl ClaimState {
         self.open(expected)?;
         principal.require_actor(self.subject)?;
         self.binding.check(&admission.binding())?;
-        if admission.acceptance() != &self.acceptance {
+        if admission.acceptance() != self.acceptance() {
             return Err(ContractError::InvalidPolicy);
         }
         if admission.outcome() != aggregation::AdmissionOutcome::Passed {
@@ -670,7 +683,7 @@ impl ClaimState {
         self.native_only()?;
         self.open(expected)?;
         self.binding.check(&decision.binding())?;
-        if decision.acceptance() != &self.acceptance {
+        if decision.acceptance() != self.acceptance() {
             return Err(ContractError::InvalidPolicy);
         }
         if self.status != ClaimStatus::Posted {
@@ -1013,7 +1026,7 @@ impl ClaimState {
         self.open(expected)?;
         self.working()?;
         self.binding.check(&decision.binding())?;
-        if decision.acceptance() != &self.acceptance {
+        if decision.acceptance() != self.acceptance() {
             return Err(ContractError::InvalidPolicy);
         }
         for witness in decision.nonartifact_witnesses() {

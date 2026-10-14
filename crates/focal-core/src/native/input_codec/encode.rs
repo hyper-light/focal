@@ -320,6 +320,7 @@ fn command(sink: &mut impl Sink, value: &NativeCommand) -> Result<(), Error> {
                 claim
                     .definition
                     .acceptance
+                    .view()
                     .check_declarations(declarations.iter().filter(|declaration| {
                         declaration.claim().0 == claim.definition.binding.object.0
                     }))

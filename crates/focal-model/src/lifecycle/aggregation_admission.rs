@@ -57,8 +57,8 @@ pub fn admission_completion_visits(
     let policy = claim.acceptance();
     let declarations = policy.declarations().len();
     let rows = registrations.rows();
-    let mut visits = add(declarations, policy.slots.len())?;
-    for slot in &policy.slots {
+    let mut visits = add(declarations, policy.body.slots.len())?;
+    for slot in &policy.body.slots {
         visits = add(visits, slot.checks.len())?;
     }
     visits = add(visits, rows.len())?;
@@ -145,8 +145,8 @@ pub fn project_admission<'a>(
     }
     let mut visits = Visits(limits.visits);
     visits.take(declarations.len())?;
-    visits.take(policy.slots.len())?;
-    for slot in &policy.slots {
+    visits.take(policy.body.slots.len())?;
+    for slot in &policy.body.slots {
         visits.take(slot.checks.len())?;
     }
     registrations.check(claim)?;

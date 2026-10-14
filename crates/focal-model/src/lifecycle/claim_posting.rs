@@ -44,7 +44,7 @@ impl PostingPlan {
         if claim.binding.revision.0 == 0 {
             return Err(ContractError::StaleRevision);
         }
-        claim.acceptance.check(claim.binding, claim.issuer)?;
+        claim.acceptance().check(claim.binding, claim.issuer)?;
         // Child registration may advance a Generated parent's lifecycle
         // revision. The lineage was built for its creation binding.
         claim.lineage.check_binding(&claim.creation_binding())?;

@@ -365,7 +365,7 @@ fn acceptance_slot_views_preserve_presence_indexes_modes_and_empty_check_sets() 
             .collect::<Vec<_>>(),
         [19, 7, 2]
     );
-    assert!(original.has_slot(7));
+    assert!(original.view().has_slot(7));
     assert!(
         !original
             .declarations()

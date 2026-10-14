@@ -156,7 +156,7 @@ fn all_non_generated_states_and_repeat_post_refuse_without_repainting() {
 
 #[test]
 fn retained_identity_and_impossible_generated_facts_are_checked_before_mutation() {
-    for case in 0..7 {
+    for case in 0..6 {
         let mut value = generated();
         let error = match case {
             0 => {
@@ -181,17 +181,9 @@ fn retained_identity_and_impossible_generated_facts_are_checked_before_mutation(
                 value.local_sealed_at = Some(SessionSeq(1));
                 ContractError::InvalidTransition
             }
+            // A claim's acceptance manifest holds no binding of its own (doc 31 M3): it is read
+            // bound to the claim's, so one checked for other content has no place to be.
             4 => {
-                value.acceptance = aggregation::acceptance_for(
-                    Binding {
-                        content: ContentHash([9; 32]),
-                        ..value.binding()
-                    },
-                    ISSUER,
-                );
-                ContractError::ContentConflict
-            }
-            5 => {
                 // A lineage holds no binding of its own (doc 31 M3): one built for another
                 // ledger names its corrections there, and the claim's refuses them.
                 let elsewhere = Binding {

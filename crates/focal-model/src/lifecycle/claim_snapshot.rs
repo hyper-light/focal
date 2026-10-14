@@ -336,6 +336,7 @@ impl<R: ClaimResponseSource + ?Sized, S: scope::RegistrySnapshotSource + ?Sized>
         check_records(self.fields, &responses, self.response_visits)?;
         let definition = self.definition;
         let definition_binding = definition.binding;
+        let acceptance_revision = definition.acceptance.claim().revision;
         let restored = ClaimState {
             binding: self.fields.binding,
             issuer: self.fields.issuer,
@@ -343,7 +344,8 @@ impl<R: ClaimResponseSource + ?Sized, S: scope::RegistrySnapshotSource + ?Sized>
             created: self.fields.created,
             graph: definition.graph,
             lineage: definition.lineage,
-            acceptance: definition.acceptance,
+            acceptance: definition.acceptance.into_body(),
+            acceptance_revision,
             scopes,
             status: self.fields.status,
             receipt: self.fields.receipt,

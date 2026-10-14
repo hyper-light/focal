@@ -8,7 +8,7 @@ use super::{
 use crate::native::{NativeError, Row};
 use focal_memory::MemoryError;
 use focal_model::lifecycle::{
-    ContractError, aggregation::AcceptancePolicy, artifact_descriptor::ArtifactDescriptor,
+    ContractError, aggregation::Acceptance, artifact_descriptor::ArtifactDescriptor,
     validation::Declaration,
 };
 use focal_model::{ArtifactRef, ClaimId, ValidationId};
@@ -42,7 +42,7 @@ pub(super) struct Quote {
 }
 pub(super) trait Dependencies {
     /// May be independently restored policy workspace; never fabricate a Claim.
-    fn policy(&self, claim: ClaimId) -> Result<&AcceptancePolicy, ContractError>;
+    fn policy(&self, claim: ClaimId) -> Result<Acceptance<'_>, ContractError>;
     fn artifact(&self, reference: ArtifactRef) -> Result<&ArtifactDescriptor, ContractError>;
     fn declaration(&self, id: ValidationId) -> Result<&Declaration, ContractError>;
 }

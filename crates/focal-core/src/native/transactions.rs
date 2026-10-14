@@ -261,7 +261,7 @@ pub(super) fn prepare(
                 )?)?;
             }
             for proposal in &claims {
-                proposal.definition.acceptance.check_declarations(
+                proposal.definition.acceptance.view().check_declarations(
                     declarations
                         .iter()
                         .filter(|row| row.claim().0 == proposal.definition.binding.object.0),

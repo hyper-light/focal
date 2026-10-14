@@ -169,7 +169,10 @@ impl ClaimState {
             created: self.created,
             graph: self.graph.try_copy(self.graph.copy_charge()?)?,
             lineage: self.lineage.try_copy(self.lineage.copy_charge()?)?,
-            acceptance: self.acceptance.try_copy(self.acceptance.copy_charge()?)?,
+            acceptance: self
+                .acceptance
+                .try_copy(self.acceptance.copy_heap_bytes()?)?,
+            acceptance_revision: self.acceptance_revision,
             scopes: self.scopes.try_copy(self.scopes.copy_charge()?)?,
             status: self.status,
             receipt: self.receipt,

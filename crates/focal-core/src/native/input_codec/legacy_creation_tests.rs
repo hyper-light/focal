@@ -346,6 +346,7 @@ fn complete_legacy_frame_reconstructs_global_cohort_and_preserves_original_nativ
         claim
             .definition
             .acceptance
+            .view()
             .check_declarations(
                 declarations
                     .iter()

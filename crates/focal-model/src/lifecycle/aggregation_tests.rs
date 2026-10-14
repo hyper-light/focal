@@ -227,12 +227,12 @@ fn claim_index(
     limits: Limits,
 ) -> Result<ClaimAggregation, ContractError> {
     let policy = fixture_policy(slots, limits)?;
-    ClaimAggregation::from_policy(binding(1), ClaimStatus::Validating, &policy, limits)
+    ClaimAggregation::from_policy(binding(1), ClaimStatus::Validating, policy.view(), limits)
 }
 fn index(response: &Response, slots: &[SlotPolicy<'_>]) -> ResponseAggregation {
     ResponseAggregation::from_policy(
         binding(1),
-        &fixture_policy(slots, limits()).unwrap(),
+        fixture_policy(slots, limits()).unwrap().view(),
         response.evaluation().unwrap(),
         &[delivery(response)],
         limits(),
@@ -390,7 +390,7 @@ fn delivery_requires_real_post_receipt_evaluation_and_pure_receipt_result() {
     assert!(matches!(
         ResponseAggregation::from_policy(
             binding(1),
-            &fixture_policy(&[], limits()).unwrap(),
+            fixture_policy(&[], limits()).unwrap().view(),
             response.evaluation().unwrap(),
             &[bogus],
             limits()
@@ -996,18 +996,19 @@ fn acceptance_index(
 ) -> ClaimAggregation {
     let policy =
         AcceptancePolicy::new(binding(1), parent().issuer, &[], declarations, limits()).unwrap();
-    ClaimAggregation::from_policy(binding(1), status, &policy, limits()).unwrap()
+    ClaimAggregation::from_policy(binding(1), status, policy.view(), limits()).unwrap()
 }
 fn delivered_for(aggregate: &ClaimAggregation, id: u128, sequence: u64) -> ResponseUpdate {
     let response = response(id, &[]);
     let definition = aggregate
         .policy
+        .view()
         .declaration(ValidationId::from_u128(900))
         .unwrap()
         .definition_stamp();
     ResponseAggregation::from_policy(
         binding(1),
-        &aggregate.policy,
+        aggregate.policy.view(),
         response.evaluation().unwrap(),
         &[delivery_for_definition(&response, 900, definition)],
         limits(),
@@ -1506,7 +1507,7 @@ fn multiple_required_receipts_need_complete_unique_exact_response_proofs() {
     assert!(matches!(
         ResponseAggregation::from_policy(
             binding(1),
-            &policy,
+            policy.view(),
             response.evaluation().unwrap(),
             &[first],
             limits()
@@ -1516,7 +1517,7 @@ fn multiple_required_receipts_need_complete_unique_exact_response_proofs() {
     assert!(matches!(
         ResponseAggregation::from_policy(
             binding(1),
-            &policy,
+            policy.view(),
             response.evaluation().unwrap(),
             &[first, first],
             limits()
@@ -1525,7 +1526,7 @@ fn multiple_required_receipts_need_complete_unique_exact_response_proofs() {
     ));
     let mut response_index = ResponseAggregation::from_policy(
         binding(1),
-        &policy,
+        policy.view(),
         response.evaluation().unwrap(),
         &[second, first],
         limits(),
@@ -1534,7 +1535,7 @@ fn multiple_required_receipts_need_complete_unique_exact_response_proofs() {
     let update = response_index.apply(SessionSeq(1), &[]).unwrap();
     assert_eq!(update.delivery_results(), &[first, second]);
     let mut aggregate =
-        ClaimAggregation::from_policy(binding(1), ClaimStatus::Validating, &policy, limits())
+        ClaimAggregation::from_policy(binding(1), ClaimStatus::Validating, policy.view(), limits())
             .unwrap();
     assert_eq!(
         aggregate.apply(SessionSeq(1), &[update]).unwrap(),

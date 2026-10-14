@@ -196,8 +196,10 @@ impl AcceptancePolicy {
         Ok(Self {
             claim,
             issuer,
-            slots: Vec::new(),
-            declarations: Vec::new(),
+            body: PolicyBody {
+                slots: Vec::new(),
+                declarations: Vec::new(),
+            },
         })
     }
 }
@@ -675,8 +677,10 @@ fn build<S: AcceptanceSource>(
     let policy = AcceptancePolicy {
         claim: plan.claim,
         issuer: plan.issuer,
-        slots,
-        declarations,
+        body: PolicyBody {
+            slots,
+            declarations,
+        },
     };
     visits.charge(bytes::add(scaled(shape.counts.slots, 2)?, 1)?)?;
     bytes::fits(policy.retained_bytes()?, shape.quote.charge)?;

@@ -375,7 +375,7 @@ fn exact_visit_byte_and_allocation_limits_refuse_before_copy_and_retry_identical
         );
     }
     let original = quote.build(charge, visits).unwrap();
-    let original_slots = original.slots.as_ptr();
+    let original_slots = original.body.slots.as_ptr();
     for after in 0..allocations {
         let plan = bytes::fail_after(0, || prepare(&source));
         bytes::fail_after(after, || {
@@ -385,13 +385,13 @@ fn exact_visit_byte_and_allocation_limits_refuse_before_copy_and_retry_identical
             );
             assert_eq!(bytes::remaining_allocations(), Some(0));
         });
-        assert_eq!(original.slots.as_ptr(), original_slots);
+        assert_eq!(original.body.slots.as_ptr(), original_slots);
         assert_eq!(original.intent_fingerprint(), intent);
         let retry =
             bytes::fail_after(allocations, || prepare(&source).build(charge, visits)).unwrap();
         assert_eq!(retry, original);
         assert_eq!(retry.retained_bytes().unwrap(), charge);
-        assert_ne!(retry.slots.as_ptr(), original_slots);
+        assert_ne!(retry.body.slots.as_ptr(), original_slots);
     }
 }
 

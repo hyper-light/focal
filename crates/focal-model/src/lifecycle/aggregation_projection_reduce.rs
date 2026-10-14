@@ -234,6 +234,7 @@ fn reduce_response(
         }
         let policy = claim
             .acceptance()
+            .body
             .slots
             .get(state.policy)
             .ok_or(ContractError::InvalidPolicy)?;
@@ -390,7 +391,7 @@ pub(super) fn build<'a, V: WholeWorkView>(
                 },
             )?;
         }
-        for (policy, slot) in claim.acceptance().slots.iter().enumerate() {
+        for (policy, slot) in claim.acceptance().body.slots.iter().enumerate() {
             visits.take(1)?;
             let artifact = row
                 .source
@@ -527,6 +528,7 @@ pub(super) fn build<'a, V: WholeWorkView>(
                 .ok_or(ContractError::InvalidTarget)?;
             let policy = claim
                 .acceptance()
+                .body
                 .slots
                 .get(slot.policy)
                 .ok_or(ContractError::InvalidPolicy)?;
@@ -570,7 +572,7 @@ pub(super) fn build<'a, V: WholeWorkView>(
             }
         }
         let mut complete = chosen_delivery.is_some();
-        for (policy, covered) in claim.acceptance().slots.iter().zip(&coverage) {
+        for (policy, covered) in claim.acceptance().body.slots.iter().zip(&coverage) {
             visits.take(1)?;
             if policy.mode == ValidationMode::Required && covered.is_none() {
                 complete = false;
@@ -608,6 +610,7 @@ pub(super) fn build<'a, V: WholeWorkView>(
                             visits.take(claim.acceptance().slot_count())?;
                             claim
                                 .acceptance()
+                                .body
                                 .slots
                                 .iter()
                                 .position(|policy| policy.slot == slot)
@@ -665,6 +668,7 @@ pub(super) fn build<'a, V: WholeWorkView>(
             .ok_or(ContractError::InvalidTarget)?;
         let policy = claim
             .acceptance()
+            .body
             .slots
             .get(slot.policy)
             .ok_or(ContractError::InvalidPolicy)?;
@@ -765,6 +769,7 @@ pub(super) fn build<'a, V: WholeWorkView>(
             }
             let policy = claim
                 .acceptance()
+                .body
                 .slots
                 .get(slot.policy)
                 .ok_or(ContractError::InvalidPolicy)?;

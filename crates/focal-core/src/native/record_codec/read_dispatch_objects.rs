@@ -1,7 +1,7 @@
 //! Exact restored-row adapters. Narrow model traits retain native lookup errors
 //! in one stack-owned cell, then return the original cause at the dispatch edge.
 use super::*;
-use focal_model::lifecycle::aggregation::{AcceptancePolicy, PublicationPosition};
+use focal_model::lifecycle::aggregation::{Acceptance, PublicationPosition};
 use focal_model::lifecycle::{
     artifact_descriptor::ArtifactDescriptor,
     claim::ClaimState,
@@ -224,7 +224,7 @@ impl<O: Objects> read_claim::Objects for Access<'_, O> {
     }
 }
 impl<O: Objects> evidence::Dependencies for Access<'_, O> {
-    fn policy(&self, _claim: ClaimId) -> Result<&AcceptancePolicy, ContractError> {
+    fn policy(&self, _claim: ClaimId) -> Result<Acceptance<'_>, ContractError> {
         Err(ContractError::InvalidPolicy)
     }
     fn artifact(&self, reference: ArtifactRef) -> Result<&ArtifactDescriptor, ContractError> {
@@ -244,10 +244,10 @@ impl<O: Objects> ResponseArtifacts for Access<'_, O> {
 }
 pub(super) struct Policy<'a, 'o, O> {
     pub(super) access: &'a Access<'o, O>,
-    pub(super) policy: &'a AcceptancePolicy,
+    pub(super) policy: Acceptance<'a>,
 }
 impl<O: Objects> evidence::Dependencies for Policy<'_, '_, O> {
-    fn policy(&self, claim: ClaimId) -> Result<&AcceptancePolicy, ContractError> {
+    fn policy(&self, claim: ClaimId) -> Result<Acceptance<'_>, ContractError> {
         if self.policy.claim().object.0 != claim.0
             || self.policy.claim().ledger != self.access.ledger()
         {

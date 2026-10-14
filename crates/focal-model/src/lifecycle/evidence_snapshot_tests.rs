@@ -1,4 +1,5 @@
 use super::*;
+use crate::lifecycle::aggregation::AcceptancePolicy;
 use crate::lifecycle::artifact_descriptor::{ArtifactSpec, Limits as ArtifactLimits, PayloadSpec};
 use crate::{ObjectId, ObjectRevision, ReceiptId, SessionId, TenantId, ValidationMode};
 
@@ -349,9 +350,14 @@ impl Fixture {
             .response
             .snapshot_v1(self.generated, usize::MAX)
             .unwrap();
-        let plan =
-            Response::prepare_hydration_v1(&snapshot, &self.policy, self, limits(), usize::MAX)
-                .unwrap();
+        let plan = Response::prepare_hydration_v1(
+            &snapshot,
+            self.policy.view(),
+            self,
+            limits(),
+            usize::MAX,
+        )
+        .unwrap();
         let (charge, visits) = (plan.construction_charge(), plan.build_visits());
         let result = plan.build(charge, visits).unwrap();
         assert_eq!(result, self.response);
@@ -418,10 +424,10 @@ fn scalar_work_and_diagnostic_restoration_checks_actual_identity_and_failed_prov
             None
         };
         let snapshot = work.snapshot_v1().unwrap();
-        let visits = WorkArtifact::hydration_visits(&fixture.policy).unwrap();
+        let visits = WorkArtifact::hydration_visits(fixture.policy.view()).unwrap();
         assert_eq!(
             WorkArtifact::hydrate_v1(
-                &fixture.policy,
+                fixture.policy.view(),
                 snapshot,
                 fixture.artifact(work.reference()).unwrap(),
                 diagnostic,
@@ -432,7 +438,7 @@ fn scalar_work_and_diagnostic_restoration_checks_actual_identity_and_failed_prov
         );
         assert!(
             WorkArtifact::hydrate_v1(
-                &fixture.policy,
+                fixture.policy.view(),
                 snapshot,
                 fixture.artifact(work.reference()).unwrap(),
                 diagnostic,
@@ -444,7 +450,7 @@ fn scalar_work_and_diagnostic_restoration_checks_actual_identity_and_failed_prov
         corrupt.receipt.epoch += 1;
         assert!(
             WorkArtifact::hydrate_v1(
-                &fixture.policy,
+                fixture.policy.view(),
                 corrupt,
                 fixture.artifact(work.reference()).unwrap(),
                 diagnostic,
@@ -483,9 +489,14 @@ fn response_hydration_admits_all_buffers_before_build_and_retries_after_each_all
         .response
         .snapshot_v1(fixture.generated, usize::MAX)
         .unwrap();
-    let plan =
-        Response::prepare_hydration_v1(&snapshot, &fixture.policy, &fixture, limits(), usize::MAX)
-            .unwrap();
+    let plan = Response::prepare_hydration_v1(
+        &snapshot,
+        fixture.policy.view(),
+        &fixture,
+        limits(),
+        usize::MAX,
+    )
+    .unwrap();
     assert_eq!(plan.construction_heap_allocations(), 4);
     let (charge, visits, inspect) = (
         plan.construction_charge(),
@@ -497,18 +508,34 @@ fn response_hydration_admits_all_buffers_before_build_and_retries_after_each_all
         charge
     );
     assert!(plan.build(charge - 1, visits).is_err());
-    let plan =
-        Response::prepare_hydration_v1(&snapshot, &fixture.policy, &fixture, limits(), inspect)
-            .unwrap();
+    let plan = Response::prepare_hydration_v1(
+        &snapshot,
+        fixture.policy.view(),
+        &fixture,
+        limits(),
+        inspect,
+    )
+    .unwrap();
     assert!(plan.build(charge, visits - 1).is_err());
     assert!(
-        Response::prepare_hydration_v1(&snapshot, &fixture.policy, &fixture, limits(), inspect - 1)
-            .is_err()
+        Response::prepare_hydration_v1(
+            &snapshot,
+            fixture.policy.view(),
+            &fixture,
+            limits(),
+            inspect - 1
+        )
+        .is_err()
     );
     for fail in 0..4 {
-        let plan =
-            Response::prepare_hydration_v1(&snapshot, &fixture.policy, &fixture, limits(), inspect)
-                .unwrap();
+        let plan = Response::prepare_hydration_v1(
+            &snapshot,
+            fixture.policy.view(),
+            &fixture,
+            limits(),
+            inspect,
+        )
+        .unwrap();
         assert!(bytes::fail_after(fail, || plan.build(charge, visits)).is_err());
         fixture.round_trip();
     }
@@ -549,9 +576,14 @@ fn changed_source_and_corrupt_original_revision_manifest_and_report_frame_are_re
         source,
         change: std::cell::Cell::new(false),
     };
-    let plan =
-        Response::prepare_hydration_v1(&changed, &fixture.policy, &fixture, limits(), usize::MAX)
-            .unwrap();
+    let plan = Response::prepare_hydration_v1(
+        &changed,
+        fixture.policy.view(),
+        &fixture,
+        limits(),
+        usize::MAX,
+    )
+    .unwrap();
     let (charge, visits) = (plan.construction_charge(), plan.build_visits());
     changed.change.set(true);
     assert!(plan.build(charge, visits).is_err());
@@ -570,7 +602,7 @@ fn changed_source_and_corrupt_original_revision_manifest_and_report_frame_are_re
         assert!(
             Response::prepare_hydration_v1(
                 &changed,
-                &fixture.policy,
+                fixture.policy.view(),
                 &fixture,
                 limits(),
                 usize::MAX
@@ -606,7 +638,7 @@ fn response_bounds_are_utf8_bytes_and_refuse_overflow_before_callbacks_or_alloca
     let mut short = limits();
     short.summary_bytes = value.summary.len() - 1;
     assert!(
-        Response::prepare_hydration_v1(&source, &fixture.policy, &fixture, short, usize::MAX)
+        Response::prepare_hydration_v1(&source, fixture.policy.view(), &fixture, short, usize::MAX)
             .is_err()
     );
     let mut changed = Changed {
@@ -616,11 +648,18 @@ fn response_bounds_are_utf8_bytes_and_refuse_overflow_before_callbacks_or_alloca
     };
     changed.fields.failed_work_count = usize::MAX;
     assert!(
-        Response::prepare_hydration_v1(&changed, &fixture.policy, &fixture, limits(), usize::MAX)
-            .is_err()
+        Response::prepare_hydration_v1(
+            &changed,
+            fixture.policy.view(),
+            &fixture,
+            limits(),
+            usize::MAX
+        )
+        .is_err()
     );
     assert!(
-        Response::prepare_hydration_v1(&source, &fixture.policy, &fixture, limits(), 0).is_err()
+        Response::prepare_hydration_v1(&source, fixture.policy.view(), &fixture, limits(), 0)
+            .is_err()
     );
 }
 
@@ -683,11 +722,11 @@ fn work_revision_is_not_inferred_from_the_immutable_descriptor_revision() {
     .unwrap();
     assert_eq!(source.binding().revision, ObjectRevision(1));
     let restored = WorkArtifact::hydrate_v1(
-        &fixture.policy,
+        fixture.policy.view(),
         work.snapshot_v1().unwrap(),
         source,
         None,
-        WorkArtifact::hydration_visits(&fixture.policy).unwrap(),
+        WorkArtifact::hydration_visits(fixture.policy.view()).unwrap(),
     )
     .unwrap();
     assert_eq!(restored, work);
@@ -700,11 +739,11 @@ fn work_revision_is_not_inferred_from_the_immutable_descriptor_revision() {
         .unwrap();
     assert_eq!(
         WorkArtifact::hydrate_v1(
-            &fixture.policy,
+            fixture.policy.view(),
             received.snapshot_v1().unwrap(),
             source,
             None,
-            WorkArtifact::hydration_visits(&fixture.policy).unwrap()
+            WorkArtifact::hydration_visits(fixture.policy.view()).unwrap()
         )
         .unwrap(),
         received
@@ -898,10 +937,10 @@ fn actual_aggregate_terminal_rows_retain_exact_cuts_and_reject_foreign_causes() 
         assert_eq!(restored.terminal(), fixture.response.terminal());
         let work = fixture.work[0];
         let snapshot = work.snapshot_v1().unwrap();
-        let visits = WorkArtifact::hydration_visits(&fixture.policy).unwrap();
+        let visits = WorkArtifact::hydration_visits(fixture.policy.view()).unwrap();
         assert_eq!(
             WorkArtifact::hydrate_v1(
-                &fixture.policy,
+                fixture.policy.view(),
                 snapshot,
                 fixture.artifact(work.reference()).unwrap(),
                 None,
@@ -925,7 +964,7 @@ fn actual_aggregate_terminal_rows_retain_exact_cuts_and_reject_foreign_causes() 
                 });
                 assert!(
                     WorkArtifact::hydrate_v1(
-                        &fixture.policy,
+                        fixture.policy.view(),
                         corrupt,
                         fixture.artifact(work.reference()).unwrap(),
                         None,
@@ -951,7 +990,7 @@ fn actual_aggregate_terminal_rows_retain_exact_cuts_and_reject_foreign_causes() 
                 assert!(
                     Response::prepare_hydration_v1(
                         &corrupt,
-                        &fixture.policy,
+                        fixture.policy.view(),
                         &fixture,
                         limits(),
                         usize::MAX
@@ -969,7 +1008,7 @@ fn actual_aggregate_terminal_rows_retain_exact_cuts_and_reject_foreign_causes() 
             });
             assert!(
                 WorkArtifact::hydrate_v1(
-                    &fixture.policy,
+                    fixture.policy.view(),
                     corrupt,
                     fixture.artifact(work.reference()).unwrap(),
                     None,

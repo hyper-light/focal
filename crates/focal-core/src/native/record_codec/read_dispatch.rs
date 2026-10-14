@@ -246,7 +246,7 @@ fn with_policy<O: Objects, C: evidence::Custody, T>(
     claim: ClaimId,
     context: &Context<'_, O, C>,
     access: &Access<'_, O>,
-    consume: impl FnOnce(&aggregation::AcceptancePolicy, usize) -> Result<T, NativeError>,
+    consume: impl FnOnce(aggregation::Acceptance<'_>, usize) -> Result<T, NativeError>,
 ) -> Result<T, NativeError> {
     let body = match access.claim_dependency(claim)? {
         ClaimDependency::Raw(body) => body,
@@ -282,7 +282,7 @@ fn with_policy<O: Objects, C: evidence::Custody, T>(
     let policy = plan.build(charge, visits)?;
     // The model plan verifies actual owned capacities before returning. Its
     // quoted allocation count is also the native allocator bookkeeping charge.
-    consume(&policy, workspace_bytes)
+    consume(policy.view(), workspace_bytes)
 }
 
 fn process<O: Objects, C: evidence::Custody>(

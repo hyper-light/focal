@@ -47,7 +47,7 @@ fn acceptance_rejects_alternate_definition_materialization_registration_and_resu
     ];
     let policy =
         AcceptancePolicy::new(binding(200), original.issuer, &[], &definitions, limits()).unwrap();
-    let mut registry = EvaluationRegistry::from_policy(&policy, limits()).unwrap();
+    let mut registry = EvaluationRegistry::from_policy(policy.view(), limits()).unwrap();
     registry.register(&ready(&definitions[0])).unwrap();
     let Program::Programmatic { check, .. } = original.program else {
         panic!()
@@ -119,7 +119,7 @@ fn acceptance_rejects_alternate_definition_materialization_registration_and_resu
         let result = report_value(&active, VerdictValue::Pass).result.unwrap();
         assert!(result.is_terminal());
         assert_eq!(
-            policy.check_result(result).unwrap_err(),
+            policy.view().check_result(result).unwrap_err(),
             ContractError::InvalidPolicy
         );
         assert!(registry.check_result(result).is_err());

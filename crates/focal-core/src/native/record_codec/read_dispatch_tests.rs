@@ -328,7 +328,7 @@ fn unchanged_policy_and_issuer_borrow_actual_base_without_workspace_or_reconstru
     };
     let access = Access::new(&objects, &lookup);
     with_policy(claim_id, &context, &access, |policy, workspace| {
-        assert!(std::ptr::eq(policy, claim.acceptance()));
+        assert!(std::ptr::eq(policy.body(), claim.acceptance().body()));
         assert_eq!(workspace, 0);
         assert_eq!(budget.stats().used, 1);
         Ok(())
@@ -433,8 +433,8 @@ fn changed_claim_body_precedes_base_and_its_scoped_policy_refunds_workspace() {
     assert!(objects.get(Key::Claim(id), &lookup).unwrap().is_none());
     with_policy(id, &context, &access, |policy, workspace| {
         assert!(!std::ptr::eq(
-            policy,
-            base.native_claim(id).unwrap().acceptance()
+            policy.body(),
+            base.native_claim(id).unwrap().acceptance().body()
         ));
         assert_eq!(
             policy.declarations(),

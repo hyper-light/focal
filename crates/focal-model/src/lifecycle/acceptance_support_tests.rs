@@ -159,10 +159,17 @@ fn cancellation<'a>(view: &'a View<'a>) -> ownership::CancellationPlan<'a> {
 fn complete_definition_set_is_order_independent_and_includes_slot_coverage() {
     let definitions = full_definitions();
     let policy = policy(&definitions);
-    policy.check_declarations(&definitions).unwrap();
-    policy.check_declarations(definitions.iter().rev()).unwrap();
+    policy.view().check_declarations(&definitions).unwrap();
+    policy
+        .view()
+        .check_declarations(definitions.iter().rev())
+        .unwrap();
     assert_eq!(
-        policy.check_declaration(&definitions[2]).unwrap().target(),
+        policy
+            .view()
+            .check_declaration(&definitions[2])
+            .unwrap()
+            .target(),
         ObligationTarget::Slot(0)
     );
 }
@@ -170,14 +177,16 @@ fn complete_definition_set_is_order_independent_and_includes_slot_coverage() {
 fn omission_extra_and_duplicate_cannot_satisfy_the_manifest() {
     let definitions = full_definitions();
     let policy = policy(&definitions);
-    assert!(policy.check_declarations(&definitions[..2]).is_err());
+    assert!(policy.view().check_declarations(&definitions[..2]).is_err());
     assert!(
         policy
+            .view()
             .check_declarations([&definitions[0], &definitions[0], &definitions[2]])
             .is_err()
     );
     assert!(
         policy
+            .view()
             .check_declarations([
                 &definitions[0],
                 &definitions[1],
@@ -196,11 +205,12 @@ fn same_public_binding_cannot_substitute_different_semantic_definition() {
     let altered = build(altered);
     assert_eq!(altered.binding(), definitions[1].binding());
     assert_eq!(
-        policy.check_declaration(&altered),
+        policy.view().check_declaration(&altered),
         Err(ContractError::InvalidPolicy)
     );
     assert!(
         policy
+            .view()
             .check_declarations([&definitions[0], &altered, &definitions[2]])
             .is_err()
     );
@@ -212,21 +222,21 @@ fn declaration_identity_revision_index_issuer_target_and_mode_are_pinned() {
     let base = spec(202, 1, v::TargetDeclaration::Admission);
     let mut changed = base;
     changed.binding.revision = ObjectRevision(2);
-    assert!(policy.check_declaration(&build(changed)).is_err());
+    assert!(policy.view().check_declaration(&build(changed)).is_err());
     let mut changed = base;
     changed.claim = ClaimId::from_u128(999);
-    assert!(policy.check_declaration(&build(changed)).is_err());
+    assert!(policy.view().check_declaration(&build(changed)).is_err());
     let mut changed = base;
     changed.issuer = EVALUATOR;
-    assert!(policy.check_declaration(&build(changed)).is_err());
+    assert!(policy.view().check_declaration(&build(changed)).is_err());
     let mut changed = base;
     changed.declaration_index = 4;
-    assert!(policy.check_declaration(&build(changed)).is_err());
+    assert!(policy.view().check_declaration(&build(changed)).is_err());
     let mut changed = base;
     changed.mode = ValidationMode::Observe;
-    assert!(policy.check_declaration(&build(changed)).is_err());
+    assert!(policy.view().check_declaration(&build(changed)).is_err());
     let changed = spec(202, 1, v::TargetDeclaration::Increment);
-    assert!(policy.check_declaration(&build(changed)).is_err());
+    assert!(policy.view().check_declaration(&build(changed)).is_err());
 }
 #[test]
 fn admission_materialization_and_begin_require_actual_posted_owner() {

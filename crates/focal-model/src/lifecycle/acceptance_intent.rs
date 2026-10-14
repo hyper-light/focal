@@ -86,13 +86,13 @@ impl Fingerprint {
     }
 }
 
-impl AcceptancePolicy {
+impl Acceptance<'_> {
     /// Bind every immutable declaration and ordered slot/check to the native
     /// authored intent. Claim creation revision is assigned by the owner and is
     /// excluded; pinned validation-definition revisions remain significant.
     pub fn intent_fingerprint(&self) -> ContentHash {
-        let mut hash = Fingerprint::start(self.claim, self.issuer, self.declarations.len());
-        for declaration in &self.declarations {
+        let mut hash = Fingerprint::start(self.claim, self.issuer, self.body.declarations.len());
+        for declaration in &self.body.declarations {
             hash.declaration(*declaration);
         }
         hash.finish_slots(self.slots())

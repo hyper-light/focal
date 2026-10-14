@@ -90,7 +90,7 @@ fn compact_claim_copy_keeps_all_owned_history_after_original_is_dropped() {
         copied.scopes.iter().next().unwrap().roots().as_ptr(),
         original.scopes.iter().next().unwrap().roots().as_ptr()
     );
-    let fingerprint = copied.acceptance.intent_fingerprint();
+    let fingerprint = copied.acceptance().intent_fingerprint();
     original.responses.clear();
     original.graph = graph::Declaration::empty();
     original.receipt = None;
@@ -103,7 +103,7 @@ fn compact_claim_copy_keeps_all_owned_history_after_original_is_dropped() {
     assert_eq!(copied.lineage.corrections().len(), 1);
     assert_eq!(copied.scopes.children().len(), 1);
     assert!(copied.scopes.released());
-    assert_eq!(copied.acceptance.intent_fingerprint(), fingerprint);
+    assert_eq!(copied.acceptance().intent_fingerprint(), fingerprint);
     assert_eq!(copied.receipt.unwrap().fence.epoch, 7);
     assert_eq!(copied.local_sealed_at, Some(SessionSeq(9)));
     assert!(copied.terminal_cut.is_some());

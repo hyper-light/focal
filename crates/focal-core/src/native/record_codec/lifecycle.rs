@@ -141,7 +141,7 @@ fn lineage(
     }
     sink.visit(1)
 }
-fn acceptance(sink: &mut impl Sink, value: &aggregation::AcceptancePolicy) -> Result<(), Error> {
+fn acceptance(sink: &mut impl Sink, value: aggregation::Acceptance<'_>) -> Result<(), Error> {
     types::binding(sink, value.claim())?;
     raw(sink, &value.issuer().0)?;
     count(sink, value.slot_count())?;
