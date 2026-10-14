@@ -242,6 +242,9 @@ pub(in crate::native) fn publish(
 #[test]
 fn authored_bodies_policy_and_resolution_move_into_one_atomic_prefix() {
     let mut core = core();
+    // What moves without a copy is what a held row shows: rows spilled to a log (doc 31 M3)
+    // are read back, decoded where they are read.
+    drop(core.detach_payload_log());
     let authored = proposal(1, 1); // Numeric IDs intentionally repeat across families.
     // A claim's content is held as its encoding (doc 31 M3): read back, it is the same
     // descriptor, decoded; a declaration's body still moves in without a copy.
@@ -1234,6 +1237,44 @@ fn spilled_rows_match_held_ones(bound: Option<usize>) {
     let root = checkpoint(&plain);
     assert_eq!(checkpoint(&spilled), root);
     assert_eq!(checkpoint(&follower), root);
+    // Each claim, waiting to be delivered and tied to nothing, and its definition left memory
+    // where its publication left it (doc 31 M3), on the leader and the follower alike (a full
+    // log left the rest held), and each reads back as the held one.
+    let mut spilled_claims = 0usize;
+    for id in 1..=12u128 {
+        let claim = ClaimId::from_u128(id);
+        let definition = ValidationId::from_u128(10_000 + id);
+        for replica in [&spilled, &follower] {
+            let Some(Row::Claim(row)) = replica.state.rows.get(&Key::Claim(claim)) else {
+                panic!("claim {id} is held or spilled");
+            };
+            if row.logged().is_some() {
+                spilled_claims += 1;
+                assert!(matches!(
+                    replica.state.rows.get(&Key::Definition(definition)),
+                    Some(Row::Definition(row)) if row.logged().is_some()
+                ));
+            } else {
+                assert!(bound.is_some(), "only a full log leaves a claim held");
+            }
+            assert_eq!(replica.native_claim(claim), plain.native_claim(claim));
+            // A declaration is compared by its binding, its claim, its place and the
+            // fingerprint of its intent, a hash of all it declares.
+            let read = |core: &Core<NativeState>| {
+                core.native_definition(definition).map(|read| {
+                    (
+                        read.binding(),
+                        read.claim(),
+                        read.declaration_index(),
+                        read.intent_fingerprint(),
+                    )
+                })
+            };
+            assert_eq!(read(replica), read(&plain));
+            assert!(read(&plain).is_some());
+        }
+    }
+    assert!(spilled_claims > 0);
     let frozen = spilled.freeze_native().unwrap();
     let plan = record_codec::checkpoint::EncodingPlan::prepare_frozen(&frozen, limits).unwrap();
     let mut frozen_root = vec![0; plan.quote().bytes];
@@ -1294,5 +1335,14 @@ fn spilled_rows_match_held_ones(bound: Option<usize>) {
             assert!(spilled_events < events, "the bound left some held");
         }
     }
-    assert!(spilled.state.budget.stats().used < plain.state.budget.stats().used);
+    // What the rows take, the read-back floor a spilling core holds aside (doc 31 M3).
+    assert!(
+        spilled
+            .state
+            .budget
+            .stats()
+            .used
+            .saturating_sub(crate::native::read_back::FLOOR)
+            < plain.state.budget.stats().used
+    );
 }

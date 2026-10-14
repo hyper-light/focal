@@ -262,6 +262,7 @@ impl<'a> StructuralArchive<'a> {
                     budget,
                     events: crate::native::event_index::EventIndex::unbuilt(),
                     payloads: None,
+                    reads: crate::native::read_back::ReadBack::new(limits.native),
                 },
                 limits: limits.native,
             },

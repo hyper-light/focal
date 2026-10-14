@@ -104,10 +104,18 @@ pub(super) trait BaseRows {
     fn base_payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog>;
     /// The prefix the record must extend.
     fn base_prefix(&self) -> u64;
+    /// The first spilled base row the replay's reads could not take back (doc 31 M3).
+    fn base_read_failure(&self) -> Result<(), NativeError> {
+        Ok(())
+    }
 }
 impl BaseRows for Core<NativeState> {
+    /// The committed row at `key`, a spilled claim or definition read back (doc 31 M3).
     fn base_row(&self, key: Key) -> Option<&Row> {
-        self.state.rows.get(&key)
+        self.state.row(&key)
+    }
+    fn base_read_failure(&self) -> Result<(), NativeError> {
+        self.state.reads.failure()
     }
     fn base_payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
         self.state.payloads()
@@ -519,8 +527,11 @@ pub(super) fn stage<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows
         changes.push(change);
     }
     entries.allocation.absorb(&mut changes_allocation)?;
-    // Validated: the record's events and contents go to the payload log, each charged as it is
-    // spilled (doc 31 M3).
+    // A spilled base row its checks could not take back was lent as it is stored: the record is
+    // validated only where none failed (doc 31 M3).
+    base.base_read_failure()?;
+    // Validated: the record's events, contents, posted claims and definitions go to the payload
+    // log, each charged as it is spilled (doc 31 M3).
     crate::native::payloads::spill_changes(&mut changes, base.base_payload_log(), header.ledger)?;
     let write_bytes = mutation::bytes(changes.len())?;
     let writes = mutation::WriteSet::capture(

@@ -10,7 +10,7 @@ fn source() -> MemoryBudget {
 }
 
 fn parent(core: &Core<NativeState>) -> (&ClaimState, &RegistrationSet) {
-    let Some(Row::Claim(row)) = core.state.rows.get(&Key::Claim(fixture::key(1).claim)) else {
+    let Some(Row::Claim(row)) = core.state.row(&Key::Claim(fixture::key(1).claim)) else {
         panic!("actual claim row")
     };
     (row.claim().unwrap(), row.registrations().unwrap())

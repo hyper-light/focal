@@ -403,10 +403,7 @@ fn changed_claim_body_precedes_base_and_its_scoped_policy_refunds_workspace() {
     let base = f::running(&[]);
     let changed = f::running(&[(focal_model::ValidationMode::Required, true)]);
     let id = ClaimId::from_u128(1);
-    let bytes = wire(
-        Key::Claim(id),
-        changed.state.rows.get(&Key::Claim(id)).unwrap(),
-    );
+    let bytes = wire(Key::Claim(id), changed.state.row(&Key::Claim(id)).unwrap());
     let body = encoded(&bytes).body();
     let objects = ClaimOverlay {
         base: &base,
@@ -476,10 +473,7 @@ fn changed_claim_body_precedes_base_and_its_scoped_policy_refunds_workspace() {
 fn deleted_malformed_or_substituted_claim_dependency_cannot_use_the_old_policy() {
     let core = f::running(&[]);
     let id = ClaimId::from_u128(1);
-    let bytes = wire(
-        Key::Claim(id),
-        core.state.rows.get(&Key::Claim(id)).unwrap(),
-    );
+    let bytes = wire(Key::Claim(id), core.state.row(&Key::Claim(id)).unwrap());
     let mut wrong_issuer = encoded(&bytes).body().to_vec();
     // Full binding is 88 bytes; the next 16 bytes are the claimant. Its
     // acceptance issuer remains unchanged, so this raw body must be rejected.

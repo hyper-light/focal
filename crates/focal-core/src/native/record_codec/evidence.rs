@@ -238,8 +238,16 @@ pub(super) fn missing(sink: &mut impl Sink, owned: &OwnedMissingResult) -> Resul
         },
     )
 }
-pub(super) fn definition(sink: &mut impl Sink, owned: &OwnedDeclaration) -> Result<(), Error> {
+pub(super) fn definition(
+    sink: &mut impl Sink,
+    owned: &OwnedDeclaration,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), Error> {
     sink.visit(2)?;
+    // A spilled one holds its record encoding (doc 31 M3).
+    if let Some(at) = owned.logged() {
+        return super::rows::spilled(sink, at, 0, payloads);
+    }
     let value = owned.get().ok_or(Error::InvalidTag("definition row"))?;
     match owned.descriptor() {
         None => {

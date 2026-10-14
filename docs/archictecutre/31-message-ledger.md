@@ -807,6 +807,59 @@ Each stage lands on its own, measured:
        reader changes. A policy spills what was not touched recently. The entries themselves
        still take about 1,300 bytes a claim (about 470,000 claims here), so past that, cold
        leaves leave memory as Kafka's old segments do, or the claim table takes their place.
+   - **The backlog leaves memory (as built).** A claim waiting to be delivered is a message no
+     consumer has taken: Kafka and NATS keep it in their logs. Focal now does the same with the
+     claim's row and its authored definitions.
+     - **Which claims.** One generated or posted, no receipt taken, no evaluation registered
+       against it, no dependency of its own, none on it, created by a root command and owning no
+       scope: the independent backlog. A claim in work, or tied into a graph or a scope that work
+       on another claim reaches, stays held, so a lifecycle's steps, the completions they fund
+       and the walks over claims in work read it where it is, and never wait on memory to read it
+       back under pressure.
+     - **Where.** Once a publication stands, each such claim and each authored definition it
+       wrote is encoded to the replica's payload log and its row rewritten where it stands to
+       hold where its bytes are (`RangeStore::rewrite`, `Core::spill_published`): the same key
+       in the same page, the page's charge let go by the heap it held, the store's prefix and
+       state unchanged, so a plan made before it publishes as it would have. What a publication
+       just wrote is the store's own, so the rewrite never meets a page an image still reads.
+       Candidates keep their claims held while they are pending: the owner's checks of a
+       candidate read them there. A record and a checkpoint copy a spilled row's bytes, byte for
+       byte what the held row encodes (the spill test compares records, replays, inline and
+       frozen checkpoints and every claim and definition read back, leader and follower).
+     - **Read back where touched** (`read_back.rs`). `View::get`, the state's own reads and
+       replay's base reads decode a spilled claim or definition (checked as a replayed row is)
+       into an arena the state holds, lent for the borrow, so no reader changes. A row read back
+       twice between two changes of the state is decoded once; every row read back is let go at
+       the next change (a publication, the owner's next operation). A walk of every row (the
+       owner's integrity check) reads into an arena of its own let go row by row, and a lease
+       reads into one of its own for each projection. A row that cannot be read back is never
+       taken for an absent one: the read is lent the row as stored, which holds nothing a reader
+       can take, and the failure fails the operation (a plan, a replay) that met it. A spilling
+       state holds a 16 KiB floor for its reads from the time its log is attached, so a few
+       reads never wait on memory and a refusal leaves the budget as it was.
+     - **Measured.** One authored claim with one definition (`measure_memory_per_authored_claim_by_family`,
+       release, 2,000 claims, the node's range configuration): 2,650 → 1,241 bytes charged a
+       claim, the claim's row 928 → 96 bytes and its definition 603 → 96 (each now an entry, its
+       bytes in the log). About 500,000 open claims in the comparison's envelope, against the
+       300,000 a 4,000-a-second run writes. Publication 12.6 → 13.1 µs a claim, preparation
+       unchanged (`measure_time_per_authored_claim`, release, 5,000 claims, three interleaved
+       runs, least of each).
+     - **Found by forcing it.** With `FOCAL_TEST_SPILL` set, every core of the test suite spills
+       to a log in memory. The paths it found are fixed and tested: the owner's post-plan checks
+       read a candidate's claims (so candidates keep them held), completions under pressure read
+       a failed claim's dependents (so a claim another depends on stays held), the integrity
+       walk and leases read stored rows (so both read back into arenas of their own).
+   - **Archival: a seal is known short from counters.** The archive agent derived the outcome
+     seal's plan every five seconds on the owner's thread, which visits every outcome awaiting a
+     seal, only to drop it while they were fewer than half a bundle (about 15,000). The leader's
+     slowest steps in the comparison at 200 writes a second were `range: seal bundle` every
+     5.08 s, 61.6 ms growing to 119.5 ms, and the clients' p99.9 matched (96 ms against NATS's
+     9.7). The resident outcomes less those the open generations hold, each with a creation
+     result, bound every plan's rows (`Core::sealable_rows_bound`), so a round with nothing to
+     seal visits nothing. Next for archival, borrowed from Kafka's segment roll and log cleaner:
+     seal small and as generations close, a constant step rather than half a 6 MiB bundle at
+     once, and cut the bundle off the owner from the payload log, where outcomes already are in
+     append order, the owner proposing only the seal's record.
    - **The session's share of its allowance, beside the stages.**
      - **Measured first.** The per-session memory gauges (`focal_session_memory_*`,
        `focal_session_native_memory_*`) put the fill at the native engine's share, not at the

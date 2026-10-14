@@ -49,16 +49,27 @@ struct ClaimRow {
     state: ClaimState,
     registrations: RegistrationSet,
 }
+/// A claim's row: its state and registration set held, or spilled to the replica's payload log
+/// as its record encoding once a candidate's checks have read it (doc 31 M3), holding where its
+/// bytes are and nothing on the heap. A read takes a spilled row back decoded
+/// (`super::read_back`), so readers see a held one.
 #[derive(Debug)]
-pub(super) struct OwnedClaim(Vec<ClaimRow>);
+pub(super) struct OwnedClaim(ClaimStorage);
+#[derive(Debug)]
+enum ClaimStorage {
+    Held(Vec<ClaimRow>),
+    Logged(super::payloads::PayloadRef),
+}
 /// A definition in one allocation of exactly its body, held in the row itself: a boxed slice of
-/// one is narrow enough that no box around the row is needed (doc 31 M3).
+/// one is narrow enough that no box around the row is needed (doc 31 M3). An authored one is
+/// spilled as a claim's row is, and read back the same way.
 #[derive(Debug)]
 pub(super) struct OwnedDeclaration(DeclarationStorage);
 #[derive(Debug)]
 enum DeclarationStorage {
     Legacy(Box<[Declaration]>),
     Authored(Box<[ValidationDescriptor]>),
+    Logged(super::payloads::PayloadRef),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ClaimContentProfile {
@@ -236,33 +247,95 @@ impl OwnedClaim {
             Self::container_charge(),
             add(claim_heap(&state)?, registrations_heap(&registrations)?)?,
         )?;
-        Ok(Self(singleton(
+        Ok(Self(ClaimStorage::Held(singleton(
             ClaimRow {
                 state,
                 registrations,
             },
             Self::container_charge(),
-        )?))
+        )?)))
     }
+    fn held(&self) -> Option<&ClaimRow> {
+        match &self.0 {
+            ClaimStorage::Held(rows) => get(rows),
+            ClaimStorage::Logged(_) => None,
+        }
+    }
+    /// The claim a held row holds; none for a spilled one, which a read takes back held.
     pub(super) fn claim(&self) -> Option<&ClaimState> {
-        get(&self.0).map(|row| &row.state)
+        self.held().map(|row| &row.state)
     }
     pub(super) fn registrations(&self) -> Option<&RegistrationSet> {
-        get(&self.0).map(|row| &row.registrations)
+        self.held().map(|row| &row.registrations)
+    }
+    /// Where a spilled row's record encoding is.
+    pub(super) fn logged(&self) -> Option<super::payloads::PayloadRef> {
+        match self.0 {
+            ClaimStorage::Logged(at) => Some(at),
+            ClaimStorage::Held(_) => None,
+        }
+    }
+    /// This row spilled to `log` as its record encoding, where it is held, it waits to be
+    /// delivered, the encoding fits a spilled row and the log takes it: what a candidate's rows
+    /// become once every check has read them (`payloads::spill_changes`).
+    ///
+    /// Only a claim that waits to be delivered, on nothing and in nothing, spills: generated or
+    /// posted, no receipt taken, no evaluation registered against it, no dependency of its own,
+    /// created by a root command and owning no scope (the caller checks that no claim depends on
+    /// it). It is the backlog, as a message no consumer has taken is in Kafka's or NATS's log, and
+    /// is read back once, when it is delivered. A claim in work, or tied into a graph or a scope
+    /// that work on other claims reaches, stays held: its lifecycle's steps and the completions
+    /// they fund read it where it is, and a walk of the claims in work skips every spilled one
+    /// unread.
+    pub(super) fn spill(
+        &self,
+        log: &dyn super::payloads::PayloadLog,
+    ) -> Result<Option<Self>, NativeError> {
+        let Some(row) = self.held() else {
+            return Ok(None);
+        };
+        if !matches!(
+            row.state.status(),
+            focal_model::ClaimStatus::Generated | focal_model::ClaimStatus::Posted
+        ) || row.state.receipt().is_some()
+            || !row.registrations.rows().is_empty()
+            || !row.state.graph().obligations().is_empty()
+            || !matches!(row.state.lineage().cause(), focal_model::Cause::Root(_))
+            || row.state.scopes().iter().next().is_some()
+            || !row.state.scopes().children().is_empty()
+        {
+            return Ok(None);
+        }
+        let mut buffer = [0u8; super::payloads::SPILLED_BYTES];
+        let Some(len) = super::record_codec::encode_claim(self, &mut buffer) else {
+            return Ok(None);
+        };
+        let bytes = buffer
+            .get(..len)
+            .ok_or(NativeError::Capacity("claim row"))?;
+        Ok(log.append(bytes).map(|at| Self(ClaimStorage::Logged(at))))
     }
     /// Native-owner access during private preparation. The owner precharges
     /// growth and publishes state and registration changes atomically.
     #[cfg(test)]
     pub(super) fn parts_mut(&mut self) -> Option<(&mut ClaimState, &mut RegistrationSet)> {
-        match self.0.as_mut_slice() {
-            [row] => Some((&mut row.state, &mut row.registrations)),
-            _ => None,
+        match &mut self.0 {
+            ClaimStorage::Held(rows) => match rows.as_mut_slice() {
+                [row] => Some((&mut row.state, &mut row.registrations)),
+                _ => None,
+            },
+            ClaimStorage::Logged(_) => None,
         }
     }
     pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
-        let row = get(&self.0).ok_or(MemoryError::MissingKey)?;
+        let rows = match &self.0 {
+            ClaimStorage::Held(rows) => rows,
+            // A spilled row holds nothing on the heap.
+            ClaimStorage::Logged(_) => return Ok(0),
+        };
+        let row = get(rows).ok_or(MemoryError::MissingKey)?;
         add(
-            container_heap::<ClaimRow>(self.0.capacity())?,
+            container_heap::<ClaimRow>(rows.capacity())?,
             add(
                 claim_heap(&row.state)?,
                 registrations_heap(&row.registrations)?,
@@ -271,8 +344,11 @@ impl OwnedClaim {
     }
     /// Storage precharges the complete old row before copying a retained neighbor.
     pub(super) fn copy(&self) -> Result<Self, MemoryError> {
+        if let ClaimStorage::Logged(at) = self.0 {
+            return Ok(Self(ClaimStorage::Logged(at)));
+        }
         let old = self.heap_charge()?;
-        let row = get(&self.0).ok_or(MemoryError::MissingKey)?;
+        let row = self.held().ok_or(MemoryError::MissingKey)?;
         let state = row
             .state
             .try_copy(
@@ -321,20 +397,52 @@ impl OwnedDeclaration {
             Self::authored_container_charge(),
         )?)?)))
     }
+    /// The declaration a held row holds; none for a spilled one, which a read takes back held.
     pub(super) fn get(&self) -> Option<&Declaration> {
         match &self.0 {
             DeclarationStorage::Legacy(rows) => get(rows),
             DeclarationStorage::Authored(rows) => get(rows).map(ValidationDescriptor::declaration),
+            DeclarationStorage::Logged(_) => None,
         }
     }
     pub(super) fn descriptor(&self) -> Option<&ValidationDescriptor> {
         match &self.0 {
-            DeclarationStorage::Legacy(_) => None,
+            DeclarationStorage::Legacy(_) | DeclarationStorage::Logged(_) => None,
             DeclarationStorage::Authored(rows) => get(rows),
         }
     }
+    /// Where a spilled row's record encoding is.
+    pub(super) fn logged(&self) -> Option<super::payloads::PayloadRef> {
+        match self.0 {
+            DeclarationStorage::Logged(at) => Some(at),
+            DeclarationStorage::Legacy(_) | DeclarationStorage::Authored(_) => None,
+        }
+    }
+    /// This row spilled to `log` as its record encoding, where it is an authored one held, the
+    /// encoding fits a spilled row and the log takes it (`payloads::spill_changes`). A legacy
+    /// definition keeps its bytes.
+    pub(super) fn spill(
+        &self,
+        log: &dyn super::payloads::PayloadLog,
+    ) -> Result<Option<Self>, NativeError> {
+        if !matches!(self.0, DeclarationStorage::Authored(_)) {
+            return Ok(None);
+        }
+        let mut buffer = [0u8; super::payloads::SPILLED_BYTES];
+        let Some(len) = super::record_codec::encode_definition(self, &mut buffer) else {
+            return Ok(None);
+        };
+        let bytes = buffer
+            .get(..len)
+            .ok_or(NativeError::Capacity("definition row"))?;
+        Ok(log
+            .append(bytes)
+            .map(|at| Self(DeclarationStorage::Logged(at))))
+    }
     pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
         match &self.0 {
+            // A spilled row holds nothing on the heap.
+            DeclarationStorage::Logged(_) => Ok(0),
             DeclarationStorage::Legacy(rows) => add(
                 container_heap::<Declaration>(rows.len())?,
                 declaration_heap(get(rows).ok_or(MemoryError::MissingKey)?)?,
@@ -348,6 +456,7 @@ impl OwnedDeclaration {
     pub(super) fn copy(&self) -> Result<Self, MemoryError> {
         let old = self.heap_charge()?;
         let copied = match &self.0 {
+            DeclarationStorage::Logged(at) => Self(DeclarationStorage::Logged(*at)),
             DeclarationStorage::Legacy(rows) => {
                 let declaration = get(rows).ok_or(MemoryError::MissingKey)?;
                 let charge = declaration

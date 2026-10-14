@@ -33,9 +33,9 @@
 
 use super::{
     ALLOCATOR_OVERHEAD, Allocation, BudgetKind, BudgetLane, Change, DirectoryBuild, Entry,
-    MemoryBudget, MemoryError, Page, PageDirectory, RangeId, RangeStore, Root, bounded_push,
-    bounded_vec, checked_add, checked_mul, groups, layout, merge_layout_charge, page_charge,
-    root_charge, visit_merged,
+    MemoryBudget, MemoryError, Page, PageDirectory, RangeId, RangeStore, Rewrite, Root,
+    bounded_push, bounded_vec, checked_add, checked_mul, groups, layout, merge_layout_charge,
+    page_charge, root_charge, visit_merged,
 };
 use std::sync::Arc;
 
@@ -662,6 +662,36 @@ impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
         root.prefix = prefix;
         self.state = state;
         Ok(())
+    }
+
+    /// Replaces the value of `key`'s row where it stands with what `rewrite`
+    /// makes of it (a row of no more heap than it held), letting go of its
+    /// page's charge by the difference: the same key in the same page, and
+    /// nothing else changed, so the store's prefix and state stay its own and
+    /// a plan made on it publishes as it would have. Where a frozen image or a
+    /// lease still reads the page or a node above it, nothing is rewritten
+    /// ([`Rewrite::Shared`]); what a publication just wrote is the store's
+    /// own. A value moved off the heap (a row spilled to a log) is what this
+    /// is for.
+    pub fn rewrite<F>(&mut self, key: &K, rewrite: F) -> Result<Rewrite, MemoryError>
+    where
+        F: FnOnce(&V) -> Result<Option<(V, usize)>, MemoryError>,
+    {
+        self.check_live()?;
+        let Some(root) = Arc::get_mut(&mut self.root) else {
+            return Ok(Rewrite::Shared);
+        };
+        if root.len == 0 {
+            return Ok(Rewrite::Absent);
+        }
+        let index = root.page_index(key);
+        let Some(slot) = root.pages.page_owned_mut(index)? else {
+            return Ok(Rewrite::Shared);
+        };
+        let Some(page) = Arc::get_mut(slot) else {
+            return Ok(Rewrite::Shared);
+        };
+        page.rewrite(key, rewrite)
     }
 
     /// Makes the store's root its own: a root something else holds (a frozen

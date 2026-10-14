@@ -228,6 +228,57 @@ impl<K: crate::RangeKey, V> Page<K, V> {
             _allocation: allocation,
         }
     }
+
+    /// Replaces `key`'s value where it stands with what `rewrite` makes of it, a value of no
+    /// more heap than the row held, and lets go of the page's charge by the difference (a page
+    /// is charged its entries and their heap, [`page_charge`]). Refused, nothing changed.
+    pub(crate) fn rewrite<F>(&mut self, key: &K, rewrite: F) -> Result<Rewrite, MemoryError>
+    where
+        F: FnOnce(&V) -> Result<Option<(V, usize)>, MemoryError>,
+    {
+        let probe = key.order_prefix();
+        let Ok(index) = self.entries.binary_search_by(|entry| {
+            entry
+                .key
+                .order_prefix()
+                .cmp(&probe)
+                .then_with(|| entry.key.cmp_past_prefix(key))
+        }) else {
+            return Ok(Rewrite::Absent);
+        };
+        let entry = self.entries.get_mut(index).ok_or(MemoryError::MissingKey)?;
+        let Some((value, heap_bytes)) = rewrite(&entry.value)? else {
+            return Ok(Rewrite::Unchanged);
+        };
+        let released =
+            entry
+                .heap_bytes
+                .checked_sub(heap_bytes)
+                .ok_or(MemoryError::InvalidConfiguration(
+                    "a rewrite may not grow a row",
+                ))?;
+        let held = self._allocation.bytes().checked_sub(released).ok_or(
+            MemoryError::InvalidConfiguration("a page charged less than its rows"),
+        )?;
+        self._allocation.shrink_to(held)?;
+        entry.value = value;
+        entry.heap_bytes = heap_bytes;
+        Ok(Rewrite::Rewritten)
+    }
+}
+
+/// What a rewrite of a row where it stands did ([`RangeStore::rewrite`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rewrite {
+    /// Its value replaced, the page's charge let go by the heap it no longer holds.
+    Rewritten,
+    /// The rewrite left it as it was.
+    Unchanged,
+    /// Something else still reads its page or a node above it (a frozen image, a lease):
+    /// nothing changed.
+    Shared,
+    /// The store holds no row at the key.
+    Absent,
 }
 
 // Field order keeps the complete owned input alive under its permit on every

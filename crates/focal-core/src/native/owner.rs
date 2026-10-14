@@ -579,6 +579,11 @@ impl NativeOwner {
                 let Key::Claim(id) = entry.key else {
                     continue;
                 };
+                // A spilled claim waits to be delivered (`OwnedClaim::spill`): it holds no
+                // receipt, so no respondent's work, and is not read back for none (doc 31 M3).
+                if matches!(entry.value, Row::Claim(claim) if claim.logged().is_some()) {
+                    continue;
+                }
                 let claim = view.claim(id).ok_or(ContractError::InvalidTarget)?;
                 let Some((_, credit)) = super::respondent_state::read(&view, claim, core.limits)?
                 else {
@@ -982,6 +987,8 @@ impl NativeOwner {
         custody: Option<(&mut ContentStore, ContentDomainId)>,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
+        // What earlier operations read back is theirs alone (doc 31 M3).
+        self.core.state.reads.release();
         // Room for the candidate, made before its chain is borrowed: a retry is answered whatever
         // the memory says, a fresh request is refused only where no room could be funded.
         let room = self.reserve_pending().is_ok();
@@ -1001,6 +1008,9 @@ impl NativeOwner {
                 .core
                 .check_monitor_deadline_chain(input, logical_time, pending)?,
         };
+        // A spilled row its checks could not take back was lent as it is stored: they stand only
+        // where none failed (doc 31 M3).
+        self.core.state.reads.failure()?;
         match preparation {
             prepare::Checked::Existing { outcome, committed } => {
                 let candidate = if committed {
@@ -1054,6 +1064,7 @@ impl NativeOwner {
                         .and_then(|()| self.book.check_serial(serial))
                         .and_then(|()| self.book.check_parents(&view, &prepared))
                         .and_then(|()| self.book.check_graph_growth(&view, &prepared))
+                        .and_then(|()| self.core.state.reads.failure())
                 });
                 if let Err(error) = checked {
                     drop(prepared);

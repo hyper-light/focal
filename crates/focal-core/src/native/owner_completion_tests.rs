@@ -19,7 +19,7 @@ use focal_model::{
 const DOMAIN: ContentDomainId = ContentDomainId::from_u128(1900);
 
 fn completion_visit_bound(core: &Core<NativeState>) -> usize {
-    let Row::Claim(row) = core.state.rows.get(&Key::Claim(key(1).claim)).unwrap() else {
+    let Row::Claim(row) = core.state.row(&Key::Claim(key(1).claim)).unwrap() else {
         panic!("claim row");
     };
     let claim = row.claim().unwrap();

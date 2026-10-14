@@ -284,6 +284,49 @@ impl DefinitionPlan<'_, '_> {
     }
 }
 
+/// The authored definition row whose record encoding `bytes` are (a spilled row's, doc 31 M3),
+/// checked as a replayed one is, under its own issuer (the bytes are the replica's own, written
+/// once the definition's checks had read it), and its heap charged by `fund` at its plan's quote
+/// before it is built. Every bound is the encoding's own length: an element takes a byte at least,
+/// and a decoded definition is a few times its encoding.
+pub(in crate::native) fn decode_definition(
+    bytes: &[u8],
+    fund: &dyn Fn(usize) -> Result<focal_memory::Allocation, NativeError>,
+) -> Result<(crate::native::OwnedDeclaration, focal_memory::Allocation), NativeError> {
+    let len = bytes.len();
+    let visits = len
+        .checked_mul(256)
+        .and_then(|n| n.checked_add(4096))
+        .ok_or(NativeError::Capacity("definition decode"))?;
+    let mut cursor = Cursor::new(bytes, len, visits).map_err(codec)?;
+    let mut input = definition(&mut cursor)?;
+    cursor.finish().map_err(codec)?;
+    if !matches!(input, DefinitionInput::Authored(_)) {
+        return Err(ContractError::InvalidManifest.into());
+    }
+    let count = u32::try_from(len).unwrap_or(u32::MAX);
+    let declaration = validation::Limits {
+        handlers: count,
+        attempts: u32::MAX,
+        slot_bytes: len,
+    };
+    let authored = validation_descriptor::Limits {
+        declaration,
+        description_bytes: len,
+        quality_bar_bytes: len,
+        contributors: len,
+        construction_bytes: visits,
+    };
+    let issuer = input.issuer();
+    let plan = input.prepare(issuer, declaration, authored, visits, visits)?;
+    let quote = plan.quote();
+    let charge = fund(quote.heap_bytes)?;
+    match plan.build(quote.heap_bytes, quote.model_build_visits)? {
+        Row::Definition(owned) if owned.heap_charge()? <= charge.bytes() => Ok((owned, charge)),
+        _ => Err(ContractError::InvalidManifest.into()),
+    }
+}
+
 pub(in crate::native::record_codec) struct ClaimContentInput<'a> {
     body: ClaimBodyInput<'a>,
     /// The descriptor's encoding exactly as the record carries it: what the row holds once it

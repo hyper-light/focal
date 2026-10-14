@@ -430,190 +430,209 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
         mut definition_indices,
         mut results,
     ) = (0, 0, 0, 0, 0, 0);
-    for entry in core.state.rows.entries() {
-        // Reconstruction traverses the actual owner once. Nested authored
-        // checks share one bounded allowance per row/claim, not per pin.
-        let mut visits = VisitBudget::new(limits.plan_edges);
-        match (&entry.key, &entry.value) {
-            (Key::Claim(id), Row::Claim(_)) if strict => {
-                claims = add(claims, 1)?;
-                let Some(Row::ClaimContent(owned)) = view.get(Key::ClaimContent(*id)) else {
-                    return Err(ContractError::InvalidPolicy.into());
-                };
-                let mut buffer = ContentBuffer::new();
-                let bytes = owned.read(view.payloads(), &mut buffer)?;
-                let held = bytes.body(&core.state.budget, focal_memory::BudgetLane::Completion)?;
-                let body: &ClaimDescriptor = &held;
-                let state = view.claim(*id).ok_or(ContractError::InvalidTarget)?;
-                budget::body_shape(body, limits, &mut visits)?;
-                budget::state_shape(state, limits, &mut visits)?;
-                pair(
-                    body,
-                    bytes.profile().ok_or(ContractError::InvalidPolicy)?,
-                    state,
-                    &mut visits,
-                )?;
-                for pin in body.requirements() {
-                    visits.charge(1)?;
-                    let descriptor =
-                        super::super::authored_reads::descriptor(view.get(Key::Definition(pin.id)))
-                            .ok_or(ContractError::InvalidPolicy)?;
-                    declaration_pair(body, state, descriptor, &mut visits)?;
-                }
-                for relation in body.relations() {
-                    visits.charge(1)?;
-                    if let RelationTarget::Object(target) = relation.target
-                        && (target.ledger != view.ledger()
-                            || target.kind != ObjectKind::Claim
-                            || view.claim(ClaimId(target.id.0)).is_none())
-                    {
-                        return Err(ContractError::InvalidTarget.into());
-                    }
-                    if let RelationTarget::Evidence(evidence) = relation.target
-                        && as_artifact(view.get(Key::Artifact(evidence.id))).is_none_or(
-                            |artifact| artifact.descriptor().content_hash() != evidence.hash,
-                        )
-                    {
-                        return Err(ContractError::InvalidTarget.into());
-                    }
-                }
-            }
-            (Key::ClaimContent(id), Row::ClaimContent(owned)) if strict => {
-                contents = add(contents, 1)?;
-                let mut buffer = ContentBuffer::new();
-                let bytes = owned.read(view.payloads(), &mut buffer)?;
-                let held = bytes.body(&core.state.budget, focal_memory::BudgetLane::Completion)?;
-                let body: &ClaimDescriptor = &held;
-                budget::body_shape(body, limits, &mut visits)?;
-                visits.charge(budget::claim_heap_visits(body)?)?;
-                owner_shape(body, bytes.profile().ok_or(ContractError::InvalidPolicy)?)?;
-                if entry.heap_bytes != owned.heap_charge()?
-                    || body.id() != *id
-                    || view.claim(*id).is_none()
-                    || !matches!(view.get(Key::ClaimIdentity(body.schema(), body.content_hash())), Some(Row::ClaimIdentity(found)) if found == id)
-                {
-                    return Err(ContractError::InvalidPolicy.into());
-                }
-            }
-            (Key::Definition(id), Row::Definition(owned)) if strict => {
-                definitions = add(definitions, 1)?;
-                let body = owned.descriptor().ok_or(ContractError::InvalidPolicy)?;
-                // The owning claim's requirements, read in place.
-                let mut buffer = ContentBuffer::new();
-                let claim = super::super::authored_reads::content_view(
-                    view.get(Key::ClaimContent(body.declaration().claim())),
-                    view.payloads(),
-                    &mut buffer,
-                )?
-                .ok_or(ContractError::InvalidTarget)?;
-                within(
-                    claim.requirement_count(),
-                    limits.definitions.min(limits.range.max_batch_entries),
-                )?;
-                visits.charge(claim.requirement_count())?;
-                if entry.heap_bytes != add(owned.heap_charge()?, entry.value.boxed_heap())?
-                    || body.binding().object.0 != id.0
-                    || !claim.requires(*id)?
-                    || !matches!(view.get(Key::DefinitionIdentity(body.schema(), body.content_hash())), Some(Row::DefinitionIdentity(found)) if found == id)
-                {
-                    return Err(ContractError::InvalidPolicy.into());
-                }
-            }
-            (Key::ClaimIdentity(schema, hash), Row::ClaimIdentity(id)) if strict => {
-                claim_indices = add(claim_indices, 1)?;
-                let Some(Row::ClaimContent(body)) = view.get(Key::ClaimContent(*id)) else {
-                    return Err(ContractError::InvalidPolicy.into());
-                };
-                let mut buffer = ContentBuffer::new();
-                let body = body.read(view.payloads(), &mut buffer)?;
-                if entry.heap_bytes != 0
-                    || body.schema() != Some(*schema)
-                    || body.content_hash() != Some(*hash)
-                {
-                    return Err(ContractError::ContentConflict.into());
-                }
-            }
-            (Key::DefinitionIdentity(schema, hash), Row::DefinitionIdentity(id)) if strict => {
-                definition_indices = add(definition_indices, 1)?;
-                let body = super::super::authored_reads::descriptor(view.get(Key::Definition(*id)))
-                    .ok_or(ContractError::InvalidPolicy)?;
-                if entry.heap_bytes != 0 || body.schema() != *schema || body.content_hash() != *hash
-                {
-                    return Err(ContractError::ContentConflict.into());
-                }
-            }
-            (Key::CreationResult(key), Row::CreationResult(stored)) if strict => {
-                results = add(results, 1)?;
-                if entry.heap_bytes != stored.heap_charge()? {
-                    return Err(ContractError::InvalidPolicy.into());
-                }
-                let result = stored.read(
-                    view.payloads(),
-                    &core.state.budget,
-                    focal_memory::BudgetLane::Completion,
-                )?;
-                within(result.entries().len(), limits.range.max_batch_entries)?;
-                let outcome = view.outcome(*key)?.ok_or(ContractError::InvalidPolicy)?;
-                if outcome.operation != NativeOperation::Create || outcome.invocation != *key {
-                    return Err(ContractError::InvalidPolicy.into());
-                }
-                // A created claim that retired to the archive (26 §4) left
-                // its identity with it; its continuation vouches for the
-                // entry, and the definitions created beside it left with
-                // their claim.
-                let retired = result.entries().iter().any(|object| {
-                    object.family == NativeCreatedFamily::Claim
-                        && matches!(
-                            view.get(Key::Retired(ClaimId(object.resolved.0))),
-                            Some(Row::Retired(_))
-                        )
-                });
-                for object in result.entries() {
-                    visits.charge(1)?;
-                    let matches = match object.family {
-                        NativeCreatedFamily::Claim => {
-                            matches!(view.get(Key::ClaimIdentity(object.schema, object.content)), Some(Row::ClaimIdentity(id)) if id.0 == object.resolved.0)
-                                || matches!(
-                                    view.get(Key::Retired(ClaimId(object.resolved.0))),
-                                    Some(Row::Retired(_))
-                                )
-                        }
-                        NativeCreatedFamily::Validation => {
-                            matches!(view.get(Key::DefinitionIdentity(object.schema, object.content)), Some(Row::DefinitionIdentity(id)) if id.0 == object.resolved.0)
-                                || (retired
-                                    && view
-                                        .get(Key::Definition(ValidationId(object.resolved.0)))
-                                        .is_none())
-                        }
+    // Each row's reads take spilled rows back into an arena let go of with the row (doc 31 M3):
+    // the walk never holds more read back than one row's.
+    let mut reads = super::super::read_back::ReadBack::new(limits);
+    for stored in core.state.rows.entries() {
+        {
+            let view = View::committed(&core.state).with_reads(&reads);
+            let entry = view.read_back(stored);
+            // Reconstruction traverses the actual owner once. Nested authored
+            // checks share one bounded allowance per row/claim, not per pin.
+            let mut visits = VisitBudget::new(limits.plan_edges);
+            match (&entry.key, &entry.value) {
+                (Key::Claim(id), Row::Claim(_)) if strict => {
+                    claims = add(claims, 1)?;
+                    let Some(Row::ClaimContent(owned)) = view.get(Key::ClaimContent(*id)) else {
+                        return Err(ContractError::InvalidPolicy.into());
                     };
-                    if !matches {
+                    let mut buffer = ContentBuffer::new();
+                    let bytes = owned.read(view.payloads(), &mut buffer)?;
+                    let held =
+                        bytes.body(&core.state.budget, focal_memory::BudgetLane::Completion)?;
+                    let body: &ClaimDescriptor = &held;
+                    let state = view.claim(*id).ok_or(ContractError::InvalidTarget)?;
+                    budget::body_shape(body, limits, &mut visits)?;
+                    budget::state_shape(state, limits, &mut visits)?;
+                    pair(
+                        body,
+                        bytes.profile().ok_or(ContractError::InvalidPolicy)?,
+                        state,
+                        &mut visits,
+                    )?;
+                    for pin in body.requirements() {
+                        visits.charge(1)?;
+                        let descriptor = super::super::authored_reads::descriptor(
+                            view.get(Key::Definition(pin.id)),
+                        )
+                        .ok_or(ContractError::InvalidPolicy)?;
+                        declaration_pair(body, state, descriptor, &mut visits)?;
+                    }
+                    for relation in body.relations() {
+                        visits.charge(1)?;
+                        if let RelationTarget::Object(target) = relation.target
+                            && (target.ledger != view.ledger()
+                                || target.kind != ObjectKind::Claim
+                                || view.claim(ClaimId(target.id.0)).is_none())
+                        {
+                            return Err(ContractError::InvalidTarget.into());
+                        }
+                        if let RelationTarget::Evidence(evidence) = relation.target
+                            && as_artifact(view.get(Key::Artifact(evidence.id))).is_none_or(
+                                |artifact| artifact.descriptor().content_hash() != evidence.hash,
+                            )
+                        {
+                            return Err(ContractError::InvalidTarget.into());
+                        }
+                    }
+                }
+                (Key::ClaimContent(id), Row::ClaimContent(owned)) if strict => {
+                    contents = add(contents, 1)?;
+                    let mut buffer = ContentBuffer::new();
+                    let bytes = owned.read(view.payloads(), &mut buffer)?;
+                    let held =
+                        bytes.body(&core.state.budget, focal_memory::BudgetLane::Completion)?;
+                    let body: &ClaimDescriptor = &held;
+                    budget::body_shape(body, limits, &mut visits)?;
+                    visits.charge(budget::claim_heap_visits(body)?)?;
+                    owner_shape(body, bytes.profile().ok_or(ContractError::InvalidPolicy)?)?;
+                    if entry.heap_bytes != owned.heap_charge()?
+                        || body.id() != *id
+                        || view.claim(*id).is_none()
+                        || !matches!(view.get(Key::ClaimIdentity(body.schema(), body.content_hash())), Some(Row::ClaimIdentity(found)) if found == id)
+                    {
+                        return Err(ContractError::InvalidPolicy.into());
+                    }
+                }
+                (Key::Definition(id), Row::Definition(owned)) if strict => {
+                    definitions = add(definitions, 1)?;
+                    let body = owned.descriptor().ok_or(ContractError::InvalidPolicy)?;
+                    // The owning claim's requirements, read in place.
+                    let mut buffer = ContentBuffer::new();
+                    let claim = super::super::authored_reads::content_view(
+                        view.get(Key::ClaimContent(body.declaration().claim())),
+                        view.payloads(),
+                        &mut buffer,
+                    )?
+                    .ok_or(ContractError::InvalidTarget)?;
+                    within(
+                        claim.requirement_count(),
+                        limits.definitions.min(limits.range.max_batch_entries),
+                    )?;
+                    visits.charge(claim.requirement_count())?;
+                    // The row as it is stored is charged as it is held there: a spilled one nothing.
+                    let Row::Definition(held) = stored.value else {
+                        return Err(ContractError::InvalidPolicy.into());
+                    };
+                    if stored.heap_bytes != add(held.heap_charge()?, stored.value.boxed_heap())?
+                        || body.binding().object.0 != id.0
+                        || !claim.requires(*id)?
+                        || !matches!(view.get(Key::DefinitionIdentity(body.schema(), body.content_hash())), Some(Row::DefinitionIdentity(found)) if found == id)
+                    {
+                        return Err(ContractError::InvalidPolicy.into());
+                    }
+                }
+                (Key::ClaimIdentity(schema, hash), Row::ClaimIdentity(id)) if strict => {
+                    claim_indices = add(claim_indices, 1)?;
+                    let Some(Row::ClaimContent(body)) = view.get(Key::ClaimContent(*id)) else {
+                        return Err(ContractError::InvalidPolicy.into());
+                    };
+                    let mut buffer = ContentBuffer::new();
+                    let body = body.read(view.payloads(), &mut buffer)?;
+                    if entry.heap_bytes != 0
+                        || body.schema() != Some(*schema)
+                        || body.content_hash() != Some(*hash)
+                    {
                         return Err(ContractError::ContentConflict.into());
                     }
                 }
-            }
-            (Key::Outcome(key), Row::Outcome(outcome)) if strict => {
-                let operation = outcome.row(view.ledger(), *key, view.payloads())?.operation;
-                if operation == NativeOperation::Create
-                    && !matches!(
-                        view.get(Key::CreationResult(*key)),
-                        Some(Row::CreationResult(_))
-                    )
-                {
+                (Key::DefinitionIdentity(schema, hash), Row::DefinitionIdentity(id)) if strict => {
+                    definition_indices = add(definition_indices, 1)?;
+                    let body =
+                        super::super::authored_reads::descriptor(view.get(Key::Definition(*id)))
+                            .ok_or(ContractError::InvalidPolicy)?;
+                    if entry.heap_bytes != 0
+                        || body.schema() != *schema
+                        || body.content_hash() != *hash
+                    {
+                        return Err(ContractError::ContentConflict.into());
+                    }
+                }
+                (Key::CreationResult(key), Row::CreationResult(stored)) if strict => {
+                    results = add(results, 1)?;
+                    if entry.heap_bytes != stored.heap_charge()? {
+                        return Err(ContractError::InvalidPolicy.into());
+                    }
+                    let result = stored.read(
+                        view.payloads(),
+                        &core.state.budget,
+                        focal_memory::BudgetLane::Completion,
+                    )?;
+                    within(result.entries().len(), limits.range.max_batch_entries)?;
+                    let outcome = view.outcome(*key)?.ok_or(ContractError::InvalidPolicy)?;
+                    if outcome.operation != NativeOperation::Create || outcome.invocation != *key {
+                        return Err(ContractError::InvalidPolicy.into());
+                    }
+                    // A created claim that retired to the archive (26 §4) left
+                    // its identity with it; its continuation vouches for the
+                    // entry, and the definitions created beside it left with
+                    // their claim.
+                    let retired = result.entries().iter().any(|object| {
+                        object.family == NativeCreatedFamily::Claim
+                            && matches!(
+                                view.get(Key::Retired(ClaimId(object.resolved.0))),
+                                Some(Row::Retired(_))
+                            )
+                    });
+                    for object in result.entries() {
+                        visits.charge(1)?;
+                        let matches = match object.family {
+                            NativeCreatedFamily::Claim => {
+                                matches!(view.get(Key::ClaimIdentity(object.schema, object.content)), Some(Row::ClaimIdentity(id)) if id.0 == object.resolved.0)
+                                    || matches!(
+                                        view.get(Key::Retired(ClaimId(object.resolved.0))),
+                                        Some(Row::Retired(_))
+                                    )
+                            }
+                            NativeCreatedFamily::Validation => {
+                                matches!(view.get(Key::DefinitionIdentity(object.schema, object.content)), Some(Row::DefinitionIdentity(id)) if id.0 == object.resolved.0)
+                                    || (retired
+                                        && view
+                                            .get(Key::Definition(ValidationId(object.resolved.0)))
+                                            .is_none())
+                            }
+                        };
+                        if !matches {
+                            return Err(ContractError::ContentConflict.into());
+                        }
+                    }
+                }
+                (Key::Outcome(key), Row::Outcome(outcome)) if strict => {
+                    let operation = outcome.row(view.ledger(), *key, view.payloads())?.operation;
+                    if operation == NativeOperation::Create
+                        && !matches!(
+                            view.get(Key::CreationResult(*key)),
+                            Some(Row::CreationResult(_))
+                        )
+                    {
+                        return Err(ContractError::InvalidPolicy.into());
+                    }
+                }
+                (
+                    _,
+                    Row::ClaimContent(_)
+                    | Row::ClaimIdentity(_)
+                    | Row::DefinitionIdentity(_)
+                    | Row::CreationResult(_),
+                ) => return Err(ContractError::InvalidPolicy.into()),
+                (_, Row::Definition(owned)) if owned.descriptor().is_some() => {
                     return Err(ContractError::InvalidPolicy.into());
                 }
+                _ => {}
             }
-            (
-                _,
-                Row::ClaimContent(_)
-                | Row::ClaimIdentity(_)
-                | Row::DefinitionIdentity(_)
-                | Row::CreationResult(_),
-            ) => return Err(ContractError::InvalidPolicy.into()),
-            (_, Row::Definition(owned)) if owned.descriptor().is_some() => {
-                return Err(ContractError::InvalidPolicy.into());
-            }
-            _ => {}
         }
+        reads.failure()?;
+        reads.release();
     }
     if strict
         && (

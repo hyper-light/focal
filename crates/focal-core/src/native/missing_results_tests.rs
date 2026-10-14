@@ -222,7 +222,7 @@ impl Fixture {
         View::committed(&self.core.state)
     }
     fn registry(&self) -> &RegistrationSet {
-        match self.core.state.rows.get(&Key::Claim(ClaimId::from_u128(1))) {
+        match self.core.state.row(&Key::Claim(ClaimId::from_u128(1))) {
             Some(Row::Claim(row)) => row.registrations().unwrap(),
             _ => panic!("retained claim"),
         }

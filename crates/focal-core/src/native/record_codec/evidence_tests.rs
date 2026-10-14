@@ -21,6 +21,11 @@ fn held_content(sink: &mut impl Sink, row: &OwnedClaimContent) -> Result<(), Err
     claim_content(sink, row, None)
 }
 
+/// A held definition's encoding: it reads no payload log.
+fn held_definition(sink: &mut impl Sink, row: &OwnedDeclaration) -> Result<(), Error> {
+    definition(sink, row, None)
+}
+
 macro_rules! encoded {
     ($writer:path, $value:expr) => {{
         let value = $value;
@@ -801,7 +806,7 @@ fn authored_and_legacy_definitions_keep_distinct_bodies_and_original_claim_profi
     };
     let body = encoded!(descriptors::validation, &descriptor);
     let authored = OwnedDeclaration::new_authored(descriptor).unwrap();
-    let bytes = encoded!(definition, &authored);
+    let bytes = encoded!(held_definition, &authored);
     assert_eq!(bytes[0], 1);
     assert_eq!(&bytes[1..], &body);
     let legacy = authored
@@ -810,7 +815,7 @@ fn authored_and_legacy_definitions_keep_distinct_bodies_and_original_claim_profi
         .try_copy(authored.get().unwrap().retained_bytes().unwrap())
         .unwrap();
     let legacy = OwnedDeclaration::new(legacy).unwrap();
-    let bytes = encoded!(definition, &legacy);
+    let bytes = encoded!(held_definition, &legacy);
     assert_eq!(bytes[0], 0);
     assert_eq!(
         &bytes[1..],

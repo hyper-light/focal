@@ -83,7 +83,7 @@ impl Core<NativeState> {
         as_response_record(self.state.rows.get(&Key::Response(id)))
     }
     pub fn native_registrations(&self, id: ClaimId) -> Option<&RegistrationSet> {
-        as_registrations(self.state.rows.get(&Key::Claim(id)))
+        as_registrations(self.state.row(&Key::Claim(id)))
     }
     pub fn native_delivery_result(&self, key: NativeResultKey) -> Option<&NativeDeliveryResult> {
         as_delivery(self.state.rows.get(&Key::DeliveryResult(key)))
@@ -140,16 +140,12 @@ impl NativeRead {
         now: u64,
         project: impl FnOnce(&RegistrationSet) -> T,
     ) -> Result<Option<T>, MemoryError> {
-        let key = Key::Claim(id);
-        self.lease
-            .project_next(&key, false, &Key::End, now, |entry| {
-                if entry.key == key {
-                    as_registrations(Some(entry.value)).map(project)
-                } else {
-                    None
-                }
-            })
-            .map(Option::flatten)
+        // A spilled claim is read back for the projection (doc 31 M3).
+        self.project_row(Key::Claim(id), now, |row| {
+            as_registrations(Some(row)).map(project)
+        })
+        .map(Option::flatten)
+        .map_err(super::lease_read_back)
     }
     pub fn with_delivery_result<T>(
         &self,

@@ -191,8 +191,7 @@ fn multi_root_creation_keeps_disconnected_successors_and_settles_new_and_existin
     assert_eq!(status(&recovered, 5), ClaimStatus::Generated);
     assert_eq!(status(&recovered, 6), ClaimStatus::Generated);
     assert_eq!(status(&recovered, 7), ClaimStatus::DependencyFailed);
-    let Some(Row::Claim(newly_failed)) =
-        recovered.state.rows.get(&Key::Claim(ClaimId::from_u128(7)))
+    let Some(Row::Claim(newly_failed)) = recovered.state.row(&Key::Claim(ClaimId::from_u128(7)))
     else {
         panic!("newly created failed claim")
     };
