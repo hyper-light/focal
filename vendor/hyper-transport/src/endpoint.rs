@@ -2812,7 +2812,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
 
     /// A peer's exchange settles its stream's credit with the pool as its reply is finished, before
     /// the finish: QUIC gives a stream's credit back to its peer once its request is read and its
-    /// reply finished, not once the reply is acknowledged (hyper-quic `VENDORED.md` §27), so the
+    /// reply finished, not once the reply is acknowledged (hyper-quic `VENDORED.md` §29), so the
     /// connection's grant must be the pool's by then, or the stream goes back to the peer past it.
     fn settle_credit(&mut self, conn: &mut Conn<C::Role>, id: u64) {
         let Some(exchange) = self.exchanges.get_mut(id) else {

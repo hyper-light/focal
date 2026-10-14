@@ -713,6 +713,55 @@ pub(crate) fn enter(context: &ShardContext) -> Entered<'_> {
     }
 }
 
+/// This thread's current-shard cell, lent to a loop that enters its desk around each of many polls
+/// ([`with_current_cell`], [`enter_in`]): one lookup of the thread-local serves them all, where [`enter`]
+/// looks it up at the span's start and again at its end (on macOS each lookup is a call into the dynamic
+/// linker's thread-local resolver).
+#[derive(Clone, Copy)]
+pub(crate) struct CurrentCell<'thread>(&'thread Cell<*const ShardContext>);
+
+/// The span [`enter_in`] opens: [`Entered`]'s, with the cell held rather than looked up at its end.
+pub(crate) struct EnteredIn<'thread, 'context> {
+    cell: Option<CurrentCell<'thread>>,
+    previous: *const ShardContext,
+    context: std::marker::PhantomData<&'context ShardContext>,
+}
+
+impl Drop for EnteredIn<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(CurrentCell(cell)) = self.cell {
+            cell.set(self.previous);
+        }
+    }
+}
+
+/// Runs `body` with `state` and this thread's current-shard cell; `None` for the cell only on a thread whose
+/// locals are being torn down, where [`enter`] finds none either.
+pub(crate) fn with_current_cell<S, R>(
+    state: &mut S,
+    mut body: impl FnMut(&mut S, Option<CurrentCell<'_>>) -> R,
+) -> R {
+    match CURRENT.try_with(|cell| body(state, Some(CurrentCell(cell)))) {
+        Ok(out) => out,
+        Err(_) => body(state, None),
+    }
+}
+
+/// [`enter`] through a cell [`with_current_cell`] lent: the same span, the same restore at its end.
+pub(crate) fn enter_in<'thread, 'context>(
+    cell: Option<CurrentCell<'thread>>,
+    context: &'context ShardContext,
+) -> EnteredIn<'thread, 'context> {
+    let previous = cell.map_or(std::ptr::null(), |CurrentCell(cell)| {
+        cell.replace(std::ptr::from_ref(context))
+    });
+    EnteredIn {
+        cell,
+        previous,
+        context: std::marker::PhantomData,
+    }
+}
+
 /// Runs `f` with this thread's running shard's context, or `None` outside a shard's span. The reference
 /// cannot leave `f`:
 ///
@@ -722,13 +771,20 @@ pub(crate) fn enter(context: &ShardContext) -> Entered<'_> {
 /// }
 /// ```
 pub fn with_current<R>(f: impl FnOnce(&ShardContext) -> R) -> Option<R> {
-    let current = CURRENT.try_with(Cell::get).ok()?;
+    with_here(|here| here.map(f))
+}
+
+/// Runs `f` with this thread's running shard's context, `None` outside a shard's span: `f` runs either way,
+/// so what it was handed comes back out of a call made off any shard. The reference cannot leave `f`, as for
+/// [`with_current`].
+pub(crate) fn with_here<R>(f: impl FnOnce(Option<&ShardContext>) -> R) -> R {
+    let current = CURRENT.try_with(Cell::get).unwrap_or(std::ptr::null());
     // SAFETY: the cell is non-null only inside an `Entered` span, and holds the context that span's guard
     // borrows (or, after an inner span ended, the enclosing span's context, whose guard borrows it for
     // longer). A borrowed context cannot be freed: its owner (`LocalRuntime`, `SimRuntime`, a worker's own
     // frame) is borrowed for the guard's life, and `reclaim_context` runs only on an owner that is not.
-    let context = unsafe { current.as_ref() }?;
-    Some(f(context))
+    let context = unsafe { current.as_ref() };
+    f(context)
 }
 
 /// The current shard's id, if this thread runs one.

@@ -16,10 +16,13 @@
 //!   limited the transfer (Chromium QUIC's `QuicFlowController::MaybeIncreaseMaxWindowSize`, slates
 //!   `flow.rs`). Each growth is reserved from the node's budget first, so the window is
 //!   `min(BDP, share)`: it follows the path's bandwidth-delay product while the budget funds it.
-//! - **The stream window's ceiling** is quinn's 1,024-span assembler limit made explicit (patch Q5):
-//!   a window `W` of frames of at least `d` bytes is left with at most `W / (2d)` spans when every
-//!   other frame is lost, so a window of at most `2 · 1,024 · d` cannot close the connection with
-//!   "too many gaps in stream buffer" (node.md §3.3; focal reached the limit with a 10 MiB window).
+//! - **The stream window's ceiling** is `2 · 1,024 · d`, from the floor of hyper-quic's span bound
+//!   (patch Q5): a window `W` of frames of at least `d` bytes is left with at most `W / (2d)` spans
+//!   when every other frame is lost, so this window never reaches the 1,024 past which upstream
+//!   quinn closes the connection with "too many gaps in stream buffer" (node.md §3.3; focal reached
+//!   that limit with a 10 MiB window). hyper-quic now holds the spans any window pays for (its
+//!   patch Q15), so the ceiling no longer guards the connection; what should bound one stream's
+//!   window below the connection's is owed (`docs/STATUS.md`).
 
 use std::time::{Duration, Instant};
 
@@ -63,8 +66,8 @@ pub fn class_reserve(above: u8) -> u64 {
     u64::from(above).saturating_mul(STREAM_BYTES_PER_PACKET)
 }
 
-/// The largest stream window that quinn's assembler cannot be made to refuse: `2 · 1,024 · d`,
-/// about 2.3 MB.
+/// The stream window: `2 · 1,024 · d`, about 2.3 MB, the largest upstream quinn's assembler cannot
+/// be made to refuse.
 pub fn stream_window_ceiling() -> u64 {
     let spans = u64::try_from(MAX_STREAM_CHUNKS).unwrap_or(u64::MAX);
     spans

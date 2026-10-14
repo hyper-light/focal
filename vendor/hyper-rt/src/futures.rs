@@ -10,7 +10,7 @@ use pin_project_lite::pin_project;
 
 use crate::error::RtError;
 use crate::registry;
-use crate::shard::{ShardId, TaskId, TimerId, boxed};
+use crate::shard::{ShardId, TaskId, TimerId};
 use crate::task::Outcome;
 use crate::waker::polling_task;
 
@@ -64,7 +64,7 @@ pub fn current_task() -> Option<TaskId> {
 
 /// Spawns a joinable task on the current shard with no parent.
 pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
-    registry::with_current(|ctx| ctx.spawn_local(boxed(future), None))
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, true, false))
         .ok_or(RtError::NotOnShardThread)?
 }
 
@@ -74,7 +74,7 @@ pub fn spawn<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtEr
 /// A service must turn typed failures into cleanup. A panicked future cannot be safely
 /// resumed; this opt-in does not promise recovery from panic or a blocking destructor.
 pub fn spawn_service<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
-    registry::with_current(|ctx| ctx.spawn_service_local(boxed(future), None))
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, true, true))
         .ok_or(RtError::NotOnShardThread)?
 }
 
@@ -136,7 +136,7 @@ impl Future for Cancelled {
 /// Spawns a detached task on the current shard: nobody joins it, and its slot is freed when it ends (a
 /// server's per-connection task).
 pub fn spawn_detached<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
-    registry::with_current(|ctx| ctx.spawn_detached(boxed(future)))
+    registry::with_current(|ctx| ctx.spawn_framed(future, None, false, false))
         .ok_or(RtError::NotOnShardThread)?
 }
 
@@ -144,7 +144,7 @@ pub fn spawn_detached<F: Future<Output = ()> + 'static>(future: F) -> Result<Tas
 pub fn spawn_child<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
     registry::with_current(|ctx| {
         let parent = ctx.current_task().map(|t| t.0.slot());
-        ctx.spawn_local(boxed(future), parent)
+        ctx.spawn_framed(future, parent, true, false)
     })
     .ok_or(RtError::NotOnShardThread)?
 }
@@ -175,13 +175,16 @@ impl Future for Join {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let id = self.id;
-        let joiner = polling_task(cx.waker());
-        registry::with_current(|ctx| ctx.poll_join(id, joiner))
-            .unwrap_or(Poll::Ready(Err(RtError::NotOnShardThread)))
+        registry::with_current(|ctx| {
+            ctx.poll_join(id, crate::waker::polling_task_in(ctx, cx.waker()))
+        })
+        .unwrap_or(Poll::Ready(Err(RtError::NotOnShardThread)))
     }
 }
 
-/// Yields once: the task is re-queued and resumes after the rest of the batch.
+/// Yields once: the task wakes itself, and so resumes after the loop has next read its inputs (its
+/// control, wakes from other threads, timers, pollers and the driver's completions) and polled what they
+/// made ready ([`crate::queue`]).
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false }
 }
@@ -197,6 +200,37 @@ impl Future for YieldNow {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if self.yielded {
+            return Poll::Ready(());
+        }
+        self.yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+/// Yields only where the shard is wanted ([`ShardContext::wanted`], docs/runtime.md §3.10): a task listed
+/// or yielded, an intent unapplied, a wake or control message from another thread, a timer or the driver's
+/// harvest due. Where nothing is, it is ready at once, and the task goes on without the loop's round trip,
+/// which with nothing else to run would only poll it again. The cooperative point of a task that runs
+/// operations back to back (Seastar's `maybe_yield`; IX's batching only under congestion). Off a shard's
+/// thread it yields, as [`yield_now`] does.
+///
+/// [`ShardContext::wanted`]: crate::shard::ShardContext::wanted
+pub fn maybe_yield() -> MaybeYield {
+    MaybeYield { yielded: false }
+}
+
+/// The conditional yield's future.
+#[derive(Debug)]
+pub struct MaybeYield {
+    yielded: bool,
+}
+
+impl Future for MaybeYield {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.yielded || !registry::with_current(|ctx| ctx.wanted()).unwrap_or(true) {
             return Poll::Ready(());
         }
         self.yielded = true;

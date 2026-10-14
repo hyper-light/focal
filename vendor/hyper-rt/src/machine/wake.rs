@@ -35,6 +35,20 @@
 //!   to seven on a virtual machine needs 38,000–75,000 wakes for an interval ten percent wide, where
 //!   250 ms buys three to six thousand), which is why the
 //!   runtime refines this estimate from its own wakes after boot (`slates-rt`'s wake-cost estimate).
+//! - **The mean, as the median of the rounds' means.** The probe reports the mean as the median of its
+//!   rounds' means ([`crate::machine::stats::median_of_means`]), not the mean of every wake pooled. Both
+//!   estimate the expected cost, but every wake of a burst in any round moves the pooled mean, and one
+//!   burst at boot then set the step quantum, the timer tick, the loop's batch and the shards' tracked
+//!   prior for a whole run: one of mantle's benchmark calibrations on 2026-10-13 read 227,774 ns where
+//!   the same host's others read 1,444–5,904 ns (`benchmark-results/mantle-contig-20261013`,
+//!   `n10000000-r111-mcs`). A burst confined to fewer than half the rounds cannot move the median of
+//!   their means outside the other rounds' means, and under any finite variance its error is
+//!   sub-Gaussian [A: Lugosi & Mendelson, Found. Comput. Math. 19, 2019, Theorem 2]. Its interval is the
+//!   bootstrap resampled within each round, and the spread that sizes the online estimate's window
+//!   ([`WakeLatency::sd_ns`]) is the rounds' median coefficient of variation, so one round's held wake
+//!   cannot widen that window either. A burst over every round is the host's state at boot, which no
+//!   statistic of the probe can tell from a lasting state; a shard's own wakes replace it within its
+//!   first few dozen ([`WakeTrack`]).
 //! - **Rounds.** [`WAKE_ROUNDS`] rounds, each with a fresh waiter thread (and, pinned, its own shard core).
 //!   A run-long mode is invisible to a within-run interval — every old run converged tightly and runs still
 //!   differed 23× — so the rounds are compared, and disagree when a round's median interval misses the
@@ -58,16 +72,18 @@ use crate::machine::probes::{
     Pinning, SavedAffinity, pin_current_thread, pinning_code, pinning_from_code, weaker,
 };
 use crate::machine::stats::{
-    CONVERGED_WIDTH_PERMILLE, Interval, MeanInterval, Percentile, Sample, Xorshift,
-    bootstrap_interval, bootstrap_mean_interval, converged_mean, standard_deviation,
+    CONVERGED_WIDTH_PERMILLE, Interval, Percentile, Sample, Xorshift, bootstrap_interval,
+    bootstrap_mean_interval, bootstrap_median_of_means, converged_mean, mean, median_of,
+    standard_deviation,
 };
 
 /// The wake latency the profile reports (§4.1) and every derivation reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WakeLatency {
-    /// The mean wake, nanoseconds: the expected cost of parking, the statistic every consumer derives from.
+    /// The mean wake, nanoseconds: the expected cost of parking, the statistic every consumer derives from,
+    /// estimated as the median of the rounds' means.
     pub mean_ns: u64,
-    /// The lower edge of the mean's 95 % bootstrap interval.
+    /// The lower edge of the mean's 95 % bootstrap interval (resampled within each round).
     pub mean_lower_ns: u64,
     /// The upper edge.
     pub mean_upper_ns: u64,
@@ -75,8 +91,10 @@ pub struct WakeLatency {
     pub p50_ns: u64,
     /// The p99 of the kept samples: what the inbound ring is sized against at its overflow target.
     pub p99_ns: u64,
-    /// The population standard deviation of the kept samples: with the mean, how many wakes an online
-    /// estimate needs to reach the probe's precision ([`WakeLatency::estimate_shift`]).
+    /// The standard deviation the rounds agree on: the median of the coefficients of variation of the
+    /// rounds that kept the stopping rule's floor, times the mean (the pooled sample's own where none did).
+    /// With the mean, how many wakes an online estimate needs to reach the probe's precision
+    /// ([`WakeLatency::estimate_shift`]).
     pub sd_ns: u64,
     /// Samples kept, pooled over the rounds.
     pub samples: u32,
@@ -94,7 +112,9 @@ pub struct WakeLatency {
     /// Whether the waiter was confirmed asleep in the kernel before every wake, rather than having only
     /// announced its park (Windows, or a thread query the OS refused).
     pub asleep_confirmed: bool,
-    /// True when the budget ended before the pooled mean's interval converged.
+    /// True when the budget ended before the mean's interval converged, before the rounds kept the
+    /// stopping rule's floor of wakes between them ([`wake`]), or before each of the planned rounds kept a
+    /// wake (a median of fewer rounds' means outlasts fewer bursts).
     pub quick: bool,
 }
 
@@ -147,13 +167,12 @@ pub fn window_shift(window: u64) -> u32 {
     shift.min(WakeEstimate::MAX_SHIFT)
 }
 
-/// An online estimate of the mean wake (§4.1, §4.3, §4.7): an exponentially weighted mean over about
-/// `2^shift` wakes, seeded with the boot probe's mean and fed each wake the product measures afterwards
-/// (the runtime's kicked parks, a client's woken waits), so a machine whose neighbours change after boot
-/// is tracked rather than frozen at one 250 ms sample. Kept in fixed point — the accumulator is the mean
-/// shifted left by `shift` — so a small correction is never rounded away: an integer mean updated by
-/// `(sample − mean) >> shift` drops every deviation under `2^shift`, keeps the tail's large ones, and
-/// drifts upward.
+/// An online mean of a cost with a light tail: an exponentially weighted mean over about `2^shift`
+/// samples, seeded with a prior (a park's CPU, `crate::park_cost`, whose cycles vary with a coefficient of
+/// variation near a third; the wake itself, heavy-tailed, is tracked by [`WakeTrack`]). Kept in fixed
+/// point — the accumulator is the mean shifted left by `shift` — so a small correction is never rounded
+/// away: an integer mean updated by `(sample − mean) >> shift` drops every deviation under `2^shift`, keeps
+/// the tail's large ones, and drifts upward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WakeEstimate {
     scaled: u128,
@@ -195,6 +214,105 @@ impl WakeEstimate {
     }
 }
 
+/// Shape: the blocks a shard's wake estimate takes the median of: as many as the probe's rounds, whose
+/// estimate seeds them; odd, so the median is one block's mean.
+const BLOCKS: usize = 5;
+
+/// A shard's online estimate of the mean wake (§4.1, §4.3, §4.7): the median of the means of its last
+/// [`BLOCKS`] blocks of consecutive wakes (the median-of-means estimator, as the boot probe's over its
+/// rounds), seeded with the boot probe's estimate in every block and fed each wake the shard measures
+/// afterwards (its kicked parks), so a machine whose neighbours change after boot is tracked rather than
+/// frozen at one sample of a few tens of milliseconds.
+///
+/// **Blocks start at the floor and double to the window.** The first blocks together hold the stopping
+/// rule's floor ([`MIN_SAMPLES`]), so the boot's estimate is outvoted once a majority of them, three blocks
+/// of twelve wakes, has been measured: within seconds even on a shard busy enough to park ten times a
+/// second (mantle's fill parked 123 times in 13.8 s), where the exponentially weighted mean this replaces,
+/// seeded with a 227,774 ns burst at boot and weighting 2¹⁴ wakes, had moved under one percent of the way
+/// by the run's end. Every [`BLOCKS`] blocks the next ones are twice as long, until together they hold
+/// the window the probe's precision asks for ([`WakeLatency::estimate_window`]), and stay that long.
+///
+/// **A burst moves at most its own blocks.** One wake held for a quarter of a second raises one block's
+/// mean among five and moves the estimate not at all, where it moved the weighted mean by its whole
+/// length over the window; a change that lasts is followed once it fills a majority of the blocks, about
+/// half the window. Each block's mean is exact (its sum is kept in `u128`), so nothing drifts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeTrack {
+    /// The last blocks' means; `oldest` is the next one replaced.
+    blocks: [u64; BLOCKS],
+    oldest: usize,
+    /// The block being filled: its sum and count.
+    sum: u128,
+    count: u64,
+    /// How many wakes the block being filled takes, and how many blocks of that length have been filled.
+    length: u64,
+    filled: u64,
+    /// The longest a block grows: the window over the blocks.
+    longest: u64,
+    /// The median of the blocks' means.
+    estimate: u64,
+    samples: u64,
+}
+
+impl WakeTrack {
+    /// An estimate seeded with `prior_ns` in every block, its blocks growing to hold `window` wakes between
+    /// them.
+    pub fn new(prior_ns: u64, window: u64) -> WakeTrack {
+        let blocks = u64::try_from(BLOCKS).unwrap_or(u64::MAX);
+        let longest = window.div_ceil(blocks).max(1);
+        let floor = u64::try_from(MIN_SAMPLES).unwrap_or(u64::MAX);
+        WakeTrack {
+            blocks: [prior_ns; BLOCKS],
+            oldest: 0,
+            sum: 0,
+            count: 0,
+            length: floor.div_ceil(blocks).clamp(1, longest),
+            filled: 0,
+            longest,
+            estimate: prior_ns,
+            samples: 0,
+        }
+    }
+
+    /// Folds one measured wake in; a block it completes replaces the oldest, and the estimate is taken again.
+    pub fn record(&mut self, wake_ns: u64) {
+        self.samples = self.samples.saturating_add(1);
+        self.sum = self.sum.saturating_add(u128::from(wake_ns));
+        self.count = self.count.saturating_add(1);
+        if self.count < self.length {
+            return;
+        }
+        let mean = self.sum.checked_div(u128::from(self.count)).unwrap_or(0);
+        if let Some(block) = self.blocks.get_mut(self.oldest) {
+            *block = u64::try_from(mean).unwrap_or(u64::MAX);
+        }
+        self.oldest = self
+            .oldest
+            .checked_add(1)
+            .and_then(|next| next.checked_rem(BLOCKS))
+            .unwrap_or(0);
+        self.sum = 0;
+        self.count = 0;
+        self.filled = self.filled.saturating_add(1);
+        if self.filled >= u64::try_from(BLOCKS).unwrap_or(u64::MAX) && self.length < self.longest {
+            self.length = self.length.saturating_mul(2).min(self.longest);
+            self.filled = 0;
+        }
+        let mut means = self.blocks;
+        self.estimate = median_of(&mut means).unwrap_or(self.estimate);
+    }
+
+    /// The estimated mean wake, nanoseconds.
+    pub fn mean_ns(&self) -> u64 {
+        self.estimate
+    }
+
+    /// Wakes folded in since the seed (a non-vacuity count).
+    pub fn samples(&self) -> u64 {
+        self.samples
+    }
+}
+
 /// Shape: the rounds a wake probe splits its budget into. Five, from the split it must expose: the
 /// 2026-09-22 container runs landed in the fast placement mode in two runs of five, and five independent
 /// rounds show both modes with probability `1 − (0.6⁵ + 0.4⁵) ≈ 91 %`.
@@ -220,7 +338,12 @@ const DONE: u32 = 2;
 /// one-nanosecond step quantum; CI run 36201648573, a 30 ms budget on a macOS runner). So while the pooled
 /// sample is under the stopping rule's floor ([`MIN_SAMPLES`]), up to [`WAKE_ROUNDS`] more rounds run, each
 /// with twice the last one's share: a slow machine gets exponentially more time. Short of the floor even
-/// then, the probe refuses `MeasurementTimeout` rather than report a mean it did not measure.
+/// then, the probe reports the wakes it did measure, `quick`, and refuses `MeasurementTimeout` only when it
+/// measured none: a mean of fewer wakes than the floor is measured, only imprecise, and each shard's own
+/// wakes replace it within its first few dozen ([`WakeTrack`]). Refusing it stopped the runtime from
+/// starting on a loaded host, the cost of a slow machine landing on the consumer rather than on the
+/// estimate's precision (windows-2025, CI run 38376252976: the record test's second 40 ms probe, the lib's
+/// other probes pinned to the same cores at once).
 ///
 /// A round's share times wakes, and begins once its fresh waiter runs. Starting a thread pinned to a busy
 /// core is the round's setup, not a wake: it is waited for within the probe's span, every share its rounds
@@ -244,14 +367,14 @@ fn wake_with(
     let mut round_budget = budget.checked_div(WAKE_ROUNDS).unwrap_or(budget);
     let probe = Probe::starting(round_budget);
     let mut rng = Xorshift::new(Xorshift::SEED);
-    let mut kept: Vec<u64> = Vec::new();
+    let mut kept: Vec<Vec<u64>> = Vec::new();
+    let mut pooled = 0usize;
     let mut round_medians: Vec<Interval> = Vec::new();
     let mut placement = Pinning::Pinned;
     let mut same_cpu_samples = 0u32;
     let mut asleep_confirmed = true;
     let mut rounds = 0u32;
-    while (rounds < WAKE_ROUNDS
-        || (kept.len() < MIN_SAMPLES && rounds < WAKE_ROUNDS.saturating_mul(2)))
+    while (rounds < WAKE_ROUNDS || (pooled < MIN_SAMPLES && rounds < WAKE_ROUNDS.saturating_mul(2)))
         && probe.left() > Duration::ZERO
     {
         if rounds >= WAKE_ROUNDS {
@@ -272,20 +395,18 @@ fn wake_with(
         {
             round_medians.push(interval);
         }
-        kept.extend(outcome.samples);
+        pooled = pooled.saturating_add(outcome.samples.len());
+        if !outcome.samples.is_empty() {
+            kept.push(outcome.samples);
+        }
     }
     if !saved.restore() {
         // The calling thread (the anchor's) could not be given its mask back: nothing measured after this
         // can vouch for its placement, and the profile says so (the core matrix's rule).
         placement = Pinning::Refused;
     }
-    let pooled = (kept.len() >= MIN_SAMPLES)
-        .then(|| bootstrap_mean_interval(&kept, &mut rng))
-        .flatten()
-        .ok_or(MachineError::MeasurementTimeout { probe: "wake" })?;
-    Ok(summarize(
+    summarize(
         &kept,
-        pooled,
         &round_medians,
         Tally {
             placement,
@@ -294,7 +415,8 @@ fn wake_with(
             rounds,
         },
         &mut rng,
-    ))
+    )
+    .ok_or(MachineError::MeasurementTimeout { probe: "wake" })
 }
 
 /// What the rounds found beside their samples.
@@ -306,30 +428,68 @@ struct Tally {
     rounds: u32,
 }
 
-/// The pooled result: the mean with its interval, the quantiles for the record, and the rounds' verdict.
+/// The result from each round's kept wakes (`kept`, a round that kept none left out): the mean as the
+/// median of the rounds' means with its interval, the spread the rounds agree on, the pooled quantiles for
+/// the record and the ring, and the rounds' verdict. `None` when no round kept a wake.
 fn summarize(
-    kept: &[u64],
-    pooled: MeanInterval,
+    kept: &[Vec<u64>],
     round_medians: &[Interval],
     tally: Tally,
     rng: &mut Xorshift,
-) -> WakeLatency {
-    let sorted = Sample::new(kept.to_vec());
+) -> Option<WakeLatency> {
+    let estimate = bootstrap_median_of_means(kept, rng)?;
+    let pooled: Vec<u64> = kept.iter().flatten().copied().collect();
+    let sorted = Sample::new(pooled);
     let pooled_median = bootstrap_interval(&sorted, rng);
-    WakeLatency {
-        mean_ns: pooled.mean,
-        mean_lower_ns: pooled.lower,
-        mean_upper_ns: pooled.upper,
+    Some(WakeLatency {
+        mean_ns: estimate.mean,
+        mean_lower_ns: estimate.lower,
+        mean_upper_ns: estimate.upper,
         p50_ns: sorted.median().unwrap_or(0),
         p99_ns: sorted.percentile(Percentile::P99).unwrap_or(0),
-        sd_ns: standard_deviation(kept).unwrap_or(0),
-        samples: u32::try_from(kept.len()).unwrap_or(u32::MAX),
+        sd_ns: agreed_spread(kept, estimate.mean, sorted.values()),
+        samples: u32::try_from(sorted.len()).unwrap_or(u32::MAX),
         same_cpu_samples: tally.same_cpu_samples,
         rounds: tally.rounds,
         rounds_agree: pooled_median.and_then(|pooled| rounds_agree(round_medians, &pooled)),
         placement: tally.placement,
         asleep_confirmed: tally.asleep_confirmed,
-        quick: !converged_mean(&pooled),
+        quick: !converged_mean(&estimate)
+            || sorted.len() < MIN_SAMPLES
+            || u32::try_from(kept.len()).unwrap_or(u32::MAX) < WAKE_ROUNDS,
+    })
+}
+
+/// Format: parts per million, the unit a coefficient of variation is carried in.
+const PER_MILLION: u128 = 1_000_000;
+
+/// The standard deviation the rounds agree on: the median of the coefficients of variation of the rounds
+/// that kept the stopping rule's floor ([`MIN_SAMPLES`]), times `mean_ns`; the `pooled` sample's own when no
+/// round kept the floor. A round's spread is its own wakes', so one round's held wake widens its own and no
+/// other's, where it widened the pooled spread and, through it, the online estimate's window: probes on one
+/// host gave windows of 2⁸ to 2²¹ wakes (`benchmark-results/mantle-contig-20261013`, the configurations'
+/// `shift`).
+fn agreed_spread(kept: &[Vec<u64>], mean_ns: u64, pooled: &[u64]) -> u64 {
+    let mut ratios: Vec<u64> = kept
+        .iter()
+        .filter(|round| round.len() >= MIN_SAMPLES)
+        .filter_map(|round| {
+            let spread = u128::from(standard_deviation(round)?);
+            let ratio = spread
+                .saturating_mul(PER_MILLION)
+                .checked_div(u128::from(mean(round)?))?;
+            u64::try_from(ratio).ok()
+        })
+        .collect();
+    match median_of(&mut ratios) {
+        Some(ratio) => u64::try_from(
+            u128::from(mean_ns)
+                .saturating_mul(u128::from(ratio))
+                .checked_div(PER_MILLION)
+                .unwrap_or(0),
+        )
+        .unwrap_or(u64::MAX),
+        None => standard_deviation(pooled).unwrap_or(0),
     }
 }
 
@@ -870,6 +1030,167 @@ mod tests {
         assert_eq!(tailed.samples(), 400_000);
     }
 
+    /// Records `value` until the block being filled is empty again, so the next wake starts a block.
+    fn to_a_block_boundary(track: &mut WakeTrack, value: u64) {
+        while track.count != 0 {
+            track.record(value);
+        }
+    }
+
+    /// The shard's blocks are as many as the probe's rounds, whose estimate seeds them.
+    #[test]
+    fn a_shard_takes_the_median_of_as_many_blocks_as_the_probe_has_rounds() {
+        assert_eq!(BLOCKS, usize::try_from(WAKE_ROUNDS).unwrap());
+    }
+
+    /// Do: seed a shard's estimate with mantle's burst at boot (227,774 ns) and feed it wakes of 3 µs.
+    /// Expect: the first blocks hold twelve wakes each (the floor of 59 over five blocks), so the seed holds
+    /// through two of them and the 3 µs wakes are the estimate, exactly, at the 36th: the third block, a
+    /// majority. The weighted mean it replaces had moved under one percent of the way by then.
+    #[test]
+    fn a_burst_at_boot_is_outvoted_once_a_majority_of_the_first_blocks_is_measured() {
+        let mut track = WakeTrack::new(227_774, 1 << 14);
+        for _ in 0..35 {
+            track.record(3_000);
+        }
+        assert_eq!(track.mean_ns(), 227_774);
+        track.record(3_000);
+        assert_eq!(track.mean_ns(), 3_000);
+        assert_eq!(track.samples(), 36);
+        let mut weighted = WakeEstimate::new(227_774, 14);
+        for _ in 0..36 {
+            weighted.record(3_000);
+        }
+        assert!(weighted.mean_ns() > 225_000, "{}", weighted.mean_ns());
+    }
+
+    /// Do: grow a shard's blocks to their longest on wakes of 3 µs, then hold one wake a quarter of a second.
+    /// Expect: the block that holds it is one of five, and the estimate stays 3 µs through that block and
+    /// the next, exactly; the weighted mean over the same window was raised eightyfold.
+    #[test]
+    fn one_held_wake_moves_one_block_and_not_the_estimate() {
+        let mut track = WakeTrack::new(3_000, 1 << 10);
+        for _ in 0..20_000 {
+            track.record(3_000);
+        }
+        to_a_block_boundary(&mut track, 3_000);
+        assert_eq!(track.length, track.longest);
+        track.record(250_000_000);
+        for _ in 0..track.longest.saturating_mul(2) {
+            track.record(3_000);
+            assert_eq!(track.mean_ns(), 3_000);
+        }
+        let mut weighted = WakeEstimate::new(3_000, 10);
+        weighted.record(250_000_000);
+        assert!(weighted.mean_ns() > 80 * 3_000, "{}", weighted.mean_ns());
+    }
+
+    /// Do: at its longest blocks, feed a shard's estimate a lasting change from 3 µs to 9 µs. Expect: it
+    /// holds 3 µs until the change fills a majority of the blocks, and is 9 µs, exactly, from the wake that
+    /// completes the third.
+    #[test]
+    fn a_lasting_change_is_followed_once_it_fills_a_majority_of_the_blocks() {
+        let mut track = WakeTrack::new(3_000, 1 << 10);
+        for _ in 0..20_000 {
+            track.record(3_000);
+        }
+        to_a_block_boundary(&mut track, 3_000);
+        for _ in 1..track.longest.saturating_mul(3) {
+            track.record(9_000);
+        }
+        assert_eq!(track.mean_ns(), 3_000);
+        track.record(9_000);
+        assert_eq!(track.mean_ns(), 9_000);
+    }
+
+    /// The blocks' lengths: twelve wakes first, doubling every five blocks until the five hold the window
+    /// between them (a window of 1,024 wakes: blocks of 205 at most); a window under the floor caps the first
+    /// blocks too.
+    #[test]
+    fn blocks_start_at_the_floor_and_double_to_the_window() {
+        let mut track = WakeTrack::new(1, 1 << 10);
+        let mut lengths = Vec::new();
+        for _ in 0..5_000 {
+            if track.count == 0 && lengths.last() != Some(&track.length) {
+                lengths.push(track.length);
+            }
+            track.record(1);
+        }
+        assert_eq!(lengths, vec![12, 24, 48, 96, 192, 205]);
+        assert_eq!(WakeTrack::new(1, 16).length, 4);
+        assert_eq!(WakeTrack::new(1, 0).length, 1);
+    }
+
+    /// What the probe's rounds found, for [`summarize`].
+    fn tally() -> Tally {
+        Tally {
+            placement: Pinning::Scheduled,
+            same_cpu_samples: 0,
+            asleep_confirmed: true,
+            rounds: WAKE_ROUNDS,
+        }
+    }
+
+    /// Do: summarize five rounds, three of wakes about 3 µs long whose spread is half their mean and two in
+    /// a burst a hundred times longer, one wake of each held 13 ms. Expect: the mean is the largest quiet
+    /// round's mean, exactly, where the pooled mean is fifty times it; the spread is half the mean (the
+    /// quiet rounds' coefficient of variation, the median of the five), so the online window is the 400
+    /// wakes that spread asks for, where the pooled spread asked for over a hundred times as many.
+    #[test]
+    fn a_burst_in_two_rounds_moves_neither_the_mean_nor_the_window() {
+        let quiet = |mean: u64| -> Vec<u64> {
+            (0..60)
+                .map(|k| if k % 2 == 0 { mean / 2 } else { mean * 3 / 2 })
+                .collect()
+        };
+        let burst = |mean: u64| -> Vec<u64> {
+            (0..60)
+                .map(|k| if k == 0 { 13_000_000 } else { mean })
+                .collect()
+        };
+        let kept = vec![
+            quiet(2_900),
+            burst(228_000),
+            quiet(3_100),
+            quiet(3_000),
+            burst(230_000),
+        ];
+        let w = summarize(&kept, &[], tally(), &mut Xorshift::new(Xorshift::SEED)).unwrap();
+        assert_eq!(w.mean_ns, 3_100, "{w:?}");
+        assert!(
+            w.mean_lower_ns <= w.mean_ns && w.mean_ns <= w.mean_upper_ns,
+            "{w:?}"
+        );
+        let pooled: Vec<u64> = kept.iter().flatten().copied().collect();
+        assert!(mean(&pooled).unwrap() > 50 * 3_100);
+        assert_eq!(w.sd_ns, 1_550, "{w:?}");
+        assert_eq!(w.estimate_window(), 400, "{w:?}");
+        let pooled_window =
+            sample_window(mean(&pooled).unwrap(), standard_deviation(&pooled).unwrap());
+        assert!(pooled_window > 100 * w.estimate_window(), "{pooled_window}");
+        assert_eq!(w.samples, 300);
+    }
+
+    /// Do: summarize rounds that kept fifteen wakes between them, and rounds that kept none. Expect: the
+    /// wakes measured are reported, quick (under the floor, short of the planned rounds), the mean the
+    /// smaller middle of the two rounds' means; nothing measured is no result.
+    #[test]
+    fn a_probe_short_of_the_floor_reports_what_it_measured_quick() {
+        let w = summarize(
+            &[vec![2_000; 10], vec![3_000; 5]],
+            &[],
+            tally(),
+            &mut Xorshift::new(Xorshift::SEED),
+        )
+        .unwrap();
+        assert_eq!((w.mean_ns, w.samples), (2_000, 15), "{w:?}");
+        assert!(w.quick, "{w:?}");
+        assert_eq!(
+            summarize(&[], &[], tally(), &mut Xorshift::new(Xorshift::SEED)),
+            None
+        );
+    }
+
     /// The window follows the probe's spread: `(1.96 · cv / 0.05)²` wakes, at least the probe's minimum,
     /// its shift the ceiling of its binary logarithm.
     #[test]
@@ -937,11 +1258,16 @@ mod tests {
         }
     }
 
-    /// A wake that was measured: at least the planned rounds, at least the stopping rule's floor of samples,
-    /// a positive mean inside its own interval, and quantiles in order.
+    /// A wake that was measured: a round's wakes at least, the planned rounds and the stopping rule's floor
+    /// of samples unless the probe says it fell short (`quick`), a positive mean inside its own interval, and
+    /// quantiles in order.
     fn assert_a_measured_mean(w: &WakeLatency) {
-        assert!(w.rounds >= WAKE_ROUNDS, "{w:?}");
-        assert!(w.samples >= u32::try_from(MIN_SAMPLES).unwrap(), "{w:?}");
+        assert!(w.rounds >= 1 && w.samples >= 1, "{w:?}");
+        assert!(
+            w.quick
+                || (w.rounds >= WAKE_ROUNDS && w.samples >= u32::try_from(MIN_SAMPLES).unwrap()),
+            "{w:?}"
+        );
         assert!(
             w.mean_lower_ns <= w.mean_ns && w.mean_ns <= w.mean_upper_ns && w.mean_ns > 0,
             "{w:?}"

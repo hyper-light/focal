@@ -34,9 +34,11 @@
 //!   asks, so the leader's appends, heartbeats and snapshots would make it a follower again and
 //!   end its asking; a leader that is up answers a pre-vote with a heartbeat, which can come
 //!   before every grant, ask after ask. They are dropped while it asks, as lost messages are.
-//! - **A leader that trusts a member again** sends it a heartbeat, so a member that was cut off
-//!   while the group was idle catches up (CockroachDB wakes a quiesced range when a node becomes
-//!   live again).
+//! - **A leader that trusts a member again** takes what it sent it while it was suspected for lost,
+//!   as raft takes a report that a member is unreachable (`MsgUnreachable`: a window out is given
+//!   up and the member probed from what it is known to hold), and sends it a heartbeat, so a member
+//!   that was cut off catches up at once, whether its group was idle (CockroachDB wakes a quiesced
+//!   range when a node becomes live again) or committed while it was cut off.
 //!
 //! Time is the owner's monotonic clock in nanoseconds, given at [`crate::RawNode::wake`], which the
 //! owner calls after each call it makes and at [`crate::RawNode::deadline`]. What a call arms is

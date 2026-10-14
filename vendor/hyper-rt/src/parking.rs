@@ -58,7 +58,10 @@ const KICKED: u32 = 2;
 pub struct Parking {
     /// [`RUNNING`], [`PARKED`] or [`KICKED`].
     state: AtomicU32,
-    kicks_skipped: AtomicU64,
+    /// Kicks the announcement saved: every wake of a running shard counts one, so the count is alone on its
+    /// line, which the senders keep among themselves; on the registry entry's line it shared with the control
+    /// mark and the exit flag, each wake's count took from the shard the line it reads every step.
+    kicks_skipped: crate::cells::Padded<AtomicU64>,
     /// When the kick of the current park was sent (the shard's clock, `machine::clock::shard_clock_ns`), 0
     /// when none was; the shard takes it after its wait. A measurement word, outside the protocol: its orders
     /// are `Relaxed`, and a stamp lost to a race costs one sample, never a wake.
@@ -191,7 +194,7 @@ impl Parking {
     pub fn new() -> Self {
         Self {
             state: AtomicU32::new(RUNNING),
-            kicks_skipped: AtomicU64::new(0),
+            kicks_skipped: crate::cells::Padded(AtomicU64::new(0)),
             kicked_at: AtomicU64::new(0),
             kick_cpu_ns: AtomicU64::new(0),
             kick_cpu_samples: AtomicU64::new(0),
@@ -234,7 +237,7 @@ impl Parking {
                 kick();
             }
         } else {
-            self.kicks_skipped.fetch_add(1, Ordering::Relaxed);
+            self.kicks_skipped.0.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -282,7 +285,7 @@ impl Parking {
 
     /// Kicks skipped because the shard had not announced parking (the saving, counted).
     pub fn kicks_skipped(&self) -> u64 {
-        self.kicks_skipped.load(Ordering::Relaxed)
+        self.kicks_skipped.0.load(Ordering::Relaxed)
     }
 
     /// The CPU the measured kicks cost their senders, nanoseconds, and how many were measured: running sums,

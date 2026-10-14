@@ -35,10 +35,18 @@ pub fn word_of(waker: &Waker) -> Option<Encoded> {
 /// shard (a timer, a driver interest, a timer wait) takes the task's identity from here, never from the
 /// waker's word, which on a 32-bit target names the slot only.
 pub(crate) fn polling_task(waker: &Waker) -> Option<Encoded> {
+    registry::with_current(|ctx| polling_task_in(ctx, waker)).flatten()
+}
+
+/// [`polling_task`] on the shard `ctx` a caller has already looked up: one lookup of the thread's current
+/// shard serves both.
+pub(crate) fn polling_task_in(ctx: &ShardContext, waker: &Waker) -> Option<Encoded> {
     let carried = word_of(waker)?;
-    let current = registry::with_current(ShardContext::current_task)
-        .flatten()?
-        .0;
+    let current = ctx.current_task()?.0;
+    // A 64-bit waker carries the whole word: the same word is the same task, at one compare.
+    if carried == current {
+        return Some(current);
+    }
     let same_task = current.shard() == carried.shard()
         && current.slot() == carried.slot()
         && (carried.generation() == current.generation()

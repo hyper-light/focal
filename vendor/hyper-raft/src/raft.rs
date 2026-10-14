@@ -2293,15 +2293,38 @@ impl<S: Storage> Raft<S> {
     /// The owner's detectors trust `member`'s node again. A follower that
     /// knows it for its leader no longer campaigns for it; a leader tells
     /// it who leads, so a member cut off while the group was idle catches
-    /// up.
+    /// up. What the leader sent it while it was suspected is taken for lost,
+    /// as a report that it was unreachable takes it ([`Raft::unreachable`]):
+    /// a member cut off while its group committed was sent a window of what
+    /// the cut lost, and would be asked where it is only once a beat passed
+    /// with that window unanswered, or, by a leader the owner has given no
+    /// timing yet, never.
     pub fn trust(&mut self, member: NodeId) -> Result<()> {
         if !self.watch_mut()?.trust(member) {
             return Ok(());
         }
         if self.state == StateRole::Leader && member != self.id {
+            self.unreachable(member);
             self.probe(member)?;
         }
         Ok(())
+    }
+    /// What was sent `member` ahead of its answers is likely lost: the
+    /// window is given up and the member probed again from what it is known
+    /// to hold, and a probe that was out is sent again (raft's
+    /// `MsgUnreachable`). A snapshot on its way waits for its report.
+    fn unreachable(&mut self, member: NodeId) {
+        let position = self.config.heartbeat_answers == HeartbeatAnswers::Position;
+        if let Some(progress) = self.tracker.get_mut(member) {
+            match progress.state {
+                ProgressState::Replicate => progress.become_probe(),
+                ProgressState::Probe if position => {
+                    progress.paused = false;
+                    progress.stalled = 0;
+                }
+                ProgressState::Probe | ProgressState::Snapshot => {}
+            }
+        }
     }
     /// What the owner's measurements give this group's elections
     /// ([`Timing`]). A member that has none draws no delay and beats on no
@@ -3043,20 +3066,7 @@ impl<S: Storage> Raft<S> {
                 Ok(())
             }
             MessageType::MsgUnreachable => {
-                // What was sent ahead is likely lost; a probe that was, is
-                // sent again.
-                if let Some(progress) = self.tracker.get_mut(message.from) {
-                    match progress.state {
-                        ProgressState::Replicate => progress.become_probe(),
-                        ProgressState::Probe
-                            if self.config.heartbeat_answers == HeartbeatAnswers::Position =>
-                        {
-                            progress.paused = false;
-                            progress.stalled = 0;
-                        }
-                        ProgressState::Probe | ProgressState::Snapshot => {}
-                    }
-                }
+                self.unreachable(message.from);
                 Ok(())
             }
             MessageType::MsgTransferLeader => self.handle_transfer_leader(&message),

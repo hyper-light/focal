@@ -143,6 +143,13 @@ pub(crate) fn take_waiter(waiter: &impl WaiterWord) -> Taken<std::thread::Thread
 /// that succeeds or the first read of an empty word.
 pub(crate) fn take<H>(waiter: &impl WaiterWord, read: impl FnOnce(u64) -> H) -> Taken<H> {
     fence(Ordering::SeqCst);
+    take_fenced(waiter, read)
+}
+
+/// [`take`] for a publisher that has fenced (`SeqCst`) after its state change and written nothing since: that
+/// fence orders the change before the read of the word as [`take`]'s own would, so a second costs a full
+/// barrier and adds no order.
+pub(crate) fn take_fenced<H>(waiter: &impl WaiterWord, read: impl FnOnce(u64) -> H) -> Taken<H> {
     let mut word = waiter.load_word(Ordering::Acquire);
     loop {
         if word == NO_WAITER || word == CLAIMED {
@@ -169,7 +176,36 @@ pub(crate) fn take<H>(waiter: &impl WaiterWord, read: impl FnOnce(u64) -> H) -> 
 /// Wakes what the word names, if anything waits there: a task through the registry, a parked thread by its
 /// handle ([`take_waiter`]). Of several publishers, one wakes each registration.
 pub(crate) fn wake_waiter(waiter: &impl WaiterWord) {
-    match take_waiter(waiter) {
+    wake_taken(take_waiter(waiter));
+}
+
+/// [`wake_waiter`] for a publisher that has fenced after its state change and written nothing since
+/// ([`take_fenced`]), on the shard `here` when the publisher is a task that looked its shard up already: a
+/// waiting task of that shard is listed on its desk at once, where the registry would look the thread's
+/// shard up again.
+pub(crate) fn wake_waiter_fenced(
+    waiter: &impl WaiterWord,
+    here: Option<&crate::shard::ShardContext>,
+) {
+    let taken = take_fenced(waiter, |word| {
+        // SAFETY: `take_fenced` calls this only with a registered thread word while it holds the word's claim;
+        // thread words are registered only by `wait_as_thread`, whose handle lives on its stack and which does
+        // not return while the word reads `CLAIMED` (`clone_thread`'s contract).
+        unsafe { clone_thread(word) }
+    });
+    match (taken, here) {
+        (Taken::Task(word), Some(here))
+            if crate::mem::Encoded::from_word(word).shard() == here.id =>
+        {
+            here.wake_local(crate::mem::Encoded::from_word(word).slot());
+        }
+        (taken, _) => wake_taken(taken),
+    }
+}
+
+/// Wakes what a publisher took: a task through the registry, a thread by its handle.
+fn wake_taken(taken: Taken<std::thread::Thread>) {
+    match taken {
         Taken::Task(word) => crate::registry::wake(crate::mem::Encoded::from_word(word)),
         Taken::Thread(thread) => thread.unpark(),
         Taken::Nobody => {}
@@ -282,6 +318,28 @@ mod loom_tests {
                 loom::thread::spawn(move || {
                     version.fetch_add(1, Ordering::Relaxed);
                     matches!(take(&*waiter, |_| ()), Taken::Task(WORD))
+                })
+            };
+            register_task(&*waiter, WORD);
+            let saw = version.load(Ordering::Relaxed) != 0;
+            let woke = sender.join().unwrap();
+            assert!(saw || woke, "the receiver slept through the change");
+        });
+    }
+
+    /// [`take_fenced`] with the fence its publisher makes after its change: as above, the receiver either sees
+    /// the new version or is woken.
+    #[test]
+    fn a_waiter_either_sees_the_change_or_is_woken_by_a_fenced_take() {
+        loom::model(|| {
+            let waiter = Arc::new(AtomicU64::new(NO_WAITER));
+            let version = Arc::new(AtomicU64::new(0));
+            let sender = {
+                let (waiter, version) = (Arc::clone(&waiter), Arc::clone(&version));
+                loom::thread::spawn(move || {
+                    version.fetch_add(1, Ordering::Relaxed);
+                    fence(Ordering::SeqCst);
+                    matches!(take_fenced(&*waiter, |_| ()), Taken::Task(WORD))
                 })
             };
             register_task(&*waiter, WORD);

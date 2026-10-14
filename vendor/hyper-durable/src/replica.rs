@@ -217,7 +217,7 @@ pub struct Writes {
 }
 
 /// A write the replica made, oldest first, with what waits for it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Out {
     kind: Kind,
     state: State,
@@ -256,7 +256,7 @@ enum State {
 }
 
 /// Writes refused for room, waiting to be made again.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Stall {
     fault: Fault,
     /// Writes that were out behind the refused one when its refusal was taken: each is refused
@@ -285,7 +285,10 @@ enum Stop {
     Failed(Cause),
 }
 
-/// One member of one group (module docs).
+/// One member of one group (module docs). A copy is a second member in the same state, for a
+/// simulation that forks its world (`docs/sim.md` §3.7); its log, machine and budget must be values
+/// to copy, so no owner of a device's handle has one.
+#[derive(Clone)]
 pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     node: RawNode<Held<L>>,
     machine: M,

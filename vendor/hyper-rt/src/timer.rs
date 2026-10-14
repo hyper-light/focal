@@ -59,6 +59,10 @@ impl Entry {
 pub struct Wheel {
     tick_ns: u64,
     now_tick: u64,
+    /// Where the tick after `now_tick` begins, nanoseconds: an advance to a time before it has nothing to do,
+    /// found by a compare where the tick's number takes a division (the loop advances at every reading of its
+    /// inputs, many within a tick).
+    next_tick_ns: u64,
     entries: Box<[Entry]>,
     heads: Box<[u32]>,
     occupied: [u64; LEVELS],
@@ -71,9 +75,11 @@ impl Wheel {
     /// A wheel with `tick_ns` per tick, room for timers `0..capacity`, starting at `now_ns`.
     pub fn new(tick_ns: u64, capacity: usize, now_ns: u64) -> Self {
         let tick_ns = tick_ns.max(1);
+        let now_tick = now_ns.checked_div(tick_ns).unwrap_or(0);
         Self {
             tick_ns,
-            now_tick: now_ns.checked_div(tick_ns).unwrap_or(0),
+            now_tick,
+            next_tick_ns: now_tick.saturating_add(1).saturating_mul(tick_ns),
             entries: vec![Entry::IDLE; capacity].into_boxed_slice(),
             heads: vec![NONE; SLOTS_PER_LEVEL.saturating_mul(LEVELS)].into_boxed_slice(),
             occupied: [0; LEVELS],
@@ -153,11 +159,16 @@ impl Wheel {
     /// ([`Wheel::next_event_tick`]), so the cost is per timer event, never per idle tick (slates measured a
     /// shard idle for 66,600 ticks examining 66,595 of them before, 2026-09-27).
     pub fn advance(&mut self, now_ns: u64, fired: &mut Vec<(u32, u64)>) {
+        // Before the next tick begins the target is the tick the wheel is at: nothing to do.
+        if now_ns < self.next_tick_ns {
+            return;
+        }
         let target = now_ns.checked_div(self.tick_ns).unwrap_or(0);
         while self.now_tick < target {
             self.now_tick = self.next_event_tick(target);
             self.expire_tick(fired);
         }
+        self.next_tick_ns = self.now_tick.saturating_add(1).saturating_mul(self.tick_ns);
     }
 
     /// The next tick after `now_tick`, at most `target`, at which some level has an occupied slot to process:
