@@ -984,7 +984,9 @@ fn complete_response_history_must_fit_entry_and_quotes_need_no_free_budget() {
     let core = observed_with_response_cap(4);
     let (claim, registrations, _) = parts(&core);
     let history = charged_heap(claim.max_response_history_heap_bytes().unwrap(), 1).unwrap();
-    let minimum = heap(claim).unwrap() + history;
+    // The row as it is, its complete response history, and the terminal cut that settling it
+    // adds.
+    let minimum = heap(claim).unwrap() + terminal_growth(claim).unwrap() + history;
     let registry = registry_bound(core.limits, claim, registrations).unwrap().1;
     let exact_entry =
         size_of::<Entry<Key, Row>>() + OwnedClaim::container_charge() + registry + minimum;

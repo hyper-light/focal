@@ -1007,7 +1007,8 @@ fn all_twenty_states_preserve_terminal_status_content_and_original_cut() {
     for status in ClaimStatus::ALL {
         let mut claim = validating();
         claim.status = *status;
-        claim.terminal_cut = terminal(*status).then_some(ClaimTerminalCut::Explicit(cut(4)));
+        claim.terminal_cut =
+            terminal(*status).then(|| held_cut(ClaimTerminalCut::Explicit(cut(4))).unwrap());
         claim.local_sealed_at = terminal(*status).then_some(SessionSeq(4));
         assert_eq!(terminal(*status), status.is_terminal());
         if !terminal(*status) {
@@ -1797,4 +1798,48 @@ fn measure_claim_state_field_widths() {
     ] {
         println!("{name:<14} {width}");
     }
+}
+
+/// A claim's terminal cut is held behind its own allocation (doc 31 M3): an open claim holds a
+/// pointer's width for it, the transition that settles it adds exactly the growth its quote
+/// names, and a refused allocation leaves the claim as it was.
+#[test]
+fn an_open_claim_holds_no_terminal_cut_and_settling_it_adds_the_quoted_growth() {
+    assert_eq!(
+        std::mem::size_of::<Option<Box<[ClaimTerminalCut; 1]>>>(),
+        std::mem::size_of::<usize>()
+    );
+    let mut claim = posted();
+    assert!(claim.terminal_cut().is_none());
+    let heap = claim.retained_heap_bytes().unwrap();
+    let allocations = claim.heap_allocations().unwrap();
+    let growth = claim.terminal_growth_heap_bytes().unwrap();
+    assert_eq!(growth, std::mem::size_of::<ClaimTerminalCut>());
+    assert_eq!(claim.terminal_growth_heap_allocations(), 1);
+
+    let before = claim.clone();
+    let refused = crate::lifecycle::memory::fail_after(0, || {
+        apply(
+            &mut claim,
+            Principal::Actor(ISSUER),
+            ClaimIntent::Cancel { cut: cut(4) },
+        )
+    });
+    assert_eq!(refused, Err(ContractError::Capacity));
+    assert_eq!(claim, before);
+
+    apply(
+        &mut claim,
+        Principal::Actor(ISSUER),
+        ClaimIntent::Cancel { cut: cut(4) },
+    )
+    .unwrap();
+    assert_eq!(
+        claim.terminal_cut(),
+        Some(ClaimTerminalCut::Explicit(cut(4)))
+    );
+    assert_eq!(claim.retained_heap_bytes().unwrap(), heap + growth);
+    assert_eq!(claim.heap_allocations().unwrap(), allocations + 1);
+    assert_eq!(claim.terminal_growth_heap_bytes().unwrap(), 0);
+    assert_eq!(claim.terminal_growth_heap_allocations(), 0);
 }

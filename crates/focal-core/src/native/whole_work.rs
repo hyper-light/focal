@@ -1,6 +1,6 @@
 //! Explicit claimant entry and its complete deterministic object consequences.
 //! Every model step is journaled; only final rows enter the atomic range write.
-use super::prepare::{Extra, Extras, Scratch, heap};
+use super::prepare::{Extra, Extras, Scratch, heap, terminal_growth};
 use super::*;
 use aggregation::PublicationPosition;
 use focal_model::lifecycle::{aggregation, claim::ClaimCut};
@@ -361,6 +361,8 @@ pub(super) fn project_effects(
                 None
             } else {
                 let mut changed = copy_claim(parent, scratch)?;
+                // A blocked aggregate makes the claim terminal: the cut it adds.
+                scratch.charge(terminal_growth(parent)?)?;
                 changed.apply_aggregate(&parent.binding(), &projection.claim_decision())?;
                 Some(changed)
             };

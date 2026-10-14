@@ -204,7 +204,11 @@ fn reverse_transitive_dependencies_fail_from_original_root_without_repainting_te
         assert_eq!(terminal.origin().created(), root_created);
         assert_eq!(terminal.sequence(), cut(&view).position);
         let original = view.claim(ClaimId(row.binding().object.0)).unwrap();
-        assert!(heap(row).unwrap() <= heap(original).unwrap());
+        // A graph failure adds the terminal cut's own allocation and nothing else.
+        assert_eq!(
+            heap(row).unwrap(),
+            super::super::prepare::transition_heap(original).unwrap()
+        );
         assert_eq!(row.response_count(), original.response_count());
         assert_eq!(row.scopes(), original.scopes());
     }

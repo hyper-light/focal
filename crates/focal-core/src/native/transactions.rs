@@ -368,7 +368,8 @@ pub(super) fn prepare(
                 if !token.changes_state() {
                     continue;
                 }
-                scratch.charge(heap(token.claim())?)?;
+                // The copy, and the cut the cancellation adds as it makes the claim terminal.
+                scratch.charge(super::prepare::transition_heap(token.claim())?)?;
                 let mut row = token.claim().try_copy(token.claim().retained_bytes()?)?;
                 row.apply_cancellation(token)?;
                 rows.push(row);

@@ -4,6 +4,19 @@ use super::*;
 use crate::lifecycle::memory as bytes;
 
 impl ClaimState {
+    /// The terminal cut's own allocation, held once the claim is terminal.
+    fn terminal_heap_bytes(&self) -> Result<usize, ContractError> {
+        bytes::array::<ClaimTerminalCut>(usize::from(self.terminal_cut.is_some()))
+    }
+    /// What a transition that makes this claim terminal adds to its heap: the cut's own
+    /// allocation, which an open claim does not hold. Nothing once it is terminal.
+    pub fn terminal_growth_heap_bytes(&self) -> Result<usize, ContractError> {
+        bytes::array::<ClaimTerminalCut>(usize::from(self.terminal_cut.is_none()))
+    }
+    /// The allocations such a transition adds, for the owner's allocator overhead.
+    pub fn terminal_growth_heap_allocations(&self) -> usize {
+        usize::from(self.terminal_cut.is_none())
+    }
     pub fn response_history_heap_bytes(&self) -> Result<usize, ContractError> {
         bytes::array::<ResponseRecord>(self.responses.capacity())
     }
@@ -58,7 +71,10 @@ impl ClaimState {
     }
     /// Number of buffers requested by a compact copy, for owner allocator overhead.
     pub fn copy_heap_allocations(&self) -> Result<usize, ContractError> {
-        let mut count = bytes::allocation::<ResponseRecord>(self.responses.len());
+        let mut count = bytes::add(
+            bytes::allocation::<ResponseRecord>(self.responses.len()),
+            usize::from(self.terminal_cut.is_some()),
+        )?;
         for part in [
             self.graph.copy_heap_allocations()?,
             self.lineage.copy_heap_allocations()?,
@@ -71,7 +87,10 @@ impl ClaimState {
     }
     /// Number of actual nonzero-capacity buffers, including reserved empty Vecs.
     pub fn heap_allocations(&self) -> Result<usize, ContractError> {
-        let mut count = bytes::allocation::<ResponseRecord>(self.responses.capacity());
+        let mut count = bytes::add(
+            bytes::allocation::<ResponseRecord>(self.responses.capacity()),
+            usize::from(self.terminal_cut.is_some()),
+        )?;
         for part in [
             self.graph.heap_allocations()?,
             self.lineage.heap_allocations()?,
@@ -85,7 +104,10 @@ impl ClaimState {
     /// Dynamic requested capacities for a compact copy. RangeStore separately
     /// charges the inline Entry/row and must not add that storage a second time.
     pub fn copy_heap_bytes(&self) -> Result<usize, ContractError> {
-        let mut size = bytes::array::<ResponseRecord>(self.responses.len())?;
+        let mut size = bytes::add(
+            bytes::array::<ResponseRecord>(self.responses.len())?,
+            self.terminal_heap_bytes()?,
+        )?;
         for part in [
             self.graph.copy_heap_bytes()?,
             self.lineage.copy_heap_bytes()?,
@@ -98,7 +120,10 @@ impl ClaimState {
     }
     /// Actual dynamic Vec capacities, excluding inline row/allocator metadata.
     pub fn retained_heap_bytes(&self) -> Result<usize, ContractError> {
-        let mut size = bytes::array::<ResponseRecord>(self.responses.capacity())?;
+        let mut size = bytes::add(
+            bytes::array::<ResponseRecord>(self.responses.capacity())?,
+            self.terminal_heap_bytes()?,
+        )?;
         for part in [
             self.graph.retained_heap_bytes()?,
             self.lineage.retained_heap_bytes()?,
@@ -153,7 +178,11 @@ impl ClaimState {
             deadline: self.deadline,
             local_complete: self.local_complete,
             local_sealed_at: self.local_sealed_at,
-            terminal_cut: self.terminal_cut,
+            terminal_cut: self
+                .terminal_cut
+                .as_deref()
+                .map(|[cut]| held_cut(*cut))
+                .transpose()?,
         };
         bytes::fits(copied.retained_bytes()?, max_bytes)?;
         Ok(copied)

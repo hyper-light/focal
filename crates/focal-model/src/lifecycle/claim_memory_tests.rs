@@ -62,10 +62,13 @@ fn retained() -> ClaimState {
     state.status = ClaimStatus::Satisfied;
     state.local_complete = true;
     state.local_sealed_at = Some(SessionSeq(9));
-    state.terminal_cut = Some(ClaimTerminalCut::Explicit(ClaimCut {
-        position: SessionSeq(10),
-        cause: ContentHash([10; 32]),
-    }));
+    state.terminal_cut = Some(
+        held_cut(ClaimTerminalCut::Explicit(ClaimCut {
+            position: SessionSeq(10),
+            cause: ContentHash([10; 32]),
+        }))
+        .unwrap(),
+    );
     state
 }
 
@@ -114,15 +117,15 @@ fn claim_copy_preflights_nested_capacity_and_counts_allocator_buffers() {
         assert_eq!(original.try_copy(charge - 1), Err(ContractError::Capacity));
         assert_eq!(bytes::remaining_allocations(), Some(5));
     });
-    // Graph, lineage, three acceptance buffers, three scope buffers, responses.
-    assert_eq!(original.copy_heap_allocations().unwrap(), 9);
-    assert_eq!(original.heap_allocations().unwrap(), 9);
+    // Graph, lineage, three acceptance buffers, three scope buffers, responses, terminal cut.
+    assert_eq!(original.copy_heap_allocations().unwrap(), 10);
+    assert_eq!(original.heap_allocations().unwrap(), 10);
     assert_eq!(
         charge,
         std::mem::size_of::<ClaimState>() + original.copy_heap_bytes().unwrap()
     );
     let copied = original.try_copy(charge).unwrap();
-    assert_eq!(copied.heap_allocations().unwrap(), 9);
+    assert_eq!(copied.heap_allocations().unwrap(), 10);
     assert_eq!(copied.retained_bytes().unwrap(), charge);
     assert!(copied.retained_heap_bytes().unwrap() < original.retained_heap_bytes().unwrap());
 }

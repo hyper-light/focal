@@ -1,7 +1,7 @@
 //! First receipt acquisition resolves complete stored eligibility at one prefix.
 //! A receipt is responsibility, not a respondent report or acceptance verdict.
 use super::admission_view::AdmissionRows;
-use super::prepare::{Extra, Extras, Scratch, heap};
+use super::prepare::{Extra, Extras, Scratch, heap, transition_heap};
 use super::*;
 use focal_model::lifecycle::{aggregation, claim::ClaimCut, graph};
 use focal_model::{Cause, WaitPredicate};
@@ -226,7 +226,8 @@ pub(super) fn prepare(
         }
         let release = graph.release(source_id)?;
         peers(&mut peer_rows, &claims, source_id)?;
-        scratch.charge(heap(source)?)?;
+        // The copy, and the cut its release adds as it satisfies the claim.
+        scratch.charge(transition_heap(source)?)?;
         let mut changed = source.try_copy(source.retained_bytes()?)?;
         changed.graph_release(&source.binding(), &release, &peer_rows, cut.position)?;
         rows.push(changed);

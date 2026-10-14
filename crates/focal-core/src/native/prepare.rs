@@ -65,6 +65,20 @@ pub(super) fn heap(row: &ClaimState) -> Result<usize, NativeError> {
             .ok_or(NativeError::Capacity("allocator charge"))?,
     )
 }
+/// What a transition that makes `row` terminal adds to its heap: the terminal cut's own
+/// allocation and the allocator's charge for it (doc 31 M3). Nothing once the claim is terminal.
+pub(super) fn terminal_growth(row: &ClaimState) -> Result<usize, NativeError> {
+    add(
+        row.terminal_growth_heap_bytes()?,
+        row.terminal_growth_heap_allocations()
+            .checked_mul(ALLOCATION)
+            .ok_or(NativeError::Capacity("allocator charge"))?,
+    )
+}
+/// The most `row` holds once a transition that may make it terminal has run on its copy.
+pub(super) fn transition_heap(row: &ClaimState) -> Result<usize, NativeError> {
+    add(heap(row)?, terminal_growth(row)?)
+}
 pub(super) fn within(bytes: usize, max: usize) -> Result<(), NativeError> {
     if bytes > max {
         Err(NativeError::Capacity("preparation bytes"))

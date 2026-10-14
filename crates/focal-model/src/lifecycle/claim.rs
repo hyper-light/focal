@@ -223,8 +223,23 @@ pub struct ClaimState {
     deadline: Option<Deadline>,
     local_complete: bool,
     local_sealed_at: Option<SessionSeq>,
-    terminal_cut: Option<ClaimTerminalCut>,
+    /// Behind its own allocation, made when the claim becomes terminal: an open claim holds a
+    /// pointer's width for it, where its widest form (208 bytes) took room in every claim row
+    /// (doc 31 M3).
+    terminal_cut: Option<Box<[ClaimTerminalCut; 1]>>,
     origin: ClaimOrigin,
+}
+
+/// `cut` in an allocation of its own, made fallibly before a transition changes anything.
+pub(super) fn held_cut(cut: ClaimTerminalCut) -> Result<Box<[ClaimTerminalCut; 1]>, ContractError> {
+    let mut held = crate::lifecycle::memory::reserve::<ClaimTerminalCut>(1)?;
+    if held.capacity() != 1 {
+        return Err(ContractError::Capacity);
+    }
+    held.push(cut);
+    held.into_boxed_slice()
+        .try_into()
+        .map_err(|_| ContractError::Capacity)
 }
 
 impl ClaimState {
@@ -390,7 +405,7 @@ impl ClaimState {
         self.local_sealed_at
     }
     pub fn terminal_cut(&self) -> Option<ClaimTerminalCut> {
-        self.terminal_cut
+        self.terminal_cut.as_deref().map(|[cut]| *cut)
     }
     pub fn origin(&self) -> ClaimOrigin {
         self.origin
@@ -444,10 +459,11 @@ impl ClaimState {
             return Err(ContractError::InvalidCut);
         }
         let binding = self.binding.next()?;
+        let held = held_cut(ClaimTerminalCut::Explicit(cut))?;
         self.binding = binding;
         self.status = status;
         self.local_sealed_at.get_or_insert(cut.position);
-        self.terminal_cut = Some(ClaimTerminalCut::Explicit(cut));
+        self.terminal_cut = Some(held);
         Ok(())
     }
 
@@ -479,10 +495,11 @@ impl ClaimState {
         cancellation.check(self)?;
         if let Some(binding) = cancellation.next_binding() {
             let cut = cancellation.cut();
+            let held = held_cut(ClaimTerminalCut::Explicit(cut))?;
             self.binding = binding;
             self.status = ClaimStatus::Cancelled;
             self.local_sealed_at.get_or_insert(cut.position);
-            self.terminal_cut = Some(ClaimTerminalCut::Explicit(cut));
+            self.terminal_cut = Some(held);
         }
         Ok(())
     }
@@ -658,10 +675,11 @@ impl ClaimState {
                     return Err(ContractError::InvalidCut);
                 }
                 let binding = self.binding.next()?;
+                let held = held_cut(ClaimTerminalCut::Required(cut))?;
                 self.binding = binding;
                 self.status = ClaimStatus::PostFailed;
                 self.local_sealed_at = Some(cut.sequence());
-                self.terminal_cut = Some(ClaimTerminalCut::Required(cut));
+                self.terminal_cut = Some(held);
                 Ok(())
             }
         }
@@ -822,13 +840,14 @@ impl ClaimState {
             return Err(ContractError::InvalidCut);
         }
         let binding = self.binding.next()?;
+        let held = held_cut(ClaimTerminalCut::Graph(cut))?;
         self.binding = binding;
         self.status = match cut.kind() {
             graph::FailureKind::DependencyFailed => ClaimStatus::DependencyFailed,
             graph::FailureKind::Deadlocked => ClaimStatus::Deadlocked,
         };
         self.local_sealed_at.get_or_insert(cut.sequence());
-        self.terminal_cut = Some(ClaimTerminalCut::Graph(cut));
+        self.terminal_cut = Some(held);
         Ok(())
     }
 
@@ -1058,10 +1077,11 @@ impl ClaimState {
                     aggregation::BlockingKind::Errored => ClaimStatus::ValidationErrored,
                 };
                 let binding = self.binding.next()?;
+                let held = held_cut(ClaimTerminalCut::Required(cut))?;
                 self.binding = binding;
                 self.status = status;
                 self.local_sealed_at = Some(cut.sequence());
-                self.terminal_cut = Some(ClaimTerminalCut::Required(cut));
+                self.terminal_cut = Some(held);
                 Ok(())
             }
         }

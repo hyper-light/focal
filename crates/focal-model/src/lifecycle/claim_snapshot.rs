@@ -115,6 +115,14 @@ impl ClaimState {
             overhead(usize::from(count != 0))?,
         )
     }
+    /// The terminal cut's own allocation for a recorded row that has one, with its allocator
+    /// overhead (doc 31 M3). A funding quote; hydration checks the recorded cut itself.
+    pub fn hydration_terminal_heap_charge_v1(terminal: bool) -> Result<usize, ContractError> {
+        bytes::add(
+            bytes::array::<ClaimTerminalCut>(usize::from(terminal))?,
+            overhead(usize::from(terminal))?,
+        )
+    }
     pub fn snapshot_v1(&self) -> ClaimSnapshotV1 {
         ClaimSnapshotV1 {
             binding: self.binding,
@@ -128,7 +136,7 @@ impl ClaimState {
             deadline: self.deadline,
             local_complete: self.local_complete,
             local_sealed_at: self.local_sealed_at,
-            terminal_cut: self.terminal_cut.map(ClaimTerminalCut::snapshot_v1),
+            terminal_cut: self.terminal_cut().map(ClaimTerminalCut::snapshot_v1),
             origin: self.origin,
         }
     }
@@ -218,8 +226,12 @@ impl ClaimState {
                 definition.acceptance.retained_heap_bytes()?,
             )?,
             bytes::add(
-                scopes.construction_heap_bytes(),
-                bytes::array::<ResponseRecord>(fields.responses)?,
+                bytes::add(
+                    scopes.construction_heap_bytes(),
+                    bytes::array::<ResponseRecord>(fields.responses)?,
+                )?,
+                // A terminal claim's cut in its own allocation.
+                bytes::array::<ClaimTerminalCut>(usize::from(terminal.is_some()))?,
             )?,
         )?;
         let allocations = bytes::add(
@@ -232,7 +244,10 @@ impl ClaimState {
             )?,
             bytes::add(
                 scopes.construction_heap_allocations(),
-                usize::from(fields.responses != 0),
+                bytes::add(
+                    usize::from(fields.responses != 0),
+                    usize::from(terminal.is_some()),
+                )?,
             )?,
         )?;
         Ok(ClaimHydrationPlan {
@@ -329,7 +344,7 @@ impl<R: ClaimResponseSource + ?Sized, S: scope::RegistrySnapshotSource + ?Sized>
             deadline: self.fields.deadline,
             local_complete: self.fields.local_complete,
             local_sealed_at: self.fields.local_sealed_at,
-            terminal_cut: self.terminal,
+            terminal_cut: self.terminal.map(held_cut).transpose()?,
             origin: self.fields.origin,
         };
         bytes::fits(

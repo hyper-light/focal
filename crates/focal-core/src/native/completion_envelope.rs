@@ -3,7 +3,9 @@
 //! its exclusive loans. No reservation or authority is granted by this value.
 
 use super::cohort_budget::CohortBudget;
-use super::prepare::{ALLOCATION, add, array, containers, event_containers, heap, within};
+use super::prepare::{
+    ALLOCATION, add, array, containers, event_containers, heap, terminal_growth, within,
+};
 use super::prepare_budget::ConstructionBudget;
 use super::*;
 use focal_memory::{RangeWriteEnvelope, RangeWriteLimits};
@@ -515,9 +517,14 @@ pub(super) fn parent_bound(
             scope_limits.scopes.min(scope_limits.roots),
         )?,
     )?;
-    let immutable = heap(claim)?
-        .checked_sub(add(current_scopes, current_responses)?)
-        .ok_or(NativeError::Capacity("claim mutable heap accounting"))?;
+    // What the row holds besides its responses and scopes, and the terminal cut a completion
+    // that settles it adds (doc 31 M3).
+    let immutable = add(
+        heap(claim)?
+            .checked_sub(add(current_scopes, current_responses)?)
+            .ok_or(NativeError::Capacity("claim mutable heap accounting"))?,
+        terminal_growth(claim)?,
+    )?;
     let (_, registry) = registry_bound(limits, claim, registrations)?;
     let row_heap = entry_heap(limits)?;
     let available_parent = row_heap
