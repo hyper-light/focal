@@ -34,14 +34,28 @@ on:
 
 permissions:
   contents: read
+  # The pinned images copied into the repository's own registry (mirror.sh).
+  packages: write
 
 jobs:
   image:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    outputs:
+      registry: ${{ steps.mirror.outputs.BENCH_REGISTRY }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Every pinned image copied by digest into the repository's registry, once:
+      # anonymous pulls from public registries share the runners' limits.
+      - id: mirror
+        run: bash tools/compare/compose/mirror.sh "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/focal-bench" >> "$GITHUB_OUTPUT"
       # The node, focal-load and focal-compare, built as the release's musl lane
       # builds them (tools/compare/compose/focal.Dockerfile).
       - uses: docker/build-push-action@v6
@@ -50,6 +64,7 @@ jobs:
           file: tools/compare/compose/focal.Dockerfile
           tags: focal:bench
           load: true
+          build-args: BASE=${{ steps.mirror.outputs.BENCH_REGISTRY || 'public.ecr.aws/docker/library' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - run: docker save focal:bench | zstd -T0 -3 > focal-bench.tar.zst
@@ -69,6 +84,13 @@ jobs:
         with:
           name: focal-bench-image
       - run: zstd -dc focal-bench.tar.zst | docker load
+      - uses: docker/login-action@v3
+        if: needs.image.outputs.registry != ''
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: The disk the runs write to
         run: |
           mkdir -p tools/compare/compose/reports
@@ -89,6 +111,10 @@ jobs:
       - name: Runs
         env:
           NODE_CPUS: "1"
+          # The competitors' images from the repository's registry where the image
+          # job copied them (compose.yaml's defaults are the public sources).
+          BENCH_LIBRARY: ${{ needs.image.outputs.registry || 'public.ecr.aws/docker/library' }}
+          BENCH_KAFKA: ${{ needs.image.outputs.registry && format('{0}/kafka', needs.image.outputs.registry) || 'apache/kafka' }}
         run: |
           for system in ${{ github.event.inputs.systems || 'focal kafka nats redis' }}; do
             for rate in ${{ github.event.inputs.rates || '100 200 1000 4000' }}; do

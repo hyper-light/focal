@@ -21,14 +21,14 @@ x-limits: &limits
 # there.
 x-nats: &nats
   <<: *limits
-  image: public.ecr.aws/docker/library/nats:2.12-alpine@sha256:b270f5e2428354c0335612694d7dd2fb588148e567a5757fdff325ef9c9332e6
+  image: ${BENCH_LIBRARY:-public.ecr.aws/docker/library}/nats:2.12-alpine@sha256:b270f5e2428354c0335612694d7dd2fb588148e567a5757fdff325ef9c9332e6
   profiles: [nats]
   command: ["-c", "/etc/nats/nats.conf"]
   volumes: ["./nats.conf:/etc/nats/nats.conf:ro"]
 
 x-kafka: &kafka
   <<: *limits
-  image: apache/kafka:4.1.0@sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f
+  image: ${BENCH_KAFKA:-apache/kafka}:4.1.0@sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f
   profiles: [kafka]
   environment: &kafka-env
     KAFKA_PROCESS_ROLES: broker,controller
@@ -45,7 +45,7 @@ x-kafka: &kafka
 
 x-redis: &redis
   <<: *limits
-  image: public.ecr.aws/docker/library/redis:8.2-alpine@sha256:b51665e66f00759be7c3152ad5ac3c66fb2f619c13ef62dea7cc1f9914524635
+  image: ${BENCH_LIBRARY:-public.ecr.aws/docker/library}/redis:8.2-alpine@sha256:b51665e66f00759be7c3152ad5ac3c66fb2f619c13ef62dea7cc1f9914524635
   profiles: [redis]
 
 x-focal: &focal
