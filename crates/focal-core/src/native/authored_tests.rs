@@ -841,7 +841,24 @@ fn measure_time_per_authored_claim() {
 #[test]
 #[ignore = "measurement: run with --ignored --nocapture"]
 fn measure_memory_per_authored_claim_by_family() {
-    let mut core = core();
+    // The range configuration a node runs with (focal-ledger's native session): leaves of 128
+    // entries within a 4 KiB memory page, Linux's; the fixtures' 8-entry leaves would measure
+    // their own page overhead.
+    let mut core = Core::new_native_authored(
+        ledger(),
+        RangeId(405),
+        NativeLimits {
+            range: RangeConfig {
+                page_entries: 128,
+                page_bytes: 4096,
+                max_batch_entries: 256,
+                ..RangeConfig::default()
+            },
+            ..limits()
+        },
+        MemoryBudget::new(512 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
+    )
+    .unwrap();
     const CLAIMS: u128 = 2_000;
     let before = core.state.budget.stats().used;
     for id in 1..=CLAIMS {
@@ -851,6 +868,37 @@ fn measure_memory_per_authored_claim_by_family() {
     // What the native engine's budget holds a claim, every structure included: the row
     // stores' pages and directories, the key sets' blocks, the rows' heap.
     let charged = core.state.budget.stats().used.saturating_sub(before);
+    let by_kind = core.state.budget.stats().by_kind;
+    let kinds = [
+        "arena",
+        "payload",
+        "index",
+        "pages",
+        "roots",
+        "read pins",
+        "pending",
+        "query",
+        "monitor",
+        "dedup",
+        "timer",
+        "recovery",
+        "control",
+        "reserved",
+    ];
+    let mut kinds_line = String::new();
+    for (name, bytes) in kinds.iter().zip(by_kind.iter()) {
+        if *bytes != 0 {
+            kinds_line.push_str(&format!(" {name} {:.0}", *bytes as f64 / CLAIMS as f64));
+        }
+    }
+    println!("charged by kind, a claim:{kinds_line}");
+    let stats = core.state.rows.stats();
+    println!(
+        "row store: {} entries (index keys among them) in {} pages: {:.1} entries a page",
+        stats.entries,
+        stats.pages,
+        stats.entries as f64 / stats.pages.max(1) as f64
+    );
     println!(
         "charged {:.0} B a claim ({} claims, the native budget's use)",
         charged as f64 / CLAIMS as f64,
@@ -919,6 +967,18 @@ fn measure_memory_per_authored_claim_by_family() {
         .fold((0, 0), |(keys, bytes), stats| {
             (keys + stats.keys, bytes + stats.block_bytes)
         });
+    // What a claim's state holds, by part: where its row's heap goes.
+    let state = core.native_claim(ClaimId::from_u128(1)).unwrap();
+    println!(
+        "claim state: {} B inline; heap: graph {} B, lineage {} B, acceptance {} B, scopes {} B, all {} B ({} allocations)",
+        std::mem::size_of::<focal_model::lifecycle::claim::ClaimState>(),
+        state.graph().retained_heap_bytes().unwrap(),
+        state.lineage().retained_heap_bytes().unwrap(),
+        state.acceptance().retained_heap_bytes().unwrap(),
+        state.scopes().retained_heap_bytes().unwrap(),
+        state.retained_heap_bytes().unwrap(),
+        state.heap_allocations().unwrap()
+    );
     println!(
         "key sets: {:.2} keys a claim, {:.0} block bytes a claim ({:.1} a key)",
         sets.0 as f64 / claims,

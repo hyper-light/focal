@@ -327,15 +327,33 @@ fn small_immutable_definitions_keep_their_owned_addresses_through_pending_lifecy
     assert!(core.native_outcome(request(ISSUER, 2)).is_none());
     let posted = prepared(core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[]));
     core.publish_native(posted).unwrap();
+    // The pinned read keeps the definition it read. Every family but the counters shares one
+    // page class (doc 31 M3), so the publication copied the page the definition shares with the
+    // claim while the pin held it: the live definition is the same declaration, copied.
     assert_eq!(
-        std::ptr::from_ref(core.native_definition(id).unwrap()),
-        original
+        pinned.with_definition(id, 1, std::ptr::from_ref).unwrap(),
+        Some(original)
+    );
+    assert_eq!(
+        core.native_definition(id).unwrap().intent_fingerprint(),
+        original_intent
     );
     assert_eq!(
         pinned
             .with_claim(key(1).claim, 1, |row| row.status())
             .unwrap(),
         Some(ClaimStatus::Generated)
+    );
+    // With no pin, a lifecycle write edits its page where it stands: the definition is not
+    // copied.
+    core.release_native(&pinned).unwrap();
+    let live = std::ptr::from_ref(core.native_definition(id).unwrap());
+    let claim = core.native_claim(key(1).claim).unwrap().binding();
+    let evaluation = core.native_evaluation(key(1)).unwrap().binding();
+    publish(&mut core, 30, begin(3, claim, 1, evaluation));
+    assert_eq!(
+        std::ptr::from_ref(core.native_definition(id).unwrap()),
+        live
     );
     check_entries(&core);
 }
@@ -416,9 +434,13 @@ fn small_immutable_artifact_descriptor_survives_control_writes_without_copying()
     assert_eq!(core.native_claim(key(1).claim).unwrap().binding(), expected);
     let cancelled = prepared(core.prepare_native(context(ISSUER, 50), cancel(), &[]));
     core.publish_native(cancelled).unwrap();
+    // The pinned read keeps the descriptor it read; the live one is the same descriptor, copied
+    // where the pin held the page it shares with the claim (one page class, doc 31 M3).
     assert_eq!(
-        std::ptr::from_ref(core.native_artifact(artifact.id).unwrap()),
-        original
+        pinned
+            .with_artifact(artifact.id, 1, std::ptr::from_ref)
+            .unwrap(),
+        Some(original)
     );
     assert_eq!(
         pinned

@@ -1187,30 +1187,23 @@ impl TimerTarget {
     }
 }
 
-/// Separate immutable definition/descriptor pages from frequently rewritten
-/// lifecycle rows. This is an owner-local storage layout, not a wire partition
-/// or placement choice. Creating another immutable object may rewrite its own
-/// namespace; a lifecycle-only mutation must share those retained pages.
+/// The page class of a row: the session's counters apart from every other row. The counters are
+/// rewritten by every mutation; sharing class 0 with the events put them on the oldest events'
+/// page, so every mutation deep-copied that page's rows (the 2026-09-29 allocation audit's R4:
+/// about a hundred 504-byte event copies a claim). On a page of their own a rewrite copies one row.
+///
+/// Every other family shares one class (doc 31 M3). Classes were also kept for the immutable
+/// payloads (definitions, artifacts, content, creation results) so a lifecycle rewrite would not
+/// copy them, but a claim's own rows sit together in the key order (its state beside its
+/// content, an outcome beside its creation result), so the classes alternated row by row and
+/// cut a page at nearly every row: 2.3 rows a page at the node's 4 KiB leaves, a fixed charge
+/// each, 400 bytes a claim. A leaf is bounded by its bytes, heap included, so what a copy-on-write
+/// copies is a page's worth whichever rows share it, and a page is copied only where a capture or
+/// a lease still reads it: publication edits it in place.
 fn page_partition(key: &layout::PackedKey) -> u64 {
     // By the key's family (its bytes after the affinity), as the store places every key.
     match key.family() {
-        // Definition, DefinitionIdentity.
-        8 | 28 => 1,
-        // Artifact, ArtifactIdentity.
-        10 | 11 => 2,
-        // ClaimContent, ClaimIdentity.
-        26 | 27 => 3,
-        // CreationResult.
-        29 => 4,
-        // The legacy families.
-        30..=33 => 5,
-        // The secondary index families and the due timers (ByIssuer through ByObject).
-        34..=48 => 6,
-        // The session's counters are rewritten by every mutation. Sharing class 0 with the events put them on
-        // the oldest events' page, so every mutation deep-copied that page's rows (the 2026-09-29 allocation
-        // audit's R4: about a hundred 504-byte event copies a claim). On a page of their own a rewrite copies
-        // one row.
-        6 => 7,
+        6 => 1,
         _ => 0,
     }
 }
