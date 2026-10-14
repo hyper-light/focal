@@ -689,19 +689,22 @@ Each stage lands on its own, measured:
        - the deadline copies;
        - supersession in the creation plan;
        - claim recovery's quote for a recorded terminal row.
-   - **One binding a claim** (in part). A claim's binding (88 bytes) was held five times: its
-     state, its lineage, its scope registry, its acceptance policy and its registration set.
-     - **As built.** The claim keeps the revision it was created at beside its one binding; its
-       creation binding (what its lineage was built for, and what records and checkpoints
-       encode as its lineage's and its registry's owner) is that binding at that revision. The
-       lineage is checked against it by what it carries, its cause and corrections, and the
-       registry's snapshot is taken with it (`ClaimState::scope_snapshot_v1`). Hydration
-       refuses a definition bound to anything but the claim's binding at another revision. The
-       encodings are unchanged. ClaimState 800 → 632 bytes; a claim 3,776 → 3,554 bytes.
-     - **Not yet.** The acceptance policy's claim and issuer are what prove which claim its
-       declarations were checked for, and the registration set tracks its own revision of the
-       binding; taking them out needs the policy split into what the claim holds and what it is
-       checked with, which the claim table makes (about 180 bytes).
+   - **One binding a claim.** A claim's binding (88 bytes) was held five times: its state, its
+     lineage, its scope registry, its acceptance manifest and its registration set.
+     - **As built.** The claim keeps its one binding and, beside it, the revisions the others
+       were made at: the one it was created at (its lineage's and its registry's owner), the
+       one its acceptance manifest was checked for, and the one its registration set was last
+       adopted at. Each part is read bound to the claim's binding at its revision: the lineage
+       is checked against it by what it carries, the registry's and the registration set's
+       snapshots (what records and checkpoints encode) are taken with it, and the manifest is
+       read through a borrowed view (`Acceptance`) carrying the binding and the claim's issuer,
+       while the claim holds the manifest's slots and declarations alone (`PolicyBody`). Every
+       revision a part may hold apart from the claim's was checked to be its binding's but for
+       the revision where it is admitted and restored, so every encoding is the one held
+       before. A definition's manifest, and a legacy registry's, stay whole.
+     - **Measured.** ClaimState 800 → 536 bytes, the registration set 176 → 96; a claim
+       3,776 → 3,554 bytes (lineage and registry) and 2,826 → 2,650 (registration set and
+       manifest, after the payloads below).
    - **The payloads written once and read rarely off the heap.**
      - **The model, borrowed from Kafka and NATS.** A claim's events, its content, its creation
        result and its outcome hold where their bytes are in a log, sixteen or twenty-four bytes,
@@ -758,13 +761,21 @@ Each stage lands on its own, measured:
      - **Measured.** A claim's events, content, creation result and outcome 1,481 → 480 bytes
        (their entries alone); a claim 4,138 → 2,826 bytes charged, its held rows (2,379 bytes)
        now fewer than their encoding (2,429).
-   - **Next on this path.**
-     - **The claim's own row** (1,104 bytes: its state 632 inline, the acceptance policy's
-       heap, the registration set): its cold parts behind their own allocations, the policy
-       split from its witness.
-     - **Leaves of encoded keys:** a key front-coded against its neighbour in its leaf, where a
-       fixed 56-byte packed key now takes each entry (about 300 bytes).
-     - Then the claim table proper.
+   - **Where a claim's 2,650 bytes are now** (one authored claim, one definition, production
+     configuration): its row 928 (its state 536 inline, the registration set 96, the
+     manifest's buffers 136, an entry), its definition 603, seven entries of 96 bytes for its
+     spilled and identity rows (672: a 56-byte packed key, a 32-byte row, the heap count), its
+     nine index keys in their key sets 192, and pages about 240.
+   - **Next on this path, measured first.** The claim's 2,650 bytes put the comparison's
+     envelope at about 250,000 open claims, past the 165,000 its runs reach, so what comes
+     next is chosen by the comparison and a profile of the owner, as the claim table is to be
+     built where it beats this store on those measures:
+     - **The entries** (a third of a claim): a key front-coded against its neighbour in its
+       leaf where a fixed 56-byte packed key takes each, and small fixed rows held as their
+       key and value bytes in key sets, as index rows already are (about 400 bytes).
+     - **The claim's state** (536 bytes): the registry's release cut and the claim's
+       optional parts behind their own allocations or in their niches (about 110 bytes).
+     - **The claim table proper.**
    - **The session's share of its allowance, beside the stages.**
      - **Measured first.** The per-session memory gauges (`focal_session_memory_*`,
        `focal_session_native_memory_*`) put the fill at the native engine's share, not at the
