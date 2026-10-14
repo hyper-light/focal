@@ -29,7 +29,7 @@ pub(super) fn audit(
     };
     let claim = owner.claim().ok_or_else(invalid)?;
     let registrations = owner.registrations().ok_or_else(invalid)?;
-    let header = registrations.snapshot_v1();
+    let header = registrations.snapshot_v1(claim.binding());
     if !header.sealed
         || !header.increments_sealed
         || header.sealed_at != Some(cohort.sealed_at())

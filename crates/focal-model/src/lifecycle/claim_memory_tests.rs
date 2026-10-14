@@ -145,3 +145,42 @@ fn every_nested_copy_allocation_failure_preserves_original_and_allows_retry() {
         assert_eq!(original.try_copy(charge).unwrap(), before);
     }
 }
+
+/// Measurement, not a check: the inline width of each part of a claim's state, and of the parts
+/// beside it, so the claim row's layout is decided from what each takes (doc 31 M3).
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn measure_claim_state_layout() {
+    use std::mem::size_of;
+    for (name, width) in [
+        ("ClaimState", size_of::<ClaimState>()),
+        ("Binding", size_of::<Binding>()),
+        ("ParticipantId", size_of::<crate::ParticipantId>()),
+        ("SessionSeq", size_of::<SessionSeq>()),
+        ("graph::Declaration", size_of::<graph::Declaration>()),
+        ("succession::Lineage", size_of::<succession::Lineage>()),
+        (
+            "aggregation::AcceptancePolicy",
+            size_of::<aggregation::AcceptancePolicy>(),
+        ),
+        ("scope::Registry", size_of::<scope::Registry>()),
+        ("scope::ScopeLimits", size_of::<scope::ScopeLimits>()),
+        ("ClaimStatus", size_of::<ClaimStatus>()),
+        (
+            "Option<ReceiptEntitlement>",
+            size_of::<Option<ReceiptEntitlement>>(),
+        ),
+        ("Vec<ResponseRecord>", size_of::<Vec<ResponseRecord>>()),
+        ("ResponseRecord", size_of::<ResponseRecord>()),
+        ("Option<Deadline>", size_of::<Option<Deadline>>()),
+        ("Option<SessionSeq>", size_of::<Option<SessionSeq>>()),
+        ("Option<ClaimCut>", size_of::<Option<ClaimCut>>()),
+        ("ClaimOrigin", size_of::<ClaimOrigin>()),
+        (
+            "aggregation::RegistrationSet",
+            size_of::<aggregation::RegistrationSet>(),
+        ),
+    ] {
+        println!("{name:<32} {width}");
+    }
+}

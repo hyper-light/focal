@@ -80,7 +80,7 @@ pub(super) fn claim(sink: &mut impl Sink, row: &OwnedClaim) -> Result<(), Error>
         return Err(Error::InvalidTag("claim response count"));
     }
     scopes(sink, value.scope_snapshot_v1())?;
-    registration(sink, registrations)
+    registration(sink, registrations, value.binding())
 }
 
 fn graph(sink: &mut impl Sink, value: &graph::Declaration) -> Result<(), Error> {
@@ -254,9 +254,13 @@ fn scopes(sink: &mut impl Sink, source: scope::RegistrySnapshotView<'_>) -> Resu
     }
     Ok(())
 }
-fn registration(sink: &mut impl Sink, value: &aggregation::RegistrationSet) -> Result<(), Error> {
+fn registration(
+    sink: &mut impl Sink,
+    value: &aggregation::RegistrationSet,
+    claim: focal_model::lifecycle::Binding,
+) -> Result<(), Error> {
     sink.visit(1)?;
-    let snapshot = value.snapshot_v1();
+    let snapshot = value.snapshot_v1(claim);
     types::binding(sink, snapshot.claim)?;
     count(sink, snapshot.max_rows)?;
     write_u8(sink, u8::from(snapshot.sealed))?;

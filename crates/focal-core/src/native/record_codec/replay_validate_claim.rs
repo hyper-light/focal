@@ -403,6 +403,7 @@ fn registrations<O: Overlay>(
     read: &ReplayRead<'_, '_, O>,
 ) -> Result<(), NativeError> {
     let current = next.registrations().ok_or_else(invalid)?;
+    let next_binding = next.claim().ok_or_else(invalid)?.binding();
     let before = old
         .map(|old| old.registrations().ok_or_else(invalid))
         .transpose()?;
@@ -416,14 +417,15 @@ fn registrations<O: Overlay>(
                 && before.max_rows() == current.max_rows()
                 && (!before.is_sealed() || current.is_sealed())
                 && before
-                    .snapshot_v1()
+                    .snapshot_v1(next_binding)
                     .sealed_at
-                    .is_none_or(|at| current.snapshot_v1().sealed_at == Some(at)),
+                    .is_none_or(|at| current.snapshot_v1(next_binding).sealed_at == Some(at)),
         )?;
+        // The set keeps the revision of its claim it was last adopted at (doc 31 M3).
         if adopted {
-            require(current.snapshot_v1().claim == next.claim().ok_or_else(invalid)?.binding())?;
+            require(current.revision() == next_binding.revision)?;
         } else {
-            require(before.snapshot_v1().claim == current.snapshot_v1().claim)?;
+            require(before.revision() == current.revision())?;
         }
         if before.increment_targets_sealed() && !current.increment_targets_sealed() {
             require(adopted && !before.is_sealed())?;

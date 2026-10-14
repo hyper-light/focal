@@ -46,7 +46,7 @@ fn restore_registry(
     let plan = bytes::fail_after(0, || {
         RegistrationSet::prepare_hydration_v1(
             claim,
-            registry.snapshot_v1(),
+            registry.snapshot_v1(claim.binding()),
             rows,
             registry.max_rows(),
             usize::MAX,
@@ -137,7 +137,7 @@ fn registration_current_frames_survive_adoption_and_preserve_original_cohort_sea
     assert_eq!(historical.last_result(), delivered.last_result());
     assert_eq!(sealed.state(), v::State::Ready);
     assert!(sealed.sealed().is_some());
-    let mut wrong_cut = registry.snapshot_v1();
+    let mut wrong_cut = registry.snapshot_v1(claim.binding());
     wrong_cut.sealed_at = Some(SessionSeq(10));
     assert!(matches!(
         RegistrationSet::prepare_hydration_v1(&claim, wrong_cut, rows.as_slice(), 8, usize::MAX),
@@ -157,7 +157,7 @@ fn registration_exact_quotes_refuse_without_allocating_and_legacy_unstamped_seal
     let prepare = || {
         RegistrationSet::prepare_hydration_v1(
             &claim,
-            registry.snapshot_v1(),
+            registry.snapshot_v1(claim.binding()),
             rows.as_slice(),
             8,
             usize::MAX,
@@ -171,7 +171,7 @@ fn registration_exact_quotes_refuse_without_allocating_and_legacy_unstamped_seal
     assert!(matches!(
         RegistrationSet::prepare_hydration_v1(
             &claim,
-            registry.snapshot_v1(),
+            registry.snapshot_v1(claim.binding()),
             rows.as_slice(),
             8,
             inspection - 1
@@ -190,7 +190,7 @@ fn registration_exact_quotes_refuse_without_allocating_and_legacy_unstamped_seal
     }
     restore_registry(&claim, &registry, &rows);
     registry.seal_targets(&claim).unwrap();
-    assert!(registry.snapshot_v1().sealed_at.is_none());
+    assert!(registry.snapshot_v1(claim.binding()).sealed_at.is_none());
     let restored = restore_registry(&claim, &registry, &rows);
     assert!(restored.is_sealed());
     assert!(restored.audit_targets(&claim).is_err());
@@ -236,7 +236,7 @@ fn registration_rejects_changed_current_frame_duplicates_and_substituted_declara
     };
     let plan = RegistrationSet::prepare_hydration_v1(
         &claim,
-        registry.snapshot_v1(),
+        registry.snapshot_v1(claim.binding()),
         &source,
         8,
         usize::MAX,
@@ -251,7 +251,7 @@ fn registration_rejects_changed_current_frame_duplicates_and_substituted_declara
     ));
     let plan = RegistrationSet::prepare_hydration_v1(
         &claim,
-        registry.snapshot_v1(),
+        registry.snapshot_v1(claim.binding()),
         &source,
         8,
         usize::MAX,
@@ -261,7 +261,7 @@ fn registration_rejects_changed_current_frame_duplicates_and_substituted_declara
     let duplicate = [rows[0], rows[0]];
     let fields = aggregation::RegistrationSnapshotV1 {
         rows: 2,
-        ..registry.snapshot_v1()
+        ..registry.snapshot_v1(claim.binding())
     };
     assert!(matches!(
         RegistrationSet::prepare_hydration_v1(&claim, fields, duplicate.as_slice(), 8, usize::MAX),
@@ -275,7 +275,7 @@ fn registration_rejects_changed_current_frame_duplicates_and_substituted_declara
     assert!(
         RegistrationSet::prepare_hydration_v1(
             &claim,
-            registry.snapshot_v1(),
+            registry.snapshot_v1(claim.binding()),
             bad.as_slice(),
             8,
             usize::MAX
@@ -292,7 +292,7 @@ fn registration_rejects_changed_current_frame_duplicates_and_substituted_declara
     assert!(
         RegistrationSet::prepare_hydration_v1(
             &claim,
-            registry.snapshot_v1(),
+            registry.snapshot_v1(claim.binding()),
             bad.as_slice(),
             8,
             usize::MAX

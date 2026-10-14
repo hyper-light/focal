@@ -215,7 +215,7 @@ pub(super) fn claim(
         last_registration = Some(recorded);
         Ok(())
     })?;
-    let registration_header = registrations.snapshot_v1();
+    let registration_header = registrations.snapshot_v1(claim.binding());
     if (registration_header.sealed || registration_header.increments_sealed)
         && last_registration.is_none()
     {

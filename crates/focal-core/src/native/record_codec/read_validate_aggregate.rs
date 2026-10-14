@@ -426,7 +426,7 @@ fn seals(
 ) -> Result<(), NativeError> {
     let read = rows;
     let cut = claim.local_sealed_at();
-    let recorded = registry.snapshot_v1();
+    let recorded = registry.snapshot_v1(claim.binding());
     require(
         recorded.sealed == cut.is_some()
             && recorded.sealed_at == cut
