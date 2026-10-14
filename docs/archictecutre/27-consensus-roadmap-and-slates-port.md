@@ -1917,8 +1917,8 @@ of the controller on three local nodes at 16,000 writes a second offered:
   cycle, so the window grows with the batches until the cycle reaches the bound. Only
   an answer that is not an error is counted or measured: a refused write was never
   served the cycle a committed one takes.
-- *A write is refused at the door once its queue holds its window, at once*
-  (`delay_exceeded`, counted at `bound="delay"`): taken in at most a window a bound, the
+- *A write is refused at the door once its queue holds its window, at once* (since §18,
+  held there instead) (`delay_exceeded`, counted at `bound="delay"`): taken in at most a window a bound, the
   next would wait past the bound to be taken, and no interval need pass to know it. The
   door is asked as the request reaches the session's host, before it is routed
   (`ReplicaHost::refuses_for_delay`). Nothing is dropped at the head: a write the door let
@@ -1970,14 +1970,61 @@ credit for. focal's transport already carries such a credit: the streams a QUIC 
   send nothing the door would refuse. A window is the most writes answered in one bound, so twice
   it leaves room to grow: the pool grows a doubling a bound, as a slow start's. It is sized again
   each least bound of the led sessions, which is the span a window is counted over.
-- *The door stays* (§16). Credit is a commitment QUIC cannot take back: a connection holds what
+- *The door stays* (§16; since §18 it holds rather than refuses). Credit is a commitment QUIC cannot take back: a connection holds what
   it was told until it uses it. So the pool overcommits by its idle connections' credit, and by
   their handshake grants, and the door refuses what an overload sends past it, as Breakwater's
   AQM does past its credits.
-- *Where a participant waits, and how long.* An exchange waiting for a stream waits at its
+- *Where a participant waits, and how long* (until §18). An exchange waiting for a stream waits at its
   participant: nothing is sent, so nothing is refused at the node. A participant's endpoint bounds
   that wait (`AskQueue::Credit`): asked while its connection already waits for a round of what it
   was granted, an exchange is refused `Unsent` at once, which focal reads as `Capacity`, the
   request known not taken. Its wait is held to about a round of its credit, as the door holds a
   session's queue to what it answers in its bound; a request that waited a whole period for a
   stream never granted is refused `Unsent` too, never left unknown.
+
+## 18. Held, not refused (2026-10-14)
+
+§16's door and §17's participant door refused: a write past a session's window was answered
+`Capacity` at once, and a participant refused its own ask past a round of its credit. In the
+comparison every ingress refusal was the door's (`bound="delay"`: 225 at 200 a second, 6,342 at
+1,000, 32,490 at 4,000 on the leader of run 38513842743), and at 1,000 a second they came in
+bursts every one to two seconds: the leader stalled for about 100 ms, or ran at half its rate for
+a second, and the door refused 40 to 90 writes in each 100 ms of it, which the session would have
+served a few milliseconds later. The client resent each refusal up to three times, at a round
+trip and a decode the leader paid for each. Kafka, NATS and Redis refuse nothing for load: Kafka's
+network threads stop reading a connection while its request queue is full
+(`queued.max.requests`), and its producer blocks its caller once its buffer is full; NATS and
+Redis leave a client's commands in its socket.
+
+**As built.**
+
+- *The door holds* (`TickPeriod::hold`, `pace::Door`). A participant's request whose door is shut
+  (its kind's `delay_exceeded`) waits there, its place charged to the session's memory first, in
+  the order it came. The owner wakes the oldest held as it takes a request of the kind from the
+  queue (a `QueueTicket` given back), and each one admitted wakes the next while the door stays
+  open, so a window that grew while writes were held fills to its room. A write's place in the
+  queue is taken as it is admitted, in the same step as the count is read
+  (`QueueMarks::enter_within`), so writes admitted at once never pass the window between them.
+  A woken request that finds the door shut again (another came in between) is held first again.
+- *Where it is held.* After the request is routed and its redirect checked, so a request for a
+  session this node does not lead is redirected at once and never waits; its evidence path, if
+  any, is done before it waits. Progress and termination of admitted work
+  (`completion_request`) and peers' frames are never held.
+- *What bounds it.* What participants can have at a node at once is what the transport's stream
+  pool grants them (§17), each held request has its place charged (`InputBound::Memory` if the
+  session has no room for it), and each wait ends at the session's request time
+  (`ReplicaConfig::request_timeout`), what the session gives a request it has taken: a request
+  held that long, the session having taken nothing of its kind in all of it, is refused then,
+  counted at `bound="delay"`, nothing done.
+- *Participants wait for credit* (`AskQueue::Table` for every endpoint): an ask waits for a stream
+  as long as its connection's credit queue moves, and is refused `Unsent` only if it stands still
+  a whole period. Past the stream pool, an overload's queue is the participant's, as Kafka's is
+  its producer's, and the caller waits; the node never pays for a refusal.
+- *Observed* as `focal_sessions_requests_held_total`, beside the refusals by bound.
+
+Tested: five tests drive the door (an open door admits at once; writes held in order, each
+admitted as the owner takes one before it; a write held past its deadline refused, the next
+admitted past its word; a grown window filled to its room; a read held while its queue's delay
+stands) and two drive a session (a write past the
+window behind a paused disk is held and served, nothing refused; one held past its request time
+is refused and counted at the delay). The comparison's effect is recorded in doc 09.

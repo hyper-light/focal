@@ -894,12 +894,14 @@ fn the_only_stopped_session_past_the_first_512_shows_in_the_first_round() {
     .unwrap()
 }
 
-/// A session refuses a participant's write that would wait past its delay bound — once its
-/// window's worth is queued for its pipeline, the next would be taken only after a bound —
-/// before it is charged or queued, and counts it at the delay; what the door let in is served
-/// however long it waited; and once its queue drains the session takes writes again.
+/// A session holds a participant's write that would wait past its delay bound — once its
+/// window's worth is queued for its pipeline, the next would be taken only after a bound — at
+/// its door, charged, and serves it once the owner takes what it stood behind: held, counted
+/// held, never refused for the wait. A write held its whole request time with the door never
+/// opening is refused then, counted at the delay. Once its queue drains the session takes
+/// writes at once again.
 #[test]
-fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
+fn a_session_holds_what_would_wait_past_its_delay_bound_and_serves_it() {
     focal_rt::block_on(async move {
         let path = tempfile::tempdir().unwrap();
         let fixture = fixture(path.path(), 1);
@@ -957,7 +959,7 @@ fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
         .unwrap();
         assert!(host.pace.queueing_delay(true) > Duration::ZERO);
         // Then the session measures a cycle of a microsecond: its window is the initial ten,
-        // and with ten writes queued for it the next would wait past its bound, refused.
+        // and with ten writes queued for it the next would wait past its bound: its door shuts.
         host.pace.served(Duration::from_micros(1));
         crate::test_waits::within(&[&host], steps, TICK, async {
             while !host.pace.delay_exceeded(true) {
@@ -968,6 +970,122 @@ fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
         })
         .await
         .unwrap();
+        // The next write is held at the door, not refused.
+        let held = host.clone();
+        let held = focal_rt::spawn(async move {
+            dispatch(&held, peer(), write(300), &ReplicaHost::wire_limits()).await
+        })
+        .unwrap();
+        crate::test_waits::within(&[&host], steps, TICK, async {
+            while host.input_refusals().requests_held < 1 {
+                focal_rt::time::sleep(Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!held.is_finished(), "held while the door is shut");
+        assert_eq!(
+            host.input_refusals().requests_refused,
+            Default::default(),
+            "nothing refused"
+        );
+        answers.push(held);
+        resume.send(()).unwrap();
+        drop(disk.join().unwrap());
+        // The write out is answered, the queued ones are served however long they waited, and
+        // the held one with them: nothing is refused.
+        for answer in answers {
+            let result = answer.await.unwrap().result;
+            assert!(
+                !matches!(result, Response::Error(AccessError::Capacity)),
+                "a write queued or held is served: {result:?}"
+            );
+        }
+        assert_eq!(
+            host.input_refusals().requests_refused,
+            Default::default(),
+            "nothing refused"
+        );
+        assert_eq!(host.input_refusals().requests_held, 1);
+        // The queue drained: with a cycle the queue can be taken within, the session takes
+        // writes again.
+        assert_eq!(host.pace.queueing_delay(true), Duration::ZERO);
+        host.pace.forget_service();
+        host.pace.served(Duration::from_millis(100));
+        assert!(!host.pace.delay_exceeded(true));
+        let again = dispatch(&host, peer(), write(400), &ReplicaHost::wire_limits()).await;
+        assert!(!matches!(
+            again.result,
+            Response::Error(AccessError::Capacity)
+        ));
+        drop(host);
+        shutdown(fixture).await;
+    })
+    .unwrap()
+}
+
+/// A write held at a shut door its whole request time, the session taking nothing of its kind in
+/// all of it, is refused then, nothing done, and counted at the delay; the writes queued before
+/// it are served once the session moves again.
+#[test]
+fn a_write_held_its_whole_request_time_is_refused_and_counted_at_the_delay() {
+    focal_rt::block_on(async move {
+        let path = tempfile::tempdir().unwrap();
+        let fixture = fixture(path.path(), 1);
+        settle(&fixture).await;
+        let host = fixture.hosts[&ledger(1)].clone();
+        let write = |id: u128| RequestEnvelope {
+            request_id: RequestId::from_u128(id),
+            ..envelope(
+                1,
+                Operation::OpenEpoch {
+                    epoch: RequestEpoch(1),
+                },
+            )
+        };
+        let lease = blocker(&fixture.wal);
+        let (resume, disk) = pause(lease);
+        host.pace.forget_service();
+        let mut observation = host.progress.clone();
+        observation.borrow_and_update();
+        let mut answers = Vec::new();
+        let first = host.clone();
+        answers.push(
+            focal_rt::spawn(async move {
+                dispatch(&first, peer(), write(100), &ReplicaHost::wire_limits()).await
+            })
+            .unwrap(),
+        );
+        let steps = TICK * (2 * crate::test_waits::STEP);
+        crate::test_waits::within(&[&host], steps, TICK, observation.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        for id in 0..crate::pace::INITIAL_WINDOW {
+            let queued = host.clone();
+            let id = 200 + u128::try_from(id).unwrap();
+            answers.push(
+                focal_rt::spawn(async move {
+                    dispatch(&queued, peer(), write(id), &ReplicaHost::wire_limits()).await
+                })
+                .unwrap(),
+            );
+        }
+        let window = u64::try_from(crate::pace::INITIAL_WINDOW).unwrap();
+        crate::test_waits::within(&[&host], steps, TICK, async {
+            while host.pace.queued(true) < window {
+                focal_rt::time::sleep(Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        host.pace.served(Duration::from_micros(1));
+        assert!(host.pace.delay_exceeded(true));
+        // The disk stays paused past the request time: the held write's door never opens.
         let refused = dispatch(&host, peer(), write(300), &ReplicaHost::wire_limits()).await;
         assert!(matches!(
             refused.result,
@@ -982,33 +1100,16 @@ fn a_session_refuses_what_would_wait_past_its_delay_bound_and_counts_it() {
             },
             "counted at the delay"
         );
+        assert_eq!(counted.requests_held, 1);
         resume.send(()).unwrap();
         drop(disk.join().unwrap());
-        // The write out is answered, and the queued ones the door let in are served however long
-        // they waited: only the door's refusal is counted.
         for answer in answers {
             let result = answer.await.unwrap().result;
             assert!(
                 !matches!(result, Response::Error(AccessError::Capacity)),
-                "a write the door let in is served: {result:?}"
+                "a write queued before it is served: {result:?}"
             );
         }
-        assert_eq!(
-            host.input_refusals().requests_refused.delay,
-            1,
-            "the door's alone"
-        );
-        // The queue drained: with a cycle the queue can be taken within, the session takes
-        // writes again.
-        assert_eq!(host.pace.queueing_delay(true), Duration::ZERO);
-        host.pace.forget_service();
-        host.pace.served(Duration::from_millis(100));
-        assert!(!host.pace.delay_exceeded(true));
-        let again = dispatch(&host, peer(), write(400), &ReplicaHost::wire_limits()).await;
-        assert!(!matches!(
-            again.result,
-            Response::Error(AccessError::Capacity)
-        ));
         drop(host);
         shutdown(fixture).await;
     })
