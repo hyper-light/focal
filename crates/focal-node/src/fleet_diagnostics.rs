@@ -125,6 +125,10 @@ impl Owner {
                 let session = self.session.memory_stats();
                 let width = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
                 let payloads = self.session.native_payload_log().unwrap_or_default();
+                let mut native_by_kind = [0; focal_client::admin::NATIVE_MEMORY_KINDS];
+                for (slot, kind) in native_by_kind.iter_mut().zip(focal_memory::BudgetKind::ALL) {
+                    *slot = width(native.used_by(kind));
+                }
                 focal_client::admin::AdminSessionMemory {
                     used: width(session.used),
                     limit: width(session.limit),
@@ -133,6 +137,7 @@ impl Owner {
                     payload_segments: width(payloads.segments),
                     payload_bytes: payloads.bytes,
                     payload_open_refusals: payloads.open_refusals,
+                    native_by_kind,
                 }
             }),
         };

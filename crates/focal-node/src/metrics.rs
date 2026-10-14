@@ -1945,6 +1945,31 @@ impl MetricsSnapshot {
                 }
             }
         }
+        // What each session's native engine holds, kind by kind: where its share fills.
+        text.header(
+            "focal_session_native_memory_by_kind_bytes",
+            "gauge",
+            "Bytes a session's native engine uses of its share, by the kind of what they hold; they sum to focal_session_native_memory_used_bytes when nothing is charged between the reads.",
+        );
+        for session in &self.sessions {
+            let Some(memory) = session.memory.filter(|_| session.observed) else {
+                continue;
+            };
+            for (kind, bytes) in focal_memory::BudgetKind::ALL
+                .iter()
+                .zip(memory.native_by_kind)
+            {
+                text.labeled(
+                    "focal_session_native_memory_by_kind_bytes",
+                    &[
+                        ("tenant", session.tenant.as_str()),
+                        ("session", session.session.as_str()),
+                        ("kind", kind.label()),
+                    ],
+                    bytes,
+                );
+            }
+        }
         text.out
     }
 }
@@ -2313,6 +2338,12 @@ mod tests {
             payload_segments: 3,
             payload_bytes: 4_096,
             payload_open_refusals: 0,
+            native_by_kind: {
+                let mut kinds = [0; focal_client::admin::NATIVE_MEMORY_KINDS];
+                kinds[0] = 7_000;
+                kinds[3] = 1_000;
+                kinds
+            },
         });
         let mut managed = sample.sessions[0].clone();
         managed.session = "m".into();
@@ -2328,9 +2359,16 @@ mod tests {
             "focal_session_memory_limit_bytes{tenant=\"t\",session=\"s\"} 800000\n",
             "focal_session_native_memory_used_bytes{tenant=\"t\",session=\"s\"} 8000\n",
             "focal_session_native_memory_limit_bytes{tenant=\"t\",session=\"s\"} 400000\n",
+            "focal_session_native_memory_by_kind_bytes{tenant=\"t\",session=\"s\",kind=\"arena\"} 7000\n",
+            "focal_session_native_memory_by_kind_bytes{tenant=\"t\",session=\"s\",kind=\"pages\"} 1000\n",
         ] {
             assert!(text.contains(line), "missing {line}");
         }
+        // The client's count of kinds is the budget's.
+        assert_eq!(
+            focal_memory::BudgetKind::ALL.len(),
+            focal_client::admin::NATIVE_MEMORY_KINDS
+        );
         for session in ["m", "u"] {
             let labels = format!("{{tenant=\"t\",session=\"{session}\"}}");
             assert!(text.contains(&format!("focal_session_observed{labels}")));

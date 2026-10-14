@@ -252,6 +252,9 @@ pub struct AdminReplicaDiagnostics {
     #[serde(default)]
     pub memory: Option<AdminSessionMemory>,
 }
+/// The kinds a session's native memory is told by ([`AdminSessionMemory::native_by_kind`]): the
+/// node's budget kinds, in their order (`focal_memory::BudgetKind::ALL`).
+pub const NATIVE_MEMORY_KINDS: usize = 14;
 /// A session's memory on one replica, in bytes (doc 31 M3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -276,6 +279,10 @@ pub struct AdminSessionMemory {
     /// without one holds its rows' payloads in memory until it opens.
     #[serde(default)]
     pub payload_open_refusals: u64,
+    /// What its native engine uses, kind by kind, in the budget's order of kinds
+    /// (`focal_memory::BudgetKind::ALL`): what fills its share, where it fills.
+    #[serde(default)]
+    pub native_by_kind: [u64; NATIVE_MEMORY_KINDS],
 }
 /// A native session's live outcome window and its seals on one replica
 /// (F12, 26 §4a).

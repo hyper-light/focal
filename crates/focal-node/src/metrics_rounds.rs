@@ -583,6 +583,7 @@ impl SessionMetrics {
                 payload_segments: wide,
                 payload_bytes: wide,
                 payload_open_refusals: wide,
+                native_by_kind: [wide; focal_client::admin::NATIVE_MEMORY_KINDS],
             }),
         }
     }
