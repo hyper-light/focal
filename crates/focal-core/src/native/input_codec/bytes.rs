@@ -153,6 +153,17 @@ pub(in crate::native) trait Sink {
     /// Debit explicitly quoted non-byte work without changing the output.
     /// The caller supplies the complete charge; zero has no implicit overhead.
     fn visit(&mut self, amount: usize) -> Result<(), Error>;
+    /// Whether this sink only measures what is written: one that does is handed a spilled row's
+    /// length ([`Self::count_unwritten`]) rather than its bytes read back (doc 31 M3).
+    fn measures(&self) -> bool {
+        false
+    }
+    /// Count `len` bytes exactly as writing them would, without them: only a measuring sink
+    /// ([`Self::measures`]) takes this.
+    fn count_unwritten(&mut self, len: usize) -> Result<(), Error> {
+        let _ = len;
+        Err(Error::Capacity)
+    }
 }
 
 pub(in crate::native) struct CountingSink {
@@ -190,8 +201,14 @@ impl Sink for CountingSink {
         self.visits.charge(amount)
     }
     fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let len = add(self.len, bytes.len())?;
-        let used = self.visits.after(add(1, bytes.len())?)?;
+        self.count_unwritten(bytes.len())
+    }
+    fn measures(&self) -> bool {
+        true
+    }
+    fn count_unwritten(&mut self, count: usize) -> Result<(), Error> {
+        let len = add(self.len, count)?;
+        let used = self.visits.after(add(1, count)?)?;
         if len > self.maximum {
             return Err(Error::Capacity);
         }

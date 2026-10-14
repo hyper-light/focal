@@ -8,6 +8,10 @@
 //! replay, a restore), never where it is published: publication stays without I/O. A log that
 //! refuses a payload (its bound, an I/O error) leaves the row holding its bytes.
 
+/// Most a spilled row's bytes may be, whatever its kind: what a reader's stack buffer holds. A row
+/// whose bytes are wider stays held.
+pub(crate) const SPILLED_BYTES: usize = 1024;
+
 /// Where a payload's bytes are in the log: its segment, offset and length, and a check over the
 /// bytes, so a read that returns anything else is refused rather than decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,10 +106,48 @@ pub(super) fn segments_of<'a>(
     live: &mut std::collections::BTreeSet<u32>,
 ) {
     for row in rows {
-        if let super::Row::Event(super::OwnedEvent::Logged(at)) = row {
-            live.insert(at.segment());
+        match row {
+            super::Row::Event(super::OwnedEvent::Logged(at))
+            | super::Row::ClaimContent(super::OwnedClaimContent::Logged(at)) => {
+                live.insert(at.segment());
+            }
+            _ => {}
         }
     }
+}
+
+/// Spill every row among `changes` the log keeps (an event; a claim's content that fits) to
+/// `log`, each entry's heap charge the spilled row's: what a candidate's rows become once every
+/// check has read them held, the leader's at the end of its plan and a replay's once it is
+/// validated, so no check reads back what was just written. A row the log refuses keeps its
+/// bytes and its charge.
+pub(super) fn spill_changes(
+    changes: &mut [focal_memory::Change<super::Key, super::Row>],
+    log: Option<&dyn PayloadLog>,
+    ledger: super::LedgerId,
+) -> Result<(), super::NativeError> {
+    let Some(log) = log else {
+        return Ok(());
+    };
+    for change in changes.iter_mut() {
+        let focal_memory::Change::Put(entry) = change else {
+            continue;
+        };
+        let spilled = match &entry.value {
+            super::Row::Event(event) => event.spill(ledger, log)?.map(super::Row::Event),
+            super::Row::ClaimContent(content) => content.spill(log).map(super::Row::ClaimContent),
+            _ => None,
+        };
+        if let Some(row) = spilled {
+            entry.heap_bytes = match &row {
+                super::Row::Event(event) => event.heap_charge()?,
+                super::Row::ClaimContent(content) => content.heap_charge()?,
+                _ => entry.heap_bytes,
+            };
+            entry.value = row;
+        }
+    }
+    Ok(())
 }
 
 /// The read side of a held log.

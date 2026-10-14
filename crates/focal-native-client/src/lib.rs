@@ -82,6 +82,7 @@ impl From<NativeError> for CompileError {
             NativeError::Memory(_) => Self::Capacity("memory"),
             NativeError::RequestConflict => Self::Unsupported("request identity conflict"),
             NativeError::Evidence(_) => Self::Unsupported("evidence"),
+            NativeError::Payload(_) => Self::Missing("a spilled row's bytes from the payload log"),
         }
     }
 }

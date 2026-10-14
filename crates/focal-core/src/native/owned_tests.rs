@@ -327,6 +327,13 @@ fn authored_definition(claim: &ClaimState) -> ValidationDescriptor {
 }
 
 fn authored_content(claim: &ClaimState) -> ClaimDescriptor {
+    authored_content_described(
+        claim,
+        "Fix this regression and report the tests, including failures.",
+    )
+}
+
+fn authored_content_described(claim: &ClaimState, description: &str) -> ClaimDescriptor {
     use focal_model::{
         ActionType, OccurrenceId, Relation, RelationKind, RelationTarget, RequirementRef,
         RootCommandId, ScopeKind,
@@ -375,7 +382,7 @@ fn authored_content(claim: &ClaimState) -> ClaimDescriptor {
             id: ClaimId(claim.binding().object.0),
             schema: 1,
             occurrence: OccurrenceId::from_u128(91),
-            description: "Fix this regression and report the tests, including failures.",
+            description,
             relations: &relations,
             scopes: &scopes,
             requirements: &requirements,
@@ -388,14 +395,14 @@ fn authored_content(claim: &ClaimState) -> ClaimDescriptor {
             policy: None,
         },
         authored_claim::Limits {
-            description_bytes: 256,
+            description_bytes: 4096,
             relations: 8,
             scopes: 4,
             scope_key_bytes: 64,
             requirements: 4,
             slots: 4,
             checks: 8,
-            construction_bytes: 4096,
+            construction_bytes: 16384,
         },
     )
     .unwrap();
@@ -508,16 +515,19 @@ fn authored_claim_content_is_held_encoded_and_reads_back_whole() {
         charge < claim_heap_of(&expected),
         "the encoding is held in less than the decoded descriptor took"
     );
-    assert_eq!(owned.content_hash(), Some(expected.content_hash()));
-    assert_eq!(owned.schema(), Some(expected.schema()));
-    assert_eq!(owned.binding(), Some(expected.binding()));
     assert_eq!(
-        owned.intent_fingerprint(),
+        owned.held().unwrap().content_hash(),
+        Some(expected.content_hash())
+    );
+    assert_eq!(owned.held().unwrap().schema(), Some(expected.schema()));
+    assert_eq!(owned.held().unwrap().binding(), Some(expected.binding()));
+    assert_eq!(
+        owned.held().unwrap().intent_fingerprint(),
         Some(expected.intent_fingerprint())
     );
-    assert_eq!(owned.profile(), Some(profile));
+    assert_eq!(owned.held().unwrap().profile(), Some(profile));
     let budget = read_budget();
-    let held = owned.body(&budget, lane()).unwrap();
+    let held = owned.held().unwrap().body(&budget, lane()).unwrap();
     assert_eq!(*held, expected);
     assert!(
         budget.stats().used > 0,
@@ -525,7 +535,7 @@ fn authored_claim_content_is_held_encoded_and_reads_back_whole() {
     );
     drop(held);
     assert_eq!(budget.stats().used, 0);
-    let view = owned.view().unwrap();
+    let view = owned.held().unwrap().view().unwrap();
     assert_eq!(view.fields().id, expected.id());
     assert_eq!(view.roles().unwrap().action, expected.action());
     assert_eq!(view.requirement_count(), expected.requirements().len());
@@ -535,7 +545,7 @@ fn authored_claim_content_is_held_encoded_and_reads_back_whole() {
     // A record carries the row's encoding as it is held: the descriptor, then the profile.
     let mut sink = super::super::input_codec::bytes::CountingSink::new(usize::MAX, usize::MAX);
     super::super::input_codec::descriptors::claim(&mut sink, &expected).unwrap();
-    assert!(owned.encoded().len() > sink.len());
+    assert!(owned.held().unwrap().encoded().len() > sink.len());
 }
 
 fn claim_heap_of(descriptor: &ClaimDescriptor) -> usize {
@@ -593,19 +603,34 @@ fn authored_copies_compact_container_capacity_preserve_profiles_and_outlive_sour
         profile.owner,
     )
     .unwrap();
-    original.0.reserve_exact(4);
+    let OwnedClaimContent::Held(bytes) = &mut original else {
+        panic!("a new content row is held");
+    };
+    bytes.reserve_exact(4);
     let old_heap = original.heap_charge().unwrap();
-    let fingerprint = original.intent_fingerprint().unwrap();
+    let fingerprint = original.held().unwrap().intent_fingerprint().unwrap();
     let copied = original.copy().unwrap();
     assert!(copied.heap_charge().unwrap() < old_heap);
-    assert_eq!(copied.encoded(), original.encoded());
-    assert_eq!(copied.profile(), original.profile());
+    assert_eq!(
+        copied.held().unwrap().encoded(),
+        original.held().unwrap().encoded()
+    );
+    assert_eq!(
+        copied.held().unwrap().profile(),
+        original.held().unwrap().profile()
+    );
     let budget = read_budget();
-    let expected = original.body(&budget, lane()).unwrap();
+    let expected = original.held().unwrap().body(&budget, lane()).unwrap();
     drop(original);
-    assert_eq!(*copied.body(&budget, lane()).unwrap(), *expected);
-    assert_eq!(copied.intent_fingerprint(), Some(fingerprint));
-    assert_eq!(copied.profile(), Some(profile));
+    assert_eq!(
+        *copied.held().unwrap().body(&budget, lane()).unwrap(),
+        *expected
+    );
+    assert_eq!(
+        copied.held().unwrap().intent_fingerprint(),
+        Some(fingerprint)
+    );
+    assert_eq!(copied.held().unwrap().profile(), Some(profile));
 }
 
 #[test]
@@ -624,9 +649,9 @@ fn authored_container_allocation_refusal_preserves_copy_sources_and_allows_retry
     )
     .unwrap();
     let fingerprint = original.descriptor().unwrap().intent_fingerprint();
-    let content_fingerprint = content.intent_fingerprint().unwrap();
+    let content_fingerprint = content.held().unwrap().intent_fingerprint().unwrap();
     let handler = handler_address(original.get().unwrap());
-    let encoded = content.encoded().to_vec();
+    let encoded = content.held().unwrap().encoded().to_vec();
     for fault in [AllocationFault::Fail, AllocationFault::Excess] {
         assert_fault(fault, with_fault(fault, || original.copy()));
         assert_fault(fault, with_fault(fault, || content.copy()));
@@ -656,12 +681,21 @@ fn authored_container_allocation_refusal_preserves_copy_sources_and_allows_retry
             fingerprint
         );
         assert_eq!(handler_address(original.get().unwrap()), handler);
-        assert_eq!(content.intent_fingerprint(), Some(content_fingerprint));
-        assert_eq!(content.encoded(), encoded);
+        assert_eq!(
+            content.held().unwrap().intent_fingerprint(),
+            Some(content_fingerprint)
+        );
+        assert_eq!(content.held().unwrap().encoded(), encoded);
         same_authored(&original.copy().unwrap(), &original);
         let retry = content.copy().unwrap();
-        assert_eq!(retry.encoded(), content.encoded());
-        assert_eq!(retry.profile(), content.profile());
+        assert_eq!(
+            retry.held().unwrap().encoded(),
+            content.held().unwrap().encoded()
+        );
+        assert_eq!(
+            retry.held().unwrap().profile(),
+            content.held().unwrap().profile()
+        );
     }
     for invalid in [
         OwnedDeclaration(DeclarationStorage::Legacy(Box::new([]))),
@@ -675,11 +709,17 @@ fn authored_container_allocation_refusal_preserves_copy_sources_and_allows_retry
         ));
         assert!(matches!(invalid.copy(), Err(MemoryError::MissingKey)));
     }
-    let invalid = OwnedClaimContent(Vec::new());
-    assert!(invalid.content_hash().is_none());
-    assert!(invalid.profile().is_none());
-    assert!(invalid.view().is_err());
-    assert!(invalid.body(&read_budget(), lane()).is_err());
+    let invalid = OwnedClaimContent::Held(Vec::new());
+    assert!(invalid.held().unwrap().content_hash().is_none());
+    assert!(invalid.held().unwrap().profile().is_none());
+    assert!(invalid.held().unwrap().view().is_err());
+    assert!(
+        invalid
+            .held()
+            .unwrap()
+            .body(&read_budget(), lane())
+            .is_err()
+    );
     assert!(matches!(
         invalid.heap_charge(),
         Err(MemoryError::MissingKey)
@@ -823,4 +863,109 @@ fn measure_definition_decode_cost() {
         "decode {:.0} ns a definition ({rounds} rounds, {held})",
         elapsed.as_nanos() as f64 / f64::from(rounds)
     );
+}
+
+/// A spilled event holds its record encoding and a spilled content its row's bytes (doc 31 M3):
+/// each is sized for a record or a checkpoint from where it is, reading nothing back, as its held
+/// form is; read back through its log, each is the held form's; without the log, neither reads.
+#[test]
+fn spilled_rows_are_sized_without_their_log_and_read_back_as_held_ones() {
+    use crate::native::payloads::MemoryPayloads;
+    use crate::native::record_codec::checkpoint::row_bytes;
+    use crate::native::{Key, NativeClaimEvent, NativeEvent, NativeEventKind, NativeFact, Row};
+    use focal_model::{RequestEpoch, RequestId, RequestKey, SessionSeq};
+    let claim = crate::native::tests::owned_claim_fixture();
+    let ledger = claim.binding().ledger;
+    let log = MemoryPayloads::default();
+    let event = NativeEvent {
+        invocation: RequestKey {
+            principal: claim.issuer(),
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(80),
+        }
+        .into(),
+        sequence: SessionSeq(1),
+        ordinal: 0,
+        fact: NativeFact::Claim(NativeClaimEvent {
+            graph: None,
+            kind: NativeEventKind::Created,
+            before: None,
+            after: claim.binding(),
+            owned_child: None,
+            status: claim.status(),
+        }),
+    };
+    let held = OwnedEvent::new(event, ledger).unwrap();
+    let logged = held.spill(ledger, &log).unwrap().unwrap();
+    assert!(matches!(logged, OwnedEvent::Logged(_)));
+    assert!(
+        logged.spill(ledger, &log).unwrap().is_none(),
+        "spilled once"
+    );
+    assert_eq!(logged.heap_charge().unwrap(), 0);
+    assert_eq!(logged.get(ledger, Some(&log)), Some(event));
+    assert_eq!(logged.get(ledger, None), None);
+    let key = Key::Event(event.sequence, event.ordinal);
+    assert_eq!(
+        row_bytes(key, &Row::Event(logged.copy().unwrap()), ledger, None).unwrap(),
+        row_bytes(key, &Row::Event(held.copy().unwrap()), ledger, None).unwrap()
+    );
+
+    let content = OwnedClaimContent::new(
+        authored_content(&claim),
+        4,
+        ScopeLimits {
+            scopes: 1,
+            roots: 2,
+            children: 3,
+        },
+        None,
+    )
+    .unwrap();
+    let spilled = content.spill(&log).unwrap();
+    assert!(spilled.spill(&log).is_none(), "spilled once");
+    assert!(spilled.held().is_none());
+    assert_eq!(spilled.heap_charge().unwrap(), 0);
+    let mut buffer = ContentBuffer::new();
+    let read = spilled.read(Some(&log), &mut buffer).unwrap();
+    let own = content.held().unwrap();
+    assert_eq!(read.encoded(), own.encoded());
+    assert_eq!(read.content_hash(), own.content_hash());
+    assert_eq!(read.profile(), own.profile());
+    assert!(matches!(
+        spilled.read(None, &mut ContentBuffer::new()),
+        Err(NativeError::Payload(
+            crate::native::payloads::PayloadError::Unavailable
+        ))
+    ));
+    let key = Key::ClaimContent(ClaimId::from_u128(1));
+    assert_eq!(
+        row_bytes(
+            key,
+            &Row::ClaimContent(spilled.copy().unwrap()),
+            ledger,
+            None
+        )
+        .unwrap(),
+        row_bytes(
+            key,
+            &Row::ClaimContent(content.copy().unwrap()),
+            ledger,
+            None
+        )
+        .unwrap()
+    );
+    // A row wider than a spilled one may be stays held.
+    let wide = OwnedClaimContent::new(
+        authored_content_described(&claim, &"x".repeat(CONTENT_SPILL_BYTES)),
+        4,
+        ScopeLimits {
+            scopes: 1,
+            roots: 2,
+            children: 3,
+        },
+        None,
+    )
+    .unwrap();
+    assert!(wide.spill(&log).is_none());
 }

@@ -23,10 +23,14 @@ const CLAIM_CONTAINER: usize = size_of::<ClaimRow>() + ALLOCATION;
 const DECLARATION_CONTAINER: usize = size_of::<Declaration>() + ALLOCATION;
 const AUTHORED_DECLARATION_CONTAINER: usize = size_of::<ValidationDescriptor>() + ALLOCATION;
 /// The bytes before a content row's descriptor: the content's hash, and the descriptor's length
-/// (u32, little-endian).
-const CONTENT_HEAD: usize = 36;
+/// (u32, little-endian). What follows is the row's record encoding.
+pub(super) const CONTENT_HEAD: usize = 36;
 /// Codec work a content row's own bytes take to write or read, beyond one a byte.
 const CONTENT_VISITS: usize = 64;
+/// Most a content row's encoding may be for it to spill (doc 31 M3): what a reader's stack
+/// buffer holds. An authored claim's is a few hundred bytes; one with a long description stays
+/// held.
+pub(super) const CONTENT_SPILL_BYTES: usize = super::payloads::SPILLED_BYTES;
 const EVALUATION_CONTAINER: usize = size_of::<EvaluationState>() + ALLOCATION;
 /// The widest retained event's encoding with its ledger implied (every fact
 /// field is fixed-width, so the bound is finite; `owned_tests` proves each
@@ -34,6 +38,11 @@ const EVALUATION_CONTAINER: usize = size_of::<EvaluationState>() + ALLOCATION;
 const EVENT_BYTES: usize = 504;
 const EVENT_VISITS: usize = 4 * EVENT_BYTES;
 const EVENT_CONTAINER: usize = EVENT_BYTES + ALLOCATION;
+/// Most a spilled event's bytes may be: its record encoding, the ledger of every binding written,
+/// which is what a record and a checkpoint copy (doc 31 M3), and what a reader's stack buffer
+/// holds. An event whose record encoding is wider stays held.
+pub(super) const EVENT_RECORD_BYTES: usize = super::payloads::SPILLED_BYTES;
+const EVENT_RECORD_VISITS: usize = 4 * EVENT_RECORD_BYTES;
 
 #[derive(Debug)]
 struct ClaimRow {
@@ -64,8 +73,27 @@ pub(super) struct ClaimContentProfile {
 /// schema, the profile) is read in place; the body is decoded only where a check needs it
 /// ([`OwnedClaimContent::body`]), charged while it is held. A record and a checkpoint write the
 /// row's encoding as it is held, and a page's copy-on-write copies bytes.
+///
+/// A row whose encoding fits [`CONTENT_SPILL_BYTES`] is spilled to the replica's payload log
+/// where it is built, as events are, and holds where its bytes are: sixteen bytes and nothing on
+/// the heap. Its readers read it through the log into a [`ContentBuffer`] of their own
+/// ([`OwnedClaimContent::read`]); a longer one, or one the log refuses, stays held.
 #[derive(Debug)]
-pub(super) struct OwnedClaimContent(Vec<u8>);
+pub(super) enum OwnedClaimContent {
+    Held(Vec<u8>),
+    Logged(super::payloads::PayloadRef),
+}
+/// Room for a spilled content row's bytes while a read borrows them: on the reader's stack.
+pub(super) struct ContentBuffer([u8; CONTENT_SPILL_BYTES]);
+impl ContentBuffer {
+    pub(super) const fn new() -> Self {
+        Self([0; CONTENT_SPILL_BYTES])
+    }
+}
+/// A content row's bytes as a read borrows them: the row's own where it holds them, else a
+/// spilled row's, read from the payload log into a [`ContentBuffer`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ContentBytes<'a>(&'a [u8]);
 /// A claim's descriptor decoded from its content row, charged while it is held.
 #[derive(Debug)]
 pub struct HeldClaimBody {
@@ -349,7 +377,8 @@ impl OwnedDeclaration {
 }
 
 impl OwnedClaimContent {
-    /// Hold `descriptor` with its creation profile, as its encoding.
+    /// Hold `descriptor` with its creation profile, as its encoding: held while a candidate's
+    /// checks read it, spilled with its other rows once they have (`payloads::spill_changes`).
     pub(super) fn new(
         descriptor: ClaimDescriptor,
         max_responses: u32,
@@ -362,18 +391,20 @@ impl OwnedClaimContent {
             owner,
         };
         let body = Self::body_len(&descriptor)?;
-        Self::write(body, descriptor.content_hash(), &profile, |sink| {
+        Self::write(body, descriptor.content_hash(), &profile, None, |sink| {
             super::input_codec::descriptors::claim(sink, &descriptor)
         })
     }
-    /// Hold a descriptor's encoding `body`, as a record carries it once replay has checked it,
-    /// with its content's hash and its creation profile.
-    pub(super) fn from_encoded(
+    /// Hold a descriptor's encoding `body`, as a record or a checkpoint carries it once it is
+    /// checked, with its content's hash and its creation profile: spilled to `log` where there is
+    /// one that takes it (a restore's rows; see the type).
+    pub(super) fn from_encoded_in(
         body: &[u8],
         content_hash: ContentHash,
         profile: &ClaimContentProfile,
+        log: Option<&dyn super::payloads::PayloadLog>,
     ) -> Result<Self, MemoryError> {
-        Self::write(body.len(), content_hash, profile, |sink| {
+        Self::write(body.len(), content_hash, profile, log, |sink| {
             super::input_codec::bytes::write_raw(sink, body)
         })
     }
@@ -405,14 +436,37 @@ impl OwnedClaimContent {
             .map_err(|_| MemoryError::AllocationFailed)?;
         add(add(CONTENT_HEAD, body)?, count.len())
     }
+    /// The row's bytes written by `write_body` and the rest, spilled to `log` where it takes them
+    /// and they fit [`CONTENT_SPILL_BYTES`], else held at exactly their length.
     fn write(
         body: usize,
         content_hash: ContentHash,
         profile: &ClaimContentProfile,
+        log: Option<&dyn super::payloads::PayloadLog>,
         write_body: impl FnOnce(&mut SliceSink<'_>) -> Result<(), CodecError>,
     ) -> Result<Self, MemoryError> {
         let len = Self::held_len(body, profile)?;
+        if let Some(log) = log
+            && len <= CONTENT_SPILL_BYTES
+        {
+            let mut buffer = [0u8; CONTENT_SPILL_BYTES];
+            let bytes = buffer.get_mut(..len).ok_or(MemoryError::AllocationFailed)?;
+            Self::encode(bytes, body, content_hash, profile, write_body)?;
+            if let Some(at) = log.append(bytes) {
+                return Ok(Self::Logged(at));
+            }
+            // The log refused them: the row keeps its bytes.
+            return Self::hold(bytes, container_heap::<u8>(len)?);
+        }
         let charge = container_heap::<u8>(len)?;
+        let mut bytes = Self::reserve(len, charge)?;
+        // Within the reserved capacity: no reallocation.
+        bytes.resize(len, 0);
+        Self::encode(&mut bytes, body, content_hash, profile, write_body)?;
+        Ok(Self::Held(bytes))
+    }
+    /// An empty buffer of `len` bytes' capacity, within `charge`.
+    fn reserve(len: usize, charge: usize) -> Result<Vec<u8>, MemoryError> {
         let mut bytes = Vec::new();
         #[cfg(test)]
         let requested = tests::allocation_capacity(len)?;
@@ -422,11 +476,26 @@ impl OwnedClaimContent {
             .try_reserve_exact(requested)
             .map_err(|_| MemoryError::AllocationFailed)?;
         within(container_heap::<u8>(bytes.capacity())?, charge)?;
-        // Within the reserved capacity: no reallocation.
-        bytes.resize(len, 0);
-        let visits = add(add(len, len)?, CONTENT_VISITS)?;
-        let mut sink = SliceSink::new(&mut bytes, visits);
-        let written = super::input_codec::bytes::write_raw(&mut sink, &content_hash.0)
+        Ok(bytes)
+    }
+    /// `bytes` held at exactly their length, within `charge`.
+    fn hold(bytes: &[u8], charge: usize) -> Result<Self, MemoryError> {
+        let mut held = Self::reserve(bytes.len(), charge)?;
+        held.extend_from_slice(bytes);
+        Ok(Self::Held(held))
+    }
+    /// The row's bytes into `into`, exactly their length: the hash, the descriptor's length, the
+    /// descriptor `write_body` writes, the profile.
+    fn encode(
+        into: &mut [u8],
+        body: usize,
+        content_hash: ContentHash,
+        profile: &ClaimContentProfile,
+        write_body: impl FnOnce(&mut SliceSink<'_>) -> Result<(), CodecError>,
+    ) -> Result<(), MemoryError> {
+        let visits = add(add(into.len(), into.len())?, CONTENT_VISITS)?;
+        let mut sink = SliceSink::new(into, visits);
+        super::input_codec::bytes::write_raw(&mut sink, &content_hash.0)
             .and_then(|()| {
                 super::input_codec::bytes::write_u32(
                     &mut sink,
@@ -435,26 +504,82 @@ impl OwnedClaimContent {
             })
             .and_then(|()| write_body(&mut sink))
             .and_then(|()| super::record_codec::content_profile(&mut sink, profile))
-            .and_then(|()| sink.finish());
-        written.map_err(|_| MemoryError::AllocationFailed)?;
-        Ok(Self(bytes))
+            .and_then(|()| sink.finish())
+            .map_err(|_| MemoryError::AllocationFailed)
     }
+    /// A held row's bytes, read in place: none for a spilled one.
+    pub(super) fn held(&self) -> Option<ContentBytes<'_>> {
+        match self {
+            Self::Held(bytes) => Some(ContentBytes(bytes)),
+            Self::Logged(_) => None,
+        }
+    }
+    /// The row's bytes for a read: its own, or a spilled row's read from `payloads` into `buffer`.
+    pub(super) fn read<'a>(
+        &'a self,
+        payloads: Option<&dyn super::payloads::PayloadRead>,
+        buffer: &'a mut ContentBuffer,
+    ) -> Result<ContentBytes<'a>, NativeError> {
+        match self {
+            Self::Held(bytes) => Ok(ContentBytes(bytes)),
+            Self::Logged(at) => {
+                let payloads = payloads.ok_or(super::payloads::PayloadError::Unavailable)?;
+                let into = buffer
+                    .0
+                    .get_mut(..at.len())
+                    .ok_or(super::payloads::PayloadError::Corrupt)?;
+                payloads.read(*at, into)?;
+                Ok(ContentBytes(into))
+            }
+        }
+    }
+    /// This row spilled to `log` (see the type), where it is held, its bytes fit
+    /// [`CONTENT_SPILL_BYTES`] and the log takes them: what a candidate's rows become once every
+    /// check has read them.
+    pub(super) fn spill(&self, log: &dyn super::payloads::PayloadLog) -> Option<Self> {
+        match self {
+            Self::Held(bytes)
+                if bytes.len() >= CONTENT_HEAD && bytes.len() <= CONTENT_SPILL_BYTES =>
+            {
+                log.append(bytes).map(Self::Logged)
+            }
+            _ => None,
+        }
+    }
+    pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
+        match self {
+            Self::Held(bytes) if bytes.len() < CONTENT_HEAD => Err(MemoryError::MissingKey),
+            Self::Held(bytes) => container_heap::<u8>(bytes.capacity()),
+            Self::Logged(at) if at.len() < CONTENT_HEAD => Err(MemoryError::MissingKey),
+            Self::Logged(_) => Ok(0),
+        }
+    }
+    pub(super) fn copy(&self) -> Result<Self, MemoryError> {
+        let old = self.heap_charge()?;
+        match self {
+            Self::Held(held) => Self::hold(held, old),
+            Self::Logged(at) => Ok(Self::Logged(*at)),
+        }
+    }
+}
+
+impl<'a> ContentBytes<'a> {
     /// The row's encoding as a record and a checkpoint write it: the descriptor, then the profile.
-    pub(super) fn encoded(&self) -> &[u8] {
+    pub(super) fn encoded(self) -> &'a [u8] {
         self.0.get(CONTENT_HEAD..).unwrap_or(&[])
     }
     /// The descriptor's encoding.
-    fn body_bytes(&self) -> Option<&[u8]> {
+    fn body_bytes(self) -> Option<&'a [u8]> {
         let length = self.0.get(32..CONTENT_HEAD)?;
         let length = usize::try_from(u32::from_le_bytes(length.try_into().ok()?)).ok()?;
         self.0.get(CONTENT_HEAD..CONTENT_HEAD.checked_add(length)?)
     }
     /// The content's hash.
-    pub(super) fn content_hash(&self) -> Option<ContentHash> {
+    pub(super) fn content_hash(self) -> Option<ContentHash> {
         Some(ContentHash(self.0.get(..32)?.try_into().ok()?))
     }
     /// The descriptor's ledger, id and schema, read in place.
-    fn head(&self) -> Option<(LedgerId, ClaimId, u16)> {
+    fn head(self) -> Option<(LedgerId, ClaimId, u16)> {
         let body = self.body_bytes()?;
         let mut cursor = Cursor::new(body, body.len(), CONTENT_VISITS).ok()?;
         let ledger = LedgerId {
@@ -466,11 +591,11 @@ impl OwnedClaimContent {
         Some((ledger, id, schema))
     }
     /// The descriptor's schema.
-    pub(super) fn schema(&self) -> Option<u16> {
+    pub(super) fn schema(self) -> Option<u16> {
         self.head().map(|(_, _, schema)| schema)
     }
     /// The content's binding: its ledger, its claim, its hash, at its one revision.
-    pub(super) fn binding(&self) -> Option<Binding> {
+    pub(super) fn binding(self) -> Option<Binding> {
         let (ledger, id, _) = self.head()?;
         Some(Binding {
             ledger,
@@ -480,14 +605,14 @@ impl OwnedClaimContent {
         })
     }
     /// The content's intent fingerprint, as the descriptor's.
-    pub(super) fn intent_fingerprint(&self) -> Option<ContentHash> {
+    pub(super) fn intent_fingerprint(self) -> Option<ContentHash> {
         let (_, id, _) = self.head()?;
         Some(focal_model::lifecycle::claim_descriptor::intent_of(
             id,
             self.content_hash()?,
         ))
     }
-    pub(super) fn profile(&self) -> Option<ClaimContentProfile> {
+    pub(super) fn profile(self) -> Option<ClaimContentProfile> {
         let body = self.body_bytes()?.len();
         let profile = self.0.get(CONTENT_HEAD.checked_add(body)?..)?;
         let visits = Self::read_visits(profile.len()).ok()?;
@@ -507,7 +632,7 @@ impl OwnedClaimContent {
     }
     /// The descriptor as a view over its encoding: its fields, roles, scopes, relations and
     /// requirements read in place, nothing built and nothing allocated.
-    pub(super) fn view(&self) -> Result<super::input_codec::ClaimBodyInput<'_>, NativeError> {
+    pub(super) fn view(self) -> Result<super::input_codec::ClaimBodyInput<'a>, NativeError> {
         let body = self.body_bytes().ok_or(ContractError::InvalidPolicy)?;
         let visits = Self::read_visits(body.len())?;
         super::input_codec::ClaimBodyInput::inspect(
@@ -524,7 +649,7 @@ impl OwnedClaimContent {
     /// in `lane` before it is built and while it is held. The encoding was checked when the row
     /// was written; what bounds this decode is the encoding's own length.
     pub(super) fn body(
-        &self,
+        self,
         budget: &focal_memory::MemoryBudget,
         lane: focal_memory::BudgetLane,
     ) -> Result<HeldClaimBody, NativeError> {
@@ -574,26 +699,6 @@ impl OwnedClaimContent {
             _charge: charge,
         })
     }
-    pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
-        if self.0.len() < CONTENT_HEAD {
-            return Err(MemoryError::MissingKey);
-        }
-        container_heap::<u8>(self.0.capacity())
-    }
-    pub(super) fn copy(&self) -> Result<Self, MemoryError> {
-        let old = self.heap_charge()?;
-        let mut bytes = Vec::new();
-        #[cfg(test)]
-        let requested = tests::allocation_capacity(self.0.len())?;
-        #[cfg(not(test))]
-        let requested = self.0.len();
-        bytes
-            .try_reserve_exact(requested)
-            .map_err(|_| MemoryError::AllocationFailed)?;
-        within(container_heap::<u8>(bytes.capacity())?, old)?;
-        bytes.extend_from_slice(&self.0);
-        Ok(Self(bytes))
-    }
 }
 
 impl OwnedEvaluation {
@@ -626,12 +731,7 @@ impl OwnedEvent {
     /// Hold `event` under `ledger`. Every binding it names must be under that
     /// ledger, and a claim fact's graph capture must name an earlier ordinal.
     pub(super) fn new(event: NativeEvent, ledger: LedgerId) -> Result<Self, NativeError> {
-        if let NativeFact::Claim(row) = event.fact {
-            row.check_graph_capture(event.ordinal)?;
-        }
-        if !super::history::under(event, ledger) {
-            return Err(ContractError::WrongLedger.into());
-        }
+        Self::check(event, ledger)?;
         let bindings = EventBindings::Implied(ledger);
         let len = Self::held_len(event, bindings)?;
         within(container_heap::<u8>(len)?, EVENT_CONTAINER)?;
@@ -648,35 +748,65 @@ impl OwnedEvent {
         Ok(Self::Held(bytes))
     }
     /// `event` under `ledger`, spilled to `log` where there is one that takes it (doc 31 M3):
-    /// encoded on the stack and appended, the row holding where it is and nothing on the heap.
-    /// Held as [`Self::new`] holds it otherwise.
+    /// its record encoding written on the stack and appended, the row holding where it is and
+    /// nothing on the heap. Held as [`Self::new`] holds it otherwise.
     pub(super) fn new_in(
         event: NativeEvent,
         ledger: LedgerId,
         log: Option<&dyn super::payloads::PayloadLog>,
     ) -> Result<Self, NativeError> {
-        let Some(log) = log else {
-            return Self::new(event, ledger);
-        };
+        if let Some(log) = log {
+            Self::check(event, ledger)?;
+            if let Some(logged) = Self::logged(event, log)? {
+                return Ok(logged);
+            }
+        }
+        Self::new(event, ledger)
+    }
+    /// What every event row holds to: a claim fact's graph capture names an earlier ordinal, and
+    /// every binding it names is under `ledger`.
+    fn check(event: NativeEvent, ledger: LedgerId) -> Result<(), NativeError> {
         if let NativeFact::Claim(row) = event.fact {
             row.check_graph_capture(event.ordinal)?;
         }
         if !super::history::under(event, ledger) {
             return Err(ContractError::WrongLedger.into());
         }
-        let bindings = EventBindings::Implied(ledger);
-        let len = Self::held_len(event, bindings)?;
-        let mut buffer = [0u8; EVENT_BYTES];
-        let bytes = buffer
-            .get_mut(..len)
-            .ok_or(NativeError::Capacity("event row"))?;
-        let mut sink = SliceSink::new(bytes, EVENT_VISITS);
-        encode_event(&mut sink, event, bindings).map_err(event_codec)?;
-        sink.finish().map_err(event_codec)?;
-        match log.append(bytes) {
-            Some(at) => Ok(Self::Logged(at)),
-            None => Self::new(event, ledger),
+        Ok(())
+    }
+    /// This event spilled to `log` (see [`Self::new_in`]), where it is held and the log takes it:
+    /// what a candidate's rows become once every check has read them.
+    pub(super) fn spill(
+        &self,
+        ledger: LedgerId,
+        log: &dyn super::payloads::PayloadLog,
+    ) -> Result<Option<Self>, NativeError> {
+        if !matches!(self, Self::Held(_)) {
+            return Ok(None);
         }
+        let event = self
+            .get(ledger, None)
+            .ok_or(ContractError::InvalidManifest)?;
+        Self::logged(event, log)
+    }
+    /// `event`'s record encoding appended to `log`: where it is, or none where it is wider than a
+    /// spilled event may be or the log refuses it.
+    fn logged(
+        event: NativeEvent,
+        log: &dyn super::payloads::PayloadLog,
+    ) -> Result<Option<Self>, NativeError> {
+        let mut count = CountingSink::new(EVENT_RECORD_BYTES, EVENT_RECORD_VISITS);
+        if encode_event(&mut count, event, EventBindings::Written).is_err() {
+            return Ok(None);
+        }
+        let mut buffer = [0u8; EVENT_RECORD_BYTES];
+        let bytes = buffer
+            .get_mut(..count.len())
+            .ok_or(NativeError::Capacity("event row"))?;
+        let mut sink = SliceSink::new(bytes, EVENT_RECORD_VISITS);
+        encode_event(&mut sink, event, EventBindings::Written).map_err(event_codec)?;
+        sink.finish().map_err(event_codec)?;
+        Ok(log.append(bytes).map(Self::Logged))
     }
     /// Exactly what [`Self::new`] charges for `event` under `ledger`, without
     /// allocating: what a recovery plan quotes before building the row.
@@ -696,16 +826,22 @@ impl OwnedEvent {
         ledger: LedgerId,
         payloads: Option<&dyn super::payloads::PayloadRead>,
     ) -> Option<NativeEvent> {
-        let decode = |bytes: &[u8]| {
-            let mut cursor = Cursor::new(bytes, EVENT_BYTES, EVENT_VISITS).ok()?;
-            let event = decode_event(&mut cursor, EventBindings::Implied(ledger)).ok()?;
-            cursor.finish().ok()?;
-            Some(event)
-        };
         match self {
-            Self::Held(bytes) => decode(bytes),
+            Self::Held(bytes) => {
+                let mut cursor = Cursor::new(bytes, EVENT_BYTES, EVENT_VISITS).ok()?;
+                let event = decode_event(&mut cursor, EventBindings::Implied(ledger)).ok()?;
+                cursor.finish().ok()?;
+                Some(event)
+            }
+            // Its record encoding, every binding's ledger written: each must be `ledger`.
             Self::Logged(at) => {
-                super::payloads::with_payload::<EVENT_BYTES, _>(payloads?, *at, decode)
+                super::payloads::with_payload::<EVENT_RECORD_BYTES, _>(payloads?, *at, |bytes| {
+                    let mut cursor =
+                        Cursor::new(bytes, EVENT_RECORD_BYTES, EVENT_RECORD_VISITS).ok()?;
+                    let event = decode_event(&mut cursor, EventBindings::Written).ok()?;
+                    cursor.finish().ok()?;
+                    super::history::under(event, ledger).then_some(event)
+                })
             }
         }
     }

@@ -11,6 +11,11 @@ use focal_model::{
     ArtifactRef, ContentDomainId, ObjectRevision, ReceiptId, ValidationMode, VerdictValue,
 };
 
+/// A held content row's encoding: it reads no payload log.
+fn held_content(sink: &mut impl Sink, row: &OwnedClaimContent) -> Result<(), Error> {
+    claim_content(sink, row, None)
+}
+
 macro_rules! encoded {
     ($writer:path, $value:expr) => {{
         let value = $value;
@@ -821,7 +826,7 @@ fn authored_and_legacy_definitions_keep_distinct_bodies_and_original_claim_profi
         children: 11,
     };
     let row = OwnedClaimContent::new(descriptor, 7, profile, Some(owner)).unwrap();
-    let bytes = encoded!(claim_content, &row);
+    let bytes = encoded!(held_content, &row);
     assert_eq!(&bytes[..body.len()], &body);
     let mut cursor = Cursor::new(&bytes[body.len()..], bytes.len(), usize::MAX).unwrap();
     assert_eq!(cursor.u32().unwrap(), 7);
@@ -837,7 +842,7 @@ fn authored_and_legacy_definitions_keep_distinct_bodies_and_original_claim_profi
     );
     assert_eq!(cursor.u64().unwrap(), 6);
     cursor.finish().unwrap();
-    assert_eq!(encoded!(claim_content, &row.copy().unwrap()), bytes);
+    assert_eq!(encoded!(held_content, &row.copy().unwrap()), bytes);
 }
 
 #[test]

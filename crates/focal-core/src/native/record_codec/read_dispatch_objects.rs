@@ -343,7 +343,12 @@ fn binding(value: Binding, ledger: LedgerId, id: [u8; 16]) -> Result<(), NativeE
     }
     Ok(())
 }
-pub(super) fn check(key: Key, row: &Row, ledger: LedgerId) -> Result<(), NativeError> {
+pub(super) fn check(
+    key: Key,
+    row: &Row,
+    ledger: LedgerId,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), NativeError> {
     mutation::check_family(key, row)?;
     match (key, row) {
         (Key::Claim(id), Row::Claim(value)) => {
@@ -380,6 +385,8 @@ pub(super) fn check(key: Key, row: &Row, ledger: LedgerId) -> Result<(), NativeE
             id.0,
         )?,
         (Key::ClaimContent(id), Row::ClaimContent(value)) => {
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let value = value.read(payloads, &mut buffer)?;
             binding(value.binding().ok_or_else(invalid)?, ledger, id.0)?
         }
         (Key::Diagnostic(id), Row::Diagnostic(value)) => {

@@ -1137,18 +1137,21 @@ fn measure_record_bytes_by_family() {
 /// frozen image encodes the same root, a follower that spills replays the leader's records to
 /// the same root, every event reads back whole, and the spilling replicas hold no event's bytes.
 #[test]
-fn spilled_events_encode_replay_and_checkpoint_as_held_ones() {
-    spilled_events_match_held_ones(None);
+fn spilled_rows_encode_replay_and_checkpoint_as_held_ones() {
+    spilled_rows_match_held_ones(None);
 }
 
 /// As above, with each spilling replica's log refusing appends once it holds a few events:
 /// the events past its bound stay held, and every encoding is unchanged.
 #[test]
-fn a_full_payload_log_leaves_events_held_and_every_encoding_unchanged() {
-    spilled_events_match_held_ones(Some(2_000));
+fn a_full_payload_log_leaves_rows_held_and_every_encoding_unchanged() {
+    spilled_rows_match_held_ones(Some(2_000));
 }
 
-fn spilled_events_match_held_ones(bound: Option<usize>) {
+/// A leader and a follower that spill their events and contents (doc 31 M3) against one that
+/// holds them: every record, checkpoint (inline and frozen) and outcome is the same, and every
+/// spilled row reads back as the held one.
+fn spilled_rows_match_held_ones(bound: Option<usize>) {
     use crate::native::payloads::MemoryPayloads;
     let log = || Box::new(MemoryPayloads::bounded(bound));
     let mut plain = core();
@@ -1215,6 +1218,32 @@ fn spilled_events_match_held_ones(bound: Option<usize>) {
     plan.write_into(&mut frozen_root).unwrap();
     assert_eq!(frozen_root, root);
     for replica in [&spilled, &follower] {
+        let (mut contents, mut spilled_contents) = (0, 0);
+        for entry in replica.state.rows.entries() {
+            let (Key::ClaimContent(id), Row::ClaimContent(content)) = (entry.key, entry.value)
+            else {
+                continue;
+            };
+            match content {
+                crate::native::owned::OwnedClaimContent::Logged(_) => {
+                    assert_eq!(content.heap_charge().unwrap(), 0);
+                    assert_eq!(entry.heap_bytes, 0);
+                    spilled_contents += 1;
+                }
+                crate::native::owned::OwnedClaimContent::Held(_) => {
+                    assert!(bound.is_some(), "only a full log leaves one held")
+                }
+            }
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let read = content.read(replica.state.payloads(), &mut buffer).unwrap();
+            let Some(Row::ClaimContent(held)) = plain.state.rows.get(&Key::ClaimContent(id)) else {
+                panic!("the holding replica's content");
+            };
+            assert_eq!(read.encoded(), held.held().unwrap().encoded());
+            contents += 1;
+        }
+        assert_eq!(contents, 12);
+        assert!(spilled_contents > 0);
         let mut events = 0;
         let mut spilled_events = 0;
         for entry in replica.state.rows.entries() {

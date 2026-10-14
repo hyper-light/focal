@@ -360,9 +360,10 @@ pub(crate) fn content_error(error: focal_core::native::NativeError) -> AccessErr
     use focal_core::native::NativeError;
     match error {
         NativeError::Memory(_) | NativeError::Capacity(_) => AccessError::Capacity,
-        NativeError::Contract(_) | NativeError::Evidence(_) | NativeError::RequestConflict => {
-            AccessError::Unavailable
-        }
+        NativeError::Contract(_)
+        | NativeError::Evidence(_)
+        | NativeError::RequestConflict
+        | NativeError::Payload(_) => AccessError::Unavailable,
     }
 }
 pub(crate) fn claim(

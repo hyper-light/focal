@@ -26,12 +26,18 @@ fn evaluation_of(row: Option<&Row>) -> Result<Option<&validation::EvaluationStat
     }
 }
 
-/// The content of claim `id`, read in place from its encoding (doc 31 M3).
+/// The content of claim `id`, read in place from its encoding (doc 31 M3), a spilled one through
+/// `buffer`.
 fn content<'a, O: Overlay>(
     id: ClaimId,
     read: &'a ReplayRead<'_, '_, O>,
+    buffer: &'a mut crate::native::owned::ContentBuffer,
 ) -> Result<Option<crate::native::input_codec::ClaimBodyInput<'a>>, NativeError> {
-    authored_reads::content_view(read.get(Key::ClaimContent(id))?)
+    authored_reads::content_view(
+        read.get(Key::ClaimContent(id))?,
+        read.overlay.payloads(),
+        buffer,
+    )
 }
 
 /// Run the derivation of the primary row `key` belongs to, in its after
@@ -53,8 +59,9 @@ fn derives<O: Overlay>(
             let after = read.claim(id)?;
             let before = as_claim(read.before(Key::Claim(id))?);
             // A claim's content names index rows only where it is created.
+            let mut buffer = crate::native::owned::ContentBuffer::new();
             let content = match before {
-                None => content(id, read)?,
+                None => content(id, read, &mut buffer)?,
                 Some(_) => None,
             };
             index_rows::claim(
@@ -140,8 +147,9 @@ pub(super) fn claim_complete<O: Overlay>(
 ) -> Result<(), NativeError> {
     let after = row.claim().ok_or_else(invalid)?;
     let before = as_claim(read.before(Key::Claim(id))?);
+    let mut buffer = crate::native::owned::ContentBuffer::new();
     let content = match before {
-        None => content(id, read)?,
+        None => content(id, read, &mut buffer)?,
         Some(_) => None,
     };
     let outcomes = Outcomes(read);

@@ -25,6 +25,8 @@ fn claim_resolution(
             let Some(Row::ClaimContent(stored)) = view.get(Key::ClaimContent(*id)) else {
                 return Err(ContractError::InvalidPolicy.into());
             };
+            let mut buffer = super::super::owned::ContentBuffer::new();
+            let stored = stored.read(view.payloads(), &mut buffer)?;
             // The stored content's hash, schema and binding, read in place: no body decoded.
             let content = stored.content_hash().ok_or(ContractError::InvalidPolicy)?;
             let schema = stored.schema().ok_or(ContractError::InvalidPolicy)?;

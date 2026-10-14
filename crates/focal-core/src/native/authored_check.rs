@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::owned::ContentBuffer;
 use focal_model::{ObjectKind, RelationKind};
 
 #[path = "authored_check_budget.rs"]
@@ -223,9 +224,11 @@ pub(in crate::native) fn check_plan(
         match (&extra.key, &extra.row) {
             (Key::ClaimContent(id), Row::ClaimContent(owned)) => {
                 claims = add(claims, 1)?;
-                let held = owned.body(&view.state.budget, focal_memory::BudgetLane::Ordinary)?;
+                let mut buffer = ContentBuffer::new();
+                let bytes = owned.read(view.payloads(), &mut buffer)?;
+                let held = bytes.body(&view.state.budget, focal_memory::BudgetLane::Ordinary)?;
                 let body: &ClaimDescriptor = &held;
-                let profile = owned.profile().ok_or(ContractError::InvalidPolicy)?;
+                let profile = bytes.profile().ok_or(ContractError::InvalidPolicy)?;
                 visits.charge(plan.rows.len())?;
                 let state = plan
                     .rows
@@ -245,8 +248,14 @@ pub(in crate::native) fn check_plan(
                 super::peer::check_one(
                     Principal::Actor(proof.request.principal),
                     body,
+                    // A candidate's rows are held until every check has read them (doc 31 M3).
                     extras.rows.iter().filter_map(|extra| match &extra.row {
-                        Row::ClaimContent(content) => Some(content.view()),
+                        Row::ClaimContent(content) => Some(
+                            content
+                                .held()
+                                .ok_or(NativeError::Contract(ContractError::InvalidPolicy))
+                                .and_then(|bytes| bytes.view()),
+                        ),
                         _ => None,
                     }),
                     view,
@@ -280,7 +289,10 @@ pub(in crate::native) fn check_plan(
                 let Row::ClaimContent(owner) = &owner.row else {
                     return Err(ContractError::InvalidPolicy.into());
                 };
-                let owner = owner.body(&view.state.budget, focal_memory::BudgetLane::Ordinary)?;
+                let mut buffer = ContentBuffer::new();
+                let owner = owner
+                    .read(view.payloads(), &mut buffer)?
+                    .body(&view.state.budget, focal_memory::BudgetLane::Ordinary)?;
                 visits.charge(owner.requirements().len())?;
                 if !owner.requirements().iter().any(|pin| pin.id == *id) {
                     return Err(ContractError::InvalidPolicy.into());
@@ -313,6 +325,8 @@ pub(in crate::native) fn check_plan(
                 else {
                     return Err(ContractError::InvalidPolicy.into());
                 };
+                let mut buffer = ContentBuffer::new();
+                let body = body.read(view.payloads(), &mut buffer)?;
                 if body.schema() != Some(*schema)
                     || body.content_hash() != Some(*content)
                     || view.get(extra.key).is_some()
@@ -420,14 +434,16 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
                 let Some(Row::ClaimContent(owned)) = view.get(Key::ClaimContent(*id)) else {
                     return Err(ContractError::InvalidPolicy.into());
                 };
-                let held = owned.body(&core.state.budget, focal_memory::BudgetLane::Completion)?;
+                let mut buffer = ContentBuffer::new();
+                let bytes = owned.read(view.payloads(), &mut buffer)?;
+                let held = bytes.body(&core.state.budget, focal_memory::BudgetLane::Completion)?;
                 let body: &ClaimDescriptor = &held;
                 let state = view.claim(*id).ok_or(ContractError::InvalidTarget)?;
                 budget::body_shape(body, limits, &mut visits)?;
                 budget::state_shape(state, limits, &mut visits)?;
                 pair(
                     body,
-                    owned.profile().ok_or(ContractError::InvalidPolicy)?,
+                    bytes.profile().ok_or(ContractError::InvalidPolicy)?,
                     state,
                     &mut visits,
                 )?;
@@ -458,11 +474,13 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
             }
             (Key::ClaimContent(id), Row::ClaimContent(owned)) if strict => {
                 contents = add(contents, 1)?;
-                let held = owned.body(&core.state.budget, focal_memory::BudgetLane::Completion)?;
+                let mut buffer = ContentBuffer::new();
+                let bytes = owned.read(view.payloads(), &mut buffer)?;
+                let held = bytes.body(&core.state.budget, focal_memory::BudgetLane::Completion)?;
                 let body: &ClaimDescriptor = &held;
                 budget::body_shape(body, limits, &mut visits)?;
                 visits.charge(budget::claim_heap_visits(body)?)?;
-                owner_shape(body, owned.profile().ok_or(ContractError::InvalidPolicy)?)?;
+                owner_shape(body, bytes.profile().ok_or(ContractError::InvalidPolicy)?)?;
                 if entry.heap_bytes != owned.heap_charge()?
                     || body.id() != *id
                     || view.claim(*id).is_none()
@@ -475,8 +493,11 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
                 definitions = add(definitions, 1)?;
                 let body = owned.descriptor().ok_or(ContractError::InvalidPolicy)?;
                 // The owning claim's requirements, read in place.
+                let mut buffer = ContentBuffer::new();
                 let claim = super::super::authored_reads::content_view(
                     view.get(Key::ClaimContent(body.declaration().claim())),
+                    view.payloads(),
+                    &mut buffer,
                 )?
                 .ok_or(ContractError::InvalidTarget)?;
                 within(
@@ -497,6 +518,8 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
                 let Some(Row::ClaimContent(body)) = view.get(Key::ClaimContent(*id)) else {
                     return Err(ContractError::InvalidPolicy.into());
                 };
+                let mut buffer = ContentBuffer::new();
+                let body = body.read(view.payloads(), &mut buffer)?;
                 if entry.heap_bytes != 0
                     || body.schema() != Some(*schema)
                     || body.content_hash() != Some(*hash)

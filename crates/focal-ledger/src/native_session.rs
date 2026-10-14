@@ -469,6 +469,10 @@ impl NativeSessionError {
                 },
                 NativeError::Evidence(_) => Request,
                 NativeError::Contract(_) | NativeError::RequestConflict => Request,
+                // The payload log is a cache of the replica's records and checkpoints (doc 31
+                // M3): one it cannot read back is rebuilt by reopening, which restores and
+                // respills every row.
+                NativeError::Payload(_) => FailClosed,
             }
         }
         match self {

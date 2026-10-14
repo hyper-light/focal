@@ -429,6 +429,8 @@ fn an_authored_family_leaves_with_its_identities_and_the_owner_reconstructs() {
         else {
             return None;
         };
+        let mut buffer = crate::native::owned::ContentBuffer::new();
+        let content = content.read(core.state.payloads(), &mut buffer).ok()?;
         core.state
             .rows
             .get(&Key::ClaimIdentity(

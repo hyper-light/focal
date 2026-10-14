@@ -110,7 +110,11 @@ pub(super) fn quote(
         match &extra.row {
             Row::ClaimContent(owned) => {
                 claims = add(claims, 1)?;
-                let held = owned.body(memory, focal_memory::BudgetLane::Ordinary)?;
+                // A candidate's rows are held until every check has read them (doc 31 M3).
+                let held = owned
+                    .held()
+                    .ok_or(ContractError::InvalidPolicy)?
+                    .body(memory, focal_memory::BudgetLane::Ordinary)?;
                 let body: &ClaimDescriptor = &held;
                 let shape = body_shape(body, limits, &mut inspection)?;
                 pins = add(pins, shape.pins)?;

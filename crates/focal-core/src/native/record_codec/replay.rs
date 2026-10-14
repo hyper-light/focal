@@ -171,8 +171,10 @@ impl<B: BaseRows> read_dispatch::Objects for Objects<'_, '_, B> {
     fn payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
         self.overlay.base.base_payloads()
     }
+    /// None: a record's rows are built held, read held by its validation, and spilled once it
+    /// is validated ([`stage`]), so validation reads back nothing it just wrote (doc 31 M3).
     fn payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog> {
-        self.overlay.base.base_payload_log()
+        None
     }
     fn prefix(&self) -> SessionSeq {
         self.header.outcome.sequence
@@ -517,6 +519,9 @@ pub(super) fn stage<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows
         changes.push(change);
     }
     entries.allocation.absorb(&mut changes_allocation)?;
+    // Validated: the record's events and contents go to the payload log, each charged as it is
+    // spilled (doc 31 M3).
+    crate::native::payloads::spill_changes(&mut changes, base.base_payload_log(), header.ledger)?;
     let write_bytes = mutation::bytes(changes.len())?;
     let writes = mutation::WriteSet::capture(
         header.profile,

@@ -634,6 +634,8 @@ pub(super) fn validate<O: Overlay>(
         let Row::ClaimContent(content) = read.require(Key::ClaimContent(id))? else {
             return Err(invalid());
         };
+        let mut buffer = crate::native::owned::ContentBuffer::new();
+        let content = content.read(read.overlay.payloads(), &mut buffer)?;
         let held = content.body(read.budget, focal_memory::BudgetLane::Committed)?;
         let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
         let profile = content.profile().ok_or_else(invalid)?;

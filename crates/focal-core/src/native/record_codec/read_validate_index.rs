@@ -34,7 +34,12 @@ fn derives(key: Key, read: &ValidationRead<'_, '_>) -> Result<bool, NativeError>
     match index_rows::primary(key).ok_or_else(invalid)? {
         Primary::Claim(id) => {
             let claim = read.claim(id)?;
-            let content = authored_reads::content_view(read.get(Key::ClaimContent(id))?)?;
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let content = authored_reads::content_view(
+                read.get(Key::ClaimContent(id))?,
+                read.payloads,
+                &mut buffer,
+            )?;
             index_rows::claim(
                 None,
                 claim,
@@ -99,7 +104,9 @@ pub(super) fn require_claim(
     claim: &ClaimState,
     read: &ValidationRead<'_, '_>,
 ) -> Result<(), NativeError> {
-    let content = authored_reads::content_view(read.get(Key::ClaimContent(id))?)?;
+    let mut buffer = crate::native::owned::ContentBuffer::new();
+    let content =
+        authored_reads::content_view(read.get(Key::ClaimContent(id))?, read.payloads, &mut buffer)?;
     let outcomes = Outcomes(read);
     complete(read, |sink| {
         index_rows::claim(

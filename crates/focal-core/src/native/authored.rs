@@ -207,8 +207,11 @@ pub(super) fn check_postable(view: &View<'_>, claim: &ClaimState) -> Result<(), 
         return Ok(());
     }
     // The roles, read in place from the content's encoding (doc 31 M3).
+    let mut buffer = super::owned::ContentBuffer::new();
     let roles = super::authored_reads::content_view(
         view.get(Key::ClaimContent(ClaimId(claim.binding().object.0))),
+        view.payloads(),
+        &mut buffer,
     )?
     .ok_or(ContractError::InvalidPolicy)?
     .roles()?;
@@ -235,6 +238,8 @@ fn retained_fingerprint(extras: &Extras) -> Result<ContentHash, NativeError> {
         match &extra.row {
             Row::ClaimContent(row) => {
                 hash.update(&[0]);
+                // A candidate's rows are held until every check has read them (doc 31 M3).
+                let row = row.held().ok_or(ContractError::InvalidPolicy)?;
                 let intent = row
                     .intent_fingerprint()
                     .ok_or(ContractError::InvalidPolicy)?;

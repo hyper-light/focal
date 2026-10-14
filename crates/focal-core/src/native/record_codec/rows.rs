@@ -143,12 +143,13 @@ pub(super) fn value(
             };
             fixed::outcome(s, v.expand(ledger, invocation))
         }
+        // A spilled event holds its record encoding (doc 31 M3).
+        Row::Event(crate::native::OwnedEvent::Logged(at)) => spilled(s, *at, 0, payloads),
         Row::Event(v) => events::event(
             s,
-            v.get(ledger, payloads)
-                .ok_or(Error::InvalidTag("event row"))?,
+            v.get(ledger, None).ok_or(Error::InvalidTag("event row"))?,
         ),
-        Row::ClaimContent(v) => evidence::claim_content(s, v),
+        Row::ClaimContent(v) => evidence::claim_content(s, v, payloads),
         Row::ClaimIdentity(id) => raw(s, &id.0),
         Row::DefinitionIdentity(id) => raw(s, &id.0),
         Row::CreationResult(v) => evidence::creation(s, v),
@@ -183,4 +184,34 @@ fn legacy(s: &mut impl Sink, v: &OwnedLegacy) -> Result<(), Error> {
     s.visit(1)?;
     bytes::write_count(s, v.bytes().len())?;
     raw(s, v.bytes())
+}
+
+/// A spilled row's record encoding, which its payload holds from byte `from` on as the record and
+/// the checkpoint carry it (doc 31 M3): counted by its length where `s` only measures, so a size
+/// reads nothing back; else read back and copied, never decoded.
+pub(super) fn spilled(
+    s: &mut impl Sink,
+    at: crate::native::payloads::PayloadRef,
+    from: usize,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), Error> {
+    let len = at
+        .len()
+        .checked_sub(from)
+        .ok_or(Error::InvalidTag("spilled row"))?;
+    if s.measures() {
+        return s.count_unwritten(len);
+    }
+    let mut buffer = [0u8; crate::native::payloads::SPILLED_BYTES];
+    let bytes = buffer
+        .get_mut(..at.len())
+        .ok_or(Error::InvalidTag("spilled row"))?;
+    payloads
+        .ok_or(Error::InvalidTag("spilled row"))?
+        .read(at, bytes)
+        .map_err(|_| Error::InvalidTag("spilled row"))?;
+    raw(
+        s,
+        bytes.get(from..).ok_or(Error::InvalidTag("spilled row"))?,
+    )
 }

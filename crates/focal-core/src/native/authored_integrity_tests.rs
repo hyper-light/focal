@@ -154,6 +154,7 @@ fn retained_proof_detects_changed_original_owner_and_result_positions() {
         .unwrap();
     let (descriptor, profile) = match &extras.rows[content_index].row {
         Row::ClaimContent(row) => {
+            let row = row.held().unwrap();
             let body = row
                 .body(&read_budget(), focal_memory::BudgetLane::Ordinary)
                 .unwrap();
@@ -222,7 +223,7 @@ fn binding_from(extras: &Extras) -> Binding {
         .rows
         .iter()
         .find_map(|extra| match &extra.row {
-            Row::ClaimContent(row) => row.binding(),
+            Row::ClaimContent(row) => row.held().and_then(|row| row.binding()),
             _ => None,
         })
         .unwrap()

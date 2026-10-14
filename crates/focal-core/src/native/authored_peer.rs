@@ -45,10 +45,13 @@ fn citation(content: &ClaimDescriptor, visits: &mut VisitBudget) -> Result<Citat
 /// The committed follow-up policy of `claim`, if it was authored with one: read in place from
 /// its content's encoding (doc 31 M3).
 fn policy(view: &View<'_>, claim: ClaimId) -> Result<Option<PeerPolicy>, NativeError> {
-    Ok(
-        super::super::authored_reads::content_view(view.get(Key::ClaimContent(claim)))?
-            .and_then(|content| content.fields().policy),
-    )
+    let mut buffer = super::super::owned::ContentBuffer::new();
+    Ok(super::super::authored_reads::content_view(
+        view.get(Key::ClaimContent(claim)),
+        view.payloads(),
+        &mut buffer,
+    )?
+    .and_then(|content| content.fields().policy))
 }
 
 /// Committed claims of `action` that relate to `target` through `kind`,
@@ -61,11 +64,15 @@ fn related_count(
     visits: &mut VisitBudget,
 ) -> Result<usize, NativeError> {
     let mut count = 0usize;
+    let mut buffer = super::super::owned::ContentBuffer::new();
     for child in view.relation_sources(kind, target) {
         visits.charge(1)?;
-        let related =
-            super::super::authored_reads::content_view(view.get(Key::ClaimContent(child)))?
-                .ok_or(ContractError::InvalidPolicy)?;
+        let related = super::super::authored_reads::content_view(
+            view.get(Key::ClaimContent(child)),
+            view.payloads(),
+            &mut buffer,
+        )?
+        .ok_or(ContractError::InvalidPolicy)?;
         if related.roles()?.action == action {
             count = add(count, 1)?;
         }
@@ -196,9 +203,13 @@ pub(super) fn check_one<S: super::super::index_rows::ContentSource>(
             }
             let challenge = cited.challenge.ok_or(ContractError::InvalidTarget)?;
             let state = view.claim(challenge).ok_or(ContractError::InvalidTarget)?;
-            let challenged =
-                super::super::authored_reads::content_view(view.get(Key::ClaimContent(challenge)))?
-                    .ok_or(ContractError::InvalidTarget)?;
+            let mut buffer = super::super::owned::ContentBuffer::new();
+            let challenged = super::super::authored_reads::content_view(
+                view.get(Key::ClaimContent(challenge)),
+                view.payloads(),
+                &mut buffer,
+            )?
+            .ok_or(ContractError::InvalidTarget)?;
             if challenged.roles()?.action != ActionType::Challenge {
                 return Err(ContractError::InvalidTarget.into());
             }

@@ -313,15 +313,7 @@ impl<'source> OriginalPlan<'source> {
             view,
             outcome.operation,
             &mut history,
-            |fact| {
-                record_fact(
-                    &mut changes,
-                    outcome,
-                    &mut ordinal,
-                    fact,
-                    view.payload_log(),
-                )
-            },
+            |fact| record_fact(&mut changes, outcome, &mut ordinal, fact),
         )?;
         if visited
             != usize::try_from(original_outcome.events)
@@ -332,13 +324,7 @@ impl<'source> OriginalPlan<'source> {
         }
         if let Some(suffix) = &mut suffix {
             suffix.emit(&self, |fact| {
-                record_fact(
-                    &mut changes,
-                    outcome,
-                    &mut ordinal,
-                    fact,
-                    view.payload_log(),
-                )
+                record_fact(&mut changes, outcome, &mut ordinal, fact)
             })?;
         }
         if ordinal != outcome.events {
@@ -407,6 +393,9 @@ impl<'source> OriginalPlan<'source> {
                 heap,
             )));
         }
+        // Every check and the index derivation have read the plan's rows held: its events and
+        // contents go to the payload log now, each charged as it is spilled (doc 31 M3).
+        crate::native::payloads::spill_changes(&mut changes, view.payload_log(), view.ledger())?;
         Ok(SealedChanges {
             changes,
             outcome,

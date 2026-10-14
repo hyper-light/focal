@@ -128,9 +128,10 @@ pub(crate) fn reference(ledger: LedgerId, query: &NativeArchiveQuery) -> Content
 fn hydration_error(error: NativeError) -> AccessError {
     match error {
         NativeError::Memory(_) | NativeError::Capacity(_) => AccessError::Capacity,
-        NativeError::Contract(_) | NativeError::Evidence(_) | NativeError::RequestConflict => {
-            AccessError::Unavailable
-        }
+        NativeError::Contract(_)
+        | NativeError::Evidence(_)
+        | NativeError::RequestConflict
+        | NativeError::Payload(_) => AccessError::Unavailable,
     }
 }
 /// One page holding the archived object, or `Missing` for a row the bundle

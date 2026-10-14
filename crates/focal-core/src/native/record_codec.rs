@@ -360,14 +360,20 @@ struct RowSize<'a, S> {
 }
 impl<S: Sink> Sink for RowSize<'_, S> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
-        let total = add(self.bytes, bytes.len())?;
-        u32::try_from(total).map_err(|_| CodecError::Capacity)?;
-        self.sink.visit(add(1, bytes.len())?)?;
-        self.bytes = total;
-        Ok(())
+        self.count_unwritten(bytes.len())
     }
     fn visit(&mut self, amount: usize) -> Result<(), CodecError> {
         self.sink.visit(amount)
+    }
+    fn measures(&self) -> bool {
+        true
+    }
+    fn count_unwritten(&mut self, len: usize) -> Result<(), CodecError> {
+        let total = add(self.bytes, len)?;
+        u32::try_from(total).map_err(|_| CodecError::Capacity)?;
+        self.sink.visit(add(1, len)?)?;
+        self.bytes = total;
+        Ok(())
     }
 }
 

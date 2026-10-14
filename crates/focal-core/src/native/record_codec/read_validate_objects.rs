@@ -330,6 +330,8 @@ pub(super) fn claim(
         let Row::ClaimContent(content) = read.require(Key::ClaimContent(id))? else {
             return Err(invalid());
         };
+        let mut buffer = crate::native::owned::ContentBuffer::new();
+        let content = content.read(read.payloads, &mut buffer)?;
         let held = content.body(read.budget, focal_memory::BudgetLane::Committed)?;
         let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
         read.meter.budget(|visits| {
@@ -395,7 +397,10 @@ pub(super) fn definition(
             else {
                 return Err(invalid());
             };
-            let held = body.body(read.budget, focal_memory::BudgetLane::Committed)?;
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let held = body
+                .read(read.payloads, &mut buffer)?
+                .body(read.budget, focal_memory::BudgetLane::Committed)?;
             let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
             read.meter.budget(|visits| {
                 authored::check_recorded_declaration(body, claim, descriptor, visits).map_err(model)
@@ -496,7 +501,9 @@ pub(super) fn authored(
     match (key, row) {
         (Key::ClaimContent(id), Row::ClaimContent(value)) => {
             use focal_model::lifecycle::claim_descriptor::ClaimSource;
-            // Read in place from the content's encoding (doc 31 M3).
+            // Read in place from the content's encoding (doc 31 M3), a spilled one read back.
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let value = value.read(read.payloads, &mut buffer)?;
             let body = value.view()?;
             let fields = body.fields();
             let hash = value.content_hash().ok_or_else(invalid)?;
@@ -530,6 +537,8 @@ pub(super) fn authored(
             let Row::ClaimContent(value) = read.require(Key::ClaimContent(*id))? else {
                 return Err(invalid());
             };
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let value = value.read(read.payloads, &mut buffer)?;
             if value.schema() != Some(schema) || value.content_hash() != Some(hash) {
                 return Err(invalid());
             }

@@ -65,6 +65,8 @@ pub enum RetirementRefusal {
     OutcomesReserved,
     /// The committed rows contradict themselves.
     Corrupt,
+    /// A member's spilled row could not be read back from the replica's payload log (doc 31 M3).
+    PayloadUnavailable,
 }
 
 /// The rows a family takes to the archive, in key order.
@@ -554,6 +556,7 @@ impl Core<NativeState> {
             }
         }
         // Index rows of the claims and their results.
+        let mut buffer = crate::native::owned::ContentBuffer::new();
         for member in closure.members.clone() {
             let (claim, content) = match self.state.rows.get(&Key::Claim(member)) {
                 Some(Row::Claim(owned)) => {
@@ -566,7 +569,14 @@ impl Core<NativeState> {
                 }
                 _ => return Err(RetirementRefusal::Corrupt),
             };
-            // The content read in place from its encoding (doc 31 M3).
+            // The content read in place from its encoding (doc 31 M3), a spilled one read back.
+            let content = content
+                .map(|content| content.read(self.state.payloads(), &mut buffer))
+                .transpose()
+                .map_err(|error| match error {
+                    NativeError::Payload(_) => RetirementRefusal::PayloadUnavailable,
+                    _ => RetirementRefusal::Corrupt,
+                })?;
             let view = content
                 .map(|content| content.view())
                 .transpose()

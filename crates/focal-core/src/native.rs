@@ -1567,6 +1567,9 @@ pub enum NativeError {
     RequestConflict,
     #[error("native owner bound exceeded: {0}")]
     Capacity(&'static str),
+    /// A spilled row's bytes could not be read back from the replica's payload log (doc 31 M3).
+    #[error("native payload log: {0}")]
+    Payload(#[from] payloads::PayloadError),
 }
 /// A refused publication. Refused before any row moved, the candidate is
 /// returned whole; failed past that point (an invariant broken, its store
@@ -1621,6 +1624,9 @@ pub struct NativeRead {
     lease: ranges::RangeLeases,
     /// The store's ledger, which an outcome row does not repeat.
     ledger: LedgerId,
+    /// A reader of the payload log the leased rows' spilled bytes are in, with handles of its
+    /// own: a sweep after the lease was taken never breaks its reads (doc 31 M3).
+    payloads: Option<Box<dyn payloads::PayloadRead + Send>>,
 }
 impl NativeRead {
     pub fn sequence(&self) -> SessionSeq {
@@ -1816,6 +1822,11 @@ impl Core<NativeState> {
     /// The payload log this core spills to, lent (to a restore that spills to it as well).
     pub fn payload_log(&self) -> Option<&dyn payloads::PayloadLog> {
         self.state.payloads.as_deref()
+    }
+    /// Where this core's spilled rows' bytes are read from: what a candidate's own reads take
+    /// ([`NativePrepared::written_claim_content`]).
+    pub fn native_payloads(&self) -> Option<&dyn payloads::PayloadRead> {
+        self.state.payloads()
     }
     /// The segments of the payload log a committed row references, added to `live`.
     pub(crate) fn live_payload_segments(&self, live: &mut std::collections::BTreeSet<u32>) {
@@ -2301,9 +2312,15 @@ impl Core<NativeState> {
             .ok_or(NativeError::Capacity("checkpoint bytes"))
     }
     pub fn pin_native(&mut self, now: u64, ttl: u64) -> Result<NativeRead, MemoryError> {
+        // A reader that cannot be made (its handles) refuses the lease, as a frozen image's does.
+        let payloads = match self.state.payloads.as_deref() {
+            Some(log) => Some(log.reader().map_err(|_| MemoryError::AllocationFailed)?),
+            None => None,
+        };
         self.state.rows.pin(now, ttl).map(|lease| NativeRead {
             lease,
             ledger: self.state.ledger,
+            payloads,
         })
     }
     pub fn release_native(&mut self, read: &NativeRead) -> Result<(), MemoryError> {
@@ -2598,19 +2615,28 @@ impl EffectiveClaims for View<'_> {
         as_claim(self.get(Key::Claim(id)))
     }
     // Both read the parent's content in place (doc 31 M3). Its encoding was checked when it was
-    // written, so a read cannot fail but on corruption, where each answers what refuses: the
-    // holder's escalation, and no designation.
+    // written, so a read fails only on corruption or a spilled row the payload log cannot give
+    // back, where each answers what refuses: the holder's escalation, and no designation.
     fn cause_escalation(&self, parent: ClaimId) -> focal_model::Escalation {
-        authored_reads::content_view(self.get(Key::ClaimContent(parent)))
-            .ok()
-            .flatten()
-            .and_then(|content| content.fields().policy)
-            .map_or(focal_model::Escalation::Holder, |policy| policy.escalation)
+        let mut buffer = owned::ContentBuffer::new();
+        authored_reads::content_view(
+            self.get(Key::ClaimContent(parent)),
+            self.payloads(),
+            &mut buffer,
+        )
+        .ok()
+        .flatten()
+        .and_then(|content| content.fields().policy)
+        .map_or(focal_model::Escalation::Holder, |policy| policy.escalation)
     }
     fn is_designated_evaluator(&self, parent: ClaimId, actor: ParticipantId) -> bool {
         use focal_model::lifecycle::claim_descriptor::ClaimSource;
-        let Ok(Some(content)) = authored_reads::content_view(self.get(Key::ClaimContent(parent)))
-        else {
+        let mut buffer = owned::ContentBuffer::new();
+        let Ok(Some(content)) = authored_reads::content_view(
+            self.get(Key::ClaimContent(parent)),
+            self.payloads(),
+            &mut buffer,
+        ) else {
             return false;
         };
         content.view().requirements().any(|pin| {

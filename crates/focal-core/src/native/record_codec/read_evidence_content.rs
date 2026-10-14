@@ -405,10 +405,12 @@ impl ClaimContentPlan<'_, '_> {
     pub(in crate::native::record_codec) fn quote(&self) -> Quote {
         self.quote
     }
+    /// The row, spilled to `log` where there is one that takes it (doc 31 M3).
     pub(in crate::native::record_codec) fn build(
         self,
         max_bytes: usize,
         max_model_visits: usize,
+        log: Option<&dyn crate::native::payloads::PayloadLog>,
     ) -> Result<Row, NativeError> {
         fits(self.quote.heap_bytes, max_bytes)?;
         fits(self.quote.model_build_visits, max_model_visits)?;
@@ -417,8 +419,12 @@ impl ClaimContentPlan<'_, '_> {
             scope_limits: self.scope_limits,
             owner: self.owner,
         };
-        let owned =
-            OwnedClaimContent::from_encoded(self.bytes, self.body.content_hash(), &profile)?;
+        let owned = OwnedClaimContent::from_encoded_in(
+            self.bytes,
+            self.body.content_hash(),
+            &profile,
+            log,
+        )?;
         let actual = owned.heap_charge()?;
         finish(Row::ClaimContent(owned), actual, self.quote, max_bytes)
     }

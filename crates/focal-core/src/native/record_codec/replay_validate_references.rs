@@ -39,7 +39,10 @@ pub(super) fn check<O: Overlay>(
                     else {
                         return Err(invalid());
                     };
-                    let held = body.body(read.budget, focal_memory::BudgetLane::Committed)?;
+                    let mut buffer = crate::native::owned::ContentBuffer::new();
+                    let held = body
+                        .read(read.overlay.payloads(), &mut buffer)?
+                        .body(read.budget, focal_memory::BudgetLane::Committed)?;
                     let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
                     let failure = std::cell::Cell::new(None);
                     let checked = read.meter.budget(|visits| {
@@ -281,7 +284,9 @@ fn authored<O: Overlay>(
     match (key, row) {
         (Key::ClaimContent(id), Row::ClaimContent(value)) => {
             use focal_model::lifecycle::claim_descriptor::ClaimSource;
-            // Read in place from the content's encoding (doc 31 M3).
+            // Read in place from the content's encoding (doc 31 M3), a spilled one read back.
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let value = value.read(read.overlay.payloads(), &mut buffer)?;
             let body = value.view()?;
             let fields = body.fields();
             let hash = value.content_hash().ok_or_else(invalid)?;
@@ -309,6 +314,8 @@ fn authored<O: Overlay>(
             let Row::ClaimContent(value) = read.require(Key::ClaimContent(*id))? else {
                 return Err(invalid());
             };
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let value = value.read(read.overlay.payloads(), &mut buffer)?;
             require(value.schema() == Some(schema) && value.content_hash() == Some(hash))?;
         }
         (Key::DefinitionIdentity(schema, hash), Row::DefinitionIdentity(id)) => {

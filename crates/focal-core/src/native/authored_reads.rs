@@ -1,5 +1,6 @@
 //! Content and lifecycle reads borrow a single effective or retained prefix.
-use super::owned::HeldClaimBody;
+use super::owned::{ContentBuffer, HeldClaimBody};
+use super::payloads::PayloadRead;
 use super::*;
 use focal_memory::BudgetLane;
 use focal_model::lifecycle::{
@@ -7,24 +8,34 @@ use focal_model::lifecycle::{
 };
 
 /// The claim content `row` holds, decoded and charged to `budget` in `lane` while it is held
-/// (doc 31 M3): none where `row` is not a claim's content.
+/// (doc 31 M3), read through `payloads` where it is spilled: none where `row` is not a claim's
+/// content.
 pub(super) fn content(
     row: Option<&Row>,
+    payloads: Option<&dyn PayloadRead>,
     budget: &MemoryBudget,
     lane: BudgetLane,
 ) -> Result<Option<HeldClaimBody>, NativeError> {
     match row {
-        Some(Row::ClaimContent(row)) => row.body(budget, lane).map(Some),
+        Some(Row::ClaimContent(row)) => {
+            let mut buffer = ContentBuffer::new();
+            row.read(payloads, &mut buffer)?
+                .body(budget, lane)
+                .map(Some)
+        }
         _ => Ok(None),
     }
 }
-/// The claim content `row` holds, read in place from its encoding: nothing built, nothing
-/// allocated. None where `row` is not a claim's content.
-pub(super) fn content_view(
-    row: Option<&Row>,
-) -> Result<Option<super::input_codec::ClaimBodyInput<'_>>, NativeError> {
+/// The claim content `row` holds, read in place from its encoding (from `payloads` into `buffer`
+/// where it is spilled): nothing built, nothing allocated. None where `row` is not a claim's
+/// content.
+pub(super) fn content_view<'a>(
+    row: Option<&'a Row>,
+    payloads: Option<&dyn PayloadRead>,
+    buffer: &'a mut ContentBuffer,
+) -> Result<Option<super::input_codec::ClaimBodyInput<'a>>, NativeError> {
     match row {
-        Some(Row::ClaimContent(row)) => row.view().map(Some),
+        Some(Row::ClaimContent(row)) => row.read(payloads, buffer)?.view().map(Some),
         _ => Ok(None),
     }
 }
@@ -51,7 +62,12 @@ impl Core<NativeState> {
         id: ClaimId,
         read: impl FnOnce(&dyn super::NativeClaimContentRead) -> Result<T, NativeError>,
     ) -> Result<Option<T>, NativeError> {
-        match content_view(self.state.rows.get(&Key::ClaimContent(id)))? {
+        let mut buffer = ContentBuffer::new();
+        match content_view(
+            self.state.rows.get(&Key::ClaimContent(id)),
+            self.state.payloads(),
+            &mut buffer,
+        )? {
             Some(view) => read(&view).map(Some),
             None => Ok(None),
         }
@@ -61,6 +77,7 @@ impl Core<NativeState> {
     pub fn native_claim_content(&self, id: ClaimId) -> Result<Option<HeldClaimBody>, NativeError> {
         content(
             self.state.rows.get(&Key::ClaimContent(id)),
+            self.state.payloads(),
             &self.state.budget,
             BudgetLane::Ordinary,
         )
@@ -76,14 +93,17 @@ impl Core<NativeState> {
     }
 }
 impl NativePrepared {
-    /// The content of claim `id` this candidate writes, decoded and charged to `budget`.
+    /// The content of claim `id` this candidate writes, decoded and charged to `budget`, read
+    /// through `payloads` (its core's, [`Core::native_payloads`]) where it is spilled.
     pub fn written_claim_content(
         &self,
         id: ClaimId,
+        payloads: Option<&dyn PayloadRead>,
         budget: &MemoryBudget,
     ) -> Result<Option<HeldClaimBody>, NativeError> {
         content(
             self.fragments.get(&Key::ClaimContent(id)),
+            payloads,
             budget,
             BudgetLane::Ordinary,
         )
@@ -107,6 +127,7 @@ impl<'a> NativeView<'a> {
     pub fn claim_content(&self, id: ClaimId) -> Result<Option<HeldClaimBody>, NativeError> {
         content(
             self.0.get(Key::ClaimContent(id)),
+            self.0.payloads(),
             &self.0.state.budget,
             BudgetLane::Ordinary,
         )
@@ -144,7 +165,14 @@ impl NativeRead {
                     .lease
                     .project_next(&key, false, &Key::End, now, |entry| {
                         let body = if entry.key == key {
-                            content(Some(entry.value), budget, BudgetLane::Ordinary)?
+                            content(
+                                Some(entry.value),
+                                self.payloads
+                                    .as_deref()
+                                    .map(|read| -> &dyn PayloadRead { read }),
+                                budget,
+                                BudgetLane::Ordinary,
+                            )?
                         } else {
                             None
                         }

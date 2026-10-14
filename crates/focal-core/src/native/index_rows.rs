@@ -638,11 +638,12 @@ impl Collector {
 
 /// The authored body of `id` as this plan sees it: a body written by this
 /// same plan (creation) or the retained body of an existing claim, read in place from its
-/// encoding (doc 31 M3).
+/// encoding (doc 31 M3), a spilled one through `buffer`.
 fn content_of<'a>(
     id: ClaimId,
     view: &'a View<'_>,
     extras: &'a prepare::Extras,
+    buffer: &'a mut super::owned::ContentBuffer,
 ) -> Result<Option<super::input_codec::ClaimBodyInput<'a>>, NativeError> {
     let written = extras
         .rows
@@ -652,8 +653,10 @@ fn content_of<'a>(
             _ => None,
         });
     match written {
-        Some(row) => authored_reads::content_view(Some(row)),
-        None => authored_reads::content_view(view.get(Key::ClaimContent(id))),
+        Some(row) => authored_reads::content_view(Some(row), view.payloads(), buffer),
+        None => {
+            authored_reads::content_view(view.get(Key::ClaimContent(id)), view.payloads(), buffer)
+        }
     }
 }
 
@@ -691,12 +694,13 @@ fn derive_into(
         view,
         current: invocation,
     };
+    let mut buffer = super::owned::ContentBuffer::new();
     for row in rows {
         let id = ClaimId(row.binding().object.0);
         let before = view.claim(id);
         // A claim's content names its index rows only where it is created.
         let content = match before {
-            None => content_of(id, view, extras)?,
+            None => content_of(id, view, extras, &mut buffer)?,
             Some(_) => None,
         };
         claim(

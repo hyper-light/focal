@@ -134,6 +134,9 @@ fn native_kind(error: &NativeError) -> NativeRefusalKind {
             focal_evidence::NativeEvidenceError::Content(_)
             | focal_evidence::NativeEvidenceError::Memory(_) => NativeRefusalKind::Capacity,
         },
+        // Never a request's refusal: an unreadable payload log fails the session closed until it
+        // reopens (`FailureClass`), so no refusal is formed from it.
+        NativeError::Payload(_) => NativeRefusalKind::Capacity,
     }
 }
 /// Deterministic request refusals become closed wire refusals; everything else

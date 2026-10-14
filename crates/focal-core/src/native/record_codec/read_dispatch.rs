@@ -196,7 +196,12 @@ pub(super) fn with_build<O: Objects, C: evidence::Custody, T>(
     // Includes all nested allocation counters and immutable identity checks.
     // Heap size bounds collection elements; fixed inline work has its own debit.
     debit(context.model, add(quote.heap_bytes, 4096)?)?;
-    objects::check(row.key, &value, context.objects.ledger())?;
+    objects::check(
+        row.key,
+        &value,
+        context.objects.ledger(),
+        context.objects.payloads(),
+    )?;
     let actual = objects::heap(&value)?;
     if actual > quote.heap_bytes || actual > retained_allowance {
         return Err(NativeError::Capacity("recovery actual heap"));
@@ -460,7 +465,16 @@ fn process<O: Objects, C: evidence::Custody>(
                 let quote = plan.quote();
                 Ok((plan, quote))
             })?;
-            evidence_plan!(plan, value_quote, 0)
+            let quote = quoted(value_quote.heap_bytes, 0, build)?;
+            let row = if build.is_some() {
+                // Spilled as it is built where the rows are restored (doc 31 M3).
+                Some(build_evidence(context, value_quote, |bytes, visits| {
+                    plan.build(bytes, visits, context.objects.payload_log())
+                })?)
+            } else {
+                None
+            };
+            Ok((quote, row))
         }
         Key::Work(_) => {
             let input = parse(body, context.parsing, evidence::work)?;
