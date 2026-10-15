@@ -283,6 +283,10 @@ fn a_family_leaves_the_core_only_when_terminal_released_and_unreferenced() {
     // root's running total says: the retirement took its families' bytes away.
     let encoded = ckpt::encode(&core);
     assert_eq!(core.checkpoint_bytes().unwrap(), encoded.len());
+    assert_eq!(
+        core.state.finishing,
+        crate::native::finishing::of_rows(&core.state.rows).unwrap()
+    );
     let restored = recovery::restore(
         &ckpt::inspect(&encoded),
         RangeId(777),

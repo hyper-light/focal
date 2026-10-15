@@ -631,6 +631,7 @@ impl Core<NativeState> {
         // (doc 31 M3), counted before anything changes, as a leader's publication counts them: a
         // replica that applied a retirement here kept the bytes of the families it took away.
         let encoded = self.encoded_after_changes(&changes)?;
+        let reserved = self.finishing_after_changes(&changes)?;
         let written = changes.len();
         for retiring in &families {
             self.unfile_family_events(&retiring.family);
@@ -645,6 +646,7 @@ impl Core<NativeState> {
             return Err(error);
         }
         self.state.encoded_rows = encoded;
+        self.state.finishing = reserved;
         self.state.marks.churned(written);
         Ok(outcome)
     }

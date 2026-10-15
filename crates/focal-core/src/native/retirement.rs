@@ -1121,6 +1121,7 @@ impl Core<NativeState> {
         // What the rows take in a checkpoint once it publishes, and the rows it writes (doc 31
         // M3), counted before anything changes: the root's running totals move with it.
         let encoded = self.encoded_after_changes(&changes)?;
+        let reserved = self.finishing_after_changes(&changes)?;
         let written = changes.len();
         // One publication of what a family's bound allows: its rows, a
         // continuation per member, the meta and the outcome. Its events are
@@ -1140,6 +1141,7 @@ impl Core<NativeState> {
             return Err(error);
         }
         self.state.encoded_rows = encoded;
+        self.state.finishing = reserved;
         self.state.marks.churned(written);
         Ok(count)
     }

@@ -107,6 +107,43 @@ fn release_input(owner: &NativeOwner, claim: u128, id: u128) -> NativeInput {
     }
 }
 
+/// A monitor on `claim` waiting for `other`'s satisfaction, due at 100.
+fn register_satisfied(owner: &mut NativeOwner, claim: u128, monitor: u128, other: u128, time: u64) {
+    let source = owner.effective().claim(ClaimId::from_u128(claim)).unwrap();
+    let command = NativeCommand::RegisterMonitor {
+        expected: source.binding(),
+        receipt: source.receipt().map(|receipt| receipt.fence),
+        id: MonitorId::from_u128(monitor),
+        roots: vec![WaitPredicate::Satisfied(ClaimId::from_u128(other))],
+        deadline: timer(claim, monitor, 100).deadline,
+    };
+    let candidate = stage(
+        owner,
+        NativeInput {
+            request: request(ISSUER, 70_000 + u128::from(time)),
+            command,
+        },
+        time,
+    );
+    owner.publish_after_durable(candidate).unwrap();
+}
+
+/// Fires `input`'s monitor deadline, printing what it changed: what it ends takes no more than
+/// the reservation it gives back.
+fn fire_and_check(owner: &mut NativeOwner, input: NativeMonitorDeadlineInput, label: &str) {
+    let before = snapshot(owner);
+    let held = reserved(owner);
+    let (candidate, _) = monitor_fire(owner, input, 100);
+    owner.publish_after_durable(candidate).unwrap();
+    diff(label, &before, &snapshot(owner));
+    let after = reserved(owner);
+    eprintln!("    with reservations: {held:?} -> {after:?}");
+    assert!(
+        after.0 <= held.0 && after.1 <= held.1,
+        "{label} took more than it reserved: {held:?} -> {after:?}"
+    );
+}
+
 /// Every transition that ends a claim or releases one takes no more of the checkpoint's bound
 /// than the reservation it gives back (rows and bytes alike), on every path: a cancel of a posted
 /// claim, of one whose evaluation has begun or never began (fenced), of one others depend on (one
@@ -130,6 +167,7 @@ fn finishing_a_claim_takes_no_more_than_it_reserved() {
             &[(graph::Kind::DependsOn, 2), (graph::Kind::DependsOn, 4)],
         ),
         (6, 500, &[(ValidationMode::Required, false)], &[]),
+        (8, 500, &[], &[(graph::Kind::Awaits, 2)]),
         (
             7,
             500,
@@ -224,6 +262,14 @@ fn finishing_a_claim_takes_no_more_than_it_reserved() {
             true,
         );
     }
+    let awaiting = owner.effective().claim(ClaimId::from_u128(8)).unwrap();
+    eprintln!("    (the awaiting claim is {:?})", awaiting.status());
+    let next = if awaiting.is_terminal() {
+        release_input(&owner, 8, 61_015)
+    } else {
+        cancel_input(&owner, 8, 61_016)
+    };
+    step(&mut owner, "finish the awaiting claim", next, 48, true);
 
     eprintln!("== a claim with a monitor");
     let posted = authored_posted(&[(1, 500, &[], &[]), (2, 500, &[], &[])]);
@@ -280,6 +326,53 @@ fn finishing_a_claim_takes_no_more_than_it_reserved() {
     step(&mut owner, "cancel the fired monitor", next, 101, true);
     let next = release_input(&owner, 1, 65_002);
     step(&mut owner, "release it", next, 102, true);
+
+    eprintln!("== a monitor cycle: the newer claim's monitor fires, the older deadlocks");
+    let posted = authored_posted(&[(1, 500, &[], &[]), (2, 500, &[], &[])]);
+    let mut owner = NativeOwner::new(posted).unwrap();
+    let earlier = timer(1, 1, 100);
+    let trigger = timer(2, 2, 100);
+    register_timer(&mut owner, earlier, 2, 25);
+    register_timer(&mut owner, trigger, 1, 26);
+    fire_and_check(&mut owner, trigger, "the trigger's monitor fires");
+    assert!(
+        owner
+            .effective()
+            .claim(ClaimId::from_u128(1))
+            .unwrap()
+            .is_terminal()
+    );
+
+    eprintln!("== a monitor cycle on satisfaction: the victim's own monitor fires");
+    let posted = authored_posted(&[(1, 500, &[], &[]), (2, 500, &[], &[])]);
+    let mut owner = NativeOwner::new(posted).unwrap();
+    register_satisfied(&mut owner, 1, 1, 2, 25);
+    register_satisfied(&mut owner, 2, 2, 1, 26);
+    fire_and_check(
+        &mut owner,
+        timer(1, 1, 100),
+        "the victim's own monitor fires",
+    );
+    for claim in [1, 2] {
+        let state = owner.effective().claim(ClaimId::from_u128(claim)).unwrap();
+        eprintln!(
+            "    claim {claim}: {:?}, {} monitors active",
+            state.status(),
+            state.scopes().iter().filter(|scope| scope.active()).count()
+        );
+    }
+
+    eprintln!("== a monitor cycle of three on satisfaction: the oldest's own monitor fires");
+    let posted = authored_posted(&[(1, 500, &[], &[]), (2, 500, &[], &[]), (3, 500, &[], &[])]);
+    let mut owner = NativeOwner::new(posted).unwrap();
+    register_satisfied(&mut owner, 1, 1, 2, 25);
+    register_satisfied(&mut owner, 2, 2, 3, 26);
+    register_satisfied(&mut owner, 3, 3, 1, 27);
+    fire_and_check(
+        &mut owner,
+        timer(1, 1, 100),
+        "the oldest's own monitor fires",
+    );
 
     eprintln!("== a claim whose deadline passes");
     let posted = authored_posted(&[(1, 50, &[], &[])]);

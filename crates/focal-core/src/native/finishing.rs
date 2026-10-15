@@ -68,9 +68,11 @@ const TERMINAL: Finishing = Finishing {
     rows: 3,
     bytes: 57 + 258 + 160 + 209,
 };
-/// What a claim with dependencies may add beyond [`TERMINAL`]: a dependency's failure ends it at a
-/// graph cut, 164 bytes against a cancel's 57.
-const GRAPH_CUT: usize = 164 - 57;
+/// What a claim on anything may add beyond [`TERMINAL`]: a graph cut ends it, 204 bytes at most
+/// (a monitor cycle's, which names the claim whose deadline fired it, the deadline and when it
+/// fired; a dependency's failure is 164) against a cancel's 57. A claim with dependencies of its
+/// own or a monitor active can be ended so.
+const GRAPH_CUT: usize = 204 - 57;
 /// What a claim with a monitor active may add beyond [`TERMINAL`]: the monitor's deadline ends it
 /// with an event of 274 bytes (against 258), a status event of 176 (against 160) and the outcome
 /// of a timer's invocation, 241 (against 209).
@@ -103,8 +105,8 @@ const FENCE_WAITING: Finishing = Finishing {
 
 /// What the row `row` at `key` reserves for its finishing, by the shape it has: a claim not yet
 /// released its release and a monitor's cancel for each monitor it has active, and an open claim
-/// its terminal transition as well, by what can end it (a dependency's failure where it has
-/// dependencies, a monitor's deadline where it has one active); a live evaluation its fence, as
+/// its terminal transition as well, by what can end it (a graph cut where it has dependencies or a
+/// monitor active, a monitor's deadline where it has one active); a live evaluation its fence, as
 /// begun or not. A spilled claim waits to be delivered, on nothing and in nothing
 /// (`OwnedClaim::spillable`), so it reserves what an open claim of no dependency and no monitor
 /// does, unread.
@@ -123,7 +125,7 @@ pub(super) fn of(key: &Key, row: &Row) -> Result<Finishing, NativeError> {
                 if state.is_terminal() {
                     return Ok(release);
                 }
-                let graph = if state.graph().obligations().is_empty() {
+                let graph = if state.graph().obligations().is_empty() && monitors == 0 {
                     0
                 } else {
                     GRAPH_CUT

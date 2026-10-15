@@ -223,6 +223,11 @@ fn a_retirement_is_ordered_with_the_writes_around_it_and_a_follower_derives_it_a
         leader.checkpoint_bytes().unwrap()
     );
     assert_eq!(follower.state.marks.churn(), leader.state.marks.churn());
+    // What the rows reserve for their finishing likewise.
+    let reserved =
+        |core: &Core<NativeState>| crate::native::finishing::of_rows(&core.state.rows).unwrap();
+    assert_eq!(leader.state.finishing, reserved(leader));
+    assert_eq!(follower.state.finishing, reserved(&follower));
 }
 
 /// A family a pending candidate touches waits: here the families an earlier retirement, not
