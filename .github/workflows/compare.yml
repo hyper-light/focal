@@ -125,7 +125,7 @@ jobs:
           BENCH_KAFKA: ${{ needs.image.outputs.registry && format('{0}/kafka', needs.image.outputs.registry) || 'apache/kafka' }}
         run: |
           for system in ${{ github.event.inputs.systems || 'focal' }}; do
-            for rate in ${{ github.event.inputs.rates || '1000 4000' }}; do
+            for rate in ${{ github.event.inputs.rates || '1000' }}; do
               bash tools/compare/compose/run.sh "$system" "$rate" \
                 "${{ github.event.inputs.seconds || '60' }}" \
                 "${{ github.event.inputs.warmup || '15' }}" \
