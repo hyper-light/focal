@@ -565,9 +565,9 @@ fn a_request_the_memory_refused_refuses_its_like_from_its_header() {
             .prepare_frame(context(ISSUER, 10), &retried, limits, None)
             .unwrap(),
     );
-    // The ordinary lane squeezed to less than a creation needs.
+    // The ordinary lane squeezed to less than any creation or post holds.
     let budget = owner.core.state.budget.clone();
-    let left = 64 * 1024;
+    let left = 8 * 1024;
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
@@ -650,8 +650,9 @@ fn a_request_the_memory_refused_refuses_its_like_from_its_header() {
         "{smaller:?}"
     );
     assert_eq!(budget.refusals().count, refusals + 4);
-    // Another command is decoded and prepared: the budget refuses it on its
-    // merits, and its shortfall is kept beside the creation's.
+    // Another command is decoded and prepared, not refused from the
+    // creation's header: charged only what it holds, it reaches its own
+    // check (its target is absent) and leaves no shortfall.
     let other = encoded(
         &post(802, binding(802)),
         NativeContentProfile::ProjectionOnly,
@@ -660,14 +661,14 @@ fn a_request_the_memory_refused_refuses_its_like_from_its_header() {
     assert!(
         matches!(
             posted,
-            Err(NativeOwnerError::Native(NativeError::Memory(
-                MemoryError::Capacity { .. }
+            Err(NativeOwnerError::Native(NativeError::Contract(
+                ContractError::InvalidTarget
             )))
         ),
         "{posted:?}"
     );
-    assert_eq!(budget.refusals().count, refusals + 5);
-    assert_eq!(owner.shortfalls.iter().flatten().count(), 2);
+    assert_eq!(budget.refusals().count, refusals + 4);
+    assert_eq!(owner.shortfalls.iter().flatten().count(), 1);
     let refused = owner.prepare_frame(context(ISSUER, 10), &large(805), limits, None);
     assert!(
         matches!(
@@ -678,7 +679,7 @@ fn a_request_the_memory_refused_refuses_its_like_from_its_header() {
         ),
         "{refused:?}"
     );
-    assert_eq!(budget.refusals().count, refusals + 5);
+    assert_eq!(budget.refusals().count, refusals + 4);
     // A capacity the budget did not refuse leaves no shortfall.
     let held = owner.shortfalls;
     owner.shortfalls = [None; SHORTFALLS];

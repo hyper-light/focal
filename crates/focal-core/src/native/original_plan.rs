@@ -296,16 +296,16 @@ impl<'source> OriginalPlan<'source> {
         history
             .try_reserve_exact(rows.len())
             .map_err(|_| MemoryError::AllocationFailed)?;
-        within(
+        let held = add(
             add(
-                add(
-                    array::<Change<Key, Row>>(changes.capacity())?,
-                    array::<History>(history.capacity())?,
-                )?,
-                add(add(containers(rows.len())?, event_charge)?, index_bytes)?,
+                array::<Change<Key, Row>>(changes.capacity())?,
+                array::<History>(history.capacity())?,
             )?,
-            allowance,
+            add(add(containers(rows.len())?, event_charge)?, index_bytes)?,
         )?;
+        within(held, allowance)?;
+        // Charged as held, under this allowance rather than the scratch's.
+        scratch.hold(held)?;
         let mut ordinal = 0;
         let visited = visit_history(
             rows,

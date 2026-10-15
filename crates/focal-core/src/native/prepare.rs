@@ -273,6 +273,9 @@ pub(super) fn fail_range_after<T>(count: usize, action: impl FnOnce() -> T) -> T
 pub(super) struct Scratch {
     pub used: usize,
     pub max: usize,
+    /// Bytes charged to the meter under allowances of their own (a
+    /// preparation's change buffers), apart from this bound.
+    beside: usize,
     meter: Option<Allocation>,
 }
 
@@ -286,6 +289,7 @@ impl Scratch {
         Self {
             used: 0,
             max,
+            beside: 0,
             meter: None,
         }
     }
@@ -298,6 +302,7 @@ impl Scratch {
         Ok(Self {
             used: 0,
             max,
+            beside: 0,
             meter: Some(budget.reserve(BudgetKind::Pending, lane, 0)?.commit()),
         })
     }
@@ -309,18 +314,37 @@ impl Scratch {
     pub fn charge(&mut self, bytes: usize) -> Result<(), NativeError> {
         let next = add(self.used, bytes)?;
         within(next, self.max)?;
-        if let Some(meter) = self.meter.as_mut() {
-            let held = meter.bytes();
-            if next > held {
-                let step = next
-                    .saturating_sub(held)
-                    .max(METER_STEP)
-                    .min(self.max.saturating_sub(held));
-                meter.grow(step)?;
-            }
-        }
+        self.meter_to(add(next, self.beside)?)?;
         self.used = next;
         Ok(())
+    }
+    /// Charges `bytes` held under an allowance of their own: the meter grows,
+    /// this bound's use does not.
+    pub fn hold(&mut self, bytes: usize) -> Result<(), NativeError> {
+        let beside = add(self.beside, bytes)?;
+        self.meter_to(add(self.used, beside)?)?;
+        self.beside = beside;
+        Ok(())
+    }
+    /// Grows the meter to `target`, in steps, never past the larger of the
+    /// target and the bound.
+    fn meter_to(&mut self, target: usize) -> Result<(), NativeError> {
+        let Some(meter) = self.meter.as_mut() else {
+            return Ok(());
+        };
+        let held = meter.bytes();
+        if target > held {
+            let step = target
+                .saturating_sub(held)
+                .max(METER_STEP)
+                .min(target.max(self.max).saturating_sub(held));
+            meter.grow(step)?;
+        }
+        Ok(())
+    }
+    /// What this scratch holds of its budget, for what outlives it.
+    pub fn into_meter(self) -> Option<Allocation> {
+        self.meter
     }
     /// A bound already partly used, for a test of what follows.
     #[cfg(test)]
@@ -328,6 +352,7 @@ impl Scratch {
         Self {
             used,
             max,
+            beside: 0,
             meter: None,
         }
     }
@@ -371,6 +396,9 @@ pub(super) struct Extras {
     pub(super) admission_graph: Option<super::admission_graph::Proof>,
     max: usize,
     allowance: usize,
+    /// What the rows' buffer holds, charged as it grows; after the rows, so
+    /// they go first.
+    meter: Option<Allocation>,
 }
 impl Extras {
     pub(super) fn new(max: usize, allowance: usize) -> Result<Self, NativeError> {
@@ -383,7 +411,19 @@ impl Extras {
             admission_graph: None,
             max,
             allowance,
+            meter: None,
         })
+    }
+    /// Bounded as [`Self::new`], its buffer charged to `budget` as it grows.
+    pub(super) fn metered(
+        max: usize,
+        allowance: usize,
+        budget: &focal_memory::MemoryBudget,
+        lane: BudgetLane,
+    ) -> Result<Self, NativeError> {
+        let mut extras = Self::new(max, allowance)?;
+        extras.meter = Some(budget.reserve(BudgetKind::Pending, lane, 0)?.commit());
+        Ok(extras)
     }
     pub fn events(&self) -> usize {
         match &self.journal {
@@ -448,16 +488,24 @@ impl Extras {
                 .min(self.max);
             let old = array::<Extra>(self.rows.capacity())?;
             within(add(old, array::<Extra>(capacity)?)?, self.allowance)?;
+            // Charged while both are held: the replacement and the rows it takes.
+            if let Some(meter) = self.meter.as_mut() {
+                meter.grow(array::<Extra>(capacity)?)?;
+            }
             let mut replacement = Vec::new();
             replacement
                 .try_reserve_exact(capacity)
                 .map_err(|_| MemoryError::AllocationFailed)?;
-            within(
-                add(old, array::<Extra>(replacement.capacity())?)?,
-                self.allowance,
-            )?;
+            let given = array::<Extra>(replacement.capacity())?;
+            within(add(old, given)?, self.allowance)?;
+            if let Some(meter) = self.meter.as_mut() {
+                meter.grow(given.saturating_sub(array::<Extra>(capacity)?))?;
+            }
             replacement.append(&mut self.rows);
             self.rows = replacement;
+            if let Some(meter) = self.meter.as_mut() {
+                meter.shrink_to(given)?;
+            }
         }
         if self.journal.is_some()
             && let Some(fact) = row.fact.take()
@@ -1042,21 +1090,27 @@ impl BuiltNative {
     fn new(
         prepared: NativePrepared,
         seals: Vec<validation::SealTransition>,
-        funding: Allocation,
+        funding: Option<Allocation>,
     ) -> Result<Self, NativeError> {
         // Keep drop order explicit through the owned fields even on refusal:
         // pages and tokens are destroyed before their construction debit.
         let mut built = Self {
             prepared,
             seals,
-            funding: Some(funding),
+            funding,
         };
+        // What outlives the construction is its seals' buffer, charged as
+        // exactly that.
         let bytes = array::<validation::SealTransition>(built.seals.capacity())?;
-        built
-            .funding
-            .as_mut()
-            .ok_or(ContractError::InvalidManifest)?
-            .shrink_to(bytes)?;
+        match built.funding.as_mut() {
+            Some(funding) if funding.bytes() < bytes => {
+                let more = bytes.saturating_sub(funding.bytes());
+                funding.grow(more)?;
+            }
+            Some(funding) => funding.shrink_to(bytes)?,
+            None if bytes == 0 => {}
+            None => return Err(NativeError::Capacity("seal transition funding")),
+        }
         if bytes == 0 {
             drop(built.funding.take());
         }
@@ -1471,11 +1525,16 @@ impl<'a> Fresh<'a> {
         } else {
             None
         };
-        let allocation = source
-            .reserve(BudgetKind::Pending, lane, construction.temporary_bytes()?)?
-            .commit();
-        let mut scratch = Scratch::bound(construction.scratch_bytes);
-        let mut extras = Extras::new(construction.extras_count, construction.extras_bytes)?;
+        // Each buffer is charged what it holds as it is taken, never the
+        // operation's bound (doc 27): a short message prepares in bytes.
+        let mut scratch = Scratch::metered(source, lane, construction.scratch_bytes)?;
+        let mut extras = Extras::metered(
+            construction.extras_count,
+            construction.extras_bytes,
+            source,
+            lane,
+        )?;
+        let mut window_scratch = Scratch::metered(source, lane, construction.window_bytes)?;
         let report_parent = match &dispatch {
             Dispatch::Request {
                 input:
@@ -1498,7 +1557,6 @@ impl<'a> Fresh<'a> {
                 // The principal's window as this request leaves it (F12):
                 // admitted here again on the same facts the fence saw, and
                 // written beside the meta and the outcome.
-                let mut window_scratch = Scratch::bound(construction.window_bytes);
                 let mut admitted = super::epochs::admit(
                     &view,
                     &mut meta,
@@ -1784,7 +1842,7 @@ impl<'a> Fresh<'a> {
                 retire: None,
             },
             seals,
-            allocation,
+            scratch.into_meter(),
         )
     }
 }

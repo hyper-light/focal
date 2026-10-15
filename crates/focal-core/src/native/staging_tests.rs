@@ -286,7 +286,7 @@ fn impossible_capacities_fail_before_changing_scratch_or_allocating_rows() {
 }
 
 #[test]
-fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
+fn owner_charges_construction_as_it_holds_it_never_its_bound() {
     let budget = MemoryBudget::new(16 * 1024 * 1024, 0).unwrap();
     let limits = NativeLimits {
         range: RangeConfig {
@@ -316,8 +316,9 @@ fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
         + event_containers(limits.range.max_batch_entries).unwrap()
         + index
         + crate::native::epochs::window_bytes(limits).unwrap();
-    // Leave every descriptor and all but one container byte available. No
-    // candidate may enter semantic execution under this incomplete reservation.
+    // Leave all but one byte of the operation's bound: a preparation is charged
+    // what it holds as it takes it, never its bound, so this post reaches its
+    // real check (an absent target) and gives back all it held.
     let pressure = budget
         .reserve(
             BudgetKind::Query,
@@ -343,8 +344,7 @@ fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
     };
     assert!(matches!(
         core.prepare_native(context, input(), &[]),
-        Err(NativeError::Memory(MemoryError::Capacity { requested, available }))
-            if requested == entire_charge && available == entire_charge - 1
+        Err(NativeError::Contract(ContractError::InvalidTarget))
     ));
     assert_eq!(budget.stats(), constrained);
     assert_eq!(core.native_sequence(), SessionSeq(0));
