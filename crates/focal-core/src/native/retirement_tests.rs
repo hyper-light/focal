@@ -969,6 +969,43 @@ fn the_event_index_finds_what_a_walk_of_every_event_finds() {
 /// A replica that spills its events (doc 31 M3) derives, bundles and retires a family as one
 /// that keeps them does: the same family, the same bundle, the same index, and the same root
 /// once the family has left, its spilled events with it.
+/// A finished family is due to retire once its grace has passed, and at once while its session is
+/// short of memory (doc 31 M3), so a session under sustained load gives its finished families
+/// back rather than fill: the waiver is the offering authority's, and the family is the one a
+/// replica derives either way.
+#[test]
+fn a_finished_family_is_due_after_its_grace_or_at_once_when_memory_is_short() {
+    let mut core = f::core();
+    // Created at 10, cancelled at 20, released at 30: its last event settled at 30.
+    finished(&mut core, 1, 1, 10);
+    let family = core.retirement_family(id(1)).unwrap();
+    let day = 24 * 60 * 60 * 1000;
+    assert!(!core.native_memory_short());
+    assert_eq!(
+        core.retirement_due(&family, 30 + day - 1, day).unwrap(),
+        Some(false)
+    );
+    assert_eq!(
+        core.retirement_due(&family, 30 + day, day).unwrap(),
+        Some(true)
+    );
+    let budget = core.state.budget.clone();
+    let squeezed = budget
+        .reserve(
+            focal_memory::BudgetKind::Payload,
+            focal_memory::BudgetLane::Ordinary,
+            budget.headroom(focal_memory::BudgetLane::Ordinary) - budget.limit() / 16,
+        )
+        .unwrap()
+        .commit();
+    assert!(core.native_memory_short());
+    assert_eq!(core.retirement_due(&family, 30, day).unwrap(), Some(true));
+    assert_eq!(core.retirement_family(id(1)).unwrap(), family);
+    drop(squeezed);
+    assert!(!core.native_memory_short());
+    assert_eq!(core.retirement_due(&family, 30, day).unwrap(), Some(false));
+}
+
 #[test]
 fn a_spilling_replica_retires_a_family_as_a_holding_one_does() {
     let checkpoint = |core: &Core<NativeState>| {

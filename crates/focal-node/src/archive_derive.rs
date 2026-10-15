@@ -87,21 +87,16 @@ fn eligible_in(
     if !report.allows_family(family.through) {
         return Ok(None);
     }
-    // The family's last event was published by the outcome at its
-    // sequence; the outcome carries the logical time it settled at.
-    let event = core
-        .native_event(family.through, 0)
-        .ok_or(LedgerError::Corrupt)?;
-    // An outcome that cannot be read back is the payload log's failure, not an absence.
-    let settled = core
-        .native_outcome(event.invocation)
+    // Its last event settled the grace ago, or its session is short of memory (doc 31 M3). An
+    // outcome that cannot be read back is the payload log's failure, not an absence.
+    match core
+        .retirement_due(&family, now, min_age_ms)
         .map_err(focal_ledger::NativeSessionError::from)?
-        .map(|outcome| outcome.logical_time)
-        .ok_or(LedgerError::Corrupt)?;
-    if now.saturating_sub(settled) < min_age_ms {
-        return Ok(None);
+    {
+        Some(true) => Ok(Some(family)),
+        Some(false) => Ok(None),
+        None => Err(LedgerError::Corrupt),
     }
-    Ok(Some(family))
 }
 /// What one cold walk did (doc 31 M2, A2): how many families it retired, deferred and refused,
 /// whether it found more than one batch of offers, whether it submitted a candidate, and where

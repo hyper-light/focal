@@ -406,7 +406,10 @@ the family's last event, everything published when there is no
 consumer), and the family's last event settled at least the grace ago
 (`FOCAL_RETIRE_AFTER_MS`, one day by default, measured on the node's
 logical clock against the logical time of the outcome that published
-that event: a finished claim stays readable in the core for that long) —
+that event: a finished claim stays readable in the core for that long;
+a session short of memory, its ordinary headroom under an eighth of its
+allowance, waives the grace, so its finished families retire as soon as
+they may, the first memory it gets back) —
 seals the bundle under custody, and proposes the record once
 every required copy holds a receipt; one family per replica per tick, and
 a family whose copies have not all answered waits for a later tick with

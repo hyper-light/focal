@@ -85,6 +85,13 @@ struct Lost {
     at: Option<Key>,
 }
 
+/// Whether `budget` is short of memory: its ordinary headroom below its low water, an eighth of
+/// its allowance. There a session's young generation spills its oldest rows and its finished
+/// families retire without waiting out their grace.
+pub(super) fn short(budget: &MemoryBudget) -> bool {
+    budget.headroom(BudgetLane::Ordinary) < budget.limit().checked_div(LOW_WATER).unwrap_or(0)
+}
+
 pub(super) struct Young {
     /// Oldest first, those whose spill was put off behind the rest.
     keys: VecDeque<Tracked>,

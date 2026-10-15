@@ -2273,6 +2273,34 @@ impl Core<NativeState> {
     pub fn native_read_failure(&self) -> Result<(), NativeError> {
         self.state.reads.failure()
     }
+    /// Whether the session is short of memory (doc 31 M3): its ordinary headroom below an eighth
+    /// of its allowance, where its young generation spills its oldest rows and its finished
+    /// families retire without waiting out their grace ([`Self::retirement_due`]).
+    pub fn native_memory_short(&self) -> bool {
+        young::short(&self.state.budget)
+    }
+    /// Whether `family`, which may retire, is due to at logical time `now` under a grace of
+    /// `grace_ms` (26 §4): its last event settled that long ago or longer, or the session is short
+    /// of memory, which waives the grace, since a finished family is the first memory a session
+    /// gets back (doc 31 §4.8). `None` where the event or the outcome that settled it is missing.
+    /// The grace is the offering authority's alone: a replica checks what a family holds, never
+    /// its age.
+    pub fn retirement_due(
+        &self,
+        family: &retirement::RetirementFamily,
+        now: u64,
+        grace_ms: u64,
+    ) -> Result<Option<bool>, NativeError> {
+        let Some(event) = self.native_event(family.through, 0) else {
+            return Ok(None);
+        };
+        let Some(outcome) = self.native_outcome(event.invocation)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.native_memory_short() || now.saturating_sub(outcome.logical_time) >= grace_ms,
+        ))
+    }
     /// The young generation (doc 31 M3): the keys it tracks, the spills it put off and kept to
     /// try again, and the keys it could not keep, since it was made.
     pub fn native_young(&self) -> (usize, u64, u64) {

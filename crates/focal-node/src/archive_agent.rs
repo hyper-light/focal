@@ -25,7 +25,9 @@ pub const INTERVAL_ENV: &str = "FOCAL_RETIRE_INTERVAL_MS";
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 /// Milliseconds of logical time a family's last event must have settled
 /// for before it is offered: the grace a finished claim stays readable in
-/// the core for. The default is one day.
+/// the core for. The default is one day. A session short of memory (its
+/// ordinary headroom under an eighth of its allowance) waives it: its
+/// finished families retire as soon as they may (doc 31 M3).
 pub const GRACE_ENV: &str = "FOCAL_RETIRE_AFTER_MS";
 const DEFAULT_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 /// How soon the agent asks again for the seals of a replica whose seal is
