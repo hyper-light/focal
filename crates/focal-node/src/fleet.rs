@@ -2547,12 +2547,9 @@ impl Owner {
         // patience before it asks whether a quorum heard it (27 §8.4): how late
         // they answer this replica's messages, as it stepped their answers.
         let scalars = self.session.scalars();
-        let tail = self.acks.quorum_tail(
-            self.session.members().voters,
-            scalars.node_id,
-            scalars.term,
-            Instant::now(),
-        );
+        let tail = self
+            .acks
+            .quorum_tail(self.session.members().voters, scalars.node_id);
         self.pace.publish_quorum_tail(tail);
         self.session.set_quorum_patience(
             self.pace

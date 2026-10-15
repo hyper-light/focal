@@ -13,8 +13,15 @@
 //! times one packet a round trip, and only an answer of its term answers it: an append by the
 //! first answer that takes the log to its last entry or past it, a heartbeat by the next answer
 //! to a heartbeat. A timed message whose answer never comes (lost, or refused and sent again)
-//! is answered by the first that does; until then its age is the peer's lateness, so a peer is
-//! seen late while it stalls and not only once the stall ends.
+//! is answered by the first that does.
+//!
+//! Only answers measure. A peer that stalls is measured late once it answers, its answer as old
+//! as the stall; a message still unanswered measures nothing. The patience a replica takes from
+//! these answers (before it asks whether a quorum heard it, and beyond a request's time) is
+//! what its voters' answers have taken, and grows only as late answers come: silence never
+//! renews it, so a leader its quorum no longer answers (cut off, or its peers gone) stands down
+//! within an election timeout and that patience, where taking the unanswered message's age as
+//! lateness moved the check on at every tick, up to its cap.
 use focal_consensus::{Message, MessageType, Stepped};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -109,35 +116,30 @@ impl AckClock {
         }
     }
 
-    /// How late `peer` answers at least: the tail of its answers, or the age of the message of
-    /// `term` timed and not yet answered where that is more. `None` while nothing was measured
-    /// or is out.
-    pub(crate) fn lateness(&self, peer: u64, term: u64, now: Instant) -> Option<Duration> {
+    /// How late `peer` answers: the tail of its answers, `None` while it has answered nothing.
+    /// A message of it still unanswered makes it no later.
+    pub(crate) fn answered(&self, peer: u64) -> Option<Duration> {
         let clock = self.peers.get(&peer)?;
-        let answered = clock.answers.tail_ns().map(Duration::from_nanos);
-        let age = clock
-            .timed
-            .filter(|timed| timed.term == term)
-            .map(|timed| now.saturating_duration_since(timed.sent));
-        match (answered, age) {
-            (Some(answered), Some(age)) => Some(answered.max(age)),
-            (answered, age) => answered.or(age),
-        }
+        clock.answers.tail_ns().map(Duration::from_nanos)
     }
 
-    /// The lateness a commit of `term` waits on among `voters`, `local` among them
-    /// ([`crate::pace::quorum_tail`]).
-    pub(crate) fn quorum_tail(
-        &mut self,
-        voters: &[u64],
-        local: u64,
-        term: u64,
-        now: Instant,
-    ) -> Option<Duration> {
+    /// The age of the message of `term` timed to `peer` and not yet answered, if one is.
+    #[cfg(test)]
+    pub(crate) fn outstanding(&self, peer: u64, term: u64, now: Instant) -> Option<Duration> {
+        let clock = self.peers.get(&peer)?;
+        clock
+            .timed
+            .filter(|timed| timed.term == term)
+            .map(|timed| now.saturating_duration_since(timed.sent))
+    }
+
+    /// How late a commit's quorum answers among `voters`, `local` among them
+    /// ([`crate::pace::quorum_tail`]): of their answers alone, so never later for their silence.
+    pub(crate) fn quorum_tail(&mut self, voters: &[u64], local: u64) -> Option<Duration> {
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
         for voter in voters.iter().filter(|voter| **voter != local) {
-            if let Some(late) = self.lateness(*voter, term, now) {
+            if let Some(late) = self.answered(*voter) {
                 // A voter there is no room to gather for is one not measured.
                 if scratch.try_reserve(1).is_ok() {
                     scratch.push(late);

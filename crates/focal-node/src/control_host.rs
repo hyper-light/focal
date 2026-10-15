@@ -1074,12 +1074,9 @@ impl<V: AuthorityVerifier> Owner<V> {
                     // whether a quorum heard it (27 §8.4): the same ticks a request is given.
                     // How late they answer is what this owner timed of their answers.
                     let scalars = self.replica.scalars();
-                    let tail = self.acks.quorum_tail(
-                        self.replica.membership().voters,
-                        scalars.node_id,
-                        scalars.term,
-                        Instant::now(),
-                    );
+                    let tail = self
+                        .acks
+                        .quorum_tail(self.replica.membership().voters, scalars.node_id);
                     self.pace.publish_quorum_tail(tail);
                     self.replica.set_quorum_patience(
                         self.pace
