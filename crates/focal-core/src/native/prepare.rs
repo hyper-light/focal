@@ -696,10 +696,12 @@ impl Core<NativeState> {
             NativeCommand::ReportAdmission { .. } => NativeOperation::ReportAdmission,
         };
         // Finishing work already taken (a cancel, a report, a respondent's diagnostic, close or
-        // post) is on the completion lane, which fresh work cannot take.
+        // post, the release of a finished claim's scope that lets its family retire) is on the
+        // completion lane, which fresh work cannot take.
         let lane = if matches!(
             operation,
             NativeOperation::Cancel
+                | NativeOperation::ReleaseScope
                 | NativeOperation::ReportAdmission
                 | NativeOperation::ReportIncrement
                 | NativeOperation::ReportWork
@@ -1805,6 +1807,10 @@ impl<'a> Fresh<'a> {
             view.state.ledger,
             view.payloads(),
         )?;
+        // What the rows it puts reserve for their finishing; what those it replaces reserved is
+        // counted with their bytes.
+        let finishing_added =
+            super::finishing::added(fragments.changes().map(|(_, _, change)| change))?;
         // What the rows this mutation replaces or deletes take in a checkpoint, as the state it
         // is prepared on holds them, which is the root it publishes onto: published, it takes
         // them away without looking each up again.
@@ -1816,6 +1822,7 @@ impl<'a> Fresh<'a> {
             }
         }
         let encoded_removed = removed.bytes();
+        let rows_removed = removed.rows();
         writes.check(&fragments)?;
         // Its changes' place in an owner's pending index, funded as the rest of it is.
         let index = super::pending_index::entry_charge()
@@ -1842,6 +1849,9 @@ impl<'a> Fresh<'a> {
                 writes,
                 encoded_added,
                 encoded_removed,
+                rows_removed,
+                finishing_added,
+                finishing_taken: removed.finishing(),
                 _index: Some(index),
                 events,
                 retire: None,

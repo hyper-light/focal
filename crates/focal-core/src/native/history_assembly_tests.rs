@@ -139,6 +139,7 @@ fn publish(core: &mut Core<NativeState>, staged: Staged) -> (NativeOutcome, Vec<
     let encoded_added =
         crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())
             .unwrap();
+    let finishing_added = crate::native::finishing::added(changes.iter()).unwrap();
     let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let range = core
         .state
@@ -157,6 +158,9 @@ fn publish(core: &mut Core<NativeState>, staged: Staged) -> (NativeOutcome, Vec<
         writes: mutation::WriteSet::unrecorded(),
         encoded_added,
         encoded_removed: removed.bytes(),
+        rows_removed: removed.rows(),
+        finishing_added,
+        finishing_taken: removed.finishing(),
         _index: None,
         events: None,
         retire: None,

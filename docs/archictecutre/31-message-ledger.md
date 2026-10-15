@@ -904,6 +904,183 @@ Each stage lands on its own, measured:
        - What the session held beside its native engine peaked at 0.27 MB at both rates,
          sampled every 5 s, against the eighth of the allowance (100 MB) the wide share leaves
          it.
+   - **Refused work leaves nothing in the payload log (2026-10-15).** A candidate's plan spills
+     its events and outcome to the log as it builds them, before its session has weighed it. A
+     candidate refused after that (the checkpoint's bound, the pending room, the disk headroom, a
+     moving range, the owner's own post-plan checks) left its payloads in a segment the open claims
+     kept live: a million open claims offered to one node in a 2 GiB envelope grew the log from
+     787 MB to 1.39 GB while nothing committed.
+     - Now the log holds what a fresh preparation appends (`PayloadLog::hold`): none of it is
+       handed to the writer until the candidate is admitted (`keep`). Refused or discarded, it is
+       given back (`give_back`): the window cut where the hold began, segments opened since sealed
+       empty, the next append where the first held one went. This is what a broker does when it
+       validates a batch before appending it.
+     - The owner keeps a hold before anything else appends: another preparation, a staged
+       retirement, a publication once its ticket is the head's, the log detached. So a hold only
+       ever covers its own candidate's bytes, and no published row names a byte the files lack.
+     - Tested: refused creations leave the log's bytes as they were, a discarded candidate gives
+       its bytes back, a rejected publication leaves the next candidate's held bytes to its
+       discard, and held bytes never reach a file, even when a reader's barrier asks for every
+       byte or a hold crosses chunks and segments.
+     - **A refused transfer kept the hold (review).** Handing the committed core back from the
+       owner kept the newest candidate's hold before it checked that nothing was pending; refused,
+       it returned an owner whose discard could give nothing back. It keeps only once the
+       transfer goes ahead. Tested: a transfer refused with a candidate pending, then the
+       candidate's discard, leaves nothing in the log (698 bytes stayed before).
+   - **At the checkpoint's bound (2026-10-15).** A million open claims offered to one node in
+     a 2 GiB envelope (2,000 creations a second, none consumed) committed 434,661. Every write
+     after that was refused at the checkpoint's bound, while the native share was at 577 of
+     939.5 MB. The bound is real while an installing replica assembles the encoded root whole
+     (`SeedManifest::assemble`). Besides the payloads refused work left behind (above), the run
+     showed two defects at the bound, each fixed at its cause:
+     - **A ledger at its bound could not empty.** The projection counted every write as a row
+       and took nothing away, so a retirement projected growth. One limit stood for all work,
+       so a cancel and a release were refused as a creation was. A ledger that reached the
+       bound could neither finish its claims nor retire its families. The test that found it:
+       2 of 14 claims could be cancelled at the bound, and the retirement was refused.
+       - The projection is now exact (`NativeOwner::checkpoint_projection`): committed rows
+         and bytes, plus what each pending candidate puts or adds, less what it replaces,
+         deletes or takes away. Each candidate is measured on the root its predecessors leave,
+         and a discard takes a suffix.
+       - The bound has the memory's lanes (`CheckpointBound`): fresh work stops an eighth
+         short of it, and work that finishes what was taken goes on to the bound.
+         `ReleaseScope` joins the completion lane: it requires a terminal claim, and it is what
+         lets the family retire. A candidate that takes away at least what it adds is never
+         refused by the bound.
+       - A root within a quarter of the bound of where fresh work stops retires finished
+         families without waiting out their grace, as a session pressed for memory does
+         (`Core::checkpoint_pressed`). The bound lives on the core and is set where the session
+         makes the core its owner's, so admission and the archive's due rule read one value.
+       - Tested: at the bound, 8 of 13 claims are cancelled where fresh work stops. Then the
+         retirement is admitted, and a cancel the bound had refused is admitted after it.
+     - **Each refusal there cost a preparation.** The check ran after the candidate was built,
+       about 46 µs of owner time per refused request. The owner now checks the bound as it
+       stages the candidate. A refused one leaves a shortfall, as a memory refusal does
+       (`ingress::Need::Checkpoint`: its lane, and the rows and bytes it grew the root by).
+       While the root has no room for that, a like request is refused from its header. Every
+       32nd is prepared as a probe, the interval doubling to 1,024 while it is refused.
+       - Measured (`measure_refusal_at_the_checkpoint_bound`, release): 45.8 µs a prepared
+         creation, then 5,000 of 5,000 refused at 0.21 µs each. At the memory's bound the
+         refusal costs 0.25 µs.
+     - **A fixed reserve could not hold every claim's finishing.** The bound's lanes left an
+       eighth of it to finishing work, and a review found the order that wedged it: at the
+       bound, cancel every claim first, then release them. A cancel adds 3 rows and 680 bytes
+       (its outcome, the claim's event and its status event, and the cut the claim ends at), a
+       release 2 rows and 503 bytes, and only a released family retires. The cancels took the
+       eighth before any release came: every release was refused, no family could retire, and the
+       ledger could finish nothing more (14 claims, 10 cancels, every release refused).
+       - Now each claim reserves its finishing where it is admitted (`Finishing`), by the shape
+         it has: an open claim what its terminal transition adds and its release, a terminal one
+         its release, each monitor it has active the cancel that must come before the release,
+         and each live evaluation its fence. A claim with dependencies or a monitor active reserves
+         for the largest cut a graph ends it at (204 bytes, a monitor cycle's, which names the
+         claim whose deadline fired it; a dependency's failure is 164), one with a monitor for the
+         monitor's deadline as well. A review found the monitor cycle: two claims waiting on each
+         other's satisfaction, the older's own monitor firing, ended it at that cut 99 bytes past
+         its reservation.
+         The root with its reservations never passes the bound, and fresh work stops an eighth
+         short of it as before. A transition that ends a claim or releases one takes no more
+         than the reservation it gives back, so the bound never refuses it, in any order. This is
+         how XFS and ext4's jbd2 reserve a transaction's log space before it changes anything,
+         and how doc 22's completion promises reserve a report's rows before it arrives.
+       - The reservations are kept as the encoded bytes are: counted for each candidate as its
+         build counts what it replaces, kept as each publication, seal, replay and retirement
+         applied straight to the root moves them, and summed once where a root is built whole. A spilled claim waits to be delivered, on
+         nothing and in nothing, so it reserves what an open claim of no dependency and no
+         monitor does, unread. Nothing a transition deletes (a timer it consumes) is counted on.
+       - What it costs: an open claim of no dependency and no monitor reserves 5 rows and 1,187
+         bytes beside the 12 to 14 rows and 1.7 to 1.9 KB its creation takes. With the rows
+         deciding (a 200-row bound), 9 claims fit where 13 did; the other 4 were claims the
+         ledger could not have finished.
+       - Tested: every finishing path takes no more than it reserved, rows and bytes, and the
+         running reservation is after every step what a walk of the rows gives
+         (`finishing_a_claim_takes_no_more_than_it_reserved`: cancels of a posted claim, of one
+         with an evaluation begun or not, of one others depend on (one on two claims) or await, of
+         an owned tree's root; a claim's deadline and a monitor's; monitor cycles of two and three
+         claims, the trigger's monitor firing or the victim's own; a monitor's cancel; every
+         release). A
+         ledger at its bound cancels every claim, then releases every one, then retires every
+         family, then admits fresh work. Both fail with the reservations set to nothing.
+     - **Not fixed, recorded.**
+       - An installing replica still assembles the encoded root whole, so the bound stays where
+         its memory puts it. Streaming the install chunk by chunk, as TiKV and CockroachDB
+         ingest snapshots and Redis loads an RDB, would leave memory the only bound.
+       - `NATIVE_ENTRY_BYTES` (96, `size_of::<(Key, Row)>()`) bounds the checkpoint's rows. A
+         resident row measured 74 bytes in the run, so the row bound refuses before memory
+         would.
+   - **The payload log's sweep (2026-10-15).** The 2 GiB deliver run (env-7) held native
+     memory near 690 MB, with retirement keeping pace. Its payload log grew by about 755 bytes a
+     write all the same: 883 MB in 14 segments after 1.17 million writes, none ever let go.
+     - **A sweep could let go of a segment rows still named.** The sweep's walk of the
+       committed rows dated from when the log took events alone: it named the segments of
+       events and nothing else. A segment only claims, definitions, outcomes, contents or
+       creation results named was let go, and those rows could no longer be read back. A
+       checkpoint, which reads every spilled row, then failed. It never showed in a run because
+       events pinned every segment. Found by reading the walk; shown by a test that gives each
+       append a segment of its own.
+     - **The walk held the replica's thread.** It walked the root at once, at most once a
+       segment's worth of payloads, and only after a retirement: a ledger whose rows were
+       replaced and never retired never swept at all.
+     - **Now (`payloads::Marks`).**
+       - A pass over every committed row, of every kind, a bounded step at each applied batch:
+         4,096 rows a step, a few tens of microseconds. A pass begins once the log has sealed
+         two segments since the last pass that swept, or once rows an eighth of the root were
+         written since that pass began (`CHURN_SHARE`): retirements and deletions leave copies
+         no row names without sealing a segment, and a log at its segment cap seals none.
+       - Rows spilled while it goes on land where appends go, from where it began, so its sweep
+         lets go only of segments sealed before it began.
+       - A publication while it goes on names its rows' segments to it. A candidate prepared
+         before the pass and published after the pass had been past its keys would otherwise
+         lose its bytes. A leader's pending candidates are named at the end.
+       - What a pass notes (each segment met, with the bytes seen naming it) is charged as it
+         grows, a doubling at a time on the completion lane, its charge admitted first and kept
+         with the room between passes. A pass that cannot be charged for a segment it meets sweeps
+         nothing (its notes are incomplete) and the next begins afresh; the log's sweep reads the
+         notes in place, with no copy. A pass that fell short is not taken for a sweep
+         (`SweepStep::Short`): the next is as due, after a wait that doubles from one step with
+         each that falls short, to 1,024 at most (`SWEEP_RETRY_STEPS`).
+       - The replica's diagnostics report the passes, the segments let go, the passes that fell
+         short, and the bytes the last pass saw its rows name (`payload_passes`,
+         `payload_let_go`, `payload_short`, `payload_named` beside `payload_bytes`). The last is
+         an upper bound of the live bytes, not an exact count: a row published while a pass goes
+         on may be counted twice, and one replaced after its count still counts.
+     - **A cleaner, built and measured, not kept.** A pass that moved the rows of segments named
+       half or less to where appends go (LFS's cleaner, WiscKey's value-log collection) freed
+       nothing in the deliver run (env-9). 43% of its moves were refused: a frozen checkpoint
+       image or a lifecycle read's lease shares the store's pages much of the time, and a
+       rewrite in place must refuse a shared page (a reader holding the old reference needs the
+       old segment as long as it reads). Its moved copies only grew the log, 1.06 GB against
+       933 MB.
+     - **Open: what pins the oldest segments.** With 97,000 of 146,000 families retired, the last
+       pass of env-9 still found 321 MB named and no segment empty: something in every old
+       segment outlives retirement. That decides the fix: retire or seal what pins them, or a
+       cleaner that waits for the store's pages and keeps what it moves apart from new writes.
+     - **A pass that fell short was taken for a sweep (review).** The replica counted the log's
+       segments as swept when a pass ended, short or not, and the next pass waited for two more
+       to be sealed. A log at its segment cap seals none, so a passing memory refusal stopped its
+       reclamation for good. Now the pass says it fell short, the replica tries again at the
+       bounded cadence above, and rows written make a pass due without the log growing.
+     - **Retirements applied directly kept stale totals (review).** A follower applies a
+       committed retirement record (and a legacy retirement applies a family) by publishing its
+       changes straight to the root, as a seal does, but neither moved the root's running totals:
+       the encoded bytes kept the retired families' (11,086 against the 7,081 the rows give in the
+       follower test), so a follower promoted to leader projected its checkpoint too large and
+       refused fresh work it had room for, and the rows it wrote were no churn, so a follower's
+       log at its cap never swept for its retirements. Both now count their changes before
+       anything changes and move the totals with the publication. Tested: a follower's totals
+       equal a walk of its rows and the leader's after a derived retirement; a legacy
+       retirement's checkpoint is what its total says; both fail without the counts.
+     - **What a retirement leaves.** In a session at its cap, a finished family's retirement left
+       its oldest segments named by its requests' outcomes and creation results. A seal takes
+       those once their generation closes, as the archive's seals do in a running node.
+     - **Tested.** A sweep keeps the segment of every committed row of any kind (a log whose
+       every append is a segment of its own; it fails with events alone named). A candidate
+       published after a pass's last step keeps its segments (it fails without the
+       publication's word), and what an unpublished one spilled goes. A session's log at its cap
+       of 256 segments, every pass short while finished families and then open claims fill it,
+       the families retired and their generation sealed: once memory is back, 12 dead segments
+       are let go within the longest wait and one pass, no segment sealed (10 passes fell short;
+       it fails with the short pass taken for a sweep).
 4. **M4, durability classes.**
    - Memory-quorum acknowledgement with a bounded background flush; the disk class kept.
    - Measure: p99 at 1k, 4k and 12k/s against Kafka, NATS and Redis.

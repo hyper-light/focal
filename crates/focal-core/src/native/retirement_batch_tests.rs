@@ -209,6 +209,25 @@ fn a_retirement_is_ordered_with_the_writes_around_it_and_a_follower_derives_it_a
     replay_into(&mut follower, &second_record, range, &store);
     ckpt::compare(owner.committed_core(), &follower);
     assert!(follower.state.events.complete());
+    // The root's running totals are what its rows give, on the follower as on the leader: a
+    // retirement applied there kept the bytes of the families it took away, and wrote no rows.
+    let leader = owner.committed_core();
+    let encoded = |core: &Core<NativeState>| {
+        crate::native::encoded_rows_of(&core.state.rows, core.state.ledger, core.state.payloads())
+            .unwrap()
+    };
+    assert_eq!(leader.state.encoded_rows, encoded(leader));
+    assert_eq!(follower.state.encoded_rows, encoded(&follower));
+    assert_eq!(
+        follower.checkpoint_bytes().unwrap(),
+        leader.checkpoint_bytes().unwrap()
+    );
+    assert_eq!(follower.state.marks.churn(), leader.state.marks.churn());
+    // What the rows reserve for their finishing likewise.
+    let reserved =
+        |core: &Core<NativeState>| crate::native::finishing::of_rows(&core.state.rows).unwrap();
+    assert_eq!(leader.state.finishing, reserved(leader));
+    assert_eq!(follower.state.finishing, reserved(&follower));
 }
 
 /// A family a pending candidate touches waits: here the families an earlier retirement, not

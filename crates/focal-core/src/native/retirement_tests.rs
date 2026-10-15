@@ -349,9 +349,11 @@ fn a_family_leaves_the_core_only_when_terminal_released_and_unreferenced() {
     );
     let issuer_request = f::request(f::ISSUER, 1);
     let outcomes_before = core.native_stats().entries;
+    let churn = core.state.marks.churn();
     let rows = core
         .retire_native_family(&family, hash, bytes.len() as u64, through)
         .unwrap();
+    assert!(core.state.marks.churn() > churn, "it wrote no rows");
     assert_eq!(rows, family.rows());
     assert_eq!(core.native_sequence(), SessionSeq(through.0 + 1));
     assert!(core.native_claim(id(1)).is_none());
@@ -383,8 +385,14 @@ fn a_family_leaves_the_core_only_when_terminal_released_and_unreferenced() {
         core.retirement_family(id(1)).unwrap_err(),
         RetirementRefusal::Unknown(id(1))
     );
-    // The checkpoint restores and validates with the continuation in place.
+    // The checkpoint restores and validates with the continuation in place, and is what the
+    // root's running total says: the retirement took its families' bytes away.
     let encoded = ckpt::encode(&core);
+    assert_eq!(core.checkpoint_bytes().unwrap(), encoded.len());
+    assert_eq!(
+        core.state.finishing,
+        crate::native::finishing::of_rows(&core.state.rows).unwrap()
+    );
     let restored = recovery::restore(
         &ckpt::inspect(&encoded),
         RangeId(777),
@@ -1117,6 +1125,56 @@ fn a_finished_family_is_due_after_its_grace_or_at_once_when_memory_is_pressed() 
     assert_eq!(core.retirement_family(id(1)).unwrap(), family);
     drop(squeezed);
     assert!(!core.native_memory_pressed());
+    assert!(!core.retirement_due(Some(30), 30, day));
+}
+
+/// A root pressed on its checkpoint's bound retires its finished families without waiting out
+/// their grace, as one pressed for memory does: within a quarter of the bound of where fresh work
+/// stops, in rows or in bytes. A ledger at its bound otherwise refused fresh work until the grace
+/// ended. Fresh work stops an eighth short of the bound; finishing work goes on to the bound.
+#[test]
+fn a_finished_family_is_due_at_once_when_its_root_presses_on_its_checkpoint_bound() {
+    use crate::native::CheckpointBound;
+    let mut core = f::core();
+    finished(&mut core, 1, 1, 10);
+    let day = 24 * 60 * 60 * 1000;
+    let rows = core.state.rows.len();
+    let bytes = core.checkpoint_bytes().unwrap();
+    assert!(rows >= 8 && bytes >= 8, "{rows} rows, {bytes} bytes");
+    assert!(!core.checkpoint_pressed());
+    assert!(!core.retirement_due(Some(30), 30, day));
+    // Pressed past five eighths of the bound: the root is half of one here, so not pressed.
+    let roomy = CheckpointBound {
+        rows: rows * 2,
+        bytes: bytes * 2,
+    };
+    assert_eq!(
+        roomy.on(focal_memory::BudgetLane::Ordinary),
+        (rows * 2 - rows * 2 / 8, bytes * 2 - bytes * 2 / 8)
+    );
+    assert_eq!(
+        roomy.on(focal_memory::BudgetLane::Completion),
+        (rows * 2, bytes * 2)
+    );
+    core.bound_checkpoint(Some(roomy));
+    assert!(!core.checkpoint_pressed());
+    assert!(!core.retirement_due(Some(30), 30, day));
+    // Four fifths of the bound in rows, or in bytes alone: pressed, and due at once.
+    core.bound_checkpoint(Some(CheckpointBound {
+        rows: rows + rows / 4,
+        bytes: bytes * 2,
+    }));
+    assert!(core.checkpoint_pressed());
+    assert!(core.retirement_due(Some(30), 30, day));
+    assert!(core.retirement_due(None, 30, day));
+    core.bound_checkpoint(Some(CheckpointBound {
+        rows: rows * 2,
+        bytes: bytes + bytes / 4,
+    }));
+    assert!(core.checkpoint_pressed());
+    assert!(core.retirement_due(Some(30), 30, day));
+    core.bound_checkpoint(None);
+    assert!(!core.checkpoint_pressed());
     assert!(!core.retirement_due(Some(30), 30, day));
 }
 

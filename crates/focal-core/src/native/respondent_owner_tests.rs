@@ -561,6 +561,7 @@ fn copied(f: &Fixture, configured: NativeLimits) -> Core<NativeState> {
     core.state.encoded_rows =
         crate::native::encoded_rows_of(&core.state.rows, core.state.ledger, core.state.payloads())
             .unwrap();
+    core.state.finishing = crate::native::finishing::of_rows(&core.state.rows).unwrap();
     core
 }
 

@@ -298,6 +298,21 @@ pub fn node_row(view: &Value, id: u64) -> Option<&Value> {
             .find(|node| node["node"] == id)
     })
 }
+/// Whether `node` is in the root membership as `founder` reads it (`inspect membership`), voter or
+/// learner. A removal's `membership_removed` says what that run did, so after a retried removal
+/// this is what shows the node is gone.
+pub fn member(founder: &Node, node: u64) -> bool {
+    let output = run(founder, None, &["inspect", "membership"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let configuration = &value["result"]["configuration"];
+    ids(&configuration["voters"]).contains(&node) || ids(&configuration["learners"]).contains(&node)
+}
+
 pub fn ids(value: &Value) -> Vec<u64> {
     value
         .as_array()

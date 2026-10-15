@@ -1294,10 +1294,7 @@ fn a_ledger_at_its_checkpoint_bound_refuses_fresh_rows_and_still_checkpoints() {
             Err(error) => break error,
         }
     };
-    assert!(
-        matches!(refused, NativeSessionError::Capacity(_)),
-        "{refused:?}"
-    );
+    assert!(refused_at_checkpoint(&refused), "{refused:?}");
     assert_eq!(refused.class(), FailureClass::Retryable);
     assert!(request > 2, "the bound refused before any claim fit");
     // What it admitted, it checkpoints.
@@ -1319,6 +1316,301 @@ fn a_ledger_at_its_checkpoint_bound_refuses_fresh_rows_and_still_checkpoints() {
             .propose(context(), create(retried, 1_000 + retried))
             .unwrap(),
         NativeSubmission::Committed(outcome)
+    );
+}
+
+/// Whether `error` is the checkpoint's bound refusing a candidate.
+fn refused_at_checkpoint(error: &NativeSessionError) -> bool {
+    matches!(
+        error,
+        NativeSessionError::Owner(NativeOwnerError::Native(NativeError::Capacity(text)))
+            if *text == focal_core::native::CHECKPOINT_REFUSAL
+    )
+}
+
+/// Creations from request `first` on, each committed as it is admitted, until one is refused:
+/// the refused request and its refusal.
+fn fill_to_the_bound(
+    session: &mut NativeSession<BuiltinNativeSchemas>,
+    first: u128,
+) -> (u128, NativeSessionError) {
+    let mut request = first;
+    loop {
+        assert!(
+            request < first + 1_000,
+            "the bound never refused a creation"
+        );
+        match session.propose(context(), create(request, 1_000 + request)) {
+            Ok(NativeSubmission::Pending { outcome, .. }) => {
+                let committed = (0..16).any(|_| {
+                    session
+                        .poll()
+                        .unwrap()
+                        .committed
+                        .iter()
+                        .any(|commit| commit.outcome == outcome)
+                });
+                assert!(committed, "creation {request} never committed");
+            }
+            Ok(other) => panic!("a fresh creation was {other:?}"),
+            Err(error) => return (request, error),
+        }
+        request += 1;
+    }
+}
+
+/// Refuse, or allow again, the growth of the payload sweep's notes in `session`'s core, as a
+/// budget out of memory does.
+fn refuse_marks(session: &mut NativeSession<BuiltinNativeSchemas>, refuse: bool) {
+    match session.engine.domain.as_mut() {
+        Some(super::engine::Domain::Active(owner, _)) => owner.refuse_payload_marks(refuse),
+        Some(super::engine::Domain::Passive(core)) => core.refuse_payload_marks(refuse),
+        None => panic!("no domain"),
+    }
+}
+
+/// A payload log at its segment cap whose sweep fell short for want of memory lets go of its dead
+/// segments once memory is back, sealing no segment to get there. A pass that fell short was
+/// taken for a sweep: the log's segments were counted as swept, the next pass waited for two more
+/// to be sealed, and a log at its cap seals none, so a passing memory refusal stopped its
+/// reclamation for good. Here every pass falls short while finished families and then open
+/// claims fill the log to its cap, the families retire, and memory comes back.
+#[test]
+fn a_payload_log_at_its_cap_lets_go_of_dead_segments_after_a_sweep_fell_short() {
+    const SEGMENT: u64 = 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(1 << 30, 64 << 20).unwrap();
+    let mut session = open_with(dir.path(), &parent, limits()).unwrap();
+    // The log the session opened, empty yet, opened again with segments a test can fill.
+    assert_eq!(session.engine.payload_bytes(), 0);
+    drop(session.engine.take_payload_log());
+    session.engine.payload_segment_bytes = Some(SEGMENT);
+    session.engine.open_payload_log();
+    lead(&mut session);
+    refuse_marks(&mut session, true);
+    // Families finished first: the oldest segments hold what they spilled.
+    let families: Vec<u128> = (0..8).map(|n| 100_000 + n).collect();
+    let mut request = 1u128;
+    for claim in &families {
+        finished_family(&mut session, request, *claim);
+        request += 3;
+    }
+    // The principal closes their generation from its next, as a client moves on: what the
+    // families' requests left is the closed generation's, to be sealed.
+    let mut advance = NativeInput {
+        request: key(request),
+        command: NativeCommand::AdvanceEpochFloor {
+            minimum: RequestEpoch(2),
+        },
+    };
+    advance.request.epoch = RequestEpoch(2);
+    commit(&mut session, advance, "the generation's close");
+    request += 1;
+    // Open claims until the log holds its most segments.
+    let mut claim = 200_000u128;
+    while session.engine.payload_segments() < super::payloads::MAX_SEGMENTS {
+        assert!(
+            claim < 204_000,
+            "the log never reached its cap: {} segments, {} bytes",
+            session.engine.payload_segments(),
+            session.engine.payload_bytes()
+        );
+        let mut input = create(request, claim);
+        input.request.epoch = RequestEpoch(2);
+        commit(&mut session, input, "a creation toward the cap");
+        request += 1;
+        claim += 1;
+    }
+    // The finished families retire: nothing names what they spilled now.
+    for (at, root) in families.iter().enumerate() {
+        let root = ClaimId::from_u128(*root);
+        let family = session
+            .committed_core()
+            .unwrap()
+            .retirement_family(root)
+            .unwrap();
+        let offer = focal_core::native::retirement_batch::RetireOffer {
+            root,
+            family: focal_core::native::retirement_batch::family_digest(ledger(), &family).unwrap(),
+            bundle: ContentHash([u8::try_from(at + 1).unwrap(); 32]),
+            bytes: 4096,
+        };
+        let (batch, submission) = session.retire(&[offer]).unwrap();
+        let Some(NativeSubmission::Pending { outcome, .. }) = submission else {
+            panic!("the retirement of {root:?} was refused: {batch:?}, {submission:?}");
+        };
+        let committed = (0..16).any(|_| {
+            session
+                .poll()
+                .unwrap()
+                .committed
+                .iter()
+                .any(|commit| commit.outcome == outcome)
+        });
+        assert!(committed, "the retirement of {root:?} never committed");
+    }
+    // What retirement leaves of the families, the outcomes and creation results of their closed
+    // generation, a seal takes, as the archive's seals take them in a running node.
+    {
+        let (plan, bundle, length) = {
+            let core = session.committed_core().unwrap();
+            let floors = core.pressure_floors(super::seal::MAX_FLOORS).unwrap();
+            let plan = core
+                .seal_plan(
+                    &floors,
+                    focal_core::native::seal::SealBound {
+                        principals: core.native_limits().principals,
+                        rows: focal_core::native::seal::DEFAULT_SEAL_ROWS_PER_BUNDLE,
+                    },
+                )
+                .unwrap();
+            let quote = core.seal_quote(&plan, limits().encoding).unwrap();
+            let mut bytes = vec![0; quote.bytes];
+            let hash = core.seal_into(&plan, &mut bytes, quote.visits).unwrap();
+            (plan, hash, u64::try_from(bytes.len()).unwrap())
+        };
+        assert!(
+            plan.outcomes() > families.len(),
+            "the seal takes the closed generation's outcomes: {}",
+            plan.outcomes()
+        );
+        let applied = session.seals_applied();
+        session.propose_seal(&plan, bundle, length, None).unwrap();
+        assert!(
+            (0..16).any(|_| {
+                let _ = session.poll().unwrap();
+                session.seals_applied() > applied
+            }),
+            "the seal never applied"
+        );
+    }
+    let swept = session.engine.payload_sweep();
+    assert!(swept.short > 0, "no pass fell short: nothing is measured");
+    assert_eq!(swept.let_go, 0);
+    let held = session.engine.payload_segments();
+    assert_eq!(held, super::payloads::MAX_SEGMENTS);
+    // Memory back: within the longest wait and one pass's steps, the dead segments go.
+    refuse_marks(&mut session, false);
+    let rows = session.committed_core().unwrap().native_stats().entries;
+    let bound = usize::try_from(super::engine::SWEEP_RETRY_STEPS).unwrap() + rows / 4096 + 4;
+    let mut polls = 0usize;
+    while session.engine.payload_sweep().let_go == 0 {
+        assert!(polls < bound, "the sweep never let go within {bound} polls");
+        let _ = session.poll().unwrap();
+        polls += 1;
+    }
+    let after = session.engine.payload_segments();
+    assert!(after < held, "{after} segments of {held}");
+    eprintln!(
+        "{} passes fell short; after {polls} polls {} segments let go, {after} of {held} held",
+        swept.short,
+        session.engine.payload_sweep().let_go
+    );
+}
+
+/// A candidate refused at admission leaves nothing in the payload log. Its plan spilled its rows
+/// as it built them, before the session weighed it; the log held them back and gives them back.
+/// Before, each refusal at the checkpoint's bound left its payloads in a segment the ledger's
+/// open claims kept live: a node refusing two thousand creations a second grew its log by 2.2 MB
+/// a second, past 1.3 GB, committing nothing.
+#[test]
+fn a_candidate_refused_at_admission_leaves_nothing_in_the_payload_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let mut bounded = limits();
+    bounded.checkpoint.rows = 200;
+    let mut session = open_with(dir.path(), &parent, bounded).unwrap();
+    lead(&mut session);
+    let (mut request, refused) = fill_to_the_bound(&mut session, 1);
+    assert!(refused_at_checkpoint(&refused), "{refused:?}");
+    let held = session.engine.payload_bytes();
+    assert!(
+        held > 0,
+        "the creations spilled nothing: nothing is measured"
+    );
+    for _ in 0..64 {
+        request += 1;
+        let refused = session
+            .propose(context(), create(request, 1_000 + request))
+            .unwrap_err();
+        assert!(refused_at_checkpoint(&refused), "{refused:?}");
+    }
+    let _ = session.poll().unwrap();
+    assert_eq!(
+        session.engine.payload_bytes(),
+        held,
+        "refused candidates left their payloads in the log"
+    );
+}
+
+/// A ledger at its checkpoint's bound still finishes what it took and retires what finished:
+/// every claim taken before the bound is cancelled at it, each having reserved its finishing as
+/// it was admitted (`focal_core::native::Finishing`), and a retirement takes rows away, so neither
+/// is refused where fresh work is; the retirement leaves the root with its reservations smaller.
+/// Before, the bound refused both as it refused a creation: a ledger that reached it could
+/// neither finish its claims nor retire its families, and refused all work for good.
+#[test]
+fn a_ledger_at_its_checkpoint_bound_still_finishes_and_retires() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let mut bounded = limits();
+    bounded.checkpoint.rows = 200;
+    let mut session = open_with(dir.path(), &parent, bounded).unwrap();
+    lead(&mut session);
+    // A family finished before the bound, to retire at it.
+    finished_family(&mut session, 1, 100);
+    let (request, refused) = fill_to_the_bound(&mut session, 10);
+    assert!(refused_at_checkpoint(&refused), "{refused:?}");
+    // Every claim created before the bound is finished at it.
+    let mut next = request;
+    for claim in 10..request {
+        let (_, expected) = claim_status(&session, 1_000 + claim);
+        next += 1;
+        commit(
+            &mut session,
+            cancel(next, expected),
+            "a cancel at the bound",
+        );
+    }
+    // A family finished before the bound retires at it, as the archive's walk offers it: a
+    // candidate among the writes.
+    let family = session
+        .committed_core()
+        .unwrap()
+        .retirement_family(ClaimId::from_u128(100))
+        .unwrap();
+    let offer = focal_core::native::retirement_batch::RetireOffer {
+        root: ClaimId::from_u128(100),
+        family: focal_core::native::retirement_batch::family_digest(ledger(), &family).unwrap(),
+        bundle: ContentHash([9; 32]),
+        bytes: 4096,
+    };
+    let before = projection_reserved(&session);
+    let (batch, submission) = session.retire(&[offer]).unwrap();
+    let Some(NativeSubmission::Pending { outcome, .. }) = submission else {
+        panic!("the bound refused a retirement: {batch:?}, {submission:?}");
+    };
+    let committed = (0..16).any(|_| {
+        session
+            .poll()
+            .unwrap()
+            .committed
+            .iter()
+            .any(|commit| commit.outcome == outcome)
+    });
+    assert!(committed, "the retirement never committed");
+    assert!(
+        session
+            .committed_core()
+            .unwrap()
+            .native_claim(ClaimId::from_u128(100))
+            .is_none()
+    );
+    // What it took away is room again: the root with its reservations is smaller by it.
+    let after = projection_reserved(&session);
+    assert!(
+        after.1.0 < before.1.0 && after.1.1 < before.1.1,
+        "the retirement took nothing away: {before:?} -> {after:?}"
     );
 }
 
@@ -1598,4 +1890,138 @@ fn a_native_engine_admits_within_its_share_and_holds_its_sessions_allowance() {
     );
     assert_eq!(budget.reservation_limit(BudgetLane::Completion), 700 << 20);
     assert_eq!(budget.reservation_limit(BudgetLane::Committed), 800 << 20);
+}
+
+/// The projection of the active owner's checkpoint, rows and bytes, alone and with what its claims
+/// reserve for their finishing.
+fn projection_reserved(
+    session: &NativeSession<BuiltinNativeSchemas>,
+) -> ((usize, usize), (usize, usize)) {
+    let Some(super::engine::Domain::Active(owner, _)) = session.engine.domain.as_ref() else {
+        panic!("no active owner");
+    };
+    let projection = owner.checkpoint_projection().unwrap();
+    ((projection.rows, projection.bytes), projection.reserved())
+}
+/// The projection of the active owner's checkpoint: rows and bytes.
+fn projection(session: &NativeSession<BuiltinNativeSchemas>) -> (usize, usize) {
+    let Some(super::engine::Domain::Active(owner, _)) = session.engine.domain.as_ref() else {
+        panic!("no active owner");
+    };
+    let projection = owner.checkpoint_projection().unwrap();
+    (projection.rows, projection.bytes)
+}
+
+/// A ledger at its checkpoint's bound finishes every claim it holds, whatever order its clients
+/// finish them in: here every claim is cancelled first, then every one released, then every
+/// family retired, and fresh work is admitted again. No claim was finished before the bound.
+/// Before, fresh work stopped an eighth short of the bound and the cancels took that eighth
+/// before any release came: every release was refused, no family could retire, and the ledger
+/// could finish nothing more (a review's repro: 14 claims, 10 cancels, every release refused).
+/// Each claim now reserves its finishing where it is admitted (`focal_core::native::Finishing`),
+/// so the root with its reservations never passes the bound and no finishing is refused by it.
+#[test]
+fn a_ledger_at_its_checkpoint_bound_finishes_every_claim_in_any_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let mut bounded = limits();
+    bounded.checkpoint.rows = 200;
+    let mut session = open_with(dir.path(), &parent, bounded).unwrap();
+    lead(&mut session);
+    let (request, refused) = fill_to_the_bound(&mut session, 10);
+    assert!(refused_at_checkpoint(&refused), "{refused:?}");
+    let claims: Vec<u128> = (10..request).map(|at| 1_000 + at).collect();
+    assert!(claims.len() >= 8, "only {} claims fit", claims.len());
+    let mut next = request;
+    for claim in &claims {
+        let (_, expected) = claim_status(&session, *claim);
+        next += 1;
+        commit(
+            &mut session,
+            cancel(next, expected),
+            "a cancel at the bound",
+        );
+    }
+    for claim in &claims {
+        let (_, expected) = claim_status(&session, *claim);
+        next += 1;
+        commit(
+            &mut session,
+            release(next, expected),
+            "a release at the bound",
+        );
+    }
+    for (at, claim) in claims.iter().enumerate() {
+        let root = ClaimId::from_u128(*claim);
+        let family = session
+            .committed_core()
+            .unwrap()
+            .retirement_family(root)
+            .unwrap();
+        let offer = focal_core::native::retirement_batch::RetireOffer {
+            root,
+            family: focal_core::native::retirement_batch::family_digest(ledger(), &family).unwrap(),
+            bundle: ContentHash([u8::try_from(at + 1).unwrap(); 32]),
+            bytes: 4096,
+        };
+        let (batch, submission) = session.retire(&[offer]).unwrap();
+        let Some(NativeSubmission::Pending { outcome, .. }) = submission else {
+            panic!("the bound refused the retirement of {claim}: {batch:?}, {submission:?}");
+        };
+        let committed = (0..16).any(|_| {
+            session
+                .poll()
+                .unwrap()
+                .committed
+                .iter()
+                .any(|commit| commit.outcome == outcome)
+        });
+        assert!(committed, "the retirement of {claim} never committed");
+    }
+    let core = session.committed_core().unwrap();
+    assert!(
+        claims
+            .iter()
+            .all(|claim| core.native_claim(ClaimId::from_u128(*claim)).is_none())
+    );
+    assert_eq!(
+        core.finishing_reserved(),
+        focal_core::native::Finishing::default()
+    );
+    // What they took away is room again.
+    commit(
+        &mut session,
+        create(next + 1, 9_000),
+        "a creation once the ledger emptied",
+    );
+}
+
+#[test]
+#[ignore = "measurement"]
+fn measure_the_checkpoint_growth_of_each_step_of_a_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let mut session = open_with(dir.path(), &parent, limits()).unwrap();
+    lead(&mut session);
+    for claim in 0..3u128 {
+        let base = 100 * (claim + 1);
+        let at = projection(&session);
+        commit(&mut session, create(base, 1_000 + base), "create");
+        let created = projection(&session);
+        let (_, expected) = claim_status(&session, 1_000 + base);
+        commit(&mut session, cancel(base + 1, expected), "cancel");
+        let cancelled = projection(&session);
+        let (_, expected) = claim_status(&session, 1_000 + base);
+        commit(&mut session, release(base + 2, expected), "release");
+        let released = projection(&session);
+        eprintln!(
+            "claim {claim}: create +{} rows +{} B, cancel +{} rows +{} B, release +{} rows +{} B",
+            created.0 - at.0,
+            created.1 - at.1,
+            cancelled.0 - created.0,
+            cancelled.1 - created.1,
+            released.0 - cancelled.0,
+            released.1 - cancelled.1
+        );
+    }
 }

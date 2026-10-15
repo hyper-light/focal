@@ -137,6 +137,10 @@ impl Owner {
                     payload_segments: width(payloads.segments),
                     payload_bytes: payloads.bytes,
                     payload_open_refusals: payloads.open_refusals,
+                    payload_passes: payloads.sweep.passes,
+                    payload_let_go: payloads.sweep.let_go,
+                    payload_short: payloads.sweep.short,
+                    payload_named: payloads.sweep.named,
                     native_by_kind,
                 }
             }),

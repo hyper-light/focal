@@ -540,6 +540,8 @@ impl Core<NativeState> {
             view.state.ledger,
             view.payloads(),
         )?;
+        let finishing_added =
+            super::finishing::added(fragments.changes().map(|(_, _, change)| change))?;
         let mut removed = super::EncodedRemoved::new(view.state.ledger, view.payloads());
         for (_, _, change) in fragments.changes() {
             let key = change.key();
@@ -567,6 +569,9 @@ impl Core<NativeState> {
             writes,
             encoded_added,
             encoded_removed: removed.bytes(),
+            rows_removed: removed.rows(),
+            finishing_added,
+            finishing_taken: removed.finishing(),
             _index: Some(index),
             events: None,
             retire: Some(RetireBody {
@@ -622,6 +627,12 @@ impl Core<NativeState> {
         if outcome != header.outcome {
             return Err(ContractError::InvalidManifest.into());
         }
+        // What the rows take in a checkpoint once the record publishes, and the rows it writes
+        // (doc 31 M3), counted before anything changes, as a leader's publication counts them: a
+        // replica that applied a retirement here kept the bytes of the families it took away.
+        let encoded = self.encoded_after_changes(&changes)?;
+        let reserved = self.finishing_after_changes(&changes)?;
+        let written = changes.len();
         for retiring in &families {
             self.unfile_family_events(&retiring.family);
         }
@@ -634,6 +645,9 @@ impl Core<NativeState> {
             self.state.events.drop_all();
             return Err(error);
         }
+        self.state.encoded_rows = encoded;
+        self.state.finishing = reserved;
+        self.state.marks.churned(written);
         Ok(outcome)
     }
 }

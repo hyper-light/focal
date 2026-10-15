@@ -320,8 +320,12 @@ fn runbook_node_loss() {
         },
     );
     assert_eq!(guarantee(&view, &ledger), (Some(1), 0));
-    let removed = wait_removed(&founder, lost);
-    assert_eq!(removed["membership_removed"], true, "{removed}");
+    let (removed, attempts) = wait_removed(&founder, lost);
+    assert!(
+        removed["membership_removed"] == true || attempts > 1,
+        "{removed}"
+    );
+    assert!(!member(&founder, lost), "{removed}");
     assert_eq!(claim_id(&read_claim(&founder, &claim)), claim);
     let _ = tenant;
 }
@@ -329,9 +333,13 @@ fn runbook_node_loss() {
 fn start_placeholder() -> Server {
     Server(std::process::Command::new("true").spawn().unwrap(), None)
 }
-fn wait_removed(founder: &Node, node: u64) -> Value {
+/// The removal of `node`, retried until it succeeds, and how many runs it took: a run refused
+/// after it removed the member leaves the next to report `membership_removed: false`.
+fn wait_removed(founder: &Node, node: u64) -> (Value, u32) {
     let mut deadline = deadline::Deadline::after(Duration::from_secs(180));
+    let mut attempts = 0u32;
     loop {
+        attempts += 1;
         let output = run(
             founder,
             None,
@@ -339,7 +347,7 @@ fn wait_removed(founder: &Node, node: u64) -> Value {
         );
         if output.status.success() {
             let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-            return value["result"].clone();
+            return (value["result"].clone(), attempts);
         }
         assert!(
             deadline.open(),
@@ -655,8 +663,12 @@ fn runbook_expired_credentials() {
         },
     );
     assert_eq!(guarantee(&view, &ledger), (Some(1), 0));
-    let removed = wait_removed(&founder, expired);
-    assert_eq!(removed["membership_removed"], true, "{removed}");
+    let (removed, attempts) = wait_removed(&founder, expired);
+    assert!(
+        removed["membership_removed"] == true || attempts > 1,
+        "{removed}"
+    );
+    assert!(!member(&founder, expired), "{removed}");
     assert_eq!(claim_id(&read_claim(&founder, &claim)), claim);
     drop(hosts);
 }

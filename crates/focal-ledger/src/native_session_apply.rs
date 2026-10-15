@@ -208,7 +208,11 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         let domain = self.domain.take().ok_or(NativeSessionError::Failed)?;
         self.domain = Some(match domain {
             Domain::Active(owner, permit) => Domain::Active(owner, permit),
-            Domain::Passive(core) => {
+            Domain::Passive(mut core) => {
+                // What it admits it can checkpoint (rule 2), and what presses its finished
+                // families to retire: the bound its share allows.
+                let (rows, bytes) = self.limits.admission_checkpoint();
+                core.bound_checkpoint(Some(focal_core::native::CheckpointBound { rows, bytes }));
                 match NativeOwner::with_record_buffers(core, &self.schemas, self.limits.encoding) {
                     Ok(owner) => {
                         // The boxed owner is an explicitly charged session allocation;
@@ -1260,6 +1264,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             return Err(NativeSessionError::Corrupt);
         }
         self.applied_raft = applied_index;
+        // What the entries replaced, deleted or retired may have left a segment no row names: the
+        // sweep goes on a step (doc 31 M3).
+        self.step_payload_sweep();
         Ok(())
     }
     /// A completed caller-correlated read barrier becomes a boundary naming the

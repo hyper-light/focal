@@ -104,18 +104,18 @@ fn the_chain_keeps_its_projection_finds_by_serial_and_gives_back_a_bursts_memory
     let core = core();
     let floor = core.limits.pending;
     let mut owner = NativeOwner::new(core).unwrap();
-    let walk = |owner: &NativeOwner| -> (usize, usize) {
-        let rows = owner
-            .pending
-            .iter()
-            .map(|row| row.prepared.mutation_count())
-            .sum::<usize>();
-        let bytes = owner
-            .pending
-            .iter()
-            .map(|row| row.prepared.encoded_added)
-            .sum::<usize>();
-        (rows, bytes)
+    let walk = |owner: &NativeOwner| -> ((usize, usize), (usize, usize)) {
+        let sum = |of: &dyn Fn(&NativePrepared) -> usize| {
+            owner
+                .pending
+                .iter()
+                .map(|row| of(&row.prepared))
+                .sum::<usize>()
+        };
+        (
+            (sum(&|p| p.rows_put()), sum(&|p| p.rows_removed())),
+            (sum(&|p| p.encoded_added), sum(&|p| p.encoded_removed)),
+        )
     };
     let kept = |owner: &NativeOwner| (owner.pending_rows, owner.pending_bytes);
     let required = [(ValidationMode::Required, false)];
@@ -158,7 +158,7 @@ fn the_chain_keeps_its_projection_finds_by_serial_and_gives_back_a_bursts_memory
         owner.publish_after_durable(candidate).unwrap();
         assert_eq!(kept(&owner), walk(&owner));
     }
-    assert_eq!(kept(&owner), (0, 0));
+    assert_eq!(kept(&owner), ((0, 0), (0, 0)));
     assert!(
         owner.pending.capacity() < grown,
         "the drained chain gave back its buffer"
@@ -921,6 +921,129 @@ fn a_publication_takes_away_what_its_build_replaced() {
             state.encoded_rows,
             crate::native::encoded_rows_of(&state.rows, state.ledger, state.payloads()).unwrap()
         );
+        // What the rows reserve for their finishing is kept the same way, exactly.
+        assert_eq!(
+            state.finishing,
+            crate::native::finishing::of_rows(&state.rows).unwrap()
+        );
     }
     assert_eq!(owner.pending_len(), 0);
+}
+
+/// What a candidate's plan spills to the payload log is held until its admission is decided: one
+/// the owner refuses as it prepares it (here at the checkpoint's bound) or one its session
+/// discards leaves nothing in the log, and one admitted keeps what it spilled through its
+/// publication. Before, each refusal left its payloads in the log for good.
+#[test]
+fn a_candidate_refused_or_discarded_leaves_nothing_in_the_payload_log() {
+    let mut core = core();
+    core.attach_payload_log(Box::new(super::super::payloads::MemoryPayloads::default()));
+    let mut owner = NativeOwner::new(core).unwrap();
+    let logged = |owner: &NativeOwner| {
+        owner
+            .committed_core()
+            .payload_log()
+            .map_or(0, |log| log.held_bytes())
+    };
+    let required = [(ValidationMode::Required, false)];
+    let (first, _) = stage(&mut owner, 1, creation(1, 1, &required, None));
+    assert!(
+        logged(&owner) > 0,
+        "a creation spilled nothing: nothing is measured"
+    );
+    owner.keep_appends();
+    let outcome = owner.publish_after_durable(first).unwrap();
+    let published = logged(&owner);
+    // Discarded by its session: what it spilled is given back.
+    let (second, _) = stage(&mut owner, 2, creation(2, 2, &required, None));
+    assert!(logged(&owner) > published);
+    owner.discard_from(second).unwrap();
+    assert_eq!(logged(&owner), published);
+    // Refused by the checkpoint's bound as it is prepared: nothing stays.
+    let projection = owner.checkpoint_projection().unwrap();
+    owner
+        .core
+        .bound_checkpoint(Some(super::super::CheckpointBound {
+            rows: projection.rows + 1,
+            bytes: projection.bytes + 1,
+        }));
+    let third = creation(3, 3, &required, None);
+    let refused = owner
+        .prepare(context(third.request.principal, 3), third, None)
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            NativeOwnerError::Native(NativeError::Capacity(CHECKPOINT_REFUSAL))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(logged(&owner), published);
+    // An exact retry of what was published is answered, and appends nothing.
+    let retry = creation(1, 1, &required, None);
+    assert!(matches!(
+        owner.prepare(context(retry.request.principal, 4), retry, None),
+        Ok(NativeStaging::Existing { outcome: answered, .. }) if answered == outcome
+    ));
+    assert_eq!(logged(&owner), published);
+}
+
+/// A transfer of the committed core refused while a candidate is pending returns the owner with
+/// its hold: the candidate's discard after it still gives back everything it spilled. The
+/// transfer kept the hold before it checked, so the refused owner's discard gave nothing back.
+#[test]
+fn a_refused_transfer_leaves_the_pending_candidates_appends_to_its_discard() {
+    let mut core = core();
+    core.attach_payload_log(Box::new(super::super::payloads::MemoryPayloads::default()));
+    let mut owner = NativeOwner::new(core).unwrap();
+    let logged = |owner: &NativeOwner| {
+        owner
+            .committed_core()
+            .payload_log()
+            .map_or(0, |log| log.held_bytes())
+    };
+    let required = [(ValidationMode::Required, false)];
+    let (candidate, _) = stage(&mut owner, 1, creation(1, 1, &required, None));
+    assert!(
+        logged(&owner) > 0,
+        "a creation spilled nothing: nothing is measured"
+    );
+    let refused = owner.into_committed_core().unwrap_err();
+    assert!(matches!(refused.error, NativeOwnerError::PendingCandidates));
+    let mut owner = refused.owner;
+    owner.discard_from(candidate).unwrap();
+    assert_eq!(logged(&owner), 0);
+}
+
+/// A rejected publication must not keep another candidate's held appends: its session may
+/// still discard that suffix, which gives back everything it spilled before admission.
+#[test]
+fn a_rejected_publication_leaves_the_discarded_candidates_appends_reclaimable() {
+    let mut core = core();
+    core.attach_payload_log(Box::new(super::super::payloads::MemoryPayloads::default()));
+    let mut owner = NativeOwner::new(core).unwrap();
+    let logged = |owner: &NativeOwner| {
+        owner
+            .committed_core()
+            .payload_log()
+            .map_or(0, |log| log.held_bytes())
+    };
+    let required = [(ValidationMode::Required, false)];
+    let (first, expected) = stage(&mut owner, 1, creation(1, 1, &required, None));
+    owner.keep_appends();
+    let kept = logged(&owner);
+    let (second, _) = stage(&mut owner, 2, creation(2, 2, &required, None));
+    assert!(logged(&owner) > kept);
+
+    assert!(matches!(
+        owner.publish_after_durable(second),
+        Err(NativeOwnerError::OutOfOrder)
+    ));
+    owner.discard_from(second).unwrap();
+    assert_eq!(
+        logged(&owner),
+        kept,
+        "rejection committed the suffix's appends"
+    );
+    assert_eq!(owner.publish_after_durable(first).unwrap(), expected);
 }

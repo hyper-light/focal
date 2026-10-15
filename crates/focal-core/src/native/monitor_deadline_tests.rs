@@ -416,3 +416,5 @@ fn ordinary_claim_timer_keeps_scc_precedence_across_monitor_release_and_fresh_tr
 }
 #[path = "monitor_commands_tests.rs"]
 mod command_tests;
+#[path = "finishing_growth_tests.rs"]
+mod finishing_growth_tests;

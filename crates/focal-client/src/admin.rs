@@ -279,6 +279,19 @@ pub struct AdminSessionMemory {
     /// without one holds its rows' payloads in memory until it opens.
     #[serde(default)]
     pub payload_open_refusals: u64,
+    /// The payload log's sweep since the replica's core was made (doc 31 M3): the passes over its
+    /// rows that ended, the segments their sweeps let go, the passes that could not be charged for
+    /// what they met and swept nothing, and the bytes the last pass saw its rows name: an upper
+    /// bound of how much of `payload_bytes` is live (a row published while a pass goes on may be
+    /// counted twice, and one replaced after its count still counts).
+    #[serde(default)]
+    pub payload_passes: u64,
+    #[serde(default)]
+    pub payload_let_go: u64,
+    #[serde(default)]
+    pub payload_short: u64,
+    #[serde(default)]
+    pub payload_named: u64,
     /// What its native engine uses, kind by kind, in the budget's order of kinds
     /// (`focal_memory::BudgetKind::ALL`): what fills its share, where it fills.
     #[serde(default)]

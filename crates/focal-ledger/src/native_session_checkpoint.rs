@@ -497,8 +497,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.movement = Some(movement);
         // The restore spilled its rows afresh: what the core it replaced spilled is referenced
         // by nothing now, and goes.
-        self.payload_segments_swept = 0;
-        self.sweep_payloads_if_due();
+        self.sweep_payloads_now();
         // The cold streams resume from what the checkpoint names, fresh when it names none:
         // replay appends the batches of every cold record after it alike on every replica.
         if self.cold_source.is_some() {
