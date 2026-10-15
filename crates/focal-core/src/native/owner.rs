@@ -486,6 +486,23 @@ impl std::fmt::Debug for NativeOwner {
 }
 // Whole-owner destruction needs no journal rollback: pending records/pages
 // drop before Core and book, and every pool permit keeps its actual backing.
+/// The segments of the payload log the pending candidates' rows name, added to `live`: what a
+/// sweep keeps beside the committed rows' (doc 31 M3).
+fn pending_segments(pending: &VecDeque<Pending>, live: &mut std::collections::BTreeSet<u32>) {
+    for row in pending {
+        super::payloads::segments_of(
+            row.prepared
+                .fragments
+                .changes()
+                .filter_map(|(_, _, change)| match change {
+                    super::ranges::RowChange::Put(entry) => Some(entry.value),
+                    super::ranges::RowChange::Delete(_) => None,
+                }),
+            live,
+        );
+    }
+}
+
 // Explicit suffix discard still rolls back journals before further admission.
 
 impl NativeOwner {
@@ -1340,28 +1357,32 @@ impl NativeOwner {
     pub fn attach_payload_log(&mut self, log: Box<dyn super::payloads::PayloadLog>) {
         self.core.attach_payload_log(log);
     }
-    /// Let go of the payload log's sealed segments no committed or pending row references (doc
-    /// 31 M3). How many it let go.
-    pub fn sweep_payloads(&self) -> usize {
-        let Some(log) = self.core.payload_log() else {
-            return 0;
-        };
-        let mut live = std::collections::BTreeSet::new();
-        self.core.live_payload_segments(&mut live);
-        for pending in &self.pending {
-            super::payloads::segments_of(
-                pending
-                    .prepared
-                    .fragments
-                    .changes()
-                    .filter_map(|(_, _, change)| match change {
-                        super::ranges::RowChange::Put(entry) => Some(entry.value),
-                        super::ranges::RowChange::Delete(_) => None,
-                    }),
-                &mut live,
-            );
+    /// One step of the payload log's sweep (doc 31 M3, [`Core::sweep_payloads_step`]): the
+    /// segments the pending candidates' rows name kept as the committed rows' are. How many
+    /// segments it let go of when its pass ended, none while one goes on or none is due.
+    pub fn sweep_payloads_step(&mut self, due: bool) -> Option<usize> {
+        if !self.core.mark_payloads(due) {
+            return None;
         }
-        log.sweep(&live)
+        let pending = &self.pending;
+        Some(
+            self.core
+                .sweep_marked(|live| pending_segments(pending, live)),
+        )
+    }
+    /// A whole pass of the payload log's sweep, now ([`Core::sweep_payloads`]), the pending
+    /// candidates' segments kept. How many segments it let go of.
+    pub fn sweep_payloads(&mut self) -> usize {
+        let steps = super::payloads::pass_steps(self.core.state.rows.len());
+        for _ in 0..steps {
+            if self.core.mark_payloads(true) {
+                let pending = &self.pending;
+                return self
+                    .core
+                    .sweep_marked(|live| pending_segments(pending, live));
+            }
+        }
+        0
     }
 
     /// The most a checkpoint of the committed root, with every pending

@@ -726,6 +726,7 @@ impl Session {
             segments: engine.payload_segments(),
             bytes: engine.payload_bytes(),
             open_refusals: engine.payload_open_refusals(),
+            sweep: engine.payload_sweep(),
         })
     }
     pub fn pending_seed(&self) -> Option<&crate::PendingSeed> {
@@ -1449,4 +1450,6 @@ pub struct NativePayloadLog {
     pub bytes: u64,
     /// Times it could not be opened.
     pub open_refusals: u64,
+    /// What its sweep has done since the replica's core was made.
+    pub sweep: focal_core::native::payloads::PayloadSweep,
 }

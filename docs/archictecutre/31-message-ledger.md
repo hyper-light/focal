@@ -922,6 +922,46 @@ Each stage lands on its own, measured:
        its bytes back, a rejected publication leaves the next candidate's held bytes to its
        discard, and held bytes never reach a file, even when a reader's barrier asks for every
        byte or a hold crosses chunks and segments.
+   - **The payload log's sweep (2026-10-15).** The 2 GiB deliver run (env-7) held native
+     memory near 690 MB, with retirement keeping pace. Its payload log grew by about 755 bytes a
+     write all the same: 883 MB in 14 segments after 1.17 million writes, none ever let go.
+     - **A sweep could let go of a segment rows still named.** The sweep's walk of the
+       committed rows dated from when the log took events alone: it named the segments of
+       events and nothing else. A segment only claims, definitions, outcomes, contents or
+       creation results named was let go, and those rows could no longer be read back. A
+       checkpoint, which reads every spilled row, then failed. It never showed in a run because
+       events pinned every segment. Found by reading the walk; shown by a test that gives each
+       append a segment of its own.
+     - **The walk held the replica's thread.** It walked the root at once, at most once a
+       segment's worth of payloads, and only after a retirement: a ledger whose rows were
+       replaced and never retired never swept at all.
+     - **Now (`payloads::Marks`).**
+       - A pass over every committed row, of every kind, a bounded step at each applied batch:
+         4,096 rows a step, a few tens of microseconds. A pass begins once the log has sealed
+         two segments since the last.
+       - Rows spilled while it goes on land where appends go, from where it began, so its sweep
+         lets go only of segments sealed before it began.
+       - A publication while it goes on names its rows' segments to it. A candidate prepared
+         before the pass and published after the pass had been past its keys would otherwise
+         lose its bytes. A leader's pending candidates are named at the end.
+       - The replica's diagnostics report the passes, the segments let go and the bytes the last
+         pass found named (`payload_passes`, `payload_let_go`, `payload_named` beside
+         `payload_bytes`).
+     - **A cleaner, built and measured, not kept.** A pass that moved the rows of segments named
+       half or less to where appends go (LFS's cleaner, WiscKey's value-log collection) freed
+       nothing in the deliver run (env-9). 43% of its moves were refused: a frozen checkpoint
+       image or a lifecycle read's lease shares the store's pages much of the time, and a
+       rewrite in place must refuse a shared page (a reader holding the old reference needs the
+       old segment as long as it reads). Its moved copies only grew the log, 1.06 GB against
+       933 MB.
+     - **Open: what pins the oldest segments.** With 97,000 of 146,000 families retired, the last
+       pass of env-9 still found 321 MB named and no segment empty: something in every old
+       segment outlives retirement. That decides the fix: retire or seal what pins them, or a
+       cleaner that waits for the store's pages and keeps what it moves apart from new writes.
+     - **Tested.** A sweep keeps the segment of every committed row of any kind (a log whose
+       every append is a segment of its own; it fails with events alone named). A candidate
+       published after a pass's last step keeps its segments (it fails without the
+       publication's word), and what an unpublished one spilled goes.
 4. **M4, durability classes.**
    - Memory-quorum acknowledgement with a bounded background flush; the disk class kept.
    - Measure: p99 at 1k, 4k and 12k/s against Kafka, NATS and Redis.

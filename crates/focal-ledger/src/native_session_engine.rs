@@ -604,6 +604,14 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         core.payload_log()
             .map_or(0, focal_core::native::payloads::PayloadLog::held_segments)
     }
+    /// What the payload log's sweep has done since the replica's core was made.
+    pub(crate) fn payload_sweep(&self) -> focal_core::native::payloads::PayloadSweep {
+        match self.domain.as_ref() {
+            Some(Domain::Passive(core)) => core.payload_sweep(),
+            Some(Domain::Active(owner, _)) => owner.committed_core().payload_sweep(),
+            None => focal_core::native::payloads::PayloadSweep::default(),
+        }
+    }
     /// The payload bytes the replica's payload log holds: none without one.
     pub(crate) fn payload_bytes(&self) -> u64 {
         let core = match self.domain.as_ref() {
@@ -614,30 +622,61 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         core.payload_log()
             .map_or(0, focal_core::native::payloads::PayloadLog::held_bytes)
     }
-    /// Let go of the payload log's segments retired rows left unreferenced (doc 31 M3), once
-    /// the log has sealed another segment since the last sweep: a sweep walks every spilled
-    /// row, so it comes at most once a segment's worth of payloads.
+    /// One step of the payload log's sweep (doc 31 M3, `payloads::Marks`): a pass over every
+    /// committed row begins once the log has sealed another segment since the last sweep and
+    /// goes on a bounded step at each call, and at its end the segments no row names are let
+    /// go. A whole walk of the rows at once held the replica's thread for as long as the root
+    /// took to walk.
     pub(super) fn sweep_payloads_if_due(&mut self) {
         self.open_payload_log();
+        self.step_payload_sweep();
+    }
+    /// One step of the payload log's sweep ([`Self::sweep_payloads_if_due`]), the log as it is:
+    /// what each applied batch of entries takes, never opening a log that could not open.
+    pub(super) fn step_payload_sweep(&mut self) {
         let held = |core: &Core<NativeState>| {
             core.payload_log()
                 .map_or(0, focal_core::native::payloads::PayloadLog::held_segments)
         };
+        let due = |core: &Core<NativeState>, swept: usize| held(core) > swept.saturating_add(1);
         let swept = self.payload_segments_swept;
-        let after = match self.domain.as_ref() {
-            Some(Domain::Passive(core)) if held(core) > swept.saturating_add(1) => {
-                core.sweep_payloads();
-                held(core)
+        let after = match self.domain.as_mut() {
+            Some(Domain::Passive(core)) => {
+                let due = due(core, swept);
+                core.sweep_payloads_step(due).map(|_| held(core))
             }
-            Some(Domain::Active(owner, _))
-                if held(owner.committed_core()) > swept.saturating_add(1) =>
-            {
-                owner.sweep_payloads();
-                held(owner.committed_core())
+            Some(Domain::Active(owner, _)) => {
+                let due = due(owner.committed_core(), swept);
+                owner
+                    .sweep_payloads_step(due)
+                    .map(|_| held(owner.committed_core()))
             }
-            _ => return,
+            None => None,
         };
-        self.payload_segments_swept = after;
+        if let Some(after) = after {
+            self.payload_segments_swept = after;
+        }
+    }
+    /// A whole pass of the payload log's sweep, now: after a restore, whose rows spilled afresh
+    /// to segments of their own, so what the core it replaced spilled is named by nothing.
+    pub(super) fn sweep_payloads_now(&mut self) {
+        self.open_payload_log();
+        let held = match self.domain.as_mut() {
+            Some(Domain::Passive(core)) => {
+                core.sweep_payloads();
+                core.payload_log()
+                    .map_or(0, focal_core::native::payloads::PayloadLog::held_segments)
+            }
+            Some(Domain::Active(owner, _)) => {
+                owner.sweep_payloads();
+                owner
+                    .committed_core()
+                    .payload_log()
+                    .map_or(0, focal_core::native::payloads::PayloadLog::held_segments)
+            }
+            None => return,
+        };
+        self.payload_segments_swept = held;
     }
     /// The chunks of the latest checkpoint seed, sorted.
     pub(crate) fn seed_chunks(&self) -> &[ContentHash] {

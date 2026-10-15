@@ -1648,3 +1648,91 @@ fn spilled_rows_match_held_ones(bound: Option<usize>) {
             < plain.state.budget.stats().used
     );
 }
+
+/// A sweep keeps every segment a committed row names, whatever the row: an authored claim and its
+/// definition spilled where their publication left them, its content, its outcome, its creation
+/// result and its events where its plan built them, each here in a segment of its own. The
+/// sweep's walk named the events alone, so it let go of a segment only a claim, a definition, an
+/// outcome or a content named, and that row could not be read back: a checkpoint, which reads
+/// every spilled row, failed.
+#[test]
+fn a_sweep_keeps_every_segment_a_committed_row_names() {
+    let checkpoint = |core: &Core<NativeState>| {
+        let limits = record_codec::EncodingLimits {
+            bytes: 1 << 24,
+            visits: usize::MAX,
+            rows: 1 << 16,
+        };
+        let plan = record_codec::checkpoint::EncodingPlan::prepare(core, limits).unwrap();
+        let mut bytes = vec![0; plan.quote().bytes];
+        plan.write_into(&mut bytes).unwrap();
+        bytes
+    };
+    let mut core = core();
+    core.attach_payload_log_with_young(
+        Box::new(crate::native::payloads::SegmentedPayloads::default()),
+        0,
+    );
+    for id in 1..=6u128 {
+        publish(&mut core, create(id, vec![proposal(id, 10_000 + id)]));
+    }
+    assert!(
+        (1..=6).all(|id| claim_logged(&core, id)),
+        "no claim spilled: nothing is measured"
+    );
+    let before = checkpoint(&core);
+    let held = core.payload_log().unwrap().held_segments();
+    core.sweep_payloads();
+    assert_eq!(
+        core.payload_log().unwrap().held_segments(),
+        held,
+        "a sweep let go of a segment a committed row names"
+    );
+    assert_eq!(checkpoint(&core), before);
+}
+
+/// A pass of the sweep takes several steps, and a candidate prepared before it began and published
+/// after its last step still names its rows' segments to it. Those rows stood nowhere the pass
+/// walked, in segments before where it began; without the publication's word the sweep let them go
+/// and the rows could not be read back. What nothing names goes: what a candidate never published
+/// spilled is let go by the next pass.
+#[test]
+fn a_publication_while_a_sweep_goes_on_keeps_its_segments() {
+    let checkpoint = |core: &Core<NativeState>| {
+        let limits = record_codec::EncodingLimits {
+            bytes: 1 << 24,
+            visits: usize::MAX,
+            rows: 1 << 16,
+        };
+        let plan = record_codec::checkpoint::EncodingPlan::prepare(core, limits).unwrap();
+        let mut bytes = vec![0; plan.quote().bytes];
+        plan.write_into(&mut bytes).unwrap();
+        bytes
+    };
+    let mut core = core();
+    core.attach_payload_log_with_young(
+        Box::new(crate::native::payloads::SegmentedPayloads::default()),
+        0,
+    );
+    for id in 1..=6u128 {
+        publish(&mut core, create(id, vec![proposal(id, 10_000 + id)]));
+    }
+    let late = prepare(&core, create(7, vec![proposal(7, 10_007)]), &[]);
+    let mut steps = 0;
+    while !core.mark_payloads(true) {
+        steps += 1;
+        assert!(steps < 1_000, "the pass never ended");
+    }
+    assert!(steps > 1, "the pass took one step: nothing is measured");
+    let held = core.payload_log().unwrap().held_segments();
+    core.publish_native(late).unwrap();
+    core.sweep_marked(|_| {});
+    assert!(core.payload_log().unwrap().held_segments() > held);
+    let reference = checkpoint(&core);
+    // A candidate let go unpublished: its plan's spills are named by nothing, and go.
+    drop(prepare(&core, create(8, vec![proposal(8, 10_008)]), &[]));
+    let held = core.payload_log().unwrap().held_segments();
+    assert!(core.sweep_payloads() > 0);
+    assert!(core.payload_log().unwrap().held_segments() < held);
+    assert_eq!(checkpoint(&core), reference);
+}

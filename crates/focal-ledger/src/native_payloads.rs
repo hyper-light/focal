@@ -866,18 +866,20 @@ impl FilePayloads {
         })
     }
 
-    /// Remove every sealed segment no row references, `live` naming those that some row does:
-    /// the committed rows, every pending candidate's, a restore's. The current segment stays.
-    /// What the window held of a removed segment is let go with it. How many it removed.
-    pub fn sweep(&self, live: &BTreeSet<u32>) -> usize {
+    /// Remove every sealed segment before segment `before` no row references, `live` naming
+    /// those that some row does: the committed rows, every pending candidate's, a restore's, as
+    /// a sweep's pass found them. The current segment stays, and so does every segment from
+    /// `before` on (rows spilled while the pass went on are there). What the window held of a
+    /// removed segment is let go with it. How many it removed.
+    pub fn sweep(&self, live: &BTreeSet<u32>, before: u32) -> usize {
         let Ok(mut writer) = self.writer.lock() else {
             return 0;
         };
         let current = writer.current;
         let dead: Vec<u32> = writer
             .segments
-            .keys()
-            .copied()
+            .range(..before)
+            .map(|(id, _)| *id)
             .filter(|id| *id != current && !live.contains(id))
             .collect();
         let mut removed = 0usize;
@@ -1048,8 +1050,11 @@ impl PayloadLog for FilePayloads {
         writer.rewind(held);
         gave
     }
-    fn sweep(&self, live: &BTreeSet<u32>) -> usize {
-        FilePayloads::sweep(self, live)
+    fn sweep(&self, live: &BTreeSet<u32>, before: u32) -> usize {
+        FilePayloads::sweep(self, live, before)
+    }
+    fn segment(&self) -> u32 {
+        self.writer.lock().map_or(0, |writer| writer.current)
     }
     fn held_segments(&self) -> usize {
         self.segments()

@@ -142,11 +142,16 @@ pub trait PayloadLog: PayloadRead + Send + Sync {
     fn give_back(&self, hold: PayloadHold) -> bool;
     /// A reader of what the log holds now, for another thread (a frozen image's encoder).
     fn reader(&self) -> Result<Box<dyn PayloadRead + Send>, PayloadError>;
-    /// Let go of every sealed part of the log no row references, `live` naming the segments
-    /// that some row does (every committed and pending row's, [`segments_of`]). How many parts
-    /// it let go.
-    fn sweep(&self, live: &std::collections::BTreeSet<u32>) -> usize {
-        let _ = live;
+    /// Let go of every sealed part of the log before segment `before` that no row references,
+    /// `live` naming the segments that some row does (every committed and pending row's, as a
+    /// sweep's pass found them, [`Marks`]). How many parts it let go.
+    fn sweep(&self, live: &std::collections::BTreeSet<u32>, before: u32) -> usize {
+        let _ = (live, before);
+        0
+    }
+    /// The segment appends go to now: what a sweep's pass that begins now may let go of is before
+    /// it.
+    fn segment(&self) -> u32 {
         0
     }
     /// The parts (segments) the log holds now: what a sweep's schedule follows.
@@ -160,36 +165,145 @@ pub trait PayloadLog: PayloadRead + Send + Sync {
     }
 }
 
+/// Where a spilled row's bytes are in the log, whatever its kind: none for a row that holds them.
+pub(super) fn logged(row: &super::Row) -> Option<PayloadRef> {
+    match row {
+        super::Row::Event(super::OwnedEvent::Logged(at))
+        | super::Row::ClaimContent(super::OwnedClaimContent::Logged(at)) => Some(*at),
+        super::Row::Outcome(super::OwnedOutcome::Logged(at)) => Some(at.at()),
+        super::Row::CreationResult(super::creation_result::OwnedCreationResult::Logged(at)) => {
+            Some(*at)
+        }
+        super::Row::Claim(claim) => claim.logged(),
+        super::Row::Definition(definition) => definition.logged(),
+        _ => None,
+    }
+}
+
 /// The segment of every spilled row among `rows`, added to `live`. Bounded by the segments a log
 /// holds: a set of `u32`.
 pub(super) fn segments_of<'a>(
     rows: impl Iterator<Item = &'a super::Row>,
     live: &mut std::collections::BTreeSet<u32>,
 ) {
-    for row in rows {
-        match row {
-            super::Row::Event(super::OwnedEvent::Logged(at))
-            | super::Row::ClaimContent(super::OwnedClaimContent::Logged(at)) => {
-                live.insert(at.segment());
+    for at in rows.filter_map(logged) {
+        live.insert(at.segment());
+    }
+}
+
+/// The committed rows a sweep's pass visits a step: a few tens of microseconds of a replica's
+/// thread, so no step walks the whole root.
+#[cfg(not(test))]
+pub(super) const MARK_ROWS: usize = 4096;
+/// A few rows a step in this crate's tests, so a pass over a test's root takes several.
+#[cfg(test)]
+pub(super) const MARK_ROWS: usize = 16;
+
+/// The steps a pass over `rows` committed rows takes at most: [`MARK_ROWS`] rows a step, and the
+/// last step finds the end.
+pub(super) fn pass_steps(rows: usize) -> usize {
+    rows.checked_div(MARK_ROWS)
+        .unwrap_or(rows)
+        .saturating_add(2)
+}
+
+/// A pass over a core's committed rows that learns which segments of its payload log they name, and
+/// how many of each segment's bytes (doc 31 M3), [`MARK_ROWS`] rows a step from where the last step
+/// stopped, and the sweep it allows: the segments sealed before it began that no row named.
+///
+/// - **Every row counts.** A pass that named the events alone let go of a segment only a claim, a
+///   definition, an outcome or a content named, and that row could not be read back.
+/// - **Rows put while it goes on.** A row spilled while it goes on lands in the segment appends go
+///   to, from where it began, never one it may let go of; a row a publication puts while it goes on
+///   may stand where it has already been, so a publication names its rows' segments to it
+///   ([`Marks::published`]).
+#[derive(Debug, Default)]
+pub(crate) struct Marks {
+    /// Where appends went when the pass began: what it may let go of is before it. None between
+    /// passes.
+    from: Option<u32>,
+    /// The last row the pass visited: the next step begins after it.
+    after: Option<super::Key>,
+    /// The bytes of each segment the rows it visited, and the rows published since it began, name.
+    /// Bounded by the segments the log holds.
+    live: std::collections::BTreeMap<u32, u64>,
+    /// What the passes have done, since the core was made ([`PayloadSweep`]).
+    done: PayloadSweep,
+}
+
+/// What a core's payload log sweep has done since the core was made (doc 31 M3): the passes that
+/// ended, the segments their sweeps let go, and the bytes the last pass found its rows naming:
+/// beside the log's own size, how much of it is live.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PayloadSweep {
+    pub passes: u64,
+    pub let_go: u64,
+    pub named: u64,
+}
+
+impl Marks {
+    /// Whether a pass is under way.
+    pub(super) fn running(&self) -> bool {
+        self.from.is_some()
+    }
+    /// A pass begun where appends go now: what it may let go of is before `from`.
+    pub(super) fn begin(&mut self, from: u32) {
+        self.from = Some(from);
+        self.after = None;
+        self.live.clear();
+    }
+    fn name(&mut self, at: PayloadRef) {
+        let bytes = u64::try_from(at.len()).unwrap_or(u64::MAX);
+        let named = self.live.entry(at.segment()).or_insert(0);
+        *named = named.saturating_add(bytes);
+    }
+    /// The rows a publication puts while a pass goes on name their segments to it.
+    pub(super) fn published<'a>(&mut self, rows: impl Iterator<Item = &'a super::Row>) {
+        if self.running() {
+            for at in rows.filter_map(logged) {
+                self.name(at);
             }
-            super::Row::Outcome(super::OwnedOutcome::Logged(at)) => {
-                live.insert(at.at().segment());
-            }
-            super::Row::CreationResult(super::creation_result::OwnedCreationResult::Logged(at)) => {
-                live.insert(at.segment());
-            }
-            super::Row::Claim(claim) => {
-                if let Some(at) = claim.logged() {
-                    live.insert(at.segment());
-                }
-            }
-            super::Row::Definition(definition) => {
-                if let Some(at) = definition.logged() {
-                    live.insert(at.segment());
-                }
-            }
-            _ => {}
         }
+    }
+    /// What the passes have done.
+    pub(super) fn done(&self) -> PayloadSweep {
+        self.done
+    }
+    /// Where the next step begins: after the last row visited, from the first at the start.
+    pub(super) fn after(&self) -> Option<&super::Key> {
+        self.after.as_ref()
+    }
+    /// The rows a step reached, at most [`MARK_ROWS`] from `rows`: their segments named, the last
+    /// of them where the next step begins. Whether it reached the last row.
+    pub(super) fn visited<'a>(
+        &mut self,
+        rows: impl Iterator<Item = super::ranges::RowEntry<'a>>,
+    ) -> bool {
+        let mut visited = 0usize;
+        for entry in rows {
+            if let Some(at) = logged(entry.value) {
+                self.name(at);
+            }
+            self.after = Some(entry.key);
+            visited = visited.saturating_add(1);
+        }
+        visited < MARK_ROWS
+    }
+    /// The pass ended: where it began, the segments it named and their bytes, the pass over.
+    pub(super) fn end(&mut self) -> Option<(u32, std::collections::BTreeMap<u32, u64>)> {
+        let from = self.from.take()?;
+        self.after = None;
+        let live = std::mem::take(&mut self.live);
+        self.done.passes = self.done.passes.saturating_add(1);
+        self.done.named = live
+            .values()
+            .fold(0u64, |sum, bytes| sum.saturating_add(*bytes));
+        Some((from, live))
+    }
+    /// The segments a pass's sweep let go.
+    pub(super) fn let_go(&mut self, segments: usize) {
+        let segments = u64::try_from(segments).unwrap_or(u64::MAX);
+        self.done.let_go = self.done.let_go.saturating_add(segments);
     }
 }
 
@@ -346,5 +460,102 @@ impl PayloadLog for MemoryPayloads {
         self.bytes
             .lock()
             .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+    }
+}
+
+/// A log of segments of at most `size` bytes each (a segment of its own for every append at
+/// zero), its sweep letting go of every sealed segment it is told no row names, as a file-backed
+/// log does: a read of a segment let go fails.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct SegmentedPayloads {
+    size: usize,
+    segments: std::sync::Mutex<Vec<Option<Vec<u8>>>>,
+}
+
+#[cfg(test)]
+impl SegmentedPayloads {
+    fn current(segments: &[Option<Vec<u8>>]) -> u32 {
+        u32::try_from(segments.len().saturating_sub(1)).unwrap()
+    }
+}
+
+#[cfg(test)]
+impl PayloadRead for SegmentedPayloads {
+    fn read(&self, at: PayloadRef, into: &mut [u8]) -> Result<(), PayloadError> {
+        let segments = self.segments.lock().unwrap();
+        let segment = segments
+            .get(usize::try_from(at.segment()).unwrap())
+            .and_then(Option::as_ref)
+            .ok_or(PayloadError::Unavailable)?;
+        let from = usize::try_from(at.offset()).unwrap();
+        let bytes = segment
+            .get(from..from + at.len())
+            .ok_or(PayloadError::Unavailable)?;
+        if into.len() != bytes.len() || !at.holds(bytes) {
+            return Err(PayloadError::Corrupt);
+        }
+        into.copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl PayloadLog for SegmentedPayloads {
+    fn append(&self, bytes: &[u8]) -> Option<PayloadRef> {
+        let mut segments = self.segments.lock().unwrap();
+        let fits = segments
+            .last()
+            .and_then(Option::as_ref)
+            .is_some_and(|last| last.len() + bytes.len() <= self.size);
+        if !fits {
+            segments.push(Some(Vec::new()));
+        }
+        let segment = Self::current(&segments);
+        let last = segments.last_mut().unwrap().as_mut().unwrap();
+        let at = PayloadRef::at(segment, u32::try_from(last.len()).unwrap(), bytes).unwrap();
+        last.extend_from_slice(bytes);
+        Some(at)
+    }
+    fn hold(&self) -> Option<PayloadHold> {
+        None
+    }
+    fn keep(&self, _: PayloadHold) {}
+    fn give_back(&self, _: PayloadHold) -> bool {
+        false
+    }
+    fn reader(&self) -> Result<Box<dyn PayloadRead + Send>, PayloadError> {
+        let segments = self.segments.lock().unwrap().clone();
+        Ok(Box::new(SegmentedPayloads {
+            size: self.size,
+            segments: std::sync::Mutex::new(segments),
+        }))
+    }
+    fn sweep(&self, live: &std::collections::BTreeSet<u32>, before: u32) -> usize {
+        let mut segments = self.segments.lock().unwrap();
+        let current = Self::current(&segments);
+        let mut removed = 0;
+        for (id, segment) in segments.iter_mut().enumerate() {
+            let id = u32::try_from(id).unwrap();
+            if id < before && id != current && segment.is_some() && !live.contains(&id) {
+                *segment = None;
+                removed += 1;
+            }
+        }
+        removed
+    }
+    fn segment(&self) -> u32 {
+        Self::current(&self.segments.lock().unwrap())
+    }
+    fn held_segments(&self) -> usize {
+        self.segments.lock().unwrap().iter().flatten().count()
+    }
+    fn held_bytes(&self) -> u64 {
+        let segments = self.segments.lock().unwrap();
+        segments
+            .iter()
+            .flatten()
+            .map(|bytes| u64::try_from(bytes.len()).unwrap())
+            .sum()
     }
 }

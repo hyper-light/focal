@@ -264,6 +264,7 @@ impl<'a> StructuralArchive<'a> {
                     payloads: None,
                     reads: crate::native::read_back::ReadBack::new(limits.native),
                     young: crate::native::young::Young::none(),
+                    marks: crate::native::payloads::Marks::default(),
                 },
                 limits: limits.native,
             },

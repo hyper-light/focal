@@ -289,6 +289,8 @@ pub struct NativeState {
     /// The newest spillable claims and definitions, held until newer ones push them out
     /// (doc 31 M3, [`young`]).
     young: young::Young,
+    /// The payload log's sweep under way (doc 31 M3, [`payloads::Marks`]).
+    marks: payloads::Marks,
 }
 impl NativeState {
     /// Where a spilled row's bytes are read from.
@@ -2232,6 +2234,7 @@ impl Core<NativeState> {
                 payloads,
                 reads,
                 young: young::Young::none(),
+                marks: payloads::Marks::default(),
             },
             limits,
         })
@@ -2313,26 +2316,76 @@ impl Core<NativeState> {
     pub fn native_payloads(&self) -> Option<&dyn payloads::PayloadRead> {
         self.state.payloads()
     }
-    /// The segments of the payload log a committed row references, added to `live`.
-    pub(crate) fn live_payload_segments(&self, live: &mut std::collections::BTreeSet<u32>) {
-        payloads::segments_of(
-            self.state
-                .rows
-                .entries_from(&Key::Event(SessionSeq(0), 0), false)
-                .take_while(|entry| matches!(entry.key, Key::Event(..)))
-                .map(|entry| entry.value),
-            live,
-        );
+    /// One step of the payload log's sweep (doc 31 M3, [`payloads::Marks`]): a pass begun when
+    /// `due` and none goes on, its next [`payloads::MARK_ROWS`] committed rows visited, whatever
+    /// their kind. Whether the pass has visited every row, and its sweep may be made
+    /// ([`Self::sweep_marked`]).
+    pub(crate) fn mark_payloads(&mut self, due: bool) -> bool {
+        let NativeState {
+            rows,
+            payloads,
+            marks,
+            ..
+        } = &mut self.state;
+        let Some(log) = payloads.as_deref() else {
+            return false;
+        };
+        if !marks.running() {
+            if !due {
+                return false;
+            }
+            marks.begin(log.segment());
+        }
+        match marks.after().copied() {
+            Some(after) => marks.visited(rows.entries_from(&after, true).take(payloads::MARK_ROWS)),
+            None => marks.visited(rows.entries().take(payloads::MARK_ROWS)),
+        }
     }
-    /// Let go of the payload log's sealed segments no committed row references (doc 31 M3):
-    /// for a core with no candidates pending. How many it let go.
-    pub fn sweep_payloads(&self) -> usize {
-        let Some(log) = self.state.payloads.as_deref() else {
+    /// The sweep a pass that has visited every row allows (doc 31 M3): the segments sealed before
+    /// it began that no row it visited, no row published since it began and nothing `also` names
+    /// (a leader's pending candidates' rows) let go. How many.
+    pub(crate) fn sweep_marked(
+        &mut self,
+        also: impl FnOnce(&mut std::collections::BTreeSet<u32>),
+    ) -> usize {
+        let NativeState {
+            payloads, marks, ..
+        } = &mut self.state;
+        let Some((from, named)) = marks.end() else {
             return 0;
         };
-        let mut live = std::collections::BTreeSet::new();
-        self.live_payload_segments(&mut live);
-        log.sweep(&live)
+        let Some(log) = payloads.as_deref() else {
+            return 0;
+        };
+        let mut live: std::collections::BTreeSet<u32> = named.keys().copied().collect();
+        also(&mut live);
+        let swept = log.sweep(&live, from);
+        marks.let_go(swept);
+        swept
+    }
+    /// What the payload log's sweep has done since this core was made ([`payloads::PayloadSweep`]).
+    pub fn payload_sweep(&self) -> payloads::PayloadSweep {
+        self.state.marks.done()
+    }
+    /// One step of the payload log's sweep for a core without candidates: how many segments it
+    /// let go of when its pass ended, none while one goes on or none is due.
+    pub fn sweep_payloads_step(&mut self, due: bool) -> Option<usize> {
+        if self.mark_payloads(due) {
+            Some(self.sweep_marked(|_| {}))
+        } else {
+            None
+        }
+    }
+    /// A whole pass of the payload log's sweep and its sweep, now: for a core no session steps (a
+    /// restore's, a test's). A pass under way goes on to its end. How many segments it let go of.
+    pub fn sweep_payloads(&mut self) -> usize {
+        let steps = payloads::pass_steps(self.state.rows.len());
+        for _ in 0..steps {
+            if self.mark_payloads(true) {
+                return self.sweep_marked(|_| {});
+            }
+        }
+        0
     }
     pub fn native_sequence(&self) -> SessionSeq {
         SessionSeq(self.state.rows.prefix())
@@ -2621,6 +2674,16 @@ impl Core<NativeState> {
         if retire.is_some() {
             self.unfile_deleted_events(&fragments);
         }
+        // What it puts may stand where a sweep's pass has been: it names its rows' segments to
+        // the pass (doc 31 M3). A publication refused after only keeps more.
+        self.state.marks.published(
+            fragments
+                .changes()
+                .filter_map(|(_, _, change)| match change {
+                    ranges::RowChange::Put(entry) => Some(entry.value),
+                    ranges::RowChange::Delete(_) => None,
+                }),
+        );
         if let Err((error, fragments)) = self.state.rows.publish_recoverable(fragments) {
             if retire.is_some() {
                 self.state.events.drop_all();

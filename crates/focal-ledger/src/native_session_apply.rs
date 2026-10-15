@@ -1260,6 +1260,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             return Err(NativeSessionError::Corrupt);
         }
         self.applied_raft = applied_index;
+        // What the entries replaced, deleted or retired may have left a segment no row names: the
+        // sweep goes on a step (doc 31 M3).
+        self.step_payload_sweep();
         Ok(())
     }
     /// A completed caller-correlated read barrier becomes a boundary naming the
