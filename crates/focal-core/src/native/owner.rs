@@ -655,6 +655,10 @@ impl NativeOwner {
     /// 2026-10-12). That limit remains the committed headroom a seal's outcome is checked
     /// against, which every replica replays alike; the depth of one leader's pipeline is its own.
     pub(super) fn reserve_pending(&mut self) -> Result<(), NativeError> {
+        self.reserve_pending_on(BudgetLane::Ordinary)
+    }
+    /// [`Self::reserve_pending`] with the growth charged to `lane`.
+    fn reserve_pending_on(&mut self, lane: BudgetLane) -> Result<(), NativeError> {
         if self.pending.len() < self.pending.capacity() {
             return Ok(());
         }
@@ -665,11 +669,11 @@ impl NativeOwner {
             .checked_mul(2)
             .ok_or(MemoryError::CounterExhausted("native candidate queue"))?;
         let bytes = prepare::array::<Pending>(wanted)?;
-        let reservation =
-            self.core
-                .state
-                .budget
-                .reserve(BudgetKind::Pending, BudgetLane::Ordinary, bytes)?;
+        let reservation = self
+            .core
+            .state
+            .budget
+            .reserve(BudgetKind::Pending, lane, bytes)?;
         self.pending
             .try_reserve_exact(wanted.saturating_sub(self.pending.len()))
             .map_err(|_| MemoryError::AllocationFailed)?;
@@ -852,7 +856,12 @@ impl NativeOwner {
         else {
             return Ok(None);
         };
-        let room = self.reserve_pending().is_ok();
+        // A retirement gives back more than it takes once it applies: it is finishing work, staged
+        // on the completion lane fresh writes cannot take, its room in the chain as well. Staged
+        // on the ordinary lane, a session its writes had filled refused the candidates that would
+        // have emptied it (1.4 to 2.9 MB of pages each, beside writes of a few kilobytes; a
+        // 1 GiB session's walks failed hundreds of times a minute).
+        let room = self.reserve_pending_on(BudgetLane::Completion).is_ok();
         if let Some(through) = batch.through {
             let quoted = u64::try_from(index)
                 .ok()
@@ -879,7 +888,7 @@ impl NativeOwner {
         if !room {
             return Err(NativeError::Capacity("pending candidates").into());
         }
-        let lane = BudgetLane::Ordinary;
+        let lane = BudgetLane::Completion;
         let source = View::over(
             &self.core.state,
             Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),

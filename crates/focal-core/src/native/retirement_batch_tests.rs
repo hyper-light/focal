@@ -492,6 +492,57 @@ fn a_retirement_packs_its_families_into_candidates_within_the_bound() {
     ));
 }
 
+/// A session whose writes took its ordinary headroom still retires: a retirement gives back more
+/// than it takes once it applies, so it is staged on the completion lane fresh writes cannot take,
+/// its room in the pending chain as well. Staged on the ordinary lane, a session its writes had
+/// filled refused the candidates that would have emptied it.
+#[test]
+fn a_session_whose_writes_took_its_ordinary_headroom_still_retires() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ckpt::store(directory.path());
+    let mut base = f::core();
+    for claim in 1..=2u128 {
+        finished(
+            &mut base,
+            claim,
+            claim * 100,
+            u64::try_from(claim).unwrap() * 100,
+        );
+    }
+    let offers: Vec<_> = (1..=2)
+        .map(|root| RetireOffer {
+            bundle: ContentHash([0; 32]),
+            bytes: 0,
+            ..offer(&base, root)
+        })
+        .collect();
+    let mut leading = owner(restored(&base, 811, &store));
+    let budget = leading.committed_core().state.budget.clone();
+    let writes = budget
+        .reserve(
+            focal_memory::BudgetKind::Payload,
+            focal_memory::BudgetLane::Ordinary,
+            budget.headroom(focal_memory::BudgetLane::Ordinary),
+        )
+        .unwrap()
+        .commit();
+    assert_eq!(budget.headroom(focal_memory::BudgetLane::Ordinary), 0);
+    assert!(budget.headroom(focal_memory::BudgetLane::Completion) > 0);
+    let (batch, staged) = leading
+        .prepare_retirement(&offers, Some(encoding()))
+        .unwrap();
+    let Some(NativeStaging::Prepared { candidate, .. }) = staged else {
+        panic!("a full ordinary lane refused the retirement: {batch:?}");
+    };
+    assert_eq!(batch.roots().collect::<Vec<_>>(), [id(1), id(2)]);
+    assert!(batch.deferred.is_empty() && batch.refused.is_empty());
+    leading.publish_after_durable(candidate).unwrap();
+    for claim in 1..=2 {
+        assert!(leading.committed_core().native_claim(id(claim)).is_none());
+    }
+    drop(writes);
+}
+
 /// Every key digests whole, the widest of each kind included: a result's, a verdict's, a due
 /// timer's and a deadline outcome's, each naming an evaluation of a work artifact. A family
 /// holding a key past what the digest writes could never be offered: a family of work results

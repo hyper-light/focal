@@ -1417,9 +1417,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             ContentDomainId,
         ) -> Result<NativeStaging, NativeOwnerError>,
     ) -> Result<NativeSubmission, NativeSessionError> {
-        let ((), submission) = self.admit_with(consensus, |owner, schemas, domain| {
-            prepare(owner, schemas, domain).map(|staged| ((), Some(staged)))
-        })?;
+        let ((), submission) =
+            self.admit_with(consensus, BudgetLane::Ordinary, |owner, schemas, domain| {
+                prepare(owner, schemas, domain).map(|staged| ((), Some(staged)))
+            })?;
         submission.ok_or(NativeSessionError::Failed)
     }
     /// Retire the families `offers` name as the leader's next candidate (doc 31 M2), admitted
@@ -1450,14 +1451,15 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         // Planned once, each offer's family derived once, then staged a candidate at a time
         // through every gate a write meets, while the session has room: a retirement takes all
         // its offers that may leave now, however few families one candidate holds.
-        let (mut batch, mut submission) = self.admit_with(consensus, |owner, _, _| {
-            let batch = owner.plan_retirement(offers, cold)?;
-            let staged = owner.stage_retirement(&batch, 0)?;
-            Ok((batch, staged))
-        })?;
+        let (mut batch, mut submission) =
+            self.admit_with(consensus, BudgetLane::Completion, |owner, _, _| {
+                let batch = owner.plan_retirement(offers, cold)?;
+                let staged = owner.stage_retirement(&batch, 0)?;
+                Ok((batch, staged))
+            })?;
         let mut staged = usize::from(submission.is_some());
         while staged > 0 && staged < batch.ends.len() {
-            let next = self.admit_with(consensus, |owner, _, _| {
+            let next = self.admit_with(consensus, BudgetLane::Completion, |owner, _, _| {
                 Ok(((), owner.stage_retirement(&batch, staged)?))
             });
             // A candidate refused (no room, the session busy) leaves the rest to a later offer.
@@ -1471,10 +1473,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         Ok((batch, submission))
     }
     /// Admit what `prepare` makes of the owner, a candidate or none, as a write is: every gate a
-    /// write meets, the movement's fence, the session's room, and the submission.
+    /// write meets, the movement's fence, the session's room on `lane` (a retirement's on the
+    /// completion lane, as the owner stages it), and the submission.
     fn admit_with<T>(
         &mut self,
         consensus: &mut DurableNode,
+        lane: BudgetLane,
         prepare: impl FnOnce(
             &mut NativeOwner,
             &S,
@@ -1496,7 +1500,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         // Room for the candidate, funded by the session's memory before it is prepared: the
         // candidates a leader holds in flight are as many as its memory funds (`reserve_pending`).
-        let full = self.reserve_pending().is_err();
+        let full = self.reserve_pending(lane).is_err();
         let domain = self.limits.content_domain;
         let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
             return Err(NativeSessionError::Failed);
@@ -1596,8 +1600,8 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// charged to the session's budget before it is allocated, as the native owner's own queue
     /// grows (`NativeOwner::reserve_pending`). `NativeLimits::pending`, the count this queue was
     /// fixed at, remains the committed headroom of a seal's outcome; a leader's pipeline is as
-    /// deep as its memory funds.
-    fn reserve_pending(&mut self) -> Result<(), NativeSessionError> {
+    /// deep as its memory funds. The growth is charged to `lane`.
+    fn reserve_pending(&mut self, lane: BudgetLane) -> Result<(), NativeSessionError> {
         if self.pending.len() < self.pending.capacity() {
             return Ok(());
         }
@@ -1608,9 +1612,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             .checked_mul(2)
             .ok_or(NativeSessionError::Capacity("pending candidates"))?;
         let bytes = array::<Pending>(wanted)?;
-        let permit = self
-            .budget
-            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, bytes)?;
+        let permit = self.budget.reserve(BudgetKind::Pending, lane, bytes)?;
         self.pending
             .try_reserve_exact(wanted.saturating_sub(self.pending.len()))
             .map_err(|_| NativeSessionError::Capacity("pending candidates"))?;
