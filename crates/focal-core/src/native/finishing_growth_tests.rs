@@ -446,3 +446,68 @@ fn finishing_a_claim_takes_no_more_than_it_reserved() {
         );
     }
 }
+
+/// A terminal claim's monitor still waiting is cancelled and the claim's scope released while
+/// fresh work's lane is spent: each finishes work already taken, on the completion lane. A
+/// monitor's cancel was fresh work's, and a scope releases only once its monitors are disposed
+/// of, so with that lane spent a finished claim's family could never be released or retired.
+#[test]
+fn a_finished_claims_waiting_monitor_is_cancelled_and_its_scope_released_under_fresh_works_pressure()
+ {
+    let posted = authored_posted(&[(1, 500, &[], &[]), (2, 500, &[], &[])]);
+    let mut owner = NativeOwner::new(posted).unwrap();
+    // Claim 1 waits for claim 2, which never ends; then claim 1 is cancelled, its monitor active.
+    register_timer(&mut owner, timer(1, 1, 400), 2, 25);
+    let next = cancel_input(&owner, 1, 66_001);
+    let candidate = stage(&mut owner, next, 40);
+    owner.publish_after_durable(candidate).unwrap();
+    let claim = owner.committed().claim(ClaimId::from_u128(1)).unwrap();
+    assert!(claim.is_terminal());
+    assert!(claim.scopes().iter().any(|scope| scope.active()));
+    // Fresh work's lane spent.
+    let source = owner.budget_for_test();
+    let pressure = source
+        .reserve(
+            focal_memory::BudgetKind::Payload,
+            focal_memory::BudgetLane::Ordinary,
+            source.headroom(focal_memory::BudgetLane::Ordinary),
+        )
+        .unwrap()
+        .commit();
+    let expected = owner
+        .effective()
+        .claim(ClaimId::from_u128(1))
+        .unwrap()
+        .binding();
+    let cancel_monitor = NativeInput {
+        request: request(ISSUER, 66_002),
+        command: NativeCommand::CancelMonitor {
+            expected,
+            receipt: None,
+            id: MonitorId::from_u128(1),
+        },
+    };
+    let cancelled = owner
+        .prepare(context(ISSUER, 41), cancel_monitor, None)
+        .unwrap_or_else(|error| panic!("the monitor's cancel was refused: {error:?}"));
+    let NativeStaging::Prepared { candidate, .. } = cancelled else {
+        panic!("a fresh cancel of the monitor");
+    };
+    owner.publish_after_durable(candidate).unwrap();
+    let next = release_input(&owner, 1, 66_003);
+    let released = owner
+        .prepare(context(ISSUER, 42), next, None)
+        .unwrap_or_else(|error| panic!("the release was refused: {error:?}"));
+    let NativeStaging::Prepared { candidate, .. } = released else {
+        panic!("a fresh release");
+    };
+    owner.publish_after_durable(candidate).unwrap();
+    assert!(
+        owner
+            .committed()
+            .claim(ClaimId::from_u128(1))
+            .unwrap()
+            .released()
+    );
+    drop(pressure);
+}

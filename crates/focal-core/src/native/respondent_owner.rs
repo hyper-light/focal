@@ -253,26 +253,12 @@ pub(super) fn attach(
     schemas: &impl NativeSchemaVerifier,
 ) -> Result<(NativePrepared, CandidateJournal), NativeError> {
     let operation = prepared.outcome.operation;
-    // Every journal is charged to the state's budget as it is made: completion work (a report,
-    // a respondent's action, a due timer, a cancel) on the completion lane fresh work cannot
-    // take. Nothing was set aside for it when its evaluation began or its receipt was taken.
-    let lane = if matches!(
-        operation,
-        NativeOperation::Cancel
-            | NativeOperation::ClaimDeadline
-            | NativeOperation::MonitorDeadline
-            | NativeOperation::EvaluationDeadline
-            | NativeOperation::ReportAdmission
-            | NativeOperation::ReportIncrement
-            | NativeOperation::ReportWork
-            | NativeOperation::SubmitDiagnostic
-            | NativeOperation::CloseResponse
-            | NativeOperation::PostResponse
-    ) {
-        BudgetLane::Completion
-    } else {
-        BudgetLane::Ordinary
-    };
+    // Every journal is charged to the state's budget as it is made: completion work on the
+    // completion lane fresh work cannot take, by the one list every charge reads
+    // (`NativeOperation::budget_lane`; this one had kept its own, and charged a release's and a
+    // monitor's cancel's respondents to fresh work's lane). Nothing was set aside for it when its
+    // evaluation began or its receipt was taken.
+    let lane = operation.budget_lane();
     let funding = JournalFunding::External {
         source: &source.state.budget,
         lane,

@@ -945,8 +945,13 @@ Each stage lands on its own, measured:
        - The bound has the memory's lanes (`CheckpointBound`): fresh work stops an eighth
          short of it, and work that finishes what was taken goes on to the bound.
          `ReleaseScope` joins the completion lane: it requires a terminal claim, and it is what
-         lets the family retire. A candidate that takes away at least what it adds is never
-         refused by the bound.
+         lets the family retire. A monitor's cancel joins it too (a review): it is accepted only
+         on a terminal claim, and a scope releases only once its monitors are disposed of, so on
+         fresh work's lane a finished claim whose monitor still waited could be neither released
+         nor retired while that lane was spent. One list decides every charge's lane
+         (`NativeOperation::budget_lane`); the respondents' journal had kept its own, which left
+         the release and the monitor's cancel out. A candidate that takes away at least what it
+         adds is never refused by the bound.
        - A root within a quarter of the bound of where fresh work stops retires finished
          families without waiting out their grace, as a session pressed for memory does
          (`Core::checkpoint_pressed`). The bound lives on the core and is set where the session

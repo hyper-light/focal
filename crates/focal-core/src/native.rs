@@ -950,6 +950,54 @@ pub enum NativeOperation {
     /// Closed outcomes sealed into a bundle (F12): a session decision.
     Seal,
 }
+impl NativeOperation {
+    /// The budget lane a candidate of this operation is charged on, one list for every place that
+    /// charges one: work that finishes what was already taken (a cancel; a deadline that ends a
+    /// claim, a monitor or an evaluation; a report; a respondent's diagnostic, close or post; a
+    /// finished claim's waiting monitor disposed of; the release of its scope that lets its family
+    /// retire) on the completion lane, which fresh work cannot take, and everything else on the
+    /// ordinary lane. A finished claim's scope is released only once its monitors are disposed of,
+    /// so a monitor's cancel on the ordinary lane left a finished family unreleasable, and so
+    /// unretirable, while fresh work's lane was spent.
+    pub(crate) fn budget_lane(self) -> focal_memory::BudgetLane {
+        match self {
+            Self::Cancel
+            | Self::CancelMonitor
+            | Self::ReleaseScope
+            | Self::ClaimDeadline
+            | Self::MonitorDeadline
+            | Self::EvaluationDeadline
+            | Self::ReportAdmission
+            | Self::ReportIncrement
+            | Self::ReportWork
+            | Self::SubmitDiagnostic
+            | Self::CloseResponse
+            | Self::PostResponse => focal_memory::BudgetLane::Completion,
+            Self::RegisterMonitor
+            | Self::RebindMonitor
+            | Self::GenerateResultTestament
+            | Self::PostResultTestament
+            | Self::EnterWholeWork
+            | Self::SealIncrementTargets
+            | Self::BeginIncrement
+            | Self::FailWorkProduction
+            | Self::RejectWork
+            | Self::SubmitWork
+            | Self::ReceiveWork
+            | Self::ReceiveResponse
+            | Self::AcquireReceipt
+            | Self::AdoptReceipt
+            | Self::Create
+            | Self::Post
+            | Self::BeginAdmission
+            | Self::BeginWork
+            | Self::Import
+            | Self::Retire
+            | Self::AdvanceEpochFloor
+            | Self::Seal => focal_memory::BudgetLane::Ordinary,
+        }
+    }
+}
 /// Address of one frozen legacy row retained by import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeLegacyKey {

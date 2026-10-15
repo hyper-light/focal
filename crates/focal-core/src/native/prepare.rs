@@ -695,24 +695,9 @@ impl Core<NativeState> {
             NativeCommand::BeginAdmission { .. } => NativeOperation::BeginAdmission,
             NativeCommand::ReportAdmission { .. } => NativeOperation::ReportAdmission,
         };
-        // Finishing work already taken (a cancel, a report, a respondent's diagnostic, close or
-        // post, the release of a finished claim's scope that lets its family retire) is on the
-        // completion lane, which fresh work cannot take.
-        let lane = if matches!(
-            operation,
-            NativeOperation::Cancel
-                | NativeOperation::ReleaseScope
-                | NativeOperation::ReportAdmission
-                | NativeOperation::ReportIncrement
-                | NativeOperation::ReportWork
-                | NativeOperation::SubmitDiagnostic
-                | NativeOperation::CloseResponse
-                | NativeOperation::PostResponse
-        ) {
-            BudgetLane::Completion
-        } else {
-            BudgetLane::Ordinary
-        };
+        // Finishing work already taken is on the completion lane, which fresh work cannot take
+        // (`NativeOperation::budget_lane`).
+        let lane = operation.budget_lane();
         Ok(Checked::Fresh(Fresh {
             dispatch: Dispatch::Request { input, context },
             view,
