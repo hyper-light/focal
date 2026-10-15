@@ -2273,6 +2273,12 @@ impl Core<NativeState> {
     pub fn native_read_failure(&self) -> Result<(), NativeError> {
         self.state.reads.failure()
     }
+    /// The young generation (doc 31 M3): the keys it tracks, the spills it put off and kept to
+    /// try again, and the keys it could not keep, since it was made.
+    pub fn native_young(&self) -> (usize, u64, u64) {
+        let (put_off, untracked) = self.state.young.counts();
+        (self.state.young.len(), put_off, untracked)
+    }
     /// Rows reads have taken back since the core last changed, and the bytes they hold.
     pub fn native_read_backs(&self) -> (usize, usize) {
         (self.state.reads.rows(), self.state.reads.bytes())
@@ -2634,18 +2640,21 @@ impl Core<NativeState> {
             rows,
             payloads,
             young,
+            budget,
             ..
         } = &mut self.state;
         let Some(log) = payloads.as_deref() else {
             return 0;
         };
         let mut spilled = 0usize;
+        // The rows this publication wrote join the generation first, each that may spill (its
+        // claim taken or tied into work since, a row stays held). One the generation cannot keep
+        // spills now.
+        let mut admitted = 0usize;
         for (key, deleted) in writes.entries() {
             if deleted || !matches!(key, Key::Claim(_) | Key::Definition(_)) {
                 continue;
             }
-            // Only a row that may spill joins the generation; the oldest it pushes out spills
-            // if its row still may (its claim taken or tied into work since, it stays held).
             let spillable = match rows.get(&key) {
                 Some(Row::Claim(claim)) => claim.spillable(),
                 Some(Row::Definition(definition)) => definition.spillable(),
@@ -2654,28 +2663,24 @@ impl Core<NativeState> {
             if !spillable {
                 continue;
             }
-            let Some(oldest) = young.admit(key) else {
+            admitted = admitted.saturating_add(1);
+            let Some(now) = young.admit(key) else {
                 continue;
             };
-            let row = match rows.get(&oldest) {
-                // A claim another depends on is reached by work on that one: it stays held.
-                Some(Row::Claim(_)) if matches!(oldest, Key::Claim(id) if rows.get(&Key::IncomingHead(id)).is_some()) => {
-                    None
-                }
-                Some(Row::Claim(claim)) => claim.spill(log).ok().flatten().map(Row::Claim),
-                Some(Row::Definition(definition)) => {
-                    definition.spill(log).ok().flatten().map(Row::Definition)
-                }
-                _ => None,
-            };
-            let Some(row) = row else {
-                continue;
-            };
-            if matches!(
-                rows.rewrite(&oldest, move |_| Ok(Some((row, 0)))),
-                Ok(focal_memory::Rewrite::Rewritten)
-            ) {
-                spilled = spilled.saturating_add(1);
+            match spill_row(rows, log, &now) {
+                RowSpill::Spilled => spilled = spilled.saturating_add(1),
+                RowSpill::Stays => {}
+                RowSpill::PutOff => young.lost(),
+            }
+        }
+        // Then its oldest, while it tracks more than it holds by choice or memory is short, a
+        // bounded number a publication; one whose spill is put off is kept to try again.
+        let mut pass = young::Pass::new(admitted);
+        while let Some(oldest) = young.next(budget, &mut pass) {
+            match spill_row(rows, log, &oldest) {
+                RowSpill::Spilled => spilled = spilled.saturating_add(1),
+                RowSpill::Stays => {}
+                RowSpill::PutOff => young.put_off(oldest, &mut pass),
             }
         }
         spilled
@@ -3397,4 +3402,64 @@ pub(in crate::native) fn encoded_added(
         }
         None => Ok(sum),
     })
+}
+
+/// What spilling one row where it stands came to ([`spill_row`]).
+enum RowSpill {
+    Spilled,
+    /// Held for what it is: another claim depends on it, it may not spill, its encoding is wider
+    /// than a spilled row's, or it is gone. Only a change to it alters that.
+    Stays,
+    /// Put off: its page is shared with a frozen image or a lease, or the log refuses payloads
+    /// for now.
+    PutOff,
+}
+
+/// Spill the row at `key` where it stands (doc 31 M3): its payload appended to `log` only once its
+/// page is the store's own, so a page shared with a frozen image or a lease costs the log nothing.
+fn spill_row(
+    rows: &mut ranges::NativeRanges,
+    log: &dyn payloads::PayloadLog,
+    key: &Key,
+) -> RowSpill {
+    // A claim another depends on is reached by work on that one: it stays held.
+    if let Key::Claim(id) = key
+        && rows.get(&Key::IncomingHead(*id)).is_some()
+    {
+        return RowSpill::Stays;
+    }
+    let mut refused = false;
+    let rewritten = rows.rewrite(key, |row| {
+        let spill = match row {
+            Row::Claim(claim) => claim.spill(log).map(|spill| match spill {
+                payloads::Spill::Spilled(claim) => payloads::Spill::Spilled(Row::Claim(claim)),
+                payloads::Spill::Stays => payloads::Spill::Stays,
+                payloads::Spill::Refused => payloads::Spill::Refused,
+            }),
+            Row::Definition(definition) => definition.spill(log).map(|spill| match spill {
+                payloads::Spill::Spilled(definition) => {
+                    payloads::Spill::Spilled(Row::Definition(definition))
+                }
+                payloads::Spill::Stays => payloads::Spill::Stays,
+                payloads::Spill::Refused => payloads::Spill::Refused,
+            }),
+            _ => Ok(payloads::Spill::Stays),
+        };
+        Ok(match spill {
+            Ok(payloads::Spill::Spilled(row)) => Some((row, 0)),
+            Ok(payloads::Spill::Refused) => {
+                refused = true;
+                None
+            }
+            Ok(payloads::Spill::Stays) | Err(_) => None,
+        })
+    });
+    match rewritten {
+        Ok(focal_memory::Rewrite::Rewritten) => RowSpill::Spilled,
+        Ok(focal_memory::Rewrite::Shared) => RowSpill::PutOff,
+        Ok(focal_memory::Rewrite::Unchanged) if refused => RowSpill::PutOff,
+        Ok(focal_memory::Rewrite::Unchanged | focal_memory::Rewrite::Absent) => RowSpill::Stays,
+        // The store refused to look: tried again, within a publication's bound.
+        Err(_) => RowSpill::PutOff,
+    }
 }

@@ -1166,8 +1166,8 @@ fn spilled_rows_encode_replay_and_checkpoint_as_held_ones() {
     spilled_rows_match_held_ones(None);
 }
 
-/// As above, with each spilling replica's log refusing appends once it holds a few events:
-/// the events past its bound stay held, and every encoding is unchanged.
+/// A young generation (doc 31 M3) keeps the newest waiting claims and definitions held: only
+/// those newer ones push out spill, and every claim reads as a core that holds them all.
 #[test]
 fn the_newest_waiting_claims_stay_held_and_only_those_pushed_out_spill() {
     use crate::native::payloads::MemoryPayloads;
@@ -1203,6 +1203,212 @@ fn the_newest_waiting_claims_stay_held_and_only_those_pushed_out_spill() {
     }
 }
 
+#[test]
+fn a_session_short_of_memory_spills_its_oldest_held_waiting_claims_first() {
+    use crate::native::payloads::MemoryPayloads;
+    let plain = {
+        let mut plain = core();
+        for id in 1..=4 {
+            let held = prepare(&plain, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+            plain.publish_native(held).unwrap();
+        }
+        plain
+    };
+    let mut young = core();
+    young.attach_payload_log_with_young(Box::new(MemoryPayloads::default()), 1024);
+    for id in 1..=3 {
+        let prepared = prepare(&young, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        young.publish_native(prepared).unwrap();
+    }
+    let logged = |core: &Core<NativeState>, id: u128| match core
+        .state
+        .rows
+        .get(&Key::Claim(ClaimId::from_u128(id)))
+    {
+        Some(Row::Claim(row)) => row.logged().is_some(),
+        _ => panic!("claim {id} is held or spilled"),
+    };
+    // Room to spare: every waiting claim is held.
+    assert!((1..=3).all(|id| !logged(&young, id)));
+    // The ordinary lane squeezed below the low water: the next publication spills the oldest
+    // the generation holds, oldest first, as many as memory wants (64 a publication at most).
+    let budget = young.state.budget.clone();
+    let squeeze = budget
+        .reserve(
+            focal_memory::BudgetKind::Payload,
+            focal_memory::BudgetLane::Ordinary,
+            budget.headroom(focal_memory::BudgetLane::Ordinary) - (1 << 20),
+        )
+        .unwrap()
+        .commit();
+    let prepared = prepare(&young, create(4, vec![proposal(4, 10_004)]), &[]);
+    young.publish_native(prepared).unwrap();
+    assert!((1..=3).all(|id| logged(&young, id)), "the oldest spilled");
+    for id in 1..=4u128 {
+        assert_eq!(
+            young.native_claim(ClaimId::from_u128(id)),
+            plain.native_claim(ClaimId::from_u128(id))
+        );
+    }
+    drop(squeeze);
+}
+
+/// A payload log that refuses every payload while `refuse` is set: a log out of room or failing,
+/// then repaired.
+#[derive(Debug)]
+struct Switched {
+    log: crate::native::payloads::MemoryPayloads,
+    refuse: &'static std::sync::atomic::AtomicBool,
+}
+
+impl crate::native::payloads::PayloadRead for Switched {
+    fn read(
+        &self,
+        at: crate::native::payloads::PayloadRef,
+        into: &mut [u8],
+    ) -> Result<(), crate::native::payloads::PayloadError> {
+        self.log.read(at, into)
+    }
+}
+
+impl crate::native::payloads::PayloadLog for Switched {
+    fn append(&self, bytes: &[u8]) -> Option<crate::native::payloads::PayloadRef> {
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return None;
+        }
+        self.log.append(bytes)
+    }
+    fn reader(
+        &self,
+    ) -> Result<
+        Box<dyn crate::native::payloads::PayloadRead + Send>,
+        crate::native::payloads::PayloadError,
+    > {
+        self.log.reader()
+    }
+}
+
+/// Whether claim `id` is spilled; a test fails where the core holds no such claim.
+fn claim_logged(core: &Core<NativeState>, id: u128) -> bool {
+    match core.state.rows.get(&Key::Claim(ClaimId::from_u128(id))) {
+        Some(Row::Claim(row)) => row.logged().is_some(),
+        _ => panic!("claim {id} is held or spilled"),
+    }
+}
+
+/// The ordinary lane of `core`'s budget squeezed to a mebibyte: below the young generation's low
+/// water, so a publication spills the oldest rows for memory.
+fn squeeze(core: &Core<NativeState>) -> focal_memory::Allocation {
+    let budget = core.state.budget.clone();
+    budget
+        .reserve(
+            focal_memory::BudgetKind::Payload,
+            focal_memory::BudgetLane::Ordinary,
+            budget.headroom(focal_memory::BudgetLane::Ordinary) - (1 << 20),
+        )
+        .unwrap()
+        .commit()
+}
+
+/// A spill the payload log refuses (out of room, failing) is put off, its key kept: the rows stay
+/// held while it refuses, and once it takes payloads again an unrelated publication spills them.
+/// (Forgotten instead, they were held for good: the review's case of three old rows, still held
+/// after the log was repaired.)
+#[test]
+fn a_spill_the_log_refuses_is_kept_and_done_once_the_log_takes_payloads_again() {
+    static REFUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let mut plain = core();
+    let mut young = core();
+    young.attach_payload_log_with_young(
+        Box::new(Switched {
+            log: crate::native::payloads::MemoryPayloads::default(),
+            refuse: &REFUSE,
+        }),
+        1024,
+    );
+    for id in 1..=3 {
+        let held = prepare(&plain, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        plain.publish_native(held).unwrap();
+        let prepared = prepare(&young, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        young.publish_native(prepared).unwrap();
+    }
+    assert!((1..=3).all(|id| !claim_logged(&young, id)));
+    let squeezed = squeeze(&young);
+    REFUSE.store(true, std::sync::atomic::Ordering::SeqCst);
+    let prepared = prepare(&young, create(4, vec![proposal(4, 10_004)]), &[]);
+    young.publish_native(prepared).unwrap();
+    // Nothing spilled, nothing forgotten: every row is tracked, its spill put off.
+    assert!((1..=4).all(|id| !claim_logged(&young, id)));
+    let (tracked, put_off, untracked) = young.native_young();
+    assert_eq!(
+        (tracked, untracked),
+        (8, 0),
+        "four claims and their definitions"
+    );
+    assert!(put_off >= 3, "{put_off}");
+    REFUSE.store(false, std::sync::atomic::Ordering::SeqCst);
+    let prepared = prepare(&young, create(5, vec![proposal(5, 10_005)]), &[]);
+    young.publish_native(prepared).unwrap();
+    assert!(
+        (1..=5).all(|id| claim_logged(&young, id)),
+        "spilled once it may"
+    );
+    let held = prepare(&plain, create(4, vec![proposal(4, 10_004)]), &[]);
+    plain.publish_native(held).unwrap();
+    let held = prepare(&plain, create(5, vec![proposal(5, 10_005)]), &[]);
+    plain.publish_native(held).unwrap();
+    for id in 1..=5u128 {
+        let claim = ClaimId::from_u128(id);
+        assert_eq!(young.native_claim(claim), plain.native_claim(claim));
+    }
+    drop(squeezed);
+}
+
+/// A spill put off while a frozen image (a checkpoint encoding) shares the row's page keeps its
+/// key: the publication under memory pressure spills nothing it may not, and once the image is
+/// let go, unrelated publications spill every row it held, within a bounded number of them.
+#[test]
+fn a_spill_put_off_while_a_frozen_image_shares_its_page_is_done_once_the_image_is_let_go() {
+    use crate::native::payloads::MemoryPayloads;
+    let mut young = core();
+    young.attach_payload_log_with_young(Box::new(MemoryPayloads::default()), 4096);
+    // Enough claims that the store has pages a later publication does not touch.
+    const CLAIMS: u128 = 300;
+    for id in 1..=CLAIMS {
+        let prepared = prepare(&young, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        young.publish_native(prepared).unwrap();
+    }
+    assert!((1..=CLAIMS).all(|id| !claim_logged(&young, id)));
+    let frozen = young.freeze_native().unwrap();
+    let squeezed = squeeze(&young);
+    let far = 1_000_000;
+    let prepared = prepare(&young, create(far, vec![proposal(far, far + 10_000)]), &[]);
+    young.publish_native(prepared).unwrap();
+    let (_, put_off, untracked) = young.native_young();
+    assert!(put_off > 0, "the image shares the oldest rows' pages");
+    assert_eq!(untracked, 0);
+    assert!(!claim_logged(&young, 1), "its page is the image's too");
+    drop(frozen);
+    let mut publications = 0;
+    for request in 0..20u128 {
+        if (1..=CLAIMS).all(|id| claim_logged(&young, id)) {
+            break;
+        }
+        let id = 2_000_000 + request;
+        let prepared = prepare(&young, create(id, vec![proposal(id, id + 10_000)]), &[]);
+        young.publish_native(prepared).unwrap();
+        publications += 1;
+    }
+    assert!(
+        (1..=CLAIMS).all(|id| claim_logged(&young, id)),
+        "every row the image held spilled, within {publications} publications"
+    );
+    assert_eq!(young.native_young().2, 0);
+    drop(squeezed);
+}
+
+/// As above, with each spilling replica's log refusing appends once it holds a few events:
+/// the events past its bound stay held, and every encoding is unchanged.
 #[test]
 fn a_full_payload_log_leaves_rows_held_and_every_encoding_unchanged() {
     spilled_rows_match_held_ones(Some(2_000));

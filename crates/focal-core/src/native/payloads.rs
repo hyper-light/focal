@@ -12,6 +12,15 @@
 /// whose bytes are wider stays held.
 pub(crate) const SPILLED_BYTES: usize = 1024;
 
+/// What spilling a row came to: its spilled form; held for what it is (it may not spill, or its
+/// encoding is wider than a spilled row's), which only a change to it alters; or refused by the
+/// log for now (full, or failing), to be tried again.
+pub(crate) enum Spill<T> {
+    Spilled(T),
+    Stays,
+    Refused,
+}
+
 /// Where a payload's bytes are in the log: its segment, offset and length, and a check over the
 /// bytes, so a read that returns anything else is refused rather than decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

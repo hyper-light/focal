@@ -306,18 +306,22 @@ impl OwnedClaim {
     pub(super) fn spill(
         &self,
         log: &dyn super::payloads::PayloadLog,
-    ) -> Result<Option<Self>, NativeError> {
+    ) -> Result<super::payloads::Spill<Self>, NativeError> {
+        use super::payloads::Spill;
         if !self.spillable() {
-            return Ok(None);
+            return Ok(Spill::Stays);
         }
         let mut buffer = [0u8; super::payloads::SPILLED_BYTES];
         let Some(len) = super::record_codec::encode_claim(self, &mut buffer) else {
-            return Ok(None);
+            return Ok(Spill::Stays);
         };
         let bytes = buffer
             .get(..len)
             .ok_or(NativeError::Capacity("claim row"))?;
-        Ok(log.append(bytes).map(|at| Self(ClaimStorage::Logged(at))))
+        Ok(match log.append(bytes) {
+            Some(at) => Spill::Spilled(Self(ClaimStorage::Logged(at))),
+            None => Spill::Refused,
+        })
     }
     /// Native-owner access during private preparation. The owner precharges
     /// growth and publishes state and registration changes atomically.
@@ -432,20 +436,22 @@ impl OwnedDeclaration {
     pub(super) fn spill(
         &self,
         log: &dyn super::payloads::PayloadLog,
-    ) -> Result<Option<Self>, NativeError> {
+    ) -> Result<super::payloads::Spill<Self>, NativeError> {
+        use super::payloads::Spill;
         if !self.spillable() {
-            return Ok(None);
+            return Ok(Spill::Stays);
         }
         let mut buffer = [0u8; super::payloads::SPILLED_BYTES];
         let Some(len) = super::record_codec::encode_definition(self, &mut buffer) else {
-            return Ok(None);
+            return Ok(Spill::Stays);
         };
         let bytes = buffer
             .get(..len)
             .ok_or(NativeError::Capacity("definition row"))?;
-        Ok(log
-            .append(bytes)
-            .map(|at| Self(DeclarationStorage::Logged(at))))
+        Ok(match log.append(bytes) {
+            Some(at) => Spill::Spilled(Self(DeclarationStorage::Logged(at))),
+            None => Spill::Refused,
+        })
     }
     pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
         match &self.0 {
