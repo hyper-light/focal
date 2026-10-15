@@ -484,10 +484,15 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
 
     // Remove the drained host: root membership (it was admitted as a
     // member), then its credential; a repeat resumes and changes nothing.
-    let removed = wait_for_removal(founder, drained);
+    let (removed, attempts) = wait_for_removal(founder, drained);
     assert_eq!(removed["kind"], "node_removed", "{removed}");
     assert_eq!(removed["node"], drained);
-    assert_eq!(removed["membership_removed"], true, "{removed}");
+    // What the run that succeeded did; an earlier one refused after removing the member leaves
+    // it false, and the membership read below shows the node gone either way.
+    assert!(
+        removed["membership_removed"] == true || attempts > 1,
+        "{removed}"
+    );
     // Its seat in the partition group went first — leadership handed back
     // to a voter that stays — so the group counts no voter that is gone.
     assert_eq!(removed["partitions_vacated"], 1, "{removed}");
@@ -798,13 +803,20 @@ fn plan_until_planned(founder: &Path, args: &[&str]) -> Value {
 }
 /// Removal waits for the retiring copies to leave the directory; until
 /// then it is refused as holding.
-fn wait_for_removal(founder: &Path, node: u64) -> Value {
+/// The removal of `node`, retried while it is refused for a passing reason, and how many runs it
+/// took.
+fn wait_for_removal(founder: &Path, node: u64) -> (Value, u32) {
     let text = node.to_string();
     let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
+    let mut attempts = 0u32;
     loop {
+        attempts += 1;
         let output = command(founder, &["remove", "node", "--node", &text]);
         if output.status.success() {
-            return serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();
+            return (
+                serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone(),
+                attempts,
+            );
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(

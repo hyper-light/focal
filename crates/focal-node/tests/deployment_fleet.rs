@@ -365,7 +365,9 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
         settled(view, &ledger, &healed, 1)
     });
     let mut deadline = deadline::Deadline::after(Duration::from_secs(180));
+    let mut attempts = 0u32;
     let removed = loop {
+        attempts += 1;
         let output = fleet::run(
             &founder,
             None,
@@ -384,7 +386,14 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
     // Record the removal that succeeded (the retry loop above used the bare
     // runner so the recording shows the operator's one command).
     journey.steps_record_remove(&founder, node_b);
-    assert_eq!(removed["membership_removed"], true, "{removed}");
+    // `membership_removed` is what the run that succeeded did: an earlier attempt may have
+    // removed the member and then been refused at a later step (the invitation's read or
+    // revocation as the root's configuration changed). Either way the node is no member now.
+    assert!(
+        removed["membership_removed"] == true || attempts > 1,
+        "{removed}"
+    );
+    assert!(!fleet::member(&founder, node_b), "{removed}");
     journey.same(&founder, &second);
     // The heal settled the session; wait for it to be quiet, then a fresh
     // claim written and read back proves the shrunk fleet still serves
