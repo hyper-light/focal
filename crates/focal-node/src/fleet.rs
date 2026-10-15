@@ -632,6 +632,9 @@ impl PendingMembershipCall {
 /// and termination of existing work can consume the completion allowance.
 fn completion_request(request: &VerifiedRequest) -> bool {
     let command = match &request.request().operation {
+        Operation::Native { frame } => {
+            return crate::native_ingress::lane(frame) == BudgetLane::Completion;
+        }
         Operation::RequestStreamControl {
             command:
                 RequestStreamCommand::Acknowledge { .. }

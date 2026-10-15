@@ -37,6 +37,79 @@ fn submit(id: u128, command: Command) -> RequestEnvelope {
         },
     )
 }
+
+#[test]
+fn native_disposal_uses_fleet_completion_admission_when_ordinary_memory_is_full() {
+    use focal_core::native::{NativeCommand, NativeInput, input_codec};
+    let expected = focal_model::lifecycle::Binding {
+        ledger: ledger(),
+        object: ObjectId::from_u128(900),
+        content: ContentHash([7; 32]),
+        revision: ObjectRevision(1),
+    };
+    let budget = MemoryBudget::new(16 * 1024, 4 * 1024).unwrap();
+    let ordinary = budget
+        .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 12 * 1024)
+        .unwrap()
+        .commit();
+    assert!(
+        budget
+            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 1)
+            .is_err()
+    );
+    for protocol in [NATIVE_PROTOCOL_VERSION, NATIVE_WRITTEN_PROTOCOL_VERSION] {
+        for (command, completion) in [
+            (NativeCommand::Cancel { expected }, true),
+            (NativeCommand::ReleaseScope { expected }, true),
+            (
+                NativeCommand::CancelMonitor {
+                    expected,
+                    receipt: None,
+                    id: MonitorId::from_u128(901),
+                },
+                true,
+            ),
+            (NativeCommand::Post { expected }, false),
+        ] {
+            let input = NativeInput {
+                request: RequestKey {
+                    principal: actor().principal(),
+                    epoch: RequestEpoch(1),
+                    id: RequestId::from_u128(4),
+                },
+                command,
+            };
+            let plan = input_codec::EncodingPlan::prepare(
+                input_codec::InputFrame::Request {
+                    ledger: ledger(),
+                    profile: focal_ledger::NativeContentProfile::ProjectionOnly,
+                    input: &input,
+                },
+                input_codec::EncodingLimits {
+                    bytes: 1 << 20,
+                    visits: 1 << 28,
+                },
+            )
+            .unwrap();
+            let mut frame = vec![0; plan.quote().bytes];
+            plan.write_into(&mut frame).unwrap();
+            let mut envelope = request(4, Operation::Native { frame });
+            envelope.protocol = protocol;
+            let verified = verify_request(actor(), envelope, &WireLimits::default()).unwrap();
+            assert_eq!(completion_request(&verified), completion);
+            let lane = if completion_request(&verified) {
+                BudgetLane::Completion
+            } else {
+                BudgetLane::Ordinary
+            };
+            let admission = budget.reserve(BudgetKind::Pending, lane, 512);
+            assert_eq!(admission.is_ok(), completion);
+            drop(admission);
+        }
+    }
+    drop(ordinary);
+    assert_eq!(budget.stats().used, 0);
+}
 #[test]
 fn completion_and_receipt_probe_use_reserved_bytes_and_queue_slots() {
     focal_rt::block_on(async move {
