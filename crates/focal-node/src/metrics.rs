@@ -1945,31 +1945,12 @@ impl MetricsSnapshot {
                 }
             }
         }
-        // What each session's native engine holds, kind by kind: where its share fills.
-        text.header(
-            "focal_session_native_memory_by_kind_bytes",
-            "gauge",
-            "Bytes a session's native engine uses of its share, by the kind of what they hold; they sum to focal_session_native_memory_used_bytes when nothing is charged between the reads.",
-        );
-        for session in &self.sessions {
-            let Some(memory) = session.memory.filter(|_| session.observed) else {
-                continue;
-            };
-            for (kind, bytes) in focal_memory::BudgetKind::ALL
-                .iter()
-                .zip(memory.native_by_kind)
-            {
-                text.labeled(
-                    "focal_session_native_memory_by_kind_bytes",
-                    &[
-                        ("tenant", session.tenant.as_str()),
-                        ("session", session.session.as_str()),
-                        ("kind", kind.label()),
-                    ],
-                    bytes,
-                );
-            }
-        }
+        // A session's memory by kind is not listed here: fourteen series a session took a third
+        // of what a session's entry costs on a page (7,706 bytes at their widest, beside a
+        // 38,261-byte fixed part of a 61,436-byte page), so a node of a three-host fleet listed
+        // two of its three sessions a round. The node's charge by kind
+        // (`focal_memory_used_by_kind_bytes`) sums every session's, and each session's own is in
+        // its replica diagnostics (`native_by_kind`).
         text.out
     }
 }
@@ -2359,11 +2340,13 @@ mod tests {
             "focal_session_memory_limit_bytes{tenant=\"t\",session=\"s\"} 800000\n",
             "focal_session_native_memory_used_bytes{tenant=\"t\",session=\"s\"} 8000\n",
             "focal_session_native_memory_limit_bytes{tenant=\"t\",session=\"s\"} 400000\n",
-            "focal_session_native_memory_by_kind_bytes{tenant=\"t\",session=\"s\",kind=\"arena\"} 7000\n",
-            "focal_session_native_memory_by_kind_bytes{tenant=\"t\",session=\"s\",kind=\"pages\"} 1000\n",
         ] {
             assert!(text.contains(line), "missing {line}");
         }
+        // By kind, the node's charge is listed and no session's: a session's own is in its
+        // replica diagnostics, never fourteen series of a session's page entry.
+        assert!(text.contains("focal_memory_used_by_kind_bytes{"));
+        assert!(!text.contains("_by_kind_bytes{tenant="), "{text}");
         // The client's count of kinds is the budget's.
         assert_eq!(
             focal_memory::BudgetKind::ALL.len(),

@@ -72,6 +72,9 @@ fn a_page_holds_its_fixed_part_and_one_of_each_family() {
 fn a_round_lists_all_it_can_and_a_fair_share_of_each_family_when_it_cannot() {
     let budget = PageBudget::derive(&labels(), memory().stats()).unwrap();
     assert_eq!(budget.capacities([1, 2, 1, 1]), [1, 2, 1, 1]);
+    // A node of a three-host fleet whose three sessions each have a copy on it, its two peers
+    // measured: every one in each round, so a scrape reads every session's leader at once.
+    assert_eq!(budget.capacities([3, 2, 2, 1]), [3, 2, 2, 1], "{budget:?}");
     for counts in [
         [4096, 5, 1024, 64],
         [4096, 0, 0, 0],
