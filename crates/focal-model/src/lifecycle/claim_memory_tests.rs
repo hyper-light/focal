@@ -62,10 +62,13 @@ fn retained() -> ClaimState {
     state.status = ClaimStatus::Satisfied;
     state.local_complete = true;
     state.local_sealed_at = Some(SessionSeq(9));
-    state.terminal_cut = Some(ClaimTerminalCut::Explicit(ClaimCut {
-        position: SessionSeq(10),
-        cause: ContentHash([10; 32]),
-    }));
+    state.terminal_cut = Some(
+        held_cut(ClaimTerminalCut::Explicit(ClaimCut {
+            position: SessionSeq(10),
+            cause: ContentHash([10; 32]),
+        }))
+        .unwrap(),
+    );
     state
 }
 
@@ -87,7 +90,7 @@ fn compact_claim_copy_keeps_all_owned_history_after_original_is_dropped() {
         copied.scopes.iter().next().unwrap().roots().as_ptr(),
         original.scopes.iter().next().unwrap().roots().as_ptr()
     );
-    let fingerprint = copied.acceptance.intent_fingerprint();
+    let fingerprint = copied.acceptance().intent_fingerprint();
     original.responses.clear();
     original.graph = graph::Declaration::empty();
     original.receipt = None;
@@ -100,7 +103,7 @@ fn compact_claim_copy_keeps_all_owned_history_after_original_is_dropped() {
     assert_eq!(copied.lineage.corrections().len(), 1);
     assert_eq!(copied.scopes.children().len(), 1);
     assert!(copied.scopes.released());
-    assert_eq!(copied.acceptance.intent_fingerprint(), fingerprint);
+    assert_eq!(copied.acceptance().intent_fingerprint(), fingerprint);
     assert_eq!(copied.receipt.unwrap().fence.epoch, 7);
     assert_eq!(copied.local_sealed_at, Some(SessionSeq(9)));
     assert!(copied.terminal_cut.is_some());
@@ -114,15 +117,15 @@ fn claim_copy_preflights_nested_capacity_and_counts_allocator_buffers() {
         assert_eq!(original.try_copy(charge - 1), Err(ContractError::Capacity));
         assert_eq!(bytes::remaining_allocations(), Some(5));
     });
-    // Graph, lineage, three acceptance buffers, three scope buffers, responses.
-    assert_eq!(original.copy_heap_allocations().unwrap(), 9);
-    assert_eq!(original.heap_allocations().unwrap(), 9);
+    // Graph, lineage, three acceptance buffers, three scope buffers, responses, terminal cut.
+    assert_eq!(original.copy_heap_allocations().unwrap(), 10);
+    assert_eq!(original.heap_allocations().unwrap(), 10);
     assert_eq!(
         charge,
         std::mem::size_of::<ClaimState>() + original.copy_heap_bytes().unwrap()
     );
     let copied = original.try_copy(charge).unwrap();
-    assert_eq!(copied.heap_allocations().unwrap(), 9);
+    assert_eq!(copied.heap_allocations().unwrap(), 10);
     assert_eq!(copied.retained_bytes().unwrap(), charge);
     assert!(copied.retained_heap_bytes().unwrap() < original.retained_heap_bytes().unwrap());
 }
@@ -140,5 +143,44 @@ fn every_nested_copy_allocation_failure_preserves_original_and_allows_retry() {
         );
         assert_eq!(original, before);
         assert_eq!(original.try_copy(charge).unwrap(), before);
+    }
+}
+
+/// Measurement, not a check: the inline width of each part of a claim's state, and of the parts
+/// beside it, so the claim row's layout is decided from what each takes (doc 31 M3).
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn measure_claim_state_layout() {
+    use std::mem::size_of;
+    for (name, width) in [
+        ("ClaimState", size_of::<ClaimState>()),
+        ("Binding", size_of::<Binding>()),
+        ("ParticipantId", size_of::<crate::ParticipantId>()),
+        ("SessionSeq", size_of::<SessionSeq>()),
+        ("graph::Declaration", size_of::<graph::Declaration>()),
+        ("succession::Lineage", size_of::<succession::Lineage>()),
+        (
+            "aggregation::AcceptancePolicy",
+            size_of::<aggregation::AcceptancePolicy>(),
+        ),
+        ("scope::Registry", size_of::<scope::Registry>()),
+        ("scope::ScopeLimits", size_of::<scope::ScopeLimits>()),
+        ("ClaimStatus", size_of::<ClaimStatus>()),
+        (
+            "Option<ReceiptEntitlement>",
+            size_of::<Option<ReceiptEntitlement>>(),
+        ),
+        ("Vec<ResponseRecord>", size_of::<Vec<ResponseRecord>>()),
+        ("ResponseRecord", size_of::<ResponseRecord>()),
+        ("Option<Deadline>", size_of::<Option<Deadline>>()),
+        ("Option<SessionSeq>", size_of::<Option<SessionSeq>>()),
+        ("Option<ClaimCut>", size_of::<Option<ClaimCut>>()),
+        ("ClaimOrigin", size_of::<ClaimOrigin>()),
+        (
+            "aggregation::RegistrationSet",
+            size_of::<aggregation::RegistrationSet>(),
+        ),
+    ] {
+        println!("{name:<32} {width}");
     }
 }

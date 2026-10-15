@@ -54,20 +54,16 @@ pub struct Compiled {
 pub fn compile(
     operation: &NativeAuthoredOperation,
     context: &BuildContext,
-    request: RequestId,
+    request: RequestKey,
     ids: &mut impl IdGenerator,
     resolved: &Resolved,
     limits: &CompileLimits,
 ) -> Result<Compiled, CompileError> {
     context.validate()?;
-    if request.is_zero() {
-        return Err(InputError::Invalid("zero request identity").into());
+    if request.id.is_zero() || request.epoch.0 == 0 || request.principal != context.actor {
+        return Err(InputError::Invalid("request identity").into());
     }
-    let key = RequestKey {
-        principal: context.actor,
-        epoch: RequestEpoch(1),
-        id: request,
-    };
+    let key = request;
     let mut created = Vec::new();
     let command = match operation {
         NativeAuthoredOperation::ClaimSubmit(document) => {
@@ -122,6 +118,14 @@ pub fn compile(
         NativeAuthoredOperation::ClaimReleaseScope(document) => NativeCommand::ReleaseScope {
             expected: claim_binding(resolved, &document.claim)?,
         },
+        NativeAuthoredOperation::EpochAdvance(document) => {
+            if document.minimum == 0 {
+                return Err(InputError::Invalid("zero generation").into());
+            }
+            NativeCommand::AdvanceEpochFloor {
+                minimum: RequestEpoch(document.minimum),
+            }
+        }
         NativeAuthoredOperation::ReceiptAdopt(document) => {
             adopt(document, context, resolved, ids, &mut created)?
         }
@@ -787,7 +791,7 @@ fn selected_evaluation<'a>(
     slot: Option<u32>,
     target: Option<&str>,
 ) -> Result<&'a ResolvedEvaluation, CompileError> {
-    let selector = EvaluationSelector::parse(phase, slot, target)?;
+    let selector = crate::resolve::parse_selector(phase, slot, target)?;
     let evaluation = resolved.evaluation(
         ClaimId(claim.binding.object.0),
         ValidationId(parse_id(validation)?),

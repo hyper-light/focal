@@ -16,10 +16,34 @@
 //! machine-checked: the peak heap growth during a decode of an oversized or
 //! truncated frame stays within a small fixed budget, never the multi-megabyte
 //! size the header claimed.
-use focal_wire::{FrameKind, HEADER_BYTES, WireError, read_frame};
+use focal_wire::{FrameKind, FrameStream, HEADER_BYTES, WireError, read_frame};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::AsyncWriteExt;
+
+/// A stream of `bytes` and then its end: what the peer sent, whole.
+struct Sent {
+    bytes: Vec<u8>,
+    at: usize,
+}
+impl Sent {
+    fn of(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.to_vec(),
+            at: 0,
+        }
+    }
+}
+impl FrameStream for Sent {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, WireError> {
+        let count = (self.bytes.len() - self.at).min(buf.len());
+        buf[..count].copy_from_slice(&self.bytes[self.at..self.at + count]);
+        self.at += count;
+        Ok(count)
+    }
+    async fn write_all(&mut self, _buf: &[u8]) -> Result<(), WireError> {
+        Err(WireError::Connection)
+    }
+}
 
 /// Tracks live heap bytes and the peak since the last reset. One test binary,
 /// one test function, so the counters are not raced by concurrent allocations.
@@ -72,8 +96,12 @@ struct Small {
     value: u64,
 }
 
-#[tokio::test]
-async fn oversized_and_malformed_frames_reject_before_allocating_the_declared_length() {
+#[test]
+fn oversized_and_malformed_frames_reject_before_allocating_the_declared_length() {
+    focal_rt::block_on(async { all_rejected().await }).unwrap();
+}
+
+async fn all_rejected() {
     // A small budget: no decode below may grow the heap by more than this.
     // It comfortably exceeds a header and a few small buffers, and is far
     // below any of the megabyte lengths the adversarial headers declare.
@@ -83,12 +111,7 @@ async fn oversized_and_malformed_frames_reject_before_allocating_the_declared_le
     // ---- A header declaring the maximum length is refused at the header,
     // before a payload buffer of that size is ever allocated.
     {
-        let (mut writer, mut reader) = tokio::io::duplex(64);
-        writer
-            .write_all(&header(FrameKind::Request, u32::MAX))
-            .await
-            .unwrap();
-        drop(writer);
+        let mut reader = Sent::of(&header(FrameKind::Request, u32::MAX));
         let baseline = reset_peak();
         let result: Result<Small, WireError> =
             read_frame(&mut reader, FrameKind::Request, limit).await;
@@ -103,12 +126,7 @@ async fn oversized_and_malformed_frames_reject_before_allocating_the_declared_le
     // ---- A header declaring 8 MiB (within MAX_FRAME_BYTES but above the
     // caller's `limit`) is likewise refused at the header.
     {
-        let (mut writer, mut reader) = tokio::io::duplex(64);
-        writer
-            .write_all(&header(FrameKind::Request, 8 * 1024 * 1024))
-            .await
-            .unwrap();
-        drop(writer);
+        let mut reader = Sent::of(&header(FrameKind::Request, 8 * 1024 * 1024));
         let baseline = reset_peak();
         let result: Result<Small, WireError> =
             read_frame(&mut reader, FrameKind::Request, limit).await;
@@ -126,12 +144,7 @@ async fn oversized_and_malformed_frames_reject_before_allocating_the_declared_le
     // ---- A truncated header (fewer than the fixed header bytes) is refused
     // without allocating a payload.
     {
-        let (mut writer, mut reader) = tokio::io::duplex(64);
-        writer
-            .write_all(&header(FrameKind::Request, 16)[..8])
-            .await
-            .unwrap();
-        drop(writer);
+        let mut reader = Sent::of(&header(FrameKind::Request, 16)[..8]);
         let baseline = reset_peak();
         let result: Result<Small, WireError> =
             read_frame(&mut reader, FrameKind::Request, limit).await;
@@ -145,11 +158,9 @@ async fn oversized_and_malformed_frames_reject_before_allocating_the_declared_le
 
     // ---- The wrong magic is refused at the header.
     {
-        let (mut writer, mut reader) = tokio::io::duplex(64);
         let mut bad = header(FrameKind::Request, 16);
         bad[0] = b'X';
-        writer.write_all(&bad).await.unwrap();
-        drop(writer);
+        let mut reader = Sent::of(&bad);
         let baseline = reset_peak();
         let result: Result<Small, WireError> =
             read_frame(&mut reader, FrameKind::Request, limit).await;
@@ -168,18 +179,13 @@ async fn oversized_and_malformed_frames_reject_before_allocating_the_declared_le
     // allocates only up to the declared bound, never more, and still fails.
     {
         let declared = limit; // 4096, within the caller's limit
-        let (mut writer, mut reader) = tokio::io::duplex(1024);
         let mut frame = header(FrameKind::Request, declared).to_vec();
         frame.extend_from_slice(&[0u8; 100]); // far fewer than declared
-        let write = tokio::spawn(async move {
-            let _ = writer.write_all(&frame).await;
-            drop(writer);
-        });
+        let mut reader = Sent::of(&frame);
         let baseline = reset_peak();
         let result: Result<Small, WireError> =
             read_frame(&mut reader, FrameKind::Request, limit).await;
         let growth = peak_growth(baseline);
-        write.await.unwrap();
         assert!(result.is_err(), "a truncated payload");
         // The buffer is the declared length plus bounded overhead, never the
         // 8 MiB / u32::MAX the earlier headers claimed.

@@ -1,0 +1,27 @@
+[package]
+name = "hyper-tls"
+version = "0.1.0"
+edition = "2021"
+# focal's toolchain (rust-toolchain.toml); this snapshot builds on it, which focal's gates show.
+rust-version = "1.98.1"
+license = "Apache-2.0 OR ISC OR MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+
+[lib]
+name = "hyper_tls"
+
+[dependencies]
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+brotli = { version = "8", default-features = false, features = ["std"] }
+brotli-decompressor = "5.0.0"
+log = "0.4.8"
+once_cell = { version = "1.16", default-features = false, features = ["alloc", "race", "std"] }
+pki-types = { package = "rustls-pki-types", version = "1.12", features = ["alloc", "std"] }
+subtle = { version = "2.5.0", default-features = false }
+webpki = { package = "rustls-webpki", version = "0.103.14", default-features = false, features = ["alloc", "std", "aws-lc-rs"] }
+zeroize = "1.8"
+zlib-rs = "0.6"
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside focal's workspace. Its
+# suites, benchmarks and lint wall run in hyper-raft's repository, on all six targets.
+[workspace]

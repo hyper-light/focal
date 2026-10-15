@@ -12,8 +12,6 @@ mod tests;
 #[derive(Debug)]
 pub(super) struct SchemaSet {
     budgets: Vec<NativeVerificationBudget>,
-    workspace: usize,
-    custody: usize,
     // Drop the owned buffer before returning its accounting credit. The Grant
     // container accounts for this struct's inline fields, exactly once.
     _allocation: Allocation,
@@ -55,15 +53,11 @@ impl SchemaSet {
             }
             .into());
         }
-        let mut workspace = 0;
-        let mut custody = 0;
         for schema in declaration.evidence_schemas() {
             let quote = NativeVerificationBudget::for_schema(schema, schemas)?;
             if budgets.len() == budgets.capacity() {
                 return Err(NativeError::Capacity("completion schema buffer"));
             }
-            workspace = workspace.max(quote.peak_bytes());
-            custody = custody.max(quote.retained_bytes());
             budgets.push(quote);
         }
         budgets.sort_unstable_by_key(|quote| quote.schema());
@@ -80,8 +74,6 @@ impl SchemaSet {
         allocation.shrink_to(actual)?;
         Ok(Self {
             budgets,
-            workspace,
-            custody,
             _allocation: allocation,
         })
     }
@@ -101,16 +93,6 @@ impl SchemaSet {
             .ok_or(ContractError::InvalidPolicy)?;
         quote.check_schema(schema, schemas)?;
         Ok(quote)
-    }
-
-    /// Maximum verification peak, including its retained custody token.
-    pub(super) fn workspace_bytes(&self) -> usize {
-        self.workspace
-    }
-
-    /// Maximum custody token retained after verification workspace is released.
-    pub(super) fn custody_bytes(&self) -> usize {
-        self.custody
     }
 
     /// Owned quote buffer and allocator metadata; excludes inline Grant fields.

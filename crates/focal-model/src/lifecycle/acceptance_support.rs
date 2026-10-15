@@ -3,7 +3,7 @@
 use super::*;
 use crate::lifecycle::validation::{EvaluationState, State};
 
-impl AcceptancePolicy {
+impl Acceptance<'_> {
     /// Exact all-definition correspondence, independent of input ordering. The
     /// immutable policy already proves complete slot/check coverage. Matching
     /// every stored declaration one-for-one therefore preserves that coverage
@@ -19,16 +19,16 @@ impl AcceptancePolicy {
         let rows = declarations.into_iter();
         let mut count = 0usize;
         for declaration in rows.clone() {
-            if count == self.declarations.len() {
+            if count == self.body.declarations.len() {
                 return Err(ContractError::InvalidPolicy);
             }
             self.check_declaration(declaration)?;
             count = count.checked_add(1).ok_or(ContractError::Capacity)?;
         }
-        if count != self.declarations.len() {
+        if count != self.body.declarations.len() {
             return Err(ContractError::InvalidPolicy);
         }
-        for required in &self.declarations {
+        for required in &self.body.declarations {
             let mut matching = false;
             for declaration in rows.clone() {
                 if declaration.binding().object == required.binding.object {

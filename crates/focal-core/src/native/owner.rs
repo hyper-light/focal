@@ -4,10 +4,9 @@
 use super::completion_book::{
     CandidateJournal, CompletionBook, GraphMembers, JournalFunding, ReportAdvance,
 };
-use super::completion_envelope::{
-    CompletionEnvelope, EvidenceBounds, ReportParent, descriptor_limits,
-};
+use super::completion_envelope::{CompletionEnvelope, ReportParent, descriptor_limits};
 use super::completion_schemas::SchemaSet;
+use super::pending_index::{self, Chain, PendingIndex};
 use super::*;
 use focal_evidence::{
     BuiltinNativeSchemas, ContentStore, NativeSchemaVerifier, VerifiedNativeArtifact,
@@ -59,26 +58,19 @@ fn completion_contract(
         limits.plan_edges,
     )?;
     let descriptor = descriptor_limits(limits, registered.parent, registered.registry)?;
-    let evidence = EvidenceBounds {
-        workspace_bytes: pins
-            .workspace_bytes()
-            .checked_sub(pins.custody_bytes())
-            .ok_or(NativeError::Capacity("completion verification workspace"))?,
-        retained_bytes: pins.custody_bytes(),
-    };
     let (envelope, members) = if matches!(
         registered.state.target(),
         validation::Target::Artifact { .. }
     ) {
         let (envelope, members) =
-            CompletionEnvelope::derive_work(view, limits, registered, descriptor, evidence)?;
+            CompletionEnvelope::derive_work(view, limits, registered, descriptor)?;
         super::work_authority::check_completion_target(view, registered, &envelope, limits)?;
         (envelope, Some(members))
     } else if matches!(
         registered.state.target(),
         validation::Target::Admission { .. }
     ) {
-        CompletionEnvelope::derive_admission(view, limits, registered, descriptor, evidence)?
+        CompletionEnvelope::derive_admission(view, limits, registered, descriptor)?
     } else {
         (
             CompletionEnvelope::derive(
@@ -88,7 +80,6 @@ fn completion_contract(
                 registered.registry,
                 registered.definition,
                 descriptor,
-                evidence,
             )?,
             None,
         )
@@ -118,14 +109,19 @@ fn build_funded(
             .map(|(prepared, journal)| (prepared, journal, true));
     }
     if let Some(deadline) = fresh.authorize_deadline()? {
+        // A begun evaluation's due timer finishes work already taken: charged as it is written, on
+        // the completion lane.
         let funding = if deadline.begun {
-            JournalFunding::HeldCompletion
+            JournalFunding::External {
+                source,
+                lane: BudgetLane::Completion,
+            }
         } else {
             JournalFunding::External { source, lane }
         };
         let built = if deadline.begun {
             let loan = book.deadline_contract(deadline.key, deadline.binding)?;
-            fresh.build_recorded(loan.source(), None, None, Some(loan.storage()))?
+            fresh.build_recorded(source, None, None, Some(loan.storage()))?
         } else {
             fresh.build_recorded(source, None, None, None)?
         };
@@ -228,7 +224,7 @@ fn build_funded(
                     fresh.input()?.request,
                     artifact.get().ok_or(ContractError::MissingEvidence)?,
                     domain,
-                    loan.source(),
+                    source,
                     schemas,
                     loan.verification(),
                 )?)
@@ -236,7 +232,7 @@ fn build_funded(
                 None
             };
             let built = fresh.build_recorded(
-                loan.source(),
+                source,
                 verified.as_ref().or(evidence),
                 Some(loan.envelope()),
                 None,
@@ -249,11 +245,15 @@ fn build_funded(
                 Some(ReportAdvance {
                     key,
                     before,
-                    usage: parent.completion_use_recorded(prepared)?,
+                    usage: parent
+                        .completion_use_recorded(prepared, publication_source.payloads())?,
                 }),
                 None,
                 built.seals(),
-                JournalFunding::HeldCompletion,
+                JournalFunding::External {
+                    source,
+                    lane: BudgetLane::Completion,
+                },
             )?;
             Ok((
                 built.into_prepared(),
@@ -411,11 +411,20 @@ impl std::fmt::Display for NativeOwnerIntoCoreError {
 impl std::error::Error for NativeOwnerIntoCoreError {}
 
 #[derive(Debug)]
-struct Pending {
+pub(super) struct Pending {
     candidate: NativeCandidate,
     record: record_codec::PendingRecord,
     prepared: NativePrepared,
     journal: CandidateJournal,
+}
+
+impl Pending {
+    pub(super) fn serial(&self) -> u64 {
+        self.candidate.serial
+    }
+    pub(super) fn prepared(&self) -> &NativePrepared {
+        &self.prepared
+    }
 }
 
 /// Owns the Core and every unpublished candidate in exactly one ordered chain.
@@ -427,9 +436,21 @@ struct Pending {
 /// protects bounded RAM/report slots; disk capacity and durable reconstruction
 /// still require the enclosing log/custody owner.
 /// A durable owner must retain it while append/commit status is unresolved.
+/// [`NativeOwner::checkpoint_projection`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointProjection {
+    pub rows: usize,
+    pub bytes: usize,
+}
+
 pub struct NativeOwner {
     // Drop buffers and retained pages before releasing their queue allowance.
     pending: VecDeque<Pending>,
+    /// Every pending candidate's changes by key: what a read during
+    /// preparation finds before the committed rows (doc 30 §9).
+    index: PendingIndex,
+    /// The index's root node, which its candidates' charges do not cover.
+    _index_root: Allocation,
     core: Core<NativeState>,
     book: CompletionBook,
     record_buffers: Option<record_codec::EncodingLimits>,
@@ -437,6 +458,19 @@ pub struct NativeOwner {
     _queue_allocation: Allocation,
     incarnation: OwnerId,
     next_serial: u64,
+    /// What the pending candidates add to a checkpoint, kept as the chain changes: their writes
+    /// and their encoded bytes ([`NativeOwner::checkpoint_projection`]). Summed over the chain at
+    /// each admission, it was a walk of the whole pipeline for every write, quadratic in its depth
+    /// once the depth was the memory's to bound ([`NativeOwner::reserve_pending`]). Bounded by
+    /// what the pending candidates are charged, so a sum never nears `usize::MAX`; it saturates
+    /// rather than wrap, which could only overstate it and refuse admission.
+    pending_rows: usize,
+    pending_bytes: usize,
+    /// The last fresh request of each of a few commands that this owner's
+    /// memory refused, while the headroom stays short of what it needed:
+    /// another like it is refused from its header
+    /// ([`NativeOwner::refuse_when_full`]).
+    shortfalls: [Option<ingress::Shortfall>; ingress::SHORTFALLS],
 }
 impl std::fmt::Debug for NativeOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -494,14 +528,20 @@ impl NativeOwner {
         let resources = (|| {
             super::authored::check_storage(&core)?;
             let (incarnation, pending, allocation) = Self::allocate_queue(&core)?;
+            let index_root = core
+                .state
+                .budget
+                .reserve(
+                    BudgetKind::Pending,
+                    BudgetLane::Ordinary,
+                    pending_index::root_charge(),
+                )?
+                .commit();
             let mut book = CompletionBook::new(&core.state.budget, core.limits)?;
             if let Some(limits) = record_buffers {
                 book = book.with_record_buffers(limits);
             }
-            let view = View {
-                state: &core.state,
-                tail: None,
-            };
+            let view = View::committed(&core.state);
             for entry in core.state.rows.entries() {
                 let Key::Evaluation(key) = entry.key else {
                     continue;
@@ -537,6 +577,11 @@ impl NativeOwner {
                 let Key::Claim(id) = entry.key else {
                     continue;
                 };
+                // A spilled claim waits to be delivered (`OwnedClaim::spill`): it holds no
+                // receipt, so no respondent's work, and is not read back for none (doc 31 M3).
+                if matches!(entry.value, Row::Claim(claim) if claim.logged().is_some()) {
+                    continue;
+                }
                 let claim = view.claim(id).ok_or(ContractError::InvalidTarget)?;
                 let Some((_, credit)) = super::respondent_state::read(&view, claim, core.limits)?
                 else {
@@ -548,12 +593,20 @@ impl NativeOwner {
                     book.install_recovered_respondent(&view, claim, &envelope, verification)?;
                 }
             }
-            book.check_slots(view.meta(), view.prefix(), core.state.rows.len())?;
-            Ok::<_, NativeError>((incarnation, pending, allocation, book))
+            // What is committed may stand anywhere within the bounds.
+            book.check_slots(
+                view.meta(),
+                view.prefix(),
+                core.state.rows.len(),
+                BudgetLane::Completion,
+            )?;
+            Ok::<_, NativeError>((incarnation, pending, allocation, index_root, book))
         })();
         match resources {
-            Ok((incarnation, pending, allocation, book)) => Ok(Self {
+            Ok((incarnation, pending, allocation, index_root, book)) => Ok(Self {
                 pending,
+                index: PendingIndex::default(),
+                _index_root: index_root,
                 core,
                 book,
                 record_buffers,
@@ -561,6 +614,9 @@ impl NativeOwner {
                 _queue_allocation: allocation,
                 incarnation,
                 next_serial: 0,
+                pending_rows: 0,
+                pending_bytes: 0,
+                shortfalls: [None; ingress::SHORTFALLS],
             }),
             Err(error) => Err(NativeOwnerInitError {
                 error: error.into(),
@@ -589,6 +645,79 @@ impl NativeOwner {
 
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Room for one more pending candidate: a full queue doubles its capacity, the growth charged
+    /// to the core's budget before it is allocated. The candidates a leader holds in flight are as
+    /// many as its memory funds, never a count picked for them: a queue fixed at
+    /// `NativeLimits::pending` held a session on hyper-durable's shell at 355 writes a second
+    /// against a 55 ms commit, every write past the 32nd in flight refused (Little's law,
+    /// 2026-10-12). That limit remains the committed headroom a seal's outcome is checked
+    /// against, which every replica replays alike; the depth of one leader's pipeline is its own.
+    pub(super) fn reserve_pending(&mut self) -> Result<(), NativeError> {
+        self.reserve_pending_on(BudgetLane::Ordinary)
+    }
+    /// [`Self::reserve_pending`] with the growth charged to `lane`.
+    fn reserve_pending_on(&mut self, lane: BudgetLane) -> Result<(), NativeError> {
+        if self.pending.len() < self.pending.capacity() {
+            return Ok(());
+        }
+        let wanted = self
+            .pending
+            .capacity()
+            .max(1)
+            .checked_mul(2)
+            .ok_or(MemoryError::CounterExhausted("native candidate queue"))?;
+        let bytes = prepare::array::<Pending>(wanted)?;
+        let reservation = self
+            .core
+            .state
+            .budget
+            .reserve(BudgetKind::Pending, lane, bytes)?;
+        self.pending
+            .try_reserve_exact(wanted.saturating_sub(self.pending.len()))
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        // Allocator rounding cannot silently widen the charge.
+        prepare::within(prepare::array::<Pending>(self.pending.capacity())?, bytes)?;
+        self._queue_allocation = reservation.commit();
+        Ok(())
+    }
+
+    /// Gives back what a burst grew the chain to once it has drained to a quarter of it: the chain
+    /// moves into a buffer half as large, never below the committed headroom it began at, and its
+    /// charge shrinks to match. Kept grown, every session that once ran deep would hold that
+    /// memory from its rows for good. A buffer the allocator cannot give leaves the chain as it
+    /// is, and a charge that cannot shrink stays as it was, more than the chain holds: neither
+    /// is a failure of the publication that drained the chain.
+    fn shrink_pending(&mut self) {
+        let capacity = self.pending.capacity();
+        let floor = self.core.limits.pending;
+        if capacity <= floor || self.pending.len() > capacity / 4 {
+            return;
+        }
+        let wanted = (capacity / 2).max(floor);
+        let mut smaller = VecDeque::new();
+        if smaller.try_reserve_exact(wanted).is_err() {
+            return;
+        }
+        // Within the reserved capacity: no reallocation.
+        smaller.extend(self.pending.drain(..));
+        self.pending = smaller;
+        if let Ok(bytes) = prepare::array::<Pending>(self.pending.capacity()) {
+            let _ = self._queue_allocation.shrink_to(bytes);
+        }
+    }
+
+    /// Adds `prepared` to what the pending candidates add to a checkpoint.
+    fn count_pending(&mut self, prepared: &NativePrepared) {
+        self.pending_rows = self.pending_rows.saturating_add(prepared.mutation_count());
+        self.pending_bytes = self.pending_bytes.saturating_add(prepared.encoded_added);
+    }
+
+    /// Takes `prepared` from what the pending candidates add to a checkpoint.
+    fn uncount_pending(&mut self, prepared: &NativePrepared) {
+        self.pending_rows = self.pending_rows.saturating_sub(prepared.mutation_count());
+        self.pending_bytes = self.pending_bytes.saturating_sub(prepared.encoded_added);
     }
 
     pub fn oldest(&self) -> Option<NativeCandidate> {
@@ -660,6 +789,178 @@ impl NativeOwner {
         )
     }
 
+    /// Prepare the retirement of the families `offers` name (doc 31 M2): planned
+    /// ([`Self::plan_retirement`]) and its first candidate staged
+    /// ([`Self::stage_retirement`]); every family past it is deferred. What a caller that
+    /// stages one candidate at a time uses; a session stages them all while it has room.
+    pub fn prepare_retirement(
+        &mut self,
+        offers: &[retirement_batch::RetireOffer],
+        cold: Option<record_codec::EncodingLimits>,
+    ) -> Result<(retirement_batch::RetireBatch, Option<NativeStaging>), NativeOwnerError> {
+        let mut batch = self.plan_retirement(offers, cold)?;
+        let staged = self.stage_retirement(&batch, 0)?;
+        batch.keep(usize::from(staged.is_some()))?;
+        Ok((batch, staged))
+    }
+
+    /// Plan the retirement of the families `offers` name (doc 31 M2) on the chain as it stands:
+    /// each derived once, a family a pending candidate touches deferred and a refused one saying
+    /// why, the rest packed into candidates each within the store's bound on a batch's changes.
+    /// Nothing is staged; [`Self::stage_retirement`] stages each candidate in turn, ordered with
+    /// every write before and after it, so nothing waits for it and it waits for nothing. Its
+    /// record carries its families' roots and bundles, and every replica derives the rest.
+    ///
+    /// Under `cold` (doc 31 M2, A2), each candidate's record is a cold one: each family's bundle
+    /// is its frame at its candidate's sequence (the chain's next for the first), encoded under
+    /// those bounds, by its digest and length.
+    pub fn plan_retirement(
+        &mut self,
+        offers: &[retirement_batch::RetireOffer],
+        cold: Option<record_codec::EncodingLimits>,
+    ) -> Result<retirement_batch::RetireBatch, NativeOwnerError> {
+        // The first record's own sequence, the chain's next: the prefix its frames claim.
+        let through = self.next_sequence()?;
+        let plan = cold.map(|limits| retirement_batch::ColdPlan { through, limits });
+        Ok(self.core.plan_retirement_batch(
+            offers,
+            Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),
+            plan,
+        )?)
+    }
+
+    /// The sequence the next candidate claims: one past the chain's prefix.
+    fn next_sequence(&self) -> Result<SessionSeq, NativeOwnerError> {
+        Ok(View::over(
+            &self.core.state,
+            Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),
+        )
+        .prefix()
+        .0
+        .checked_add(1)
+        .map(SessionSeq)
+        .ok_or(NativeError::Capacity("native prefix"))?)
+    }
+
+    /// Stage candidate `index` of `batch` ([`Self::plan_retirement`]) as the next candidate:
+    /// none when it holds no family. A cold candidate is staged only at the sequence its frames
+    /// were quoted at, the plan's candidates one after another with nothing between them.
+    pub fn stage_retirement(
+        &mut self,
+        batch: &retirement_batch::RetireBatch,
+        index: usize,
+    ) -> Result<Option<NativeStaging>, NativeOwnerError> {
+        let Some(families) = batch
+            .candidate(index)
+            .filter(|families| !families.is_empty())
+        else {
+            return Ok(None);
+        };
+        // A retirement gives back more than it takes once it applies: it is finishing work, staged
+        // on the completion lane fresh writes cannot take, its room in the chain as well. Staged
+        // on the ordinary lane, a session its writes had filled refused the candidates that would
+        // have emptied it (1.4 to 2.9 MB of pages each, beside writes of a few kilobytes; a
+        // 1 GiB session's walks failed hundreds of times a minute).
+        let room = self.reserve_pending_on(BudgetLane::Completion).is_ok();
+        if let Some(through) = batch.through {
+            let quoted = u64::try_from(index)
+                .ok()
+                .and_then(|index| through.0.checked_add(index))
+                .ok_or(NativeError::Capacity("native prefix"))?;
+            if self.next_sequence()?.0 != quoted {
+                return Err(NativeError::Capacity(
+                    "a cold retirement staged at another sequence than its frames claim",
+                )
+                .into());
+            }
+        }
+        if self.faulted {
+            return Err(NativeError::Capacity("completion owner requires reconstruction").into());
+        }
+        if let Err(error) = self.book.check_health() {
+            self.faulted = true;
+            return Err(error.into());
+        }
+        let serial = self
+            .next_serial
+            .checked_add(1)
+            .ok_or(MemoryError::CounterExhausted("native candidate serial"))?;
+        if !room {
+            return Err(NativeError::Capacity("pending candidates").into());
+        }
+        let lane = BudgetLane::Completion;
+        let source = View::over(
+            &self.core.state,
+            Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),
+        );
+        let prepared = self.core.prepare_retirement_batch(
+            &source,
+            families,
+            if batch.through.is_some() {
+                retirement_batch::RETIRE_COLD
+            } else {
+                retirement_batch::RETIRE_CUSTODY
+            },
+            &self.core.state.budget,
+            lane,
+        )?;
+        let journal = self.book.apply_prepared(
+            &source,
+            &prepared,
+            None,
+            None,
+            &[],
+            JournalFunding::External {
+                source: &self.core.state.budget,
+                lane,
+            },
+        )?;
+        let journal = CandidateJournal::single(journal);
+        let checked = source.with_own(&prepared).and_then(|view| {
+            self.book
+                .check_slots(view.meta(), view.prefix(), prepared.fragments.len(), lane)
+                .and_then(|()| self.book.check_serial(serial))
+                .and_then(|()| self.book.check_parents(&view, &prepared))
+                .and_then(|()| self.book.check_graph_growth(&view, &prepared))
+        });
+        let record = match checked {
+            Ok(()) => record_codec::PendingRecord::reserve(
+                &prepared,
+                &self.core.state.budget,
+                lane,
+                self.record_buffers,
+                self.core.state.payloads(),
+            ),
+            Err(error) => Err(error.into()),
+        };
+        let record = match record {
+            Ok(record) => record,
+            Err(error) => {
+                drop(prepared);
+                if let Err(rollback) = self.book.rollback_candidate(journal) {
+                    self.faulted = true;
+                    return Err(rollback.into());
+                }
+                return Err(error);
+            }
+        };
+        let candidate = NativeCandidate {
+            owner: self.incarnation,
+            serial,
+        };
+        let outcome = prepared.outcome();
+        self.index.add(serial, &prepared.fragments);
+        self.count_pending(&prepared);
+        self.pending.push_back(Pending {
+            candidate,
+            record,
+            prepared,
+            journal,
+        });
+        self.next_serial = serial;
+        Ok(Some(NativeStaging::Prepared { candidate, outcome }))
+    }
+
     /// Check participant authority and the exact pending attempt before touching
     /// evidence storage. Verification and native construction use the same held
     /// owner capacity. Focal verifies submitted evidence; it does not run the
@@ -699,7 +1000,12 @@ impl NativeOwner {
         custody: Option<(&mut ContentStore, ContentDomainId)>,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
-        let pending = self.pending.iter().map(|row| &row.prepared);
+        // What earlier operations read back is theirs alone (doc 31 M3).
+        self.core.state.reads.release();
+        // Room for the candidate, made before its chain is borrowed: a retry is answered whatever
+        // the memory says, a fresh request is refused only where no room could be funded.
+        let room = self.reserve_pending().is_ok();
+        let pending = Some(Chain::indexed(&self.index, &self.pending, u64::MAX));
         let preparation = match input {
             OwnerInput::Request(context, input) => {
                 self.core.check_native_chain(context, input, pending)?
@@ -715,6 +1021,9 @@ impl NativeOwner {
                 .core
                 .check_monitor_deadline_chain(input, logical_time, pending)?,
         };
+        // A spilled row its checks could not take back was lent as it is stored: they stand only
+        // where none failed (doc 31 M3).
+        self.core.state.reads.failure()?;
         match preparation {
             prepare::Checked::Existing { outcome, committed } => {
                 let candidate = if committed {
@@ -744,18 +1053,16 @@ impl NativeOwner {
                     .next_serial
                     .checked_add(1)
                     .ok_or(MemoryError::CounterExhausted("native candidate serial"))?;
-                if self.pending.len() >= self.core.limits.pending
-                    || self.pending.len() == self.pending.capacity()
-                {
+                if !room {
                     return Err(NativeError::Capacity("pending candidates").into());
                 }
                 let lane = fresh.lane();
                 let (prepared, journal, held_record) =
                     build_funded(fresh, &mut self.book, evidence, custody, schemas)?;
-                let source = View {
-                    state: &self.core.state,
-                    tail: self.pending.back().map(|row| &row.prepared),
-                };
+                let source = View::over(
+                    &self.core.state,
+                    Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),
+                );
                 let (prepared, journal) = respondent::attach(
                     &source,
                     prepared,
@@ -764,16 +1071,14 @@ impl NativeOwner {
                     self.core.limits,
                     schemas,
                 )?;
-                let view = View {
-                    state: &self.core.state,
-                    tail: Some(&prepared),
-                };
-                let checked = self
-                    .book
-                    .check_slots(view.meta(), view.prefix(), prepared.fragments.len())
-                    .and_then(|()| self.book.check_serial(serial))
-                    .and_then(|()| self.book.check_parents(&view, &prepared))
-                    .and_then(|()| self.book.check_graph_growth(&view, &prepared));
+                let checked = source.with_own(&prepared).and_then(|view| {
+                    self.book
+                        .check_slots(view.meta(), view.prefix(), prepared.fragments.len(), lane)
+                        .and_then(|()| self.book.check_serial(serial))
+                        .and_then(|()| self.book.check_parents(&view, &prepared))
+                        .and_then(|()| self.book.check_graph_growth(&view, &prepared))
+                        .and_then(|()| self.core.state.reads.failure())
+                });
                 if let Err(error) = checked {
                     drop(prepared);
                     if let Err(rollback) = self.book.rollback_candidate(journal) {
@@ -782,20 +1087,18 @@ impl NativeOwner {
                     }
                     return Err(error.into());
                 }
-                let record_source = if held_record {
-                    self.book.source()
-                } else {
-                    &self.core.state.budget
-                };
+                // Completion work's record is charged on the completion lane, every record to the
+                // state's budget: nothing was set aside for it.
                 let record = match record_codec::PendingRecord::reserve(
                     &prepared,
-                    record_source,
+                    &self.core.state.budget,
                     if held_record {
                         BudgetLane::Completion
                     } else {
                         lane
                     },
                     self.record_buffers,
+                    self.core.state.payloads(),
                 ) {
                     Ok(record) => record,
                     Err(error) => {
@@ -812,6 +1115,8 @@ impl NativeOwner {
                     serial,
                 };
                 let outcome = prepared.outcome();
+                self.index.add(serial, &prepared.fragments);
+                self.count_pending(&prepared);
                 self.pending.push_back(Pending {
                     candidate,
                     record,
@@ -841,28 +1146,37 @@ impl NativeOwner {
             .pending
             .pop_front()
             .ok_or(NativeOwnerError::UnknownCandidate)?;
+        // Its changes are about to be the committed rows.
+        self.index
+            .remove_published(head.candidate.serial, &head.prepared.fragments);
+        self.uncount_pending(&head.prepared);
         match self.core.publish_native(head.prepared) {
             Ok(outcome) => {
                 drop(head.record);
+                self.shrink_pending();
                 if let Err(error) = self.book.commit_candidate(head.journal) {
-                    self.faulted = true;
-                    return Err(error.into());
-                }
-                if self.pending.is_empty()
-                    && let Err(error) = self.book.trim_idle()
-                {
                     self.faulted = true;
                     return Err(error.into());
                 }
                 Ok(outcome)
             }
             Err(refused) => {
+                let Some(prepared) = refused.prepared else {
+                    // Refused past its checks: a store is poisoned and the
+                    // candidate is gone. Nothing published can be trusted.
+                    self.faulted = true;
+                    let _ = self.book.rollback_candidate(head.journal);
+                    return Err(refused.error.into());
+                };
                 // pop_front retained this exact slot: restoration cannot grow
                 // the buffer, allocate, change the ticket, or reorder the chain.
+                self.index
+                    .restore_oldest(head.candidate.serial, &prepared.fragments);
+                self.count_pending(&prepared);
                 self.pending.push_front(Pending {
                     candidate: head.candidate,
                     record: head.record,
-                    prepared: refused.prepared,
+                    prepared,
                     journal: head.journal,
                 });
                 Err(refused.error.into())
@@ -883,6 +1197,12 @@ impl NativeOwner {
             .ok_or(NativeOwnerError::UnknownCandidate)?;
         while self.pending.len() > position {
             if let Some(row) = self.pending.pop_back() {
+                let pending = &self.pending;
+                self.index
+                    .remove_discarded(row.candidate.serial, &row.prepared.fragments, |key| {
+                        pending_index::newest_among(pending, key)
+                    });
+                self.uncount_pending(&row.prepared);
                 drop(row.record);
                 drop(row.prepared);
                 if let Err(error) = self.book.rollback_candidate(row.journal) {
@@ -890,12 +1210,6 @@ impl NativeOwner {
                     return Err(error.into());
                 }
             }
-        }
-        if self.pending.is_empty()
-            && let Err(error) = self.book.trim_idle()
-        {
-            self.faulted = true;
-            return Err(error.into());
         }
         Ok(count)
     }
@@ -905,14 +1219,17 @@ impl NativeOwner {
     pub fn discard_all(&mut self) -> usize {
         let count = self.pending.len();
         while let Some(row) = self.pending.pop_back() {
+            let pending = &self.pending;
+            self.index
+                .remove_discarded(row.candidate.serial, &row.prepared.fragments, |key| {
+                    pending_index::newest_among(pending, key)
+                });
+            self.uncount_pending(&row.prepared);
             drop(row.record);
             drop(row.prepared);
             if self.book.rollback_candidate(row.journal).is_err() {
                 self.faulted = true;
             }
-        }
-        if !self.faulted && self.book.trim_idle().is_err() {
-            self.faulted = true;
         }
         count
     }
@@ -921,23 +1238,93 @@ impl NativeOwner {
         if candidate.owner != self.incarnation {
             return Err(NativeOwnerError::WrongOwner);
         }
+        // The chain is in serial order: each candidate takes the next serial at its back, the head
+        // leaves at its front, and a discard takes a suffix. So a candidate is found by halving,
+        // not by a walk, which for the candidate just prepared at the back was the whole chain.
         self.pending
-            .iter()
-            .position(|row| row.candidate == candidate)
+            .binary_search_by_key(&candidate.serial, |row| row.candidate.serial)
+            .ok()
+            .filter(|&at| {
+                self.pending
+                    .get(at)
+                    .is_some_and(|row| row.candidate == candidate)
+            })
             .ok_or(NativeOwnerError::UnknownCandidate)
     }
 
     pub fn committed(&self) -> NativeView<'_> {
-        NativeView(View {
-            state: &self.core.state,
-            tail: None,
-        })
+        NativeView(View::committed(&self.core.state))
     }
 
     /// Borrow the actual committed root for streaming checkpoint encoding.
     /// Pending rows remain isolated; this borrow prevents concurrent mutation.
     pub fn committed_core(&self) -> &Core<NativeState> {
         &self.core
+    }
+
+    /// The payload log the committed core spills to, given back (for a restored core).
+    pub fn detach_payload_log(&mut self) -> Option<Box<dyn super::payloads::PayloadLog>> {
+        self.core.detach_payload_log()
+    }
+    /// Spill to `log` again, given back by a refused restore.
+    pub fn attach_payload_log(&mut self, log: Box<dyn super::payloads::PayloadLog>) {
+        self.core.attach_payload_log(log);
+    }
+    /// Let go of the payload log's sealed segments no committed or pending row references (doc
+    /// 31 M3). How many it let go.
+    pub fn sweep_payloads(&self) -> usize {
+        let Some(log) = self.core.payload_log() else {
+            return 0;
+        };
+        let mut live = std::collections::BTreeSet::new();
+        self.core.live_payload_segments(&mut live);
+        for pending in &self.pending {
+            super::payloads::segments_of(
+                pending
+                    .prepared
+                    .fragments
+                    .changes()
+                    .filter_map(|(_, _, change)| match change {
+                        super::ranges::RowChange::Put(entry) => Some(entry.value),
+                        super::ranges::RowChange::Delete(_) => None,
+                    }),
+                &mut live,
+            );
+        }
+        log.sweep(&live)
+    }
+
+    /// The most a checkpoint of the committed root, with every pending
+    /// candidate published, could take: its rows (the committed rows and
+    /// every pending candidate's writes, each at most one new row) and an
+    /// upper bound of its encoded bytes (a frame header, every row at its
+    /// widest inline encoding, and the rows' heap at the codec's expansion). A session refuses fresh work whose
+    /// projection its checkpoint could not hold, typed at admission, so that
+    /// what it admitted it can always checkpoint (rule 2) instead of failing
+    /// that checkpoint and stopping.
+    pub fn checkpoint_projection(&self) -> Result<CheckpointProjection, NativeOwnerError> {
+        let capacity =
+            |_: ()| NativeOwnerError::Native(NativeError::Capacity("checkpoint projection"));
+        let rows = self
+            .core
+            .state
+            .rows
+            .len()
+            .checked_add(self.pending_rows)
+            .ok_or_else(|| capacity(()))?;
+        // What the committed root encodes to, exactly (its frame and the rows' running total,
+        // `Core::checkpoint_bytes`), and every row a pending candidate puts, whole: what a
+        // candidate replaces or deletes is not taken away, so with every candidate published
+        // the checkpoint is at most this. The bound it replaced inferred the rows' bodies from
+        // the memory their pages are charged and quadrupled it: twenty-two times what a
+        // checkpoint of authored claims encodes to, and admission refused at a twentieth of
+        // what a checkpoint holds.
+        let bytes = self
+            .core
+            .checkpoint_bytes()?
+            .checked_add(self.pending_bytes)
+            .ok_or_else(|| capacity(()))?;
+        Ok(CheckpointProjection { rows, bytes })
     }
 
     /// The range layout the committed rows are held in (25 §4).
@@ -976,6 +1363,28 @@ impl NativeOwner {
         Ok(self.core.rename_native_member(index, id)?)
     }
 
+    /// Which owner this is: a rebuilt one is another.
+    pub fn incarnation(&self) -> OwnerId {
+        self.incarnation
+    }
+
+    /// Apply a committed anchored seal (F12) to the committed rows ([`Core::apply_anchored`]),
+    /// the owner going on over them: what it keeps beside the rows (its completion book, whose
+    /// promises name evaluations and claims and whose counts it reads from the rows as it checks
+    /// them, and its queue, empty here) names nothing a seal takes, so it is the owner a rebuild
+    /// over the sealed rows would make, without the rebuild's two walks of every row. `None`
+    /// where it may not go on (something pending, or the owner unsound): the caller applies the
+    /// seal to the committed rows and rebuilds the owner.
+    pub fn apply_anchored(
+        &mut self,
+        record: super::seal::AnchoredRecord<'_>,
+    ) -> Result<Option<usize>, NativeError> {
+        if !self.pending.is_empty() || self.faulted {
+            return Ok(None);
+        }
+        self.core.apply_anchored(record).map(Some)
+    }
+
     fn check_layout_change(&self) -> Result<(), NativeOwnerError> {
         if !self.pending.is_empty() {
             return Err(NativeOwnerError::PendingCandidates);
@@ -983,6 +1392,40 @@ impl NativeOwner {
         if self.faulted {
             return Err(NativeError::Capacity("completion owner requires reconstruction").into());
         }
+        Ok(())
+    }
+
+    /// Whether one family may retire now (26 §4): nothing pending, the
+    /// owner sound, and the outcome and sequence the retirement publishes
+    /// to spare beyond those the book holds for the reports it promised and
+    /// the one control it keeps for an authority decision — the check every
+    /// fresh candidate passes. [`Core::retirement_family`] checks the bound
+    /// alone; this is the bound less what is promised, so a retirement never
+    /// takes the outcome a live report was admitted against, and the owner
+    /// rebuilt over the retired core admits every report it promised. A
+    /// refusal of the book is `Capacity`, as for a candidate; a faulted
+    /// owner refuses the same way, as it refuses every fresh candidate.
+    pub fn check_retirement(&self) -> Result<(), NativeOwnerError> {
+        self.check_layout_change()?;
+        let view = View::committed(&self.core.state);
+        let mut meta = view.meta();
+        meta.outcomes = meta
+            .outcomes
+            .checked_add(1)
+            .ok_or(NativeError::Capacity("outcomes"))?;
+        let sequence = SessionSeq(
+            view.prefix()
+                .0
+                .checked_add(1)
+                .ok_or(NativeError::Capacity("sequence"))?,
+        );
+        // A retirement makes room: it is not fresh work.
+        self.book.check_slots(
+            meta,
+            sequence,
+            self.core.state.rows.len(),
+            BudgetLane::Completion,
+        )?;
         Ok(())
     }
 
@@ -1023,31 +1466,57 @@ impl NativeOwner {
         limits: record_codec::EncodingLimits,
     ) -> Result<&record_codec::FundedRecord, NativeOwnerError> {
         let position = self.position(candidate)?;
+        let payloads = self.core.state.payloads();
         let pending = self
             .pending
             .get_mut(position)
             .ok_or(NativeOwnerError::UnknownCandidate)?;
-        pending.record.encode(&pending.prepared, limits)
+        pending.record.encode(&pending.prepared, limits, payloads)
+    }
+
+    /// The encoded records of `candidate` and of every candidate after it,
+    /// in chain order: what a flush proposes at once. Refused unless each of
+    /// them was encoded ([`Self::encode_candidate`]).
+    pub fn encoded_from(
+        &self,
+        candidate: NativeCandidate,
+    ) -> Result<impl Iterator<Item = &[u8]> + Clone + '_, NativeOwnerError> {
+        let position = self.position(candidate)?;
+        if self
+            .pending
+            .iter()
+            .skip(position)
+            .any(|row| row.record.encoded().is_none())
+        {
+            return Err(NativeError::Capacity("a candidate's record is not encoded").into());
+        }
+        Ok(self
+            .pending
+            .iter()
+            .skip(position)
+            .filter_map(|row| row.record.encoded().map(record_codec::FundedRecord::bytes)))
     }
 
     /// Includes all unpublished work. These observations are provisional and
     /// must not be returned as durable participant acknowledgments.
     pub fn effective(&self) -> NativeView<'_> {
-        NativeView(View {
-            state: &self.core.state,
-            tail: self.pending.back().map(|row| &row.prepared),
-        })
+        NativeView(View::over(
+            &self.core.state,
+            Some(Chain::indexed(&self.index, &self.pending, u64::MAX)),
+        ))
     }
 
+    /// The state as of `candidate`: the committed rows and every pending
+    /// candidate up to and including it.
     pub fn candidate(
         &self,
         candidate: NativeCandidate,
     ) -> Result<NativeView<'_>, NativeOwnerError> {
-        let prepared = self.prepared_candidate(candidate)?;
-        Ok(NativeView(View {
-            state: &self.core.state,
-            tail: Some(prepared),
-        }))
+        self.position(candidate)?;
+        Ok(NativeView(View::over(
+            &self.core.state,
+            Some(Chain::indexed(&self.index, &self.pending, candidate.serial)),
+        )))
     }
 
     /// Borrow the exact unpublished mutation owned by this ticket. A future
@@ -1175,8 +1644,13 @@ impl<'a> NativeView<'a> {
             _ => None,
         }
     }
-    pub fn recorded(&self, invocation: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
-        as_outcome(self.0.get(Key::Outcome(invocation.into())))
+    /// The outcome recorded for `invocation`, a spilled one read back: one that cannot be read
+    /// is an error, never taken for none.
+    pub fn recorded(
+        &self,
+        invocation: impl Into<NativeInvocation>,
+    ) -> Result<Option<NativeOutcome>, NativeError> {
+        self.0.outcome(invocation.into())
     }
     pub fn definition(&self, id: ValidationId) -> Option<&'a validation::Declaration> {
         as_definition(self.0.get(Key::Definition(id)))
@@ -1231,7 +1705,7 @@ impl<'a> NativeView<'a> {
     }
     pub fn event(&self, sequence: SessionSeq, ordinal: u32) -> Option<NativeEvent> {
         match self.0.get(Key::Event(sequence, ordinal)) {
-            Some(Row::Event(event)) => event.get().map(|row| row.expand(self.0.ledger())),
+            Some(Row::Event(event)) => event.get(self.0.ledger(), self.0.payloads()),
             _ => None,
         }
     }

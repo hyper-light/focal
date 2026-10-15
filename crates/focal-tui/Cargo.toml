@@ -1,0 +1,16 @@
+[package]
+name = "focal-tui"
+description = "focal on a terminal: hyperlight's colours and motion, focal's mark and its lenses, drawn in place"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+terminal_size = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "termios"] }
+
+[lints]
+workspace = true

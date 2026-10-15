@@ -255,6 +255,7 @@ fn staging_crash_boundaries_reopen_only_the_durable_prefix_and_never_regenerate_
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn prefix_bitrot_missing_state_and_external_links_fail_closed() {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -306,6 +307,7 @@ fn prefix_bitrot_missing_state_and_external_links_fail_closed() {
         Err(TransferError::Permissions)
     ));
 }
+#[cfg(unix)]
 fn begin_result(path: &Path, bytes: &[u8]) -> Result<UploadJournal, TransferError> {
     UploadJournal::begin(
         path,
@@ -536,8 +538,14 @@ impl ClientTransport for Downloads {
         })
     }
 }
-#[tokio::test]
-async fn client_retrieves_all_verified_chunks_and_caps_aggregate_before_network() {
+#[test]
+fn client_retrieves_all_verified_chunks_and_caps_aggregate_before_network() {
+    focal_rt::block_on(
+        client_retrieves_all_verified_chunks_and_caps_aggregate_before_network_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn client_retrieves_all_verified_chunks_and_caps_aggregate_before_network_on_a_shard() {
     let root = tempfile::tempdir().unwrap();
     let mut store = content(root.path());
     let bytes = vec![9; 70_001];
@@ -593,6 +601,7 @@ async fn client_retrieves_all_verified_chunks_and_caps_aggregate_before_network(
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn immutable_attachment_binding_and_external_bootstrap_survive_restart_and_reject_loss() {
     use std::os::unix::fs::PermissionsExt;
@@ -641,7 +650,9 @@ impl ClientTransport for SlowDownload {
     ) -> TransportFuture<'a> {
         Box::pin(async move {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            hyper_rt::futures::sleep(crate::time::nanos(std::time::Duration::from_millis(25)))
+                .await
+                .unwrap();
             let Operation::Download {
                 content, offset, ..
             } = &request.operation
@@ -688,8 +699,11 @@ fn tiny_download() -> (RequestEnvelope, ArtifactPayload) {
         ArtifactPayload::Content(reference),
     )
 }
-#[tokio::test]
-async fn complete_retrieval_deadline_covers_all_chunks() {
+#[test]
+fn complete_retrieval_deadline_covers_all_chunks() {
+    focal_rt::block_on(complete_retrieval_deadline_covers_all_chunks_on_a_shard()).unwrap();
+}
+async fn complete_retrieval_deadline_covers_all_chunks_on_a_shard() {
     let transport = SlowDownload(std::sync::atomic::AtomicUsize::new(0));
     let client = Client::new(
         &transport,
@@ -720,13 +734,7 @@ fn retrieval_without_runtime_or_time_driver_returns_typed_failure() {
     )
     .unwrap();
     let (request, payload) = tiny_download();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    assert!(matches!(
-        runtime.block_on(client.payload_bytes(request.clone(), &payload, 3)),
-        Err(TransferError::Client(ClientError::Transport))
-    ));
+    // Off a shard, where no deadline could be kept: refused, typed.
     let future = client.payload_bytes(request, &payload, 3);
     let mut future = std::pin::pin!(future);
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());

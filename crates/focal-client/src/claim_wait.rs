@@ -117,7 +117,7 @@ impl<T: ClientTransport> Client<T> {
         {
             return Err(ClaimWaitError::InvalidRequest);
         }
-        // Contain a missing Tokio time driver without leaking an in-flight read.
+        // Contain a dependency's panic without leaking an in-flight read.
         let future = self.wait_inner(request, until, timeout.min(self.retry_timeout()));
         let mut future = pin!(future);
         poll_fn(
@@ -135,13 +135,13 @@ impl<T: ClientTransport> Client<T> {
         until: ClaimWaitUntil,
         timeout: Duration,
     ) -> Result<ClaimWaitResult, ClaimWaitError> {
-        let deadline = tokio::time::Instant::now()
+        let deadline = crate::time::Instant::now()
             .checked_add(timeout)
             .ok_or(ClaimWaitError::InvalidRequest)?;
         let seed = request.request_id;
         let mut latest: Option<ClaimWaitResult> = None;
         for probe in 0u32..31 {
-            if tokio::time::Instant::now() >= deadline {
+            if crate::time::Instant::now() >= deadline {
                 break;
             }
             if probe > 0 {
@@ -163,9 +163,11 @@ impl<T: ClientTransport> Client<T> {
                 }
             }
             let page =
-                match tokio::time::timeout_at(deadline, self.claim_get(request.clone())).await {
-                    Ok(result) => result?,
-                    Err(_) => break,
+                match crate::time::within(deadline.remaining(), self.claim_get(request.clone()))
+                    .await?
+                {
+                    Some(result) => result?,
+                    None => break,
                 };
             let Some(ReadObject::Claim { id, value }) = page.objects.into_iter().next() else {
                 return Err(ClientError::InvalidResponse.into());
@@ -219,10 +221,10 @@ impl<T: ClientTransport> Client<T> {
             latest = Some(result);
             // The response and full immutable claim are released before sleeping.
             drop(value);
-            let next = tokio::time::Instant::now()
+            let next = crate::time::Instant::now()
                 .checked_add(Duration::from_secs(1))
                 .ok_or(ClaimWaitError::InvalidRequest)?;
-            tokio::time::sleep_until(next.min(deadline)).await;
+            crate::time::sleep(next.min(deadline).remaining()).await?;
         }
         latest.ok_or_else(|| ClientError::Transport.into())
     }

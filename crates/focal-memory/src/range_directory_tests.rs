@@ -597,3 +597,147 @@ fn every_multi_level_directory_allocation_failure_preserves_base_pin_and_all_cha
     drop(store);
     assert_eq!(budget.stats().used, 0);
 }
+impl crate::RangeKey for CountedKey<'_> {}
+
+/// A key whose order prefix is its high bits alone: 256 keys share each
+/// prefix, so most directory comparisons tie on the prefix and fall to the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Coarse(u32);
+impl crate::RangeKey for Coarse {
+    fn order_prefix(&self) -> u128 {
+        u128::from(self.0 >> 8)
+    }
+}
+
+/// The cached prefixes decide a search only where they differ: every key a
+/// store holds across many pages, inserted out of order and in batches, is
+/// found where it is, and none it does not hold is found, against the
+/// store's whole-key order.
+#[test]
+fn a_search_by_cached_prefix_finds_exactly_what_the_whole_key_order_holds() {
+    let budget = budget();
+    let mut store = RangeStore::new(RangeId(803), 0, config(4), budget.clone()).unwrap();
+    // Even keys, scattered: a multiplicative step visits every residue.
+    let keys: Vec<u32> = (0..3000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) % 6000) * 2)
+        .collect();
+    let mut prefix = 0;
+    for batch in keys.chunks(250) {
+        let mut sorted: Vec<u32> = batch.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        prefix += 1;
+        store
+            .apply_batch(
+                prefix,
+                sorted
+                    .iter()
+                    .filter(|k| store.get(&Coarse(**k)).is_none())
+                    .map(|k| Change::Put(Entry::new(Coarse(*k), u64::from(*k), 0)))
+                    .collect(),
+                ORDINARY,
+            )
+            .unwrap();
+    }
+    assert!(store.root.pages.check_shape());
+    let held: std::collections::BTreeSet<u32> = keys.iter().copied().collect();
+    for k in 0..12_002u32 {
+        // One descent by key finds the page the rank names, ties included.
+        let pages = &store.root.pages;
+        let by_rank = pages.get(pages.page_index(&Coarse(k)));
+        let by_key = pages.page_of(&Coarse(k));
+        assert!(
+            matches!((by_rank, by_key), (Some(a), Some(b)) if Arc::ptr_eq(a, b)),
+            "key {k}"
+        );
+        let found = store.get(&Coarse(k)).copied();
+        if held.contains(&k) {
+            assert_eq!(found, Some(u64::from(k)), "key {k}");
+        } else {
+            assert_eq!(found, None, "key {k}");
+        }
+    }
+    let ordered: Vec<u32> = store.entries().map(|entry| entry.key.0).collect();
+    assert_eq!(ordered, held.iter().copied().collect::<Vec<_>>());
+}
+
+/// A plan finds each changed key in the page whose span holds it, its group's
+/// page: a deletion of a key the store does not hold is refused wherever the
+/// key falls (before the first page, between two entries of a page, between
+/// two pages, past the last), alone or among changes in other groups, and a
+/// batch's new length counts the keys it adds and not those it replaces.
+#[test]
+fn a_plan_finds_each_changed_key_in_its_groups_page() {
+    let budget = budget();
+    // Keys 4, 8, 12 and on, two to a page: [4, 8], [12, 16] and on.
+    let store = seed(&budget, 2049, 2);
+    assert!(store.root.pages.height() >= 3);
+    let before = budget.stats();
+    for absent in [
+        0,
+        1,
+        key(0) + 1,
+        key(1) + 2,
+        key(700) + 1,
+        key(2048) + 4,
+        u64::MAX,
+    ] {
+        let alone = store.plan_batch(
+            store.prefix() + 1,
+            vec![Change::Delete(absent)],
+            ORDINARY,
+            usize::MAX,
+        );
+        assert!(
+            matches!(alone, Err(MemoryError::MissingKey)),
+            "key {absent}"
+        );
+        let among = store.plan_batch(
+            store.prefix() + 1,
+            vec![
+                Change::Delete(key(5)),
+                Change::Delete(absent),
+                Change::Put(Entry::new(key(9) + 1, 1, 0)),
+                Change::Put(Entry::new(key(1200), 2, 0)),
+            ],
+            ORDINARY,
+            usize::MAX,
+        );
+        assert!(
+            matches!(among, Err(MemoryError::MissingKey)),
+            "key {absent} among others"
+        );
+    }
+    assert_eq!(budget.stats(), before);
+    let mut expected = entries(&store.root);
+    let changes = vec![
+        // Three keys added: before the first page, inside a page, past the last.
+        Change::Put(Entry::new(1, 11, 0)),
+        Change::Put(Entry::new(key(700) + 1, 12, 0)),
+        Change::Put(Entry::new(key(2048) + 1, 13, 0)),
+        // Two replaced and two deleted.
+        Change::Put(Entry::new(key(3), 14, 0)),
+        Change::Put(Entry::new(key(1500), 15, 0)),
+        Change::Delete(key(10)),
+        Change::Delete(key(2000)),
+    ];
+    for change in &changes {
+        match change {
+            Change::Put(entry) => {
+                expected.insert(entry.key, entry.value);
+            }
+            Change::Delete(key) => {
+                expected.remove(key);
+            }
+        }
+    }
+    let candidate = store
+        .prepare_batch(store.prefix() + 1, changes, ORDINARY)
+        .unwrap();
+    assert_eq!(candidate.root.len, store.len() + 1);
+    assert_eq!(entries(&candidate.root), expected);
+    assert!(candidate.root.pages.check_shape());
+    drop(candidate);
+    drop(store);
+    assert_eq!(budget.stats().used, 0);
+}

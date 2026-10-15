@@ -25,6 +25,9 @@ impl FoundingEnrollmentDraft {
     /// so retries cannot replace a certificate after a lost genesis response.
     /// This constructor has no existing-registry argument: replacing an already
     /// installed genesis is never an enrollment operation supported by this API.
+    /// `level` is the founding binary's capability level, the fence the
+    /// cluster holds from genesis (24 §21); zero founds without one.
+    #[allow(clippy::too_many_arguments)] // One founding: the place, the authority, the key, the identity, the policy, the level and the moment, each its own fact.
     pub fn open_or_create(
         path: impl AsRef<Path>,
         authority: &BootstrapAuthority,
@@ -32,6 +35,7 @@ impl FoundingEnrollmentDraft {
         node: u64,
         principal: [u8; 16],
         limits: EnrollmentLimits,
+        level: u32,
         now: i64,
     ) -> Result<Self, EnrollmentError> {
         if node == 0 || principal == [0; 16] || key.cluster() != authority.cluster() {
@@ -49,8 +53,9 @@ impl FoundingEnrollmentDraft {
                 (registry, saved.receipt)
             }
             None => {
-                let (registry, receipt) =
-                    EnrollmentRegistry::founding(authority, key, node, principal, limits, now)?;
+                let (registry, receipt) = EnrollmentRegistry::founding(
+                    authority, key, node, principal, limits, level, now,
+                )?;
                 let saved = SavedFounder {
                     schema: 1,
                     registry: registry.checkpoint()?,
@@ -63,6 +68,23 @@ impl FoundingEnrollmentDraft {
         if registry.ca_certificate() != authority.ca_certificate() {
             return Err(EnrollmentError::WrongCluster);
         }
+        let key_hash = crate::pki::csr_key_hash(key.csr())?;
+        let csr_hash = hash("focal.enrollment.csr.v1", key.csr());
+        let bound_to_key = receipt.request == key.request_id()
+            && receipt.public_key == key_hash
+            && receipt.csr_hash == csr_hash;
+        // The founder's key may have rotated since genesis (24 §11): the
+        // directory then holds a later receipt of the genesis identity,
+        // issued for the key it holds now. The committed registry, never
+        // this draft, authorizes what the founder presents.
+        let carried_to_key = !bound_to_key
+            && key.enrollment()?.is_some_and(|held| {
+                held.identity == receipt.identity
+                    && held.revision > receipt.revision
+                    && held.request == key.request_id()
+                    && held.public_key == key_hash
+                    && held.csr_hash == csr_hash
+            });
         if registry.revision() != 1
             || registry.applied_index() != 0
             || registry.enrollments().count() != 1
@@ -71,13 +93,11 @@ impl FoundingEnrollmentDraft {
             || receipt.identity.role != EnrollmentRole::Node
             || receipt.identity.node_id != Some(node)
             || receipt.identity.principal != principal
-            || receipt.request != key.request_id()
-            || receipt.public_key != crate::pki::csr_key_hash(key.csr())?
-            || receipt.csr_hash != hash("focal.enrollment.csr.v1", key.csr())
+            || !(bound_to_key || carried_to_key)
         {
             return Err(EnrollmentError::Conflict);
         }
-        crate::pki::verify_issued(&receipt, authority.ca_certificate())?;
+        crate::pki::verify_issued(&receipt, registry.trust_roots())?;
         Ok(Self {
             registry,
             receipt,
@@ -119,6 +139,7 @@ mod tests {
             41,
             [6; 16],
             EnrollmentLimits::default(),
+            0,
             now(),
         )
         .unwrap();
@@ -141,6 +162,7 @@ mod tests {
             41,
             [6; 16],
             EnrollmentLimits::default(),
+            0,
             now() + 1,
         )
         .unwrap();
@@ -151,7 +173,7 @@ mod tests {
         assert_eq!(restored.enrollments().next(), Some(&receipt));
         // The owner may complete local key custody only after installing genesis.
         let material = key
-            .complete(&receipt, authority.ca_certificate(), now())
+            .complete(&receipt, authority.issuers().unwrap().trusted(), now())
             .unwrap();
         assert_eq!(
             material.certificate_chain().first(),
@@ -166,6 +188,7 @@ mod tests {
                 42,
                 [6; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::Conflict)
@@ -178,6 +201,7 @@ mod tests {
                 41,
                 [7; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::Conflict)
@@ -191,6 +215,7 @@ mod tests {
                 41,
                 [6; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::Conflict)
@@ -204,6 +229,7 @@ mod tests {
                 41,
                 [6; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::Corrupt)
@@ -228,6 +254,7 @@ mod tests {
                 41,
                 [6; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::WrongCluster)
@@ -241,6 +268,7 @@ mod tests {
                 u64::MAX,
                 [6; 16],
                 EnrollmentLimits::default(),
+                0,
                 now()
             ),
             Err(EnrollmentError::Capacity)

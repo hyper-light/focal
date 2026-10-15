@@ -5,8 +5,8 @@ description: >-
   validator, and record an authenticated programmatic or agentic evaluation.
 ---
 
-Use the connected Focal server and the versions in [the skill manifest](../manifest.json).
-Read [the shared workflow contract](../references/workflow-contract.md) before
+Use the connected Focal server and the versions in Focal's skill manifest (`skills/manifest.json`; over MCP, `skills/list`).
+Read [the shared workflow contract](references/workflow-contract.md) before
 submitting an operation. Discover the actual tool schemas before constructing calls.
 
 ## Establish the exact work being evaluated
@@ -43,7 +43,7 @@ submitting an operation. Discover the actual tool schemas before constructing ca
    lifecycle feature: do not insert a fabricated programmatic Pass to work around
    that restriction. Completion: retain the actual result and supporting output.
 3. Register independently produced proof through `artifact.register`, or use the
-   [evidence skill](../focal-evidence/SKILL.md) when the output belongs to a
+   `focal-evidence` skill when the output belongs to a
    respondent's receipt-fenced evidence set. Retrieve existing evidence using
    `artifact.get`, `artifact.list` or `artifact.download`. Completion: every proof
    reference names a committed artifact ID and descriptor hash; raw payload
@@ -66,7 +66,7 @@ permission to invoke unrelated tools or impersonate another evaluator.
 
 ## On a native ledger
 
-When `ledger.standing` reports the native engine, evaluations are keyed by claim, definition, phase and generation and every report is a fenced attempt; follow the [native branch](../references/workflow-contract.md#native-engine).
+When `ledger.standing` reports the native engine, evaluations are keyed by claim, definition, phase and generation and every report is a fenced attempt; follow the [native branch](references/workflow-contract.md#native-engine).
 
 1. Compose the exact work with `validation.context` (`validation`, optional `phase` `admission`/`increment`/`whole_work`, `slot`, `target`, `generation`, `results_after`, `limit`): the claim, the definition, the selected registration and evaluation (`has_begun`, `attempt_index` counting from zero, `attempt_bound`, `current_attempt`), the manifest with each artifact's custody, accepted results and the delivery result at one prefix. `validation.get` returns the definition and its current evaluations; `validation.list` (`claim`, `evaluator`) and `evaluation.list` (`claim`, `validation`, `evaluator`, `verdict`) select them. Completion: know the target (`Artifact`, `MissingSlot`, `Admission`, `Increment`, `Delivery`) before acting.
 2. As the designated evaluator, begin with `validation.begin` (`claim`, `validation`, `phase`, optional `slot`/`target`) and report with `validation.report` (`claim`, `validation`, `phase`, `verdict` `pass`, `fail`, `incomplete` or `error`, `payload` with the actual proof or diagnostic). The report artifact records the claim, definition, exact target, generation, attempt and verdict. An `error` verdict means you could not run the pinned handler: while the handler's declared `attempts` remain, the evaluation stays open on the next attempt for a further `validation.report`; only the final attempt makes it `Errored`. A missing slot cannot be begun or reported (`not_found`); the issuer's `validation.enter_whole_work` (`claim`, `testament`) assesses it as `ValidationIncomplete` without any manufactured verdict. `validation.seal_increments` (`claim`) closes the increment cohort while the response is open.

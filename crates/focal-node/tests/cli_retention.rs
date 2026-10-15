@@ -49,6 +49,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -190,7 +191,7 @@ fn retired(root: &Path, claim: &str) -> Value {
     }
 }
 fn retention(root: &Path) -> Value {
-    let shown = admin(root, &["cluster", "retention", "show"]);
+    let shown = admin(root, &["inspect", "replicas", "--retention"]);
     assert_eq!(shown["result"]["kind"], "retention", "{shown}");
     shown["result"]["retention"].clone()
 }
@@ -209,7 +210,7 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
@@ -217,9 +218,8 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     admin(
         root,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -231,8 +231,8 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
             client.path(),
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 "alice",
                 "--invite-file",
                 invitation.to_str().unwrap()
@@ -241,7 +241,10 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
         .status
         .success()
     );
-    let alice_standing = admin(client.path(), &["--client-context", "alice", "status"]);
+    let alice_standing = admin(
+        client.path(),
+        &["--client-context", "alice", "inspect", "prefix"],
+    );
     let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
 
     // Two claims: one runs its course and is released, one stays live.
@@ -276,30 +279,32 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     // released only just now and still under the agent's cadence.
     let before = retention(root);
     assert_eq!(before["retired"], 0, "{before}");
-    committed(&cli(root, None, &["claim", "cancel", &a]));
+    committed(&cli(root, None, &["cancel", "claim", &a]));
     // The final status is read before the release: once released, the
     // agent may retire the claim before another read lands.
     let status = first_object(root, &a)["Claim"]["status"].clone();
     assert!(!status.is_null());
-    committed(&cli(root, None, &["claim", "release-scope", &a]));
-    // The agent seals the bundle under custody and commits the record.
+    committed(&cli(root, None, &["release", "scope", &a]));
+    // The agent offers the family and every replica writes its frame to its
+    // own cold stream as the record applies (doc 31 M2, A2).
     let continuation = retired(root, &a);
     assert_eq!(hex_hash(&continuation["claim"]), a);
     assert_eq!(continuation["status"], status);
     assert!(continuation["bytes"].as_u64().unwrap() > 0);
     let through = continuation["through"].as_u64().unwrap();
-    assert!(continuation["retired_at"].as_u64().unwrap() > through);
+    // A cold family's frame claims the retirement's own sequence.
+    assert_eq!(continuation["retired_at"].as_u64().unwrap(), through);
     assert!(continuation["events"].as_u64().unwrap() > 0);
     let bundle = hex_hash(&continuation["bundle"]);
     // The live claim is untouched, and the retired one refuses commands.
     assert!(first_object(root, &b).get("Claim").is_some());
-    let (code, _) = refused(root, &["claim", "cancel", &a]);
+    let (code, _) = refused(root, &["cancel", "claim", &a]);
     assert_ne!(code, 0);
     // The operator sees the count and the verified bundle with its receipt.
     let after = retention(root);
     assert_eq!(after["retired"], 1, "{after}");
     assert_eq!(after["retiring"], false, "{after}");
-    let archive = admin(root, &["cluster", "archive", "show", "--claim", &a]);
+    let archive = admin(root, &["inspect", "archive", "--claim", &a]);
     assert_eq!(archive["result"]["kind"], "archive", "{archive}");
     let shown = &archive["result"]["archive"];
     assert_eq!(shown["claim"], json!(a));
@@ -309,38 +314,39 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     assert_eq!(shown["members"], json!([a]));
     assert!(shown["rows"].as_u64().unwrap() >= 4, "{archive}");
     assert!(!shown["families"].as_array().unwrap().is_empty());
-    let identity = admin(root, &["cluster", "node", "identity"])["result"]["identity"].clone();
-    let node = identity["node"].clone();
-    let tenant_hex = identity["tenant"].as_str().unwrap().to_owned();
-    assert_eq!(shown["receipts"], json!([node]), "{archive}");
+    let identity = admin(root, &["inspect", "node", "--identity"])["result"]["identity"].clone();
+    let _ = identity["node"].clone();
+    // A frame of the cold stream is no custody object: no receipt names it.
+    assert_eq!(shown["receipts"], json!([]), "{archive}");
     // A live claim has no archive.
-    let none = admin(root, &["cluster", "archive", "show", "--claim", &b]);
+    let none = admin(root, &["inspect", "archive", "--claim", &b]);
     assert_eq!(none["result"]["archive"], Value::Null, "{none}");
     // The outcome of the retired claim's creation stays: the exact retry
     // is answered from it.
     let retried = cli(
         root,
         None,
-        &["request", "retry", "--operation-id", &operation],
+        &["retry", "request", "--operation-id", &operation],
     );
     assert_eq!(retried["condition"], "Committed", "{retried}");
     assert_eq!(retried["result"]["created"], created_outcome["created"]);
-    // A corrupted bundle is detected: its digest no longer verifies, the
+    // A corrupted frame is detected: its digest no longer verifies, the
     // continuation still names it, and the operator sees it unverified.
-    let chunk = std::fs::read_dir(root.join("content").join("objects").join(&tenant_hex))
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "chunk"))
-        .unwrap();
+    let chunk = frame_file(&root.join("cold")).expect("the family's frame in the cold stream");
     let original = std::fs::read(&chunk).unwrap();
     let mut tampered = original.clone();
-    tampered[0] ^= 0xff;
+    let at = original
+        .windows(8)
+        .position(|window| window == b"FCNARCHV")
+        .unwrap()
+        + 12;
+    tampered[at] ^= 0xff;
     std::fs::write(&chunk, &tampered).unwrap();
-    let archive = admin(root, &["cluster", "archive", "show", "--claim", &a]);
+    let archive = admin(root, &["inspect", "archive", "--claim", &a]);
     assert_eq!(archive["result"]["archive"]["verified"], false, "{archive}");
     assert_eq!(archive["result"]["archive"]["bundle"], json!(bundle));
     std::fs::write(&chunk, &original).unwrap();
-    let archive = admin(root, &["cluster", "archive", "show", "--claim", &a]);
+    let archive = admin(root, &["inspect", "archive", "--claim", &a]);
     assert_eq!(archive["result"]["archive"]["verified"], true, "{archive}");
     // A kill and restart keep the continuation, the count and the bundle.
     drop(server);
@@ -350,11 +356,34 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     assert!(first_object(root, &b).get("Claim").is_some());
     let restarted = retention(root);
     assert_eq!(restarted["retired"], 1, "{restarted}");
-    let archive = admin(root, &["cluster", "archive", "show", "--claim", &a]);
+    let archive = admin(root, &["inspect", "archive", "--claim", &a]);
     assert_eq!(archive["result"]["archive"]["verified"], true, "{archive}");
     assert_eq!(
         archive["result"]["archive"]["receipts"],
-        json!([node]),
+        json!([]),
         "{archive}"
     );
+}
+
+/// The file under `directory` holding an archive frame (`FCNARCHV`).
+fn frame_file(directory: &Path) -> Option<std::path::PathBuf> {
+    let mut stack = vec![directory.to_path_buf()];
+    // At most a few hundred directories in a test's data directory.
+    for _ in 0..4096 {
+        let directory = stack.pop()?;
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if std::fs::read(&path)
+                .is_ok_and(|bytes| bytes.windows(8).any(|window| window == b"FCNARCHV"))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
 }

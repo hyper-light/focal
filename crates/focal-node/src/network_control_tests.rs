@@ -69,20 +69,46 @@ fn runtime(namespace: LedgerId) -> AuthenticatedPeer {
     })
     .unwrap()
 }
-async fn state(adapter: &NetworkEnrollmentControl<'_>) -> ControlSnapshot {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match adapter.read_state(RequestId::from_u128(7)).await {
-                Ok(state) => return state,
-                Err(error) if retryable(error) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await
+/// The periods the control replicas have run: what a wait for the root is
+/// charged to (27 §3.1 P8).
+fn periods(replicas: &[Running]) -> Vec<u64> {
+    replicas
+        .iter()
+        .map(|replica| replica.host.periods())
+        .collect()
+}
+/// A wait for the root charged to the replicas' own periods: what five
+/// seconds hold at their tick, however long a loaded machine takes to run
+/// them, and a minute of none run at all for a wedged one.
+fn settling(replicas: &[Running]) -> focal_timing::ProgressDeadline {
+    focal_timing::ProgressDeadline::begin(
+        &periods(replicas),
+        focal_timing::ProgressDeadline::periods(
+            Duration::from_secs(5),
+            replicas[0].host.tick_period(),
+        ),
+        Duration::from_secs(60),
+    )
+}
+/// The root's state, read again a period later while the replicated root
+/// answers with a failure the founder retries (`retryable`): a root between
+/// leaders answers as soon as it elects one.
+async fn state(adapter: &NetworkEnrollmentControl<'_>, replicas: &[Running]) -> ControlSnapshot {
+    let mut wait = settling(replicas);
+    loop {
+        match adapter.read_state(RequestId::from_u128(7)).await {
+            Ok(state) => return state,
+            Err(error) if retryable(error) => {
+                if let Err(spent) = wait.check(&periods(replicas)) {
+                    panic!("the root's state was not read: {spent}: {error:?}");
                 }
-                Err(error) => panic!("root state failed: {error:?}"),
+                focal_rt::time::sleep(replicas[0].host.tick_period())
+                    .await
+                    .unwrap();
             }
+            Err(error) => panic!("root state failed: {error:?}"),
         }
-    })
-    .await
-    .unwrap()
+    }
 }
 fn registry(state: &ControlSnapshot) -> EnrollmentRegistry {
     let ControlBootstrap::Root { enrollment, .. } = &state.state else {
@@ -90,13 +116,46 @@ fn registry(state: &ControlSnapshot) -> EnrollmentRegistry {
     };
     EnrollmentRegistry::restore(enrollment, CLUSTER, EnrollmentLimits::default()).unwrap()
 }
+/// A decision asked of the signer once more — the exact request — a period
+/// of the replicas later while the replicated root answers with a failure
+/// the founder retries (`retryable`): an invitation or an admission is
+/// answered from its committed fact on a retry and never made twice, and a
+/// root between leaders decides once it has one. The asking is charged to
+/// the replicas' progress: eight asks 25 ms apart ran out while a loaded
+/// root was still electing (`NotLeader { leader: 0 }`, a peer's run of
+/// three suites at once, 2026-10-03).
+async fn decided<T>(
+    replicas: &[Running],
+    mut call: impl AsyncFnMut() -> Result<T, QuorumEnrollmentError>,
+) -> Result<T, QuorumEnrollmentError> {
+    let mut wait = settling(replicas);
+    loop {
+        match call().await {
+            Err(QuorumEnrollmentError::Control(failure)) if retryable(failure) => {
+                if let Err(spent) = wait.check(&periods(replicas)) {
+                    panic!(
+                        "the signer's decision did not settle: {spent}: {failure:?}; {:?}",
+                        replicas
+                            .iter()
+                            .map(|replica| replica.host.progress())
+                            .collect::<Vec<_>>()
+                    );
+                }
+                focal_rt::time::sleep(replicas[0].host.tick_period())
+                    .await
+                    .unwrap();
+            }
+            other => return other,
+        }
+    }
+}
 struct Running {
     host: ControlHost,
     owner: ControlOwner,
     server: Arc<QuicServer>,
-    serving: tokio::task::JoinHandle<Result<(), WireError>>,
-    pool: Arc<PeerConnectionPool>,
-    sending: tokio::task::JoinHandle<()>,
+    serving: focal_rt::JoinHandle<Result<(), WireError>>,
+    pool: std::rc::Rc<PeerConnectionPool>,
+    sending: focal_rt::JoinHandle<()>,
 }
 
 fn drain_seed_replicas(replicas: &mut [(ControlReplica, MemoryBudget)]) {
@@ -150,27 +209,26 @@ fn pinned_join_request(
     invitation: &Invitation,
     key: &JoinKey,
 ) -> JoinRequest {
+    let mut client_config = invitation.client_config().unwrap();
     let mut client = rustls::ClientConnection::new(
-        Arc::new(invitation.client_config().unwrap()),
+        &mut client_config,
         rustls::pki_types::ServerName::try_from(invitation.trust().server_name.clone()).unwrap(),
     )
     .unwrap();
-    let mut server = rustls::ServerConnection::new(Arc::new(
-        authority.server_identity().server_config().unwrap(),
-    ))
-    .unwrap();
+    let mut server_config = authority.server_identity().server_config().unwrap();
+    let mut server = rustls::ServerConnection::new(&server_config).unwrap();
     for _ in 0..32 {
         if client.wants_write() {
             let mut bytes = Vec::new();
             client.write_tls(&mut bytes).unwrap();
             server.read_tls(&mut std::io::Cursor::new(bytes)).unwrap();
-            server.process_new_packets().unwrap();
+            server.process_new_packets(&mut server_config).unwrap();
         }
         if server.wants_write() {
             let mut bytes = Vec::new();
             server.write_tls(&mut bytes).unwrap();
             client.read_tls(&mut std::io::Cursor::new(bytes)).unwrap();
-            client.process_new_packets().unwrap();
+            client.process_new_packets(&mut client_config).unwrap();
         }
         if !client.is_handshaking() && !server.is_handshaking() {
             return invitation.request_after_tls(&client, key, now()).unwrap();
@@ -179,669 +237,674 @@ fn pinned_join_request(
     panic!("seed enrollment TLS handshake did not finish");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_pin_and_revocation()
-{
-    let disk = tempfile::tempdir().unwrap();
-    let ca_path = disk.path().join("ca");
-    let authority = BootstrapAuthority::open_or_create(
-        &ca_path,
-        CLUSTER,
-        vec!["root.focal.test".into()],
-        now(),
-    )
-    .unwrap();
-    let roots = vec![authority.ca_certificate().to_vec()];
-    let founder = node_identity();
-    let namespace = root_namespace(&founder);
-    let root = RootDirectory::new(
-        focal_directory::ClusterId(CLUSTER),
-        RootConfig::default(),
-        budget(),
-    )
-    .unwrap();
-    let founder_key = JoinKey::open_or_create(disk.path().join("key1"), CLUSTER).unwrap();
-    let draft = FoundingEnrollmentDraft::open_or_create(
-        disk.path().join("draft1"),
-        &authority,
-        &founder_key,
-        founder.node,
-        founder.issuer.0,
-        EnrollmentLimits::default(),
-        now(),
-    )
-    .unwrap();
-    let bootstrap = ControlBootstrap::root(&root, draft.registry()).unwrap();
-    let mut materials = vec![
-        founder_key
-            .complete(draft.receipt(), authority.ca_certificate(), now())
-            .unwrap(),
-    ];
-    let mut receipts = vec![draft.receipt().clone()];
-    let group = root_group(CLUSTER);
-    let identity = bootstrap
-        .identity(&ControlOptions::new(NodeConfig::single(1, CLUSTER, group)))
-        .unwrap();
-    let genesis = NetworkGenesis {
-        founder,
-        root: identity,
-        root_namespace: namespace,
-        bootstrap: bootstrap.clone(),
-    };
-    let pin = FounderControlAuthority::from_genesis(&genesis).unwrap();
-    // Keep immutable genesis pinned to the one founder, then commit every
-    // additional peer enrollment in the same actual three-voter root log.
-    // The trusted setup pump is replaced by authenticated TLS below; transport
-    // grants never substitute for these shared durable registry decisions.
-    let mut seeded = Vec::new();
-    for node in 1..=3 {
-        let allowance = budget();
-        let replica = ControlReplica::open(
-            ControlOptions::new(NodeConfig::joining(
-                node,
-                CLUSTER,
-                group,
-                vec![1, 2, 3],
-                vec![],
-            )),
-            bootstrap.clone(),
-            allowance.clone(),
-            disk.path().join(format!("wal{node}")),
+#[test]
+fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_pin_and_revocation() {
+    focal_rt::block_on(async move {
+        let disk = tempfile::tempdir().unwrap();
+        let ca_path = disk.path().join("ca");
+        let authority = BootstrapAuthority::open_or_create(
+            &ca_path,
+            CLUSTER,
+            vec!["root.focal.test".into()],
+            now(),
         )
         .unwrap();
-        seeded.push((replica, allowance));
-    }
-    seeded[0].0.campaign().unwrap();
-    drain_seed_replicas(&mut seeded);
-    for node in 2..=3u64 {
-        let key = JoinKey::open_or_create(disk.path().join(format!("key{node}")), CLUSTER).unwrap();
-        let draft = seeded[0]
+        let roots = vec![authority.ca_certificate().to_vec()];
+        let founder = node_identity();
+        let namespace = root_namespace(&founder);
+        let root = RootDirectory::new(
+            focal_directory::ClusterId(CLUSTER),
+            RootConfig::default(),
+            budget(),
+        )
+        .unwrap();
+        let founder_key = JoinKey::open_or_create(disk.path().join("key1"), CLUSTER).unwrap();
+        let draft = FoundingEnrollmentDraft::open_or_create(
+            disk.path().join("draft1"),
+            &authority,
+            &founder_key,
+            founder.node,
+            founder.issuer.0,
+            EnrollmentLimits::default(),
+            0,
+            now(),
+        )
+        .unwrap();
+        let bootstrap = ControlBootstrap::root(&root, draft.registry()).unwrap();
+        let mut materials = vec![
+            founder_key
+                .complete(
+                    draft.receipt(),
+                    authority.issuers().unwrap().trusted(),
+                    now(),
+                )
+                .unwrap(),
+        ];
+        let mut receipts = vec![draft.receipt().clone()];
+        let group = root_group(CLUSTER);
+        let identity = bootstrap
+            .identity(&ControlOptions::new(NodeConfig::single(1, CLUSTER, group)))
+            .unwrap();
+        let genesis = NetworkGenesis {
+            founder,
+            root: identity,
+            root_namespace: namespace,
+            bootstrap: bootstrap.clone(),
+        };
+        let pin = FounderControlAuthority::from_genesis(&genesis).unwrap();
+        // Keep immutable genesis pinned to the one founder, then commit every
+        // additional peer enrollment in the same actual three-voter root log.
+        // The trusted setup pump is replaced by authenticated TLS below; transport
+        // grants never substitute for these shared durable registry decisions.
+        let mut seeded = Vec::new();
+        for node in 1..=3 {
+            let allowance = budget();
+            let replica = ControlReplica::open(
+                ControlOptions::new(NodeConfig::joining(
+                    node,
+                    CLUSTER,
+                    group,
+                    vec![1, 2, 3],
+                    vec![],
+                )),
+                bootstrap.clone(),
+                allowance.clone(),
+                disk.path().join(format!("wal{node}")),
+            )
+            .unwrap();
+            seeded.push((replica, allowance));
+        }
+        seeded[0].0.campaign().unwrap();
+        drain_seed_replicas(&mut seeded);
+        for node in 2..=3u64 {
+            let key =
+                JoinKey::open_or_create(disk.path().join(format!("key{node}")), CLUSTER).unwrap();
+            let draft = seeded[0]
+                .0
+                .enrollment()
+                .unwrap()
+                .prepare_invitation(
+                    &authority,
+                    InviteOptions {
+                        endpoint: "127.0.0.1:7443".into(),
+                        server_name: "root.focal.test".into(),
+                        role: EnrollmentRole::Node,
+                        expires_at: now() + 600,
+                    },
+                    now(),
+                )
+                .unwrap();
+            commit_seed_enrollment(&mut seeded, (node - 2) * 2 + 1, draft.command().clone());
+            let invitation = draft.release(seeded[0].0.enrollment().unwrap()).unwrap();
+            let request = pinned_join_request(&authority, &invitation, &key);
+            let JoinPreparation::Commit(command) = seeded[0]
+                .0
+                .enrollment()
+                .unwrap()
+                .prepare_join(&authority, &request, now())
+                .unwrap()
+            else {
+                panic!("expected a new shared enrollment");
+            };
+            commit_seed_enrollment(&mut seeded, (node - 2) * 2 + 2, command);
+            let receipt = seeded[0]
+                .0
+                .enrollment()
+                .unwrap()
+                .release(&request, now())
+                .unwrap();
+            assert_eq!(receipt.identity.node_id, Some(node));
+            materials.push(
+                key.complete(&receipt, authority.issuers().unwrap().trusted(), now())
+                    .unwrap(),
+            );
+            receipts.push(receipt);
+        }
+        for (replica, _) in &seeded {
+            assert_eq!(replica.identity(), identity);
+            assert_eq!(replica.enrollment().unwrap().revision(), 5);
+            for receipt in &receipts {
+                replica
+                    .enrollment()
+                    .unwrap()
+                    .authorize_certificate(&receipt.certificate, now())
+                    .unwrap();
+            }
+        }
+        let configuration = seeded[0].0.configuration();
+        seeded[0]
             .0
-            .enrollment()
-            .unwrap()
+            .transfer(&ControlTransfer {
+                expected_configuration_index: configuration.configuration_index,
+                expected: configuration.configuration,
+                target: 2,
+            })
+            .unwrap();
+        drain_seed_replicas(&mut seeded);
+        for (replica, _) in &seeded {
+            assert_eq!(replica.status().leader_id, 2);
+        }
+        let peers = PeerRegistry::new(8).unwrap();
+        for receipt in &receipts {
+            peers
+                .register_certificate(
+                    &receipt.certificate,
+                    PeerGrant {
+                        principal: ParticipantId(receipt.identity.principal),
+                        tenants: BTreeSet::from([namespace.tenant]),
+                        role: PeerRole::Node {
+                            node_id: receipt.identity.node_id.unwrap(),
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        let mut pending = Vec::new();
+        let mut routes = BTreeMap::new();
+        let limits = WireLimits {
+            request_timeout: Duration::from_secs(2),
+            ..ControlHost::wire_limits()
+        };
+        for (index, (material, (replica, allowance))) in materials.iter().zip(seeded).enumerate() {
+            let node = index as u64 + 1;
+            let mut config = ControlHostConfig::new(namespace);
+            config.enrollment_authority = Some(pin.clone());
+            config.tick = Duration::from_millis(50);
+            config.request_timeout = Duration::from_secs(1);
+            let (host, owner, channel) =
+                ControlHost::spawn(replica, NoDirectoryAuthority, config, allowance).unwrap();
+            let server = Arc::new(
+                QuicServer::bind(
+                    "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+                    server_tls(tls(material), roots.clone(), &limits).unwrap(),
+                    peers.clone(),
+                    limits.clone(),
+                    focal_memory::MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
+                )
+                .unwrap(),
+            );
+            routes.insert(
+                node,
+                PeerEndpoint {
+                    address: server.local_addr().unwrap(),
+                    server_name: receipts[index].identity.server_name.clone(),
+                    name: None,
+                },
+            );
+            let serving_server = server.clone();
+            let handler = host.clone();
+            let serving =
+                focal_rt::spawn(async move { serving_server.serve(handler).await }).unwrap();
+            let connector = QuicConnector::bind_standalone(
+                "127.0.0.1:0".parse().unwrap(),
+                client_tls(
+                    tls(material),
+                    roots.clone(),
+                    &limits,
+                    focal_wire::net::Sender::Node,
+                )
+                .unwrap(),
+                limits.clone(),
+            )
+            .unwrap();
+            let pool = std::rc::Rc::new(
+                PeerConnectionPool::new(
+                    connector,
+                    PeerPoolLimits {
+                        max_routes: 16,
+                        max_connections: 3,
+                        max_inflight: 12,
+                        attempts: 1,
+                        timeout: Duration::from_secs(2),
+                        ..PeerPoolLimits::default()
+                    },
+                )
+                .unwrap(),
+            );
+            pending.push((host, owner, channel, server, serving, pool));
+        }
+        let mut replicas = Vec::new();
+        for (host, owner, mut channel, server, serving, pool) in pending {
+            pool.replace_routes(1, routes.clone()).unwrap();
+            let sending_pool = pool.clone();
+            let sending = focal_rt::spawn(async move {
+                while let Ok(frame) = channel.recv().await {
+                    let _ = sending_pool.send(frame.target, &frame.request).await;
+                    drop(frame);
+                }
+            })
+            .unwrap();
+            replicas.push(Running {
+                host,
+                owner,
+                server,
+                serving,
+                pool,
+                sending,
+            });
+        }
+        // The trusted setup transferred the established seed leader to node 2;
+        // bypassing its active lease with another campaign would race node 1.
+        let allowance = budget();
+        let (_presented, presented) =
+            focal_rt::watch::channel(certificate_fingerprint(&receipts[0].certificate)).unwrap();
+        let adapter = NetworkEnrollmentControl::new(
+            &replicas[0].pool,
+            &replicas[0].host,
+            pin.clone(),
+            &peers,
+            presented,
+            RouteEpoch(1),
+            &allowance,
+        )
+        .unwrap();
+        // Off its shard the adapter cannot be polled at all: it borrows its
+        // shard's pool, which no other thread may reach (`!Sync`), so the
+        // compiler refuses what a runtime check once guarded.
+        let initial = state(&adapter, &replicas).await;
+        assert_eq!(initial.identity, identity);
+        assert_eq!(registry(&initial).revision(), 5);
+        assert_eq!(replicas[1].host.progress().leader, 2);
+        assert_ne!(replicas[0].host.progress().leader, 1);
+        assert!(replicas[0].pool.stats().delivered > 0);
+        let packet = rpc_packet(&pin, ControlRpc::Read(ControlRead::State));
+        assert_eq!(postcard::to_allocvec(&packet.operation).unwrap()[0], 12);
+        assert_eq!(packet.operation.registered_tag(), 13);
+        // A committed Node enrollment and TLS connection still cannot use the
+        // founder's sequence authority, even for the public State selector.
+        assert_eq!(
+            control_reply(
+                &replicas[2]
+                    .pool
+                    .send_enrollment_control(2, &packet)
+                    .await
+                    .unwrap()
+            ),
+            ControlReply::Rejected(ControlFailure::Unauthorized)
+        );
+        let mut bad_genesis = packet.clone();
+        if let Operation::EnrollmentControl { genesis, .. } = &mut bad_genesis.operation {
+            *genesis = [1; 32];
+        }
+        assert_eq!(
+            control_reply(
+                &replicas[0]
+                    .pool
+                    .send_enrollment_control(2, &bad_genesis)
+                    .await
+                    .unwrap()
+            ),
+            ControlReply::Rejected(ControlFailure::WrongOwner)
+        );
+        for query in [
+            ControlRead::Membership,
+            ControlRead::Contacts,
+            ControlRead::Receipt(ControlRequestId {
+                client: pin.signer.0,
+                sequence: 1,
+            }),
+        ] {
+            assert_eq!(
+                control_reply(
+                    &replicas[0]
+                        .pool
+                        .send_enrollment_control(2, &rpc_packet(&pin, ControlRpc::Read(query)))
+                        .await
+                        .unwrap()
+                ),
+                ControlReply::Rejected(ControlFailure::Unauthorized)
+            );
+        }
+        let arbitrary = ControlRequest {
+            id: ControlRequestId {
+                client: pin.signer.0,
+                sequence: 1,
+            },
+            acknowledged_through: 0,
+            command: ControlCommand::Root(focal_directory::RootCommand {
+                expected_revision: 0,
+                operation: focal_directory::RootOperation::RegisterRegion {
+                    region: focal_directory::RegionRecord {
+                        id: focal_directory::RegionId::from_u128(1),
+                        label: "forged".into(),
+                        authority_epoch: 1,
+                    },
+                    expected_epoch: None,
+                },
+            }),
+        };
+        assert_eq!(
+            control_reply(
+                &replicas[0]
+                    .pool
+                    .send_enrollment_control(2, &rpc_packet(&pin, ControlRpc::Submit(arbitrary)))
+                    .await
+                    .unwrap()
+            ),
+            ControlReply::Rejected(ControlFailure::Unauthorized)
+        );
+        let draft = registry(&initial)
             .prepare_invitation(
                 &authority,
                 InviteOptions {
                     endpoint: "127.0.0.1:7443".into(),
                     server_name: "root.focal.test".into(),
-                    role: EnrollmentRole::Node,
+                    role: EnrollmentRole::Client,
                     expires_at: now() + 600,
                 },
                 now(),
             )
             .unwrap();
-        commit_seed_enrollment(&mut seeded, (node - 2) * 2 + 1, draft.command().clone());
-        let invitation = draft.release(seeded[0].0.enrollment().unwrap()).unwrap();
-        let request = pinned_join_request(&authority, &invitation, &key);
-        let JoinPreparation::Commit(command) = seeded[0]
-            .0
-            .enrollment()
-            .unwrap()
-            .prepare_join(&authority, &request, now())
-            .unwrap()
-        else {
-            panic!("expected a new shared enrollment");
-        };
-        commit_seed_enrollment(&mut seeded, (node - 2) * 2 + 2, command);
-        let receipt = seeded[0]
-            .0
-            .enrollment()
-            .unwrap()
-            .release(&request, now())
-            .unwrap();
-        assert_eq!(receipt.identity.node_id, Some(node));
-        materials.push(
-            key.complete(&receipt, authority.ca_certificate(), now())
-                .unwrap(),
-        );
-        receipts.push(receipt);
-    }
-    for (replica, _) in &seeded {
-        assert_eq!(replica.identity(), identity);
-        assert_eq!(replica.enrollment().unwrap().revision(), 5);
-        for receipt in &receipts {
-            replica
-                .enrollment()
-                .unwrap()
-                .authorize_certificate(&receipt.certificate, now())
-                .unwrap();
-        }
-    }
-    let configuration = seeded[0].0.configuration();
-    seeded[0]
-        .0
-        .transfer(&ControlTransfer {
-            expected_configuration_index: configuration.configuration_index,
-            expected: configuration.configuration,
-            target: 2,
-        })
-        .unwrap();
-    drain_seed_replicas(&mut seeded);
-    for (replica, _) in &seeded {
-        assert_eq!(replica.status().leader_id, 2);
-    }
-    let peers = PeerRegistry::new(8).unwrap();
-    for receipt in &receipts {
-        peers
-            .register_certificate(
-                &receipt.certificate,
-                PeerGrant {
-                    principal: ParticipantId(receipt.identity.principal),
-                    tenants: BTreeSet::from([namespace.tenant]),
-                    role: PeerRole::Node {
-                        node_id: receipt.identity.node_id.unwrap(),
-                    },
-                },
-            )
-            .unwrap();
-    }
-    let founder_peer = peers
-        .authenticate(certificate_fingerprint(&receipts[0].certificate))
-        .unwrap();
-    let mut pending = Vec::new();
-    let mut routes = BTreeMap::new();
-    let limits = WireLimits {
-        request_timeout: Duration::from_secs(2),
-        ..ControlHost::wire_limits()
-    };
-    for (index, (material, (replica, allowance))) in materials.iter().zip(seeded).enumerate() {
-        let node = index as u64 + 1;
-        let mut config = ControlHostConfig::new(namespace);
-        config.enrollment_authority = Some(pin.clone());
-        config.tick = Duration::from_millis(50);
-        config.request_timeout = Duration::from_secs(1);
-        let (host, owner, channel) =
-            ControlHost::spawn(replica, NoDirectoryAuthority, config, allowance).unwrap();
-        let server = Arc::new(
-            QuicServer::bind(
-                "127.0.0.1:0".parse().unwrap(),
-                server_tls(tls(material), roots.clone(), &limits).unwrap(),
-                peers.clone(),
-                limits.clone(),
-            )
-            .unwrap(),
-        );
-        routes.insert(
-            node,
-            PeerEndpoint {
-                address: server.local_addr().unwrap(),
-                server_name: receipts[index].identity.server_name.clone(),
-                name: None,
+        let forged = ControlRequest {
+            id: ControlRequestId {
+                client: [5; 16],
+                sequence: 1,
             },
-        );
-        let serving_server = server.clone();
-        let handler = host.clone();
-        let serving = tokio::spawn(async move { serving_server.serve(handler).await });
-        let connector = QuicConnector::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            client_tls(tls(material), roots.clone(), &limits).unwrap(),
-            limits.clone(),
-        )
-        .unwrap();
-        let pool = Arc::new(
-            PeerConnectionPool::new(
-                connector,
-                PeerPoolLimits {
-                    max_routes: 16,
-                    max_connections: 3,
-                    max_inflight: 12,
-                    attempts: 1,
-                    timeout: Duration::from_secs(2),
-                    ..PeerPoolLimits::default()
-                },
-            )
-            .unwrap(),
-        );
-        pending.push((host, owner, channel, server, serving, pool));
-    }
-    let mut replicas = Vec::new();
-    for (host, owner, mut channel, server, serving, pool) in pending {
-        pool.replace_routes(1, routes.clone()).unwrap();
-        let sending_pool = pool.clone();
-        let sending = tokio::spawn(async move {
-            while let Some(frame) = channel.recv().await {
-                let _ = sending_pool.send(frame.target, &frame.request).await;
-                drop(frame);
-            }
-        });
-        replicas.push(Running {
-            host,
-            owner,
-            server,
-            serving,
-            pool,
-            sending,
-        });
-    }
-    // The trusted setup transferred the established seed leader to node 2;
-    // bypassing its active lease with another campaign would race node 1.
-    let allowance = budget();
-    let adapter = NetworkEnrollmentControl::new(
-        &replicas[0].pool,
-        &replicas[0].host,
-        pin.clone(),
-        founder_peer.clone(),
-        RouteEpoch(1),
-        &allowance,
-    )
-    .unwrap();
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                let mut missing = Box::pin(adapter.read_state(RequestId::from_u128(200)));
-                assert!(matches!(
-                    std::future::Future::poll(
-                        missing.as_mut(),
-                        &mut std::task::Context::from_waker(std::task::Waker::noop())
-                    ),
-                    std::task::Poll::Ready(Err(ControlFailure::Unavailable))
-                ));
-                let no_timer = tokio::runtime::Builder::new_current_thread()
-                    .build()
-                    .unwrap();
-                assert!(matches!(
-                    no_timer.block_on(adapter.read_state(RequestId::from_u128(201))),
-                    Err(ControlFailure::Unavailable)
-                ));
-            })
-            .join()
-            .unwrap();
-    });
-    let initial = state(&adapter).await;
-    assert_eq!(initial.identity, identity);
-    assert_eq!(registry(&initial).revision(), 5);
-    assert_eq!(replicas[1].host.progress().leader, 2);
-    assert_ne!(replicas[0].host.progress().leader, 1);
-    assert!(replicas[0].pool.stats().delivered > 0);
-    let packet = rpc_packet(&pin, ControlRpc::Read(ControlRead::State));
-    assert_eq!(postcard::to_allocvec(&packet.operation).unwrap()[0], 12);
-    assert_eq!(packet.operation.registered_tag(), 13);
-    // A committed Node enrollment and TLS connection still cannot use the
-    // founder's sequence authority, even for the public State selector.
-    assert_eq!(
-        control_reply(
-            &replicas[2]
-                .pool
-                .send_enrollment_control(2, &packet)
-                .await
-                .unwrap()
-        ),
-        ControlReply::Rejected(ControlFailure::Unauthorized)
-    );
-    let mut bad_genesis = packet.clone();
-    if let Operation::EnrollmentControl { genesis, .. } = &mut bad_genesis.operation {
-        *genesis = [1; 32];
-    }
-    assert_eq!(
-        control_reply(
-            &replicas[0]
-                .pool
-                .send_enrollment_control(2, &bad_genesis)
-                .await
-                .unwrap()
-        ),
-        ControlReply::Rejected(ControlFailure::WrongOwner)
-    );
-    for query in [
-        ControlRead::Membership,
-        ControlRead::Contacts,
-        ControlRead::Receipt(ControlRequestId {
-            client: pin.signer.0,
-            sequence: 1,
-        }),
-    ] {
+            acknowledged_through: 0,
+            command: ControlCommand::Enrollment(draft.command().clone()),
+        };
         assert_eq!(
             control_reply(
                 &replicas[0]
                     .pool
-                    .send_enrollment_control(2, &rpc_packet(&pin, ControlRpc::Read(query)))
+                    .send_enrollment_control(2, &rpc_packet(&pin, ControlRpc::Submit(forged)))
                     .await
                     .unwrap()
             ),
             ControlReply::Rejected(ControlFailure::Unauthorized)
         );
-    }
-    let arbitrary = ControlRequest {
-        id: ControlRequestId {
-            client: pin.signer.0,
-            sequence: 1,
-        },
-        acknowledged_through: 0,
-        command: ControlCommand::Root(focal_directory::RootCommand {
-            expected_revision: 0,
-            operation: focal_directory::RootOperation::RegisterRegion {
-                region: focal_directory::RegionRecord {
-                    id: focal_directory::RegionId::from_u128(1),
-                    label: "forged".into(),
-                    authority_epoch: 1,
-                },
-                expected_epoch: None,
-            },
-        }),
-    };
-    assert_eq!(
-        control_reply(
-            &replicas[0]
-                .pool
-                .send_enrollment_control(2, &rpc_packet(&pin, ControlRpc::Submit(arbitrary)))
+        // A node peer is not scoped by tenant on the wire (24 §16); the owner
+        // still refuses a request addressed outside its namespace.
+        let mut wrong_scope = packet.clone();
+        wrong_scope.ledger.tenant = TenantId::from_u128(999);
+        assert_eq!(
+            control_reply(
+                &replicas[0]
+                    .pool
+                    .send_enrollment_control(2, &wrong_scope)
+                    .await
+                    .unwrap()
+            ),
+            ControlReply::Rejected(ControlFailure::Unauthorized)
+        );
+        assert!(
+            verify_request(
+                AuthenticatedPeer::local(PeerGrant {
+                    principal: pin.principal,
+                    tenants: BTreeSet::from([namespace.tenant]),
+                    role: PeerRole::Node { node_id: 1 }
+                })
+                .unwrap(),
+                packet,
+                &limits
+            )
+            .is_err()
+        );
+        let config = QuorumEnrollmentConfig::new(
+            identity,
+            pin.signer_principal(),
+            "root.focal.test".into(),
+            BTreeSet::from([namespace.tenant]),
+        );
+        let staging = disk.path().join("signer");
+        let (signer, driver) =
+            QuorumEnrollmentHost::create(authority, &staging, config.clone(), allowance.clone())
+                .unwrap();
+        let intent = InviteIntent {
+            endpoint: "127.0.0.1:7443".into(),
+            role: EnrollmentRole::Client,
+            lifetime_seconds: 600,
+        };
+        let (result, token) = hyper_rt::combine::join2(driver.run(&adapter), async {
+            let invitation = decided(&replicas, async || {
+                signer
+                    .invite(RequestId::from_u128(41), intent.clone())
+                    .await
+            })
+            .await
+            .unwrap();
+            assert_eq!(registry(&state(&adapter, &replicas).await).revision(), 6);
+            let token = invitation.expose_token().unwrap();
+            let operator = runtime(namespace);
+            let ControlReadResult::Configuration(configuration) = replicas[1]
+                .host
+                .read(
+                    operator.clone(),
+                    RequestId::from_u128(50),
+                    ControlRead::Configuration,
+                )
                 .await
                 .unwrap()
-        ),
-        ControlReply::Rejected(ControlFailure::Unauthorized)
-    );
-    let draft = registry(&initial)
-        .prepare_invitation(
-            &authority,
-            InviteOptions {
-                endpoint: "127.0.0.1:7443".into(),
-                server_name: "root.focal.test".into(),
-                role: EnrollmentRole::Client,
-                expires_at: now() + 600,
-            },
+            else {
+                panic!("configuration");
+            };
+            replicas[1]
+                .host
+                .transfer(
+                    operator,
+                    RequestId::from_u128(51),
+                    ControlTransfer {
+                        expected_configuration_index: configuration.configuration_index,
+                        expected: configuration.configuration,
+                        target: 3,
+                    },
+                )
+                .await
+                .unwrap();
+            // Charged to the periods the replicas run (27 §3.1 P8).
+            let mut wait = settling(&replicas);
+            while replicas[2].host.progress().leader != 3 || replicas[0].host.progress().leader != 3
+            {
+                if let Err(spent) = wait.check(&periods(&replicas)) {
+                    panic!(
+                        "leadership never moved to 3: {spent}: {:?}",
+                        replicas
+                            .iter()
+                            .map(|replica| replica.host.progress())
+                            .collect::<Vec<_>>()
+                    );
+                }
+                focal_rt::time::sleep(Duration::from_millis(10))
+                    .await
+                    .unwrap();
+            }
+            let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut stale = routes.clone();
+            stale.get_mut(&2).unwrap().address = blackhole.local_addr().unwrap();
+            replicas[0].pool.replace_routes(2, stale).unwrap();
+            // A call that finds the leader it knows asks no other route. A
+            // leader that was slow to answer, or had been replaced, sends the
+            // call on to the routes, and the dead one among them is asked in
+            // its turn: so without the bypass no call leaves the cursor where
+            // it was, and with it a call does once the leader answers in time.
+            let mut wait = settling(&replicas);
+            loop {
+                let cursor = adapter.route_cursor.load(Ordering::Relaxed);
+                state(&adapter, &replicas).await;
+                if adapter.route_cursor.load(Ordering::Relaxed) == cursor {
+                    break;
+                }
+                if let Err(spent) = wait.check(&periods(&replicas)) {
+                    panic!(
+                        "no call went to the known leader alone: {spent}: {:?}",
+                        replicas
+                            .iter()
+                            .map(|replica| replica.host.progress())
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+            replicas[0].pool.replace_routes(3, routes.clone()).unwrap();
+            decided(&replicas, async || {
+                signer
+                    .invite(RequestId::from_u128(42), intent.clone())
+                    .await
+            })
+            .await
+            .unwrap();
+            assert_eq!(registry(&state(&adapter, &replicas).await).revision(), 7);
+            signer.stop().await.unwrap();
+            token
+        })
+        .await;
+        result.unwrap();
+        // The private sequence journal survives signer restart on a follower while
+        // the public decisions remain in the replicated root on the new leader.
+        let authority = BootstrapAuthority::open_or_create(
+            &ca_path,
+            CLUSTER,
+            vec!["root.focal.test".into()],
             now(),
         )
         .unwrap();
-    let forged = ControlRequest {
-        id: ControlRequestId {
-            client: [5; 16],
-            sequence: 1,
-        },
-        acknowledged_through: 0,
-        command: ControlCommand::Enrollment(draft.command().clone()),
-    };
-    assert_eq!(
-        control_reply(
-            &replicas[0]
-                .pool
-                .send_enrollment_control(2, &rpc_packet(&pin, ControlRpc::Submit(forged)))
-                .await
-                .unwrap()
-        ),
-        ControlReply::Rejected(ControlFailure::Unauthorized)
-    );
-    // A node peer is not scoped by tenant on the wire (24 §16); the owner
-    // still refuses a request addressed outside its namespace.
-    let mut wrong_scope = packet.clone();
-    wrong_scope.ledger.tenant = TenantId::from_u128(999);
-    assert_eq!(
-        control_reply(
-            &replicas[0]
-                .pool
-                .send_enrollment_control(2, &wrong_scope)
-                .await
-                .unwrap()
-        ),
-        ControlReply::Rejected(ControlFailure::Unauthorized)
-    );
-    assert!(
-        verify_request(
-            AuthenticatedPeer::local(PeerGrant {
-                principal: pin.principal,
-                tenants: BTreeSet::from([namespace.tenant]),
-                role: PeerRole::Node { node_id: 1 }
-            })
-            .unwrap(),
-            packet,
-            &limits
-        )
-        .is_err()
-    );
-    let config = QuorumEnrollmentConfig::new(
-        identity,
-        pin.signer_principal(),
-        "root.focal.test".into(),
-        BTreeSet::from([namespace.tenant]),
-    );
-    let staging = disk.path().join("signer");
-    let (signer, driver) =
-        QuorumEnrollmentHost::create(authority, &staging, config.clone(), allowance.clone())
-            .unwrap();
-    let intent = InviteIntent {
-        endpoint: "127.0.0.1:7443".into(),
-        role: EnrollmentRole::Client,
-        lifetime_seconds: 600,
-    };
-    let (result, token) = tokio::join!(driver.run(&adapter), async {
-        let invitation = signer
-            .invite(RequestId::from_u128(41), intent.clone())
-            .await
-            .unwrap();
-        assert_eq!(registry(&state(&adapter).await).revision(), 6);
-        let token = invitation.expose_token().unwrap();
-        let operator = runtime(namespace);
-        let ControlReadResult::Configuration(configuration) = replicas[1]
-            .host
-            .read(
-                operator.clone(),
-                RequestId::from_u128(50),
-                ControlRead::Configuration,
-            )
-            .await
-            .unwrap()
-        else {
-            panic!("configuration");
-        };
-        replicas[1]
-            .host
-            .transfer(
-                operator,
-                RequestId::from_u128(51),
-                ControlTransfer {
-                    expected_configuration_index: configuration.configuration_index,
-                    expected: configuration.configuration,
-                    target: 3,
-                },
-            )
-            .await
-            .unwrap();
-        // Charged to the periods the replicas run (27 §3.1 P8).
-        let periods = || -> Vec<u64> {
-            replicas
-                .iter()
-                .map(|replica| replica.host.periods())
-                .collect()
-        };
-        let deadline = || {
-            focal_timing::ProgressDeadline::begin(
-                &periods(),
-                focal_timing::ProgressDeadline::periods(
-                    Duration::from_secs(5),
-                    replicas[0].host.tick_period(),
-                ),
-                Duration::from_secs(60),
-            )
-        };
-        let mut wait = deadline();
-        while replicas[2].host.progress().leader != 3 || replicas[0].host.progress().leader != 3 {
-            if let Err(spent) = wait.check(&periods()) {
-                panic!(
-                    "leadership never moved to 3: {spent}: {:?}",
-                    replicas
-                        .iter()
-                        .map(|replica| replica.host.progress())
-                        .collect::<Vec<_>>()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut stale = routes.clone();
-        stale.get_mut(&2).unwrap().address = blackhole.local_addr().unwrap();
-        replicas[0].pool.replace_routes(2, stale).unwrap();
-        // A call that finds the leader it knows asks no other route. A
-        // leader that was slow to answer, or had been replaced, sends the
-        // call on to the routes, and the dead one among them is asked in
-        // its turn: so without the bypass no call leaves the cursor where
-        // it was, and with it a call does once the leader answers in time.
-        let mut wait = deadline();
-        loop {
-            let cursor = adapter.route_cursor.load(Ordering::Relaxed);
-            state(&adapter).await;
-            if adapter.route_cursor.load(Ordering::Relaxed) == cursor {
-                break;
-            }
-            if let Err(spent) = wait.check(&periods()) {
-                panic!(
-                    "no call went to the known leader alone: {spent}: {:?}",
-                    replicas
-                        .iter()
-                        .map(|replica| replica.host.progress())
-                        .collect::<Vec<_>>()
-                );
-            }
-        }
-        replicas[0].pool.replace_routes(3, routes.clone()).unwrap();
-        signer
-            .invite(RequestId::from_u128(42), intent.clone())
-            .await
-            .unwrap();
-        assert_eq!(registry(&state(&adapter).await).revision(), 7);
-        signer.stop().await.unwrap();
-        token
-    });
-    result.unwrap();
-    // The private sequence journal survives signer restart on a follower while
-    // the public decisions remain in the replicated root on the new leader.
-    let authority = BootstrapAuthority::open_or_create(
-        &ca_path,
-        CLUSTER,
-        vec!["root.focal.test".into()],
-        now(),
-    )
-    .unwrap();
-    let (signer, driver) =
-        QuorumEnrollmentHost::open(authority, &staging, config, allowance.clone()).unwrap();
-    let (result, ()) = tokio::join!(driver.run(&adapter), async {
-        assert_eq!(
-            signer
-                .invite(RequestId::from_u128(41), intent.clone())
+        let (signer, driver) =
+            QuorumEnrollmentHost::open(authority, &staging, config, allowance.clone()).unwrap();
+        let (result, ()) = hyper_rt::combine::join2(driver.run(&adapter), async {
+            assert_eq!(
+                decided(&replicas, async || {
+                    signer
+                        .invite(RequestId::from_u128(41), intent.clone())
+                        .await
+                })
                 .await
                 .unwrap()
                 .expose_token()
                 .unwrap(),
-            token
-        );
-        // A tenant is admitted once under the founder authority; a retry
-        // reads as done, and every certificate's grant names it from then on
-        // without a restart (doc 24 §16).
-        signer.admit_tenant([9; 16]).await.unwrap();
-        let view = state(&adapter).await;
-        assert_eq!(registry(&view).revision(), 8);
-        assert!(registry(&view).admits_tenant([9; 16]));
-        signer.admit_tenant([9; 16]).await.unwrap();
-        assert_eq!(registry(&state(&adapter).await).revision(), 8);
-        assert!(matches!(
-            signer.admit_tenant([0; 16]).await,
-            Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Invalid))
-        ));
-        let granted = signer
-            .authorize_certificate(receipts[1].certificate.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            granted.tenants,
-            BTreeSet::from([namespace.tenant, TenantId([9; 16])])
-        );
-        let view = state(&adapter).await;
-        assert_eq!(registry(&view).revision(), 8);
-        let revoke = registry(&view)
-            .prepare_revoke(receipts[0].invitation, now())
-            .unwrap();
-        let operator = runtime(namespace);
-        replicas[2]
-            .host
-            .submit(
-                operator.clone(),
-                ControlRequest {
-                    id: ControlRequestId {
-                        client: operator.principal().0,
-                        sequence: 1,
+                token
+            );
+            // A tenant is admitted once under the founder authority; a retry
+            // reads as done, and every certificate's grant names it from then on
+            // without a restart (doc 24 §16).
+            decided(&replicas, async || signer.admit_tenant([9; 16]).await)
+                .await
+                .unwrap();
+            let view = state(&adapter, &replicas).await;
+            assert_eq!(registry(&view).revision(), 8);
+            assert!(registry(&view).admits_tenant([9; 16]));
+            decided(&replicas, async || signer.admit_tenant([9; 16]).await)
+                .await
+                .unwrap();
+            assert_eq!(registry(&state(&adapter, &replicas).await).revision(), 8);
+            assert!(matches!(
+                signer.admit_tenant([0; 16]).await,
+                Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Invalid))
+            ));
+            let granted = signer
+                .authorize_certificate(receipts[1].certificate.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                granted.tenants,
+                BTreeSet::from([namespace.tenant, TenantId([9; 16])])
+            );
+            let view = state(&adapter, &replicas).await;
+            assert_eq!(registry(&view).revision(), 8);
+            let revoke = registry(&view)
+                .prepare_revoke(receipts[0].invitation, now())
+                .unwrap();
+            let operator = runtime(namespace);
+            replicas[2]
+                .host
+                .submit(
+                    operator.clone(),
+                    ControlRequest {
+                        id: ControlRequestId {
+                            client: operator.principal().0,
+                            sequence: 1,
+                        },
+                        acknowledged_through: 0,
+                        command: ControlCommand::Enrollment(revoke),
                     },
-                    acknowledged_through: 0,
-                    command: ControlCommand::Enrollment(revoke),
-                },
+                )
+                .await
+                .unwrap();
+            // Leave the TLS grant/cache untouched: the owner must reject the pin
+            // from its current committed enrollment, including exact old retries.
+            assert!(matches!(
+                signer.invite(RequestId::from_u128(41), intent).await,
+                Err(QuorumEnrollmentError::Control(ControlFailure::Unauthorized))
+            ));
+            assert_eq!(
+                control_reply(
+                    &replicas[0]
+                        .pool
+                        .send_enrollment_control(
+                            3,
+                            &rpc_packet(&pin, ControlRpc::Read(ControlRead::State))
+                        )
+                        .await
+                        .unwrap()
+                ),
+                ControlReply::Rejected(ControlFailure::Unauthorized)
+            );
+            signer.stop().await.unwrap();
+        })
+        .await;
+        result.unwrap();
+        let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead: BTreeMap<_, _> = (100..116)
+            .map(|node| {
+                (
+                    node,
+                    PeerEndpoint {
+                        address: blackhole.local_addr().unwrap(),
+                        server_name: receipts[2].identity.server_name.clone(),
+                        name: None,
+                    },
+                )
+            })
+            .collect();
+        replicas[0].pool.replace_routes(4, dead).unwrap();
+        let before = allowance.stats();
+        for id in [202, 203] {
+            let previous = adapter.route_cursor.load(Ordering::Relaxed);
+            let sent = replicas[0].pool.stats();
+            let answer = focal_rt::time::timeout(
+                Duration::from_secs(5),
+                adapter.read_state(RequestId::from_u128(id)),
             )
             .await
             .unwrap();
-        // Leave the TLS grant/cache untouched: the owner must reject the pin
-        // from its current committed enrollment, including exact old retries.
-        assert!(matches!(
-            signer.invite(RequestId::from_u128(41), intent).await,
-            Err(QuorumEnrollmentError::Control(ControlFailure::Unauthorized))
-        ));
-        assert_eq!(
-            control_reply(
-                &replicas[0]
-                    .pool
-                    .send_enrollment_control(
-                        3,
-                        &rpc_packet(&pin, ControlRpc::Read(ControlRead::State))
-                    )
-                    .await
-                    .unwrap()
-            ),
-            ControlReply::Rejected(ControlFailure::Unauthorized)
-        );
-        signer.stop().await.unwrap();
-    });
-    result.unwrap();
-    let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let dead: BTreeMap<_, _> = (100..116)
-        .map(|node| {
-            (
-                node,
-                PeerEndpoint {
-                    address: blackhole.local_addr().unwrap(),
-                    server_name: receipts[2].identity.server_name.clone(),
-                    name: None,
-                },
-            )
-        })
-        .collect();
-    replicas[0].pool.replace_routes(4, dead).unwrap();
-    let before = allowance.stats();
-    for id in [202, 203] {
-        let previous = adapter.route_cursor.load(Ordering::Relaxed);
-        let sent = replicas[0].pool.stats();
-        let answer = tokio::time::timeout(
-            Duration::from_secs(5),
-            adapter.read_state(RequestId::from_u128(id)),
-        )
-        .await
-        .unwrap();
-        // A round some of whose asks left this node cannot know their
-        // outcome; one none of whose asks could be dialed, the pool's three
-        // connections all taken by dials to the dead, was refused the room
-        // here and says so.
-        let after = replicas[0].pool.stats();
-        match answer {
-            Err(ControlFailure::OutcomeUnknown) => {
-                assert!(after.lost > sent.lost, "{sent:?} {after:?}");
+            // A round some of whose asks left this node cannot know their
+            // outcome: a dial was started, or an exchange was counted lost. One
+            // none of whose asks could be dialed — the pool's three connections
+            // all taken by dials to the dead, or the peer in the cooldown its
+            // failed dial began, which the pool counts lost without dialing —
+            // was refused the room here and says so: nothing was dialed.
+            let after = replicas[0].pool.stats();
+            match answer {
+                Err(ControlFailure::OutcomeUnknown) => {
+                    assert!(
+                        after.dials > sent.dials || after.lost > sent.lost,
+                        "{sent:?} {after:?}"
+                    );
+                }
+                Err(ControlFailure::Capacity) => {
+                    assert!(after.busy > sent.busy, "{sent:?} {after:?}");
+                    assert_eq!(after.dials, sent.dials, "{sent:?} {after:?}");
+                }
+                other => panic!("the round over dead routes answered {other:?}"),
             }
-            Err(ControlFailure::Capacity) => {
-                assert!(after.busy > sent.busy, "{sent:?} {after:?}");
-                assert_eq!(after.lost, sent.lost, "{sent:?} {after:?}");
+            let current = adapter.route_cursor.load(Ordering::Relaxed);
+            assert!((100..116).contains(&current));
+            if previous >= 100 {
+                assert!(current > previous && current <= previous + MAX_ROUTE_PROBES as u64);
             }
-            other => panic!("the round over dead routes answered {other:?}"),
+            assert_eq!(
+                allowance.stats(),
+                before,
+                "timed-out routing round retained its allocation"
+            );
         }
-        let current = adapter.route_cursor.load(Ordering::Relaxed);
-        assert!((100..116).contains(&current));
-        if previous >= 100 {
-            assert!(current > previous && current <= previous + MAX_ROUTE_PROBES as u64);
+        drop(adapter);
+        for replica in replicas {
+            replica.host.stop().await.unwrap();
+            replica.owner.join().unwrap();
+            replica.server.close().unwrap();
+            replica.serving.await.unwrap().unwrap();
+            replica.pool.close();
+            replica.sending.await.unwrap();
         }
-        assert_eq!(
-            allowance.stats(),
-            before,
-            "timed-out routing round retained its allocation"
-        );
-    }
-    drop(adapter);
-    for replica in replicas {
-        replica.host.stop().await.unwrap();
-        replica.owner.join().unwrap();
-        replica.server.close();
-        replica.serving.await.unwrap().unwrap();
-        replica.pool.close();
-        replica.sending.await.unwrap();
-    }
+    })
+    .unwrap()
 }

@@ -8,14 +8,10 @@ use std::{
     ffi::OsStr,
     fs::File,
     io, mem,
-    os::windows::{
-        ffi::OsStrExt,
-        io::{AsRawHandle, FromRawHandle},
-    },
+    os::windows::{ffi::OsStrExt, io::FromRawHandle},
     path::Path,
     ptr,
 };
-use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree},
     Security::{
@@ -27,16 +23,14 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW,
-        FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDiskFreeSpaceExW,
-        GetFileInformationByHandle, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        OPEN_ALWAYS, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
     },
     System::{
-        Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId},
-        Threading::{
-            GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-        },
+        SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
+        Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
 
@@ -71,7 +65,38 @@ pub(crate) fn available_space(path: &Path) -> Option<u64> {
     (ok != 0).then_some(available)
 }
 
+pub(crate) fn total_space(path: &Path) -> Option<u64> {
+    let wide = wide(path);
+    let mut total: u64 = 0;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; `total` is a
+    // live aligned u64 written only on success; the two free counts we do not
+    // need are null. On failure the function returns 0 and leaves `total` at 0.
+    let ok =
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), ptr::null_mut(), &mut total, ptr::null_mut()) };
+    (ok != 0).then_some(total)
+}
+
 /// The current process user's SID bytes.
+/// The machine's physical memory in bytes (`ullTotalPhys`).
+pub(crate) fn physical_memory() -> Option<u64> {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: u32::try_from(mem::size_of::<MEMORYSTATUSEX>()).ok()?,
+        ..unsafe_zeroed_status()
+    };
+    // SAFETY: `status` is a live, writable MEMORYSTATUSEX whose `dwLength`
+    // names its own size, as the API requires; the call writes only within
+    // it and keeps no pointer past its return.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0).then_some(status.ullTotalPhys)
+}
+/// An all-zero MEMORYSTATUSEX: every field is a plain integer, for which
+/// zero is a valid value.
+fn unsafe_zeroed_status() -> MEMORYSTATUSEX {
+    // SAFETY: MEMORYSTATUSEX holds only u32 and u64 fields; the all-zero bit
+    // pattern is a valid value of each.
+    unsafe { mem::zeroed() }
+}
+
 pub(crate) fn current_owner() -> io::Result<Vec<u8>> {
     let mut token: HANDLE = ptr::null_mut();
     // SAFETY: GetCurrentProcess returns the current-process pseudo-handle;
@@ -188,17 +213,17 @@ impl OwnerOnlyDacl {
         // ACL header + one allow ACE (its trailing SidStart overlaps the SID's
         // first DWORD, hence the `- 4`) + the SID bytes.
         let ace_header = mem::size_of::<windows_sys::Win32::Security::ACCESS_ALLOWED_ACE>();
-        let acl_size = mem::size_of::<ACL>() + ace_header + sid.len() - mem::size_of::<u32>();
+        let acl_size = mem::size_of::<ACL>()
+            .checked_add(ace_header)
+            .and_then(|size| size.checked_add(sid.len()))
+            .and_then(|size| size.checked_sub(mem::size_of::<u32>()))
+            .ok_or_else(|| io::Error::other("owner-only ACL size"))?;
+        let acl_len =
+            u32::try_from(acl_size).map_err(|_| io::Error::other("owner-only ACL size"))?;
         let mut acl = vec![0u8; acl_size];
         // SAFETY: `acl` is `acl_size` bytes; InitializeAcl formats it as an
         // empty ACL of that size at ACL_REVISION.
-        let ok = unsafe {
-            InitializeAcl(
-                acl.as_mut_ptr().cast(),
-                acl_size as u32,
-                ACL_REVISION as u32,
-            )
-        };
+        let ok = unsafe { InitializeAcl(acl.as_mut_ptr().cast(), acl_len, ACL_REVISION) };
         if ok == 0 {
             return Err(last_error());
         }
@@ -208,7 +233,7 @@ impl OwnerOnlyDacl {
         let ok = unsafe {
             AddAccessAllowedAce(
                 acl.as_mut_ptr().cast(),
-                ACL_REVISION as u32,
+                ACL_REVISION,
                 windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
                 sid.as_mut_ptr().cast(),
             )
@@ -272,7 +297,7 @@ pub(crate) fn create_private_new(path: &Path, read: bool, write: bool) -> io::Re
 fn open_with(path: &Path, read: bool, write: bool, disposition: u32) -> io::Result<File> {
     let wide = wide(path);
     let mut dacl = OwnerOnlyDacl::new()?;
-    let mut attributes = dacl.attributes();
+    let attributes = dacl.attributes();
     let mut access = 0u32;
     if read {
         access |= FILE_GENERIC_READ;
@@ -292,7 +317,7 @@ fn open_with(path: &Path, read: bool, write: bool, disposition: u32) -> io::Resu
             wide.as_ptr(),
             access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            &mut attributes,
+            &attributes,
             disposition,
             FILE_ATTRIBUTE_NORMAL,
             ptr::null_mut(),
@@ -310,10 +335,10 @@ fn open_with(path: &Path, read: bool, write: bool, disposition: u32) -> io::Resu
 pub(crate) fn create_dir_private(path: &Path) -> io::Result<()> {
     let wide = wide(path);
     let mut dacl = OwnerOnlyDacl::new()?;
-    let mut attributes = dacl.attributes();
+    let attributes = dacl.attributes();
     // SAFETY: `wide` is NUL-terminated; `attributes` and its DACL live across
     // the call. CreateDirectoryW returns nonzero on success.
-    let ok = unsafe { CreateDirectoryW(wide.as_ptr(), &mut attributes) };
+    let ok = unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) };
     if ok == 0 {
         return Err(last_error());
     }
@@ -358,7 +383,11 @@ fn info_at(path: &Path) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     let wide = wide(path);
     // SAFETY: `wide` is NUL-terminated. Open a query-only handle (no access
     // rights requested); FILE_FLAG_BACKUP_SEMANTICS lets it open a directory
-    // too. The handle is closed below.
+    // too, and FILE_FLAG_OPEN_REPARSE_POINT names the path itself, never
+    // what a reparse point leads to, as `symlink_metadata` does on Unix: an
+    // AF_UNIX socket's file is a reparse point that cannot be followed, so
+    // without it a local server had no identity for its socket and left the
+    // file behind. The handle is closed below.
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
@@ -366,7 +395,7 @@ fn info_at(path: &Path) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null_mut(),
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             ptr::null_mut(),
         )
     };
@@ -412,101 +441,4 @@ pub(crate) fn hard_link_count_open(file: &File) -> io::Result<u64> {
     Ok(u64::from(
         info_from_handle(file.as_raw_handle() as HANDLE)?.nNumberOfLinks,
     ))
-}
-
-/// Create one instance of an owner-only, local-only, byte-mode named-pipe
-/// server at `name`. `first` must be true for the first instance of a name
-/// (it fences another process squatting the name) and false for the rest.
-pub fn create_pipe_server(
-    name: &std::ffi::OsStr,
-    first: bool,
-    max_instances: usize,
-) -> io::Result<NamedPipeServer> {
-    let mut dacl = OwnerOnlyDacl::new()?;
-    let mut attributes = dacl.attributes();
-    let mut options = ServerOptions::new();
-    options
-        .first_pipe_instance(first)
-        .reject_remote_clients(true)
-        .max_instances(max_instances)
-        .pipe_mode(PipeMode::Byte)
-        .access_inbound(true)
-        .access_outbound(true);
-    // SAFETY: `attributes` and the DACL/ACL/SID it points to (owned by `dacl`)
-    // stay live across the call; tokio wraps the created handle in a
-    // NamedPipeServer that owns and closes it. The attributes pointer is only
-    // read during creation, so it need not outlive this call.
-    unsafe {
-        options.create_with_security_attributes_raw(
-            name,
-            (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<std::ffi::c_void>(),
-        )
-    }
-}
-
-/// The SID bytes of the user owning the client connected to `server`.
-pub(crate) fn pipe_client_owner(server: &NamedPipeServer) -> io::Result<Vec<u8>> {
-    let handle = server.as_raw_handle() as HANDLE;
-    let mut pid: u32 = 0;
-    // SAFETY: `handle` is the valid, connected pipe-server handle tokio owns;
-    // `pid` is written on success (nonzero return).
-    let ok = unsafe { GetNamedPipeClientProcessId(handle, &mut pid) };
-    if ok == 0 {
-        return Err(last_error());
-    }
-    owner_of_process(pid)
-}
-
-/// The SID bytes of the user owning the server behind `client`.
-pub(crate) fn pipe_server_owner(client: &NamedPipeClient) -> io::Result<Vec<u8>> {
-    let handle = client.as_raw_handle() as HANDLE;
-    let mut pid: u32 = 0;
-    // SAFETY: `handle` is the valid, connected pipe-client handle tokio owns;
-    // `pid` is written on success (nonzero return).
-    let ok = unsafe { GetNamedPipeServerProcessId(handle, &mut pid) };
-    if ok == 0 {
-        return Err(last_error());
-    }
-    owner_of_process(pid)
-}
-
-/// The SID bytes of the user owning process `pid`.
-fn owner_of_process(pid: u32) -> io::Result<Vec<u8>> {
-    // SAFETY: OpenProcess takes an access mask, an inherit flag and a pid; it
-    // returns an owned handle or null. QUERY_LIMITED_INFORMATION is the least
-    // right that permits opening the token of a same-user process.
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process.is_null() {
-        return Err(last_error());
-    }
-    let mut token: HANDLE = ptr::null_mut();
-    // SAFETY: `process` is the handle just opened; OpenProcessToken opens its
-    // token for query into `token`, closed below.
-    let ok = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
-    if ok == 0 {
-        let error = last_error();
-        // SAFETY: `process` is the valid handle just opened; closed once.
-        unsafe {
-            CloseHandle(process);
-        }
-        return Err(error);
-    }
-    let owner = owner_from_token(token);
-    // SAFETY: `token` and `process` are the valid handles opened above; each is
-    // closed exactly once.
-    unsafe {
-        CloseHandle(token);
-        CloseHandle(process);
-    }
-    owner
-}
-
-/// Whether the client connected to `server` runs as the current user.
-pub fn pipe_client_is_current_owner(server: &NamedPipeServer) -> io::Result<bool> {
-    Ok(pipe_client_owner(server)? == current_owner()?)
-}
-
-/// Whether the server behind `client` runs as the current user.
-pub fn pipe_server_is_current_owner(client: &NamedPipeClient) -> io::Result<bool> {
-    Ok(pipe_server_owner(client)? == current_owner()?)
 }

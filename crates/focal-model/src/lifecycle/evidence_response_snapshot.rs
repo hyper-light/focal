@@ -1,4 +1,5 @@
 use super::*;
+use crate::lifecycle::aggregation::Acceptance;
 
 /// Fixed-width collections are indexed without constructing decoding arrays.
 /// Each method must be repeatable. The model bounds calls; source parsing and
@@ -149,7 +150,7 @@ fn stamp_visits(value: ResponseSnapshotFieldsV1<'_>) -> Result<usize, ContractEr
 }
 fn inspection_visits(
     value: ResponseSnapshotFieldsV1<'_>,
-    policy: &AcceptancePolicy,
+    policy: Acceptance<'_>,
 ) -> Result<usize, ContractError> {
     let work = work_count(value)?;
     // Fixed scalar/frame/terminal checks; per-row descriptor and immutable work
@@ -238,7 +239,7 @@ fn same_frame(
     )
 }
 fn checked_work(
-    policy: &AcceptancePolicy,
+    policy: Acceptance<'_>,
     artifacts: &impl ResponseArtifacts,
     work: &WorkArtifact,
 ) -> Result<(), ContractError> {
@@ -265,7 +266,7 @@ fn checked_work(
 }
 fn inspect<'a>(
     source: &'a impl ResponseSnapshotSource,
-    policy: &AcceptancePolicy,
+    policy: Acceptance<'_>,
     artifacts: &impl ResponseArtifacts,
     limits: ResponseLimits,
     visits: &mut VisitBudget,
@@ -379,7 +380,7 @@ fn inspect<'a>(
 
 pub struct ResponseHydrationPlan<'a, S, A> {
     source: &'a S,
-    policy: &'a AcceptancePolicy,
+    policy: Acceptance<'a>,
     artifacts: &'a A,
     limits: ResponseLimits,
     fields: ResponseSnapshotFieldsV1<'a>,
@@ -414,7 +415,7 @@ impl Response {
     }
     pub fn prepare_hydration_v1<'a, S: ResponseSnapshotSource, A: ResponseArtifacts>(
         source: &'a S,
-        policy: &'a AcceptancePolicy,
+        policy: Acceptance<'a>,
         artifacts: &'a A,
         limits: ResponseLimits,
         max_visits: usize,

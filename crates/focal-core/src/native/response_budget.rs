@@ -190,11 +190,12 @@ pub(super) fn work_limit(limits: NativeLimits) -> Result<usize, NativeError> {
     if budget.max_claim_rows == 0 {
         return Err(refusal());
     }
-    // Closing writes seven fixed rows and the claim's two status index rows
-    // beside the two rows each closed attachment adds (doc 22 §7).
+    // Closing writes eight fixed rows (the principal's window among them,
+    // F12) and the claim's two status index rows beside the two rows each
+    // closed attachment adds (doc 22 §7).
     let changes = budget
         .max_changes
-        .checked_sub(7)
+        .checked_sub(8)
         .and_then(|changes| changes.checked_sub(crate::native::index_rows::STATUS_ROWS))
         .ok_or_else(refusal)?
         / 2;
@@ -221,13 +222,13 @@ mod tests {
     #[test]
     fn exact_close_row_bound_covers_empty_odd_and_even_batches() {
         for (batch, expected) in [
-            (9, 0),
             (10, 0),
-            (11, 1),
+            (11, 0),
             (12, 1),
-            (129, 60),
+            (13, 1),
             (130, 60),
-            (131, 61),
+            (131, 60),
+            (132, 61),
         ] {
             let limits = limits(batch);
             let actual = work_limit(limits).unwrap();
@@ -305,9 +306,9 @@ mod tests {
             let artifact_index = crate::native::index_rows::artifact_rows(inputs).unwrap();
             for count in 0..16 {
                 let batch = if count == 0 {
-                    9 + artifact_index
+                    10 + artifact_index
                 } else {
-                    3 * count + 11 + artifact_index + crate::native::index_rows::STATUS_ROWS
+                    3 * count + 12 + artifact_index + crate::native::index_rows::STATUS_ROWS
                 };
                 assert!(check_increment_shape(count, inputs, limits(batch)).is_ok());
                 assert!(check_increment_shape(count, inputs, limits(batch - 1)).is_err());
@@ -325,10 +326,11 @@ mod tests {
     fn receipt_prices_both_complete_cohorts_at_the_exact_batch_boundary() {
         for delivery in 0..8 {
             for work in 0..8 {
-                // One changed claim/response, their facts, Meta and outcome,
-                // then the claim's two status index rows; Delivery adds four
-                // rows and each Ready work check adds two plus its due timer.
-                let batch = 4 * delivery + 3 * work + 6 + crate::native::index_rows::STATUS_ROWS;
+                // One changed claim/response, their facts, Meta, the outcome
+                // and the principal's window, then the claim's two status
+                // index rows; Delivery adds four rows and each Ready work
+                // check adds two plus its due timer.
+                let batch = 4 * delivery + 3 * work + 7 + crate::native::index_rows::STATUS_ROWS;
                 assert!(check_receipt_shape(delivery, work, limits(batch)).is_ok());
                 assert!(check_receipt_shape(delivery, work, limits(batch - 1)).is_err());
             }

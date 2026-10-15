@@ -61,6 +61,88 @@ fn pressured(budget: &MemoryBudget) -> focal_memory::Reservation {
         .unwrap()
 }
 
+/// The chain keeps what its candidates add to a checkpoint as it changes, never walking it:
+/// through preparations, a discard and publications its sums are what a walk gives. A candidate
+/// is found by halving the chain, after a discard's gap in the serials as before it. And a chain
+/// a burst grew past its headroom gives back its buffer, and the buffer's charge, as it drains.
+#[test]
+fn the_chain_keeps_its_projection_finds_by_serial_and_gives_back_a_bursts_memory() {
+    let core = core();
+    let floor = core.limits.pending;
+    let mut owner = NativeOwner::new(core).unwrap();
+    let walk = |owner: &NativeOwner| -> (usize, usize) {
+        let rows = owner
+            .pending
+            .iter()
+            .map(|row| row.prepared.mutation_count())
+            .sum::<usize>();
+        let bytes = owner
+            .pending
+            .iter()
+            .map(|row| row.prepared.encoded_added)
+            .sum::<usize>();
+        (rows, bytes)
+    };
+    let kept = |owner: &NativeOwner| (owner.pending_rows, owner.pending_bytes);
+    let required = [(ValidationMode::Required, false)];
+    // A burst of four times the headroom grows the chain past it.
+    let burst = floor * 4;
+    let mut staged = Vec::new();
+    for id in 1..=u128::try_from(burst).unwrap() {
+        let time = u64::try_from(id).unwrap();
+        staged.push(stage(&mut owner, time, creation(id, id, &required, None)).0);
+        assert_eq!(kept(&owner), walk(&owner));
+    }
+    let grown = owner.pending.capacity();
+    let charged = owner._queue_allocation.bytes();
+    assert!(grown >= burst && grown > floor);
+    for candidate in &staged {
+        assert!(owner.prepared_candidate(*candidate).is_ok());
+    }
+    // A discard of the last quarter leaves a gap in the serials; the next candidate takes the
+    // serial after the discarded ones, and both sides of the gap are found.
+    let cut = staged[burst * 3 / 4];
+    owner.discard_from(cut).unwrap();
+    assert_eq!(kept(&owner), walk(&owner));
+    assert!(
+        owner.prepared_candidate(cut).is_err(),
+        "a discarded candidate is not found"
+    );
+    let id = u128::try_from(burst).unwrap() + 1;
+    let (after_gap, _) = stage(
+        &mut owner,
+        u64::try_from(id).unwrap(),
+        creation(id, id, &required, None),
+    );
+    assert!(owner.prepared_candidate(after_gap).is_ok());
+    assert!(owner.prepared_candidate(staged[0]).is_ok());
+    assert_eq!(kept(&owner), walk(&owner));
+    // Published in order, the chain drains: its sums follow it to nothing, and below a quarter of
+    // what it grew to it moves into a buffer half as large, never below its headroom.
+    let remaining = staged[..burst * 3 / 4].iter().copied().chain([after_gap]);
+    for candidate in remaining {
+        owner.publish_after_durable(candidate).unwrap();
+        assert_eq!(kept(&owner), walk(&owner));
+    }
+    assert_eq!(kept(&owner), (0, 0));
+    assert!(
+        owner.pending.capacity() < grown,
+        "the drained chain gave back its buffer"
+    );
+    assert!(
+        owner.pending.capacity() >= floor,
+        "never below the headroom it began at"
+    );
+    assert!(
+        owner._queue_allocation.bytes() < charged,
+        "and the buffer's charge"
+    );
+    assert_eq!(
+        owner._queue_allocation.bytes(),
+        prepare::array::<Pending>(owner.pending.capacity()).unwrap()
+    );
+}
+
 #[test]
 fn one_owner_chain_exposes_distinct_candidate_and_committed_facts_until_ordered_publication() {
     let mut core = core();
@@ -110,7 +192,7 @@ fn one_owner_chain_exposes_distinct_candidate_and_committed_facts_until_ordered_
         validation::State::Validating
     );
     assert_eq!(
-        owner.effective().recorded(request(ISSUER, 1)),
+        owner.effective().recorded(request(ISSUER, 1)).unwrap(),
         Some(created_outcome)
     );
     let before = budget.stats();
@@ -182,8 +264,20 @@ fn discarded_suffix_rewinds_owned_registry_and_reused_request_prefix_cannot_revi
     assert_eq!(current.binding(), binding(1));
     assert!(current.scopes().children().is_empty());
     assert!(owner.effective().claim(ClaimId::from_u128(2)).is_none());
-    assert!(owner.effective().recorded(request(ISSUER, 2)).is_none());
-    assert!(owner.effective().recorded(request(ISSUER, 3)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 2))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 3))
+            .unwrap()
+            .is_none()
+    );
     // The discarded clock 30 also disappears. Reusing the exact request at 20
     // recreates identical logical history but must never recreate its capability.
     let (new_child, replay) = stage(&mut owner, 20, child(2, 2, binding(1)));
@@ -258,8 +352,14 @@ fn identical_ledgers_ranges_requests_and_sequences_do_not_share_owner_tickets() 
         Err(NativeOwnerError::UnknownCandidate)
     ));
     right.publish_after_durable(b).unwrap();
-    assert_eq!(left.committed().recorded(first.invocation), Some(first));
-    assert_eq!(right.committed().recorded(second.invocation), Some(second));
+    assert_eq!(
+        left.committed().recorded(first.invocation).unwrap(),
+        Some(first)
+    );
+    assert_eq!(
+        right.committed().recorded(second.invocation).unwrap(),
+        Some(second)
+    );
     drop(left);
     let mut replacement = NativeOwner::new(core()).unwrap();
     let (c, _) = stage(&mut replacement, 10, creation(1, 1, &[], None));
@@ -338,10 +438,17 @@ fn failed_domain_admission_preserves_tail_clock_requests_and_ability_to_publish(
         owner
             .candidate(first)
             .unwrap()
-            .recorded(original.invocation),
+            .recorded(original.invocation)
+            .unwrap(),
         Some(original)
     );
-    assert!(owner.effective().recorded(request(ISSUER, 2)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 2))
+            .unwrap()
+            .is_none()
+    );
     let (valid, _) = stage(&mut owner, 20, post(2, binding(1)));
     owner.publish_after_durable(first).unwrap();
     owner.publish_after_durable(valid).unwrap();
@@ -352,7 +459,7 @@ fn failed_domain_admission_preserves_tail_clock_requests_and_ability_to_publish(
 }
 
 #[test]
-fn retained_neighbor_copy_failure_keeps_the_entire_existing_chain_and_refunds_candidate_memory() {
+fn range_failure_keeps_the_entire_existing_chain_and_refunds_candidate_memory() {
     let mut core = core();
     super::super::report_tests::publish(&mut core, 10, creation(1, 1, &[], None));
     super::super::report_tests::publish(&mut core, 20, creation(2, 2, &[], None));
@@ -360,7 +467,9 @@ fn retained_neighbor_copy_failure_keeps_the_entire_existing_chain_and_refunds_ca
     let mut owner = NativeOwner::new(core).unwrap();
     let (first, first_outcome) = stage(&mut owner, 30, creation(3, 3, &[], None));
     let before = budget.stats();
-    let failed = super::super::prepare::fail_copies_after(1, || {
+    // The write's range step fails, its last before it is a candidate: whatever it did
+    // before must leave no trace.
+    let failed = super::super::prepare::fail_range_after(0, || {
         owner.prepare(context(ISSUER, 900), creation(4, 4, &[], None), None)
     });
     assert!(matches!(
@@ -374,7 +483,13 @@ fn retained_neighbor_copy_failure_keeps_the_entire_existing_chain_and_refunds_ca
     assert_eq!(owner.oldest(), Some(first));
     assert_eq!(owner.effective().sequence(), first_outcome.sequence);
     assert!(owner.effective().claim(ClaimId::from_u128(4)).is_none());
-    assert!(owner.effective().recorded(request(ISSUER, 4)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 4))
+            .unwrap()
+            .is_none()
+    );
     let (retried, _) = stage(&mut owner, 40, creation(4, 4, &[], None));
     owner.publish_after_durable(first).unwrap();
     owner.publish_after_durable(retried).unwrap();
@@ -500,10 +615,16 @@ fn discard_all_is_idempotent_and_never_erases_committed_requests_or_reuses_ticke
     assert_eq!(owner.oldest(), None);
     assert_eq!(owner.effective().sequence(), original.sequence);
     assert_eq!(
-        owner.effective().recorded(original.invocation),
+        owner.effective().recorded(original.invocation).unwrap(),
         Some(original)
     );
-    assert!(owner.effective().recorded(request(ISSUER, 2)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 2))
+            .unwrap()
+            .is_none()
+    );
     let (replacement, _) = stage(&mut owner, 20, creation(2, 2, &[], None));
     assert_ne!(replacement, second);
     assert_ne!(replacement, third);
@@ -545,7 +666,7 @@ fn owner_construction_refuses_unfunded_queue_storage_and_returns_original_core_f
     assert_eq!(budget.stats(), before);
     assert_eq!(refused.core.native_sequence(), outcome.sequence);
     assert_eq!(
-        refused.core.native_outcome(outcome.invocation),
+        refused.core.native_outcome(outcome.invocation).unwrap(),
         Some(outcome)
     );
     assert_eq!(
@@ -555,7 +676,7 @@ fn owner_construction_refuses_unfunded_queue_storage_and_returns_original_core_f
     drop(pressure);
     let owner = NativeOwner::new(refused.core).unwrap();
     assert_eq!(
-        owner.committed().recorded(outcome.invocation),
+        owner.committed().recorded(outcome.invocation).unwrap(),
         Some(outcome)
     );
     assert_eq!(owner.pending_len(), 0);
@@ -623,10 +744,13 @@ fn lower_level_publication_refusal_restores_the_exact_head_ticket_and_successors
     owner.publish_after_durable(first).unwrap();
     owner.publish_after_durable(second).unwrap();
     assert_eq!(
-        owner.committed().recorded(original.invocation),
+        owner.committed().recorded(original.invocation).unwrap(),
         Some(original)
     );
-    assert_eq!(owner.committed().recorded(later.invocation), Some(later));
+    assert_eq!(
+        owner.committed().recorded(later.invocation).unwrap(),
+        Some(later)
+    );
     drop(pressure);
 }
 
@@ -665,9 +789,104 @@ fn owner_snapshot_facade_pins_only_committed_facts_and_expires_retained_pages() 
         generated.with_claim(key(1).claim, 100, |row| row.status()),
         Err(MemoryError::LeaseExpired)
     );
-    assert_eq!(
+    assert!(matches!(
         empty.recorded(request(ISSUER, 1), 100),
-        Err(MemoryError::LeaseExpired)
+        Err(NativeError::Memory(MemoryError::LeaseExpired))
+    ));
+    assert_eq!(owner.pending_len(), 0);
+}
+
+/// The admission check rests on this bound (rule 2): what a checkpoint of the
+/// committed root with every pending candidate published projects is never
+/// less than what that checkpoint actually encodes to, in rows or bytes; with
+/// nothing pending it is exactly what it encodes to.
+#[test]
+fn a_checkpoint_projection_bounds_the_checkpoint_it_projects() {
+    use crate::native::record_codec::{EncodingLimits, checkpoint::EncodingPlan};
+    let core = core();
+    let mut owner = NativeOwner::new(core).unwrap();
+    let mut staged = Vec::new();
+    for id in 1..=24u128 {
+        staged.push(stage(
+            &mut owner,
+            u64::try_from(id).unwrap(),
+            creation(id, id, &[(ValidationMode::Required, false)], None),
+        ));
+    }
+    let projection = owner.checkpoint_projection().unwrap();
+    for (candidate, outcome) in staged {
+        assert_eq!(owner.publish_after_durable(candidate).unwrap(), outcome);
+    }
+    assert_eq!(owner.pending_len(), 0);
+    let plan = EncodingPlan::prepare(
+        owner.committed_core(),
+        EncodingLimits {
+            bytes: usize::MAX,
+            visits: usize::MAX,
+            rows: usize::MAX,
+        },
+    )
+    .unwrap();
+    let actual = plan.quote();
+    assert!(
+        projection.rows >= actual.rows,
+        "projected {} rows, encoded {}",
+        projection.rows,
+        actual.rows
     );
+    assert!(
+        projection.bytes >= actual.bytes,
+        "projected {} bytes, encoded {}",
+        projection.bytes,
+        actual.bytes
+    );
+    // Published, the projection is the committed root alone, and exactly what it encodes to:
+    // the rows' running total and the frame are the checkpoint, byte for byte.
+    let after = owner.checkpoint_projection().unwrap();
+    assert_eq!((after.rows, after.bytes), (actual.rows, actual.bytes));
+}
+
+/// A publication takes away what the committed rows it replaces or deletes took in a checkpoint,
+/// counted as its build took them out of their pages rather than looked up again: through
+/// creations, posts, a begun admission and cancellations, each prepared on the rows the one before
+/// it leaves, the running total is at every publication what a lookup of each written key gives,
+/// and what the committed rows encode to.
+#[test]
+fn a_publication_takes_away_what_its_build_replaced() {
+    let mut owner = NativeOwner::new(core()).unwrap();
+    let required = [(ValidationMode::Required, false)];
+    let claims = 12u128;
+    let mut staged = Vec::new();
+    for id in 1..=claims {
+        let time = u64::try_from(id).unwrap();
+        staged.push(stage(&mut owner, time, creation(id, id, &required, None)).0);
+    }
+    for id in 1..=claims {
+        let time = u64::try_from(100 + id).unwrap();
+        staged.push(stage(&mut owner, time, post(100 + id, binding(id))).0);
+    }
+    let claim = owner.effective().claim(key(1).claim).unwrap().binding();
+    let evaluation = owner.effective().evaluation(key(1)).unwrap().binding();
+    staged.push(stage(&mut owner, 200, begin(200, claim, 1, evaluation)).0);
+    for id in (2..=claims).step_by(2) {
+        let expected = owner
+            .effective()
+            .claim(ClaimId::from_u128(id))
+            .unwrap()
+            .binding();
+        let time = u64::try_from(300 + id).unwrap();
+        staged.push(stage(&mut owner, time, cancel(300 + id, expected)).0);
+    }
+    for candidate in staged {
+        let head = &owner.pending.front().unwrap().prepared;
+        let looked_up = owner.core.encoded_after_by_lookup(head).unwrap();
+        owner.publish_after_durable(candidate).unwrap();
+        let state = &owner.core.state;
+        assert_eq!(state.encoded_rows, looked_up);
+        assert_eq!(
+            state.encoded_rows,
+            crate::native::encoded_rows_of(&state.rows, state.ledger, state.payloads()).unwrap()
+        );
+    }
     assert_eq!(owner.pending_len(), 0);
 }

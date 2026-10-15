@@ -3,7 +3,7 @@ use super::*;
 #[derive(Clone)]
 struct Capable {
     managed: bool,
-    calls: tokio::sync::watch::Sender<usize>,
+    calls: Arc<AtomicUsize>,
 }
 impl RequestHandler for Capable {
     fn supports_managed_requests(&self) -> bool {
@@ -11,8 +11,7 @@ impl RequestHandler for Capable {
     }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move {
-            self.calls
-                .send_modify(|count| *count = count.saturating_add(1));
+            self.calls.fetch_add(1, Ordering::SeqCst);
             response(request.request())
         })
     }
@@ -58,88 +57,94 @@ fn managed_negotiation_preserves_legacy_bytes_and_requires_explicit_support() {
     assert!(!managed.accepts_protocol(3));
 }
 
-#[tokio::test]
-async fn quic_capability_is_negotiated_before_request_and_legacy_requests_remain_valid() {
-    let pki = Pki::new();
-    let (certificate, key) = pki.issue(false);
-    let registry = PeerRegistry::new(4).unwrap();
-    registry
-        .register_certificate(&certificate, grant())
-        .unwrap();
-    let connector = connector(&pki, certificate, key);
-    for capable in [false, true] {
-        let (calls, count) = tokio::sync::watch::channel(0);
-        let (server, task) = server(
-            &pki,
-            registry.clone(),
-            Arc::new(Capable {
-                managed: capable,
-                calls,
-            }),
-        )
-        .await;
-        let remote = connector
-            .connect(server.local_addr().unwrap(), "localhost")
-            .await
+#[test]
+fn quic_capability_is_negotiated_before_request_and_legacy_requests_remain_valid() {
+    focal_rt::block_on(async move {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(4).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
             .unwrap();
-        assert_eq!(remote.negotiated().protocol, if capable { 2 } else { 1 });
+        let connector = connector(&pki, certificate, key);
+        for capable in [false, true] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let (server, task) = server(
+                &pki,
+                registry.clone(),
+                Arc::new(Capable {
+                    managed: capable,
+                    calls: count.clone(),
+                }),
+            )
+            .await;
+            let remote = connector
+                .connect(server.local_addr().unwrap(), "localhost")
+                .await
+                .unwrap();
+            assert_eq!(remote.negotiated().protocol, if capable { 2 } else { 1 });
+            assert_eq!(
+                remote.request(&request(1)).await.unwrap(),
+                response(&request(1))
+            );
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            if !capable {
+                let managed = RequestEnvelope {
+                    protocol: MANAGED_PROTOCOL_VERSION,
+                    ..request(2)
+                };
+                assert!(matches!(
+                    remote.request(&managed).await,
+                    Err(WireError::Access(AccessError::UnsupportedProtocol))
+                ));
+                assert_eq!(
+                    count.load(Ordering::SeqCst),
+                    1,
+                    "no unsupported managed request reached ingress"
+                );
+            }
+            remote.close().unwrap();
+            server.close().unwrap();
+            task.join().await.unwrap();
+        }
+    })
+    .unwrap()
+}
+
+#[test]
+fn local_managed_capability_refusal_precedes_request_transmission() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("focal.sock");
+        let server = Arc::new(LocalServer::bind(&path, grant(), limits()).unwrap());
+        let count = Arc::new(AtomicUsize::new(0));
+        let running = server.clone();
+        let calls = count.clone();
+        let task = spawn(async move {
+            running
+                .serve(Capable {
+                    managed: false,
+                    calls,
+                })
+                .await
+        });
+        let remote = LocalRemote::new(path, limits()).unwrap();
+        let managed = RequestEnvelope {
+            protocol: MANAGED_PROTOCOL_VERSION,
+            ..request(2)
+        };
+        assert!(matches!(
+            remote.request(&managed).await,
+            Err(WireError::Access(AccessError::UnsupportedProtocol))
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
         assert_eq!(
             remote.request(&request(1)).await.unwrap(),
             response(&request(1))
         );
-        assert_eq!(*count.borrow(), 1);
-        if !capable {
-            let managed = RequestEnvelope {
-                protocol: MANAGED_PROTOCOL_VERSION,
-                ..request(2)
-            };
-            assert!(matches!(
-                remote.request(&managed).await,
-                Err(WireError::Access(AccessError::UnsupportedProtocol))
-            ));
-            assert_eq!(
-                *count.borrow(),
-                1,
-                "no unsupported managed request reached ingress"
-            );
-        }
-        remote.close();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
         server.close();
-        task.await.unwrap().unwrap();
-    }
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn unix_managed_capability_refusal_precedes_request_transmission() {
-    let root = tempfile::tempdir().unwrap();
-    let path = root.path().join("focal.sock");
-    let server = Arc::new(UnixServer::bind(&path, grant(), limits()).unwrap());
-    let (calls, count) = tokio::sync::watch::channel(0);
-    let running = server.clone();
-    let task = tokio::spawn(async move {
-        running
-            .serve(Capable {
-                managed: false,
-                calls,
-            })
-            .await
-    });
-    let remote = UnixRemote::new(path, limits()).unwrap();
-    let managed = RequestEnvelope {
-        protocol: MANAGED_PROTOCOL_VERSION,
-        ..request(2)
-    };
-    assert!(matches!(
-        remote.request(&managed).await,
-        Err(WireError::Access(AccessError::UnsupportedProtocol))
-    ));
-    assert_eq!(*count.borrow(), 0);
-    assert_eq!(
-        remote.request(&request(1)).await.unwrap(),
-        response(&request(1))
-    );
-    assert_eq!(*count.borrow(), 1);
-    server.close();
-    task.await.unwrap().unwrap();
+        task.join().await.unwrap();
+    })
+    .unwrap()
 }

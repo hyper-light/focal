@@ -3,6 +3,7 @@
 //! An in-place bounded sort enables object-local walks without repeated root scans.
 use super::read_validate::{ValidationRead, invalid};
 use super::*;
+use crate::native::ranges::KeyedRows as _;
 use focal_memory::{Allocation, BudgetKind, BudgetLane};
 use focal_model::lifecycle::aggregation::PublicationPosition;
 
@@ -112,7 +113,7 @@ fn key(event: NativeEvent) -> HistoryKey {
 // In-place heapsort has no allocator or error-hiding comparison callback.
 // Each sift performs at most height comparisons of two children and the root.
 // The three linear sift schedules fit n*(height+1)*1024 fixed-key work units.
-fn sort_visits(count: usize) -> Result<usize, NativeError> {
+pub(super) fn sort_visits(count: usize) -> Result<usize, NativeError> {
     let height = usize::BITS
         .checked_sub(count.leading_zeros())
         .ok_or_else(invalid)?;
@@ -178,7 +179,6 @@ impl HistoryIndex {
             return Err(NativeError::Capacity("recovery history events"));
         }
         let capacity = count.checked_mul(2).ok_or_else(invalid)?;
-        read.charge(sort_visits(capacity)?)?;
         let charge = capacity
             .checked_mul(size_of::<IndexedEvent>())
             .and_then(|bytes| {
@@ -195,7 +195,7 @@ impl HistoryIndex {
         // uses constant stack state. The permit lasts through root validation.
         let allocation = read
             .budget
-            .reserve(BudgetKind::Recovery, BudgetLane::Completion, charge)?
+            .reserve(BudgetKind::Recovery, BudgetLane::Committed, charge)?
             .commit();
         let mut rows = Vec::new();
         rows.try_reserve_exact(capacity)
@@ -205,7 +205,7 @@ impl HistoryIndex {
         }
         let mut observed = 0_usize;
         lookup(read)?;
-        for row in read.root.entries_from(&Key::Event(SessionSeq(0), 0), false) {
+        for row in read.root.rows_from(&Key::Event(SessionSeq(0), 0), false) {
             read.charge(128)?;
             let Key::Event(sequence, ordinal) = row.key else {
                 break;
@@ -217,7 +217,7 @@ impl HistoryIndex {
             let Row::Event(stored) = &row.value else {
                 return Err(invalid());
             };
-            let event = stored.get().ok_or_else(invalid)?.expand(read.ledger);
+            let event = stored.get(read.ledger, read.payloads).ok_or_else(invalid)?;
             if event.sequence != sequence
                 || event.ordinal != ordinal
                 || sequence.0 == 0
@@ -267,6 +267,10 @@ impl HistoryIndex {
         if observed != count {
             return Err(invalid());
         }
+        // The sort is charged for the entries there are, once they are
+        // counted — the events and the secondary entries some carry — not for
+        // the capacity every event might have filled (the audit's F57).
+        read.charge(sort_visits(rows.len())?)?;
         sort(&mut rows)?;
         read.charge(
             rows.len()

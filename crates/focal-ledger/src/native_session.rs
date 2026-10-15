@@ -3,6 +3,7 @@
 //! Followers own a passive Core. Admission credits are reconstructed once at a
 //! current-term read barrier, never by replaying participant commands.
 pub(crate) use apply::NativeOutput;
+pub(crate) use checkpoint::CapturedCheckpoint;
 use engine::NativeEngine;
 use focal_consensus::{
     ConsensusError, DurableNode, Message, NodeConfig, NodeEvents, NodeStatus, StateRole,
@@ -28,18 +29,25 @@ mod checkpoint;
 #[cfg(test)]
 #[path = "native_session_cluster_tests.rs"]
 mod cluster_tests;
+#[path = "native_cold.rs"]
+pub(crate) mod cold;
 #[path = "native_session_engine.rs"]
 pub(crate) mod engine;
 #[path = "native_session_genesis.rs"]
 pub mod genesis;
+#[path = "native_payloads.rs"]
+pub mod payloads;
 #[path = "native_session_range.rs"]
 pub mod range;
 #[path = "native_session_retention.rs"]
 pub mod retention;
 #[path = "native_session_retirement.rs"]
 pub mod retirement;
+#[path = "native_session_seal.rs"]
+pub mod seal;
 pub use range::LayoutOperation;
 pub use retirement::RetirementRecord;
+pub use seal::{AnchoredSealRecord, SealRecord};
 #[path = "native_session_movement.rs"]
 pub mod movement;
 pub use movement::{LedgerRangeVerifier, MovementRecord};
@@ -60,8 +68,14 @@ pub struct NativeSessionLimits {
     /// Largest borrowed native input frame and its cumulative decode work.
     pub frame_bytes: usize,
     pub decode_work: input_codec::DecodeWork,
+    /// What this engine admits within: its share of the session's allowance ([`NativeShare`]),
+    /// `completion_reserve_bytes` of it kept for completing what was admitted.
     pub memory_bytes: usize,
     pub completion_reserve_bytes: usize,
+    /// What it may hold applying what its session committed, at least `memory_bytes`: the
+    /// session's allowance, so a replica follows a leader whose share is wider than its own
+    /// (doc 31 M3). Its checkpoints' bounds follow it; what admission projects follows the share.
+    pub hold_bytes: usize,
     pub content_domain: focal_model::ContentDomainId,
     /// Free bytes the WAL filesystem must keep before a fresh candidate is
     /// admitted; zero disables the watermark. Admission reserves memory for the
@@ -77,6 +91,60 @@ pub struct NativeSessionLimits {
     /// Bounds on the movement coordinator (25 §6): members, historical maps,
     /// pins and the movement section of a checkpoint.
     pub ranges: focal_ranges::RangeLimits,
+    /// How this session's authority seals (F12): the node sets it from the
+    /// fence it knows (`SEAL_LEVEL`); every replica applies both records.
+    pub seal_rule: SealRule,
+    /// How this session's authority retires (doc 31 M2): the node sets it from the fence it
+    /// knows (`RETIRE_LEVEL`); every replica applies both records.
+    pub retire_rule: RetireRule,
+    /// How fresh cold streams are cut (doc 31 M2, A2): [`focal_evidence::ColdGeometry::STANDARD`]
+    /// outside tests; restored ones keep the geometry their checkpoint names.
+    pub cold_geometry: focal_evidence::ColdGeometry,
+}
+/// How an authority seals the closed outcomes of its live window (F12).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SealRule {
+    /// The seal is derived at the committed prefix under the pressure's
+    /// floors and applies only there; the archive agent notices the
+    /// pressure at its tick. What a node runs below the fence's
+    /// `SEAL_LEVEL`.
+    #[default]
+    Derived,
+    /// The seal names what was closed where it was derived and applies after
+    /// the commits its custody took; the owner closes generations itself as
+    /// the window comes under pressure, through a closing seal; a seal waits
+    /// for the pipeline to drain instead of being refused for it.
+    Anchored,
+}
+/// How much of its session's allowance a native engine admits within (doc 31 M3). Every binary
+/// that knows this rule applies within the whole allowance whatever its share, so it follows a
+/// leader of either share; a leader admits within the wide share only once the fence its node
+/// knew as the session's hosting was built opens `SHARE_LEVEL`, where no binary that holds less
+/// can serve.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NativeShare {
+    /// Half the allowance: what every binary below `SHARE_LEVEL` admits and holds.
+    #[default]
+    Half,
+    /// The allowance less the session's completion reserve, which the rest of the session's
+    /// work completes within: beside its native engine a native session held at most 0.27 MB
+    /// at 1,000 and at 4,000 creations a second (the session's memory gauges, sampled every 5 s).
+    Wide,
+}
+/// How an authority retires families (doc 31 M2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RetireRule {
+    /// One family at a time, as a session decision at the exact prefix it was derived at
+    /// (`FOCALRT1`): what a node runs below the fence's `RETIRE_LEVEL`, whose binaries cannot
+    /// read a batch.
+    #[default]
+    Exact,
+    /// Batches of families as candidates among the writes (`FCRETIRE`), derived and checked by
+    /// every replica where they apply.
+    Pipeline,
+    /// Batches whose families every replica writes to its own cold stream where the record
+    /// applies (`FCRETIRE` version 2, doc 31 M2, A2): nothing is sealed under custody.
+    Cold,
 }
 /// What the materializer has done since this session opened.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -126,6 +194,19 @@ impl NativeSessionLimits {
             attempts: 64,
             slot_bytes: 4096,
         };
+        // A session's root is charged to its memory budget, so it never holds
+        // more rows than that budget can keep resident; its checkpoint carries
+        // that many, and admission refuses what would outgrow either bound
+        // (`checkpointable`). The fixed 100,000 rows was stricter than memory:
+        // a ledger was admitted past it, its checkpoint failed, and it stopped.
+        let memory_bytes: usize = 128 << 20;
+        let checkpoint = crate::native_checkpoint::Limits {
+            rows: memory_bytes
+                .checked_div(focal_core::native::NATIVE_ENTRY_BYTES)
+                .unwrap_or(0),
+            ..crate::native_checkpoint::Limits::default()
+        }
+        .derived();
         Self {
             recovery: recovery::Limits {
                 // Bounded owner shapes: every completion-class admission funds
@@ -134,6 +215,14 @@ impl NativeSessionLimits {
                 native: focal_core::native::NativeLimits {
                     range: focal_memory::RangeConfig {
                         page_entries: 128,
+                        // A leaf is a memory page (a B-tree node sized to the unit the
+                        // system moves, Bayer and McCreight 1972): a mutation rebuilds its
+                        // touched leaves whole, so a leaf's bytes are what each costs to
+                        // copy, and the page is what the copy faults in. Measured on
+                        // macOS at 16 KiB against the 64 KiB it replaced: 35% fewer
+                        // allocations and 38% fewer bytes per committed claim, the
+                        // same live heap (docs/qualification/allocations-2026-09-29.md §9).
+                        page_bytes: focal_platform::memory_page_bytes().unwrap_or(usize::MAX),
                         max_batch_entries: 256,
                         ..focal_memory::RangeConfig::default()
                     },
@@ -183,12 +272,15 @@ impl NativeSessionLimits {
                     construction_bytes: 4 * 1024 * 1024,
                 },
                 creation_objects: 4096,
-                work: recovery::Work {
-                    parsing: 1 << 30,
-                    source: 1 << 30,
-                    model: 1 << 30,
-                    lookup: 1 << 30,
-                },
+                // The work a restore of the largest checkpoint this
+                // configuration admits may spend, derived from the
+                // checkpoint's own bounds (the audit's F57): an admitted
+                // checkpoint always fits its recovery envelope.
+                work: recovery::Work::for_limits(
+                    checkpoint.visits,
+                    checkpoint.assembled_bytes,
+                    checkpoint.rows,
+                ),
             },
             encoding: record::EncodingLimits {
                 // One record: a preparation-sized body at the codec's fourfold
@@ -203,7 +295,7 @@ impl NativeSessionLimits {
                 rows: 100_000,
                 row_bytes: 6 << 20,
             },
-            checkpoint: crate::native_checkpoint::Limits::default(),
+            checkpoint,
             frame_bytes: 1 << 20,
             decode_work: input_codec::DecodeWork {
                 parse: 1 << 28,
@@ -212,13 +304,67 @@ impl NativeSessionLimits {
                 acceptance: 1 << 28,
                 native: 1 << 28,
             },
-            memory_bytes: 128 << 20,
+            memory_bytes,
             completion_reserve_bytes: 16 << 20,
+            hold_bytes: memory_bytes,
             content_domain,
             disk_headroom_bytes: 64 << 20,
             materializer: record::materialize::MaterializerLimits::default(),
             ranges: focal_ranges::RangeLimits::default(),
+            seal_rule: SealRule::Derived,
+            retire_rule: RetireRule::Exact,
+            cold_geometry: focal_evidence::ColdGeometry::STANDARD,
         }
+    }
+}
+impl NativeSessionLimits {
+    /// The standard limits for an engine that admits within `memory_bytes` and holds up to
+    /// `hold_bytes` (at least `memory_bytes`): its completion reserve an eighth of its share, as
+    /// the standard 16 of 128 MiB, and its checkpoint's bounds following what it holds. A root is
+    /// charged to the engine's budget, so it holds at most as many rows as that budget keeps
+    /// resident, and admission refuses a mutation whose projected checkpoint would pass what the
+    /// share allows (`checkpointable`): both follow the allowance, down as well as up, so an
+    /// engine on a small node refuses at what it can hold rather than holding what it cannot.
+    pub fn standard_within(
+        content_domain: focal_model::ContentDomainId,
+        memory_bytes: usize,
+        hold_bytes: usize,
+    ) -> Self {
+        let hold_bytes = hold_bytes.max(memory_bytes);
+        let mut limits = Self::standard(content_domain);
+        limits.memory_bytes = memory_bytes;
+        limits.completion_reserve_bytes = memory_bytes / 8;
+        limits.hold_bytes = hold_bytes;
+        limits.checkpoint.rows = hold_bytes
+            .checked_div(focal_core::native::NATIVE_ENTRY_BYTES)
+            .unwrap_or(0);
+        limits.checkpoint.assembled_bytes = hold_bytes;
+        limits.checkpoint = limits.checkpoint.derived();
+        limits
+    }
+    /// The checkpoint a mutation may project as it is admitted, rows and assembled bytes: what
+    /// the share allows, within what the engine's checkpoints hold. A leader admitting within it
+    /// leaves every replica that holds as much as the share able to checkpoint what it admitted.
+    pub fn admission_checkpoint(&self) -> (usize, usize) {
+        let rows = self
+            .memory_bytes
+            .checked_div(focal_core::native::NATIVE_ENTRY_BYTES)
+            .unwrap_or(0);
+        (
+            rows.min(self.checkpoint.rows),
+            self.memory_bytes.min(self.checkpoint.assembled_bytes),
+        )
+    }
+    /// The budget this engine charges under `parent`: its share, its reserve and its hold.
+    pub(crate) fn budget_within(
+        &self,
+        parent: &focal_memory::MemoryBudget,
+    ) -> Result<focal_memory::MemoryBudget, focal_memory::MemoryError> {
+        parent.child_holding(
+            self.memory_bytes,
+            self.completion_reserve_bytes,
+            self.hold_bytes.max(self.memory_bytes),
+        )
     }
 }
 /// Fresh admissions between free-space samples while far above the watermark.
@@ -239,14 +385,21 @@ pub enum NativeSessionError {
     Checkpoint(#[from] crate::native_checkpoint::Error),
     #[error("native session is not authoritative; known leader {leader}")]
     NotReady { leader: u64 },
-    #[error("native session capacity exceeded")]
-    Capacity,
+    /// A bound the session holds to refused, named: the caller retries, and an operator reads
+    /// which bound it was.
+    #[error("native session capacity: {0}")]
+    Capacity(&'static str),
     #[error("native session identity, profile or committed prefix mismatch")]
     Corrupt,
     #[error("native-only session refuses legacy history or migration")]
     Legacy,
     #[error("native session stopped after committed application failure; reopen to recover")]
     Failed,
+    /// [`Self::Failed`], naming what stopped it: the first error the session
+    /// failed closed on, so the stop it reports is its cause and not only
+    /// that it stopped.
+    #[error("native session stopped after committed application failure ({0}); reopen to recover")]
+    Stopped(Box<str>),
     #[error("content named by a committed fact is not local yet; poll again once custody arrives")]
     CustodyPending,
     #[error("a committed layout change is in flight; propose again once it applies")]
@@ -257,8 +410,27 @@ pub enum NativeSessionError {
     Range(focal_ranges::RangeError),
     #[error("a committed retirement is in flight; propose again once it applies")]
     Retiring,
+    /// A batch of retirements asked of an authority that retires a family at a time
+    /// ([`RetireRule::Exact`]): its cluster's fence has not opened `RETIRE_LEVEL`, so a binary
+    /// in it may be one that cannot read a batch.
+    #[error(
+        "retirement batches wait for the upgrade fence; this session retires a family at a time"
+    )]
+    RetireExact,
+    #[error("a committed seal is in flight; propose again once it applies")]
+    Sealing,
+    #[error("seal refused: {0:?}")]
+    Seal(focal_core::native::seal::SealRefusal),
     #[error("retirement refused: {0:?}")]
     Retirement(focal_core::native::retirement::RetirementRefusal),
+    /// A committed retirement the authority checked against an outcome
+    /// bound of `committed` makes a state this replica's bound of `local`
+    /// cannot hold: this replica is configured below the authority and
+    /// stops rather than diverge (26 §4).
+    #[error(
+        "a committed retirement was checked against an outcome bound of {committed}; this replica's bound of {local} cannot hold the state it makes"
+    )]
+    OutcomeBound { committed: u64, local: u64 },
 }
 impl From<focal_ranges::RangeError> for NativeSessionError {
     fn from(error: focal_ranges::RangeError) -> Self {
@@ -297,16 +469,21 @@ impl NativeSessionError {
                 },
                 NativeError::Evidence(_) => Request,
                 NativeError::Contract(_) | NativeError::RequestConflict => Request,
+                // The payload log is a cache of the replica's records and checkpoints (doc 31
+                // M3): one it cannot read back is rebuilt by reopening, which restores and
+                // respills every row.
+                NativeError::Payload(_) => FailClosed,
             }
         }
         match self {
-            Self::Capacity
+            Self::Capacity(_)
             | Self::Memory(_)
             | Self::CustodyPending
             | Self::LayoutChanging
             | Self::Retiring
+            | Self::Sealing
             | Self::RangeMoving => Retryable,
-            Self::Retirement(_) => Request,
+            Self::Retirement(_) | Self::Seal(_) | Self::RetireExact => Request,
             Self::Range(
                 focal_ranges::RangeError::Capacity | focal_ranges::RangeError::Memory(_),
             ) => Retryable,
@@ -326,7 +503,9 @@ impl NativeSessionError {
             | Self::Checkpoint(_)
             | Self::Corrupt
             | Self::Legacy
-            | Self::Failed => FailClosed,
+            | Self::Failed
+            | Self::Stopped(_)
+            | Self::OutcomeBound { .. } => FailClosed,
         }
     }
 }
@@ -398,7 +577,12 @@ pub struct NativeSession<S: NativeSchemaVerifier> {
 pub struct PendingSeed {
     pub index: u64,
     pub term: u64,
+    /// Every chunk to pull: the root's seeds, then the cold streams' (doc 31 M2, A2).
     pub missing: Vec<ContentHash>,
+    /// Of `missing`, those of the cold data stream and of its marks: what an install takes into
+    /// the cold streams rather than the seeds.
+    cold_data: Vec<ContentHash>,
+    cold_marks: Vec<ContentHash>,
     _allocation: Allocation,
 }
 impl PendingSeed {
@@ -411,7 +595,7 @@ impl PendingSeed {
         let allocation = budget
             .reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 array::<ContentHash>(missing.capacity())?,
             )?
             .commit();
@@ -419,15 +603,63 @@ impl PendingSeed {
             index,
             term,
             missing,
+            cold_data: Vec::new(),
+            cold_marks: Vec::new(),
             _allocation: allocation,
         })
+    }
+    /// A checkpoint whose cold streams name chunks this replica lacks (doc 31 M2, A2): those of
+    /// the data stream and those of its marks.
+    pub(crate) fn cold(
+        index: u64,
+        term: u64,
+        data: Vec<ContentHash>,
+        marks: Vec<ContentHash>,
+        budget: &MemoryBudget,
+    ) -> Result<Self, NativeSessionError> {
+        let count = data
+            .len()
+            .checked_add(marks.len())
+            .ok_or(NativeSessionError::Capacity("missing chunks"))?;
+        let allocation = budget
+            .reserve(
+                BudgetKind::Recovery,
+                BudgetLane::Committed,
+                array::<ContentHash>(count.saturating_mul(2))?,
+            )?
+            .commit();
+        let mut missing = Vec::new();
+        missing
+            .try_reserve_exact(count)
+            .map_err(|_| NativeSessionError::Capacity("missing chunks"))?;
+        missing.extend_from_slice(&data);
+        missing.extend_from_slice(&marks);
+        Ok(Self {
+            index,
+            term,
+            missing,
+            cold_data: data,
+            cold_marks: marks,
+            _allocation: allocation,
+        })
+    }
+    /// Where a pulled chunk belongs: the cold data stream (`Some(true)`), its marks
+    /// (`Some(false)`), or the seeds (`None`).
+    pub(crate) fn cold_of(&self, hash: ContentHash) -> Option<bool> {
+        if self.cold_data.contains(&hash) {
+            Some(true)
+        } else if self.cold_marks.contains(&hash) {
+            Some(false)
+        } else {
+            None
+        }
     }
     /// A copy of the missing chunks a host can carry away.
     pub fn missing_chunks(&self) -> Result<Vec<ContentHash>, NativeSessionError> {
         let mut chunks = Vec::new();
         chunks
             .try_reserve_exact(self.missing.len())
-            .map_err(|_| NativeSessionError::Capacity)?;
+            .map_err(|_| NativeSessionError::Capacity("missing chunks"))?;
         chunks.extend_from_slice(&self.missing);
         Ok(chunks)
     }
@@ -452,7 +684,7 @@ impl PendingCustody {
         let allocation = budget
             .reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 array::<focal_model::ContentRef>(missing.capacity())?,
             )?
             .commit();
@@ -466,7 +698,7 @@ impl PendingCustody {
         let mut objects = Vec::new();
         objects
             .try_reserve_exact(self.missing.len())
-            .map_err(|_| NativeSessionError::Capacity)?;
+            .map_err(|_| NativeSessionError::Capacity("missing objects"))?;
         objects.extend(self.missing.iter().cloned());
         Ok(objects)
     }
@@ -495,13 +727,13 @@ impl<'a> RecordingReader<'a> {
         }
     }
 }
-impl focal_evidence::NativeCustodyReader for RecordingReader<'_> {
-    fn read_content(
+impl RecordingReader<'_> {
+    /// An object found missing is recorded once, up to the pending bound.
+    fn note<T>(
         &self,
         reference: &focal_model::ContentRef,
-        budget: usize,
-    ) -> Result<Vec<u8>, focal_evidence::ContentError> {
-        let result = self.inner.read_content(reference, budget);
+        result: Result<T, focal_evidence::ContentError>,
+    ) -> Result<T, focal_evidence::ContentError> {
         if let Err(focal_evidence::ContentError::Io(error)) = &result
             && error.kind() == std::io::ErrorKind::NotFound
             && let Ok(mut missing) = self.missing.lock()
@@ -514,6 +746,21 @@ impl focal_evidence::NativeCustodyReader for RecordingReader<'_> {
         result
     }
 }
+impl focal_evidence::NativeCustodyReader for RecordingReader<'_> {
+    fn read_content(
+        &self,
+        reference: &focal_model::ContentRef,
+        budget: usize,
+    ) -> Result<Vec<u8>, focal_evidence::ContentError> {
+        self.note(reference, self.inner.read_content(reference, budget))
+    }
+    fn manifest_chunks(
+        &self,
+        reference: &focal_model::ContentRef,
+    ) -> Result<usize, focal_evidence::ContentError> {
+        self.note(reference, self.inner.manifest_chunks(reference))
+    }
+}
 
 /// The single durable capability identity: the enclosing checkpoint codec's
 /// descriptor hash covers the session, input, mutation and root envelopes.
@@ -521,12 +768,13 @@ fn decoder() -> [u8; 32] {
     crate::native_checkpoint::format_hash().0
 }
 fn add(a: usize, b: usize) -> Result<usize, NativeSessionError> {
-    a.checked_add(b).ok_or(NativeSessionError::Capacity)
+    a.checked_add(b)
+        .ok_or(NativeSessionError::Capacity("session arithmetic"))
 }
 fn array<T>(count: usize) -> Result<usize, NativeSessionError> {
     let bytes = count
         .checked_mul(size_of::<T>())
-        .ok_or(NativeSessionError::Capacity)?;
+        .ok_or(NativeSessionError::Capacity("session arithmetic"))?;
     add(
         bytes,
         if count == 0 {
@@ -540,9 +788,9 @@ fn reserved<T>(count: usize) -> Result<Vec<T>, NativeSessionError> {
     let mut values = Vec::new();
     values
         .try_reserve_exact(count)
-        .map_err(|_| NativeSessionError::Capacity)?;
+        .map_err(|_| NativeSessionError::Capacity("session allocation"))?;
     if values.capacity() > count {
-        return Err(NativeSessionError::Capacity);
+        return Err(NativeSessionError::Capacity("session allocation"));
     }
     Ok(values)
 }
@@ -590,7 +838,9 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         schemas: S,
     ) -> Result<Opened<S>, NativeSessionError> {
         if !consensus.is_budgeted_within(parent) {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity(
+                "storage outside the session budget",
+            ));
         }
         let is_new = consensus.required_decoder().is_none();
         if !is_new && consensus.required_decoder() != Some(decoder()) {
@@ -623,6 +873,15 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
             engine::NativeSources {
                 reader,
                 seeds: seeds.reader(),
+                cold: Some(cold::ColdSource {
+                    root: store.root().join("cold"),
+                    disk: consensus.disk_budget(),
+                    geometry: limits.cold_geometry,
+                }),
+                payloads: Some(payloads::PayloadSource {
+                    root: store.root().join("payloads"),
+                    disk: consensus.disk_budget(),
+                }),
             },
             schemas,
         )?;
@@ -640,7 +899,7 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         self.consensus.status()
     }
     pub fn is_authoritative(&self) -> bool {
-        self.engine.is_authoritative(&self.consensus.status())
+        self.engine.is_authoritative(&self.consensus.scalars())
     }
     pub fn genesis(&self) -> Option<ContentHash> {
         self.engine.genesis()
@@ -708,7 +967,10 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     /// family is derived from the committed state first, so an applicable
     /// record is what the log carries. Refused while candidates are
     /// pending, a layout change, movement step or another retirement is in
-    /// flight, or the family is ineligible.
+    /// flight, or the family is ineligible — the outcome the retirement
+    /// publishes past the core's bound (`OutcomeCapacity`) or promised to a
+    /// live report (`OutcomesReserved`) among the reasons; nothing is
+    /// proposed and nothing fenced on a refusal.
     pub fn propose_retirement(
         &mut self,
         root: focal_model::ClaimId,
@@ -723,10 +985,70 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     pub fn retirement_in_flight(&self) -> Option<RetirementRecord> {
         self.engine.retirement_in_flight()
     }
+    /// Propose one seal of closed outcomes as a session decision (F12): the
+    /// plan is derived from the committed state first, so an applicable
+    /// record is what the log carries. Refused under the retirement's
+    /// gates, while a seal or a retirement is in flight, or when the plan
+    /// does not name the committed prefix.
+    pub fn propose_seal(
+        &mut self,
+        plan: &focal_core::native::seal::SealPlan,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<focal_core::native::seal::Fold>,
+    ) -> Result<(), NativeSessionError> {
+        self.engine
+            .propose_seal(&mut self.consensus, plan, bundle, bytes, fold)
+    }
+    /// Whether this authority could propose a seal now (F12): what the
+    /// archive agent asks before it derives a plan and writes a bundle.
+    pub fn check_seal(&self) -> Result<(), NativeSessionError> {
+        self.engine.check_seal(&self.consensus.scalars())
+    }
+    /// The seal this authority proposed and has not seen applied.
+    pub fn seal_in_flight(&self) -> Option<SealRecord> {
+        self.engine.seal_in_flight()
+    }
+    /// Seals applied through this replica's applied prefix.
+    pub fn seals_applied(&self) -> u64 {
+        self.engine.seals_applied()
+    }
+    /// The active owner's incarnation, if there is one: a rebuilt owner is another.
+    #[cfg(test)]
+    pub(crate) fn owner_incarnation(&self) -> Option<focal_memory::OwnerId> {
+        self.engine.owner_incarnation()
+    }
+    /// Closing seals applied through this replica's applied prefix.
+    pub fn closes_applied(&self) -> u64 {
+        self.engine.closes_applied()
+    }
+    /// Anchored seals this authority let go before proposal.
+    pub fn seals_dropped(&self) -> u64 {
+        self.engine.seals_dropped()
+    }
+    /// The anchored seal this authority proposed and has not seen applied.
+    pub fn anchored_in_flight(&self) -> Option<AnchoredSealRecord> {
+        self.engine.anchored_in_flight().cloned()
+    }
+    /// Whether a seal is held for the pipeline to drain.
+    pub fn seal_wanted(&self) -> bool {
+        self.engine.decision_wanted()
+    }
+    /// Committed seal records this replica applied nothing for.
+    pub fn seals_inert(&self) -> u64 {
+        self.engine.seals_inert()
+    }
     /// Families retired through this replica's applied prefix (26 §4),
     /// counted from genesis or the checkpoint that seeded it.
     pub fn retired_families(&self) -> u64 {
         self.engine.retired_families()
+    }
+    /// Committed retirement records this replica applied nothing for since
+    /// it opened (26 §4): the prefix they named had passed, a movement was
+    /// pending, or the committed state refused the family — a version-1
+    /// record beyond this replica's outcome bound among them.
+    pub fn retirements_inert(&self) -> u64 {
+        self.engine.retirements_inert()
     }
     /// Propose one movement step as a session decision (25 §6): checked
     /// against the committed coordinator state first, refused while
@@ -810,7 +1132,7 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         boundary: NativeReadBoundary,
     ) -> Result<&Core<NativeState>, NativeSessionError> {
         self.engine
-            .read_at_least(boundary, &self.consensus.status())
+            .read_at_least(boundary, &self.consensus.scalars())
     }
     pub fn campaign(&mut self) -> Result<(), NativeSessionError> {
         self.engine.check()?;
@@ -826,15 +1148,31 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         &mut self,
         peer: u64,
         bytes: &[u8],
-    ) -> Result<(), NativeSessionError> {
+    ) -> Result<focal_consensus::Stepped, NativeSessionError> {
         self.engine.check()?;
-        self.consensus.step_authenticated(peer, bytes)?;
-        Ok(())
+        Ok(self.consensus.step_authenticated(peer, bytes)?)
     }
     pub fn step(&mut self, message: Message) -> Result<(), NativeSessionError> {
         self.engine.check()?;
         self.consensus.step(message)?;
         Ok(())
+    }
+    /// The fields beyond raft-rs's this group's member reads and writes from now on
+    /// (`focal_consensus::Wire`): raised by focal-node once the upgrade fence opens
+    /// `RAFT_KEPT_LEVEL`, before a member opened under that fence sends. Under `Wire::Kept` the
+    /// member reads a refusal's `kept` and `lost` and keeps what arrives ahead of a hole (R17).
+    pub fn set_raft_wire(&mut self, wire: focal_consensus::Wire) -> Result<(), NativeSessionError> {
+        self.engine.check()?;
+        self.consensus.set_raft_wire(wire)?;
+        Ok(())
+    }
+    /// What this group's messages are encoded under (`focal_consensus::encode_message_in`).
+    pub fn wire(&self) -> focal_consensus::Wire {
+        self.consensus.wire()
+    }
+    /// The bounds this group's core holds its queues to (`focal_consensus::CoreLimits`).
+    pub fn limits(&self) -> focal_consensus::CoreLimits {
+        self.consensus.limits()
     }
     /// Planned handover: the current authority asks `node` to campaign at once.
     /// Authority moves only through the committed readiness barrier of the new
@@ -925,6 +1263,21 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
                 owner.prepare_frame_with_custody(context, frame, limits, store, domain, schemas)
             })
     }
+    /// Retire the families `offers` name as the leader's next candidate (doc 31 M2), among
+    /// the writes around it: what the owner made of the offers, and the batch's submission,
+    /// none when nothing retires.
+    pub fn retire(
+        &mut self,
+        offers: &[focal_core::native::retirement_batch::RetireOffer],
+    ) -> Result<
+        (
+            focal_core::native::retirement_batch::RetireBatch,
+            Option<NativeSubmission>,
+        ),
+        NativeSessionError,
+    > {
+        self.engine.retire(&mut self.consensus, offers)
+    }
     /// Trusted timer delivery from the host's clock. Participants cannot reach
     /// this path; the owner deduplicates exact firings through the outcome row.
     pub fn deliver_native_timer(
@@ -955,6 +1308,15 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     pub fn read_index(&mut self, correlation: ReadCorrelation) -> Result<(), NativeSessionError> {
         self.engine.read_index(&mut self.consensus, correlation)
     }
+    /// Read barriers answered above this copy's applied index and held until
+    /// it caught up, since it opened (27 §5, follower reads).
+    pub fn reads_parked(&self) -> u64 {
+        self.engine.reads_parked
+    }
+    /// Read barriers dropped at the parked bound since this session opened.
+    pub fn reads_dropped(&self) -> u64 {
+        self.engine.reads_dropped
+    }
     /// Encode the committed Core at the fully delivered prefix under a retained
     /// output permit and hand bytes and permit together to consensus. Completion
     /// requires the actual durable fence observed by `poll`/`try_poll`.
@@ -978,9 +1340,26 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         hash: ContentHash,
         bytes: &[u8],
     ) -> Result<(), NativeSessionError> {
+        // A chunk of the cold streams the seed names goes there (doc 31 M2, A2).
+        if let Some(data) = self
+            .engine
+            .pending_seed()
+            .and_then(|pending| pending.cold_of(hash))
+        {
+            return self.engine.install_cold_chunk(data, hash, bytes);
+        }
         self.seeds
             .install_as(hash, bytes)
             .map_err(|error| NativeSessionError::Native(NativeEvidenceError::from(error).into()))
+    }
+    /// The frame of a family retired cold at `sequence` (doc 31 M2, A2), by its digest: `None`
+    /// when no cold record applied there.
+    pub fn cold_frame(
+        &mut self,
+        sequence: SessionSeq,
+        digest: ContentHash,
+    ) -> Result<Option<cold::ColdFrame>, NativeSessionError> {
+        self.engine.cold_frame(sequence, digest)
     }
     /// A read-only view of this replica's seeds, for serving peers.
     pub fn seed_reader(&self) -> SeedReader {

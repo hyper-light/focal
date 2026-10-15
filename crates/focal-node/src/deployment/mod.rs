@@ -41,7 +41,7 @@ pub enum DeploymentError {
     #[error("the directory view is truncated; the plan cannot name every session")]
     Truncated,
     #[error(
-        "the directory has not reported this node yet: it is still starting, or it runs no directory; plan from a node that does, once `cluster placement` shows it"
+        "the directory has not reported this node yet: it is still starting, or it runs no directory; plan from a node that does, once `inspect placement` shows it"
     )]
     NotObserved,
     #[error("deployment plan needs the requested configuration (--config FILE)")]

@@ -146,6 +146,48 @@ pub(super) struct Cohort<'w, 'a> {
     pub(super) principal: Principal,
     pub(super) limits: validation::Limits,
     pub(super) work: &'w Work,
+    pub(super) held: super::super::held::Held<CheckedDeclaration>,
+}
+
+impl Cohort<'_, '_> {
+    /// Reads the claim's declarations from the frame once, holding them for
+    /// the passes after (if they fit), and counts them.
+    pub(super) fn hold(&mut self) -> Result<usize, ContractError> {
+        let (held, count) = super::super::held::Held::read(self.read())?;
+        self.held = held;
+        self.count = count;
+        Ok(count)
+    }
+
+    fn read(&self) -> CheckedValues<'_, '_> {
+        CheckedValues {
+            bodies: Bodies::new(self.declarations, self.work),
+            claim: self.claim,
+            principal: self.principal,
+            limits: self.limits,
+            failed: false,
+        }
+    }
+}
+
+/// A pass over a cohort's declarations: those it holds, or read from the frame.
+pub(super) enum Declarations<'s, 'w, 'a> {
+    Held(&'s [Option<CheckedDeclaration>]),
+    Read(CheckedValues<'w, 'a>),
+}
+
+impl Iterator for Declarations<'_, '_, '_> {
+    type Item = Result<CheckedDeclaration, ContractError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Held(values) => {
+                let (first, rest) = values.split_first()?;
+                *values = rest;
+                Some(first.ok_or(ContractError::InvalidManifest))
+            }
+            Self::Read(values) => values.next(),
+        }
+    }
 }
 impl aggregation::AcceptanceSource for Cohort<'_, '_> {
     type Slot<'s>
@@ -157,7 +199,7 @@ impl aggregation::AcceptanceSource for Cohort<'_, '_> {
     where
         Self: 's;
     type Declarations<'s>
-        = CheckedValues<'s, 's>
+        = Declarations<'s, 's, 's>
     where
         Self: 's;
     fn slot_count(&self) -> usize {
@@ -174,12 +216,14 @@ impl aggregation::AcceptanceSource for Cohort<'_, '_> {
         )
     }
     fn declarations(&self) -> Self::Declarations<'_> {
-        CheckedValues {
-            bodies: Bodies::new(self.declarations, self.work),
-            claim: self.claim,
-            principal: self.principal,
-            limits: self.limits,
-            failed: false,
+        match self.held.replay() {
+            Some(values) => Declarations::Held(values),
+            None => Declarations::Read(self.read()),
         }
+    }
+    /// A cohort that holds its declarations replays them; its slots are read
+    /// from the borrowed frame, which does not change, by the same decoder.
+    fn replays(&self) -> bool {
+        self.held.replay().is_some()
     }
 }

@@ -232,14 +232,6 @@ impl Core<NativeState> {
         claim: ClaimId,
         project: impl FnOnce(&NativeAudit) -> T,
     ) -> Result<T, NativeError> {
-        with_audit(
-            &View {
-                state: &self.state,
-                tail: None,
-            },
-            claim,
-            self.limits,
-            project,
-        )
+        with_audit(&View::committed(&self.state), claim, self.limits, project)
     }
 }

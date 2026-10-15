@@ -1,11 +1,16 @@
 use super::*;
-use focal_mcp::{AdminAction, AdminBackend, AdminChange, AdminError};
+use focal_mcp::{AdminAction, AdminBackend, AdminChange, AdminError, AdminFuture, Cancel};
+use hyper_rt::combine::{Either, race2};
 impl AdminBackend for ClusterAdmin {
-    fn execute(
+    fn execute<'a>(&'a mut self, action: AdminAction, cancel: &'a mut Cancel) -> AdminFuture<'a> {
+        Box::pin(self.execute_inner(action, cancel))
+    }
+}
+impl ClusterAdmin {
+    async fn execute_inner(
         &mut self,
-        runtime: &tokio::runtime::Runtime,
         action: AdminAction,
-        cancel: &mut tokio::sync::oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> std::result::Result<AdminResult, AdminError> {
         let work = async {
             match action {
@@ -192,6 +197,8 @@ impl AdminBackend for ClusterAdmin {
                 } => self.revoke(id, expected_revision).await,
                 AdminAction::RenewCredential => self.renew_credential().await,
                 AdminAction::RotateCredential => self.rotate_credential().await,
+                AdminAction::Issuers => self.issuers().await,
+                AdminAction::RotateIssuer => self.rotate_issuer().await,
                 AdminAction::Placement => self.placement().await,
                 AdminAction::Plan => self.plan().await,
                 AdminAction::AdmitTenant { tenant } => self.admit_tenant(tenant).await,
@@ -233,6 +240,32 @@ impl AdminBackend for ClusterAdmin {
                     node,
                     expected_configuration_index,
                 } => self.transfer(node, expected_configuration_index).await,
+                AdminAction::PartitionShow { partition } => self.partition_show(partition).await,
+                AdminAction::PartitionChange {
+                    partition,
+                    change,
+                    expected_configuration_index,
+                } => {
+                    self.partition_change(
+                        partition,
+                        match change {
+                            AdminChange::AddLearner(node) => MembershipChange::AddLearner { node },
+                            AdminChange::Promote(node) => MembershipChange::Promote { node },
+                            AdminChange::Remove(node) => MembershipChange::Remove { node },
+                            AdminChange::LeaveJoint => MembershipChange::LeaveJoint,
+                        },
+                        expected_configuration_index,
+                    )
+                    .await
+                }
+                AdminAction::PartitionTransfer {
+                    partition,
+                    node,
+                    expected_configuration_index,
+                } => {
+                    self.partition_transfer(partition, node, expected_configuration_index)
+                        .await
+                }
                 AdminAction::NodeEligibility { node, eligible } => {
                     self.node_eligibility(node, eligible).await
                 }
@@ -245,12 +278,16 @@ impl AdminBackend for ClusterAdmin {
                 AdminAction::Reconcile { operation_id } => self.reconcile(&operation_id).await,
             }
         };
-        runtime.block_on(async {
-            tokio::select! {
-                result=work=>result.map_err(error),
-                _=cancel=>Err(AdminError { code:"cancelled",condition:"Cancelled",detail:"Admin wait cancelled; inspect the latest journal before issuing a new mutation.".into() }),
-            }
-        })
+        // The cancel's end — sent or its sender gone — ends the wait.
+        match race2(work, cancel).await {
+            Either::First(result) => result.map_err(error),
+            Either::Second(_) => Err(AdminError {
+                code: "cancelled",
+                condition: "Cancelled",
+                detail: "Admin wait cancelled; inspect the latest journal before issuing a new mutation."
+                    .into(),
+            }),
+        }
     }
 }
 fn error(error: ClusterAdminError) -> AdminError {

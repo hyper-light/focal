@@ -8,12 +8,16 @@ mod catalog_transfer;
 mod catalog_watch;
 mod claim_get;
 mod documents;
+mod engine;
+mod examples;
 mod inventory;
 mod lifecycle;
 mod monitors;
 mod native_catalog;
 mod native_documents;
+mod native_examples;
 mod native_inventory;
+mod native_lineage;
 mod native_schema;
 mod native_wait;
 mod schema;
@@ -27,12 +31,15 @@ pub use catalog_transfer::*;
 pub use catalog_watch::*;
 pub use claim_get::*;
 pub use documents::*;
+pub use engine::*;
 pub use inventory::*;
 pub use lifecycle::*;
 pub use monitors::*;
 pub use native_catalog::*;
 pub use native_documents::*;
+pub use native_examples::{EXAMPLE_DEADLINE_MS, example_ids};
 pub use native_inventory::*;
+pub use native_lineage::*;
 pub use native_wait::*;
 pub use traversal::*;
 pub use validators::*;
@@ -519,6 +526,8 @@ fn allocated(value: Option<String>, ids: &mut impl IdGenerator) -> Result<[u8; 1
     }
 }
 
+#[cfg(test)]
+mod engine_tests;
 #[cfg(test)]
 mod native_tests;
 #[cfg(test)]

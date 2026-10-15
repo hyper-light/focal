@@ -58,6 +58,15 @@ pub trait ValidationSource<'a>: PolicySource {
     fn fields(&self) -> ValidationFields<'a>;
     fn contributor_count(&self) -> usize;
     fn contributors(&self) -> Self::Contributors<'_>;
+    /// Whether every read yields what its plan's read did: a source over
+    /// bytes it borrows (which cannot change while borrowed), read by the same
+    /// decoder. A build from such a source's plan does not inspect it again;
+    /// the descriptor it builds is still inspected and held to the plan's
+    /// content and specification. Any other source is inspected again, so one
+    /// that changes is refused.
+    fn replays(&self) -> bool {
+        false
+    }
 }
 
 impl<'a> PolicySource for ValidationSpec<'a> {
@@ -260,9 +269,10 @@ impl<'s, 'a, S: ValidationSource<'a>> ValidationSourcePlan<'s, 'a, S> {
             self.shape.checked_visits,
             Some(self.shape.content_hash),
         )?;
-        if hash::intent(fields.declaration(actual.content_hash).binding)
-            != self.intent_fingerprint()
-            || actual.specification_hash != self.shape.specification_hash
+        if !hash::same_intent(
+            fields.declaration(actual.content_hash).binding,
+            self.fields.declaration(self.shape.content_hash).binding,
+        ) || actual.specification_hash != self.shape.specification_hash
             || actual.heap != self.shape.heap
             || actual.allocations != self.shape.allocations
             || actual.contributors != self.shape.contributors
@@ -501,17 +511,24 @@ pub(super) fn build<'a, S: ValidationSource<'a>>(
     bytes::fits(shape.charge, max_bytes)?;
     bytes::fits(shape.build_visits, max_visits)?;
     let mut visits = VisitBudget::new(shape.build_visits);
-    let (fields, actual) = inspect(principal, source, limits, visits.remaining())?;
-    visits.charge(actual.inspection_visits)?;
-    if hash::intent(fields.declaration(actual.content_hash).binding)
-        != hash::intent(expected.declaration(shape.content_hash).binding)
-        || actual.specification_hash != shape.specification_hash
-        || actual.heap != shape.heap
-        || actual.allocations != shape.allocations
-        || actual.contributors != shape.contributors
-    {
-        return Err(ContractError::ContentConflict);
-    }
+    // A source that replays what its plan read is not inspected again.
+    let fields = if source.replays() {
+        expected
+    } else {
+        let (fields, actual) = inspect(principal, source, limits, visits.remaining())?;
+        visits.charge(actual.inspection_visits)?;
+        if !hash::same_intent(
+            fields.declaration(actual.content_hash).binding,
+            expected.declaration(shape.content_hash).binding,
+        ) || actual.specification_hash != shape.specification_hash
+            || actual.heap != shape.heap
+            || actual.allocations != shape.allocations
+            || actual.contributors != shape.contributors
+        {
+            return Err(ContractError::ContentConflict);
+        }
+        fields
+    };
     let adapter = DeclarationAdapter {
         source,
         fields: fields.declaration(shape.content_hash),
@@ -558,6 +575,7 @@ pub(super) fn build<'a, S: ValidationSource<'a>>(
         Some(Err(error)) => return Err(error),
         Some(Ok(_)) => return Err(ContractError::InvalidManifest),
     }
+    let contributed_by = memory::exact(contributed_by)?;
     let descriptor = ValidationDescriptor {
         schema: fields.schema,
         declaration,
@@ -573,9 +591,10 @@ pub(super) fn build<'a, S: ValidationSource<'a>>(
     };
     let (copied, checked) = inspect(principal, &owned, limits, visits.remaining())?;
     visits.charge(checked.inspection_visits)?;
-    if hash::intent(copied.declaration(checked.content_hash).binding)
-        != hash::intent(expected.declaration(shape.content_hash).binding)
-        || checked.specification_hash != shape.specification_hash
+    if !hash::same_intent(
+        copied.declaration(checked.content_hash).binding,
+        expected.declaration(shape.content_hash).binding,
+    ) || checked.specification_hash != shape.specification_hash
         || checked.attempts != shape.attempts
         || descriptor.binding() != copied.declaration(checked.content_hash).binding
     {

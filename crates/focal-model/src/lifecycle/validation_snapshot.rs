@@ -219,15 +219,17 @@ fn require(condition: bool) -> Result<(), ContractError> {
 fn policies(
     declaration: &Declaration,
 ) -> impl Iterator<Item = (Phase, &definition::OwnedPhasePolicy)> {
-    let (first, second) = match &declaration.spec.program {
-        OwnedProgram::Delivery => (None, None),
-        OwnedProgram::Programmatic { check, quality } => (
-            Some((Phase::Programmatic, check)),
-            quality.as_ref().map(|policy| (Phase::Quality, policy)),
-        ),
-        OwnedProgram::Agentic { check } => (Some((Phase::Quality, check)), None),
+    let program = &declaration.spec.program;
+    let first = match program {
+        OwnedProgram::Delivery => None,
+        OwnedProgram::Agentic(_) => program.check().map(|policy| (Phase::Quality, policy)),
+        OwnedProgram::Programmatic(_) | OwnedProgram::ProgrammaticQuality(_) => {
+            program.check().map(|policy| (Phase::Programmatic, policy))
+        }
     };
-    first.into_iter().chain(second)
+    first
+        .into_iter()
+        .chain(program.quality().map(|policy| (Phase::Quality, policy)))
 }
 
 fn quote(declaration: &Declaration, base: usize) -> Result<usize, ContractError> {

@@ -11,7 +11,7 @@
 //! Outcome and creation-result rows stay: every native sequence keeps its
 //! one outcome, and an exact retry keeps finding it.
 use super::*;
-use focal_memory::{Change, Entry};
+use focal_memory::{Allocation, BudgetKind, BudgetLane, Change};
 use focal_model::Cause;
 use focal_model::lifecycle::artifact_descriptor::PayloadSpec;
 use std::collections::BTreeSet;
@@ -55,8 +55,18 @@ pub enum RetirementRefusal {
         evaluation: EvaluationKey,
     },
     TooLarge,
+    /// The outcome the retirement publishes would take the core past its
+    /// outcome bound, the bound checkpoint recovery enforces: the state it
+    /// made could not be restored under the configuration that made it.
+    OutcomeCapacity,
+    /// The outcome is promised to a live report, or is the one control
+    /// outcome the owner keeps for an authority decision; it frees as the
+    /// reports arrive.
+    OutcomesReserved,
     /// The committed rows contradict themselves.
     Corrupt,
+    /// A member's spilled row could not be read back from the replica's payload log (doc 31 M3).
+    PayloadUnavailable,
 }
 
 /// The rows a family takes to the archive, in key order.
@@ -85,6 +95,71 @@ impl RetirementFamily {
         self.keys.len()
     }
 }
+/// The bytes of a cold batch's count, before its entries (u16, little-endian).
+pub const COLD_COUNT_BYTES: usize = 2;
+/// The bytes of one family's entry in a cold batch's header: its root, its frame's digest and
+/// its frame's length (u32, little-endian).
+pub const COLD_ENTRY_BYTES: usize = 52;
+/// One family's entry in a cold batch (doc 31 M2, A2): its root, and its frame's digest and
+/// length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColdEntry {
+    pub root: ClaimId,
+    pub digest: ContentHash,
+    pub length: u32,
+}
+/// A retirement's cold batch ([`Core::cold_batch`]): the count, each family's entry, then each
+/// family's archive frame in the entries' order: what every replica appends to its cold stream
+/// where the record applies. Charged while held.
+#[derive(Debug)]
+pub struct ColdBatch {
+    pub bytes: Vec<u8>,
+    pub entries: Vec<ColdEntry>,
+    _charge: Allocation,
+}
+/// A family's frame past what a frame may hold, or memory refused it.
+fn cold_codec(error: record_codec::CodecError) -> NativeError {
+    match error {
+        record_codec::CodecError::Allocation => NativeError::Memory(MemoryError::AllocationFailed),
+        _ => NativeError::Capacity("cold frame"),
+    }
+}
+/// A cold batch's header, read from its first bytes: its entries, and where its frames begin.
+pub fn cold_header(bytes: &[u8]) -> Result<(Vec<ColdEntry>, usize), NativeError> {
+    let count: [u8; COLD_COUNT_BYTES] = bytes
+        .get(..COLD_COUNT_BYTES)
+        .and_then(|count| count.try_into().ok())
+        .ok_or(NativeError::Capacity("cold batch header"))?;
+    let count = usize::from(u16::from_le_bytes(count));
+    let frames = count
+        .checked_mul(COLD_ENTRY_BYTES)
+        .and_then(|n| n.checked_add(COLD_COUNT_BYTES))
+        .ok_or(NativeError::Capacity("cold batch header"))?;
+    let table = bytes
+        .get(COLD_COUNT_BYTES..frames)
+        .ok_or(NativeError::Capacity("cold batch header"))?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| MemoryError::AllocationFailed)?;
+    let (table, rest) = table.as_chunks::<COLD_ENTRY_BYTES>();
+    if !rest.is_empty() {
+        return Err(NativeError::Capacity("cold batch header"));
+    }
+    for entry in table {
+        let entry_error = || NativeError::Capacity("cold batch entry");
+        let (root, entry) = entry.split_first_chunk::<16>().ok_or_else(entry_error)?;
+        let (digest, entry) = entry.split_first_chunk::<32>().ok_or_else(entry_error)?;
+        let (length, _) = entry.split_first_chunk::<4>().ok_or_else(entry_error)?;
+        entries.push(ColdEntry {
+            root: ClaimId(*root),
+            digest: ContentHash(*digest),
+            length: u32::from_le_bytes(*length),
+        });
+    }
+    Ok((entries, frames))
+}
+
 /// Where a candidate walk resumes: the status bucket and the last claim
 /// visited in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +209,10 @@ fn names_member(key: Key, member: ClaimId) -> bool {
             result.evaluation.claim == member
         }
         Key::ArtifactInput(object, _) => object.0 == member.0,
+        // A timer's outcome is its claim's (F12); a request's never.
+        Key::Outcome(NativeInvocation::ClaimDeadline(key)) => key.claim == member,
+        Key::Outcome(NativeInvocation::MonitorDeadline(key)) => key.claim == member,
+        Key::Outcome(NativeInvocation::EvaluationDeadline(key)) => key.evaluation.claim == member,
         Key::Outcome(_) | Key::CreationResult(_) => false,
         other => match index_rows::primary(other) {
             Some(index_rows::Primary::Claim(claim)) => claim == member,
@@ -302,7 +381,13 @@ impl Closure<'_> {
             if layout::affinity(&entry.key) != affinity {
                 break;
             }
-            if matches!(entry.key, Key::Outcome(_) | Key::CreationResult(_)) {
+            // An outcome under an object's affinity is one of its timers'
+            // (F12): it leaves with the family, into the bundle, since
+            // nothing re-delivers a retired object's timer. Requests'
+            // outcomes sit under their principal, never here.
+            if matches!(entry.key, Key::CreationResult(_))
+                || matches!(entry.key, Key::Outcome(NativeInvocation::Request(_)))
+            {
                 continue;
             }
             if found.len() >= MAX_FAMILY_ROWS {
@@ -338,9 +423,31 @@ impl Closure<'_> {
 }
 
 impl Core<NativeState> {
+    /// Whether the outcome a retirement publishes fits the core's outcome
+    /// bound, the bound checkpoint recovery enforces, as every outcome
+    /// ordinary admission publishes must: the first thing a family
+    /// derivation asks, before a row is walked, and what a session asks
+    /// before it derives one. One row read.
+    pub fn check_retirement_outcome(&self) -> Result<(), RetirementRefusal> {
+        let outcomes = match self.state.rows.get(&Key::Meta) {
+            Some(Row::Meta(meta)) => meta.outcomes.saturating_sub(meta.sealed),
+            _ => return Err(RetirementRefusal::Corrupt),
+        };
+        if outcomes
+            .checked_add(1)
+            .is_none_or(|next| next > self.limits.outcomes)
+        {
+            return Err(RetirementRefusal::OutcomeCapacity);
+        }
+        Ok(())
+    }
     /// The family rooted at `root` and every row it takes to the archive,
     /// or why it cannot leave yet. Deterministic over the committed rows.
+    /// Refused first, before a row is walked, when the outcome the
+    /// retirement publishes would pass the outcome bound
+    /// (`OutcomeCapacity`).
     pub fn retirement_family(&self, root: ClaimId) -> Result<RetirementFamily, RetirementRefusal> {
+        self.check_retirement_outcome()?;
         let mut closure = Closure {
             core: self,
             members: Vec::new(),
@@ -362,7 +469,7 @@ impl Core<NativeState> {
             if closure.members.len() >= MAX_FAMILY_MEMBERS {
                 return Err(RetirementRefusal::TooLarge);
             }
-            let claim = as_claim(self.state.rows.get(&Key::Claim(member)))
+            let claim = as_claim(self.state.row(&Key::Claim(member)))
                 .ok_or(RetirementRefusal::Unknown(member))?;
             if !claim.is_terminal() {
                 return Err(RetirementRefusal::NotTerminal(member));
@@ -427,8 +534,7 @@ impl Core<NativeState> {
         }
         for definition in closure.definitions.clone() {
             closure.scan_affinity(Key::Definition(definition), definition.0)?;
-            if let Some(Row::Definition(owned)) = self.state.rows.get(&Key::Definition(definition))
-            {
+            if let Some(Row::Definition(owned)) = self.state.row(&Key::Definition(definition)) {
                 if let Some(declaration) = owned.get() {
                     closure.index_keys(|sink| index_rows::definition(declaration, sink))?;
                 }
@@ -449,24 +555,45 @@ impl Core<NativeState> {
             }
         }
         // Index rows of the claims and their results.
+        let mut buffer = crate::native::owned::ContentBuffer::new();
         for member in closure.members.clone() {
-            let (claim, content) = match self.state.rows.get(&Key::Claim(member)) {
+            let (claim, content) = match self.state.row(&Key::Claim(member)) {
                 Some(Row::Claim(owned)) => {
                     let claim = owned.claim().ok_or(RetirementRefusal::Corrupt)?;
                     let content = match self.state.rows.get(&Key::ClaimContent(member)) {
-                        Some(Row::ClaimContent(content)) => content.get(),
+                        Some(Row::ClaimContent(content)) => Some(content),
                         _ => None,
                     };
                     (claim, content)
                 }
                 _ => return Err(RetirementRefusal::Corrupt),
             };
+            // The content read in place from its encoding (doc 31 M3), a spilled one read back.
+            let content = content
+                .map(|content| content.read(self.state.payloads(), &mut buffer))
+                .transpose()
+                .map_err(|error| match error {
+                    NativeError::Payload(_) => RetirementRefusal::PayloadUnavailable,
+                    _ => RetirementRefusal::Corrupt,
+                })?;
+            let view = content
+                .map(|content| content.view())
+                .transpose()
+                .map_err(|_| RetirementRefusal::Corrupt)?;
             closure.index_keys(|sink| {
-                index_rows::claim(None, claim, content, &index_rows::NeverConsumed, sink)
+                index_rows::claim(
+                    None,
+                    claim,
+                    view.as_ref()
+                        .map(|view| view as &dyn index_rows::ContentSource),
+                    &index_rows::NeverConsumed,
+                    sink,
+                )
             })?;
             if let Some(content) = content {
-                closure
-                    .keep_existing(Key::ClaimIdentity(content.schema(), content.content_hash()))?;
+                let schema = content.schema().ok_or(RetirementRefusal::Corrupt)?;
+                let hash = content.content_hash().ok_or(RetirementRefusal::Corrupt)?;
+                closure.keep_existing(Key::ClaimIdentity(schema, hash))?;
             }
             let first = Key::Accepted(NativeResultKey {
                 evaluation: EvaluationKey {
@@ -492,7 +619,9 @@ impl Core<NativeState> {
             }
         }
         // Events of everything above, attributed to the member whose rows
-        // they describe.
+        // they describe: read from the event index under each object's home
+        // (doc 31 M2), in proportion to the family; where the index is not
+        // built, by a walk of every event, which finds the same.
         let mut events = Vec::new();
         let mut through = SessionSeq(0);
         let mut counts = Vec::new();
@@ -500,27 +629,16 @@ impl Core<NativeState> {
             .try_reserve_exact(closure.members.len())
             .map_err(|_| RetirementRefusal::TooLarge)?;
         counts.extend(closure.members.iter().map(|_| 0u32));
-        for entry in self
-            .state
-            .rows
-            .entries_from(&Key::Event(SessionSeq(0), 0), false)
-        {
-            let Key::Event(..) = entry.key else {
-                break;
-            };
-            let Row::Event(stored) = &entry.value else {
-                return Err(RetirementRefusal::Corrupt);
-            };
+        let mut consider = |key: Key, stored: &OwnedEvent| -> Result<(), RetirementRefusal> {
             let event = stored
-                .get()
-                .ok_or(RetirementRefusal::Corrupt)?
-                .expand(self.state.ledger);
+                .get(self.state.ledger, self.state.payloads())
+                .ok_or(RetirementRefusal::Corrupt)?;
             let object = record_codec::event_object(event);
             if closure.keys.contains(&object) {
                 if events.len() >= MAX_FAMILY_ROWS {
                     return Err(RetirementRefusal::TooLarge);
                 }
-                events.push(entry.key);
+                events.push(key);
                 through = through.max(event.sequence);
                 let owner = ClaimId(layout::affinity(&object));
                 let slot = closure
@@ -530,6 +648,40 @@ impl Core<NativeState> {
                     .unwrap_or(0);
                 let count = counts.get_mut(slot).ok_or(RetirementRefusal::Corrupt)?;
                 *count = count.checked_add(1).ok_or(RetirementRefusal::TooLarge)?;
+            }
+            Ok(())
+        };
+        if self.state.events.complete() {
+            let homes: BTreeSet<[u8; 16]> = closure
+                .members
+                .iter()
+                .map(|member| member.0)
+                .chain(closure.artifacts.iter().map(|artifact| artifact.0))
+                .chain(closure.testaments.iter().map(|testament| testament.0))
+                .chain(closure.definitions.iter().map(|definition| definition.0))
+                .collect();
+            for home in homes {
+                for position in self.state.events.positions(home) {
+                    let key = Key::Event(position.sequence, position.ordinal);
+                    let Some(Row::Event(stored)) = self.state.rows.get(&key) else {
+                        return Err(RetirementRefusal::Corrupt);
+                    };
+                    consider(key, stored)?;
+                }
+            }
+        } else {
+            for entry in self
+                .state
+                .rows
+                .entries_from(&Key::Event(SessionSeq(0), 0), false)
+            {
+                let Key::Event(..) = entry.key else {
+                    break;
+                };
+                let Row::Event(stored) = &entry.value else {
+                    return Err(RetirementRefusal::Corrupt);
+                };
+                consider(entry.key, stored)?;
             }
         }
         for key in events {
@@ -587,7 +739,7 @@ impl Core<NativeState> {
                 }
                 visited = visited.saturating_add(1);
                 last = Some(id);
-                if as_claim(self.state.rows.get(&Key::Claim(id)))
+                if as_claim(self.state.row(&Key::Claim(id)))
                     .is_some_and(|claim| claim.is_terminal() && claim.released())
                 {
                     claims
@@ -646,6 +798,7 @@ impl Core<NativeState> {
             &mut sink,
             self.archive_frame(family, through),
             self.family_entries(family),
+            self.state.payloads(),
         )?;
         Ok(ArchiveQuote {
             bytes: sink.len(),
@@ -667,15 +820,150 @@ impl Core<NativeState> {
             &mut sink,
             self.archive_frame(family, through),
             self.family_entries(family),
+            self.state.payloads(),
         )?;
         sink.finish()?;
         Ok(hash)
+    }
+    /// The cold batch of the families `roots` name (doc 31 M2, A2): each derived from the
+    /// committed rows and written as its archive frame at `through`, the prefix its retirement
+    /// extends, after a header naming each family's root, frame digest and frame length, in
+    /// `roots`' order. Every replica writes the same bytes where the record applies, so its cold
+    /// stream is every replica's. Charged to `budget` in `lane` while held.
+    pub fn cold_batch(
+        &self,
+        roots: &[ClaimId],
+        through: SessionSeq,
+        limits: record_codec::EncodingLimits,
+        budget: &MemoryBudget,
+        lane: BudgetLane,
+    ) -> Result<ColdBatch, NativeError> {
+        let count = u16::try_from(roots.len()).map_err(|_| NativeError::Capacity("cold batch"))?;
+        let mut families = Vec::new();
+        families
+            .try_reserve_exact(roots.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let header = roots
+            .len()
+            .checked_mul(COLD_ENTRY_BYTES)
+            .and_then(|n| n.checked_add(COLD_COUNT_BYTES))
+            .ok_or(NativeError::Capacity("cold batch"))?;
+        let mut total = header;
+        for root in roots {
+            let family = self
+                .retirement_family(*root)
+                .map_err(|_| ContractError::InvalidManifest)?;
+            let quote = self
+                .archive_family_quote(&family, through, limits)
+                .map_err(cold_codec)?;
+            total = total
+                .checked_add(quote.bytes)
+                .ok_or(NativeError::Capacity("cold batch"))?;
+            families.push((family, quote));
+        }
+        let index = size_of::<ColdEntry>()
+            .checked_mul(roots.len())
+            .ok_or(NativeError::Capacity("cold batch"))?;
+        let charge = budget
+            .reserve(
+                BudgetKind::Payload,
+                lane,
+                total
+                    .checked_add(index)
+                    .ok_or(NativeError::Capacity("cold batch"))?,
+            )?
+            .commit();
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        bytes.resize(total, 0);
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(roots.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut offset = header;
+        for (family, quote) in &families {
+            let end = offset
+                .checked_add(quote.bytes)
+                .ok_or(NativeError::Capacity("cold batch"))?;
+            let target = bytes
+                .get_mut(offset..end)
+                .ok_or(NativeError::Capacity("cold batch"))?;
+            let digest = self
+                .archive_family_into(family, through, target, quote.visits)
+                .map_err(cold_codec)?;
+            if digest != quote.hash {
+                return Err(NativeError::Capacity("a cold frame unlike its quote"));
+            }
+            entries.push(ColdEntry {
+                root: family.root,
+                digest,
+                length: u32::try_from(quote.bytes)
+                    .map_err(|_| NativeError::Capacity("cold frame"))?,
+            });
+            offset = end;
+        }
+        let mut head = Vec::new();
+        head.try_reserve_exact(header)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        head.extend_from_slice(&count.to_le_bytes());
+        for entry in &entries {
+            head.extend_from_slice(&entry.root.0);
+            head.extend_from_slice(&entry.digest.0);
+            head.extend_from_slice(&entry.length.to_le_bytes());
+        }
+        bytes
+            .get_mut(..header)
+            .ok_or(NativeError::Capacity("cold batch"))?
+            .copy_from_slice(&head);
+        Ok(ColdBatch {
+            bytes,
+            entries,
+            _charge: charge,
+        })
+    }
+    /// Unfile every event of `family` from the event index (doc 31 M2).
+    pub(super) fn unfile_family_events(&mut self, family: &RetirementFamily) {
+        let NativeState {
+            rows,
+            events,
+            ledger,
+            payloads: log,
+            ..
+        } = &mut self.state;
+        for key in &family.keys {
+            let Key::Event(sequence, ordinal) = *key else {
+                continue;
+            };
+            if !events.complete() {
+                return;
+            }
+            match rows.get(key) {
+                Some(Row::Event(stored)) => {
+                    match stored.get(*ledger, crate::native::payloads::source(log)) {
+                        Some(event) => events.unfile(
+                            event_index::home(event),
+                            event_index::Position { sequence, ordinal },
+                        ),
+                        None => events.drop_all(),
+                    }
+                }
+                _ => events.drop_all(),
+            }
+        }
     }
     /// Retire the family (26 §4): one publication at the next native prefix
     /// that deletes every row of the family, leaves a `Retired` continuation
     /// where each member's claim row was, writes the prefix's own outcome
     /// (a `Retirement` invocation with the `Retire` operation) and the
-    /// updated meta row. Returns how many rows went.
+    /// updated meta row. Returns how many rows went. The outcome it
+    /// publishes is guarded as ordinary admission guards its own: one
+    /// outcome per published sequence (the invariant recovery checks; a
+    /// contradiction is `InvalidManifest`) and the core's outcome bound
+    /// (`Capacity`), so no publication makes a state the same configuration
+    /// cannot restore. The derivation refuses such a family first
+    /// (`OutcomeCapacity`); the guard here is the last fence, not the check.
     pub fn retire_native_family(
         &mut self,
         family: &RetirementFamily,
@@ -683,9 +971,27 @@ impl Core<NativeState> {
         bytes: u64,
         through: SessionSeq,
     ) -> Result<usize, NativeError> {
+        let mut meta = match self.state.rows.get(&Key::Meta) {
+            Some(Row::Meta(meta)) => **meta,
+            _ => return Err(ContractError::InvalidManifest.into()),
+        };
+        if u64::try_from(meta.outcomes).ok() != Some(self.native_sequence().0) {
+            return Err(ContractError::InvalidManifest.into());
+        }
+        if meta
+            .outcomes
+            .saturating_sub(meta.sealed)
+            .checked_add(1)
+            .is_none_or(|outcomes| outcomes > self.limits.outcomes)
+        {
+            return Err(NativeError::Capacity("outcomes"));
+        }
         let derived = self
             .retirement_family(family.root)
-            .map_err(|_| NativeError::Contract(ContractError::InvalidManifest))?;
+            .map_err(|refusal| match refusal {
+                RetirementRefusal::OutcomeCapacity => NativeError::Capacity("outcomes"),
+                _ => NativeError::Contract(ContractError::InvalidManifest),
+            })?;
         if derived != *family
             || bundle.0 == [0; 32]
             || bytes == 0
@@ -694,10 +1000,6 @@ impl Core<NativeState> {
         {
             return Err(ContractError::InvalidManifest.into());
         }
-        let mut meta = match self.state.rows.get(&Key::Meta) {
-            Some(Row::Meta(meta)) => *meta,
-            _ => return Err(ContractError::InvalidManifest.into()),
-        };
         let sequence = SessionSeq(
             self.native_sequence()
                 .0
@@ -739,6 +1041,22 @@ impl Core<NativeState> {
                 Row::Monitor(_) => Some(&mut meta.monitors),
                 Row::MonitorLink(_) => Some(&mut meta.monitor_links),
                 Row::Event(_) => Some(&mut meta.events),
+                Row::Outcome(outcome) => {
+                    // A timer's outcome leaving with the family is sealed
+                    // in its bundle (F12), its events with it.
+                    meta.sealed = meta
+                        .sealed
+                        .checked_add(1)
+                        .ok_or(NativeError::Capacity("sealed outcomes"))?;
+                    meta.sealed_events = meta
+                        .sealed_events
+                        .checked_add(
+                            usize::try_from(outcome.events())
+                                .map_err(|_| NativeError::Capacity("sealed events"))?,
+                        )
+                        .ok_or(NativeError::Capacity("sealed events"))?;
+                    None
+                }
                 _ => None,
             };
             if let Some(counter) = counter {
@@ -778,11 +1096,11 @@ impl Core<NativeState> {
             events: 0,
         };
         for (member, events) in family.members.iter().zip(family.events.iter()) {
-            let claim = as_claim(self.state.rows.get(&Key::Claim(*member)))
+            let claim = as_claim(self.state.row(&Key::Claim(*member)))
                 .ok_or(NativeError::Contract(ContractError::InvalidManifest))?;
-            changes.push(Change::Put(Entry::new(
+            changes.push(Change::Put(entry(
                 Key::Retired(*member),
-                Row::Retired(RetiredClaim {
+                Row::Retired(Box::new(RetiredClaim {
                     bundle,
                     bytes,
                     through,
@@ -790,19 +1108,33 @@ impl Core<NativeState> {
                     status: claim.status(),
                     retired_at: sequence,
                     events: *events,
-                }),
+                })),
                 0,
             )));
         }
-        changes.push(Change::Put(Entry::new(Key::Meta, Row::Meta(meta), 0)));
-        changes.push(Change::Put(Entry::new(
+        changes.push(Change::Put(entry(Key::Meta, Row::Meta(Box::new(meta)), 0)));
+        changes.push(Change::Put(entry(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(outcome),
+            Row::Outcome(OwnedOutcome::stored(&outcome, self.state.ledger)?),
             0,
         )));
-        self.state
-            .rows
-            .publish_changes(sequence.0, changes, focal_memory::BudgetLane::Ordinary)?;
+        // One publication of what a family's bound allows: its rows, a
+        // continuation per member, the meta and the outcome. Its events are
+        // unfiled first, while their rows still say where they are filed; a
+        // publication refused after that leaves the index to be built again.
+        self.unfile_family_events(family);
+        let bound = MAX_FAMILY_ROWS
+            .saturating_add(MAX_FAMILY_MEMBERS)
+            .saturating_add(2);
+        if let Err(error) = self.state.rows.publish_changes(
+            sequence.0,
+            changes,
+            focal_memory::BudgetLane::Ordinary,
+            bound,
+        ) {
+            self.state.events.drop_all();
+            return Err(error);
+        }
         Ok(count)
     }
 }

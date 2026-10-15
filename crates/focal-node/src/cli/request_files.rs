@@ -15,7 +15,8 @@ use std::{
 
 #[derive(Args)]
 pub(crate) struct BuildArgs {
-    #[arg(value_parser = super::discovery::operation_names())]
+    /// A V1 operation: the raw envelope is a legacy wire request.
+    #[arg(value_parser = super::discovery::legacy_operation_names())]
     operation: String,
     #[command(flatten)]
     input: DocumentInput,
@@ -33,13 +34,18 @@ pub(crate) struct BuildArgs {
     expected_revision: Option<u64>,
 }
 
-pub(super) fn authored(name: &str, input: DocumentInput) -> Result<AuthoredOperation> {
+/// One authored document (JSON, YAML or a file) as bounded canonical JSON
+/// bytes, ready for either engine's strict decoder.
+pub(super) fn document_bytes(input: DocumentInput) -> Result<Vec<u8>> {
     let value: serde_json::Value = input
         .load(false)?
         .ok_or(InputError::Invalid("provide --json, --yaml, or --file"))?;
     let mut bytes = BoundedBytes(Vec::new());
     serde_json::to_writer(&mut bytes, &value).map_err(|_| InputError::Capacity)?;
-    Ok(operations::parse_json(name, &bytes.0)?)
+    Ok(bytes.0)
+}
+fn authored(name: &str, input: DocumentInput) -> Result<AuthoredOperation> {
+    Ok(operations::parse_json(name, &document_bytes(input)?)?)
 }
 
 pub(super) fn build(settings: &Settings, selection: Option<&str>, args: BuildArgs) -> Result<()> {
@@ -121,12 +127,7 @@ pub(super) fn check(path: &Path) -> Result<()> {
         "locally checked; authentication, authority, epoch admission and server acceptance unchecked",
     )
 }
-pub(super) fn send(
-    runtime: &tokio::runtime::Runtime,
-    settings: &Settings,
-    selection: Option<&str>,
-    file: &Path,
-) -> Result<()> {
+pub(super) async fn send(settings: &Settings, selection: Option<&str>, file: &Path) -> Result<()> {
     // Preserve the original expert `request FILE` transport path, including its
     // 1 MiB JSON bound and complete wire operation surface. `check` is a separate
     // stricter offline tool; it is not an authority gate on existing raw clients.
@@ -140,7 +141,7 @@ pub(super) fn send(
         )
         .into());
     }
-    let response = runtime.block_on(context.client.request(request))?;
+    let response = context.client.request(request).await?;
     super::super::output_response(response).map_err(CliError::Other)
 }
 fn report(

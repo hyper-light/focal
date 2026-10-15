@@ -564,7 +564,7 @@ fn one_firing_breaks_each_remaining_trigger_cycle_then_expires_trigger_atomicall
     let trigger_binding = owner.committed().claim(timer.claim).unwrap().binding();
     let pinned = owner.pin(0, 5000).unwrap();
     let budget_before = parent.stats();
-    let source_before = owner.book.source().stats();
+    let source_before = owner.core.state.budget.stats();
     let (candidate, outcome) = fire(&mut owner, timer, 500);
     let mut fingerprints = Vec::new();
     for victim in 1..=2 {
@@ -656,7 +656,7 @@ fn one_firing_breaks_each_remaining_trigger_cycle_then_expires_trigger_atomicall
     }
     assert_eq!(owner.discard_from(candidate).unwrap(), 1);
     assert_eq!(parent.stats(), budget_before);
-    assert_eq!(owner.book.source().stats(), source_before);
+    assert_eq!(owner.core.state.budget.stats(), source_before);
     for claim in 1..=3 {
         assert_eq!(
             *owner.effective().evaluation(claim_key(claim, 1)).unwrap(),
@@ -725,10 +725,7 @@ fn cumulative_scc_preparation_refusal_after_private_progress_publishes_nothing()
                 limits,
             )
             .unwrap();
-            let mut scratch = crate::native::prepare::Scratch {
-                used: 0,
-                max: construction.scratch_bytes,
-            };
+            let mut scratch = crate::native::prepare::Scratch::bound(construction.scratch_bytes);
             let mut extras = crate::native::prepare::Extras::new(
                 construction.extras_count,
                 construction.extras_bytes,
@@ -781,13 +778,13 @@ fn cumulative_scc_preparation_refusal_after_private_progress_publishes_nothing()
     };
     owner.core.limits.preparation_bytes = tight;
     let before = parent.stats();
-    let source_before = owner.book.source().stats();
+    let source_before = owner.core.state.budget.stats();
     let prefix = owner.effective().sequence();
     assert!(owner.prepare_claim_deadline(timer, 500).is_err());
     assert_eq!(owner.pending_len(), 0);
     assert_eq!(owner.effective().sequence(), prefix);
     assert_eq!(parent.stats(), before);
-    assert_eq!(owner.book.source().stats(), source_before);
+    assert_eq!(owner.core.state.budget.stats(), source_before);
     assert_eq!(
         *owner.effective().evaluation(claim_key(3, 1)).unwrap(),
         original
@@ -935,7 +932,7 @@ fn pending_report_then_claim_expiry_and_suffix_discard_restore_credit_evidence_a
     let retry = copy_report(&report);
     let timer = input(&owner, 1);
     let before = parent.stats();
-    let source_before = owner.book.source().stats();
+    let source_before = owner.core.state.budget.stats();
     let mut store = Store::new();
     let reported = report_at(&mut owner, &mut store, report, 100);
     let evaluated = *owner.effective().evaluation(claim_key(1, 1)).unwrap();
@@ -974,7 +971,7 @@ fn pending_report_then_claim_expiry_and_suffix_discard_restore_credit_evidence_a
     ));
     assert_eq!(*owner.effective().evaluation(claim_key(1, 1)).unwrap(), old);
     assert_eq!(owner.book.remaining_reports(claim_key(1, 1)), credit);
-    assert_eq!(owner.book.source().stats(), source_before);
+    assert_eq!(owner.core.state.budget.stats(), source_before);
     assert_eq!(parent.stats(), before);
     assert!(
         owner
@@ -1051,10 +1048,21 @@ fn graph_closure_and_byte_capacity_refusals_never_fall_back_to_expiry() {
     let parent = core.state.budget.clone();
     let mut owner = NativeOwner::new(core).unwrap();
     let timer = input(&owner, 2);
+    // Every byte held, the completion lane's too: the deadline is refused,
+    // retryable, and nothing changed.
     let pressure = exhaust(&parent);
+    let completion = parent
+        .reserve(
+            BudgetKind::Payload,
+            BudgetLane::Completion,
+            parent.headroom(BudgetLane::Completion),
+        )
+        .unwrap()
+        .commit();
     let full = parent.stats();
     assert!(owner.prepare_claim_deadline(timer, 500).is_err());
     assert_eq!(parent.stats(), full);
+    drop(completion);
     assert_eq!(owner.pending_len(), 0);
     assert_eq!(
         owner.effective().claim(timer.claim).unwrap().status(),
@@ -1108,7 +1116,7 @@ fn multi_grant_claim_expiry_retires_and_rewinds_through_completion_when_ordinary
         .reserve(BudgetKind::Pending, BudgetLane::Completion, 1)
         .unwrap();
     drop(completion_probe);
-    let source_before = owner.book.source().stats();
+    let source_before = owner.core.state.budget.stats();
 
     // Three real grants require the multi-update retirement journal. The
     // candidate and that journal must both fit through the control lane.
@@ -1134,7 +1142,7 @@ fn multi_grant_claim_expiry_retires_and_rewinds_through_completion_when_ordinary
     }
     assert_eq!(owner.discard_from(candidate).unwrap(), 1);
     assert_eq!(parent.stats(), full);
-    assert_eq!(owner.book.source().stats(), source_before);
+    assert_eq!(owner.core.state.budget.stats(), source_before);
     for index in 1..=3 {
         assert_eq!(
             *owner.effective().evaluation(claim_key(1, index)).unwrap(),

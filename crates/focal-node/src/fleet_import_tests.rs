@@ -264,135 +264,142 @@ fn populate(session: &mut Session) {
     );
 }
 
-/// The successor floor and the local promise become durable on later polls;
-/// the ledger harness retries the same two conditions.
+/// One call: the owner holds the activation until the successor floor and
+/// the local promise it started are durable (KIND D3), where this harness
+/// retried the two conditions.
 async fn activate(host: &ReplicaHost, call: ActivateNativeCall) -> Result<(), LedgerError> {
-    let mut last = Err(LedgerError::Failed);
-    for _ in 0..200 {
-        last = host.activate_native(call).await;
-        match &last {
-            Err(LedgerError::Consensus(focal_consensus::ConsensusError::PersistencePending))
-            | Err(LedgerError::Managed(focal_ledger::ManagedError::Unsupported)) => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            _ => return last,
-        }
-    }
-    last
+    host.activate_native(call).await
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_populated_ledger_is_imported_through_the_node_after_its_host_seals_the_payloads() {
-    let dir = tempfile::tempdir().unwrap();
-    let budget = MemoryBudget::new(768 * 1024 * 1024, 256 * 1024 * 1024).unwrap();
-    let tenant = budget.child(384 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
-    let content_dir = dir.path().join("content");
-    let store = ContentStore::open(
-        &content_dir,
-        StoreLimits {
-            max_content_bytes: 64 << 20,
-            max_staging_bytes: 128 << 20,
-            max_uploads: 16,
-            chunk_bytes: CHUNK,
-            max_manifest_bytes: 1 << 20,
-        },
-    )
-    .unwrap();
-    let wal = SharedWal::open_with_budget(
-        dir.path().join("wal"),
-        WalOptions::new(WalIdentity {
-            cluster: CLUSTER,
-            node: 1,
-            stream: 1,
-        }),
-        WalWriterLimits::default(),
-        budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
-    )
-    .unwrap();
-    let node = DurableNode::open_on_wal_in(
-        NodeConfig::single(1, CLUSTER, ledger().session.0),
-        wal.clone(),
-        &tenant,
-    )
-    .unwrap();
-    let mut session = Session::from_node_in_hosted(
-        ledger(),
-        node,
-        SessionLimits::default(),
-        &tenant,
-        NativeHosting {
-            limits: NativeSessionLimits::standard(domain()),
-            reader: ContentReader::open(&content_dir).unwrap(),
-            seeds: focal_evidence::SeedStore::open(
-                content_dir.join("seeds"),
-                focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
-            )
-            .unwrap(),
-            range: RangeId(1),
-        },
-    )
-    .unwrap();
-    session.campaign().unwrap();
-    for _ in 0..8 {
-        session.poll().unwrap();
-    }
-    populate(&mut session);
-    assert!(session.legacy_populated());
-    let mut config = ReplicaConfig::new(RootCommandId::from_u128(151));
-    config.tick = Duration::from_millis(20);
-    config.request_timeout = Duration::from_millis(500);
-    let (host, owner, _outgoing) =
-        ReplicaHost::spawn(session, config, ReplicaHost::wire_limits()).unwrap();
-    let (content, content_owner) = ContentHost::spawn(
-        store,
-        CustodyConfig::new(1),
-        WireLimits::default(),
-        budget.clone(),
-    )
-    .unwrap();
-    let chunking = content.import_chunking();
-    assert_eq!(chunking.0, CHUNK);
-    let call = ActivateNativeCall {
-        profile: focal_ledger::NativeContentProfile::ProjectionOnly,
-        chunk_bytes: chunking.0,
-        max_manifest_bytes: chunking.1,
-    };
-    // Without sealed custody the proposal is refused; nothing is proposed.
-    assert!(matches!(
-        activate(&host, call).await,
-        Err(LedgerError::Native(NativeSessionError::CustodyPending))
-    ));
-    let import = host
-        .import_payloads()
-        .await
-        .unwrap()
-        .expect("populated prefix");
-    assert_eq!(import.domain, domain());
-    assert_eq!(import.payloads.len(), 1);
-    for bytes in import.payloads {
-        content
-            .seal_import_inline(import.domain, bytes, chunking.0)
-            .await
-            .unwrap();
-    }
-    activate(&host, call).await.unwrap();
-    let mut active = false;
-    for _ in 0..200 {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        let diagnostics = host.diagnostics().await.unwrap();
-        if diagnostics.value().native_active && diagnostics.value().native_authoritative {
-            active = true;
-            assert!(!diagnostics.value().native_import_pending);
-            break;
+#[test]
+fn a_populated_ledger_is_imported_through_the_node_after_its_host_seals_the_payloads() {
+    focal_rt::block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = MemoryBudget::new(768 * 1024 * 1024, 256 * 1024 * 1024).unwrap();
+        let tenant = budget.child(384 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
+        let content_dir = dir.path().join("content");
+        let store = ContentStore::open(
+            &content_dir,
+            StoreLimits {
+                max_content_bytes: 64 << 20,
+                max_staging_bytes: 128 << 20,
+                max_uploads: 16,
+                chunk_bytes: CHUNK,
+                max_manifest_bytes: 1 << 20,
+            },
+        )
+        .unwrap();
+        let wal = SharedWal::open_with_budget(
+            dir.path().join("wal"),
+            WalOptions::new(WalIdentity {
+                cluster: CLUSTER,
+                node: 1,
+                stream: 1,
+            }),
+            WalWriterLimits::default(),
+            budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
+        let node = DurableNode::open_on_wal_in(
+            NodeConfig::single(1, CLUSTER, ledger().session.0),
+            wal.clone(),
+            &tenant,
+        )
+        .unwrap();
+        let mut session = Session::from_node_in_hosted(
+            ledger(),
+            node,
+            SessionLimits::default(),
+            &tenant,
+            NativeHosting {
+                limits: NativeSessionLimits::standard(domain()),
+                reader: ContentReader::open(&content_dir).unwrap(),
+                seeds: focal_evidence::SeedStore::open(
+                    content_dir.join("seeds"),
+                    focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
+                        .unwrap(),
+                )
+                .unwrap(),
+                cold: Some(focal_ledger::ColdSource {
+                    root: content_dir.join("cold"),
+                    disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
+                        .unwrap(),
+                    geometry: focal_evidence::ColdGeometry::STANDARD,
+                }),
+                payloads: Some(focal_ledger::PayloadSource {
+                    root: content_dir.join("payloads"),
+                    disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
+                        .unwrap(),
+                }),
+                range: RangeId(1),
+            },
+        )
+        .unwrap();
+        session.campaign().unwrap();
+        for _ in 0..8 {
+            session.poll().unwrap();
         }
-    }
-    assert!(active, "the imported ledger never became native");
-    assert!(host.progress().import_pending.is_none());
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    content.stop().await.unwrap();
-    content_owner.join().unwrap();
-    drop(wal);
-    let _ = LedgerActivation::V1;
-    let _ = ActivationKind::Imported;
+        populate(&mut session);
+        assert!(session.legacy_populated());
+        let mut config = ReplicaConfig::new(RootCommandId::from_u128(151));
+        config.tick = Duration::from_millis(20);
+        config.request_timeout = Duration::from_millis(500);
+        let (host, owner, _outgoing) =
+            ReplicaHost::spawn(session, config, ReplicaHost::wire_limits()).unwrap();
+        let (content, content_owner) = ContentHost::spawn(
+            store,
+            CustodyConfig::new(1),
+            WireLimits::default(),
+            budget.clone(),
+        )
+        .unwrap();
+        let chunking = content.import_chunking();
+        assert_eq!(chunking.0, CHUNK);
+        let call = ActivateNativeCall {
+            profile: focal_ledger::NativeContentProfile::ProjectionOnly,
+            chunk_bytes: chunking.0,
+            max_manifest_bytes: chunking.1,
+        };
+        // Without sealed custody the proposal is refused; nothing is proposed.
+        assert!(matches!(
+            activate(&host, call).await,
+            Err(LedgerError::Native(NativeSessionError::CustodyPending))
+        ));
+        let import = host
+            .import_payloads()
+            .await
+            .unwrap()
+            .expect("populated prefix");
+        assert_eq!(import.domain, domain());
+        assert_eq!(import.payloads.len(), 1);
+        for bytes in import.payloads {
+            content
+                .seal_import_inline(import.domain, bytes, chunking.0)
+                .await
+                .unwrap();
+        }
+        activate(&host, call).await.unwrap();
+        let mut active = false;
+        for _ in 0..200 {
+            focal_rt::time::sleep(Duration::from_millis(25))
+                .await
+                .unwrap();
+            let diagnostics = host.diagnostics().await.unwrap();
+            if diagnostics.value().native_active && diagnostics.value().native_authoritative {
+                active = true;
+                assert!(!diagnostics.value().native_import_pending);
+                break;
+            }
+        }
+        assert!(active, "the imported ledger never became native");
+        assert!(host.progress().import_pending.is_none());
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        content.stop().await.unwrap();
+        content_owner.join().unwrap();
+        drop(wal);
+        let _ = LedgerActivation::V1;
+        let _ = ActivationKind::Imported;
+    })
+    .unwrap()
 }

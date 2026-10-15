@@ -1,8 +1,9 @@
 //! The shared driver of a native host: resolve the objects an authored
 //! operation binds to, compile and encode the exact frame, claim its `n1:`
 //! identity in the journal, and plan the exact reads. The CLI and the MCP
-//! server call these functions with their own blocking read callback so both
-//! adapters submit byte-identical frames for identical documents (doc 19).
+//! server call these functions with their own reads (an asynchronous wait on
+//! their connection) so both adapters submit byte-identical frames for
+//! identical documents (doc 19).
 use crate::EvaluationSelector;
 use crate::{
     CompileError, CompileLimits, Requirement, Resolved, compile, encode_frame, fingerprint,
@@ -20,14 +21,32 @@ use focal_core::native::NativeContentProfile;
 use focal_model::*;
 use focal_wire::*;
 use std::cell::RefCell;
+use std::future::Future;
 
 /// Items requested per fixed-prefix read page. The owner bounds what it
 /// serves; a host never needs more than one bounded page per requirement.
 pub const READ_ITEMS: u32 = 256;
+/// The pages `validation.get` follows at most: the core's evaluations per
+/// claim over a page (4096 / 256).
+pub(crate) const EVALUATION_PAGES: usize = 16;
 
-/// One blocking fixed-prefix read. The host supplies the envelope, transport
-/// and cancellation; the driver supplies only the query.
-pub type Reads<'a> = dyn FnMut(NativeReadRequest) -> Result<NativeReadPage, DriveError> + 'a;
+/// One fixed-prefix read. The host supplies the envelope, transport and
+/// cancellation; the driver supplies only the query. A synchronous closure is
+/// one, answered as it is called.
+pub trait Reads {
+    fn read(
+        &mut self,
+        request: NativeReadRequest,
+    ) -> impl Future<Output = Result<NativeReadPage, DriveError>>;
+}
+impl<F: FnMut(NativeReadRequest) -> Result<NativeReadPage, DriveError>> Reads for F {
+    fn read(
+        &mut self,
+        request: NativeReadRequest,
+    ) -> impl Future<Output = Result<NativeReadPage, DriveError>> {
+        std::future::ready(self(request))
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DriveError {
@@ -74,26 +93,38 @@ pub fn admissible(
 
 /// Read the objects the compiler binds to, one linearizable page per
 /// requirement, in the compiler's order.
-pub fn resolve(
+pub async fn resolve(
     ledger: LedgerId,
     operation: &NativeAuthoredOperation,
-    reads: &mut Reads<'_>,
+    reads: &mut impl Reads,
 ) -> Result<Resolved, DriveError> {
     let requirements = crate::requirements(operation)?;
     let mut objects = Vec::new();
     for requirement in requirements {
         let query = match requirement {
             Requirement::Objects(references) => NativeReadQuery::Objects(references),
-            Requirement::Evaluations { validation } => NativeReadQuery::Evaluations {
+            // The owner selects the current evaluation over the declaration's
+            // whole span at one prefix (F08): no page of the client's is the
+            // universe of the selection.
+            Requirement::Evaluation {
+                claim,
                 validation,
-                after: None,
-            },
+                selector,
+            } => NativeReadQuery::SelectEvaluation(NativeSelectionQuery {
+                claim,
+                validation,
+                selector,
+                generation: None,
+                live: true,
+            }),
         };
-        let page = reads(NativeReadRequest {
-            consistency: ReadConsistency::Linearizable,
-            query,
-            max_items: READ_ITEMS,
-        })?;
+        let page = reads
+            .read(NativeReadRequest {
+                consistency: ReadConsistency::Linearizable,
+                query,
+                max_items: READ_ITEMS,
+            })
+            .await?;
         objects
             .try_reserve(page.objects.len())
             .map_err(|_| InputError::Capacity)?;
@@ -102,20 +133,37 @@ pub fn resolve(
     Ok(Resolved::from_objects(ledger, &objects)?)
 }
 
-/// Claim the operation's identity, resolve, compile and encode the exact
-/// frame and journal it ready. An existing identity with the same canonical
-/// document returns the journaled operation without any read or send; a
-/// different document under the same identity is an intent conflict.
-pub fn prepare(
+/// Resolve, then claim the operation's identity, compile and encode the
+/// exact frame and journal it ready. An existing identity with the same
+/// canonical document returns the journaled operation without any read or
+/// send; a different document under the same identity is an intent conflict.
+/// The reads come first: the store claims, compiles under the identity's key
+/// and journals under one hold, as it always did, and nothing is claimed for a
+/// resolution that failed.
+pub async fn prepare(
     preparation: &Preparation<'_>,
     operation: &NativeAuthoredOperation,
     requested: Option<NativeOperationId>,
     ids: &mut dyn IdGenerator,
-    reads: &mut Reads<'_>,
+    reads: &mut impl Reads,
 ) -> Result<NativeOperation, DriveError> {
     admissible(preparation.profile, operation)?;
     let descriptor = operation.descriptor();
     let canonical = operation.canonical_intent()?;
+    let intent = OperationIntent {
+        name: descriptor.name,
+        version: descriptor.version,
+        canonical: &canonical,
+    };
+    if let Some(requested) = requested
+        && let Some(existing) =
+            preparation
+                .store
+                .existing(preparation.context, intent, requested)?
+    {
+        return Ok(existing);
+    }
+    let resolved = resolve(preparation.build.ledger, operation, reads).await?;
     let limits = preparation.limits;
     // The store's expansion callback is infallible in type only; the actual
     // read, compile or encode failure is surfaced through this channel.
@@ -126,16 +174,11 @@ pub fn prepare(
     let mut operation_ids = || ids.borrow_mut().next_id();
     let prepared = preparation.store.prepare(
         preparation.context,
-        OperationIntent {
-            name: descriptor.name,
-            version: descriptor.version,
-            canonical: &canonical,
-        },
+        intent,
         requested,
         &mut operation_ids,
-        |request| {
-            let mut expand = || -> Result<PreparedNativeRequest, DriveError> {
-                let resolved = resolve(preparation.build.ledger, operation, reads)?;
+        |request: RequestKey| {
+            let expand = || -> Result<PreparedNativeRequest, DriveError> {
                 let mut object_ids = || ids.borrow_mut().next_id();
                 let compiled = compile(
                     operation,
@@ -157,8 +200,8 @@ pub fn prepare(
                         protocol: NATIVE_PROTOCOL_VERSION,
                         ledger: preparation.build.ledger,
                         route_epoch: RouteEpoch(1),
-                        request_epoch: RequestEpoch(1),
-                        request_id: request,
+                        request_epoch: request.epoch,
+                        request_id: request.id,
                         operation: Operation::Native { frame },
                     },
                     fingerprint,
@@ -194,95 +237,216 @@ pub const CLAIM_EXPAND: NativeClaimExpand = NativeClaimExpand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeReadOutcome {
     Page(NativeReadPage),
+    Lineage(Box<focal_client::operations::NativeLineage>),
     Wait(focal_client::operations::NativeWaitResult),
 }
 
 /// Serve one read operation. Plain reads are one or two exact pages; the
 /// lineage read composes bounded reads and lists; the wait observer probes
 /// under the host's cancellable pause.
-pub fn read(
+pub async fn read(
     operation: &NativeReadOperation,
     build: &focal_client::input::BuildContext,
-    reads: &mut Reads<'_>,
-    lists: &mut Lists<'_>,
-    pause: &mut crate::observe::Pause<'_>,
+    reads: &mut impl Reads,
+    lists: &mut impl Lists,
+    pause: &mut impl crate::observe::Pause,
 ) -> Result<NativeReadOutcome, DriveError> {
     Ok(match operation {
-        NativeReadOperation::ClaimLineage(document) => {
-            NativeReadOutcome::Page(crate::observe::lineage(document, build, reads, lists)?)
-        }
+        NativeReadOperation::ClaimLineage(document) => NativeReadOutcome::Lineage(Box::new(
+            crate::observe::lineage(document, build, reads, lists).await?,
+        )),
         NativeReadOperation::ClaimWait(document) => {
-            NativeReadOutcome::Wait(crate::observe::wait(document, reads, pause)?)
+            NativeReadOutcome::Wait(crate::observe::wait(document, reads, pause).await?)
         }
-        _ => NativeReadOutcome::Page(read_page(operation, reads)?),
+        _ => NativeReadOutcome::Page(read_page(operation, reads).await?),
     })
 }
 
-fn read_page(
-    operation: &NativeReadOperation,
-    reads: &mut Reads<'_>,
+/// One linearizable page of `query`.
+async fn linearizable(
+    reads: &mut impl Reads,
+    query: NativeReadQuery,
 ) -> Result<NativeReadPage, DriveError> {
-    let mut linearizable = |query| {
-        reads(NativeReadRequest {
+    reads
+        .read(NativeReadRequest {
             consistency: ReadConsistency::Linearizable,
             query,
             max_items: READ_ITEMS,
         })
-    };
+        .await
+}
+
+async fn read_page(
+    operation: &NativeReadOperation,
+    reads: &mut impl Reads,
+) -> Result<NativeReadPage, DriveError> {
     let id = |value: &str| -> Result<[u8; 16], DriveError> { Ok(parse_id(value)?) };
     Ok(match operation {
-        NativeReadOperation::ClaimGet(document) => linearizable(NativeReadQuery::Claim {
-            id: ClaimId(id(&document.id)?),
-            expand: CLAIM_EXPAND,
-        })?,
+        NativeReadOperation::ClaimGet(document) => {
+            linearizable(
+                reads,
+                NativeReadQuery::Claim {
+                    id: ClaimId(id(&document.id)?),
+                    expand: CLAIM_EXPAND,
+                    after: None,
+                },
+            )
+            .await?
+        }
         NativeReadOperation::TestamentGet(document) => {
             let testament = TestamentId(id(&document.id)?);
-            linearizable(NativeReadQuery::Objects(vec![
-                NativeObjectRef::Response(testament),
-                NativeObjectRef::ResultTestament(testament),
-            ]))?
+            linearizable(
+                reads,
+                NativeReadQuery::Objects(vec![
+                    NativeObjectRef::Response(testament),
+                    NativeObjectRef::ResultTestament(testament),
+                ]),
+            )
+            .await?
         }
         NativeReadOperation::ArtifactGet(document) => {
             let artifact = ArtifactId(id(&document.id)?);
-            linearizable(NativeReadQuery::Objects(vec![
-                NativeObjectRef::Artifact(artifact),
-                NativeObjectRef::Work(artifact),
-                NativeObjectRef::Diagnostic(artifact),
-            ]))?
+            linearizable(
+                reads,
+                NativeReadQuery::Objects(vec![
+                    NativeObjectRef::Artifact(artifact),
+                    NativeObjectRef::Work(artifact),
+                    NativeObjectRef::Diagnostic(artifact),
+                ]),
+            )
+            .await?
+        }
+        NativeReadOperation::ArchiveGet(document) => {
+            use focal_client::operations::NativeArchiveTarget as Target;
+            let claim = ClaimId(id(&document.claim)?);
+            let object = match &document.object {
+                Target::Claim => NativeObjectRef::Claim(claim),
+                Target::Artifact { id: value } => NativeObjectRef::Artifact(ArtifactId(id(value)?)),
+                Target::Work { id: value } => NativeObjectRef::Work(ArtifactId(id(value)?)),
+                Target::Diagnostic { id: value } => {
+                    NativeObjectRef::Diagnostic(ArtifactId(id(value)?))
+                }
+                Target::Validation { id: value } => {
+                    NativeObjectRef::Definition(ValidationId(id(value)?))
+                }
+                Target::Testament { id: value } => {
+                    NativeObjectRef::Response(TestamentId(id(value)?))
+                }
+                Target::Receipt { id: value } => NativeObjectRef::Receipt(ReceiptId(id(value)?)),
+            };
+            // The claim says where its family is: live, and the object is
+            // read from the ledger; retired, and it is read from the bundle
+            // the continuation names (the audit's F11).
+            let located = linearizable(
+                reads,
+                NativeReadQuery::Claim {
+                    id: claim,
+                    expand: NativeClaimExpand::default(),
+                    after: None,
+                },
+            )
+            .await?;
+            match located.objects.first() {
+                Some(NativeObject::Retired(retired)) => {
+                    let (bundle, bytes) = (retired.bundle, retired.bytes);
+                    // The node reads the family where its continuation says it went: its own
+                    // cold stream, or its custody for a family retired before (doc 31 M2, A2). A
+                    // node that predates the cold read is asked for the bundle as before.
+                    match linearizable(
+                        reads,
+                        NativeReadQuery::Cold(NativeColdQuery { claim, object }),
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(cold) => linearizable(
+                            reads,
+                            NativeReadQuery::Archived(NativeArchiveQuery {
+                                bundle,
+                                bytes,
+                                object,
+                            }),
+                        )
+                        .await
+                        .map_err(|_| cold)?,
+                    }
+                }
+                Some(NativeObject::Claim(_)) => {
+                    linearizable(reads, NativeReadQuery::Objects(vec![object])).await?
+                }
+                _ => located,
+            }
         }
         NativeReadOperation::ValidationGet(document) => {
             let validation = ValidationId(id(&document.id)?);
-            let definition =
-                linearizable(NativeReadQuery::Objects(vec![NativeObjectRef::Definition(
-                    validation,
-                )]))?;
-            let mut evaluations = reads(NativeReadRequest {
-                consistency: ReadConsistency::AtLeast(definition.token),
-                query: NativeReadQuery::Evaluations {
-                    validation,
-                    after: None,
-                },
-                max_items: READ_ITEMS,
-            })?;
-            let mut objects = definition.objects;
-            objects
-                .try_reserve(evaluations.objects.len())
-                .map_err(|_| InputError::Capacity)?;
-            objects.append(&mut evaluations.objects);
-            evaluations.objects = objects;
-            evaluations
+            let definition = linearizable(
+                reads,
+                NativeReadQuery::Objects(vec![NativeObjectRef::Definition(validation)]),
+            )
+            .await?;
+            let claim = definition.objects.iter().find_map(|object| match object {
+                NativeObject::Definition(definition) => Some(definition.claim),
+                _ => None,
+            });
+            let mut page = definition;
+            if let Some(claim) = claim {
+                // Every evaluation of the declaration, a page at a time in
+                // key order, the pages after the first pinned to the first
+                // one's prefix; the span is bounded by the core's
+                // evaluations per claim, so the pages are too.
+                let mut after = None;
+                let mut pages = 0usize;
+                loop {
+                    if pages >= EVALUATION_PAGES {
+                        return Err(InputError::Capacity.into());
+                    }
+                    pages = pages.saturating_add(1);
+                    let mut more = reads
+                        .read(NativeReadRequest {
+                            consistency: if after.is_none() {
+                                ReadConsistency::AtLeast(page.token)
+                            } else {
+                                ReadConsistency::Exact(page.token)
+                            },
+                            query: NativeReadQuery::Evaluations {
+                                claim,
+                                validation,
+                                after,
+                            },
+                            max_items: READ_ITEMS,
+                        })
+                        .await?;
+                    page.token = more.token;
+                    page.native_sequence = more.native_sequence;
+                    page.logical_time = more.logical_time;
+                    page.visited = page.visited.saturating_add(more.visited);
+                    page.objects
+                        .try_reserve(more.objects.len())
+                        .map_err(|_| InputError::Capacity)?;
+                    page.objects.append(&mut more.objects);
+                    match more.next {
+                        Some(NativeContinuation::Evaluations(key)) => after = Some(key),
+                        Some(_) => {
+                            return Err(InputError::Invalid("evaluation continuation").into());
+                        }
+                        None => break,
+                    }
+                }
+            }
+            page
         }
         NativeReadOperation::ValidationContext(document) => {
             let validation = ValidationId(id(&document.validation)?);
-            let selector = EvaluationSelector::parse(
+            let selector = crate::resolve::parse_selector(
                 &document.phase,
                 document.slot,
                 document.target.as_deref(),
             )?;
-            let definition =
-                linearizable(NativeReadQuery::Objects(vec![NativeObjectRef::Definition(
-                    validation,
-                )]))?;
+            let definition = linearizable(
+                reads,
+                NativeReadQuery::Objects(vec![NativeObjectRef::Definition(validation)]),
+            )
+            .await?;
             let claim = definition
                 .objects
                 .iter()
@@ -291,74 +455,61 @@ fn read_page(
                     _ => None,
                 })
                 .ok_or(CompileError::Missing("definition"))?;
-            let evaluations = reads(NativeReadRequest {
-                consistency: ReadConsistency::AtLeast(definition.token),
-                query: NativeReadQuery::Evaluations {
-                    validation,
-                    after: None,
-                },
-                max_items: READ_ITEMS,
-            })?;
-            // The same selection as validation.begin, over the wire objects:
-            // the highest live generation of the requested phase, or the
-            // exact generation when one is named.
-            let mut selected: Option<&NativeEvaluation> = None;
-            for object in &evaluations.objects {
-                let NativeObject::Evaluation(evaluation) = object else {
-                    continue;
-                };
-                let matches = match (selector, evaluation.key.target) {
-                    (
-                        EvaluationSelector::WholeWork { slot: None },
-                        NativeEvaluationTarget::Work { .. },
-                    ) => true,
-                    (
-                        EvaluationSelector::WholeWork { slot: Some(wanted) },
-                        NativeEvaluationTarget::Work { slot, .. },
-                    ) => slot == wanted,
-                    (EvaluationSelector::Admission, NativeEvaluationTarget::Admission) => true,
-                    (
-                        EvaluationSelector::Increment { artifact: wanted },
-                        NativeEvaluationTarget::Increment { artifact },
-                    ) => wanted.is_none_or(|wanted| wanted == artifact),
-                    _ => false,
-                };
-                if !matches
-                    || document
-                        .generation
-                        .is_some_and(|wanted| evaluation.key.generation != wanted)
-                {
-                    continue;
+            // The owner selects over the declaration's whole span at one
+            // prefix (F08): the tie set at the highest generation the selector
+            // names, at the named generation when there is one, of any state.
+            let selection = reads
+                .read(NativeReadRequest {
+                    consistency: ReadConsistency::AtLeast(definition.token),
+                    query: NativeReadQuery::SelectEvaluation(NativeSelectionQuery {
+                        claim,
+                        validation,
+                        selector,
+                        generation: document.generation,
+                        live: false,
+                    }),
+                    max_items: READ_ITEMS,
+                })
+                .await?;
+            let mut selected = selection.objects.iter().filter_map(|object| match object {
+                NativeObject::Evaluation(evaluation) => Some(evaluation),
+                _ => None,
+            });
+            let (target, generation) = match (selected.next(), selected.next()) {
+                (Some(evaluation), None) => {
+                    (Some(evaluation.key.target), Some(evaluation.key.generation))
                 }
-                if selected.is_none_or(|current| current.key.generation < evaluation.key.generation)
-                {
-                    selected = Some(evaluation);
+                (Some(_), Some(_)) => {
+                    return Err(CompileError::Unsupported(
+                        "several current evaluations match; name the slot or target",
+                    )
+                    .into());
                 }
-            }
-            let (target, generation) = match selected {
-                Some(evaluation) => (Some(evaluation.key.target), Some(evaluation.key.generation)),
-                None => (None, document.generation),
+                (None, _) => (None, document.generation),
             };
+            let evaluations = selection;
             let kind = match selector {
                 EvaluationSelector::Admission => NativeContextKind::Admission,
                 EvaluationSelector::Increment { .. } => NativeContextKind::Increment,
                 EvaluationSelector::WholeWork { .. } => NativeContextKind::WholeWork,
             };
-            reads(NativeReadRequest {
-                consistency: ReadConsistency::AtLeast(evaluations.token),
-                query: NativeReadQuery::ValidationContext(NativeContextQuery {
-                    validation,
-                    claim,
-                    kind: Some(kind),
-                    target,
-                    generation,
-                    results_after: document.results_after.map(ObjectRevision),
-                    limit: document.limit,
-                }),
-                max_items: READ_ITEMS,
-            })?
+            reads
+                .read(NativeReadRequest {
+                    consistency: ReadConsistency::AtLeast(evaluations.token),
+                    query: NativeReadQuery::ValidationContext(NativeContextQuery {
+                        validation,
+                        claim,
+                        kind: Some(kind),
+                        target,
+                        generation,
+                        results_after: document.results_after.map(ObjectRevision),
+                        limit: document.limit,
+                    }),
+                    max_items: READ_ITEMS,
+                })
+                .await?
         }
-        NativeReadOperation::Standing(_) => linearizable(NativeReadQuery::Standing)?,
+        NativeReadOperation::Standing(_) => linearizable(reads, NativeReadQuery::Standing).await?,
         NativeReadOperation::ClaimLineage(_) | NativeReadOperation::ClaimWait(_) => {
             // Composed by `read`; a plain page cannot serve them.
             return Err(InputError::Invalid("composite native read").into());
@@ -366,20 +517,226 @@ fn read_page(
     })
 }
 
+/// One submission of an exact journaled frame. The host supplies the
+/// transport and cancellation; the driver supplies only the request. A
+/// synchronous closure is one, answered as it is called.
+pub trait Submits {
+    fn submit(
+        &mut self,
+        request: RequestEnvelope,
+    ) -> impl Future<Output = Result<NativeMutationReply, DriveError>>;
+}
+impl<F: FnMut(RequestEnvelope) -> Result<NativeMutationReply, DriveError>> Submits for F {
+    fn submit(
+        &mut self,
+        request: RequestEnvelope,
+    ) -> impl Future<Output = Result<NativeMutationReply, DriveError>> {
+        std::future::ready(self(request))
+    }
+}
+
+/// The journal's own upkeep before an operation (F12): when every operation
+/// of the earlier generations was reported and the current generation is
+/// above the floor, the floor advance is issued as a journaled protocol
+/// operation and its receipt recorded. A pending ticket or a refusal leaves
+/// the journal as it was: the next upkeep asks again. The receipt, when
+/// the floor moved now.
+pub async fn maintain(
+    preparation: &Preparation<'_>,
+    ids: &mut dyn IdGenerator,
+    reads: &mut impl Reads,
+    submit: &mut impl Submits,
+) -> Result<Option<NativeReceipt>, DriveError> {
+    let Some(minimum) = preparation.store.floor_due()? else {
+        return Ok(None);
+    };
+    let operation = NativeAuthoredOperation::EpochAdvance(
+        focal_client::operations::NativeEpochAdvanceDocument { minimum: minimum.0 },
+    );
+    let prepared = prepare(preparation, &operation, None, ids, reads).await?;
+    if let Some(receipt) = prepared.receipt {
+        preparation
+            .store
+            .record_delivered(prepared.id, &preparation.context)?;
+        return Ok(Some(receipt));
+    }
+    match submit.submit(prepared.request.clone()).await? {
+        reply @ NativeMutationReply::Committed(receipt) => {
+            preparation
+                .store
+                .record_reply(prepared.id, &preparation.context, &reply)?;
+            preparation
+                .store
+                .record_delivered(prepared.id, &preparation.context)?;
+            Ok(Some(receipt))
+        }
+        NativeMutationReply::Refused(refusal) => {
+            preparation
+                .store
+                .record_refusal(prepared.id, &preparation.context, &refusal)?;
+            Ok(None)
+        }
+        NativeMutationReply::Pending(_) => Ok(None),
+    }
+}
+
+/// An operation refused because its generation expired (F12): the owner
+/// forced the principal's floor past it. Its outcome, when the request had
+/// committed before — read from the seal and recorded as the operation's
+/// receipt — else `None`, and the journal learns the owner's window so its
+/// next operation is issued in a generation the owner admits.
+pub async fn expired(
+    store: &NativeOperationStore,
+    context: &OperationContext,
+    operation: &NativeOperation,
+    reads: &mut impl Reads,
+) -> Result<Option<NativeReceipt>, DriveError> {
+    let key = operation.key();
+    let page = outcome(key, reads).await?;
+    if let Some(NativeObject::Outcome(receipt)) = page.objects.first()
+        && receipt.invocation == NativeInvocationRef::Request(key)
+    {
+        let receipt = **receipt;
+        store.record_reply(
+            operation.id,
+            context,
+            &NativeMutationReply::Committed(receipt),
+        )?;
+        return Ok(Some(receipt));
+    }
+    let window = reads
+        .read(NativeReadRequest {
+            consistency: ReadConsistency::Linearizable,
+            query: NativeReadQuery::Epochs(context.principal),
+            max_items: 1,
+        })
+        .await?;
+    if let Some(NativeObject::Epochs(window)) = window.objects.first() {
+        let next = RequestEpoch(
+            window
+                .floor
+                .0
+                .saturating_add(u64::try_from(window.open.len()).unwrap_or(u64::MAX)),
+        );
+        store.observe_window(window.floor, next)?;
+    }
+    Ok(None)
+}
+
+/// The most generations a recovery without the journal probes (F12): the
+/// open ones, then the sealed ones newest first.
+pub const RECOVERY_PROBES: usize = 64;
+
+/// The committed outcome of one request identity without its journal
+/// (F12): the owner's window says which generations the principal has
+/// open; each is asked, then the sealed generations newest first, within
+/// [`RECOVERY_PROBES`]. The page of the first outcome found, else the last
+/// page asked (`Missing`).
+pub async fn outcome_by_id(
+    principal: ParticipantId,
+    id: RequestId,
+    reads: &mut impl Reads,
+) -> Result<NativeReadPage, DriveError> {
+    let window = reads
+        .read(NativeReadRequest {
+            consistency: ReadConsistency::Linearizable,
+            query: NativeReadQuery::Epochs(principal),
+            max_items: 1,
+        })
+        .await?;
+    let Some(NativeObject::Epochs(window)) = window.objects.first() else {
+        return Err(ClientError::InvalidResponse.into());
+    };
+    let mut epochs: Vec<RequestEpoch> = Vec::new();
+    epochs
+        .try_reserve_exact(RECOVERY_PROBES)
+        .map_err(|_| InputError::Capacity)?;
+    for open in window.open.iter().rev() {
+        if epochs.len() < RECOVERY_PROBES {
+            epochs.push(open.epoch);
+        }
+    }
+    'ranges: for range in window.ranges.iter().rev() {
+        let mut epoch = range.last.0;
+        while epoch >= range.first.0 {
+            if epochs.len() >= RECOVERY_PROBES {
+                break 'ranges;
+            }
+            epochs.push(RequestEpoch(epoch));
+            let Some(previous) = epoch.checked_sub(1) else {
+                break;
+            };
+            epoch = previous;
+        }
+    }
+    let mut last = None;
+    for epoch in epochs {
+        let key = RequestKey {
+            principal,
+            epoch,
+            id,
+        };
+        let page = outcome(key, reads).await?;
+        if matches!(page.objects.first(), Some(NativeObject::Outcome(_))) {
+            return Ok(page);
+        }
+        last = Some(page);
+    }
+    last.ok_or_else(|| ClientError::InvalidResponse.into())
+}
+
 /// The committed outcome of one journaled operation, read from the owner by
 /// its request key: the cross-tool recovery read when the local journal of
 /// another adapter is not at hand.
-pub fn outcome(key: RequestKey, reads: &mut Reads<'_>) -> Result<NativeReadPage, DriveError> {
-    reads(NativeReadRequest {
-        consistency: ReadConsistency::Linearizable,
-        query: NativeReadQuery::Outcome(NativeInvocationRef::Request(key)),
-        max_items: 1,
-    })
+pub async fn outcome(
+    key: RequestKey,
+    reads: &mut impl Reads,
+) -> Result<NativeReadPage, DriveError> {
+    let page = reads
+        .read(NativeReadRequest {
+            consistency: ReadConsistency::Linearizable,
+            query: NativeReadQuery::Outcome(NativeInvocationRef::Request(key)),
+            max_items: 1,
+        })
+        .await?;
+    // An outcome that left the live core into a seal (F12) is read from
+    // the seal's bundle: the owner said where.
+    match page.objects.first() {
+        Some(NativeObject::Sealed(sealed)) => {
+            let query = NativeReadQuery::Sealed(NativeSealQuery {
+                bundle: sealed.bundle,
+                bytes: sealed.bytes,
+                request: key,
+            });
+            reads
+                .read(NativeReadRequest {
+                    consistency: ReadConsistency::Linearizable,
+                    query,
+                    max_items: 1,
+                })
+                .await
+        }
+        _ => Ok(page),
+    }
 }
 
-/// One blocking bounded list. The host supplies the envelope, transport and
-/// cancellation; the driver supplies only the request.
-pub type Lists<'a> = dyn FnMut(NativeListRequest) -> Result<NativeListPage, DriveError> + 'a;
+/// One bounded list. The host supplies the envelope, transport and
+/// cancellation; the driver supplies only the request. A synchronous closure is
+/// one, answered as it is called.
+pub trait Lists {
+    fn list(
+        &mut self,
+        request: NativeListRequest,
+    ) -> impl Future<Output = Result<NativeListPage, DriveError>>;
+}
+impl<F: FnMut(NativeListRequest) -> Result<NativeListPage, DriveError>> Lists for F {
+    fn list(
+        &mut self,
+        request: NativeListRequest,
+    ) -> impl Future<Output = Result<NativeListPage, DriveError>> {
+        std::future::ready(self(request))
+    }
+}
 
 fn participant(value: &str, build: &BuildContext) -> Result<ParticipantId, DriveError> {
     if value == "self" {
@@ -415,7 +772,7 @@ fn hex_bytes(text: &str) -> Result<Vec<u8>, DriveError> {
     decoded
         .try_reserve_exact(bytes.len() / 2)
         .map_err(|_| InputError::Capacity)?;
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let (Some(high), Some(low)) = (pair.first(), pair.get(1)) else {
             return Err(InputError::Invalid("list cursor").into());
         };
@@ -536,10 +893,10 @@ pub fn list_request(
 }
 
 /// Serve one page of a list document.
-pub fn list(
+pub async fn list(
     operation: &NativeListOperation,
     build: &BuildContext,
-    lists: &mut Lists<'_>,
+    lists: &mut impl Lists,
 ) -> Result<NativeListPage, DriveError> {
-    lists(list_request(operation, build)?)
+    lists.list(list_request(operation, build)?).await
 }

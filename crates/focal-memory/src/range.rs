@@ -51,6 +51,15 @@ pub use hydration::{
 #[cfg(test)]
 #[path = "range_import_tests.rs"]
 mod import_tests;
+#[path = "range_inplace.rs"]
+mod inplace;
+pub use inplace::{SparseBase, SparseRange, SparseRefusal};
+#[cfg(test)]
+#[path = "range_cut_tests.rs"]
+mod cut_tests;
+#[cfg(test)]
+#[path = "range_inplace_tests.rs"]
+mod inplace_tests;
 #[path = "range_layout.rs"]
 mod layout;
 #[cfg(test)]
@@ -159,6 +168,12 @@ impl Default for RangeConfig {
 }
 
 impl RangeConfig {
+    /// The full charge of a leaf of `page_entries` entries that own no heap: what a full leaf of inline
+    /// entries costs, its bookkeeping included.
+    pub fn inline_leaf_bytes<K, V>(&self) -> Result<usize, MemoryError> {
+        page_charge::<K, V>(self.page_entries, 0)
+    }
+
     fn validate(self) -> Result<Self, MemoryError> {
         if self.page_entries == 0
             || self.page_bytes == 0
@@ -182,7 +197,88 @@ impl RangeConfig {
 
 pub(crate) struct Page<K, V> {
     pub entries: Vec<Entry<K, V>>,
+    /// The order prefix of the first key ([`crate::RangeKey`]): what a
+    /// directory search compares before it compares the key.
+    pub first: u128,
     _allocation: Allocation,
+}
+
+impl<K: crate::RangeKey, V> Page<K, V> {
+    /// The entry of `key` in this page. The sought key's prefix once; an
+    /// entry's against it, and past it only where they tie.
+    pub(crate) fn find(&self, key: &K) -> Option<&Entry<K, V>> {
+        let probe = key.order_prefix();
+        self.entries
+            .binary_search_by(|entry| {
+                entry
+                    .key
+                    .order_prefix()
+                    .cmp(&probe)
+                    .then_with(|| entry.key.cmp_past_prefix(key))
+            })
+            .ok()
+            .and_then(|index| self.entries.get(index))
+    }
+
+    pub(crate) fn new(entries: Vec<Entry<K, V>>, allocation: Allocation) -> Self {
+        let first = entries.first().map_or(0, |entry| entry.key.order_prefix());
+        Self {
+            entries,
+            first,
+            _allocation: allocation,
+        }
+    }
+
+    /// Replaces `key`'s value where it stands with what `rewrite` makes of it, a value of no
+    /// more heap than the row held, and lets go of the page's charge by the difference (a page
+    /// is charged its entries and their heap, [`page_charge`]). Refused, nothing changed.
+    pub(crate) fn rewrite<F>(&mut self, key: &K, rewrite: F) -> Result<Rewrite, MemoryError>
+    where
+        F: FnOnce(&V) -> Result<Option<(V, usize)>, MemoryError>,
+    {
+        let probe = key.order_prefix();
+        let Ok(index) = self.entries.binary_search_by(|entry| {
+            entry
+                .key
+                .order_prefix()
+                .cmp(&probe)
+                .then_with(|| entry.key.cmp_past_prefix(key))
+        }) else {
+            return Ok(Rewrite::Absent);
+        };
+        let entry = self.entries.get_mut(index).ok_or(MemoryError::MissingKey)?;
+        let Some((value, heap_bytes)) = rewrite(&entry.value)? else {
+            return Ok(Rewrite::Unchanged);
+        };
+        let released =
+            entry
+                .heap_bytes
+                .checked_sub(heap_bytes)
+                .ok_or(MemoryError::InvalidConfiguration(
+                    "a rewrite may not grow a row",
+                ))?;
+        let held = self._allocation.bytes().checked_sub(released).ok_or(
+            MemoryError::InvalidConfiguration("a page charged less than its rows"),
+        )?;
+        self._allocation.shrink_to(held)?;
+        entry.value = value;
+        entry.heap_bytes = heap_bytes;
+        Ok(Rewrite::Rewritten)
+    }
+}
+
+/// What a rewrite of a row where it stands did ([`RangeStore::rewrite`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rewrite {
+    /// Its value replaced, the page's charge let go by the heap it no longer holds.
+    Rewritten,
+    /// The rewrite left it as it was.
+    Unchanged,
+    /// Something else still reads its page or a node above it (a frozen image, a lease):
+    /// nothing changed.
+    Shared,
+    /// The store holds no row at the key.
+    Absent,
 }
 
 // Field order keeps the complete owned input alive under its permit on every
@@ -202,15 +298,37 @@ struct PartitionFunding<'a, K, P> {
 // descriptors small while newly supplied values move directly into final pages.
 enum MergeEntry<'a, K, V> {
     Retained(&'a Entry<K, V>),
-    Incoming { heap_bytes: usize },
+    /// A put: of a key the page did not hold (`inserted`), or replacing one.
+    Incoming {
+        heap_bytes: usize,
+        inserted: bool,
+    },
 }
 
 impl<K, V> MergeEntry<'_, K, V> {
     fn heap_bytes(&self) -> usize {
         match self {
             Self::Retained(entry) => entry.heap_bytes,
-            Self::Incoming { heap_bytes } => *heap_bytes,
+            Self::Incoming { heap_bytes, .. } => *heap_bytes,
         }
+    }
+}
+
+impl<K, V, P: Eq> layout::Cell for (MergeEntry<'_, K, V>, P) {
+    fn heap(&self) -> usize {
+        self.0.heap_bytes()
+    }
+    fn origin(&self) -> layout::Origin {
+        match self.0 {
+            MergeEntry::Retained(_) => layout::Origin::Old,
+            MergeEntry::Incoming { inserted: true, .. } => layout::Origin::Inserted,
+            MergeEntry::Incoming {
+                inserted: false, ..
+            } => layout::Origin::Replacement,
+        }
+    }
+    fn parts_from(&self, next: &Self) -> bool {
+        self.1 != next.1
     }
 }
 
@@ -223,13 +341,9 @@ pub(crate) struct Root<K, V> {
     _allocation: Allocation,
 }
 
-impl<K: Ord, V> Root<K, V> {
+impl<K: crate::RangeKey, V> Root<K, V> {
     pub fn get(&self, key: &K) -> Option<&Entry<K, V>> {
-        let page = self.pages.get(self.page_index(key))?;
-        page.entries
-            .binary_search_by(|entry| entry.key.cmp(key))
-            .ok()
-            .and_then(|index| page.entries.get(index))
+        self.pages.page_of(key)?.find(key)
     }
 
     pub fn page_index(&self, key: &K) -> usize {
@@ -286,6 +400,46 @@ pub struct RangeStore<K, V> {
     pins: BTreeMap<u64, Arc<LeaseState<K, V>>>,
     next_lease: u64,
     clock: Arc<AtomicU64>,
+    /// Set by a publication in place that failed past its checks: the store
+    /// may hold part of it and refuses every plan and publication after
+    /// (`range_inplace.rs`).
+    poisoned: bool,
+    /// The identity of the state the store holds, new at every publication:
+    /// a candidate planned on it names it, so one planned on another state at
+    /// the same prefix (a fork) is refused (doc 30 §9).
+    state: u64,
+    /// The next state identity to hand out.
+    states: AtomicU64,
+}
+
+/// A committed prefix held by a strong root (see [`RangeStore::freeze`]):
+/// read-only, sendable to another thread, independent of the store's later
+/// batches.
+pub struct FrozenRange<K, V> {
+    root: Arc<Root<K, V>>,
+    _allocation: Allocation,
+}
+
+impl<K: crate::RangeKey, V> FrozenRange<K, V> {
+    pub fn id(&self) -> RangeId {
+        self.root.range
+    }
+    pub fn prefix(&self) -> u64 {
+        self.root.prefix
+    }
+    pub fn len(&self) -> usize {
+        self.root.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.root.len == 0
+    }
+    /// The page count, as [`RangeStore::stats`] reports it.
+    pub fn pages(&self) -> usize {
+        self.root.pages.len()
+    }
+    pub fn entries(&self) -> impl Iterator<Item = &Entry<K, V>> {
+        self.root.from(0, 0)
+    }
 }
 
 /// Fully allocated, unpublished candidate. Admission can hold it across a
@@ -296,7 +450,7 @@ pub struct PreparedRange<K, V> {
     root: Arc<Root<K, V>>,
 }
 
-impl<K: Ord, V> PreparedRange<K, V> {
+impl<K: crate::RangeKey, V> PreparedRange<K, V> {
     pub fn id(&self) -> RangeId {
         self.root.range
     }
@@ -314,6 +468,9 @@ impl<K: Ord, V> PreparedRange<K, V> {
     }
     pub fn get(&self, key: &K) -> Option<&V> {
         self.root.get(key).map(|entry| &entry.value)
+    }
+    pub fn get_entry(&self, key: &K) -> Option<&Entry<K, V>> {
+        self.root.get(key)
     }
     /// Complete ordered view of this unpublished prefix. Entries remain owned
     /// by the candidate and cannot be modified through the view.
@@ -358,14 +515,21 @@ impl<K: Ord, V> PreparedRange<K, V> {
     }
 }
 
-impl<K: Ord + Clone, V> RangeStore<K, V> {
+impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
     pub fn new(
         id: RangeId,
         initial_prefix: u64,
         config: RangeConfig,
         budget: MemoryBudget,
     ) -> Result<Self, MemoryError> {
-        Self::new_with_partition(id, initial_prefix, config, budget, None)
+        Self::new_with_partition(
+            id,
+            initial_prefix,
+            config,
+            budget,
+            None,
+            BudgetLane::Ordinary,
+        )
     }
 
     /// Create an owner whose leaves never mix different key partitions.
@@ -382,7 +546,27 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         budget: MemoryBudget,
         partition: fn(&K) -> u64,
     ) -> Result<Self, MemoryError> {
-        Self::new_with_partition(id, initial_prefix, config, budget, Some(partition))
+        Self::new_with_partition(
+            id,
+            initial_prefix,
+            config,
+            budget,
+            Some(partition),
+            BudgetLane::Ordinary,
+        )
+    }
+    /// [`Self::new_partitioned`] with its root charged to `lane`: recovery
+    /// and repair, which complete admitted work, build their owners under
+    /// the completion allowance and never wait on ordinary credit.
+    pub fn new_partitioned_in(
+        id: RangeId,
+        initial_prefix: u64,
+        config: RangeConfig,
+        budget: MemoryBudget,
+        partition: fn(&K) -> u64,
+        lane: BudgetLane,
+    ) -> Result<Self, MemoryError> {
+        Self::new_with_partition(id, initial_prefix, config, budget, Some(partition), lane)
     }
 
     fn new_with_partition(
@@ -391,13 +575,12 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         config: RangeConfig,
         budget: MemoryBudget,
         partition: Option<fn(&K) -> u64>,
+        lane: BudgetLane,
     ) -> Result<Self, MemoryError> {
         let config = config.validate()?;
         layout::validate::<K, V>(config)?;
         let charge = root_charge::<K, V>(0)?;
-        let allocation = budget
-            .reserve(BudgetKind::Roots, BudgetLane::Ordinary, charge)?
-            .commit();
+        let allocation = budget.reserve(BudgetKind::Roots, lane, charge)?.commit();
         Ok(Self {
             root: Arc::new(Root {
                 owner: crate::OwnerId::new()?,
@@ -413,6 +596,9 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
             pins: BTreeMap::new(),
             next_lease: 1,
             clock: Arc::new(AtomicU64::new(0)),
+            poisoned: false,
+            state: 0,
+            states: AtomicU64::new(1),
         })
     }
 
@@ -420,6 +606,10 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         self.root.range
     }
     /// The budget every page and root of this store is charged to.
+    /// The most changes one write may carry ([`RangeConfig::max_batch_entries`]).
+    pub fn max_batch_entries(&self) -> usize {
+        self.config.max_batch_entries
+    }
     pub fn budget(&self) -> &MemoryBudget {
         &self.budget
     }
@@ -440,6 +630,12 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
     }
     pub fn entries(&self) -> impl Iterator<Item = &Entry<K, V>> {
         self.root.from(0, 0)
+    }
+    /// Ordered entries from the first of the page at rank `page` (none past
+    /// the last page), reached by one descent where `entries` walks from the
+    /// first row. The caller bounds the number of returned entries it consumes.
+    pub fn entries_from_page(&self, page: usize) -> impl Iterator<Item = &Entry<K, V>> {
+        self.root.from(page, 0)
     }
     /// Ordered entries at or after `key`, excluding equality when `exclusive`.
     /// The cursor borrows this committed prefix, not the search key; seeking
@@ -559,14 +755,16 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
             .build_with(copy)
     }
 
-    fn prepare_planned_with<F>(
+    fn prepare_planned_with<F, R>(
         &self,
         funded: preflight::FundedPreparation<'_, K, V>,
         source: &MemoryBudget,
         copy: &mut F,
+        replaced: &mut R,
     ) -> Result<PreparedRange<K, V>, MemoryError>
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
+        R: FnMut(&K, &V) -> Result<(), MemoryError>,
     {
         let preflight::FundedPreparation { plan, input } = funded;
         let RangePreparationPlan {
@@ -604,7 +802,7 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
                 .checked_sub(base_after)
                 .ok_or(MemoryError::MissingKey)?;
             let rank = checked_add(output_after, untouched)?;
-            let old_page = base.pages.get(group.rank);
+            let old_page = group.page;
             let selected = changes
                 .as_slice()
                 .get(..group.count)
@@ -615,18 +813,26 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
                 .flatten();
             let mut merge = |old: &[Entry<K, V>], count, rank, replace| {
                 let mut produced = 0;
-                self.merge_page_with(old, changes, count, (source, lane), copy, &mut |page| {
-                    let at = checked_add(rank, produced)?;
-                    pages = if replace && produced == 0 {
-                        pages.replace(at, page, &mut directory_build)?
-                    } else {
-                        pages.insert(at, page, &mut directory_build)?
-                    };
-                    produced = checked_add(produced, 1)?;
-                    Ok(())
-                })?;
+                self.merge_page_with(
+                    old,
+                    changes,
+                    count,
+                    (source, lane),
+                    copy,
+                    replaced,
+                    &mut |page| {
+                        let at = checked_add(rank, produced)?;
+                        if replace && produced == 0 {
+                            pages.replace_owned(at, page, &mut directory_build)?;
+                        } else {
+                            pages.insert_owned(at, page, &mut directory_build)?;
+                        }
+                        produced = checked_add(produced, 1)?;
+                        Ok(())
+                    },
+                )?;
                 if replace && produced == 0 {
-                    pages = pages.remove(rank, &mut directory_build)?;
+                    pages.remove_owned(rank, &mut directory_build)?;
                 }
                 Ok::<usize, MemoryError>(produced)
             };
@@ -720,7 +926,8 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
     where
         V: Clone,
     {
-        let mut store = Self::new_with_partition(id, 0, config, budget, partition)?;
+        let mut store =
+            Self::new_with_partition(id, 0, config, budget, partition, BudgetLane::Ordinary)?;
         let chunk_limit = config.page_entries.min(config.max_batch_entries);
         let mut source = entries.into_iter().peekable();
         while source.peek().is_some() {
@@ -838,20 +1045,29 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
             return Err((MemoryError::WrongRange, prepared));
         }
         self.root = prepared.root;
+        self.state = self.fresh_state();
         Ok(())
     }
 
-    fn merge_page_with<F, E>(
+    /// A state identity no state of this store has had.
+    fn fresh_state(&self) -> u64 {
+        self.states.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn merge_page_with<F, R, E>(
         &self,
         old: &[Entry<K, V>],
         changes: &mut std::vec::IntoIter<Change<K, V>>,
         count: usize,
         funding: (&MemoryBudget, BudgetLane),
         copy: &mut F,
+        replaced: &mut R,
         emit_page: &mut E,
     ) -> Result<(), MemoryError>
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
+        R: FnMut(&K, &V) -> Result<(), MemoryError>,
         E: FnMut(Arc<Page<K, V>>) -> Result<(), MemoryError>,
     {
         let (source, lane) = funding;
@@ -866,6 +1082,7 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
                     classify,
                 },
                 copy,
+                replaced,
                 emit_page,
             ),
             None => self.merge_partition_with(
@@ -878,22 +1095,26 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
                     classify: |_: &K| (),
                 },
                 copy,
+                replaced,
                 emit_page,
             ),
         }
     }
 
-    fn merge_partition_with<F, E, P: Copy + Eq>(
+    #[allow(clippy::too_many_arguments)]
+    fn merge_partition_with<F, R, E, P: Copy + Eq>(
         &self,
         old: &[Entry<K, V>],
         changes: &mut std::vec::IntoIter<Change<K, V>>,
         count: usize,
         funding: PartitionFunding<'_, K, P>,
         copy: &mut F,
+        replaced: &mut R,
         emit_page: &mut E,
     ) -> Result<(), MemoryError>
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
+        R: FnMut(&K, &V) -> Result<(), MemoryError>,
         E: FnMut(Arc<Page<K, V>>) -> Result<(), MemoryError>,
     {
         let PartitionFunding {
@@ -911,9 +1132,12 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         let staging_bytes = merge_partition_charge::<K, V, P>(max_entries)?;
         let _staging = source.reserve(BudgetKind::Pending, lane, staging_bytes)?;
         let mut merged = bounded_vec(max_entries)?;
-        visit_merged(old, selected, |key, entry| {
-            bounded_push(&mut merged, (entry, classify(key)), max_entries)
-        })?;
+        visit_merged(
+            old,
+            selected,
+            |key, entry| bounded_push(&mut merged, (entry, classify(key)), max_entries),
+            replaced,
+        )?;
         // Planning only borrows old rows. The incoming descriptors carry a
         // charge, allowing each owned Put to move out of the input exactly once.
         let mut incoming = changes
@@ -923,7 +1147,7 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
                 Change::Put(entry) => Some(entry),
                 Change::Delete(_) => None,
             });
-        let mut partition = layout::LeafPartition::new::<K, V>(self.config)?;
+        let mut scratch = bounded_vec(max_entries)?;
         let mut emit = |span: layout::LeafSpan| {
             let end = checked_add(span.start, span.len)?;
             let chunk = merged.get(span.start..end).ok_or(MemoryError::MissingKey)?;
@@ -942,19 +1166,10 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
                     }
                 });
             }
-            emit_page(Arc::new(Page {
-                entries,
-                _allocation: allocation,
-            }))?;
+            emit_page(Arc::new(Page::new(entries, allocation)))?;
             Ok(())
         };
-        let mut previous = None;
-        for (entry, key) in &merged {
-            let boundary = previous.is_some_and(|previous| previous != *key);
-            partition.push(entry.heap_bytes(), boundary, &mut emit)?;
-            previous = Some(*key);
-        }
-        partition.finish(&mut emit)?;
+        layout::Cutter::new::<K, V>(self.config)?.cut(&merged, &mut scratch, &mut emit)?;
         // Drain trailing deletions belonging to this page. An unplanned Put
         // would indicate an incomplete merge and must never be published.
         if incoming.next().is_some() {
@@ -978,8 +1193,35 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         Ok(before.saturating_sub(self.pins.len()))
     }
 
-    /// Only this bounded owner registry holds strong read roots. The returned
-    /// weak lease cannot retain old pages after expiry/release and maintenance.
+    /// The committed prefix, frozen: a strong root the caller holds, every
+    /// page of it staying charged where it was (each page carries its own
+    /// allocation) while later batches copy the pages they change. Unlike a
+    /// lease it does not expire; its holder bounds its life. A checkpoint
+    /// encodes from it off the owner's thread and drops it when written.
+    pub fn freeze(&self) -> Result<FrozenRange<K, V>, MemoryError> {
+        self.freeze_in(BudgetLane::Ordinary)
+    }
+    /// [`Self::freeze`], its pin charged in `lane`: committed where the image keeps what was
+    /// committed (a checkpoint's), which an owner whose fresh admissions filled its ordinary
+    /// lane must still be able to take.
+    pub fn freeze_in(&self, lane: BudgetLane) -> Result<FrozenRange<K, V>, MemoryError> {
+        let charge = checked_add(
+            ALLOCATOR_OVERHEAD,
+            checked_add(size_of::<FrozenRange<K, V>>(), size_of::<Allocation>())?,
+        )?;
+        let allocation = self
+            .budget
+            .reserve(BudgetKind::ReadPins, lane, charge)?
+            .commit();
+        Ok(FrozenRange {
+            root: Arc::clone(&self.root),
+            _allocation: allocation,
+        })
+    }
+
+    /// Only this bounded owner registry holds strong read roots, but for a
+    /// [`Self::freeze`]'s holder. The returned weak lease cannot retain old
+    /// pages after expiry/release and maintenance.
     pub fn pin(&mut self, now: u64, ttl: u64) -> Result<SnapshotLease<K, V>, MemoryError> {
         self.advance_clock(now)?;
         if ttl == 0 || ttl > self.config.max_snapshot_ttl {
@@ -1094,10 +1336,13 @@ fn bounded_push<T>(values: &mut Vec<T>, value: T, limit: usize) -> Result<(), Me
 
 // Both preflight and construction visit the same ordered retained/incoming
 // sequence. Preflight only adds counts and charges; it never copies a row.
-fn visit_merged<'a, K: Ord, V>(
+/// Visits a changed page's old entries merged with its changes, in key order; an old entry a change
+/// replaces or deletes is given to `replaced` instead, where it leaves the page.
+fn visit_merged<'a, K: crate::RangeKey, V>(
     old: &'a [Entry<K, V>],
     selected: &[Change<K, V>],
     mut visit: impl FnMut(&K, MergeEntry<'a, K, V>) -> Result<(), MemoryError>,
+    replaced: &mut impl FnMut(&K, &V) -> Result<(), MemoryError>,
 ) -> Result<(), MemoryError> {
     let mut existing = old.iter().peekable();
     for change in selected {
@@ -1108,17 +1353,21 @@ fn visit_merged<'a, K: Ord, V>(
             let entry = existing.next().ok_or(MemoryError::MissingKey)?;
             visit(&entry.key, MergeEntry::Retained(entry))?;
         }
+        let mut held = false;
         if existing
             .peek()
             .is_some_and(|entry| &entry.key == change.key())
+            && let Some(entry) = existing.next()
         {
-            existing.next();
+            replaced(&entry.key, &entry.value)?;
+            held = true;
         }
         if let Change::Put(entry) = change {
             visit(
                 &entry.key,
                 MergeEntry::Incoming {
                     heap_bytes: entry.heap_bytes,
+                    inserted: !held,
                 },
             )?;
         }
@@ -1141,13 +1390,21 @@ fn merge_layout_charge<K, V>(capacity: usize, partitioned: bool) -> Result<usize
     }
 }
 
+/// A page group's merge staging: a descriptor an entry, and the leaf cut's
+/// scratch (`layout::Cutter`) and leaf lengths, a word an entry each.
 fn merge_partition_charge<K, V, P>(capacity: usize) -> Result<usize, MemoryError> {
     if capacity == 0 {
         return Ok(0);
     }
     checked_add(
-        ALLOCATOR_OVERHEAD,
-        checked_mul(capacity, size_of::<(MergeEntry<'_, K, V>, P)>())?,
+        checked_mul(3, ALLOCATOR_OVERHEAD)?,
+        checked_mul(
+            capacity,
+            checked_add(
+                size_of::<(MergeEntry<'_, K, V>, P)>(),
+                checked_mul(2, size_of::<usize>())?,
+            )?,
+        )?,
     )
 }
 

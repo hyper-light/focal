@@ -18,9 +18,41 @@ Production code returns and handles errors. It never aborts the thread it runs o
   (`DurableNode::guarded_in`), and the path that reaches the panic is closed at
   its cause as well. The boundary is the last fence, never the fix.
 - The workspace lints deny these (`Cargo.toml`, `[workspace.lints.clippy]`) and
-  `bash scripts/check-production.sh` enforces them. Never add an `#[allow]` for
-  one of them to production code. Test modules carry the `cfg_attr(test, allow(..))`
-  block the other crates use.
+  `bash scripts/check-production.sh` enforces them twice over: Clippy on every
+  library and binary target, and `scripts/check_production_policy.py` on the
+  source, which refuses any production `#[allow]` of one of them (the opt-out a
+  `deny` would honour) and proves itself on its fixtures first. Never add an
+  `#[allow]` for one of them to production code — the measurement tools
+  (`tools/load`) and `focal-sim` included. Test modules carry the
+  `cfg_attr(test, allow(..))` block the other crates use, or an `allow` inside
+  a `#[cfg(test)]` item.
+
+## 1a. No runtime recursion. Ever.
+
+No function calls itself at runtime, directly or through others. A stack is a
+bound nobody states, and a stack overflow aborts the process (rule 1). The ban
+covers:
+
+- recursive functions and mutual recursion;
+- an async function that awaits a boxed call of itself;
+- the recursive drop of a self-referential type.
+
+Walk trees, chains, nested encodings and retries with a loop over an explicit
+stack or queue whose bound is stated. Reaching the bound is a typed refusal
+(rule 2).
+
+- Compile-time recursion is not runtime recursion: macros, const evaluation,
+  trait resolution.
+- `bash scripts/check-production.sh` enforces it with
+  `scripts/check_recursion.py`, which proves itself on its fixtures first. It
+  makes two checks:
+  - It reads the LLVM IR of every library and binary target, unoptimised so
+    every call is explicit. It refuses any cycle in the call graph that passes
+    through the workspace's code, the vendored `hyper-*` crates included.
+  - It reads the source and refuses a function that calls itself by name,
+    including the boxed-future form the IR cannot see.
+- Recursion inside a third-party dependency is listed, not edited: record it
+  with the bound that holds it, or replace the dependency.
 
 ## 2. Nothing grows without a bound.
 

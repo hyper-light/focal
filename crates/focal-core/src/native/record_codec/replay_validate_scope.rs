@@ -45,8 +45,8 @@ pub(super) fn validate<O: Overlay>(
 ) -> Result<(), NativeError> {
     let id = ClaimId(next.binding().object.0);
     let registry = next.scopes();
-    let fields = registry.snapshot_v1().fields();
-    let previous = old.map(|old| old.scopes().snapshot_v1().fields());
+    let fields = next.scope_snapshot_v1().fields();
+    let previous = old.map(|old| old.scope_snapshot_v1().fields());
     let mut last_cut = previous.map_or(SessionSeq(0), |fields| fields.last_cut);
     if let Some(previous) = previous {
         require(
@@ -59,7 +59,7 @@ pub(super) fn validate<O: Overlay>(
             require(fields.released == Some(released))?;
         }
     } else {
-        require(fields.owner == next.lineage().binding())?;
+        require(fields.owner == next.creation_binding())?;
     }
     read.charge(mul(add(fields.children, 1)?, 128)?)?;
     for child in registry.children() {

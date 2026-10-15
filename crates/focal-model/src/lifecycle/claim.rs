@@ -214,7 +214,9 @@ pub struct ClaimState {
     created: SessionSeq,
     graph: graph::Declaration,
     lineage: succession::Lineage,
-    acceptance: aggregation::AcceptancePolicy,
+    /// Its acceptance manifest's slots and declarations; the manifest was checked for the claim's
+    /// binding at `acceptance_revision` and its issuer, which the claim holds (doc 31 M3).
+    acceptance: aggregation::PolicyBody,
     scopes: scope::Registry,
     status: ClaimStatus,
     receipt: Option<ReceiptEntitlement>,
@@ -223,8 +225,28 @@ pub struct ClaimState {
     deadline: Option<Deadline>,
     local_complete: bool,
     local_sealed_at: Option<SessionSeq>,
-    terminal_cut: Option<ClaimTerminalCut>,
+    /// The revision the claim was created at: with its binding, the creation binding its
+    /// lineage was built for, held here once rather than in each part (doc 31 M3).
+    created_revision: crate::ObjectRevision,
+    /// The revision of the claim's binding its acceptance manifest was checked for.
+    acceptance_revision: crate::ObjectRevision,
+    /// Behind its own allocation, made when the claim becomes terminal: an open claim holds a
+    /// pointer's width for it, where its widest form (208 bytes) took room in every claim row
+    /// (doc 31 M3).
+    terminal_cut: Option<Box<[ClaimTerminalCut; 1]>>,
     origin: ClaimOrigin,
+}
+
+/// `cut` in an allocation of its own, made fallibly before a transition changes anything.
+pub(super) fn held_cut(cut: ClaimTerminalCut) -> Result<Box<[ClaimTerminalCut; 1]>, ContractError> {
+    let mut held = crate::lifecycle::memory::reserve::<ClaimTerminalCut>(1)?;
+    if held.capacity() != 1 {
+        return Err(ContractError::Capacity);
+    }
+    held.push(cut);
+    held.into_boxed_slice()
+        .try_into()
+        .map_err(|_| ContractError::Capacity)
 }
 
 impl ClaimState {
@@ -277,6 +299,7 @@ impl ClaimState {
         }
         lineage.check_binding(&binding)?;
         acceptance.check(binding, issuer)?;
+        let acceptance_revision = acceptance.claim().revision;
         let scopes = scope::Registry::new(binding, scope_limits)?;
         Ok(Self {
             binding,
@@ -285,7 +308,8 @@ impl ClaimState {
             created,
             graph,
             lineage,
-            acceptance,
+            acceptance: acceptance.into_body(),
+            acceptance_revision,
             scopes,
             status: ClaimStatus::Generated,
             receipt: None,
@@ -294,6 +318,7 @@ impl ClaimState {
             deadline,
             local_complete: false,
             local_sealed_at: None,
+            created_revision: binding.revision,
             terminal_cut: None,
             origin: ClaimOrigin::Native,
         })
@@ -361,8 +386,27 @@ impl ClaimState {
     pub fn lineage(&self) -> &succession::Lineage {
         &self.lineage
     }
-    pub fn acceptance(&self) -> &aggregation::AcceptancePolicy {
-        &self.acceptance
+    /// The binding the claim was created with: its object and content at the revision it began
+    /// at, which its lineage was built for.
+    pub fn creation_binding(&self) -> Binding {
+        Binding {
+            revision: self.created_revision,
+            ..self.binding
+        }
+    }
+    /// Its acceptance manifest, bound to the binding and issuer it was checked for.
+    pub fn acceptance(&self) -> aggregation::Acceptance<'_> {
+        self.acceptance.bind(
+            Binding {
+                revision: self.acceptance_revision,
+                ..self.binding
+            },
+            self.issuer,
+        )
+    }
+    /// Its scope registry's snapshot, owned by the claim's creation binding.
+    pub fn scope_snapshot_v1(&self) -> scope::RegistrySnapshotView<'_> {
+        self.scopes.snapshot_v1(self.creation_binding())
     }
     pub fn scopes(&self) -> &scope::Registry {
         &self.scopes
@@ -390,7 +434,7 @@ impl ClaimState {
         self.local_sealed_at
     }
     pub fn terminal_cut(&self) -> Option<ClaimTerminalCut> {
-        self.terminal_cut
+        self.terminal_cut.as_deref().map(|[cut]| *cut)
     }
     pub fn origin(&self) -> ClaimOrigin {
         self.origin
@@ -444,10 +488,11 @@ impl ClaimState {
             return Err(ContractError::InvalidCut);
         }
         let binding = self.binding.next()?;
+        let held = held_cut(ClaimTerminalCut::Explicit(cut))?;
         self.binding = binding;
         self.status = status;
         self.local_sealed_at.get_or_insert(cut.position);
-        self.terminal_cut = Some(ClaimTerminalCut::Explicit(cut));
+        self.terminal_cut = Some(held);
         Ok(())
     }
 
@@ -479,10 +524,11 @@ impl ClaimState {
         cancellation.check(self)?;
         if let Some(binding) = cancellation.next_binding() {
             let cut = cancellation.cut();
+            let held = held_cut(ClaimTerminalCut::Explicit(cut))?;
             self.binding = binding;
             self.status = ClaimStatus::Cancelled;
             self.local_sealed_at.get_or_insert(cut.position);
-            self.terminal_cut = Some(ClaimTerminalCut::Explicit(cut));
+            self.terminal_cut = Some(held);
         }
         Ok(())
     }
@@ -555,7 +601,7 @@ impl ClaimState {
     ) -> Result<(), ContractError> {
         self.native_only()?;
         self.binding.check(&decision.binding())?;
-        if decision.acceptance() != &self.acceptance {
+        if decision.acceptance() != self.acceptance() {
             return Err(ContractError::InvalidPolicy);
         }
         if !decision.increments_ready() {
@@ -606,7 +652,7 @@ impl ClaimState {
         self.open(expected)?;
         principal.require_actor(self.subject)?;
         self.binding.check(&admission.binding())?;
-        if admission.acceptance() != &self.acceptance {
+        if admission.acceptance() != self.acceptance() {
             return Err(ContractError::InvalidPolicy);
         }
         if admission.outcome() != aggregation::AdmissionOutcome::Passed {
@@ -637,7 +683,7 @@ impl ClaimState {
         self.native_only()?;
         self.open(expected)?;
         self.binding.check(&decision.binding())?;
-        if decision.acceptance() != &self.acceptance {
+        if decision.acceptance() != self.acceptance() {
             return Err(ContractError::InvalidPolicy);
         }
         if self.status != ClaimStatus::Posted {
@@ -658,10 +704,11 @@ impl ClaimState {
                     return Err(ContractError::InvalidCut);
                 }
                 let binding = self.binding.next()?;
+                let held = held_cut(ClaimTerminalCut::Required(cut))?;
                 self.binding = binding;
                 self.status = ClaimStatus::PostFailed;
                 self.local_sealed_at = Some(cut.sequence());
-                self.terminal_cut = Some(ClaimTerminalCut::Required(cut));
+                self.terminal_cut = Some(held);
                 Ok(())
             }
         }
@@ -822,13 +869,14 @@ impl ClaimState {
             return Err(ContractError::InvalidCut);
         }
         let binding = self.binding.next()?;
+        let held = held_cut(ClaimTerminalCut::Graph(cut))?;
         self.binding = binding;
         self.status = match cut.kind() {
             graph::FailureKind::DependencyFailed => ClaimStatus::DependencyFailed,
             graph::FailureKind::Deadlocked => ClaimStatus::Deadlocked,
         };
         self.local_sealed_at.get_or_insert(cut.sequence());
-        self.terminal_cut = Some(ClaimTerminalCut::Graph(cut));
+        self.terminal_cut = Some(held);
         Ok(())
     }
 
@@ -978,7 +1026,7 @@ impl ClaimState {
         self.open(expected)?;
         self.working()?;
         self.binding.check(&decision.binding())?;
-        if decision.acceptance() != &self.acceptance {
+        if decision.acceptance() != self.acceptance() {
             return Err(ContractError::InvalidPolicy);
         }
         for witness in decision.nonartifact_witnesses() {
@@ -1058,10 +1106,11 @@ impl ClaimState {
                     aggregation::BlockingKind::Errored => ClaimStatus::ValidationErrored,
                 };
                 let binding = self.binding.next()?;
+                let held = held_cut(ClaimTerminalCut::Required(cut))?;
                 self.binding = binding;
                 self.status = status;
                 self.local_sealed_at = Some(cut.sequence());
-                self.terminal_cut = Some(ClaimTerminalCut::Required(cut));
+                self.terminal_cut = Some(held);
                 Ok(())
             }
         }

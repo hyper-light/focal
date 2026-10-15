@@ -20,19 +20,13 @@ fn stage(
     logical_time: u64,
     evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
 ) -> Staged {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let intent = intent::fingerprint(view.ledger(), &input).unwrap();
     let sequence = SessionSeq(view.prefix().0 + 1);
     let mut meta = view.meta();
     meta.logical_time = logical_time;
     meta.outcomes += 1;
-    let mut scratch = Scratch {
-        used: 0,
-        max: core.limits.preparation_bytes,
-    };
+    let mut scratch = Scratch::bound(core.limits.preparation_bytes);
     let mut extras = Extras::new(
         core.limits.range.max_batch_entries,
         core.limits.preparation_bytes,
@@ -98,10 +92,7 @@ fn stage(
 }
 
 fn history(core: &Core<NativeState>, staged: &Staged) -> Vec<NativeFact> {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let mut workspace = Vec::<claim_changes::History>::with_capacity(staged.plan.rows.len());
     let mut facts = Vec::with_capacity(usize::try_from(staged.outcome.events).unwrap());
     let count = claim_changes::visit_history(
@@ -133,10 +124,7 @@ fn publish(core: &mut Core<NativeState>, staged: Staged) -> (NativeOutcome, Vec<
         outcome,
         mut scratch,
     } = staged;
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let changes = claim_changes::changes(
         plan,
         extras,
@@ -148,20 +136,30 @@ fn publish(core: &mut Core<NativeState>, staged: Staged) -> (NativeOutcome, Vec<
         &mut scratch,
     )
     .unwrap();
+    let encoded_added =
+        crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())
+            .unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let range = core
         .state
         .rows
-        .prepare_batch_with(
+        .prepare_batch_replacing(
             outcome.sequence.0,
             changes,
             BudgetLane::Ordinary,
             prepare::copy,
+            |key, row| removed.count(key, row),
         )
         .unwrap();
     core.publish_native(NativePrepared {
         fragments: range,
         outcome,
         writes: mutation::WriteSet::unrecorded(),
+        encoded_added,
+        encoded_removed: removed.bytes(),
+        _index: None,
+        events: None,
+        retire: None,
     })
     .unwrap();
     assert_eq!(fixture::events(core, outcome), facts);
@@ -314,10 +312,7 @@ fn failing_admission_report_keeps_original_accepted_ordinal_before_claim_failure
     ));
     // A genuine older Posted row cannot be replayed as a new transition from
     // the now-committed failure. The unpublished sink prefix is disposable.
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let mut workspace = Vec::<claim_changes::History>::with_capacity(1);
     let extras = Extras::new(0, 0).unwrap();
     assert!(
@@ -345,10 +340,7 @@ fn insufficient_workspace_sink_failure_and_unordered_final_rows_leave_source_reu
     let core = fixture::core();
     let mut staged = stage(&core, creation_input(), NativeOperation::Create, 10, None);
     let expected = history(&core, &staged);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let before_rows = staged
         .plan
         .rows
@@ -456,13 +448,7 @@ fn claimant_receipt_keeps_the_original_delivery_result_before_derived_claim_hist
             expected: response,
         },
     };
-    let logical_time = View {
-        state: &core.state,
-        tail: None,
-    }
-    .meta()
-    .logical_time
-        + 1;
+    let logical_time = View::committed(&core.state).meta().logical_time + 1;
     let staged = stage(
         &core,
         input,
@@ -526,13 +512,7 @@ fn explicit_whole_work_journal_preserves_internal_missing_and_entry_positions_ex
         request: fixture::request(fixture::ISSUER, 903),
         command: NativeCommand::EnterWholeWork { claim, expected },
     };
-    let logical_time = View {
-        state: &core.state,
-        tail: None,
-    }
-    .meta()
-    .logical_time
-        + 1;
+    let logical_time = View::committed(&core.state).meta().logical_time + 1;
     let mut staged = stage(
         &core,
         input,
@@ -542,10 +522,7 @@ fn explicit_whole_work_journal_preserves_internal_missing_and_entry_positions_ex
     );
     let original = staged.extras.journal.as_ref().unwrap().clone();
     assert_eq!(history(&core, &staged), original);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let mut workspace = Vec::<claim_changes::History>::with_capacity(staged.plan.rows.len());
     let mut emitted = 0usize;
     assert!(

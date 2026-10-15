@@ -57,12 +57,12 @@ fn replace_body(bytes: &[u8], key: Key, replacement: &[u8]) -> Vec<u8> {
     checksum(&mut value);
     value
 }
-fn encode_row(row: &Row, ledger: LedgerId) -> Vec<u8> {
+fn encode_row(key: Key, row: &Row, ledger: LedgerId) -> Vec<u8> {
     let mut count = CountingSink::new(usize::MAX, usize::MAX);
-    rows::value(&mut count, row, ledger).unwrap();
+    rows::value(&mut count, key, row, ledger, None).unwrap();
     let mut value = vec![0; count.len()];
     let mut sink = SliceSink::new(&mut value, count.visits_used());
-    rows::value(&mut sink, row, ledger).unwrap();
+    rows::value(&mut sink, key, row, ledger, None).unwrap();
     sink.finish().unwrap();
     value
 }
@@ -101,8 +101,8 @@ fn authored_descriptors_identity_indices_and_zero_event_reuse_survive_full_recov
     for id in [1, 2] {
         let claim = ClaimId::from_u128(id);
         let validation = ValidationId::from_u128(id);
-        let old_claim = core.native_claim_content(claim).unwrap();
-        let new_claim = restored.native_claim_content(claim).unwrap();
+        let old_claim = core.native_claim_content(claim).unwrap().unwrap();
+        let new_claim = restored.native_claim_content(claim).unwrap().unwrap();
         assert_eq!(new_claim, old_claim);
         assert!(!std::ptr::eq(
             new_claim.description().as_ptr(),
@@ -139,21 +139,27 @@ fn authored_descriptors_identity_indices_and_zero_event_reuse_survive_full_recov
             restored
                 .native_creation_result(request(id))
                 .unwrap()
+                .unwrap()
                 .entries(),
-            core.native_creation_result(request(id)).unwrap().entries()
+            core.native_creation_result(request(id))
+                .unwrap()
+                .unwrap()
+                .entries()
         );
     }
     assert_eq!(
         restored
             .native_creation_result(request(1))
             .unwrap()
+            .unwrap()
             .entries(),
         restored
             .native_creation_result(request(3))
             .unwrap()
+            .unwrap()
             .entries()
     );
-    let reused = restored.native_outcome(request(3)).unwrap();
+    let reused = restored.native_outcome(request(3)).unwrap().unwrap();
     assert_eq!(
         (
             reused.created,
@@ -166,6 +172,7 @@ fn authored_descriptors_identity_indices_and_zero_event_reuse_survive_full_recov
     assert!(restored.native_event(reused.sequence, 0).is_none());
     let claim = restored
         .native_claim_content(ClaimId::from_u128(1))
+        .unwrap()
         .unwrap();
     let declaration = restored
         .native_validation_descriptor(ValidationId::from_u128(1))
@@ -196,6 +203,8 @@ fn authored_descriptors_identity_indices_and_zero_event_reuse_survive_full_recov
     );
     assert_eq!(core.native_budget(), original_budget);
     assert!(memory.stats().used > before);
+    // The decoded body read above is charged while it is held (doc 31 M3).
+    drop(claim);
     drop(restored);
     assert_eq!(memory.stats().used, before);
 }
@@ -217,6 +226,7 @@ fn altered_authored_body_profile_identity_and_creation_mapping_refuse_and_refund
     let mut mappings = core
         .native_creation_result(request(3))
         .unwrap()
+        .unwrap()
         .entries()
         .to_vec();
     mappings.first_mut().unwrap().resolved = ObjectId::from_u128(2);
@@ -231,11 +241,11 @@ fn altered_authored_body_profile_identity_and_creation_mapping_refuse_and_refund
                 let key = Key::ClaimContent(ClaimId::from_u128(1));
                 let range = body_range(&bytes, key);
                 let mut body = bytes[range].to_vec();
-                let description = core
+                let held = core
                     .native_claim_content(ClaimId::from_u128(1))
                     .unwrap()
-                    .description()
-                    .as_bytes();
+                    .unwrap();
+                let description = held.description().as_bytes();
                 let at = body
                     .windows(description.len())
                     .position(|value| value == description)
@@ -253,13 +263,18 @@ fn altered_authored_body_profile_identity_and_creation_mapping_refuse_and_refund
             2 => replace_body(
                 &bytes,
                 Key::Definition(ValidationId::from_u128(1)),
-                &encode_row(&legacy_row, core.state.ledger),
+                &encode_row(
+                    Key::Definition(ValidationId::from_u128(1)),
+                    &legacy_row,
+                    core.state.ledger,
+                ),
             ),
             3 => replace_body(
                 &bytes,
                 Key::ClaimIdentity(
                     1,
                     core.native_claim_content(ClaimId::from_u128(1))
+                        .unwrap()
                         .unwrap()
                         .content_hash(),
                 ),
@@ -268,7 +283,11 @@ fn altered_authored_body_profile_identity_and_creation_mapping_refuse_and_refund
             _ => replace_body(
                 &bytes,
                 Key::CreationResult(request(3).into()),
-                &encode_row(&mapping_row, core.state.ledger),
+                &encode_row(
+                    Key::CreationResult(request(3).into()),
+                    &mapping_row,
+                    core.state.ledger,
+                ),
             ),
         };
         // The checksum/framing still pass; decoder/root validation must refuse

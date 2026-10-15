@@ -276,11 +276,26 @@ impl<T> Arena<T> {
         )?;
         let page_charge = self.budget.reserve(BudgetKind::Arena, lane, page_bytes)?;
         let new_len = checked_add(self.pages.len(), 1)?;
-        let root_bytes = checked_add(
-            ALLOCATOR_OVERHEAD,
-            checked_mul(new_len, size_of::<Page<T>>())?,
-        )?;
-        let root_charge = self.budget.reserve(BudgetKind::Arena, lane, root_bytes)?;
+        // The page directory grows to the power of two of its length and is
+        // charged for that whole capacity: a page added moves the
+        // descriptors once per doubling, never once per page (the audit's
+        // F31), and a directory with room takes the page without a new
+        // charge or a new allocation.
+        let grown = if new_len <= self.pages.capacity() {
+            None
+        } else {
+            let capacity = new_len
+                .checked_next_power_of_two()
+                .ok_or(MemoryError::CounterExhausted("arena pages"))?;
+            let root_bytes = checked_add(
+                ALLOCATOR_OVERHEAD,
+                checked_mul(capacity, size_of::<Page<T>>())?,
+            )?;
+            Some((
+                capacity,
+                self.budget.reserve(BudgetKind::Arena, lane, root_bytes)?,
+            ))
+        };
         let mut slots = Vec::new();
         slots
             .try_reserve_exact(count as usize)
@@ -306,18 +321,19 @@ impl<T> Arena<T> {
                 next_free,
             });
         }
-        let mut pages = Vec::new();
-        pages
-            .try_reserve_exact(new_len)
-            .map_err(|_| MemoryError::AllocationFailed)?;
-        // No fallible work or clone calls after changing the old page directory.
-        pages.append(&mut self.pages);
-        pages.push(Page {
+        if let Some((capacity, root_charge)) = grown {
+            // Reserved before anything of the arena changes: a refusal
+            // leaves the directory, its charge and every handle as they were.
+            self.pages
+                .try_reserve_exact(capacity.saturating_sub(self.pages.len()))
+                .map_err(|_| MemoryError::AllocationFailed)?;
+            self.root_allocation = Some(root_charge.commit());
+        }
+        // Room was reserved: this never allocates.
+        self.pages.push(Page {
             slots: slots.into_boxed_slice(),
             _allocation: page_charge.commit(),
         });
-        self.pages = pages;
-        self.root_allocation = Some(root_charge.commit());
         self.free = Some(self.capacity);
         self.capacity = next_capacity;
         Ok(())
@@ -327,6 +343,45 @@ impl<T> Arena<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The page directory doubles: over many pages it is reallocated once
+    /// per doubling, holds a power of two of pages, and the arena's root
+    /// charge is the directory's capacity, not its length (the audit's F31).
+    #[test]
+    fn the_page_directory_grows_by_doubling_and_is_charged_for_its_capacity() {
+        let budget = MemoryBudget::new(10_000_000, 0).unwrap();
+        let mut arena = Arena::new(
+            ArenaId(2),
+            ArenaConfig {
+                page_slots: 1,
+                max_slots: u32::MAX,
+            },
+            budget.clone(),
+        )
+        .unwrap();
+        let mut capacities = Vec::new();
+        for value in 0..1_000u32 {
+            arena.insert(value, 0, BudgetLane::Ordinary).unwrap();
+            let capacity = arena.pages.capacity();
+            assert!(capacity.is_power_of_two() && capacity >= arena.pages.len());
+            if capacities.last() != Some(&capacity) {
+                capacities.push(capacity);
+            }
+        }
+        assert_eq!(arena.pages.len(), 1_000);
+        assert_eq!(
+            capacities,
+            vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
+            "reallocated once per doubling"
+        );
+        let directory = ALLOCATOR_OVERHEAD + 1024 * size_of::<Page<u32>>();
+        let pages: usize = 1_000 * (ALLOCATOR_OVERHEAD + size_of::<Slot<u32>>());
+        let arena_bytes = budget.stats().used;
+        assert!(
+            arena_bytes >= directory + pages,
+            "the root charge covers the capacity: {arena_bytes} < {directory} + {pages}"
+        );
+    }
 
     #[test]
     fn maximum_generation_is_retired_instead_of_wrapping() {

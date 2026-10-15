@@ -47,6 +47,7 @@ impl Fixture {
             identity.node,
             identity.issuer.0,
             EnrollmentLimits::default(),
+            0,
             now(),
         )
         .unwrap();
@@ -271,156 +272,160 @@ fn existing_local_identity_cannot_be_replaced_by_joining() {
     assert!(!disk.path().join("JOIN").exists());
 }
 
-#[tokio::test]
-async fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_membership() {
-    let mut fixture = Fixture::new();
-    let server = Arc::new(
-        EnrollmentServer::bind(
+#[test]
+fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_membership() {
+    focal_rt::block_on(async move {
+        let mut fixture = Fixture::new();
+        let server = Arc::new(
+            EnrollmentServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                &fixture.authority.server_identity(),
+                TransportLimits {
+                    timeout: Duration::from_secs(3),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let invitation = fixture.invite(server.local_addr().unwrap(), EnrollmentRole::Node);
+        let bundle = NodeInvitation::new("worker-2", fixture.genesis.clone(), invitation).unwrap();
+        let founder = fixture.genesis.founder.clone();
+        let committed = Arc::new(Mutex::new((
+            fixture.authority,
+            fixture.registry,
+            Vec::new(),
+            false,
+        )));
+        let authority = committed.clone();
+        let serving = server.clone();
+        let task = focal_rt::spawn(async move {
+            serving
+                .serve(move |request: focal_enrollment::JoinRequest| {
+                    let authority = authority.clone();
+                    async move {
+                        let mut state = authority.lock().unwrap();
+                        let preparation = state.1.prepare_join(&state.0, &request, now()).unwrap();
+                        let receipt = match preparation {
+                            JoinPreparation::Existing(receipt) => receipt,
+                            JoinPreparation::Commit(command) => {
+                                let index = state.1.applied_index() + 1;
+                                state.2.push(command.encode().unwrap()); // authority test fixture retains exact committed command
+                                state.1.apply_committed(&command, index).unwrap();
+                                state.1.release(&request, now()).unwrap()
+                            }
+                        };
+                        if !state.3 {
+                            state.3 = true;
+                            JoinResponse::Rejected(JoinFailure::OutcomeUnknown)
+                        } else {
+                            JoinResponse::Enrolled(receipt)
+                        }
+                    }
+                })
+                .await
+                .unwrap()
+        })
+        .unwrap();
+        let disk = tempfile::tempdir().unwrap();
+        let settings = settings(disk.path());
+        let (listen, advertise) = addresses();
+        let pending = PendingJoin::open(&settings, bundle, listen, advertise).unwrap();
+        let request = pending.request_id();
+        let csr = pending.csr().to_vec();
+        let client = EnrollmentClient::bind(
             "127.0.0.1:0".parse().unwrap(),
-            &fixture.authority.server_identity(),
             TransportLimits {
                 timeout: Duration::from_secs(3),
                 ..Default::default()
             },
         )
-        .unwrap(),
-    );
-    let invitation = fixture.invite(server.local_addr().unwrap(), EnrollmentRole::Node);
-    let bundle = NodeInvitation::new("worker-2", fixture.genesis.clone(), invitation).unwrap();
-    let founder = fixture.genesis.founder.clone();
-    let committed = Arc::new(Mutex::new((
-        fixture.authority,
-        fixture.registry,
-        Vec::new(),
-        false,
-    )));
-    let authority = committed.clone();
-    let serving = server.clone();
-    let task = tokio::spawn(async move {
-        serving
-            .serve(move |request: focal_enrollment::JoinRequest| {
-                let authority = authority.clone();
-                async move {
-                    let mut state = authority.lock().unwrap();
-                    let preparation = state.1.prepare_join(&state.0, &request, now()).unwrap();
-                    let receipt = match preparation {
-                        JoinPreparation::Existing(receipt) => receipt,
-                        JoinPreparation::Commit(command) => {
-                            let index = state.1.applied_index() + 1;
-                            state.2.push(command.encode().unwrap()); // authority test fixture retains exact committed command
-                            state.1.apply_committed(&command, index).unwrap();
-                            state.1.release(&request, now()).unwrap()
-                        }
-                    };
-                    if !state.3 {
-                        state.3 = true;
-                        JoinResponse::Rejected(JoinFailure::OutcomeUnknown)
-                    } else {
-                        JoinResponse::Enrolled(receipt)
-                    }
-                }
-            })
-            .await
-            .unwrap()
-    });
-    let disk = tempfile::tempdir().unwrap();
-    let settings = settings(disk.path());
-    let (listen, advertise) = addresses();
-    let pending = PendingJoin::open(&settings, bundle, listen, advertise).unwrap();
-    let request = pending.request_id();
-    let csr = pending.csr().to_vec();
-    let client = EnrollmentClient::bind(
-        "127.0.0.1:0".parse().unwrap(),
-        TransportLimits {
-            timeout: Duration::from_secs(3),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert!(matches!(
-        pending.redeem(&client, now()).await,
-        Err(JoinError::Transport(JoinTransportError::OutcomeUnknown))
-    ));
-    assert!(!disk.path().join("IDENTITY").exists());
-    assert!(pending.enrollment().unwrap().is_none());
-    drop(pending);
-    let pending = PendingJoin::resume(&settings).unwrap();
-    assert_eq!(pending.request_id(), request);
-    assert_eq!(pending.csr(), csr);
-    let receipt = pending.redeem(&client, now()).await.unwrap();
-    assert_eq!(receipt.identity.node_id, Some(founder.node + 1));
-    assert_eq!(committed.lock().unwrap().2.len(), 1);
-    // A forged identity in an otherwise valid receipt cannot replace the saved
-    // signed certificate or install its requested physical node.
-    let mut forged = receipt.clone();
-    forged.identity.node_id = Some(999);
-    assert!(pending.install(forged, now()).is_err());
-    assert!(!disk.path().join("IDENTITY").exists());
-    // Receipt is durable even if the process stops before physical identity install.
-    let joined = JoinedNode::open(&settings, now()).unwrap();
-    assert_eq!(joined.receipt, receipt);
-    let mut assigned = founder.clone();
-    assigned.node = receipt.identity.node_id.unwrap();
-    assert_eq!(joined.directory.identity(), &assigned);
-    assert_eq!(joined.state.genesis.founder, founder);
-    assert_eq!(joined.state.advertise, advertise);
-    // A live physical owner keeps its locks; Unix context discovery is a
-    // read-only verification of its installed key/receipt, not another owner.
-    let key_path = disk.path().join("JOIN/node-key/join-key.bin");
-    let receipt_path = disk.path().join("JOIN/node-key/enrollment.bin");
-    let original_key = fs::read(&key_path).unwrap();
-    let original_receipt = fs::read(&receipt_path).unwrap();
-    assert_eq!(
-        joined_unix_principal(disk.path(), &assigned, now()).unwrap(),
-        focal_model::ParticipantId(receipt.identity.principal)
-    );
-    assert_eq!(fs::read(&key_path).unwrap(), original_key);
-    assert_eq!(fs::read(&receipt_path).unwrap(), original_receipt);
-    let mut forged = receipt.clone();
-    forged.identity.principal = [99; 16];
-    let mut record = b"FCLKEY01".to_vec();
-    record.extend_from_slice(&postcard::to_stdvec(&forged).unwrap());
-    let checksum = *blake3::hash(&record).as_bytes();
-    record.extend_from_slice(&checksum);
-    fs::write(&receipt_path, &record).unwrap();
-    assert!(joined_unix_principal(disk.path(), &assigned, now()).is_err());
-    fs::write(&receipt_path, &original_receipt).unwrap();
-    fs::remove_file(&key_path).unwrap();
-    assert!(joined_unix_principal(disk.path(), &assigned, now()).is_err());
-    assert!(!key_path.exists());
-    fs::write(&key_path, &original_key).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
-    }
-    let request = joined.discovery_request().unwrap();
-    assert_eq!(request.ledger, joined.state.genesis.root_namespace);
-    let Operation::PeerControl { group, request } = request.operation else {
-        panic!("Node-only discovery")
-    };
-    assert_eq!(group, joined.state.genesis.root.group);
-    assert_eq!(
-        ControlRpc::decode_read_only(&request, 64).unwrap(),
-        ControlRead::State
-    );
-    assert!(!disk.path().join("wal").exists());
-    assert!(!disk.path().join("cluster").exists());
-    let contact = joined.contact_request().unwrap();
-    assert!(matches!(contact.operation, Operation::NodeContact {
-        group, sequence:1, acknowledged_through:0, expected_generation:0, advertise:address, ..
-    } if group==joined.state.genesis.root.group && address==advertise));
-    drop(joined);
-    let joined = JoinedNode::open(&settings, now()).unwrap();
-    assert_eq!(joined.receipt, receipt);
-    assert_eq!(joined.contact_request().unwrap(), contact);
-    drop(joined);
-    fs::remove_dir_all(disk.path().join("JOIN")).unwrap();
-    fs::remove_file(disk.path().join("JOIN.initialized")).unwrap();
-    assert!(local_unix_principal(disk.path(), &assigned, now()).is_err());
-    client.close();
-    server.close();
-    task.await.unwrap();
+        .unwrap();
+        assert!(matches!(
+            pending.redeem(&client, now()).await,
+            Err(JoinError::Transport(JoinTransportError::OutcomeUnknown))
+        ));
+        assert!(!disk.path().join("IDENTITY").exists());
+        assert!(pending.enrollment().unwrap().is_none());
+        drop(pending);
+        let pending = PendingJoin::resume(&settings).unwrap();
+        assert_eq!(pending.request_id(), request);
+        assert_eq!(pending.csr(), csr);
+        let receipt = pending.redeem(&client, now()).await.unwrap();
+        assert_eq!(receipt.identity.node_id, Some(founder.node + 1));
+        assert_eq!(committed.lock().unwrap().2.len(), 1);
+        // A forged identity in an otherwise valid receipt cannot replace the saved
+        // signed certificate or install its requested physical node.
+        let mut forged = receipt.clone();
+        forged.identity.node_id = Some(999);
+        assert!(pending.install(forged, now()).is_err());
+        assert!(!disk.path().join("IDENTITY").exists());
+        // Receipt is durable even if the process stops before physical identity install.
+        let joined = JoinedNode::open(&settings, now()).unwrap();
+        assert_eq!(joined.receipt, receipt);
+        let mut assigned = founder.clone();
+        assigned.node = receipt.identity.node_id.unwrap();
+        assert_eq!(joined.directory.identity(), &assigned);
+        assert_eq!(joined.state.genesis.founder, founder);
+        assert_eq!(joined.state.advertise, advertise);
+        // A live physical owner keeps its locks; Unix context discovery is a
+        // read-only verification of its installed key/receipt, not another owner.
+        let key_path = disk.path().join("JOIN/node-key/join-key.bin");
+        let receipt_path = disk.path().join("JOIN/node-key/enrollment.bin");
+        let original_key = fs::read(&key_path).unwrap();
+        let original_receipt = fs::read(&receipt_path).unwrap();
+        assert_eq!(
+            joined_unix_principal(disk.path(), &assigned, now()).unwrap(),
+            focal_model::ParticipantId(receipt.identity.principal)
+        );
+        assert_eq!(fs::read(&key_path).unwrap(), original_key);
+        assert_eq!(fs::read(&receipt_path).unwrap(), original_receipt);
+        let mut forged = receipt.clone();
+        forged.identity.principal = [99; 16];
+        let mut record = b"FCLKEY01".to_vec();
+        record.extend_from_slice(&postcard::to_stdvec(&forged).unwrap());
+        let checksum = *blake3::hash(&record).as_bytes();
+        record.extend_from_slice(&checksum);
+        fs::write(&receipt_path, &record).unwrap();
+        assert!(joined_unix_principal(disk.path(), &assigned, now()).is_err());
+        fs::write(&receipt_path, &original_receipt).unwrap();
+        fs::remove_file(&key_path).unwrap();
+        assert!(joined_unix_principal(disk.path(), &assigned, now()).is_err());
+        assert!(!key_path.exists());
+        fs::write(&key_path, &original_key).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let request = joined.discovery_request().unwrap();
+        assert_eq!(request.ledger, joined.state.genesis.root_namespace);
+        let Operation::PeerControl { group, request } = request.operation else {
+            panic!("Node-only discovery")
+        };
+        assert_eq!(group, joined.state.genesis.root.group);
+        assert_eq!(
+            ControlRpc::decode_read_only(&request, 64).unwrap(),
+            ControlRead::State
+        );
+        assert!(!disk.path().join("wal").exists());
+        assert!(!disk.path().join("cluster").exists());
+        let contact = joined.contact_request().unwrap();
+        assert!(matches!(contact.operation, Operation::NodeContact {
+            group, sequence:1, acknowledged_through:0, expected_generation:0, advertise:address, ..
+        } if group==joined.state.genesis.root.group && address==advertise));
+        drop(joined);
+        let joined = JoinedNode::open(&settings, now()).unwrap();
+        assert_eq!(joined.receipt, receipt);
+        assert_eq!(joined.contact_request().unwrap(), contact);
+        drop(joined);
+        fs::remove_dir_all(disk.path().join("JOIN")).unwrap();
+        fs::remove_file(disk.path().join("JOIN.initialized")).unwrap();
+        assert!(local_unix_principal(disk.path(), &assigned, now()).is_err());
+        client.close();
+        server.close().unwrap();
+        task.await.unwrap();
+    })
+    .unwrap()
 }
 
 /// An operator who advertises a `host:port` name has that name carried into
@@ -458,4 +463,70 @@ fn a_join_carries_the_advertised_name_so_peers_can_re_resolve_a_moved_host() {
         pending.endpoint.is_none(),
         "an address literal names nothing to re-resolve"
     );
+}
+
+/// A client adopts an endorsed issuer it did not hold (24 §11): recorded
+/// beside its journal, once per issuer, the newest within the bound a
+/// verifier holds, and read back only when the file is what it wrote.
+#[test]
+fn a_client_adopts_the_endorsed_issuers_it_did_not_hold_within_the_bound_and_refuses_a_damaged_record()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let directory = dir.path().join("enrollment-alice");
+    std::fs::create_dir_all(&directory).unwrap();
+    assert!(adopted_issuers(&directory).unwrap().is_empty());
+    let authority_at = |name: &str| {
+        focal_enrollment::BootstrapAuthority::open_or_create(
+            dir.path().join(name),
+            [9; 16],
+            vec!["localhost".into()],
+            1_783_000_000,
+        )
+        .unwrap()
+    };
+    let first = authority_at("first");
+    let adopted = focal_wire::Adopted {
+        anchor: first.ca_certificate().to_vec(),
+        issuer: None,
+    };
+    assert!(adopt_issuer(&directory, &adopted).unwrap());
+    assert!(!adopt_issuer(&directory, &adopted).unwrap());
+    let recorded = adopted_issuers(&directory).unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0], first.issuer_record().unwrap());
+    // The bound: the oldest adoption leaves for the newest.
+    let mut fingerprints = vec![recorded[0].fingerprint];
+    for name in ["second", "third", "fourth", "fifth"] {
+        let authority = authority_at(name);
+        assert!(
+            adopt_issuer(
+                &directory,
+                &focal_wire::Adopted {
+                    anchor: authority.ca_certificate().to_vec(),
+                    issuer: None,
+                },
+            )
+            .unwrap()
+        );
+        fingerprints.push(authority.issuer_record().unwrap().fingerprint);
+    }
+    let recorded = adopted_issuers(&directory).unwrap();
+    assert_eq!(recorded.len(), focal_wire::MAX_TRUST_ROOTS);
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|issuer| issuer.fingerprint)
+            .collect::<Vec<_>>(),
+        fingerprints[1..].to_vec()
+    );
+    // A damaged record is refused, never trusted.
+    let path = directory.join("trust-adopted.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(matches!(
+        adopted_issuers(&directory),
+        Err(JoinError::Invalid)
+    ));
 }

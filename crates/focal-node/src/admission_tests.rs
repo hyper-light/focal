@@ -10,15 +10,19 @@ fn tenant(index: u128) -> TenantId {
 #[test]
 fn the_policy_bounds_the_operator_setting() {
     assert_eq!(
-        AdmissionPolicy::standard(None).max_tenants,
+        AdmissionPolicy::standard(None, 64 * MIB).max_tenants,
         AdmissionPolicy::DEFAULT_MAX_TENANTS
     );
-    assert_eq!(AdmissionPolicy::standard(Some(0)).max_tenants, 1);
-    assert_eq!(AdmissionPolicy::standard(Some(3)).max_tenants, 3);
+    assert_eq!(AdmissionPolicy::standard(Some(0), 64 * MIB).max_tenants, 1);
+    assert_eq!(AdmissionPolicy::standard(Some(3), 64 * MIB).max_tenants, 3);
     assert_eq!(
-        AdmissionPolicy::standard(Some(usize::MAX)).max_tenants,
+        AdmissionPolicy::standard(Some(usize::MAX), 64 * MIB).max_tenants,
         AdmissionPolicy::MAX_TENANTS
     );
+    // One tenant may use the node's whole envelope; the node budget arbitrates.
+    let policy = AdmissionPolicy::standard(None, 6 << 30);
+    assert_eq!(policy.tenant_memory, 6 << 30);
+    assert_eq!(policy.tenant_completion_reserve, (6 << 30) / 4);
 }
 
 #[test]
@@ -73,7 +77,7 @@ fn the_report_names_every_tenant_with_its_queue_and_the_volume() {
     let founder = node.child(32 * MIB, 8 * MIB).unwrap();
     let mut admission = TenantAdmission::new(
         node.clone(),
-        AdmissionPolicy::standard(Some(2)),
+        AdmissionPolicy::standard(Some(2), 64 * MIB),
         tenant(1),
         founder.clone(),
     );

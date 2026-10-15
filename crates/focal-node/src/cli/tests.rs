@@ -1,10 +1,23 @@
 use super::*;
 use clap::{CommandFactory, Parser};
 
+/// The manual command `args` say: in the derived tree's words, or as typed (`ACTION
+/// THING`), which the grammar says in the derived tree's.
 fn command(args: &[&str]) -> Commands {
-    let args =
-        super::super::Args::try_parse_from(std::iter::once("focal").chain(args.iter().copied()))
-            .unwrap();
+    let typed: Vec<std::ffi::OsString> = std::iter::once("focal")
+        .chain(args.iter().copied())
+        .map(Into::into)
+        .collect();
+    let derived = match args {
+        [action, thing, ..] => match super::grammar::lookup(action, thing) {
+            Some(used) => {
+                super::grammar::internal(&super::command_tree::command(), &typed, used.path)
+            }
+            None => typed,
+        },
+        _ => typed,
+    };
+    let args = super::super::Args::try_parse_from(derived).unwrap();
     let super::super::Commands::Manual(command) = args.command else {
         panic!("manual command expected");
     };
@@ -297,55 +310,52 @@ fn authored_documents_never_merge_with_flags_or_accept_wire_authority() {
 
 #[test]
 fn joined_markers_reject_manual_context_before_journaling_or_transmission() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(directory.path().to_owned());
-    let node = focal_node::embedded::EmbeddedNode::open(&settings).unwrap();
-    let identity = node.identity.clone();
-    drop(node);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    assert_eq!(
-        Context::open(&settings, None).unwrap().build.actor,
-        identity.issuer
-    );
-    for marker in ["JOIN", "JOIN.initialized"] {
-        let path = directory.path().join(marker);
-        std::fs::write(&path, b"joined state must not be decoded by a client").unwrap();
-        let result = run(
-            &runtime,
-            &settings,
-            command(&["claim", "post", "00000000000000000000000000000001"]),
-            None,
-        );
-        assert!(
-            matches!(result, Err(CliError::Input(message)) if message.contains("local node client context"))
-        );
-        assert!(!directory.path().join("client").exists());
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(directory.path().to_owned());
+        let node = focal_node::embedded::EmbeddedNode::open(&settings).unwrap();
+        let identity = node.identity.clone();
+        drop(node);
         assert_eq!(
-            decode_identity(&directory.path().join("IDENTITY")).unwrap(),
-            identity
+            Context::open(&settings, None).unwrap().build.actor,
+            identity.issuer
         );
-        std::fs::remove_file(path).unwrap();
-    }
-    // Even an incomplete dangling marker is evidence of joined ownership. A
-    // symlink marker is a Unix-only shape (creating one needs privilege on
-    // Windows); the private-file checks reject a reparse point there anyway.
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(
-            directory.path().join("absent"),
-            directory.path().join("JOIN"),
-        )
-        .unwrap();
-        assert!(matches!(
-            Context::open(&settings, None),
-            Err(CliError::Input(_))
-        ));
-        assert!(!directory.path().join("client").exists());
-    }
+        for marker in ["JOIN", "JOIN.initialized"] {
+            let path = directory.path().join(marker);
+            std::fs::write(&path, b"joined state must not be decoded by a client").unwrap();
+            let result = run(&settings,
+                command(&["claim", "post", "00000000000000000000000000000001"]),
+                None,
+            ).await;
+            assert!(
+                matches!(result, Err(CliError::Input(message)) if message.contains("local node client context"))
+            );
+            assert!(!directory.path().join("client").exists());
+            assert_eq!(
+                decode_identity(&directory.path().join("IDENTITY")).unwrap(),
+                identity
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+        // Even an incomplete dangling marker is evidence of joined ownership. A
+        // symlink marker is a Unix-only shape (creating one needs privilege on
+        // Windows); the private-file checks reject a reparse point there anyway.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                directory.path().join("absent"),
+                directory.path().join("JOIN"),
+            )
+            .unwrap();
+            assert!(matches!(
+                Context::open(&settings, None),
+                Err(CliError::Input(_))
+            ));
+            assert!(!directory.path().join("client").exists());
+        }
+    })
+    .unwrap()
 }
 
 #[test]
@@ -437,6 +447,36 @@ mod native_adapters {
             } => {
                 NativeAuthoredOperation::ReceiptAcquire(native_documents::receipt(args).unwrap().0)
             }
+            Commands::Claim {
+                command: ClaimCommand::Post(args),
+            } => {
+                NativeAuthoredOperation::ClaimPost(native_documents::claim_target(args).unwrap().0)
+            }
+            Commands::Claim {
+                command: ClaimCommand::Challenge(args),
+            } => NativeAuthoredOperation::ClaimChallenge(Box::new(
+                native_documents::challenge(*args).unwrap().0,
+            )),
+            Commands::Claim {
+                command: ClaimCommand::Consult(args),
+            } => NativeAuthoredOperation::ClaimConsult(Box::new(
+                native_documents::consult(*args).unwrap().0,
+            )),
+            Commands::Claim {
+                command: ClaimCommand::Correct(args),
+            } => NativeAuthoredOperation::ClaimCorrect(Box::new(
+                native_documents::correct(*args).unwrap().0,
+            )),
+            Commands::Claim {
+                command: ClaimCommand::FollowUp(args),
+            } => NativeAuthoredOperation::ClaimFollowUp(Box::new(
+                native_documents::follow_up(*args).unwrap().0,
+            )),
+            Commands::Testament {
+                command: TestamentCommand::Receive(args),
+            } => NativeAuthoredOperation::TestamentReceive(
+                native_documents::response_target(args).unwrap().0,
+            ),
             Commands::Claim {
                 command: ClaimCommand::Cancel(args),
             } => NativeAuthoredOperation::ClaimCancel(native_documents::cancel(args).unwrap().0),
@@ -894,9 +934,66 @@ mod native_adapters {
         assert!(native_documents::cancel(args).is_err());
     }
 
+    /// The engine's example of every authored descriptor, loaded through the
+    /// command the coverage table names (`--file`, the quickstart's path),
+    /// is the document the shared decoder produces: one canonical intent, so
+    /// what `schema example --native` prints is what the command journals.
+    #[test]
+    fn every_authored_descriptor_example_loads_through_its_command_with_the_same_intent() {
+        use focal_client::operations::{
+            WireProfile, authored_shape, example, native_descriptors, parse_native_json,
+        };
+        let scratch = tempfile::tempdir().unwrap();
+        let mut commands: Vec<(&str, String)> = native_coverage_table()
+            .into_iter()
+            .filter(|row| row.exposure == NativeExposure::AuthoredTool)
+            .map(|row| (row.name.unwrap(), row.cli.to_string()))
+            .collect();
+        // The peer shapes are `focal claim challenge|consult|correct|follow-up`.
+        for descriptor in native_descriptors()
+            .iter()
+            .filter(|descriptor| authored_shape(descriptor).is_some())
+        {
+            let verb = descriptor
+                .name
+                .strip_prefix("claim.")
+                .unwrap()
+                .replace('_', "-");
+            commands.push((descriptor.name, format!("focal claim {verb}")));
+        }
+        let mut checked = std::collections::BTreeSet::new();
+        for (name, cli) in commands {
+            if !checked.insert(name) {
+                continue;
+            }
+            let value = example(WireProfile::Native, name).unwrap();
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let path = scratch.path().join(format!("{name}.json"));
+            std::fs::write(&path, &bytes).unwrap();
+            let path = path.to_str().unwrap();
+            let mut args: Vec<&str> = cli.split(' ').skip(1).collect();
+            args.extend(["--file", path]);
+            let loaded = native_document(&args);
+            let decoded = parse_native_json(name, &bytes).unwrap();
+            assert_eq!(loaded.name(), name, "{cli}");
+            assert_eq!(
+                loaded.canonical_intent().unwrap(),
+                decoded.canonical_intent().unwrap(),
+                "{cli}"
+            );
+        }
+        assert_eq!(
+            checked.len(),
+            native_descriptors()
+                .iter()
+                .filter(|descriptor| descriptor.mutation)
+                .count()
+        );
+    }
+
     #[test]
     fn every_exposed_coverage_row_names_a_command_in_the_clap_tree() {
-        let tree = super::super::command_tree::command();
+        let tree = super::super::grammar::command();
         for row in native_coverage_table() {
             if row.exposure != NativeExposure::AuthoredTool {
                 assert!(row.cli.is_empty());

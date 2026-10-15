@@ -32,13 +32,19 @@ fn encode(core: &Core<NativeState>) -> Vec<u8> {
     output
 }
 fn populated() -> Core<NativeState> {
+    populated_with(1)
+}
+/// A core of `claims` claims, each with a required validation.
+fn populated_with(claims: u128) -> Core<NativeState> {
     let mut core = fixture::core();
-    let created = fixture::prepared(core.prepare_native(
-        fixture::context(fixture::ISSUER, 1),
-        fixture::creation(1, 1, &[(ValidationMode::Required, false)], None),
-        &[],
-    ));
-    core.publish_native(created).unwrap();
+    for claim in 1..=claims {
+        let created = fixture::prepared(core.prepare_native(
+            fixture::context(fixture::ISSUER, claim as u64),
+            fixture::creation(claim, claim, &[(ValidationMode::Required, false)], None),
+            &[],
+        ));
+        core.publish_native(created).unwrap();
+    }
     core
 }
 fn checksum(bytes: &mut [u8]) {
@@ -455,25 +461,31 @@ fn structural_checkpoint_rejects_deletions_duplicates_and_missing_accounting_row
 fn encoding_refuses_non_genesis_empty_roots_and_missing_meta_or_outcome() {
     for row in [
         None,
-        Some(Row::Meta(Meta::default())),
-        Some(Row::Outcome(NativeOutcome {
-            ledger: fixture::binding(1).ledger,
-            invocation: fixture::request(fixture::ISSUER, 1).into(),
-            sequence: SessionSeq(1),
-            logical_time: 1,
-            operation: NativeOperation::Post,
-            intent: ContentHash([0; 32]),
-            created: 0,
-            changed: 0,
-            definitions: 0,
-            evaluations: 0,
-            artifacts: 0,
-            results: 0,
-            receipts: 0,
-            responses: 0,
-            result_testaments: 0,
-            events: 0,
-        })),
+        Some(Row::Meta(Box::default())),
+        Some(Row::Outcome(
+            OwnedOutcome::stored(
+                &NativeOutcome {
+                    ledger: fixture::binding(1).ledger,
+                    invocation: fixture::request(fixture::ISSUER, 1).into(),
+                    sequence: SessionSeq(1),
+                    logical_time: 1,
+                    operation: NativeOperation::Post,
+                    intent: ContentHash([0; 32]),
+                    created: 0,
+                    changed: 0,
+                    definitions: 0,
+                    evaluations: 0,
+                    artifacts: 0,
+                    results: 0,
+                    receipts: 0,
+                    responses: 0,
+                    result_testaments: 0,
+                    events: 0,
+                },
+                fixture::binding(1).ledger,
+            )
+            .unwrap(),
+        )),
     ] {
         let mut core = fixture::core();
         let initial = if row.is_none() { 1 } else { 0 };
@@ -490,7 +502,7 @@ fn encoding_refuses_non_genesis_empty_roots_and_missing_meta_or_outcome() {
         .unwrap();
         if let Some(row) = row {
             let key = match &row {
-                Row::Outcome(v) => Key::Outcome(v.invocation),
+                Row::Outcome(_) => Key::Outcome(fixture::request(fixture::ISSUER, 1).into()),
                 _ => Key::Meta,
             };
             let prepared = core
@@ -558,7 +570,7 @@ fn caller_funded_output_encodes_under_total_ram_pressure_without_borrowing_new_c
 
 #[test]
 fn streaming_output_matches_exact_slice_bytes_hash_and_refuses_before_unfunded_callbacks() {
-    let core = populated();
+    let core = populated_with(8);
     let expected = encode(&core);
     let before = core.native_budget();
     let plan = EncodingPlan::prepare(&core, limits()).unwrap();
@@ -567,13 +579,17 @@ fn streaming_output_matches_exact_slice_bytes_hash_and_refuses_before_unfunded_c
     let hash = plan
         .write_with(|bytes| {
             calls += 1;
+            // Streamed in batches: no piece longer than a batch (no field of
+            // these rows is), and as many as the encoding's length takes.
+            assert!(bytes.len() <= OUTPUT_BATCH);
             output.extend_from_slice(bytes);
             Ok::<(), std::convert::Infallible>(())
         })
         .unwrap();
     assert_eq!(hash, plan.quote().hash);
     assert_eq!(output, expected);
-    assert!(calls > 10);
+    assert!(expected.len() > 3 * OUTPUT_BATCH);
+    assert!(calls >= expected.len().div_ceil(OUTPUT_BATCH));
     assert_eq!(core.native_budget(), before);
     // Corrupted private plans prove that codec limits are debited before any
     // callback. Public callers only receive immutable measured plans.
@@ -587,11 +603,13 @@ fn streaming_output_matches_exact_slice_bytes_hash_and_refuses_before_unfunded_c
             ..plan.quote()
         },
     ] {
-        let refused = EncodingPlan { core: &core, quote }.write_with(
-            |_| -> Result<(), std::convert::Infallible> {
-                panic!("insufficient codec allowance must refuse before output")
-            },
-        );
+        let refused = EncodingPlan {
+            source: Source::Core(&core.state),
+            quote,
+        }
+        .write_with(|_| -> Result<(), std::convert::Infallible> {
+            panic!("insufficient codec allowance must refuse before output")
+        });
         assert_eq!(refused, Err(WriteError::Codec(CodecError::Capacity)));
     }
     let failure = plan
@@ -689,8 +707,12 @@ fn streaming_preserves_early_middle_and_trailer_output_errors_and_allows_exact_r
         message: String,
     }
 
-    let core = populated();
+    // Enough rows that the output takes several batches: the first, a
+    // middle and the last call are three.
+    let core = populated_with(8);
     let expected = encode(&core);
+    assert!(expected.len() > 3 * OUTPUT_BATCH);
+    let sequence = core.native_sequence();
     let budget = &core.state.budget;
     let before = budget.stats();
     let plan = EncodingPlan::prepare(&core, limits()).unwrap();
@@ -737,7 +759,7 @@ fn streaming_preserves_early_middle_and_trailer_output_errors_and_allows_exact_r
         assert_eq!(calls, fail_at);
         assert!(written < expected.len());
         assert_eq!(budget.stats(), pressured);
-        assert_eq!(core.native_sequence(), SessionSeq(1));
+        assert_eq!(core.native_sequence(), sequence);
         // Retry starts from a fresh sink position; it never resumes a torn
         // output prefix using the completed plan's hash as a durability token.
         let mut written = 0;
@@ -754,4 +776,63 @@ fn streaming_preserves_early_middle_and_trailer_output_errors_and_allows_exact_r
     }
     drop(pressure);
     assert_eq!(budget.stats(), before);
+}
+
+/// The work bound a checkpoint's visit limit is derived from holds every root: what an encoding
+/// takes, measured, never passes `work_bound` of its own rows and bytes. A visit bound below it
+/// would refuse a root its row and byte bounds hold.
+#[test]
+fn the_work_bound_covers_what_an_encoding_takes() {
+    for core in [populated(), fixture::core()] {
+        let quote = EncodingPlan::prepare(&core, limits()).unwrap().quote();
+        let bound = work_bound(quote.rows, quote.bytes).unwrap();
+        assert!(
+            quote.visits <= bound,
+            "{} visits past the bound of {bound} for {} rows of {} bytes",
+            quote.visits,
+            quote.rows,
+            quote.bytes
+        );
+    }
+}
+
+#[test]
+fn a_frozen_image_encodes_exactly_as_its_core_on_another_thread_while_the_core_goes_on() {
+    fn sendable<T: Send>() {}
+    sendable::<crate::native::NativeFrozen>();
+    let mut core = populated();
+    let expected = encode(&core);
+    let before = core.state.budget.stats();
+    let frozen = core.freeze_native().unwrap();
+    assert!(
+        core.state.budget.stats().used > before.used,
+        "the freeze is charged"
+    );
+    // The core goes on: a later publication copies the pages it changes.
+    let posted = fixture::prepared(core.prepare_native(
+        fixture::context(fixture::ISSUER, 2),
+        fixture::creation(2, 2, &[(ValidationMode::Required, false)], None),
+        &[],
+    ));
+    core.publish_native(posted).unwrap();
+    assert_ne!(encode(&core), expected);
+    let (bytes, frozen) = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let plan = EncodingPlan::prepare_frozen(&frozen, limits()).unwrap();
+                let mut output = vec![0; plan.quote().bytes];
+                assert_eq!(plan.write_into(&mut output).unwrap(), plan.quote().hash);
+                (output, frozen)
+            })
+            .join()
+            .unwrap()
+    });
+    assert_eq!(bytes, expected);
+    assert_eq!(frozen.native_sequence().0 + 1, core.native_sequence().0);
+    let held = core.state.budget.stats().used;
+    drop(frozen);
+    assert!(
+        core.state.budget.stats().used < held,
+        "the old pages go with it"
+    );
 }

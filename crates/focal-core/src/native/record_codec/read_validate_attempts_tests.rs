@@ -550,7 +550,11 @@ fn actual_native_delivery_and_missing_results_keep_unbegun_cursors_independent()
             let Row::Event(event) = &entry.value else {
                 continue;
             };
-            match event.get().unwrap().expand(core.state.ledger).fact {
+            match event
+                .get(core.state.ledger, core.state.payloads())
+                .unwrap()
+                .fact
+            {
                 NativeFact::Evaluation {
                     kind,
                     key: recorded,

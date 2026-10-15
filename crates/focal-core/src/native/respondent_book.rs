@@ -24,15 +24,13 @@ pub(super) struct RespondentGrant {
     update: std::cell::Cell<Option<RespondentUpdate>>,
 }
 
+/// What a receipt's action is checked against: its contract's bounds and its verification
+/// budget. The action itself is charged to the state's budget, on the completion lane.
 pub(in crate::native) struct RespondentLoan<'a> {
-    source: &'a MemoryBudget,
     envelope: &'a RespondentEnvelope,
     verification: &'a NativeVerificationBudget,
 }
 impl RespondentLoan<'_> {
-    pub(in crate::native) fn source(&self) -> &MemoryBudget {
-        self.source
-    }
     pub(in crate::native) fn envelope(&self) -> &RespondentEnvelope {
         self.envelope
     }
@@ -72,12 +70,14 @@ fn demand(envelope: RespondentEnvelope, credit: RespondentCredit) -> Result<Tota
         return Err(ContractError::InvalidManifest.into());
     }
     Ok(Totals {
-        retained: demand.retained_bytes,
-        workspace: envelope.workspace_bytes(),
+        // Nothing is set aside for a receipt's future actions: each is charged what it holds as
+        // it is written, on the completion lane (`respondent_owner::build`). Set aside for the
+        // worst each could hold, a receipt took 29 MB of the session's share (12 actions, 1.2 to
+        // 3.6 MB each), and about twenty messages in flight refused every other write
+        // (deliveries at 200 a second, 2026-10-14).
         // This counter reserves candidate identities for all remaining funded
         // actions. Its original name is retained for evaluator-only callers.
         reports: actions,
-        slots: demand.slots,
         live: 1,
         graphs: 0,
     })
@@ -152,7 +152,6 @@ impl CompletionBook {
                 .check_schema(focal_evidence::error_report_schema(), schemas)?;
         }
         Ok(RespondentLoan {
-            source: self.source(),
             envelope: &grant.envelope,
             verification: &grant.verification,
         })
@@ -201,17 +200,9 @@ impl CompletionBook {
         envelope.check_parent(view, claim, self.limits)?;
         let before = self.totals;
         let totals = before.replace(Totals::default(), demand(*envelope, credit)?)?;
-        let needed = add(totals.retained, totals.workspace)?;
         let journals = add(self.journals, 1)?;
         let revision = self.next_revision()?;
         let growth = self.respondents.grow(&self.parent, self.limits.receipts)?;
-        let added_funding = needed.saturating_sub(self.pool.available());
-        if let Err(error) = self.pool.grow(added_funding) {
-            if let Some(growth) = growth {
-                self.respondents.restore_growth(growth)?;
-            }
-            return Err(error.into());
-        }
         if let Err(error) = self.respondents.insert(
             key,
             RespondentGrant {
@@ -221,9 +212,7 @@ impl CompletionBook {
                 seen: std::cell::Cell::new(false),
                 update: std::cell::Cell::new(None),
             },
-            envelope.workspace_bytes(),
         ) {
-            self.pool.trim_unused(added_funding)?;
             if let Some(growth) = growth {
                 self.respondents.restore_growth(growth)?;
             }
@@ -242,7 +231,6 @@ impl CompletionBook {
                 key,
                 credit,
                 growth,
-                added_funding,
             },
         })
     }
@@ -256,7 +244,7 @@ impl CompletionBook {
     ) -> Result<(), NativeError> {
         for ordinal in 0..prepared.outcome.events {
             take(visits, 1)?; // retained event
-            let event = Self::event(prepared, ordinal)?;
+            let event = Self::event(prepared, ordinal, source.payloads())?;
             if event.sequence != prepared.outcome.sequence
                 || event.ordinal != ordinal
                 || event.invocation != prepared.outcome.invocation
@@ -339,10 +327,7 @@ impl CompletionBook {
         if self.respondents.len() == 0 {
             return Ok(Journal::empty());
         }
-        let candidate = View {
-            state: source.state,
-            tail: Some(prepared),
-        };
+        let candidate = source.with_own(prepared)?;
         let mut visits = self.limits.plan_edges;
         self.affected_respondents(source, prepared, &mut visits, |_, grant| {
             grant.seen.set(false);
@@ -370,15 +355,11 @@ impl CompletionBook {
             return self.apply_respondent_one(one.ok_or(ContractError::InvalidTransition)?);
         }
         let bytes = respondent_journal_bytes(count)?;
-        let reservation = match funding {
-            JournalFunding::HeldCompletion => {
-                self.source()
-                    .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?
-            }
-            JournalFunding::External { source, lane } => {
-                source.reserve(BudgetKind::Pending, lane, bytes)?
-            }
-        };
+        let JournalFunding::External {
+            source: budget,
+            lane,
+        } = funding;
+        let reservation = budget.reserve(BudgetKind::Pending, lane, bytes)?;
         let mut updates = Vec::new();
         updates
             .try_reserve_exact(count)
@@ -419,7 +400,6 @@ impl CompletionBook {
             self.set_respondent(*update, false)?;
         }
         self.totals = totals;
-        self.totals.workspace = self.maximum_workspace();
         self.check_health()?;
         self.journals = journals;
         let before_revision = self.revision;
@@ -453,7 +433,6 @@ impl CompletionBook {
         let before = self.totals;
         self.set_respondent(update, false)?;
         self.totals = totals;
-        self.totals.workspace = self.maximum_workspace();
         self.check_health()?;
         self.journals = journals;
         let before_revision = self.revision;
@@ -473,17 +452,11 @@ impl CompletionBook {
         restore: bool,
     ) -> Result<(), NativeError> {
         let credit = if restore { update.before } else { update.after };
-        let grant = self
-            .respondents
-            .get(update.key)
-            .ok_or(ContractError::StaleReceipt)?;
-        let workspace = if credit.actions()? == 0 {
-            0
-        } else {
-            grant.envelope.workspace_bytes()
-        };
+        if self.respondents.get(update.key).is_none() {
+            return Err(ContractError::StaleReceipt.into());
+        }
         self.respondents
-            .replace_weight(update.key, workspace, |grant| grant.credit = credit)
+            .update(update.key, |grant| grant.credit = credit)
     }
 
     pub(super) fn restore_respondent(

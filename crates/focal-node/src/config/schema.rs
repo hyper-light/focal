@@ -29,41 +29,72 @@ pub fn check_unknown_keys(yaml: &str) -> Result<(), ConfigError> {
     }
     let value = parse(yaml)?;
     let schema = schema()?;
-    let mut path = String::new();
-    walk(&value, &schema, &mut path, 0)
+    walk(&value, &schema)
 }
-fn walk(
-    value: &serde_json::Value,
-    schema: &serde_json::Value,
-    path: &mut String,
-    depth: usize,
-) -> Result<(), ConfigError> {
-    if depth > MAX_DEPTH {
-        return Err(ConfigError::Invalid {
-            field: "configuration",
-            reason: "nested too deeply",
-        });
+/// An object of the configuration whose keys are being checked: its keys
+/// still to visit, the schema's properties for them, whether the schema
+/// closes it, and how long the dotted path was where it opened.
+struct Open<'a> {
+    keys: serde_json::map::Iter<'a>,
+    properties: &'a serde_json::Value,
+    closed: bool,
+    prefix: usize,
+}
+impl<'a> Open<'a> {
+    /// The object `value` checked against `schema`, when it is an object and
+    /// the schema names its properties; else nothing to check in it.
+    fn of(
+        value: &'a serde_json::Value,
+        schema: &'a serde_json::Value,
+        prefix: usize,
+    ) -> Option<Self> {
+        let (Some(object), Some(properties)) = (value.as_object(), schema.get("properties")) else {
+            return None;
+        };
+        Some(Self {
+            keys: object.iter(),
+            properties,
+            closed: schema
+                .get("additionalProperties")
+                .is_some_and(|extra| extra == &serde_json::Value::Bool(false)),
+            prefix,
+        })
     }
-    let (Some(object), Some(properties)) = (value.as_object(), schema.get("properties")) else {
-        return Ok(());
-    };
-    let closed = schema
-        .get("additionalProperties")
-        .is_some_and(|extra| extra == &serde_json::Value::Bool(false));
-    for (key, inner) in object {
-        let at = path.len();
+}
+/// Walks `value` against `schema` over an explicit stack of the objects open,
+/// at most [`MAX_DEPTH`] deep, past which the configuration is refused; the
+/// first key a closed object's schema does not name is refused with its path.
+fn walk(value: &serde_json::Value, schema: &serde_json::Value) -> Result<(), ConfigError> {
+    let mut path = String::new();
+    let mut open: Vec<Open<'_>> = Vec::new();
+    open.extend(Open::of(value, schema, 0));
+    while let Some(frame) = open.last_mut() {
+        let Some((key, inner)) = frame.keys.next() else {
+            open.pop();
+            continue;
+        };
+        let (properties, closed, prefix) = (frame.properties, frame.closed, frame.prefix);
+        path.truncate(prefix);
         if !path.is_empty() {
             path.push('.');
         }
         path.push_str(key);
         match properties.get(key) {
-            Some(property) => walk(inner, property, path, depth.saturating_add(1))?,
+            Some(property) => {
+                // `inner` sits one level below the object open last.
+                if open.len() > MAX_DEPTH {
+                    return Err(ConfigError::Invalid {
+                        field: "configuration",
+                        reason: "nested too deeply",
+                    });
+                }
+                open.extend(Open::of(inner, property, path.len()));
+            }
             None if closed => {
-                return Err(ConfigError::UnknownKey { path: path.clone() });
+                return Err(ConfigError::UnknownKey { path });
             }
             None => {}
         }
-        path.truncate(at);
     }
     Ok(())
 }

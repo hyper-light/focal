@@ -29,7 +29,7 @@ macro_rules! encoded {
 }
 
 fn claim_row(core: &Core<NativeState>) -> &OwnedClaim {
-    match core.state.rows.get(&Key::Claim(ClaimId::from_u128(1))) {
+    match core.state.row(&Key::Claim(ClaimId::from_u128(1))) {
         Some(Row::Claim(row)) => row,
         _ => panic!("claim fixture"),
     }

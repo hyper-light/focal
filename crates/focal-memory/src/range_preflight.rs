@@ -74,7 +74,7 @@ pub(super) struct FundedPreparation<'a, K, V> {
     pub(super) input: Allocation,
 }
 
-impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
+impl<K: crate::RangeKey + Clone, V> RangePreparationPlan<'_, K, V> {
     pub fn charges(&self) -> RangePreparationCharges {
         self.charges
     }
@@ -117,6 +117,21 @@ impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
     {
+        self.build_in_replacing(source, copy, |_, _| Ok(()))
+    }
+
+    /// [`Self::build_in_with`], giving `replaced` every committed entry a change replaces or
+    /// deletes ([`Self::build_in_funded_replacing`]).
+    pub fn build_in_replacing<F, R>(
+        self,
+        source: &MemoryBudget,
+        copy: F,
+        replaced: R,
+    ) -> Result<PreparedRange<K, V>, MemoryError>
+    where
+        F: FnMut(&V) -> Result<V, MemoryError>,
+        R: FnMut(&K, &V) -> Result<(), MemoryError>,
+    {
         if !source.is_within(&self.store.budget) {
             return Err(MemoryError::InvalidConfiguration(
                 "range funding source is outside its owner budget",
@@ -129,7 +144,7 @@ impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
                 self.charges.input_pending_bytes(),
             )?
             .commit();
-        self.build_in_funded_with(source, input, copy)
+        self.build_in_funded_replacing(source, input, copy, replaced)
     }
 
     /// Transfer the already held incoming write-set permit into this build.
@@ -146,10 +161,28 @@ impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
         self,
         source: &MemoryBudget,
         input: Allocation,
-        mut copy: F,
+        copy: F,
     ) -> Result<PreparedRange<K, V>, MemoryError>
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
+    {
+        self.build_in_funded_replacing(source, input, copy, |_, _| Ok(()))
+    }
+
+    /// [`Self::build_in_funded_with`], giving `replaced` every committed entry a change replaces
+    /// or deletes as the build takes it out of its page: what the build leaves behind, in hand
+    /// where it is, so its caller need not look it up again (each such lookup walks the range
+    /// from its root).
+    pub fn build_in_funded_replacing<F, R>(
+        self,
+        source: &MemoryBudget,
+        input: Allocation,
+        mut copy: F,
+        mut replaced: R,
+    ) -> Result<PreparedRange<K, V>, MemoryError>
+    where
+        F: FnMut(&V) -> Result<V, MemoryError>,
+        R: FnMut(&K, &V) -> Result<(), MemoryError>,
     {
         let funded = FundedPreparation { plan: self, input };
         if !source.is_within(&funded.plan.store.budget) {
@@ -168,7 +201,7 @@ impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
             ));
         }
         let store = funded.plan.store;
-        store.prepare_planned_with(funded, source, &mut copy)
+        store.prepare_planned_with(funded, source, &mut copy, &mut replaced)
     }
 
     pub fn build_in(self, source: &MemoryBudget) -> Result<PreparedRange<K, V>, MemoryError>
@@ -186,7 +219,7 @@ impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
     }
 }
 
-impl<K: Ord + Clone, V> RangeStore<K, V> {
+impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
     /// Preflight one owned batch without reserving or allocating additional
     /// buffers. `max_bytes` bounds its conservative *additional* peak charge;
     /// existing roots/pins and extra caller/copier workspace are separate.
@@ -197,7 +230,31 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         lane: BudgetLane,
         max_bytes: usize,
     ) -> Result<RangePreparationPlan<'_, K, V>, MemoryError> {
-        self.plan_root(&self.root, prefix, changes, lane, max_bytes)
+        self.plan_root(
+            &self.root,
+            prefix,
+            changes,
+            lane,
+            max_bytes,
+            self.config.max_batch_entries,
+        )
+    }
+
+    /// Preflight a batch bounded by `max_entries`, the bound its caller states,
+    /// instead of a write's `max_batch_entries`: a decision that takes many
+    /// rows at one prefix (a seal of a closed window, a retired family) is
+    /// planned and charged as any batch, in one publication. Held to a write's
+    /// bound such a batch was refused as if for memory, and a refusal for
+    /// memory is one its caller retries.
+    pub fn plan_bounded(
+        &self,
+        prefix: u64,
+        changes: Vec<Change<K, V>>,
+        lane: BudgetLane,
+        max_bytes: usize,
+        max_entries: usize,
+    ) -> Result<RangePreparationPlan<'_, K, V>, MemoryError> {
+        self.plan_root(&self.root, prefix, changes, lane, max_bytes, max_entries)
     }
 
     /// Preflight against the exact owned predecessor. Publication must still
@@ -213,7 +270,14 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         if predecessor.root.owner != self.root.owner {
             return Err(MemoryError::WrongRange);
         }
-        self.plan_root(&predecessor.root, prefix, changes, lane, max_bytes)
+        self.plan_root(
+            &predecessor.root,
+            prefix,
+            changes,
+            lane,
+            max_bytes,
+            self.config.max_batch_entries,
+        )
     }
 
     fn plan_root<'a>(
@@ -223,6 +287,7 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         mut changes: Vec<Change<K, V>>,
         lane: BudgetLane,
         max_bytes: usize,
+        max_entries: usize,
     ) -> Result<RangePreparationPlan<'a, K, V>, MemoryError> {
         let expected = base
             .prefix
@@ -234,10 +299,10 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
                 actual: prefix,
             });
         }
-        if changes.len() > self.config.max_batch_entries {
+        if changes.len() > max_entries {
             return Err(MemoryError::Capacity {
                 requested: changes.len(),
-                available: self.config.max_batch_entries,
+                available: max_entries,
             });
         }
         changes.sort_unstable_by(|left, right| left.key().cmp(right.key()));
@@ -258,21 +323,9 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
             )?
         };
         for change in &changes {
-            match change {
-                Change::Put(entry) => {
-                    layout::check_entry::<K, V>(entry.heap_bytes, self.config)?;
-                    input_pending_bytes = checked_add(input_pending_bytes, entry.heap_bytes)?;
-                    if base.get(&entry.key).is_none() {
-                        new_len = checked_add(new_len, 1)?;
-                    }
-                }
-                Change::Delete(key) => {
-                    let existing = base.get(key).ok_or(MemoryError::MissingKey)?;
-                    // Conservatively bound the caller's cloned deletion key by
-                    // the retained entry's combined key/value heap charge.
-                    input_pending_bytes = checked_add(input_pending_bytes, existing.heap_bytes)?;
-                    new_len = new_len.checked_sub(1).ok_or(MemoryError::MissingKey)?;
-                }
+            if let Change::Put(entry) = change {
+                layout::check_entry::<K, V>(entry.heap_bytes, self.config)?;
+                input_pending_bytes = checked_add(input_pending_bytes, entry.heap_bytes)?;
             }
         }
         let mut count = Counts {
@@ -284,7 +337,24 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
             let selected = remaining
                 .get(..group.count)
                 .ok_or(MemoryError::MissingKey)?;
-            match base.pages.get(group.rank) {
+            // A key the base holds is in the page whose span holds it, the
+            // group's: each change is found there, not by a descent of its own.
+            for change in selected {
+                let existing = group.page.and_then(|page| page.find(change.key()));
+                match (change, existing) {
+                    (Change::Put(_), Some(_)) => {}
+                    (Change::Put(_), None) => new_len = checked_add(new_len, 1)?,
+                    (Change::Delete(_), Some(existing)) => {
+                        // Conservatively bound the caller's cloned deletion key by
+                        // the retained entry's combined key/value heap charge.
+                        input_pending_bytes =
+                            checked_add(input_pending_bytes, existing.heap_bytes)?;
+                        new_len = new_len.checked_sub(1).ok_or(MemoryError::MissingKey)?;
+                    }
+                    (Change::Delete(_), None) => return Err(MemoryError::MissingKey),
+                }
+            }
+            match group.page {
                 None if base.pages.is_empty() => {
                     let produced =
                         count.merge::<K, V>(&[], selected, self.config, self.partition)?;
@@ -367,7 +437,7 @@ struct Counts {
 }
 
 impl Counts {
-    fn merge<K: Ord, V>(
+    fn merge<K: crate::RangeKey, V>(
         &mut self,
         old: &[Entry<K, V>],
         selected: &[Change<K, V>],
@@ -386,13 +456,18 @@ impl Counts {
             Ok(())
         };
         let mut previous = None;
-        visit_merged(old, selected, |key, entry| {
-            let label = classify.map_or(0, |classify| classify(key));
-            let boundary = previous.is_some_and(|previous| previous != label);
-            partition.push(entry.heap_bytes(), boundary, &mut emit)?;
-            previous = Some(label);
-            Ok(())
-        })?;
+        visit_merged(
+            old,
+            selected,
+            |key, entry| {
+                let label = classify.map_or(0, |classify| classify(key));
+                let boundary = previous.is_some_and(|previous| previous != label);
+                partition.push(entry.heap_bytes(), boundary, &mut emit)?;
+                previous = Some(label);
+                Ok(())
+            },
+            &mut |_, _| Ok(()),
+        )?;
         partition.finish(&mut emit)?;
         self.merge_pending_bytes = self.merge_pending_bytes.max(merge_layout_charge::<K, V>(
             checked_add(old.len(), selected.len())?,

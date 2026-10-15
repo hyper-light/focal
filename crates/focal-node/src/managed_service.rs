@@ -22,6 +22,7 @@ pub struct ManagedService {
     signing: Option<(
         crate::control_host::ControlHost,
         crate::placement_control::PlacementHandle,
+        crate::network_service::DirectoryHandle,
     )>,
     liveness: Option<crate::liveness::LivenessHandle>,
     /// The directory's routes, with this node's own identity for hints that
@@ -82,11 +83,11 @@ impl ManagedService {
             // A current read is served here, whoever leads.
             return None;
         }
-        let leader = replica
-            .diagnostics()
-            .await
-            .map(|diagnostics| diagnostics.value().leader)
-            .unwrap_or(0);
+        // The leader the replica published at its last drain: its progress, read where it is.
+        // Asked of its owner, every client write (refused ones as well) cost the owner a
+        // diagnostics round: 4.2% of the leader's owner at 4,000 writes a second offered on
+        // 1-CPU CI nodes (profile run 38287539180).
+        let leader = replica.observe(|progress| progress.leader);
         let to_leader = async |epoch: RouteEpoch| {
             if leader == *node || leader == 0 {
                 Some(RouteHint {
@@ -141,12 +142,13 @@ impl ManagedService {
         mut self,
         control: crate::control_host::ControlHost,
         signer: crate::placement_control::PlacementHandle,
+        directory: crate::network_service::DirectoryHandle,
     ) -> Self {
-        self.signing = Some((control, signer));
+        self.signing = Some((control, signer, directory));
         self
     }
     async fn sign(&self, request: &VerifiedRequest) -> Response {
-        let Some((control, signer)) = &self.signing else {
+        let Some((control, signer, directory)) = &self.signing else {
             return Response::Error(AccessError::UnsupportedOperation);
         };
         let Operation::SessionSign {
@@ -157,7 +159,9 @@ impl ManagedService {
             return Response::Error(AccessError::InvalidRequest);
         };
         let ledger = request.request().ledger;
-        if *group != ledger.session.0 {
+        // A session's fact names its own group; a partition group's names
+        // the group under the directory's namespace (F24).
+        if *group != ledger.session.0 && ledger != directory.namespace() {
             return Response::Error(AccessError::InvalidRequest);
         }
         let Ok(decoded) =
@@ -171,6 +175,7 @@ impl ManagedService {
         let reply = match crate::placement_control::sign_session_fact(
             &self.fleet,
             control,
+            directory,
             signer,
             ledger,
             decoded.fact,
@@ -203,7 +208,7 @@ impl ManagedService {
     /// hosts when it leads the session's log.
     async fn session_control(&self, request: &VerifiedRequest) -> Response {
         use crate::session_control::{SESSION_CONTROL_SCHEMA, SessionControlRequest};
-        let Some((control, signer)) = &self.signing else {
+        let Some((control, signer, _)) = &self.signing else {
             return Response::Error(AccessError::UnsupportedOperation);
         };
         let Operation::SessionControl {
@@ -291,6 +296,24 @@ impl RequestHandler for ManagedService {
     }
     fn supports_native_requests(&self) -> bool {
         true
+    }
+    fn supports_lane_frames(&self) -> bool {
+        true
+    }
+    /// A peer's frame from its lane, to the session's current host: nodes address replicas
+    /// directly, so no route is consulted, as for its request.
+    fn take_frame(&self, request: VerifiedRequest) -> Result<(), AccessError> {
+        if !request
+            .peer()
+            .permits_tenant(request.request().ledger.tenant)
+        {
+            return Err(AccessError::Unauthorized);
+        }
+        let replica = self
+            .fleet
+            .current_host(request.request().ledger)
+            .map_err(|_| AccessError::Unavailable)?;
+        replica.take_frame(request)
     }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })

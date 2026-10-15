@@ -1,65 +1,33 @@
-//! One advertised QUIC endpoint, two strictly separated authentication paths.
-//! Enrollment pins the bootstrap certificate before sending its secret; normal
-//! requests require a validated node/client certificate and a live server grant.
-use focal_enrollment::{CredentialMaterial, ENROLLMENT_ALPN, JoinHandler, TransportLimits};
-use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
-use focal_wire::{ALPN, PeerRegistry, RequestHandler, TlsIdentity, WireError, WireLimits};
-use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+//! One advertised QUIC endpoint, two strictly separated authentication paths, on focal-wire's
+//! endpoint (hyper-transport on hyper-rt). The endpoint's directory names each connection by the
+//! protocol its handshake negotiated: on the data protocol by a validated node or client
+//! certificate and a live grant, checked again as each request is dispatched; on the enrollment
+//! protocol as a joiner of its own, which may send the enrollment kinds alone. Enrollment pins the
+//! bootstrap certificate before sending its secret.
+use focal_enrollment::{
+    CredentialMaterial, ENROLLMENT_ALPN, ENROLLMENT_PROTOCOL, EnrollmentService, JoinHandler,
+    TransportLimits,
+};
+use focal_memory::MemoryBudget;
+use focal_wire::{
+    ALPN, AdmissionLimits, AdmissionStats, Bind, DataService, PeerRegistry, QuicServer,
+    RequestHandler, ServerIdentity, ServerTls, TlsIdentity, WireError, WireLimits,
+};
 use rustls::{
-    pki_types::CertificateDer,
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
-use std::{
-    future::Future,
-    net::{SocketAddr, UdpSocket},
-    panic::{AssertUnwindSafe, catch_unwind},
-    pin::Pin,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::net::SocketAddr;
 
-/// Quinn retains its runtime in both the endpoint and connection drivers. The
-/// pinned Quinn version drops each driver's socket before its runtime handle.
-/// Observe that final release so shutdown can promise that the listener address
-/// is available again, including after the last public Endpoint has been dropped.
-/// Audit: Quinn 0.11.11 endpoint::State drops socket/prev_socket before runtime;
-/// connection::State drops conn_events/socket/io_poller before runtime. No raw
-/// endpoint or socket escapes this listener. Recheck on dependency upgrades.
-#[derive(Debug)]
-struct ListenerRuntime {
-    delegate: quinn::TokioRuntime,
-    _released: tokio::sync::oneshot::Sender<()>,
-    // Covers the runtime holder and one completion channel, including canceled
-    // service shutdown while Quinn still owns the actual socket/driver lifetime.
-    _allocation: Allocation,
-}
-impl quinn::Runtime for ListenerRuntime {
-    fn new_timer(&self, at: Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
-        self.delegate.new_timer(at)
-    }
-    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
-        self.delegate.spawn(future);
-    }
-    fn wrap_udp_socket(
-        &self,
-        socket: UdpSocket,
-    ) -> std::io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
-        self.delegate.wrap_udp_socket(socket)
-    }
-    fn now(&self) -> Instant {
-        self.delegate.now()
-    }
-}
-
+/// The certificate a handshake is presented: the data identity to a client that offers the data
+/// protocol, the enrollment identity to a joiner.
 #[derive(Debug)]
 struct ProtocolCertificate {
-    // rustls requires shared immutable certified keys across concurrent handshakes.
-    data: Arc<dyn ResolvesServerCert>,
-    enrollment: Option<Arc<dyn ResolvesServerCert>>,
+    data: Box<dyn ResolvesServerCert>,
+    enrollment: Option<Box<dyn ResolvesServerCert>>,
 }
 impl ResolvesServerCert for ProtocolCertificate {
-    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<&CertifiedKey> {
         // Match the server's ALPN preference if a client offers both protocols.
         let data = hello
             .alpn()
@@ -73,23 +41,30 @@ impl ResolvesServerCert for ProtocolCertificate {
         }
     }
 }
-/// The TLS server configuration one advertised endpoint presents: the node's
-/// data identity, the founder's enrollment identity when it signs, and the
-/// cluster CA for client certificates.
+/// What stands in the configuration's place while its resolver is wrapped.
+#[derive(Debug)]
+struct NoCertificate;
+impl ResolvesServerCert for NoCertificate {
+    fn resolve(&self, _: ClientHello<'_>) -> Option<&CertifiedKey> {
+        None
+    }
+}
+
+/// The TLS server configuration one advertised endpoint presents: the node's data identity, the
+/// founder's enrollment identity when it signs, and the issuers clients' chains are verified
+/// against.
 fn server_config(
     node: &CredentialMaterial,
     enrollment: Option<&CredentialMaterial>,
-    ca: &[u8],
-    limits: &WireLimits,
-) -> Result<quinn::ServerConfig, WireError> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(CertificateDer::from(ca))
-        .map_err(|_| WireError::Authentication)?;
+    roots: &[Vec<u8>],
+) -> Result<ServerTls, WireError> {
+    let provider = focal_wire::crypto_provider();
+    // A client's chain is verified against the issuers this node trusts; a successor issuer's
+    // endorsement by one of them is an ordinary intermediate to it (24 §11). The enrollment
+    // protocol authenticates a joiner without a certificate.
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(roots),
-        provider.clone(),
+        focal_wire::TrustRoots::new(roots.to_vec())?.store()?,
+        provider,
     )
     .allow_unauthenticated()
     .build()
@@ -108,217 +83,136 @@ fn server_config(
         .map(CredentialMaterial::server_config)
         .transpose()
         .map_err(|_| WireError::Authentication)?
-        .map(|config| config.cert_resolver);
-    tls.cert_resolver = Arc::new(ProtocolCertificate {
-        data: tls.cert_resolver,
+        .map(|mut config| std::mem::replace(&mut config.cert_resolver, Box::new(NoCertificate)));
+    let data = std::mem::replace(&mut tls.cert_resolver, Box::new(NoCertificate));
+    tls.cert_resolver = Box::new(ProtocolCertificate {
+        data,
         enrollment: enrollment_resolver,
     });
     tls.alpn_protocols = vec![ALPN.to_vec()];
     if enrollment.is_some() {
         tls.alpn_protocols.push(ENROLLMENT_ALPN.to_vec());
     }
-    focal_wire::server_transport(tls, limits)
+    Ok(ServerTls::from_config(tls))
 }
-/// The endpoint's identity, swappable while it serves: a renewed node
-/// credential is presented to the next handshake without rebinding.
+/// The endpoint's identity, swappable while it serves: a renewed node credential, or a succeeded
+/// bootstrap server certificate (24 §11), is presented to the next handshake without rebinding.
 #[derive(Clone)]
 pub struct ListenerIdentity {
-    endpoint: quinn::Endpoint,
-    ca: Vec<u8>,
-    enrollment: Option<CredentialMaterial>,
-    limits: WireLimits,
+    server: ServerIdentity,
 }
 impl ListenerIdentity {
-    pub fn replace(&self, node: &CredentialMaterial) -> Result<(), WireError> {
-        let config = server_config(node, self.enrollment.as_ref(), &self.ca, &self.limits)?;
-        self.endpoint.set_server_config(Some(config));
-        Ok(())
+    /// Present `node` as the data identity and `enrollment` as the enrollment identity (the
+    /// founder's; none elsewhere) from the next handshake on, verifying clients against `roots` —
+    /// the issuers the committed registry names (24 §11), as the controller holds them.
+    pub async fn replace(
+        &self,
+        node: &CredentialMaterial,
+        enrollment: Option<&CredentialMaterial>,
+        roots: &[Vec<u8>],
+    ) -> Result<(), WireError> {
+        self.server
+            .replace(server_config(node, enrollment, roots)?)
+            .await
     }
 }
 pub struct NetworkListener {
-    endpoint: Option<quinn::Endpoint>,
-    released: Option<tokio::sync::oneshot::Receiver<()>>,
+    server: QuicServer,
     registry: PeerRegistry,
     limits: WireLimits,
+    /// Whether the endpoint serves the enrollment protocol: its TLS names it, and its directory
+    /// admits joiners.
+    enrolls: bool,
     join_limits: TransportLimits,
-    enrollment_slots: tokio::sync::Semaphore,
-    /// Who holds this listener's connections (27 §3.1 P5): handshakes in
-    /// progress apart from authenticated connections, which are charged to
-    /// the identity they authenticated as.
-    admission: focal_wire::Admission,
-    budget: MemoryBudget,
-    ca: Vec<u8>,
-    enrollment: Option<CredentialMaterial>,
 }
 impl NetworkListener {
     /// A handle that swaps the identity this endpoint presents.
     pub fn identity(&self) -> Result<ListenerIdentity, WireError> {
         Ok(ListenerIdentity {
-            endpoint: self.endpoint.clone().ok_or(WireError::Connection)?,
-            ca: self.ca.clone(),
-            enrollment: self.enrollment.clone(),
-            limits: self.limits.clone(),
+            server: self.server.identity(),
         })
     }
+    /// `roots`: the issuers' certificates clients' chains are verified against (24 §11). Bound on
+    /// the current shard, whose task serves it: on `address`, or on the socket its caller held.
     pub fn bind(
-        address: SocketAddr,
+        address: impl Into<Bind>,
         node: &CredentialMaterial,
         enrollment: Option<&CredentialMaterial>,
-        ca: &[u8],
+        roots: &[Vec<u8>],
         registry: PeerRegistry,
         limits: WireLimits,
         budget: MemoryBudget,
     ) -> Result<Self, WireError> {
-        tokio::runtime::Handle::try_current().map_err(|_| WireError::Connection)?;
-        Self::from_socket(
-            UdpSocket::bind(address)?,
-            node,
-            enrollment,
-            ca,
-            registry,
-            limits,
-            budget,
-        )
-    }
-    pub(crate) fn from_socket(
-        socket: UdpSocket,
-        node: &CredentialMaterial,
-        enrollment: Option<&CredentialMaterial>,
-        ca: &[u8],
-        registry: PeerRegistry,
-        limits: WireLimits,
-        budget: MemoryBudget,
-    ) -> Result<Self, WireError> {
-        tokio::runtime::Handle::try_current().map_err(|_| WireError::Connection)?;
         limits.validate()?;
-        let config = server_config(node, enrollment, ca, &limits)?;
-        let join_limits = TransportLimits::default();
-        let allocation = budget
-            .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)
-            .map_err(|_| WireError::Limit)?
-            .commit();
-        let (released, completion) = tokio::sync::oneshot::channel();
-        // Tokio exposes no fallible driver-capability query. Check time before
-        // Quinn spawns its endpoint driver, and contain its IO registration panic.
-        let endpoint = catch_unwind(AssertUnwindSafe(|| {
-            drop(tokio::time::sleep(Duration::ZERO));
-            // Quinn requires shared runtime ownership across its endpoint and
-            // connection drivers. This replaces its default runtime allocation.
-            quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
-                Some(config),
-                socket,
-                Arc::new(ListenerRuntime {
-                    delegate: quinn::TokioRuntime,
-                    _released: released,
-                    _allocation: allocation,
-                }),
-            )
-        }))
-        .map_err(|_| WireError::Connection)??;
-        let admission = focal_wire::Admission::new(focal_wire::AdmissionLimits::for_connections(
-            limits.max_connections,
-        ))
-        .map_err(|_| WireError::Limit)?;
+        let tls = server_config(node, enrollment, roots)?;
+        // Handshakes take pending places apart from authenticated connections, which are charged
+        // to the identity they authenticated as (27 §3.1 P5); the listener's budget funds the
+        // request bodies it admits (the audit's F03).
+        let admission = AdmissionLimits::for_connections(limits.max_connections)
+            .replacing_after(limits.request_timeout);
+        let server = QuicServer::bind_serving(
+            address,
+            tls,
+            registry.clone(),
+            enrollment.is_some().then_some(ENROLLMENT_PROTOCOL),
+            limits.clone(),
+            admission,
+            budget,
+        )?;
         Ok(Self {
-            endpoint: Some(endpoint),
-            released: Some(completion),
+            server,
             registry,
             limits,
-            enrollment_slots: tokio::sync::Semaphore::new(join_limits.max_connections),
-            admission,
-            join_limits,
-            budget,
-            ca: ca.to_vec(),
-            enrollment: enrollment.cloned(),
+            enrolls: enrollment.is_some(),
+            join_limits: TransportLimits::default(),
         })
     }
     pub fn local_addr(&self) -> Result<SocketAddr, WireError> {
-        self.endpoint
-            .as_ref()
-            .ok_or(WireError::Connection)?
-            .local_addr()
-            .map_err(Into::into)
+        self.server.local_addr()
     }
     /// Who holds this listener's connections, and what it refused.
-    pub fn admission(&self) -> focal_wire::AdmissionStats {
-        self.admission.stats()
+    pub async fn admission(&self) -> AdmissionStats {
+        self.server.admission().await
+    }
+    /// What this listener's socket did.
+    pub async fn io(&self) -> hyper_rt::udp::IoStats {
+        self.server.io().await
+    }
+    /// Size the stream pool this listener's participants share (`QuicServer::set_stream_pool`).
+    pub fn set_stream_pool(&self, streams: u32) -> Result<(), WireError> {
+        self.server.set_stream_pool(streams)
+    }
+    /// The streams one connection may hold: the least the stream pool is sized to, so a node that
+    /// leads nothing still answers its participants' redirects and reads.
+    pub fn streams_per_connection(&self) -> u32 {
+        self.limits.streams_per_connection
     }
     pub fn close(&self) {
-        if let Some(endpoint) = &self.endpoint {
-            endpoint.close(0u8.into(), b"shutdown");
-        }
+        // A close the shard could not queue leaves the endpoint to the service's shutdown, which
+        // awaits its end.
+        let _ = self.server.close();
     }
+    /// Closes the endpoint and waits for its end: its socket gone, the address free again. The
+    /// service supplies the bounded shutdown deadline around this wait.
     pub(crate) async fn shutdown(&mut self) {
         self.close();
-        drop(self.endpoint.take());
-        // Sender cancellation is the expected signal: every Quinn owner of the
-        // runtime (and thus its sockets) has been dropped. The service supplies
-        // the bounded shutdown deadline around this wait.
-        if let Some(released) = self.released.as_mut() {
-            let _ = released.await;
-            self.released = None;
-        }
+        self.server.ended().await;
     }
-    /// Futures borrow this listener and its enrollment semaphore. No per-handler
-    /// Arc wrapper or detached task is needed to share the physical endpoint.
+    /// Serves the data protocol with `data`, and the enrollment protocol with `enrollment` where
+    /// this endpoint offers it, until the endpoint is closed.
     pub async fn serve<H: RequestHandler + Clone, J: JoinHandler + Clone>(
         &self,
         data: H,
         enrollment: Option<J>,
     ) -> Result<(), WireError> {
-        tokio::runtime::Handle::try_current().map_err(|_| WireError::Connection)?;
-        // A handle can belong to a runtime built without its time driver.
-        catch_unwind(|| drop(tokio::time::sleep(Duration::ZERO)))
-            .map_err(|_| WireError::Connection)?;
-        // Quinn and Tokio assume configured drivers. If a dependency unwinds,
-        // discard these connection futures and their charges; never poll a
-        // partially unwound exchange again. Normal operation adds no tasks.
-        AssertUnwindSafe(self.serve_inner(data, enrollment))
-            .catch_unwind()
-            .await
-            .map_err(|_| WireError::Connection)?
-    }
-
-    async fn serve_inner<H: RequestHandler + Clone, J: JoinHandler + Clone>(
-        &self,
-        data: H,
-        enrollment: Option<J>,
-    ) -> Result<(), WireError> {
-        let endpoint = self.endpoint.as_ref().ok_or(WireError::Connection)?;
-        let mut connections = FuturesUnordered::new();
-        loop {
-            tokio::select! {
-                incoming = endpoint.accept() => {
-                    let Some(incoming) = incoming else { break; };
-                    if connections.len() >= self.limits.max_connections { incoming.refuse(); continue; }
-                    // A handshake takes a pending place, which no
-                    // authenticated connection uses.
-                    let Ok(pending) = self.admission.begin() else { incoming.refuse(); continue; };
-                    let Ok(charge) = self.budget.reserve(BudgetKind::Control, BudgetLane::Ordinary, 64 * 1024) else { incoming.refuse(); continue; };
-                    let data = data.clone();
-                    let enrollment = enrollment.clone();
-                    connections.push(async move {
-                        let _charge = charge.commit();
-                        let Ok(Ok(connection)) = tokio::time::timeout(self.limits.request_timeout, incoming).await else { return; };
-                        let protocol = connection.handshake_data().and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-                            .and_then(|data| data.protocol);
-                        if protocol.as_deref() == Some(ALPN) {
-                            let _ = focal_wire::serve_admitted_connection(connection, self.registry.clone(), self.limits.clone(), data, pending).await;
-                        } else if protocol.as_deref() == Some(ENROLLMENT_ALPN) {
-                            // A joiner has no identity yet: its own bound is
-                            // the enrollment slots.
-                            drop(pending);
-                            if let (Some(handler), Ok(_slot)) = (enrollment, self.enrollment_slots.try_acquire()) {
-                                let _ = focal_enrollment::serve_enrollment_connection(connection, handler, self.join_limits.timeout).await;
-                            } else { connection.close(1u8.into(), b"enrollment unavailable"); }
-                        } else { connection.close(1u8.into(), b"unsupported protocol"); }
-                    });
-                }
-                _ = connections.next(), if !connections.is_empty() => {}
+        let data = DataService::new(data, self.registry.clone(), self.limits.clone());
+        match enrollment.filter(|_| self.enrolls) {
+            Some(handler) => {
+                let service = EnrollmentService::new(data, handler, self.join_limits.clone())
+                    .map_err(|_| WireError::Limit)?;
+                self.server.serve_with(service).await
             }
+            None => self.server.serve_with(data).await,
         }
-        drop(connections);
-        Ok(())
     }
 }

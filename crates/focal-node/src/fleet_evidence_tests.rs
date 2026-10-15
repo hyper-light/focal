@@ -37,7 +37,7 @@ struct Fixture {
     outgoing: FleetReplication,
     wals: Vec<SharedWal>,
     budget: MemoryBudget,
-    observations: async_mpsc::Receiver<LedgerId>,
+    observations: hyper_rt::sync::ChannelReceiver<LedgerId>,
 }
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 fn fixture(path: &std::path::Path) -> Fixture {
@@ -45,7 +45,7 @@ fn fixture(path: &std::path::Path) -> Fixture {
     let tenant = budget.child(384 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
     let mut wals = Vec::new();
     let mut replicas = Vec::new();
-    let (observe, observations) = async_mpsc::channel(4);
+    let (observe, observations) = hyper_rt::sync::channel(4).unwrap();
     for index in 1..=2 {
         let wal = SharedWal::open_with_budget(
             path.join(index.to_string()),
@@ -113,7 +113,7 @@ fn fixture(path: &std::path::Path) -> Fixture {
         // tests; a full parallel workspace run schedules a commit well past
         // half a second, so the bound is generous while stop stays quick.
         config.request_timeout = REQUEST_TIMEOUT;
-        config.checkpoint_observer = Some(CheckpointObserver(observe.clone()));
+        config.checkpoint_observer = Some(CheckpointObserver::new(observe.clone()));
         replicas.push(FleetReplica { session, config });
         wals.push(wal);
     }
@@ -139,7 +139,7 @@ fn fixture(path: &std::path::Path) -> Fixture {
     }
 }
 async fn read(fixture: &Fixture, index: u128) {
-    let response = tokio::time::timeout(
+    let response = focal_rt::time::timeout(
         Duration::from_secs(5),
         dispatch(
             &fixture.hosts[&ledger(index)],
@@ -162,20 +162,30 @@ async fn read(fixture: &Fixture, index: u128) {
 async fn pending_export(
     fixture: &mut Fixture,
     ttl: Duration,
-) -> tokio::task::JoinHandle<Result<focal_ledger::DurableEvidenceSnapshot, LedgerError>> {
+) -> focal_rt::JoinHandle<Result<focal_ledger::DurableEvidenceSnapshot, LedgerError>> {
     let host = fixture.hosts[&ledger(1)].clone();
-    while fixture.observations.try_recv().is_ok() {}
-    let export = tokio::spawn(async move { host.checkpoint_evidence(ttl).await });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            // This signal follows successful snapshot preparation and its
-            // first pending disk poll. Ordinary Raft/read progress cannot
-            // satisfy the causal precondition for the independent-writer test.
-            if fixture.observations.recv().await.unwrap() == ledger(1) {
-                break;
+    while fixture
+        .observations
+        .try_recv()
+        .is_ok_and(|item| item.is_some())
+    {}
+    let export = focal_rt::spawn(async move { host.checkpoint_evidence(ttl).await }).unwrap();
+    let hosts: Vec<&ReplicaHost> = fixture.hosts.values().collect();
+    crate::test_waits::within(
+        &hosts,
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        async {
+            loop {
+                // This signal follows successful snapshot preparation and its
+                // first pending disk poll. Ordinary Raft/read progress cannot
+                // satisfy the causal precondition for the independent-writer test.
+                if fixture.observations.recv().await.unwrap() == ledger(1) {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert!(
@@ -197,133 +207,144 @@ async fn shutdown(fixture: Fixture) {
     assert_eq!(fixture.budget.stats().used, 0);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkpoint_waits_for_exact_writer_fence_while_another_writer_commits_and_reopens() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut fixture = fixture(directory.path());
-    read(&fixture, 1).await;
-    read(&fixture, 2).await;
-    let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
-    let committed = tokio::time::timeout(
-        Duration::from_secs(5),
-        dispatch(
-            &fixture.hosts[&ledger(2)],
-            peer(),
-            request(
-                2,
-                Operation::OpenEpoch {
-                    epoch: RequestEpoch(1),
-                },
+#[test]
+fn checkpoint_waits_for_exact_writer_fence_while_another_writer_commits_and_reopens() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = fixture(directory.path());
+        read(&fixture, 1).await;
+        read(&fixture, 2).await;
+        let pause = fixture.wals[0].pause_for_test().unwrap();
+        let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
+        let committed = focal_rt::time::timeout(
+            Duration::from_secs(5),
+            dispatch(
+                &fixture.hosts[&ledger(2)],
+                peer(),
+                request(
+                    2,
+                    Operation::OpenEpoch {
+                        epoch: RequestEpoch(1),
+                    },
+                ),
+                &ReplicaHost::wire_limits(),
             ),
-            &ReplicaHost::wire_limits(),
-        ),
-    )
-    .await
-    .unwrap();
-    assert!(
-        matches!(
-            committed.result,
-            Response::Submitted(MutationReply::Committed(_))
-        ),
-        "{committed:?}"
-    );
-    assert!(!export.is_finished());
-    pause.resume().unwrap();
-    let snapshot = export.await.unwrap().unwrap();
-    assert_eq!(snapshot.prefix().ledger, ledger(1));
-    assert_eq!(snapshot.prefix().sequence, SessionSeq(0));
-    assert_eq!(
-        snapshot.prefix().checkpoint,
-        ContentHash(*blake3::hash(snapshot.checkpoint()).as_bytes())
-    );
-    assert!(
-        snapshot
-            .artifact_after(None, snapshot.elapsed_clock().unwrap())
-            .unwrap()
-            .is_none()
-    );
-    let prefix = snapshot.prefix().clone();
-    drop(snapshot);
-    shutdown(fixture).await;
-    let wal = SharedWal::open(
-        directory.path().join("1"),
-        WalOptions::new(WalIdentity {
-            cluster: CLUSTER,
-            node: 1,
-            stream: 1,
-        }),
-    )
-    .unwrap();
-    let node =
-        DurableNode::open_on_wal(NodeConfig::single(1, CLUSTER, ledger(1).session.0), wal).unwrap();
-    let mut restored = Session::from_node(ledger(1), node, SessionLimits::default()).unwrap();
-    restored.poll().unwrap();
-    assert_eq!(restored.sequence(), prefix.sequence);
-    assert_eq!(restored.status().applied_index, prefix.index.0);
-    assert_eq!(restored.placement().unwrap().to_route, prefix.route);
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                committed.result,
+                Response::Submitted(MutationReply::Committed(_))
+            ),
+            "{committed:?}"
+        );
+        assert!(!export.is_finished());
+        pause.resume().unwrap();
+        let snapshot = export.await.unwrap().unwrap();
+        assert_eq!(snapshot.prefix().ledger, ledger(1));
+        assert_eq!(snapshot.prefix().sequence, SessionSeq(0));
+        assert_eq!(
+            snapshot.prefix().checkpoint,
+            ContentHash(*blake3::hash(snapshot.checkpoint()).as_bytes())
+        );
+        assert!(
+            snapshot
+                .artifact_after(None, snapshot.elapsed_clock().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let prefix = snapshot.prefix().clone();
+        drop(snapshot);
+        shutdown(fixture).await;
+        let wal = SharedWal::open(
+            directory.path().join("1"),
+            WalOptions::new(WalIdentity {
+                cluster: CLUSTER,
+                node: 1,
+                stream: 1,
+            }),
+        )
+        .unwrap();
+        let node =
+            DurableNode::open_on_wal(NodeConfig::single(1, CLUSTER, ledger(1).session.0), wal)
+                .unwrap();
+        let mut restored = Session::from_node(ledger(1), node, SessionLimits::default()).unwrap();
+        restored.poll().unwrap();
+        assert_eq!(restored.sequence(), prefix.sequence);
+        assert_eq!(restored.status().applied_index, prefix.index.0);
+        assert_eq!(restored.placement().unwrap().to_route, prefix.route);
+    })
+    .unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn expired_cancelled_and_timed_out_exports_release_interest_without_releasing_the_disk_gate()
-{
-    let directory = tempfile::tempdir().unwrap();
-    let mut fixture = fixture(directory.path());
-    read(&fixture, 1).await;
-    read(&fixture, 2).await;
-    let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&mut fixture, Duration::from_millis(30)).await;
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    read(&fixture, 2).await;
-    pause.resume().unwrap();
-    assert!(matches!(
-        export.await.unwrap(),
-        Err(LedgerError::Graph(focal_graph::GraphError::Memory(
-            focal_memory::MemoryError::LeaseExpired
-        )))
-    ));
-    read(&fixture, 1).await;
+#[test]
+fn expired_cancelled_and_timed_out_exports_release_interest_without_releasing_the_disk_gate() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = fixture(directory.path());
+        read(&fixture, 1).await;
+        read(&fixture, 2).await;
+        let pause = fixture.wals[0].pause_for_test().unwrap();
+        let export = pending_export(&mut fixture, Duration::from_millis(30)).await;
+        focal_rt::time::sleep(Duration::from_millis(60))
+            .await
+            .unwrap();
+        read(&fixture, 2).await;
+        pause.resume().unwrap();
+        assert!(matches!(
+            export.await.unwrap(),
+            Err(LedgerError::Graph(focal_graph::GraphError::Memory(
+                focal_memory::MemoryError::LeaseExpired
+            )))
+        ));
+        read(&fixture, 1).await;
 
-    let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
-    export.abort();
-    assert!(matches!(export.await, Err(error) if error.is_cancelled()));
-    read(&fixture, 2).await;
-    pause.resume().unwrap();
-    read(&fixture, 1).await;
+        let pause = fixture.wals[0].pause_for_test().unwrap();
+        let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
+        export.abort();
+        assert!(matches!(export.await, Err(error) if error.is_cancelled()));
+        read(&fixture, 2).await;
+        pause.resume().unwrap();
+        read(&fixture, 1).await;
 
-    let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
-    assert!(matches!(
-        export.await.unwrap(),
-        Err(LedgerError::OutcomeUnknown)
-    ));
-    read(&fixture, 2).await;
-    pause.resume().unwrap();
-    read(&fixture, 1).await;
-    shutdown(fixture).await;
+        let pause = fixture.wals[0].pause_for_test().unwrap();
+        let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
+        assert!(matches!(
+            export.await.unwrap(),
+            Err(LedgerError::OutcomeUnknown)
+        ));
+        read(&fixture, 2).await;
+        pause.resume().unwrap();
+        read(&fixture, 1).await;
+        shutdown(fixture).await;
+    })
+    .unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn checkpoint_stop_deadline_leaves_other_sessions_available_until_writer_recovery() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut fixture = fixture(directory.path());
-    read(&fixture, 1).await;
-    read(&fixture, 2).await;
-    let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
-    let stopped = tokio::time::timeout(
-        REQUEST_TIMEOUT.saturating_add(Duration::from_millis(800)),
-        fixture.hosts[&ledger(1)].stop(),
-    )
-    .await
-    .unwrap();
-    assert!(matches!(stopped, Err(LedgerError::OutcomeUnknown)));
-    assert!(matches!(
-        export.await.unwrap(),
-        Err(LedgerError::OutcomeUnknown)
-    ));
-    read(&fixture, 2).await;
-    pause.resume().unwrap();
-    shutdown(fixture).await;
+#[test]
+fn checkpoint_stop_deadline_leaves_other_sessions_available_until_writer_recovery() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fixture = fixture(directory.path());
+        read(&fixture, 1).await;
+        read(&fixture, 2).await;
+        let pause = fixture.wals[0].pause_for_test().unwrap();
+        let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
+        let stopped = focal_rt::time::timeout(
+            REQUEST_TIMEOUT.saturating_add(Duration::from_millis(800)),
+            fixture.hosts[&ledger(1)].stop(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(stopped, Err(LedgerError::OutcomeUnknown)));
+        assert!(matches!(
+            export.await.unwrap(),
+            Err(LedgerError::OutcomeUnknown)
+        ));
+        read(&fixture, 2).await;
+        pause.resume().unwrap();
+        shutdown(fixture).await;
+    })
+    .unwrap()
 }

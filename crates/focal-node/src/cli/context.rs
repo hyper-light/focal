@@ -331,13 +331,9 @@ fn absolute(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn run(
-    runtime: &tokio::runtime::Runtime,
-    settings: &Settings,
-    command: ContextCommand,
-) -> Result<()> {
+pub(crate) async fn run(settings: &Settings, command: ContextCommand) -> Result<()> {
     if let ContextCommand::Enroll { name, invite_file } = command {
-        return enroll(runtime, settings, &name, &invite_file);
+        return enroll(settings, &name, &invite_file).await;
     }
     let root = settings.data_dir().map_err(other)?;
     let create = matches!(command, ContextCommand::Add { .. });
@@ -529,15 +525,61 @@ pub(super) fn selected(
 }
 
 pub(super) enum Transport {
-    Unix(UnixTransport),
+    Unix(LocalTransport),
     Quic(Box<Remote>),
 }
+/// A TLS configuration for a context's connector, and where its verifier
+/// reports an endorsed issuer it found (an enrolled context's).
+type Tls = (ClientTls, Option<focal_wire::AdoptedRoots>);
+/// Makes the context's TLS configuration again: the connector takes the one
+/// it is bound with, so a bind that failed is retried with a new one.
+type MakeTls = Box<dyn Fn() -> std::result::Result<Tls, WireError> + Send + Sync>;
 pub(super) struct Remote {
-    tls: quinn::ClientConfig,
+    /// The configuration made with the context, taken by its first bind.
+    tls: Mutex<Option<Tls>>,
+    remake: MakeTls,
     initial: RouteHint,
     limits: WireLimits,
     initialized: Mutex<()>,
     transport: OnceLock<QuicTransport>,
+    /// Where an endorsed issuer this transport's verifier found, and the
+    /// context does not hold, is read and recorded (an enrolled context;
+    /// 24 §11).
+    adoption: Option<Adoption>,
+}
+/// A context's adoption of the endorsed issuers its verifier found.
+pub(super) struct Adoption {
+    /// The verifier's report of the connector bound last.
+    roots: Mutex<Option<focal_wire::AdoptedRoots>>,
+    directory: PathBuf,
+}
+impl Adoption {
+    /// Read what the verifier of the connector now bound reports.
+    fn watch(&self, adopted: focal_wire::AdoptedRoots) {
+        if let Ok(mut roots) = self.roots.lock() {
+            *roots = Some(adopted);
+        }
+    }
+    /// Record what the verifier found, once a request succeeded over the
+    /// connection. A record that cannot be written is said on standard
+    /// error and the request stands: the endorsement served it, and the
+    /// adoption is tried again at the next.
+    fn record(&self) {
+        let adopted = match self.roots.lock() {
+            Ok(mut roots) => roots.as_mut().and_then(focal_wire::AdoptedRoots::take),
+            Err(_) => None,
+        };
+        let Some(adopted) = adopted else {
+            return;
+        };
+        if let Err(error) = focal_node::network_join::adopt_issuer(&self.directory, &adopted) {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "focal: [trust_not_adopted] the issuer verified through its predecessor's endorsement was not recorded in {}: {error}",
+                self.directory.display()
+            );
+        }
+    }
 }
 impl ClientTransport for Transport {
     fn request<'a>(
@@ -561,11 +603,18 @@ impl ClientTransport for Transport {
                         }
                         .parse()
                         .map_err(|_| WireError::Connection)?;
-                        let connector = QuicConnector::bind(
-                            address,
-                            remote.tls.clone(),
-                            remote.limits.clone(),
-                        )?;
+                        let made = remote.tls.lock().map_err(|_| WireError::Connection)?.take();
+                        let (tls, adopted) = match made {
+                            Some(made) => made,
+                            None => (remote.remake)()?,
+                        };
+                        if let (Some(adoption), Some(adopted)) = (&remote.adoption, adopted) {
+                            adoption.watch(adopted);
+                        }
+                        // The context's endpoint is its own owner: it dials
+                        // the routes it is sent to, and nothing else.
+                        let connector =
+                            QuicConnector::bind_standalone(address, tls, remote.limits.clone())?;
                         let transport = QuicTransport::new(connector, remote.initial.clone(), 16)?;
                         remote
                             .transport
@@ -573,12 +622,18 @@ impl ClientTransport for Transport {
                             .map_err(|_| WireError::Connection)?;
                     }
                 }
-                remote
+                let answer = remote
                     .transport
                     .get()
                     .ok_or(WireError::Connection)?
                     .request(route, request)
-                    .await
+                    .await;
+                if answer.is_ok()
+                    && let Some(adoption) = &remote.adoption
+                {
+                    adoption.record();
+                }
+                answer
             }),
         }
     }
@@ -613,51 +668,54 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
         } => {
             let pending = focal_node::network_join::PendingClientJoin::resume_shared(enrollment)
                 .map_err(other)?;
-            let receipt = pending.enrollment().map_err(other)?.ok_or(InputError::Invalid("client enrollment is pending; retry context enroll with its original invitation"))?;
-            let credentials = pending.credentials(now()?).map_err(other)?;
-            let founder = &pending.invitation().genesis().founder;
-            let trust = pending.invitation().invitation().trust();
+            if pending.enrollment().map_err(other)?.is_none() {
+                return Err(InputError::Invalid(
+                    "client enrollment is pending; retry `enroll context` with its original invitation",
+                )
+                .into());
+            }
             let limits = WireLimits::default();
-            let tls = client_tls(
-                TlsIdentity::from_pkcs8(
-                    credentials.certificate_chain().to_vec(),
-                    credentials.private_key_der().to_vec(),
-                ),
-                vec![trust.ca_certificate.clone()],
-                &limits,
-            )
-            .map_err(other)?;
-            let actor = ParticipantId(receipt.identity.principal);
+            // The roots are the invitation's issuers and the ones this
+            // context adopted since; an issuer a verified chain carries
+            // endorsed by one of them is adopted after the connection, so
+            // a later succession still verifies (24 §11).
+            let focal_node::network_join::EnrolledClient {
+                tls,
+                adopted,
+                initial,
+                mut build,
+                mut operation,
+            } = pending.remote_client(now()?, &limits).map_err(other)?;
+            let adoption = Adoption {
+                roots: Mutex::new(None),
+                directory: pending.directory().to_path_buf(),
+            };
+            let remake_limits = limits.clone();
+            let remake: MakeTls = Box::new(move || {
+                let now = now().map_err(|_| WireError::Authentication)?;
+                let client = pending
+                    .remote_client(now, &remake_limits)
+                    .map_err(|_| WireError::Authentication)?;
+                Ok((client.tls, Some(client.adopted)))
+            });
             // The enrolled identity may address another session of its
             // tenant: one the operator created or restored.
-            let ledger = match session {
-                Some(session) => LedgerId {
-                    tenant: founder.ledger.tenant,
+            if let Some(session) = session {
+                let ledger = LedgerId {
+                    tenant: build.ledger.tenant,
                     session: SessionId(parse_id(&session)?),
-                },
-                None => founder.ledger,
-            };
-            let build = BuildContext {
-                ledger,
-                actor,
-                root: founder.root,
-                policy_revision: 1,
-            };
-            let operation = OperationContext {
-                cluster: founder.cluster,
-                ledger,
-                principal: actor,
-            };
+                };
+                build.ledger = ledger;
+                operation.ledger = ledger;
+            }
             let transport = Transport::Quic(Box::new(Remote {
-                tls,
-                initial: RouteHint {
-                    epoch: RouteEpoch(1),
-                    endpoint: trust.endpoint.clone(),
-                    server_name: pending.invitation().data_server_name().map_err(other)?,
-                },
+                tls: Mutex::new(Some((tls, Some(adopted)))),
+                remake,
+                initial,
                 limits: limits.clone(),
                 initialized: Mutex::new(()),
                 transport: OnceLock::new(),
+                adoption: Some(adoption),
             }));
             let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
             let client = match super::trace::sink() {
@@ -711,11 +769,31 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
                 .iter()
                 .map(|p| read_credential(p, false))
                 .collect::<Result<Vec<_>>>()?;
-            let key = read_credential(&private_key, true)?;
-            let tls =
-                client_tls(TlsIdentity::from_pkcs8(chain, key), roots, &limits).map_err(other)?;
+            let key = zeroize::Zeroizing::new(read_credential(&private_key, true)?);
+            // A context of an enrolled client's own credential: a participant's.
+            let tls = client_tls(
+                TlsIdentity::from_pkcs8(chain.clone(), key.to_vec()),
+                roots.clone(),
+                &limits,
+                focal_wire::net::Sender::Participant,
+            )
+            .map_err(other)?;
+            let remake_limits = limits.clone();
+            let remake: MakeTls = Box::new(move || {
+                let identity = TlsIdentity::from_pkcs8(chain.clone(), key.to_vec());
+                Ok((
+                    client_tls(
+                        identity,
+                        roots.clone(),
+                        &remake_limits,
+                        focal_wire::net::Sender::Participant,
+                    )?,
+                    None,
+                ))
+            });
             let transport = Transport::Quic(Box::new(Remote {
-                tls,
+                tls: Mutex::new(Some((tls, None))),
+                remake,
                 initial: RouteHint {
                     epoch: RouteEpoch(1),
                     endpoint,
@@ -724,6 +802,7 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
                 limits: limits.clone(),
                 initialized: Mutex::new(()),
                 transport: OnceLock::new(),
+                adoption: None,
             }));
             let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
             let client = match super::trace::sink() {
@@ -764,12 +843,7 @@ pub(super) fn now() -> Result<i64> {
     )
     .map_err(|_| InputError::Invalid("system time is out of range").into())
 }
-fn enroll(
-    runtime: &tokio::runtime::Runtime,
-    settings: &Settings,
-    selected: &str,
-    invitation: &Path,
-) -> Result<()> {
+async fn enroll(settings: &Settings, selected: &str, invitation: &Path) -> Result<()> {
     use focal_enrollment::{EnrollmentClient, TransportLimits};
     use focal_node::network_join::{ClientInvitation, PendingClientJoin};
     name(selected)?;
@@ -816,7 +890,7 @@ fn enroll(
     store.catalog.profiles.insert(selected.into(), profile);
     store.save()?;
     drop(store);
-    let receipt = runtime.block_on(async {
+    let receipt = async {
         let address = if pending
             .invitation()
             .invitation()
@@ -834,7 +908,8 @@ fn enroll(
         let result = pending.redeem(&client, now()?).await.map_err(other);
         client.close();
         result
-    })?;
+    }
+    .await?;
     super::super::print_json(&serde_json::json!({"condition":"Enrolled","name":selected,"principal":ParticipantId(receipt.identity.principal),"request_id":pending.request_id(),"selected":false})).map_err(CliError::Other)
 }
 /// A secret credential (a private key) must be reachable only by its owner:

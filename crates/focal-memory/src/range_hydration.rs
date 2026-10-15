@@ -12,7 +12,7 @@ pub use phased::{
 #[path = "range_hydration_tests.rs"]
 mod tests;
 
-impl<K: Ord + Clone, V> RangeStore<K, V> {
+impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
     /// Restore strictly ordered checkpoint rows without requiring `V: Clone`.
     /// Each source entry contains its final key, a construction plan `P`, and
     /// an upper bound on the final key/value heap in `heap_bytes`. The engine

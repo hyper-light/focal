@@ -16,10 +16,10 @@ use focal_core::native::ContentRoot;
 use focal_core::native::record_codec::{InspectionLimits, StructuralArchive};
 use focal_evidence::{CollectorConfig, ProtectionSet};
 use focal_model::{ContentClass, ContentDomainId, ContentHash, ContentRef, LedgerId};
+use focal_rt::watch;
 use focal_wire::AccessError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
 
 /// Milliseconds between passes; one minute by default.
 pub const INTERVAL_ENV: &str = "FOCAL_GC_INTERVAL_MS";
@@ -106,7 +106,12 @@ fn admin_report(report: focal_evidence::CollectorReport) -> AdminCollectorReport
 }
 
 impl GcAgent {
-    pub fn new(node: u64, interval: Duration, config: CollectorConfig) -> (Self, GcHandle) {
+    /// Refused at the runtime's cell bound (its status is a watched value).
+    pub fn new(
+        node: u64,
+        interval: Duration,
+        config: CollectorConfig,
+    ) -> Result<(Self, GcHandle), focal_rt::RtError> {
         let interval = interval.max(Duration::from_millis(10));
         let (status, receiver) = watch::channel(AdminGc {
             node,
@@ -114,8 +119,8 @@ impl GcAgent {
             passes: 0,
             collecting: false,
             last: None,
-        });
-        (
+        })?;
+        Ok((
             Self {
                 node,
                 interval,
@@ -127,11 +132,11 @@ impl GcAgent {
                 status,
             },
             GcHandle(receiver),
-        )
+        ))
     }
     /// The interval and the collector's settings from the environment, else
     /// the defaults.
-    pub fn from_env(node: u64) -> (Self, GcHandle) {
+    pub fn from_env(node: u64) -> Result<(Self, GcHandle), focal_rt::RtError> {
         let millis = |name: &str| {
             std::env::var_os(name).and_then(|value| {
                 value
@@ -155,18 +160,20 @@ impl GcAgent {
         Self::new(node, interval, config)
     }
     pub async fn run(mut self, handles: &NetworkHandles) -> Result<(), AccessError> {
-        if tokio::runtime::Handle::try_current().is_err() {
+        if hyper_rt::futures::shard_id().is_none() {
             return Err(AccessError::Unavailable);
         }
         loop {
-            tokio::time::sleep(self.interval).await;
+            focal_rt::time::sleep(self.interval)
+                .await
+                .map_err(|_| AccessError::Unavailable)?;
             // A pass that cannot run now (a store that refuses, a replica
             // that is stopping) waits for the next tick; nothing is inferred.
             let _ = self.pass(handles).await;
         }
     }
     fn publish(&self) {
-        let _ = self.status.send(AdminGc {
+        self.status.send(AdminGc {
             node: self.node,
             config: admin_config(self.interval, self.config),
             passes: self.passes,
@@ -204,7 +211,7 @@ impl GcAgent {
             if report.complete {
                 break;
             }
-            tokio::task::yield_now().await;
+            hyper_rt::futures::yield_now().await;
         }
         pass.content = admin_report(report);
         if !report.complete {
@@ -250,6 +257,7 @@ impl GcAgent {
             let mut cursor = None;
             let mut complete = false;
             let mut bundles = Vec::new();
+            let mut colds = Vec::new();
             loop {
                 let page = match host.content_roots(cursor, PAGE).await {
                     Ok(page) => page,
@@ -270,6 +278,23 @@ impl GcAgent {
                                 .map_err(|_| AccessError::Capacity)?;
                             bundles.push((root, bytes));
                         }
+                        // A seal's bundle (F12) names no content of its own.
+                        ContentRoot::Seal { root, .. } => {
+                            protection.protect_object(domain, root).map_err(content)?;
+                        }
+                        // A cold family's frame is no content object; what it names of the
+                        // ledger's content is read from the replica's cold stream (doc 31 M2,
+                        // A2). Its members share one frame.
+                        ContentRoot::Cold {
+                            digest, retired_at, ..
+                        } => {
+                            if !colds.contains(&(retired_at, digest)) {
+                                colds
+                                    .try_reserve_exact(1)
+                                    .map_err(|_| AccessError::Capacity)?;
+                                colds.push((retired_at, digest));
+                            }
+                        }
                     }
                 }
                 cursor = page.next;
@@ -277,7 +302,7 @@ impl GcAgent {
                     complete = true;
                     break;
                 }
-                tokio::task::yield_now().await;
+                hyper_rt::futures::yield_now().await;
             }
             if !complete {
                 // A replica without a native core, or one that stopped mid-walk:
@@ -316,7 +341,25 @@ impl GcAgent {
                         break;
                     }
                 }
-                tokio::task::yield_now().await;
+                hyper_rt::futures::yield_now().await;
+            }
+            for (retired_at, digest) in colds {
+                match host.cold_content(retired_at, digest).await {
+                    Ok(Some(cold)) => {
+                        for inner in cold.content.into_iter().chain(cold.inline) {
+                            protection.protect_object(domain, inner).map_err(content)?;
+                        }
+                    }
+                    // A frame not readable here leaves this domain's protection provably
+                    // incomplete: it is opaque this pass, as an unreadable bundle makes it.
+                    _ => {
+                        pass.bundles_unreadable = pass.bundles_unreadable.saturating_add(1);
+                        protection.opaque_domain(domain).map_err(content)?;
+                        pass.opaque_domains = pass.opaque_domains.saturating_add(1);
+                        break;
+                    }
+                }
+                hyper_rt::futures::yield_now().await;
             }
         }
         protection.finish();
@@ -382,7 +425,7 @@ impl GcAgent {
                 if sweep.complete {
                     break;
                 }
-                tokio::task::yield_now().await;
+                hyper_rt::futures::yield_now().await;
             }
         }
         Ok(report)

@@ -133,7 +133,7 @@ impl Read<'_, '_> {
     fn head(&self, target: ClaimId, visits: &mut Visits) -> Result<MonitorHead, ContractError> {
         match self.get(Key::MonitorHead(target), visits)? {
             None => Ok(MonitorHead::default()),
-            Some(Row::MonitorHead(head)) if head.head.is_some() == (head.count != 0) => Ok(*head),
+            Some(Row::MonitorHead(head)) if head.head.is_some() == (head.count != 0) => Ok(**head),
             _ => Err(ContractError::InvalidManifest),
         }
     }
@@ -147,7 +147,7 @@ impl Read<'_, '_> {
             return Err(ContractError::InvalidTarget);
         }
         match self.get(Key::MonitorLink(target, id), visits)? {
-            Some(Row::MonitorLink(Some(link))) => Ok(*link),
+            Some(Row::MonitorLink(Some(link))) => Ok(**link),
             _ => Err(ContractError::InvalidManifest),
         }
     }
@@ -608,7 +608,7 @@ fn unlink(
         put(
             extras,
             Key::MonitorLink(target, id),
-            Row::MonitorLink(Some(previous)),
+            Row::MonitorLink(Some(Box::new(previous))),
             visits,
             overlay,
         )?;
@@ -618,7 +618,7 @@ fn unlink(
         put(
             extras,
             Key::MonitorLink(target, id),
-            Row::MonitorLink(Some(next)),
+            Row::MonitorLink(Some(Box::new(next))),
             visits,
             overlay,
         )?;
@@ -633,7 +633,7 @@ fn unlink(
     put(
         extras,
         Key::MonitorHead(target),
-        Row::MonitorHead(head),
+        Row::MonitorHead(Box::new(head)),
         visits,
         overlay,
     )
@@ -681,7 +681,7 @@ fn insert(
         put(
             extras,
             Key::MonitorLink(target, id),
-            Row::MonitorLink(Some(old)),
+            Row::MonitorLink(Some(Box::new(old))),
             visits,
             overlay,
         )?;
@@ -690,14 +690,14 @@ fn insert(
     put(
         extras,
         Key::MonitorLink(target, scope.id()),
-        Row::MonitorLink(Some(link)),
+        Row::MonitorLink(Some(Box::new(link))),
         visits,
         overlay,
     )?;
     put(
         extras,
         Key::MonitorHead(target),
-        Row::MonitorHead(head),
+        Row::MonitorHead(Box::new(head)),
         visits,
         overlay,
     )?;
@@ -771,10 +771,10 @@ pub(super) fn stage(
                 put(
                     extras,
                     Key::MonitorLink(target, id),
-                    Row::MonitorLink(Some(MonitorLink {
+                    Row::MonitorLink(Some(Box::new(MonitorLink {
                         stamp: stamp(new),
                         ..link
-                    })),
+                    }))),
                     &mut visits,
                     overlay,
                 )?;
@@ -814,11 +814,11 @@ pub(super) fn stage(
         put(
             extras,
             Key::Monitor(id),
-            Row::Monitor(MonitorAllocation {
+            Row::Monitor(Box::new(MonitorAllocation {
                 owner: before.binding(),
                 registered: new.registered(),
                 deadline: new.deadline(),
-            }),
+            })),
             &mut visits,
             overlay,
         )?;

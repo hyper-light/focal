@@ -521,6 +521,7 @@ pub(in crate::native) fn settle_scopes(
                 ) {
                     Ok(failure) => {
                         let mut next = copy(source, scratch)?;
+                        scratch.charge(terminal_growth(source)?)?;
                         next.dependency_failed(&source.binding(), &failure, &peers, cut.position)?;
                         journal(
                             extras,
@@ -538,6 +539,7 @@ pub(in crate::native) fn settle_scopes(
                         {
                             let witness = snapshot.release(ClaimId(source.binding().object.0))?;
                             let mut next = copy(source, scratch)?;
+                            scratch.charge(terminal_growth(source)?)?;
                             next.graph_release(&source.binding(), &witness, &peers, cut.position)?;
                             journal(
                                 extras,

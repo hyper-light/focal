@@ -4,23 +4,111 @@ use crate::embedded::{EmbeddedNode, NodeError};
 use focal_ledger::{LedgerError, Submission};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
+use focal_rt::watch;
 use focal_wire::*;
+use hyper_rt::sync::OneshotSender;
 use std::{
+    collections::VecDeque,
     future::Future,
     pin::Pin,
     sync::mpsc,
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{oneshot, watch};
 
 enum Work {
     Request(
         Box<VerifiedRequest>,
-        oneshot::Sender<OwnedResponse>,
+        OneshotSender<OwnedResponse>,
         Allocation,
     ),
-    Stop(oneshot::Sender<Result<(), NodeError>>),
+    Stop(OneshotSender<Result<(), NodeError>>),
+}
+/// Requests the ingress queue holds, and native proposals the owner holds
+/// unanswered: holding that many, it waits for the log before it takes
+/// another request, so a slow disk slows callers rather than growing a queue.
+const INGRESS: usize = 32;
+/// What the owner made of one request: its reply, and for a native frame
+/// it proposed, the proposal whose commit the reply waits for.
+pub(crate) struct Dispatched {
+    pub(crate) reply: ResponseEnvelope,
+    pub(crate) proposal: Option<crate::native_ingress::Proposal>,
+}
+#[cfg(test)]
+impl Dispatched {
+    /// The answer of a request that is not a native proposal.
+    pub(crate) fn answered(self) -> ResponseEnvelope {
+        if let Some(proposal) = self.proposal {
+            panic!("parked proposal {proposal:?}");
+        }
+        self.reply
+    }
+}
+/// A native proposal waiting for its commit, with its reply's header, the
+/// caller's answer channel and the request's charge.
+pub(crate) struct Waiting {
+    pub(crate) header: ResponseEnvelope,
+    pub(crate) proposal: crate::native_ingress::Proposal,
+    /// Owner polls since the proposal; at `COMMIT_POLLS` it is answered
+    /// with its ticket.
+    pub(crate) polls: usize,
+    pub(crate) response: OneshotSender<OwnedResponse>,
+    pub(crate) charge: Allocation,
+}
+impl Waiting {
+    fn finish(self, result: Response, limits: &WireLimits) {
+        let mut header = self.header;
+        header.result = result;
+        let _ = self
+            .response
+            .send(finish_response(bounded(header, limits), self.charge));
+    }
+}
+/// One poll of the session serves every parked proposal: the frames
+/// proposed while the last flush was in flight go to the log in one append
+/// (group commit), and each is answered once its outcome is the session's,
+/// or with its ticket after `COMMIT_POLLS` polls, as a lone proposal is.
+pub(crate) fn settle(
+    node: &mut EmbeddedNode,
+    waiting: &mut VecDeque<Waiting>,
+    limits: &WireLimits,
+) {
+    let polled = node.session.poll().map(|_| ()).map_err(access);
+    let count = waiting.len();
+    for _ in 0..count {
+        let Some(mut entry) = waiting.pop_front() else {
+            break;
+        };
+        let result = match &polled {
+            Err(error) => Some(Response::Error(error.clone())),
+            Ok(()) => match crate::native_ingress::settled(&node.session, entry.proposal) {
+                Ok(Some(response)) => Some(response),
+                Ok(None) => {
+                    entry.polls = entry.polls.saturating_add(1);
+                    (entry.polls >= crate::native_ingress::COMMIT_POLLS)
+                        .then(|| crate::native_ingress::ticket(entry.proposal))
+                }
+                Err(error) => Some(Response::Error(error)),
+            },
+        };
+        match result {
+            Some(response) => entry.finish(response, limits),
+            None => waiting.push_back(entry),
+        }
+    }
+}
+/// Answer every parked proposal: each takes at most `COMMIT_POLLS` polls.
+pub(crate) fn settle_all(
+    node: &mut EmbeddedNode,
+    waiting: &mut VecDeque<Waiting>,
+    limits: &WireLimits,
+) {
+    for _ in 0..crate::native_ingress::COMMIT_POLLS {
+        if waiting.is_empty() {
+            return;
+        }
+        settle(node, waiting, limits);
+    }
 }
 #[derive(Clone)]
 pub struct LocalHost {
@@ -47,9 +135,15 @@ impl LocalHost {
         let budget =
             MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).map_err(LedgerError::from)?;
         let host_limits = limits.clone();
+        let host_budget = budget.clone();
         let native = node.session.activation().is_native();
-        let (sender, receiver) = mpsc::sync_channel(32);
-        let (liveness, ended) = watch::channel(());
+        let (sender, receiver) = mpsc::sync_channel(INGRESS);
+        let mut waiting = VecDeque::new();
+        waiting
+            .try_reserve_exact(INGRESS)
+            .map_err(|_| NodeError::Ledger(LedgerError::Capacity))?;
+        let (liveness, ended) =
+            watch::channel(()).map_err(|_| NodeError::Ledger(LedgerError::Capacity))?;
         let mut views = crate::reads::ReadViews::new();
         let mut streams =
             crate::streams::Streams::new().map_err(|error| NodeError::Domain(error.to_string()))?;
@@ -57,10 +151,13 @@ impl LocalHost {
             .name("focal-session-owner".into())
             .spawn(move || {
                 let _liveness = liveness;
+                let mut archive = crate::archive_agent::EmbeddedArchive::from_env();
                 let mut next_tick = Instant::now();
                 loop {
                     if Instant::now() >= next_tick {
-                        if let Err(error) = maintain(&mut node, &mut views) {
+                        if let Err(error) =
+                            maintain(&mut node, &mut views, &mut archive, &host_budget)
+                        {
                             use std::io::Write as _;
                             let _ = writeln!(
                                 std::io::stderr().lock(),
@@ -72,23 +169,66 @@ impl LocalHost {
                         else {
                             break;
                         };
-                        next_tick = deadline;
+                        // Sooner when the archive's next walk of the families is due.
+                        next_tick = deadline.min(archive.due());
                     }
-                    let work = match receiver
-                        .recv_timeout(next_tick.saturating_duration_since(Instant::now()))
-                    {
-                        Ok(work) => work,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    // Every queued request is taken before the owner waits
+                    // on the log; it blocks for a request only when no
+                    // proposal waits for its commit.
+                    let work = if waiting.is_empty() {
+                        match receiver
+                            .recv_timeout(next_tick.saturating_duration_since(Instant::now()))
+                        {
+                            Ok(work) => work,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    } else if waiting.len() < INGRESS {
+                        match receiver.try_recv() {
+                            Ok(work) => work,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                settle(&mut node, &mut waiting, &limits);
+                                continue;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                settle_all(&mut node, &mut waiting, &limits);
+                                break;
+                            }
+                        }
+                    } else {
+                        settle(&mut node, &mut waiting, &limits);
+                        continue;
                     };
                     match work {
-                        Work::Request(request, response, charge) => {
+                        Work::Request(request, response, mut charge) => {
+                            // A native read's page is charged to the read as the owner builds
+                            // it, object by object (`native_reads::PageObjects`).
                             // A vanished caller cannot cancel an already admitted mutation.
-                            let reply =
-                                dispatch(&mut node, &mut views, &mut streams, *request, &limits);
-                            let _ = response.send(finish_response(reply, charge));
+                            let dispatched = dispatch(
+                                &mut node,
+                                &mut views,
+                                &mut streams,
+                                *request,
+                                &limits,
+                                &host_budget,
+                                &mut charge,
+                            );
+                            match dispatched.proposal {
+                                None => {
+                                    let _ =
+                                        response.send(finish_response(dispatched.reply, charge));
+                                }
+                                Some(proposal) => waiting.push_back(Waiting {
+                                    header: dispatched.reply,
+                                    proposal,
+                                    polls: 0,
+                                    response,
+                                    charge,
+                                }),
+                            }
                         }
                         Work::Stop(response) => {
+                            settle_all(&mut node, &mut waiting, &limits);
                             let _ = response.send(node.checkpoint());
                             break;
                         }
@@ -114,7 +254,8 @@ impl LocalHost {
     /// Returns Capacity without enqueueing when ingress is full; callers can
     /// retry after draining ingress. No blocking task or extra thread is needed.
     pub async fn stop(&self) -> Result<(), NodeError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| NodeError::Ledger(focal_ledger::LedgerError::Capacity))?;
         self.sender
             .try_send(Work::Stop(send))
             .map_err(|error| match error {
@@ -131,10 +272,11 @@ impl LocalHost {
     }
 }
 impl HostOwner {
-    /// Joins without blocking the async executor. Unlike Tokio's blocking-pool
-    /// spawn, OS thread exhaustion is returned by Builder as an I/O error.
+    /// Joins without blocking the shard: the join waits on a thread of its
+    /// own, and OS thread exhaustion is returned by Builder as an I/O error.
     pub async fn join_async(self) -> Result<(), NodeError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| NodeError::Ledger(focal_ledger::LedgerError::Capacity))?;
         let _bridge = std::thread::Builder::new()
             .name("focal-owner-join".into())
             .spawn(move || {
@@ -260,16 +402,34 @@ impl RequestHandler for LocalHost {
                         ..
                     }
             );
+            let native_read = matches!(
+                request.request().operation,
+                Operation::NativeRead(_) | Operation::NativeList(_)
+            );
             let bytes = postcard::experimental::serialized_size(request.request())
                 .ok()
-                .and_then(|n| n.checked_mul(32))
                 .and_then(|n| {
-                    payload
-                        .checked_mul(32)
-                        .and_then(|reply| n.checked_add(reply))
-                })
-                .and_then(|n| n.checked_add(if content { 8 * 1024 * 1024 } else { 0 }))
-                .and_then(|n| n.checked_add(4096));
+                    if native_read {
+                        // A native read waits as its request and a place: each object its page
+                        // takes is charged as the owner builds it (`native_reads::PageObjects`),
+                        // and given back to what the reply holds as it is answered. Reserved for
+                        // every read as it waited, 32 times the client's frame, the host's budget
+                        // took two reads at once and refused the rest (a deliver load on one
+                        // embedded node: 177 of 200 lifecycles abandoned, every event tail's page
+                        // refused).
+                        n.checked_mul(2)?
+                            .checked_add(crate::fleet::NATIVE_READ_PLACE_BYTES)
+                    } else {
+                        n.checked_mul(32)
+                            .and_then(|n| {
+                                payload
+                                    .checked_mul(32)
+                                    .and_then(|reply| n.checked_add(reply))
+                            })
+                            .and_then(|n| n.checked_add(if content { 8 * 1024 * 1024 } else { 0 }))
+                            .and_then(|n| n.checked_add(4096))
+                    }
+                });
             let Some(bytes) = bytes else {
                 return OwnedResponse::new(full);
             };
@@ -295,7 +455,9 @@ impl RequestHandler for LocalHost {
             let Ok(charge) = self.budget.reserve(BudgetKind::Pending, lane, bytes) else {
                 return OwnedResponse::new(full);
             };
-            let (send, receive) = oneshot::channel();
+            let Ok((send, receive)) = hyper_rt::sync::oneshot() else {
+                return OwnedResponse::new(full);
+            };
             match self
                 .sender
                 .try_send(Work::Request(Box::new(request), send, charge.commit()))
@@ -321,16 +483,24 @@ pub(crate) fn finish_response(
     mut header: ResponseEnvelope,
     mut charge: Allocation,
 ) -> OwnedResponse {
-    // Admission covers the maximum page before constructing it. Once staging
-    // is gone retain only this reply's conservative resident/encoding allowance,
-    // so a small response does not pin the entire possible page budget.
-    let retained = postcard::experimental::serialized_size(&header)
-        .ok()
+    // A reply admitted with room to spare keeps only its conservative resident/encoding
+    // allowance, so a small response does not pin what its request was admitted with. A native
+    // page charged object by object as the owner built it (`native_reads::PageObjects`) holds
+    // what its objects were charged, which is what its reply holds: kept, and grown to the
+    // reply's encoding where that is more.
+    let encoded = postcard::experimental::serialized_size(&header).ok();
+    let retained = encoded
         .and_then(|n| n.checked_mul(32))
         .and_then(|n| n.checked_add(512));
-    match retained {
-        Some(bytes) if bytes <= charge.bytes() => {
+    match (retained, encoded.and_then(|n| n.checked_add(512))) {
+        (Some(bytes), _) if bytes <= charge.bytes() => {
             if charge.shrink_to(bytes).is_err() {
+                header.result = Response::Error(AccessError::OutcomeUnknown);
+            }
+        }
+        (_, Some(floor)) if floor <= charge.bytes() => {}
+        (_, Some(floor)) => {
+            if charge.grow(floor.saturating_sub(charge.bytes())).is_err() {
                 header.result = Response::Error(AccessError::OutcomeUnknown);
             }
         }
@@ -366,6 +536,21 @@ pub(crate) fn known_receipt(
         ))
     }))
 }
+/// What a read barrier that could not be begun answers: nothing was taken,
+/// so the node is unavailable for the read — a replica that leads no one
+/// and knows no leader (an isolated leader once it stands down,
+/// `ConsensusError::NotLeader`), a session that stopped — never an unknown
+/// outcome, which is a mutation's word. Capacity and the client's standing
+/// keep their names.
+pub(crate) fn barrier_refused(error: LedgerError) -> AccessError {
+    match error {
+        LedgerError::Capacity
+        | LedgerError::Behind
+        | LedgerError::ResyncRequired
+        | LedgerError::Consensus(focal_consensus::ConsensusError::Capacity) => access(error),
+        _ => AccessError::Unavailable,
+    }
+}
 pub(crate) fn access(error: LedgerError) -> AccessError {
     match error {
         LedgerError::Managed(error) => match error {
@@ -390,7 +575,12 @@ pub(crate) fn access(error: LedgerError) -> AccessError {
         _ => AccessError::OutcomeUnknown,
     }
 }
-fn maintain(node: &mut EmbeddedNode, views: &mut crate::reads::ReadViews) -> Result<(), NodeError> {
+fn maintain(
+    node: &mut EmbeddedNode,
+    views: &mut crate::reads::ReadViews,
+    archive: &mut crate::archive_agent::EmbeddedArchive,
+    budget: &MemoryBudget,
+) -> Result<(), NodeError> {
     views
         .advance(&mut node.session)
         .map_err(|error| NodeError::Domain(error.to_string()))?;
@@ -406,15 +596,21 @@ fn maintain(node: &mut EmbeddedNode, views: &mut crate::reads::ReadViews) -> Res
     // Trusted timers of the native engine fire from this clock; a refusal
     // of one timer is that timer's outcome, not a maintenance failure.
     crate::native_timers::sweep(&mut node.session)?;
+    // The archive agent of this node (26 §4, F12): released families retire
+    // and closed outcomes seal here as on a network node, into this node's
+    // own store.
+    archive.maintain(node, budget)?;
     Ok(())
 }
-fn dispatch(
+pub(crate) fn dispatch(
     node: &mut EmbeddedNode,
     views: &mut crate::reads::ReadViews,
     streams: &mut crate::streams::Streams,
     verified: VerifiedRequest,
     limits: &WireLimits,
-) -> ResponseEnvelope {
+    budget: &MemoryBudget,
+    charge: &mut focal_memory::Allocation,
+) -> Dispatched {
     let principal = verified.peer().principal();
     let peer = verified.peer();
     let request = verified.request();
@@ -422,8 +618,12 @@ fn dispatch(
     // remain borrowed until mutation authentication consumes their ownership.
     let mut response = request.reply(Response::Error(AccessError::OutcomeUnknown));
     if let Err(error) = views.advance(&mut node.session) {
-        return request.reply(Response::Error(error));
+        return Dispatched {
+            reply: request.reply(Response::Error(error)),
+            proposal: None,
+        };
     }
+    let mut proposal = None;
     let result = if request.ledger != node.identity.ledger {
         Err(AccessError::Unauthorized)
     } else if request.route_epoch != RouteEpoch(1)
@@ -443,7 +643,7 @@ fn dispatch(
             epoch: RouteEpoch(1),
             endpoint: node
                 .root()
-                .join("focal.sock")
+                .join(crate::network_admin::LOCAL_SOCKET)
                 .to_string_lossy()
                 .into_owned(),
             server_name: "local".into(),
@@ -494,16 +694,52 @@ fn dispatch(
             }
             Operation::ManagedSupport { .. } => Err(AccessError::UnsupportedOperation),
             Operation::Native { frame } => {
-                crate::native_ingress::admit_local(node, peer, request, frame)
+                crate::native_ingress::admit_local(node, peer, request, frame, &mut proposal)
             }
-            Operation::NativeRead(read) => crate::native_reads::local(
-                &mut node.session,
-                peer,
-                read,
-                request.request_id,
-                request.route_epoch,
-                limits,
-            )
+            // An archived object is read from the node's own custody (the
+            // audit's F11); every other read from the session's core.
+            Operation::NativeRead(read) => match &read.query {
+                NativeReadQuery::Archived(query) => crate::archive_reads::page(
+                    &node.content,
+                    budget,
+                    request.ledger,
+                    peer,
+                    request.route_epoch,
+                    read,
+                    query,
+                    limits,
+                    charge,
+                ),
+                NativeReadQuery::Sealed(query) => crate::archive_reads::sealed_page(
+                    &node.content,
+                    request.ledger,
+                    peer,
+                    request.route_epoch,
+                    read,
+                    query,
+                    limits,
+                    charge,
+                ),
+                NativeReadQuery::Cold(query) => crate::archive_reads::cold_page(
+                    &mut node.session,
+                    budget,
+                    peer,
+                    request.route_epoch,
+                    read,
+                    query,
+                    limits,
+                    charge,
+                ),
+                _ => crate::native_reads::local(
+                    &mut node.session,
+                    peer,
+                    read,
+                    request.request_id,
+                    request.route_epoch,
+                    limits,
+                    charge,
+                ),
+            }
             .map(Response::NativeRead),
             Operation::NativeList(list) => crate::native_lists::local(
                 &mut node.session,
@@ -512,6 +748,7 @@ fn dispatch(
                 list,
                 request.route_epoch,
                 limits,
+                charge,
             )
             .map(Response::NativeListed),
             Operation::Monitor { id } => crate::monitor_reads::local(
@@ -643,6 +880,7 @@ fn dispatch(
                 .map(Response::Stream),
             Operation::Subscribe(_)
             | Operation::Raft { .. }
+            | Operation::RaftOrdered { .. }
             | Operation::Control { .. }
             | Operation::PeerControl { .. }
             | Operation::NodeContact { .. }
@@ -656,7 +894,14 @@ fn dispatch(
         }
     };
     response.result = result.unwrap_or_else(Response::Error);
-    if encode_payload(&response, limits.max_frame_bytes).is_err() {
+    Dispatched {
+        reply: bounded(response, limits),
+        proposal,
+    }
+}
+/// The limit alone decides: the reply is encoded once, by the transport.
+fn bounded(mut response: ResponseEnvelope, limits: &WireLimits) -> ResponseEnvelope {
+    if payload_len(&response, limits.max_frame_bytes).is_err() {
         response.result = Response::Error(AccessError::Capacity);
     }
     response
@@ -776,57 +1021,115 @@ mod tests {
     use super::*;
     use futures_util::FutureExt;
 
-    #[tokio::test]
-    async fn local_replies_retain_only_their_owned_bytes_through_owner_shutdown() {
-        let root = tempfile::tempdir().unwrap();
-        let mut settings = crate::config::Settings::default();
-        settings.node.data_dir = Some(root.path().to_owned());
-        let node = EmbeddedNode::open(&settings).unwrap();
-        let identity = node.identity.clone();
-        let limits = WireLimits::default();
-        let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
-        let peer = AuthenticatedPeer::local(PeerGrant {
-            principal: identity.issuer,
-            tenants: std::collections::BTreeSet::from([identity.ledger.tenant]),
-            role: PeerRole::Actor,
+    #[test]
+    fn local_replies_retain_only_their_owned_bytes_through_owner_shutdown() {
+        focal_rt::block_on(async move {
+            let root = tempfile::tempdir().unwrap();
+            let mut settings = crate::config::Settings::default();
+            settings.node.data_dir = Some(root.path().to_owned());
+            let node = EmbeddedNode::open(&settings).unwrap();
+            let identity = node.identity.clone();
+            let limits = WireLimits::default();
+            let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
+            let peer = AuthenticatedPeer::local(PeerGrant {
+                principal: identity.issuer,
+                tenants: std::collections::BTreeSet::from([identity.ledger.tenant]),
+                role: PeerRole::Actor,
+            })
+            .unwrap();
+            let request = RequestEnvelope {
+                protocol: PROTOCOL_VERSION,
+                ledger: identity.ledger,
+                route_epoch: RouteEpoch(1),
+                request_epoch: RequestEpoch(1),
+                request_id: RequestId::from_u128(1),
+                operation: Operation::Read(ReadRequest {
+                    consistency: ReadConsistency::Linearizable,
+                    query: ReadQuery::Objects(Vec::new()),
+                    max_items: 1,
+                }),
+            };
+            let first =
+                focal_wire::dispatch_accounted(&host, peer.clone(), request.clone(), &limits).await;
+            assert!(matches!(first.envelope().result, Response::Read(_)));
+            let held = host.budget.stats().ordinary_used;
+            assert!(
+                held > 0 && held < 1024 * 1024,
+                "small reply retained full page allowance: {held}"
+            );
+            let second = focal_wire::dispatch_accounted(&host, peer, request, &limits).await;
+            assert!(matches!(second.envelope().result, Response::Read(_)));
+            assert_eq!(host.budget.stats().ordinary_used, held * 2);
+            drop(first);
+            assert_eq!(host.budget.stats().ordinary_used, held);
+            host.stop().await.unwrap();
+            owner.join().unwrap();
+            assert_eq!(host.budget.stats().ordinary_used, held);
+            drop(second);
+            assert_eq!(host.budget.stats().used, 0);
         })
-        .unwrap();
-        let request = RequestEnvelope {
-            protocol: PROTOCOL_VERSION,
-            ledger: identity.ledger,
-            route_epoch: RouteEpoch(1),
-            request_epoch: RequestEpoch(1),
-            request_id: RequestId::from_u128(1),
-            operation: Operation::Read(ReadRequest {
-                consistency: ReadConsistency::Linearizable,
-                query: ReadQuery::Objects(Vec::new()),
-                max_items: 1,
-            }),
-        };
-        let first =
-            focal_wire::dispatch_accounted(&host, peer.clone(), request.clone(), &limits).await;
-        assert!(matches!(first.envelope().result, Response::Read(_)));
-        let held = host.budget.stats().ordinary_used;
-        assert!(
-            held > 0 && held < 1024 * 1024,
-            "small reply retained full page allowance: {held}"
-        );
-        let second = focal_wire::dispatch_accounted(&host, peer, request, &limits).await;
-        assert!(matches!(second.envelope().result, Response::Read(_)));
-        assert_eq!(host.budget.stats().ordinary_used, held * 2);
-        drop(first);
-        assert_eq!(host.budget.stats().ordinary_used, held);
-        host.stop().await.unwrap();
-        owner.join().unwrap();
-        assert_eq!(host.budget.stats().ordinary_used, held);
-        drop(second);
-        assert_eq!(host.budget.stats().used, 0);
+        .unwrap()
+    }
+
+    /// Native reads waiting together are all served: each waits as its request and a place,
+    /// and its page is funded as the owner builds it. Reserved 32 times the client's frame as it
+    /// waited, the host's budget held two at once and refused the rest for capacity.
+    #[test]
+    fn native_reads_waiting_together_are_all_served() {
+        focal_rt::block_on(async move {
+            let root = tempfile::tempdir().unwrap();
+            let mut settings = crate::config::Settings::default();
+            settings.node.data_dir = Some(root.path().to_owned());
+            crate::native_activation::activate_local(
+                &settings,
+                focal_ledger::NativeContentProfile::AuthoredV1,
+            )
+            .unwrap();
+            let node = EmbeddedNode::open(&settings).unwrap();
+            let identity = node.identity.clone();
+            let limits = WireLimits::default();
+            let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
+            let peer = AuthenticatedPeer::local(PeerGrant {
+                principal: identity.issuer,
+                tenants: std::collections::BTreeSet::from([identity.ledger.tenant]),
+                role: PeerRole::Runtime,
+            })
+            .unwrap();
+            let reads = (1..=24u128).map(|id| {
+                let request = RequestEnvelope {
+                    protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
+                    ledger: identity.ledger,
+                    route_epoch: RouteEpoch(1),
+                    request_epoch: RequestEpoch(1),
+                    request_id: RequestId::from_u128(id),
+                    operation: Operation::NativeRead(focal_wire::NativeReadRequest {
+                        consistency: ReadConsistency::Linearizable,
+                        query: focal_wire::NativeReadQuery::Epochs(identity.issuer),
+                        max_items: 1,
+                    }),
+                };
+                focal_wire::dispatch_accounted(&host, peer.clone(), request, &limits)
+            });
+            let answers = futures_util::future::join_all(reads).await;
+            for answer in &answers {
+                assert!(
+                    matches!(answer.envelope().result, Response::NativeRead(_)),
+                    "{:?}",
+                    answer.envelope().result
+                );
+            }
+            drop(answers);
+            host.stop().await.unwrap();
+            owner.join().unwrap();
+            assert_eq!(host.budget.stats().used, 0);
+        })
+        .unwrap()
     }
 
     #[test]
     fn shutdown_backpressure_and_closed_owner_need_no_runtime_or_worker() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        let (_liveness, ended) = watch::channel(());
+        let (_liveness, ended) = watch::channel(()).unwrap();
         let host = LocalHost {
             sender,
             ended,
@@ -834,7 +1137,7 @@ mod tests {
             limits: WireLimits::default(),
             native: false,
         };
-        let (send, _receive) = oneshot::channel();
+        let (send, _receive) = hyper_rt::sync::oneshot().unwrap();
         host.sender.try_send(Work::Stop(send)).unwrap();
         assert!(matches!(
             host.stop().now_or_never(),

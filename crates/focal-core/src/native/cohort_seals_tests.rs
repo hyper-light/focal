@@ -1,4 +1,4 @@
-use crate::native::claim_changes::{OriginalPlan, SealedChanges};
+use crate::native::claim_changes::{Admitted, OriginalPlan, SealedChanges};
 use crate::native::prepare::{Extras, Scratch};
 use crate::native::report_tests as fixture;
 use crate::native::*;
@@ -20,19 +20,13 @@ fn stage(
     operation: NativeOperation,
     evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
 ) -> Staged {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let intent = intent::fingerprint(view.ledger(), &input).unwrap();
     let sequence = SessionSeq(view.prefix().0 + 1);
     let mut meta = view.meta();
     meta.logical_time += 1;
     meta.outcomes += 1;
-    let mut scratch = Scratch {
-        used: 0,
-        max: core.limits.preparation_bytes,
-    };
+    let mut scratch = Scratch::bound(core.limits.preparation_bytes);
     let mut extras = Extras::new(
         core.limits.range.max_batch_entries,
         core.limits.preparation_bytes,
@@ -98,10 +92,7 @@ fn stage(
 }
 
 fn original_history(core: &Core<NativeState>, staged: &Staged) -> Vec<NativeFact> {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let mut workspace = Vec::with_capacity(staged.plan.rows.len());
     let mut facts = Vec::with_capacity(usize::try_from(staged.outcome.events).unwrap());
     let count = claim_changes::visit_history(
@@ -126,19 +117,20 @@ fn assemble(core: &Core<NativeState>, staged: Staged) -> SealedChanges {
     let Staged {
         plan,
         extras,
-        meta,
+        mut meta,
         outcome,
         mut scratch,
     } = staged;
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
+    let window = crate::native::epochs::staged(&view, &mut meta, outcome, core.limits);
     OriginalPlan::check(
         plan,
         extras,
-        meta,
-        outcome,
+        Admitted {
+            meta,
+            outcome,
+            window,
+        },
         &view,
         core.limits,
         &mut scratch,
@@ -152,20 +144,33 @@ fn assemble(core: &Core<NativeState>, staged: Staged) -> SealedChanges {
 
 fn publish(core: &mut Core<NativeState>, changes: SealedChanges) -> NativeOutcome {
     let outcome = changes.outcome;
+    let encoded_added = crate::native::encoded_added(
+        changes.changes.iter(),
+        core.state.ledger,
+        core.state.payloads(),
+    )
+    .unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let range = core
         .state
         .rows
-        .prepare_batch_with(
+        .prepare_batch_replacing(
             outcome.sequence.0,
             changes.changes,
             BudgetLane::Ordinary,
             prepare::copy,
+            |key, row| removed.count(key, row),
         )
         .unwrap();
     core.publish_native(NativePrepared {
         fragments: range,
         outcome,
         writes: mutation::WriteSet::unrecorded(),
+        encoded_added,
+        encoded_removed: removed.bytes(),
+        _index: None,
+        events: None,
+        retire: None,
     })
     .unwrap()
 }
@@ -522,7 +527,7 @@ fn suffix_refusal_for_bytes_or_visits_leaves_the_actual_source_reusable() {
         let Staged {
             plan,
             extras,
-            meta,
+            mut meta,
             outcome,
             mut scratch,
         } = stage(
@@ -531,10 +536,7 @@ fn suffix_refusal_for_bytes_or_visits_leaves_the_actual_source_reusable() {
             NativeOperation::ReportAdmission,
             Some(&evidence),
         );
-        let view = View {
-            state: &core.state,
-            tail: None,
-        };
+        let view = View::committed(&core.state);
         let mut limits = core.limits;
         if !short_bytes {
             // The original Admission failure now has a real checked journal.
@@ -549,8 +551,20 @@ fn suffix_refusal_for_bytes_or_visits_leaves_the_actual_source_reusable() {
                 admission_graph::checker_visits_bound(&sources, extras.rows.len(), extras.events())
                     .unwrap();
         }
-        let original =
-            OriginalPlan::check(plan, extras, meta, outcome, &view, limits, &mut scratch).unwrap();
+        let window = crate::native::epochs::staged(&view, &mut meta, outcome, limits);
+        let original = OriginalPlan::check(
+            plan,
+            extras,
+            Admitted {
+                meta,
+                outcome,
+                window,
+            },
+            &view,
+            limits,
+            &mut scratch,
+        )
+        .unwrap();
         if short_bytes {
             scratch.max = scratch.used;
         }

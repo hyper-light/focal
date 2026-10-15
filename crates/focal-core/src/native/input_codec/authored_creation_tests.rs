@@ -92,6 +92,15 @@ fn deadline() -> Deadline {
     }
 }
 fn definition(id: u128, parent: u128, delivery: bool) -> descriptor::ValidationDescriptor {
+    definition_at(id, parent, if delivery { 1 } else { 2 }, delivery)
+}
+/// [`definition`]'s validation at declaration index `index`.
+fn definition_at(
+    id: u128,
+    parent: u128,
+    index: u32,
+    delivery: bool,
+) -> descriptor::ValidationDescriptor {
     let phase = |agentic| validation::PhasePolicy {
         evaluator: ISSUER,
         definition: ContentHash([12; 32]),
@@ -106,7 +115,7 @@ fn definition(id: u128, parent: u128, delivery: bool) -> descriptor::ValidationD
             schema: 1,
             claim: ClaimId::from_u128(parent),
             issuer: ISSUER,
-            declaration_index: if delivery { 1 } else { 2 },
+            declaration_index: index,
             kind: if delivery {
                 ValidationKind::Receipt
             } else {
@@ -482,6 +491,7 @@ fn decoded_authored_creation_enters_the_real_ram_owner_without_extra_testimony()
     assert_eq!(
         core.native_claim_content(ClaimId::from_u128(1))
             .unwrap()
+            .unwrap()
             .description(),
         "Fix the regression; report failures as evidence."
     );
@@ -605,4 +615,146 @@ fn final_native_capacity_inspection_prices_each_additional_scope_and_slot() {
         encoded(&plan.build(quote.bytes, quote.construction).unwrap()),
         bytes
     );
+}
+
+/// Measurement, not a check: what an owner spends decoding an authored claim's
+/// frame (inspected, planned and built), over `FOCAL_MEASURE_FRAMES` frames of
+/// one claim and its two validations (2,000 unless set), `FOCAL_MEASURE_ROUNDS`
+/// times for a profiler. The frames are encoded first, as a client encodes them.
+#[test]
+#[ignore = "measurement"]
+fn measure_time_to_decode_an_authored_frame() {
+    let frames: u128 = std::env::var("FOCAL_MEASURE_FRAMES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2_000);
+    let rounds: u32 = std::env::var("FOCAL_MEASURE_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let bytes: Vec<Vec<u8>> = (1..=frames)
+        .map(|id| encoded(&input(vec![proposal(id, Change::None)])))
+        .collect();
+    // The plan alone (FOCAL_MEASURE_PLAN_ONLY): what an owner spent on a
+    // request before it could refuse it for a full queue.
+    let plan_only = std::env::var("FOCAL_MEASURE_PLAN_ONLY").is_ok();
+    for round in 0..rounds {
+        let started = std::time::Instant::now();
+        for frame in &bytes {
+            let plan = inspect(frame)
+                .prepare_authored_creation(native(), limits())
+                .unwrap()
+                .unwrap();
+            if plan_only {
+                std::hint::black_box(plan.intent_fingerprint());
+                continue;
+            }
+            let quote = plan.quote();
+            std::hint::black_box(plan.build(quote.bytes, quote.construction).unwrap());
+        }
+        println!(
+            "round {round}: {frames} frames, {:.1} µs a frame",
+            started.elapsed().as_secs_f64() * 1e6 / frames as f64
+        );
+    }
+}
+
+/// A claim's declarations are read from the frame once and replayed to its
+/// acceptance's passes and its requirements' check when they fit what its
+/// cohort holds, and read from the frame at every pass when they do not: with
+/// 8, 9 and 16 validations, the plan's intent is the typed input's and its
+/// build is the frame.
+#[test]
+fn an_authored_cohort_held_or_read_at_every_pass_reconstructs_the_same_input() {
+    for count in [8u32, 9, 16] {
+        let id = 7;
+        let delivery = definition_at(id * 100, id, 1, true);
+        let checking: Vec<_> = (2..=count)
+            .map(|index| definition_at(id * 100 + u128::from(index), id, index, false))
+            .collect();
+        let requirements: Vec<_> = std::iter::once(&delivery)
+            .chain(&checking)
+            .map(|value| RequirementRef {
+                id: ValidationId(value.binding().object.0),
+                specification: value.specification_hash(),
+            })
+            .collect();
+        let checks: Vec<_> = checking
+            .iter()
+            .map(|value| CheckPolicy {
+                declaration_index: value.declaration().declaration_index(),
+                validation: ValidationId(value.binding().object.0),
+                mode: ValidationMode::Required,
+            })
+            .collect();
+        let slots = [SlotPolicy {
+            slot: 1,
+            missing_declaration_index: 100,
+            mode: ValidationMode::Required,
+            checks: &checks,
+        }];
+        let relations = [
+            Relation {
+                kind: RelationKind::Issuer,
+                target: RelationTarget::Participant(ISSUER),
+            },
+            Relation {
+                kind: RelationKind::Subject,
+                target: RelationTarget::Participant(ParticipantId([2; 16])),
+            },
+            Relation {
+                kind: RelationKind::ClaimAction,
+                target: RelationTarget::Action(ActionType::Challenge),
+            },
+            Relation {
+                kind: RelationKind::CausedBy,
+                target: RelationTarget::Root(RootCommandId([13; 16])),
+            },
+        ];
+        let plan = claim::ClaimDescriptor::prepare(
+            claim::ClaimSpec {
+                ledger: ledger(),
+                id: ClaimId::from_u128(id),
+                schema: 1,
+                occurrence: OccurrenceId::from_u128(id),
+                description: "Fix the regression; report failures as evidence.",
+                relations: &relations,
+                scopes: &[],
+                requirements: &requirements,
+                slots: &slots,
+                deadline: Some(deadline()),
+                policy: None,
+            },
+            limits().claim,
+        )
+        .unwrap();
+        let bytes = plan.construction_charge();
+        let content = plan.build(bytes).unwrap();
+        let mut declarations = checking;
+        declarations.push(delivery);
+        let expected = input(vec![NativeAuthoredProposal {
+            content,
+            declarations,
+            max_responses: 3,
+            scope_limits: scope::ScopeLimits {
+                scopes: 0,
+                roots: 0,
+                children: 0,
+            },
+            owner: None,
+        }]);
+        let bytes = encoded(&expected);
+        let plan = inspect(&bytes)
+            .prepare_authored_creation(native(), limits())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.intent_fingerprint(),
+            super::super::super::intent::fingerprint(ledger(), &expected).unwrap(),
+            "{count} validations"
+        );
+        let quote = plan.quote();
+        let built = plan.build(quote.bytes, quote.construction).unwrap();
+        assert_eq!(encoded(&built), bytes, "{count} validations");
+    }
 }

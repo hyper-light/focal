@@ -17,16 +17,10 @@ fn mid(n: u128) -> MonitorId {
     MonitorId::from_u128(n)
 }
 fn view(core: &Core<NativeState>) -> View<'_> {
-    View {
-        state: &core.state,
-        tail: None,
-    }
+    View::committed(&core.state)
 }
 fn scratch() -> Scratch {
-    Scratch {
-        used: 0,
-        max: 16 * 1024 * 1024,
-    }
+    Scratch::bound(16 * 1024 * 1024)
 }
 fn cut(core: &Core<NativeState>) -> ClaimCut {
     ClaimCut {
@@ -179,7 +173,11 @@ fn install(core: &mut Core<NativeState>, next: ClaimState, extras: Extras, added
     let mut meta = source.meta();
     meta.monitors += added.monitors;
     meta.monitor_links += added.links;
-    changes.push(Change::Put(Entry::new(Key::Meta, Row::Meta(meta), 0)));
+    changes.push(Change::Put(Entry::new(
+        Key::Meta,
+        Row::Meta(Box::new(meta)),
+        0,
+    )));
     let candidate = core
         .state
         .rows
@@ -331,12 +329,12 @@ fn full_chain_is_checked_before_first_yield_and_exact_visit_bound_includes_rerea
     let Some(Row::MonitorLink(Some(link))) = source.get(Key::MonitorLink(id(3), mid(51))) else {
         panic!("link")
     };
-    let mut corrupt = *link;
+    let mut corrupt = **link;
     corrupt.next = Some(mid(51));
     replace(
         &mut core,
         Key::MonitorLink(id(3), mid(51)),
-        Row::MonitorLink(Some(corrupt)),
+        Row::MonitorLink(Some(Box::new(corrupt))),
     );
     let source = view(&core);
     let mut refused = subscribers(&source, id(3), core.limits);
@@ -366,7 +364,7 @@ fn journal_replay_rejects_omitted_neighbors_unrelated_rows_and_wrong_provenance(
                 extra
                     .push(Extra {
                         key: Key::MonitorHead(id(1)),
-                        row: Row::MonitorHead(MonitorHead::default()),
+                        row: Row::MonitorHead(Box::default()),
                         heap: 0,
                         fact: None,
                     })

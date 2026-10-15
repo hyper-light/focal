@@ -49,7 +49,7 @@ pub(crate) async fn save_local_intent(
         // An admitted write may still complete after timeout. Drop its future
         // and recover the original disk record before any subsequent request.
         let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, host.persist_local_intent(owner, bytes)).await {
+        match focal_rt::time::timeout(remaining, host.persist_local_intent(owner, bytes)).await {
             Ok(Ok(owner)) => {
                 *journal = Some(owner);
                 return Ok(());
@@ -63,7 +63,9 @@ pub(crate) async fn save_local_intent(
                 if Instant::now() >= deadline {
                     return Err(LocalIntentError::Capacity);
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                focal_rt::time::sleep(Duration::from_millis(10))
+                    .await
+                    .map_err(|_| LocalIntentError::Unavailable)?;
             }
             Ok(Err(failure)) => {
                 *journal = failure.rejected.map(|(owner, _)| owner);
@@ -77,7 +79,7 @@ pub(crate) async fn save_local_intent(
 pub(super) struct LocalIntentWrite {
     journal: PrivateJournal,
     bytes: Vec<u8>,
-    response: oneshot::Sender<(IntentResult, Allocation)>,
+    response: OneshotSender<(IntentResult, Allocation)>,
     input: Allocation,
 }
 impl LocalIntentWrite {
@@ -137,7 +139,12 @@ impl ControlHost {
                 });
             }
         };
-        let (response, receive) = oneshot::channel();
+        let Ok((response, receive)) = hyper_rt::sync::oneshot() else {
+            return Err(LocalIntentFailure {
+                error: LocalIntentError::Capacity,
+                rejected: Some((journal, bytes)),
+            });
+        };
         let work = Work::PersistLocalIntent(Box::new(LocalIntentWrite {
             journal,
             bytes,

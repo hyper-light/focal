@@ -286,6 +286,23 @@ impl Directory {
         sync_dir(&self.path)?;
         Ok(())
     }
+    /// The child directories by name, at most `limit` of them; files and
+    /// links are not children.
+    pub(crate) fn children(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if names.len() >= limit {
+                break;
+            }
+            names.try_reserve(1).map_err(|_| StoreError::Capacity)?;
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        Ok(names)
+    }
     pub(crate) fn check_child(&self, component: &str) -> Result<(), StoreError> {
         let owner = store_owner(&self.path)?;
         match focal_platform::fs::private_dir_owner(&self.path.join(component)) {

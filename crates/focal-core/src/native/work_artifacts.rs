@@ -34,7 +34,7 @@ pub(super) fn cycle(
 ) -> Result<NativeCycle, NativeError> {
     let cycle = match view.get(Key::Cycle(NativeCycleKey::of(parent))) {
         None => NativeCycle::default(),
-        Some(Row::Cycle(cycle)) => *cycle,
+        Some(Row::Cycle(cycle)) => **cycle,
         Some(_) => return Err(ContractError::InvalidTarget.into()),
     };
     if cycle.response.is_some() {
@@ -599,7 +599,7 @@ pub(super) fn prepare(
     }
     extras.push(Extra {
         key: Key::Cycle(key),
-        row: Row::Cycle(cycle),
+        row: Row::Cycle(Box::new(cycle)),
         heap: 0,
         fact: (!plan.registry.is_empty()).then_some(NativeFact::Registrations { claim }),
     })?;

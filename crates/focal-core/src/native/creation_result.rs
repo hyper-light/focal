@@ -182,10 +182,35 @@ impl NativeCreationResult {
     }
 }
 
-/// The result already owns its bounded vector. An inline wrapper adds neither
-/// a second mapping buffer nor a singleton allocation to the range row.
+/// A creation result as its row holds it: its bounded vector inline (no second mapping buffer nor
+/// a singleton allocation), or, spilled to the replica's payload log (doc 31 M3), where its record
+/// encoding is, nothing on the heap. A spilled one is read on exact retries and by readers alone,
+/// decoded and charged while it is held ([`OwnedCreationResult::read`]).
 #[derive(Debug)]
-pub(super) struct OwnedCreationResult(NativeCreationResult);
+pub(super) enum OwnedCreationResult {
+    Held(NativeCreationResult),
+    Logged(super::payloads::PayloadRef),
+}
+
+/// A creation result as a read takes it: a held row's, borrowed, or a spilled row's, decoded and
+/// charged while it is held.
+#[derive(Debug)]
+pub enum NativeCreationRead<'a> {
+    Borrowed(&'a NativeCreationResult),
+    Decoded {
+        result: NativeCreationResult,
+        _charge: focal_memory::Allocation,
+    },
+}
+impl std::ops::Deref for NativeCreationRead<'_> {
+    type Target = NativeCreationResult;
+    fn deref(&self) -> &NativeCreationResult {
+        match self {
+            Self::Borrowed(result) => result,
+            Self::Decoded { result, .. } => result,
+        }
+    }
+}
 
 impl OwnedCreationResult {
     pub(super) const fn container_charge() -> usize {
@@ -194,22 +219,90 @@ impl OwnedCreationResult {
 
     pub(super) fn new(result: NativeCreationResult) -> Result<Self, MemoryError> {
         result.heap_charge()?;
-        Ok(Self(result))
+        Ok(Self::Held(result))
     }
 
-    pub(super) fn get(&self) -> &NativeCreationResult {
-        &self.0
+    /// A held row's result: none for a spilled one. A candidate's rows are held until every
+    /// check has read them.
+    pub(super) fn held(&self) -> Option<&NativeCreationResult> {
+        match self {
+            Self::Held(result) => Some(result),
+            Self::Logged(_) => None,
+        }
+    }
+
+    /// The result, a spilled one read back through `payloads`, decoded and charged to `budget` in
+    /// `lane` while it is held.
+    pub(super) fn read(
+        &self,
+        payloads: Option<&dyn super::payloads::PayloadRead>,
+        budget: &focal_memory::MemoryBudget,
+        lane: focal_memory::BudgetLane,
+    ) -> Result<NativeCreationRead<'_>, NativeError> {
+        match self {
+            Self::Held(result) => Ok(NativeCreationRead::Borrowed(result)),
+            Self::Logged(at) => {
+                let mut buffer = [0u8; super::payloads::SPILLED_BYTES];
+                let bytes = buffer
+                    .get_mut(..at.len())
+                    .ok_or(super::payloads::PayloadError::Corrupt)?;
+                payloads
+                    .ok_or(super::payloads::PayloadError::Unavailable)?
+                    .read(*at, bytes)?;
+                let charge = budget
+                    .reserve(
+                        focal_memory::BudgetKind::Query,
+                        lane,
+                        super::record_codec::creation_decode_bound(bytes.len())?,
+                    )?
+                    .commit();
+                let result = super::record_codec::decode_creation(bytes)?;
+                fits(result.heap_charge()?, charge.bytes())?;
+                Ok(NativeCreationRead::Decoded {
+                    result,
+                    _charge: charge,
+                })
+            }
+        }
+    }
+
+    /// This row spilled to `log` as its record encoding, where it is held, the encoding fits a
+    /// spilled row and the log takes it: what a candidate's rows become once every check has read
+    /// them.
+    pub(super) fn spill(
+        &self,
+        log: &dyn super::payloads::PayloadLog,
+    ) -> Result<Option<Self>, NativeError> {
+        if !matches!(self, Self::Held(_)) {
+            return Ok(None);
+        }
+        let mut buffer = [0u8; super::payloads::SPILLED_BYTES];
+        let Some(len) = super::record_codec::encode_creation(self, &mut buffer) else {
+            return Ok(None);
+        };
+        let bytes = buffer
+            .get(..len)
+            .ok_or(NativeError::Capacity("creation result row"))?;
+        Ok(log.append(bytes).map(Self::Logged))
     }
 
     pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
-        self.0.heap_charge()
+        match self {
+            Self::Held(result) => result.heap_charge(),
+            Self::Logged(_) => Ok(0),
+        }
     }
 
     pub(super) fn copy(&self) -> Result<Self, MemoryError> {
-        let allowance = self.heap_charge()?;
-        let copied = Self::new(self.0.try_copy(allowance)?)?;
-        fits(copied.heap_charge()?, allowance)?;
-        Ok(copied)
+        match self {
+            Self::Held(result) => {
+                let allowance = self.heap_charge()?;
+                let copied = Self::new(result.try_copy(allowance)?)?;
+                fits(copied.heap_charge()?, allowance)?;
+                Ok(copied)
+            }
+            Self::Logged(at) => Ok(Self::Logged(*at)),
+        }
     }
 }
 

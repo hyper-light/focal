@@ -24,7 +24,7 @@ impl NativeOutput {
             array::<NativeCommit>(commits)?,
             array::<NativeReadBoundary>(reads)?,
         )?;
-        let permit = budget.reserve(BudgetKind::Pending, BudgetLane::Completion, charge)?;
+        let permit = budget.reserve(BudgetKind::Pending, BudgetLane::Committed, charge)?;
         Ok(Self {
             committed: reserved(commits)?,
             reads: reserved(reads)?,
@@ -137,7 +137,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             }
             Err(error) => {
                 if error.class() == FailureClass::FailClosed {
-                    self.failed = true;
+                    self.fail_closed(&error);
                 }
                 self.delivery = Some(delivery);
                 Err(error)
@@ -152,6 +152,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     ) -> Result<(), NativeSessionError> {
         self.ready_term = None;
         self.pending.clear();
+        self.encoded = 0;
+        self.submitted = 0;
+        self.flush_stalled = false;
         let domain = self.domain.take().ok_or(NativeSessionError::Failed)?;
         let core = match domain {
             Domain::Passive(core) => core,
@@ -191,6 +194,16 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 return Err(NativeSessionError::Corrupt);
             }
             self.resolve_suffix(SuffixEvidence::NewerTermBarrier)?;
+        }
+        #[cfg(test)]
+        if self.refuse_reconstructions > 0 {
+            self.refuse_reconstructions = self.refuse_reconstructions.saturating_sub(1);
+            return Err(NativeSessionError::Memory(
+                focal_memory::MemoryError::Capacity {
+                    requested: 1,
+                    available: 0,
+                },
+            ));
         }
         let domain = self.domain.take().ok_or(NativeSessionError::Failed)?;
         self.domain = Some(match domain {
@@ -327,6 +340,20 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             self.resolve_suffix(SuffixEvidence::LayoutChanged)?;
         }
         let max = self.limits.recovery.native.max_ranges;
+        // What decides whether this replica can hold the committed layout is
+        // checked first, against its committed layout and its member bound:
+        // a refusal there means it is configured below the authority, and it
+        // fails closed. What can fail after it is memory for the boundary
+        // pages the split copies: a resource the delivery waits for, retried
+        // at the next poll (the record is not applied until it succeeds).
+        let layout = self.committed_core()?.native_layout();
+        let checked = match record.operation {
+            range::LayoutOperation::Split { at, id } => layout.check_split(at, id, max),
+            range::LayoutOperation::Merge { left } => layout.check_merge(left).map(|_| ()),
+        };
+        if checked.is_err() {
+            return Err(NativeSessionError::Corrupt);
+        }
         let applied = match self.domain.as_mut() {
             Some(Domain::Passive(core)) => apply_layout_to(core, record.operation, max),
             Some(Domain::Active(owner, _)) => match record.operation {
@@ -342,7 +369,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             },
             None => return Err(NativeSessionError::Failed),
         };
-        applied.map_err(|_| NativeSessionError::Corrupt)?;
+        applied?;
         if let Some(movement) = self.movement.as_mut() {
             match record.operation {
                 range::LayoutOperation::Split { at, id } => movement.split(at, id)?,
@@ -353,8 +380,17 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     }
     /// Apply a committed retirement record (26 §4): inert when the prefix
     /// it named has passed, a movement is pending, or the committed state
-    /// refuses the family; otherwise the same family leaves this replica
-    /// alike behind its continuation, and the record counts. On an
+    /// refuses the family — the same on every replica, and counted
+    /// (`retirements_inert`); otherwise the same family leaves this replica
+    /// alike behind its continuation, and the record counts. One refusal
+    /// is not inert: a record that carries the outcome bound the authority
+    /// checked it against, whose outcome this replica's own bound cannot
+    /// hold, fails closed (`OutcomeBound`) — this replica is configured
+    /// below the authority, and applying nothing where every other replica
+    /// retired would diverge silently, while applying it would make a
+    /// state its own checkpoint could not restore. A version-1 record
+    /// carries no bound (it was proposed without the check): where it does
+    /// not fit it is inert and counted, as any refused family. On an
     /// authority the record ends every pending candidate first; the owner
     /// is reconstructed at the next readiness barrier, as after any record
     /// it did not author.
@@ -367,6 +403,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             self.retirement = None;
         }
         if self.sequence()? != record.expected_prefix {
+            self.retirements_inert = self.retirements_inert.saturating_add(1);
             return Ok(());
         }
         if self
@@ -374,6 +411,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             .as_ref()
             .is_some_and(|movement| movement.pending().is_some())
         {
+            self.retirements_inert = self.retirements_inert.saturating_add(1);
             return Ok(());
         }
         if !self.pending.is_empty() {
@@ -385,13 +423,29 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         // a fresh readiness barrier and reconstructs its owner there.
         self.readiness_requested = None;
         self.reconstruction_needed = true;
+        let local = u64::try_from(self.limits.recovery.native.outcomes).unwrap_or(u64::MAX);
         let Some(Domain::Passive(core)) = self.domain.as_mut() else {
             return Err(NativeSessionError::Failed);
         };
-        let Ok(family) = core.retirement_family(record.root) else {
-            return Ok(());
+        // A family is derived through the event index (doc 31 M2); one a restore could not
+        // fund is built now.
+        core.build_event_index();
+        let family = match core.retirement_family(record.root) {
+            Ok(family) => family,
+            Err(focal_core::native::retirement::RetirementRefusal::OutcomeCapacity) => {
+                if let Some(committed) = record.outcome_limit {
+                    return Err(NativeSessionError::OutcomeBound { committed, local });
+                }
+                self.retirements_inert = self.retirements_inert.saturating_add(1);
+                return Ok(());
+            }
+            Err(_) => {
+                self.retirements_inert = self.retirements_inert.saturating_add(1);
+                return Ok(());
+            }
         };
         if record.through < family.through {
+            self.retirements_inert = self.retirements_inert.saturating_add(1);
             return Ok(());
         }
         match core.retire_native_family(&family, record.bundle, record.bytes, record.through) {
@@ -402,6 +456,171 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             Err(_) => return Err(NativeSessionError::Corrupt),
         }
         self.retired_families = self.retired_families.saturating_add(1);
+        self.sweep_payloads_if_due();
+        Ok(())
+    }
+    /// Apply a committed seal record (F12): inert when the prefix it named
+    /// has passed or a movement is pending — the same on every replica, and
+    /// counted (`seals_inert`); otherwise the same plan is derived from the
+    /// committed state under the floors and the bound the record names, and
+    /// the same rows leave this replica alike behind the seal's row. The
+    /// floors are the pressure floors of the prefix: a replica that derives
+    /// others under another resident outcome bound than the authority's is
+    /// configured apart from it and fails closed by name (`OutcomeBound`),
+    /// as for a retirement; under the same bound they are a divergence
+    /// (`Corrupt`), as is a plan whose count is not the record's. On an
+    /// authority the record ends every pending candidate first; the owner
+    /// is reconstructed at the next readiness barrier.
+    fn apply_seal(&mut self, data: &[u8]) -> Result<(), NativeSessionError> {
+        let record = seal::SealRecord::decode(data)?;
+        if record.ledger != self.ledger {
+            return Err(NativeSessionError::Corrupt);
+        }
+        if self.seal.as_ref() == Some(&record) {
+            self.seal = None;
+        }
+        if self.sequence()? != record.expected_prefix {
+            self.seals_inert = self.seals_inert.saturating_add(1);
+            return Ok(());
+        }
+        if self
+            .movement
+            .as_ref()
+            .is_some_and(|movement| movement.pending().is_some())
+        {
+            self.seals_inert = self.seals_inert.saturating_add(1);
+            return Ok(());
+        }
+        if !self.pending.is_empty() {
+            self.resolve_suffix(SuffixEvidence::Retired)?;
+        } else if matches!(self.domain, Some(Domain::Active(..))) {
+            self.passive_for_replay()?;
+        }
+        self.readiness_requested = None;
+        self.reconstruction_needed = true;
+        let local = u64::try_from(self.limits.recovery.native.outcomes).unwrap_or(u64::MAX);
+        let Some(Domain::Passive(core)) = self.domain.as_mut() else {
+            return Err(NativeSessionError::Failed);
+        };
+        let floors = core
+            .pressure_floors(record.floors.len())
+            .map_err(NativeSessionError::Native)?;
+        if floors != record.floors {
+            if record.outcome_limit != local {
+                return Err(NativeSessionError::OutcomeBound {
+                    committed: record.outcome_limit,
+                    local,
+                });
+            }
+            return Err(NativeSessionError::Corrupt);
+        }
+        let applied = core.apply_seal(focal_core::native::seal::SealRecord {
+            floors: &record.floors,
+            bound: record.bound,
+            bundle: record.bundle,
+            bytes: record.bytes,
+            count: record.count,
+            fold: record.fold,
+        });
+        match applied {
+            Ok(_) => {}
+            Err(error @ (NativeError::Memory(_) | NativeError::Capacity(_))) => {
+                return Err(error.into());
+            }
+            Err(_) => return Err(NativeSessionError::Corrupt),
+        }
+        self.seals_applied = self.seals_applied.saturating_add(1);
+        Ok(())
+    }
+    /// Apply a committed anchored seal record (F12, `SealRule::Anchored`):
+    /// inert when the prefix it named has passed or a movement is pending,
+    /// as a derived seal's; otherwise the floors are the pressure's here (a
+    /// replica under another resident outcome bound fails closed by name,
+    /// `OutcomeBound`; under the same bound they are a divergence), and the
+    /// plan the record names is derived again and published
+    /// (`Core::apply_anchored`). The authority proposed it with nothing
+    /// pending, and admission held behind it, so the state it applies to is
+    /// the state it was proposed against: a plan or an ordinal that does
+    /// not hold is a divergence. An owner with nothing pending takes it in
+    /// place and goes on (`NativeOwner::apply_anchored`); any other replica
+    /// applies it to its committed rows and rebuilds its owner at the next
+    /// readiness barrier. A closing seal is counted apart.
+    fn apply_anchored_seal(&mut self, data: &[u8]) -> Result<(), NativeSessionError> {
+        let record = seal::AnchoredSealRecord::decode(data)?;
+        if record.ledger != self.ledger {
+            return Err(NativeSessionError::Corrupt);
+        }
+        if self.anchored.as_ref() == Some(&record) {
+            self.anchored = None;
+        }
+        if self.sequence()? != record.expected_prefix {
+            self.seals_inert = self.seals_inert.saturating_add(1);
+            return Ok(());
+        }
+        if self
+            .movement
+            .as_ref()
+            .is_some_and(|movement| movement.pending().is_some())
+        {
+            self.seals_inert = self.seals_inert.saturating_add(1);
+            return Ok(());
+        }
+        if !self.pending.is_empty() {
+            self.resolve_suffix(SuffixEvidence::Retired)?;
+        }
+        self.close_check_at = 0;
+        let local = u64::try_from(self.limits.recovery.native.outcomes).unwrap_or(u64::MAX);
+        let floors = self
+            .committed_core()?
+            .close_floors(record.floors.len())
+            .map_err(NativeSessionError::Native)?;
+        if floors != record.floors {
+            if record.outcome_limit != local {
+                return Err(NativeSessionError::OutcomeBound {
+                    committed: record.outcome_limit,
+                    local,
+                });
+            }
+            return Err(NativeSessionError::Corrupt);
+        }
+        let anchored = || focal_core::native::seal::AnchoredRecord {
+            floors: &record.floors,
+            ordinal: record.ordinal,
+            through: record.through,
+            principals: &record.principals,
+            count: record.count,
+            bundle: record.bundle,
+            bytes: record.bytes,
+            fold: record.fold,
+        };
+        let refused = |error: NativeError| -> NativeSessionError {
+            match error {
+                error @ (NativeError::Memory(_) | NativeError::Capacity(_)) => error.into(),
+                _ => NativeSessionError::Corrupt,
+            }
+        };
+        let in_place = match self.domain.as_mut() {
+            Some(Domain::Active(owner, _)) => {
+                owner.apply_anchored(anchored()).map_err(refused)?.is_some()
+            }
+            _ => false,
+        };
+        if !in_place {
+            if matches!(self.domain, Some(Domain::Active(..))) {
+                self.passive_for_replay()?;
+            }
+            self.readiness_requested = None;
+            self.reconstruction_needed = true;
+            let Some(Domain::Passive(core)) = self.domain.as_mut() else {
+                return Err(NativeSessionError::Failed);
+            };
+            core.apply_anchored(anchored()).map_err(refused)?;
+        }
+        if record.is_closing() {
+            self.closes_applied = self.closes_applied.saturating_add(1);
+        } else {
+            self.seals_applied = self.seals_applied.saturating_add(1);
+        }
         Ok(())
     }
     /// Apply a committed movement record (25 §6): the coordinator's step at
@@ -480,7 +699,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     }
     /// Term and role observation. A change alone leaves unresolved candidates
     /// and grants intact; only committed evidence may discard them.
-    pub(crate) fn observe(&mut self, status: &NodeStatus) {
+    pub(crate) fn observe(&mut self, status: &focal_consensus::NodeScalars) {
         let leader = status.role == StateRole::Leader;
         if status.term != self.observed_term || leader != self.observed_leader {
             self.ready_term = None;
@@ -489,6 +708,11 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             self.genesis_proposed = false;
             self.layout_change = None;
             self.retirement = None;
+            self.seal = None;
+            self.anchored = None;
+            self.waiting_seal = None;
+            self.close_wanted = false;
+            self.close_check_at = 0;
             if let Some(movement) = self.movement.as_mut() {
                 movement.in_flight = None;
             }
@@ -500,9 +724,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn is_native_entry(data: &[u8]) -> bool {
         data.starts_with(&genesis::MAGIC)
             || data.starts_with(&record::MAGIC)
+            || data.starts_with(&record::RETIRE_MAGIC)
             || data.starts_with(&range::MAGIC)
             || data.starts_with(&movement::MAGIC)
             || data.starts_with(&retirement::MAGIC)
+            || data.starts_with(&seal::MAGIC)
+            || data.starts_with(&seal::ANCHORED_MAGIC)
     }
     /// Caller-issued read barriers carry this correlation namespace.
     pub(crate) fn is_correlated_read(context: &[u8]) -> bool {
@@ -575,6 +802,28 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             self.applied_raft = entry.index;
             return Ok(());
         }
+        if entry.data.starts_with(&seal::MAGIC) {
+            if self.genesis.is_none() {
+                return Err(NativeSessionError::Corrupt);
+            }
+            self.apply_seal(&entry.data)?;
+            self.applied_raft = entry.index;
+            return Ok(());
+        }
+        if entry.data.starts_with(&seal::ANCHORED_MAGIC) {
+            if self.genesis.is_none() {
+                return Err(NativeSessionError::Corrupt);
+            }
+            self.apply_anchored_seal(&entry.data)?;
+            self.applied_raft = entry.index;
+            return Ok(());
+        }
+        if entry.data.starts_with(&record::RETIRE_MAGIC) {
+            if self.genesis.is_none() {
+                return Err(NativeSessionError::Corrupt);
+            }
+            return self.apply_retire_record(entry, output);
+        }
         if !entry.data.starts_with(&record::MAGIC) {
             return Err(NativeSessionError::Legacy);
         }
@@ -595,23 +844,16 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             return Err(NativeSessionError::Corrupt);
         }
         let matches = self.pending.front().is_some_and(|pending| {
-            pending.submitted
+            self.submitted > 0
                 && pending.hash == Some(header.hash)
                 && pending.outcome == header.outcome
                 && header.range == self.range
         });
+        if output.committed.len() == output.committed.capacity() {
+            return Err(NativeSessionError::Capacity("committed output"));
+        }
         let outcome = if matches {
-            let candidate = self
-                .pending
-                .front()
-                .ok_or(NativeSessionError::Corrupt)?
-                .candidate;
-            let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
-                return Err(NativeSessionError::Corrupt);
-            };
-            let outcome = owner.publish_after_durable(candidate)?;
-            self.pending.pop_front();
-            outcome
+            self.publish_own_head()?
         } else {
             if !self.pending.is_empty() {
                 // A different record at our committed prefix: the whole suffix
@@ -660,8 +902,160 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 self.materializer.serial_micros.saturating_add(elapsed);
             outcome
         };
+        output.committed.push(NativeCommit {
+            raft_index: entry.index,
+            raft_term: entry.term,
+            record_hash: header.hash,
+            outcome,
+        });
+        self.applied_raft = entry.index;
+        self.recording_range = Some(header.range);
+        self.recording_term = entry.term;
+        Ok(())
+    }
+    /// The cold batch of a cold retirement record (doc 31 M2, A2), from the committed rows at its
+    /// base, each family's frame the one the record names: a replica whose rows make another is
+    /// diverged, and one that keeps no cold streams cannot follow the log.
+    fn cold_batch(
+        &self,
+        record: &record::RetireRecord,
+    ) -> Result<focal_core::native::retirement::ColdBatch, NativeSessionError> {
+        if !self.cold.is_kept() {
+            return Err(NativeSessionError::Stopped(Box::from(
+                "a cold retirement on a replica that keeps no cold streams",
+            )));
+        }
+        let core = match self.domain.as_ref() {
+            Some(Domain::Active(owner, _)) => owner.committed_core(),
+            Some(Domain::Passive(core)) => core,
+            None => return Err(NativeSessionError::Failed),
+        };
+        let retired = record.retired();
+        let mut roots = Vec::new();
+        roots
+            .try_reserve_exact(retired.len())
+            .map_err(|_| NativeSessionError::Capacity("cold batch"))?;
+        roots.extend(retired.iter().map(|one| one.root));
+        // Written at the record's own sequence, the prefix every frame claims.
+        let batch = core.cold_batch(
+            &roots,
+            record.header().outcome.sequence,
+            self.limits.encoding,
+            &self.budget,
+            BudgetLane::Committed,
+        )?;
+        let alike = batch.entries.len() == retired.len()
+            && batch.entries.iter().zip(retired).all(|(entry, one)| {
+                entry.root == one.root
+                    && entry.digest == one.bundle
+                    && u64::from(entry.length) == one.bytes
+            });
+        if !alike {
+            return Err(NativeSessionError::Native(
+                focal_model::lifecycle::ContractError::InvalidManifest.into(),
+            ));
+        }
+        Ok(batch)
+    }
+    /// Publish this leader's own oldest candidate, which the committed entry carries.
+    fn publish_own_head(&mut self) -> Result<NativeOutcome, NativeSessionError> {
+        let candidate = self
+            .pending
+            .front()
+            .ok_or(NativeSessionError::Corrupt)?
+            .candidate;
+        let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
+            return Err(NativeSessionError::Corrupt);
+        };
+        let outcome = owner.publish_after_durable(candidate)?;
+        self.pending.pop_front();
+        self.encoded = self.encoded.saturating_sub(1);
+        self.submitted = self.submitted.saturating_sub(1);
+        self.shrink_pending();
+        Ok(outcome)
+    }
+    /// Apply a committed retirement batch (doc 31 M2), in Raft order with the native records
+    /// around it and under the same header rules: this leader's own candidate published where
+    /// the entry carries it, else the families derived from the committed rows at the record's
+    /// place and retired alike. Rows that cannot derive them alike are a divergence that stops
+    /// this replica (`InvalidManifest`), never a retirement skipped.
+    fn apply_retire_record(
+        &mut self,
+        entry: &focal_consensus::CommittedEntry,
+        output: &mut NativeOutput,
+    ) -> Result<(), NativeSessionError> {
+        let record = record::RetireRecord::inspect(
+            &entry.data,
+            self.limits.inspection,
+            focal_core::native::retirement_batch::MAX_RETIRE_FAMILIES,
+        )?;
+        let header = record.header();
+        if header.ledger != self.ledger
+            || header.profile != self.profile
+            || header.range.0 == 0
+            || header.base != self.sequence()?
+            || entry.term == 0
+            || entry.term < self.recording_term
+            || (entry.term == self.recording_term && self.recording_range != Some(header.range))
+            || (self.recording_range.is_none() && header.base != self.records_floor)
+        {
+            return Err(NativeSessionError::Corrupt);
+        }
+        let matches = self.pending.front().is_some_and(|pending| {
+            self.submitted > 0
+                && pending.hash == Some(header.hash)
+                && pending.outcome == header.outcome
+                && header.range == self.range
+        });
+        // A cold record's batch (doc 31 M2, A2): encoded here from the committed rows at the
+        // record's base, the leader's and a follower's alike, checked family by family against
+        // the record, and appended to the cold streams once the record applies. What it takes of
+        // the streams is promised first: a refusal (no room, no memory) leaves the record to be
+        // applied again, nothing changed, and once it applies its batch fails only on IO.
+        let cold = if record.version() == focal_core::native::retirement_batch::RETIRE_COLD {
+            let batch = self.cold_batch(&record)?;
+            let room = self
+                .cold
+                .writer(self.cold_source.as_ref(), &self.budget)
+                .map_err(super::cold::cold_error)?
+                .ok_or(NativeSessionError::Failed)?
+                .room(batch.bytes.len())
+                .map_err(super::cold::cold_error)?;
+            Some((batch, room))
+        } else {
+            None
+        };
         if output.committed.len() == output.committed.capacity() {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("committed output"));
+        }
+        let outcome = if matches {
+            self.publish_own_head()?
+        } else {
+            if !self.pending.is_empty() {
+                self.resolve_suffix(SuffixEvidence::ConflictingCommittedPrefix)?;
+            } else if matches!(self.domain, Some(Domain::Active(..))) {
+                self.passive_for_replay()?;
+            }
+            let Some(Domain::Passive(core)) = self.domain.as_mut() else {
+                return Err(NativeSessionError::Failed);
+            };
+            core.build_event_index();
+            core.apply_retirement_record(&record)?
+        };
+        if let Some((batch, room)) = cold {
+            let appended = match self.cold.writer(self.cold_source.as_ref(), &self.budget) {
+                Ok(Some(writer)) => writer.append(outcome.sequence, &batch.bytes, room),
+                Ok(None) => Err(focal_evidence::ContentError::Failed),
+                Err(error) => Err(error),
+            };
+            // The record applied and its batch is not in the streams: this replica stops, and a
+            // reopen restores the streams from its checkpoint and appends the batch again as it
+            // replays the record.
+            if let Err(error) = appended {
+                return Err(NativeSessionError::Stopped(Box::from(format!(
+                    "a cold batch could not be appended after its record applied: {error}"
+                ))));
+            }
         }
         output.committed.push(NativeCommit {
             raft_index: entry.index,
@@ -669,6 +1063,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             record_hash: header.hash,
             outcome,
         });
+        self.retired_families = self
+            .retired_families
+            .saturating_add(u64::try_from(record.retired().len()).unwrap_or(u64::MAX));
+        self.sweep_payloads_if_due();
         self.applied_raft = entry.index;
         self.recording_range = Some(header.range);
         self.recording_term = entry.term;
@@ -735,7 +1133,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         let mut records = Vec::new();
         records
             .try_reserve_exact(entries.len())
-            .map_err(|_| NativeSessionError::Capacity)?;
+            .map_err(|_| NativeSessionError::Capacity("replayed records"))?;
         let mut sequence = self.sequence()?;
         let mut recording_range = self.recording_range;
         let mut recording_term = self.recording_term;
@@ -782,6 +1180,15 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             recording_term = entry.term;
             expected_index = Some(entry.index);
         }
+        // Room for every commit the run reports, before any record publishes.
+        if output
+            .committed
+            .capacity()
+            .saturating_sub(output.committed.len())
+            < entries.len()
+        {
+            return Err(NativeSessionError::Capacity("committed output"));
+        }
         if matches!(self.domain, Some(Domain::Active(..))) {
             self.passive_for_replay()?;
         }
@@ -824,12 +1231,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             stats.serial_fallbacks = stats.serial_fallbacks.saturating_add(1);
         }
         let mut applied = 0usize;
-        for (outcome, entry) in batch.outcomes.into_iter().zip(entries) {
-            let record = record::StructuralRecord::inspect(&entry.data, self.limits.inspection)?;
+        // Each record as the walk above inspected it.
+        for ((outcome, entry), (record, _)) in batch.outcomes.into_iter().zip(entries).zip(&records)
+        {
             let header = record.header();
-            if output.committed.len() == output.committed.capacity() {
-                return Err(NativeSessionError::Capacity);
-            }
             output.committed.push(NativeCommit {
                 raft_index: entry.index,
                 raft_term: entry.term,
@@ -878,7 +1283,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             native_sequence: self.sequence()?,
         };
         if output.reads.len() == output.reads.capacity() {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("read output"));
         }
         output.reads.push(boundary);
         Ok(())
@@ -888,7 +1293,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// leader without a genesis proposes it.
     pub(crate) fn settle(
         &mut self,
-        status: &NodeStatus,
+        status: &focal_consensus::NodeScalars,
         consensus: &mut DurableNode,
     ) -> Result<(), NativeSessionError> {
         let leader = status.role == StateRole::Leader;
@@ -899,6 +1304,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             && self.applied_raft != 0
             && consensus.has_committed_current_term()
             && consensus.published_term(self.applied_raft)? == status.term
+            // Past the entry the term began with: in a fast group what the new leader recovered
+            // is of its term too, and precedes that entry, so a candidate restamped there is
+            // published before it, never discarded (hyper-raft S-4).
+            && consensus.term_began_by(self.applied_raft)?
         {
             self.resolve_suffix(SuffixEvidence::NewerTermBarrier)?;
         }
@@ -926,14 +1335,22 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         &mut self,
         consensus: &mut DurableNode,
     ) -> Option<NativeSessionError> {
-        if !self.is_authoritative(&consensus.status()) {
+        if !self.is_authoritative(&consensus.scalars()) {
             return None;
         }
-        match self.flush_proposals(consensus) {
+        // A host taking a batch proposes its candidates when the batch ends
+        // (`flush_deferred`), not at a poll inside it; a seal held for the
+        // drain is proposed once nothing is pending, batch or not.
+        let flushed = if self.defer_proposals {
+            Ok(())
+        } else {
+            self.flush_proposals(consensus)
+        };
+        match flushed.and_then(|()| self.propose_wanted(consensus)) {
             Ok(()) => None,
             Err(error) => {
                 if error.class() == FailureClass::FailClosed {
-                    self.failed = true;
+                    self.fail_closed(&error);
                 }
                 Some(error)
             }
@@ -944,14 +1361,18 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &mut DurableNode,
         delivery: &mut Delivery,
     ) -> Result<(), NativeSessionError> {
-        let status = consensus.status();
+        let status = consensus.scalars();
         let leader = status.role == StateRole::Leader;
         self.observe(&status);
         if delivery.output.is_none() {
             delivery.output = Some(NativeOutput::reserve(
                 &self.budget,
                 delivery.events.committed.len(),
-                delivery.events.read_states.len(),
+                delivery
+                    .events
+                    .read_states
+                    .len()
+                    .saturating_add(self.parked_reads.len()),
             )?);
         }
         if !delivery.snapshot {
@@ -994,26 +1415,31 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             delivery.membership = add(delivery.membership, 1)?;
         }
         self.finish_entries(applied_index)?;
+        // Barriers parked by an earlier delivery whose index this one reached.
+        let bound = consensus.pending_reads();
+        for barrier in self.take_applied_parked_reads() {
+            self.apply_read_barrier(&barrier, leader, &status, consensus, delivery)?;
+        }
         while let Some(barrier) = delivery.events.read_states.get(delivery.read) {
             if barrier.index > self.applied_raft {
-                return Err(NativeSessionError::Corrupt);
-            }
-            // Classify the barrier by its 8-byte magic, not by full equality with
-            // the current term: READINESS and CORRELATION share their first seven
-            // bytes, so a readiness barrier confirmed in a prior term and drained
-            // after a term bump would otherwise be misread as a correlated read
-            // and fail closed. A readiness barrier for the current term promotes;
-            // a stale-term one is a benign internal barrier and is ignored.
-            if barrier.context.starts_with(READINESS.as_slice()) {
-                if leader && barrier.context == readiness(status.term) {
-                    self.promote(status.term, consensus)?;
+                // Answered by a leader ahead of this copy: the read waits
+                // for the entries it names (27 §5, follower reads).
+                match self.park_read(barrier, bound) {
+                    Ok(()) => {}
+                    // The parked set is full: the barrier is dropped and
+                    // counted, never held back with the delivery — the
+                    // delivery carries the entries the parked reads wait
+                    // for; new reads are refused at the request.
+                    Err(NativeSessionError::Capacity(_)) => {
+                        self.reads_dropped = self.reads_dropped.saturating_add(1);
+                    }
+                    Err(error) => return Err(error),
                 }
-            } else if Self::is_correlated_read(&barrier.context) {
-                let output = delivery.output.as_mut().ok_or(NativeSessionError::Failed)?;
-                self.apply_correlated_read(barrier, output)?;
-            } else {
-                return Err(NativeSessionError::Corrupt);
+                delivery.read = add(delivery.read, 1)?;
+                continue;
             }
+            let barrier = barrier.clone();
+            self.apply_read_barrier(&barrier, leader, &status, consensus, delivery)?;
             delivery.read = add(delivery.read, 1)?;
         }
         self.settle(&status, consensus)?;
@@ -1027,13 +1453,40 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         Ok(())
     }
+    /// One barrier this copy has applied up to. Classified by its 8-byte
+    /// magic, not by full equality with the current term: READINESS and
+    /// CORRELATION share their first seven bytes, so a readiness barrier
+    /// confirmed in a prior term and drained after a term bump would
+    /// otherwise be misread as a correlated read and fail closed. A
+    /// readiness barrier for the current term promotes; a stale-term one is
+    /// a benign internal barrier and is ignored.
+    fn apply_read_barrier(
+        &mut self,
+        barrier: &focal_consensus::ReadBarrier,
+        leader: bool,
+        status: &focal_consensus::NodeScalars,
+        consensus: &mut DurableNode,
+        delivery: &mut Delivery,
+    ) -> Result<(), NativeSessionError> {
+        if barrier.context.starts_with(READINESS.as_slice()) {
+            if leader && barrier.context == readiness(status.term) {
+                self.promote(status.term, consensus)?;
+            }
+        } else if Self::is_correlated_read(&barrier.context) {
+            let output = delivery.output.as_mut().ok_or(NativeSessionError::Failed)?;
+            self.apply_correlated_read(barrier, output)?;
+        } else {
+            return Err(NativeSessionError::Corrupt);
+        }
+        Ok(())
+    }
     fn request_read(
         &mut self,
         consensus: &mut DurableNode,
         context: &[u8],
     ) -> Result<(), NativeSessionError> {
         if context.is_empty() || context.len() > 1024 {
-            return Err(NativeSessionError::Capacity);
+            return Err(NativeSessionError::Capacity("read context"));
         }
         let _permit = self.budget.reserve(
             BudgetKind::Pending,
@@ -1053,7 +1506,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &mut DurableNode,
         correlation: ReadCorrelation,
     ) -> Result<(), NativeSessionError> {
-        self.require_authority(&consensus.status())?;
+        self.require_reader(&consensus.scalars())?;
+        // A copy whose parked reads are at their bound is too far behind to
+        // take another: refused here, typed, not dropped when answered.
+        if self.parked_reads.len() >= consensus.pending_reads() {
+            return Err(NativeSessionError::Capacity("parked reads"));
+        }
         let mut context = [0u8; 24];
         if let Some(prefix) = context.get_mut(..8) {
             prefix.copy_from_slice(CORRELATION);

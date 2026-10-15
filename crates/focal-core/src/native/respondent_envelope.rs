@@ -3,8 +3,7 @@
 //! credits are independent: several Generated responses can await posting.
 
 use super::completion_envelope::{
-    CompletionSlots, EvidenceBounds, entry_heap, parent_bound, pinned_descriptor_charge,
-    registry_bound,
+    entry_heap, parent_bound, pinned_descriptor_charge, registry_bound,
 };
 use super::prepare::{add, array, containers, event_containers, heap, within};
 use super::prepare_budget::ConstructionBudget;
@@ -26,15 +25,12 @@ mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RespondentDemand {
-    pub(super) retained_bytes: usize,
-    pub(super) slots: CompletionSlots,
     pub(super) actions: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Action {
     storage: RangeWriteEnvelope,
-    slots: CompletionSlots,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,20 +58,12 @@ pub(super) struct RespondentEnvelope {
     diagnostic: Action,
     close: Action,
     post: Action,
-    workspace: usize,
 }
 
 fn multiply(left: usize, right: usize) -> Result<usize, NativeError> {
     left.checked_mul(right).ok_or(NativeError::Capacity(
         "respondent completion multiplication",
     ))
-}
-
-fn transient(storage: RangeWriteEnvelope) -> Result<usize, NativeError> {
-    storage
-        .additional_peak_bytes()
-        .checked_sub(storage.additional_retained_bytes())
-        .ok_or(NativeError::Capacity("respondent range workspace"))
 }
 
 fn count(value: u32) -> Result<usize, NativeError> {
@@ -88,7 +76,6 @@ fn action(
     changes: usize,
     deleted: usize,
     incoming_heap: usize,
-    slots: CompletionSlots,
 ) -> Result<Action, NativeError> {
     Ok(Action {
         storage: view.state.rows.future_write_envelope(
@@ -101,7 +88,6 @@ fn action(
             },
             max_ranges,
         )?,
-        slots,
     })
 }
 
@@ -165,7 +151,6 @@ impl RespondentEnvelope {
         claim: &ClaimState,
         limits: NativeLimits,
         mut descriptor: ArtifactLimits,
-        evidence: EvidenceBounds,
     ) -> Result<Self, NativeError> {
         let (key, maximum) = super::respondent_state::read(view, claim, limits)?
             .ok_or(ContractError::InvalidTransition)?;
@@ -206,11 +191,12 @@ impl RespondentEnvelope {
             ConstructionBudget::for_operation(NativeOperation::PostResponse, limits)?;
         // Index rows (doc 22 §7): a diagnostic artifact's identity, producer,
         // kind, schema and inputs; a close's and a post's claim status move. A
-        // diagnostic's eight primary rows and four fixed index rows leave the
-        // batch's remainder to the inputs its descriptor may cite.
+        // diagnostic's nine primary rows (the principal's window among them,
+        // F12) and four fixed index rows leave the batch's remainder to the
+        // inputs its descriptor may cite.
         let inputs = crate::native::index_rows::cap_inputs(
             super::completion_envelope::input_bound(descriptor),
-            add(8, crate::native::index_rows::ARTIFACT_FIXED_ROWS)?,
+            add(9, crate::native::index_rows::ARTIFACT_FIXED_ROWS)?,
             limits.range.max_batch_entries,
         );
         descriptor.inputs = inputs;
@@ -308,7 +294,7 @@ impl RespondentEnvelope {
         let diagnostic = action(
             view,
             limits.max_ranges,
-            add(8, diagnostic_index)?,
+            add(9, diagnostic_index)?,
             0,
             add(
                 add(
@@ -320,72 +306,24 @@ impl RespondentEnvelope {
                 )?,
                 event_containers(2)?,
             )?,
-            CompletionSlots {
-                artifacts: 1,
-                identities: 1,
-                outcomes: 1,
-                events: 2,
-                sequences: 1,
-                new_rows: 7,
-                ..CompletionSlots::default()
-            },
         )?;
         let close_events = add(work_limit, 2)?;
         let close = action(
             view,
             limits.max_ranges,
-            add(add(multiply(2, work_limit)?, 7)?, close_index)?,
+            add(add(multiply(2, work_limit)?, 8)?, close_index)?,
             1,
             add(
                 add(claim_row, response_row)?,
                 add(work_rows, event_containers(close_events)?)?,
             )?,
-            CompletionSlots {
-                responses: 1,
-                outcomes: 1,
-                events: close_events,
-                sequences: 1,
-                new_rows: add(work_limit, 5)?,
-                ..CompletionSlots::default()
-            },
         )?;
         let post = action(
             view,
             limits.max_ranges,
-            add(6, post_index)?,
+            add(7, post_index)?,
             1,
             add(add(claim_row, response_row)?, event_containers(2)?)?,
-            CompletionSlots {
-                outcomes: 1,
-                events: 2,
-                sequences: 1,
-                new_rows: 3,
-                ..CompletionSlots::default()
-            },
-        )?;
-        // Ingress and verification coexist with Core's conservative input
-        // precharge. Only one action executes at once; its range transient is
-        // additional to the independently retained sum of every future action.
-        let diagnostic_workspace = add(
-            add(
-                input_heap,
-                add(evidence.workspace_bytes, evidence.retained_bytes)?,
-            )?,
-            add(
-                diagnostic_construction.temporary_bytes()?,
-                transient(diagnostic.storage)?,
-            )?,
-        )?;
-        let close_workspace = add(
-            response_input_heap,
-            add(
-                close_construction.temporary_bytes()?,
-                transient(close.storage)?,
-            )?,
-        )?;
-        let post_workspace = add(
-            post_construction.temporary_bytes()?,
-            transient(post.storage)?,
         )?;
         let envelope = Self {
             record_buffers: None,
@@ -411,9 +349,6 @@ impl RespondentEnvelope {
             diagnostic,
             close,
             post,
-            workspace: diagnostic_workspace
-                .max(close_workspace)
-                .max(post_workspace),
         };
         envelope.demand(maximum)?;
         envelope.check_parent(view, claim, limits)?;
@@ -427,41 +362,11 @@ impl RespondentEnvelope {
         {
             return Err(NativeError::Capacity("respondent credit exceeds contract"));
         }
-        let mut retained_bytes = 0;
-        let mut slots = CompletionSlots::default();
-        for (action, count) in [
-            (self.diagnostic, credit.diagnostics),
-            (self.close, credit.closes),
-            (self.post, credit.posts),
-        ] {
-            retained_bytes = add(
-                retained_bytes,
-                multiply(
-                    add(
-                        crate::native::mutation::retained(action.storage)?,
-                        self.record_buffers
-                            .map(|limits| record_codec::future_record_bytes(action.storage, limits))
-                            .transpose()?
-                            .unwrap_or(0),
-                    )?,
-                    self::count(count)?,
-                )?,
-            )?;
-            slots = slots.checked_add(action.slots.checked_scale(count)?)?;
-        }
         let actions = u64::from(credit.diagnostics)
             .checked_add(u64::from(credit.closes))
             .and_then(|n| n.checked_add(u64::from(credit.posts)))
             .ok_or(NativeError::Capacity("respondent action serials"))?;
-        Ok(RespondentDemand {
-            retained_bytes,
-            slots,
-            actions,
-        })
-    }
-
-    pub(super) fn workspace_bytes(&self) -> usize {
-        self.workspace
+        Ok(RespondentDemand { actions })
     }
 
     pub(super) fn with_record_buffers(
@@ -484,15 +389,7 @@ impl RespondentEnvelope {
         limits: NativeLimits,
     ) -> Result<ConstructionBudget, NativeError> {
         self.storage(operation)?;
-        let construction = ConstructionBudget::for_operation(operation, limits)?;
-        within(
-            add(
-                construction.temporary_bytes()?,
-                transient(self.storage(operation)?)?,
-            )?,
-            self.workspace,
-        )?;
-        Ok(construction)
+        ConstructionBudget::for_operation(operation, limits)
     }
 
     pub(super) fn storage(

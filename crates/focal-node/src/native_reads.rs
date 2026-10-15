@@ -20,6 +20,115 @@ pub(crate) struct Reader<'a> {
     pub route: RouteEpoch,
 }
 
+/// A page's objects, each charged to its read as the page takes it: its slot as the list grows,
+/// its document's box and the bytes it encodes to, which stand for the strings and lists in it
+/// and which its reply holds again. A read holds what its page holds, never a bound on what a
+/// page might (it reserved thirty-two times its client's frame for every page, and one read's
+/// reservation refused every other request beside it). Where the read's budget cannot fund the
+/// next object, the page ends before it.
+pub(crate) struct PageObjects<'c> {
+    objects: Vec<NativeObject>,
+    charge: &'c mut focal_memory::Allocation,
+    /// What the objects taken are charged beside their slots: given back as they are let go.
+    taken: usize,
+}
+
+impl<'c> PageObjects<'c> {
+    pub(crate) fn new(charge: &'c mut focal_memory::Allocation) -> Self {
+        Self {
+            objects: Vec::new(),
+            charge,
+            taken: 0,
+        }
+    }
+    /// `object` taken, its bytes and any growth of the list charged first: `false` where the
+    /// read's budget refuses them, and the object is not taken.
+    pub(crate) fn take(&mut self, object: NativeObject) -> Result<bool, AccessError> {
+        let bytes = object_bytes(&object)?;
+        let grow = if self.objects.len() == self.objects.capacity() {
+            self.objects.capacity().max(4)
+        } else {
+            0
+        };
+        let charge = grow
+            .checked_mul(size_of::<NativeObject>())
+            .and_then(|slots| slots.checked_add(bytes))
+            .ok_or(AccessError::Capacity)?;
+        if self.charge.grow(charge).is_err() {
+            return Ok(false);
+        }
+        if grow > 0 && self.objects.try_reserve_exact(grow).is_err() {
+            let held = self.charge.bytes().saturating_sub(charge);
+            let _ = self.charge.shrink_to(held);
+            return Err(AccessError::Capacity);
+        }
+        self.taken = self.taken.saturating_add(bytes);
+        self.objects.push(object);
+        Ok(true)
+    }
+    /// `object` taken as the whole of what a read answers: refused where it cannot be funded.
+    pub(crate) fn only(mut self, object: NativeObject) -> Result<Vec<NativeObject>, AccessError> {
+        if !self.take(object)? {
+            return Err(AccessError::Capacity);
+        }
+        Ok(self.objects)
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.objects.len()
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+    /// The read's charge, lent to a page built inside this one: what that page takes is given
+    /// back by the caller before its objects are taken here.
+    pub(crate) fn charge(&mut self) -> &mut focal_memory::Allocation {
+        self.charge
+    }
+    /// Every object let go, with what it was charged; the list keeps its slots.
+    pub(crate) fn clear(&mut self) {
+        self.objects.clear();
+        let held = self.charge.bytes().saturating_sub(self.taken);
+        let _ = self.charge.shrink_to(held);
+        self.taken = 0;
+    }
+    pub(crate) fn into_vec(self) -> Vec<NativeObject> {
+        self.objects
+    }
+}
+
+/// What one object holds in a page beside its slot: its document's box, and the bytes it
+/// encodes to.
+pub(crate) fn object_bytes(object: &NativeObject) -> Result<usize, AccessError> {
+    let encoded =
+        postcard::experimental::serialized_size(object).map_err(|_| AccessError::Capacity)?;
+    let boxed = match object {
+        NativeObjectIn::Claim(document) => size_of_val(&**document),
+        NativeObjectIn::Definition(document) => size_of_val(&**document),
+        NativeObjectIn::Evaluation(document) => size_of_val(&**document),
+        NativeObjectIn::Result(document) => size_of_val(&**document),
+        NativeObjectIn::Artifact(document) => size_of_val(&**document),
+        NativeObjectIn::Work(document) | NativeObjectIn::Diagnostic(document) => {
+            size_of_val(&**document)
+        }
+        NativeObjectIn::Response(document) => size_of_val(&**document),
+        NativeObjectIn::Monitor(document) => size_of_val(&**document),
+        NativeObjectIn::Outcome(document) => size_of_val(&**document),
+        NativeObjectIn::Event(document) => size_of_val(&**document),
+        NativeObjectIn::Context(document) => size_of_val(&**document),
+        NativeObjectIn::Epochs(document) => size_of_val(&**document),
+        NativeObjectIn::Archived(document) => size_of_val(&**document),
+        NativeObjectIn::ResultTestament(_)
+        | NativeObjectIn::Receipt(_)
+        | NativeObjectIn::CreationResult(_)
+        | NativeObjectIn::Standing(_)
+        | NativeObjectIn::Legacy(_)
+        | NativeObjectIn::Missing(_)
+        | NativeObjectIn::Retired(_)
+        | NativeObjectIn::Sealed(_) => 0,
+    };
+    encoded.checked_add(boxed).ok_or(AccessError::Capacity)
+}
+
 /// Where a query's rows live (25 §6): the members a replica must hold to
 /// serve it. A compound query that walks several objects names each; one
 /// that lists across the group names the control affinity and every object
@@ -58,8 +167,11 @@ pub(crate) fn locations(query: &NativeReadQuery) -> Vec<focal_core::native::Nati
             }
             NativeInvocationRef::ClaimDeadline { claim, .. }
             | NativeInvocationRef::MonitorDeadline { claim, .. } => L::Claim(*claim),
-            NativeInvocationRef::Import => L::Control,
-            NativeInvocationRef::Retirement { root } => L::Claim(*root),
+            // Retirements' and seals' own outcomes sit under the control
+            // affinity (F12).
+            NativeInvocationRef::Import
+            | NativeInvocationRef::Retirement { .. }
+            | NativeInvocationRef::Seal { .. } => L::Control,
         }
     }
     match query {
@@ -70,8 +182,13 @@ pub(crate) fn locations(query: &NativeReadQuery) -> Vec<focal_core::native::Nati
         NativeReadQuery::Outcome(invocation) => vec![invocation_location(invocation)],
         NativeReadQuery::Receipt(_) => vec![L::Receipt],
         NativeReadQuery::Monitor { id, .. } => vec![L::Monitor(*id)],
-        NativeReadQuery::Evaluations { validation, .. } => {
-            vec![L::Definition(*validation), L::Control]
+        // The definition sits under its own affinity; the registrations and
+        // the evaluation rows sit under the claim's (25 §3).
+        NativeReadQuery::Evaluations {
+            claim, validation, ..
+        } => vec![L::Claim(*claim), L::Definition(*validation)],
+        NativeReadQuery::SelectEvaluation(query) => {
+            vec![L::Claim(query.claim), L::Definition(query.validation)]
         }
         NativeReadQuery::Results { evaluation, .. } => vec![L::Claim(evaluation.claim)],
         NativeReadQuery::ValidationContext(context) => {
@@ -81,7 +198,13 @@ pub(crate) fn locations(query: &NativeReadQuery) -> Vec<focal_core::native::Nati
                 L::Control,
             ]
         }
-        NativeReadQuery::Events { .. } | NativeReadQuery::Standing => vec![L::Control],
+        NativeReadQuery::Events { .. } | NativeReadQuery::Standing | NativeReadQuery::Epochs(_) => {
+            vec![L::Control]
+        }
+        // Served from custody, never from a session's core (`archive_reads`).
+        NativeReadQuery::Archived(_) | NativeReadQuery::Sealed(_) => Vec::new(),
+        // The claim's continuation names where its family went (doc 31 M2, A2).
+        NativeReadQuery::Cold(query) => vec![L::Claim(query.claim)],
     }
 }
 
@@ -102,12 +225,21 @@ pub(crate) fn role(peer: &AuthenticatedPeer) -> Result<NativePeerRole, AccessErr
         PeerRole::Node { .. } => Err(AccessError::Unauthorized),
     }
 }
+/// The correlation of one native read barrier: the principal's request as
+/// this owner minted it — its node and its incarnation (drawn when the owner
+/// started) scope the nonce, so the same principal's exact retry at two
+/// replicas, or at one replica across a restart, never names one context
+/// twice (the audit's F63: a leader answers one context once).
 pub(crate) fn correlation(
+    node: u64,
+    incarnation: u64,
     principal: ParticipantId,
     request: RequestId,
     nonce: u64,
 ) -> ReadCorrelation {
-    let mut hash = blake3::Hasher::new_derive_key("focal.native.read-correlation.v1");
+    let mut hash = blake3::Hasher::new_derive_key("focal.native.read-correlation.v2");
+    hash.update(&node.to_le_bytes());
+    hash.update(&incarnation.to_le_bytes());
     hash.update(&principal.0);
     hash.update(&request.0);
     hash.update(&nonce.to_le_bytes());
@@ -124,12 +256,15 @@ pub(crate) fn local(
     request_id: RequestId,
     route: RouteEpoch,
     limits: &WireLimits,
+    charge: &mut focal_memory::Allocation,
 ) -> Result<NativeReadPage, AccessError> {
     read.validate(limits)?;
     let profile = profile(session)?;
     let role = role(peer)?;
     if matches!(read.consistency, ReadConsistency::Linearizable) {
-        let correlation = correlation(peer.principal(), request_id, 0);
+        // The embedded owner is the only asker of its own core: no other
+        // origin can share its contexts.
+        let correlation = correlation(session.status().node_id, 0, peer.principal(), request_id, 0);
         session.native_read_index(correlation).map_err(access)?;
         let mut boundary = None;
         for _ in 0..BARRIER_POLLS {
@@ -155,6 +290,7 @@ pub(crate) fn local(
                 route,
             },
             read,
+            charge,
         );
     }
     let core = session.native_core().map_err(access)?;
@@ -169,6 +305,7 @@ pub(crate) fn local(
             route,
         },
         read,
+        charge,
     )
 }
 pub(crate) fn check_consistency(
@@ -200,22 +337,22 @@ pub(crate) fn check_consistency(
     }
     Ok(())
 }
-fn object(reader: &Reader<'_>, reference: NativeObjectRef) -> Result<NativeObject, AccessError> {
+pub(crate) fn object(
+    reader: &Reader<'_>,
+    reference: NativeObjectRef,
+) -> Result<NativeObject, AccessError> {
     let core = reader.core;
     let found = match reference {
-        NativeObjectRef::Claim(id) => core
-            .native_claim(id)
-            .map(|state| {
-                NativeObject::Claim(Box::new(docs::claim(
-                    core,
-                    state,
-                    NativeClaimExpand::default(),
-                )))
-            })
-            .or_else(|| {
-                core.native_retired(id)
-                    .map(|value| NativeObject::Retired(docs::retired(id, value)))
-            }),
+        NativeObjectRef::Claim(id) => match core.native_claim(id) {
+            Some(state) => Some(NativeObject::Claim(Box::new(docs::claim(
+                core,
+                state,
+                NativeClaimExpand::default(),
+            )?))),
+            None => core
+                .native_retired(id)
+                .map(|value| NativeObject::Retired(docs::retired(id, value))),
+        },
         NativeObjectRef::Definition(id) => core.native_definition(id).map(|declaration| {
             NativeObject::Definition(Box::new(docs::definition(core, declaration)))
         }),
@@ -228,12 +365,21 @@ fn object(reader: &Reader<'_>, reference: NativeObjectRef) -> Result<NativeObjec
                 (Some(declaration), Some(state)) => Some(NativeObject::Evaluation(Box::new(
                     docs::evaluation(declaration, core_key, state)?,
                 ))),
-                _ => None,
+                // The key names its claim: a claim that retired answers with
+                // its continuation, where the evaluation went (the audit's
+                // F11), never with an absence.
+                _ => core
+                    .native_retired(key.claim)
+                    .map(|value| NativeObject::Retired(docs::retired(key.claim, value))),
             }
         }
         NativeObjectRef::Result(key) => core
             .native_result(docs::result_key_of(key))
-            .map(|accepted| NativeObject::Result(Box::new(docs::result(accepted)))),
+            .map(|accepted| NativeObject::Result(Box::new(docs::result(accepted))))
+            .or_else(|| {
+                core.native_retired(key.evaluation.claim)
+                    .map(|value| NativeObject::Retired(docs::retired(key.evaluation.claim, value)))
+            }),
         NativeObjectRef::Artifact(id) => core
             .native_artifact(id)
             .map(|artifact| NativeObject::Artifact(Box::new(docs::artifact(artifact)))),
@@ -290,11 +436,13 @@ fn object(reader: &Reader<'_>, reference: NativeObjectRef) -> Result<NativeObjec
             .map(|scope| NativeObject::Monitor(Box::new(docs::monitor(claim, scope)))),
         NativeObjectRef::Outcome(invocation) => core
             .native_outcome(docs::invocation_of(invocation))
+            .map_err(docs::content_error)?
             .map(|outcome| NativeObject::Outcome(Box::new(docs::outcome(outcome)))),
         NativeObjectRef::CreationResult(invocation) => {
             let key = docs::invocation_of(invocation);
             core.native_creation_result(key)
-                .map(|result| NativeObject::CreationResult(docs::creation_result(key, result)))
+                .map_err(docs::content_error)?
+                .map(|result| NativeObject::CreationResult(docs::creation_result(key, &result)))
         }
         NativeObjectRef::Event { sequence, ordinal } => core
             .native_event(sequence, ordinal)
@@ -356,27 +504,45 @@ fn finish(
         visited,
     }
 }
+/// The chain link a stored response is, for the walk from the latest cycle back.
+fn response_link(
+    identity: &focal_model::lifecycle::evidence::ResponseIdentity,
+) -> focal_model::lifecycle::claim::ResponseLink {
+    focal_model::lifecycle::claim::ResponseLink {
+        testament: TestamentId(identity.binding.object.0),
+        content: identity.binding.content,
+        receipt: identity.receipt,
+        cycle: identity.cycle,
+        prior: identity.prior,
+    }
+}
 fn count(value: usize) -> Result<u32, AccessError> {
     u32::try_from(value).map_err(|_| AccessError::Capacity)
 }
-/// Build one page from a fixed prefix. Expansions append related objects after
-/// the requested one so every document stays flat.
+/// Build one page from a fixed prefix, each object charged to the read as the page takes it
+/// (`PageObjects`). Expansions append related objects after the requested one so every document
+/// stays flat. A paged query whose next object the read cannot fund ends where it stands, with
+/// its continuation; one that could take nothing, or a query whose answer is not paged, is
+/// refused (`Capacity`).
 pub(crate) fn page(
     reader: &Reader<'_>,
     read: &NativeReadRequest,
+    charge: &mut focal_memory::Allocation,
 ) -> Result<NativeReadPage, AccessError> {
     let core = reader.core;
     let max_items = read.max_items as usize;
+    let mut objects = PageObjects::new(charge);
     match &read.query {
         NativeReadQuery::Objects(references) => {
-            let mut objects = Vec::with_capacity(references.len());
             for reference in references {
-                objects.push(object(reader, *reference)?);
+                if !objects.take(object(reader, *reference)?)? {
+                    return Err(AccessError::Capacity);
+                }
             }
             let visited = count(objects.len())?;
-            Ok(finish(reader, objects, None, visited))
+            Ok(finish(reader, objects.into_vec(), None, visited))
         }
-        NativeReadQuery::Claim { id, expand } => {
+        NativeReadQuery::Claim { id, expand, after } => {
             if expand.history {
                 return Err(AccessError::UnsupportedOperation);
             }
@@ -386,94 +552,155 @@ pub(crate) fn page(
                     Some(value) => NativeObject::Retired(docs::retired(*id, value)),
                     None => NativeObject::Missing(NativeObjectRef::Claim(*id)),
                 };
-                return Ok(finish(reader, vec![object], None, 1));
+                return Ok(finish(reader, objects.only(object)?, None, 1));
             };
-            let mut objects = vec![NativeObject::Claim(Box::new(docs::claim(
-                core, state, *expand,
-            )))];
+            // The expansion is ordered: the responses from the latest cycle
+            // back, then the evaluations in key order. A page that fills
+            // before the expansion ends carries the position it stopped at,
+            // and a resumed page (an exact read at the same prefix) holds
+            // only what follows that position — never a silent truncation.
+            let (responses_below, evaluations_after, resumed) = match after {
+                None => (None, None, false),
+                Some(NativeContinuation::Responses { cycle }) => (Some(*cycle), None, true),
+                Some(NativeContinuation::Evaluations(key)) => (
+                    Some(0),
+                    Some(focal_core::native::event_record::evaluation_key_of(*key)),
+                    true,
+                ),
+                Some(_) => return Err(AccessError::InvalidRequest),
+            };
+            if !resumed
+                && !objects.take(NativeObject::Claim(Box::new(docs::claim(
+                    core, state, *expand,
+                )?)))?
+            {
+                return Err(AccessError::Capacity);
+            }
             let mut visited = 1usize;
-            if expand.responses {
+            let mut next = None;
+            if expand.responses && responses_below != Some(0) {
                 let mut link = state.latest_response();
-                while let Some(current) = link
-                    && objects.len() < max_items
-                {
+                while let Some(current) = link {
+                    if responses_below.is_some_and(|below| current.cycle >= below) {
+                        link = current
+                            .prior
+                            .and_then(|prior| core.native_response(prior))
+                            .map(|response| response_link(&response.identity()));
+                        continue;
+                    }
+                    if objects.len() >= max_items {
+                        next = Some(NativeContinuation::Responses {
+                            cycle: current.cycle.saturating_add(1),
+                        });
+                        break;
+                    }
                     visited = visited.saturating_add(1);
-                    if let Some(response) = core.native_response(current.testament) {
-                        objects.push(NativeObject::Response(Box::new(docs::response(response))));
+                    if let Some(response) = core.native_response(current.testament)
+                        && !objects
+                            .take(NativeObject::Response(Box::new(docs::response(response))))?
+                    {
+                        // Not funded: the page ends before it, resumed at its cycle.
+                        if objects.is_empty() {
+                            return Err(AccessError::Capacity);
+                        }
+                        next = Some(NativeContinuation::Responses {
+                            cycle: current.cycle.saturating_add(1),
+                        });
+                        break;
                     }
                     link = current
                         .prior
                         .and_then(|prior| core.native_response(prior))
-                        .map(|response| {
-                            let identity = response.identity();
-                            focal_model::lifecycle::claim::ResponseLink {
-                                testament: TestamentId(identity.binding.object.0),
-                                content: identity.binding.content,
-                                receipt: identity.receipt,
-                                cycle: identity.cycle,
-                                prior: identity.prior,
-                            }
-                        });
+                        .map(|response| response_link(&response.identity()));
                 }
             }
-            if expand.evaluations
-                && let Some(registrations) = core.native_registrations(*id)
-            {
-                for row in registrations.rows() {
+            if next.is_none() && expand.evaluations {
+                let mut last = None;
+                for key in core.native_claim_evaluations_from(*id, evaluations_after) {
                     if objects.len() >= max_items {
+                        next = Some(match last {
+                            Some(key) => NativeContinuation::Evaluations(key),
+                            // Full before the first evaluation: the resumed
+                            // page starts the evaluations from their first key.
+                            None => NativeContinuation::Responses { cycle: 0 },
+                        });
                         break;
                     }
                     visited = visited.saturating_add(1);
-                    let validation = ValidationId(row.binding().object.0);
-                    let Some(declaration) = core.native_definition(validation) else {
-                        continue;
-                    };
-                    let key = focal_core::native::EvaluationKey {
-                        claim: *id,
-                        validation,
-                        target: focal_core::native::EvaluationTarget::of(row.target()),
-                        generation: row.generation(),
-                    };
-                    if let Some(evaluation) = core.native_evaluation(key) {
-                        objects.push(NativeObject::Evaluation(Box::new(docs::evaluation(
+                    if let Some(declaration) = core.native_definition(key.validation)
+                        && let Some(evaluation) = core.native_evaluation(key)
+                        && !objects.take(NativeObject::Evaluation(Box::new(docs::evaluation(
                             declaration,
                             key,
                             evaluation,
-                        )?)));
+                        )?)))?
+                    {
+                        // Not funded: the page ends before it, resumed after the last it took.
+                        if objects.is_empty() {
+                            return Err(AccessError::Capacity);
+                        }
+                        next = Some(match last {
+                            Some(key) => NativeContinuation::Evaluations(key),
+                            None => NativeContinuation::Responses { cycle: 0 },
+                        });
+                        break;
                     }
+                    last = Some(docs::evaluation_key(key));
                 }
             }
             let visited = count(visited)?;
-            Ok(finish(reader, objects, None, visited))
+            Ok(finish(reader, objects.into_vec(), next, visited))
         }
         NativeReadQuery::Outcome(invocation) => {
-            let objects = vec![object(reader, NativeObjectRef::Outcome(*invocation))?];
-            Ok(finish(reader, objects, None, 1))
+            let mut found = object(reader, NativeObjectRef::Outcome(*invocation))?;
+            // A request's outcome that left the live core into a seal (F12)
+            // is answered with where it is; a generation the window still
+            // holds, or never held, is `Missing`.
+            if let (NativeObject::Missing(_), NativeInvocationRef::Request(request)) =
+                (&found, invocation)
+                && let Some(window) = core.native_epochs(request.principal)
+                && request.epoch.0 < window.sealed.0
+                && let Some(seal) = window.seal_of(request.epoch)
+                && let Some((ordinal, row)) = core.native_seal(seal)
+            {
+                found = NativeObject::Sealed(NativeSealedRef {
+                    request: *request,
+                    ordinal,
+                    bundle: row.bundle,
+                    bytes: row.bytes,
+                });
+            }
+            Ok(finish(reader, objects.only(found)?, None, 1))
+        }
+        NativeReadQuery::Epochs(principal) => {
+            // A principal reads its own window; a runtime any.
+            if reader.role != NativePeerRole::Runtime && *principal != reader.principal {
+                return Err(AccessError::Unauthorized);
+            }
+            let first = focal_core::native::EpochWindow::first();
+            let window = core.native_epochs(*principal).unwrap_or(&first);
+            let window = NativeObject::Epochs(Box::new(docs::epoch_window(*principal, window)));
+            Ok(finish(reader, objects.only(window)?, None, 1))
         }
         NativeReadQuery::Receipt(id) => {
-            let objects = vec![object(reader, NativeObjectRef::Receipt(*id))?];
-            Ok(finish(reader, objects, None, 1))
+            let receipt = object(reader, NativeObjectRef::Receipt(*id))?;
+            Ok(finish(reader, objects.only(receipt)?, None, 1))
         }
         NativeReadQuery::Monitor { claim, id } => {
-            let objects = vec![object(
+            let monitor = object(
                 reader,
                 NativeObjectRef::Monitor {
                     claim: *claim,
                     id: *id,
                 },
-            )?];
-            Ok(finish(reader, objects, None, 1))
+            )?;
+            Ok(finish(reader, objects.only(monitor)?, None, 1))
         }
         NativeReadQuery::Responses { claim, after } => {
             let Some(state) = core.native_claim(*claim) else {
-                return Ok(finish(
-                    reader,
-                    vec![NativeObject::Missing(NativeObjectRef::Claim(*claim))],
-                    None,
-                    1,
-                ));
+                let missing = NativeObject::Missing(NativeObjectRef::Claim(*claim));
+                return Ok(finish(reader, objects.only(missing)?, None, 1));
             };
-            let mut objects = Vec::new();
             let mut visited = 1usize;
             let mut next = None;
             let mut cursor = state.latest_response().map(|link| link.testament);
@@ -483,94 +710,160 @@ pub(crate) fn page(
                 };
                 let identity = response.identity();
                 visited = visited.saturating_add(1);
-                if after.is_none_or(|after| identity.cycle < after) {
-                    if objects.len() >= max_items {
-                        next = Some(NativeContinuation::Responses {
-                            cycle: identity.cycle.saturating_add(1),
-                        });
-                        break;
+                if after.is_none_or(|after| identity.cycle < after)
+                    && (objects.len() >= max_items
+                        || !objects
+                            .take(NativeObject::Response(Box::new(docs::response(response))))?)
+                {
+                    // Full, or the next not funded: resumed at its cycle.
+                    if objects.is_empty() {
+                        return Err(AccessError::Capacity);
                     }
-                    objects.push(NativeObject::Response(Box::new(docs::response(response))));
+                    next = Some(NativeContinuation::Responses {
+                        cycle: identity.cycle.saturating_add(1),
+                    });
+                    break;
                 }
                 cursor = identity.prior;
             }
             let visited = count(visited)?;
-            Ok(finish(reader, objects, next, visited))
+            Ok(finish(reader, objects.into_vec(), next, visited))
         }
-        NativeReadQuery::Evaluations { validation, after } => {
-            let Some(declaration) = core.native_definition(*validation) else {
-                return Ok(finish(
-                    reader,
-                    vec![NativeObject::Missing(NativeObjectRef::Definition(
-                        *validation,
-                    ))],
-                    None,
-                    1,
-                ));
+        NativeReadQuery::SelectEvaluation(query) => {
+            let Some(declaration) = core.native_definition(query.validation) else {
+                let missing = NativeObject::Missing(NativeObjectRef::Definition(query.validation));
+                return Ok(finish(reader, objects.only(missing)?, None, 1));
             };
-            let claim = declaration.claim();
-            let mut objects = Vec::new();
+            if declaration.claim() != query.claim {
+                return Err(AccessError::InvalidRequest);
+            }
+            // Over the declaration's whole span — bounded by the core's
+            // evaluations per claim, never by a page — the evaluations the
+            // selector names, at the named generation when there is one,
+            // live when asked; of those, the ones at the highest generation.
+            // The page is that tie set; one that would not fit (in the
+            // read's items or its budget) is refused, never cut.
             let mut visited = 1usize;
-            let mut next = None;
-            if let Some(registrations) = core.native_registrations(claim) {
-                for row in registrations.rows() {
-                    if ValidationId(row.binding().object.0) != *validation {
-                        continue;
+            let mut best: Option<u64> = None;
+            for key in core.native_declaration_evaluations_from(query.claim, query.validation, None)
+            {
+                visited = visited.saturating_add(1);
+                if !query.selector.selects(docs::evaluation_target(key.target))
+                    || query
+                        .generation
+                        .is_some_and(|wanted| key.generation != wanted)
+                {
+                    continue;
+                }
+                let Some(evaluation) = core.native_evaluation(key) else {
+                    continue;
+                };
+                if query.live && evaluation.state().is_terminal() {
+                    continue;
+                }
+                match best {
+                    Some(generation) if key.generation < generation => continue,
+                    Some(generation) if key.generation == generation => {}
+                    _ => {
+                        best = Some(key.generation);
+                        objects.clear();
                     }
-                    let key = focal_core::native::EvaluationKey {
-                        claim,
-                        validation: *validation,
-                        target: focal_core::native::EvaluationTarget::of(row.target()),
-                        generation: row.generation(),
-                    };
-                    let wire_key = docs::evaluation_key(key);
-                    if after.is_some_and(|after| wire_key <= after) {
-                        continue;
-                    }
-                    visited = visited.saturating_add(1);
-                    if objects.len() >= max_items {
-                        next = Some(NativeContinuation::Evaluations(wire_key));
-                        break;
-                    }
-                    if let Some(evaluation) = core.native_evaluation(key) {
-                        objects.push(NativeObject::Evaluation(Box::new(docs::evaluation(
-                            declaration,
-                            key,
-                            evaluation,
-                        )?)));
-                    }
+                }
+                if objects.len() >= max_items
+                    || !objects.take(NativeObject::Evaluation(Box::new(docs::evaluation(
+                        declaration,
+                        key,
+                        evaluation,
+                    )?)))?
+                {
+                    return Err(AccessError::Capacity);
                 }
             }
             let visited = count(visited)?;
-            Ok(finish(reader, objects, next, visited))
+            Ok(finish(reader, objects.into_vec(), None, visited))
+        }
+        NativeReadQuery::Evaluations {
+            claim,
+            validation,
+            after,
+        } => {
+            let Some(declaration) = core.native_definition(*validation) else {
+                let missing = NativeObject::Missing(NativeObjectRef::Definition(*validation));
+                return Ok(finish(reader, objects.only(missing)?, None, 1));
+            };
+            if declaration.claim() != *claim {
+                return Err(AccessError::InvalidRequest);
+            }
+            // The declaration's evaluations in key order, the order the
+            // continuation compares in (F07): `after` is the last key the
+            // previous page consumed, resumed exclusively; the page is judged
+            // full before a row is consumed, so `next` names the last row it
+            // holds and no row is skipped or repeated.
+            let resume = after.map(focal_core::native::event_record::evaluation_key_of);
+            let mut visited = 1usize;
+            let mut next = None;
+            let mut last = None;
+            for key in core.native_declaration_evaluations_from(*claim, *validation, resume) {
+                if objects.len() >= max_items {
+                    next = last.map(NativeContinuation::Evaluations);
+                    break;
+                }
+                visited = visited.saturating_add(1);
+                if let Some(evaluation) = core.native_evaluation(key)
+                    && !objects.take(NativeObject::Evaluation(Box::new(docs::evaluation(
+                        declaration,
+                        key,
+                        evaluation,
+                    )?)))?
+                {
+                    // Not funded: the page ends before it, resumed after the last it took.
+                    if objects.is_empty() {
+                        return Err(AccessError::Capacity);
+                    }
+                    next = last.map(NativeContinuation::Evaluations);
+                    break;
+                }
+                last = Some(docs::evaluation_key(key));
+            }
+            let visited = count(visited)?;
+            Ok(finish(reader, objects.into_vec(), next, visited))
         }
         NativeReadQuery::Results { evaluation, after } => {
             if after.is_some() {
                 return Err(AccessError::UnsupportedOperation);
             }
             let key = docs::evaluation_key_of(*evaluation);
-            let mut objects = Vec::new();
             let mut visited = 1usize;
             if let Some(state) = core.native_evaluation(key)
                 && let Some(result) = state.last_result()
             {
                 visited = visited.saturating_add(1);
                 let result_key = focal_core::native::NativeResultKey::of(result);
-                if let Some(accepted) = core.native_result(result_key) {
-                    objects.push(NativeObject::Result(Box::new(docs::result(accepted))));
+                if let Some(accepted) = core.native_result(result_key)
+                    && !objects.take(NativeObject::Result(Box::new(docs::result(accepted))))?
+                {
+                    return Err(AccessError::Capacity);
                 }
             }
             let visited = count(visited)?;
-            Ok(finish(reader, objects, None, visited))
+            Ok(finish(reader, objects.into_vec(), None, visited))
         }
-        NativeReadQuery::ValidationContext(query) => validation_context(reader, query, max_items),
+        NativeReadQuery::ValidationContext(query) => {
+            validation_context(reader, query, max_items, objects)
+        }
+        // An archived object and a sealed outcome are read from custody by
+        // the content owner (`archive_reads`), never from a session's core.
+        // A retired family's object is read from the replica's cold stream or its custody
+        // (`archive_reads::cold_page`), never from the core's rows.
+        NativeReadQuery::Archived(_) | NativeReadQuery::Sealed(_) | NativeReadQuery::Cold(_) => {
+            Err(AccessError::UnsupportedOperation)
+        }
         NativeReadQuery::Events { after, limit } => {
             let prefix = core.native_sequence();
             let (mut sequence, mut ordinal) = match after {
                 Some((sequence, ordinal)) => (*sequence, ordinal.saturating_add(1)),
                 None => (SessionSeq(1), 0),
             };
-            let mut objects = Vec::new();
             let mut visited = 0u32;
             let budget = limit.saturating_add(EVENT_SCAN_SLACK);
             // The last slot actually visited, not the last event emitted: a page
@@ -582,13 +875,22 @@ pub(crate) fn page(
             let mut last_visited = None;
             while sequence <= prefix && objects.len() < *limit as usize && visited < budget {
                 visited = visited.saturating_add(1);
-                last_visited = Some((sequence, ordinal));
                 match core.native_event(sequence, ordinal) {
                     Some(event) => {
-                        objects.push(NativeObject::Event(Box::new(docs::event_record(event))));
+                        // Not funded: the page ends before it, the continuation the slot before.
+                        if !objects
+                            .take(NativeObject::Event(Box::new(docs::event_record(event))))?
+                        {
+                            if objects.is_empty() {
+                                return Err(AccessError::Capacity);
+                            }
+                            break;
+                        }
+                        last_visited = Some((sequence, ordinal));
                         ordinal = ordinal.saturating_add(1);
                     }
                     None => {
+                        last_visited = Some((sequence, ordinal));
                         sequence = SessionSeq(sequence.0.saturating_add(1));
                         ordinal = 0;
                     }
@@ -603,7 +905,7 @@ pub(crate) fn page(
             } else {
                 None
             };
-            Ok(finish(reader, objects, next, visited))
+            Ok(finish(reader, objects.into_vec(), next, visited))
         }
         NativeReadQuery::Standing => {
             let standing = NativeStanding {
@@ -615,7 +917,7 @@ pub(crate) fn page(
             };
             Ok(finish(
                 reader,
-                vec![NativeObject::Standing(standing)],
+                objects.only(NativeObject::Standing(standing))?,
                 None,
                 1,
             ))
@@ -633,28 +935,19 @@ fn validation_context(
     reader: &Reader<'_>,
     query: &NativeContextQuery,
     max_items: usize,
+    objects: PageObjects<'_>,
 ) -> Result<NativeReadPage, AccessError> {
     use focal_core::native::{EvaluationKey, EvaluationTarget, NativeResultKey};
     use focal_model::lifecycle::validation;
     let core = reader.core;
     let mut visited = 1usize;
     let Some(claim) = core.native_claim(query.claim) else {
-        return Ok(finish(
-            reader,
-            vec![NativeObject::Missing(NativeObjectRef::Claim(query.claim))],
-            None,
-            1,
-        ));
+        let missing = NativeObject::Missing(NativeObjectRef::Claim(query.claim));
+        return Ok(finish(reader, objects.only(missing)?, None, 1));
     };
     let Some(declaration) = core.native_definition(query.validation) else {
-        return Ok(finish(
-            reader,
-            vec![NativeObject::Missing(NativeObjectRef::Definition(
-                query.validation,
-            ))],
-            None,
-            1,
-        ));
+        let missing = NativeObject::Missing(NativeObjectRef::Definition(query.validation));
+        return Ok(finish(reader, objects.only(missing)?, None, 1));
     };
     if declaration.claim() != query.claim {
         return Err(AccessError::InvalidRequest);
@@ -849,7 +1142,7 @@ fn validation_context(
         }
     };
     let context = NativeValidationContext {
-        claim: docs::claim(core, claim, NativeClaimExpand::default()),
+        claim: docs::claim(core, claim, NativeClaimExpand::default())?,
         definition: docs::definition(core, declaration),
         registration,
         evaluation,
@@ -860,10 +1153,6 @@ fn validation_context(
         next,
     };
     let visited = count(visited)?;
-    Ok(finish(
-        reader,
-        vec![NativeObject::Context(Box::new(context))],
-        None,
-        visited,
-    ))
+    let context = NativeObject::Context(Box::new(context));
+    Ok(finish(reader, objects.only(context)?, None, visited))
 }

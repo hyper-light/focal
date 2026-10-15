@@ -3,7 +3,9 @@
 //! its exclusive loans. No reservation or authority is granted by this value.
 
 use super::cohort_budget::CohortBudget;
-use super::prepare::{ALLOCATION, add, array, containers, event_containers, heap, within};
+use super::prepare::{
+    ALLOCATION, add, array, containers, event_containers, heap, terminal_growth, within,
+};
 use super::prepare_budget::ConstructionBudget;
 use super::*;
 use focal_memory::{RangeWriteEnvelope, RangeWriteLimits};
@@ -24,15 +26,6 @@ use graph::CompletionGraph;
 #[cfg(test)]
 #[path = "completion_envelope_tests.rs"]
 pub(super) mod tests;
-
-/// Supplied by the owner's pinned verifier contract for every reachable schema.
-/// Workspace excludes the separately retained verification capability. Both may
-/// coexist with ingress and Core construction, so the envelope sums them.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct EvidenceBounds {
-    pub(super) workspace_bytes: usize,
-    pub(super) retained_bytes: usize,
-}
 
 /// The one additional allowance belongs only to a checked Admission failure.
 /// Other changed parent rows do not consume that target-specific credit.
@@ -67,17 +60,19 @@ impl ReportParent {
     pub(super) fn completion_use_recorded(
         self,
         prepared: &NativePrepared,
+        payloads: Option<&dyn crate::native::payloads::PayloadRead>,
     ) -> Result<CompletionUse, NativeError> {
         let operation = prepared.outcome.operation;
-        let changed = prepared.claim(self.claim_id());
+        let changed = prepared.written_claim(self.claim_id());
         if operation != NativeOperation::ReportAdmission
             || self.status != ClaimStatus::Posted
             || changed.is_none_or(|row| row.status() != ClaimStatus::PostFailed)
         {
             return self.completion_use(operation, changed);
         }
-        let event = super::completion_book::CompletionBook::admission_failure_event(prepared)?
-            .ok_or(ContractError::InvalidCut)?;
+        let event =
+            super::completion_book::CompletionBook::admission_failure_event(prepared, payloads)?
+                .ok_or(ContractError::InvalidCut)?;
         self.completion_use_prepared(operation, changed, Some(event))
     }
 
@@ -164,131 +159,6 @@ impl ReportParent {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct CompletionSlots {
-    pub(super) claims: usize,
-    pub(super) definitions: usize,
-    pub(super) evaluations: usize,
-    pub(super) artifacts: usize,
-    pub(super) identities: usize,
-    pub(super) results: usize,
-    pub(super) responses: usize,
-    pub(super) receipts: usize,
-    pub(super) result_testaments: usize,
-    pub(super) monitors: usize,
-    pub(super) monitor_links: usize,
-    pub(super) outcomes: usize,
-    pub(super) events: usize,
-    pub(super) sequences: u64,
-    /// New unique rows, including history and auxiliary records. Replaced rows
-    /// consume range-write capacity without consuming a new-row slot.
-    pub(super) new_rows: usize,
-}
-
-impl CompletionSlots {
-    pub(super) fn checked_add(self, other: Self) -> Result<Self, NativeError> {
-        Ok(Self {
-            claims: add(self.claims, other.claims)?,
-            definitions: add(self.definitions, other.definitions)?,
-            evaluations: add(self.evaluations, other.evaluations)?,
-            artifacts: add(self.artifacts, other.artifacts)?,
-            identities: add(self.identities, other.identities)?,
-            results: add(self.results, other.results)?,
-            responses: add(self.responses, other.responses)?,
-            receipts: add(self.receipts, other.receipts)?,
-            result_testaments: add(self.result_testaments, other.result_testaments)?,
-            monitors: add(self.monitors, other.monitors)?,
-            monitor_links: add(self.monitor_links, other.monitor_links)?,
-            outcomes: add(self.outcomes, other.outcomes)?,
-            events: add(self.events, other.events)?,
-            sequences: self
-                .sequences
-                .checked_add(other.sequences)
-                .ok_or(NativeError::Capacity("completion sequence slots"))?,
-            new_rows: add(self.new_rows, other.new_rows)?,
-        })
-    }
-
-    pub(super) fn checked_sub(self, other: Self) -> Result<Self, NativeError> {
-        let subtract = |left: usize, right: usize| {
-            left.checked_sub(right)
-                .ok_or(NativeError::Capacity("completion slot subtraction"))
-        };
-        Ok(Self {
-            claims: subtract(self.claims, other.claims)?,
-            definitions: subtract(self.definitions, other.definitions)?,
-            evaluations: subtract(self.evaluations, other.evaluations)?,
-            artifacts: subtract(self.artifacts, other.artifacts)?,
-            identities: subtract(self.identities, other.identities)?,
-            results: subtract(self.results, other.results)?,
-            responses: subtract(self.responses, other.responses)?,
-            receipts: subtract(self.receipts, other.receipts)?,
-            result_testaments: subtract(self.result_testaments, other.result_testaments)?,
-            monitors: subtract(self.monitors, other.monitors)?,
-            monitor_links: subtract(self.monitor_links, other.monitor_links)?,
-            outcomes: subtract(self.outcomes, other.outcomes)?,
-            events: subtract(self.events, other.events)?,
-            sequences: self
-                .sequences
-                .checked_sub(other.sequences)
-                .ok_or(NativeError::Capacity("completion sequence slots"))?,
-            new_rows: subtract(self.new_rows, other.new_rows)?,
-        })
-    }
-
-    pub(super) fn checked_scale(self, reports: u32) -> Result<Self, NativeError> {
-        let count =
-            usize::try_from(reports).map_err(|_| NativeError::Capacity("completion slot count"))?;
-        Ok(Self {
-            claims: multiply(self.claims, count)?,
-            definitions: multiply(self.definitions, count)?,
-            evaluations: multiply(self.evaluations, count)?,
-            artifacts: multiply(self.artifacts, count)?,
-            identities: multiply(self.identities, count)?,
-            results: multiply(self.results, count)?,
-            responses: multiply(self.responses, count)?,
-            receipts: multiply(self.receipts, count)?,
-            result_testaments: multiply(self.result_testaments, count)?,
-            monitors: multiply(self.monitors, count)?,
-            monitor_links: multiply(self.monitor_links, count)?,
-            outcomes: multiply(self.outcomes, count)?,
-            events: multiply(self.events, count)?,
-            sequences: self
-                .sequences
-                .checked_mul(u64::from(reports))
-                .ok_or(NativeError::Capacity("completion sequence slots"))?,
-            new_rows: multiply(self.new_rows, count)?,
-        })
-    }
-}
-
-/// Target-specific finite-record policy. A future WholeWork constructor may
-/// price its complete worst-case aggregation on every attempt; the book never
-/// infers an event count or auxiliary-row count from the number of reports.
-#[derive(Debug, Clone, Copy)]
-struct SlotDemand {
-    per_report: CompletionSlots,
-    failure: Option<CompletionSlots>,
-}
-
-impl SlotDemand {
-    fn remaining(
-        self,
-        reports: u32,
-        failure_available: bool,
-    ) -> Result<CompletionSlots, NativeError> {
-        if reports == 0 {
-            return Ok(CompletionSlots::default());
-        }
-        let slots = self.per_report.checked_scale(reports)?;
-        if failure_available {
-            slots.checked_add(self.failure.ok_or(ContractError::InvalidTransition)?)
-        } else {
-            Ok(slots)
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CompletionEnvelope {
     record_buffers: Option<record_codec::EncodingLimits>,
@@ -307,15 +177,6 @@ pub(super) struct CompletionEnvelope {
     reports: u32,
     ordinary_report: RangeWriteEnvelope,
     failed_report: Option<RangeWriteEnvelope>,
-    // Mixed completion journals survive construction until their pending
-    // candidate commits or rolls back, just like the candidate's range rows.
-    ordinary_journal_bytes: usize,
-    failed_journal_bytes: usize,
-    retained: usize,
-    workspace: usize,
-    required: usize,
-    slot_demand: SlotDemand,
-    slots: CompletionSlots,
     cohort: CohortBudget,
     work: Option<work::WorkCompletion>,
     graph: Option<CompletionGraph>,
@@ -515,9 +376,14 @@ pub(super) fn parent_bound(
             scope_limits.scopes.min(scope_limits.roots),
         )?,
     )?;
-    let immutable = heap(claim)?
-        .checked_sub(add(current_scopes, current_responses)?)
-        .ok_or(NativeError::Capacity("claim mutable heap accounting"))?;
+    // What the row holds besides its responses and scopes, and the terminal cut a completion
+    // that settles it adds (doc 31 M3).
+    let immutable = add(
+        heap(claim)?
+            .checked_sub(add(current_scopes, current_responses)?)
+            .ok_or(NativeError::Capacity("claim mutable heap accounting"))?,
+        terminal_growth(claim)?,
+    )?;
     let (_, registry) = registry_bound(limits, claim, registrations)?;
     let row_heap = entry_heap(limits)?;
     let available_parent = row_heap
@@ -713,7 +579,6 @@ impl CompletionEnvelope {
         registrations: &RegistrationSet,
         declaration: &validation::Declaration,
         mut descriptor: ArtifactLimits,
-        evidence: EvidenceBounds,
     ) -> Result<Self, NativeError> {
         let target = CompletionTarget::of(declaration)?;
         // WholeWork needs the actual response, complete graph and future
@@ -783,13 +648,13 @@ impl CompletionEnvelope {
             let moved = add(1, cohort.claims())?;
             add(
                 add(
-                    add(11, cohort.changed_keys())?,
+                    add(12, cohort.changed_keys())?,
                     add(report_fixed, add(moved, moved)?)?,
                 )?,
                 timers,
             )?
         } else {
-            add(add(9, report_fixed)?, timers)?
+            add(add(10, report_fixed)?, timers)?
         };
         descriptor.inputs =
             crate::native::index_rows::cap_inputs(input_bound(descriptor), fixed_rows, batch);
@@ -857,7 +722,9 @@ impl CompletionEnvelope {
         // also moves the parent and every sealed cohort claim between status
         // keys (doc 22 §7).
         let report_index = crate::native::index_rows::report_rows(input_bound(descriptor))?;
-        let ordinary_keys = add(add(9, report_index)?, timers)?;
+        // The report's rows, the meta, its outcome and its principal's
+        // window (F12), the index rows it writes and the timers it retires.
+        let ordinary_keys = add(add(10, report_index)?, timers)?;
         let ordinary_report = rows.future_write_envelope(
             RangeWriteLimits {
                 changed_keys: ordinary_keys,
@@ -871,7 +738,7 @@ impl CompletionEnvelope {
         let failed_report = if failure_possible {
             let moved = add(1, cohort.claims())?;
             let changes = add(
-                add(11, cohort.changed_keys())?,
+                add(12, cohort.changed_keys())?,
                 add(report_index, add(add(moved, moved)?, timers)?)?,
             )?;
             Some(rows.future_write_envelope(
@@ -894,69 +761,6 @@ impl CompletionEnvelope {
             None
         };
         let reports = declaration.attempt_bound();
-        let count = usize::try_from(reports).map_err(|_| NativeError::Capacity("report count"))?;
-        let failed_journal_bytes = if cohort.claims() == 0 {
-            0
-        } else {
-            super::completion_book::journal_bytes(add(1, cohort.evaluations())?)?
-        };
-        let regular_retained = crate::native::mutation::retained(ordinary_report)?;
-        let retained = if let Some(failed) = failed_report {
-            add(
-                multiply(
-                    count
-                        .checked_sub(1)
-                        .ok_or(NativeError::Capacity("report count"))?,
-                    regular_retained,
-                )?,
-                add(
-                    crate::native::mutation::retained(failed)?,
-                    failed_journal_bytes,
-                )?,
-            )?
-        } else {
-            multiply(count, regular_retained)?
-        };
-        let transient = |envelope: RangeWriteEnvelope| {
-            envelope
-                .additional_peak_bytes()
-                .checked_sub(envelope.additional_retained_bytes())
-                .ok_or(NativeError::Capacity("range temporary charge"))
-        };
-        let range_workspace =
-            transient(ordinary_report)?.max(failed_report.map(transient).transpose()?.unwrap_or(0));
-        // The owner serializes verification/construction. Charge one workspace,
-        // never one peak for every possible attempt. Ingress may have its own
-        // permit while Core's conservative input precharges coexist with it.
-        let workspace = add(
-            add(
-                input_heap,
-                add(evidence.workspace_bytes, evidence.retained_bytes)?,
-            )?,
-            add(construction.temporary_bytes()?, range_workspace)?,
-        )?;
-        let failure_events = add(1, cohort.events())?;
-        // A report's new rows: artifact, identity, accepted result, outcome,
-        // three events, and the artifact's and verdict's index rows (22 §7).
-        // A failed report moves status keys without adding rows.
-        let slot_demand = SlotDemand {
-            per_report: CompletionSlots {
-                artifacts: 1,
-                identities: 1,
-                results: 1,
-                outcomes: 1,
-                events: 3,
-                sequences: 1,
-                new_rows: add(7, report_index)?,
-                ..CompletionSlots::default()
-            },
-            failure: failed_report.map(|_| CompletionSlots {
-                events: failure_events,
-                new_rows: failure_events,
-                ..CompletionSlots::default()
-            }),
-        };
-        let slots = slot_demand.remaining(reports, failed_report.is_some())?;
         let result = Self {
             record_buffers: None,
             target,
@@ -974,13 +778,6 @@ impl CompletionEnvelope {
             reports,
             ordinary_report,
             failed_report,
-            ordinary_journal_bytes: 0,
-            failed_journal_bytes,
-            retained,
-            workspace,
-            required: add(retained, workspace)?,
-            slot_demand,
-            slots,
             cohort,
             work: None,
             graph: None,
@@ -1009,47 +806,6 @@ impl CompletionEnvelope {
     pub(super) fn reports(self) -> u32 {
         self.reports
     }
-    pub(super) fn slots(self) -> CompletionSlots {
-        self.slots
-    }
-    pub(super) fn remaining_slots(
-        self,
-        remaining_reports: u32,
-        failure_available: bool,
-    ) -> Result<CompletionSlots, NativeError> {
-        if remaining_reports > self.reports {
-            return Err(ContractError::InvalidTransition.into());
-        }
-        self.slot_demand
-            .remaining(remaining_reports, failure_available)
-    }
-
-    /// Exercise heterogeneous accounting before any new target is activated.
-    #[cfg(test)]
-    pub(super) fn with_slot_demand_for_test(
-        mut self,
-        per_report: CompletionSlots,
-        failure: Option<CompletionSlots>,
-    ) -> Result<Self, NativeError> {
-        if failure.is_some() != self.failed_report.is_some() {
-            return Err(ContractError::InvalidTransition.into());
-        }
-        self.slot_demand = SlotDemand {
-            per_report,
-            failure,
-        };
-        self.slots = self.remaining_slots(self.reports, failure.is_some())?;
-        Ok(self)
-    }
-    pub(super) fn total_retained_bytes(self) -> usize {
-        self.retained
-    }
-    pub(super) fn workspace_bytes(self) -> usize {
-        self.workspace
-    }
-    pub(super) fn required_bytes(self) -> usize {
-        self.required
-    }
     pub(super) fn report_storage(
         self,
         usage: CompletionUse,
@@ -1061,25 +817,6 @@ impl CompletionEnvelope {
             CompletionUse::Regular => Ok(self.ordinary_report),
         }
     }
-    pub(super) fn per_report_retained_bytes(
-        self,
-        usage: CompletionUse,
-    ) -> Result<usize, NativeError> {
-        let storage = self.report_storage(usage)?;
-        let records = self
-            .record_buffers
-            .map(|limits| record_codec::future_record_bytes(storage, limits))
-            .transpose()?
-            .unwrap_or(0);
-        add(
-            add(crate::native::mutation::retained(storage)?, records)?,
-            match usage {
-                CompletionUse::Regular => self.ordinary_journal_bytes,
-                CompletionUse::AdmissionFailure => self.failed_journal_bytes,
-            },
-        )
-    }
-
     pub(super) fn with_record_buffers(
         mut self,
         limits: record_codec::EncodingLimits,
@@ -1087,24 +824,11 @@ impl CompletionEnvelope {
         if self.record_buffers.is_some() {
             return Err(ContractError::InvalidTransition.into());
         }
-        let regular = record_codec::future_record_bytes(self.ordinary_report, limits)?;
-        let records = if let Some(failed) = self.failed_report {
-            add(
-                multiply(
-                    usize::try_from(self.reports.checked_sub(1).ok_or(ContractError::Capacity)?)
-                        .map_err(|_| ContractError::Capacity)?,
-                    regular,
-                )?,
-                record_codec::future_record_bytes(failed, limits)?,
-            )?
-        } else {
-            multiply(
-                usize::try_from(self.reports).map_err(|_| ContractError::Capacity)?,
-                regular,
-            )?
-        };
-        self.retained = add(self.retained, records)?;
-        self.required = add(self.required, records)?;
+        // Every report's record must encode within the record limits.
+        record_codec::future_record_bytes(self.ordinary_report, limits)?;
+        if let Some(failed) = self.failed_report {
+            record_codec::future_record_bytes(failed, limits)?;
+        }
         self.record_buffers = Some(limits);
         Ok(self)
     }
@@ -1136,25 +860,6 @@ impl CompletionEnvelope {
             )?,
             dimensions.incoming_heap,
         )?;
-        let transient = storage
-            .additional_peak_bytes()
-            .checked_sub(storage.additional_retained_bytes())
-            .ok_or(NativeError::Capacity("deadline range temporary charge"))?;
-        within(
-            add(construction.temporary_bytes()?, transient)?,
-            self.workspace_bytes(),
-        )?;
-        self.remaining_slots(1, false)?
-            .checked_sub(CompletionSlots {
-                artifacts: 0,
-                identities: 0,
-                results: 0,
-                outcomes: 1,
-                events: 1,
-                sequences: 1,
-                new_rows: 2,
-                ..CompletionSlots::default()
-            })?;
         Ok(storage)
     }
 

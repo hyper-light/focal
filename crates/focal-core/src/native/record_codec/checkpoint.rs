@@ -37,9 +37,80 @@ pub struct CheckpointHeader {
 /// its quoted work. The caller separately funds its output buffering through
 /// checkpoint persistence/retention and accounts any surrounding Session data.
 /// This plan does not acquire any buffer, permit, root handle or snapshot.
+#[derive(Clone, Copy)]
 pub struct EncodingPlan<'a> {
-    core: &'a Core<NativeState>,
+    source: Source<'a>,
     quote: EncodingQuote,
+}
+
+/// The rows a plan encodes: a live core's, or a frozen image of them that
+/// another thread holds ([`crate::native::NativeFrozen`]). Both encode alike.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Core(&'a NativeState),
+    Frozen(&'a crate::native::NativeFrozen),
+}
+
+impl<'a> Source<'a> {
+    fn ledger(self) -> LedgerId {
+        match self {
+            Self::Core(state) => state.ledger,
+            Self::Frozen(frozen) => frozen.ledger,
+        }
+    }
+    fn profile(self) -> NativeContentProfile {
+        match self {
+            Self::Core(state) => state.profile,
+            Self::Frozen(frozen) => frozen.profile,
+        }
+    }
+    fn range(self) -> RangeId {
+        match self {
+            Self::Core(state) => state.rows.id(),
+            Self::Frozen(frozen) => frozen.rows.id(),
+        }
+    }
+    fn prefix(self) -> u64 {
+        match self {
+            Self::Core(state) => state.rows.prefix(),
+            Self::Frozen(frozen) => frozen.rows.prefix(),
+        }
+    }
+    fn len(self) -> usize {
+        match self {
+            Self::Core(state) => state.rows.len(),
+            Self::Frozen(frozen) => frozen.rows.len(),
+        }
+    }
+    fn root_frame(self) -> Result<RootFrame<'a>, CodecError> {
+        let (layout, layout_epoch, pages) = match self {
+            Self::Core(state) => (
+                state.rows.layout().members(),
+                state.rows.layout().epoch(),
+                state.rows.stats().pages,
+            ),
+            Self::Frozen(frozen) => (
+                frozen.rows.members(),
+                frozen.rows.epoch(),
+                frozen.rows.pages(),
+            ),
+        };
+        let payloads = match self {
+            Self::Core(state) => state.payloads(),
+            Self::Frozen(frozen) => frozen.payloads(),
+        };
+        Ok(RootFrame {
+            ledger: self.ledger(),
+            profile: self.profile(),
+            range: self.range(),
+            prefix: self.prefix(),
+            count: self.len(),
+            layout,
+            layout_epoch,
+            seeks: seeks(pages, layout.len())?,
+            payloads,
+        })
+    }
 }
 
 /// Preserve an output adapter's original error without boxing, cloning or
@@ -68,10 +139,59 @@ impl<E: std::error::Error + 'static> std::error::Error for WriteError<E> {
     }
 }
 
+/// Bytes gathered before the output takes them. An encoding is written a piece at a time (a
+/// field, a length, a staged row), and a seeded checkpoint's output copies each into its chunk:
+/// a call and a loop a piece took 15% of a checkpoint's encoding on the comparison (cluster
+/// profile run 38196905347, `Sealer::push`). In batches the output takes them a buffer at a
+/// time; the meter still charges every piece as it comes.
+const OUTPUT_BATCH: usize = 4096;
+
 struct CallbackSink<'a, F, E> {
     meter: CountingSink,
     output: &'a mut F,
     error: Option<E>,
+    batch: [u8; OUTPUT_BATCH],
+    held: usize,
+}
+
+impl<'a, F, E> CallbackSink<'a, F, E>
+where
+    F: FnMut(&[u8]) -> Result<(), E>,
+{
+    fn new(meter: CountingSink, output: &'a mut F) -> Self {
+        Self {
+            meter,
+            output,
+            error: None,
+            batch: [0; OUTPUT_BATCH],
+            held: 0,
+        }
+    }
+    /// Hands the output `bytes`, or what is held when `bytes` is `None`.
+    fn emit(&mut self, bytes: Option<&[u8]>) -> Result<(), CodecError> {
+        let bytes = match bytes {
+            Some(bytes) => bytes,
+            None => {
+                let held = self.held;
+                self.held = 0;
+                if held == 0 {
+                    return Ok(());
+                }
+                self.batch.get(..held).ok_or(CodecError::Capacity)?
+            }
+        };
+        match (self.output)(bytes) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.error = Some(error);
+                Err(CodecError::InvalidTag("checkpoint output"))
+            }
+        }
+    }
+    /// Hands the output what is still held, once the encoding has written its last piece.
+    fn finish(&mut self) -> Result<(), CodecError> {
+        self.emit(None)
+    }
 }
 
 impl<F, E> Sink for CallbackSink<'_, F, E>
@@ -81,13 +201,21 @@ where
     fn write(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
         // Debit complete output byte/work bounds before calling user code.
         self.meter.write(bytes)?;
-        match (self.output)(bytes) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.error = Some(error);
-                Err(CodecError::InvalidTag("checkpoint output"))
+        let end = add(self.held, bytes.len())?;
+        if end > OUTPUT_BATCH {
+            self.emit(None)?;
+            if bytes.len() >= OUTPUT_BATCH {
+                return self.emit(Some(bytes));
             }
         }
+        let start = self.held;
+        let end = add(start, bytes.len())?;
+        let target = self.batch.get_mut(start..end).ok_or(CodecError::Capacity)?;
+        if !focal_memory::short_copy::copy(target, bytes) {
+            return Err(CodecError::Capacity);
+        }
+        self.held = end;
+        Ok(())
     }
 
     fn visit(&mut self, amount: usize) -> Result<(), CodecError> {
@@ -100,17 +228,58 @@ impl<'a> EncodingPlan<'a> {
         core: &'a Core<NativeState>,
         limits: EncodingLimits,
     ) -> Result<Self, CodecError> {
-        if core.state.rows.len() > limits.rows {
+        Self::prepare_from(Source::Core(&core.state), limits)
+    }
+    /// A plan over a frozen image, encodable on the thread that holds it.
+    pub fn prepare_frozen(
+        frozen: &'a crate::native::NativeFrozen,
+        limits: EncodingLimits,
+    ) -> Result<Self, CodecError> {
+        Self::prepare_from(Source::Frozen(frozen), limits)
+    }
+    /// The frozen image's root written to `output` in one pass, measured as
+    /// it goes: the plan [`Self::prepare_frozen`] would have made, without
+    /// its separate measuring walk. Its bytes are out once it returns; a
+    /// caller that frames them after (a seeded checkpoint names its chunks
+    /// and the root's digest after the root) needs the root walked once.
+    pub fn write_frozen<E>(
+        frozen: &'a crate::native::NativeFrozen,
+        limits: EncodingLimits,
+        mut output: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<Self, WriteError<E>> {
+        let source = Source::Frozen(frozen);
+        if source.len() > limits.rows {
+            return Err(WriteError::Codec(CodecError::Capacity));
+        }
+        let mut sink =
+            CallbackSink::new(CountingSink::new(limits.bytes, limits.visits), &mut output);
+        let result = frame(&mut sink, source).and_then(|hash| sink.finish().map(|()| hash));
+        if let Some(error) = sink.error.take() {
+            return Err(WriteError::Output(error));
+        }
+        let hash = result.map_err(WriteError::Codec)?;
+        Ok(Self {
+            source,
+            quote: EncodingQuote {
+                bytes: sink.meter.len(),
+                visits: sink.meter.visits_used(),
+                rows: source.len(),
+                hash,
+            },
+        })
+    }
+    fn prepare_from(source: Source<'a>, limits: EncodingLimits) -> Result<Self, CodecError> {
+        if source.len() > limits.rows {
             return Err(CodecError::Capacity);
         }
         let mut sink = CountingSink::new(limits.bytes, limits.visits);
-        let hash = frame(&mut sink, core)?;
+        let hash = frame(&mut sink, source)?;
         Ok(Self {
-            core,
+            source,
             quote: EncodingQuote {
                 bytes: sink.len(),
                 visits: sink.visits_used(),
-                rows: core.state.rows.len(),
+                rows: source.len(),
                 hash,
             },
         })
@@ -124,10 +293,10 @@ impl<'a> EncodingPlan<'a> {
     /// checkpoint layers can bind their metadata before writing any bytes.
     pub fn header(&self) -> Result<CheckpointHeader, CodecError> {
         Ok(CheckpointHeader {
-            ledger: self.core.state.ledger,
-            profile: self.core.state.profile,
-            range: self.core.state.rows.id(),
-            prefix: self.core.native_sequence(),
+            ledger: self.source.ledger(),
+            profile: self.source.profile(),
+            range: self.source.range(),
+            prefix: SessionSeq(self.source.prefix()),
             rows: u64::try_from(self.quote.rows).map_err(|_| CodecError::Capacity)?,
             hash: self.quote.hash,
         })
@@ -140,7 +309,7 @@ impl<'a> EncodingPlan<'a> {
             return Err(CodecError::Capacity);
         }
         let mut sink = SliceSink::new(output, self.quote.visits);
-        let hash = frame(&mut sink, self.core)?;
+        let hash = frame(&mut sink, self.source)?;
         if sink.len() != self.quote.bytes
             || sink.visits_used() != self.quote.visits
             || hash != self.quote.hash
@@ -166,12 +335,11 @@ impl<'a> EncodingPlan<'a> {
         &self,
         mut output: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<ContentHash, WriteError<E>> {
-        let mut sink = CallbackSink {
-            meter: CountingSink::new(self.quote.bytes, self.quote.visits),
-            output: &mut output,
-            error: None,
-        };
-        let result = frame(&mut sink, self.core);
+        let mut sink = CallbackSink::new(
+            CountingSink::new(self.quote.bytes, self.quote.visits),
+            &mut output,
+        );
+        let result = frame(&mut sink, self.source).and_then(|hash| sink.finish().map(|()| hash));
         if let Some(error) = sink.error.take() {
             return Err(WriteError::Output(error));
         }
@@ -304,11 +472,13 @@ impl<'a> StructuralCheckpoint<'a> {
     }
     /// The range layout the rows are held in, decoded again from the
     /// inspected bytes into a layout of at most `max` members charged to
-    /// `budget` (25 §4).
+    /// `budget` on `lane` (25 §4) — the restore's lane, so a recovery funded
+    /// by the completion allowance never waits on ordinary credit.
     pub fn layout(
         &self,
         max: usize,
         budget: &MemoryBudget,
+        lane: BudgetLane,
     ) -> Result<ranges::RangeLayout, NativeError> {
         if self.members > max.min(ranges::MAX_LAYOUT_MEMBERS) {
             return Err(NativeError::Capacity("range layout members"));
@@ -316,7 +486,7 @@ impl<'a> StructuralCheckpoint<'a> {
         let allocation = budget
             .reserve(
                 BudgetKind::Roots,
-                BudgetLane::Ordinary,
+                lane,
                 prepare::array::<ranges::RangeBoundary>(self.members)?,
             )?
             .commit();
@@ -360,6 +530,37 @@ impl<'a> StructuralCheckpoint<'a> {
     }
 }
 
+impl<'a> inspect::RowFrame<'a> for StructuralCheckpoint<'a> {
+    fn ledger(&self) -> LedgerId {
+        self.header.ledger
+    }
+    fn quote(&self) -> InspectionQuote {
+        self.quote
+    }
+    fn rows(&self, max_visits: usize) -> Result<RecordRows<'a>, CodecError> {
+        StructuralCheckpoint::rows(self, max_visits)
+    }
+}
+
+/// The work of one row of an in-order walk inside a page: the advance and its
+/// key comparison, one level of a seek's walk (`iteration_work`'s step).
+const ROW_STEP: usize = 64;
+
+/// The seeks an in-order walk of `state`'s rows can take: one into each
+/// member, one per page it steps to, and the terminating probe.
+fn store_seeks(state: &NativeState) -> Result<usize, CodecError> {
+    seeks(
+        state.rows.stats().pages,
+        state.rows.layout().members().len(),
+    )
+}
+fn seeks(pages: usize, members: usize) -> Result<usize, CodecError> {
+    pages
+        .checked_add(members)
+        .and_then(|seeks| seeks.checked_add(1))
+        .ok_or(CodecError::Capacity)
+}
+
 fn iteration_work() -> Result<usize, CodecError> {
     // A next/initial seek may walk the bounded persistent directory height.
     // Include key comparisons and the terminating probe without a root pin or
@@ -371,21 +572,20 @@ fn iteration_work() -> Result<usize, CodecError> {
         .ok_or(CodecError::Capacity)
 }
 
-fn frame(sink: &mut impl Sink, core: &Core<NativeState>) -> Result<ContentHash, CodecError> {
-    let state = &core.state;
-    frame_entries(
-        sink,
-        RootFrame {
-            ledger: state.ledger,
-            profile: state.profile,
-            range: state.rows.id(),
-            prefix: state.rows.prefix(),
-            count: state.rows.len(),
-            layout: state.rows.layout().members(),
-            layout_epoch: state.rows.layout().epoch(),
-        },
-        state.rows.entries().map(|entry| (entry.key, &entry.value)),
-    )
+fn frame(sink: &mut impl Sink, source: Source<'_>) -> Result<ContentHash, CodecError> {
+    let root = source.root_frame()?;
+    match source {
+        Source::Core(state) => frame_entries(
+            sink,
+            root,
+            state.rows.entries().map(|entry| (entry.key, entry.value)),
+        ),
+        Source::Frozen(frozen) => frame_entries(
+            sink,
+            root,
+            frozen.rows.entries().map(|entry| (entry.key, entry.value)),
+        ),
+    }
 }
 
 /// The content hash of the Core's rows alone, under a fixed range identity
@@ -414,8 +614,10 @@ pub fn rows_digest(
                 start: None,
             }],
             layout_epoch: 0,
+            seeks: store_seeks(state)?,
+            payloads: state.payloads(),
         },
-        state.rows.entries().map(|entry| (entry.key, &entry.value)),
+        state.rows.entries().map(|entry| (entry.key, entry.value)),
     )
 }
 
@@ -462,8 +664,11 @@ pub fn member_digest(
                 start: None,
             }],
             layout_epoch: 0,
+            // One member's pages are among the store's.
+            seeks: store_seeks(state)?,
+            payloads: state.payloads(),
         },
-        entries.map(|entry| (entry.key, &entry.value)),
+        entries.map(|entry| (entry.key, entry.value)),
     )
 }
 
@@ -478,6 +683,12 @@ pub(in crate::native) struct RootFrame<'l> {
     /// The members of the range layout in key order and its epoch (25 §4).
     pub(in crate::native) layout: &'l [ranges::RangeBoundary],
     pub(in crate::native) layout_epoch: u64,
+    /// The directory seeks the rows' iterator can take: a store's in-order
+    /// walk seeks once into each member and at most once more per page; a
+    /// slice seeks once.
+    pub(in crate::native) seeks: usize,
+    /// Where a spilled row's bytes are read from (doc 31 M3).
+    pub(in crate::native) payloads: Option<&'l dyn crate::native::payloads::PayloadRead>,
 }
 
 /// The work of parsing or writing a layout of `members`: each member's fixed
@@ -666,6 +877,7 @@ pub(in crate::native) fn archive_frame<'a>(
     sink: &mut impl Sink,
     frame: ArchiveFrame<'_>,
     mut entries: impl Iterator<Item = (Key, &'a Row)>,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
 ) -> Result<ContentHash, CodecError> {
     if frame.ledger.tenant.is_zero()
         || frame.ledger.session.is_zero()
@@ -687,10 +899,7 @@ pub(in crate::native) fn archive_frame<'a>(
         add(add(256, frame.members.len())?, frame.content.len())?,
         frame.inline.len(),
     )?)?;
-    let mut hashed = HashSink {
-        sink,
-        hash: blake3::Hasher::new_derive_key(ARCHIVE_HASH_DOMAIN),
-    };
+    let mut hashed = HashSink::new(sink, blake3::Hasher::new_derive_key(ARCHIVE_HASH_DOMAIN));
     write_raw(&mut hashed, &ARCHIVE_MAGIC)?;
     write_u16(&mut hashed, ARCHIVE_VERSION)?;
     write_u8(
@@ -718,6 +927,7 @@ pub(in crate::native) fn archive_frame<'a>(
     write_u64(&mut hashed, count)?;
     let iteration = iteration_work()?;
     let mut previous = None;
+    let mut stage = Stage::new();
     for _ in 0..frame.count {
         hashed.visit(iteration)?;
         let (key, value) = entries
@@ -728,12 +938,184 @@ pub(in crate::native) fn archive_frame<'a>(
         }
         rows::family(key, value)?;
         previous = Some(key);
-        put_row(&mut hashed, key, value, frame.ledger)?;
+        put_row(&mut hashed, &mut stage, key, value, frame.ledger, payloads)?;
     }
     if entries.next().is_some() {
         return Err(CodecError::InvalidTag("archive row count"));
     }
-    let digest = ContentHash(*hashed.hash.finalize().as_bytes());
+    let digest = hashed.digest();
+    write_raw(hashed.sink, &digest.0)?;
+    Ok(digest)
+}
+/// A seal bundle's frame (the audit's F12): the outcome and creation-result
+/// rows that left the core in one seal, in key order, under a header naming
+/// the ledger, the prefix the seal was derived at, its ordinal and the
+/// generations of each principal it holds; or a fold: the seals it covers
+/// and the generations that point into each. Digested like a checkpoint
+/// root; read, never restored.
+pub const SEAL_MAGIC: [u8; 8] = *b"FCNSEAL1";
+pub const SEAL_VERSION: u16 = 1;
+pub(super) const SEAL_HASH_DOMAIN: &str = "focal.native.seal.v1";
+pub(in crate::native) enum SealFrame<'m> {
+    Seal {
+        ledger: LedgerId,
+        profile: NativeContentProfile,
+        through: SessionSeq,
+        ordinal: u64,
+        /// Sorted by principal: the sealed generations of each.
+        principals: &'m [super::super::seal::SealedPrincipal],
+        count: usize,
+    },
+    Fold {
+        ledger: LedgerId,
+        profile: NativeContentProfile,
+        first: u64,
+        last: u64,
+        /// The rows folded, by ordinal, ascending.
+        members: &'m [(u64, super::super::seal::SealRow)],
+        /// Every sealed range pointing into a member, by principal then
+        /// range.
+        ranges: &'m [(ParticipantId, super::super::epochs::SealedRange)],
+    },
+}
+pub(in crate::native) fn seal_frame<'a>(
+    sink: &mut impl Sink,
+    frame: SealFrame<'_>,
+    mut entries: impl Iterator<Item = (Key, &'a Row)>,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<ContentHash, CodecError> {
+    let mut hashed = HashSink::new(sink, blake3::Hasher::new_derive_key(SEAL_HASH_DOMAIN));
+    write_raw(&mut hashed, &SEAL_MAGIC)?;
+    write_u16(&mut hashed, SEAL_VERSION)?;
+    let (ledger, profile) = match &frame {
+        SealFrame::Seal {
+            ledger, profile, ..
+        }
+        | SealFrame::Fold {
+            ledger, profile, ..
+        } => (*ledger, *profile),
+    };
+    if ledger.tenant.is_zero() || ledger.session.is_zero() {
+        return Err(CodecError::InvalidTag("seal frame"));
+    }
+    write_u8(
+        &mut hashed,
+        match profile {
+            NativeContentProfile::ProjectionOnly => 0,
+            NativeContentProfile::AuthoredV1 => 1,
+        },
+    )?;
+    types::ledger(&mut hashed, ledger)?;
+    let count = match frame {
+        SealFrame::Seal {
+            through,
+            ordinal,
+            principals,
+            count,
+            ..
+        } => {
+            if through.0 == 0 || ordinal == 0 || count == 0 {
+                return Err(CodecError::InvalidTag("seal frame"));
+            }
+            if !principals
+                .windows(2)
+                .all(|pair| matches!(pair, [a, b] if a.principal < b.principal))
+                || principals.iter().any(|entry| {
+                    entry.principal.is_zero() || entry.first.0 == 0 || entry.first > entry.last
+                })
+            {
+                return Err(CodecError::InvalidTag("seal principals"));
+            }
+            hashed.visit(add(256, principals.len())?)?;
+            write_u8(&mut hashed, 0)?;
+            write_u64(&mut hashed, through.0)?;
+            write_u64(&mut hashed, ordinal)?;
+            write_u32(
+                &mut hashed,
+                u32::try_from(principals.len()).map_err(|_| CodecError::Capacity)?,
+            )?;
+            for entry in principals {
+                write_raw(&mut hashed, &entry.principal.0)?;
+                write_u64(&mut hashed, entry.first.0)?;
+                write_u64(&mut hashed, entry.last.0)?;
+            }
+            write_u64(
+                &mut hashed,
+                u64::try_from(count).map_err(|_| CodecError::Capacity)?,
+            )?;
+            count
+        }
+        SealFrame::Fold {
+            first,
+            last,
+            members,
+            ranges,
+            ..
+        } => {
+            if first == 0
+                || first >= last
+                || members.len() < 2
+                || !members
+                    .windows(2)
+                    .all(|pair| matches!(pair, [a, b] if a.0 < b.0))
+                || members.first().is_none_or(|(_, row)| row.first != first)
+                || members.last().is_none_or(|(ordinal, _)| *ordinal != last)
+                || !ranges
+                    .windows(2)
+                    .all(|pair| matches!(pair, [a, b] if (a.0, a.1.last.0) < (b.0, b.1.first.0)))
+                || ranges.iter().any(|(principal, range)| {
+                    principal.is_zero() || !(first..=last).contains(&range.seal)
+                })
+            {
+                return Err(CodecError::InvalidTag("fold frame"));
+            }
+            hashed.visit(add(add(256, members.len())?, ranges.len())?)?;
+            write_u8(&mut hashed, 1)?;
+            write_u64(&mut hashed, first)?;
+            write_u64(&mut hashed, last)?;
+            write_u32(
+                &mut hashed,
+                u32::try_from(members.len()).map_err(|_| CodecError::Capacity)?,
+            )?;
+            for (ordinal, row) in members {
+                write_u64(&mut hashed, *ordinal)?;
+                fixed::seal_row(&mut hashed, row)?;
+            }
+            write_u32(
+                &mut hashed,
+                u32::try_from(ranges.len()).map_err(|_| CodecError::Capacity)?,
+            )?;
+            for (principal, range) in ranges {
+                write_raw(&mut hashed, &principal.0)?;
+                write_u64(&mut hashed, range.first.0)?;
+                write_u64(&mut hashed, range.last.0)?;
+                write_u64(&mut hashed, range.seal)?;
+            }
+            write_u64(&mut hashed, 0)?;
+            0
+        }
+    };
+    let iteration = iteration_work()?;
+    let mut previous = None;
+    let mut stage = Stage::new();
+    for _ in 0..count {
+        hashed.visit(iteration)?;
+        let (key, value) = entries
+            .next()
+            .ok_or(CodecError::InvalidTag("seal row count"))?;
+        if previous.is_some_and(|last| last >= key)
+            || !matches!(key, Key::Outcome(_) | Key::CreationResult(_))
+        {
+            return Err(CodecError::InvalidTag("seal key order"));
+        }
+        rows::family(key, value)?;
+        previous = Some(key);
+        put_row(&mut hashed, &mut stage, key, value, ledger, payloads)?;
+    }
+    if entries.next().is_some() {
+        return Err(CodecError::InvalidTag("seal row count"));
+    }
+    let digest = hashed.digest();
     write_raw(hashed.sink, &digest.0)?;
     Ok(digest)
 }
@@ -752,10 +1134,7 @@ fn frame_entries<'a>(
     }
     let count_u64 = u64::try_from(count).map_err(|_| CodecError::Capacity)?;
     sink.visit(256)?;
-    let mut hashed = HashSink {
-        sink,
-        hash: blake3::Hasher::new_derive_key(HASH_DOMAIN),
-    };
+    let mut hashed = HashSink::new(sink, blake3::Hasher::new_derive_key(HASH_DOMAIN));
     write_raw(&mut hashed, &MAGIC)?;
     write_u16(&mut hashed, VERSION)?;
     write_u8(
@@ -770,13 +1149,22 @@ fn frame_entries<'a>(
     write_u64(&mut hashed, prefix)?;
     write_u64(&mut hashed, count_u64)?;
     write_layout(&mut hashed, frame.layout_epoch, frame.layout)?;
+    // A walk's seeks are charged once each and its in-page steps once a row.
+    // Charging every row a whole seek counted about a hundredfold more work
+    // than a walk does, and a ledger past 4,800 claims could not be
+    // checkpointed.
     let iteration = iteration_work()?;
-    hashed.visit(iteration)?;
+    hashed.visit(
+        iteration
+            .checked_mul(frame.seeks)
+            .ok_or(CodecError::Capacity)?,
+    )?;
     let mut previous = None;
+    let mut stage = Stage::new();
     let mut meta = false;
     let mut outcome = false;
     for _ in 0..count {
-        hashed.visit(iteration)?;
+        hashed.visit(ROW_STEP)?;
         let (key, value) = entries
             .next()
             .ok_or(CodecError::InvalidTag("checkpoint row count"))?;
@@ -787,7 +1175,14 @@ fn frame_entries<'a>(
         previous = Some(key);
         meta |= key == Key::Meta;
         outcome |= matches!(key, Key::Outcome(_));
-        put_row(&mut hashed, key, value, frame.ledger)?;
+        put_row(
+            &mut hashed,
+            &mut stage,
+            key,
+            value,
+            frame.ledger,
+            frame.payloads,
+        )?;
     }
     hashed.visit(iteration)?;
     if entries.next().is_some() {
@@ -796,20 +1191,172 @@ fn frame_entries<'a>(
     if prefix != 0 && (!meta || !outcome) {
         return Err(CodecError::InvalidTag("checkpoint accounting rows"));
     }
-    let digest = ContentHash(*hashed.hash.finalize().as_bytes());
+    let digest = hashed.digest();
     write_raw(hashed.sink, &digest.0)?;
     Ok(digest)
 }
 
-fn put_row(sink: &mut impl Sink, key: Key, row: &Row, ledger: LedgerId) -> Result<(), CodecError> {
-    write_u8(sink, 1)?;
-    fixed::key(sink, key)?;
-    let mut measure = RowSize { sink, bytes: 0 };
-    rows::value(&mut measure, row, ledger)?;
+/// The most work an encoding of a root of at most `rows` rows and `bytes` bytes takes, by the
+/// charges [`frame_entries`] makes: the frame's start (256), its range layout at the most members a
+/// layout holds (`layout_visits`), a step a row (`ROW_STEP`), a walk's iteration at each seek and
+/// once more at its end (`iteration_work`; a seek per page, no more pages than rows, and one into
+/// each layout member and the terminating probe), and each write's one visit and one a byte. A
+/// write is a length-prefixed element's prefix or its bytes, so there are no more writes than
+/// twice the bytes, and the writes take at most three visits a byte. A checkpoint's visit bound
+/// derived from this never refuses a root its row and byte bounds hold (a ledger session filled
+/// to its admission bound stopped at its checkpoint, 268,771,520 visits past a fixed 256 Mi).
+pub fn work_bound(rows: usize, bytes: usize) -> Option<usize> {
+    let members = super::super::ranges::MAX_LAYOUT_MEMBERS;
+    let seeks = rows.checked_add(members)?.checked_add(2)?;
+    let walk = iteration_work().ok()?.checked_mul(seeks)?;
+    let steps = ROW_STEP.checked_mul(rows)?;
+    let writes = bytes.checked_mul(3)?;
+    256usize
+        .checked_add(layout_visits(members).ok()?)?
+        .checked_add(walk)?
+        .checked_add(steps)?
+        .checked_add(writes)
+}
+
+/// What one row adds to a checkpoint, exactly: its tag, its key, its body's length and its body,
+/// as [`put_row`] writes them. Kept as a running total over a root's rows
+/// (`NativeState::encoded_rows`), so what admission projects a checkpoint to is what it encodes
+/// to, never a bound inferred from memory.
+pub(in crate::native) fn row_bytes(
+    key: Key,
+    row: &Row,
+    ledger: LedgerId,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<usize, CodecError> {
+    // The body is measured once and counted, not walked a second time to be counted again.
+    let mut sink = CountingSink::new(usize::MAX, usize::MAX);
+    write_u8(&mut sink, 1)?;
+    fixed::key(&mut sink, key)?;
+    let mut measure = RowSize {
+        sink: &mut sink,
+        bytes: 0,
+    };
+    rows::value(&mut measure, key, row, ledger, payloads)?;
     let size = measure.bytes;
     if size == 0 {
         return Err(CodecError::InvalidTag("empty checkpoint body"));
     }
-    write_count(sink, size)?;
-    rows::value(sink, row, ledger)
+    write_count(&mut sink, size)?;
+    sink.count(size)?;
+    Ok(sink.len())
+}
+
+/// What a checkpoint of `state` takes besides its rows, exactly: the frame's header, its range
+/// layout and the trailing digest, written by the calls [`frame_entries`] makes. The prefix and
+/// the row count are fixed-width, so this depends on the layout alone.
+pub(in crate::native) fn frame_bytes(state: &NativeState) -> Result<usize, CodecError> {
+    let mut sink = CountingSink::new(usize::MAX, usize::MAX);
+    write_raw(&mut sink, &MAGIC)?;
+    write_u16(&mut sink, VERSION)?;
+    write_u8(&mut sink, 0)?;
+    types::ledger(&mut sink, state.ledger)?;
+    write_raw(&mut sink, &state.rows.id().0.to_le_bytes())?;
+    write_u64(&mut sink, state.rows.prefix())?;
+    write_u64(&mut sink, 0)?;
+    write_layout(
+        &mut sink,
+        state.rows.layout().epoch(),
+        state.rows.layout().members(),
+    )?;
+    write_raw(&mut sink, &[0u8; 32])?;
+    Ok(sink.len())
+}
+
+/// The longest row body a [`Stage`] holds. A body is encoded once into the stage and written
+/// whole after its length; measured first, as it had been, every field of every row was walked
+/// twice (once to count it, once to write it), and each piece reached the sink on its own. Most
+/// bodies are a few hundred bytes; one longer than this is counted as it is staged and walked a
+/// second time into the sink.
+const ROW_STAGE: usize = 4096;
+
+/// A row body staged before its length is written (see [`ROW_STAGE`]).
+struct Stage {
+    bytes: [u8; ROW_STAGE],
+    held: usize,
+    /// The body's whole length, held or not.
+    size: usize,
+    /// The body outgrew the stage: it is written by a second walk.
+    spilled: bool,
+}
+impl Stage {
+    fn new() -> Self {
+        Self {
+            bytes: [0; ROW_STAGE],
+            held: 0,
+            size: 0,
+            spilled: false,
+        }
+    }
+}
+
+/// Encodes a row body into a [`Stage`], charging each write the work [`RowSize`] charges for
+/// measuring it.
+struct Staging<'a, S> {
+    sink: &'a mut S,
+    stage: &'a mut Stage,
+}
+impl<S: Sink> Sink for Staging<'_, S> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+        let size = add(self.stage.size, bytes.len())?;
+        u32::try_from(size).map_err(|_| CodecError::Capacity)?;
+        self.sink.visit(add(1, bytes.len())?)?;
+        self.stage.size = size;
+        if !self.stage.spilled {
+            let end = add(self.stage.held, bytes.len())?;
+            match self.stage.bytes.get_mut(self.stage.held..end) {
+                Some(target) => {
+                    if !focal_memory::short_copy::copy(target, bytes) {
+                        return Err(CodecError::Capacity);
+                    }
+                    self.stage.held = end;
+                }
+                None => self.stage.spilled = true,
+            }
+        }
+        Ok(())
+    }
+    fn visit(&mut self, amount: usize) -> Result<(), CodecError> {
+        self.sink.visit(amount)
+    }
+}
+
+fn put_row(
+    sink: &mut impl Sink,
+    stage: &mut Stage,
+    key: Key,
+    row: &Row,
+    ledger: LedgerId,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), CodecError> {
+    write_u8(sink, 1)?;
+    fixed::key(sink, key)?;
+    stage.held = 0;
+    stage.size = 0;
+    stage.spilled = false;
+    rows::value(
+        &mut Staging {
+            sink: &mut *sink,
+            stage: &mut *stage,
+        },
+        key,
+        row,
+        ledger,
+        payloads,
+    )?;
+    if stage.size == 0 {
+        return Err(CodecError::InvalidTag("empty checkpoint body"));
+    }
+    write_count(sink, stage.size)?;
+    if stage.spilled {
+        return rows::value(sink, key, row, ledger, payloads);
+    }
+    write_raw(
+        sink,
+        stage.bytes.get(..stage.held).ok_or(CodecError::Capacity)?,
+    )
 }

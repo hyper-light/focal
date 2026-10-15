@@ -202,65 +202,70 @@ fn chunk_path(path: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
     ))
 }
 
-#[tokio::test]
-async fn exact_checkpoint_and_all_artifacts_survive_advance_compaction_and_content_reopen() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut session, store, reference) = fixture(dir.path());
-    let snapshot = session.checkpoint_evidence(0, 30_000).unwrap();
-    let prefix = snapshot.prefix().clone();
-    assert_eq!(prefix.artifacts, 2);
-    let checkpoint = snapshot.checkpoint().to_vec();
-    // Newer materialized state contains an additional absent content object.
-    // The already captured prefix must remain exactly its previous artifact set.
-    let mut absent = reference;
-    absent.root = ContentHash([211; 32]);
-    register(&mut session, 30, ArtifactPayload::Content(absent));
-    let cutover = place(&mut session, 2);
-    session.checkpoint().unwrap();
-    let budget = memory();
-    let (host, owner) = ContentHost::spawn(
-        store,
-        CustodyConfig::new(1),
-        WireLimits::default(),
-        budget.clone(),
-    )
-    .unwrap();
-    let witness = host.verify_prefix(snapshot, None).await.unwrap();
-    assert_eq!(witness.manifest().prefix, prefix);
-    assert!(witness.manifest().prefix.sequence < session.sequence());
-    assert_eq!(witness.manifest().verified_artifacts, 2);
-    assert_eq!(witness.manifest().verified_content_references, 1);
-    assert_eq!(witness.manifest().verified_content_bytes, 12);
-    assert!(
-        witness
-            .verify_cutover(&session.placement_witness(&cutover).unwrap().unwrap())
-            .is_err()
-    );
-    let next = session.checkpoint_evidence(30_000, 30_000).unwrap();
-    assert!(host.verify_prefix(next, None).await.is_err());
-    let manifest_hash = witness.digest();
-    drop(witness);
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    drop(host);
-    assert_eq!(budget.stats().used, 0);
-    drop(session);
-    let reopened = ContentStore::open(dir.path().join("content"), limits()).unwrap();
-    let durable_checkpoint = reopened
-        .read_custody_record(
-            CustodyRecordKind::Checkpoint,
-            prefix.checkpoint,
-            8 * 1024 * 1024,
+#[test]
+fn exact_checkpoint_and_all_artifacts_survive_advance_compaction_and_content_reopen() {
+    focal_rt::block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut session, store, reference) = fixture(dir.path());
+        let snapshot = session.checkpoint_evidence(30_000).unwrap();
+        let prefix = snapshot.prefix().clone();
+        assert_eq!(prefix.artifacts, 2);
+        let checkpoint = snapshot.checkpoint().to_vec();
+        // Newer materialized state contains an additional absent content object.
+        // The already captured prefix must remain exactly its previous artifact set.
+        let mut absent = reference;
+        absent.root = ContentHash([211; 32]);
+        register(&mut session, 30, ArtifactPayload::Content(absent));
+        let cutover = place(&mut session, 2);
+        session.checkpoint().unwrap();
+        let budget = memory();
+        let (host, owner) = ContentHost::spawn(
+            store,
+            CustodyConfig::new(1),
+            WireLimits::default(),
+            budget.clone(),
         )
         .unwrap();
-    assert_eq!(durable_checkpoint, checkpoint);
-    let bytes = reopened
-        .read_custody_record(CustodyRecordKind::Manifest, manifest_hash, 4096)
-        .unwrap();
-    let (manifest, rest): (CustodyPrefixManifest, _) = postcard::take_from_bytes(&bytes).unwrap();
-    assert!(rest.is_empty());
-    assert_eq!(manifest.prefix, prefix);
-    assert_eq!(manifest.verified_artifacts, 2);
+        let witness = host.verify_prefix(snapshot, None).await.unwrap();
+        assert_eq!(witness.manifest().prefix, prefix);
+        assert!(witness.manifest().prefix.sequence < session.sequence());
+        assert_eq!(witness.manifest().verified_artifacts, 2);
+        assert_eq!(witness.manifest().verified_content_references, 1);
+        assert_eq!(witness.manifest().verified_content_bytes, 12);
+        assert!(
+            witness
+                .verify_cutover(&session.placement_witness(&cutover).unwrap().unwrap())
+                .is_err()
+        );
+        session.move_read_clock_ahead(std::time::Duration::from_secs(30));
+        let next = session.checkpoint_evidence(30_000).unwrap();
+        assert!(host.verify_prefix(next, None).await.is_err());
+        let manifest_hash = witness.digest();
+        drop(witness);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        drop(host);
+        assert_eq!(budget.stats().used, 0);
+        drop(session);
+        let reopened = ContentStore::open(dir.path().join("content"), limits()).unwrap();
+        let durable_checkpoint = reopened
+            .read_custody_record(
+                CustodyRecordKind::Checkpoint,
+                prefix.checkpoint,
+                8 * 1024 * 1024,
+            )
+            .unwrap();
+        assert_eq!(durable_checkpoint, checkpoint);
+        let bytes = reopened
+            .read_custody_record(CustodyRecordKind::Manifest, manifest_hash, 4096)
+            .unwrap();
+        let (manifest, rest): (CustodyPrefixManifest, _) =
+            postcard::take_from_bytes(&bytes).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(manifest.prefix, prefix);
+        assert_eq!(manifest.verified_artifacts, 2);
+    })
+    .unwrap()
 }
 
 #[test]
@@ -268,7 +273,7 @@ fn missing_and_corrupt_last_chunks_never_produce_an_empty_or_partial_seal() {
     for missing in [true, false] {
         let dir = tempfile::tempdir().unwrap();
         let (mut session, store, _) = fixture(dir.path());
-        let snapshot = session.checkpoint_evidence(0, 30_000).unwrap();
+        let snapshot = session.checkpoint_evidence(30_000).unwrap();
         let path = chunk_path(dir.path(), b"ijkl");
         if missing {
             std::fs::remove_file(path).unwrap();
@@ -297,7 +302,7 @@ fn preparing_scope_keeps_active_ingress_and_rejects_policy_change_mid_verificati
     let budget = memory();
     let mut owner = CustodyStore::new(store, CustodyConfig::new(1), budget.clone()).unwrap();
     owner.install_policy(policy(1)).unwrap();
-    let snapshot = session.checkpoint_evidence(0, 30_000).unwrap();
+    let snapshot = session.checkpoint_evidence(30_000).unwrap();
     let state = CustodyVerification::new(snapshot, Some(policy(1).scope()), &budget).unwrap();
     let witness = finish(Box::new(state), &mut owner, &budget).unwrap();
     assert_eq!(witness.manifest().prefix.route, RouteEpoch(2));
@@ -311,8 +316,9 @@ fn preparing_scope_keeps_active_ingress_and_rejects_policy_change_mid_verificati
     assert_eq!(owner.installed(ledger()), Some(&policy(1)));
     drop(witness);
 
+    session.move_read_clock_ahead(std::time::Duration::from_secs(30));
     let state = CustodyVerification::new(
-        session.checkpoint_evidence(30_000, 30_000).unwrap(),
+        session.checkpoint_evidence(30_000).unwrap(),
         Some(policy(1).scope()),
         &budget,
     )
@@ -332,67 +338,60 @@ fn preparing_scope_keeps_active_ingress_and_rejects_policy_change_mid_verificati
     assert_eq!(owner.installed(ledger()), Some(&policy(2)));
 }
 
-#[tokio::test]
-async fn canceled_continuation_releases_owned_charge_and_expired_or_dropped_snapshot_fails() {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut session, store, _) = fixture(dir.path());
-    let clock = std::time::Instant::now();
-    let now = || u64::try_from(clock.elapsed().as_millis()).unwrap();
-    let budget = memory();
-    let (host, owner) = ContentHost::spawn(
-        store,
-        CustodyConfig::new(1),
-        WireLimits::default(),
-        budget.clone(),
-    )
-    .unwrap();
-    let baseline = budget.stats().used;
-    let progress = host
-        .begin_verification(session.checkpoint_evidence(now(), 30_000).unwrap(), None)
-        .await
+#[test]
+fn canceled_continuation_releases_owned_charge_and_expired_or_dropped_snapshot_fails() {
+    focal_rt::block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut session, store, _) = fixture(dir.path());
+        let budget = memory();
+        let (host, owner) = ContentHost::spawn(
+            store,
+            CustodyConfig::new(1),
+            WireLimits::default(),
+            budget.clone(),
+        )
         .unwrap();
-    assert!(matches!(progress, CustodyVerificationProgress::Pending(_)));
-    assert_eq!(budget.stats().used, baseline + RESIDENT_BYTES);
-    drop(progress);
-    assert_eq!(budget.stats().used, baseline);
+        let baseline = budget.stats().used;
+        let progress = host
+            .begin_verification(session.checkpoint_evidence(30_000).unwrap(), None)
+            .await
+            .unwrap();
+        assert!(matches!(progress, CustodyVerificationProgress::Pending(_)));
+        assert_eq!(budget.stats().used, baseline + RESIDENT_BYTES);
+        drop(progress);
+        assert_eq!(budget.stats().used, baseline);
 
-    let expired_snapshot = session.checkpoint_evidence(now(), 30_000).unwrap();
-    // Expire the owner's actual registry before a new continuation is created.
-    // This has no fast-fsync assumption. Elapsed capture TTL during stalled IO
-    // is separately exercised by the grouped physical-writer regression.
-    let expired_at = expired_snapshot.expires_at();
-    session.advance_read_clock(expired_at).unwrap();
-    assert!(matches!(
-        host.verify_prefix(expired_snapshot, None).await,
-        Err(AccessError::SnapshotExpired)
-    ));
-    assert_eq!(budget.stats().used, baseline);
-    let snapshot = session
-        .checkpoint_evidence(expired_at + now(), 30_000)
-        .unwrap();
-    drop(session);
-    assert!(matches!(
-        host.verify_prefix(snapshot, None).await,
-        Err(AccessError::SnapshotExpired)
-    ));
-    assert_eq!(budget.stats().used, baseline);
-    host.stop().await.unwrap();
-    owner.join().unwrap();
+        let expired_snapshot = session.checkpoint_evidence(30_000).unwrap();
+        // Expire the owner's actual registry before a new continuation is created.
+        // This has no fast-fsync assumption. Elapsed capture TTL during stalled IO
+        // is separately exercised by the grouped physical-writer regression.
+        session.move_read_clock_ahead(std::time::Duration::from_millis(30_000));
+        session.advance_read_clock().unwrap();
+        assert!(matches!(
+            host.verify_prefix(expired_snapshot, None).await,
+            Err(AccessError::SnapshotExpired)
+        ));
+        assert_eq!(budget.stats().used, baseline);
+        let snapshot = session.checkpoint_evidence(30_000).unwrap();
+        drop(session);
+        assert!(matches!(
+            host.verify_prefix(snapshot, None).await,
+            Err(AccessError::SnapshotExpired)
+        ));
+        assert_eq!(budget.stats().used, baseline);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+    })
+    .unwrap()
 }
 
 #[test]
 fn admission_pressure_and_wrong_physical_owner_fail_before_sealing() {
     let dir = tempfile::tempdir().unwrap();
     let (mut session, store, _) = fixture(dir.path());
-    let clock = std::time::Instant::now();
-    let now = || u64::try_from(clock.elapsed().as_millis()).unwrap();
     let budget = MemoryBudget::new(RESIDENT_BYTES - 1, 0).unwrap();
     assert!(matches!(
-        CustodyVerification::new(
-            session.checkpoint_evidence(now(), 30_000).unwrap(),
-            None,
-            &budget
-        ),
+        CustodyVerification::new(session.checkpoint_evidence(30_000).unwrap(), None, &budget),
         Err(AccessError::Capacity)
     ));
     assert_eq!(budget.stats().used, 0);
@@ -404,12 +403,9 @@ fn admission_pressure_and_wrong_physical_owner_fail_before_sealing() {
     );
     let budget = memory();
     let mut owner = CustodyStore::new(store, CustodyConfig::new(2), budget.clone()).unwrap();
-    let state = CustodyVerification::new(
-        session.checkpoint_evidence(now(), 30_000).unwrap(),
-        None,
-        &budget,
-    )
-    .unwrap();
+    let state =
+        CustodyVerification::new(session.checkpoint_evidence(30_000).unwrap(), None, &budget)
+            .unwrap();
     assert!(matches!(
         Box::new(state).advance(&mut owner, &budget),
         Err(AccessError::Unavailable)

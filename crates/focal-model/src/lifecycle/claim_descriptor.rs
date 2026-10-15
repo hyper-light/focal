@@ -22,6 +22,49 @@ mod identity;
 mod source;
 pub use source::{ClaimFields, ClaimSlotFields, ClaimSlotSource, ClaimSource, ClaimSourcePlan};
 
+/// The roles a claim's relations name: its issuer, subject, action and cause, as a descriptor
+/// holds them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimRoles {
+    pub issuer: ParticipantId,
+    pub subject: ParticipantId,
+    pub action: ActionType,
+    pub cause: Cause,
+}
+impl ClaimRoles {
+    /// [`ClaimDescriptor::check_postable`], on the roles alone.
+    pub fn check_postable(&self) -> Result<(), ContractError> {
+        if self.issuer == self.subject && self.action != ActionType::Handoff {
+            return Err(ContractError::InvalidPolicy);
+        }
+        Ok(())
+    }
+}
+
+/// The roles `source`'s relations name, derived by a descriptor's own rules (each role once, of
+/// its kind): what a holder of the descriptor's encoding reads without building the descriptor.
+pub fn roles_of<'a>(source: &impl ClaimSource<'a>) -> Result<ClaimRoles, ContractError> {
+    let fields = source.fields();
+    let mut roles = RoleBuilder::default();
+    for relation in source.relations() {
+        roles.relation(fields.ledger, fields.id, &relation?)?;
+    }
+    let roles = roles.finish()?;
+    Ok(ClaimRoles {
+        issuer: roles.issuer,
+        subject: roles.subject,
+        action: roles.action,
+        cause: roles.cause,
+    })
+}
+
+/// The intent fingerprint of the claim `id` whose content hashes to `content`: what
+/// [`ClaimDescriptor::intent_fingerprint`] answers, for a holder of the two without the
+/// descriptor (an encoded row).
+pub fn intent_of(id: ClaimId, content: ContentHash) -> ContentHash {
+    identity::intent(id, content)
+}
+
 /// Authored subject scope. This is not a runtime monitor or ownership scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScopeSpec<'a> {

@@ -7,7 +7,7 @@ use crate::directory_bootstrap::{
 };
 
 type DirectoryResult = Result<PartitionBootstrapPermit, DirectoryBootstrapError>;
-pub(super) type DirectoryReply = oneshot::Sender<(DirectoryResult, Allocation)>;
+pub(super) type DirectoryReply = OneshotSender<(DirectoryResult, Allocation)>;
 
 fn admission_error(error: ControlError) -> DirectoryBootstrapError {
     use focal_consensus::ConsensusError;
@@ -23,7 +23,10 @@ fn admission_error(error: ControlError) -> DirectoryBootstrapError {
         | ControlError::Consensus(ConsensusError::Capacity) => DirectoryBootstrapError::Capacity,
         ControlError::NotReady
         | ControlError::Consensus(
-            ConsensusError::PersistencePending | ConsensusError::LearnerBehind,
+            ConsensusError::PersistencePending
+            | ConsensusError::LearnerBehind
+            | ConsensusError::MembershipPending
+            | ConsensusError::LeaderLeaving,
         ) => DirectoryBootstrapError::NotReady,
         ControlError::Consensus(ConsensusError::NotLeader { .. }) => {
             DirectoryBootstrapError::Unavailable
@@ -66,7 +69,8 @@ impl ControlHost {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 1024)
             .map_err(|_| DirectoryBootstrapError::Capacity)?
             .commit();
-        let (response, receive) = oneshot::channel();
+        let (response, receive) =
+            hyper_rt::sync::oneshot().map_err(|_| DirectoryBootstrapError::Capacity)?;
         self.sender
             .try_send(Work::PrepareDirectory {
                 plan: Box::new(plan),
@@ -101,10 +105,12 @@ impl<V: AuthorityVerifier> Owner<V> {
             {
                 return Err(DirectoryBootstrapError::Capacity);
             }
+            // The root replica this node runs mints the permit, leading or
+            // following: the barrier below is asked of the leader either way
+            // (a replica that knows none is refused there), and the facts it
+            // is minted on are committed state.
             let status = self.replica.status();
-            if self.replica.identity().scope != ControlScope::Root
-                || status.role != StateRole::Leader
-            {
+            if self.replica.identity().scope != ControlScope::Root {
                 return Err(DirectoryBootstrapError::Unavailable);
             }
             let deadline = self
@@ -146,10 +152,10 @@ impl<V: AuthorityVerifier> Owner<V> {
             return;
         }
         let status = self.replica.status();
-        if pending.term != status.term
-            || status.role != StateRole::Leader
-            || self.pace.periods() >= pending.deadline
-        {
+        // The barrier is the leader's, confirmed by this replica as leader
+        // or asked through the leader it follows (27 §5); the permit needs
+        // the term it was asked in, not this replica's leadership.
+        if pending.term != status.term || self.pace.periods() >= pending.deadline {
             pending.finish(Err(DirectoryBootstrapError::Unavailable));
         } else if events.read_states.iter().any(|read| {
             read.context == pending.context && read.index <= self.replica.applied_index()

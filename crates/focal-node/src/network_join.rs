@@ -20,8 +20,10 @@ use focal_wire::{
 };
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     net::SocketAddr,
     path::Path,
@@ -32,7 +34,9 @@ const MAGIC: &[u8; 8] = b"FCLINV01";
 const CLIENT_MAGIC: &[u8; 8] = b"FCLCLI01";
 #[path = "client_join.rs"]
 mod client;
-pub use client::{ClientInvitation, PendingClientJoin};
+pub use client::{
+    ClientInvitation, EnrolledClient, PendingClientJoin, adopt_issuer, adopted_issuers,
+};
 #[path = "joined_context.rs"]
 mod joined_context;
 pub use joined_context::{joined_unix_principal, local_unix_principal};
@@ -240,7 +244,7 @@ impl NodeInvitation {
         value.validate_role(role)?;
         Ok(value)
     }
-    /// Read an invitation the operator delivered: a file `cluster invite`
+    /// Read an invitation the operator delivered: a file `invite node`
     /// wrote (mode 0600), or one a packaged secret mounted (24 §24) — a
     /// symbolic link to a regular file owned by another user, readable by
     /// this process's group and by nobody else, writable by its owner alone.
@@ -435,7 +439,7 @@ impl PendingJoin {
         }
         Ok(self
             .key
-            .complete(receipt, &self.bundle.invitation.trust().ca_certificate, now)?)
+            .complete(receipt, self.bundle.invitation.trust().issuers.iter(), now)?)
     }
     /// Retire this pending join (24 §24): its journal and never-enrolled key
     /// move under a marker named by the invitation they were for, so a
@@ -627,15 +631,17 @@ impl JoinedNode {
             }
             .parse()
             .map_err(|_| JoinError::Invalid)?;
-            let connector = QuicConnector::bind(
+            // One exchange's endpoint, its own owner.
+            let connector = QuicConnector::bind_standalone(
                 bind,
                 focal_wire::client_tls(
                     TlsIdentity::from_pkcs8(
                         self.credentials.certificate_chain().to_vec(),
                         self.credentials.private_key_der().to_vec(),
                     ),
-                    vec![self.state.sponsor.ca_certificate.clone()],
+                    self.state.sponsor.root_certificates(),
                     &limits,
+                    focal_wire::net::Sender::Node,
                 )?,
                 limits.clone(),
             )?;
@@ -643,7 +649,9 @@ impl JoinedNode {
                 .connect(address, &founder.identity.server_name)
                 .await?;
             let response = remote.request(request).await;
-            remote.close();
+            // A close the shard could not queue is the connector's to end:
+            // its endpoint goes with it at the end of this exchange.
+            let _ = remote.close();
             let response = response?;
             if response.ledger != request.ledger
                 || response.request_id != request.request_id
@@ -681,6 +689,12 @@ impl JoinedNode {
             },
         })
     }
+}
+/// The fence the cluster held from its genesis: a floor under every fence it commits after.
+pub(crate) fn genesis_fence(
+    genesis: &NetworkGenesis,
+) -> Result<focal_enrollment::UpgradeFence, JoinError> {
+    Ok(genesis_registry(genesis)?.fence())
 }
 fn genesis_registry(genesis: &NetworkGenesis) -> Result<EnrollmentRegistry, JoinError> {
     let ControlBootstrap::Root { enrollment, .. } = &genesis.bootstrap else {
@@ -829,7 +843,7 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
     }
     let lock = options.open(&lock_path)?;
     check_private(&lock_path)?;
-    focal_platform::try_lock_exclusive(&lock)?;
+    let _lock = focal_platform::FileLock::exclusive(lock)?;
     if fs::symlink_metadata(path).is_ok() {
         recover_output_link(path, &temporary)?;
         if read_private(path, MAX_BUNDLE)?.as_slice() != bytes {
@@ -898,7 +912,7 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
     // Serialize concurrent publications of this exact output path.
     let lock = focal_platform::fs::open_private(&lock_path, true, true, true)?;
     check_private(&lock_path)?;
-    focal_platform::try_lock_exclusive(&lock)?;
+    let _lock = focal_platform::FileLock::exclusive(lock)?;
     // Republishing the identical bytes is success; different bytes at the same
     // path is a genuine conflict. The installed file is already durable, so no
     // read-time re-sync (FlushFileBuffers would reject a read-only handle).

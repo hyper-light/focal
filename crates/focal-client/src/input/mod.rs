@@ -4,6 +4,7 @@
 mod build;
 mod decode;
 mod documents;
+pub mod shape;
 mod vocabulary;
 pub use decode::{InputFormat, MAX_INPUT_BYTES, parse_document};
 pub use documents::*;
@@ -89,18 +90,9 @@ fn parse_hex<const N: usize>(value: &str) -> Result<[u8; N], InputError> {
         return Err(InputError::Invalid("hexadecimal width"));
     }
     let mut result = [0; N];
-    for (output, pair) in result.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
-        let mut digits = pair.iter();
-        let hi = digits
-            .next()
-            .copied()
-            .and_then(hex_digit)
-            .ok_or(InputError::Invalid("hexadecimal digit"))?;
-        let lo = digits
-            .next()
-            .copied()
-            .and_then(hex_digit)
-            .ok_or(InputError::Invalid("hexadecimal digit"))?;
+    for (output, &[hi, lo]) in result.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
+        let hi = hex_digit(hi).ok_or(InputError::Invalid("hexadecimal digit"))?;
+        let lo = hex_digit(lo).ok_or(InputError::Invalid("hexadecimal digit"))?;
         *output = (hi << 4) | lo;
     }
     Ok(result)

@@ -153,6 +153,17 @@ pub(in crate::native) trait Sink {
     /// Debit explicitly quoted non-byte work without changing the output.
     /// The caller supplies the complete charge; zero has no implicit overhead.
     fn visit(&mut self, amount: usize) -> Result<(), Error>;
+    /// Whether this sink only measures what is written: one that does is handed a spilled row's
+    /// length ([`Self::count_unwritten`]) rather than its bytes read back (doc 31 M3).
+    fn measures(&self) -> bool {
+        false
+    }
+    /// Count `len` bytes exactly as writing them would, without them: only a measuring sink
+    /// ([`Self::measures`]) takes this.
+    fn count_unwritten(&mut self, len: usize) -> Result<(), Error> {
+        let _ = len;
+        Err(Error::Capacity)
+    }
 }
 
 pub(in crate::native) struct CountingSink {
@@ -174,14 +185,30 @@ impl CountingSink {
     pub(in crate::native) fn visits_used(&self) -> usize {
         self.visits.used
     }
+    /// Counts `bytes` more of output whose write visits were charged as they
+    /// were measured (a row's length is measured before it is written).
+    pub(in crate::native) fn count(&mut self, bytes: usize) -> Result<(), Error> {
+        let len = add(self.len, bytes)?;
+        if len > self.maximum {
+            return Err(Error::Capacity);
+        }
+        self.len = len;
+        Ok(())
+    }
 }
 impl Sink for CountingSink {
     fn visit(&mut self, amount: usize) -> Result<(), Error> {
         self.visits.charge(amount)
     }
     fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let len = add(self.len, bytes.len())?;
-        let used = self.visits.after(add(1, bytes.len())?)?;
+        self.count_unwritten(bytes.len())
+    }
+    fn measures(&self) -> bool {
+        true
+    }
+    fn count_unwritten(&mut self, count: usize) -> Result<(), Error> {
+        let len = add(self.len, count)?;
+        let used = self.visits.after(add(1, count)?)?;
         if len > self.maximum {
             return Err(Error::Capacity);
         }
@@ -210,6 +237,23 @@ impl<'a> SliceSink<'a> {
     pub(in crate::native) fn visits_used(&self) -> usize {
         self.visits.used
     }
+    /// The bytes written so far.
+    pub(in crate::native) fn written(&self) -> &[u8] {
+        self.bytes.get(..self.written).unwrap_or(&[])
+    }
+    /// Writes `value` over the four bytes written at `at`, a length written
+    /// before what it measures; the write it replaces was charged.
+    pub(in crate::native) fn patch_u32(&mut self, at: usize, value: u32) -> Result<(), Error> {
+        let end = add(at, 4)?;
+        if end > self.written {
+            return Err(Error::Capacity);
+        }
+        self.bytes
+            .get_mut(at..end)
+            .ok_or(Error::Capacity)?
+            .copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
     /// Exact fill is a metadata check and adds no write visits. Counting and
     /// slice encoders therefore have identical costs for the same write stream.
     pub(in crate::native) fn finish(self) -> Result<(), Error> {
@@ -230,8 +274,12 @@ impl Sink for SliceSink<'_> {
             .bytes
             .get_mut(self.written..end)
             .ok_or(Error::Capacity)?;
-        // The checked range has exactly bytes.len() elements.
-        target.copy_from_slice(bytes);
+        // The checked range has exactly bytes.len() elements; a field of a
+        // few bytes is moved without a call to the C library's memcpy
+        // (`focal_memory::short_copy`).
+        if !focal_memory::short_copy::copy(target, bytes) {
+            return Err(Error::Capacity);
+        }
         self.written = end;
         self.visits.used = used;
         Ok(())

@@ -94,6 +94,12 @@ impl Balancer {
     pub fn config(&self) -> BalancerConfig {
         self.config
     }
+    /// What this balancer's observations hold, by their entries.
+    pub(crate) fn held_bytes(&self) -> Option<usize> {
+        focal_memory::map_bytes::<(LedgerId, RangeId), u8>(self.over.len())?.checked_add(
+            focal_memory::map_bytes::<(LedgerId, RangeId), u8>(self.under.len())?,
+        )
+    }
     /// Observe one group's members in key order and decide, at most one
     /// change: a split of the first member past the bound for enough
     /// observations (while the group can grow), else a merge of the first

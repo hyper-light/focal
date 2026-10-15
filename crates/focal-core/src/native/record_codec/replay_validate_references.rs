@@ -39,7 +39,11 @@ pub(super) fn check<O: Overlay>(
                     else {
                         return Err(invalid());
                     };
-                    let body = body.get().ok_or_else(invalid)?;
+                    let mut buffer = crate::native::owned::ContentBuffer::new();
+                    let held = body
+                        .read(read.overlay.payloads(), &mut buffer)?
+                        .body(read.budget, focal_memory::BudgetLane::Committed)?;
+                    let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
                     let failure = std::cell::Cell::new(None);
                     let checked = read.meter.budget(|visits| {
                         authored::check_recorded_declaration(body, claim, descriptor, visits)
@@ -279,24 +283,27 @@ fn authored<O: Overlay>(
     require(read.profile == NativeContentProfile::AuthoredV1)?;
     match (key, row) {
         (Key::ClaimContent(id), Row::ClaimContent(value)) => {
-            let body = value.get().ok_or_else(invalid)?;
+            use focal_model::lifecycle::claim_descriptor::ClaimSource;
+            // Read in place from the content's encoding (doc 31 M3), a spilled one read back.
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let value = value.read(read.overlay.payloads(), &mut buffer)?;
+            let body = value.view()?;
+            let fields = body.fields();
+            let hash = value.content_hash().ok_or_else(invalid)?;
             let binding = read.claim(id)?.binding();
+            require(fields.id == id && fields.ledger == read.ledger && hash == binding.content)?;
             require(
-                body.id() == id
-                    && body.ledger() == read.ledger
-                    && body.binding().content == binding.content,
-            )?;
-            require(
-                matches!(read.require(Key::ClaimIdentity(body.schema(), body.content_hash()))?, Row::ClaimIdentity(found) if *found == id),
+                matches!(read.require(Key::ClaimIdentity(fields.schema, hash))?, Row::ClaimIdentity(found) if *found == id),
             )?;
             read.charge(add(
-                add(body.requirements().len(), body.relations().len())?,
+                add(body.requirement_count(), body.view().relation_count())?,
                 1,
             )?)?;
-            for requirement in body.requirements() {
-                read.definition(requirement.id)?;
+            for requirement in body.view().requirements() {
+                read.definition(requirement?.id)?;
             }
-            for relation in body.relations() {
+            for relation in body.view().relations() {
+                let relation = relation?;
                 if let RelationTarget::Object(target) = relation.target {
                     require(target.ledger == read.ledger && target.kind == ObjectKind::Claim)?;
                     read.claim(ClaimId(target.id.0))?;
@@ -307,8 +314,9 @@ fn authored<O: Overlay>(
             let Row::ClaimContent(value) = read.require(Key::ClaimContent(*id))? else {
                 return Err(invalid());
             };
-            let body = value.get().ok_or_else(invalid)?;
-            require(body.schema() == schema && body.content_hash() == hash)?;
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let value = value.read(read.overlay.payloads(), &mut buffer)?;
+            require(value.schema() == Some(schema) && value.content_hash() == Some(hash))?;
         }
         (Key::DefinitionIdentity(schema, hash), Row::DefinitionIdentity(id)) => {
             let Row::Definition(value) = read.require(Key::Definition(*id))? else {
@@ -322,8 +330,10 @@ fn authored<O: Overlay>(
                 invocation == read.outcome.invocation
                     && read.outcome.operation == NativeOperation::Create,
             )?;
-            read.charge(add(value.get().entries().len(), 1)?)?;
-            for object in value.get().entries() {
+            // A record's rows are held while it is validated (doc 31 M3).
+            let entries = value.held().ok_or_else(invalid)?.entries();
+            read.charge(add(entries.len(), 1)?)?;
+            for object in entries {
                 let actual = match object.family {
                     NativeCreatedFamily::Claim => {
                         match read.require(Key::ClaimIdentity(object.schema, object.content))? {

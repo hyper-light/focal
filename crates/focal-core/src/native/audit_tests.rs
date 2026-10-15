@@ -419,8 +419,8 @@ fn audit_refuses_open_claim_or_ordinary_pressure_before_callback_and_releases_qu
     let pressure = parent
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            parent.limit() - parent.stats().used,
+            BudgetLane::Ordinary,
+            parent.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
@@ -463,8 +463,20 @@ fn completed_core() -> (Core<NativeState>, fixture::Custody, Vec<NativeAccepted>
         );
         let evidence = fixture::verified(&mut custody, &input);
         let prepared = fixture::report(&core, input, &[], &evidence);
-        let result = prepared.evaluation(index).unwrap().last_result().unwrap();
-        history.push(*prepared.result(NativeResultKey::of(result)).unwrap());
+        let result = core
+            .native_chain(&[&prepared])
+            .unwrap()
+            .evaluation(index)
+            .unwrap()
+            .last_result()
+            .unwrap();
+        history.push(
+            *core
+                .native_chain(&[&prepared])
+                .unwrap()
+                .result(NativeResultKey::of(result))
+                .unwrap(),
+        );
         core.publish_native(prepared).unwrap();
     }
     (core, custody, history)
@@ -502,7 +514,7 @@ fn audit_rejects_corrupt_history_publications_and_artifact_identity() {
                 event.fact = NativeFact::Registrations {
                     claim: core.native_claim(CLAIM).unwrap().binding(),
                 };
-                let row = OwnedEvent::new(StoredEvent::pack(event).unwrap()).unwrap();
+                let row = OwnedEvent::new(event, core.state.ledger).unwrap();
                 let heap = row.heap_charge().unwrap();
                 Change::Put(Entry::new(
                     Key::Event(first.sequence(), first.ordinal()),

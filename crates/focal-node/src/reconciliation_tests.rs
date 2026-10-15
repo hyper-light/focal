@@ -36,13 +36,25 @@ fn response(
     let limits = WireLimits::default();
     let verified = verify_request(principal.clone(), request.clone(), &limits)
         .unwrap_or_else(|error| panic!("{error:?}: {request:?}"));
+    let budget = focal_memory::MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+    let mut charge = budget
+        .reserve(
+            focal_memory::BudgetKind::Query,
+            focal_memory::BudgetLane::Ordinary,
+            0,
+        )
+        .unwrap()
+        .commit();
     let response = super::dispatch(
         node,
         &mut ReadViews::new(),
         &mut Streams::new().unwrap(),
         verified,
         &limits,
-    );
+        &budget,
+        &mut charge,
+    )
+    .answered();
     validate_response(&request, &response, Some(principal.principal()), &limits)
         .unwrap_or_else(|error| panic!("{error:?}: {request:?} => {response:?}"));
     response
@@ -166,10 +178,14 @@ fn local_reconciliation_reads_committed_core_without_writes_and_preserves_floor_
     );
     opening.request_epoch = RequestEpoch(2);
     let opened = response(&mut node, actor.clone(), opening);
-    assert!(matches!(
-        opened.result,
-        Response::Submitted(MutationReply::Committed(_))
-    ));
+    assert!(
+        matches!(
+            opened.result,
+            Response::Submitted(MutationReply::Committed(_))
+        ),
+        "{:?}",
+        opened.result
+    );
     let mut floor = envelope(
         ledger,
         31,
@@ -240,25 +256,28 @@ fn local_reconciliation_reads_committed_core_without_writes_and_preserves_floor_
     ));
 }
 
-#[tokio::test]
-async fn local_reconciliation_response_permit_survives_owner_shutdown() {
-    let root = tempfile::tempdir().unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(root.path().to_owned());
-    let node = EmbeddedNode::open(&settings).unwrap();
-    let actor = peer(&node, node.identity.issuer, PeerRole::Actor);
-    let request = envelope(node.identity.ledger, 40, receipt(10));
-    let limits = WireLimits::default();
-    let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
-    let reply = focal_wire::dispatch_accounted(&host, actor, request, &limits).await;
-    assert!(matches!(reply.envelope().result, Response::Reconciled(_)));
-    let held = host.budget.stats().used;
-    assert!(held > 0 && held < 1024 * 1024);
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    assert_eq!(host.budget.stats().used, held);
-    drop(reply);
-    assert_eq!(host.budget.stats().used, 0);
+#[test]
+fn local_reconciliation_response_permit_survives_owner_shutdown() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.path().to_owned());
+        let node = EmbeddedNode::open(&settings).unwrap();
+        let actor = peer(&node, node.identity.issuer, PeerRole::Actor);
+        let request = envelope(node.identity.ledger, 40, receipt(10));
+        let limits = WireLimits::default();
+        let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
+        let reply = focal_wire::dispatch_accounted(&host, actor, request, &limits).await;
+        assert!(matches!(reply.envelope().result, Response::Reconciled(_)));
+        let held = host.budget.stats().used;
+        assert!(held > 0 && held < 1024 * 1024);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        assert_eq!(host.budget.stats().used, held);
+        drop(reply);
+        assert_eq!(host.budget.stats().used, 0);
+    })
+    .unwrap()
 }
 
 #[test]
@@ -379,40 +398,43 @@ fn cursor_reconciliation_keeps_original_metadata_prefix_principal_and_restart_re
     );
 }
 
-#[tokio::test]
-async fn scalar_epoch_reconciliation_admits_under_pressure_without_a_full_frame_reservation() {
-    let root = tempfile::tempdir().unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(root.path().to_owned());
-    let node = EmbeddedNode::open(&settings).unwrap();
-    let actor = peer(&node, node.identity.issuer, PeerRole::Actor);
-    let query = envelope(
-        node.identity.ledger,
-        70,
-        reconcile(ReconcileQuery::Epoch {
-            epoch: RequestEpoch(1),
-        }),
-    );
-    let limits = WireLimits::default();
-    let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
-    let stats = host.budget.stats();
-    let pressure = host
-        .budget
-        .reserve(
-            BudgetKind::Payload,
-            BudgetLane::Ordinary,
-            stats.limit - stats.completion_reserve - stats.ordinary_used - 128 * 1024,
-        )
-        .unwrap();
-    let reply = focal_wire::dispatch_accounted(&host, actor, query, &limits).await;
-    assert!(
-        matches!(reply.envelope().result, Response::Reconciled(_)),
-        "{:?}",
-        reply.envelope()
-    );
-    drop(reply);
-    drop(pressure);
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    assert_eq!(host.budget.stats().used, 0);
+#[test]
+fn scalar_epoch_reconciliation_admits_under_pressure_without_a_full_frame_reservation() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.path().to_owned());
+        let node = EmbeddedNode::open(&settings).unwrap();
+        let actor = peer(&node, node.identity.issuer, PeerRole::Actor);
+        let query = envelope(
+            node.identity.ledger,
+            70,
+            reconcile(ReconcileQuery::Epoch {
+                epoch: RequestEpoch(1),
+            }),
+        );
+        let limits = WireLimits::default();
+        let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
+        let stats = host.budget.stats();
+        let pressure = host
+            .budget
+            .reserve(
+                BudgetKind::Payload,
+                BudgetLane::Ordinary,
+                stats.limit - stats.completion_reserve - stats.ordinary_used - 128 * 1024,
+            )
+            .unwrap();
+        let reply = focal_wire::dispatch_accounted(&host, actor, query, &limits).await;
+        assert!(
+            matches!(reply.envelope().result, Response::Reconciled(_)),
+            "{:?}",
+            reply.envelope()
+        );
+        drop(reply);
+        drop(pressure);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        assert_eq!(host.budget.stats().used, 0);
+    })
+    .unwrap()
 }

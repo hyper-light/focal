@@ -46,12 +46,15 @@ fn outcome(invocation: NativeInvocation, operation: NativeOperation) -> NativeOu
         events: 1,
     }
 }
-fn encode(row: &Row) -> Vec<u8> {
+fn outcome_row(invocation: NativeInvocation, operation: NativeOperation) -> Row {
+    Row::Outcome(OwnedOutcome::stored(&outcome(invocation, operation), ledger()).unwrap())
+}
+fn encode(key: Key, row: &Row) -> Vec<u8> {
     let mut size = CountingSink::new(usize::MAX, usize::MAX);
-    rows::value(&mut size, row, ledger()).unwrap();
+    rows::value(&mut size, key, row, ledger(), None).unwrap();
     let mut bytes = vec![0; size.len()];
     let mut sink = SliceSink::new(&mut bytes, usize::MAX);
-    rows::value(&mut sink, row, ledger()).unwrap();
+    rows::value(&mut sink, key, row, ledger(), None).unwrap();
     sink.finish().unwrap();
     bytes
 }
@@ -60,17 +63,17 @@ fn values() -> Vec<(Key, Row)> {
     vec![
         (
             Key::IncomingHead(claim(1)),
-            Row::IncomingHead(incoming_graph::IncomingHead {
+            Row::IncomingHead(Box::new(incoming_graph::IncomingHead {
                 head: None,
                 count: 0,
-            }),
+            })),
         ),
         (
             Key::IncomingHead(claim(2)),
-            Row::IncomingHead(incoming_graph::IncomingHead {
+            Row::IncomingHead(Box::new(incoming_graph::IncomingHead {
                 head: Some(claim(1)),
                 count: 1,
-            }),
+            })),
         ),
         (
             Key::IncomingLink(claim(1), claim(1)),
@@ -84,7 +87,7 @@ fn values() -> Vec<(Key, Row)> {
         ),
         (
             Key::Monitor(monitor(1)),
-            Row::Monitor(monitor_index::MonitorAllocation {
+            Row::Monitor(Box::new(monitor_index::MonitorAllocation {
                 owner: fixture::binding(1),
                 registered: SessionSeq(1),
                 deadline: Deadline {
@@ -92,21 +95,21 @@ fn values() -> Vec<(Key, Row)> {
                     generation: 1,
                     at: 0,
                 },
-            }),
+            })),
         ),
         (
             Key::MonitorHead(claim(1)),
-            Row::MonitorHead(monitor_index::MonitorHead {
+            Row::MonitorHead(Box::new(monitor_index::MonitorHead {
                 head: None,
                 count: 0,
-            }),
+            })),
         ),
         (
             Key::MonitorHead(claim(2)),
-            Row::MonitorHead(monitor_index::MonitorHead {
+            Row::MonitorHead(Box::new(monitor_index::MonitorHead {
                 head: Some(monitor(1)),
                 count: 1,
-            }),
+            })),
         ),
         (
             Key::MonitorLink(claim(1), monitor(1)),
@@ -114,17 +117,17 @@ fn values() -> Vec<(Key, Row)> {
         ),
         (
             Key::MonitorLink(claim(1), monitor(2)),
-            Row::MonitorLink(Some(monitor_index::MonitorLink {
+            Row::MonitorLink(Some(Box::new(monitor_index::MonitorLink {
                 owner: claim(2),
                 registered: SessionSeq(1),
                 stamp: SessionSeq(3),
                 previous: Some(monitor(1)),
                 next: Some(monitor(3)),
-            })),
+            }))),
         ),
         (
             Key::Meta,
-            Row::Meta(Meta {
+            Row::Meta(Box::new(Meta {
                 claims: 1,
                 outcomes: 2,
                 events: 3,
@@ -139,8 +142,12 @@ fn values() -> Vec<(Key, Row)> {
                 monitor_links: 12,
                 creation_results: 13,
                 legacy: 14,
+                sealed: 15,
+                sealed_events: 16,
+                seals: 17,
+                principals: 18,
                 logical_time: u64::MAX,
-            }),
+            })),
         ),
         (
             Key::ArtifactIdentity(ContentHash([1; 32])),
@@ -148,7 +155,7 @@ fn values() -> Vec<(Key, Row)> {
         ),
         (
             Key::Receipt(ReceiptId::from_u128(1)),
-            Row::Receipt(NativeReceipt {
+            Row::Receipt(Box::new(NativeReceipt {
                 claim: claim(1),
                 fence: ReceiptFence {
                     receipt: ReceiptId::from_u128(1),
@@ -156,48 +163,48 @@ fn values() -> Vec<(Key, Row)> {
                 },
                 holder: fixture::SUBJECT,
                 acquired: SessionSeq(1),
-            }),
+            })),
         ),
-        (Key::Cycle(cycle_key(1)), Row::Cycle(NativeCycle::default())),
+        (Key::Cycle(cycle_key(1)), Row::Cycle(Box::default())),
         (
             Key::Cycle(cycle_key(2)),
-            Row::Cycle(NativeCycle {
+            Row::Cycle(Box::new(NativeCycle {
                 work_head: Some(artifact(1)),
                 work_count: 1,
                 diagnostic_head: Some(artifact(2)),
                 diagnostic_count: 2,
                 response: Some(testament(1)),
-            }),
+            })),
         ),
         (
             Key::RetiredCycleHead(claim(1)),
-            Row::RetiredCycleHead(RetiredCycleHead {
+            Row::RetiredCycleHead(Box::new(RetiredCycleHead {
                 head: None,
                 count: 0,
                 work_count: 0,
-            }),
+            })),
         ),
         (
             Key::RetiredCycleHead(claim(1)),
-            Row::RetiredCycleHead(RetiredCycleHead {
+            Row::RetiredCycleHead(Box::new(RetiredCycleHead {
                 head: Some(cycle_key(2)),
                 count: 2,
                 work_count: 0,
-            }),
+            })),
         ),
         (
             Key::RetiredCycle(cycle_key(1)),
-            Row::RetiredCycle(RetiredCycle {
+            Row::RetiredCycle(Box::new(RetiredCycle {
                 holder: fixture::SUBJECT,
                 next: None,
-            }),
+            })),
         ),
         (
             Key::RetiredCycle(cycle_key(2)),
-            Row::RetiredCycle(RetiredCycle {
+            Row::RetiredCycle(Box::new(RetiredCycle {
                 holder: fixture::SUBJECT,
                 next: Some(cycle_key(1)),
-            }),
+            })),
         ),
         (Key::WorkSlot(cycle_key(1), 0), Row::WorkSlot(artifact(1))),
         (
@@ -206,7 +213,7 @@ fn values() -> Vec<(Key, Row)> {
         ),
         (
             Key::Outcome(request),
-            Row::Outcome(outcome(request, NativeOperation::Create)),
+            outcome_row(request, NativeOperation::Create),
         ),
         (
             Key::ClaimIdentity(1, ContentHash([1; 32])),
@@ -222,12 +229,12 @@ fn values() -> Vec<(Key, Row)> {
 #[test]
 fn every_fixed_family_roundtrips_exact_bytes_with_bounded_decoding_and_no_heap_build() {
     for (key, row) in values() {
-        let bytes = encode(&row);
+        let bytes = encode(key, &row);
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let restored = read_fixed(key, &mut cursor, ledger()).unwrap().unwrap();
         let visits = cursor.visits_used();
         cursor.finish().unwrap();
-        assert_eq!(encode(&restored), bytes, "key {key:?}");
+        assert_eq!(encode(key, &restored), bytes, "key {key:?}");
         let mut cursor = Cursor::new(&bytes, bytes.len(), visits).unwrap();
         assert!(read_fixed(key, &mut cursor, ledger()).unwrap().is_some());
         let mut cursor = Cursor::new(&bytes, bytes.len(), visits - 1).unwrap();
@@ -262,10 +269,10 @@ fn malformed_heads_cycles_receipts_keys_and_invocation_namespaces_refuse() {
     let invalid_rows = [
         (
             Key::IncomingHead(claim(1)),
-            Row::IncomingHead(incoming_graph::IncomingHead {
+            Row::IncomingHead(Box::new(incoming_graph::IncomingHead {
                 head: Some(claim(2)),
                 count: 0,
-            }),
+            })),
         ),
         (
             Key::IncomingLink(claim(1), claim(2)),
@@ -275,39 +282,39 @@ fn malformed_heads_cycles_receipts_keys_and_invocation_namespaces_refuse() {
         ),
         (
             Key::MonitorLink(claim(1), monitor(2)),
-            Row::MonitorLink(Some(monitor_index::MonitorLink {
+            Row::MonitorLink(Some(Box::new(monitor_index::MonitorLink {
                 owner: claim(2),
                 registered: SessionSeq(3),
                 stamp: SessionSeq(2),
                 previous: None,
                 next: None,
-            })),
+            }))),
         ),
         (
             Key::Cycle(cycle_key(1)),
-            Row::Cycle(NativeCycle {
+            Row::Cycle(Box::new(NativeCycle {
                 work_count: 1,
                 ..NativeCycle::default()
-            }),
+            })),
         ),
         (
             Key::RetiredCycleHead(claim(2)),
-            Row::RetiredCycleHead(RetiredCycleHead {
+            Row::RetiredCycleHead(Box::new(RetiredCycleHead {
                 head: Some(cycle_key(1)),
                 count: 1,
                 work_count: 0,
-            }),
+            })),
         ),
         (
             Key::RetiredCycle(cycle_key(1)),
-            Row::RetiredCycle(RetiredCycle {
+            Row::RetiredCycle(Box::new(RetiredCycle {
                 holder: fixture::SUBJECT,
                 next: Some(cycle_key(1)),
-            }),
+            })),
         ),
         (
             Key::Receipt(ReceiptId::from_u128(2)),
-            Row::Receipt(NativeReceipt {
+            Row::Receipt(Box::new(NativeReceipt {
                 claim: claim(1),
                 fence: ReceiptFence {
                     receipt: ReceiptId::from_u128(1),
@@ -315,7 +322,7 @@ fn malformed_heads_cycles_receipts_keys_and_invocation_namespaces_refuse() {
                 },
                 holder: fixture::SUBJECT,
                 acquired: SessionSeq(1),
-            }),
+            })),
         ),
         (
             Key::ClaimIdentity(0, ContentHash([1; 32])),
@@ -327,11 +334,11 @@ fn malformed_heads_cycles_receipts_keys_and_invocation_namespaces_refuse() {
         ),
         (
             Key::Outcome(request),
-            Row::Outcome(outcome(request, NativeOperation::ClaimDeadline)),
+            outcome_row(request, NativeOperation::ClaimDeadline),
         ),
     ];
     for (key, row) in invalid_rows {
-        let bytes = encode(&row);
+        let bytes = encode(key, &row);
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         assert!(
             read_fixed(key, &mut cursor, ledger()).is_err(),
@@ -339,7 +346,7 @@ fn malformed_heads_cycles_receipts_keys_and_invocation_namespaces_refuse() {
         );
     }
     for (key, row) in values() {
-        let bytes = encode(&row);
+        let bytes = encode(key, &row);
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let mut foreign = ledger();
         foreign.session = focal_model::SessionId::from_u128(999);
@@ -390,23 +397,31 @@ fn all_outcome_namespaces_and_large_scalar_counters_preserve_their_complete_widt
         (monitor_deadline.into(), NativeOperation::MonitorDeadline),
     ] {
         let expected = outcome(invocation, operation);
-        let bytes = encode(&Row::Outcome(expected));
+        let bytes = encode(
+            Key::Outcome(invocation),
+            &outcome_row(invocation, operation),
+        );
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let Some(Row::Outcome(actual)) =
             read_fixed(Key::Outcome(invocation), &mut cursor, ledger()).unwrap()
         else {
             panic!("expected an outcome");
         };
-        assert_eq!(actual, expected);
+        assert_eq!(actual.expand(ledger(), invocation, None).unwrap(), expected);
+        // The row keeps neither its invocation nor its ledger, so bytes naming another invocation than the
+        // key are refused, not taken as the key's.
+        let other = NativeInvocation::Seal(77);
+        let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
+        assert!(read_fixed(Key::Outcome(other), &mut cursor, ledger()).is_err());
     }
     #[cfg(target_pointer_width = "64")]
     {
         let large = usize::try_from(u64::from(u32::MAX) + 19).unwrap();
-        let row = Row::IncomingHead(incoming_graph::IncomingHead {
+        let row = Row::IncomingHead(Box::new(incoming_graph::IncomingHead {
             head: Some(claim(1)),
             count: large,
-        });
-        let bytes = encode(&row);
+        }));
+        let bytes = encode(Key::IncomingHead(claim(2)), &row);
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let Some(Row::IncomingHead(actual)) =
             read_fixed(Key::IncomingHead(claim(2)), &mut cursor, ledger()).unwrap()
@@ -420,10 +435,10 @@ fn all_outcome_namespaces_and_large_scalar_counters_preserve_their_complete_widt
         epoch: RequestEpoch(0),
         id: RequestId::from_u128(1),
     });
-    let bytes = encode(&Row::Outcome(outcome(
-        zero_request,
-        NativeOperation::Create,
-    )));
+    let bytes = encode(
+        Key::Outcome(zero_request),
+        &outcome_row(zero_request, NativeOperation::Create),
+    );
     let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
     assert!(read_fixed(Key::Outcome(zero_request), &mut cursor, ledger()).is_err());
 }
@@ -444,7 +459,7 @@ fn actual_native_events_prepare_without_allocation_then_build_under_exact_precha
         .entries()
         .filter(|entry| matches!(entry.key, Key::Event(..)))
     {
-        let bytes = encode(&entry.value);
+        let bytes = encode(entry.key, entry.value);
         let before = budget.stats();
         let mut cursor = Cursor::new(&bytes, bytes.len(), usize::MAX).unwrap();
         let plan = EventPlan::read(entry.key, &mut cursor, ledger()).unwrap();
@@ -454,14 +469,14 @@ fn actual_native_events_prepare_without_allocation_then_build_under_exact_precha
         let heap = plan.heap_bytes();
         let work = plan.build_visits();
         assert!(matches!(
-            plan.build(heap - 1, work),
+            plan.build(heap - 1, work, None),
             Err(NativeError::Contract(ContractError::Capacity))
         ));
         assert_eq!(budget.stats(), before);
         let mut cursor = Cursor::new(&bytes, bytes.len(), reads).unwrap();
         let plan = EventPlan::read(entry.key, &mut cursor, ledger()).unwrap();
         assert!(matches!(
-            plan.build(heap, work - 1),
+            plan.build(heap, work - 1, None),
             Err(NativeError::Contract(ContractError::Capacity))
         ));
         let mut cursor = Cursor::new(&bytes, bytes.len(), reads).unwrap();
@@ -469,9 +484,9 @@ fn actual_native_events_prepare_without_allocation_then_build_under_exact_precha
         let permit = budget
             .reserve(BudgetKind::Pending, BudgetLane::Completion, heap)
             .unwrap();
-        let (restored, actual) = plan.build(heap, work).unwrap();
+        let (restored, actual) = plan.build(heap, work, None).unwrap();
         assert_eq!(actual, heap);
-        assert_eq!(encode(&restored), bytes);
+        assert_eq!(encode(entry.key, &restored), bytes);
         drop(restored);
         drop(permit);
         assert_eq!(budget.stats(), before);

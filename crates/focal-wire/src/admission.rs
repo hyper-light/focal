@@ -1,34 +1,27 @@
-//! Admission of inbound connections by identity (27 §3.1 P5).
+//! Admission of inbound connections by identity (27 §3.1 P5), and of what they send (the audit's
+//! F03 and F20), as a listener is configured and reports it. The rules live where the connections
+//! and the bytes do since the move to hyper-transport (27 §15):
 //!
-//! A listener's connections were one pool: any peer could fill it with
-//! handshakes that never authenticate, and one identity could hold every
-//! slot. Here a connection is admitted twice. Before its handshake it takes
-//! one of a bounded number of **pending** places, which authenticated
-//! connections never use, so unauthenticated work cannot take the capacity
-//! of peers that have proven who they are. Once its certificate has
-//! authenticated it is charged to its **identity** (the principal its grant
-//! names, which a renewed certificate keeps):
+//! - **Connections** are admitted by the endpoint (`hyper_transport::AdmissionLimits`, its
+//!   `admission` module, ported from this one): a handshake takes one of a bounded number of
+//!   pending places, which authenticated connections never use; an authenticated connection is
+//!   charged to its identity (its certificate); an identity past its bound replaces its own
+//!   connection used longest ago among those that are idle — none of its exchanges under way, and
+//!   nothing moved on it for the listener's request timeout — and with none idle is refused,
+//!   retryably (64 callers of one principal against a bound of 16 replaced 27,765 connections in
+//!   30 s while replacing busy ones, and a third of their writes ended unknown); the connections
+//!   held in all are bounded, met after the replacement rule, and a full listener gives an
+//!   identity under its fair share an idle connection of the identity holding the most (max-min
+//!   fairness: Bertsekas and Gallager, *Data Networks*, §6.5.2). One identity never takes
+//!   another's place but by that rule.
+//! - **Bytes** are admitted by the network owner (`net::owner`): before any of a request's body
+//!   is reserved, its sender is held to its share of the lane the body is funded from — control
+//!   bodies from the completion lane, so participants' bodies never starve consensus — the lane's
+//!   capacity among the peers with a connection up, one frame at least; the body is reserved from
+//!   the listener's budget and given back as the exchange ends.
 //!
-//! - a node holds at most [`AdmissionLimits::per_node`] connections, any
-//!   other identity at most [`AdmissionLimits::per_participant`];
-//! - a connection past the bound replaces the one of that identity that has
-//!   been idle longest, which is closed. A client that exited, a node that
-//!   restarted or moved, leaves a connection behind that the listener holds
-//!   until its idle timeout: refusing the newcomer would make an identity
-//!   wait out what it left behind, and the connection it uses least is the
-//!   one most likely to be that. A live client whose idle connection is
-//!   closed dials again at its next request.
-//!
-//! One identity never takes another's place: the number of identities is
-//! bounded, and an identity past its own bound displaces only itself. Every
-//! refusal is typed and counted.
-use crate::PeerRole;
-use focal_model::ParticipantId;
-use quinn::Connection;
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::Mutex,
-};
+//! Every refusal is typed and counted ([`AdmissionStats`]).
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionLimits {
@@ -36,8 +29,19 @@ pub struct AdmissionLimits {
     pub pending: usize,
     /// Identities holding a connection.
     pub identities: usize,
+    /// Connections held in all, once authenticated.
+    pub connections: usize,
+    /// The most connections a node holds: its peer pool's few. Kept for the configurations that
+    /// state it; the endpoint's fair share bounds every identity alike.
     pub per_node: usize,
+    /// The least share of the listener a participant is ever left. Kept for the configurations
+    /// that state it; the endpoint's fair share is the listener among the identities holding
+    /// connections.
     pub per_participant: usize,
+    /// How long a connection must have begun no request before it may be replaced: a live client
+    /// between requests is not, one that left its connection behind is. The endpoint counts it as
+    /// the listener's request timeout, its serve period.
+    pub replace_after: Duration,
 }
 impl AdmissionLimits {
     /// For a listener of `connections` in total: a quarter of them may be
@@ -46,223 +50,88 @@ impl AdmissionLimits {
         Self {
             pending: connections.checked_div(4).unwrap_or(0).max(1),
             identities: connections.max(1),
+            connections: connections.max(1),
             per_node: 4,
             per_participant: 16,
+            replace_after: Duration::ZERO,
         }
     }
-    fn valid(&self) -> bool {
-        self.pending > 0 && self.identities > 0 && self.per_node > 0 && self.per_participant > 0
+    /// These limits, a connection replaceable once it has begun no request
+    /// for `idle`.
+    pub fn replacing_after(self, idle: Duration) -> Self {
+        Self {
+            replace_after: idle,
+            ..self
+        }
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum AdmissionRefusal {
-    #[error("admission limits must not be zero")]
-    InvalidLimits,
-    #[error("too many handshakes are in progress")]
-    Pending,
-    #[error("too many identities hold connections")]
-    Identities,
-    #[error("the listener is closed")]
-    Closed,
-}
+/// Who holds a listener's connections, what its bodies hold, and what it refused.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AdmissionStats {
     pub pending: usize,
     pub identities: usize,
     pub connections: usize,
+    /// Bytes the listener holds of its budget: request bodies being read, its connections'
+    /// receive windows, and the pool its datagrams are received into.
+    pub bytes: usize,
+    /// Of those, the receive pool: chunks the endpoint keeps for the datagrams it reads, held
+    /// whether or not a connection is up (hyper-transport's `receive`, bounded by its
+    /// `receive_chunks`).
+    pub pooled: usize,
+    /// Exchanges under way on the connections held: what keeps a connection from being replaced.
+    pub serving: usize,
     pub admitted: u64,
     pub replaced: u64,
     pub refused_pending: u64,
     pub refused_identities: u64,
-    /// Every admission, refusal and release so far: what a wait on this
-    /// listener is charged in.
+    pub refused_connections: u64,
+    /// Connections refused for an identity at its bound with none idle.
+    pub refused_busy: u64,
+    /// Requests refused for their sender's share of the ingress.
+    pub refused_bytes: u64,
+    /// Reservations the listener's budget could not fund.
+    pub refused_memory: u64,
+    /// Every admission and refusal so far: what a wait on this listener is charged in.
     pub changes: u64,
 }
-struct Held {
-    /// Least recently used first.
-    connections: VecDeque<(u64, Connection)>,
-}
-#[derive(Default)]
-struct State {
-    pending: usize,
-    identities: BTreeMap<ParticipantId, Held>,
-    connections: usize,
-    next: u64,
-    admitted: u64,
-    replaced: u64,
-    refused_pending: u64,
-    refused_identities: u64,
-    changes: u64,
-}
-pub struct Admission {
-    limits: AdmissionLimits,
-    state: Mutex<State>,
-}
-fn bump(counter: &mut u64) {
-    *counter = counter.saturating_add(1);
-}
-impl Admission {
-    pub fn new(limits: AdmissionLimits) -> Result<Self, AdmissionRefusal> {
-        if !limits.valid() {
-            return Err(AdmissionRefusal::InvalidLimits);
+impl AdmissionStats {
+    /// A listener's admission, from what its owner reports.
+    pub fn of(stats: &crate::net::NetStats) -> Self {
+        let admission = stats.endpoint.admission;
+        let bytes = stats
+            .budget
+            .ordinary
+            .saturating_add(stats.budget.completion);
+        let refusals = [
+            admission.refused_pending,
+            admission.refused_identities,
+            admission.refused_connections,
+            admission.refused_busy,
+            admission.refused_identity,
+            stats.refused_ingress,
+            stats.budget.refused,
+        ];
+        Self {
+            pending: admission.pending,
+            identities: admission.identities,
+            connections: admission.connections,
+            bytes,
+            pooled: stats
+                .endpoint
+                .receive_chunks
+                .saturating_mul(hyper_transport::RECEIVE_CHUNK),
+            serving: admission.serving,
+            admitted: admission.admitted,
+            replaced: admission.replaced,
+            refused_pending: admission.refused_pending,
+            refused_identities: admission.refused_identities,
+            refused_connections: admission.refused_connections,
+            refused_busy: admission.refused_busy,
+            refused_bytes: stats.refused_ingress,
+            refused_memory: stats.budget.refused,
+            changes: refusals
+                .into_iter()
+                .fold(admission.admitted, u64::saturating_add),
         }
-        Ok(Self {
-            limits,
-            state: Mutex::new(State::default()),
-        })
-    }
-    pub fn limits(&self) -> AdmissionLimits {
-        self.limits
-    }
-    pub fn stats(&self) -> AdmissionStats {
-        let Ok(state) = self.state.lock() else {
-            return AdmissionStats::default();
-        };
-        AdmissionStats {
-            pending: state.pending,
-            identities: state.identities.len(),
-            connections: state.connections,
-            admitted: state.admitted,
-            replaced: state.replaced,
-            refused_pending: state.refused_pending,
-            refused_identities: state.refused_identities,
-            changes: state.changes,
-        }
-    }
-    /// A place for one handshake, held until it authenticates or ends.
-    pub fn begin(&self) -> Result<Pending<'_>, AdmissionRefusal> {
-        let mut state = self.state.lock().map_err(|_| AdmissionRefusal::Closed)?;
-        bump(&mut state.changes);
-        if state.pending >= self.limits.pending {
-            bump(&mut state.refused_pending);
-            return Err(AdmissionRefusal::Pending);
-        }
-        state.pending = state.pending.saturating_add(1);
-        Ok(Pending { admission: self })
-    }
-    fn admit(
-        &self,
-        identity: ParticipantId,
-        role: PeerRole,
-        connection: &Connection,
-    ) -> Result<(u64, Option<Connection>), AdmissionRefusal> {
-        let mut state = self.state.lock().map_err(|_| AdmissionRefusal::Closed)?;
-        bump(&mut state.changes);
-        let bound = if matches!(role, PeerRole::Node { .. }) {
-            self.limits.per_node
-        } else {
-            self.limits.per_participant
-        };
-        let held = state
-            .identities
-            .get(&identity)
-            .map_or(0, |held| held.connections.len());
-        if held == 0 && state.identities.len() >= self.limits.identities {
-            bump(&mut state.refused_identities);
-            return Err(AdmissionRefusal::Identities);
-        }
-        let id = state.next;
-        state.next = state.next.checked_add(1).ok_or(AdmissionRefusal::Closed)?;
-        let entry = state.identities.entry(identity).or_insert_with(|| Held {
-            connections: VecDeque::new(),
-        });
-        let replaced = if entry.connections.len() >= bound {
-            entry.connections.pop_front().map(|(_, old)| old)
-        } else {
-            None
-        };
-        entry.connections.push_back((id, connection.clone()));
-        if replaced.is_some() {
-            bump(&mut state.replaced);
-        } else {
-            state.connections = state.connections.saturating_add(1);
-        }
-        bump(&mut state.admitted);
-        Ok((id, replaced))
-    }
-    /// The connection served a request: it is this identity's most
-    /// recently used.
-    fn used(&self, identity: ParticipantId, id: u64) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        let Some(held) = state.identities.get_mut(&identity) else {
-            return;
-        };
-        if held.connections.back().is_some_and(|(last, _)| *last == id) {
-            return;
-        }
-        if let Some(position) = held.connections.iter().position(|(held, _)| *held == id)
-            && let Some(entry) = held.connections.remove(position)
-        {
-            held.connections.push_back(entry);
-        }
-    }
-    fn release(&self, identity: ParticipantId, id: u64) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        bump(&mut state.changes);
-        let Some(held) = state.identities.get_mut(&identity) else {
-            return;
-        };
-        let before = held.connections.len();
-        held.connections.retain(|(held, _)| *held != id);
-        let removed = before.saturating_sub(held.connections.len());
-        if held.connections.is_empty() {
-            state.identities.remove(&identity);
-        }
-        state.connections = state.connections.saturating_sub(removed);
-    }
-}
-/// One handshake in progress.
-pub struct Pending<'a> {
-    admission: &'a Admission,
-}
-impl<'a> Pending<'a> {
-    /// The handshake authenticated as `identity`: charge the connection to
-    /// it and give the pending place back. A connection this one replaces is
-    /// closed before this returns.
-    pub fn authenticated(
-        self,
-        identity: ParticipantId,
-        role: PeerRole,
-        connection: &Connection,
-    ) -> Result<Admitted<'a>, AdmissionRefusal> {
-        let admission = self.admission;
-        let (id, replaced) = admission.admit(identity, role, connection)?;
-        if let Some(replaced) = replaced {
-            replaced.close(3u8.into(), b"replaced");
-        }
-        Ok(Admitted {
-            admission,
-            identity,
-            id,
-        })
-    }
-}
-impl Drop for Pending<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.admission.state.lock() {
-            state.pending = state.pending.saturating_sub(1);
-            bump(&mut state.changes);
-        }
-    }
-}
-/// One authenticated connection, charged to its identity until dropped.
-pub struct Admitted<'a> {
-    admission: &'a Admission,
-    identity: ParticipantId,
-    id: u64,
-}
-impl Admitted<'_> {
-    /// The connection served a request.
-    pub fn used(&self) {
-        self.admission.used(self.identity, self.id);
-    }
-}
-impl Drop for Admitted<'_> {
-    fn drop(&mut self) {
-        self.admission.release(self.identity, self.id);
     }
 }

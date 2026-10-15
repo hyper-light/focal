@@ -27,29 +27,30 @@ separately. Unknown outcomes retain the original expanded command.
 |---|---|---|
 | `submit claim` | `claim.submit` | Generate an immutable claim and its pinned requirements as the authenticated issuer. |
 | `submit claims` | `claim.submit_batch` | Atomically generate 1–64 immutable claims, including intra-batch dependencies, under one durable request identity. |
-| `claim post ID` | `claim.post` | Post an admitted generated claim. |
-| `receipt acquire ID` | `receipt.acquire` | Acquire responsibility as the allowed subject; create no testament. |
-| `evidence begin --claim ID` | `evidence.begin` | Open an evidence set under the exact execution receipt. |
+| `post claim ID` | `claim.post` | Post an admitted generated claim. |
+| `acquire receipt ID` | `receipt.acquire` | Acquire responsibility as the allowed subject; create no testament. |
+| `begin evidence --claim ID` | `evidence.begin` | Open an evidence set under the exact execution receipt. |
 | `submit artifact` | `artifact.submit` | Register and attach verified evidence under the holder's receipt and evidence set. |
 | `submit testament` | `testament.submit` | Respondent authors an explicit outcome, summary and confidence after success or failure, freezing the exact artifact manifest. Every non-Complete outcome requires a durable error artifact. |
-| `testament receive ID --claim ID` | `testament.receive` | Issuer records receipt of the exact current testament. This is delivery acknowledgment. |
-| `validation begin --claim ID` | `validation.begin` | Issuer pins whole-work validation runs over the acknowledged response. |
-| `validation begin-increment` | `validation.begin_increment` | Issuer pins an incremental requirement to an already attached artifact and an observed evidence manifest. |
-| `artifact register` | `artifact.register` | Participant registers its own independent proof artifact without borrowing a respondent's receipt. |
+| `receive testament ID --claim ID` | `testament.receive` | Issuer records receipt of the exact current testament. This is delivery acknowledgment. |
+| `begin validation --claim ID` | `validation.begin` | Issuer pins whole-work validation runs over the acknowledged response. |
+| `begin increment` | `validation.begin_increment` | Issuer pins an incremental requirement to an already attached artifact and an observed evidence manifest. |
+| `register artifact` | `artifact.register` | Participant registers its own independent proof artifact without borrowing a respondent's receipt. |
 | `submit validation` | `validation.submit` | Actual designated evaluator submits its fenced result and committed proof references. |
-| `validation complete --claim ID` | `validation.complete` | Issuer requests deterministic aggregation of committed results and graph conditions. No desired outcome is accepted. |
-| `claim cancel ID` | `claim.cancel` | Authorized cancellation with a reason. |
-| `claim supersede ID` | `claim.supersede` | Generate a compatible successor with explicit immutable predecessor lineage. |
-| `claim release-scope ID` | `claim.release_scope` | Native: the issuer releases a terminal claim's owned scope once. |
-| `receipt adopt ID --holder P` | `receipt.adopt` | Native: the issuer replaces the current holder; the committed receipt is fenced one epoch earlier. |
-| `artifact fail --claim ID --slot N --diagnostic ID[:HASH]` | `artifact.fail` | Native: the holder records an unproducible slot with its committed production diagnostic. |
-| `artifact receive ID --claim ID` | `artifact.receive` | Native: the issuer receives one generated work artifact. |
-| `artifact reject ID --claim ID --reason structure\|metadata` | `artifact.reject` | Native: the issuer rejects one work artifact with its own diagnostic, inheriting the product's visibility. |
+| `complete validation --claim ID` | `validation.complete` | Issuer requests deterministic aggregation of committed results and graph conditions. No desired outcome is accepted. |
+| `cancel claim ID` | `claim.cancel` | Authorized cancellation with a reason. |
+| `supersede claim ID` | `claim.supersede` | Generate a compatible successor with explicit immutable predecessor lineage. |
+| `release scope ID` | `claim.release_scope` | Native: the issuer releases a terminal claim's owned scope once. |
+| `adopt receipt ID --holder P` | `receipt.adopt` | Native: the issuer replaces the current holder; the committed receipt is fenced one epoch earlier. |
+| `fail slot --claim ID --slot N --diagnostic ID[:HASH]` | `artifact.fail` | Native: the holder records an unproducible slot with its committed production diagnostic. |
+| `receive artifact ID --claim ID` | `artifact.receive` | Native: the issuer receives one generated work artifact. |
+| `reject artifact ID --claim ID --reason structure\|metadata` | `artifact.reject` | Native: the issuer rejects one work artifact with its own diagnostic, inheriting the product's visibility. |
 | `validation begin\|report … --phase admission\|increment [--target ID]` | `validation.begin`, `validation.report` | Native: the same two verbs select admission and increment evaluations by phase. |
-| `validation seal-increments --claim ID` | `validation.seal_increments` | Native: the issuer freezes increment target membership while the response is open. |
-| `validation enter-whole-work ID --claim ID` | `validation.enter_whole_work` | Native: the issuer closes the increment cohort of the received testament and enters whole-work evaluation. |
-| `audit generate --claim ID`, `audit post ID` | `audit.generate`, `audit.post` | Native: the issuer generates and posts the closed claim's result testament. |
+| `seal increments --claim ID` | `validation.seal_increments` | Native: the issuer freezes increment target membership while the response is open. |
+| `enter whole-work ID --claim ID` | `validation.enter_whole_work` | Native: the issuer closes the increment cohort of the received testament and enters whole-work evaluation. |
+| `generate audit --claim ID`, `post audit ID` | `audit.generate`, `audit.post` | Native: the issuer generates and posts the closed claim's result testament. |
 | `monitor register\|rebind\|cancel` | `monitor.register`, `monitor.rebind`, `monitor.cancel` | Native: durable waits over committed claims with a logical-time deadline; rebinding follows a committed supersession; cancellation needs a terminal owner. |
+| `get archived CLAIM [--artifact\|--work\|--diagnostic\|--validation\|--testament\|--receipt ID]` | `archive.get` | Native: one object of a claim's family wherever the family is — from the ledger while it is live, from the archive bundle its `Retired` continuation names once it retired (the audit's F11); a validation comes with its evaluations and accepted results. |
 
 Each of the four families has singular `get` and plural `list` commands. List
 filters are optional. `get claim --source` enforces singular selection; use a list
@@ -78,6 +79,12 @@ exactly as the client journaled it; `NativeRead` (tag 26) returns fixed-prefix
 documents of committed native rows; `NativeList` (tag 27) is a bounded list
 over the native index families ([22 §7](22-native-record-format.md)), served
 statelessly from the committed prefix with a node-authenticated continuation.
+The registered encodings of the three operations are pinned by
+`native_tests::native_envelopes_and_replies_round_trip_with_frozen_bytes`; the
+read query's shape changed once, on 2026-09-29 (the audit's F07 and F08: the
+claim expansion's continuation, the declaration page's claim and the
+`SelectEvaluation` query), before any release carried the profile, and the
+fixture was re-registered with it.
 Under the profile the shared content transfer,
 managed request stream, reconcile, summary and stream operations stay
 admissible; legacy typed submissions and legacy reads do not, and native
@@ -106,8 +113,20 @@ acceptance slots, scopes and authored content; definitions with their program
 and authored specification; evaluations bound to their declaration; accepted
 results; artifacts with local custody; work artifacts and diagnostics;
 responses; result testaments; receipts; monitors; outcomes; creation results;
-events; frozen legacy rows as bytes). Claim expansions append the related
-objects to the same page. Bounded lists are served from the index families,
+events; frozen legacy rows as bytes). A claim expansion appends the related
+objects to the same page in one order — the responses from the latest cycle
+back, then the evaluations in key order — and a page that fills before the
+expansion ends carries the position to resume at (`after`, an exact read at
+the same prefix that never repeats the claim) rather than truncating. A
+declaration's evaluations page in key order under its claim, the continuation
+the last key the page consumed, so pages of any size concatenate to the whole
+span at one prefix. The owner selects the current evaluation of a declaration
+itself (`SelectEvaluation`: of the declaration's whole span — bounded by the
+core's evaluations per claim, never by a page — the targets the selector
+names, at the named generation when there is one, live when asked, the tie set
+at the highest generation; one object is the current evaluation, several an
+ambiguity the caller narrows, a set that does not fit a `Capacity` refusal,
+never a cut). Bounded lists are served from the index families,
 the validation context is composed from one prefix, and the node's timers
 are scheduled by the due-timer family
 ([22 §7](22-native-record-format.md#7-secondary-index-families)); claim
@@ -128,7 +147,8 @@ carries `wire = Native` and `retry = NativeN1`, and publishes a hand-written
 input schema ([native_schema.rs](../../crates/focal-client/src/operations/native_schema.rs)).
 The host first asks the compiler which committed objects the verb binds to
 (`requirements`: the claim, the claim and its response, or the claim and the
-current evaluations of one declaration), reads them once at a fixed prefix and
+owner's selection of the current evaluation of one declaration over its whole
+span — never a page of it), reads them once at a fixed prefix and
 extracts their bindings (`Resolved`), then compiles the document, the
 authenticated context, the claimed request identity and those bindings into a
 `NativeInput` and encodes the `FCNINPUT` frame
@@ -157,14 +177,33 @@ Identity is durable before transmission
 ([native_store.rs](../../crates/focal-client/src/native_store.rs)): the store
 claims an `n1:` reference (the request identity, epoch one) under the
 canonical document, persists the compiled frame, fingerprint and minted object
-identities, and only then marks the operation ready. `Client::submit_native`
+identities, and only then marks the operation ready. An operation's life ends
+by retirement (2026-09-29, the audit's F04–F06): once its committed receipt or
+a closed refusal has been reported it stays answered from its journal until a
+claim needs its slot; then the one reported longest ago retires — its frame
+and journal leave the store, its identity stays taken in the catalogue's
+retired table, bounded to the journal's capacity with the oldest leaving
+first — so the journal is bounded by its capacity rather than by the work
+ever done, and an old reference is never another operation under any intent
+(`Retired` answers it; the owner answers an exact retry from its receipt). A
+capacity refusal admitted nothing and keeps the frame for the exact retry,
+never retirable. A claim whose expansion fails is released with the failure, and
+a claim that never became ready is swept when the store is next opened: no
+bytes ever left under it. Every transition — receipt, delivery, refusal —
+reads, judges and writes under one hold of the store's lock, so a committed
+receipt is never overwritten by a stale refusal and a delivery never
+regresses, whichever process speaks second. `Client::submit_native`
 resends the identical frame while the owner answers with a pending ticket; if
 the ticket never commits within the retry policy the outcome is reported
 unknown with the request retained, and a refusal is final even after an
 uncertain attempt because the owner resolves the request key before admission.
 A capacity refusal from the node admitted nothing, so the client resends the
 identical request up to three times with backoff and then reports the refusal
-itself; the journaled reference stays pending for a later exact retry.
+itself; the journaled reference stays pending for a later exact retry. Each
+pause is the capped exponential step spread by full jitter — drawn uniformly
+from nothing to the step (2026-09-29, the audit's F64) — so callers refused
+together do not return together; the attempt, elapsed and refusal budgets
+bound the retries as before.
 Only a committed receipt whose invocation and intent equal the journaled frame
 is recorded. Refusal categories map to the exit classes of
 [failure.rs](../../crates/focal-client/src/failure.rs): invalid input 2,
@@ -189,7 +228,7 @@ and a test asserts it is empty, so a future owner operation must choose its
 surface explicitly. Each verb's compile reads exactly the objects it binds
 (a work artifact and its descriptor for a rejection, the diagnostic for a
 failed slot, the result testament for its posting, both claims for a
-rebinding), and the CLI's `focal audit` root is the only addition to the
+rebinding), and the CLI's `focal generate audit` and `focal post audit` are the only addition to the
 command tree of [13](13-cli-and-agent-implementation-plan.md).
 
 ### Native CLI routing and replicated custody
@@ -227,7 +266,7 @@ target's manifest with custody, the results after a revision cursor and the
 delivery result) and reached by `get validation ID --context` and
 `validation.context`; the trusted timers fire from the node's sweep
 ([native_timers.rs](../../crates/focal-node/src/native_timers.rs)) without
-any verb. `focal schema coverage` prints the R4.0 table and `focal schema get
+any verb. `focal inspect coverage` prints the R4.0 table and `focal get schema
 NAME --native` the version 2 schema.
 
 On the replicated host the data service attests artifact-bearing frames
@@ -265,7 +304,7 @@ identical documents therefore produce byte-identical frames from flags,
 documents and tools. MCP results are consumed explicitly, as managed results
 are: a committed operation stays in `request.pending` until acknowledged, a
 recorded refusal leaves it, and `request.inspect` with `remote: true` (and
-`focal request inspect --operation-id n1:… --remote`) reads the owner's
+`focal inspect request --operation-id n1:… --remote`) reads the owner's
 committed outcome by request key so each adapter can observe the other's
 operations. An unreachable owner at startup keeps the V1 catalogue only for a
 context that never journaled a native operation; a context with a native
@@ -277,6 +316,11 @@ Peer mutations use explicitly negotiated wire protocol 3. The server advertises
 that profile only through a handler implementing participant admission. Profiles
 1 and 2 retain their previous capability restrictions. A profile 3 envelope for
 another operation is rejected; a node certificate is not participant authority.
+Above it, profile 4 carries native frames (above) and profile 5, the ordered
+replication profile, is a node's alone: a node's replication handlers advertise
+it, a connection between nodes negotiates the highest profile both offer, and
+`Operation::RaftOrdered` is held to profile 5 as the plain `Raft` frame is held
+to the base ([27](27-consensus-roadmap-and-slates-port.md) §12).
 
 The ledger owner checks committed immutable issuer/producer identity before
 allowing an individual legacy runtime-gated command. Authentication alone leaves
@@ -379,8 +423,8 @@ currently resolves the pinned implementation in its own environment.
 
 ## Recorded validator contracts
 
-`validator list` / `validator.list` inspect the external handlers actually pinned
-in immutable validation requirements. `validator get ID --version HASH` /
+`list validators` / `validator.list` inspect the external handlers actually pinned
+in immutable validation requirements. `get validator ID --version HASH` /
 `validator.get` select an exact handler version. Every list filter is optional;
 claim, evaluator, kind, phase, mode, agentic capability and expected evidence
 schema are conjunctive. One row is a whole requirement, retaining its original
@@ -407,23 +451,23 @@ Local operation requires only the data directory. Named contexts add connection
 selection without changing the domain commands:
 
 ```sh
-focal context add laptop --node-data-dir /absolute/path/to/node
-focal context use laptop
+focal add context laptop --node-data-dir /absolute/path/to/node
+focal use context laptop
 focal list claims
 focal --client-context laptop get claim CLAIM_ID
-focal context show
-focal context list
-focal context use local
+focal inspect context
+focal list contexts
+focal use context local
 ```
 
 For an independently authenticated remote participant:
 
 ```sh
-focal --data-dir /node cluster client invite --name alice --output /private/alice.invite
-focal --data-dir /client context enroll alice --invite-file /private/alice.invite
-focal --data-dir /client context use alice
+focal --data-dir /node invite client --name alice --output /private/alice.invite
+focal --data-dir /client enroll context alice --invite-file /private/alice.invite
+focal --data-dir /client use context alice
 focal --data-dir /client list claims
-focal --data-dir /client mcp serve
+focal --data-dir /client serve mcp
 ```
 
 Enrollment persists one invitation, key, CSR, request ID, and completed
@@ -440,7 +484,7 @@ files. Losing initialized catalogue or request history fails closed. Explicitly
 selecting `local` restores the ordinary local context. `--client-context` avoids
 colliding with the existing validation `--context` read option.
 
-`context add --file` accepts an explicit Unix or QUIC connection document for
+`add context --file` accepts an explicit Unix or QUIC connection document for
 already provisioned credentials. Remote documents carry credential paths, not
 secret bytes. Endpoint, trust, selected ledger, and client identity are distinct
 fields; a principal in a document is a client hint checked by authenticated
@@ -523,8 +567,8 @@ must preserve these distinctions when the new lifecycle profile is activated;
 old-profile release observations cannot supply missing successor provenance.
 
 Large payload workflows save exact staged bytes, hashes, offsets, upload identity
-and final artifact command before transmission. `artifact upload inspect` sends
-nothing; `artifact upload cancel` saves and retries the existing cancellation
+and final artifact command before transmission. `inspect upload` sends
+nothing; `cancel upload` saves and retries the existing cancellation
 request. Cancellation preserves immutable content references and committed
 artifact facts. A terminal server upload fence prevents delayed Begin from
 reviving a canceled or finished local upload identity. File-transfer cancellation
@@ -537,10 +581,10 @@ to stderr, while results and partial pages stay on stdout. MCP uses the same
 SDK classification through nested store, watch and transfer errors. Administrative
 errors preserve their separate root/application operation identities and fences.
 
-Offline `schema validate` compiles strict authored input under a real selected
+Offline `validate document` compiles strict authored input under a real selected
 context; `--shape-only` explicitly limits the check to document structure.
-`request build` freezes a complete raw envelope into a private, no-clobber file.
-`request check` verifies supported raw shape, resource bounds and exact wire hash,
+`build request` freezes a complete raw envelope into a private, no-clobber file.
+`check request` verifies supported raw shape, resource bounds and exact wire hash,
 without authenticating the author. The existing raw sender remains compatible
 with protocol families outside the offline checker's supported subset. Discovery,
 examples and completion derive from the released descriptors and command tree.
@@ -571,6 +615,82 @@ surface (`operations::surface_of`), so a tool it did not advertise is refused
 by the dispatcher as well as by the protocol layer; the command-tree test
 resolves every `cli_path` to a leaf of the clap tree. The operator surfaces
 R9 adds (`deployment.*`, `backup.*`, `upgrade.*`) extend this registry.
+
+## Code mode
+
+An agent that calls focal one tool at a time pays a model turn per call, carries every
+tool schema it might use in its context, and passes every intermediate result through
+that context to reach the next call. Code mode (decision F59) gives the agent the whole
+operation registry as a program interface instead: it writes one short JavaScript
+program, focal runs it in a bounded sandbox inside the same binary, and only the value
+the program returns enters the model's context. Anthropic measured a Drive-to-Salesforce
+workflow fall from 150,000 tokens to 2,000 this way ("Code execution with MCP", 2025);
+Cloudflare's Code Mode runs the same pattern over its whole API with two tools, `search`
+and `execute`, the API's schema never leaving the sandbox unless a search returns it.
+
+**Two tools, one registry.** `code.search` and `code.run`, offered beside the ordinary
+tools (a profile that offers them alone follows with tool profiles).
+
+- `code.search { program }` runs a program over the registry as data: every descriptor
+  `{name, description, input, output, read_only, destructive}` the caller's standing may use (the skills join it when they are
+  served over MCP, the next batch). The program returns the subset it needs —
+  `registry.filter(d => d.name.startsWith("validation.")).map(d => d.input)` — and
+  nothing else of the registry is sent.
+- `code.run { run, program, arguments? }` runs a program with one host object,
+  `focal`, whose methods are the descriptors: `focal.call(name, input)` and the
+  generated `focal.claim.submit(input)` spellings of it. Each call is a `ToolCall`
+  dispatched through `Backend::execute` exactly as a direct tool call is, so the
+  server-side capability check, the surface dispatch, the operation journal and every
+  operation's own limits are unchanged; a name the caller's standing does not list is
+  refused there, in the program, as an exception carrying the typed condition.
+
+**Exactly once across a retried run.** `run` is the caller's identity for the program
+(1–64 bytes). Every mutation the program makes without naming its own reference takes
+`n1:` + the first 16 bytes of BLAKE3 keyed-derived from (`run`, the call's ordinal) — the
+agent-chosen reference the native journal already binds to one input (a V1 ledger takes
+the same 32 hex digits as its permanently bound legacy id). A lost reply is answered by
+sending the same `run` and program again, which replays the calls in order: each
+mutation already journaled resumes its saved outcome, and the first not yet sent is
+sent. A replay that reaches a reference with different input is refused, as any
+reference bound to other input is, so a program that does not replay identically cannot
+double its effects. This is the durable-execution model of Temporal and Azure Durable
+Functions (deterministic replay against a recorded history) over focal's existing
+journal. Replay needs determinism, so the sandbox has none of the sources that break it:
+no clock (`Date.now()` is the run's fixed logical time), no entropy (`Math.random` is
+seeded from `run`), no timers, no I/O but `focal`.
+
+**Bounds, each a typed refusal.** The engine is QuickJS-NG through `rquickjs`: of the
+maintained JavaScript engines small enough to embed in one binary, the one with all
+three hard runtime bounds — a heap
+limit (`JS_SetMemoryLimit`, exceeding it throws), an interrupt hook called on function
+calls and backward jumps (counted here, never timed), and a stack limit. Per run:
+
+| Bound | Rule |
+|---|---|
+| Program bytes | at most the MCP frame bound |
+| Heap | twice the response bound (32 MiB: one call's largest result as text and as its parsed value), reserved with the text crossing the boundary from the adapter's `MemoryBudget` before the runtime exists, so a run that cannot be funded is refused before it starts |
+| Work | 214,410 interrupt-hook calls (each 10,000 of the engine's polls): no longer than one `claim.wait` may hold the worker (30 s) at the slowest rate measured, 7,147 calls a second for a loop of built-in sorts (release, Apple M-series); an empty loop spends it in about 0.5 s |
+| Stack | half the worker thread's stack (512 KiB), the rest for the frames beneath the engine |
+| Calls | a quarter of the protocol's tree bound (4,096), so the listing of calls fits it |
+| Result | an eighth of the response bound (2 MiB of JSON text) and the protocol's tree bound: the response carries the value twice, once escaped at up to six bytes a byte |
+| Concurrency | one runtime per active call, within `max_active_calls` |
+
+A heap exhausted, a budget spent, a stack overflowed or a result too large ends the
+program with `isError` and `outcome.code` naming the bound (`heap`, `work`, `stack`,
+`calls`, `result`, `unsettled`, `cancelled`, `program`, `exception`), never a partial result; the
+calls it made before that are durable and named in the result, so a retry with the same
+`run` resumes them. Cancellation interrupts the program at its next hook call. The
+engine is C, and is called behind the unwind boundary like every dependency that can
+panic; its bindings are fed only from focal's own schema-validated values.
+
+**Why JavaScript and not a language of focal's own.** Agents write JavaScript and
+TypeScript well because those are what they were trained on, which is the reason both
+published designs chose them; a smaller language of focal's own would be bounded the
+same way but read worse to every model. Boa, the pure-Rust engine, has per-loop
+iteration and recursion limits but no heap limit, so a single `"x".repeat(n)` is
+unbounded growth; Starlark (Meta's `starlark-rust`) is deterministic and hermetic but
+has no heap limit either. The CLI runs the same programs (`focal run code --run ID
+--file P`, `focal search tools --file P`), one binary, one registry.
 
 ## Remaining independent work
 
@@ -611,8 +731,11 @@ relation index. The client packages these as authored shapes of
 `claim.follow_up`: typed documents lowered to one claim document by
 `focal-native-client/src/peer.rs`, so the coverage table claims them through
 `claim.submit`'s frame tags), composes `claim.lineage` from one full claim
-read, bounded ancestor reads and three relation lists at or after the first
-read's token (`observe.rs`), and observes `claim.wait` with the V1 bounds
+read, bounded ancestor reads and three relation lists, every later read exact
+at the first read's token, into one `NativeLineage` observation that names
+what its bounds left beyond it — the next ancestor past the depth, an
+ancestor unreadable at the prefix, followers listed but not read and each
+relation list's continuation (`observe.rs`; the audit's F10), and observes `claim.wait` with the V1 bounds
 plus the `testament` predicate; the CLI verbs `claim challenge|consult|
 correct|follow-up|lineage|wait` and the MCP tools of the same names share
 those documents.

@@ -21,10 +21,10 @@ fn extra(id: u128) -> Extra {
     let binding = binding(id);
     Extra {
         key: Key::Definition(ValidationId(binding.object.0)),
-        row: Row::Meta(Meta {
+        row: Row::Meta(Box::new(Meta {
             definitions: usize::try_from(id).unwrap(),
             ..Meta::default()
-        }),
+        })),
         heap: 0,
         fact: Some(NativeFact::Definition {
             binding,
@@ -40,7 +40,7 @@ fn assert_extra(row: &Extra, id: u128) {
     assert_eq!(row.key, expected.key);
     assert_eq!(row.fact, expected.fact);
     assert_eq!(row.heap, 0);
-    match row.row {
+    match &row.row {
         Row::Meta(meta) => assert_eq!(meta.definitions, usize::try_from(id).unwrap()),
         _ => panic!("staged payload changed"),
     }
@@ -123,10 +123,7 @@ fn conflicting_descriptor_cannot_replace_fact_or_trigger_growth() {
 fn scratch_refuses_missing_bytes_and_charges_actual_coexisting_capacities() {
     let original = 37;
     let requested = array::<Binding>(7).unwrap();
-    let mut scratch = Scratch {
-        used: original,
-        max: original + requested - 1,
-    };
+    let mut scratch = Scratch::with_used(original, original + requested - 1);
     assert!(matches!(
         scratch.reserve::<Binding>(7),
         Err(NativeError::Capacity(_))
@@ -219,10 +216,7 @@ fn evaluation_requires_entire_singleton_charge_before_staging_any_fact() {
     .unwrap()
     .into_state();
     let mut extras = Extras::new(1, array::<Extra>(1).unwrap() * 2).unwrap();
-    let mut scratch = Scratch {
-        used: 19,
-        max: 19 + OwnedEvaluation::container_charge() - 1,
-    };
+    let mut scratch = Scratch::with_used(19, 19 + OwnedEvaluation::container_charge() - 1);
     for _ in 0..2 {
         assert!(matches!(
             extras.evaluation(
@@ -270,10 +264,7 @@ fn evaluation_requires_entire_singleton_charge_before_staging_any_fact() {
 
 #[test]
 fn impossible_capacities_fail_before_changing_scratch_or_allocating_rows() {
-    let mut scratch = Scratch {
-        used: 1,
-        max: usize::MAX,
-    };
+    let mut scratch = Scratch::with_used(1, usize::MAX);
     assert!(matches!(
         scratch.charge(usize::MAX),
         Err(NativeError::Capacity(_))
@@ -295,7 +286,7 @@ fn impossible_capacities_fail_before_changing_scratch_or_allocating_rows() {
 }
 
 #[test]
-fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
+fn owner_charges_construction_as_it_holds_it_never_its_bound() {
     let budget = MemoryBudget::new(16 * 1024 * 1024, 0).unwrap();
     let limits = NativeLimits {
         range: RangeConfig {
@@ -323,9 +314,11 @@ fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
         + changes
         + containers(limits.plan_nodes).unwrap()
         + event_containers(limits.range.max_batch_entries).unwrap()
-        + index;
-    // Leave every descriptor and all but one container byte available. No
-    // candidate may enter semantic execution under this incomplete reservation.
+        + index
+        + crate::native::epochs::window_bytes(limits).unwrap();
+    // Leave all but one byte of the operation's bound: a preparation is charged
+    // what it holds as it takes it, never its bound, so this post reaches its
+    // real check (an absent target) and gives back all it held.
     let pressure = budget
         .reserve(
             BudgetKind::Query,
@@ -351,12 +344,11 @@ fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
     };
     assert!(matches!(
         core.prepare_native(context, input(), &[]),
-        Err(NativeError::Memory(MemoryError::Capacity { requested, available }))
-            if requested == entire_charge && available == entire_charge - 1
+        Err(NativeError::Contract(ContractError::InvalidTarget))
     ));
     assert_eq!(budget.stats(), constrained);
     assert_eq!(core.native_sequence(), SessionSeq(0));
-    assert!(core.native_outcome(request).is_none());
+    assert!(core.native_outcome(request).unwrap().is_none());
     drop(pressure);
     // Adequate reservation reaches the real absent-target check. Its refusal
     // releases the entire temporary permit and retains no request outcome.
@@ -365,5 +357,45 @@ fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
         Err(NativeError::Contract(ContractError::InvalidTarget))
     ));
     assert_eq!(budget.stats(), initial);
-    assert!(core.native_outcome(request).is_none());
+    assert!(core.native_outcome(request).unwrap().is_none());
+}
+
+#[test]
+fn a_metered_scratch_holds_what_it_charged_never_its_bound() {
+    let budget = MemoryBudget::new(64 * 1024 * 1024, 0).unwrap();
+    let bound = 32 * 1024 * 1024;
+    let mut scratch = Scratch::metered(&budget, BudgetLane::Ordinary, bound).unwrap();
+    // A preparation's bound is no reservation: nothing is held before use.
+    assert_eq!(scratch.held(), 0);
+    assert_eq!(budget.stats().used, 0);
+    scratch.charge(100).unwrap();
+    let step = scratch.held();
+    assert!((100..=64 * 1024).contains(&step), "held {step}");
+    assert_eq!(budget.stats().used, step);
+    // Charges within the held step take nothing more from the budget.
+    scratch.charge(step - 100).unwrap();
+    assert_eq!(budget.stats().used, step);
+    // Past it, the charge grows in steps, never past the bound.
+    scratch.charge(step * 3).unwrap();
+    assert!(scratch.held() >= scratch.used && scratch.held() <= bound);
+    assert_eq!(budget.stats().used, scratch.held());
+    // The bound refuses without charging more.
+    let held = scratch.held();
+    assert!(scratch.charge(bound).is_err());
+    assert_eq!(scratch.held(), held);
+    // A refusal by the budget leaves the scratch as it was.
+    let pressure = budget
+        .reserve(
+            BudgetKind::Payload,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
+        )
+        .unwrap()
+        .commit();
+    let used = scratch.used;
+    assert!(scratch.charge(held + 1).is_err());
+    assert_eq!((scratch.used, scratch.held()), (used, held));
+    drop(pressure);
+    drop(scratch);
+    assert_eq!(budget.stats().used, 0);
 }

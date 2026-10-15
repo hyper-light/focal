@@ -8,7 +8,6 @@ use crate::{
 use focal_control::{ControlBootstrap, ControlIdentity, ControlScope};
 use focal_enrollment::{EnrollmentLimits, EnrollmentRegistry, EnrollmentRole};
 use focal_model::{LedgerId, SessionId};
-use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, path::Path, time::Duration};
 
@@ -114,15 +113,39 @@ pub struct NetworkState {
     pub sponsor: focal_enrollment::ServerTrust,
     pub genesis: NetworkGenesis,
 }
-pub const NETWORK_STATE_SCHEMA: u16 = 2;
-/// The shape schema 1 wrote: no advertised name.
+pub const NETWORK_STATE_SCHEMA: u16 = 4;
+/// The shape schema 1 wrote: no advertised name, a sponsor with one pin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NetworkStateV1 {
     schema: u16,
     node: u64,
     listen: SocketAddr,
     advertise: SocketAddr,
-    sponsor: focal_enrollment::ServerTrust,
+    sponsor: focal_enrollment::ServerTrustV1,
+    genesis: NetworkGenesis,
+}
+/// The shape schema 2 wrote: a sponsor with one pin (before the bootstrap
+/// server certificate could stage a successor, 24 §11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NetworkStateV2 {
+    schema: u16,
+    node: u64,
+    listen: SocketAddr,
+    advertise: SocketAddr,
+    endpoint: Option<String>,
+    sponsor: focal_enrollment::ServerTrustV1,
+    genesis: NetworkGenesis,
+}
+/// The shape schema 3 wrote: a sponsor with two pins and the genesis
+/// issuer as its one root (before the issuer could succeed itself, 24 §11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NetworkStateV3 {
+    schema: u16,
+    node: u64,
+    listen: SocketAddr,
+    advertise: SocketAddr,
+    endpoint: Option<String>,
+    sponsor: focal_enrollment::ServerTrustV2,
     genesis: NetworkGenesis,
 }
 /// The addresses a start resolved against the saved state (24 §24).
@@ -152,27 +175,26 @@ pub async fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr, NodeError> {
     if !focal_wire::valid_endpoint_name(endpoint) {
         return Err(NodeError::Identity);
     }
-    let lookup = async {
-        tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(endpoint))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "endpoint resolution timed out",
-                )
-            })?
-    };
-    Ok(std::panic::AssertUnwindSafe(lookup)
-        .catch_unwind()
+    Ok(resolve_first(endpoint, "endpoint").await?)
+}
+/// The first address the platform's resolver gives `endpoint`'s host, waited
+/// for no longer than five seconds.
+async fn resolve_first(endpoint: &str, what: &str) -> Result<SocketAddr, std::io::Error> {
+    let resolved = focal_wire::resolve_all(endpoint, 1, Duration::from_secs(5))
         .await
-        .map_err(|_| std::io::Error::other("Tokio endpoint resolution failed"))??
-        .next()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::AddrNotAvailable,
-                "endpoint resolved to no addresses",
-            )
-        })?)
+        .map_err(|error| match error {
+            focal_wire::WireError::Timeout => std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("{what} resolution timed out"),
+            ),
+            _ => std::io::Error::other(format!("{what} resolution failed")),
+        })?;
+    resolved.first().copied().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("{what} resolved to no addresses"),
+        )
+    })
 }
 impl NetworkState {
     pub fn load(directory: &NodeDirectory) -> Result<Option<Self>, NodeError> {
@@ -211,7 +233,37 @@ impl NetworkState {
                     listen: legacy.listen,
                     advertise: legacy.advertise,
                     endpoint: None,
-                    sponsor: legacy.sponsor,
+                    sponsor: legacy.sponsor.try_into().map_err(|_| NodeError::Identity)?,
+                    genesis: legacy.genesis,
+                }
+            }
+            2 => {
+                let (legacy, trailing): (NetworkStateV2, _) = postcard::take_from_bytes(payload)?;
+                if !trailing.is_empty() {
+                    return Err(NodeError::Identity);
+                }
+                Self {
+                    schema: NETWORK_STATE_SCHEMA,
+                    node: legacy.node,
+                    listen: legacy.listen,
+                    advertise: legacy.advertise,
+                    endpoint: legacy.endpoint,
+                    sponsor: legacy.sponsor.try_into().map_err(|_| NodeError::Identity)?,
+                    genesis: legacy.genesis,
+                }
+            }
+            3 => {
+                let (legacy, trailing): (NetworkStateV3, _) = postcard::take_from_bytes(payload)?;
+                if !trailing.is_empty() {
+                    return Err(NodeError::Identity);
+                }
+                Self {
+                    schema: NETWORK_STATE_SCHEMA,
+                    node: legacy.node,
+                    listen: legacy.listen,
+                    advertise: legacy.advertise,
+                    endpoint: legacy.endpoint,
+                    sponsor: legacy.sponsor.try_into().map_err(|_| NodeError::Identity)?,
                     genesis: legacy.genesis,
                 }
             }
@@ -245,10 +297,17 @@ impl NetworkState {
         )?;
         Ok(())
     }
+    /// The same node under the same sponsor and genesis. The sponsor's pins
+    /// are facts the registry moves as the bootstrap server certificate
+    /// succeeds itself (24 §11), not identity.
     fn same_identity(&self, other: &Self) -> bool {
-        self.node == other.node && self.sponsor == other.sponsor && self.genesis == other.genesis
+        self.node == other.node
+            && self.sponsor.same_sponsor(&other.sponsor)
+            && self.genesis == other.genesis
     }
-    fn write(&self, root: &Path) -> Result<(), NodeError> {
+    /// Write this state over the saved one: the controller adopts the
+    /// sponsor's pins the registry names (24 §11).
+    pub(crate) fn write(&self, root: &Path) -> Result<(), NodeError> {
         let length = postcard::experimental::serialized_size(self)?;
         if length > MAX_BYTES.checked_sub(40).ok_or(NodeError::Identity)? {
             return Err(NodeError::Identity);
@@ -352,32 +411,7 @@ pub async fn resolve_addresses(settings: &Settings) -> Result<(SocketAddr, Socke
     let advertise = if let Ok(address) = advertised.parse::<SocketAddr>() {
         address
     } else {
-        tokio::runtime::Handle::try_current()
-            .map_err(|_| std::io::Error::other("endpoint resolution requires a Tokio runtime"))?;
-        // Tokio's timer and resolver can panic when a caller supplied a runtime
-        // without the corresponding driver, or the blocking pool cannot start.
-        // Contain that dependency failure before it reaches the node owner.
-        let lookup = async {
-            tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(advertised))
-                .await
-                .map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "advertised endpoint resolution timed out",
-                    )
-                })?
-        };
-        std::panic::AssertUnwindSafe(lookup)
-            .catch_unwind()
-            .await
-            .map_err(|_| std::io::Error::other("Tokio endpoint resolution failed"))??
-            .next()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::AddrNotAvailable,
-                    "advertised endpoint resolved to no addresses",
-                )
-            })?
+        resolve_first(advertised, "advertised endpoint").await?
     };
     if !valid_advertise(advertise) {
         return Err(NodeError::Identity);

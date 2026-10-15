@@ -10,8 +10,9 @@
 //! The pool counts each as given up on, which lengthens what that peer is
 //! expected to take ([`crate::PeerConnectionPool::exchange_tail`]), so an
 //! estimate that ended a round too early corrects itself.
+use focal_rt::Concurrent;
 use focal_timing::{RoundBudget, RoundWait};
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use hyper_rt::combine::{Either, race2};
 use std::future::Future;
 
 /// The most peers one round asks.
@@ -54,12 +55,11 @@ pub async fn gather<T, F>(
 where
     F: Future<Output = Option<T>>,
 {
-    let mut exchanges = FuturesUnordered::new();
+    let mut exchanges = Concurrent::new(MAX_ROUND_PEERS).map_err(|_| RoundError::Capacity)?;
     for (peer, ask) in asks {
-        if exchanges.len() >= MAX_ROUND_PEERS {
-            return Err(RoundError::Capacity);
-        }
-        exchanges.push(async move { (peer, ask.await) });
+        exchanges
+            .push(focal_rt::keyed(peer, ask))
+            .map_err(|_| RoundError::Capacity)?;
     }
     let asked = exchanges.len();
     let mut round = Round {
@@ -68,23 +68,19 @@ where
         reported: 0,
         answered: 0,
     };
-    if tokio::runtime::Handle::try_current().is_err() {
+    if hyper_rt::futures::shard_id().is_none() {
         return Err(RoundError::Runtime);
     }
-    let started = tokio::time::Instant::now();
-    let elapsed = |started: tokio::time::Instant| {
-        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
-    };
+    // The shard's clock: a simulated shard's virtual one under test.
+    let started = hyper_rt::futures::now_ns();
+    let elapsed = |started: u64| hyper_rt::futures::now_ns().saturating_sub(started);
     let mut wait = RoundWait::begin(&budget, 0);
     let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
     loop {
-        let judged = started
-            .checked_add(std::time::Duration::from_nanos(wait.next_judgement_ns()))
-            .ok_or(RoundError::Runtime)?;
-        tokio::select! {
-            // A reply in hand is read before the wait is judged.
-            biased;
-            reported = exchanges.next() => {
+        let judged = wait.next_judgement_ns().saturating_sub(elapsed(started));
+        // A reply in hand is read before the wait is judged: the race polls it first.
+        match race2(exchanges.join_next(), hyper_rt::futures::sleep(judged)).await {
+            Either::First(reported) => {
                 let Some((peer, answer)) = reported else {
                     return Ok(round);
                 };
@@ -98,12 +94,14 @@ where
                     }
                 }
             }
-            () = tokio::time::sleep_until(judged) => {
+            Either::Second(Ok(())) => {
                 if !wait.judge(count(round.answered), elapsed(started)) {
                     round.end = RoundEnd::Expired;
                     return Ok(round);
                 }
             }
+            // No timer to judge the wait by: the round cannot keep its deadline.
+            Either::Second(Err(_)) => return Err(RoundError::Runtime),
         }
     }
 }
@@ -117,8 +115,10 @@ mod tests {
     fn ms(value: u64) -> Duration {
         Duration::from_millis(value)
     }
-    /// A near group: opens for 100 ms, judged at 75 ms, extended 100 ms at
-    /// a time, stalled after 200 ms without an answer.
+    /// A near group: opens for 100 ms, given all of it while nothing has
+    /// arrived, judged at 75 ms of the deadline in force once something
+    /// has, extended 100 ms at a time, stalled after 200 ms without an
+    /// answer.
     fn budget() -> RoundBudget {
         RoundBudget::derive(ms(100), Some(ms(10)), ms(5_000))
     }
@@ -128,15 +128,21 @@ mod tests {
         if after == NEVER {
             std::future::pending::<()>().await;
         }
-        tokio::time::sleep(ms(after)).await;
+        hyper_rt::futures::sleep(after * 1_000_000).await.unwrap();
         answers.then_some(after)
+    }
+    /// Runs a test's round on a simulated shard: virtual time, exact to the nanosecond.
+    fn simulated<T: Send + 'static>(test: impl Future<Output = T> + Send + 'static) -> T {
+        focal_rt::simulate(0, test)
+            .unwrap()
+            .expect("the round ended")
     }
     async fn run(
         peers: &[(u64, bool)],
         budget: RoundBudget,
         need: usize,
     ) -> (Round, Vec<u64>, Duration) {
-        let started = tokio::time::Instant::now();
+        let started = hyper_rt::futures::now_ns();
         let mut answers = Vec::new();
         let asks = peers
             .iter()
@@ -148,134 +154,164 @@ mod tests {
         })
         .await
         .unwrap();
-        (round, answers, started.elapsed())
+        let took = hyper_rt::futures::now_ns().saturating_sub(started);
+        (round, answers, Duration::from_nanos(took))
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_dead_peer_costs_the_round_nothing() {
-        let (round, answers, took) =
-            run(&[(10, true), (NEVER, true), (20, true)], budget(), 2).await;
-        assert_eq!(
-            round,
-            Round {
-                end: RoundEnd::Enough,
-                asked: 3,
-                reported: 2,
-                answered: 2
-            }
-        );
-        assert_eq!(answers, vec![1, 3]);
-        assert_eq!(took, ms(20));
+    #[test]
+    fn a_dead_peer_costs_the_round_nothing() {
+        simulated(async move {
+            let (round, answers, took) =
+                run(&[(10, true), (NEVER, true), (20, true)], budget(), 2).await;
+            assert_eq!(
+                round,
+                Round {
+                    end: RoundEnd::Enough,
+                    asked: 3,
+                    reported: 2,
+                    answered: 2
+                }
+            );
+            assert_eq!(answers, vec![1, 3]);
+            assert_eq!(took, ms(20));
+        });
     }
-    #[tokio::test(start_paused = true)]
-    async fn a_round_ends_when_every_peer_has_reported() {
-        let (round, answers, took) =
-            run(&[(10, true), (30, false), (20, false)], budget(), 2).await;
-        assert_eq!(
-            round,
-            Round {
-                end: RoundEnd::AllReported,
-                asked: 3,
-                reported: 3,
-                answered: 1
-            }
-        );
-        assert_eq!(answers, vec![1]);
-        assert_eq!(took, ms(30));
-        let (round, _, took) = run(&[], budget(), 1).await;
-        assert_eq!(
-            (round.end, round.asked, took),
-            (RoundEnd::AllReported, 0, ms(0))
-        );
+    #[test]
+    fn a_round_ends_when_every_peer_has_reported() {
+        simulated(async move {
+            let (round, answers, took) =
+                run(&[(10, true), (30, false), (20, false)], budget(), 2).await;
+            assert_eq!(
+                round,
+                Round {
+                    end: RoundEnd::AllReported,
+                    asked: 3,
+                    reported: 3,
+                    answered: 1
+                }
+            );
+            assert_eq!(answers, vec![1]);
+            assert_eq!(took, ms(30));
+            let (round, _, took) = run(&[], budget(), 1).await;
+            assert_eq!(
+                (round.end, round.asked, took),
+                (RoundEnd::AllReported, 0, ms(0))
+            );
+        });
     }
-    #[tokio::test(start_paused = true)]
-    async fn a_round_with_no_answer_ends_at_its_lookahead() {
-        let (round, _, took) = run(&[(NEVER, true), (NEVER, true)], budget(), 1).await;
-        assert_eq!((round.end, round.reported), (RoundEnd::Expired, 0));
-        assert_eq!(took, ms(75));
-        // A refusal is a report and no answer: it does not extend the round.
-        let (round, _, took) = run(&[(5, false), (NEVER, true)], budget(), 1).await;
-        assert_eq!((round.end, round.reported), (RoundEnd::Expired, 1));
-        assert_eq!(took, ms(75));
+    #[test]
+    fn a_round_with_no_answer_ends_at_its_deadline() {
+        simulated(async move {
+            let (round, _, took) = run(&[(NEVER, true), (NEVER, true)], budget(), 1).await;
+            assert_eq!((round.end, round.reported), (RoundEnd::Expired, 0));
+            assert_eq!(took, ms(100));
+            // A refusal is a report and no answer: it does not extend the round.
+            let (round, _, took) = run(&[(5, false), (NEVER, true)], budget(), 1).await;
+            assert_eq!((round.end, round.reported), (RoundEnd::Expired, 1));
+            assert_eq!(took, ms(100));
+        });
     }
-    #[tokio::test(start_paused = true)]
-    async fn a_round_whose_answers_keep_arriving_is_extended_past_its_deadline() {
-        let peers: Vec<(u64, bool)> = (1..=10).map(|peer| (peer * 60, true)).collect();
-        let (round, answers, took) = run(&peers, budget(), 10).await;
-        assert_eq!((round.end, round.answered), (RoundEnd::Enough, 10));
-        assert_eq!(answers.len(), 10);
-        assert_eq!(took, ms(600));
-        assert!(took > Duration::from_nanos(budget().deadline_ns));
+    #[test]
+    fn an_answer_in_the_last_quarter_of_the_deadline_is_collected() {
+        simulated(async move {
+            // The deadline is the tail of these peers: an answer at 90 ms of a
+            // 100 ms round is the answer the round opened for.
+            let (round, answers, took) = run(&[(90, true), (NEVER, true)], budget(), 1).await;
+            assert_eq!((round.end, round.answered), (RoundEnd::Enough, 1));
+            assert_eq!(answers, vec![1]);
+            assert_eq!(took, ms(90));
+        });
     }
-    #[tokio::test(start_paused = true)]
-    async fn a_round_that_stalls_ends_with_its_peers_outstanding() {
-        // Two answers early, then nothing: judged at 75 and 150 ms with an
-        // answer inside the stall window, and at 225 ms without.
-        let (round, answers, took) = run(
-            &[(10, true), (20, true), (NEVER, true), (NEVER, true)],
-            budget(),
-            3,
-        )
-        .await;
-        assert_eq!(
-            round,
-            Round {
-                end: RoundEnd::Expired,
-                asked: 4,
-                reported: 2,
-                answered: 2
-            }
-        );
-        assert_eq!(answers, vec![1, 2]);
-        assert_eq!(took, ms(225));
+    #[test]
+    fn a_round_whose_answers_keep_arriving_is_extended_past_its_deadline() {
+        simulated(async move {
+            let peers: Vec<(u64, bool)> = (1..=10).map(|peer| (peer * 60, true)).collect();
+            let (round, answers, took) = run(&peers, budget(), 10).await;
+            assert_eq!((round.end, round.answered), (RoundEnd::Enough, 10));
+            assert_eq!(answers.len(), 10);
+            assert_eq!(took, ms(600));
+            assert!(took > Duration::from_nanos(budget().deadline_ns));
+        });
     }
-    #[tokio::test(start_paused = true)]
-    async fn extensions_end() {
-        // An answer every 50 ms for ever, and never enough.
-        let peers: Vec<(u64, bool)> = (1..=200).map(|peer| (peer * 50, true)).collect();
-        let (round, _, took) = run(&peers, budget(), usize::MAX).await;
-        assert_eq!(round.end, RoundEnd::Expired);
-        assert!(
-            took <= Duration::from_nanos(budget().max_deadline_ns()),
-            "{took:?}"
-        );
-        assert!(took >= ms(800), "{took:?}");
+    #[test]
+    fn a_round_that_stalls_ends_with_its_peers_outstanding() {
+        simulated(async move {
+            // Two answers early, then nothing: judged at 75 and 150 ms with an
+            // answer inside the stall window, and at 225 ms without.
+            let (round, answers, took) = run(
+                &[(10, true), (20, true), (NEVER, true), (NEVER, true)],
+                budget(),
+                3,
+            )
+            .await;
+            assert_eq!(
+                round,
+                Round {
+                    end: RoundEnd::Expired,
+                    asked: 4,
+                    reported: 2,
+                    answered: 2
+                }
+            );
+            assert_eq!(answers, vec![1, 2]);
+            assert_eq!(took, ms(225));
+        });
     }
-    #[tokio::test(start_paused = true)]
-    async fn an_answer_that_arrives_with_the_judgement_is_read_first() {
-        // The third answer arrives at 225 ms, the instant the round of the
-        // stalled test ended.
-        let (round, answers, took) = run(
-            &[(10, true), (20, true), (225, true), (NEVER, true)],
-            budget(),
-            3,
-        )
-        .await;
-        assert_eq!((round.end, round.answered), (RoundEnd::Enough, 3));
-        assert_eq!(answers, vec![1, 2, 3]);
-        assert_eq!(took, ms(225));
+    #[test]
+    fn extensions_end() {
+        simulated(async move {
+            // An answer every 50 ms for ever, and never enough.
+            let peers: Vec<(u64, bool)> = (1..=200).map(|peer| (peer * 50, true)).collect();
+            let (round, _, took) = run(&peers, budget(), usize::MAX).await;
+            assert_eq!(round.end, RoundEnd::Expired);
+            assert!(
+                took <= Duration::from_nanos(budget().max_deadline_ns()),
+                "{took:?}"
+            );
+            assert!(took >= ms(800), "{took:?}");
+        });
     }
-    #[tokio::test(start_paused = true)]
-    async fn an_unmeasured_peer_opens_the_round_to_the_ceiling() {
-        let budget = RoundBudget::derive(ms(100), None, ms(5_000));
-        let (round, _, took) = run(&[(4_000, true), (NEVER, true)], budget, 1).await;
-        assert_eq!((round.end, took), (RoundEnd::Enough, ms(4_000)));
-        let (round, _, took) = run(&[(NEVER, true)], budget, 1).await;
-        assert_eq!((round.end, took), (RoundEnd::Expired, ms(5_000)));
+    #[test]
+    fn an_answer_that_arrives_with_the_judgement_is_read_first() {
+        simulated(async move {
+            // The third answer arrives at 225 ms, the instant the round of the
+            // stalled test ended.
+            let (round, answers, took) = run(
+                &[(10, true), (20, true), (225, true), (NEVER, true)],
+                budget(),
+                3,
+            )
+            .await;
+            assert_eq!((round.end, round.answered), (RoundEnd::Enough, 3));
+            assert_eq!(answers, vec![1, 2, 3]);
+            assert_eq!(took, ms(225));
+        });
     }
-    #[tokio::test(start_paused = true)]
-    async fn a_round_asks_a_bounded_number_of_peers() {
-        let asks = (0..=MAX_ROUND_PEERS as u64).map(|peer| (peer, peer_answer()));
-        assert_eq!(
-            gather(asks, budget(), |_, _: u64| false).await,
-            Err(RoundError::Capacity)
-        );
-        let asks = (0..MAX_ROUND_PEERS as u64).map(|peer| (peer, peer_answer()));
-        let round = gather(asks, budget(), |_, _: u64| false).await.unwrap();
-        assert_eq!(
-            (round.end, round.answered),
-            (RoundEnd::AllReported, MAX_ROUND_PEERS)
-        );
+    #[test]
+    fn an_unmeasured_peer_opens_the_round_to_the_ceiling() {
+        simulated(async move {
+            let budget = RoundBudget::derive(ms(100), None, ms(5_000));
+            let (round, _, took) = run(&[(4_000, true), (NEVER, true)], budget, 1).await;
+            assert_eq!((round.end, took), (RoundEnd::Enough, ms(4_000)));
+            let (round, _, took) = run(&[(NEVER, true)], budget, 1).await;
+            assert_eq!((round.end, took), (RoundEnd::Expired, ms(5_000)));
+        });
+    }
+    #[test]
+    fn a_round_asks_a_bounded_number_of_peers() {
+        simulated(async move {
+            let asks = (0..=MAX_ROUND_PEERS as u64).map(|peer| (peer, peer_answer()));
+            assert_eq!(
+                gather(asks, budget(), |_, _: u64| false).await,
+                Err(RoundError::Capacity)
+            );
+            let asks = (0..MAX_ROUND_PEERS as u64).map(|peer| (peer, peer_answer()));
+            let round = gather(asks, budget(), |_, _: u64| false).await.unwrap();
+            assert_eq!(
+                (round.end, round.answered),
+                (RoundEnd::AllReported, MAX_ROUND_PEERS)
+            );
+        });
     }
     async fn peer_answer() -> Option<u64> {
         Some(1)

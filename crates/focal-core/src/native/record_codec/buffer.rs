@@ -124,11 +124,12 @@ impl PendingRecord {
         source: &MemoryBudget,
         lane: BudgetLane,
         limits: Option<EncodingLimits>,
+        payloads: Option<&dyn crate::native::payloads::PayloadRead>,
     ) -> Result<Self, NativeOwnerError> {
         let Some(limits) = limits else {
             return Ok(Self::Disabled);
         };
-        let quote = EncodingPlan::prepare(prepared, limits)
+        let quote = EncodingPlan::prepare_with(prepared, limits, payloads)
             .map_err(NativeOwnerError::Record)?
             .quote();
         let allocation = source
@@ -141,10 +142,19 @@ impl PendingRecord {
         Ok(Self::Reserved { quote, allocation })
     }
 
+    /// The record once encoded ([`Self::encode`]); none before.
+    pub(in crate::native) fn encoded(&self) -> Option<&FundedRecord> {
+        match self {
+            Self::Encoded(record) => Some(record),
+            Self::Disabled | Self::Reserved { .. } => None,
+        }
+    }
+
     pub(in crate::native) fn encode(
         &mut self,
         prepared: &NativePrepared,
         limits: EncodingLimits,
+        payloads: Option<&dyn crate::native::payloads::PayloadRead>,
     ) -> Result<&FundedRecord, NativeOwnerError> {
         let quote = match self {
             Self::Disabled => {
@@ -168,8 +178,14 @@ impl PendingRecord {
                 return Err(MemoryError::AllocationFailed.into());
             }
             bytes.resize(quote.bytes, 0);
-            let plan = EncodingPlan { prepared, quote };
-            plan.write_into(&mut bytes)
+            let plan = EncodingPlan {
+                prepared,
+                quote,
+                payloads,
+            };
+            // The record's hash is its write's: the measuring pass does not hash.
+            let hash = plan
+                .write_into(&mut bytes)
                 .map_err(NativeOwnerError::Record)?;
             let previous = std::mem::replace(self, Self::Disabled);
             let Self::Reserved { allocation, .. } = previous else {
@@ -177,7 +193,7 @@ impl PendingRecord {
             };
             *self = Self::Encoded(FundedRecord {
                 bytes,
-                quote,
+                quote: EncodingQuote { hash, ..quote },
                 allocation,
             });
         }

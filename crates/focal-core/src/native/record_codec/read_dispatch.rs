@@ -31,6 +31,15 @@ pub(super) enum ClaimDependency<'a> {
 /// never fall back to the old base row. Deleted and missing claims are errors.
 pub(super) trait Objects {
     fn ledger(&self) -> LedgerId;
+    /// Where a spilled row's bytes are read from; none where every row holds its bytes (a
+    /// restore's).
+    fn payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        None
+    }
+    /// Where a row decoded here is spilled (doc 31 M3); none where rows keep their bytes.
+    fn payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog> {
+        None
+    }
     fn prefix(&self) -> SessionSeq;
     fn get(&self, key: Key, meter: &Meter) -> Result<Option<&Row>, NativeError>;
     fn claim_dependency(
@@ -92,6 +101,28 @@ fn parse<'a, T>(
     let value = result?;
     cursor.finish().map_err(evidence::codec)?;
     Ok(value)
+}
+/// Checks a secondary index family's or a due timer's row as a checkpoint
+/// carries it, read as every fixed row is: the unit row its member's key set
+/// holds (doc 31 M3), which a restore gives the set rather than the store.
+pub(super) fn index_row(
+    encoded: &EncodedRow<'_>,
+    parsing: &Meter,
+    model: &Meter,
+    ledger: LedgerId,
+) -> Result<(), NativeError> {
+    debit(model, 16)?;
+    if encoded.deleted() || !crate::native::index_rows::is_index(encoded.key) {
+        return Err(invalid());
+    }
+    let row = parse(encoded.body(), parsing, |c| {
+        read_rows::read_fixed(encoded.key, c, ledger)
+    })?
+    .ok_or_else(invalid)?;
+    if !matches!(row, Row::Index) {
+        return Err(invalid());
+    }
+    Ok(())
 }
 fn quoted(
     heap_bytes: usize,
@@ -165,7 +196,12 @@ pub(super) fn with_build<O: Objects, C: evidence::Custody, T>(
     // Includes all nested allocation counters and immutable identity checks.
     // Heap size bounds collection elements; fixed inline work has its own debit.
     debit(context.model, add(quote.heap_bytes, 4096)?)?;
-    objects::check(row.key, &value, context.objects.ledger())?;
+    objects::check(
+        row.key,
+        &value,
+        context.objects.ledger(),
+        context.objects.payloads(),
+    )?;
     let actual = objects::heap(&value)?;
     if actual > quote.heap_bytes || actual > retained_allowance {
         return Err(NativeError::Capacity("recovery actual heap"));
@@ -210,7 +246,7 @@ fn with_policy<O: Objects, C: evidence::Custody, T>(
     claim: ClaimId,
     context: &Context<'_, O, C>,
     access: &Access<'_, O>,
-    consume: impl FnOnce(&aggregation::AcceptancePolicy, usize) -> Result<T, NativeError>,
+    consume: impl FnOnce(aggregation::Acceptance<'_>, usize) -> Result<T, NativeError>,
 ) -> Result<T, NativeError> {
     let body = match access.claim_dependency(claim)? {
         ClaimDependency::Raw(body) => body,
@@ -246,7 +282,7 @@ fn with_policy<O: Objects, C: evidence::Custody, T>(
     let policy = plan.build(charge, visits)?;
     // The model plan verifies actual owned capacities before returning. Its
     // quoted allocation count is also the native allocator bookkeeping charge.
-    consume(&policy, workspace_bytes)
+    consume(policy.view(), workspace_bytes)
 }
 
 fn process<O: Objects, C: evidence::Custody>(
@@ -429,7 +465,16 @@ fn process<O: Objects, C: evidence::Custody>(
                 let quote = plan.quote();
                 Ok((plan, quote))
             })?;
-            evidence_plan!(plan, value_quote, 0)
+            let quote = quoted(value_quote.heap_bytes, 0, build)?;
+            let row = if build.is_some() {
+                // Spilled as it is built where the rows are restored (doc 31 M3).
+                Some(build_evidence(context, value_quote, |bytes, visits| {
+                    plan.build(bytes, visits, context.objects.payload_log())
+                })?)
+            } else {
+                None
+            };
+            Ok((quote, row))
         }
         Key::Work(_) => {
             let input = parse(body, context.parsing, evidence::work)?;
@@ -503,6 +548,20 @@ fn process<O: Objects, C: evidence::Custody>(
             })?;
             evidence_plan!(plan, value_quote, 0)
         }
+        Key::Epochs(_) => {
+            let plan = parse(body, context.parsing, |c| {
+                read_rows::EpochsPlan::read(encoded.key, c, context.limits.native.seals)
+            })?;
+            let quote = quoted(plan.heap_bytes()?, 0, build)?;
+            let row = if build.is_some() {
+                let visits = plan.build_visits();
+                debit(context.model, visits)?;
+                Some(plan.build(quote.heap_bytes, visits)?.0)
+            } else {
+                None
+            };
+            Ok((quote, row))
+        }
         Key::Event(..) => {
             let plan = parse(body, context.parsing, |c| {
                 read_rows::EventPlan::read(encoded.key, c, ledger)
@@ -511,7 +570,10 @@ fn process<O: Objects, C: evidence::Custody>(
             let row = if build.is_some() {
                 let visits = plan.build_visits();
                 debit(context.model, visits)?;
-                Some(plan.build(quote.heap_bytes, visits)?.0)
+                Some(
+                    plan.build(quote.heap_bytes, visits, context.objects.payload_log())?
+                        .0,
+                )
             } else {
                 None
             };
@@ -548,11 +610,22 @@ fn process<O: Objects, C: evidence::Custody>(
         | Key::ByVerdict(..)
         | Key::ByCreated(..)
         | Key::DueTimer(..)
-        | Key::ByObject(..) => {
-            let row = parse(body, context.parsing, |c| {
+        | Key::ByObject(..)
+        | Key::Seal(_) => {
+            let mut row = parse(body, context.parsing, |c| {
                 read_rows::read_fixed(encoded.key, c, ledger)
             })?
             .ok_or_else(invalid)?;
+            // A restored outcome spills as it is built (doc 31 M3); a replayed one, with the rest of
+            // its record once that is validated.
+            if build.is_some()
+                && let (Key::Outcome(invocation), Some(log)) =
+                    (encoded.key, context.objects.payload_log())
+                && let Row::Outcome(outcome) = &row
+                && let Some(spilled) = outcome.spill(ledger, invocation, log)?
+            {
+                row = Row::Outcome(spilled);
+            }
             let quote = quoted(0, 0, build)?;
             Ok((quote, build.map(|_| row)))
         }

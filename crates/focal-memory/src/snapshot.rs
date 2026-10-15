@@ -84,6 +84,15 @@ impl<K, V> SnapshotLease<K, V> {
         self.state.ptr_eq(&Arc::downgrade(state))
     }
 
+    /// Holds the leased prefix for one read: checked as a projection is (unexpired at `now`) and
+    /// held until the hold drops, which its holder keeps no longer than the read. Any number of
+    /// keys are looked up under it.
+    pub fn hold(&self, now: u64) -> Result<LeaseHold<K, V>, MemoryError> {
+        Ok(LeaseHold {
+            state: self.checked_state(now)?,
+        })
+    }
+
     pub(crate) fn checked_state(&self, now: u64) -> Result<Arc<LeaseState<K, V>>, MemoryError> {
         let state = self.state.upgrade().ok_or(MemoryError::LeaseExpired)?;
         // A stale clock supplied by a delayed reader cannot revive an expired
@@ -93,6 +102,18 @@ impl<K, V> SnapshotLease<K, V> {
             return Err(MemoryError::LeaseExpired);
         }
         Ok(state)
+    }
+}
+
+/// A lease's prefix held for one read ([`SnapshotLease::hold`]).
+pub struct LeaseHold<K, V> {
+    state: Arc<LeaseState<K, V>>,
+}
+
+impl<K: crate::RangeKey, V> LeaseHold<K, V> {
+    /// The entry the leased prefix holds at `key`.
+    pub fn get(&self, key: &K) -> Option<&Entry<K, V>> {
+        self.state.root.get(key)
     }
 }
 
@@ -201,7 +222,7 @@ impl<K, V> std::fmt::Debug for ReadPage<K, V> {
     }
 }
 
-impl<K: Ord, V> SnapshotLease<K, V> {
+impl<K: crate::RangeKey, V> SnapshotLease<K, V> {
     /// Project one immutable entry without copying its potentially large value.
     /// The borrow cannot escape the callback. The caller accounts any owned
     /// projection; this method allocates no response buffer or continuation.
@@ -236,7 +257,7 @@ impl<K: Ord, V> SnapshotLease<K, V> {
     }
 }
 
-impl<K: Ord + Clone, V: Clone> SnapshotLease<K, V> {
+impl<K: crate::RangeKey + Clone, V: Clone> SnapshotLease<K, V> {
     pub fn get(&self, key: &K, now: u64) -> Result<ReadPage<K, V>, MemoryError> {
         let state = self.checked_state(now)?;
         let entry = state.root.get(key);

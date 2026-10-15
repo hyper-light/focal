@@ -16,7 +16,7 @@ fn checked_sub(left: usize, right: usize) -> Result<usize, MemoryError> {
     left.checked_sub(right).ok_or(MemoryError::MissingKey)
 }
 
-impl<K: Ord + Clone, V> RangeStore<K, V> {
+impl<K: crate::RangeKey + Clone, V> RangeStore<K, V> {
     /// An empty store at this store's prefix in this store's group: the
     /// member that will hold keys nothing has written yet.
     pub fn new_sibling(&self, id: RangeId) -> Result<Self, MemoryError> {
@@ -292,6 +292,9 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
             pins: BTreeMap::new(),
             next_lease: 1,
             clock: Arc::clone(&self.clock),
+            poisoned: false,
+            state: 0,
+            states: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -323,9 +326,6 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
                 heap_bytes: entry.heap_bytes,
             });
         }
-        Ok(Arc::new(Page {
-            entries: copied,
-            _allocation: allocation,
-        }))
+        Ok(Arc::new(Page::new(copied, allocation)))
     }
 }

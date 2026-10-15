@@ -67,7 +67,7 @@ pub fn intent_fingerprint(proposals: &[Proposal]) -> Result<ContentHash, Contrac
                 subject: definition.subject,
                 deadline: definition.deadline,
                 max_responses: definition.max_responses,
-                lineage_binding: definition.lineage.binding(),
+                lineage_binding: definition.binding,
                 cause: definition.lineage.cause(),
                 acceptance: definition.acceptance.intent_fingerprint(),
                 scope_limits: definition.scope_limits,
@@ -552,6 +552,18 @@ impl CreationPlan {
                 let predecessor = rows
                     .get_mut(predecessor_index)
                     .ok_or(ContractError::InvalidTarget)?;
+                // Superseding makes the predecessor terminal: the cut it adds (doc 31 M3).
+                charge(
+                    &mut used,
+                    bytes::add(
+                        predecessor.terminal_growth_heap_bytes()?,
+                        predecessor
+                            .terminal_growth_heap_allocations()
+                            .checked_mul(ALLOCATION)
+                            .ok_or(ContractError::Capacity)?,
+                    )?,
+                    limits.bytes,
+                )?;
                 let expected = predecessor.binding();
                 predecessor.supersede_verified(&expected, cut)?;
             }

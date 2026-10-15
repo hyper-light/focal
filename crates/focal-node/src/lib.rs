@@ -11,8 +11,10 @@
     )
 )]
 //! Node composition and user-facing deployment intent.
+mod ack_clock;
 pub mod admission;
 pub mod archive_agent;
+mod archive_derive;
 pub mod backup;
 pub mod cluster;
 pub mod cluster_admin;
@@ -40,6 +42,7 @@ pub mod liveness;
 #[cfg(test)]
 mod liveness_tests;
 pub mod managed_service;
+pub(crate) mod memory_envelope;
 pub mod metrics;
 pub mod network_admin;
 pub mod network_bootstrap;
@@ -51,6 +54,7 @@ pub mod network_listener;
 pub mod network_service;
 pub mod network_state;
 pub mod node_directory;
+pub(crate) mod owner_steps;
 mod pace;
 pub mod placement;
 pub mod placement_agent;
@@ -64,14 +68,19 @@ pub mod range_balancer;
 mod reads;
 mod reconciliation;
 pub mod replication;
+pub mod resequence;
 pub mod route_cache_host;
 #[cfg(test)]
 mod route_cache_tests;
 pub mod session_control;
 pub mod session_registration;
+pub mod storage_level;
+mod storage_start;
 mod streams;
 #[cfg(test)]
 mod streams_tests;
+#[cfg(test)]
+mod test_waits;
 pub mod topology;
 pub mod upgrade;
 
@@ -82,6 +91,7 @@ mod managed_requests;
 mod participant_ingress;
 mod snapshot_feedback;
 
+mod archive_reads;
 mod ledger_summary;
 mod monitor_reads;
 pub mod native_activation;
@@ -92,6 +102,9 @@ mod native_host_tests;
 mod native_ingress;
 mod native_lists;
 mod native_reads;
+#[cfg(test)]
+#[path = "native_reads_tests.rs"]
+mod native_reads_tests;
 mod native_timers;
 
 /// Test-only: tighten a fresh temp path to owner-only. On Unix this sets the

@@ -1,6 +1,7 @@
 use super::*;
 use crate::native::report_tests as fixture;
 use focal_evidence::BuiltinNativeSchemas;
+use focal_memory::Change;
 use focal_memory::{BudgetKind, BudgetLane, Entry};
 use focal_model::{ValidationMode, VerdictValue};
 
@@ -83,7 +84,11 @@ fn real_mutations_capture_every_write_and_leave_unchanged_content_out() {
     // A wrong-root publication returns the same funded write set for retry.
     let charge = posted.mutation_heap_bytes();
     let mut foreign = fixture::core();
-    let refused = foreign.publish_native(posted).unwrap_err().prepared;
+    let refused = foreign
+        .publish_native(posted)
+        .unwrap_err()
+        .prepared
+        .unwrap();
     assert_eq!(refused.mutation_heap_bytes(), charge);
     refused.writes.check(&refused.fragments).unwrap();
     core.publish_native(refused).unwrap();
@@ -92,14 +97,14 @@ fn real_mutations_capture_every_write_and_leave_unchanged_content_out() {
 #[test]
 fn malformed_or_unfunded_capture_refuses_and_returns_its_complete_debit() {
     let source = MemoryBudget::new(1 << 20, 0).unwrap();
-    let meta = || Change::Put(Entry::new(Key::Meta, Row::Meta(Meta::default()), 0));
+    let meta = || Change::Put(Entry::new(Key::Meta, Row::Meta(Box::default()), 0));
     for changes in [
         vec![],
         vec![meta(), meta()],
         vec![Change::Delete(Key::End)],
         vec![Change::Put(Entry::new(
             Key::ArtifactIdentity(ContentHash([1; 32])),
-            Row::Meta(Meta::default()),
+            Row::Meta(Box::default()),
             0,
         ))],
         vec![Change::Delete(Key::Claim(ClaimId::from_u128(1))), meta()],
@@ -258,8 +263,8 @@ fn held_reports_retain_write_sets_through_pending_and_release_them_on_rollback()
     let _pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();

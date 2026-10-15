@@ -19,7 +19,7 @@ use focal_model::{
 const DOMAIN: ContentDomainId = ContentDomainId::from_u128(1900);
 
 fn completion_visit_bound(core: &Core<NativeState>) -> usize {
-    let Row::Claim(row) = core.state.rows.get(&Key::Claim(key(1).claim)).unwrap() else {
+    let Row::Claim(row) = core.state.row(&Key::Claim(key(1).claim)).unwrap() else {
         panic!("claim row");
     };
     let claim = row.claim().unwrap();
@@ -247,8 +247,8 @@ fn exhaust(parent: &MemoryBudget) -> Allocation {
     parent
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            parent.limit() - parent.stats().used,
+            BudgetLane::Ordinary,
+            parent.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit()
@@ -337,15 +337,15 @@ fn fallback_posted() -> Core<NativeState> {
 }
 
 #[test]
-fn held_begin_capacity_completes_every_retry_fallback_and_quality_phase_with_real_custody() {
+fn completion_lane_completes_every_retry_fallback_and_quality_phase_with_real_custody() {
     let core = fallback_posted();
     let parent = core.state.budget.clone();
     let mut owner = NativeOwner::new(core).unwrap();
     let begun = start(&mut owner, 1, 3);
     owner.publish_after_durable(begun).unwrap();
     assert_eq!(owner.book.remaining_reports(key(1)), Some(5));
-    let hold = owner.book.funded_capacity();
-    assert!(hold > 0);
+    // Fresh work holds every ordinary byte: each report is charged what it
+    // holds on the completion lane, which fresh work cannot take.
     let pressure = exhaust(&parent);
     let exhausted = parent.stats();
     let mut store = Store::new();
@@ -380,8 +380,6 @@ fn held_begin_capacity_completes_every_retry_fallback_and_quality_phase_with_rea
             owner.book.remaining_reports(key(1)),
             Some(4 - offset as u32)
         );
-        assert_eq!(owner.book.funded_capacity(), hold);
-        assert_eq!(parent.stats().used, exhausted.used);
         assert_eq!(parent.stats().ordinary_used, exhausted.ordinary_used);
         let artifact = owner
             .effective()
@@ -443,7 +441,6 @@ fn held_begin_capacity_completes_every_retry_fallback_and_quality_phase_with_rea
             .response_count(),
         0
     );
-    assert!(owner.book.funded_capacity() < hold);
     drop(pressure);
     drop(owner);
     assert_eq!(parent.stats().used, 0);
@@ -461,14 +458,14 @@ fn discarded_report_returns_its_attempt_and_credit_for_identical_retry_under_pre
     let original = *owner.effective().evaluation(key(1)).unwrap();
     let pressure = exhaust(&parent);
     let before = parent.stats();
-    let source = owner.book.source().stats();
+    let source = owner.core.state.budget.stats();
     let mut store = Store::new();
     let first = report_stage(&mut owner, &mut store, input);
     assert_eq!(owner.book.remaining_reports(key(1)), Some(2));
     assert_eq!(owner.discard_from(first).unwrap(), 1);
     assert_eq!(*owner.effective().evaluation(key(1)).unwrap(), original);
     assert_eq!(owner.book.remaining_reports(key(1)), Some(3));
-    assert_eq!(owner.book.source().stats(), source);
+    assert_eq!(owner.core.state.budget.stats(), source);
     assert_eq!(parent.stats(), before);
     let second = report_stage(&mut owner, &mut store, retry);
     assert_ne!(first, second);
@@ -503,7 +500,6 @@ fn tail_begin_rollback_restores_funding_and_grant_buffer_growth_without_disturbi
     assert_eq!(owner.book.remaining_reports(key(1)), Some(2));
     assert_eq!(owner.discard_from(first).unwrap(), 1);
     assert_eq!(owner.book.len(), 0);
-    assert_eq!(owner.book.funded_capacity(), 0);
     assert_eq!(parent.stats(), before);
     drop(owner);
     assert_eq!(parent.stats().used, 0);
@@ -528,7 +524,13 @@ fn begin_refusal_under_pressure_leaves_no_responsibility_or_grant_and_can_retry(
     assert_eq!(owner.book.len(), 0);
     assert_eq!(owner.pending_len(), 0);
     assert!(!owner.effective().evaluation(key(1)).unwrap().has_begun());
-    assert!(owner.effective().recorded(request(EVALUATOR, 3)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(EVALUATOR, 3))
+            .unwrap()
+            .is_none()
+    );
     drop(pressure);
     let candidate = start(&mut owner, 1, 3);
     assert_eq!(owner.book.remaining_reports(key(1)), Some(2));
@@ -651,7 +653,7 @@ fn pinned_schema_change_cannot_spend_a_report_grant_or_prevent_exact_contract_re
     let retry = copy_report(&input);
     let pressure = exhaust(&parent);
     let before = parent.stats();
-    let source = owner.book.source().stats();
+    let source = owner.core.state.budget.stats();
     let mut store = Store::new();
     let schemas = ChangedSchemas {
         wider: Cell::new(true),
@@ -670,7 +672,7 @@ fn pinned_schema_change_cannot_spend_a_report_grant_or_prevent_exact_contract_re
     );
     assert_eq!(schemas.verified.get(), 0);
     assert_eq!(parent.stats(), before);
-    assert_eq!(owner.book.source().stats(), source);
+    assert_eq!(owner.core.state.budget.stats(), source);
     assert_eq!(owner.book.remaining_reports(key(1)), Some(2));
     schemas.wider.set(false);
     let NativeStaging::Prepared { candidate, .. } = owner
@@ -708,17 +710,16 @@ fn retired_grant_keeps_published_and_pinned_pages_charged_until_owner_releases_t
     let pass = report_stage(&mut owner, &mut store, pass);
     owner.publish_after_durable(pass).unwrap();
     assert_eq!(owner.book.remaining_reports(key(1)), None);
-    assert!(owner.book.source().stats().used > 0);
-    assert!(owner.book.funded_capacity() >= owner.book.source().stats().used);
+    assert!(owner.core.state.budget.stats().used > 0);
     assert_eq!(
         pin.with_evaluation(key(1), 1, |state| state.state())
             .unwrap(),
         Some(validation::State::Validating)
     );
-    let retained = owner.book.source().stats().used;
+    let retained = owner.core.state.budget.stats().used;
     owner.release(&pin).unwrap();
-    assert!(owner.book.source().stats().used < retained);
-    assert!(owner.book.source().stats().used > 0);
+    assert!(owner.core.state.budget.stats().used < retained);
+    assert!(owner.core.state.budget.stats().used > 0);
     drop(owner);
     assert_eq!(
         parent.stats().used,
@@ -740,8 +741,7 @@ fn ordinary_mutation_cannot_spend_candidate_serials_promised_to_the_live_report_
     owner.next_serial = u64::MAX - 3;
     let serial = owner.next_serial;
     let budget = parent.stats();
-    let source = owner.book.source().stats();
-    let funding = owner.book.funded_capacity();
+    let source = owner.core.state.budget.stats();
     let sequence = owner.effective().sequence();
     let evaluation = *owner.effective().evaluation(key(1)).unwrap();
     let refusal = owner
@@ -753,14 +753,19 @@ fn ordinary_mutation_cannot_spend_candidate_serials_promised_to_the_live_report_
     ));
     assert_eq!(owner.next_serial, serial);
     assert_eq!(parent.stats(), budget);
-    assert_eq!(owner.book.source().stats(), source);
-    assert_eq!(owner.book.funded_capacity(), funding);
+    assert_eq!(owner.core.state.budget.stats(), source);
     assert_eq!(owner.book.remaining_reports(key(1)), Some(2));
     assert_eq!(owner.effective().sequence(), sequence);
     assert_eq!(*owner.effective().evaluation(key(1)).unwrap(), evaluation);
     assert_eq!(owner.pending_len(), 0);
     assert!(owner.effective().claim(ClaimId::from_u128(2)).is_none());
-    assert!(owner.effective().recorded(request(ISSUER, 601)).is_none());
+    assert!(
+        owner
+            .effective()
+            .recorded(request(ISSUER, 601))
+            .unwrap()
+            .is_none()
+    );
 
     let pressure = exhaust(&parent);
     let mut store = Store::new();

@@ -5,6 +5,14 @@ use crate::lifecycle::{aggregation, graph::VisitBudget};
 
 #[path = "claim_source_adapters.rs"]
 mod adapters;
+
+impl super::ClaimDescriptor {
+    /// The descriptor as a [`ClaimSource`]: what reads a claim's content alike, whether it is
+    /// built or held as its encoding.
+    pub fn source(&self) -> impl ClaimSource<'_> + '_ {
+        adapters::OwnedSource(self)
+    }
+}
 #[path = "claim_source_build.rs"]
 mod construction;
 #[path = "claim_source_inspect.rs"]

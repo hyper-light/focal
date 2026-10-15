@@ -87,7 +87,7 @@ pub(super) fn generated<O: Overlay>(
     };
     let claim = owner.claim().ok_or_else(invalid)?;
     let registry = owner.registrations().ok_or_else(invalid)?;
-    let header = registry.snapshot_v1();
+    let header = registry.snapshot_v1(claim.binding());
     require(
         cohort.claim_binding() == claim.binding()
             && cohort.issuer() == claim.issuer()

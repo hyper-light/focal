@@ -4,10 +4,7 @@ use focal_client::artifact_transfer::{
 };
 use focal_client::input::parse_hash;
 use serde::Deserialize;
-use std::{
-    panic::AssertUnwindSafe,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,14 +59,20 @@ fn upload_id(text: &str) -> Result<[u8; 16], BackendError> {
     Ok(parse_id(text)?)
 }
 impl<T: ClientTransport> Backend<T> {
-    pub(super) fn transfer(
+    pub(super) fn transfer<'a>(
+        &'a self,
+        call: &'a mut ToolCall,
+        cancel: &'a mut Cancel,
+    ) -> Branch<'a> {
+        Box::pin(self.transfer_inner(call, cancel))
+    }
+    async fn transfer_inner(
         &self,
-        runtime: &Runtime,
         call: &mut ToolCall,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> Result<(&'static str, OperationOutput), BackendError> {
         if call.tool == "artifact.download" {
-            return self.artifact_download(runtime, decode(call)?, cancel);
+            return self.artifact_download(decode(call)?, cancel).await;
         }
         let store = self.uploads.as_ref().ok_or(BackendError::Configuration)?;
         let mut journal = match call.tool.as_str() {
@@ -114,7 +117,8 @@ impl<T: ClientTransport> Backend<T> {
             }
             _ => return Err(BackendError::Configuration),
         };
-        self.drive_upload(runtime, &mut journal, cancel, call.tool == "upload.seal")?;
+        self.drive_upload(&mut journal, cancel, call.tool == "upload.seal")
+            .await?;
         let condition = if journal.progress().cancelled {
             "Cancelled"
         } else if journal.reference().is_some() {
@@ -129,11 +133,10 @@ impl<T: ClientTransport> Backend<T> {
             },
         ))
     }
-    fn drive_upload(
+    async fn drive_upload(
         &self,
-        runtime: &Runtime,
         journal: &mut UploadJournal,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
         seal: bool,
     ) -> Result<(), BackendError> {
         let start = Instant::now();
@@ -161,25 +164,29 @@ impl<T: ClientTransport> Backend<T> {
                 }
                 .into());
             }
-            let reply = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                runtime.block_on(async {
-                    tokio::select! {
-                        result = tokio::time::timeout(remaining, self.client.upload(request.clone())) => {
-                            result.map_err(|_| BackendError::Client(ClientError::OutcomeUnknown { request: Box::new(request.clone()) }))?.map_err(BackendError::Client)
-                        }
-                        _ = &mut *cancel => Err(BackendError::Cancelled),
-                    }
-                })
-            })).map_err(|_| BackendError::Client(ClientError::Transport))??;
+            let upload = within(
+                remaining,
+                async {
+                    self.client
+                        .upload(request.clone())
+                        .await
+                        .map_err(BackendError::Client)
+                },
+                || {
+                    BackendError::Client(ClientError::OutcomeUnknown {
+                        request: Box::new(request.clone()),
+                    })
+                },
+            );
+            let reply = contained(cancellable(cancel, upload)).await?;
             journal.record_reply(&request, &reply)?;
         }
         Err(TransferError::Capacity.into())
     }
-    fn artifact_download(
+    async fn artifact_download(
         &self,
-        runtime: &Runtime,
         input: Download,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> Result<(&'static str, OperationOutput), BackendError> {
         let id = ArtifactId(parse_id(&input.id)?);
         if input.max_bytes == 0
@@ -209,49 +216,89 @@ impl<T: ClientTransport> Backend<T> {
         if let Some(token) = input.token {
             request.route_epoch = token.route_epoch;
         }
-        std::panic::catch_unwind(AssertUnwindSafe(|| {
-            runtime.block_on(async {
+        {
+            {
                 let operation = async {
                     let page = self.client.read(request).await?;
-                    if page.objects.is_empty() { return Err(BackendError::NotFound); }
-                    if page.next.is_some() || page.objects.len() != 1 { return Err(ClientError::InvalidResponse.into()); }
-                    let Some(ReadObject::Artifact { id: found, value }) = page.objects.into_iter().next() else {
+                    if page.objects.is_empty() {
+                        return Err(BackendError::NotFound);
+                    }
+                    if page.next.is_some() || page.objects.len() != 1 {
+                        return Err(ClientError::InvalidResponse.into());
+                    }
+                    let Some(ReadObject::Artifact { id: found, value }) =
+                        page.objects.into_iter().next()
+                    else {
                         return Err(ClientError::InvalidResponse.into());
                     };
-                    if found != id || value.content().ledger != self.context.ledger
-                        || value.content().schema != 1 || value.lifecycle().created > page.token.sequence
-                        || value.content().content_hash().map_err(|_| InputError::Capacity)? != value.content_hash() {
+                    if found != id
+                        || value.content().ledger != self.context.ledger
+                        || value.content().schema != 1
+                        || value.lifecycle().created > page.token.sequence
+                        || value
+                            .content()
+                            .content_hash()
+                            .map_err(|_| InputError::Capacity)?
+                            != value.content_hash()
+                    {
                         return Err(ClientError::InvalidResponse.into());
                     }
                     let chunk = match &value.content().payload {
                         ArtifactPayload::Inline(bytes) => {
-                            let start = usize::try_from(input.offset).map_err(|_| InputError::Capacity)?;
-                            let through = start.checked_add(input.max_bytes as usize).ok_or(InputError::Capacity)?.min(bytes.len());
-                            let selected = bytes.get(start..through).ok_or(InputError::Invalid("payload offset"))?;
+                            let start =
+                                usize::try_from(input.offset).map_err(|_| InputError::Capacity)?;
+                            let through = start
+                                .checked_add(input.max_bytes as usize)
+                                .ok_or(InputError::Capacity)?
+                                .min(bytes.len());
+                            let selected = bytes
+                                .get(start..through)
+                                .ok_or(InputError::Invalid("payload offset"))?;
                             let mut copied = Vec::new();
-                            copied.try_reserve_exact(selected.len()).map_err(|_| InputError::Capacity)?;
+                            copied
+                                .try_reserve_exact(selected.len())
+                                .map_err(|_| InputError::Capacity)?;
                             copied.extend_from_slice(selected);
-                            ContentChunk { offset: input.offset, eof: through == bytes.len(), bytes: copied }
+                            ContentChunk {
+                                offset: input.offset,
+                                eof: through == bytes.len(),
+                                bytes: copied,
+                            }
                         }
                         ArtifactPayload::Content(reference) => {
-                            if reference.domain.0 != self.context.ledger.tenant.0 || input.offset > reference.length {
+                            if reference.domain.0 != self.context.ledger.tenant.0
+                                || input.offset > reference.length
+                            {
                                 return Err(ClientError::InvalidResponse.into());
                             }
-                            let mut request = envelope(self.context.ledger, Operation::Download {
-                                content: reference.clone(), offset: input.offset, max_bytes: input.max_bytes
-                            })?;
+                            let mut request = envelope(
+                                self.context.ledger,
+                                Operation::Download {
+                                    content: reference.clone(),
+                                    offset: input.offset,
+                                    max_bytes: input.max_bytes,
+                                },
+                            )?;
                             request.route_epoch = page.token.route_epoch;
                             self.client.download(request).await?
                         }
                     };
-                    Ok(("Read", OperationOutput::ArtifactPayload { artifact: id, token: page.token, content_hash: value.content_hash(), chunk }))
+                    Ok((
+                        "Read",
+                        OperationOutput::ArtifactPayload {
+                            artifact: id,
+                            token: page.token,
+                            content_hash: value.content_hash(),
+                            chunk,
+                        },
+                    ))
                 };
-                tokio::select! {
-                    result = tokio::time::timeout(Duration::from_secs(30), operation) => result.map_err(|_| BackendError::Client(ClientError::Transport))?,
-                    _ = cancel => Err(BackendError::Cancelled),
-                }
-            })
-        })).map_err(|_| BackendError::Client(ClientError::Transport))?
+                let bounded = within(Duration::from_secs(30), operation, || {
+                    BackendError::Client(ClientError::Transport)
+                });
+                contained(cancellable(cancel, bounded)).await
+            }
+        }
     }
 }
 fn hex_bytes(value: &str) -> Result<Vec<u8>, BackendError> {
@@ -263,17 +310,9 @@ fn hex_bytes(value: &str) -> Result<Vec<u8>, BackendError> {
     bytes
         .try_reserve_exact(value.len() / 2)
         .map_err(|_| InputError::Capacity)?;
-    for pair in value.as_bytes().chunks_exact(2) {
-        let high = pair
-            .first()
-            .copied()
-            .and_then(digit)
-            .ok_or(InputError::Invalid("payload hexadecimal"))?;
-        let low = pair
-            .get(1)
-            .copied()
-            .and_then(digit)
-            .ok_or(InputError::Invalid("payload hexadecimal"))?;
+    for &[high, low] in value.as_bytes().as_chunks::<2>().0 {
+        let high = digit(high).ok_or(InputError::Invalid("payload hexadecimal"))?;
+        let low = digit(low).ok_or(InputError::Invalid("payload hexadecimal"))?;
         bytes.push(
             high.checked_mul(16)
                 .and_then(|n| n.checked_add(low))

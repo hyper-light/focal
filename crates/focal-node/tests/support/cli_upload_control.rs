@@ -4,7 +4,7 @@ use super::*;
 fn saved_cli_upload_inspection_and_unknown_cancel_preserve_exact_identity_across_restart() {
     let root = tempfile::tempdir_in("/tmp").unwrap();
     let server = start(root.path());
-    let operation = cli(root.path(), &["request", "reserve"])["operation_id"]
+    let operation = cli(root.path(), &["reserve", "request"])["operation_id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -14,8 +14,8 @@ fn saved_cli_upload_inspection_and_unknown_cancel_preserve_exact_identity_across
     let pending = run(
         root.path(),
         &[
-            "artifact",
             "register",
+            "artifact",
             "--kind",
             "test-report",
             "--schema-hash",
@@ -43,14 +43,14 @@ fn saved_cli_upload_inspection_and_unknown_cancel_preserve_exact_identity_across
         .join(upload)
         .join("upload.bin");
     let before = std::fs::read(&state).unwrap();
-    let inspected = cli(root.path(), &["artifact", "upload", "inspect", upload]);
+    let inspected = cli(root.path(), &["inspect", "upload", upload]);
     assert_eq!(inspected["condition"], "Uploading");
     assert_eq!(inspected["cancel_requested"], false);
     assert_eq!(inspected["progress"]["received"], 0);
     assert_eq!(std::fs::read(&state).unwrap(), before);
     let yaml = run(
         root.path(),
-        &["artifact", "upload", "inspect", upload, "--format", "yaml"],
+        &["inspect", "upload", upload, "--format", "yaml"],
     );
     assert!(yaml.status.success());
     let yaml: Value = serde_saphyr::from_str(std::str::from_utf8(&yaml.stdout).unwrap()).unwrap();
@@ -58,7 +58,7 @@ fn saved_cli_upload_inspection_and_unknown_cancel_preserve_exact_identity_across
     assert_eq!(std::fs::read(&state).unwrap(), before);
     let cancel = run(
         root.path(),
-        &["artifact", "upload", "cancel", upload, "--format", "json"],
+        &["cancel", "upload", upload, "--format", "json"],
     );
     assert_eq!(
         cancel.status.code(),
@@ -70,7 +70,7 @@ fn saved_cli_upload_inspection_and_unknown_cancel_preserve_exact_identity_across
     assert!(text.contains("--data-dir"));
     assert!(text.contains(root.path().to_str().unwrap()));
     assert!(text.contains("--client-context 'local'"));
-    assert!(text.contains(&format!("artifact upload cancel {upload} --origin cli")));
+    assert!(text.contains(&format!("cancel upload {upload} --origin cli")));
     let result: Value = serde_json::from_slice(&cancel.stdout).unwrap();
     assert_eq!(result["condition"], "CancelPending");
     assert_eq!(result["cancel_requested"], true);
@@ -78,7 +78,7 @@ fn saved_cli_upload_inspection_and_unknown_cancel_preserve_exact_identity_across
     let cancelled_bytes = std::fs::read(&state).unwrap();
     let again = run(
         root.path(),
-        &["artifact", "upload", "cancel", upload, "--format", "json"],
+        &["cancel", "upload", upload, "--format", "json"],
     );
     assert_eq!(again.status.code(), Some(7));
     assert_eq!(std::fs::read(&state).unwrap(), cancelled_bytes);
@@ -90,7 +90,7 @@ fn saved_cli_upload_inspection_and_unknown_cancel_preserve_exact_identity_across
     let no_stderr = Command::new(env!("CARGO_BIN_EXE_focal"))
         .arg("--data-dir")
         .arg(root.path())
-        .args(["artifact", "upload", "cancel", upload, "--format", "json"])
+        .args(["cancel", "upload", upload, "--format", "json"])
         .stderr(writer)
         .output()
         .unwrap();
@@ -101,7 +101,7 @@ fn saved_cli_upload_inspection_and_unknown_cancel_preserve_exact_identity_across
     );
     assert_eq!(std::fs::read(&state).unwrap(), cancelled_bytes);
     assert_eq!(
-        cli(root.path(), &["artifact", "upload", "inspect", upload])["condition"],
+        cli(root.path(), &["inspect", "upload", upload])["condition"],
         "CancelPending"
     );
     let (writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -110,19 +110,18 @@ fn saved_cli_upload_inspection_and_unknown_cancel_preserve_exact_identity_across
     let no_stdout = Command::new(env!("CARGO_BIN_EXE_focal"))
         .arg("--data-dir")
         .arg(root.path())
-        .args(["artifact", "upload", "cancel", upload, "--format", "json"])
+        .args(["cancel", "upload", upload, "--format", "json"])
         .stdout(writer)
         .output()
         .unwrap();
     assert_eq!(no_stdout.status.code(), Some(7));
     assert!(String::from_utf8_lossy(&no_stdout.stderr).contains("outcome_unknown"));
     assert!(
-        String::from_utf8_lossy(&no_stdout.stderr)
-            .contains(&format!("artifact upload cancel {upload}"))
+        String::from_utf8_lossy(&no_stdout.stderr).contains(&format!("cancel upload {upload}"))
     );
     assert_eq!(std::fs::read(&state).unwrap(), cancelled_bytes);
     let server = start(root.path());
-    let acknowledged = cli(root.path(), &["artifact", "upload", "cancel", upload]);
+    let acknowledged = cli(root.path(), &["cancel", "upload", upload]);
     assert_eq!(acknowledged["condition"], "CancelAcknowledged");
     assert_eq!(acknowledged["progress"]["cancelled"], true);
     assert_eq!(acknowledged["progress"]["cancel_acknowledged"], true);
@@ -130,8 +129,8 @@ fn saved_cli_upload_inspection_and_unknown_cancel_preserve_exact_identity_across
     let retry = run(
         root.path(),
         &[
-            "request",
             "retry",
+            "request",
             "--operation-id",
             &operation,
             "--format",
@@ -153,11 +152,11 @@ fn saved_cli_upload_inspection_and_unknown_cancel_preserve_exact_identity_across
     drop(server);
     let _server = start(root.path());
     assert_eq!(
-        cli(root.path(), &["artifact", "upload", "inspect", upload])["progress"],
+        cli(root.path(), &["inspect", "upload", upload])["progress"],
         acknowledged["progress"]
     );
     assert_eq!(
-        cli(root.path(), &["artifact", "upload", "cancel", upload])["progress"],
+        cli(root.path(), &["cancel", "upload", upload])["progress"],
         acknowledged["progress"]
     );
 }
@@ -168,7 +167,7 @@ fn cli_can_inspect_and_cancel_mcp_upload_without_removing_committed_artifact_con
     let server = start(root.path());
     let absent = run(
         root.path(),
-        &["artifact", "upload", "inspect", &id(1), "--format", "json"],
+        &["inspect", "upload", &id(1), "--format", "json"],
     );
     assert!(!absent.status.success());
     assert!(!root.path().join("CLI.uploads").exists());
@@ -189,7 +188,7 @@ fn cli_can_inspect_and_cancel_mcp_upload_without_removing_committed_artifact_con
     drop(mcp);
     let inspected = cli(
         root.path(),
-        &["artifact", "upload", "inspect", &upload, "--origin", "mcp"],
+        &["inspect", "upload", &upload, "--origin", "mcp"],
     );
     assert_eq!(inspected["condition"], "Sealed");
     assert_eq!(
@@ -198,7 +197,7 @@ fn cli_can_inspect_and_cancel_mcp_upload_without_removing_committed_artifact_con
     );
     let cancelled = cli(
         root.path(),
-        &["artifact", "upload", "cancel", &upload, "--origin", "mcp"],
+        &["cancel", "upload", &upload, "--origin", "mcp"],
     );
     assert_eq!(cancelled["condition"], "CancelAcknowledged");
     assert_eq!(cancelled["progress"]["cancelled"], false);

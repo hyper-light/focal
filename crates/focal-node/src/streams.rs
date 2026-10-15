@@ -13,6 +13,9 @@ use focal_stream::*;
 use focal_wire::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The lease a projection consumer holds from each durable renewal; the
+/// node renews a polled lease itself once half of it has passed
+/// (`Session::propose_cursor_renewal`).
 const LEASE_MS: u64 = 60_000;
 const REPLY_OVERHEAD: usize = 512;
 // Seed objects use the graph model's conservative 64x heap allowance. Split
@@ -40,7 +43,19 @@ impl StreamKey {
 }
 enum Stage {
     Barrier(Vec<u8>),
+    /// A command proposed: the reply waits on its receipt.
     Receipt,
+    /// Nothing proposed: a poll with nothing to acknowledge is a read.
+    Read,
+    /// A read whose page was empty, waiting for one (the audit's F61): the
+    /// request is answered when the stream line moves past `published` and
+    /// a page comes of it, or with the empty page it holds when the owner
+    /// gives it up. Its staging is released while it waits. A poll that
+    /// acknowledged is answered at once, with its receipt.
+    Parked {
+        published: SessionSeq,
+        reply: Box<StreamReply>,
+    },
     Finished,
 }
 /// A bounded owned request, including any seed page captured before proposing
@@ -62,22 +77,71 @@ pub(crate) struct PendingStream {
     /// boundary, positions live on the stream line (23 §6), the seed is read
     /// by the client and the reply token names the native prefix.
     native: bool,
-    _charge: Allocation,
+    /// Whether an empty page may wait for one: the owner of a replicated
+    /// host answers parked requests from its loop; the one-voter driver
+    /// answers in place.
+    park: bool,
+    /// The charge: the request's own bytes, kept while parked, and the
+    /// page's staging on top while a page is pumped.
+    parked_bytes: usize,
+    full_bytes: usize,
+    charge: Allocation,
 }
 impl PendingStream {
     /// Timeout/leadership-loss outcome depends on whether a proposal could have
     /// reached the log. It never claims that an admitted ACK was rolled back.
     pub fn interrupted(&self) -> AccessError {
         match self.stage {
-            Stage::Barrier(_) => AccessError::Unavailable,
+            Stage::Barrier(_) | Stage::Read | Stage::Parked { .. } => AccessError::Unavailable,
             Stage::Receipt | Stage::Finished => AccessError::OutcomeUnknown,
         }
+    }
+    /// The empty page a parked request holds, for the owner that gives the
+    /// request up: its barrier was current when it crossed it.
+    pub fn parked_reply(&mut self) -> Option<StreamReply> {
+        if !matches!(self.stage, Stage::Parked { .. }) {
+            return None;
+        }
+        match std::mem::replace(&mut self.stage, Stage::Finished) {
+            Stage::Parked { reply, .. } => Some(*reply),
+            _ => None,
+        }
+    }
+    fn park(&mut self, reply: StreamReply, published: SessionSeq) -> Result<(), AccessError> {
+        // The page's staging leaves with the page; the request's bytes stay.
+        self.charge
+            .shrink_to(self.parked_bytes)
+            .map_err(|_| AccessError::Capacity)?;
+        self.stage = Stage::Parked {
+            published,
+            reply: Box::new(reply),
+        };
+        Ok(())
+    }
+    /// The staging back, to pump a page: false when the budget has none to
+    /// give now — the request stays parked and asks again.
+    fn wake(&mut self, budget: &MemoryBudget) -> bool {
+        let Ok(reservation) = budget.reserve(
+            BudgetKind::Pending,
+            BudgetLane::Ordinary,
+            self.full_bytes.saturating_sub(self.parked_bytes),
+        ) else {
+            return false;
+        };
+        let mut staging = reservation.commit();
+        self.charge.absorb(&mut staging).is_ok()
     }
 }
 pub(crate) struct Streams {
     budget: MemoryBudget,
     incarnation: [u8; 16],
     next: u64,
+    lease: u64,
+    /// The time a test set in place of the wall clock, so what it asserts
+    /// of a lease's half is a fact of the times it names and never of how
+    /// long the machine took between two calls.
+    #[cfg(test)]
+    clock: Option<u64>,
 }
 impl Streams {
     #[cfg(test)]
@@ -104,7 +168,29 @@ impl Streams {
             budget,
             incarnation,
             next: 0,
+            lease: LEASE_MS,
+            #[cfg(test)]
+            clock: None,
         })
+    }
+    /// The same host with another lease term, in milliseconds.
+    #[cfg(test)]
+    pub fn with_lease(mut self, lease: u64) -> Self {
+        self.lease = lease;
+        self
+    }
+    /// From now on this host reads `now` (Unix milliseconds) as its clock.
+    #[cfg(test)]
+    pub fn at(&mut self, now: u64) {
+        self.clock = Some(now);
+    }
+    /// The wall clock in Unix milliseconds; in a test, the time it set.
+    fn now_ms(&self) -> Result<u64, AccessError> {
+        #[cfg(test)]
+        if let Some(now) = self.clock {
+            return Ok(now);
+        }
+        wall_ms()
     }
     pub fn begin(
         &mut self,
@@ -157,19 +243,18 @@ impl Streams {
             .min(limits.max_frame_bytes)
             .min(if seed { MAX_SEED_BYTES } else { u32::MAX })
             as usize;
-        let charge = request_bytes
+        let retained = request_bytes
             .checked_mul(64)
-            .and_then(|n| {
-                response_bytes
-                    .checked_mul(if seed { 64 } else { 3 })
-                    .and_then(|r| n.checked_add(r))
-            })
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(AccessError::Capacity)?;
+        let charge = response_bytes
+            .checked_mul(if seed { 64 } else { 3 })
+            .and_then(|r| retained.checked_add(r))
             .and_then(|n| {
                 (stream.credits().items.min(limits.max_items) as usize)
                     .checked_mul(size_of::<StreamEvent>())
                     .and_then(|r| n.checked_add(r))
             })
-            .and_then(|n| n.checked_add(4096))
             .ok_or(AccessError::Capacity)?;
         let allocation = self
             .budget
@@ -203,7 +288,10 @@ impl Streams {
             stage: Stage::Barrier(context),
             seed: None,
             native,
-            _charge: allocation,
+            park: true,
+            parked_bytes: retained,
+            full_bytes: charge,
+            charge: allocation,
         })
     }
     /// Call with every Session::poll result. The host sends all Raft messages
@@ -229,6 +317,12 @@ impl Streams {
             || session.status().term != pending.term
             || !session.is_authoritative()
         {
+            // A poll parked with nothing to deliver is answered with what it
+            // holds: the barrier it crossed was current, and the page is
+            // empty whoever leads now.
+            if let Some(reply) = pending.parked_reply() {
+                return Ok(Some(reply));
+            }
             return Err(pending.interrupted());
         }
         if let Stage::Barrier(context) = &pending.stage {
@@ -256,53 +350,121 @@ impl Streams {
                 }
             };
             let original = original_cursor_token(session, pending.key, pending.intent_hash)?;
-            let now = wall_ms()?.max(session.cursor_clock());
-            let operation =
-                Self::operation(session, views, pending, original, prefix, now, limits)?;
-            let command = CursorCommand {
-                expected_revision: session.cursor_revision(),
-                now,
-                operation,
-            };
-            match pending.key {
-                StreamKey::Legacy(key) => {
-                    let input = CursorInput {
-                        ledger: pending.ledger,
-                        key,
-                        intent_hash: pending.intent_hash,
-                        command,
+            let now = self.now_ms()?.max(session.cursor_clock());
+            let lease = self.lease;
+            match Self::operation(
+                session, views, pending, original, prefix, now, lease, limits,
+            )? {
+                Some(operation) => {
+                    let command = CursorCommand {
+                        expected_revision: session.cursor_revision(),
+                        now,
+                        operation,
                     };
-                    match session.submit_cursor(&input).map_err(cursor_error)? {
-                        CursorSubmission::Committed(_) | CursorSubmission::Pending(_) => {}
+                    match pending.key {
+                        StreamKey::Legacy(key) => {
+                            let input = CursorInput {
+                                ledger: pending.ledger,
+                                key,
+                                intent_hash: pending.intent_hash,
+                                command,
+                            };
+                            match session.submit_cursor(&input).map_err(cursor_error)? {
+                                CursorSubmission::Committed(_) | CursorSubmission::Pending(_) => {}
+                            }
+                        }
+                        StreamKey::Managed(key) => {
+                            let input = ManagedCursorInput {
+                                key,
+                                intent_hash: pending.intent_hash,
+                                command,
+                            };
+                            match session
+                                .propose_managed_cursor(&input, false)
+                                .map_err(cursor_error)?
+                            {
+                                ManagedSubmission::Committed(_) | ManagedSubmission::Pending(_) => {
+                                }
+                                ManagedSubmission::Domain(_) => {
+                                    return Err(AccessError::InvalidRequest);
+                                }
+                            }
+                        }
                     }
+                    pending.stage = Stage::Receipt;
                 }
-                StreamKey::Managed(key) => {
-                    let input = ManagedCursorInput {
-                        key,
-                        intent_hash: pending.intent_hash,
-                        command,
-                    };
-                    match session
-                        .propose_managed_cursor(&input, false)
-                        .map_err(cursor_error)?
-                    {
-                        ManagedSubmission::Committed(_) | ManagedSubmission::Pending(_) => {}
-                        ManagedSubmission::Domain(_) => return Err(AccessError::InvalidRequest),
-                    }
+                None => {
+                    // Nothing to acknowledge: the poll is a read and proposes
+                    // nothing; a lease it finds past its half-life the node
+                    // renews by its own entry (the audit's F61).
+                    self.renew_if_due(session, pending, now)?;
+                    pending.stage = Stage::Read;
                 }
             }
-            pending.stage = Stage::Receipt;
         }
-        let Some(token) = original_cursor_token(session, pending.key, pending.intent_hash)? else {
+        if let Stage::Parked { published, .. } = &pending.stage
+            && (session.stream_published() <= *published || !pending.wake(&self.budget))
+        {
             return Ok(None);
+        }
+        let committed = match &pending.stage {
+            Stage::Receipt => true,
+            Stage::Read | Stage::Parked { .. } => false,
+            Stage::Barrier(_) | Stage::Finished => return Err(AccessError::InvalidRequest),
         };
-        let now = wall_ms()?.max(session.cursor_clock());
-        let reply = self.reply(session, pending, token, now, limits)?;
+        let original = if committed {
+            let Some(token) = original_cursor_token(session, pending.key, pending.intent_hash)?
+            else {
+                return Ok(None);
+            };
+            token
+        } else {
+            row_token(session, pending)?
+        };
+        let now = self.now_ms()?.max(session.cursor_clock());
+        let reply = self.reply(session, pending, original, now, limits)?;
+        // A read with nothing to read waits for something, where the host
+        // answers from its loop; a poll that acknowledged carries its
+        // receipt and is answered at once.
+        if !committed && pending.park && reply.seed.is_none() && reply.events.is_empty() {
+            pending.park(reply, session.stream_published())?;
+            return Ok(None);
+        }
         pending.stage = Stage::Finished;
         Ok(Some(reply))
     }
+    /// A polled lease past its half-life is renewed by the node's own
+    /// entry, best effort: the log's one maintenance slot may be taken, or
+    /// leadership may have moved, and the next poll renews then.
+    fn renew_if_due(
+        &self,
+        session: &mut Session,
+        pending: &PendingStream,
+        now: u64,
+    ) -> Result<(), AccessError> {
+        let StreamRequest::Poll { cursor, .. } = &pending.stream else {
+            return Ok(());
+        };
+        let Some(row) = session.cursor(cursor.key.consumer) else {
+            return Ok(());
+        };
+        if row.mode == CursorMode::Protected {
+            return Ok(());
+        }
+        let generation = row.token.generation;
+        let expires_at = now
+            .checked_add(self.lease)
+            .ok_or(AccessError::Unavailable)?;
+        match session.propose_cursor_renewal(cursor.key.consumer, generation, now, expires_at) {
+            Ok(_) => Ok(()),
+            Err(LedgerError::Capacity | LedgerError::NotReady { .. }) => Ok(()),
+            Err(error) => Err(cursor_error(error)),
+        }
+    }
     // Seed reads use a barrier already completed by the host, avoiding the
     // one-voter polling helper inside ReadViews::read(Linearizable).
+    // `None` is a poll that proposes nothing: a read.
+    #[allow(clippy::too_many_arguments)]
     fn operation(
         session: &mut Session,
         views: &mut ReadViews,
@@ -310,9 +472,10 @@ impl Streams {
         original: Option<CursorToken>,
         barrier: SessionSeq,
         now: u64,
+        lease: u64,
         limits: &WireLimits,
-    ) -> Result<CursorOperation, AccessError> {
-        let expires_at = now.checked_add(LEASE_MS).ok_or(AccessError::Unavailable)?;
+    ) -> Result<Option<CursorOperation>, AccessError> {
+        let expires_at = now.checked_add(lease).ok_or(AccessError::Unavailable)?;
 
         let operation = match &pending.stream {
             StreamRequest::Open {
@@ -333,13 +496,13 @@ impl Streams {
                     // server-side seed: the client reads its seed at a prefix
                     // no older than this snapshot and the tail from here, so
                     // every fact between the two arrives at least once.
-                    return Ok(CursorOperation::BeginSeed {
+                    return Ok(Some(CursorOperation::BeginSeed {
                         consumer: *consumer,
                         scope: pending.scope,
                         filter: filter.clone(),
                         snapshot: barrier,
                         expires_at,
-                    });
+                    }));
                 }
                 // Capture the immutable prefix before committing its tail pin.
                 // A retry uses its original snapshot; it cannot silently seed a
@@ -424,6 +587,22 @@ impl Streams {
                         *cursor,
                         pending.stream.filter(),
                     )?;
+                    // A plain poll acknowledges what is new to the row, and
+                    // with nothing new proposes nothing: it is a read. A
+                    // managed poll is a durable request whose receipt the
+                    // client retires, and a request answered once is
+                    // answered from its receipt: both propose.
+                    if let StreamKey::Legacy(_) = pending.key {
+                        let row = session
+                            .cursor(cursor.key.consumer)
+                            .map(|row| row.token.position);
+                        let new = acknowledged.is_some_and(|token| {
+                            row.is_some_and(|position| token.position > position)
+                        });
+                        if !new {
+                            return Ok(None);
+                        }
+                    }
                 }
                 match acknowledged {
                     Some(token) => CursorOperation::AcknowledgeAndRenew {
@@ -455,7 +634,7 @@ impl Streams {
                 }
             }
         };
-        Ok(operation)
+        Ok(Some(operation))
     }
     fn reply(
         &self,
@@ -576,17 +755,34 @@ impl Streams {
             return Err(AccessError::Unavailable);
         }
         let mut pending = self.begin(session, peer, request, stream, limits)?;
+        // One voter answers in place: an empty page is a page, never parked.
+        pending.park = false;
         for _ in 0..4 {
             let events = session.poll().map_err(cursor_error)?;
             if !events.messages.is_empty() {
                 return Err(pending.interrupted());
             }
             if let Some(reply) = self.advance(session, views, &mut pending, &events, limits)? {
+                // A renewal the poll proposed commits on this poll.
+                let events = session.poll().map_err(cursor_error)?;
+                if !events.messages.is_empty() {
+                    return Err(pending.interrupted());
+                }
                 return Ok(reply);
             }
         }
         Err(pending.interrupted())
     }
+}
+/// The row's own token, for a poll that proposed nothing.
+fn row_token(session: &Session, pending: &PendingStream) -> Result<CursorToken, AccessError> {
+    let StreamRequest::Poll { cursor, .. } = &pending.stream else {
+        return Err(AccessError::InvalidRequest);
+    };
+    session
+        .cursor(cursor.key.consumer)
+        .map(|row| row.token)
+        .ok_or(AccessError::ResyncRequired { floor: None })
 }
 fn wall_ms() -> Result<u64, AccessError> {
     u64::try_from(

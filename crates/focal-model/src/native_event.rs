@@ -67,6 +67,10 @@ pub enum NativeInvocationRef {
     Retirement {
         root: ClaimId,
     },
+    /// A committed seal of closed outcomes (F12), by its ordinal.
+    Seal {
+        ordinal: u64,
+    },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +104,24 @@ pub enum NativeValidationState {
     ErroredNotRequired,
     QualityBarValidationFailed,
     QualityBarValidationFailedNotRequired,
+}
+impl NativeValidationState {
+    /// The same partition as the lifecycle's `State::is_terminal`: an
+    /// evaluation that is ready or validating is live, every other state is
+    /// terminal.
+    pub const fn is_terminal(self) -> bool {
+        match self {
+            Self::Ready | Self::Validating | Self::ValidatingQualityBar => false,
+            Self::Validated
+            | Self::ValidationIncomplete
+            | Self::ValidationFailed
+            | Self::ValidationFailedNotRequired
+            | Self::Errored
+            | Self::ErroredNotRequired
+            | Self::QualityBarValidationFailed
+            | Self::QualityBarValidationFailedNotRequired => true,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativePhase {

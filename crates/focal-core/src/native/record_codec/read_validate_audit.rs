@@ -1,6 +1,7 @@
 //! Complete frozen audit membership and publication coverage. Point/range reads
 //! use existing ordered keys; no full-ledger scan is repeated for each bundle.
 use super::*;
+use crate::native::ranges::KeyedRows as _;
 use focal_model::{ObjectRevision, lifecycle::aggregation::PublicationPosition};
 use read_validate::{ValidationRead, invalid};
 
@@ -28,7 +29,7 @@ pub(super) fn audit(
     };
     let claim = owner.claim().ok_or_else(invalid)?;
     let registrations = owner.registrations().ok_or_else(invalid)?;
-    let header = registrations.snapshot_v1();
+    let header = registrations.snapshot_v1(claim.binding());
     if !header.sealed
         || !header.increments_sealed
         || header.sealed_at != Some(cohort.sealed_at())
@@ -118,7 +119,7 @@ fn coverage(
     let traversal = read_index::lookup_work()?;
     read.charge(traversal)?;
     let start = family.start(evaluation);
-    let mut rows = read.root.entries_from(&start, false);
+    let mut rows = read.root.rows_from(&start, false);
     let mut count = 0usize;
     loop {
         read.charge(traversal)?;

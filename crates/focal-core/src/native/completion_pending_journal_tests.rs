@@ -87,8 +87,8 @@ fn exhaust(owner: &NativeOwner) -> Allocation {
     source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit()
@@ -157,11 +157,19 @@ fn separate_pending_seal_journals_retain_and_refund_their_own_credit_under_press
         .unwrap()
         .mutation_heap_bytes();
     assert!(first_writes > 0);
+    // A candidate also holds its batch, its merge staging and its place in
+    // the pending index until it publishes.
+    let first_held = owner
+        .prepared_candidate(first)
+        .unwrap()
+        .held_pending_bytes();
     let after_first = owner.budget_stats();
-    assert_eq!(after_first.used, before.used);
+    // Fresh work holds every ordinary byte; the report holds its own bytes on
+    // the completion lane.
+    assert_eq!(after_first.ordinary_used, before.ordinary_used);
     assert_eq!(
         after_first.by_kind[BudgetKind::Pending as usize],
-        before.by_kind[BudgetKind::Pending as usize] + journal + first_writes
+        before.by_kind[BudgetKind::Pending as usize] + journal + first_writes + first_held
     );
     let second = fail(&mut owner, &mut store, 2);
     let second_writes = owner
@@ -169,11 +177,20 @@ fn separate_pending_seal_journals_retain_and_refund_their_own_credit_under_press
         .unwrap()
         .mutation_heap_bytes();
     assert!(second_writes > 0);
+    let second_held = owner
+        .prepared_candidate(second)
+        .unwrap()
+        .held_pending_bytes();
     let after_second = owner.budget_stats();
-    assert_eq!(after_second.used, before.used);
+    assert_eq!(after_second.ordinary_used, before.ordinary_used);
     assert_eq!(
         after_second.by_kind[BudgetKind::Pending as usize],
-        before.by_kind[BudgetKind::Pending as usize] + 2 * journal + first_writes + second_writes
+        before.by_kind[BudgetKind::Pending as usize]
+            + 2 * journal
+            + first_writes
+            + second_writes
+            + first_held
+            + second_held
     );
     assert_eq!(owner.pending_len(), 2);
     assert_eq!(owner.committed().sequence(), committed);
@@ -207,7 +224,8 @@ fn separate_pending_seal_journals_retain_and_refund_their_own_credit_under_press
     owner.publish_after_durable(first).unwrap();
     assert_eq!(
         owner.budget_stats().by_kind[BudgetKind::Pending as usize],
-        before.by_kind[BudgetKind::Pending as usize] + journal + second_writes - graph_members
+        before.by_kind[BudgetKind::Pending as usize] + journal + second_writes + second_held
+            - graph_members
     );
     assert!(
         owner

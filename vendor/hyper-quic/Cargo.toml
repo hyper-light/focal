@@ -1,0 +1,40 @@
+[package]
+name = "hyper-quic"
+version = "0.1.0"
+edition = "2024"
+# focal's toolchain (rust-toolchain.toml); this snapshot builds on it, which focal's gates show.
+rust-version = "1.98.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hyper-light/hyper-raft"
+
+[features]
+# qlog traces. Off in focal: `qlog` turns on serde_json's `preserve_order` for the whole build,
+# and focal's schemas, output and canonical documents are written against sorted maps (the shared
+# crate's VENDORED.md §20).
+qlog = ["dep:qlog"]
+
+[dependencies]
+aws-lc-rs = { version = "1.9", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+bytes = "1"
+fastbloom = { version = "0.17", default-features = false }
+lru-slab = "0.1.2"
+qlog = { version = "0.15.2", optional = true }
+rand = "0.10.1"
+rand_pcg = "0.10"
+rustc-hash = "2"
+rustls = { package = "hyper-tls", version = "0.1.0", path = "../hyper-tls" }
+slab = "0.4.6"
+thiserror = "2.0.3"
+tinyvec = { version = "1.1", features = ["alloc"] }
+tracing = { version = "0.1.10", default-features = false, features = ["std"] }
+
+# hyper-raft's workspace declares the configurations its model checks and fuzzers build under
+# (its Cargo.toml [workspace.lints.rust]); this root declares the same, and the `arbitrary`
+# feature upstream's fuzzing derives sit behind, which focal never enables (its dependency is left
+# out of this manifest, so it never enters focal's lockfile).
+[lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(fuzzing)", 'cfg(feature, values("arbitrary"))'] }
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside focal's workspace. Its
+# suites, benchmarks and lint wall run in hyper-raft's repository, on all six targets.
+[workspace]

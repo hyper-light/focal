@@ -44,13 +44,10 @@ impl PostingPlan {
         if claim.binding.revision.0 == 0 {
             return Err(ContractError::StaleRevision);
         }
-        claim.acceptance.check(claim.binding, claim.issuer)?;
+        claim.acceptance().check(claim.binding, claim.issuer)?;
         // Child registration may advance a Generated parent's lifecycle
-        // revision. Its original immutable lineage binding remains unchanged.
-        claim.lineage.check_binding(&Binding {
-            revision: claim.lineage.binding().revision,
-            ..claim.binding
-        })?;
+        // revision. The lineage was built for its creation binding.
+        claim.lineage.check_binding(&claim.creation_binding())?;
         match claim.lineage.cause() {
             Cause::Root(id) if id.is_zero() => return Err(ContractError::InvalidTarget),
             Cause::Claim(id) if id.is_zero() || id.0 == claim.binding.object.0 => {

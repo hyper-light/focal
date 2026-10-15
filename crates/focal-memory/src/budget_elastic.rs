@@ -2,49 +2,11 @@
 //! rather than a separately sampled limit/usage pair, serializes spending with
 //! trimming. Allocations may cross threads; resize authority remains unique.
 
-use super::{Backing, BudgetKind, BudgetLane, Counters, KindCounters, MemoryBudget, MemoryError};
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use super::{
+    Backing, BudgetKind, BudgetLane, Ended, Funding, Level, MemoryBudget, MemoryError, Terms,
+    child_metadata, release_tree, reserve_tree,
 };
-
-#[derive(Debug)]
-pub(super) struct ElasticBacking {
-    pub(super) lane: BudgetLane,
-    // Includes non-spendable metadata. Only the unique controller changes this;
-    // final Counters drop releases the aggregate through its retained parent.
-    held: AtomicUsize,
-    available: AtomicUsize,
-    metadata: usize,
-}
-
-impl ElasticBacking {
-    /// Exclusively acquire already-funded credit before publishing local usage
-    /// or reclassifying ancestors. Failure changes no counter.
-    pub(super) fn acquire(&self, bytes: usize) -> Result<(), MemoryError> {
-        self.available
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
-                available.checked_sub(bytes)
-            })
-            .map(|_| ())
-            .map_err(|available| MemoryError::Capacity {
-                requested: bytes,
-                available,
-            })
-    }
-
-    /// Restore exact acquired credit only after local usage and every ancestor
-    /// category have been refunded. Newly grown credit likewise has full parent
-    /// backing before this publication. Those ownership rules bound the sum by
-    /// funded capacity, including concurrent returns and in-flight acquisitions.
-    pub(super) fn release(&self, bytes: usize) {
-        self.available.fetch_add(bytes, Ordering::Release);
-    }
-
-    pub(super) fn held_bytes(&self) -> usize {
-        self.held.load(Ordering::Acquire)
-    }
-}
+use std::sync::atomic::Ordering;
 
 /// Unique growth/trim authority for one shareable accounting source. The source
 /// can be cloned for existing storage/custody APIs; such clones cannot resize it.
@@ -78,53 +40,50 @@ impl ElasticFundedPool {
     /// Spendable backing, including both idle and already-issued capacity.
     /// Metadata is excluded. This is a diagnostic, not an admission permit.
     pub fn funded_capacity(&self) -> usize {
-        match &self.budget.0.backing {
-            Backing::Elastic(backing) => backing.held_bytes().saturating_sub(backing.metadata),
-            // The private constructor installs only Elastic. Remain total even
-            // if an internal caller violates that representation invariant.
-            Backing::None | Backing::Fixed(_) => 0,
-        }
+        // The private constructor installs only elastic backing. Remain total
+        // even if an internal caller violates that representation invariant.
+        self.backing().map_or(0, |backing| {
+            backing.held_bytes().saturating_sub(backing.metadata())
+        })
     }
 
     /// Currently unissued funded credit. A concurrent allocation or refund can
     /// change this immediately; trim and reserve use checked atomic acquisition.
     pub fn available(&self) -> usize {
-        match &self.budget.0.backing {
-            Backing::Elastic(backing) => backing.available.load(Ordering::Acquire),
-            Backing::None | Backing::Fixed(_) => 0,
-        }
+        self.backing()
+            .map_or(0, |backing| backing.available.load(Ordering::Acquire))
     }
 
     /// Fund additional capacity in the original lane before making it usable.
     /// Failure preserves the source and parent exactly. Growth allocates no heap
-    /// buffer; the temporary parent reservation transfers into aggregate backing.
+    /// buffer; the parent's charge goes straight into the aggregate backing.
     pub fn grow(&mut self, bytes: usize) -> Result<(), MemoryError> {
         let backing = self.backing()?;
-        let parent = self.parent()?;
+        let (parent, lane) = self.parent()?;
         let held = backing.held_bytes();
         let capacity =
-            held.checked_sub(backing.metadata)
+            held.checked_sub(backing.metadata())
                 .ok_or(MemoryError::InvalidConfiguration(
                     "elastic metadata missing",
                 ))?;
         let next_capacity = crate::checked_add(capacity, bytes)?;
-        if next_capacity > self.budget.0.limit {
+        let limit = self.budget.limit();
+        if next_capacity > limit {
             return Err(MemoryError::Capacity {
                 requested: bytes,
-                available: self.budget.0.limit.saturating_sub(capacity),
+                available: limit.saturating_sub(capacity),
             });
         }
         let next_held = crate::checked_add(held, bytes)?;
-        let mut reservation = parent.reserve(BudgetKind::Reserved, backing.lane, bytes)?;
+        reserve_tree(parent, BudgetKind::Reserved, lane, bytes)?;
         // Every fallible check is complete. The unique controller serializes
         // held-byte updates; concurrent spending/refunds only change available.
         backing.held.store(next_held, Ordering::Release);
-        reservation.0.bytes = 0;
         #[cfg(test)]
         if bytes != 0 {
             super::interleaving_tests::pause(
                 super::interleaving_tests::Step::GrowReady,
-                &self.budget,
+                self.budget.level,
             );
         }
         backing.release(bytes);
@@ -136,11 +95,11 @@ impl ElasticFundedPool {
     /// capacity promised by its completion book. No partial trim occurs.
     pub fn trim_unused(&mut self, bytes: usize) -> Result<(), MemoryError> {
         let backing = self.backing()?;
-        let parent = self.parent()?;
+        let (parent, lane) = self.parent()?;
         let next_held = backing
             .held_bytes()
             .checked_sub(bytes)
-            .filter(|remaining| *remaining >= backing.metadata)
+            .filter(|remaining| *remaining >= backing.metadata())
             .ok_or_else(|| MemoryError::Capacity {
                 requested: bytes,
                 available: backing.available.load(Ordering::Acquire),
@@ -153,27 +112,31 @@ impl ElasticFundedPool {
         if bytes != 0 {
             super::interleaving_tests::pause(
                 super::interleaving_tests::Step::TrimReady,
-                &self.budget,
+                self.budget.level,
             );
         }
-        parent.release_tree(BudgetKind::Reserved, backing.lane, bytes);
+        // The pool's level holds its parent, so nothing ends here.
+        release_tree(parent, BudgetKind::Reserved, lane, bytes, &mut Ended::new());
         Ok(())
     }
 
-    fn backing(&self) -> Result<&ElasticBacking, MemoryError> {
-        match &self.budget.0.backing {
-            Backing::Elastic(backing) => Ok(backing),
-            Backing::None | Backing::Fixed(_) => Err(MemoryError::InvalidConfiguration(
+    fn backing(&self) -> Result<&'static Backing, MemoryError> {
+        let backing = &self.budget.level.backing;
+        if backing.is_elastic() {
+            Ok(backing)
+        } else {
+            Err(MemoryError::InvalidConfiguration(
                 "elastic controller has no elastic backing",
-            )),
+            ))
         }
     }
 
-    fn parent(&self) -> Result<&MemoryBudget, MemoryError> {
-        self.budget
-            .0
-            .parent
-            .as_ref()
+    /// The pool's parent level and the lane its backing is charged in.
+    fn parent(&self) -> Result<(&'static Level, BudgetLane), MemoryError> {
+        let level = self.budget.level;
+        level
+            .parent()
+            .zip(level.backing.lane())
             .ok_or(MemoryError::InvalidConfiguration(
                 "elastic backing has no parent",
             ))
@@ -201,48 +164,43 @@ impl MemoryBudget {
                 "invalid elastic funded allowance",
             ));
         }
-        let depth = self
-            .0
-            .depth
-            .checked_add(1)
-            .filter(|depth| *depth <= 8)
-            .ok_or(MemoryError::InvalidConfiguration(
-                "memory budget hierarchy exceeds eight levels",
-            ))?;
-        let metadata = crate::checked_add(
-            crate::ALLOCATOR_OVERHEAD,
-            crate::checked_add(
-                size_of::<Counters>(),
-                crate::checked_mul(2, size_of::<usize>())?,
-            )?,
-        )?;
+        if funding_lane == BudgetLane::Committed {
+            return Err(MemoryError::InvalidConfiguration(
+                "committed work is never prepaid",
+            ));
+        }
+        let depth = self.child_depth()?;
+        let metadata = child_metadata();
         let held = crate::checked_add(initial_capacity, metadata)?;
-        let mut reservation = self.reserve(BudgetKind::Reserved, funding_lane, held)?;
-        let budget = Self(Arc::new(Counters {
-            limit: ceiling,
-            ordinary_limit: match funding_lane {
-                BudgetLane::Ordinary => ceiling,
-                BudgetLane::Completion => 0,
+        reserve_tree(self.level, BudgetKind::Reserved, funding_lane, held)?;
+        let budget = Self::begin(
+            &Terms {
+                limit: ceiling,
+                ordinary_limit: match funding_lane {
+                    BudgetLane::Ordinary => ceiling,
+                    BudgetLane::Completion | BudgetLane::Committed => 0,
+                },
+                hold_limit: ceiling,
+                depth,
+                funding: Funding::Elastic {
+                    lane: funding_lane,
+                    held,
+                    available: initial_capacity,
+                    metadata,
+                },
             },
-            total: AtomicUsize::new(0),
-            ordinary: AtomicUsize::new(0),
-            kinds: KindCounters::new(),
-            parent: Some(self.clone()),
-            depth,
-            // Until aggregate adoption the reservation alone owns the backing.
-            // No source handle or available credit has escaped construction.
-            backing: Backing::Elastic(ElasticBacking {
-                lane: funding_lane,
-                held: AtomicUsize::new(0),
-                available: AtomicUsize::new(0),
-                metadata,
-            }),
-        }));
-        let controller = ElasticFundedPool { budget };
-        let backing = controller.backing()?;
-        backing.held.store(held, Ordering::Release);
-        reservation.0.bytes = 0;
-        backing.release(initial_capacity);
-        Ok(controller)
+            Some(self),
+        )
+        .inspect_err(|_| {
+            // This budget holds its level, so nothing ends here.
+            release_tree(
+                self.level,
+                BudgetKind::Reserved,
+                funding_lane,
+                held,
+                &mut Ended::new(),
+            );
+        })?;
+        Ok(ElasticFundedPool { budget })
     }
 }

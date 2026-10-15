@@ -200,7 +200,7 @@ fn failed_funded_report_returns_scratch_and_pages_without_losing_custody_or_exac
     let before = pool.stats();
     let parent = owner.stats();
     let sequence = core.native_sequence();
-    let failed = super::prepare::fail_copies_after(0, || {
+    let failed = super::prepare::fail_range_after(0, || {
         core.prepare_native_in(
             &pool,
             context(EVALUATOR, 100),
@@ -216,7 +216,7 @@ fn failed_funded_report_returns_scratch_and_pages_without_losing_custody_or_exac
     assert_eq!(pool.stats(), before);
     assert_eq!(owner.stats(), parent);
     assert_eq!(core.native_sequence(), sequence);
-    assert_eq!(core.native_outcome(input.request), None);
+    assert_eq!(core.native_outcome(input.request).unwrap(), None);
 
     let independent = MemoryBudget::new(64 * 1024 * 1024, 0).unwrap();
     assert!(matches!(

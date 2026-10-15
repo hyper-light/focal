@@ -10,6 +10,7 @@ use focal_client::{
     managed_store::ManagedOperationId,
     operations::{AuthoredOperation, PlannedOperation},
 };
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
@@ -141,11 +142,7 @@ fn existing(context: &Context) -> Result<Option<UploadStore>> {
     }
     Ok(None)
 }
-pub(super) fn artifact(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    mut args: ArtifactArgs,
-) -> Result<()> {
+pub(super) async fn artifact(context: &Context, mut args: ArtifactArgs) -> Result<()> {
     let path = args
         .payload_file
         .take()
@@ -154,25 +151,15 @@ pub(super) fn artifact(
     if source.length <= 16 * 1024 {
         args.payload_file = Some(source.path);
         let (document, options) = documents::artifact(args)?;
-        return submit(runtime, context, Document::Attach(document), options);
+        return submit(context, Document::Attach(document), options).await;
     }
     // Parse every authored field before reserving identity or admitting bytes.
     args.text = Some(String::new());
     let (mut document, options) = documents::artifact(args)?;
     document.payload = PayloadDocument::Inline { bytes: Vec::new() };
-    large(
-        runtime,
-        context,
-        source,
-        Document::Attach(document),
-        options,
-    )
+    large(context, source, Document::Attach(document), options).await
 }
-pub(super) fn register(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    mut args: RegisterArtifactArgs,
-) -> Result<()> {
+pub(super) async fn register(context: &Context, mut args: RegisterArtifactArgs) -> Result<()> {
     let path = args
         .payload_file
         .take()
@@ -184,7 +171,7 @@ pub(super) fn register(
         let AuthoredOperation::ArtifactRegister(document) = authored else {
             return Err(CliError::InvalidResponse);
         };
-        return submit(runtime, context, Document::Register(document), options);
+        return submit(context, Document::Register(document), options).await;
     }
     args.text = Some(String::new());
     let (authored, options) = lifecycle::register(args)?;
@@ -192,16 +179,9 @@ pub(super) fn register(
         return Err(CliError::InvalidResponse);
     };
     document.payload = PayloadDocument::Inline { bytes: Vec::new() };
-    large(
-        runtime,
-        context,
-        source,
-        Document::Register(document),
-        options,
-    )
+    large(context, source, Document::Register(document), options).await
 }
-fn large(
-    runtime: &tokio::runtime::Runtime,
+async fn large(
     context: &Context,
     mut source: Source,
     document: Document,
@@ -212,11 +192,7 @@ fn large(
     let identity = if let Some(path) = &options.operation {
         Identity::Legacy(path_bytes(path))
     } else {
-        Identity::Managed(managed::reserve_for_submission(
-            runtime,
-            context,
-            &mut options,
-        )?)
+        Identity::Managed(managed::reserve_for_submission(context, &mut options).await?)
     };
     let attachment = Attachment {
         version: 2,
@@ -231,7 +207,7 @@ fn large(
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(InputError::Capacity.into());
     }
-    let result = (|| {
+    let result = async {
         let store = store(context)?;
         let mut journal = store
             .begin(
@@ -246,11 +222,12 @@ fn large(
             )
             .map_err(other)?;
         bind_attachment(&mut journal, &attachment, &bytes)?;
-        stage_source(&mut journal, &mut source.file)
-            .and_then(|()| finish(runtime, context, journal, attachment, options.output.format))
-    })();
+        stage_source(&mut journal, &mut source.file)?;
+        finish(context, journal, attachment, options.output.format).await
+    }
+    .await;
     let (document, options) = report(context, &identity, options.output.format, result)?;
-    submit(runtime, context, document, options)
+    submit(context, document, options).await
 }
 fn bind_attachment(
     journal: &mut UploadJournal,
@@ -295,8 +272,7 @@ fn stage_source(journal: &mut UploadJournal, source: &mut File) -> Result<()> {
     }
     Ok(())
 }
-fn finish(
-    runtime: &tokio::runtime::Runtime,
+async fn finish(
     context: &Context,
     mut journal: UploadJournal,
     mut attachment: Attachment,
@@ -321,16 +297,17 @@ fn finish(
             }
             .into());
         }
-        let reply = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            runtime.block_on(async {
-                tokio::time::timeout(remaining, context.client.upload(request.clone()))
-                    .await
-                    .map_err(|_| ClientError::OutcomeUnknown {
-                        request: Box::new(request.clone()),
-                    })?
-            })
-        }))
-        .map_err(|_| ClientError::Transport)??;
+        let upload = async {
+            focal_rt::time::timeout(remaining, context.client.upload(request.clone()))
+                .await
+                .map_err(|_| ClientError::OutcomeUnknown {
+                    request: Box::new(request.clone()),
+                })?
+        };
+        let reply = AssertUnwindSafe(upload)
+            .catch_unwind()
+            .await
+            .map_err(|_| ClientError::Transport)??;
         journal.record_reply(&request, &reply).map_err(other)?;
     }
     let reference = journal
@@ -359,21 +336,16 @@ fn finish(
     drop(journal);
     Ok((attachment.document, options))
 }
-fn submit(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    document: Document,
-    options: MutationOptions,
-) -> Result<()> {
+async fn submit(context: &Context, document: Document, options: MutationOptions) -> Result<()> {
     let authored = document.authored();
     if options.operation.is_none() {
-        return managed::submit(runtime, context, authored, options);
+        return managed::submit(context, authored, options).await;
     }
     let PlannedOperation::Mutation(command) = authored.build(&context.build, &mut random_id)?
     else {
         return Err(CliError::InvalidResponse);
     };
-    super::submit(runtime, context, command, options)
+    super::submit(context, command, options).await
 }
 enum Identity {
     Managed(ManagedOperationId),
@@ -404,16 +376,14 @@ impl Identity {
         result
     }
 }
-pub(super) fn resume_managed(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn resume_managed(
     context: &Context,
     id: ManagedOperationId,
     format: OutputFormat,
 ) -> Result<bool> {
-    resume(runtime, context, Identity::Managed(id), format)
+    resume(context, Identity::Managed(id), format).await
 }
-pub(super) fn resume_legacy(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn resume_legacy(
     context: &Context,
     path: &Path,
     format: OutputFormat,
@@ -423,14 +393,9 @@ pub(super) fn resume_legacy(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    resume(runtime, context, Identity::Legacy(path_bytes(path)), format)
+    resume(context, Identity::Legacy(path_bytes(path)), format).await
 }
-fn resume(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    identity: Identity,
-    format: OutputFormat,
-) -> Result<bool> {
+async fn resume(context: &Context, identity: Identity, format: OutputFormat) -> Result<bool> {
     let Some(store) = existing(context)? else {
         return Ok(false);
     };
@@ -464,9 +429,9 @@ fn resume(
         context,
         &identity,
         format,
-        finish(runtime, context, journal, attachment, format),
+        finish(context, journal, attachment, format).await,
     )?;
-    submit(runtime, context, document, options)?;
+    submit(context, document, options).await?;
     Ok(true)
 }
 fn report<T>(
@@ -487,18 +452,18 @@ fn report<T>(
             if let Some(command) = &context.invocation {
                 writeln!(
                     stderr,
-                    "Artifact transfer remains saved. Recovery: {command} request retry --operation-id {id}"
+                    "Artifact transfer remains saved. Recovery: {command} retry request --operation-id {id}"
                 )?;
             } else {
                 writeln!(
                     stderr,
-                    "Artifact transfer remains saved. Recovery: focal request retry --operation-id {id} (with the same data directory and client context)."
+                    "Artifact transfer remains saved. Recovery: focal retry request --operation-id {id} (with the same data directory and client context)."
                 )?;
             }
         } else {
             writeln!(
                 std::io::stderr().lock(),
-                "Artifact transfer remains saved; retry the same --operation path with request retry."
+                "Artifact transfer remains saved; retry the same --operation path with `retry request`."
             )?;
         }
     }

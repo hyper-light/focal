@@ -20,12 +20,26 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
 
 const OPERATION_ID: &str = "000000000000000000000000000000ab";
+/// How long a wait may see no progress before it is over: a wedge, not
+/// slowness (27 §3.1 P8).
+const FROZEN: Duration = Duration::from_secs(60);
 struct Observed {
     request: RequestEnvelope,
-    response: oneshot::Sender<Result<ResponseEnvelope, WireError>>,
+    response: hyper_rt::sync::OneshotSender<Result<ResponseEnvelope, WireError>>,
+    /// Disconnected once the backend's wait for the response is gone: answered, or dropped as its
+    /// call was cancelled.
+    waiting: mpsc::Receiver<()>,
+}
+impl Observed {
+    /// Whether the backend no longer waits for this response.
+    fn abandoned(&self) -> bool {
+        matches!(
+            self.waiting.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        )
+    }
 }
 struct Controlled {
     requests: mpsc::SyncSender<Observed>,
@@ -37,13 +51,18 @@ impl ClientTransport for Controlled {
         request: &'a RequestEnvelope,
     ) -> TransportFuture<'a> {
         Box::pin(async move {
-            let (response, receive) = oneshot::channel();
+            let (response, receive) =
+                hyper_rt::sync::oneshot().map_err(|_| WireError::Connection)?;
+            let (alive, waiting) = mpsc::sync_channel::<()>(1);
             self.requests
                 .send(Observed {
                     request: request.clone(),
                     response,
+                    waiting,
                 })
                 .map_err(|_| WireError::Connection)?;
+            // Held for the wait's life: its drop tells the test the wait is gone.
+            let _alive = alive;
             receive.await.map_err(|_| WireError::Connection)?
         })
     }
@@ -163,8 +182,8 @@ impl Running {
         self.input.shutdown(Shutdown::Write).unwrap();
         let result = self
             .done
-            .recv_timeout(Duration::from_secs(5))
-            .expect("EOF did not finish within bound");
+            .recv_timeout(FROZEN)
+            .expect("EOF did not finish: nothing for the frozen window");
         assert!(result.is_ok(), "runner shutdown: {result:?}");
         self.join.take().unwrap().join().unwrap();
     }
@@ -222,21 +241,21 @@ fn answer(observed: Observed, result: MutationReply) {
 fn application(response: &Value) -> ApplicationResult {
     serde_json::from_value(response["result"]["structuredContent"].clone()).unwrap()
 }
-fn inspect_when_retired(runner: &mut Running, start: u64) -> ApplicationResult {
-    for offset in 0..40 {
-        let id = start + offset;
-        runner.tool(id, "request.inspect", json!({"operation_id":OPERATION_ID}));
-        let response = runner.response(id);
-        if response["result"].get("structuredContent").is_some() {
-            assert_eq!(
-                response["result"]["isError"], false,
-                "inspection is successful even while its saved mutation is pending"
-            );
-            return application(&response);
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    panic!("cancelled backend did not release active protocol slot")
+/// An inspection asked right after a cancellation: served at once, behind the
+/// cancelled call at the worker, never refused because that call had not yet
+/// ended when it was asked (a cancelled call holds no capacity).
+fn inspect_after_cancel(runner: &mut Running, id: u64) -> ApplicationResult {
+    runner.tool(id, "request.inspect", json!({"operation_id":OPERATION_ID}));
+    let response = runner.response(id);
+    assert!(
+        response["result"].get("structuredContent").is_some(),
+        "an inspection after a cancellation was refused: {response}"
+    );
+    assert_eq!(
+        response["result"]["isError"], false,
+        "inspection is successful even while its saved mutation is pending"
+    );
+    application(&response)
 }
 
 #[test]
@@ -272,12 +291,9 @@ fn pending_mutation_keeps_control_responsive_cancel_suppressed_and_restart_retri
     );
     runner
         .send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}));
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !pending.response.is_closed() {
-        assert!(Instant::now() < deadline, "backend request did not cancel");
-        thread::sleep(Duration::from_millis(2));
-    }
-    let inspected = inspect_when_retired(&mut runner, 10);
+    // Asked before the cancelled call has ended: it waits behind it.
+    let inspected = inspect_after_cancel(&mut runner, 10);
+    assert!(pending.abandoned(), "backend request did not cancel");
     assert_eq!(inspected.condition, "Pending");
     assert_eq!(inspected.operation_id.as_deref(), Some(OPERATION_ID));
     assert!(
@@ -391,10 +407,10 @@ fn unknown_reply_and_eof_leave_exact_epoch_request_recoverable() {
     reopened.tool(2, "request.retry", json!({"operation_id":OPERATION_ID}));
     let pending = reopened.observed();
     assert_eq!(pending.request, saved);
-    let start = Instant::now();
+    // EOF cancels the pending backend call: the shutdown is clean (`stop`
+    // refuses the bounded one, which would have waited for it).
     reopened.stop();
-    assert!(start.elapsed() < Duration::from_secs(4));
-    assert!(pending.response.is_closed());
+    assert!(pending.abandoned());
     let store = OperationStore::open(&path, StoreLimits::default()).unwrap();
     let journal = store.open_existing(OPERATION_ID, &context()).unwrap();
     assert_eq!(journal.next_request().unwrap(), Some(&saved));
@@ -428,3 +444,9 @@ fn a_withheld_tool_invoked_directly_is_refused_and_never_dispatched() {
     );
     runner.stop();
 }
+
+#[path = "code_stdio_tests.rs"]
+mod code;
+
+#[path = "skills_stdio_tests.rs"]
+mod skills;

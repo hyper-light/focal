@@ -279,7 +279,7 @@ pub(super) fn prepare(
             })?;
             extras.push(Extra {
                 key: Key::Cycle(key),
-                row: Row::Cycle(cycle),
+                row: Row::Cycle(Box::new(cycle)),
                 heap: 0,
                 fact: None,
             })?;

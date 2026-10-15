@@ -1,5 +1,5 @@
 //! Scalar counts copied directly from committed Core after an actual ReadIndex.
-use crate::host::access;
+use crate::host::{access, barrier_refused};
 use focal_ledger::Session;
 use focal_model::{ParticipantId, RequestId, RouteEpoch, SessionSeq};
 use focal_wire::{AccessError, LedgerSummary, ReadToken, ResponseEnvelope, WireLimits};
@@ -63,7 +63,9 @@ pub(crate) fn local(
     let mut context = b"focal.local.summary.v1\0".to_vec();
     context.extend_from_slice(&principal.0);
     context.extend_from_slice(&request.0);
-    session.read_index(context.clone()).map_err(access)?;
+    session
+        .read_index(context.clone())
+        .map_err(barrier_refused)?;
     let events = session.poll().map_err(access)?;
     if !session.is_authoritative() || session.status().term != status.term {
         return Err(AccessError::Unavailable);

@@ -120,7 +120,9 @@ impl ClientTransport for &Mock {
         Box::pin(async move {
             self.seen.lock().unwrap().push(request.clone());
             if !self.delay.is_zero() {
-                tokio::time::sleep(self.delay).await;
+                hyper_rt::futures::sleep(crate::time::nanos(self.delay))
+                    .await
+                    .unwrap();
             }
             Ok(request.reply(
                 self.replies
@@ -135,8 +137,14 @@ impl ClientTransport for &Mock {
 fn client(mock: &Mock) -> Client<&Mock> {
     Client::new(mock, RetryPolicy::default(), WireLimits::default(), 4).unwrap()
 }
-#[tokio::test]
-async fn filtered_selection_preserves_empty_page_progress_and_proves_unique_end() {
+#[test]
+fn filtered_selection_preserves_empty_page_progress_and_proves_unique_end() {
+    focal_rt::block_on(
+        filtered_selection_preserves_empty_page_progress_and_proves_unique_end_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn filtered_selection_preserves_empty_page_progress_and_proves_unique_end_on_a_shard() {
     let mock = Mock::new(vec![
         page(vec![], Some(1)),
         page(vec![object(10)], Some(2)),
@@ -166,8 +174,14 @@ async fn filtered_selection_preserves_empty_page_progress_and_proves_unique_end(
     assert_ne!(seen[0].request_id, seen[1].request_id);
     assert_ne!(seen[1].request_id, seen[2].request_id);
 }
-#[tokio::test]
-async fn absent_ambiguous_expired_and_exhausted_are_distinct_and_never_restart() {
+#[test]
+fn absent_ambiguous_expired_and_exhausted_are_distinct_and_never_restart() {
+    focal_rt::block_on(
+        absent_ambiguous_expired_and_exhausted_are_distinct_and_never_restart_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn absent_ambiguous_expired_and_exhausted_are_distinct_and_never_restart_on_a_shard() {
     let mock = Mock::new(vec![page(vec![], None)]);
     assert!(matches!(
         client(&mock).claim_get(request()).await,
@@ -199,8 +213,12 @@ async fn absent_ambiguous_expired_and_exhausted_are_distinct_and_never_restart()
     ));
     assert_eq!(mock.seen.lock().unwrap().len(), 64);
 }
-#[tokio::test]
-async fn inconsistent_prefix_cursor_scope_and_filters_are_invalid() {
+#[test]
+fn inconsistent_prefix_cursor_scope_and_filters_are_invalid() {
+    focal_rt::block_on(inconsistent_prefix_cursor_scope_and_filters_are_invalid_on_a_shard())
+        .unwrap();
+}
+async fn inconsistent_prefix_cursor_scope_and_filters_are_invalid_on_a_shard() {
     for mode in 0..4 {
         let mut second = page(vec![], Some(1));
         if let Response::Listed(page) = &mut second {
@@ -246,8 +264,14 @@ async fn inconsistent_prefix_cursor_scope_and_filters_are_invalid() {
         );
     }
 }
-#[tokio::test]
-async fn exact_read_preserves_saved_route_and_whole_call_deadline_is_bounded() {
+#[test]
+fn exact_read_preserves_saved_route_and_whole_call_deadline_is_bounded() {
+    focal_rt::block_on(
+        exact_read_preserves_saved_route_and_whole_call_deadline_is_bounded_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn exact_read_preserves_saved_route_and_whole_call_deadline_is_bounded_on_a_shard() {
     let mut saved = token();
     saved.route_epoch = RouteEpoch(3);
     let mock = Mock::new(vec![Response::Read(ReadPage {
@@ -277,8 +301,11 @@ async fn exact_read_preserves_saved_route_and_whole_call_deadline_is_bounded() {
     ));
     assert_eq!(mock.seen.lock().unwrap().len(), 2);
 }
-#[tokio::test]
-async fn invalid_selectors_do_not_reach_transport() {
+#[test]
+fn invalid_selectors_do_not_reach_transport() {
+    focal_rt::block_on(invalid_selectors_do_not_reach_transport_on_a_shard()).unwrap();
+}
+async fn invalid_selectors_do_not_reach_transport_on_a_shard() {
     for mode in 0..4 {
         let mock = Mock::new(vec![]);
         let mut input = request();
@@ -333,14 +360,12 @@ fn authored_exact_compatibility_and_filter_scope_are_checked_without_id_generati
     assert!(parse_json("claim.get", br#"{"source":"self","producer":"self"}"#).is_err());
 }
 
+/// Off a shard, where no deadline could be kept, a read is refused before anything is sent.
 #[test]
-fn missing_time_driver_is_contained_before_transport() {
+fn a_read_off_a_shard_is_refused_before_transport() {
     let mock = Mock::new(Vec::new());
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
     assert!(matches!(
-        runtime.block_on(client(&mock).claim_get(request())),
+        crate::time::off_a_shard(client(&mock).claim_get(request())),
         Err(ClaimGetError::Client(ClientError::Transport))
     ));
     assert!(mock.seen.lock().unwrap().is_empty());

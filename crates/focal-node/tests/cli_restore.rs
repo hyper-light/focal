@@ -47,6 +47,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -167,9 +168,8 @@ fn enroll(root: &Path, client: &Path, name: &str) -> String {
     admin(
         root,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             name,
             "--output",
@@ -181,8 +181,8 @@ fn enroll(root: &Path, client: &Path, name: &str) -> String {
             client,
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 name,
                 "--invite-file",
                 invitation.to_str().unwrap()
@@ -191,13 +191,13 @@ fn enroll(root: &Path, client: &Path, name: &str) -> String {
         .status
         .success()
     );
-    let standing = admin(client, &["--client-context", name, "status"]);
+    let standing = admin(client, &["--client-context", name, "inspect", "prefix"]);
     hex_hash(&objects(&standing)[0]["Standing"]["principal"])
 }
 fn wait_registered(root: &Path, session: &str) -> Value {
     let mut deadline = deadline::Deadline::after(Duration::from_secs(90));
     loop {
-        let placement = admin(root, &["cluster", "placement"]);
+        let placement = admin(root, &["inspect", "placement"]);
         let found = placement["result"]["placement"]["partitions"]
             .as_array()
             .unwrap()
@@ -218,11 +218,11 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
     let founder = temp("focal-restore-a-");
     let client = temp("focal-restore-client-a-");
     let root = founder.path();
-    let activation = admin(root, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let identity = admin(root, &["cluster", "node", "identity"])["result"]["identity"].clone();
+    let identity = admin(root, &["inspect", "node", "--identity"])["result"]["identity"].clone();
     let session = identity["session"].as_str().unwrap().to_owned();
     let tenant = identity["tenant"].as_str().unwrap().to_owned();
     let alice = enroll(root, client.path(), "alice");
@@ -243,17 +243,17 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
         &["submit", "claim", "--json", &document.to_string()],
     ));
     let claim = created(&result, "Claim").remove(0);
-    committed(&cli(root, None, &["claim", "post", &claim]));
+    committed(&cli(root, None, &["post", "claim", &claim]));
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["receipt", "acquire", &claim],
+        &["acquire", "receipt", &claim],
     ));
     let (_, result) = committed(&cli(
         client.path(),
         Some("alice"),
         &[
-            "artifact", "submit", "--claim", &claim, "--slot", "0", "--text", PROOF,
+            "submit", "artifact", "--claim", &claim, "--slot", "0", "--text", PROOF,
         ],
     ));
     let artifact = created(&result, "Artifact").remove(0);
@@ -264,13 +264,7 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
     let backup = founder.path().join("backup");
     let created_backup = admin(
         root,
-        &[
-            "cluster",
-            "backup",
-            "create",
-            "--output",
-            backup.to_str().unwrap(),
-        ],
+        &["create", "backup", "--output", backup.to_str().unwrap()],
     );
     assert_eq!(created_backup["result"]["kind"], "backup_created");
     let backed = created_backup["result"]["backup"].clone();
@@ -282,16 +276,14 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
     let other = temp("focal-restore-b-");
     let client_b = temp("focal-restore-client-b-");
     let root_b = other.path();
-    let activation = admin(root_b, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root_b, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise_b = address();
     let server_b = start(root_b, &advertise_b);
-    let identity_b = admin(root_b, &["cluster", "node", "identity"])["result"]["identity"].clone();
+    let identity_b =
+        admin(root_b, &["inspect", "node", "--identity"])["result"]["identity"].clone();
     assert_ne!(identity_b["cluster"], identity["cluster"]);
-    let admitted = admin(
-        root_b,
-        &["cluster", "tenants", "admit", "--tenant", &tenant],
-    );
+    let admitted = admin(root_b, &["admit", "tenant", "--tenant", &tenant]);
     assert_eq!(admitted["result"]["kind"], "tenants", "{admitted}");
     assert!(
         admitted["result"]["admitted"]
@@ -315,8 +307,8 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
         root_b,
         None,
         &[
-            "cluster",
             "restore",
+            "session",
             "--input",
             backup.to_str().unwrap(),
             "--new-incarnation",
@@ -335,8 +327,8 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
         root_b,
         None,
         &[
-            "cluster",
             "restore",
+            "session",
             "--input",
             backup.to_str().unwrap(),
             "--format",
@@ -351,8 +343,8 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
     let restored = admin(
         root_b,
         &[
-            "cluster",
             "restore",
+            "session",
             "--input",
             backup.to_str().unwrap(),
             "--new-incarnation",
@@ -383,8 +375,8 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
             client_b.path(),
             None,
             &[
-                "context",
                 "add",
+                "context",
                 "restored",
                 "--node-data-dir",
                 root_b.to_str().unwrap(),
@@ -438,9 +430,8 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
     let created_again = admin(
         root_b,
         &[
-            "cluster",
-            "backup",
             "create",
+            "backup",
             "--tenant",
             &tenant,
             "--session",
@@ -455,13 +446,7 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
     assert_eq!(again_backup["prefix"]["session"], session);
     let verified = admin(
         root_b,
-        &[
-            "cluster",
-            "backup",
-            "verify",
-            "--input",
-            again.to_str().unwrap(),
-        ],
+        &["verify", "backup", "--input", again.to_str().unwrap()],
     );
     assert_eq!(
         verified["result"]["verification"]["complete"], true,
@@ -472,8 +457,8 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
         root_b,
         None,
         &[
-            "cluster",
             "restore",
+            "session",
             "--input",
             backup.to_str().unwrap(),
             "--new-incarnation",

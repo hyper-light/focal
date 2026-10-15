@@ -12,13 +12,28 @@
 //! name ranges to the directory); the producer identity, what records carry,
 //! is the group's and is set by whoever opens it.
 
+use super::layout::{self, PackedKey};
 use super::prepare::{self, array};
-use super::{ContractError, Key, NativeError, Row, layout};
+use super::{ContractError, Key, NativeError, Row};
 use focal_memory::{
-    Allocation, BudgetKind, BudgetLane, Change, Entry, MemoryBudget, MemoryError, PreparedRange,
-    RangeConfig, RangeId, RangePreparationPlan, RangeStats, RangeStore, RangeWriteEnvelope,
-    RangeWriteLimits, SnapshotLease,
+    Allocation, BudgetKind, BudgetLane, Change, Entry, FrozenKeySet, FrozenRange, KeyIter, KeySet,
+    KeySetFunding, MemoryBudget, MemoryError, PreparedRange, RangeConfig, RangeId,
+    RangePreparationPlan, RangeStats, RangeStore, RangeWriteEnvelope, RangeWriteLimits, Rewrite,
+    SetKey, SnapshotLease, SparseBase, SparseRange, WeakKeySet,
 };
+
+/// The most reads a group keeps its members' key sets pinned for at once, beside what each
+/// member's store bounds its own leases by.
+const MAX_INDEX_PINS: usize = 1024;
+
+/// One read's key sets, frozen at its prefix and retained by the group until the read is
+/// released, its lease expires, or the group goes (as a store's lease registry retains its
+/// pinned roots); the read holds weak handles alone.
+struct PinnedKeys {
+    expires_at: u64,
+    _sets: Vec<FrozenKeySet>,
+    _charge: Allocation,
+}
 
 #[cfg(test)]
 #[path = "ranges_tests.rs"]
@@ -32,6 +47,435 @@ pub const MAX_LAYOUT_MEMBERS: usize = 1024;
 /// storage order, so a boundary at an affinity never divides an object's
 /// rows. A claim's affinity is its identity's bytes.
 pub type Affinity = [u8; 16];
+
+/// A row as a read sees it: its key whole, its row where its member holds it,
+/// and the heap the row takes. Members hold keys packed (doc 31 M3); a read
+/// gives each back as the key it is.
+#[derive(Clone, Copy)]
+pub(super) struct RowEntry<'a> {
+    pub(super) key: Key,
+    pub(super) value: &'a Row,
+    pub(super) heap_bytes: usize,
+}
+impl<'a> RowEntry<'a> {
+    pub(super) fn of(entry: &'a Entry<PackedKey, Row>) -> Self {
+        Self {
+            key: entry.key.unpack(),
+            value: &entry.value,
+            heap_bytes: entry.heap_bytes,
+        }
+    }
+}
+/// A pending change as a read sees it: a row put at a key, or a key deleted.
+#[derive(Clone, Copy)]
+pub(super) enum RowChange<'a> {
+    Put(RowEntry<'a>),
+    Delete(Key),
+}
+impl<'a> RowChange<'a> {
+    pub(super) fn of(change: &'a Change<PackedKey, Row>) -> Self {
+        match change {
+            Change::Put(entry) => Self::Put(RowEntry::of(entry)),
+            Change::Delete(key) => Self::Delete(key.unpack()),
+        }
+    }
+    pub(super) fn key(&self) -> Key {
+        match self {
+            Self::Put(entry) => entry.key,
+            Self::Delete(key) => *key,
+        }
+    }
+}
+/// A change as the checks over a candidate's changes read it, whichever form holds it: a
+/// change a caller built, or one a candidate holds.
+pub(super) trait ChangeRead {
+    /// The key it changes.
+    fn changed(&self) -> Key;
+    /// The row it puts, `None` for a deletion.
+    fn row(&self) -> Option<&Row>;
+}
+impl ChangeRead for &Change<Key, Row> {
+    fn changed(&self) -> Key {
+        *self.key()
+    }
+    fn row(&self) -> Option<&Row> {
+        match self {
+            Change::Put(entry) => Some(&entry.value),
+            Change::Delete(_) => None,
+        }
+    }
+}
+impl ChangeRead for RowChange<'_> {
+    fn changed(&self) -> Key {
+        self.key()
+    }
+    fn row(&self) -> Option<&Row> {
+        match self {
+            Self::Put(entry) => Some(entry.value),
+            Self::Delete(_) => None,
+        }
+    }
+}
+/// A store's rows read by key, its keys packed underneath: what the checks over a store being
+/// restored read.
+pub(super) trait KeyedRows {
+    fn row(&self, key: &Key) -> Option<&Row>;
+    fn rows_from<'a>(
+        &'a self,
+        key: &Key,
+        exclusive: bool,
+    ) -> impl Iterator<Item = RowEntry<'a>> + use<'a, Self>;
+    fn rows(&self) -> impl Iterator<Item = RowEntry<'_>>;
+}
+impl<'v> KeyedRows for focal_memory::RangeHydrationView<'v, PackedKey, Row> {
+    fn row(&self, key: &Key) -> Option<&Row> {
+        self.get(&PackedKey::probe(key))
+    }
+    fn rows_from<'a>(
+        &'a self,
+        key: &Key,
+        exclusive: bool,
+    ) -> impl Iterator<Item = RowEntry<'a>> + use<'a, 'v> {
+        self.entries_from(&PackedKey::probe(key), exclusive)
+            .map(RowEntry::of)
+    }
+    fn rows(&self) -> impl Iterator<Item = RowEntry<'_>> {
+        self.entries().map(RowEntry::of)
+    }
+}
+/// The row a member's key set gives back for every key it holds: the
+/// secondary index families' unit row (22 §7).
+static INDEX_ROW: Row = Row::Index;
+
+/// Whether `key` is a secondary index family's or a due timer's: a unit row
+/// its member keeps in its key set (doc 31 M3), not its row store. A row
+/// store's entry pays a key slot, a value and a heap count for what is a key
+/// alone; the set pays the key's bytes past the prefix it shares with the key
+/// before it (`focal_memory::KeySet`).
+pub(super) fn indexed(key: &PackedKey) -> bool {
+    matches!(key.family(), 34..=48)
+}
+
+/// A key a member's key set holds, as a read sees it.
+fn index_entry(key: &SetKey) -> RowEntry<'static> {
+    RowEntry {
+        key: layout::unpack_bytes(key.as_bytes()),
+        value: &INDEX_ROW,
+        heap_bytes: 0,
+    }
+}
+
+/// A member's rows and its key set's keys in key order: the two never hold
+/// one key.
+fn merged<'a>(
+    rows: impl Iterator<Item = &'a Entry<PackedKey, Row>>,
+    keys: impl Iterator<Item = SetKey>,
+) -> impl Iterator<Item = RowEntry<'a>> {
+    let mut rows = rows.peekable();
+    let mut keys = keys.peekable();
+    std::iter::from_fn(move || {
+        let row_first = match (rows.peek(), keys.peek()) {
+            (Some(row), Some(key)) => row.key.as_bytes() < key.as_bytes(),
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if row_first {
+            rows.next().map(RowEntry::of)
+        } else {
+            keys.next().map(|key| index_entry(&key))
+        }
+    })
+}
+
+/// A key set as a write leaves it: `base`'s keys with `changes` (ascending
+/// puts of the unit row and deletions) over them.
+fn overlay<'a>(
+    mut base: KeyIter<'a>,
+    changes: &'a [Change<PackedKey, Row>],
+) -> impl Iterator<Item = SetKey> + 'a {
+    let mut held = base.next();
+    let mut changes = changes.iter().peekable();
+    // Each call takes a held key or a change, and returns but where a
+    // deletion removes one: at most the base's keys and the changes.
+    std::iter::from_fn(move || {
+        loop {
+            let change = changes.peek().copied();
+            match (held, change) {
+                (None, None) => return None,
+                (Some(key), None) => {
+                    held = base.next();
+                    return Some(key);
+                }
+                (None, Some(change)) => {
+                    changes.next();
+                    if let Change::Put(entry) = change {
+                        return SetKey::new(entry.key.as_bytes()).ok();
+                    }
+                }
+                (Some(key), Some(change)) => match key.as_bytes().cmp(change.key().as_bytes()) {
+                    std::cmp::Ordering::Less => {
+                        held = base.next();
+                        return Some(key);
+                    }
+                    std::cmp::Ordering::Equal => {
+                        held = base.next();
+                        changes.next();
+                        if let Change::Put(_) = change {
+                            return Some(key);
+                        }
+                    }
+                    std::cmp::Ordering::Greater => {
+                        changes.next();
+                        if let Change::Put(entry) = change {
+                            return SetKey::new(entry.key.as_bytes()).ok();
+                        }
+                    }
+                },
+            }
+        }
+    })
+}
+
+/// The changes of a member's index families taken out of `changes` (sorted),
+/// sorted, the rest left in place: the member's key set publishes them.
+fn take_index(
+    changes: &mut Vec<Change<PackedKey, Row>>,
+) -> Result<Vec<Change<PackedKey, Row>>, MemoryError> {
+    let count = changes
+        .iter()
+        .filter(|change| indexed(change.key()))
+        .count();
+    let mut index = Vec::new();
+    if count == 0 {
+        return Ok(index);
+    }
+    index
+        .try_reserve_exact(count)
+        .map_err(|_| MemoryError::AllocationFailed)?;
+    index.extend(changes.extract_if(.., |change| indexed(change.key())));
+    Ok(index)
+}
+
+/// A member's index changes in one write (doc 31 M3): strictly ascending puts
+/// of the unit row and deletions, each checked against the state the write is
+/// planned on, and what their publication may spend.
+struct IndexPart {
+    changes: Vec<Change<PackedKey, Row>>,
+    /// The keys the member's set holds before this publishes, and after.
+    base_len: usize,
+    len: usize,
+    /// What the publication may spend; none for no change.
+    funding: Option<KeySetFunding>,
+    /// The changes' vector.
+    _input: Allocation,
+}
+
+impl IndexPart {
+    /// `changes` (sorted) checked over a state whose set holds `base_len`
+    /// keys, `present` saying which it holds; their vector charged to
+    /// `funding` where the caller funded its changes (a replayed record's), to
+    /// `source` otherwise; their publication funded from `source`.
+    #[allow(clippy::too_many_arguments)]
+    fn plan(
+        set: &KeySet,
+        source: &MemoryBudget,
+        funding: Option<&mut Allocation>,
+        base_len: usize,
+        changes: Vec<Change<PackedKey, Row>>,
+        lane: BudgetLane,
+        present: &mut impl FnMut(&PackedKey) -> Option<usize>,
+    ) -> Result<Self, MemoryError> {
+        if set.is_poisoned() {
+            return Err(MemoryError::InvalidConfiguration(
+                "key set poisoned by a failed publication",
+            ));
+        }
+        if changes.windows(2).any(|pair| {
+            pair.first()
+                .zip(pair.last())
+                .is_some_and(|(left, right)| left.key() >= right.key())
+        }) {
+            return Err(MemoryError::DuplicateKey);
+        }
+        let mut len = base_len;
+        for change in &changes {
+            match change {
+                Change::Put(entry) => {
+                    if !matches!(entry.value, Row::Index)
+                        || entry.heap_bytes != entry.key.heap_bytes()
+                    {
+                        return Err(MemoryError::InvalidConfiguration(
+                            "an index family's row holds a value",
+                        ));
+                    }
+                    if present(&entry.key).is_none() {
+                        len = len.checked_add(1).ok_or(MemoryError::AllocationFailed)?;
+                    }
+                }
+                Change::Delete(key) => {
+                    present(key).ok_or(MemoryError::MissingKey)?;
+                    len = len.checked_sub(1).ok_or(MemoryError::MissingKey)?;
+                }
+            }
+        }
+        let input = input_bytes(changes.capacity())?;
+        let input = match funding {
+            Some(funding) => funding.split_off(input)?,
+            None => source.reserve(BudgetKind::Pending, lane, input)?.commit(),
+        };
+        let funding = if changes.is_empty() {
+            None
+        } else {
+            Some(set.fund(source, lane, changes.len())?)
+        };
+        Ok(Self {
+            changes,
+            base_len,
+            len,
+            funding,
+            _input: input,
+        })
+    }
+    /// Where this part changes `key`, and the change.
+    fn change(&self, key: &PackedKey) -> Option<(usize, &Change<PackedKey, Row>)> {
+        let index = self
+            .changes
+            .binary_search_by(|change| change.key().cmp(key))
+            .ok()?;
+        self.changes.get(index).map(|change| (index, change))
+    }
+    /// What the part holds from plan to publication.
+    fn held_bytes(&self) -> Result<usize, MemoryError> {
+        input_bytes(self.changes.capacity())?
+            .checked_add(self.funding.as_ref().map_or(0, KeySetFunding::bytes))
+            .ok_or(MemoryError::AllocationFailed)
+    }
+    /// Publishes the part onto `set`, which holds `base_len` keys.
+    fn publish(&mut self, set: &mut KeySet) -> Result<(), MemoryError> {
+        if self.changes.is_empty() {
+            return Ok(());
+        }
+        let funding = self
+            .funding
+            .as_mut()
+            .ok_or(MemoryError::InvalidConfiguration(
+                "an index part lost its funding",
+            ))?;
+        set.publish(&self.changes, funding)
+    }
+}
+
+/// The charge of a vector of `capacity` changes.
+fn input_bytes(capacity: usize) -> Result<usize, MemoryError> {
+    if capacity == 0 {
+        return Ok(0);
+    }
+    capacity
+        .checked_mul(size_of::<Change<PackedKey, Row>>())
+        .and_then(|bytes| bytes.checked_add(prepare::ALLOCATION))
+        .ok_or(MemoryError::AllocationFailed)
+}
+
+/// A member's rows' and index changes, merged in key order, each with its
+/// position: the rows' at their index, the index changes' after every row
+/// change.
+fn merged_changes<'a>(
+    rows: &'a [Change<PackedKey, Row>],
+    index: &'a [Change<PackedKey, Row>],
+) -> impl Iterator<Item = (usize, &'a Change<PackedKey, Row>)> + 'a {
+    let offset = rows.len();
+    let mut rows = rows.iter().enumerate().peekable();
+    let mut index = index.iter().enumerate().peekable();
+    std::iter::from_fn(move || {
+        let row_first = match (rows.peek(), index.peek()) {
+            (Some((_, row)), Some((_, key))) => row.key() < key.key(),
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => return None,
+        };
+        if row_first {
+            rows.next()
+        } else {
+            index
+                .next()
+                .map(|(position, change)| (offset.saturating_add(position), change))
+        }
+    })
+}
+
+/// A restore's rows and index keys, read as one store (doc 31 M3): what the
+/// checks over a store being restored read.
+pub(super) struct HydratedRows<'a> {
+    rows: &'a focal_memory::RangeHydrationView<'a, PackedKey, Row>,
+    keys: &'a KeySet,
+}
+impl<'a> HydratedRows<'a> {
+    pub(super) fn new(
+        rows: &'a focal_memory::RangeHydrationView<'a, PackedKey, Row>,
+        keys: &'a KeySet,
+    ) -> Self {
+        Self { rows, keys }
+    }
+    pub(super) fn len(&self) -> usize {
+        self.rows.len().saturating_add(self.keys.len())
+    }
+    pub(super) fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.keys.is_empty()
+    }
+}
+impl<'h> KeyedRows for HydratedRows<'h> {
+    fn row(&self, key: &Key) -> Option<&Row> {
+        let key = PackedKey::probe(key);
+        if indexed(&key) {
+            return self.keys.contains(key.as_bytes()).then_some(&INDEX_ROW);
+        }
+        self.rows.get(&key)
+    }
+    fn rows_from<'b>(
+        &'b self,
+        key: &Key,
+        exclusive: bool,
+    ) -> impl Iterator<Item = RowEntry<'b>> + use<'b, 'h> {
+        let key = PackedKey::probe(key);
+        merged(
+            self.rows.entries_from(&key, exclusive),
+            self.keys.iter_from(key.as_bytes(), exclusive),
+        )
+    }
+    fn rows(&self) -> impl Iterator<Item = RowEntry<'_>> {
+        merged(self.rows.entries(), self.keys.iter())
+    }
+}
+
+/// `changes` with every key packed, each wide key's heap charged to the row it
+/// keys (a delete's key is its caller's, gone with the change).
+fn pack_changes(
+    changes: Vec<Change<Key, Row>>,
+) -> Result<Vec<Change<PackedKey, Row>>, MemoryError> {
+    let mut packed = Vec::new();
+    packed
+        .try_reserve_exact(changes.len())
+        .map_err(|_| MemoryError::AllocationFailed)?;
+    for change in changes {
+        packed.push(match change {
+            Change::Put(entry) => {
+                let key = PackedKey::pack(&entry.key)?;
+                let heap_bytes = entry
+                    .heap_bytes
+                    .checked_add(key.heap_bytes())
+                    .ok_or(MemoryError::AllocationFailed)?;
+                Change::Put(Entry {
+                    key,
+                    value: entry.value,
+                    heap_bytes,
+                })
+            }
+            Change::Delete(key) => Change::Delete(PackedKey::pack(&key)?),
+        });
+    }
+    Ok(packed)
+}
 
 /// One member's boundary: its identity and the least affinity it holds,
 /// `None` for the first member.
@@ -63,7 +507,7 @@ impl RangeLayout {
     /// One member holding every key.
     pub(super) fn single(id: RangeId, budget: &MemoryBudget) -> Result<Self, MemoryError> {
         let mut members = Vec::new();
-        let allocation = reserve::<RangeBoundary>(budget, 1)?;
+        let allocation = reserve::<RangeBoundary>(budget, 1, BudgetLane::Ordinary)?;
         members
             .try_reserve_exact(1)
             .map_err(|_| MemoryError::AllocationFailed)?;
@@ -180,8 +624,8 @@ impl RangeLayout {
     }
     /// The member holding `key`: the last whose start is at or below the
     /// key's affinity.
-    pub(super) fn route(&self, key: &Key) -> usize {
-        route(&self.members, |member| member.start, &layout::affinity(key))
+    fn route_packed(&self, key: &PackedKey) -> usize {
+        self.route_affinity(&key.affinity())
     }
     /// The member holding `affinity`.
     pub fn route_affinity(&self, affinity: &Affinity) -> usize {
@@ -193,15 +637,21 @@ impl RangeLayout {
     }
 }
 
-fn reserve<T>(budget: &MemoryBudget, count: usize) -> Result<Allocation, MemoryError> {
+fn reserve<T>(
+    budget: &MemoryBudget,
+    count: usize,
+    lane: BudgetLane,
+) -> Result<Allocation, MemoryError> {
     let bytes = array::<T>(count).map_err(|_| MemoryError::Capacity {
         requested: count,
         available: MAX_LAYOUT_MEMBERS,
     })?;
-    Ok(budget
-        .reserve(BudgetKind::Roots, BudgetLane::Ordinary, bytes)?
-        .commit())
+    Ok(budget.reserve(BudgetKind::Roots, lane, bytes)?.commit())
 }
+
+/// How many rows a member's split point reads from its middle for an
+/// affinity that divides it.
+const SPLIT_SCAN: usize = 4096;
 
 fn route<T>(members: &[T], start: impl Fn(&T) -> Option<Affinity>, affinity: &Affinity) -> usize {
     members
@@ -209,12 +659,65 @@ fn route<T>(members: &[T], start: impl Fn(&T) -> Option<Affinity>, affinity: &Af
         .saturating_sub(1)
 }
 
+/// A range group frozen at its committed prefix ([`NativeRanges::freeze`]):
+/// read-only and sendable, every page charged where it was.
+pub(super) struct FrozenRanges {
+    producer: RangeId,
+    epoch: u64,
+    members: Vec<RangeBoundary>,
+    stores: Vec<FrozenRange<PackedKey, Row>>,
+    /// Each member's key set as it stood (doc 31 M3).
+    indexes: Vec<FrozenKeySet>,
+    _charges: [Allocation; 3],
+}
+
+impl FrozenRanges {
+    pub(super) fn id(&self) -> RangeId {
+        self.producer
+    }
+    pub(super) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub(super) fn members(&self) -> &[RangeBoundary] {
+        &self.members
+    }
+    pub(super) fn prefix(&self) -> u64 {
+        self.stores.first().map_or(0, FrozenRange::prefix)
+    }
+    pub(super) fn len(&self) -> usize {
+        self.stores
+            .iter()
+            .map(FrozenRange::len)
+            .chain(self.indexes.iter().map(FrozenKeySet::len))
+            .sum()
+    }
+    pub(super) fn pages(&self) -> usize {
+        self.stores
+            .iter()
+            .fold(0, |pages, store| pages.saturating_add(store.pages()))
+    }
+    /// Every row in key order.
+    pub(super) fn entries(&self) -> impl Iterator<Item = RowEntry<'_>> {
+        self.stores
+            .iter()
+            .zip(self.indexes.iter())
+            .flat_map(|(store, index)| merged(store.entries(), index.iter()))
+    }
+}
+
 /// The rows of one native state: the range group.
 pub(super) struct NativeRanges {
     producer: RangeId,
     layout: RangeLayout,
-    stores: Vec<RangeStore<Key, Row>>,
+    stores: Vec<RangeStore<PackedKey, Row>>,
+    /// Each member's index families' keys (doc 31 M3), beside its rows:
+    /// `indexes[i]` holds member `i`'s.
+    indexes: Vec<KeySet>,
+    /// The key sets pinned for reads, by the read's serial.
+    index_pins: std::collections::BTreeMap<u64, PinnedKeys>,
+    next_pin: u64,
     _allocation: Allocation,
+    _index_allocation: Allocation,
 }
 
 impl std::fmt::Debug for NativeRanges {
@@ -235,28 +738,32 @@ impl NativeRanges {
         producer: RangeId,
         config: RangeConfig,
         budget: &MemoryBudget,
-        partition: fn(&Key) -> u64,
+        partition: fn(&PackedKey) -> u64,
     ) -> Result<Self, MemoryError> {
         let store = RangeStore::new_partitioned(producer, 0, config, budget.clone(), partition)?;
+        let index = KeySet::new(budget, BudgetLane::Ordinary)?;
         let layout = RangeLayout::single(producer, budget)?;
         Self::assemble(
             producer,
             layout,
             store,
+            index,
             budget,
             BudgetLane::Ordinary,
             prepare::copy,
         )
     }
 
-    /// A group over `store`, which holds every row, laid out per `layout`:
-    /// the store is divided at every boundary (sharing every page but the
-    /// boundary pages, copied through `copy`). Member identities are the
-    /// layout's; the stores' own identities are process-local.
+    /// A group over `store` and `index`, which hold every row and every index
+    /// key, laid out per `layout`: each is divided at every boundary (sharing
+    /// every page but the boundary pages, copied through `copy`, and every
+    /// block but the boundary block). Member identities are the layout's; the
+    /// stores' own identities are process-local.
     pub(super) fn from_store<F>(
         producer: RangeId,
         layout: RangeLayout,
-        store: RangeStore<Key, Row>,
+        store: RangeStore<PackedKey, Row>,
+        index: KeySet,
         budget: &MemoryBudget,
         lane: BudgetLane,
         copy: F,
@@ -264,13 +771,15 @@ impl NativeRanges {
     where
         F: FnMut(&Row) -> Result<Row, MemoryError>,
     {
-        Self::assemble(producer, layout, store, budget, lane, copy)
+        Self::assemble(producer, layout, store, index, budget, lane, copy)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble<F>(
         producer: RangeId,
         layout: RangeLayout,
-        store: RangeStore<Key, Row>,
+        store: RangeStore<PackedKey, Row>,
+        index: KeySet,
         budget: &MemoryBudget,
         lane: BudgetLane,
         mut copy: F,
@@ -282,12 +791,21 @@ impl NativeRanges {
         if members == 0 {
             return Err(MemoryError::InvalidConfiguration("empty range layout"));
         }
-        let allocation = reserve::<RangeStore<Key, Row>>(budget, members)?;
+        // The group's own directory is charged to the assembly's lane, as
+        // its stores are: a restore funded by the completion allowance
+        // assembles under it alone.
+        let allocation = reserve::<RangeStore<PackedKey, Row>>(budget, members, lane)?;
+        let index_allocation = reserve::<KeySet>(budget, members, lane)?;
         let mut stores = Vec::new();
         stores
             .try_reserve_exact(members)
             .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut indexes = Vec::new();
+        indexes
+            .try_reserve_exact(members)
+            .map_err(|_| MemoryError::AllocationFailed)?;
         let mut remaining = store;
+        let mut remaining_index = index;
         for (index, boundary) in layout.members.iter().enumerate().skip(1) {
             let start = boundary
                 .start
@@ -298,21 +816,31 @@ impl NativeRanges {
                 .ok_or(MemoryError::WrongRange)?
                 .id;
             let (left, right) = remaining.split_where_with(
-                |key| layout::affinity(key) >= start,
+                |key| key.affinity() >= start,
                 left_id,
                 boundary.id,
                 lane,
                 &mut copy,
             )?;
+            // A key's first sixteen bytes are its affinity: the keys from
+            // `start` on are those at or above it as bytes.
+            let (left_index, right_index) = remaining_index.split_at(&start, lane)?;
             stores.push(left);
+            indexes.push(left_index);
             remaining = right;
+            remaining_index = right_index;
         }
         stores.push(remaining);
+        indexes.push(remaining_index);
         Ok(Self {
             producer,
             layout,
             stores,
+            indexes,
+            index_pins: std::collections::BTreeMap::new(),
+            next_pin: 0,
             _allocation: allocation,
+            _index_allocation: index_allocation,
         })
     }
 
@@ -323,6 +851,11 @@ impl NativeRanges {
     pub(super) fn layout(&self) -> &RangeLayout {
         &self.layout
     }
+    /// Each member's key set, for a measurement.
+    #[cfg(test)]
+    pub(super) fn indexes(&self) -> &[KeySet] {
+        &self.indexes
+    }
     pub(super) fn members(&self) -> usize {
         self.stores.len()
     }
@@ -330,62 +863,158 @@ impl NativeRanges {
         self.stores.first().map_or(0, RangeStore::prefix)
     }
     pub(super) fn len(&self) -> usize {
-        self.stores.iter().map(RangeStore::len).sum()
-    }
-    fn member(&self, key: &Key) -> Option<&RangeStore<Key, Row>> {
-        self.stores.get(self.layout.route(key))
+        self.stores
+            .iter()
+            .map(RangeStore::len)
+            .chain(self.indexes.iter().map(KeySet::len))
+            .sum()
     }
     pub(super) fn get(&self, key: &Key) -> Option<&Row> {
-        self.member(key)?.get(key)
+        let key = PackedKey::probe(key);
+        let member = self.layout.route_packed(&key);
+        if indexed(&key) {
+            return self
+                .indexes
+                .get(member)?
+                .contains(key.as_bytes())
+                .then_some(&INDEX_ROW);
+        }
+        self.stores.get(member)?.get(&key)
+    }
+    /// Rewrites the row at `key` where it stands ([`RangeStore::rewrite`]): a held row's value
+    /// moved off the heap. An index family's key has no value to rewrite.
+    pub(super) fn rewrite(
+        &mut self,
+        key: &Key,
+        rewrite: impl FnOnce(&Row) -> Result<Option<(Row, usize)>, MemoryError>,
+    ) -> Result<Rewrite, MemoryError> {
+        let key = PackedKey::probe(key);
+        if indexed(&key) {
+            return Ok(Rewrite::Unchanged);
+        }
+        let member = self.layout.route_packed(&key);
+        match self.stores.get_mut(member) {
+            Some(store) => store.rewrite(&key, rewrite),
+            None => Ok(Rewrite::Absent),
+        }
     }
     /// Every row in key order.
-    pub(super) fn entries(&self) -> impl Iterator<Item = &Entry<Key, Row>> {
-        self.stores.iter().flat_map(RangeStore::entries)
+    pub(super) fn entries(&self) -> impl Iterator<Item = RowEntry<'_>> {
+        self.stores
+            .iter()
+            .zip(self.indexes.iter())
+            .flat_map(|(store, index)| merged(store.entries(), index.iter()))
+    }
+    /// Every member frozen at the committed prefix, in the layout they lie
+    /// in: an image a checkpoint encodes from while the group goes on. Its
+    /// charges are committed work: a checkpoint keeps what was committed, so
+    /// an owner whose fresh admissions filled its ordinary lane, as a full
+    /// session's have, still takes one (doc 31 M3).
+    pub(super) fn freeze(&self, budget: &MemoryBudget) -> Result<FrozenRanges, MemoryError> {
+        let count = self.stores.len();
+        let boundaries_charge = reserve::<RangeBoundary>(budget, count, BudgetLane::Committed)?;
+        let stores_charge =
+            reserve::<FrozenRange<PackedKey, Row>>(budget, count, BudgetLane::Committed)?;
+        let indexes_charge = reserve::<FrozenKeySet>(budget, count, BudgetLane::Committed)?;
+        let mut indexes = Vec::new();
+        indexes
+            .try_reserve_exact(count)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        for index in &self.indexes {
+            indexes.push(index.freeze(BudgetLane::Committed)?);
+        }
+        let mut members = Vec::new();
+        members
+            .try_reserve_exact(count)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        members.extend(self.layout.members.iter().copied());
+        let mut stores = Vec::new();
+        stores
+            .try_reserve_exact(count)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        for store in &self.stores {
+            stores.push(store.freeze_in(BudgetLane::Committed)?);
+        }
+        Ok(FrozenRanges {
+            producer: self.producer,
+            epoch: self.layout.epoch,
+            members,
+            stores,
+            indexes,
+            _charges: [boundaries_charge, stores_charge, indexes_charge],
+        })
     }
     /// Rows at or after `key` in key order, across members.
     pub(super) fn entries_from<'a>(
         &'a self,
         key: &Key,
         exclusive: bool,
-    ) -> impl Iterator<Item = &'a Entry<Key, Row>> + use<'a> {
-        let index = self.layout.route(key);
+    ) -> impl Iterator<Item = RowEntry<'a>> + use<'a> {
+        let key = PackedKey::probe(key);
+        let index = self.layout.route_packed(&key);
         let first = self
             .stores
             .get(index)
-            .map(|store| store.entries_from(key, exclusive));
+            .zip(self.indexes.get(index))
+            .map(|(store, set)| {
+                merged(
+                    store.entries_from(&key, exclusive),
+                    set.iter_from(key.as_bytes(), exclusive),
+                )
+            });
         let rest = self
             .stores
             .get(index.saturating_add(1)..)
             .into_iter()
             .flatten()
-            .flat_map(RangeStore::entries);
+            .zip(
+                self.indexes
+                    .get(index.saturating_add(1)..)
+                    .into_iter()
+                    .flatten(),
+            )
+            .flat_map(|(store, set)| merged(store.entries(), set.iter()));
         first.into_iter().flatten().chain(rest)
     }
     /// The rows of the member at `index`, in key order.
     pub(super) fn member_entries(
         &self,
         index: usize,
-    ) -> Option<impl Iterator<Item = &Entry<Key, Row>>> {
-        self.stores.get(index).map(|store| store.entries())
+    ) -> Option<impl Iterator<Item = RowEntry<'_>>> {
+        self.stores
+            .get(index)
+            .zip(self.indexes.get(index))
+            .map(|(store, set)| merged(store.entries(), set.iter()))
     }
-    /// The statistics of the member at `index`.
+    /// The statistics of the member at `index`: its index keys among its
+    /// entries.
     pub(super) fn member_stats(&self, index: usize) -> Option<RangeStats> {
-        self.stores.get(index).map(RangeStore::stats)
+        let mut stats = self.stores.get(index).map(RangeStore::stats)?;
+        stats.entries = stats
+            .entries
+            .saturating_add(self.indexes.get(index).map_or(0, KeySet::len));
+        Some(stats)
     }
     /// An affinity that divides the member at `index` near its middle (25
     /// §8): the first affinity boundary at or after the median row, so both
     /// sides keep rows; `None` when the member's rows share one affinity.
+    /// An affinity dividing member `index` near its middle: the first after
+    /// a row of a smaller one, from the page before its middle page on
+    /// (reached by one descent; the walk from its first row to its middle one
+    /// read half its rows, and its balancer asks again at every pass a split
+    /// is refused, which it is while candidates are pending). None where no
+    /// affinity changes within [`SPLIT_SCAN`] rows of there, or the member has
+    /// fewer than two rows.
     pub(super) fn member_split_point(&self, index: usize) -> Option<Affinity> {
         let store = self.stores.get(index)?;
-        let count = store.len();
-        if count < 2 {
+        if store.len() < 2 {
             return None;
         }
-        let middle = count / 2;
+        let start = (store.stats().pages / 2).saturating_sub(1);
         let mut previous: Option<Affinity> = None;
-        for (position, entry) in store.entries().enumerate() {
-            let affinity = layout::affinity(&entry.key);
-            if position >= middle && previous.is_some_and(|before| affinity > before) {
+        for entry in store.entries_from_page(start).take(SPLIT_SCAN) {
+            let affinity = entry.key.affinity();
+            if previous.is_some_and(|before| affinity > before) {
                 return Some(affinity);
             }
             previous = Some(affinity);
@@ -400,6 +1029,9 @@ impl NativeRanges {
             pinned_snapshots: 0,
             clock: 0,
         };
+        for index in &self.indexes {
+            stats.entries = stats.entries.saturating_add(index.len());
+        }
         for store in &self.stores {
             let member = store.stats();
             stats.entries = stats.entries.saturating_add(member.entries);
@@ -409,15 +1041,36 @@ impl NativeRanges {
         }
         stats
     }
-    /// Audit an ordered chain of fragment sets against every member.
+    /// Audit an ordered chain of fragment sets against every member: the
+    /// first on the published prefix, each after on the one before it.
     pub(super) fn validate_chain<'a>(
         &self,
-        pending: impl Iterator<Item = &'a Fragments> + Clone,
+        mut pending: impl Iterator<Item = &'a Fragments> + Clone,
     ) -> Result<(), MemoryError> {
+        let Some(first) = pending.clone().next() else {
+            return Ok(());
+        };
+        if let FragmentKind::Sparse(parts) = &first.kind {
+            if parts.len() != self.stores.len() {
+                return Err(MemoryError::WrongRange);
+            }
+            for ((store, set), part) in self.stores.iter().zip(&self.indexes).zip(parts.iter()) {
+                store.check_sparse(&part.value.rows)?;
+                check_index(set, &part.value.index)?;
+            }
+            let mut previous = pending.next();
+            for next in pending {
+                if let Some(previous) = previous {
+                    previous.validate_successor(next)?;
+                }
+                previous = Some(next);
+            }
+            return Ok(());
+        }
         for (index, store) in self.stores.iter().enumerate() {
             let mut missing = false;
             store.validate_chain(pending.clone().filter_map(|fragments| {
-                let part = fragments.part(index);
+                let part = fragments.built(index);
                 missing |= part.is_none();
                 part
             }))?;
@@ -425,53 +1078,197 @@ impl NativeRanges {
                 return Err(MemoryError::WrongRange);
             }
         }
+        if let (FragmentKind::Built(parts), true) = (&first.kind, pending.clone().nth(1).is_none())
+        {
+            for (set, part) in self.indexes.iter().zip(parts.iter()) {
+                check_index(set, &part.value.index)?;
+            }
+        }
         Ok(())
     }
-    /// Plan one write at the next prefix over the published members. A
-    /// group of one plans without allocating; a wider group charges one
-    /// vector of further plans to `source`, the budget the write will build
-    /// from, within the group bytes its envelope carries.
-    pub(super) fn plan_batch<'a>(
-        &'a self,
+    /// Plan one write at the next prefix as its changes alone (doc 30 §9),
+    /// over the base state its caller reads: the published members with the
+    /// pending candidates' changes over them, `tail` the newest of those,
+    /// `present` the heap of the row that state holds at a key. Each member's
+    /// part holds its changes and what its publication may spend; nothing of
+    /// the members' pages. A wider group charges one vector of further parts
+    /// to `source`.
+    pub(super) fn plan_sparse(
+        &self,
         source: &MemoryBudget,
+        tail: Option<&Fragments>,
         prefix: u64,
         changes: Vec<Change<Key, Row>>,
         lane: BudgetLane,
-        max_bytes: usize,
-    ) -> Result<RangesPlan<'a>, MemoryError> {
-        self.plan(source, None, prefix, changes, lane, max_bytes)
+        present: impl FnMut(&Key) -> Option<usize>,
+    ) -> Result<Fragments, MemoryError> {
+        self.plan_sparse_from(source, None, tail, prefix, changes, lane, None, present)
     }
-    /// Plan one write against an unpublished predecessor's fragments.
-    pub(super) fn plan_after<'a>(
-        &'a self,
+    /// [`Self::plan_sparse`] of a change set that may pass the store's bound on a batch, up to
+    /// `max_entries`: a retirement's, whose one family may (doc 31 M2).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn plan_sparse_bounded(
+        &self,
         source: &MemoryBudget,
-        predecessor: &'a Fragments,
+        tail: Option<&Fragments>,
         prefix: u64,
         changes: Vec<Change<Key, Row>>,
         lane: BudgetLane,
-        max_bytes: usize,
-    ) -> Result<RangesPlan<'a>, MemoryError> {
-        if predecessor.parts.len() != self.stores.len() {
+        max_entries: usize,
+        present: impl FnMut(&Key) -> Option<usize>,
+    ) -> Result<Fragments, MemoryError> {
+        self.plan_sparse_from(
+            source,
+            None,
+            tail,
+            prefix,
+            changes,
+            lane,
+            Some(max_entries),
+            present,
+        )
+    }
+    /// [`Self::plan_sparse`] over the published members alone, each member's
+    /// part of the changes funded from `funding`, which its caller reserved
+    /// with them (a follower's replayed record): never charged twice.
+    pub(super) fn plan_sparse_funded(
+        &self,
+        source: &MemoryBudget,
+        funding: &mut Allocation,
+        prefix: u64,
+        changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        present: impl FnMut(&Key) -> Option<usize>,
+    ) -> Result<Fragments, MemoryError> {
+        self.plan_sparse_from(
+            source,
+            Some(funding),
+            None,
+            prefix,
+            changes,
+            lane,
+            None,
+            present,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn plan_sparse_from(
+        &self,
+        source: &MemoryBudget,
+        mut funding: Option<&mut Allocation>,
+        tail: Option<&Fragments>,
+        prefix: u64,
+        changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        max_entries: Option<usize>,
+        mut present: impl FnMut(&Key) -> Option<usize>,
+    ) -> Result<Fragments, MemoryError> {
+        #[cfg(test)]
+        prepare::copy_failure()?;
+        let mut changes = pack_changes(changes)?;
+        changes.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+        // The index families' changes leave for their own vector, published by
+        // each member's key set (doc 31 M3).
+        let mut index_changes = take_index(&mut changes)?;
+        let mut present = |key: &PackedKey| present(&key.unpack());
+        let members = self.stores.len();
+        if tail.is_some_and(|tail| tail.members() != members) {
             return Err(MemoryError::WrongRange);
         }
-        self.plan(source, Some(predecessor), prefix, changes, lane, max_bytes)
-    }
-    fn plan<'a>(
-        &'a self,
-        source: &MemoryBudget,
-        predecessor: Option<&'a Fragments>,
-        prefix: u64,
-        mut changes: Vec<Change<Key, Row>>,
-        lane: BudgetLane,
-        max_bytes: usize,
-    ) -> Result<RangesPlan<'a>, MemoryError> {
-        changes.sort_unstable_by(|left, right| left.key().cmp(right.key()));
-        let members = self.stores.len();
         let (mut rest, allocation) = Parts::reserve_rest(members, source, lane)?;
-        // Divide the sorted input at every boundary from the last member
-        // down, so every member's part is one split of the same vector; the
-        // parts are planned in member order as they come off the stack.
-        let mut stack: Vec<Vec<Change<Key, Row>>> = Vec::new();
+        let mut stack = self.divide(&mut changes)?;
+        let mut index_stack = self.divide(&mut index_changes)?;
+        let mut first = None;
+        for (index, (store, set)) in self.stores.iter().zip(&self.indexes).enumerate() {
+            let (part, index_part) = if index == 0 {
+                (
+                    std::mem::take(&mut changes),
+                    std::mem::take(&mut index_changes),
+                )
+            } else {
+                (
+                    stack.pop().unwrap_or_default(),
+                    index_stack.pop().unwrap_or_default(),
+                )
+            };
+            let base = match tail {
+                Some(tail) => SparseBase::After(tail.sparse(index).ok_or(MemoryError::WrongRange)?),
+                None => SparseBase::Committed,
+            };
+            let base_len = match tail {
+                Some(tail) => tail.index_part(index).ok_or(MemoryError::WrongRange)?.len,
+                None => set.len(),
+            };
+            let value = match funding.as_deref_mut() {
+                Some(funding) => store.plan_sparse_funded(
+                    source,
+                    funding,
+                    base,
+                    prefix,
+                    part,
+                    lane,
+                    max_entries.unwrap_or(store.max_batch_entries()),
+                    &mut present,
+                )?,
+                None => store.plan_sparse(
+                    source,
+                    base,
+                    prefix,
+                    part,
+                    lane,
+                    max_entries.unwrap_or(store.max_batch_entries()),
+                    &mut present,
+                )?,
+            };
+            let index_part = IndexPart::plan(
+                set,
+                source,
+                funding.as_deref_mut(),
+                base_len,
+                index_part,
+                lane,
+                &mut present,
+            )?;
+            let member = RangesMember {
+                start: self
+                    .layout
+                    .members
+                    .get(index)
+                    .ok_or(MemoryError::WrongRange)?
+                    .start,
+                value: SparseMember {
+                    rows: value,
+                    index: index_part,
+                },
+            };
+            if index == 0 {
+                first = Some(member);
+            } else {
+                if rest.len() >= rest.capacity() {
+                    return Err(MemoryError::WrongRange);
+                }
+                rest.push(member);
+            }
+        }
+        let first = first.ok_or(MemoryError::InvalidConfiguration("empty range group"))?;
+        Ok(Fragments {
+            producer: self.producer,
+            kind: FragmentKind::Sparse(Parts {
+                first,
+                rest,
+                _allocation: allocation,
+            }),
+        })
+    }
+    /// Divides sorted `changes` at every member boundary from the last down:
+    /// `changes` keeps the first member's, and the stack the rest's, the
+    /// second member's on top.
+    fn divide(
+        &self,
+        changes: &mut Vec<Change<PackedKey, Row>>,
+    ) -> Result<Vec<Vec<Change<PackedKey, Row>>>, MemoryError> {
+        let members = self.stores.len();
+        let mut stack: Vec<Vec<Change<PackedKey, Row>>> = Vec::new();
         if members > 1 {
             stack
                 .try_reserve_exact(members.saturating_sub(1))
@@ -481,7 +1278,7 @@ impl NativeRanges {
             let start = boundary
                 .start
                 .ok_or(MemoryError::InvalidConfiguration("unbounded range member"))?;
-            let at = changes.partition_point(|change| layout::affinity(change.key()) < start);
+            let at = changes.partition_point(|change| change.key().affinity() < start);
             let part = if at == changes.len() {
                 Vec::new()
             } else {
@@ -489,22 +1286,99 @@ impl NativeRanges {
             };
             stack.push(part);
         }
+        Ok(stack)
+    }
+    /// Plan one write at the next prefix over the published members. A
+    /// group of one plans without allocating; a wider group charges one
+    /// vector of further plans to `source`, the budget the write will build
+    /// from, within the group bytes its envelope carries.
+    #[cfg(test)]
+    pub(super) fn plan_batch<'a>(
+        &'a self,
+        source: &MemoryBudget,
+        prefix: u64,
+        changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        max_bytes: usize,
+    ) -> Result<RangesPlan<'a>, MemoryError> {
+        self.plan(source, None, prefix, changes, lane, max_bytes, None)
+    }
+    /// `max_entries`: a decision's own bound on its batch, where a write is
+    /// held to the members' `max_batch_entries`.
+    #[allow(clippy::too_many_arguments)]
+    fn plan<'a>(
+        &'a self,
+        source: &MemoryBudget,
+        predecessor: Option<&'a Fragments>,
+        prefix: u64,
+        changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        max_bytes: usize,
+        max_entries: Option<usize>,
+    ) -> Result<RangesPlan<'a>, MemoryError> {
+        let mut changes = pack_changes(changes)?;
+        changes.sort_unstable_by(|left, right| left.key().cmp(right.key()));
+        let mut index_changes = take_index(&mut changes)?;
+        let members = self.stores.len();
+        let (mut rest, allocation) = Parts::reserve_rest(members, source, lane)?;
+        // Divide the sorted input at every boundary from the last member
+        // down, so every member's part is one split of the same vector; the
+        // parts are planned in member order as they come off the stack.
+        let mut stack = self.divide(&mut changes)?;
+        let mut index_stack = self.divide(&mut index_changes)?;
         let mut remaining = max_bytes;
         let mut first = None;
-        for (index, store) in self.stores.iter().enumerate() {
-            let part = if index == 0 {
-                std::mem::take(&mut changes)
+        for (index, (store, set)) in self.stores.iter().zip(&self.indexes).enumerate() {
+            let (part, index_part) = if index == 0 {
+                (
+                    std::mem::take(&mut changes),
+                    std::mem::take(&mut index_changes),
+                )
             } else {
-                stack.pop().unwrap_or_default()
+                (
+                    stack.pop().unwrap_or_default(),
+                    index_stack.pop().unwrap_or_default(),
+                )
             };
-            let plan = match predecessor {
-                Some(predecessor) => {
-                    let base = predecessor.part(index).ok_or(MemoryError::WrongRange)?;
+            let plan = match (predecessor, max_entries) {
+                (Some(predecessor), _) => {
+                    let base = predecessor.built(index).ok_or(MemoryError::WrongRange)?;
                     store.plan_after(base, prefix, part, lane, remaining)?
                 }
-                None => store.plan_batch(prefix, part, lane, remaining)?,
+                (None, Some(bound)) => store.plan_bounded(prefix, part, lane, remaining, bound)?,
+                (None, None) => store.plan_batch(prefix, part, lane, remaining)?,
             };
             remaining = remaining.saturating_sub(plan.charges().additional_peak_bytes());
+            let base_len = match predecessor {
+                Some(predecessor) => {
+                    predecessor
+                        .index_part(index)
+                        .ok_or(MemoryError::WrongRange)?
+                        .len
+                }
+                None => set.len(),
+            };
+            let base = match predecessor {
+                Some(predecessor) => predecessor
+                    .index_base(index)
+                    .ok_or(MemoryError::WrongRange)?
+                    .clone(),
+                None => set.freeze(lane)?,
+            };
+            let mut present = |key: &PackedKey| {
+                let held = match predecessor.and_then(|predecessor| {
+                    predecessor
+                        .index_part(index)
+                        .and_then(|part| part.change(key))
+                }) {
+                    Some((_, Change::Put(_))) => true,
+                    Some((_, Change::Delete(_))) => false,
+                    None => base.contains(key.as_bytes()),
+                };
+                held.then_some(0)
+            };
+            let index_part =
+                IndexPart::plan(set, source, None, base_len, index_part, lane, &mut present)?;
             let member = RangesMember {
                 start: self
                     .layout
@@ -512,7 +1386,11 @@ impl NativeRanges {
                     .get(index)
                     .ok_or(MemoryError::WrongRange)?
                     .start,
-                value: plan,
+                value: PlanMember {
+                    rows: plan,
+                    index: index_part,
+                    base,
+                },
             };
             if index == 0 {
                 first = Some(member);
@@ -537,12 +1415,21 @@ impl NativeRanges {
     /// Publish one set of changes at `prefix` (the next prefix) as a session
     /// decision applies it (26 §4): planned over the published members,
     /// built under the group's budget and published whole or not at all.
+    /// The batch is held to `max_entries`, the decision's own bound (a seal's
+    /// rows, a family's), not to a write's: a decision is one publication
+    /// however many rows it takes. Past its own bound it is refused as a
+    /// contract the record broke — never as memory, which its caller would
+    /// retry for good.
     pub(super) fn publish_changes(
         &mut self,
         prefix: u64,
         changes: Vec<Change<Key, Row>>,
         lane: BudgetLane,
+        max_entries: usize,
     ) -> Result<(), NativeError> {
+        if changes.len() > max_entries {
+            return Err(NativeError::Contract(ContractError::InvalidManifest));
+        }
         let budget = self
             .stores
             .first()
@@ -550,7 +1437,15 @@ impl NativeRanges {
             .budget()
             .clone();
         let fragments = self
-            .plan_batch(&budget, prefix, changes, lane, usize::MAX)?
+            .plan(
+                &budget,
+                None,
+                prefix,
+                changes,
+                lane,
+                usize::MAX,
+                Some(max_entries),
+            )?
             .build_in_with(&budget, super::prepare::copy)?;
         self.publish_recoverable(fragments)
             .map_err(|(error, _)| error)?;
@@ -569,27 +1464,23 @@ impl NativeRanges {
     where
         F: FnMut(&Row) -> Result<Row, MemoryError>,
     {
-        let budget = self
-            .stores
-            .first()
-            .ok_or(MemoryError::InvalidConfiguration("empty range group"))?
-            .budget()
-            .clone();
-        self.plan_batch(&budget, prefix, changes, lane, usize::MAX)?
-            .build_in_with(&budget, copy)
+        self.prepare_batch_replacing(prefix, changes, lane, copy, |_, _| Ok(()))
     }
-    /// Prepare one write against an unpublished predecessor's fragments.
+    /// A fixture's write of `changes` over `predecessor` (or the published
+    /// members), planned as a leader's is: its changes alone, checked against
+    /// the base state, `replaced` given every row of that state a change
+    /// replaces or deletes.
     #[cfg(test)]
-    pub(super) fn prepare_after_with<F>(
+    pub(super) fn forge<R>(
         &self,
-        predecessor: &Fragments,
+        predecessor: Option<&Fragments>,
         prefix: u64,
         changes: Vec<Change<Key, Row>>,
         lane: BudgetLane,
-        copy: F,
+        mut replaced: R,
     ) -> Result<Fragments, MemoryError>
     where
-        F: FnMut(&Row) -> Result<Row, MemoryError>,
+        R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
     {
         let budget = self
             .stores
@@ -597,24 +1488,94 @@ impl NativeRanges {
             .ok_or(MemoryError::InvalidConfiguration("empty range group"))?
             .budget()
             .clone();
-        self.plan_after(&budget, predecessor, prefix, changes, lane, usize::MAX)?
-            .build_in_with(&budget, copy)
+        let base = |key: &Key| match predecessor {
+            Some(previous) if previous.is_sparse() => match previous.change(key) {
+                Some(change) => change,
+                None => self.get_entry(key),
+            },
+            Some(previous) => previous.get_entry(key),
+            None => self.get_entry(key),
+        };
+        for change in &changes {
+            if let Some(old) = base(change.key()) {
+                replaced(change.key(), old.value)?;
+            }
+        }
+        self.plan_sparse(&budget, predecessor, prefix, changes, lane, |key| {
+            base(key).map(|entry| entry.heap_bytes)
+        })
     }
+    /// [`Self::prepare_batch_with`], giving `replaced` every committed row a change replaces or
+    /// deletes ([`RangesPlan::build_in_replacing`]).
     #[cfg(test)]
-    pub(super) fn get_entry(&self, key: &Key) -> Option<&Entry<Key, Row>> {
-        self.member(key)?.get_entry(key)
+    pub(super) fn prepare_batch_replacing<F, R>(
+        &self,
+        prefix: u64,
+        changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        copy: F,
+        replaced: R,
+    ) -> Result<Fragments, MemoryError>
+    where
+        F: FnMut(&Row) -> Result<Row, MemoryError>,
+        R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
+    {
+        drop(copy);
+        self.forge(None, prefix, changes, lane, replaced)
+    }
+    /// Prepare one write against an unpublished predecessor's fragments, giving `replaced` every
+    /// row of the predecessor's a change replaces or deletes ([`RangesPlan::build_in_replacing`]).
+    #[cfg(test)]
+    pub(super) fn prepare_after_replacing<F, R>(
+        &self,
+        predecessor: &Fragments,
+        prefix: u64,
+        changes: Vec<Change<Key, Row>>,
+        lane: BudgetLane,
+        copy: F,
+        replaced: R,
+    ) -> Result<Fragments, MemoryError>
+    where
+        F: FnMut(&Row) -> Result<Row, MemoryError>,
+        R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
+    {
+        drop(copy);
+        self.forge(Some(predecessor), prefix, changes, lane, replaced)
+    }
+    pub(super) fn get_entry(&self, key: &Key) -> Option<RowEntry<'_>> {
+        let packed = PackedKey::probe(key);
+        let member = self.layout.route_packed(&packed);
+        if indexed(&packed) {
+            return self
+                .indexes
+                .get(member)?
+                .contains(packed.as_bytes())
+                .then_some(RowEntry {
+                    key: *key,
+                    value: &INDEX_ROW,
+                    heap_bytes: 0,
+                });
+        }
+        self.stores
+            .get(member)?
+            .get_entry(&packed)
+            .map(RowEntry::of)
     }
     /// A group of one member over `store`, the member and producer both
     /// named by the store's identity: the fixtures' way of installing
     /// forged rows.
     #[cfg(test)]
-    pub(super) fn single_from_store(store: RangeStore<Key, Row>) -> Result<Self, MemoryError> {
+    pub(super) fn single_from_store(
+        store: RangeStore<PackedKey, Row>,
+    ) -> Result<Self, MemoryError> {
         let budget = store.budget().clone();
         let layout = RangeLayout::single(store.id(), &budget)?;
+        let index = KeySet::new(&budget, BudgetLane::Ordinary)?;
         Self::from_store(
             store.id(),
             layout,
             store,
+            index,
             &budget,
             BudgetLane::Ordinary,
             prepare::copy,
@@ -627,39 +1588,99 @@ impl NativeRanges {
             .map_err(|(error, _)| error)
     }
     /// Publish every fragment or none: each is checked against its member
-    /// before any root moves.
+    /// before any root moves, and a set refused there is returned whole. A
+    /// member that refuses past that check broke an invariant: a built set
+    /// returns the refused fragment and those after it, the ones before it
+    /// staying published; a sparse set is gone, its member's store poisoned,
+    /// and no set comes back.
     #[allow(clippy::result_large_err)] // A refused set is returned whole, never dropped.
     pub(super) fn publish_recoverable(
         &mut self,
         fragments: Fragments,
-    ) -> Result<(), (MemoryError, Fragments)> {
-        if fragments.parts.len() != self.stores.len() {
-            return Err((MemoryError::WrongRange, fragments));
+    ) -> Result<(), (MemoryError, Option<Fragments>)> {
+        if fragments.members() != self.stores.len() {
+            return Err((MemoryError::WrongRange, Some(fragments)));
         }
-        let refusal =
-            self.stores
+        let refusal = match &fragments.kind {
+            FragmentKind::Built(parts) => self
+                .stores
                 .iter()
-                .zip(fragments.parts.iter())
-                .find_map(|(store, fragment)| {
-                    store.validate_chain(std::iter::once(&fragment.value)).err()
-                });
+                .zip(&self.indexes)
+                .zip(parts.iter())
+                .find_map(|((store, set), fragment)| {
+                    store
+                        .validate_chain(std::iter::once(&fragment.value.range))
+                        .and_then(|()| check_index(set, &fragment.value.index))
+                        .err()
+                }),
+            FragmentKind::Sparse(parts) => self
+                .stores
+                .iter()
+                .zip(&self.indexes)
+                .zip(parts.iter())
+                .find_map(|((store, set), fragment)| {
+                    store
+                        .check_sparse(&fragment.value.rows)
+                        .and_then(|()| check_index(set, &fragment.value.index))
+                        .err()
+                }),
+        };
         if let Some(error) = refusal {
-            return Err((error, fragments));
+            return Err((error, Some(fragments)));
         }
-        // Every fragment passed the check publication repeats, so every root
-        // moves. Should a member still refuse (an invariant failure), the
-        // refused fragment and the unpublished ones after it are returned;
-        // the ones before it stay published, as their stores now hold them.
-        let Fragments { producer, parts } = fragments;
+        let Fragments { producer, kind } = fragments;
+        match kind {
+            FragmentKind::Built(parts) => self.publish_built(producer, parts),
+            FragmentKind::Sparse(parts) => {
+                // Every member's rows, then its index keys: a key set refuses
+                // only on a broken invariant, which poisons it, past which
+                // its member refuses every plan.
+                for ((store, set), fragment) in self
+                    .stores
+                    .iter_mut()
+                    .zip(self.indexes.iter_mut())
+                    .zip(parts.into_iter())
+                {
+                    let SparseMember { rows, mut index } = fragment.value;
+                    store
+                        .publish_sparse(rows, prepare::copy)
+                        .map_err(|refusal| (refusal.into_parts().0, None))?;
+                    index.publish(set).map_err(|error| (error, None))?;
+                }
+                Ok(())
+            }
+        }
+    }
+    /// Every fragment passed the check publication repeats, so every root
+    /// moves. Should a member still refuse (an invariant failure), the
+    /// refused fragment and the unpublished ones after it are returned; the
+    /// ones before it stay published, as their stores now hold them.
+    #[allow(clippy::result_large_err)] // A refused set is returned whole, never dropped.
+    fn publish_built(
+        &mut self,
+        producer: RangeId,
+        parts: Parts<Built>,
+    ) -> Result<(), (MemoryError, Option<Fragments>)> {
         let mut remaining = parts.into_iter();
-        for store in self.stores.iter_mut() {
+        for (store, set) in self.stores.iter_mut().zip(self.indexes.iter_mut()) {
             let Some(fragment) = remaining.next() else {
                 break;
             };
-            if let Err((error, range)) = store.publish_recoverable(fragment.value) {
+            let Built {
+                range,
+                touched,
+                mut index,
+                base,
+            } = fragment.value;
+            if let Err((error, range)) = store.publish_recoverable(range) {
                 let refused = RangesMember {
                     start: fragment.start,
-                    value: range,
+                    value: Built {
+                        range,
+                        touched,
+                        index,
+                        base,
+                    },
                 };
                 let mut rest = Vec::new();
                 if rest.try_reserve_exact(remaining.rest.len()).is_ok() {
@@ -667,16 +1688,21 @@ impl NativeRanges {
                 }
                 return Err((
                     error,
-                    Fragments {
+                    Some(Fragments {
                         producer,
-                        parts: Parts {
+                        kind: FragmentKind::Built(Parts {
                             first: refused,
                             rest,
                             _allocation: remaining._allocation.take(),
-                        },
-                    },
+                        }),
+                    }),
                 ));
             }
+            // Past its rows' publication a member's index keys are refused
+            // only on a broken invariant, which poisons its key set: nothing
+            // comes back, as for a sparse set.
+            drop(base);
+            index.publish(set).map_err(|error| (error, None))?;
         }
         Ok(())
     }
@@ -691,6 +1717,53 @@ impl NativeRanges {
             .clone();
         let (mut rest, allocation) =
             Parts::reserve_rest(self.stores.len(), &budget, BudgetLane::Ordinary)?;
+        // The read's key sets: frozen and retained by the group, the read holding weak handles
+        // alone, charged as a lease's state is (doc 31 M3).
+        if self.index_pins.len() >= MAX_INDEX_PINS {
+            return Err(MemoryError::Capacity {
+                requested: 1,
+                available: 0,
+            });
+        }
+        let serial = self.next_pin;
+        let next_pin = serial
+            .checked_add(1)
+            .ok_or(MemoryError::CounterExhausted("key set pin"))?;
+        let expires_at = now
+            .checked_add(ttl)
+            .ok_or(MemoryError::CounterExhausted("snapshot expiry"))?;
+        let members = self.indexes.len();
+        let pinned_charge = budget
+            .reserve(
+                BudgetKind::ReadPins,
+                BudgetLane::Ordinary,
+                array::<FrozenKeySet>(members)
+                    .ok()
+                    .and_then(|sets| {
+                        sets.checked_add(focal_memory::map_entry_bytes::<u64, PinnedKeys>()?)
+                    })
+                    .ok_or(MemoryError::AllocationFailed)?,
+            )?
+            .commit();
+        let indexes_charge = budget
+            .reserve(
+                BudgetKind::ReadPins,
+                BudgetLane::Ordinary,
+                array::<WeakKeySet>(members).map_err(|_| MemoryError::AllocationFailed)?,
+            )?
+            .commit();
+        let mut sets = Vec::new();
+        sets.try_reserve_exact(members)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut indexes = Vec::new();
+        indexes
+            .try_reserve_exact(members)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        for index in &self.indexes {
+            let set = index.freeze(BudgetLane::Ordinary)?;
+            indexes.push(set.downgrade());
+            sets.push(set);
+        }
         let prefix = self.prefix();
         let mut first = None;
         let mut failure = None;
@@ -738,6 +1811,15 @@ impl NativeRanges {
             return Err(error);
         }
         let first = first.ok_or(MemoryError::InvalidConfiguration("empty range group"))?;
+        self.index_pins.insert(
+            serial,
+            PinnedKeys {
+                expires_at,
+                _sets: sets,
+                _charge: pinned_charge,
+            },
+        );
+        self.next_pin = next_pin;
         Ok(RangeLeases {
             prefix,
             epoch: self.layout.epoch,
@@ -746,6 +1828,9 @@ impl NativeRanges {
                 rest,
                 _allocation: allocation,
             },
+            serial,
+            indexes,
+            _indexes_charge: indexes_charge,
         })
     }
     /// Release a read's leases, each from the member it pinned. After a
@@ -756,6 +1841,7 @@ impl NativeRanges {
         if read.epoch == self.layout.epoch && read.leases.len() != self.stores.len() {
             return Err(MemoryError::WrongLease);
         }
+        self.index_pins.remove(&read.serial);
         let stale = read.epoch != self.layout.epoch;
         for lease in read.leases.iter() {
             let id = lease.value.range_id();
@@ -778,24 +1864,40 @@ impl NativeRanges {
         for store in &mut self.stores {
             expired = expired.saturating_add(store.advance_clock(now)?);
         }
+        self.index_pins.retain(|_, pin| pin.expires_at > now);
         Ok(expired)
     }
     /// The input bytes one write of `count` changes needs beyond its one
     /// vector when divided among the members: a vector per touched member
     /// and at most one slot per moved change (the shared envelope's term).
     pub(super) fn input_extra_bytes(&self, count: usize) -> Result<usize, NativeError> {
+        let slots = count
+            .checked_mul(size_of::<Change<PackedKey, Row>>())
+            .ok_or(NativeError::Capacity("range input vectors"))?;
+        // The index families' changes leave for a vector of their own, each
+        // moved into it once (doc 31 M3).
+        let index = if count == 0 {
+            0
+        } else {
+            prepare::add(prepare::ALLOCATION, slots)?
+        };
         let touched = self.stores.len().min(count.max(1));
         if touched <= 1 {
-            return Ok(0);
+            return Ok(index);
         }
+        // Dividing the rows' vector and the index changes' among the members:
+        // a vector each a touched member past the first, and every change
+        // moved once more.
         prepare::add(
-            touched
-                .saturating_sub(1)
-                .checked_mul(prepare::ALLOCATION)
-                .ok_or(NativeError::Capacity("range input vectors"))?,
-            count
-                .checked_mul(size_of::<Change<Key, Row>>())
-                .ok_or(NativeError::Capacity("range input vectors"))?,
+            index,
+            prepare::add(
+                touched
+                    .saturating_sub(1)
+                    .checked_mul(2)
+                    .and_then(|vectors| vectors.checked_mul(prepare::ALLOCATION))
+                    .ok_or(NativeError::Capacity("range input vectors"))?,
+                slots,
+            )?,
         )
     }
     /// One future write's envelope over a group of up to `max_members`
@@ -805,16 +1907,55 @@ impl NativeRanges {
         limits: RangeWriteLimits,
         max_members: usize,
     ) -> Result<RangeWriteEnvelope, MemoryError> {
+        // A row wider than a pointer is boxed (`Row`): each key a write puts may
+        // bring at most the widest box, and each it deletes may release as much.
+        let wide = super::wide_heap_max();
+        let limits = RangeWriteLimits {
+            incoming_heap: limits
+                .incoming_heap
+                .checked_add(
+                    limits
+                        .changed_keys
+                        .checked_mul(wide)
+                        .ok_or(MemoryError::AllocationFailed)?,
+                )
+                .ok_or(MemoryError::AllocationFailed)?,
+            deleted_heap: limits
+                .deleted_heap
+                .checked_add(
+                    limits
+                        .deleted_keys
+                        .checked_mul(wide)
+                        .ok_or(MemoryError::AllocationFailed)?,
+                )
+                .ok_or(MemoryError::AllocationFailed)?,
+            ..limits
+        };
         let members = max_members.max(self.stores.len());
         let group = group_bytes(members).map_err(|_| MemoryError::Capacity {
             requested: members,
             available: MAX_LAYOUT_MEMBERS,
         })?;
+        // A write's index keys, whichever members they fall in: each touched
+        // member's key-set funding and its changes' vector (doc 31 M3).
+        let changed = limits.changed_keys;
+        let touched = members.min(changed);
+        let key_sets = KeySet::quote_parts(changed, touched)?
+            .checked_add(KeySet::growth(changed)?)
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    touched
+                        .checked_mul(prepare::ALLOCATION)?
+                        .checked_add(changed.checked_mul(size_of::<Change<PackedKey, Row>>())?)?,
+                )
+            })
+            .ok_or(MemoryError::AllocationFailed)?;
         self.stores
             .first()
             .ok_or(MemoryError::InvalidConfiguration("empty range group"))?
             .future_write_envelope_shared(limits, members)?
-            .with_group_bytes(group)
+            .with_group_bytes(group)?
+            .with_key_set_bytes(key_sets)
     }
     /// Give member `index` the durable identity `id` (see
     /// [`RangeLayout::rename`]).
@@ -858,17 +1999,22 @@ impl NativeRanges {
             .checked_add(1)
             .ok_or(NativeError::Capacity("range layout epoch"))?;
         let store = self.stores.get(index).ok_or(MemoryError::WrongRange)?;
-        let (left, right) = store.split_where_with(
-            |key| layout::affinity(key) >= at,
-            boundary.id,
-            id,
-            lane,
-            copy,
-        )?;
-        let stores_allocation = reserve::<RangeStore<Key, Row>>(&budget, next)?;
-        let layout_allocation = reserve::<RangeBoundary>(&budget, next)?;
+        let (left, right) =
+            store.split_where_with(|key| key.affinity() >= at, boundary.id, id, lane, copy)?;
+        let (left_index, right_index) = self
+            .indexes
+            .get(index)
+            .ok_or(MemoryError::WrongRange)?
+            .split_at(&at, lane)?;
+        let stores_allocation = reserve::<RangeStore<PackedKey, Row>>(&budget, next, lane)?;
+        let indexes_allocation = reserve::<KeySet>(&budget, next, lane)?;
+        let layout_allocation = reserve::<RangeBoundary>(&budget, next, lane)?;
         let mut stores = Vec::new();
         stores
+            .try_reserve_exact(next)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut indexes = Vec::new();
+        indexes
             .try_reserve_exact(next)
             .map_err(|_| MemoryError::AllocationFailed)?;
         let mut members = Vec::new();
@@ -876,13 +2022,20 @@ impl NativeRanges {
             .try_reserve_exact(next)
             .map_err(|_| MemoryError::AllocationFailed)?;
         let old_stores = std::mem::take(&mut self.stores);
+        let old_indexes = std::mem::take(&mut self.indexes);
         let mut halves = Some((left, right));
-        for (position, old) in old_stores.into_iter().enumerate() {
+        let mut index_halves = Some((left_index, right_index));
+        for (position, (old, old_index)) in old_stores.into_iter().zip(old_indexes).enumerate() {
             if position == index {
                 if let Some((left, right)) = halves.take() {
                     stores.push(left);
                     stores.push(right);
                 }
+                if let Some((left, right)) = index_halves.take() {
+                    indexes.push(left);
+                    indexes.push(right);
+                }
+                drop(old_index);
                 members.push(boundary);
                 members.push(RangeBoundary {
                     id,
@@ -891,14 +2044,17 @@ impl NativeRanges {
                 continue;
             }
             stores.push(old);
+            indexes.push(old_index);
             if let Some(member) = self.layout.members.get(position) {
                 members.push(*member);
             }
         }
         let layout = RangeLayout::new(epoch, members, layout_allocation, max)?;
         self.stores = stores;
+        self.indexes = indexes;
         self.layout = layout;
         self._allocation = stores_allocation;
+        self._index_allocation = indexes_allocation;
         Ok(())
     }
     /// Remove the boundary after member `index`, joining it with the next
@@ -925,11 +2081,26 @@ impl NativeRanges {
             .get(right_index)
             .ok_or(MemoryError::WrongRange)?;
         let joined = left.merge_with(right, left.id(), lane)?;
+        let joined_index = self
+            .indexes
+            .get(index)
+            .ok_or(MemoryError::WrongRange)?
+            .join(
+                self.indexes
+                    .get(right_index)
+                    .ok_or(MemoryError::WrongRange)?,
+                lane,
+            )?;
         let count = self.stores.len().saturating_sub(1);
-        let stores_allocation = reserve::<RangeStore<Key, Row>>(&budget, count)?;
-        let layout_allocation = reserve::<RangeBoundary>(&budget, count)?;
+        let stores_allocation = reserve::<RangeStore<PackedKey, Row>>(&budget, count, lane)?;
+        let indexes_allocation = reserve::<KeySet>(&budget, count, lane)?;
+        let layout_allocation = reserve::<RangeBoundary>(&budget, count, lane)?;
         let mut stores = Vec::new();
         stores
+            .try_reserve_exact(count)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut indexes = Vec::new();
+        indexes
             .try_reserve_exact(count)
             .map_err(|_| MemoryError::AllocationFailed)?;
         let mut members = Vec::new();
@@ -937,11 +2108,13 @@ impl NativeRanges {
             .try_reserve_exact(count)
             .map_err(|_| MemoryError::AllocationFailed)?;
         let old_stores = std::mem::take(&mut self.stores);
-        let mut joined = Some(joined);
-        for (position, old) in old_stores.into_iter().enumerate() {
+        let old_indexes = std::mem::take(&mut self.indexes);
+        let mut joined = Some((joined, joined_index));
+        for (position, (old, old_index)) in old_stores.into_iter().zip(old_indexes).enumerate() {
             if position == index {
-                if let Some(joined) = joined.take() {
+                if let Some((joined, joined_index)) = joined.take() {
                     stores.push(joined);
+                    indexes.push(joined_index);
                 }
                 if let Some(member) = self.layout.members.get(position) {
                     members.push(*member);
@@ -950,19 +2123,53 @@ impl NativeRanges {
             }
             if position == right_index {
                 drop(old);
+                drop(old_index);
                 continue;
             }
             stores.push(old);
+            indexes.push(old_index);
             if let Some(member) = self.layout.members.get(position) {
                 members.push(*member);
             }
         }
         let layout = RangeLayout::new(epoch, members, layout_allocation, MAX_LAYOUT_MEMBERS)?;
         self.stores = stores;
+        self.indexes = indexes;
         self.layout = layout;
         self._allocation = stores_allocation;
+        self._index_allocation = indexes_allocation;
         Ok(())
     }
+}
+
+/// Whether `index` publishes onto `set`: planned on what it holds now, the
+/// set unpoisoned. The member's rows' check says the part was planned on this
+/// state; this says the set did not move beside them.
+fn check_index(set: &KeySet, index: &IndexPart) -> Result<(), MemoryError> {
+    if set.is_poisoned() {
+        return Err(MemoryError::InvalidConfiguration(
+            "key set poisoned by a failed publication",
+        ));
+    }
+    if index.base_len != set.len() {
+        return Err(MemoryError::WrongRange);
+    }
+    Ok(())
+}
+
+/// A member's part of a leader's or a follower's write: its rows' changes
+/// alone, and its index keys' (doc 31 M3).
+struct SparseMember {
+    rows: SparseRange<PackedKey, Row>,
+    index: IndexPart,
+}
+
+/// A member's plan of a built write: its rows' plan, its index changes, and
+/// the key set they were planned on, which a built set's reads see them over.
+struct PlanMember<'a> {
+    rows: RangePreparationPlan<'a, PackedKey, Row>,
+    index: IndexPart,
+    base: FrozenKeySet,
 }
 
 /// One member's part of a plan, fragment set or lease set.
@@ -1015,8 +2222,8 @@ impl<T> Parts<T> {
     }
     /// The member holding `key`: the last whose start is at or below the
     /// key's affinity.
-    fn route(&self, key: &Key) -> usize {
-        let affinity = layout::affinity(key);
+    fn route(&self, key: &PackedKey) -> usize {
+        let affinity = key.affinity();
         self.rest
             .partition_point(|member| member.start.is_some_and(|start| start <= affinity))
     }
@@ -1048,8 +2255,11 @@ impl<T> Iterator for PartsIter<T> {
 pub(super) fn group_bytes(members: usize) -> Result<usize, NativeError> {
     let further = members.saturating_sub(1);
     prepare::add(
-        array::<RangesMember<RangePreparationPlan<'static, Key, Row>>>(further)?,
-        array::<RangesMember<PreparedRange<Key, Row>>>(further)?,
+        prepare::add(
+            array::<RangesMember<PlanMember<'static>>>(further)?,
+            array::<RangesMember<Built>>(further)?,
+        )?,
+        array::<RangesMember<SparseMember>>(further)?,
     )
 }
 
@@ -1059,31 +2269,44 @@ pub(super) fn group_bytes(members: usize) -> Result<usize, NativeError> {
 pub(super) struct RangesPlan<'a> {
     producer: RangeId,
     lane: BudgetLane,
-    plans: Parts<RangePreparationPlan<'a, Key, Row>>,
+    plans: Parts<PlanMember<'a>>,
 }
 
 impl<'a> RangesPlan<'a> {
     /// The changed keys in key order across members.
-    pub(super) fn changes(&self) -> impl Iterator<Item = &Change<Key, Row>> {
+    #[cfg(test)]
+    pub(super) fn changes(&self) -> impl Iterator<Item = RowChange<'_>> {
         self.plans
             .iter()
-            .flat_map(|member| member.value.changes().iter())
+            .flat_map(|member| {
+                merged_changes(member.value.rows.changes(), &member.value.index.changes)
+            })
+            .map(|(_, change)| RowChange::of(change))
     }
+    #[cfg(test)]
     pub(super) fn changes_len(&self) -> usize {
         self.plans
             .iter()
-            .map(|member| member.value.changes().len())
+            .map(|member| {
+                member
+                    .value
+                    .rows
+                    .changes()
+                    .len()
+                    .saturating_add(member.value.index.changes.len())
+            })
             .sum()
     }
-    /// The input bytes every member's plan holds, summed.
-    pub(super) fn input_pending_bytes(&self) -> usize {
-        self.plans
-            .iter()
-            .map(|member| member.value.charges().input_pending_bytes())
-            .fold(0, usize::saturating_add)
-    }
+    #[cfg(test)]
     pub(super) fn check_envelope(&self, envelope: &RangeWriteEnvelope) -> Result<(), MemoryError> {
-        envelope.check_plans(self.plans.iter().map(|member| &member.value))
+        envelope.check_plans(self.plans.iter().map(|member| &member.value.rows))?;
+        let mut held = 0usize;
+        for member in self.plans.iter() {
+            held = held
+                .checked_add(member.value.index.held_bytes()?)
+                .ok_or(MemoryError::AllocationFailed)?;
+        }
+        envelope.check_key_sets(held)
     }
     /// Build every fragment from `source` under the copier contract of
     /// [`RangeStore::prepare_batch_with`]; a refusal drops the built ones.
@@ -1097,38 +2320,52 @@ impl<'a> RangesPlan<'a> {
     {
         self.build_each(source, |plan| plan.build_in_with(source, &mut copy))
     }
-    /// Build every fragment with the input already funded by `input`, which
-    /// is divided among the members by each plan's input bytes.
-    pub(super) fn build_in_funded_with<F>(
+    /// [`Self::build_in_with`], giving `replaced` every committed row a change replaces or
+    /// deletes as the build takes it out of its page
+    /// (`RangePreparationPlan::build_in_replacing`).
+    #[cfg(test)]
+    pub(super) fn build_in_replacing<F, R>(
         self,
         source: &MemoryBudget,
-        mut input: Allocation,
         mut copy: F,
+        mut replaced: R,
     ) -> Result<Fragments, MemoryError>
     where
         F: FnMut(&Row) -> Result<Row, MemoryError>,
+        R: FnMut(&Key, &Row) -> Result<(), MemoryError>,
     {
         self.build_each(source, |plan| {
-            let part = input.split_off(plan.charges().input_pending_bytes())?;
-            plan.build_in_funded_with(source, part, &mut copy)
+            plan.build_in_replacing(source, &mut copy, &mut |key: &PackedKey, row: &Row| {
+                replaced(&key.unpack(), row)
+            })
         })
     }
     fn build_each(
         self,
         source: &MemoryBudget,
         mut build: impl FnMut(
-            RangePreparationPlan<'a, Key, Row>,
-        ) -> Result<PreparedRange<Key, Row>, MemoryError>,
+            RangePreparationPlan<'a, PackedKey, Row>,
+        ) -> Result<PreparedRange<PackedKey, Row>, MemoryError>,
     ) -> Result<Fragments, MemoryError> {
         let members = self.plans.len();
         let (mut rest, allocation) = Parts::reserve_rest(members, source, self.lane)?;
         let mut plans = self.plans.into_iter();
+        let mut built = |plan: PlanMember<'a>| {
+            let PlanMember { rows, index, base } = plan;
+            let touched = !rows.changes().is_empty() || !index.changes.is_empty();
+            build(rows).map(|range| Built {
+                range,
+                touched,
+                index,
+                base,
+            })
+        };
         let first = plans
             .next()
             .ok_or(MemoryError::InvalidConfiguration("empty range group"))?;
         let first = RangesMember {
             start: first.start,
-            value: build(first.value)?,
+            value: built(first.value)?,
         };
         for member in plans {
             if rest.len() >= rest.capacity() {
@@ -1136,32 +2373,53 @@ impl<'a> RangesPlan<'a> {
             }
             rest.push(RangesMember {
                 start: member.start,
-                value: build(member.value)?,
+                value: built(member.value)?,
             });
         }
         Ok(Fragments {
             producer: self.producer,
-            parts: Parts {
+            kind: FragmentKind::Built(Parts {
                 first,
                 rest,
                 _allocation: allocation,
-            },
+            }),
         })
     }
 }
 
 /// One unpublished write over every member: a fragment per member at the
-/// next prefix, published together or not at all.
+/// next prefix, published together or not at all. A leader's write holds its
+/// changes alone and is read through its view's pending chain (doc 30 §9); a
+/// follower's replay builds its pages beside the committed root.
 pub struct Fragments {
     producer: RangeId,
-    parts: Parts<PreparedRange<Key, Row>>,
+    kind: FragmentKind,
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a leader's sparse set holds its first member inline so a group of one allocates \
+              nothing; a replay's built set is published at once"
+)]
+enum FragmentKind {
+    Built(Parts<Built>),
+    Sparse(Parts<SparseMember>),
+}
+
+/// A member's built fragment, whether the write changes the member, its
+/// index changes and the key set they were planned on (doc 31 M3).
+struct Built {
+    range: PreparedRange<PackedKey, Row>,
+    touched: bool,
+    index: IndexPart,
+    base: FrozenKeySet,
 }
 
 impl std::fmt::Debug for Fragments {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Fragments")
             .field("producer", &self.producer)
-            .field("members", &self.parts.len())
+            .field("members", &self.members())
             .field("base", &self.base_prefix())
             .finish_non_exhaustive()
     }
@@ -1172,57 +2430,361 @@ impl Fragments {
         self.producer
     }
     pub(super) fn prefix(&self) -> u64 {
-        self.parts.first.value.prefix()
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.first.value.range.prefix(),
+            FragmentKind::Sparse(parts) => parts.first.value.rows.prefix(),
+        }
     }
     pub(super) fn base_prefix(&self) -> u64 {
-        self.parts.first.value.base_prefix()
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.first.value.range.base_prefix(),
+            FragmentKind::Sparse(parts) => parts.first.value.rows.base_prefix(),
+        }
     }
+    fn members(&self) -> usize {
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.len(),
+            FragmentKind::Sparse(parts) => parts.len(),
+        }
+    }
+    /// The rows the members hold once this set publishes, their index keys
+    /// among them.
     pub(super) fn len(&self) -> usize {
-        self.parts.iter().map(|part| part.value.len()).sum()
+        match &self.kind {
+            FragmentKind::Built(parts) => parts
+                .iter()
+                .map(|part| part.value.range.len().saturating_add(part.value.index.len))
+                .sum(),
+            FragmentKind::Sparse(parts) => parts
+                .iter()
+                .map(|part| part.value.rows.len().saturating_add(part.value.index.len))
+                .sum(),
+        }
+    }
+    /// Member `index`'s rows' part of a sparse set.
+    fn sparse(&self, index: usize) -> Option<&SparseRange<PackedKey, Row>> {
+        match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => parts.get(index).map(|part| &part.value.rows),
+        }
+    }
+    /// Member `index`'s index changes.
+    fn index_part(&self, index: usize) -> Option<&IndexPart> {
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.get(index).map(|part| &part.value.index),
+            FragmentKind::Sparse(parts) => parts.get(index).map(|part| &part.value.index),
+        }
+    }
+    /// The key set member `index`'s index changes of a built set were planned on.
+    fn index_base(&self, index: usize) -> Option<&FrozenKeySet> {
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.get(index).map(|part| &part.value.base),
+            FragmentKind::Sparse(_) => None,
+        }
     }
     /// The positions (in layout order) of the members this set writes.
     pub(super) fn touched_members(&self) -> impl Iterator<Item = usize> + '_ {
-        self.parts
-            .iter()
-            .enumerate()
-            .filter(|(_, part)| !part.value.is_empty())
-            .map(|(index, _)| index)
+        (0..self.members()).filter(|index| match &self.kind {
+            FragmentKind::Built(parts) => parts.get(*index).is_some_and(|part| part.value.touched),
+            FragmentKind::Sparse(parts) => parts.get(*index).is_some_and(|part| {
+                !part.value.rows.changes().is_empty() || !part.value.index.changes.is_empty()
+            }),
+        })
     }
-    fn part(&self, index: usize) -> Option<&PreparedRange<Key, Row>> {
-        self.parts.get(index).map(|part| &part.value)
+    fn built(&self, index: usize) -> Option<&PreparedRange<PackedKey, Row>> {
+        match &self.kind {
+            FragmentKind::Built(parts) => parts.get(index).map(|part| &part.value.range),
+            FragmentKind::Sparse(_) => None,
+        }
     }
+    /// The row this set leaves at `key`: a built set's whole state, a sparse
+    /// set's own puts alone (a view reads the rest through its chain).
     pub(super) fn get(&self, key: &Key) -> Option<&Row> {
-        self.part(self.parts.route(key))?.get(key)
+        self.get_entry(key).map(|entry| entry.value)
     }
+    /// A built set's row at `key`, whole; a sparse set's own put.
+    pub(super) fn get_entry(&self, key: &Key) -> Option<RowEntry<'_>> {
+        match &self.kind {
+            FragmentKind::Built(parts) => {
+                let packed = PackedKey::probe(key);
+                let part = &parts.get(parts.route(&packed))?.value;
+                if indexed(&packed) {
+                    let held = match part.index.change(&packed) {
+                        Some((_, Change::Put(_))) => true,
+                        Some((_, Change::Delete(_))) => false,
+                        None => part.base.contains(packed.as_bytes()),
+                    };
+                    return held.then_some(RowEntry {
+                        key: *key,
+                        value: &INDEX_ROW,
+                        heap_bytes: 0,
+                    });
+                }
+                part.range.get_entry(&packed).map(RowEntry::of)
+            }
+            FragmentKind::Sparse(_) => self.change(key)?,
+        }
+    }
+    /// Visits each row a sparse set's publication copies onto `ranges` where
+    /// something else still holds a page it edits
+    /// (`RangeStore::visit_retained`), member by member: what a caller that
+    /// meters a publication's work prepays before anything changes.
+    pub(super) fn visit_retained(
+        &self,
+        ranges: &NativeRanges,
+        mut visit: impl FnMut(&Row) -> Result<(), MemoryError>,
+    ) -> Result<(), MemoryError> {
+        let FragmentKind::Sparse(parts) = &self.kind else {
+            return Err(MemoryError::WrongRange);
+        };
+        if parts.len() != ranges.stores.len() {
+            return Err(MemoryError::WrongRange);
+        }
+        for (store, part) in ranges.stores.iter().zip(parts.iter()) {
+            store.visit_retained(&part.value.rows, &mut visit)?;
+        }
+        Ok(())
+    }
+    /// Where a sparse set changes `key`: its member and the change's index
+    /// there.
+    pub(super) fn position(&self, key: &Key) -> Option<(usize, usize)> {
+        match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => {
+                let key = PackedKey::probe(key);
+                let member = parts.route(&key);
+                let part = &parts.get(member)?.value;
+                if indexed(&key) {
+                    let (index, _) = part.index.change(&key)?;
+                    return Some((member, part.rows.changes().len().checked_add(index)?));
+                }
+                part.rows.position(&key).map(|index| (member, index))
+            }
+        }
+    }
+    /// This set's own change of `key`: `Some(Some(entry))` where it puts one,
+    /// `Some(None)` where it deletes the key, `None` where it leaves the key
+    /// (and for a built set, which holds its state rather than its changes).
+    pub(super) fn change(&self, key: &Key) -> Option<Option<RowEntry<'_>>> {
+        match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => {
+                let key = PackedKey::probe(key);
+                let part = &parts.get(parts.route(&key))?.value;
+                if indexed(&key) {
+                    let (_, change) = part.index.change(&key)?;
+                    return Some(match change {
+                        Change::Put(entry) => Some(RowEntry::of(entry)),
+                        Change::Delete(_) => None,
+                    });
+                }
+                part.rows.change(&key).map(|entry| entry.map(RowEntry::of))
+            }
+        }
+    }
+    /// Member `member`'s `index`th change, by key order (a pending index's
+    /// version).
+    pub(super) fn change_at(&self, member: usize, index: usize) -> Option<RowChange<'_>> {
+        match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => {
+                let part = &parts.get(member)?.value;
+                let rows = part.rows.changes();
+                match rows.get(index) {
+                    Some(change) => Some(RowChange::of(change)),
+                    None => part
+                        .index
+                        .changes
+                        .get(index.checked_sub(rows.len())?)
+                        .map(RowChange::of),
+                }
+            }
+        }
+    }
+    /// Every change of a sparse set, with its member and its index there, in
+    /// key order; none for a built set.
+    pub(super) fn changes(&self) -> impl Iterator<Item = (usize, usize, RowChange<'_>)> + '_ {
+        let parts = match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => Some(parts),
+        };
+        parts.into_iter().flat_map(|parts| {
+            parts.iter().enumerate().flat_map(|(member, part)| {
+                merged_changes(part.value.rows.changes(), &part.value.index.changes)
+                    .map(move |(index, change)| (member, index, RowChange::of(change)))
+            })
+        })
+    }
+    /// The changes of a sparse set at or after `key` in key order (`exclusive`:
+    /// after it); none for a built set.
+    pub(super) fn changes_from<'a>(
+        &'a self,
+        key: &Key,
+        exclusive: bool,
+    ) -> impl Iterator<Item = RowChange<'a>> + use<'a> {
+        let parts = match &self.kind {
+            FragmentKind::Built(_) => None,
+            FragmentKind::Sparse(parts) => Some(parts),
+        };
+        let key = PackedKey::probe(key);
+        let start = parts.map_or(0, |parts| parts.route(&key));
+        parts
+            .into_iter()
+            .flat_map(move |parts| {
+                let key = key.clone();
+                parts.iter().skip(start).flat_map(move |part| {
+                    let after = |changes: &'a [Change<PackedKey, Row>]| {
+                        let at = changes.partition_point(|change| {
+                            if exclusive {
+                                change.key() <= &key
+                            } else {
+                                change.key() < &key
+                            }
+                        });
+                        changes.get(at..).unwrap_or(&[])
+                    };
+                    merged_changes(
+                        after(part.value.rows.changes()),
+                        after(&part.value.index.changes),
+                    )
+                    .map(|(_, change)| change)
+                })
+            })
+            .map(RowChange::of)
+    }
+    /// What a sparse set's parts hold as pending input and staging.
     #[cfg(test)]
-    pub(super) fn entries(&self) -> impl Iterator<Item = &Entry<Key, Row>> {
-        self.parts.iter().flat_map(|part| part.value.entries())
+    pub(super) fn pending_bytes(&self) -> usize {
+        match &self.kind {
+            FragmentKind::Built(_) => 0,
+            FragmentKind::Sparse(parts) => parts
+                .iter()
+                .map(|part| {
+                    part.value.rows.input_bytes()
+                        + part.value.rows.staging_bytes()
+                        + input_bytes(part.value.index.changes.capacity()).unwrap_or(0)
+                })
+                .sum(),
+        }
     }
+    pub(super) fn is_sparse(&self) -> bool {
+        matches!(self.kind, FragmentKind::Sparse(_))
+    }
+    /// Check a sparse set's parts against one write's envelope.
+    pub(super) fn check_envelope(&self, envelope: &RangeWriteEnvelope) -> Result<(), MemoryError> {
+        match &self.kind {
+            FragmentKind::Built(_) => Err(MemoryError::InvalidConfiguration(
+                "a built set's envelope is its plan's",
+            )),
+            FragmentKind::Sparse(parts) => {
+                envelope.check_sparse(parts.iter().map(|part| &part.value.rows))?;
+                let mut held = 0usize;
+                for part in parts.iter() {
+                    held = held
+                        .checked_add(part.value.index.held_bytes()?)
+                        .ok_or(MemoryError::AllocationFailed)?;
+                }
+                envelope.check_key_sets(held)
+            }
+        }
+    }
+    /// A built set's whole state; a sparse set's own puts.
+    #[cfg(test)]
+    pub(super) fn entries(&self) -> impl Iterator<Item = RowEntry<'_>> {
+        let parts = match &self.kind {
+            FragmentKind::Built(parts) => Some(parts),
+            FragmentKind::Sparse(_) => None,
+        };
+        let built = parts.into_iter().flat_map(|parts| {
+            parts.iter().flat_map(|part| {
+                merged(
+                    part.value.range.entries(),
+                    overlay(part.value.base.iter(), &part.value.index.changes),
+                )
+            })
+        });
+        let puts = self.changes().filter_map(|(_, _, change)| match change {
+            RowChange::Put(entry) => Some(entry),
+            RowChange::Delete(_) => None,
+        });
+        built.chain(puts)
+    }
+    /// A built set's rows at or after `key`; none for a sparse set, which a
+    /// view reads through its chain.
     pub(super) fn entries_from<'a>(
         &'a self,
         key: &Key,
         exclusive: bool,
-    ) -> impl Iterator<Item = &'a Entry<Key, Row>> + use<'a> {
-        let index = self.parts.route(key);
-        let first = self
-            .part(index)
-            .map(|part| part.entries_from(key, exclusive));
-        let rest = self
-            .parts
-            .iter()
-            .skip(index.saturating_add(1))
-            .flat_map(|part| part.value.entries());
+    ) -> impl Iterator<Item = RowEntry<'a>> + use<'a> {
+        let parts = match &self.kind {
+            FragmentKind::Built(parts) => Some(parts),
+            FragmentKind::Sparse(_) => None,
+        };
+        let key = PackedKey::probe(key);
+        let index = parts.map_or(0, |parts| parts.route(&key));
+        let first = parts.and_then(|parts| parts.get(index)).map(|part| {
+            merged(
+                part.value.range.entries_from(&key, exclusive),
+                overlay(
+                    part.value.base.iter_from(key.as_bytes(), exclusive),
+                    &part.value.index.changes,
+                )
+                .filter(move |held| {
+                    if exclusive {
+                        held.as_bytes() > key.as_bytes()
+                    } else {
+                        held.as_bytes() >= key.as_bytes()
+                    }
+                }),
+            )
+        });
+        let rest = parts.into_iter().flat_map(move |parts| {
+            parts.iter().skip(index.saturating_add(1)).flat_map(|part| {
+                merged(
+                    part.value.range.entries(),
+                    overlay(part.value.base.iter(), &part.value.index.changes),
+                )
+            })
+        });
         first.into_iter().flatten().chain(rest)
     }
     /// Check `next` is the exact successor of this set on every member.
     pub(super) fn validate_successor(&self, next: &Self) -> Result<(), MemoryError> {
-        if self.parts.len() != next.parts.len() {
-            return Err(MemoryError::WrongRange);
+        match (&self.kind, &next.kind) {
+            (FragmentKind::Built(mine), FragmentKind::Built(theirs)) => {
+                if mine.len() != theirs.len() {
+                    return Err(MemoryError::WrongRange);
+                }
+                for (mine, theirs) in mine.iter().zip(theirs.iter()) {
+                    mine.value.range.validate_successor(&theirs.value.range)?;
+                    if theirs.value.index.base_len != mine.value.index.len {
+                        return Err(MemoryError::WrongRange);
+                    }
+                }
+                Ok(())
+            }
+            (FragmentKind::Sparse(mine), FragmentKind::Sparse(theirs)) => {
+                if mine.len() != theirs.len() || self.producer != next.producer {
+                    return Err(MemoryError::WrongRange);
+                }
+                for (mine, theirs) in mine.iter().zip(theirs.iter()) {
+                    if theirs.value.rows.base_prefix() != mine.value.rows.prefix() {
+                        return Err(MemoryError::StalePreparation {
+                            prepared_at: theirs.value.rows.base_prefix(),
+                            current_prefix: mine.value.rows.prefix(),
+                        });
+                    }
+                    // Planned on another state at this prefix: a fork.
+                    if !theirs.value.rows.follows(&mine.value.rows)
+                        || theirs.value.index.base_len != mine.value.index.len
+                    {
+                        return Err(MemoryError::WrongRange);
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(MemoryError::WrongRange),
         }
-        for (mine, theirs) in self.parts.iter().zip(next.parts.iter()) {
-            mine.value.validate_successor(&theirs.value)?;
-        }
-        Ok(())
     }
 }
 
@@ -1231,7 +2793,34 @@ pub struct RangeLeases {
     prefix: u64,
     /// The layout epoch the leases were taken under.
     epoch: u64,
-    leases: Parts<SnapshotLease<Key, Row>>,
+    leases: Parts<SnapshotLease<PackedKey, Row>>,
+    /// The serial its key sets are pinned under in the group's registry, and each member's
+    /// handle on its set as it stood at the prefix (doc 31 M3).
+    serial: u64,
+    indexes: Vec<WeakKeySet>,
+    _indexes_charge: Allocation,
+}
+
+/// Every member of a group's leased prefix held for one read ([`RangeLeases::hold`]).
+pub(super) struct LeasedRows<'l> {
+    leases: &'l Parts<SnapshotLease<PackedKey, Row>>,
+    holds: Vec<focal_memory::LeaseHold<PackedKey, Row>>,
+    _charge: Allocation,
+}
+
+impl LeasedRows<'_> {
+    /// The row the leased prefix holds at `key`; an index family's key, which a member's key set
+    /// holds, is not read here.
+    pub(super) fn get(&self, key: &Key) -> Option<&Row> {
+        let packed = PackedKey::probe(key);
+        if indexed(&packed) {
+            return None;
+        }
+        self.holds
+            .get(self.leases.route(&packed))?
+            .get(&packed)
+            .map(|entry| &entry.value)
+    }
 }
 
 impl std::fmt::Debug for RangeLeases {
@@ -1247,6 +2836,35 @@ impl RangeLeases {
     pub(super) fn prefix(&self) -> u64 {
         self.prefix
     }
+    /// Every member's leased prefix held for one read, its holds charged to `budget` while they
+    /// are (doc 31 M3: a spilled row read back through a lease reads the rows it names here).
+    pub(super) fn hold(
+        &self,
+        now: u64,
+        budget: &MemoryBudget,
+    ) -> Result<LeasedRows<'_>, MemoryError> {
+        let members = self.leases.len();
+        let charge = budget
+            .reserve(
+                BudgetKind::Query,
+                BudgetLane::Committed,
+                array::<focal_memory::LeaseHold<PackedKey, Row>>(members)
+                    .map_err(|_| MemoryError::CounterExhausted("lease holds"))?,
+            )?
+            .commit();
+        let mut holds = Vec::new();
+        holds
+            .try_reserve_exact(members)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        for member in self.leases.iter() {
+            holds.push(member.value.hold(now)?);
+        }
+        Ok(LeasedRows {
+            leases: &self.leases,
+            holds,
+            _charge: charge,
+        })
+    }
     /// Project the first row at or after `start` (after it when
     /// `exclusive`) below `end`, wherever it lives: the member holding
     /// `start`, else the first later member with any row below `end`.
@@ -1256,14 +2874,16 @@ impl RangeLeases {
         exclusive: bool,
         end: &Key,
         now: u64,
-        project: impl FnOnce(&Entry<Key, Row>) -> R,
+        project: impl FnOnce(RowEntry<'_>) -> R,
     ) -> Result<Option<R>, MemoryError> {
-        let index = self.leases.route(start);
-        let end_affinity = layout::affinity(end);
+        let start = PackedKey::probe(start);
+        let end = PackedKey::probe(end);
+        let index = self.leases.route(&start);
+        let end_affinity = end.affinity();
         let mut project = Some(project);
         for (position, lease) in self.leases.iter().enumerate().skip(index) {
             let (from, exclusive) = if position == index {
-                (Some(start), exclusive)
+                (Some(&start), exclusive)
             } else {
                 // A later member begins at its start affinity; past the
                 // end's affinity nothing below `end` remains.
@@ -1272,15 +2892,38 @@ impl RangeLeases {
                 }
                 (None, false)
             };
-            let found = lease
-                .value
-                .project_from(from, exclusive, end, now, |entry| {
-                    project.take().map(|project| project(entry))
-                })?;
+            // The member's first index key in the span, if any: its rows are
+            // read below it, and it is the row found where none is (doc 31 M3).
+            let set = self
+                .indexes
+                .get(position)
+                .ok_or(MemoryError::WrongLease)?
+                .upgrade()
+                .ok_or(MemoryError::LeaseExpired)?;
+            let first_index = match from {
+                Some(from) => set.iter_from(from.as_bytes(), exclusive).next(),
+                None => set.iter().next(),
+            }
+            .filter(|key| key.as_bytes() < end.as_bytes());
+            let bound = first_index
+                .as_ref()
+                .map(|key| PackedKey::of_bytes(key.as_bytes()));
+            let found = lease.value.project_from(
+                from,
+                exclusive,
+                bound.as_ref().unwrap_or(&end),
+                now,
+                |entry| project.take().map(|project| project(RowEntry::of(entry))),
+            )?;
             match found {
                 Some(Some(value)) => return Ok(Some(value)),
                 Some(None) => return Ok(None),
-                None => continue,
+                None => {
+                    if let Some(key) = first_index {
+                        return Ok(project.take().map(|project| project(index_entry(&key))));
+                    }
+                    continue;
+                }
             }
         }
         Ok(None)

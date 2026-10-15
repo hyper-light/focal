@@ -63,10 +63,7 @@ fn owned(ids: &[u128]) -> Vec<(ClaimState, RegistrationSet)> {
 }
 
 fn scratch() -> Scratch {
-    Scratch {
-        used: 17,
-        max: usize::MAX,
-    }
+    Scratch::with_used(17, usize::MAX)
 }
 
 #[test]
@@ -80,7 +77,7 @@ fn empty_and_one_move_complete_native_membership_without_collection_allocation()
     let original = registry.rows().to_vec();
     let pointer = registry.rows().as_ptr();
     let retained = registry.retained_bytes().unwrap();
-    let mut scratch = Scratch { used: 17, max: 17 };
+    let mut scratch = Scratch::with_used(17, 17);
     overrides.insert(&claim, registry, 1, &mut scratch).unwrap();
     assert_eq!(scratch.used, 17);
     assert_eq!(overrides.len(), 1);
@@ -235,10 +232,7 @@ fn refused_spill_precharge_does_not_move_one_or_consume_any_scratch() {
     let rows = registry.rows().to_vec();
     let pointer = registry.rows().as_ptr();
     let mut overrides = RegistryOverrides::new();
-    let mut limited = Scratch {
-        used: 17,
-        max: exact - 1,
-    };
+    let mut limited = Scratch::with_used(17, exact - 1);
     overrides.insert(&first, registry, 2, &mut limited).unwrap();
     assert!(
         overrides
@@ -422,14 +416,8 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         },
         &[],
     ));
-    let view = View {
-        state: &core.state,
-        tail: Some(&receipt),
-    };
-    let mut allowance = Scratch {
-        used: 0,
-        max: core.limits.preparation_bytes,
-    };
+    let view = View::committed(&core.state).with_own(&receipt).unwrap();
+    let mut allowance = Scratch::bound(core.limits.preparation_bytes);
     let mut rows = allowance.reserve::<ClaimState>(2).unwrap();
     let mut registry = RegistryOverrides::new();
     for id in [2u128, 1] {
@@ -502,21 +490,31 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         &mut allowance,
     )
     .unwrap();
+    let encoded_added =
+        crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())
+            .unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let range = core
         .state
         .rows
-        .prepare_after_with(
+        .prepare_after_replacing(
             &receipt.fragments,
             sequence.0,
             changes,
             BudgetLane::Ordinary,
             prepare::copy,
+            |key, row| removed.count(key, row),
         )
         .unwrap();
     let sealed = NativePrepared {
         fragments: range,
         outcome,
         writes: mutation::WriteSet::unrecorded(),
+        encoded_added,
+        encoded_removed: removed.bytes(),
+        _index: None,
+        events: None,
+        retire: None,
     };
     assert_eq!(core.native_sequence(), original_sequence);
     for (id, members) in &original {
@@ -528,20 +526,25 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
                 .increment_targets_sealed()
         );
         assert!(
-            !receipt
+            !core
+                .native_chain(&[&receipt])
+                .unwrap()
                 .registrations(*id)
                 .unwrap()
                 .increment_targets_sealed()
         );
-        assert_eq!(receipt.registrations(*id).unwrap().rows(), members);
-        assert!(
-            sealed
+        assert_eq!(
+            core.native_chain(&[&receipt])
+                .unwrap()
                 .registrations(*id)
                 .unwrap()
-                .increment_targets_sealed()
+                .rows(),
+            members
         );
-        assert!(!sealed.registrations(*id).unwrap().is_sealed());
-        assert_eq!(sealed.registrations(*id).unwrap().rows(), members);
+        let after = core.native_chain(&[&receipt, &sealed]).unwrap();
+        assert!(after.registrations(*id).unwrap().increment_targets_sealed());
+        assert!(!after.registrations(*id).unwrap().is_sealed());
+        assert_eq!(after.registrations(*id).unwrap().rows(), members);
     }
     core.publish_native(receipt).unwrap();
     assert!(original.iter().all(|(id, _)| {
@@ -553,7 +556,8 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
     core.publish_native(sealed).unwrap();
     assert_eq!(core.native_sequence(), sequence);
     assert_eq!(
-        core.native_outcome(fixture::request(fixture::ISSUER, 103)),
+        core.native_outcome(fixture::request(fixture::ISSUER, 103))
+            .unwrap(),
         Some(outcome)
     );
     for (ordinal, (id, members)) in original.iter().enumerate() {

@@ -173,3 +173,40 @@ fn reservations_from_independent_owners_share_one_envelope() {
     assert_eq!(disk.stats().free, Some(0));
     assert_eq!(disk.stats().outstanding, 0);
 }
+
+/// A promise split in two is two promises of the same kind and lane whose
+/// bytes sum to it: committing one charges the volume its part, dropping the
+/// other gives its part back, and a split past what is held changes nothing.
+#[test]
+fn a_reservation_split_commits_and_returns_its_parts_exactly() {
+    let disk = budget(0, 0);
+    disk.observe(100 * MIB);
+    let mut whole = disk
+        .reserve(DiskKind::Wal, BudgetLane::Completion, 30 * MIB)
+        .unwrap();
+    assert!(matches!(
+        whole.split_off(31 * MIB),
+        Err(MemoryError::InvalidConfiguration(_))
+    ));
+    assert_eq!(whole.bytes(), 30 * MIB);
+    let part = whole.split_off(10 * MIB).unwrap();
+    assert_eq!((part.bytes(), whole.bytes()), (10 * MIB, 20 * MIB));
+    assert_eq!(part.kind(), DiskKind::Wal);
+    assert_eq!(disk.stats().outstanding, 30 * MIB);
+    part.commit();
+    let stats = disk.stats();
+    assert_eq!(stats.outstanding, 20 * MIB);
+    assert_eq!(
+        stats.free,
+        Some(90 * MIB),
+        "the committed part is on the volume"
+    );
+    drop(whole);
+    let stats = disk.stats();
+    assert_eq!(stats.outstanding, 0);
+    assert_eq!(
+        stats.free,
+        Some(90 * MIB),
+        "the dropped part was given back"
+    );
+}

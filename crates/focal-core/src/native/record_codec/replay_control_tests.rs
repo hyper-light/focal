@@ -92,12 +92,22 @@ fn cancellation_propagates_pure_dependencies_without_monitors_and_replays_atomic
     );
     let outcome = prepared.outcome();
     assert_eq!(
-        prepared.claim(ClaimId::from_u128(1)).unwrap().status(),
+        original
+            .native_chain(&[&prepared])
+            .unwrap()
+            .claim(ClaimId::from_u128(1))
+            .unwrap()
+            .status(),
         ClaimStatus::Cancelled
     );
     for id in [2, 3] {
         assert_eq!(
-            prepared.claim(ClaimId::from_u128(id)).unwrap().status(),
+            original
+                .native_chain(&[&prepared])
+                .unwrap()
+                .claim(ClaimId::from_u128(id))
+                .unwrap()
+                .status(),
             ClaimStatus::DependencyFailed
         );
     }
@@ -181,16 +191,18 @@ fn multi_root_creation_keeps_disconnected_successors_and_settles_new_and_existin
     assert_eq!(status(&recovered, 5), ClaimStatus::Generated);
     assert_eq!(status(&recovered, 6), ClaimStatus::Generated);
     assert_eq!(status(&recovered, 7), ClaimStatus::DependencyFailed);
-    let Some(Row::Claim(newly_failed)) =
-        recovered.state.rows.get(&Key::Claim(ClaimId::from_u128(7)))
+    let Some(Row::Claim(newly_failed)) = recovered.state.row(&Key::Claim(ClaimId::from_u128(7)))
     else {
         panic!("newly created failed claim")
     };
     let registry = newly_failed.registrations().unwrap();
     assert!(registry.rows().is_empty());
     assert!(registry.is_sealed());
-    assert_eq!(registry.snapshot_v1().claim, f::binding(7));
-    assert_eq!(registry.snapshot_v1().sealed_at, Some(outcome.sequence));
+    assert_eq!(registry.revision(), f::binding(7).revision);
+    assert_eq!(
+        registry.snapshot_v1(f::binding(7)).sealed_at,
+        Some(outcome.sequence)
+    );
     let events = (0..outcome.events)
         .map(|ordinal| recovered.native_event(outcome.sequence, ordinal).unwrap())
         .collect::<Vec<_>>();

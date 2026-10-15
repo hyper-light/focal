@@ -172,20 +172,14 @@ fn begin(core: &Core<NativeState>, index: u32, id: u128) -> NativeInput {
 }
 
 fn bound(core: &Core<NativeState>) -> usize {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let claim = view.owned_claim(ClaimId::from_u128(1)).unwrap();
     aggregation::admission_completion_visits(claim.claim().unwrap(), claim.registrations().unwrap())
         .unwrap()
 }
 
 fn project(core: &Core<NativeState>, visits: usize) -> Result<(), ContractError> {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let claim = view.owned_claim(ClaimId::from_u128(1)).unwrap();
     aggregation::project_admission(
         claim.claim().unwrap(),
@@ -224,7 +218,7 @@ fn begin_refuses_currently_valid_cohort_whose_later_results_exceed_visit_limit()
     assert_eq!(core.native_evaluation(fixture::key(1)), Some(&state));
     assert_eq!(core.native_stats(), stats);
     assert_eq!(core.state.budget.stats(), budget);
-    assert!(core.native_outcome(request).is_none());
+    assert!(core.native_outcome(request).unwrap().is_none());
 }
 
 #[test]
@@ -317,7 +311,7 @@ fn begin_requires_failure_write_capacity_and_checks_actor_first() {
     // status rows (doc 22 §7): eighteen in all. A smaller batch cannot hold
     // any failed report, so admission is refused by shape.
     let minimum = crate::native::index_rows::MINIMUM_FAILED_REPORT_ROWS;
-    assert_eq!(minimum, 18);
+    assert_eq!(minimum, 19);
     for capacity in 4..minimum {
         core.limits.range.max_batch_entries = capacity;
         assert!(matches!(
@@ -358,9 +352,17 @@ fn pending_post_cohort_is_checked_without_consuming_or_dropping_the_predecessor(
     ));
     let input = fixture::begin(
         3,
-        post.claim(ClaimId::from_u128(1)).unwrap().binding(),
+        core.native_chain(&[&post])
+            .unwrap()
+            .claim(ClaimId::from_u128(1))
+            .unwrap()
+            .binding(),
         1,
-        post.evaluation(fixture::key(1)).unwrap().binding(),
+        core.native_chain(&[&post])
+            .unwrap()
+            .evaluation(fixture::key(1))
+            .unwrap()
+            .binding(),
     );
     let budget = core.state.budget.stats();
     assert!(matches!(
@@ -409,10 +411,7 @@ fn numeric_bound_never_substitutes_for_complete_definition_resolution() {
         }
     }
     let core = posted(1, 256, 1, false);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let row = view.owned_claim(ClaimId::from_u128(1)).unwrap();
     let missing = MissingReceipt(crate::native::admission_view::AdmissionRows {
         view: &view,
@@ -471,5 +470,5 @@ fn native_begin_refuses_unavailable_future_quality_policy_before_publication() {
     assert_eq!(core.native_evaluation(fixture::key(1)), Some(&old));
     assert_eq!(core.native_stats(), stats);
     assert_eq!(core.state.budget.stats(), budget);
-    assert!(core.native_outcome(request).is_none());
+    assert!(core.native_outcome(request).unwrap().is_none());
 }

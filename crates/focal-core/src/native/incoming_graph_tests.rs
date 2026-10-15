@@ -60,10 +60,7 @@ fn create(request: u128, definitions: &[(u128, &[(Kind, u128)])]) -> NativeInput
 }
 
 fn view(core: &Core<NativeState>) -> View<'_> {
-    View {
-        state: &core.state,
-        tail: None,
-    }
+    View::committed(&core.state)
 }
 fn members(core: &Core<NativeState>, target: u128) -> Vec<ClaimId> {
     incoming(&view(core), id(target), core.limits)
@@ -92,7 +89,7 @@ fn replace(core: &mut Core<NativeState>, key: Key, row: Row) {
                 // Preserve every actual inline neighbor (the claim's other
                 // rows share its span under the storage layout) while
                 // corrupting only the explicitly selected head/link under test.
-                Row::IncomingHead(row) => Ok(Row::IncomingHead(*row)),
+                Row::IncomingHead(row) => Ok(Row::IncomingHead(Box::new(**row))),
                 Row::IncomingLink(row) => Ok(Row::IncomingLink(*row)),
                 other => crate::native::prepare::copy(other),
             },
@@ -143,7 +140,7 @@ fn same_batch_targets_and_shared_heads_index_each_dependent_once() {
     assert_eq!(members(&core, 2), vec![id(3)]);
     assert!(members(&core, 3).is_empty());
     assert!(
-        matches!(view(&core).get(Key::IncomingHead(id(1))), Some(Row::IncomingHead(IncomingHead { head: Some(found), count: 2 })) if *found == id(4))
+        matches!(view(&core).get(Key::IncomingHead(id(1))), Some(Row::IncomingHead(head)) if matches!(**head, IncomingHead { head: Some(found), count: 2 } if found == id(4)))
     );
     assert!(matches!(
         view(&core).get(Key::IncomingLink(id(1), id(3))),
@@ -164,10 +161,7 @@ fn pending_append_and_discard_preserve_committed_membership_and_budget() {
         2,
         create(2, &[(5, &[(Kind::DependsOn, 1), (Kind::Awaits, 1)])]),
     );
-    let tail = View {
-        state: &core.state,
-        tail: Some(&candidate),
-    };
+    let tail = View::committed(&core.state).with_own(&candidate).unwrap();
     let discovered: Vec<_> = incoming(&tail, id(1), core.limits)
         .map(|row| ClaimId(row.unwrap().binding().object.0))
         .collect();
@@ -226,24 +220,24 @@ fn malformed_chain_is_rejected_before_exposing_any_dependent() {
     for (key, row) in [
         (
             Key::IncomingHead(id(1)),
-            Row::IncomingHead(IncomingHead {
+            Row::IncomingHead(Box::new(IncomingHead {
                 head: None,
                 count: 2,
-            }),
+            })),
         ),
         (
             Key::IncomingHead(id(1)),
-            Row::IncomingHead(IncomingHead {
+            Row::IncomingHead(Box::new(IncomingHead {
                 head: Some(id(3)),
                 count: 1,
-            }),
+            })),
         ),
         (
             Key::IncomingHead(id(1)),
-            Row::IncomingHead(IncomingHead {
+            Row::IncomingHead(Box::new(IncomingHead {
                 head: Some(id(3)),
                 count: 3,
-            }),
+            })),
         ),
         (
             Key::IncomingLink(id(1), id(2)),
@@ -255,7 +249,7 @@ fn malformed_chain_is_rejected_before_exposing_any_dependent() {
         ),
         (
             Key::IncomingLink(id(1), id(3)),
-            Row::IncomingHead(IncomingHead::default()),
+            Row::IncomingHead(Box::default()),
         ),
     ] {
         let mut core = seeded();
@@ -275,10 +269,10 @@ fn plausible_link_cannot_replace_the_dependents_actual_immutable_declaration() {
     replace(
         &mut core,
         Key::IncomingHead(id(4)),
-        Row::IncomingHead(IncomingHead {
+        Row::IncomingHead(Box::new(IncomingHead {
             head: Some(id(2)),
             count: 1,
-        }),
+        })),
     );
     replace(
         &mut core,
@@ -301,10 +295,10 @@ fn create_cannot_append_to_a_corrupt_head_or_publish_partial_index_rows() {
     replace(
         &mut core,
         Key::IncomingHead(id(1)),
-        Row::IncomingHead(IncomingHead {
+        Row::IncomingHead(Box::new(IncomingHead {
             head: Some(id(3)),
             count: 1,
-        }),
+        })),
     );
     let budget = core.native_budget();
     let range = core.native_stats();

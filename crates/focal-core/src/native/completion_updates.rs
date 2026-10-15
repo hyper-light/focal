@@ -19,7 +19,6 @@ pub(in crate::native) struct ReportAdvance {
 /// loan. Held loans always borrow this book's one completion pool; external
 /// controls retain their original source and lane without cloning a budget.
 pub(in crate::native) enum JournalFunding<'a> {
-    HeldCompletion,
     External {
         source: &'a MemoryBudget,
         lane: BudgetLane,
@@ -204,8 +203,9 @@ fn frame(
     prepared: &NativePrepared,
     ordinal: u32,
     begin: Option<&prepare::BeginTransition<'_>>,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
 ) -> Result<Option<Frame>, NativeError> {
-    let event = CompletionBook::event(prepared, ordinal)?;
+    let event = CompletionBook::event(prepared, ordinal, payloads)?;
     if event.sequence != prepared.outcome.sequence
         || event.ordinal != ordinal
         || event.invocation != prepared.outcome.invocation
@@ -380,8 +380,9 @@ fn at_binding(
     seals: &SealIndex<'_>,
     visits: &mut usize,
 ) -> Result<EvaluationState, NativeError> {
+    // Every evaluation event a candidate records comes with its row.
     let final_state = *prepared
-        .evaluation(key)
+        .written_evaluation(key)
         .ok_or(ContractError::InvalidTarget)?;
     if final_state.binding() == binding {
         return Ok(final_state);
@@ -511,7 +512,7 @@ fn check_missing(
     {
         return Err(ContractError::InvalidTarget.into());
     }
-    let entry = CompletionBook::event(prepared, entered.ordinal)?;
+    let entry = CompletionBook::event(prepared, entered.ordinal, source.payloads())?;
     if entry.sequence != entered.sequence
         || entry.ordinal != entered.ordinal
         || entry.invocation != prepared.outcome.invocation
@@ -540,7 +541,7 @@ fn check_missing(
         {
             return Err(ContractError::InvalidCut.into());
         }
-        let publication = CompletionBook::event(prepared, missing.ordinal())?;
+        let publication = CompletionBook::event(prepared, missing.ordinal(), source.payloads())?;
         if publication.sequence != missing.sequence()
             || publication.ordinal != missing.ordinal()
             || publication.invocation != prepared.outcome.invocation
@@ -558,11 +559,12 @@ fn check_report(
     previous: EvaluationState,
     next: EvaluationState,
     definition: &validation::Declaration,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
 ) -> Result<(), NativeError> {
     let attempt = previous.bind(definition)?.current_attempt()?;
     let result = next.last_result().ok_or(ContractError::MissingEvidence)?;
     let accepted = prepared
-        .result(NativeResultKey::of(result))
+        .written_result(NativeResultKey::of(result))
         .ok_or(ContractError::MissingEvidence)?;
     if previous.fence().is_some()
         || previous.state().is_terminal()
@@ -585,7 +587,7 @@ fn check_report(
     {
         return Err(ContractError::InvalidManifest.into());
     }
-    let publication = CompletionBook::event(prepared, accepted.ordinal())?;
+    let publication = CompletionBook::event(prepared, accepted.ordinal(), payloads)?;
     if publication.fact
         != (NativeFact::Accepted {
             key: NativeResultKey::of(result),
@@ -684,8 +686,8 @@ impl CompletionBook {
             if record.key != key {
                 return Err(ContractError::InvalidManifest.into());
             }
-            let event =
-                frame(prepared, record.ordinal, begin)?.ok_or(ContractError::InvalidManifest)?;
+            let event = frame(prepared, record.ordinal, begin, source.payloads())?
+                .ok_or(ContractError::InvalidManifest)?;
             let next = at_binding(key, event.after, prepared, begin, seals, visits)?;
             check_frame(event, current, next, definition)?;
             match event.kind {
@@ -722,10 +724,17 @@ impl CompletionBook {
                     {
                         return Err(ContractError::StaleEvaluation.into());
                     }
-                    check_report(prepared, event, current, next, definition)?;
+                    check_report(
+                        prepared,
+                        event,
+                        current,
+                        next,
+                        definition,
+                        source.payloads(),
+                    )?;
                     let usage =
                         crate::native::completion_envelope::ReportParent::capture(source_claim)
-                            .completion_use_recorded(prepared)?;
+                            .completion_use_recorded(prepared, source.payloads())?;
                     if usage == CompletionUse::AdmissionFailure {
                         take(visits, 1)?;
                     }
@@ -751,8 +760,11 @@ impl CompletionBook {
                 NativeEvaluationEventKind::Sealed => {
                     let seal = seals.token(key, event.before, current.target(), visits)?;
                     seal.check(&current, &next)?;
+                    // The claim as the candidate leaves it: sealed by an
+                    // earlier candidate, it is the source's row.
                     let claim = prepared
-                        .claim(key.claim)
+                        .written_claim(key.claim)
+                        .or_else(|| source.claim(key.claim))
                         .ok_or(ContractError::InvalidTarget)?;
                     if claim
                         .local_sealed_at()
@@ -804,7 +816,7 @@ impl CompletionBook {
             }
             current = next;
         }
-        if prepared.evaluation(key) != Some(&current)
+        if prepared.written_evaluation(key) != Some(&current)
             || (report.is_some_and(|report| report.key == key) && !reported)
             || (starting.is_some() && !begun)
         {
@@ -868,7 +880,7 @@ impl CompletionBook {
         let mut begun = 0usize;
         for ordinal in 0..prepared.outcome.events {
             take(&mut visits, 1)?;
-            if let Some(event) = frame(prepared, ordinal, begin)? {
+            if let Some(event) = frame(prepared, ordinal, begin, source.payloads())? {
                 count = add(count, 1)?;
                 reports = add(
                     reports,
@@ -913,15 +925,11 @@ impl CompletionBook {
             };
         }
         let bytes = journal_bytes(count)?;
-        let reservation = match funding {
-            JournalFunding::HeldCompletion => {
-                self.source()
-                    .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?
-            }
-            JournalFunding::External { source, lane } => {
-                source.reserve(BudgetKind::Pending, lane, bytes)?
-            }
-        };
+        let JournalFunding::External {
+            source: budget,
+            lane,
+        } = funding;
+        let reservation = budget.reserve(BudgetKind::Pending, lane, bytes)?;
         let mut updates = Vec::new();
         updates
             .try_reserve_exact(count)
@@ -929,7 +937,7 @@ impl CompletionBook {
         within(array::<Update>(updates.capacity())?, bytes)?;
         for ordinal in 0..prepared.outcome.events {
             take(&mut visits, 1)?;
-            if let Some(event) = frame(prepared, ordinal, begin)? {
+            if let Some(event) = frame(prepared, ordinal, begin, source.payloads())? {
                 if updates.len() == updates.capacity() {
                     return Err(NativeError::Capacity("completion journal"));
                 }
@@ -1009,16 +1017,10 @@ impl CompletionBook {
         // No allocations or ordinary refusal remain after this point. Structural
         // index failure poisons the book and the exclusive owner fails closed.
         for update in &updates {
-            let workspace = if update.after.remaining_reports == 0 {
-                0
-            } else {
-                self.grant(update.key)?.envelope.workspace_bytes()
-            };
             self.entries
-                .replace_weight(update.key, workspace, |grant| grant.credit = update.after)?;
+                .update(update.key, |grant| grant.credit = update.after)?;
         }
         self.totals = totals;
-        self.totals.workspace = self.maximum_workspace();
         self.check_health()?;
         self.journals = journals;
         let before_revision = self.revision;

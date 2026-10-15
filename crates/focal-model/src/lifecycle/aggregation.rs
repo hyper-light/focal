@@ -24,9 +24,9 @@ mod snapshot;
 pub(crate) use acceptance::acceptance_for;
 pub(in crate::lifecycle) use acceptance::preparation::{SourceShape, check_sources};
 pub use acceptance::{
-    AcceptancePlan, AcceptancePolicy, AcceptanceSource, AcceptanceSourcePasses,
-    AcceptanceSourcePlan, DeclaredObligation, EvaluationRegistry, ObligationTarget, PolicyShape,
-    RegisteredEvaluation, SealedTargets,
+    Acceptance, AcceptancePlan, AcceptancePolicy, AcceptanceSource, AcceptanceSourcePasses,
+    AcceptanceSourcePlan, DeclaredObligation, EvaluationRegistry, ObligationTarget, PolicyBody,
+    PolicyShape, RegisteredEvaluation, SealedTargets,
 };
 pub use admission::{
     AdmissionLimits, AdmissionView, PublishedAdmissionResult, admission_completion_visits,
@@ -627,14 +627,14 @@ impl ResponseAggregation {
     }
     fn from_policy(
         claim: Binding,
-        policy: &AcceptancePolicy,
+        policy: Acceptance<'_>,
         response: ResponseEvaluation<'_>,
         deliveries: &[AcceptedResult],
         limits: Limits,
     ) -> Result<Self, ContractError> {
         same_content(claim, policy.claim())?;
         policy.within(limits)?;
-        let policies = &policy.slots;
+        let policies = &policy.body.slots;
         if claim.ledger != response.binding().ledger {
             return Err(ContractError::WrongLedger);
         }
@@ -740,7 +740,7 @@ impl ResponseAggregation {
     }
 
     fn check_result(&self, result: &AcceptedResult) -> Result<ValidationMode, ContractError> {
-        self.policy.check_result(*result)?;
+        self.policy.view().check_result(*result)?;
         if result.receipt() != Some(self.delivery.receipt) {
             return Err(ContractError::StaleReceipt);
         }
@@ -773,6 +773,7 @@ impl ResponseAggregation {
         same_content(self.response, response)?;
         let (policy, state) = self
             .policy
+            .body
             .slots
             .iter()
             .zip(&self.slots)
@@ -826,7 +827,7 @@ impl ResponseAggregation {
         let mut causes = reserved(
             results
                 .len()
-                .checked_add(self.policy.slots.len())
+                .checked_add(self.policy.body.slots.len())
                 .ok_or(ContractError::Capacity)?,
         )?;
         for (position, result) in results.iter().enumerate() {
@@ -852,7 +853,7 @@ impl ResponseAggregation {
         // Evaluation entry assesses absent declared slots, not streaming arrival.
         // Absence is a structural fact of this exact frozen manifest, not a run.
         if self.sequence == SessionSeq(0) {
-            for (policy, state) in self.policy.slots.iter().zip(&self.slots) {
+            for (policy, state) in self.policy.body.slots.iter().zip(&self.slots) {
                 if state.artifact.is_none() && policy.mode == ValidationMode::Required {
                     if causes.iter().any(|cause| {
                         cause.slot == Some(policy.slot)
@@ -874,9 +875,9 @@ impl ResponseAggregation {
             }
         }
         causes.sort_unstable_by_key(|cause| cause.key);
-        let mut witnesses = reserved(self.policy.slots.len())?;
-        let mut artifacts = reserved(self.policy.slots.len())?;
-        for (policy, state) in self.policy.slots.iter().zip(&self.slots) {
+        let mut witnesses = reserved(self.policy.body.slots.len())?;
+        let mut artifacts = reserved(self.policy.body.slots.len())?;
+        for (policy, state) in self.policy.body.slots.iter().zip(&self.slots) {
             let Some(artifact) = state.artifact else {
                 continue;
             };
@@ -959,6 +960,7 @@ impl ResponseAggregation {
                 });
             } else if self
                 .policy
+                .body
                 .slots
                 .iter()
                 .filter(|policy| policy.mode == ValidationMode::Required)
@@ -967,12 +969,12 @@ impl ResponseAggregation {
                 outcome = ResponseOutcome::Validated { sequence };
             }
         }
-        let update_policy = self.policy.copy()?;
+        let update_policy = self.policy.view().copy()?;
         let mut delivery_results = reserved(self.delivery_results.len())?;
         delivery_results.extend_from_slice(&self.delivery_results);
         // All fallible work completed. These bounded indexes were allocated when
         // the response entered evaluation; publication below does not allocate.
-        for (policy, state) in self.policy.slots.iter().zip(&mut self.slots) {
+        for (policy, state) in self.policy.body.slots.iter().zip(&mut self.slots) {
             if state.terminal.is_none() {
                 state.terminal = artifacts
                     .iter()
@@ -1056,7 +1058,7 @@ pub enum AdmissionOutcome {
 #[derive(Debug)]
 pub struct AdmissionDecision<'a> {
     binding: Binding,
-    acceptance: &'a AcceptancePolicy,
+    acceptance: Acceptance<'a>,
     outcome: AdmissionOutcome,
     blocking_publication: Option<(SessionSeq, u32)>,
 }
@@ -1064,7 +1066,7 @@ impl AdmissionDecision<'_> {
     pub fn binding(&self) -> Binding {
         self.binding
     }
-    pub fn acceptance(&self) -> &AcceptancePolicy {
+    pub fn acceptance(&self) -> Acceptance<'_> {
         self.acceptance
     }
     pub fn outcome(&self) -> AdmissionOutcome {
@@ -1108,7 +1110,7 @@ pub struct ClaimDecision<'a> {
     sequence: SessionSeq,
     outcome: AggregateOutcome,
     delivery: Option<DeliveryWitness>,
-    acceptance: &'a AcceptancePolicy,
+    acceptance: Acceptance<'a>,
     delivery_results: &'a [AcceptedResult],
     nonartifact: &'a [NonArtifactWitness],
     increments_ready: bool,
@@ -1187,7 +1189,7 @@ impl ClaimDecision<'_> {
     pub fn witnesses(&self) -> impl Iterator<Item = SlotWitnessRef<'_>> {
         self.coverage.iter()
     }
-    pub fn acceptance(&self) -> &AcceptancePolicy {
+    pub fn acceptance(&self) -> Acceptance<'_> {
         self.acceptance
     }
     pub fn delivery_results(&self) -> &[AcceptedResult] {
@@ -1208,13 +1210,13 @@ impl ClaimAggregation {
     fn from_policy(
         claim: Binding,
         status: ClaimStatus,
-        policy: &AcceptancePolicy,
+        policy: Acceptance<'_>,
         limits: Limits,
     ) -> Result<Self, ContractError> {
         same_content(claim, policy.claim())?;
         policy.within(limits)?;
-        let mut coverage = reserved(policy.slots.len())?;
-        coverage.resize_with(policy.slots.len(), || None);
+        let mut coverage = reserved(policy.body.slots.len())?;
+        coverage.resize_with(policy.body.slots.len(), || None);
         Ok(Self {
             claim,
             policy: policy.copy()?,
@@ -1238,7 +1240,7 @@ impl ClaimAggregation {
             sequence: self.sequence,
             outcome: self.outcome,
             delivery: self.delivery,
-            acceptance: &self.policy,
+            acceptance: self.policy.view(),
             delivery_results: &self.delivery_results,
             nonartifact: &self.accepted,
             increments_ready: self.increments_ready(),
@@ -1265,7 +1267,7 @@ impl ClaimAggregation {
         }) {
             return Err(ContractError::StaleReceipt);
         }
-        if current.acceptance() != &self.policy {
+        if current.acceptance() != self.policy.view() {
             return Err(ContractError::InvalidPolicy);
         }
         self.status = current.status();
@@ -1282,7 +1284,7 @@ impl ClaimAggregation {
     pub fn admission(&self) -> AdmissionDecision<'_> {
         AdmissionDecision {
             binding: self.claim,
-            acceptance: &self.policy,
+            acceptance: self.policy.view(),
             outcome: self.admission_outcome(),
             blocking_publication: None,
         }
@@ -1466,6 +1468,7 @@ impl ClaimAggregation {
                 }
                 let policy = self
                     .policy
+                    .body
                     .slots
                     .iter()
                     .find(|policy| policy.slot == witness.slot)
@@ -1509,8 +1512,8 @@ impl ClaimAggregation {
         if self.outcome != AggregateOutcome::Pending {
             return Ok(self.outcome);
         }
-        let mut changed = reserved(self.policy.slots.len())?;
-        for (policy, current) in self.policy.slots.iter().zip(&self.coverage) {
+        let mut changed = reserved(self.policy.body.slots.len())?;
+        for (policy, current) in self.policy.body.slots.iter().zip(&self.coverage) {
             let selected = if current.is_none() && policy.mode == ValidationMode::Required {
                 updates
                     .iter()
@@ -1544,6 +1547,7 @@ impl ClaimAggregation {
         };
         let covered = |slot| {
             self.policy
+                .body
                 .slots
                 .iter()
                 .zip(self.coverage.iter().zip(&changed))
@@ -1555,6 +1559,7 @@ impl ClaimAggregation {
             && delivery.is_some()
             && self
                 .policy
+                .body
                 .slots
                 .iter()
                 .filter(|policy| policy.mode == ValidationMode::Required)

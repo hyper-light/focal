@@ -57,11 +57,7 @@ pub(crate) struct WaitArgs {
     #[command(flatten)]
     pub(super) output: super::args::OutputOptions,
 }
-pub(super) fn run(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    args: WaitArgs,
-) -> Result<()> {
+pub(super) async fn run(context: &Context, args: WaitArgs) -> Result<()> {
     let fields = args.claim.is_some() || args.until.is_some() || args.timeout_ms.is_some();
     let document: ClaimWaitDocument = match args.input.load(fields)? {
         Some(document) => document,
@@ -78,10 +74,22 @@ pub(super) fn run(
     };
     let (read, until, timeout_ms) = document.build(&context.build)?;
     let request = context.envelope(Operation::Read(read))?;
-    let result = runtime.block_on(async {tokio::select! {
-        result=context.client.claim_wait(request,until,std::time::Duration::from_millis(u64::from(timeout_ms)))=>result.map_err(map_error),
-        signal=tokio::signal::ctrl_c()=>{ signal?; Err(CliError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted,"claim observation interrupted"))) },
-    }})?;
+    let interrupt = super::Interrupt::subscribe()?;
+    let waited = context.client.claim_wait(
+        request,
+        until,
+        std::time::Duration::from_millis(u64::from(timeout_ms)),
+    );
+    let result = match hyper_rt::combine::race2(waited, interrupt.wait()).await {
+        hyper_rt::combine::Either::First(result) => result.map_err(map_error)?,
+        hyper_rt::combine::Either::Second(signal) => {
+            signal?;
+            return Err(CliError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "claim observation interrupted",
+            )));
+        }
+    };
     let mut stdout = std::io::stdout().lock();
     match args.output.format {
         OutputFormat::Table => writeln!(
@@ -114,6 +122,6 @@ fn map_error(error: ClaimWaitError) -> CliError {
     match error {
         ClaimWaitError::Client(error) => CliError::Client(error),
         ClaimWaitError::NotFound => CliError::NotFound,
-        ClaimWaitError::InvalidRequest => CliError::Input("invalid claim wait query".into()),
+        ClaimWaitError::InvalidRequest => CliError::Input("invalid `wait claim` query".into()),
     }
 }

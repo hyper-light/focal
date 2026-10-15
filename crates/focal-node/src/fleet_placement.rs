@@ -19,7 +19,7 @@ impl PlacementReply {
 }
 pub(super) struct PlacementCall {
     request: SessionPlacementRequest,
-    response: oneshot::Sender<Result<PlacementReply, LedgerError>>,
+    response: OneshotSender<Result<PlacementReply, LedgerError>>,
     /// Answer only from the committed record this replica applied; never
     /// propose. Any replica, leader or follower, can witness.
     witness_only: bool,
@@ -87,7 +87,7 @@ impl ReplicaHost {
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, bytes)?
             .commit();
-        let (response, receive) = oneshot::channel();
+        let (response, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Placement(
                 Box::new(PlacementCall {

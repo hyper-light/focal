@@ -393,6 +393,7 @@ fn loss_of_ready_journal_prepared_or_root_catalogue_fails_closed() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn private_files_catalogue_lock_checksum_and_exact_prepared_journal_binding_are_enforced() {
     use std::os::unix::fs::PermissionsExt;
@@ -461,6 +462,7 @@ fn partial_root_and_partial_journal_are_never_overwritten_as_fresh_operations() 
     assert_eq!(fs::read_dir(&journal).unwrap().count(), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinks_hardlinks_and_unindexed_operation_directories_are_rejected() {
     use std::os::unix::fs::{DirBuilderExt, symlink};
@@ -539,6 +541,7 @@ fn saved_intent_is_checked_against_catalogue_when_inspecting_without_authored_in
     ));
 }
 
+#[cfg(unix)]
 #[test]
 fn complete_creation_link_window_recovers_catalogue_and_prepared_without_regeneration() {
     use std::os::unix::fs::MetadataExt;
@@ -584,6 +587,7 @@ fn complete_creation_link_window_recovers_catalogue_and_prepared_without_regener
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn prepared_envelopes_resume_each_uninitialized_journal_creation_midpoint() {
     use std::io::Write;
@@ -640,6 +644,7 @@ fn prepared_envelopes_resume_each_uninitialized_journal_creation_midpoint() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn creation_link_recovery_rejects_wrong_inodes_extra_links_symlinks_modes_and_bad_frames() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -708,6 +713,7 @@ fn creation_link_recovery_rejects_wrong_inodes_extra_links_symlinks_modes_and_ba
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn linked_catalogue_is_recovered_before_replace_temporary_cleanup() {
     use std::os::unix::fs::MetadataExt;
@@ -730,6 +736,7 @@ fn linked_catalogue_is_recovered_before_replace_temporary_cleanup() {
     assert_eq!(store.usage().unwrap().operations, 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn journal_resume_preserves_corruption_initialization_and_ready_fences() {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};

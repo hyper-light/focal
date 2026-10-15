@@ -36,17 +36,20 @@ fn credit(f: &Fixture, configured: NativeLimits) -> RespondentCredit {
     .unwrap()
     .1
 }
+/// Fresh work takes all it may of the session: every byte of its lane. A respondent's action
+/// finishes work already taken, on the completion lane fresh work cannot take, and is charged
+/// what it holds as it is written; nothing was set aside for it when its receipt was taken.
 fn fill(budget: &MemoryBudget, pressure: &mut Vec<Allocation>) {
-    let available = budget.limit() - budget.stats().used;
+    let available = budget.headroom(BudgetLane::Ordinary);
     if available != 0 {
         pressure.push(
             budget
-                .reserve(BudgetKind::Payload, BudgetLane::Completion, available)
+                .reserve(BudgetKind::Payload, BudgetLane::Ordinary, available)
                 .unwrap()
                 .commit(),
         );
     }
-    assert_eq!(budget.stats().used, budget.limit());
+    assert_eq!(budget.headroom(BudgetLane::Ordinary), 0);
 }
 fn duplicate(input: &NativeInput) -> NativeInput {
     let command = match &input.command {
@@ -518,7 +521,7 @@ fn copied(f: &Fixture, configured: NativeLimits) -> Core<NativeState> {
         .map(|entry| {
             Change::Put(Entry::new(
                 entry.key,
-                crate::native::prepare::copy(&entry.value).unwrap(),
+                crate::native::prepare::copy(entry.value).unwrap(),
                 entry.heap_bytes,
             ))
         })
@@ -554,6 +557,10 @@ fn copied(f: &Fixture, configured: NativeLimits) -> Core<NativeState> {
         core.state.rows.publish(prepared).unwrap();
     }
     assert_eq!(core.state.rows.prefix(), source.sequence().0);
+    // Built straight from rows, as a restore is: its total summed once, as a restore sums it.
+    core.state.encoded_rows =
+        crate::native::encoded_rows_of(&core.state.rows, core.state.ledger, core.state.payloads())
+            .unwrap();
     core
 }
 

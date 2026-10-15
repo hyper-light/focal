@@ -71,31 +71,101 @@ fn main() {
     });
 
     // Concurrent workers charging the same envelope: the cost the atomic
-    // counters pay under contention (the reason admission is lock-free).
-    for threads in [2usize, 4, 8] {
-        let shared = MemoryBudget::new(1 << 30, 1 << 20).unwrap();
+    // counters pay under contention (the reason admission is lock-free), on
+    // one level, through a node/tenant/session chain of three, and with each
+    // permit dropped by another thread than the one that reserved it, as a
+    // worker or response task releases what its owner admitted. Each case runs
+    // `FOCAL_BENCH_ROUNDS` times (default 5): on a loaded machine the spread
+    // is the noise, and the minimum is the closest to the uncontended cost.
+    let rounds: usize = std::env::var("FOCAL_BENCH_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    for threads in [1usize, 2, 4, 8] {
         let per_thread = (iters / 4) / threads as u64;
-        let start = Instant::now();
-        std::thread::scope(|scope| {
-            for _ in 0..threads {
-                let budget = shared.clone();
-                scope.spawn(move || {
-                    for _ in 0..per_thread {
-                        let alloc = budget
-                            .reserve(BudgetKind::Payload, BudgetLane::Ordinary, 4096)
-                            .unwrap()
-                            .commit();
-                        std::hint::black_box(&alloc);
-                    }
-                });
-            }
-        });
-        let elapsed = start.elapsed();
-        let total = per_thread * threads as u64;
-        let ops = total as f64 / elapsed.as_secs_f64();
-        println!(
-            "reserve/commit x{threads:<2} threads          {:8.1} ns/op  {ops:>13.0} ops/s  ({total} iters)",
-            elapsed.as_nanos() as f64 / total as f64
-        );
+        let root = MemoryBudget::new(1 << 30, 1 << 20).unwrap();
+        contended("one level", threads, per_thread, rounds, &root);
+        let node = root.child(1 << 30, 1 << 20).unwrap();
+        let tenant = node.child(1 << 29, 1 << 19).unwrap();
+        let session = tenant.child(1 << 28, 1 << 18).unwrap();
+        contended("three levels", threads, per_thread, rounds, &session);
+        handed_off(threads, per_thread, rounds, &session);
+        // A working budget is seldom empty: the same with a standing charge on
+        // every level, so no release takes one back to nothing.
+        let standing = session
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 1 << 16)
+            .unwrap()
+            .commit();
+        contended("one, charged", threads, per_thread, rounds, &root);
+        contended("three, charged", threads, per_thread, rounds, &session);
+        drop(standing);
     }
+}
+
+fn report(name: &str, threads: usize, total: u64, mut per: Vec<f64>) {
+    per.sort_by(f64::total_cmp);
+    let min = per.first().copied().unwrap_or(0.0);
+    let median = per.get(per.len() / 2).copied().unwrap_or(0.0);
+    let max = per.last().copied().unwrap_or(0.0);
+    println!(
+        "{name:13} x{threads:<2} threads  min {min:7.1}  median {median:7.1}  max {max:7.1} ns/op  ({total} ops a round, {} rounds)",
+        per.len()
+    );
+}
+
+/// `threads` workers reserve, commit and drop on `budget`, borrowed by each.
+fn contended(name: &str, threads: usize, per_thread: u64, rounds: usize, budget: &MemoryBudget) {
+    let total = per_thread * threads as u64;
+    let per = (0..rounds)
+        .map(|_| {
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| {
+                        for _ in 0..per_thread {
+                            let alloc = budget
+                                .reserve(BudgetKind::Payload, BudgetLane::Ordinary, 4096)
+                                .unwrap()
+                                .commit();
+                            std::hint::black_box(&alloc);
+                        }
+                    });
+                }
+            });
+            start.elapsed().as_nanos() as f64 / total as f64
+        })
+        .collect();
+    report(name, threads, total, per);
+}
+
+/// `threads` pairs: one reserves and commits on `budget` and hands each
+/// permit over a bounded channel to the other, which drops it.
+fn handed_off(threads: usize, per_thread: u64, rounds: usize, budget: &MemoryBudget) {
+    let total = per_thread * threads as u64;
+    let per = (0..rounds)
+        .map(|_| {
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    let (send, receive) = std::sync::mpsc::sync_channel(64);
+                    scope.spawn(move || {
+                        for alloc in receive {
+                            drop(std::hint::black_box(alloc));
+                        }
+                    });
+                    scope.spawn(move || {
+                        for _ in 0..per_thread {
+                            let alloc = budget
+                                .reserve(BudgetKind::Payload, BudgetLane::Ordinary, 4096)
+                                .unwrap()
+                                .commit();
+                            send.send(alloc).unwrap();
+                        }
+                    });
+                }
+            });
+            start.elapsed().as_nanos() as f64 / total as f64
+        })
+        .collect();
+    report("handed off", threads, total, per);
 }

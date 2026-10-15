@@ -33,52 +33,47 @@ impl OwnedPhasePolicy {
 }
 
 impl OwnedProgram {
+    /// Each phase's handlers and the phases' own allocation.
     fn copy_heap_bytes(&self) -> Result<usize, ContractError> {
-        match self {
-            Self::Delivery => Ok(0),
-            Self::Programmatic { check, quality } => bytes::add(
-                check.copy_heap_bytes()?,
-                quality
-                    .as_ref()
-                    .map(OwnedPhasePolicy::copy_heap_bytes)
-                    .transpose()?
-                    .unwrap_or(0),
-            ),
-            Self::Agentic { check } => check.copy_heap_bytes(),
+        let phases = self.phases();
+        let mut total = bytes::array::<OwnedPhasePolicy>(phases.len())?;
+        for phase in phases {
+            total = bytes::add(total, phase.copy_heap_bytes()?)?;
         }
+        Ok(total)
     }
 
     fn allocations(&self, retained: bool) -> Result<usize, ContractError> {
-        fn phase(policy: &OwnedPhasePolicy, retained: bool) -> usize {
-            bytes::allocation::<OwnedHandlerPolicy>(if retained {
-                policy.handlers.capacity()
-            } else {
-                policy.handlers.len()
-            })
+        let phases = self.phases();
+        let mut total = bytes::allocation::<OwnedPhasePolicy>(phases.len());
+        for policy in phases {
+            total = bytes::add(
+                total,
+                bytes::allocation::<OwnedHandlerPolicy>(if retained {
+                    policy.handlers.capacity()
+                } else {
+                    policy.handlers.len()
+                }),
+            )?;
         }
-        match self {
-            Self::Delivery => Ok(0),
-            Self::Programmatic { check, quality } => bytes::add(
-                phase(check, retained),
-                quality.as_ref().map_or(0, |value| phase(value, retained)),
-            ),
-            Self::Agentic { check } => Ok(phase(check, retained)),
-        }
+        Ok(total)
     }
 
     fn copy_owned(&self) -> Result<Self, ContractError> {
         Ok(match self {
             Self::Delivery => Self::Delivery,
-            Self::Programmatic { check, quality } => Self::Programmatic {
-                check: check.copy_owned()?,
-                quality: quality
-                    .as_ref()
-                    .map(OwnedPhasePolicy::copy_owned)
-                    .transpose()?,
-            },
-            Self::Agentic { check } => Self::Agentic {
-                check: check.copy_owned()?,
-            },
+            Self::Programmatic(phases) => {
+                let [check] = &**phases;
+                Self::Programmatic(boxed([check.copy_owned()?])?)
+            }
+            Self::ProgrammaticQuality(phases) => {
+                let [check, quality] = &**phases;
+                Self::ProgrammaticQuality(boxed([check.copy_owned()?, quality.copy_owned()?])?)
+            }
+            Self::Agentic(phases) => {
+                let [check] = &**phases;
+                Self::Agentic(boxed([check.copy_owned()?])?)
+            }
         })
     }
 }
@@ -182,17 +177,22 @@ impl DeclarationPlan<'_> {
             | TargetDeclaration::Admission
             | TargetDeclaration::Increment => 0,
         };
+        // Each phase's handlers, and the phases' own allocation.
         let program = match self.spec.program {
             Program::Delivery => 0,
             Program::Programmatic { check, quality } => bytes::add(
-                bytes::allocation::<OwnedHandlerPolicy>(check.handlers.len()),
-                quality.map_or(0, |policy| {
-                    bytes::allocation::<OwnedHandlerPolicy>(policy.handlers.len())
-                }),
+                bytes::add(
+                    bytes::allocation::<OwnedHandlerPolicy>(check.handlers.len()),
+                    quality.map_or(0, |policy| {
+                        bytes::allocation::<OwnedHandlerPolicy>(policy.handlers.len())
+                    }),
+                )?,
+                1,
             )?,
-            Program::Agentic { check } => {
-                bytes::allocation::<OwnedHandlerPolicy>(check.handlers.len())
-            }
+            Program::Agentic { check } => bytes::add(
+                bytes::allocation::<OwnedHandlerPolicy>(check.handlers.len()),
+                1,
+            )?,
         };
         bytes::add(target, program)
     }

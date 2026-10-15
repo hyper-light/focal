@@ -1,0 +1,775 @@
+use std::{
+    fmt,
+    net::{SocketAddrV4, SocketAddrV6},
+    num::{NonZeroUsize, TryFromIntError},
+};
+
+use aws_lc_rs::hmac;
+use rustls::client::WebPkiServerVerifier;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use thiserror::Error;
+
+use crate::crypto::rustls::{QuicServerConfig, node_provider};
+use crate::{
+    DEFAULT_SUPPORTED_VERSIONS, Duration, MAX_CID_SIZE, RandomConnectionIdGenerator, SystemTime,
+    VarInt, VarIntBoundsExceeded,
+    cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
+    crypto::{self, HandshakeTokenKey},
+    shared::ConnectionId,
+};
+
+mod configs;
+pub(crate) use configs::ConfigKey;
+pub use configs::{ClientConfigHandle, Configs, ConfigsFull, ServerConfigHandle};
+mod transport;
+pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
+#[cfg(feature = "qlog")]
+pub use transport::{QlogConfig, QlogError};
+
+/// Global configuration for the endpoint, affecting all connections
+///
+/// Default values should be suitable for most internet applications.
+pub struct EndpointConfig {
+    pub(crate) reset_key: hmac::Key,
+    pub(crate) max_udp_payload_size: VarInt,
+    /// The generator of local CIDs; each endpoint built from this configuration takes a copy
+    pub(crate) cid_generator: Box<dyn ConnectionIdGenerator>,
+    pub(crate) supported_versions: Vec<u32>,
+    pub(crate) grease_quic_bit: bool,
+    /// Minimum interval between outgoing stateless reset packets
+    pub(crate) min_reset_interval: Duration,
+    /// Optional seed to be used internally for random number generation
+    pub(crate) rng_seed: Option<[u8; 32]>,
+    /// Bound on the configurations the endpoint holds at once (see [`Configs`])
+    pub(crate) config_slots: NonZeroUsize,
+    /// Careful Resume (RFC 9959), or `None` to start every connection at the initial window
+    pub(crate) careful_resume: Option<CarefulResumeConfig>,
+    /// The remote IP addresses whose loss bursts the endpoint remembers, and for how long
+    pub(crate) loss_memory: (usize, Duration),
+}
+
+/// The loss memory's default bound and lifetime: Careful Resume's
+/// ([`CarefulResumeConfig::default`]), 256 remote addresses, the server names
+/// `TokenMemoryCache` keeps tokens for, and an hour, Chromium's bound on the age of a path estimate
+/// it resumes from.
+const LOSS_MEMORY: (usize, Duration) = (256, Duration::from_secs(60 * 60));
+
+impl EndpointConfig {
+    /// Create a default config with a particular `reset_key`
+    pub fn new(reset_key: hmac::Key) -> Self {
+        Self {
+            reset_key,
+            max_udp_payload_size: (1500u32 - 28).into(), // Ethernet MTU minus IP + UDP headers
+            cid_generator: Box::<HashedConnectionIdGenerator>::default(),
+            supported_versions: DEFAULT_SUPPORTED_VERSIONS.to_vec(),
+            grease_quic_bit: true,
+            min_reset_interval: Duration::from_millis(20),
+            rng_seed: None,
+            config_slots: configs::DEFAULT_CONFIG_SLOTS,
+            careful_resume: Some(CarefulResumeConfig::default()),
+            loss_memory: LOSS_MEMORY,
+        }
+    }
+
+    /// Supply a custom connection ID generator
+    ///
+    /// Each `Endpoint` constructed from this configuration takes its own copy, which generates the
+    /// CIDs used for incoming packets on all connections involving that `Endpoint`. A custom CID
+    /// generator allows applications to embed information in local connection IDs, e.g. to support
+    /// stateless packet-level load balancers.
+    ///
+    /// Defaults to [`HashedConnectionIdGenerator`].
+    pub fn cid_generator(&mut self, generator: Box<dyn ConnectionIdGenerator>) -> &mut Self {
+        self.cid_generator = generator;
+        self
+    }
+
+    /// Private key used to send authenticated connection resets to peers who were
+    /// communicating with a previous instance of this endpoint.
+    pub fn reset_key(&mut self, key: hmac::Key) -> &mut Self {
+        self.reset_key = key;
+        self
+    }
+
+    /// Maximum UDP payload size accepted from peers (excluding UDP and IP overhead).
+    ///
+    /// Must be greater or equal than 1200.
+    ///
+    /// Defaults to 1472, which is the largest UDP payload that can be transmitted in the typical
+    /// 1500 byte Ethernet MTU. Deployments on links with larger MTUs (e.g. loopback or Ethernet
+    /// with jumbo frames) can raise this to improve performance at the cost of a linear increase in
+    /// datagram receive buffer size.
+    pub fn max_udp_payload_size(&mut self, value: u16) -> Result<&mut Self, ConfigError> {
+        if !(1200..=65_527).contains(&value) {
+            return Err(ConfigError::OutOfBounds);
+        }
+
+        self.max_udp_payload_size = value.into();
+        Ok(self)
+    }
+
+    /// Get the current value of [`max_udp_payload_size`](Self::max_udp_payload_size)
+    //
+    // While most parameters don't need to be readable, this must be exposed to allow higher-level
+    // layers, e.g. the `quinn` crate, to determine how large a receive buffer to allocate to
+    // support an externally-defined `EndpointConfig`.
+    //
+    // While `get_` accessors are typically unidiomatic in Rust, we favor concision for setters,
+    // which will be used far more heavily.
+    pub fn get_max_udp_payload_size(&self) -> u64 {
+        self.max_udp_payload_size.into()
+    }
+
+    /// Override supported QUIC versions
+    pub fn supported_versions(&mut self, supported_versions: Vec<u32>) -> &mut Self {
+        self.supported_versions = supported_versions;
+        self
+    }
+
+    /// Whether to accept QUIC packets containing any value for the fixed bit
+    ///
+    /// Enabled by default. Helps protect against protocol ossification and makes traffic less
+    /// identifiable to observers. Disable if helping observers identify this traffic as QUIC is
+    /// desired.
+    pub fn grease_quic_bit(&mut self, value: bool) -> &mut Self {
+        self.grease_quic_bit = value;
+        self
+    }
+
+    /// Minimum interval between outgoing stateless reset packets
+    ///
+    /// Defaults to 20ms. Limits the impact of attacks which flood an endpoint with garbage packets,
+    /// e.g. [ISAKMP/IKE amplification]. Larger values provide a stronger defense, but may delay
+    /// detection of some error conditions by clients. Using a [`ConnectionIdGenerator`] with a low
+    /// rate of false positives in [`validate`](ConnectionIdGenerator::validate) reduces the risk
+    /// incurred by a small minimum reset interval.
+    ///
+    /// [ISAKMP/IKE
+    /// amplification]: https://bughunters.google.com/blog/5960150648750080/preventing-cross-service-udp-loops-in-quic#isakmp-ike-amplification-vs-quic
+    pub fn min_reset_interval(&mut self, value: Duration) -> &mut Self {
+        self.min_reset_interval = value;
+        self
+    }
+
+    /// Optional seed to be used internally for random number generation
+    ///
+    /// By default, quinn will initialize an endpoint's rng using a platform entropy source.
+    /// However, you can seed the rng yourself through this method (e.g. if you need to run quinn
+    /// deterministically or if you are using quinn in an environment that doesn't have a source of
+    /// entropy available).
+    pub fn rng_seed(&mut self, seed: Option<[u8; 32]>) -> &mut Self {
+        self.rng_seed = seed;
+        self
+    }
+
+    /// Bound on the server and client configurations an endpoint holds at once
+    ///
+    /// A configuration stays held while it is current or while connections started under it live;
+    /// adding one beyond the bound is refused with [`ConfigsFull`]. Defaults to 4: one current and
+    /// one draining configuration per side (see `DEFAULT_CONFIG_SLOTS` for the derivation).
+    pub fn config_slots(&mut self, slots: NonZeroUsize) -> &mut Self {
+        self.config_slots = slots;
+        self
+    }
+
+    /// Careful Resume (RFC 9959): a connection to a remote IP address an earlier connection
+    /// measured starts, once its first round trip confirms the path, from half of what that
+    /// connection delivered a round trip, and retreats on the first congestion
+    ///
+    /// On by default with [`CarefulResumeConfig::default`]; `None` starts every connection at the
+    /// initial window (RFC 9002 §7.2).
+    pub fn careful_resume(&mut self, config: Option<CarefulResumeConfig>) -> &mut Self {
+        self.careful_resume = config;
+        self
+    }
+
+    /// The remote IP addresses whose loss bursts the endpoint remembers at once, the oldest
+    /// replaced first, and how long what it learned of one stands without another connection
+    /// adding to it
+    ///
+    /// A connection learns from its own loss record whether its path loses in bursts, and the next
+    /// connection to the same address spaces its handshake's copies by what was learned
+    /// (`TransportConfig::handshake_copy_burst`, `docs/research/burst-loss.md` §7). Defaults to
+    /// Careful Resume's bound and lifetime, 256 addresses and an hour; zero addresses learns
+    /// nothing across connections.
+    pub fn loss_memory(&mut self, remembered: usize, lifetime: Duration) -> &mut Self {
+        self.loss_memory = (remembered, lifetime);
+        self
+    }
+}
+
+/// Careful Resume's parameters (RFC 9959 §2.4)
+#[derive(Debug, Clone, Copy)]
+pub struct CarefulResumeConfig {
+    pub(crate) remembered: usize,
+    pub(crate) lifetime: Duration,
+    pub(crate) max_jump: u64,
+    pub(crate) warm_up: bool,
+}
+
+impl CarefulResumeConfig {
+    /// The remote IP addresses whose measurements an endpoint keeps at once, the oldest replaced
+    /// first
+    ///
+    /// Defaults to 256, the server names [`TokenMemoryCache`](crate::TokenMemoryCache) keeps
+    /// address validation tokens for: a client resumes the servers it holds tokens for, and a
+    /// server remembers as many clients.
+    pub fn remembered(&mut self, value: usize) -> &mut Self {
+        self.remembered = value;
+        self
+    }
+
+    /// How long a measurement may be used after it was taken (RFC 9959 §2.4's Lifetime)
+    ///
+    /// Defaults to one hour, Chromium's bound on the age of a bandwidth estimate it resumes from
+    /// (`kNumSecondsPerHour` in `quic_server_session_base.cc`). RFC 9959 §4.3.1 leaves it to
+    /// configuration, minutes on paths known to change and hours on stable ones.
+    pub fn lifetime(&mut self, value: Duration) -> &mut Self {
+        self.lifetime = value;
+        self
+    }
+
+    /// The largest window a jump sets, in bytes (RFC 9959 §2.4's `max_jump`)
+    ///
+    /// Defaults to no bound beyond RFC 9959 §3.3's half of the measurement.
+    pub fn max_jump(&mut self, value: u64) -> &mut Self {
+        self.max_jump = value;
+        self
+    }
+
+    /// Whether a connection to a remote with no measurement measures its path while idle: PING and
+    /// PADDING packets of the path's MTU, under the window and the pacer and only when nothing else
+    /// is to be sent, until four initial windows are acknowledged in one round trip (RFC 9959
+    /// §3.1's floor for keeping a measurement), congestion is met, or sixteen initial windows are
+    /// spent; one connection to a remote at a time
+    ///
+    /// On by default: a connection that only carries exchanges smaller than the window never
+    /// delivers four initial windows a round trip, so its path would never be measured and every
+    /// burst on it would wait on the initial window (`docs/research/quic-overhead.md` §5).
+    pub fn warm_up(&mut self, value: bool) -> &mut Self {
+        self.warm_up = value;
+        self
+    }
+}
+
+impl Default for CarefulResumeConfig {
+    fn default() -> Self {
+        Self {
+            remembered: 256,
+            lifetime: Duration::from_secs(60 * 60),
+            max_jump: u64::MAX,
+            warm_up: true,
+        }
+    }
+}
+
+impl Clone for EndpointConfig {
+    fn clone(&self) -> Self {
+        Self {
+            reset_key: self.reset_key.clone(),
+            max_udp_payload_size: self.max_udp_payload_size,
+            cid_generator: self.cid_generator.clone_box(),
+            supported_versions: self.supported_versions.clone(),
+            grease_quic_bit: self.grease_quic_bit,
+            min_reset_interval: self.min_reset_interval,
+            rng_seed: self.rng_seed,
+            config_slots: self.config_slots,
+            careful_resume: self.careful_resume,
+            loss_memory: self.loss_memory,
+        }
+    }
+}
+
+impl fmt::Debug for EndpointConfig {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("EndpointConfig")
+            // reset_key not debug
+            .field("max_udp_payload_size", &self.max_udp_payload_size)
+            // cid_generator_factory not debug
+            .field("supported_versions", &self.supported_versions)
+            .field("grease_quic_bit", &self.grease_quic_bit)
+            .field("rng_seed", &self.rng_seed)
+            .field("config_slots", &self.config_slots)
+            .field("careful_resume", &self.careful_resume)
+            .field("loss_memory", &self.loss_memory)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for EndpointConfig {
+    fn default() -> Self {
+        use rand::Rng;
+
+        let mut reset_key = [0; 64];
+        rand::rng().fill_bytes(&mut reset_key);
+
+        Self::new(hmac::Key::new(hmac::HMAC_SHA256, &reset_key))
+    }
+}
+
+/// Parameters governing incoming connections
+///
+/// Default values should be suitable for most internet applications. An endpoint owns its server
+/// configuration in its [`Configs`]; each endpoint serving the same parameters builds its own.
+pub struct ServerConfig {
+    /// Transport configuration to use for incoming connections
+    pub transport: TransportConfig,
+
+    /// TLS configuration used for incoming connections
+    ///
+    /// Must be set to use TLS 1.3 only.
+    pub crypto: Box<dyn crypto::ServerConfig>,
+
+    /// Configuration for sending and handling validation tokens
+    pub validation_token: ValidationTokenConfig,
+
+    /// Used to generate one-time AEAD keys to protect handshake tokens
+    pub(crate) token_key: Box<dyn HandshakeTokenKey>,
+
+    /// Duration after a retry token was issued for which it's considered valid
+    pub(crate) retry_token_lifetime: Duration,
+
+    /// Whether to allow clients to migrate to new addresses
+    ///
+    /// Improves behavior for clients that move between different internet connections or suffer NAT
+    /// rebinding. Enabled by default.
+    pub(crate) migration: bool,
+
+    pub(crate) preferred_address_v4: Option<SocketAddrV4>,
+    pub(crate) preferred_address_v6: Option<SocketAddrV6>,
+
+    pub(crate) max_incoming: usize,
+    pub(crate) incoming_buffer_size: u64,
+    pub(crate) incoming_buffer_size_total: u64,
+
+    pub(crate) time_source: Box<dyn TimeSource>,
+}
+
+impl ServerConfig {
+    /// Create a default config with a particular handshake token key
+    pub fn new(
+        crypto: Box<dyn crypto::ServerConfig>,
+        token_key: Box<dyn HandshakeTokenKey>,
+    ) -> Self {
+        Self {
+            transport: TransportConfig::default(),
+            crypto,
+
+            token_key,
+            retry_token_lifetime: Duration::from_secs(15),
+
+            migration: true,
+
+            validation_token: ValidationTokenConfig::default(),
+
+            preferred_address_v4: None,
+            preferred_address_v6: None,
+
+            max_incoming: 1 << 16,
+            incoming_buffer_size: 10 << 20,
+            incoming_buffer_size_total: 100 << 20,
+
+            time_source: Box::new(StdSystemTime),
+        }
+    }
+
+    /// Set a custom [`TransportConfig`]
+    pub fn transport_config(&mut self, transport: TransportConfig) -> &mut Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Set a custom [`ValidationTokenConfig`]
+    pub fn validation_token_config(
+        &mut self,
+        validation_token: ValidationTokenConfig,
+    ) -> &mut Self {
+        self.validation_token = validation_token;
+        self
+    }
+
+    /// Private key used to authenticate data included in handshake tokens
+    pub fn token_key(&mut self, value: Box<dyn HandshakeTokenKey>) -> &mut Self {
+        self.token_key = value;
+        self
+    }
+
+    /// Duration after a retry token was issued for which it's considered valid
+    ///
+    /// Defaults to 15 seconds.
+    pub fn retry_token_lifetime(&mut self, value: Duration) -> &mut Self {
+        self.retry_token_lifetime = value;
+        self
+    }
+
+    /// Whether to allow clients to migrate to new addresses
+    ///
+    /// Improves behavior for clients that move between different internet connections or suffer NAT
+    /// rebinding. Enabled by default.
+    pub fn migration(&mut self, value: bool) -> &mut Self {
+        self.migration = value;
+        self
+    }
+
+    /// The preferred IPv4 address that will be communicated to clients during handshaking
+    ///
+    /// If the client is able to reach this address, it will switch to it.
+    pub fn preferred_address_v4(&mut self, address: Option<SocketAddrV4>) -> &mut Self {
+        self.preferred_address_v4 = address;
+        self
+    }
+
+    /// The preferred IPv6 address that will be communicated to clients during handshaking
+    ///
+    /// If the client is able to reach this address, it will switch to it.
+    pub fn preferred_address_v6(&mut self, address: Option<SocketAddrV6>) -> &mut Self {
+        self.preferred_address_v6 = address;
+        self
+    }
+
+    /// Maximum number of [`Incoming`][crate::Incoming] to allow to exist at a time
+    ///
+    /// An [`Incoming`][crate::Incoming] comes into existence when an incoming connection attempt
+    /// is received and stops existing when the application either accepts it or otherwise disposes
+    /// of it. While this limit is reached, new incoming connection attempts are immediately
+    /// refused. Larger values have greater worst-case memory consumption, but accommodate greater
+    /// application latency in handling incoming connection attempts.
+    ///
+    /// The default value is set to 65536. With a typical Ethernet MTU of 1500 bytes, this limits
+    /// memory consumption from this to under 100 MiB--a generous amount that still prevents memory
+    /// exhaustion in most contexts.
+    pub fn max_incoming(&mut self, max_incoming: usize) -> &mut Self {
+        self.max_incoming = max_incoming;
+        self
+    }
+
+    /// Maximum number of received bytes to buffer for each [`Incoming`][crate::Incoming]
+    ///
+    /// An [`Incoming`][crate::Incoming] comes into existence when an incoming connection attempt
+    /// is received and stops existing when the application either accepts it or otherwise disposes
+    /// of it. This limit governs only packets received within that period, and does not include
+    /// the first packet. Packets received in excess of this limit are dropped, which may cause
+    /// 0-RTT or handshake data to have to be retransmitted.
+    ///
+    /// The default value is set to 10 MiB--an amount such that in most situations a client would
+    /// not transmit that much 0-RTT data faster than the server handles the corresponding
+    /// [`Incoming`][crate::Incoming].
+    pub fn incoming_buffer_size(&mut self, incoming_buffer_size: u64) -> &mut Self {
+        self.incoming_buffer_size = incoming_buffer_size;
+        self
+    }
+
+    /// Maximum number of received bytes to buffer for all [`Incoming`][crate::Incoming]
+    /// collectively
+    ///
+    /// An [`Incoming`][crate::Incoming] comes into existence when an incoming connection attempt
+    /// is received and stops existing when the application either accepts it or otherwise disposes
+    /// of it. This limit governs only packets received within that period, and does not include
+    /// the first packet. Packets received in excess of this limit are dropped, which may cause
+    /// 0-RTT or handshake data to have to be retransmitted.
+    ///
+    /// The default value is set to 100 MiB--a generous amount that still prevents memory
+    /// exhaustion in most contexts.
+    pub fn incoming_buffer_size_total(&mut self, incoming_buffer_size_total: u64) -> &mut Self {
+        self.incoming_buffer_size_total = incoming_buffer_size_total;
+        self
+    }
+
+    /// Object to get current [`SystemTime`]
+    ///
+    /// This exists to allow system time to be mocked in tests, or wherever else desired.
+    ///
+    /// Defaults to [`StdSystemTime`], which simply calls [`SystemTime::now()`](SystemTime::now).
+    pub fn time_source(&mut self, time_source: Box<dyn TimeSource>) -> &mut Self {
+        self.time_source = time_source;
+        self
+    }
+
+    pub(crate) fn has_preferred_address(&self) -> bool {
+        self.preferred_address_v4.is_some() || self.preferred_address_v6.is_some()
+    }
+}
+
+impl ServerConfig {
+    /// Create a server config with the given certificate chain to be presented to clients
+    ///
+    /// Uses a randomized handshake token key.
+    pub fn with_single_cert(
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Self, rustls::Error> {
+        Ok(Self::with_crypto(Box::new(QuicServerConfig::new(
+            cert_chain, key,
+        )?)))
+    }
+}
+
+impl ServerConfig {
+    /// Create a server config with the given [`crypto::ServerConfig`]
+    ///
+    /// Uses a randomized handshake token key.
+    pub fn with_crypto(crypto: Box<dyn crypto::ServerConfig>) -> Self {
+        use aws_lc_rs::hkdf;
+        use rand::Rng;
+
+        let rng = &mut rand::rng();
+        let mut master_key = [0u8; 64];
+        rng.fill_bytes(&mut master_key);
+        let master_key = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(&master_key);
+
+        Self::new(crypto, Box::new(master_key))
+    }
+}
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("ServerConfig")
+            .field("transport", &self.transport)
+            // crypto not debug
+            // token not debug
+            .field("retry_token_lifetime", &self.retry_token_lifetime)
+            .field("validation_token", &self.validation_token)
+            .field("migration", &self.migration)
+            .field("preferred_address_v4", &self.preferred_address_v4)
+            .field("preferred_address_v6", &self.preferred_address_v6)
+            .field("max_incoming", &self.max_incoming)
+            .field("incoming_buffer_size", &self.incoming_buffer_size)
+            .field(
+                "incoming_buffer_size_total",
+                &self.incoming_buffer_size_total,
+            )
+            // system_time_clock not debug
+            .finish_non_exhaustive()
+    }
+}
+
+/// Configuration for sending and handling validation tokens in incoming connections
+///
+/// Default values should be suitable for most internet applications.
+///
+/// ## QUIC Tokens
+///
+/// The QUIC protocol defines a concept of "[address validation][1]". Essentially, one side of a
+/// QUIC connection may appear to be receiving QUIC packets from a particular remote UDP address,
+/// but it will only consider that remote address "validated" once it has convincing evidence that
+/// the address is not being [spoofed][2].
+///
+/// Validation is important primarily because of QUIC's "anti-amplification limit." This limit
+/// prevents a QUIC server from sending a client more than three times the number of bytes it has
+/// received from the client on a given address until that address is validated. This is designed
+/// to mitigate the ability of attackers to use QUIC-based servers as reflectors in [amplification
+/// attacks][3].
+///
+/// A path may become validated in several ways. The server is always considered validated by the
+/// client. The client usually begins in an unvalidated state upon first connecting or migrating,
+/// but then becomes validated through various mechanisms that usually take one network round trip.
+/// However, in some cases, a client which has previously attempted to connect to a server may have
+/// been given a one-time use cryptographically secured "token" that it can send in a subsequent
+/// connection attempt to be validated immediately.
+///
+/// There are two ways these tokens can originate:
+///
+/// - If the server responds to an incoming connection with `retry`, a "retry token" is minted and
+///   sent to the client, which the client immediately uses to attempt to connect again. Retry
+///   tokens operate on short timescales, such as 15 seconds.
+/// - If a client's path within an active connection is validated, the server may send the client
+///   one or more "validation tokens," which the client may store for use in later connections to
+///   the same server. Validation tokens may be valid for much longer lifetimes than retry token.
+///
+/// The usage of validation tokens is most impactful in situations where 0-RTT data is also being
+/// used--in particular, in situations where the server sends the client more than three times more
+/// 0.5-RTT data than it has received 0-RTT data. Since the successful completion of a connection
+/// handshake implicitly causes the client's address to be validated, transmission of 0.5-RTT data
+/// is the main situation where a server might be sending application data to an address that could
+/// be validated by token usage earlier than it would become validated without token usage.
+///
+/// [1]: https://www.rfc-editor.org/rfc/rfc9000.html#section-8
+/// [2]: https://en.wikipedia.org/wiki/IP_address_spoofing
+/// [3]: https://en.wikipedia.org/wiki/Denial-of-service_attack#Amplification
+///
+/// These tokens should not be confused with "stateless reset tokens," which are similarly named
+/// but entirely unrelated.
+#[derive(Clone)]
+pub struct ValidationTokenConfig {
+    pub(crate) lifetime: Duration,
+    pub(crate) sent: u32,
+}
+
+impl ValidationTokenConfig {
+    /// Duration after an address validation token was issued for which it's considered valid
+    ///
+    /// This refers only to tokens sent in NEW_TOKEN frames, in contrast to retry tokens.
+    ///
+    /// Defaults to 2 weeks.
+    pub fn lifetime(&mut self, value: Duration) -> &mut Self {
+        self.lifetime = value;
+        self
+    }
+
+    /// Number of address validation tokens sent to a client when its path is validated
+    ///
+    /// This refers only to tokens sent in NEW_TOKEN frames, in contrast to retry tokens.
+    ///
+    /// Defaults to 2.
+    pub fn sent(&mut self, value: u32) -> &mut Self {
+        self.sent = value;
+        self
+    }
+}
+
+impl Default for ValidationTokenConfig {
+    fn default() -> Self {
+        Self {
+            lifetime: Duration::from_secs(2 * 7 * 24 * 60 * 60),
+            sent: 2,
+        }
+    }
+}
+
+impl fmt::Debug for ValidationTokenConfig {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("ServerValidationTokenConfig")
+            .field("lifetime", &self.lifetime)
+            // log not debug
+            .field("sent", &self.sent)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Configuration for outgoing connections
+///
+/// Default values should be suitable for most internet applications. An endpoint owns its client
+/// configurations in its [`Configs`] ([`Endpoint::insert_client_config`](crate::Endpoint::insert_client_config)).
+#[non_exhaustive]
+pub struct ClientConfig {
+    /// Transport configuration to use
+    pub(crate) transport: TransportConfig,
+
+    /// Cryptographic configuration to use
+    pub(crate) crypto: Box<dyn crypto::ClientConfig>,
+
+    /// Validation token store to use
+
+    /// Provider that populates the destination connection ID of Initial Packets
+    pub(crate) initial_dst_cid_provider: Box<dyn Fn() -> ConnectionId + Send + Sync>,
+
+    /// QUIC protocol version to use
+    pub(crate) version: u32,
+}
+
+impl ClientConfig {
+    /// Create a default config with a particular cryptographic config
+    pub fn new(crypto: Box<dyn crypto::ClientConfig>) -> Self {
+        Self {
+            transport: Default::default(),
+            crypto,
+            initial_dst_cid_provider: Box::new(|| {
+                RandomConnectionIdGenerator::new(MAX_CID_SIZE).generate_cid()
+            }),
+            version: 1,
+        }
+    }
+
+    /// Configure how to populate the destination CID of the initial packet when attempting to
+    /// establish a new connection
+    ///
+    /// By default, it's populated with random bytes with reasonable length, so unless you have
+    /// a good reason, you do not need to change it.
+    ///
+    /// When prefer to override the default, please note that the generated connection ID MUST be
+    /// at least 8 bytes long and unpredictable, as per section 7.2 of RFC 9000.
+    pub fn initial_dst_cid_provider(
+        &mut self,
+        initial_dst_cid_provider: Box<dyn Fn() -> ConnectionId + Send + Sync>,
+    ) -> &mut Self {
+        self.initial_dst_cid_provider = initial_dst_cid_provider;
+        self
+    }
+
+    /// Set a custom [`TransportConfig`]
+    pub fn transport_config(&mut self, transport: TransportConfig) -> &mut Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Set the QUIC version to use
+    pub fn version(&mut self, version: u32) -> &mut Self {
+        self.version = version;
+        self
+    }
+}
+
+impl ClientConfig {
+    /// Create a client configuration that trusts specified trust anchors
+    pub fn with_root_certificates(roots: rustls::RootCertStore) -> Result<Self, ClientConfigError> {
+        Ok(Self::new(Box::new(crypto::rustls::QuicClientConfig::new(
+            WebPkiServerVerifier::builder_with_provider(roots, node_provider()).build()?,
+        )?)))
+    }
+}
+
+/// Why [`ClientConfig::with_root_certificates`] could not build a configuration
+#[derive(Debug, Error)]
+pub enum ClientConfigError {
+    /// The server certificate verifier could not be built from the roots
+    #[error(transparent)]
+    Verifier(#[from] rustls::client::VerifierBuilderError),
+    /// The TLS configuration cannot serve QUIC: no TLS 1.3, or no initial cipher suite
+    /// (upstream panicked)
+    #[error(transparent)]
+    Tls(#[from] rustls::Error),
+}
+
+impl fmt::Debug for ClientConfig {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("ClientConfig")
+            .field("transport", &self.transport)
+            // crypto not debug
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Errors in the configuration of an endpoint
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// Value exceeds supported bounds
+    #[error("value exceeds supported bounds")]
+    OutOfBounds,
+}
+
+impl From<TryFromIntError> for ConfigError {
+    fn from(_: TryFromIntError) -> Self {
+        Self::OutOfBounds
+    }
+}
+
+impl From<VarIntBoundsExceeded> for ConfigError {
+    fn from(_: VarIntBoundsExceeded) -> Self {
+        Self::OutOfBounds
+    }
+}
+
+/// Object to get current [`SystemTime`]
+///
+/// This exists to allow system time to be mocked in tests, or wherever else desired.
+pub trait TimeSource: Send + Sync {
+    /// Get [`SystemTime::now()`](SystemTime::now) or the mocked equivalent
+    fn now(&self) -> SystemTime;
+}
+
+/// Default implementation of [`TimeSource`]
+///
+/// Implements `now` by calling [`SystemTime::now()`](SystemTime::now).
+pub struct StdSystemTime;
+
+impl TimeSource for StdSystemTime {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "quinn-proto's default TimeSource for address-validation tokens, which an owner replaces (VENDORED.md)"
+    )]
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}

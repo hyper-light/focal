@@ -11,11 +11,12 @@
     )
 )]
 //! Bounded authenticated protocol shared by embedded and QUIC adapters.
-//! Async transport entry points require a Tokio runtime with IO and time drivers.
-//! Missing runtime context returns a typed transport error before dispatch.
+//! Async transport entry points run on a hyper-rt shard (27 §15); off one,
+//! they return a typed transport error before dispatch.
 mod admission;
 mod auth;
-pub mod congestion;
+mod crypto;
+pub use crypto::crypto_provider;
 mod frame;
 mod handler;
 mod list;
@@ -29,13 +30,17 @@ mod reconcile;
 mod round;
 mod transport;
 mod traversal;
+mod trust;
 mod validators;
 pub use admission::*;
 pub use auth::*;
 pub use frame::*;
 pub use handler::*;
+/// RFC 9002's `kGranularity`, one millisecond: the coarsest timer the transport judges its
+/// deadlines at, and so the least a node's own periodic work on its behalf waits between turns.
+pub use hyper_transport::K_GRANULARITY as TIMER_GRANULARITY;
 pub use list::*;
-pub use local::{LocalRemote, LocalServer};
+pub use local::{LocalGrant, LocalRemote, LocalServer, SOCKET_PATH_BYTES, socket_path_fits};
 pub use managed::*;
 pub use message::*;
 pub use native::*;
@@ -43,52 +48,37 @@ pub use peer_mutations::*;
 pub use peers::*;
 pub use reconcile::*;
 pub use round::*;
-// Historic names kept so the ~25 call sites do not churn across the port.
-pub use local::{LocalRemote as UnixRemote, LocalServer as UnixServer};
 pub use transport::*;
 pub use traversal::*;
+pub use trust::*;
 pub use validators::*;
 #[cfg(test)]
 mod tests;
 
+/// Whether this thread is a hyper-rt shard's: what every async entry point
+/// needs, its timers and sockets the shard's.
 pub(crate) fn require_runtime() -> Result<(), WireError> {
-    tokio::runtime::Handle::try_current()
+    hyper_rt::futures::shard_id()
         .map(|_| ())
-        .map_err(|_| WireError::Connection)
+        .ok_or(WireError::Connection)
 }
 
-/// Check the time driver once before setup can spawn endpoint tasks. IO driver
-/// registration happens inside the same containment boundary. This is used by
-/// bind constructors, never on the per-message path.
-pub(crate) fn transport_setup<T>(
-    build: impl FnOnce() -> Result<T, WireError>,
-) -> Result<T, WireError> {
-    require_runtime()?;
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(tokio::time::sleep(std::time::Duration::ZERO));
-        build()
-    }))
-    .map_err(|_| WireError::Connection)?
-}
-
-/// A handle may be used from a different runtime than the one that bound it.
-/// Contain the exchange itself, including timer construction, without adding a
-/// timer probe per request. An unwound exchange is dropped and never repolled.
-pub(crate) async fn transport_exchange<T>(
+/// An exchange contained by an unwind boundary: a dependency that unwinds
+/// ends the exchange, typed, and it is never polled again (CLAUDE.md §1: the
+/// boundary is the last fence, never the fix). Off a shard it is refused
+/// before it is polled. Named waits around the exchange, which they hold
+/// once (`focal_rt::adapt`).
+pub(crate) fn transport_exchange<T>(
     exchange: impl std::future::Future<Output = Result<T, WireError>>,
-) -> Result<T, WireError> {
-    require_runtime()?;
-    let mut exchange = std::pin::pin!(exchange);
-    std::future::poll_fn(|context| {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            exchange.as_mut().poll(context)
-        }))
-        .unwrap_or_else(|_| std::task::Poll::Ready(Err(WireError::Connection)))
-    })
-    .await
+) -> impl std::future::Future<Output = Result<T, WireError>> {
+    focal_rt::on_shard(
+        focal_rt::contained(exchange, || Err(WireError::Connection)),
+        || Err(WireError::Connection),
+    )
 }
 
 mod monitor;
+pub mod net;
 mod summary;
 pub use monitor::{MAX_MONITOR_ROOTS, MonitorPage};
 pub use summary::LedgerSummary;

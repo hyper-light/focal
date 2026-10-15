@@ -27,6 +27,29 @@ pub use contacts::*;
 pub use membership::*;
 pub use replica::*;
 pub use rpc::*;
+
+/// The voter a stopping leader hands its log to (27 §5): among the voters
+/// it has heard from recently and is not sending a snapshot, the one whose log
+/// matches furthest — the transfer catches it up to the last entry before
+/// it is asked to campaign, so the nearest one is the quickest — and the
+/// lowest id among equals, so that every reading of the same progress
+/// names one heir. None while no other voter qualifies: a leader alone
+/// has no one to hand off to, and stops as it did.
+pub fn heir(
+    status: &focal_consensus::NodeStatus,
+    peers: &[focal_consensus::PeerProgress],
+) -> Option<u64> {
+    peers
+        .iter()
+        .filter(|peer| {
+            peer.node != status.node_id
+                && status.voters.contains(&peer.node)
+                && peer.state != focal_consensus::PEER_SNAPSHOT
+                && peer.recent_active
+        })
+        .max_by_key(|peer| (peer.matched, core::cmp::Reverse(peer.node)))
+        .map(|peer| peer.node)
+}
 pub use state::*;
 
 use focal_directory::{DirectoryError, PartitionCommand, PartitionConfig, RootCommand, RootConfig};
@@ -88,6 +111,12 @@ impl Default for ControlLimits {
 #[derive(Debug, Clone)]
 pub struct ControlOptions {
     pub consensus: focal_consensus::NodeConfig,
+    /// The genesis of a group founded on a sealed image this replica does
+    /// not hold (a seated member of a split destination, 24 §13): the
+    /// replica opens with the group's identity and no state, its state
+    /// comes by snapshot, and it applies no entry before one — the founder
+    /// compacted at founding, so none is ever sent.
+    pub founded_elsewhere: Option<[u8; 32]>,
     pub limits: ControlLimits,
     pub root: RootConfig,
     pub partition: PartitionConfig,
@@ -99,6 +128,7 @@ impl ControlOptions {
     pub fn new(consensus: focal_consensus::NodeConfig) -> Self {
         Self {
             consensus,
+            founded_elsewhere: None,
             limits: ControlLimits::default(),
             root: RootConfig::default(),
             partition: PartitionConfig::default(),
@@ -232,4 +262,60 @@ fn hash<T: Serialize>(domain: &'static str, value: &T) -> Result<[u8; 32], Contr
         value,
         Sink(blake3::Hasher::new_derive_key(domain)),
     )?)
+}
+
+#[cfg(test)]
+mod heir_tests {
+    use super::heir;
+    use focal_consensus::{
+        NodeStatus, PEER_PROBE, PEER_REPLICATE, PEER_SNAPSHOT, PeerProgress, StateRole,
+    };
+
+    fn peer(node: u64, matched: u64, state: u8, recent_active: bool) -> PeerProgress {
+        PeerProgress {
+            node,
+            matched,
+            next_index: matched.saturating_add(1),
+            state,
+            recent_active,
+            paused: false,
+            pending_snapshot: 0,
+        }
+    }
+    fn leader(voters: &[u64]) -> NodeStatus {
+        NodeStatus {
+            node_id: 1,
+            leader_id: 1,
+            term: 3,
+            committed_index: 40,
+            applied_index: 40,
+            role: StateRole::Leader,
+            voters: voters.to_vec(),
+            learners: Vec::new(),
+        }
+    }
+
+    /// A voter the leader is probing after a lost message (27 §3.3) is as
+    /// fit an heir as one it streams to — its log is what counts; one being
+    /// sent a snapshot, one not heard from and a learner are not asked.
+    #[test]
+    fn the_heir_is_the_furthest_voter_heard_from_whatever_its_pipeline_state() {
+        let status = leader(&[1, 2, 3, 4, 5]);
+        let peers = [
+            peer(2, 40, PEER_REPLICATE, true),
+            peer(3, 40, PEER_PROBE, true),
+            peer(4, 12, PEER_SNAPSHOT, true),
+            peer(5, 40, PEER_REPLICATE, false),
+            peer(6, 40, PEER_REPLICATE, true),
+        ];
+        // Equal logs: the lowest id, and the probed voter counts.
+        assert_eq!(heir(&status, &peers), Some(2));
+        let peers = [
+            peer(2, 39, PEER_REPLICATE, true),
+            peer(3, 40, PEER_PROBE, true),
+            peer(4, 41, PEER_SNAPSHOT, true),
+        ];
+        assert_eq!(heir(&status, &peers), Some(3));
+        assert_eq!(heir(&status, &[peer(4, 41, PEER_SNAPSHOT, true)]), None);
+    }
 }

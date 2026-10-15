@@ -1,16 +1,7 @@
 use super::*;
-use crate::native::completion_envelope::{
-    CompletionEnvelope, CompletionSlots, CompletionUse, EvidenceBounds,
-};
+use crate::native::completion_envelope::{CompletionEnvelope, CompletionUse};
 use crate::native::prepare::Scratch;
 use focal_model::lifecycle::artifact_descriptor::Limits as ArtifactLimits;
-
-fn evidence_bounds() -> EvidenceBounds {
-    EvidenceBounds {
-        workspace_bytes: 4096,
-        retained_bytes: 512,
-    }
-}
 
 fn quote_with(
     fixture: &Fixture,
@@ -38,7 +29,6 @@ fn quote_with(
             visibility_label_bytes: 128,
             construction_bytes: 128 * 1024,
         },
-        evidence_bounds(),
     )
 }
 
@@ -57,10 +47,7 @@ fn check(fixture: &Fixture, envelope: CompletionEnvelope) -> Result<(), NativeEr
     let result = envelope.check_work(
         &fixture.view(),
         fixture.core.limits,
-        &mut Scratch {
-            used: 0,
-            max: envelope.work_check_bytes(),
-        },
+        &mut Scratch::bound(envelope.work_check_bytes()),
     );
     drop(reservation);
     result
@@ -92,51 +79,22 @@ fn received_target_prices_all_retry_versions_and_graph_consequences_before_entry
     assert_eq!(reports, 2);
     let report_index = crate::native::index_rows::report_rows(16).unwrap();
     let status = crate::native::index_rows::STATUS_ROWS;
-    assert_eq!(
-        envelope.slots(),
-        CompletionSlots {
-            artifacts: 2,
-            identities: 2,
-            results: 2,
-            outcomes: 2,
-            events: 14 + 2 * cohort.events(),
-            sequences: 2,
-            // Eleven primary rows and the artifact's twenty index rows per
-            // report (doc 22 §7).
-            new_rows: 2 * (11 + report_index) + 2 * cohort.events(),
-            ..CompletionSlots::default()
-        }
-    );
     let storage = envelope.report_storage(CompletionUse::Regular).unwrap();
-    // Sixteen primary changes, the cohort's rows, the report's index rows, a
-    // status move for the parent and every sealed cohort claim, and the due
-    // timers the report can retire: every deleted key beyond the status moves.
+    // Seventeen primary changes (the principal's window among them, F12),
+    // the cohort's rows, the report's index rows, a status move for the
+    // parent and every sealed cohort claim, and the due timers the report
+    // can retire: every deleted key beyond the status moves.
     let timers = storage.limits().deleted_keys - (1 + cohort.claims());
     assert!(timers > 1 + cohort.claims() + cohort.evaluations());
     let changed =
-        16 + cohort.changed_keys() + report_index + status * (1 + cohort.claims()) + timers;
+        17 + cohort.changed_keys() + report_index + status * (1 + cohort.claims()) + timers;
     assert_eq!(storage.limits().changed_keys, changed);
-    let journal = crate::native::completion_book::journal_bytes(1 + cohort.evaluations()).unwrap();
-    let writes = crate::native::mutation::bytes(changed).unwrap();
-    assert!(journal > 0);
-    assert_eq!(
-        envelope
-            .per_report_retained_bytes(CompletionUse::Regular)
-            .unwrap(),
-        storage.additional_retained_bytes() + writes + journal,
-        "each pending Work report owns its possible mixed journal"
-    );
-    assert_eq!(
-        envelope.total_retained_bytes(),
-        2 * (storage.additional_retained_bytes() + writes + journal)
-    );
     assert!(
         envelope
             .report_storage(CompletionUse::AdmissionFailure)
             .is_err()
     );
     assert!(envelope.work_check_bytes() > 0);
-    assert!(envelope.workspace_bytes() > envelope.work_check_bytes());
     assert!(
         envelope.descriptor_limits().construction_bytes < fixture.core.limits.preparation_bytes
     );
@@ -350,15 +308,10 @@ fn incoming_topology_growth_is_detected_even_when_original_parent_row_did_not_ch
     let timers = storage.limits().deleted_keys - (2 + cohort.claims());
     assert_eq!(
         storage.limits().changed_keys,
-        18 + cohort.changed_keys()
+        19 + cohort.changed_keys()
             + crate::native::index_rows::report_rows(16).unwrap()
             + crate::native::index_rows::STATUS_ROWS * (2 + cohort.claims())
             + timers
-    );
-    assert_eq!(larger.slots().events, 16 + 2 * larger.cohort().events());
-    assert_eq!(
-        larger.slots().new_rows,
-        2 * (12 + crate::native::index_rows::report_rows(16).unwrap()) + 2 * cohort.events()
     );
     check(&fixture, larger).unwrap();
 }

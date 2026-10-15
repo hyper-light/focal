@@ -61,6 +61,14 @@ pub struct RangeWriteEnvelope {
     merge_pending_bytes: usize,
     additional_retained_bytes: usize,
     additional_peak_bytes: usize,
+    /// What a write's sparse candidates stage (doc 30 §9): each touched
+    /// member's holds its own group's staging from plan to publication.
+    sparse_staging_bytes: usize,
+    /// What a write's index parts hold from plan to publication (doc 31 M3):
+    /// the funding of the key sets beside the stores and their changes'
+    /// vectors. None unless a group keeps key sets
+    /// ([`Self::with_key_set_bytes`]).
+    key_set_bytes: usize,
 }
 
 impl RangeWriteEnvelope {
@@ -78,6 +86,24 @@ impl RangeWriteEnvelope {
         self.additional_retained_bytes = checked_add(self.additional_retained_bytes, bytes)?;
         self.additional_peak_bytes = checked_add(self.additional_peak_bytes, bytes)?;
         Ok(self)
+    }
+    /// The same envelope with `bytes` more retained per write for what the
+    /// key sets beside a group's stores may take and hold (doc 31 M3): the
+    /// sets' blocks are retained once published, and their funding is held
+    /// from plan to publication.
+    pub fn with_key_set_bytes(mut self, bytes: usize) -> Result<Self, MemoryError> {
+        self.key_set_bytes = checked_add(self.key_set_bytes, bytes)?;
+        self.additional_retained_bytes = checked_add(self.additional_retained_bytes, bytes)?;
+        self.additional_peak_bytes = checked_add(self.additional_peak_bytes, bytes)?;
+        Ok(self)
+    }
+    pub fn key_set_bytes(self) -> usize {
+        self.key_set_bytes
+    }
+    /// Checks what a write's index parts hold against what the envelope
+    /// promised them.
+    pub fn check_key_sets(&self, bytes: usize) -> Result<(), MemoryError> {
+        fits(bytes, self.key_set_bytes)
     }
     pub fn max_base_pages(self) -> usize {
         self.max_base_pages
@@ -103,12 +129,23 @@ impl RangeWriteEnvelope {
     pub fn additional_peak_bytes(self) -> usize {
         self.additional_peak_bytes
     }
+    pub fn sparse_staging_bytes(self) -> usize {
+        self.sparse_staging_bytes
+    }
+    /// The most a write's sparse candidates hold at once: what they retain,
+    /// their input and their staging.
+    pub fn sparse_peak_bytes(self) -> Result<usize, MemoryError> {
+        checked_add(
+            checked_add(self.additional_retained_bytes, self.input_pending_bytes)?,
+            self.sparse_staging_bytes,
+        )
+    }
 
     /// Check the actual immutable-base/owned-input plan before spending a
     /// guarantee based on this envelope. This rejects foreign owner incarnations
     /// even when RangeId/config match, excessive spare input capacity, and every
     /// shape/charge violation. It allocates nothing and consumes no candidate.
-    pub fn check_plan<K: Ord + Clone, V>(
+    pub fn check_plan<K: crate::RangeKey + Clone, V>(
         &self,
         plan: &RangePreparationPlan<'_, K, V>,
     ) -> Result<(), MemoryError> {
@@ -120,7 +157,7 @@ impl RangeWriteEnvelope {
     /// [`RangeStore::future_write_envelope_shared`] for at least that many
     /// members. Sums are bounded by the whole write's limits; every plan must
     /// belong to the group's owner incarnation; a group of one is `check_plan`.
-    pub fn check_plans<'a, 'b, K: Ord + Clone + 'a, V: 'a>(
+    pub fn check_plans<'a, 'b, K: crate::RangeKey + Clone + 'a, V: 'a>(
         &self,
         plans: impl IntoIterator<Item = &'b RangePreparationPlan<'a, K, V>>,
     ) -> Result<(), MemoryError>
@@ -192,6 +229,66 @@ impl RangeWriteEnvelope {
         fits(
             checked_add(checked_add(retained, input_pending)?, merge_pending)?,
             self.additional_peak_bytes,
+        )
+    }
+}
+
+impl RangeWriteEnvelope {
+    /// Check the sparse candidates of one write across a range group (doc 30
+    /// §9), one per member in member order, against this envelope, as
+    /// [`Self::check_plans`] checks built plans: the write's shape within its
+    /// limits, and each reservation within the component that bounds it. A
+    /// candidate holds its merge staging from its plan to its publication, so
+    /// the members' staging is summed, where a rebuild's lives one group at a
+    /// time and counts its largest.
+    pub fn check_sparse<'a, K: crate::RangeKey + Clone + 'a, V: 'a>(
+        &self,
+        candidates: impl IntoIterator<Item = &'a super::SparseRange<K, V>>,
+    ) -> Result<(), MemoryError> {
+        let (mut members, mut changed, mut capacity) = (0usize, 0usize, 0usize);
+        let (mut deleted, mut deleted_heap, mut incoming_heap) = (0usize, 0usize, 0usize);
+        let (mut input, mut pages, mut nodes, mut staging) = (0usize, 0usize, 0usize, 0usize);
+        for candidate in candidates {
+            if self.owner != candidate.owner() {
+                return Err(MemoryError::WrongRange);
+            }
+            members = checked_add(members, 1)?;
+            let (keys, slots, heap, deletions, released) = candidate.shape();
+            changed = checked_add(changed, keys)?;
+            capacity = checked_add(capacity, slots)?;
+            incoming_heap = checked_add(incoming_heap, heap)?;
+            deleted = checked_add(deleted, deletions)?;
+            deleted_heap = checked_add(deleted_heap, released)?;
+            let (held_input, held_pages, held_nodes, held_staging) = candidate.charges();
+            input = checked_add(input, held_input)?;
+            pages = checked_add(pages, held_pages)?;
+            nodes = checked_add(nodes, held_nodes)?;
+            staging = checked_add(staging, held_staging)?;
+        }
+        if members == 0 || members > self.members {
+            return Err(MemoryError::InvalidConfiguration(
+                "a range group publishes one fragment per member within its envelope",
+            ));
+        }
+        fits(changed, self.limits.changed_keys)?;
+        let spare = if self.members > 1 {
+            self.limits.changed_keys
+        } else {
+            0
+        };
+        fits(capacity, checked_add(self.limits.input_capacity, spare)?)?;
+        fits(deleted, self.limits.deleted_keys)?;
+        fits(deleted_heap, self.limits.deleted_heap)?;
+        fits(incoming_heap, self.limits.incoming_heap)?;
+        fits(input, self.input_pending_bytes)?;
+        fits(nodes, self.directory_bytes)?;
+        fits(pages, self.new_pages_bytes)?;
+        fits(staging, self.sparse_staging_bytes)?;
+        let retained = checked_add(nodes, pages)?;
+        fits(retained, self.additional_retained_bytes)?;
+        fits(
+            checked_add(checked_add(retained, input)?, staging)?,
+            self.sparse_peak_bytes()?,
         )
     }
 }
@@ -320,6 +417,20 @@ impl<K, V> RangeStore<K, V> {
                 self.partition.is_some(),
             )?
         };
+        // A sparse candidate stages its page's rows and its own changes,
+        // each touched member's at once: the members' staging less the one
+        // write-wide set of changes is the rest's rows.
+        let sparse_staging_bytes = if changed_keys == 0 {
+            0
+        } else {
+            checked_add(
+                merge_pending_bytes,
+                checked_mul(
+                    touched.saturating_sub(1),
+                    merge_layout_charge::<K, V>(old_rows.max(1), self.partition.is_some())?,
+                )?,
+            )?
+        };
         let additional_retained_bytes = checked_add(directory_bytes, new_pages_bytes)?;
         let additional_peak_bytes = checked_add(
             additional_retained_bytes,
@@ -337,6 +448,8 @@ impl<K, V> RangeStore<K, V> {
             merge_pending_bytes,
             additional_retained_bytes,
             additional_peak_bytes,
+            sparse_staging_bytes,
+            key_set_bytes: 0,
         })
     }
 }

@@ -1,132 +1,19 @@
-use super::tests::{assert_shape, context, id, id_hash};
+use super::tests::{assert_shape, context};
 use super::*;
 use focal_wire::NativeOperationKind;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+/// The released example of one native descriptor, normalized: every field
+/// present with its default expanded, so the schema property set is checked
+/// exactly against the document the engine prints and accepts.
 fn fixture(name: &str) -> Value {
-    match name {
-        "claim.submit" => json!({
-            "description": "Inspect the module and report.",
-            "target": id(2),
-            "scopes": [{"kind": "file", "key": "src/lib.rs"}],
-            "relations": [{"kind": "reviews", "target": format!("claim:{}", id(40))}],
-            "validations": [
-                {"kind": "receipt", "description": "Record delivery.", "deadline": {"at": 10_000}},
-                {"kind": "test", "description": "Run the suite.", "target": {"type": "slot", "index": 0, "name": "primary"},
-                 "evaluator": id(3), "handlers": [{"id": id(77), "version": id_hash(77)}], "deadline": {"at": 10_000}}
-            ],
-            "slots": [{"slot": 0, "checks": [{"declaration": 1}]}]
-        }),
-        "claim.post" | "claim.cancel" => json!({"claim": id(10)}),
-        "receipt.acquire" => json!({"claim": id(10), "id": id(13)}),
-        "artifact.submit" => {
-            json!({"claim": id(10), "slot": 0, "payload": {"type": "text", "text": "{\"passed\":1,\"failed\":0,\"skipped\":0}"}})
-        }
-        "artifact.diagnostic" => {
-            json!({"claim": id(10), "reason": "work", "payload": {"type": "inline", "bytes": [123, 125]}})
-        }
-        "testament.submit" => {
-            json!({"claim": id(10), "summary": "Done.", "confidence": "committed", "outcome": "complete",
-            "manifest": [{"slot": 0, "artifact": {"id": id(15), "hash": id_hash(5)}}]})
-        }
-        "testament.post" | "testament.receive" => json!({"claim": id(10), "testament": id(16)}),
-        "validation.begin" => json!({"claim": id(10), "validation": id(11)}),
-        "validation.report" => {
-            json!({"claim": id(10), "validation": id(11), "verdict": "pass", "payload": {"type": "text", "text": "{\"passed\":1,\"failed\":0,\"skipped\":0}"}})
-        }
-        "claim.release_scope" | "validation.seal_increments" => json!({"claim": id(10)}),
-        "receipt.adopt" => json!({"claim": id(10), "holder": id(4), "id": id(13)}),
-        "artifact.fail" => {
-            json!({"claim": id(10), "slot": 0, "diagnostic": id(15)})
-        }
-        "artifact.receive" => json!({"claim": id(10), "artifact": id(15)}),
-        "artifact.reject" => {
-            json!({"claim": id(10), "artifact": id(15), "reason": "structure", "payload": {"type": "text", "text": "{\"code\":\"bad\",\"message\":\"Malformed report.\"}"}})
-        }
-        "validation.enter_whole_work" => json!({"claim": id(10), "testament": id(16)}),
-        "audit.generate" => json!({"claim": id(10), "id": id(17)}),
-        "audit.post" => json!({"testament": id(17)}),
-        "monitor.register" => json!({
-            "claim": id(10),
-            "roots": [{"predicate": "satisfied", "claim": id(40)}, {"predicate": "released", "claim": id(41)}],
-            "deadline": {"at": 10_000}
-        }),
-        "monitor.rebind" => {
-            json!({"claim": id(10), "monitor": id(18), "predecessor": id(40), "successor": id(41)})
-        }
-        "monitor.cancel" => json!({"claim": id(10), "monitor": id(18)}),
-        "claim.challenge" => json!({
-            "description": "Prove the report covers the edge cases.",
-            "target": id(2),
-            "artifact": format!("{}@{}", id(40), id_hash(40)),
-            "validations": [
-                {"kind": "receipt", "description": "Record delivery.", "deadline": {"at": 10_000}},
-                {"kind": "test", "description": "Run the suite.", "target": {"type": "slot", "index": 0, "name": "primary"},
-                 "evaluator": id(3), "handlers": [{"id": id(77), "version": id_hash(77)}], "deadline": {"at": 10_000}}
-            ],
-            "slots": [{"slot": 0, "checks": [{"declaration": 1}]}],
-            "policy": {"corrective_allowed": true, "max_follow_ups": 1, "single_issuer": true, "escalation": "evaluator"}
-        }),
-        "claim.consult" => json!({
-            "description": "Which cases does the parser leave undefined?",
-            "target": id(2),
-            "validations": [
-                {"kind": "receipt", "description": "Record delivery.", "deadline": {"at": 10_000}}
-            ],
-            "policy": {"max_follow_ups": 2, "escalation": "holder"}
-        }),
-        "claim.correct" => json!({
-            "challenge": id(40),
-            "verdict": id(41),
-            "description": "Redo the inspection with the missing cases.",
-            "validations": [
-                {"kind": "receipt", "description": "Record delivery.", "deadline": {"at": 10_000}}
-            ]
-        }),
-        "claim.follow_up" => json!({
-            "refines": id(40),
-            "description": "And the unicode cases?",
-            "validations": [
-                {"kind": "receipt", "description": "Record delivery.", "deadline": {"at": 10_000}}
-            ]
-        }),
-        _ => panic!("fixture {name}"),
-    }
-}
-
-/// Every list field, defaults included, so the schema property set is checked
-/// exactly against the released document.
-fn list_fixture(name: &str) -> Value {
-    let page = json!({"cursor": null, "limit": 100, "max_visits": 1024});
-    let mut fixture = match name {
-        "claim.list" => json!({
-            "issuer": "self", "subject": id(2), "status": "posted", "action": "work",
-            "scope": {"kind": "file", "key": "src/lib.rs"},
-            "relation": {"kind": "reviews", "target": format!("claim:{}", id(40))},
-            "created_after": 3
-        }),
-        "artifact.list" => {
-            json!({"producer": id(2), "kind": "test-report", "schema": id_hash(9), "input": id(10)})
-        }
-        "validation.list" => json!({"claim": id(10), "evaluator": "self"}),
-        "evaluation.list" => {
-            json!({"claim": id(10), "validation": id(11), "evaluator": id(3), "verdict": "pass"})
-        }
-        "testament.list" | "monitor.list" => json!({"claim": id(10)}),
-        "receipt.list" => json!({"holder": "self", "claim": id(10)}),
-        "event.list" => json!({"after": {"sequence": 4, "ordinal": 1}}),
-        _ => panic!("list fixture {name}"),
-    };
-    for (field, value) in page.as_object().unwrap() {
-        fixture[field] = value.clone();
-    }
-    fixture
+    example(WireProfile::Native, name).unwrap_or_else(|error| panic!("{name}: {error}"))
 }
 
 #[test]
 fn native_catalog_is_sorted_versioned_and_every_field_has_a_schema_property() {
-    assert_eq!(native_descriptors().len(), 43);
+    assert_eq!(native_descriptors().len(), 44);
     let mut previous = "";
     for descriptor in native_descriptors() {
         assert!(previous < descriptor.name, "{}", descriptor.name);
@@ -139,9 +26,9 @@ fn native_catalog_is_sorted_versioned_and_every_field_has_a_schema_property() {
             find_native(descriptor.name).unwrap(),
             descriptor
         ));
+        let fixture = fixture(descriptor.name);
         if descriptor.result_kind == ResultKind::List {
             assert!(!descriptor.mutation && !descriptor.destructive);
-            let fixture = list_fixture(descriptor.name);
             let list =
                 parse_native_list_json(descriptor.name, &serde_json::to_vec(&fixture).unwrap())
                     .unwrap();
@@ -157,6 +44,7 @@ fn native_catalog_is_sorted_versioned_and_every_field_has_a_schema_property() {
             assert_shape(&schema, &schema, &fixture);
             // Reparsing the expanded document is the identity.
             let expanded = serde_json::to_value(&list).unwrap();
+            assert_eq!(expanded["input"], fixture);
             let reparsed = parse_native_list_json(
                 descriptor.name,
                 &serde_json::to_vec(&expanded["input"]).unwrap(),
@@ -176,15 +64,6 @@ fn native_catalog_is_sorted_versioned_and_every_field_has_a_schema_property() {
         if !descriptor.mutation {
             assert_eq!(descriptor.result_kind, ResultKind::Read);
             assert!(!descriptor.destructive);
-            let fixture = match descriptor.name {
-                "ledger.standing" => json!({}),
-                "claim.wait" => json!({"claim": id(10), "until": "testament", "timeout_ms": 30000}),
-                "validation.context" => json!({
-                    "validation": id(11), "phase": "increment", "slot": null, "target": id(15),
-                    "generation": 1, "results_after": null, "limit": 16
-                }),
-                _ => json!({"id": id(10)}),
-            };
             let read =
                 parse_native_read_json(descriptor.name, &serde_json::to_vec(&fixture).unwrap())
                     .unwrap();
@@ -208,19 +87,18 @@ fn native_catalog_is_sorted_versioned_and_every_field_has_a_schema_property() {
         }
         assert_eq!(descriptor.result_kind, ResultKind::Mutation);
         assert!(parse_native_read_json(descriptor.name, b"{}").is_err());
-        let fixture = fixture(descriptor.name);
         let authored =
             parse_native_json(descriptor.name, &serde_json::to_vec(&fixture).unwrap()).unwrap();
         assert_eq!(authored.descriptor().name, descriptor.name);
         assert_eq!(authored.name(), descriptor.name);
         let serialized = serde_json::to_value(&authored).unwrap();
         let expanded = &serialized["input"];
+        assert_eq!(*expanded, fixture, "{}", descriptor.name);
         let schema = descriptor.input_schema().unwrap();
         let fields: BTreeSet<_> = expanded.as_object().unwrap().keys().collect();
         let schema_fields: BTreeSet<_> = schema["properties"].as_object().unwrap().keys().collect();
         assert_eq!(fields, schema_fields, "{}", descriptor.name);
         assert_shape(&schema, &schema, &fixture);
-        assert_shape(&schema, &schema, expanded);
         let reparsed =
             parse_native_json(descriptor.name, &serde_json::to_vec(expanded).unwrap()).unwrap();
         assert_eq!(
@@ -334,9 +212,18 @@ fn coverage_table_maps_every_frame_tag_once_and_only_exposed_rows_have_descripto
             }
             NativeExposure::InternalTimer
             | NativeExposure::Activation
-            | NativeExposure::Retirement => {
+            | NativeExposure::Retirement
+            | NativeExposure::Seal => {
                 assert!(row.name.is_none() && row.tags.is_empty() && row.cli.is_empty());
                 assert_eq!(row.actor, NativeActor::Internal);
+                assert!(row.descriptor().is_none());
+            }
+            // The generation floor is a participant frame the journal issues
+            // by itself (F12): one tag, the issuer's authority, no tool.
+            NativeExposure::ClientProtocol => {
+                assert!(row.name.is_none() && row.cli.is_empty());
+                assert_eq!(row.tags, &[28]);
+                assert_eq!(row.actor, NativeActor::Issuer);
                 assert!(row.descriptor().is_none());
             }
             NativeExposure::WireOnly => {
@@ -345,7 +232,7 @@ fn coverage_table_maps_every_frame_tag_once_and_only_exposed_rows_have_descripto
             }
         }
     }
-    // Every participant frame tag 0..=27 belongs to exactly one operation.
+    // Every participant frame tag 0..=28 belongs to exactly one operation.
     assert_eq!(tags, (0..focal_wire::NATIVE_COMMAND_TAGS).collect());
     // Every native descriptor is claimed by exactly one exposed row; the
     // peer verbs are authored shapes of claim.submit and are claimed through

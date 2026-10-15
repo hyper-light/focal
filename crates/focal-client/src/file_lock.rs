@@ -1,20 +1,16 @@
-//! A lock belongs to one scoped owner, not to the last inherited descriptor.
-//! Process creation can duplicate an open file description before close-on-exec
-//! runs. Closing only the owner's File would leave its flock held by that copy.
+//! A lock belongs to one scoped owner, not to the last inherited descriptor
+//! (`focal_platform::FileLock`, which says why and releases it so).
 use std::{fs::File, io};
 
 /// Deliberately neither Clone nor an owning File conversion: the critical
 /// section has exactly one release authority. Accessors borrow its descriptor
 /// for marker IO; production callers must not create another lock owner from it.
-pub(crate) struct FileLock {
-    file: File,
-}
+pub(crate) struct FileLock(focal_platform::FileLock);
 impl FileLock {
     pub(crate) fn acquire(file: File) -> io::Result<Self> {
-        focal_platform::try_lock_exclusive(&file)?;
-        // Construct immediately after acquisition so subsequent initialization
-        // errors release the lock as well as normal owner completion.
-        Ok(Self { file })
+        // Owned from the acquisition on, so that an error of the
+        // initialization after it releases the lock as its completion does.
+        focal_platform::FileLock::exclusive(file).map(Self)
     }
     /// Acquire, waiting up to `wait` for another owner's short critical
     /// section to end; a lock still held afterwards is `WouldBlock`.
@@ -22,7 +18,7 @@ impl FileLock {
         let deadline = std::time::Instant::now().checked_add(wait);
         loop {
             match focal_platform::try_lock_exclusive(&file) {
-                Ok(()) => return Ok(Self { file }),
+                Ok(()) => return Ok(Self(focal_platform::FileLock::owning(file))),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
                         return Err(error);
@@ -34,20 +30,7 @@ impl FileLock {
         }
     }
     pub(crate) fn file(&self) -> &File {
-        &self.file
-    }
-}
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        loop {
-            match focal_platform::unlock(&self.file) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                // Drop cannot report IO errors or panic. File's close remains
-                // the fallback; acquisition and durability errors retain their
-                // existing typed paths and are never replaced here.
-                _ => break,
-            }
-        }
+        self.0.file()
     }
 }
 

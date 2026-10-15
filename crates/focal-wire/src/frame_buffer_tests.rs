@@ -1,17 +1,11 @@
 //! Raw receive ownership and V1 framing behavior. These helpers provide no
 //! payload checksum or actor authority; typed decoding remains a separate step.
 use super::*;
-use std::{
-    pin::Pin,
-    task::{Context, Poll},
-};
-use tokio::io::ReadBuf;
 
 struct Fragmented<'a> {
     bytes: &'a [u8],
     consumed: usize,
     chunk: usize,
-    pause: bool,
 }
 impl<'a> Fragmented<'a> {
     fn new(bytes: &'a [u8], chunk: usize) -> Self {
@@ -20,29 +14,33 @@ impl<'a> Fragmented<'a> {
             bytes,
             consumed: 0,
             chunk,
-            pause: true,
         }
     }
 }
-impl AsyncRead for Fragmented<'_> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        output: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        if this.pause {
-            this.pause = false;
-            context.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-        this.pause = true;
-        let count = (this.bytes.len() - this.consumed)
-            .min(this.chunk)
-            .min(output.remaining());
-        output.put_slice(&this.bytes[this.consumed..this.consumed + count]);
-        this.consumed += count;
-        Poll::Ready(Ok(()))
+/// Each read yields to the shard once before it gives at most a chunk: a reader that cannot wait
+/// across a pause loses what it held.
+impl FrameStream for Fragmented<'_> {
+    async fn read(&mut self, output: &mut [u8]) -> Result<usize, WireError> {
+        hyper_rt::futures::yield_now().await;
+        let count = (self.bytes.len() - self.consumed)
+            .min(self.chunk)
+            .min(output.len());
+        output[..count].copy_from_slice(&self.bytes[self.consumed..self.consumed + count]);
+        self.consumed += count;
+        Ok(count)
+    }
+    async fn write_all(&mut self, _buf: &[u8]) -> Result<(), WireError> {
+        Err(WireError::Connection)
+    }
+}
+/// What is written, kept.
+impl FrameStream for Vec<u8> {
+    async fn read(&mut self, _output: &mut [u8]) -> Result<usize, WireError> {
+        Ok(0)
+    }
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), WireError> {
+        self.extend_from_slice(buf);
+        Ok(())
     }
 }
 
@@ -57,200 +55,247 @@ fn frame(kind: FrameKind, payload: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(payload);
     bytes
 }
+/// A stream that ends inside a frame: the frame is invalid.
 fn eof<T: std::fmt::Debug>(result: Result<T, WireError>) {
-    assert!(
-        matches!(result, Err(WireError::Io(ref error)) if error.kind() == std::io::ErrorKind::UnexpectedEof),
-        "{result:?}"
-    );
+    assert!(matches!(result, Err(WireError::InvalidFrame)), "{result:?}");
 }
 
-#[tokio::test]
-async fn caller_buffer_receives_fragmented_v1_payload_without_touching_its_tail() {
-    for kind in [
-        FrameKind::Hello,
-        FrameKind::HelloReply,
-        FrameKind::Request,
-        FrameKind::Response,
-    ] {
-        // Postcard encodes this u16 as LEB128. This fixture is independent of the
-        // writer/measurement code, including the exact sixteen header bytes.
-        let expected = frame(kind, &[0xac, 0x02]);
-        let mut written = Vec::new();
-        write_frame(&mut written, kind, &300u16, 1024)
-            .await
-            .unwrap();
-        assert_eq!(written, expected);
-        for chunk in [1, 3, 16, 64] {
-            let mut reader = Fragmented::new(&expected, chunk);
-            let mut buffer = [0xa5; 8];
-            let pointer = buffer.as_ptr();
-            let payload = read_frame_into(&mut reader, kind, 1024, &mut buffer)
+#[test]
+fn caller_buffer_receives_fragmented_v1_payload_without_touching_its_tail() {
+    focal_rt::block_on(async move {
+        for kind in [
+            FrameKind::Hello,
+            FrameKind::HelloReply,
+            FrameKind::Request,
+            FrameKind::Response,
+        ] {
+            // Postcard encodes this u16 as LEB128. This fixture is independent of the
+            // writer/measurement code, including the exact sixteen header bytes.
+            let expected = frame(kind, &[0xac, 0x02]);
+            let mut written = Vec::new();
+            write_frame(&mut written, kind, &300u16, 1024)
                 .await
                 .unwrap();
-            assert_eq!(payload.as_ptr(), pointer);
-            assert_eq!(payload, [0xac, 0x02]);
-            assert_eq!(decode_payload::<u16>(payload).unwrap(), 300);
-            assert_eq!(&buffer[2..], &[0xa5; 6]);
-            assert_eq!(reader.consumed, expected.len());
-            require_end(&mut reader).await.unwrap();
-            let mut reader = Fragmented::new(&expected, chunk);
-            assert_eq!(
-                read_frame::<_, u16>(&mut reader, kind, 1024).await.unwrap(),
-                300
-            );
+            assert_eq!(written, expected);
+            for chunk in [1, 3, 16, 64] {
+                let mut reader = Fragmented::new(&expected, chunk);
+                let mut buffer = [0xa5; 8];
+                let pointer = buffer.as_ptr();
+                let payload = read_frame_into(&mut reader, kind, 1024, &mut buffer)
+                    .await
+                    .unwrap();
+                assert_eq!(payload.as_ptr(), pointer);
+                assert_eq!(payload, [0xac, 0x02]);
+                assert_eq!(decode_payload::<u16>(payload).unwrap(), 300);
+                assert_eq!(&buffer[2..], &[0xa5; 6]);
+                assert_eq!(reader.consumed, expected.len());
+                require_end(&mut reader).await.unwrap();
+                let mut reader = Fragmented::new(&expected, chunk);
+                assert_eq!(
+                    read_frame::<_, u16>(&mut reader, kind, 1024).await.unwrap(),
+                    300
+                );
+            }
         }
-    }
+    })
+    .unwrap()
 }
 
-#[tokio::test]
-async fn checked_header_allows_capacity_refusal_and_retry_without_consuming_body() {
-    let bytes = frame(FrameKind::Request, &[3, 4, 5]);
-    let mut reader = Fragmented::new(&bytes, 1);
-    let checked = read_frame_header(&mut reader, FrameKind::Request, 3)
-        .await
-        .unwrap();
-    assert_eq!(checked.kind(), FrameKind::Request);
-    assert_eq!(checked.payload_bytes(), 3);
-    assert_eq!(reader.consumed, HEADER_BYTES);
-    let mut short = [0xa5; 2];
-    assert!(matches!(
-        read_frame_payload_into(&mut reader, checked, &mut short).await,
-        Err(WireError::Limit),
-    ));
-    assert_eq!(short, [0xa5; 2]);
-    assert_eq!(reader.consumed, HEADER_BYTES);
-    let mut enough = [0xa5; 3];
-    assert_eq!(
-        read_frame_payload_into(&mut reader, checked, &mut enough)
-            .await
-            .unwrap(),
-        &[3, 4, 5]
-    );
-    require_end(&mut reader).await.unwrap();
-
-    let mut reader = Fragmented::new(&bytes, 1);
-    assert!(matches!(
-        read_frame_into(&mut reader, FrameKind::Request, 3, &mut short).await,
-        Err(WireError::Limit)
-    ));
-    assert_eq!(short, [0xa5; 2]);
-    assert_eq!(reader.consumed, HEADER_BYTES);
-}
-
-#[tokio::test]
-async fn every_header_and_payload_truncation_returns_io_failure() {
-    let bytes = frame(FrameKind::Request, &[3, 4, 5]);
-    for end in 0..bytes.len() {
-        let mut reader = Fragmented::new(&bytes[..end], 1);
-        let mut buffer = [0xa5; 8];
-        eof(read_frame_into(&mut reader, FrameKind::Request, 3, &mut buffer).await);
-        assert_eq!(reader.consumed, end);
-        if end < HEADER_BYTES {
-            assert_eq!(buffer, [0xa5; 8]);
-        }
-        assert_eq!(&buffer[3..], &[0xa5; 5]);
-    }
-}
-
-#[tokio::test]
-async fn corrupt_header_and_both_length_caps_refuse_before_body_reads() {
-    for (offset, changed) in [(0, b'X'), (8, 1), (9, 2), (10, 1), (11, 0xff)] {
-        let mut bytes = frame(FrameKind::Request, &[1]);
-        bytes[offset] = changed;
-        let mut reader = Fragmented::new(&bytes, 64);
-        let mut buffer = [0xa5; 1];
-        assert!(matches!(
-            read_frame_into(&mut reader, FrameKind::Request, 1024, &mut buffer).await,
-            Err(WireError::InvalidFrame)
-        ));
-        assert_eq!(reader.consumed, HEADER_BYTES);
-        assert_eq!(buffer, [0xa5]);
-    }
-    for (length, limit) in [
-        (4, 3),
-        (MAX_FRAME_BYTES as u32 + 1, u32::MAX),
-        (u32::MAX, u32::MAX),
-    ] {
-        let bytes = header(FrameKind::Request, length);
+#[test]
+fn checked_header_allows_capacity_refusal_and_retry_without_consuming_body() {
+    focal_rt::block_on(async move {
+        let bytes = frame(FrameKind::Request, &[3, 4, 5]);
         let mut reader = Fragmented::new(&bytes, 1);
-        let mut buffer = [0xa5; 8];
-        assert!(matches!(
-            read_frame_into(&mut reader, FrameKind::Request, limit, &mut buffer).await,
-            Err(WireError::Limit)
-        ));
-        assert_eq!(reader.consumed, HEADER_BYTES);
-        assert_eq!(buffer, [0xa5; 8]);
-    }
-}
-
-#[tokio::test]
-async fn zero_length_raw_frame_is_valid_and_typed_trailing_payload_remains_invalid() {
-    let bytes = frame(FrameKind::Request, &[]);
-    let mut reader = Fragmented::new(&bytes, 1);
-    assert!(
-        read_frame_into(&mut reader, FrameKind::Request, 0, &mut [])
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let mut reader = Fragmented::new(&bytes, 1);
-    read_frame::<_, ()>(&mut reader, FrameKind::Request, 0)
-        .await
-        .unwrap();
-    assert_eq!(encode_payload(&(), 0).unwrap(), Vec::<u8>::new());
-    assert!(matches!(payload_buffer(usize::MAX), Err(WireError::Limit)));
-
-    // No checksum exists in the unchanged V1 header. Raw framing faithfully
-    // supplies bytes; malformed postcard and an extra encoded value still fail
-    // typed decoding instead of being mistaken for a complete request.
-    for payload in [&[2][..], &[1, 0][..]] {
-        let bytes = frame(FrameKind::Request, payload);
-        let mut reader = Fragmented::new(&bytes, 1);
-        let mut buffer = [0xa5; 8];
-        let raw = read_frame_into(&mut reader, FrameKind::Request, 1024, &mut buffer)
+        let checked = read_frame_header(&mut reader, FrameKind::Request, 3)
             .await
             .unwrap();
-        assert_eq!(raw, payload);
+        assert_eq!(checked.kind(), FrameKind::Request);
+        assert_eq!(checked.payload_bytes(), 3);
+        assert_eq!(reader.consumed, HEADER_BYTES);
+        let mut short = [0xa5; 2];
         assert!(matches!(
-            decode_payload::<bool>(raw),
-            Err(WireError::InvalidFrame)
+            read_frame_payload_into(&mut reader, checked, &mut short).await,
+            Err(WireError::Limit),
         ));
+        assert_eq!(short, [0xa5; 2]);
+        assert_eq!(reader.consumed, HEADER_BYTES);
+        let mut enough = [0xa5; 3];
+        assert_eq!(
+            read_frame_payload_into(&mut reader, checked, &mut enough)
+                .await
+                .unwrap(),
+            &[3, 4, 5]
+        );
+        require_end(&mut reader).await.unwrap();
+
         let mut reader = Fragmented::new(&bytes, 1);
         assert!(matches!(
-            read_frame::<_, bool>(&mut reader, FrameKind::Request, 1024).await,
-            Err(WireError::InvalidFrame)
+            read_frame_into(&mut reader, FrameKind::Request, 3, &mut short).await,
+            Err(WireError::Limit)
         ));
-    }
+        assert_eq!(short, [0xa5; 2]);
+        assert_eq!(reader.consumed, HEADER_BYTES);
+    })
+    .unwrap()
 }
 
-#[tokio::test]
-async fn raw_read_stops_at_declared_frame_and_stream_end_is_checked_separately() {
-    let first = frame(FrameKind::Request, &[1]);
-    let mut bytes = first.clone();
-    bytes.extend_from_slice(&frame(FrameKind::Response, &[0]));
-    let mut reader = Fragmented::new(&bytes, 64);
-    let mut buffer = [0xa5; 8];
-    assert_eq!(
-        read_frame_into(&mut reader, FrameKind::Request, 1024, &mut buffer)
-            .await
-            .unwrap(),
-        &[1]
-    );
-    assert_eq!(reader.consumed, first.len());
-    assert_eq!(
-        read_frame_into(&mut reader, FrameKind::Response, 1024, &mut buffer)
-            .await
-            .unwrap(),
-        &[0]
-    );
-    require_end(&mut reader).await.unwrap();
+#[test]
+fn every_header_and_payload_truncation_is_an_invalid_frame() {
+    focal_rt::block_on(async move {
+        let bytes = frame(FrameKind::Request, &[3, 4, 5]);
+        for end in 0..bytes.len() {
+            let mut reader = Fragmented::new(&bytes[..end], 1);
+            let mut buffer = [0xa5; 8];
+            eof(read_frame_into(&mut reader, FrameKind::Request, 3, &mut buffer).await);
+            assert_eq!(reader.consumed, end);
+            if end < HEADER_BYTES {
+                assert_eq!(buffer, [0xa5; 8]);
+            }
+            assert_eq!(&buffer[3..], &[0xa5; 5]);
+        }
+    })
+    .unwrap()
+}
 
-    let mut reader = Fragmented::new(&bytes, 64);
-    read_frame::<_, bool>(&mut reader, FrameKind::Request, 1024)
-        .await
-        .unwrap();
-    assert!(matches!(
-        require_end(&mut reader).await,
-        Err(WireError::InvalidFrame)
-    ));
+#[test]
+fn corrupt_header_and_both_length_caps_refuse_before_body_reads() {
+    focal_rt::block_on(async move {
+        for (offset, changed) in [(0, b'X'), (8, 1), (9, 2), (10, 1), (11, 0xff)] {
+            let mut bytes = frame(FrameKind::Request, &[1]);
+            bytes[offset] = changed;
+            let mut reader = Fragmented::new(&bytes, 64);
+            let mut buffer = [0xa5; 1];
+            assert!(matches!(
+                read_frame_into(&mut reader, FrameKind::Request, 1024, &mut buffer).await,
+                Err(WireError::InvalidFrame)
+            ));
+            assert_eq!(reader.consumed, HEADER_BYTES);
+            assert_eq!(buffer, [0xa5]);
+        }
+        for (length, limit) in [
+            (4, 3),
+            (MAX_FRAME_BYTES as u32 + 1, u32::MAX),
+            (u32::MAX, u32::MAX),
+        ] {
+            let bytes = header(FrameKind::Request, length);
+            let mut reader = Fragmented::new(&bytes, 1);
+            let mut buffer = [0xa5; 8];
+            assert!(matches!(
+                read_frame_into(&mut reader, FrameKind::Request, limit, &mut buffer).await,
+                Err(WireError::Limit)
+            ));
+            assert_eq!(reader.consumed, HEADER_BYTES);
+            assert_eq!(buffer, [0xa5; 8]);
+        }
+    })
+    .unwrap()
+}
+
+/// A typed read of a header announcing more than its bound is refused from the header, before it
+/// waits for the payload or allocates for it: the stream holds the header alone.
+#[test]
+fn oversized_header_is_rejected_before_waiting_for_or_allocating_payload() {
+    focal_rt::block_on(async move {
+        let bytes = header(FrameKind::Request, u32::MAX);
+        let mut reader = Fragmented::new(&bytes, 64);
+        let result =
+            read_frame::<_, crate::RequestEnvelope>(&mut reader, FrameKind::Request, 1024).await;
+        assert!(matches!(result, Err(WireError::Limit)), "{result:?}");
+        assert_eq!(reader.consumed, HEADER_BYTES);
+    })
+    .unwrap()
+}
+
+#[test]
+fn zero_length_raw_frame_is_valid_and_typed_trailing_payload_remains_invalid() {
+    focal_rt::block_on(async move {
+        let bytes = frame(FrameKind::Request, &[]);
+        let mut reader = Fragmented::new(&bytes, 1);
+        assert!(
+            read_frame_into(&mut reader, FrameKind::Request, 0, &mut [])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut reader = Fragmented::new(&bytes, 1);
+        read_frame::<_, ()>(&mut reader, FrameKind::Request, 0)
+            .await
+            .unwrap();
+        assert_eq!(encode_payload(&(), 0).unwrap(), Vec::<u8>::new());
+        assert!(matches!(payload_buffer(usize::MAX), Err(WireError::Limit)));
+
+        // No checksum exists in the unchanged V1 header. Raw framing faithfully
+        // supplies bytes; malformed postcard and an extra encoded value still fail
+        // typed decoding instead of being mistaken for a complete request.
+        for payload in [&[2][..], &[1, 0][..]] {
+            let bytes = frame(FrameKind::Request, payload);
+            let mut reader = Fragmented::new(&bytes, 1);
+            let mut buffer = [0xa5; 8];
+            let raw = read_frame_into(&mut reader, FrameKind::Request, 1024, &mut buffer)
+                .await
+                .unwrap();
+            assert_eq!(raw, payload);
+            assert!(matches!(
+                decode_payload::<bool>(raw),
+                Err(WireError::InvalidFrame)
+            ));
+            let mut reader = Fragmented::new(&bytes, 1);
+            assert!(matches!(
+                read_frame::<_, bool>(&mut reader, FrameKind::Request, 1024).await,
+                Err(WireError::InvalidFrame)
+            ));
+        }
+    })
+    .unwrap()
+}
+
+#[test]
+fn raw_read_stops_at_declared_frame_and_stream_end_is_checked_separately() {
+    focal_rt::block_on(async move {
+        let first = frame(FrameKind::Request, &[1]);
+        let mut bytes = first.clone();
+        bytes.extend_from_slice(&frame(FrameKind::Response, &[0]));
+        let mut reader = Fragmented::new(&bytes, 64);
+        let mut buffer = [0xa5; 8];
+        assert_eq!(
+            read_frame_into(&mut reader, FrameKind::Request, 1024, &mut buffer)
+                .await
+                .unwrap(),
+            &[1]
+        );
+        assert_eq!(reader.consumed, first.len());
+        assert_eq!(
+            read_frame_into(&mut reader, FrameKind::Response, 1024, &mut buffer)
+                .await
+                .unwrap(),
+            &[0]
+        );
+        require_end(&mut reader).await.unwrap();
+
+        let mut reader = Fragmented::new(&bytes, 64);
+        read_frame::<_, bool>(&mut reader, FrameKind::Request, 1024)
+            .await
+            .unwrap();
+        assert!(matches!(
+            require_end(&mut reader).await,
+            Err(WireError::InvalidFrame)
+        ));
+    })
+    .unwrap()
+}
+
+/// An encode appends into a buffer reserved to the measured size: the bytes
+/// are the ones a whole-vector serialization produces, and the buffer was
+/// neither zeroed first nor grown (the audit's F52).
+#[test]
+fn an_encode_writes_its_reserved_buffer_once_and_exactly() {
+    let value = (7u32, vec![9u8; 70_000], "seventy thousand".to_owned());
+    let encoded = encode_payload(&value, MAX_FRAME_BYTES as u32).unwrap();
+    assert_eq!(encoded, postcard::to_stdvec(&value).unwrap());
+    assert_eq!(
+        encoded.capacity(),
+        encoded.len(),
+        "reserved exactly, never grown"
+    );
+    assert!(matches!(encode_payload(&value, 16), Err(WireError::Limit)));
 }

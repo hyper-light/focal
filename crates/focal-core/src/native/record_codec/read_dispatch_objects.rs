@@ -1,7 +1,7 @@
 //! Exact restored-row adapters. Narrow model traits retain native lookup errors
 //! in one stack-owned cell, then return the original cause at the dispatch edge.
 use super::*;
-use focal_model::lifecycle::aggregation::{AcceptancePolicy, PublicationPosition};
+use focal_model::lifecycle::aggregation::{Acceptance, PublicationPosition};
 use focal_model::lifecycle::{
     artifact_descriptor::ArtifactDescriptor,
     claim::ClaimState,
@@ -203,7 +203,9 @@ impl<'a, O: Objects> Access<'a, O> {
             return Err(invalid());
         };
         debit(self.lookup, 256)?;
-        let value = row.get().ok_or_else(invalid)?.expand(self.ledger());
+        let value = row
+            .get(self.ledger(), self.objects.payloads())
+            .ok_or_else(invalid)?;
         if value.sequence != at.sequence || value.ordinal != at.ordinal {
             return Err(invalid());
         }
@@ -222,7 +224,7 @@ impl<O: Objects> read_claim::Objects for Access<'_, O> {
     }
 }
 impl<O: Objects> evidence::Dependencies for Access<'_, O> {
-    fn policy(&self, _claim: ClaimId) -> Result<&AcceptancePolicy, ContractError> {
+    fn policy(&self, _claim: ClaimId) -> Result<Acceptance<'_>, ContractError> {
         Err(ContractError::InvalidPolicy)
     }
     fn artifact(&self, reference: ArtifactRef) -> Result<&ArtifactDescriptor, ContractError> {
@@ -242,10 +244,10 @@ impl<O: Objects> ResponseArtifacts for Access<'_, O> {
 }
 pub(super) struct Policy<'a, 'o, O> {
     pub(super) access: &'a Access<'o, O>,
-    pub(super) policy: &'a AcceptancePolicy,
+    pub(super) policy: Acceptance<'a>,
 }
 impl<O: Objects> evidence::Dependencies for Policy<'_, '_, O> {
-    fn policy(&self, claim: ClaimId) -> Result<&AcceptancePolicy, ContractError> {
+    fn policy(&self, claim: ClaimId) -> Result<Acceptance<'_>, ContractError> {
         if self.policy.claim().object.0 != claim.0
             || self.policy.claim().ledger != self.access.ledger()
         {
@@ -309,6 +311,7 @@ pub(super) fn heap(row: &Row) -> Result<usize, NativeError> {
         Row::Event(value) => value.heap_charge()?,
         Row::ClaimContent(value) => value.heap_charge()?,
         Row::CreationResult(value) => value.heap_charge()?,
+        Row::Epochs(value) => value.heap_charge()?,
         Row::LegacyTestament(value)
         | Row::LegacyEvidenceSet(value)
         | Row::LegacyRun(value)
@@ -330,6 +333,7 @@ pub(super) fn heap(row: &Row) -> Result<usize, NativeError> {
         | Row::Outcome(_)
         | Row::ClaimIdentity(_)
         | Row::DefinitionIdentity(_)
+        | Row::Seal(_)
         | Row::Index => 0,
     })
 }
@@ -339,7 +343,12 @@ fn binding(value: Binding, ledger: LedgerId, id: [u8; 16]) -> Result<(), NativeE
     }
     Ok(())
 }
-pub(super) fn check(key: Key, row: &Row, ledger: LedgerId) -> Result<(), NativeError> {
+pub(super) fn check(
+    key: Key,
+    row: &Row,
+    ledger: LedgerId,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), NativeError> {
     mutation::check_family(key, row)?;
     match (key, row) {
         (Key::Claim(id), Row::Claim(value)) => {
@@ -376,7 +385,9 @@ pub(super) fn check(key: Key, row: &Row, ledger: LedgerId) -> Result<(), NativeE
             id.0,
         )?,
         (Key::ClaimContent(id), Row::ClaimContent(value)) => {
-            binding(value.get().ok_or_else(invalid)?.binding(), ledger, id.0)?
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let value = value.read(payloads, &mut buffer)?;
+            binding(value.binding().ok_or_else(invalid)?, ledger, id.0)?
         }
         (Key::Diagnostic(id), Row::Diagnostic(value)) => {
             let snapshot = value.get().ok_or_else(invalid)?.diagnostic.snapshot_v1();

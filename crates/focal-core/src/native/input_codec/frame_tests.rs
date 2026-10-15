@@ -447,6 +447,9 @@ pub(super) fn commands() -> Vec<NativeCommand> {
             id: MonitorId::from_u128(37),
         },
         authored(),
+        NativeCommand::AdvanceEpochFloor {
+            minimum: RequestEpoch(0x0102_0304_0506_0709),
+        },
     ]
 }
 pub(super) fn frame(input: &NativeInput, profile: NativeContentProfile) -> InputFrame<'_> {
@@ -493,9 +496,9 @@ fn refusal(bytes: &[u8], limits: InspectionLimits, error: CodecError) {
 }
 
 #[test]
-fn all_twenty_eight_actor_frames_preserve_request_headers_and_obey_exact_resource_caps() {
+fn all_twenty_nine_actor_frames_preserve_request_headers_and_obey_exact_resource_caps() {
     let values = commands();
-    assert_eq!(values.len(), 28);
+    assert_eq!(values.len(), 29);
     for (tag, command) in values.into_iter().enumerate() {
         let profile = if tag == 27 {
             NativeContentProfile::AuthoredV1
@@ -859,7 +862,7 @@ fn malformed_headers_closed_tags_options_text_and_lengths_refuse_structurally() 
         (8, 2, "input format"),
         (10, 2, "content profile"),
         (11, 4, "input namespace"),
-        (84, 28, "command"),
+        (84, 29, "command"),
         (HEADER + 2 * BINDING + 4 + SUMMARY.len(), 4, "confidence"),
         (
             HEADER + 2 * BINDING + 5 + SUMMARY.len(),

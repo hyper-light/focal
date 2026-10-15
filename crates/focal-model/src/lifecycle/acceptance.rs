@@ -66,37 +66,76 @@ impl DeclaredObligation {
     }
 }
 
-/// Complete immutable claim acceptance manifest. It is owned by ClaimState,
-/// rather than reconstructed from whichever results a caller happens to supply.
+/// What a claim's acceptance manifest holds: its slots and its declarations. A claim keeps this
+/// beside its own binding and issuer, which the manifest was checked for (doc 31 M3): it is read
+/// bound to them ([`Acceptance`]), not stored with copies of them.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
+pub struct PolicyBody {
+    pub(super) slots: Vec<OwnedSlot>,
+    declarations: Vec<DeclaredObligation>,
+}
+/// Complete immutable claim acceptance manifest with the claim and issuer it was checked for: a
+/// definition's, a legacy registry's. A claim holds its [`PolicyBody`] alone.
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(test, derive(Clone))]
 pub struct AcceptancePolicy {
     claim: Binding,
     issuer: ParticipantId,
-    pub(super) slots: Vec<OwnedSlot>,
-    declarations: Vec<DeclaredObligation>,
+    pub(super) body: PolicyBody,
+}
+/// A manifest as its readers take it: its body, bound to the claim and issuer it was checked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Acceptance<'a> {
+    claim: Binding,
+    issuer: ParticipantId,
+    pub(super) body: &'a PolicyBody,
+}
+impl PolicyBody {
+    /// This body read as the manifest of `claim`, issued by `issuer`: what it was checked for.
+    pub(in crate::lifecycle) fn bind(
+        &self,
+        claim: Binding,
+        issuer: ParticipantId,
+    ) -> Acceptance<'_> {
+        Acceptance {
+            claim,
+            issuer,
+            body: self,
+        }
+    }
 }
 impl AcceptancePolicy {
-    /// Includes declared output slots with no explicit validation checks.
-    pub fn has_slot(&self, slot: u32) -> bool {
-        self.slots
-            .binary_search_by_key(&slot, |row| row.slot)
-            .is_ok()
+    /// The manifest as its readers take it.
+    pub fn view(&self) -> Acceptance<'_> {
+        self.body.bind(self.claim, self.issuer)
+    }
+    /// Its body, for the claim that will hold it beside its own binding and issuer.
+    pub(in crate::lifecycle) fn into_body(self) -> PolicyBody {
+        self.body
+    }
+    pub fn check(&self, claim: Binding, issuer: ParticipantId) -> Result<(), ContractError> {
+        self.view().check(claim, issuer)
+    }
+    pub fn claim(&self) -> Binding {
+        self.claim
+    }
+    pub fn issuer(&self) -> ParticipantId {
+        self.issuer
+    }
+    pub fn declarations(&self) -> &[DeclaredObligation] {
+        &self.body.declarations
     }
     pub fn slot_count(&self) -> usize {
-        self.slots.len()
+        self.body.slots.len()
     }
-    /// Every authored slot in canonical slot order, including slots with no
-    /// validation declarations. Check slices borrow the immutable policy.
     pub fn slots(
         &self,
     ) -> impl ExactSizeIterator<Item = SlotPolicy<'_>> + DoubleEndedIterator + '_ {
-        self.slots.iter().map(|slot| SlotPolicy {
-            slot: slot.slot,
-            missing_declaration_index: slot.missing_declaration_index,
-            mode: slot.mode,
-            checks: &slot.checks,
-        })
+        self.view().slots()
+    }
+    pub fn intent_fingerprint(&self) -> crate::ContentHash {
+        self.view().intent_fingerprint()
     }
 
     pub fn new(
@@ -183,8 +222,68 @@ impl AcceptancePolicy {
         Ok(Self {
             claim,
             issuer,
-            slots: owned,
-            declarations,
+            body: PolicyBody {
+                slots: owned,
+                declarations,
+            },
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        claim: Binding,
+        issuer: ParticipantId,
+        slots: &[SlotPolicy<'_>],
+        delivery: Binding,
+        delivery_index: u32,
+        limits: Limits,
+    ) -> Result<Self, ContractError> {
+        let mut records = Vec::new();
+        records.push(DeclaredObligation {
+            definition: DefinitionStamp::fixture(),
+            binding: delivery,
+            index: delivery_index,
+            mode: ValidationMode::Required,
+            target: ObligationTarget::Delivery,
+        });
+        for slot in slots {
+            for check in slot.checks {
+                records.push(DeclaredObligation {
+                    definition: DefinitionStamp::fixture(),
+                    binding: Binding {
+                        object: crate::ObjectId(check.validation.0),
+                        ..claim
+                    },
+                    index: check.declaration_index,
+                    mode: check.mode,
+                    target: ObligationTarget::Slot(slot.slot),
+                });
+            }
+        }
+        Self::from_records(claim, issuer, slots, records, limits)
+    }
+}
+impl<'a> Acceptance<'a> {
+    /// Includes declared output slots with no explicit validation checks.
+    pub fn has_slot(&self, slot: u32) -> bool {
+        self.body
+            .slots
+            .binary_search_by_key(&slot, |row| row.slot)
+            .is_ok()
+    }
+    pub fn slot_count(&self) -> usize {
+        self.body.slots.len()
+    }
+    /// Every authored slot in canonical slot order, including slots with no
+    /// validation declarations. Check slices borrow the immutable policy.
+    pub fn slots(
+        &self,
+    ) -> impl ExactSizeIterator<Item = SlotPolicy<'a>> + DoubleEndedIterator + use<'a> {
+        let body = self.body;
+        body.slots.iter().map(|slot| SlotPolicy {
+            slot: slot.slot,
+            missing_declaration_index: slot.missing_declaration_index,
+            mode: slot.mode,
+            checks: &slot.checks,
         })
     }
     pub fn check(&self, claim: Binding, issuer: ParticipantId) -> Result<(), ContractError> {
@@ -200,12 +299,16 @@ impl AcceptancePolicy {
     pub fn issuer(&self) -> ParticipantId {
         self.issuer
     }
-    pub fn declarations(&self) -> &[DeclaredObligation] {
-        &self.declarations
+    pub fn declarations(&self) -> &'a [DeclaredObligation] {
+        &self.body.declarations
+    }
+    /// The body bound here: what a claim's row holds of it.
+    pub fn body(&self) -> &'a PolicyBody {
+        self.body
     }
     pub(super) fn within(&self, limits: Limits) -> Result<(), ContractError> {
-        if self.slots.len() > limits.max_slots
-            || self.declarations.len() > limits.max_checks
+        if self.body.slots.len() > limits.max_slots
+            || self.body.declarations.len() > limits.max_checks
             || limits.max_results == 0
             || limits.max_updates == 0
         {
@@ -213,14 +316,15 @@ impl AcceptancePolicy {
         }
         Ok(())
     }
-    pub(super) fn copy(&self) -> Result<Self, ContractError> {
+    pub(super) fn copy(&self) -> Result<AcceptancePolicy, ContractError> {
         self.try_copy(self.copy_charge()?)
     }
     pub(super) fn declaration(
         &self,
         validation: ValidationId,
     ) -> Result<DeclaredObligation, ContractError> {
-        self.declarations
+        self.body
+            .declarations
             .iter()
             .find(|row| row.binding.object.0 == validation.0)
             .copied()
@@ -262,39 +366,6 @@ impl AcceptancePolicy {
             return Err(ContractError::InvalidTarget);
         }
         Ok(record)
-    }
-    #[cfg(test)]
-    pub(crate) fn fixture(
-        claim: Binding,
-        issuer: ParticipantId,
-        slots: &[SlotPolicy<'_>],
-        delivery: Binding,
-        delivery_index: u32,
-        limits: Limits,
-    ) -> Result<Self, ContractError> {
-        let mut records = Vec::new();
-        records.push(DeclaredObligation {
-            definition: DefinitionStamp::fixture(),
-            binding: delivery,
-            index: delivery_index,
-            mode: ValidationMode::Required,
-            target: ObligationTarget::Delivery,
-        });
-        for slot in slots {
-            for check in slot.checks {
-                records.push(DeclaredObligation {
-                    definition: DefinitionStamp::fixture(),
-                    binding: Binding {
-                        object: crate::ObjectId(check.validation.0),
-                        ..claim
-                    },
-                    index: check.declaration_index,
-                    mode: check.mode,
-                    target: ObligationTarget::Slot(slot.slot),
-                });
-            }
-        }
-        Self::from_records(claim, issuer, slots, records, limits)
     }
 }
 
@@ -400,7 +471,7 @@ impl EvaluationRegistry {
         Self::from_policy(claim.acceptance(), limits)
     }
     pub(super) fn from_policy(
-        policy: &AcceptancePolicy,
+        policy: Acceptance<'_>,
         limits: Limits,
     ) -> Result<Self, ContractError> {
         policy.within(limits)?;
@@ -412,8 +483,8 @@ impl EvaluationRegistry {
             increments_sealed: false,
         })
     }
-    pub fn policy(&self) -> &AcceptancePolicy {
-        &self.policy
+    pub fn policy(&self) -> Acceptance<'_> {
+        self.policy.view()
     }
     pub fn rows(&self) -> &[RegisteredEvaluation] {
         &self.rows
@@ -450,7 +521,7 @@ impl EvaluationRegistry {
         {
             return Err(ContractError::InvalidTransition);
         }
-        let record = self.policy.declaration(evaluation.validation())?;
+        let record = self.policy.view().declaration(evaluation.validation())?;
         same_content(record.binding, evaluation.binding())?;
         if evaluation.claim() != ClaimId(self.policy.claim.object.0)
             || evaluation.ledger() != self.policy.claim.ledger
@@ -510,7 +581,7 @@ impl EvaluationRegistry {
         SealedTargets { registry: self }
     }
     pub(super) fn check_result(&self, result: AcceptedResult) -> Result<(), ContractError> {
-        self.policy.check_result(result)?;
+        self.policy.view().check_result(result)?;
         if !self.rows.iter().any(|row| row.matches(result)) {
             return Err(ContractError::StaleEvaluation);
         }
@@ -525,7 +596,7 @@ impl SealedTargets<'_> {
     pub fn rows(&self) -> &[RegisteredEvaluation] {
         self.registry.rows()
     }
-    pub fn policy(&self) -> &AcceptancePolicy {
+    pub fn policy(&self) -> Acceptance<'_> {
         self.registry.policy()
     }
 }

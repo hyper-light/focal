@@ -85,6 +85,11 @@ impl ControlBootstrap {
             directory: directory.checkpoint().clone(),
         }
     }
+    /// Whether this is a partition's sealed image (a split destination's
+    /// first state), as against a group's empty beginning.
+    pub fn is_image(&self) -> bool {
+        matches!(self, Self::Partition { directory } if directory.revision > 0 || directory.sealed.is_some())
+    }
     pub fn identity(&self, options: &ControlOptions) -> Result<ControlIdentity, ControlError> {
         let (cluster, scope) = match self {
             Self::Root { directory, .. } => (directory.cluster, ControlScope::Root),
@@ -105,7 +110,10 @@ impl ControlBootstrap {
             cluster,
             group: options.consensus.group_id,
             scope,
-            genesis: hash("focal.control.genesis.v1", self)?,
+            genesis: match options.founded_elsewhere {
+                Some(genesis) => genesis,
+                None => hash("focal.control.genesis.v1", self)?,
+            },
         })
     }
 }
@@ -173,7 +181,7 @@ impl Machine {
                 let _decode = budget.reserve(
                     BudgetKind::Recovery,
                     BudgetLane::Completion,
-                    charge(enrollment.len().saturating_add(8192), 32)?,
+                    EnrollmentRegistry::restore_bound(enrollment.len())?,
                 )?;
                 let enrollment = EnrollmentRegistry::restore(
                     &enrollment,
@@ -184,7 +192,7 @@ impl Machine {
                     .reserve(
                         BudgetKind::Control,
                         BudgetLane::Completion,
-                        charge(enrollment.charged_bytes(), 16)?,
+                        enrollment.held_bytes()?,
                     )?
                     .commit();
                 Self::Root {
@@ -426,20 +434,15 @@ impl Machine {
                 Err(focal_directory::DirectoryError::UnverifiedAuthority.into())
             }
             (Self::Root { enrollment, .. }, ControlCommand::Enrollment(command)) => {
-                let bytes = enrollment
-                    .charged_bytes()
-                    .checked_add(command_bytes)
-                    .and_then(|n| n.checked_add(8192))
-                    .ok_or(ControlError::Capacity)?;
                 let allocation = budget
                     .reserve(
                         BudgetKind::Control,
                         BudgetLane::Completion,
-                        charge(bytes, 16)?,
+                        enrollment.prepare_bytes(command_bytes)?,
                     )?
                     .commit();
                 let update = enrollment.prepare_command(command)?;
-                if charge(update.charged_bytes(), 16)? > allocation.bytes() {
+                if update.held_bytes()? > allocation.bytes() {
                     return Err(ControlError::Capacity);
                 }
                 Ok(PreparedMachine::Enrollment { update, allocation })

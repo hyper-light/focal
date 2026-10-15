@@ -1,6 +1,6 @@
 use super::InputError;
-use serde::de::{self, DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor};
-use std::{collections::BTreeSet, fmt};
+use serde::de::DeserializeOwned;
+use std::fmt;
 
 pub const MAX_INPUT_BYTES: usize = 256 * 1024;
 const MAX_NODES: usize = 8192;
@@ -19,18 +19,16 @@ pub fn parse_document<T: DeserializeOwned>(
         return Err(InputError::Capacity);
     }
     match format {
-        InputFormat::Json => {
-            let mut parser = serde_json::Deserializer::from_slice(bytes);
-            let mut remaining = MAX_NODES;
-            Shape {
-                remaining: &mut remaining,
-                depth: 0,
-            }
-            .deserialize(&mut parser)
-            .map_err(error)?;
-            parser.end().map_err(error)?;
-            serde_json::from_slice(bytes).map_err(error)
-        }
+        InputFormat::Json => match super::shape::check(bytes, MAX_NODES, MAX_DEPTH) {
+            Ok(()) => serde_json::from_slice(bytes).map_err(error),
+            // The decoder names what is malformed precisely; a document it would take that the
+            // first pass could not follow is refused, never decoded past its bounds.
+            Err(super::shape::ShapeError::Syntax) => match serde_json::from_slice::<T>(bytes) {
+                Err(precise) => Err(error(precise)),
+                Ok(_) => Err(shape_error(super::shape::ShapeError::Syntax)),
+            },
+            Err(refused) => Err(shape_error(refused)),
+        },
         InputFormat::Yaml => {
             let text = std::str::from_utf8(bytes).map_err(|_| InputError::Invalid("UTF-8"))?;
             let options = serde_saphyr::options! {
@@ -46,77 +44,16 @@ pub fn parse_document<T: DeserializeOwned>(
 fn error(value: impl fmt::Display) -> InputError {
     InputError::Decode(value.to_string().chars().take(512).collect())
 }
-/// First JSON pass validates structure and duplicates without constructing a
-/// recursive Value tree. DTO decoding only occurs after depth/node admission.
-struct Shape<'a> {
-    remaining: &'a mut usize,
-    depth: usize,
-}
-impl<'de> DeserializeSeed<'de> for Shape<'_> {
-    type Value = ();
-    fn deserialize<D: de::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-        *self.remaining = self
-            .remaining
-            .checked_sub(1)
-            .ok_or_else(|| de::Error::custom("node limit"))?;
-        if self.depth > MAX_DEPTH {
-            return Err(de::Error::custom("depth limit"));
+/// The first JSON pass's refusal, as the decoder names its own.
+fn shape_error(error: super::shape::ShapeError) -> InputError {
+    use super::shape::ShapeError;
+    InputError::Decode(
+        match error {
+            ShapeError::Nodes => "node limit",
+            ShapeError::Depth => "depth limit",
+            ShapeError::DuplicateKey => "duplicate mapping key",
+            ShapeError::Syntax => "malformed document",
         }
-        deserializer.deserialize_any(self)
-    }
-}
-impl<'de> Visitor<'de> for Shape<'_> {
-    type Value = ();
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("bounded document")
-    }
-    fn visit_bool<E: de::Error>(self, _: bool) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_i64<E: de::Error>(self, _: i64) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_u64<E: de::Error>(self, _: u64) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_f64<E: de::Error>(self, _: f64) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_str<E: de::Error>(self, _: &str) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
-        Ok(())
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        let depth = self
-            .depth
-            .checked_add(1)
-            .ok_or_else(|| de::Error::custom("depth limit"))?;
-        while seq
-            .next_element_seed(Shape {
-                remaining: self.remaining,
-                depth,
-            })?
-            .is_some()
-        {}
-        Ok(())
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-        let depth = self
-            .depth
-            .checked_add(1)
-            .ok_or_else(|| de::Error::custom("depth limit"))?;
-        let mut keys = BTreeSet::new();
-        while let Some(key) = map.next_key::<String>()? {
-            if !keys.insert(key) {
-                return Err(de::Error::custom("duplicate mapping key"));
-            }
-            map.next_value_seed(Shape {
-                remaining: self.remaining,
-                depth,
-            })?;
-        }
-        Ok(())
-    }
+        .to_owned(),
+    )
 }

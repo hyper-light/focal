@@ -5,7 +5,7 @@ use crate::{
     network_bootstrap::{FoundingNetwork, unix_time},
     placement_proof::ProofWindow,
 };
-use focal_consensus::{DurableNode, NodeConfig};
+use focal_consensus::NodeConfig;
 use focal_control::*;
 use focal_directory::*;
 use focal_ledger::{SessionLimits, Submission};
@@ -49,9 +49,9 @@ async fn setup(path: &std::path::Path) -> (FoundingNetwork, Settings, Session, F
     settings.node.advertise = Some("127.0.0.1:7443".into());
     let mut network = FoundingNetwork::open(&settings).await.unwrap();
     let id = network.directory.identity().clone();
-    let consensus = DurableNode::open_on_wal(
+    let consensus = crate::storage_start::test_member(
         NodeConfig::single(id.node, id.cluster, id.ledger.session.0),
-        network.wal.clone(),
+        &network.storage.storage,
     )
     .unwrap();
     let mut session = Session::from_node(id.ledger, consensus, SessionLimits::default()).unwrap();
@@ -172,403 +172,411 @@ fn views(owner: &ControlReplica) -> (ControlSnapshot, ControlAuthoritySnapshot) 
     (state, authority)
 }
 
-#[tokio::test]
-async fn founder_registration_preserves_existing_application_and_replays_exact_metadata() {
-    let directory = tempfile::tempdir().unwrap();
-    let (network, settings, mut session, partition_plan) = setup(directory.path()).await;
-    let memory = budget();
-    let id = network.directory.identity().clone();
-    let application = session.read_at_least(SessionSeq(0)).unwrap().clone();
-    assert!(!application.claims.is_empty());
-    let plan = FirstSessionPlan::capture(
-        &session,
-        &network.state.genesis,
-        &settings,
-        session.memory_stats().limit as u64,
-        &memory,
-    )
-    .unwrap();
-    assert_eq!(plan.founder(), &id);
-    let operation = plan.operation();
-    let client = plan.client();
-    let (host, owner, outgoing) = ControlHost::spawn(
-        network.control,
-        NoDirectoryAuthority,
-        ControlHostConfig::new(network.state.genesis.root_namespace),
-        budget(),
-    )
-    .unwrap();
-    let observation = host.observe_root().await.unwrap();
-    let now = unix_time().unwrap();
-    let initial = plan.prepare(&observation, now, &memory).unwrap();
-    assert_eq!(
-        initial.placement_request().placement.policy.required_memory,
-        session.memory_stats().limit as u64
-    );
-    let grant = initial.root_command().unwrap().clone();
-    let operator = peer(network.state.genesis.root_namespace, ParticipantId(client));
-    host.submit(
-        operator.clone(),
-        ControlRequest {
-            id: ControlRequestId {
-                client,
-                sequence: 1,
-            },
-            acknowledged_through: 0,
-            command: grant,
-        },
-    )
-    .await
-    .unwrap();
-    session
-        .propose_placement(initial.placement_request())
-        .unwrap();
-    assert!(
-        session
-            .placement_witness(initial.placement_request())
-            .unwrap()
-            .is_none()
-    );
-    for _ in 0..8 {
-        session.poll().unwrap();
-    }
-    assert_eq!(session.read_at_least(SessionSeq(0)).unwrap(), &application);
-    let witness = session
-        .placement_witness(initial.placement_request())
-        .unwrap()
-        .unwrap();
-    assert_eq!(witness.fence().sequence, session.sequence());
-    let refreshed = host.observe_root().await.unwrap();
-    assert!(
-        plan.prepare(&refreshed, now, &memory)
-            .unwrap()
-            .root_command()
-            .is_none()
-    );
-    let permit = host.prepare_directory(partition_plan).await.unwrap();
-    let mut partition = permit
-        .open(network.wal.clone(), &budget(), None)
-        .unwrap()
-        .into_replica();
-    let window = ProofWindow {
-        issued_at: now,
-        expires_at: now + 60,
-    };
-    let signed = host
-        .prepare_session_proof(
-            session
-                .placement_witness(initial.placement_request())
-                .unwrap()
-                .unwrap(),
-            window,
-        )
-        .await
-        .unwrap()
-        .sign(&network.credentials)
-        .unwrap();
-    let (state, installed) = views(&partition);
-    assert!(matches!(
-        initial.create_session(&state, &installed, &witness, signed, now, &memory),
-        Err(SessionRegistrationError::NotReady)
-    ));
-    let enroll = initial
-        .partition_enrollment(&state, &installed, now, &memory)
-        .unwrap()
-        .unwrap();
-    commit(&mut partition, 1, enroll.command().clone());
-    let (state, installed) = views(&partition);
-    assert!(
-        initial
-            .partition_enrollment(&state, &installed, now, &memory)
-            .unwrap()
-            .is_none()
-    );
-    let sign = || {
-        host.prepare_session_proof(
-            session
-                .placement_witness(initial.placement_request())
-                .unwrap()
-                .unwrap(),
-            window,
-        )
-    };
-    let signed = sign().await.unwrap().sign(&network.credentials).unwrap();
-    let create = initial
-        .create_session(&state, &installed, &witness, signed, now, &memory)
-        .unwrap()
-        .unwrap();
-    let serialized = postcard::to_stdvec(create.command()).unwrap();
-    commit(&mut partition, 2, create.command().clone());
-    assert_eq!(session.read_at_least(SessionSeq(0)).unwrap(), &application);
-    let descriptor = &partition.partition().unwrap().checkpoint().sessions[&id.ledger];
-    assert_eq!(descriptor.authority, *witness.fence());
-    assert_eq!(descriptor.active, initial.placement_request().placement);
-    assert_eq!(descriptor.active.policy.durability.max_failures, 0);
-    // A newer authority version requires a refreshed directory installation,
-    // not silently accepting a signature with mismatched pinned revisions.
-    let mut stale = installed.clone();
-    stale.authority.revision += 1;
-    let signed = sign().await.unwrap().sign(&network.credentials).unwrap();
-    assert!(
-        initial
-            .create_session(&state, &stale, &witness, signed, now, &memory)
-            .is_err()
-    );
-    drop(partition);
-    let permit = host.prepare_directory(partition_plan).await.unwrap();
-    let partition = permit
-        .open(network.wal.clone(), &budget(), None)
-        .unwrap()
-        .into_replica();
-    let (state, installed) = views(&partition);
-    let signed = sign().await.unwrap().sign(&network.credentials).unwrap();
-    assert!(
-        initial
-            .create_session(&state, &installed, &witness, signed, now, &memory)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(postcard::to_stdvec(create.command()).unwrap(), serialized);
-    session.checkpoint().unwrap();
-    drop(session);
-    let consensus = DurableNode::open_on_wal(
-        NodeConfig::single(id.node, id.cluster, id.ledger.session.0),
-        network.wal.clone(),
-    )
-    .unwrap();
-    let session = Session::from_node(id.ledger, consensus, SessionLimits::default()).unwrap();
-    let recovered = FirstSessionPlan::capture(
-        &session,
-        &network.state.genesis,
-        &settings,
-        session.memory_stats().limit as u64,
-        &memory,
-    )
-    .unwrap();
-    assert_eq!(recovered.operation(), operation);
-    assert_eq!(recovered.client(), client);
-    assert_eq!(recovered.founder().root, id.root);
-    assert_eq!(recovered.founder().issuer, id.issuer);
-    assert_eq!(session.read_at_least(SessionSeq(0)).unwrap(), &application);
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    drop((
-        host,
-        outgoing,
-        observation,
-        refreshed,
-        plan,
-        recovered,
-        initial,
-        enroll,
-        create,
-    ));
-    assert_eq!(memory.stats().used, 0);
-}
-
-#[tokio::test]
-async fn registration_refuses_stronger_policy_foreign_identity_and_expired_node_grants() {
-    let directory = tempfile::tempdir().unwrap();
-    let (network, settings, session, _) = setup(directory.path()).await;
-    let memory = budget();
-    let required = session.memory_stats().limit as u64;
-    assert!(
-        FirstSessionPlan::capture(
+#[test]
+fn founder_registration_preserves_existing_application_and_replays_exact_metadata() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (network, settings, mut session, partition_plan) = setup(directory.path()).await;
+        let memory = budget();
+        let id = network.directory.identity().clone();
+        let application = session.read_at_least(SessionSeq(0)).unwrap().clone();
+        assert!(!application.claims.is_empty());
+        let plan = FirstSessionPlan::capture(
             &session,
             &network.state.genesis,
             &settings,
-            required - 1,
-            &memory
+            session.memory_stats().limit as u64,
+            &memory,
         )
-        .is_err()
-    );
-    let mut foreign = network.state.genesis.clone();
-    foreign.founder.issuer = ParticipantId::from_u128(999);
-    assert!(FirstSessionPlan::capture(&session, &foreign, &settings, required, &memory).is_err());
-    assert_eq!(memory.stats().used, 0);
-    // A session the node hosts alone at another ledger registers under the
-    // node's identity at that ledger, with its own operation identity; the
-    // founder's plan refuses it, as does a host from another cluster, a
-    // zero node or a ledger the facts do not describe.
-    let created = LedgerId {
-        tenant: TenantId::from_u128(9),
-        session: SessionId::from_u128(77),
-    };
-    let mut facts = HostedSessionFacts::from_session(&session).unwrap();
-    facts.ledger = created;
-    let mut host = network.state.genesis.founder.clone();
-    host.ledger = created;
-    let hosted = FirstSessionPlan::capture_hosted(
-        &facts,
-        &network.state.genesis,
-        &host,
-        &settings,
-        required,
-        &memory,
-    )
-    .unwrap();
-    assert_eq!(hosted.ledger(), created);
-    assert_eq!(hosted.founder(), &host);
-    let founder_plan = FirstSessionPlan::capture(
-        &session,
-        &network.state.genesis,
-        &settings,
-        required,
-        &memory,
-    )
-    .unwrap();
-    assert_ne!(hosted.operation(), founder_plan.operation());
-    assert_ne!(hosted.client(), founder_plan.client());
-    assert!(
-        FirstSessionPlan::capture_facts(
-            &facts,
-            &network.state.genesis,
-            &settings,
-            required,
-            &memory
-        )
-        .is_err()
-    );
-    let mut elsewhere = host.clone();
-    elsewhere.cluster = [200; 16];
-    assert!(
-        FirstSessionPlan::capture_hosted(
-            &facts,
-            &network.state.genesis,
-            &elsewhere,
-            &settings,
-            required,
-            &memory
-        )
-        .is_err()
-    );
-    let mut nobody = host.clone();
-    nobody.node = 0;
-    assert!(
-        FirstSessionPlan::capture_hosted(
-            &facts,
-            &network.state.genesis,
-            &nobody,
-            &settings,
-            required,
-            &memory
-        )
-        .is_err()
-    );
-    let mut other = host.clone();
-    other.ledger.session = SessionId::from_u128(78);
-    assert!(
-        FirstSessionPlan::capture_hosted(
-            &facts,
-            &network.state.genesis,
-            &other,
-            &settings,
-            required,
-            &memory
-        )
-        .is_err()
-    );
-    drop(hosted);
-    drop(founder_plan);
-    assert_eq!(memory.stats().used, 0);
-    let plan = FirstSessionPlan::capture(
-        &session,
-        &network.state.genesis,
-        &settings,
-        required,
-        &memory,
-    )
-    .unwrap();
-    let mut stronger = settings.clone();
-    stronger.durability.max_failures = 1;
-    let stronger = FirstSessionPlan::capture(
-        &session,
-        &network.state.genesis,
-        &stronger,
-        required,
-        &memory,
-    )
-    .unwrap();
-    let mut residency = settings.clone();
-    residency
-        .placement
-        .residency
-        .push("not-yet-registered".into());
-    let residency = FirstSessionPlan::capture(
-        &session,
-        &network.state.genesis,
-        &residency,
-        required,
-        &memory,
-    )
-    .unwrap();
-    let (host, owner, outgoing) = ControlHost::spawn(
-        network.control,
-        NoDirectoryAuthority,
-        ControlHostConfig::new(network.state.genesis.root_namespace),
-        budget(),
-    )
-    .unwrap();
-    let observation = host.observe_root().await.unwrap();
-    let now = unix_time().unwrap();
-    assert!(matches!(
-        stronger.prepare(&observation, now, &memory),
-        Err(SessionRegistrationError::PolicyUnsatisfied)
-    ));
-    assert!(matches!(
-        residency.prepare(&observation, now, &memory),
-        Err(SessionRegistrationError::NotReady)
-    ));
-    let expiry = observation.authority().unwrap().nodes[&plan.founder().node].expires_at;
-    assert!(plan.prepare(&observation, expiry, &memory).is_err());
-    let pressure = MemoryBudget::new(1024, 512).unwrap();
-    assert!(matches!(
-        plan.prepare(&observation, now, &pressure),
-        Err(SessionRegistrationError::Capacity)
-    ));
-    assert_eq!(pressure.stats().used, 0);
-    let ControlBootstrap::Root { enrollment, .. } = &observation.snapshot().state else {
-        panic!("root observation");
-    };
-    let registry = EnrollmentRegistry::restore(
-        enrollment,
-        plan.founder().cluster,
-        EnrollmentLimits::default(),
-    )
-    .unwrap();
-    let revoke = registry
-        .prepare_revoke(network.receipt.invitation, now)
         .unwrap();
-    host.submit(
-        peer(
-            network.state.genesis.root_namespace,
-            ParticipantId(plan.client()),
-        ),
-        ControlRequest {
-            id: ControlRequestId {
-                client: plan.client(),
-                sequence: 1,
+        assert_eq!(plan.founder(), &id);
+        let operation = plan.operation();
+        let client = plan.client();
+        let (host, owner, outgoing) = ControlHost::spawn(
+            network.control,
+            NoDirectoryAuthority,
+            ControlHostConfig::new(network.state.genesis.root_namespace),
+            budget(),
+        )
+        .unwrap();
+        let observation = host.observe_root().await.unwrap();
+        let now = unix_time().unwrap();
+        let initial = plan.prepare(&observation, now, &memory).unwrap();
+        assert_eq!(
+            initial.placement_request().placement.policy.required_memory,
+            session.memory_stats().limit as u64
+        );
+        let grant = initial.root_command().unwrap().clone();
+        let operator = peer(network.state.genesis.root_namespace, ParticipantId(client));
+        host.submit(
+            operator.clone(),
+            ControlRequest {
+                id: ControlRequestId {
+                    client,
+                    sequence: 1,
+                },
+                acknowledged_through: 0,
+                command: grant,
             },
-            acknowledged_through: 0,
-            command: ControlCommand::Enrollment(revoke),
-        },
-    )
-    .await
-    .unwrap();
-    let revoked = host.observe_root().await.unwrap();
-    assert!(plan.prepare(&revoked, now, &memory).is_err());
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    drop((
-        host,
-        outgoing,
-        observation,
-        revoked,
-        plan,
-        stronger,
-        residency,
-    ));
-    assert_eq!(memory.stats().used, 0);
+        )
+        .await
+        .unwrap();
+        session
+            .propose_placement(initial.placement_request())
+            .unwrap();
+        assert!(
+            session
+                .placement_witness(initial.placement_request())
+                .unwrap()
+                .is_none()
+        );
+        for _ in 0..8 {
+            session.poll().unwrap();
+        }
+        assert_eq!(session.read_at_least(SessionSeq(0)).unwrap(), &application);
+        let witness = session
+            .placement_witness(initial.placement_request())
+            .unwrap()
+            .unwrap();
+        assert_eq!(witness.fence().sequence, session.sequence());
+        let refreshed = host.observe_root().await.unwrap();
+        assert!(
+            plan.prepare(&refreshed, now, &memory)
+                .unwrap()
+                .root_command()
+                .is_none()
+        );
+        let permit = host.prepare_directory(partition_plan).await.unwrap();
+        let mut partition = permit
+            .open(network.storage.storage.clone(), &budget(), None)
+            .unwrap()
+            .into_replica();
+        let window = ProofWindow {
+            issued_at: now,
+            expires_at: now + 60,
+        };
+        let signed = host
+            .prepare_session_proof(
+                session
+                    .placement_witness(initial.placement_request())
+                    .unwrap()
+                    .unwrap(),
+                window,
+            )
+            .await
+            .unwrap()
+            .sign(&network.credentials)
+            .unwrap();
+        let (state, installed) = views(&partition);
+        assert!(matches!(
+            initial.create_session(&state, &installed, &witness, signed, now, &memory),
+            Err(SessionRegistrationError::NotReady)
+        ));
+        let enroll = initial
+            .partition_enrollment(&state, &installed, now, &memory)
+            .unwrap()
+            .unwrap();
+        commit(&mut partition, 1, enroll.command().clone());
+        let (state, installed) = views(&partition);
+        assert!(
+            initial
+                .partition_enrollment(&state, &installed, now, &memory)
+                .unwrap()
+                .is_none()
+        );
+        let sign = || {
+            host.prepare_session_proof(
+                session
+                    .placement_witness(initial.placement_request())
+                    .unwrap()
+                    .unwrap(),
+                window,
+            )
+        };
+        let signed = sign().await.unwrap().sign(&network.credentials).unwrap();
+        let create = initial
+            .create_session(&state, &installed, &witness, signed, now, &memory)
+            .unwrap()
+            .unwrap();
+        let serialized = postcard::to_stdvec(create.command()).unwrap();
+        commit(&mut partition, 2, create.command().clone());
+        assert_eq!(session.read_at_least(SessionSeq(0)).unwrap(), &application);
+        let descriptor = &partition.partition().unwrap().checkpoint().sessions[&id.ledger];
+        assert_eq!(descriptor.authority, *witness.fence());
+        assert_eq!(descriptor.active, initial.placement_request().placement);
+        assert_eq!(descriptor.active.policy.durability.max_failures, 0);
+        // A newer authority version requires a refreshed directory installation,
+        // not silently accepting a signature with mismatched pinned revisions.
+        let mut stale = installed.clone();
+        stale.authority.revision += 1;
+        let signed = sign().await.unwrap().sign(&network.credentials).unwrap();
+        assert!(
+            initial
+                .create_session(&state, &stale, &witness, signed, now, &memory)
+                .is_err()
+        );
+        drop(partition);
+        let permit = host.prepare_directory(partition_plan).await.unwrap();
+        let partition = permit
+            .open(network.storage.storage.clone(), &budget(), None)
+            .unwrap()
+            .into_replica();
+        let (state, installed) = views(&partition);
+        let signed = sign().await.unwrap().sign(&network.credentials).unwrap();
+        assert!(
+            initial
+                .create_session(&state, &installed, &witness, signed, now, &memory)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(postcard::to_stdvec(create.command()).unwrap(), serialized);
+        session.checkpoint().unwrap();
+        drop(session);
+        let consensus = crate::storage_start::test_member(
+            NodeConfig::single(id.node, id.cluster, id.ledger.session.0),
+            &network.storage.storage,
+        )
+        .unwrap();
+        let session = Session::from_node(id.ledger, consensus, SessionLimits::default()).unwrap();
+        let recovered = FirstSessionPlan::capture(
+            &session,
+            &network.state.genesis,
+            &settings,
+            session.memory_stats().limit as u64,
+            &memory,
+        )
+        .unwrap();
+        assert_eq!(recovered.operation(), operation);
+        assert_eq!(recovered.client(), client);
+        assert_eq!(recovered.founder().root, id.root);
+        assert_eq!(recovered.founder().issuer, id.issuer);
+        assert_eq!(session.read_at_least(SessionSeq(0)).unwrap(), &application);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        drop((
+            host,
+            outgoing,
+            observation,
+            refreshed,
+            plan,
+            recovered,
+            initial,
+            enroll,
+            create,
+        ));
+        assert_eq!(memory.stats().used, 0);
+    })
+    .unwrap()
+}
+
+#[test]
+fn registration_refuses_stronger_policy_foreign_identity_and_expired_node_grants() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (network, settings, session, _) = setup(directory.path()).await;
+        let memory = budget();
+        let required = session.memory_stats().limit as u64;
+        assert!(
+            FirstSessionPlan::capture(
+                &session,
+                &network.state.genesis,
+                &settings,
+                required - 1,
+                &memory
+            )
+            .is_err()
+        );
+        let mut foreign = network.state.genesis.clone();
+        foreign.founder.issuer = ParticipantId::from_u128(999);
+        assert!(
+            FirstSessionPlan::capture(&session, &foreign, &settings, required, &memory).is_err()
+        );
+        assert_eq!(memory.stats().used, 0);
+        // A session the node hosts alone at another ledger registers under the
+        // node's identity at that ledger, with its own operation identity; the
+        // founder's plan refuses it, as does a host from another cluster, a
+        // zero node or a ledger the facts do not describe.
+        let created = LedgerId {
+            tenant: TenantId::from_u128(9),
+            session: SessionId::from_u128(77),
+        };
+        let mut facts = HostedSessionFacts::from_session(&session).unwrap();
+        facts.ledger = created;
+        let mut host = network.state.genesis.founder.clone();
+        host.ledger = created;
+        let hosted = FirstSessionPlan::capture_hosted(
+            &facts,
+            &network.state.genesis,
+            &host,
+            &settings,
+            required,
+            &memory,
+        )
+        .unwrap();
+        assert_eq!(hosted.ledger(), created);
+        assert_eq!(hosted.founder(), &host);
+        let founder_plan = FirstSessionPlan::capture(
+            &session,
+            &network.state.genesis,
+            &settings,
+            required,
+            &memory,
+        )
+        .unwrap();
+        assert_ne!(hosted.operation(), founder_plan.operation());
+        assert_ne!(hosted.client(), founder_plan.client());
+        assert!(
+            FirstSessionPlan::capture_facts(
+                &facts,
+                &network.state.genesis,
+                &settings,
+                required,
+                &memory
+            )
+            .is_err()
+        );
+        let mut elsewhere = host.clone();
+        elsewhere.cluster = [200; 16];
+        assert!(
+            FirstSessionPlan::capture_hosted(
+                &facts,
+                &network.state.genesis,
+                &elsewhere,
+                &settings,
+                required,
+                &memory
+            )
+            .is_err()
+        );
+        let mut nobody = host.clone();
+        nobody.node = 0;
+        assert!(
+            FirstSessionPlan::capture_hosted(
+                &facts,
+                &network.state.genesis,
+                &nobody,
+                &settings,
+                required,
+                &memory
+            )
+            .is_err()
+        );
+        let mut other = host.clone();
+        other.ledger.session = SessionId::from_u128(78);
+        assert!(
+            FirstSessionPlan::capture_hosted(
+                &facts,
+                &network.state.genesis,
+                &other,
+                &settings,
+                required,
+                &memory
+            )
+            .is_err()
+        );
+        drop(hosted);
+        drop(founder_plan);
+        assert_eq!(memory.stats().used, 0);
+        let plan = FirstSessionPlan::capture(
+            &session,
+            &network.state.genesis,
+            &settings,
+            required,
+            &memory,
+        )
+        .unwrap();
+        let mut stronger = settings.clone();
+        stronger.durability.max_failures = 1;
+        let stronger = FirstSessionPlan::capture(
+            &session,
+            &network.state.genesis,
+            &stronger,
+            required,
+            &memory,
+        )
+        .unwrap();
+        let mut residency = settings.clone();
+        residency
+            .placement
+            .residency
+            .push("not-yet-registered".into());
+        let residency = FirstSessionPlan::capture(
+            &session,
+            &network.state.genesis,
+            &residency,
+            required,
+            &memory,
+        )
+        .unwrap();
+        let (host, owner, outgoing) = ControlHost::spawn(
+            network.control,
+            NoDirectoryAuthority,
+            ControlHostConfig::new(network.state.genesis.root_namespace),
+            budget(),
+        )
+        .unwrap();
+        let observation = host.observe_root().await.unwrap();
+        let now = unix_time().unwrap();
+        assert!(matches!(
+            stronger.prepare(&observation, now, &memory),
+            Err(SessionRegistrationError::PolicyUnsatisfied)
+        ));
+        assert!(matches!(
+            residency.prepare(&observation, now, &memory),
+            Err(SessionRegistrationError::NotReady)
+        ));
+        let expiry = observation.authority().unwrap().nodes[&plan.founder().node].expires_at;
+        assert!(plan.prepare(&observation, expiry, &memory).is_err());
+        let pressure = MemoryBudget::new(1024, 512).unwrap();
+        assert!(matches!(
+            plan.prepare(&observation, now, &pressure),
+            Err(SessionRegistrationError::Capacity)
+        ));
+        assert_eq!(pressure.stats().used, 0);
+        let ControlBootstrap::Root { enrollment, .. } = &observation.snapshot().state else {
+            panic!("root observation");
+        };
+        let registry = EnrollmentRegistry::restore(
+            enrollment,
+            plan.founder().cluster,
+            EnrollmentLimits::default(),
+        )
+        .unwrap();
+        let revoke = registry
+            .prepare_revoke(network.receipt.invitation, now)
+            .unwrap();
+        host.submit(
+            peer(
+                network.state.genesis.root_namespace,
+                ParticipantId(plan.client()),
+            ),
+            ControlRequest {
+                id: ControlRequestId {
+                    client: plan.client(),
+                    sequence: 1,
+                },
+                acknowledged_through: 0,
+                command: ControlCommand::Enrollment(revoke),
+            },
+        )
+        .await
+        .unwrap();
+        let revoked = host.observe_root().await.unwrap();
+        assert!(plan.prepare(&revoked, now, &memory).is_err());
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        drop((
+            host,
+            outgoing,
+            observation,
+            revoked,
+            plan,
+            stronger,
+            residency,
+        ));
+        assert_eq!(memory.stats().used, 0);
+    })
+    .unwrap()
 }
 
 #[test]

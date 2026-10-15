@@ -284,25 +284,92 @@ impl DefinitionPlan<'_, '_> {
     }
 }
 
+/// The authored definition row whose record encoding `bytes` are (a spilled row's, doc 31 M3),
+/// checked as a replayed one is, under its own issuer (the bytes are the replica's own, written
+/// once the definition's checks had read it), and its heap charged by `fund` at its plan's quote
+/// before it is built. Every bound is the encoding's own length: an element takes a byte at least,
+/// and a decoded definition is a few times its encoding.
+pub(in crate::native) fn decode_definition(
+    bytes: &[u8],
+    fund: &dyn Fn(usize) -> Result<focal_memory::Allocation, NativeError>,
+) -> Result<(crate::native::OwnedDeclaration, focal_memory::Allocation), NativeError> {
+    let len = bytes.len();
+    let visits = len
+        .checked_mul(256)
+        .and_then(|n| n.checked_add(4096))
+        .ok_or(NativeError::Capacity("definition decode"))?;
+    let mut cursor = Cursor::new(bytes, len, visits).map_err(codec)?;
+    let mut input = definition(&mut cursor)?;
+    cursor.finish().map_err(codec)?;
+    if !matches!(input, DefinitionInput::Authored(_)) {
+        return Err(ContractError::InvalidManifest.into());
+    }
+    let count = u32::try_from(len).unwrap_or(u32::MAX);
+    let declaration = validation::Limits {
+        handlers: count,
+        attempts: u32::MAX,
+        slot_bytes: len,
+    };
+    let authored = validation_descriptor::Limits {
+        declaration,
+        description_bytes: len,
+        quality_bar_bytes: len,
+        contributors: len,
+        construction_bytes: visits,
+    };
+    let issuer = input.issuer();
+    let plan = input.prepare(issuer, declaration, authored, visits, visits)?;
+    let quote = plan.quote();
+    let charge = fund(quote.heap_bytes)?;
+    match plan.build(quote.heap_bytes, quote.model_build_visits)? {
+        Row::Definition(owned) if owned.heap_charge()? <= charge.bytes() => Ok((owned, charge)),
+        _ => Err(ContractError::InvalidManifest.into()),
+    }
+}
+
 pub(in crate::native::record_codec) struct ClaimContentInput<'a> {
     body: ClaimBodyInput<'a>,
+    /// The descriptor's encoding exactly as the record carries it: what the row holds once it
+    /// is checked (doc 31 M3).
+    bytes: &'a [u8],
     max_responses: u32,
     scope_limits: ScopeLimits,
     owner: Option<Owner>,
 }
 pub(in crate::native::record_codec) struct ClaimContentPlan<'s, 'a> {
     body: ClaimBodyPlan<'s, 'a>,
+    bytes: &'a [u8],
     max_responses: u32,
     scope_limits: ScopeLimits,
     owner: Option<Owner>,
     quote: Quote,
 }
+/// A claim content row's creation profile, read where the row's encoding carries it: after the
+/// descriptor.
+pub(in crate::native) fn content_profile(
+    cursor: &mut Cursor<'_>,
+) -> Result<crate::native::owned::ClaimContentProfile, crate::native::record_codec::CodecError> {
+    Ok(crate::native::owned::ClaimContentProfile {
+        max_responses: cursor.u32()?,
+        scope_limits: fields::scope_limits(cursor)?,
+        owner: fields::owner(cursor)?,
+    })
+}
 pub(in crate::native::record_codec) fn claim_content<'a>(
     cursor: &mut Cursor<'a>,
     max_source_visits: usize,
 ) -> Result<ClaimContentInput<'a>, NativeError> {
+    let unread = cursor.unread();
+    let start = cursor.offset();
+    let body = ClaimBodyInput::read(cursor, max_source_visits).map_err(decode)?;
+    let bytes = cursor
+        .offset()
+        .checked_sub(start)
+        .and_then(|length| unread.get(..length))
+        .ok_or(NativeError::Capacity("claim content encoding"))?;
     Ok(ClaimContentInput {
-        body: ClaimBodyInput::read(cursor, max_source_visits).map_err(decode)?,
+        body,
+        bytes,
         max_responses: cursor.u32().map_err(codec)?,
         scope_limits: fields::scope_limits(cursor).map_err(codec)?,
         owner: fields::owner(cursor).map_err(codec)?,
@@ -343,14 +410,33 @@ impl<'a> ClaimContentInput<'a> {
                 return Err(ContractError::InvalidManifest.into());
             }
         }
-        let quote = body_quote(
-            body.quote(),
-            size_of::<claim_descriptor::ClaimDescriptor>(),
-            OwnedClaimContent::container_charge(),
-            ownership_visits,
-        )?;
+        // The row holds the checked encoding, not a built descriptor: what it charges is the
+        // encoding's own length, and building it is a copy of it (doc 31 M3).
+        let profile = crate::native::owned::ClaimContentProfile {
+            max_responses: self.max_responses,
+            scope_limits: self.scope_limits,
+            owner: self.owner,
+        };
+        let parsed = body.quote();
+        let quote = Quote {
+            heap_bytes: OwnedClaimContent::charge_for_body(self.bytes.len(), &profile)?,
+            allocations: 1,
+            model_inspection_visits: parsed
+                .model_inspection_visits
+                .checked_add(128)
+                .and_then(|n| n.checked_add(ownership_visits))
+                .ok_or(NativeError::Capacity("claim content recovery work"))?,
+            model_build_visits: self
+                .bytes
+                .len()
+                .checked_add(128)
+                .ok_or(NativeError::Capacity("claim content recovery work"))?,
+            source_inspection_visits: parsed.source_inspection_visits,
+            source_build_visits: 0,
+        };
         Ok(ClaimContentPlan {
             body,
+            bytes: self.bytes,
             max_responses: self.max_responses,
             scope_limits: self.scope_limits,
             owner: self.owner,
@@ -362,20 +448,26 @@ impl ClaimContentPlan<'_, '_> {
     pub(in crate::native::record_codec) fn quote(&self) -> Quote {
         self.quote
     }
+    /// The row, spilled to `log` where there is one that takes it (doc 31 M3).
     pub(in crate::native::record_codec) fn build(
         self,
         max_bytes: usize,
         max_model_visits: usize,
+        log: Option<&dyn crate::native::payloads::PayloadLog>,
     ) -> Result<Row, NativeError> {
         fits(self.quote.heap_bytes, max_bytes)?;
         fits(self.quote.model_build_visits, max_model_visits)?;
-        let quote = self.body.quote();
-        let value = self
-            .body
-            .build(quote.bytes, quote.model_build_visits)
-            .map_err(decode)?;
-        let owned =
-            OwnedClaimContent::new(value, self.max_responses, self.scope_limits, self.owner)?;
+        let profile = crate::native::owned::ClaimContentProfile {
+            max_responses: self.max_responses,
+            scope_limits: self.scope_limits,
+            owner: self.owner,
+        };
+        let owned = OwnedClaimContent::from_encoded_in(
+            self.bytes,
+            self.body.content_hash(),
+            &profile,
+            log,
+        )?;
         let actual = owned.heap_charge()?;
         finish(Row::ClaimContent(owned), actual, self.quote, max_bytes)
     }

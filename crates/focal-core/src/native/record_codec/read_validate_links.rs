@@ -77,7 +77,7 @@ pub(super) fn monitors(
         if link.previous != previous {
             return Err(invalid());
         }
-        monitor_link(target, id, *link, read)?;
+        monitor_link(target, id, **link, read)?;
         previous = Some(id);
         next = link.next;
     }
@@ -282,7 +282,7 @@ pub(super) fn row(
         (Key::MonitorLink(target, id), Row::MonitorLink(value)) => {
             read.claim(target)?;
             if let Some(link) = value {
-                monitor_link(target, id, *link, read)?;
+                monitor_link(target, id, **link, read)?;
             } else if !matches!(read.require(Key::Monitor(id))?, Row::Monitor(_)) {
                 return Err(invalid());
             }

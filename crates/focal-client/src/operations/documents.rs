@@ -363,7 +363,7 @@ pub fn decode_list_cursor(value: &str) -> Result<ListCursor, InputError> {
     bytes
         .try_reserve_exact(value.len() / 2)
         .map_err(|_| InputError::Capacity)?;
-    for pair in value.as_bytes().chunks_exact(2) {
+    for pair in value.as_bytes().as_chunks::<2>().0 {
         let mut byte = 0u8;
         for digit in pair {
             let digit = match digit {

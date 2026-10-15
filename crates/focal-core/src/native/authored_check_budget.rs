@@ -89,6 +89,7 @@ pub(super) fn quote(
     plan: &super::super::super::transactions::Plan,
     extras: &Extras,
     limits: NativeLimits,
+    memory: &focal_memory::MemoryBudget,
 ) -> Result<usize, NativeError> {
     let e = extras.rows.len();
     let r = plan.rows.len();
@@ -109,7 +110,12 @@ pub(super) fn quote(
         match &extra.row {
             Row::ClaimContent(owned) => {
                 claims = add(claims, 1)?;
-                let body = owned.get().ok_or(ContractError::InvalidPolicy)?;
+                // A candidate's rows are held until every check has read them (doc 31 M3).
+                let held = owned
+                    .held()
+                    .ok_or(ContractError::InvalidPolicy)?
+                    .body(memory, focal_memory::BudgetLane::Ordinary)?;
+                let body: &ClaimDescriptor = &held;
                 let shape = body_shape(body, limits, &mut inspection)?;
                 pins = add(pins, shape.pins)?;
                 pin_pairs = add(pin_pairs, mul(shape.pins, shape.pins)?)?;
@@ -124,8 +130,10 @@ pub(super) fn quote(
             Row::ClaimIdentity(_) => claim_indices = add(claim_indices, 1)?,
             Row::DefinitionIdentity(_) => definition_indices = add(definition_indices, 1)?,
             Row::CreationResult(result) => {
-                within(result.get().entries().len(), limits.range.max_batch_entries)?;
-                objects = add(objects, result.get().entries().len())?;
+                // A candidate's rows are held until every check has read them (doc 31 M3).
+                let entries = result.held().ok_or(ContractError::InvalidPolicy)?.entries();
+                within(entries.len(), limits.range.max_batch_entries)?;
+                objects = add(objects, entries.len())?;
             }
             _ => {}
         }

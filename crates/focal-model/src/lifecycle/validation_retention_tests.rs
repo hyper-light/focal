@@ -271,7 +271,8 @@ fn preparation_checks_all_capacity_and_policy_bounds_before_owned_construction()
     let plan = Declaration::prepare(Principal::Actor(spec.issuer), spec, limits()).unwrap();
     let expected = std::mem::size_of::<Declaration>()
         + "output".len()
-        + 3 * std::mem::size_of::<OwnedHandlerPolicy>();
+        + 3 * std::mem::size_of::<OwnedHandlerPolicy>()
+        + 2 * std::mem::size_of::<definition::OwnedPhasePolicy>();
     assert_eq!(plan.construction_charge(), expected);
     let definition = plan.build().unwrap();
     assert_eq!(definition.retained_bytes().unwrap(), expected);

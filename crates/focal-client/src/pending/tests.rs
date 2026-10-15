@@ -535,8 +535,14 @@ fn symlinks_hardlinks_and_nonprivate_files_are_rejected() {
     ));
 }
 
+/// How long a wait may see no progress before it is over: a wedge, not
+/// slowness (27 §3.1 P8).
+const FROZEN: Duration = Duration::from_secs(60);
+
 struct CommitAndLose {
     core: std::sync::Mutex<Core>,
+    /// Told once the request is committed, its reply then lost.
+    committed: std::sync::Mutex<Option<hyper_rt::sync::OneshotSender<()>>>,
 }
 impl crate::ClientTransport for CommitAndLose {
     fn request<'a>(
@@ -546,32 +552,51 @@ impl crate::ClientTransport for CommitAndLose {
     ) -> crate::TransportFuture<'a> {
         Box::pin(async move {
             execute(&mut self.core.lock().unwrap(), request);
+            if let Some(committed) = self.committed.lock().unwrap().take() {
+                let _ = committed.send(());
+            }
             std::future::pending().await
         })
     }
 }
-#[tokio::test]
-async fn cancelling_network_wait_preserves_the_locked_operation_and_exact_request() {
+#[test]
+fn cancelling_network_wait_preserves_the_locked_operation_and_exact_request() {
+    focal_rt::block_on(
+        cancelling_network_wait_preserves_the_locked_operation_and_exact_request_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn cancelling_network_wait_preserves_the_locked_operation_and_exact_request_on_a_shard() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("operation");
     // Deliberately keep sync journal ownership outside the canceled network
     // future; production CLI uses this same separation on its OS main thread.
     let journal = create(&path, 10);
     let request = journal.next_request().unwrap().unwrap().clone();
+    let (committed, on_commit) = hyper_rt::sync::oneshot().unwrap();
     let client = crate::Client::new(
         CommitAndLose {
             core: std::sync::Mutex::new(Core::new(context().ledger, Limits::default())),
+            committed: std::sync::Mutex::new(Some(committed)),
         },
         crate::RetryPolicy::default(),
         crate::WireLimits::default(),
         1,
     )
     .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), client.submit(request.clone()))
-            .await
-            .is_err()
-    );
+    // The caller gives up on the network wait once the request is
+    // committed and its reply lost.
+    let raced = hyper_rt::futures::within(
+        crate::time::nanos(FROZEN),
+        hyper_rt::combine::race2(client.submit(request.clone()), on_commit),
+    )
+    .await
+    .unwrap()
+    .expect("the request never reached the transport");
+    match raced {
+        hyper_rt::combine::Either::First(_) => panic!("a lost reply answered the wait"),
+        hyper_rt::combine::Either::Second(committed) => committed.unwrap(),
+    }
     assert!(matches!(
         OperationJournal::open(&path, &context()),
         Err(PendingError::Locked)

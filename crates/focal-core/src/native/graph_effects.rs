@@ -1,7 +1,10 @@
 //! Atomic dependency consequences over the complete indexed affected closure.
 //! Each witness reads one complete frozen snapshot. Active-monitor progression
 //! recaptures after a checked transition before deriving its next consequence.
-use super::prepare::{Extras, Scratch, add, array, containers, event_containers, heap, within};
+use super::prepare::{
+    Extras, Scratch, add, array, containers, event_containers, heap, terminal_growth,
+    transition_heap, within,
+};
 use super::*;
 use focal_model::{
     Cause,
@@ -438,7 +441,9 @@ impl ConsequencePlan<'_> {
                 continue;
             }
             let (claim_heap, registry_heap) = future(claim)?;
-            let current = heap(claim)?;
+            // A member a graph transition makes terminal gains its cut's allocation.
+            let claim_heap = add(claim_heap, terminal_growth(claim)?)?;
+            let current = transition_heap(claim)?;
             within(current, claim_heap)?;
             if result.charges.monitor_events != 0 {
                 monitor_growth = add(
@@ -666,7 +671,9 @@ fn preflight_with<'a>(
             continue;
         }
         changed_rows = add(changed_rows, 1)?;
-        let claim_heap = heap(claim)?;
+        // What the row holds once its graph transition has run: a member it makes terminal
+        // gains its cut's allocation.
+        let claim_heap = transition_heap(claim)?;
         let registry_heap = transactions::registry_heap(registrations)?;
         let entry_heap = add(
             OwnedClaim::container_charge(),
@@ -695,12 +702,17 @@ fn preflight_with<'a>(
         array::<ClaimState>(claims.len())?,
         add(array::<&ClaimState>(peers)?, array::<&ClaimState>(peers)?)?,
     )?;
+    // The root's copy is its caller's; the cut its transition may add is this stage's, as each
+    // peer's copy and cut are.
     let root_heap = heap(root)?;
     let peer_copy_heap = claim_heap_bytes
-        .checked_sub(root_heap)
+        .checked_sub(transition_heap(root)?)
         .ok_or(ContractError::Capacity)?;
     let graph_bytes = add(
-        add(capture_bytes, add(buffers, peer_copy_heap)?)?,
+        add(
+            capture_bytes,
+            add(buffers, add(peer_copy_heap, terminal_growth(root)?)?)?,
+        )?,
         monitor.construction_bytes,
     )?;
     let preparation_bytes = add(
@@ -838,9 +850,10 @@ impl ConsequenceBudget {
         let mut registries = 0usize;
         let mut incoming = event_containers(events)?;
         for row in rows {
-            // Graph success/failure changes only inline fields (including its Copy
-            // terminal cut). This still checks actual retained capacities so a later
-            // model change cannot silently introduce unquoted output allocation.
+            // Graph success/failure changes only inline fields and adds the terminal
+            // cut's own allocation, which the quote counts. This still checks actual
+            // retained capacities so a later model change cannot silently introduce
+            // unquoted output allocation.
             let claim_heap = heap(row)?;
             let registry_heap = transactions::registry_heap(registry(view, row)?)?;
             let entry_heap = add(
@@ -986,6 +999,7 @@ fn prepare_with_prefix(
         let changed = match snapshot.dependency_failure_with_budget(id, failure_charge) {
             Ok(failure) => {
                 let mut changed = copy(source, scratch)?;
+                scratch.charge(terminal_growth(source)?)?;
                 changed.dependency_failed(&source.binding(), &failure, &peer_rows, cut.position)?;
                 journal(
                     extras,
@@ -1003,6 +1017,7 @@ fn prepare_with_prefix(
                 {
                     let release = snapshot.release(id)?;
                     let mut changed = copy(source, scratch)?;
+                    scratch.charge(terminal_growth(source)?)?;
                     changed.graph_release(&source.binding(), &release, &peer_rows, cut.position)?;
                     journal(
                         extras,
@@ -1019,9 +1034,9 @@ fn prepare_with_prefix(
             Err(error) => return Err(error.into()),
         };
         if let Some(changed) = changed {
-            // Both graph transitions retain only inline terminal facts. Keep
-            // the per-source bound as well as the aggregate publication check.
-            within(heap(&changed)?, heap(source)?)?;
+            // Both graph transitions make the claim terminal: it gains its cut's allocation and
+            // nothing else. Keep the per-source bound as well as the aggregate publication check.
+            within(heap(&changed)?, transition_heap(source)?)?;
             if output.len() == output.capacity() {
                 return Err(NativeError::Capacity("graph changed rows"));
             }
@@ -1048,7 +1063,8 @@ fn prepare_with_prefix(
         root_peers.push(source);
     }
     if !root.is_terminal() {
-        let root_heap = heap(&root)?;
+        let root_heap = transition_heap(&root)?;
+        scratch.charge(terminal_growth(&root)?)?;
         let before = root.binding();
         match snapshot.dependency_failure_with_budget(root_id, failure_charge) {
             Ok(failure) => {

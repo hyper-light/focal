@@ -24,7 +24,7 @@ fn build(core: &Core<NativeState>) -> prepare::BuiltNative {
                 core.native_claim(CLAIM).unwrap().binding(),
                 core.native_response(RESPONSE).unwrap().identity().binding,
             ),
-            std::iter::empty(),
+            None,
         )
         .unwrap();
     let prepare::Checked::Fresh(fresh) = checked else {
@@ -37,7 +37,7 @@ fn build(core: &Core<NativeState>) -> prepare::BuiltNative {
 
 fn events(prepared: &NativePrepared) -> Vec<NativeEvent> {
     (0..prepared.outcome.events)
-        .map(|ordinal| CompletionBook::event(prepared, ordinal).unwrap())
+        .map(|ordinal| CompletionBook::event(prepared, ordinal, None).unwrap())
         .collect()
 }
 
@@ -78,30 +78,40 @@ fn altered(
             let (row, heap) = match entry.key {
                 Key::Event(sequence, ordinal) if sequence == original.outcome.sequence => {
                     let event = *events.get(usize::try_from(ordinal).unwrap()).unwrap();
-                    let row = OwnedEvent::new(StoredEvent::pack(event).unwrap()).unwrap();
+                    let row = OwnedEvent::new(event, original.outcome.ledger).unwrap();
                     let heap = row.heap_charge().unwrap();
                     (Row::Event(row), heap)
                 }
-                _ => (prepare::copy(&entry.value).unwrap(), entry.heap_bytes),
+                _ => (prepare::copy(entry.value).unwrap(), entry.heap_bytes),
             };
             RangeChange::Put(Entry::new(entry.key, row, heap))
         })
         .collect::<Vec<_>>();
     assert!(changes.len() <= core.limits.range.max_batch_entries);
+    let encoded_added =
+        crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())
+            .unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let range = core
         .state
         .rows
-        .prepare_batch_with(
+        .prepare_batch_replacing(
             original.outcome.sequence.0,
             changes,
             BudgetLane::Ordinary,
             prepare::copy,
+            |key, row| removed.count(key, row),
         )
         .unwrap();
     NativePrepared {
         fragments: range,
         outcome: original.outcome,
         writes: crate::native::mutation::WriteSet::unrecorded(),
+        encoded_added,
+        encoded_removed: removed.bytes(),
+        _index: None,
+        events: None,
+        retire: None,
     }
 }
 
@@ -253,10 +263,7 @@ fn collector_requires_the_structural_fact_and_entry_order_without_creating_repor
     let core = work_authority::history_fixture(false, true);
     let built = build(&core);
     let prepared = built.prepared();
-    let source = View {
-        state: &core.state,
-        tail: None,
-    };
+    let source = View::committed(&core.state);
     let mut book = CompletionBook::new(&core.state.budget, core.limits).unwrap();
     let before = core.native_budget();
     let original = events(prepared);
@@ -280,7 +287,12 @@ fn collector_requires_the_structural_fact_and_entry_order_without_creating_repor
         match mutation {
             0 => {
                 changed[missing].fact = NativeFact::Registrations {
-                    claim: prepared.claim(CLAIM).unwrap().binding(),
+                    claim: core
+                        .native_chain(&[prepared])
+                        .unwrap()
+                        .claim(CLAIM)
+                        .unwrap()
+                        .binding(),
                 }
             }
             1..=5 => {
@@ -298,7 +310,15 @@ fn collector_requires_the_structural_fact_and_entry_order_without_creating_repor
                     2 => *kind = NativeEvaluationEventKind::Begun,
                     3 => *kind = NativeEvaluationEventKind::Reported,
                     4 => *before = None,
-                    5 => *before = Some(prepared.evaluation(key).unwrap().binding()),
+                    5 => {
+                        *before = Some(
+                            core.native_chain(&[prepared])
+                                .unwrap()
+                                .evaluation(key)
+                                .unwrap()
+                                .binding(),
+                        )
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -353,13 +373,10 @@ fn structural_entry_checks_charge_visits_before_reads_and_preserve_state_phase()
     let core = work_authority::history_fixture(false, true);
     let built = build(&core);
     let prepared = built.prepared();
-    let source = View {
-        state: &core.state,
-        tail: None,
-    };
+    let source = View::committed(&core.state);
     let history = events(prepared);
     let (ordinal, key) = observer(&history);
-    let event = frame(prepared, u32::try_from(ordinal).unwrap(), None)
+    let event = frame(prepared, u32::try_from(ordinal).unwrap(), None, None)
         .unwrap()
         .unwrap();
     let old = *source.evaluation(key).unwrap();

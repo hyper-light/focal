@@ -275,17 +275,12 @@ fn funded_admission_finishes_after_large_work_cohort_receipt_under_full_parent_p
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
-    assert_eq!(budget.stats().used, budget.limit());
-    assert!(
-        budget
-            .reserve(BudgetKind::Pending, BudgetLane::Completion, 1)
-            .is_err()
-    );
+    assert_eq!(budget.headroom(BudgetLane::Ordinary), 0);
     let outcome = f.commit(EVALUATOR, report);
     assert_eq!(outcome.events, 3);
     assert_eq!(outcome.changed, 0);

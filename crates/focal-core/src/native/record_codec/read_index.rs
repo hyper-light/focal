@@ -8,6 +8,9 @@ use focal_model::lifecycle::aggregation::PublicationPosition;
 use read_source::{Meter, model_error};
 
 pub(super) const PHASES: usize = 8;
+/// The hydration phase that holds the artifact rows, the ones whose custody
+/// a restore recovers.
+pub(super) const ARTIFACT_PHASE: usize = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum IndexKey {
     Claim(ClaimId),
@@ -47,6 +50,9 @@ pub(super) struct Origin {
 pub(super) struct Index<'a> {
     rows: RangeStore<IndexKey, Value<'a>>,
     pub(super) counts: [usize; PHASES],
+    /// The secondary index families' and due timers' rows, all of phase 0:
+    /// a restore gives them to the key sets, not the store (doc 31 M3).
+    pub(super) indexed: usize,
 }
 fn invalid() -> NativeError {
     ContractError::InvalidManifest.into()
@@ -65,6 +71,8 @@ pub(super) fn phase(key: Key) -> Result<usize, NativeError> {
         | Key::RetiredCycleHead(_)
         | Key::Retired(_)
         | Key::RetiredCycle(_)
+        | Key::Epochs(_)
+        | Key::Seal(_)
         | Key::WorkSlot(..)
         | Key::ClaimResultTestament(_)
         | Key::Outcome(_)
@@ -92,7 +100,7 @@ pub(super) fn phase(key: Key) -> Result<usize, NativeError> {
         | Key::DueTimer(..)
         | Key::ByObject(..) => 0,
         Key::Definition(_) | Key::ClaimContent(_) => 1,
-        Key::Artifact(_) => 2,
+        Key::Artifact(_) => ARTIFACT_PHASE,
         Key::Diagnostic(_) | Key::Work(_) => 3,
         Key::Evaluation(_) | Key::Accepted(_) | Key::DeliveryResult(_) | Key::MissingResult(_) => 4,
         Key::Response(_) => 5,
@@ -109,17 +117,19 @@ pub(super) fn lookup_work() -> Result<usize, NativeError> {
         .ok_or(NativeError::Capacity("recovery index work"))
 }
 impl<'a> Index<'a> {
-    pub(super) fn build(
-        checkpoint: &checkpoint::StructuralCheckpoint<'a>,
+    pub(super) fn build<F: inspect::RowFrame<'a>>(
+        checkpoint: &F,
         limits: NativeLimits,
         budget: &MemoryBudget,
         parsing: &Meter,
         lookup: &Meter,
+        lane: BudgetLane,
     ) -> Result<Self, NativeError> {
         // The index never exports owner capabilities and has a different key/
         // value type from the restored ledger. Its local RangeId is not the
-        // recorded or fresh ledger incarnation.
-        let mut rows = RangeStore::new_partitioned(
+        // recorded or fresh ledger incarnation. Its root is the restore's
+        // lane's, as every page it fills is.
+        let mut rows = RangeStore::new_partitioned_in(
             RangeId(0),
             0,
             limits.range,
@@ -128,6 +138,7 @@ impl<'a> Index<'a> {
                 IndexKey::Claim(_) => 0,
                 IndexKey::Artifact(_) => 1,
             },
+            lane,
         )?;
         let capacity = limits
             .range
@@ -141,7 +152,7 @@ impl<'a> Index<'a> {
             .and_then(|n| n.checked_add(crate::native::prepare::ALLOCATION))
             .ok_or(NativeError::Capacity("recovery index staging"))?;
         let _staging =
-            budget.reserve(BudgetKind::Recovery, BudgetLane::Completion, staging_bytes)?;
+            budget.reserve(BudgetKind::Recovery, BudgetLane::Committed, staging_bytes)?;
         let mut changes = Vec::new();
         changes
             .try_reserve_exact(capacity)
@@ -150,6 +161,7 @@ impl<'a> Index<'a> {
             return Err(NativeError::Capacity("recovery index capacity"));
         }
         let mut counts = [0usize; PHASES];
+        let mut indexed = 0usize;
         let maximum = limits
             .claims
             .checked_add(limits.artifacts)
@@ -167,6 +179,11 @@ impl<'a> Index<'a> {
             *slot = slot
                 .checked_add(1)
                 .ok_or(NativeError::Capacity("recovery phase count"))?;
+            if crate::native::index_rows::is_index(encoded.key) {
+                indexed = indexed
+                    .checked_add(1)
+                    .ok_or(NativeError::Capacity("recovery phase count"))?;
+            }
             let entry = match encoded.key {
                 Key::Claim(id) => Some(Entry::new(
                     IndexKey::Claim(id),
@@ -189,8 +206,7 @@ impl<'a> Index<'a> {
                             NativeInvocation::Import => ArtifactRequest::Import,
                             _ => return Err(invalid()),
                         };
-                        if binding.ledger != checkpoint.header().ledger || binding.object.is_zero()
-                        {
+                        if binding.ledger != checkpoint.ledger() || binding.object.is_zero() {
                             return Err(invalid());
                         }
                         Some(Entry::new(
@@ -243,7 +259,11 @@ impl<'a> Index<'a> {
         if rows.len() > maximum {
             return Err(NativeError::Capacity("recovery index size"));
         }
-        Ok(Self { rows, counts })
+        Ok(Self {
+            rows,
+            counts,
+            indexed,
+        })
     }
     pub(super) fn claim(&self, id: ClaimId, meter: &Meter) -> Result<&'a [u8], NativeError> {
         meter.charge(lookup_work()?).map_err(model_error)?;
@@ -283,7 +303,8 @@ fn install<'a>(
         .checked_add(1)
         .ok_or(NativeError::Capacity("recovery index prefix"))?;
     let prepared =
-        rows.prepare_batch_with(prefix, changes, BudgetLane::Completion, |value| Ok(*value))?;
+        rows.prepare_batch_with(prefix, changes, BudgetLane::Committed, |value| Ok(*value))?;
     rows.publish(prepared)?;
     Ok(())
 }
+impl focal_memory::RangeKey for IndexKey {}

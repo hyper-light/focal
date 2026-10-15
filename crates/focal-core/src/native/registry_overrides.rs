@@ -96,11 +96,7 @@ impl RegistryOverrides {
         }
         let capacity = len.checked_mul(2).unwrap_or(maximum).min(maximum);
         let quote = array::<Pair>(capacity)?;
-        let mut charged = Scratch {
-            used: scratch.used,
-            max: scratch.max,
-        };
-        charged.charge(quote)?;
+        scratch.fits(quote)?;
         let mut replacement = Vec::new();
         #[cfg(test)]
         let requested = tests::allocation_capacity(capacity)?;
@@ -112,6 +108,7 @@ impl RegistryOverrides {
         if array::<Pair>(replacement.capacity())? > quote {
             return Err(NativeError::Capacity("registry override capacity"));
         }
+        scratch.charge(quote)?;
         // All fallible checks precede ownership transfer. The replacement has
         // room for every old pair and the new one, so neither operation grows it.
         match std::mem::replace(&mut self.storage, Storage::Empty) {
@@ -121,7 +118,6 @@ impl RegistryOverrides {
         }
         replacement.insert(index, (id, registry));
         self.storage = Storage::Many(replacement);
-        *scratch = charged;
         Ok(())
     }
 

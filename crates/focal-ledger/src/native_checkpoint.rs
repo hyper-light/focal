@@ -6,8 +6,11 @@
 use focal_consensus::MembershipConfiguration;
 use focal_core::Core;
 use focal_core::native::input_codec as input;
-use focal_core::native::{NativeContentProfile, NativeState, record_codec};
-use focal_evidence::{ContentError, SEED_CHUNK_BYTES, SeedReader, SeedStore};
+use focal_core::native::{NativeContentProfile, NativeFrozen, NativeState, record_codec};
+use focal_evidence::{
+    ColdGeometry, ColdStreams, ContentError, SEED_CHUNK_BYTES, SeedBatch, SeedCommit, SeedReader,
+    SeedStore,
+};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget, MemoryError, RangeId};
 use focal_model::{ContentHash, LedgerId, SessionSeq};
 use record_codec::checkpoint as root;
@@ -16,7 +19,7 @@ use record_codec::checkpoint as root;
 mod fields;
 #[path = "native_checkpoint_read.rs"]
 mod read;
-pub use read::{AssembledCore, Checkpoint, SeedError, SeedManifest};
+pub use read::{AssembledCore, Checkpoint, ColdSection, SeedError, SeedManifest};
 
 pub const MAGIC: [u8; 8] = *b"FCNSESS1";
 // Version 2 records the prefix that holds no native record yet (zero at
@@ -40,6 +43,14 @@ pub enum Error {
     Invalid(&'static str),
     #[error("native Core checkpoint: {0}")]
     Core(#[from] record_codec::CodecError),
+    /// The root is past one of the checkpoint's bounds, named with its value and its limit: what
+    /// a session's admission must have projected, so a checkpoint never refuses what it admitted.
+    #[error("native Core checkpoint: {value} {bound} past the bound of {limit}")]
+    Exceeded {
+        bound: &'static str,
+        value: usize,
+        limit: usize,
+    },
     #[error("native Session checkpoint memory: {0}")]
     Memory(#[from] MemoryError),
     #[error("checkpoint output refused")]
@@ -48,6 +59,148 @@ pub enum Error {
     Seeded,
     #[error("checkpoint seed store: {0}")]
     Seeds(#[from] ContentError),
+}
+
+/// Which of the encoder's bounds the root `core` is past, measured again with none: on the failure
+/// path only, a walk of the root its memory budget already bounds.
+/// A frozen image's rows and the envelope's other sections, taken at one
+/// point: what a seeded checkpoint is encoded from on the thread that holds
+/// the image.
+pub struct FrozenRoot<'a> {
+    pub frozen: &'a NativeFrozen,
+    pub metadata: Metadata,
+    pub configuration: &'a MembershipConfiguration,
+    pub sections: Sections<'a>,
+    pub limits: Limits,
+}
+
+/// The bounds a root is encoded under: the larger of what travels inline and
+/// what a seeded root may assemble to.
+fn root_limits(limits: Limits) -> record_codec::EncodingLimits {
+    record_codec::EncodingLimits {
+        bytes: limits.inline_bytes.max(limits.assembled_bytes),
+        visits: limits.visits,
+        rows: limits.rows,
+    }
+}
+
+/// A root cut into seed chunks as it is encoded: full chunks from its start
+/// and a remainder, each written into the batch as it fills (made durable
+/// together by the batch's commit, once the root is whole), at most `most`.
+struct Sealer {
+    batch: SeedBatch,
+    table: Vec<SeedChunk>,
+    /// A chunk's bytes, `filled` of them written: sized once, so a field of
+    /// a few bytes is moved into it without a call to the C library's
+    /// memcpy (`focal_memory::short_copy`), where growing a vector called
+    /// it for every field.
+    buffer: Vec<u8>,
+    filled: usize,
+    most: usize,
+    _charge: Allocation,
+}
+
+impl Sealer {
+    fn new(budget: &MemoryBudget, batch: SeedBatch, most: usize) -> Result<Self, Error> {
+        let table_bytes = fields::add(fields::mul(most, size_of::<SeedChunk>())?, ALLOCATION)?;
+        let charge = budget
+            .reserve(
+                BudgetKind::Recovery,
+                BudgetLane::Committed,
+                fields::add(table_bytes, fields::add(SEED_CHUNK_BYTES, ALLOCATION)?)?,
+            )?
+            .commit();
+        let mut table = Vec::new();
+        table
+            .try_reserve_exact(most)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(SEED_CHUNK_BYTES)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        buffer.resize(SEED_CHUNK_BYTES, 0);
+        Ok(Self {
+            batch,
+            table,
+            buffer,
+            filled: 0,
+            most,
+            _charge: charge,
+        })
+    }
+    fn push(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
+        while !bytes.is_empty() {
+            let room = SEED_CHUNK_BYTES.saturating_sub(self.filled);
+            let take = room.min(bytes.len());
+            let (head, tail) = bytes.split_at_checked(take).ok_or(Error::Truncated)?;
+            let end = fields::add(self.filled, take)?;
+            let target = self
+                .buffer
+                .get_mut(self.filled..end)
+                .ok_or(Error::Capacity)?;
+            if !focal_memory::short_copy::copy(target, head) {
+                return Err(Error::Capacity);
+            }
+            self.filled = end;
+            bytes = tail;
+            if self.filled == SEED_CHUNK_BYTES {
+                self.seal()?;
+            }
+        }
+        Ok(())
+    }
+    fn seal(&mut self) -> Result<(), Error> {
+        if self.filled == 0 {
+            return Ok(());
+        }
+        if self.table.len() >= self.most {
+            return Err(Error::Invalid("seed chunk count"));
+        }
+        let chunk = self.buffer.get(..self.filled).ok_or(Error::Capacity)?;
+        let hash = self.batch.add(chunk)?;
+        self.table.push(SeedChunk {
+            hash,
+            length: u32::try_from(self.filled).map_err(|_| Error::Capacity)?,
+        });
+        self.filled = 0;
+        Ok(())
+    }
+    /// The chunks' table and the batch's commit, the remainder sealed.
+    fn finish(mut self) -> Result<(Vec<SeedChunk>, SeedCommit), Error> {
+        self.seal()?;
+        Ok((self.table, self.batch.detach()))
+    }
+}
+
+fn exceeded<'a>(
+    measure: impl Fn(
+        record_codec::EncodingLimits,
+    ) -> Result<root::EncodingPlan<'a>, record_codec::CodecError>,
+    limits: record_codec::EncodingLimits,
+) -> Error {
+    let unbounded = record_codec::EncodingLimits {
+        bytes: usize::MAX,
+        visits: usize::MAX,
+        rows: usize::MAX,
+    };
+    let quote = match measure(unbounded) {
+        Ok(plan) => plan.quote(),
+        Err(error) => return Error::Core(error),
+    };
+    let (bound, value, limit) = if quote.rows > limits.rows {
+        ("rows", quote.rows, limits.rows)
+    } else if quote.bytes > limits.bytes {
+        ("bytes", quote.bytes, limits.bytes)
+    } else if quote.visits > limits.visits {
+        ("visits", quote.visits, limits.visits)
+    } else {
+        return Error::Core(record_codec::CodecError::Capacity);
+    };
+    Error::Exceeded {
+        bound,
+        value,
+        limit,
+    }
 }
 
 /// One sealed chunk of a seeded checkpoint's Core root.
@@ -152,6 +305,8 @@ pub struct Limits {
     pub bytes: usize,
     /// Cumulative enclosing/nested parsing or preparation work. An inspected
     /// checkpoint retains the unused allowance for membership comparisons.
+    /// Derived from the other bounds (`Limits::derived`), so a root within
+    /// them is never refused for its work.
     pub visits: usize,
     pub members: usize,
     pub rows: usize,
@@ -162,22 +317,52 @@ pub struct Limits {
     pub assembled_bytes: usize,
     /// The largest movement section (25 §6) a frame may carry.
     pub movement_bytes: usize,
+    /// The most manifest chunks a cold stream's section names (31 M2, A2), 4 GiB of stream
+    /// each.
+    pub cold_manifests: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
         Self {
             bytes: 8 * 1024 * 1024,
-            visits: 256 * 1024 * 1024,
+            visits: 0,
             members: 2048,
             rows: 100_000,
             row_bytes: 8 * 1024 * 1024,
             inline_bytes: 4 * 1024 * 1024,
             assembled_bytes: 256 * 1024 * 1024,
             movement_bytes: 1024 * 1024,
+            cold_manifests: 65_536,
         }
+        .derived()
     }
 }
 impl Limits {
+    /// These limits with their work bound derived from the rest, as a checkpoint's work grows:
+    /// preparing the root (one encoding pass), then the frame, which counts the root's work again
+    /// and writes the root's bytes or its chunk table, its head, its membership check and its
+    /// fixed fields, all within the frame's `bytes`, at most three visits a byte written
+    /// (`root::work_bound`). Reading one back takes no more than writing it. Saturating: a bound
+    /// past a machine word is no bound at all, never a wrap.
+    pub fn derived(mut self) -> Self {
+        let root = root::work_bound(self.rows, self.inline_bytes.max(self.assembled_bytes))
+            .unwrap_or(usize::MAX);
+        // The membership check (`fields::check_configuration`): five, then a page of 1024 for
+        // each member and five more.
+        let membership = self
+            .members
+            .min(2048)
+            .saturating_add(5)
+            .saturating_mul(1024)
+            .saturating_add(5);
+        self.visits = root
+            .saturating_mul(2)
+            .saturating_add(self.bytes.saturating_mul(3))
+            .saturating_add(membership)
+            // The frame head's fixed fields, format and genesis hashes.
+            .saturating_add(2048);
+        self
+    }
     /// The most chunks a seeded checkpoint may name.
     pub fn max_seed_chunks(&self) -> usize {
         self.assembled_bytes.div_ceil(SEED_CHUNK_BYTES).max(1)
@@ -202,14 +387,20 @@ pub struct RetentionSection {
     pub archived_through: SessionSeq,
     pub retired_families: u64,
 }
+/// The sections a checkpoint carries beside its Core root, each when the session has one: the
+/// movement (25 §6), the retention (26 §3) and the cold stream (31 M2, A2).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sections<'a> {
+    pub movement: Option<&'a [u8]>,
+    pub retention: Option<RetentionSection>,
+    pub cold: Option<&'a ColdStreams>,
+}
 pub struct EncodingPlan<'a> {
     core: root::EncodingPlan<'a>,
     metadata: Metadata,
     configuration: &'a MembershipConfiguration,
-    /// The movement section (25 §6), when the session carries one.
-    movement: Option<&'a [u8]>,
-    /// The retention section (26 §3), when the session carries one.
-    retention: Option<RetentionSection>,
+    /// The sections the session carries beside its root.
+    sections: Sections<'a>,
     limits: Limits,
     quote: Quote,
     form: Form,
@@ -264,29 +455,80 @@ impl<'a> EncodingPlan<'a> {
         movement: Option<&'a [u8]>,
         limits: Limits,
     ) -> Result<Self, Error> {
-        Self::prepare_with_sections(core, metadata, configuration, movement, None, limits)
+        Self::prepare_with_sections(
+            core,
+            metadata,
+            configuration,
+            Sections {
+                movement,
+                ..Sections::default()
+            },
+            limits,
+        )
     }
-    /// A plan carrying a movement section (25 §6) and a retention section
-    /// (26 §3) after the configuration.
+    /// A plan carrying `sections` after the configuration: a movement section (25 §6), a
+    /// retention section (26 §3) and a cold stream's (31 M2, A2).
     pub fn prepare_with_sections(
         core: &'a Core<NativeState>,
         metadata: Metadata,
         configuration: &'a MembershipConfiguration,
-        movement: Option<&'a [u8]>,
-        retention: Option<RetentionSection>,
+        sections: Sections<'a>,
         limits: Limits,
     ) -> Result<Self, Error> {
-        if movement.is_some_and(|bytes| bytes.is_empty() || bytes.len() > limits.movement_bytes) {
+        Self::prepare_root(
+            |encoding| root::EncodingPlan::prepare(core, encoding),
+            metadata,
+            configuration,
+            sections,
+            limits,
+        )
+    }
+    /// As [`Self::prepare_with_sections`], over a frozen image of the core's
+    /// rows: a plan the thread holding the image encodes.
+    pub fn prepare_frozen_with_sections(
+        frozen: &'a NativeFrozen,
+        metadata: Metadata,
+        configuration: &'a MembershipConfiguration,
+        sections: Sections<'a>,
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        Self::prepare_root(
+            |encoding| root::EncodingPlan::prepare_frozen(frozen, encoding),
+            metadata,
+            configuration,
+            sections,
+            limits,
+        )
+    }
+    fn prepare_root(
+        measure: impl Fn(
+            record_codec::EncodingLimits,
+        ) -> Result<root::EncodingPlan<'a>, record_codec::CodecError>,
+        metadata: Metadata,
+        configuration: &'a MembershipConfiguration,
+        sections: Sections<'a>,
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        if sections
+            .movement
+            .is_some_and(|bytes| bytes.is_empty() || bytes.len() > limits.movement_bytes)
+        {
             return Err(Error::Invalid("movement section"));
         }
-        let core = root::EncodingPlan::prepare(
-            core,
-            record_codec::EncodingLimits {
-                bytes: limits.inline_bytes.max(limits.assembled_bytes),
-                visits: limits.visits,
-                rows: limits.rows,
-            },
-        )?;
+        if let Some(cold) = sections.cold {
+            for stream in [&cold.data, &cold.marks] {
+                stream.check(cold.geometry)?;
+                if stream.manifests.len() > limits.cold_manifests {
+                    return Err(Error::Invalid("cold manifests"));
+                }
+            }
+        }
+        let encoding = root_limits(limits);
+        let core = match measure(encoding) {
+            Ok(plan) => plan,
+            Err(record_codec::CodecError::Capacity) => return Err(exceeded(measure, encoding)),
+            Err(error) => return Err(error.into()),
+        };
         let available = limits
             .visits
             .checked_sub(core.quote().visits)
@@ -308,8 +550,7 @@ impl<'a> EncodingPlan<'a> {
         let head = FrameHead {
             metadata,
             configuration,
-            movement,
-            retention,
+            sections,
             members: limits.members,
         };
         let hash = match form {
@@ -328,8 +569,7 @@ impl<'a> EncodingPlan<'a> {
         Ok(Self {
             metadata,
             configuration,
-            movement,
-            retention,
+            sections,
             limits,
             quote: Quote {
                 bytes,
@@ -349,8 +589,7 @@ impl<'a> EncodingPlan<'a> {
         FrameHead {
             metadata: self.metadata,
             configuration: self.configuration,
-            movement: self.movement,
-            retention: self.retention,
+            sections: self.sections,
             members: self.limits.members,
         }
     }
@@ -418,67 +657,122 @@ impl<'a> EncodingPlan<'a> {
         budget: &MemoryBudget,
         seeds: &mut SeedStore,
     ) -> Result<EncodedCheckpoint, Error> {
+        let (encoded, commit) = self.encode_in_seeded_deferred(budget, seeds)?;
+        if let Some(commit) = commit
+            && let Err(error) = commit.run()
+        {
+            seeds.fail();
+            return Err(error.into());
+        }
+        Ok(encoded)
+    }
+
+    /// As `encode_in_seeded`, the root's seed chunks written but not yet
+    /// durable: the commit returned makes them so, and may run away from the
+    /// owner (25 §5; the session's deferred checkpoint). The bytes name the
+    /// chunks, so consensus must not take them before the commit succeeds.
+    /// An inline checkpoint has no commit.
+    pub fn encode_in_seeded_deferred(
+        &self,
+        budget: &MemoryBudget,
+        seeds: &mut SeedStore,
+    ) -> Result<(EncodedCheckpoint, Option<SeedCommit>), Error> {
+        if !self.seeded() {
+            return self.encode_in(budget).map(|encoded| (encoded, None));
+        }
+        let result = self.encode_in_batch(budget, seeds.batch()?);
+        if let Err(Error::Seeds(ContentError::Io(_))) = &result {
+            seeds.fail();
+        }
+        result.map(|(encoded, commit)| (encoded, Some(commit)))
+    }
+    /// The seeded encoding into `batch`, which may be filled on whichever
+    /// thread holds this plan; a batch's IO failure fails its store, which
+    /// its receiver applies. An inline root is refused: it needs no batch.
+    pub fn encode_in_batch(
+        &self,
+        budget: &MemoryBudget,
+        batch: SeedBatch,
+    ) -> Result<(EncodedCheckpoint, SeedCommit), Error> {
         let Form::Seeded { chunks } = self.form else {
-            return self.encode_in(budget);
+            return Err(Error::Invalid("inline root has no seeds"));
         };
-        let core_bytes = self.core.quote().bytes;
-        let table_bytes = fields::add(fields::mul(chunks, size_of::<SeedChunk>())?, ALLOCATION)?;
-        let _table_charge = budget.reserve(
-            BudgetKind::Recovery,
-            BudgetLane::Completion,
-            fields::add(table_bytes, fields::add(SEED_CHUNK_BYTES, ALLOCATION)?)?,
-        )?;
-        let mut table: Vec<SeedChunk> = Vec::new();
-        table
-            .try_reserve_exact(chunks)
-            .map_err(|_| MemoryError::AllocationFailed)?;
-        let mut buffer: Vec<u8> = Vec::new();
-        buffer
-            .try_reserve_exact(SEED_CHUNK_BYTES)
-            .map_err(|_| MemoryError::AllocationFailed)?;
-        let mut sealed = 0usize;
-        let mut seal = |buffer: &mut Vec<u8>, table: &mut Vec<SeedChunk>| -> Result<(), Error> {
-            if buffer.is_empty() {
-                return Ok(());
-            }
-            if table.len() >= chunks {
-                return Err(Error::Invalid("seed chunk count"));
-            }
-            let hash = seeds.install(buffer)?;
-            table.push(SeedChunk {
-                hash,
-                length: u32::try_from(buffer.len()).map_err(|_| Error::Capacity)?,
-            });
-            sealed = fields::add(sealed, buffer.len())?;
-            buffer.clear();
-            Ok(())
-        };
+        let mut sealer = Sealer::new(budget, batch, chunks)?;
         self.core
-            .write_with(|mut bytes| -> Result<(), Error> {
-                while !bytes.is_empty() {
-                    let room = SEED_CHUNK_BYTES.saturating_sub(buffer.len());
-                    let take = room.min(bytes.len());
-                    let (head, tail) = bytes.split_at_checked(take).ok_or(Error::Truncated)?;
-                    buffer.extend_from_slice(head);
-                    bytes = tail;
-                    if buffer.len() == SEED_CHUNK_BYTES {
-                        seal(&mut buffer, &mut table)?;
-                    }
-                }
-                Ok(())
-            })
+            .write_with(|bytes| sealer.push(bytes))
             .map_err(|error| match error {
                 root::WriteError::Output(error) => error,
                 root::WriteError::Codec(error) => Error::Core(error),
             })?;
-        seal(&mut buffer, &mut table)?;
-        if sealed != core_bytes || table.len() != chunks {
+        let (table, commit) = sealer.finish()?;
+        Ok((self.finish_seeded(budget, &table)?, commit))
+    }
+    /// The seeded encoding of a frozen image's rows, walked once: the root is
+    /// written into `batch` as it is encoded and the frame, which names its
+    /// chunks and digest, is written after it ([`Self::encode_in_batch`]
+    /// walks them twice, once to measure). A root that turns out to fit
+    /// inline is none: its batch is dropped, the files it wrote with it, and
+    /// the caller encodes the inline form, whose bytes are small.
+    pub fn encode_frozen_in_batch(
+        root: FrozenRoot<'a>,
+        budget: &MemoryBudget,
+        batch: SeedBatch,
+    ) -> Result<Option<(EncodedCheckpoint, SeedCommit)>, Error> {
+        let FrozenRoot {
+            frozen,
+            metadata,
+            configuration,
+            sections,
+            limits,
+        } = root;
+        let encoding = root_limits(limits);
+        let mut sealer = Sealer::new(budget, batch, limits.max_seed_chunks())?;
+        let core =
+            match root::EncodingPlan::write_frozen(frozen, encoding, |bytes| sealer.push(bytes)) {
+                Ok(core) => core,
+                Err(root::WriteError::Output(error)) => return Err(error),
+                Err(root::WriteError::Codec(record_codec::CodecError::Capacity)) => {
+                    return Err(exceeded(
+                        |encoding| root::EncodingPlan::prepare_frozen(frozen, encoding),
+                        encoding,
+                    ));
+                }
+                Err(root::WriteError::Codec(error)) => return Err(error.into()),
+            };
+        let (table, commit) = sealer.finish()?;
+        let plan = Self::prepare_root(|_| Ok(core), metadata, configuration, sections, limits)?;
+        let Form::Seeded { chunks } = plan.form else {
+            // Inline after all: nothing of the batch is committed.
+            return Ok(None);
+        };
+        if chunks != table.len() {
+            return Err(Error::Invalid("seeded core length"));
+        }
+        Ok(Some((plan.finish_seeded(budget, &table)?, commit)))
+    }
+    /// The seeded frame over the chunks `table` names, the root already
+    /// sealed into them.
+    fn finish_seeded(
+        &self,
+        budget: &MemoryBudget,
+        table: &[SeedChunk],
+    ) -> Result<EncodedCheckpoint, Error> {
+        let Form::Seeded { chunks } = self.form else {
+            return Err(Error::Invalid("inline root has no seeds"));
+        };
+        let sealed = table.iter().try_fold(0usize, |sum, chunk| {
+            fields::add(
+                sum,
+                usize::try_from(chunk.length).map_err(|_| Error::Capacity)?,
+            )
+        })?;
+        if sealed != self.core.quote().bytes || table.len() != chunks {
             return Err(Error::Invalid("seeded core length"));
         }
         let allocation = budget
             .reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 self.quote.output_charge,
             )?
             .commit();
@@ -525,7 +819,7 @@ impl<'a> EncodingPlan<'a> {
         let allocation = budget
             .reserve(
                 BudgetKind::Recovery,
-                BudgetLane::Completion,
+                BudgetLane::Committed,
                 self.quote.output_charge,
             )?
             .commit();
@@ -618,8 +912,7 @@ fn chunk_length(core_bytes: usize, index: usize) -> u32 {
 struct FrameHead<'a> {
     metadata: Metadata,
     configuration: &'a MembershipConfiguration,
-    movement: Option<&'a [u8]>,
-    retention: Option<RetentionSection>,
+    sections: Sections<'a>,
     members: usize,
 }
 
@@ -698,8 +991,12 @@ where
     let FrameHead {
         metadata,
         configuration,
-        movement,
-        retention,
+        sections:
+            Sections {
+                movement,
+                retention,
+                cold,
+            },
         members: member_limit,
     } = head;
     sink.visit(2048)?; // Fixed fields, format/genesis hashes, digest setup/finalize.
@@ -739,13 +1036,14 @@ where
     sink.raw(&metadata.activation.genesis.0)?;
     // Ancillary byte 0 says whether a movement section follows the
     // configuration (25 §6), byte 1 whether a retention section follows
-    // that (26 §3); the other four stay reserved.
+    // that (26 §3), byte 2 whether a cold stream's follows that (31 M2, A2);
+    // the other three stay reserved.
     match metadata.ancillary {
         AncillaryProfile::NativeOnlyV1 => {
             sink.raw(&[
                 u8::from(movement.is_some()),
                 u8::from(retention.is_some()),
-                0,
+                u8::from(cold.is_some()),
                 0,
                 0,
                 0,
@@ -761,6 +1059,25 @@ where
     if let Some(section) = retention {
         sink.u64(section.archived_through.0)?;
         sink.u64(section.retired_families)?;
+    }
+    if let Some(cold) = cold {
+        // How both are cut, then each stream, the data's then the marks': its length, its
+        // manifest chunks and the names after them, then its open chunk's bytes.
+        sink.u32(u32::try_from(cold.geometry.chunk_bytes).map_err(|_| Error::Capacity)?)?;
+        sink.u32(u32::try_from(cold.geometry.manifest_names).map_err(|_| Error::Capacity)?)?;
+        for stream in [&cold.data, &cold.marks] {
+            sink.u64(stream.length)?;
+            for names in [&stream.manifests, &stream.names] {
+                sink.u32(u32::try_from(names.len()).map_err(|_| Error::Capacity)?)?;
+                sink.visit(names.len())?;
+                for name in names {
+                    sink.raw(&name.0)?;
+                }
+            }
+            sink.u32(u32::try_from(stream.open.len()).map_err(|_| Error::Capacity)?)?;
+            sink.visit(stream.open.len())?;
+            sink.raw(&stream.open)?;
+        }
     }
     Ok(value)
 }

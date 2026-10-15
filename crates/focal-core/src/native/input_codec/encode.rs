@@ -34,6 +34,7 @@ pub(super) fn tag(command: &NativeCommand) -> u8 {
         NativeCommand::RebindMonitor { .. } => 25,
         NativeCommand::CancelMonitor { .. } => 26,
         NativeCommand::CreateAuthored { .. } => 27,
+        NativeCommand::AdvanceEpochFloor { .. } => 28,
     }
 }
 
@@ -297,6 +298,7 @@ fn command(sink: &mut impl Sink, value: &NativeCommand) -> Result<(), Error> {
             types::optional_receipt(sink, *receipt)?;
             write_raw(sink, &id.0)
         }
+        NativeCommand::AdvanceEpochFloor { minimum } => write_u64(sink, minimum.0),
         NativeCommand::Create {
             claims,
             declarations,
@@ -318,6 +320,7 @@ fn command(sink: &mut impl Sink, value: &NativeCommand) -> Result<(), Error> {
                 claim
                     .definition
                     .acceptance
+                    .view()
                     .check_declarations(declarations.iter().filter(|declaration| {
                         declaration.claim().0 == claim.definition.binding.object.0
                     }))

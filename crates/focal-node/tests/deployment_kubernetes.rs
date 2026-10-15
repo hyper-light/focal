@@ -66,7 +66,6 @@ fn the_kubernetes_stage_renders_plain_manifests_and_migrates_without_rewriting_h
         &[
             "--config",
             config.to_str().unwrap(),
-            "deployment",
             "render",
             "kubernetes",
             "--namespace",
@@ -131,7 +130,6 @@ fn the_kubernetes_stage_renders_plain_manifests_and_migrates_without_rewriting_h
             "focal",
             "--config",
             "<config>",
-            "deployment",
             "render",
             "kubernetes",
             "--namespace",
@@ -157,7 +155,7 @@ fn the_kubernetes_stage_renders_plain_manifests_and_migrates_without_rewriting_h
         &founder,
         "native engine",
         &["data directory"],
-        &["cluster", "replicas", "activate-native"],
+        &["activate", "native"],
     );
     let _founder_server = journey.start(
         &founder,

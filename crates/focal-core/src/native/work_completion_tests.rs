@@ -45,7 +45,7 @@ fn recorded_begin_work_covers_actual_received_response_entry_and_derived_outputs
         let view = f.owner.committed();
         let sequence = view.sequence();
         let first = view.event(sequence, 0).unwrap();
-        let outcome = view.recorded(first.invocation).unwrap();
+        let outcome = view.recorded(first.invocation).unwrap().unwrap();
         assert_eq!(outcome.operation, NativeOperation::BeginWork);
         let mut began = false;
         let mut claim_entry = false;
@@ -146,8 +146,8 @@ fn exhaust(f: &Fixture) -> Allocation {
     source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit()

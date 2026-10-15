@@ -4,14 +4,23 @@ use serde::Serialize;
 use std::{error::Error, io::Write};
 
 pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
-    if let Some(error) = error.downcast_ref::<CliError>() {
-        return match error {
+    // A `CliError::Other` carries the error to classify: the chain of them the
+    // error owns is walked one level a turn of this loop, never by recursion,
+    // and ends where the error does.
+    let mut error = error;
+    while let Some(cli) = error.downcast_ref::<CliError>() {
+        return match cli {
             CliError::Input(_) => Failure::error("invalid_input", 2),
             CliError::Document(error) => failure::input(error),
             CliError::Client(error) => failure::client(error),
             CliError::Pending(error) => failure::pending(error),
             CliError::Managed(error) => failure::managed_store(error),
             CliError::NotFound => Failure::error("not_found", 4),
+            CliError::Program(_) => Failure {
+                condition: "Failed",
+                code: "program_failed",
+                exit_code: 10,
+            },
             CliError::Ambiguous => Failure::error("ambiguous", 5),
             CliError::WaitUnfinished(condition) => Failure {
                 condition: condition.as_str(),
@@ -47,7 +56,10 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
                     Failure::error("operation_conflict", 5)
                 }
             },
-            CliError::Other(error) => classification(error.as_ref()),
+            CliError::Other(inner) => {
+                error = inner.as_ref();
+                continue;
+            }
             CliError::Io(error) => io(error),
         };
     }
@@ -115,6 +127,25 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
             && io.kind() == std::io::ErrorKind::PermissionDenied
         {
             return Failure::error("permission_denied", 2);
+        }
+        // A data directory other users may write to: the mode to fix, not
+        // corruption to look for.
+        if let Some(focal_node::embedded::NodeError::NotPrivate(_)) =
+            current.downcast_ref::<focal_node::embedded::NodeError>()
+        {
+            return Failure::error("permission_denied", 2);
+        }
+        if let Some(focal_node::cluster_admin::ClusterAdminError::NotPrivate(_)) =
+            current.downcast_ref::<focal_node::cluster_admin::ClusterAdminError>()
+        {
+            return Failure::error("permission_denied", 2);
+        }
+        // A data directory whose local sockets do not fit a socket's address:
+        // the directory to choose again, not a connection to retry.
+        if let Some(focal_wire::WireError::SocketPath { .. }) =
+            current.downcast_ref::<focal_wire::WireError>()
+        {
+            return Failure::error("invalid_input", 2);
         }
         cause = current.source();
     }

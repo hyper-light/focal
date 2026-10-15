@@ -4,7 +4,7 @@
 //! before reply, snapshot catch-up through the enclosing checkpoint, planned
 //! handover, correlated read barriers, a follower without evidence custody, a
 //! follower under memory pressure, and corrupted record bytes in transit.
-use super::tests::{exhaust, ledger, limits, store};
+use super::tests::{exhaust, ledger, limits, limits_with_outcomes, store};
 use super::*;
 use focal_consensus::{Message, MessageType, NodeConfig, SnapshotStatus};
 use focal_core::native::fixtures as fx;
@@ -22,24 +22,29 @@ type Node = NativeSession<BuiltinNativeSchemas>;
 fn config(id: u64) -> NodeConfig {
     NodeConfig::joining(id, [21; 16], [22; 16], vec![1, 2, 3], Vec::new())
 }
-fn open_node(
-    dir: &std::path::Path,
-    id: u64,
-    parent: &MemoryBudget,
-) -> Result<Opened<BuiltinNativeSchemas>, NativeSessionError> {
-    open_node_with(dir, id, parent, limits())
-}
 fn open_node_with(
     dir: &std::path::Path,
     id: u64,
     parent: &MemoryBudget,
     limits: NativeSessionLimits,
 ) -> Result<Opened<BuiltinNativeSchemas>, NativeSessionError> {
+    open_node_configured(dir, id, parent, limits, &|_| {})
+}
+/// A node opened under the replica configuration `configure` amends.
+fn open_node_configured(
+    dir: &std::path::Path,
+    id: u64,
+    parent: &MemoryBudget,
+    limits: NativeSessionLimits,
+    configure: &dyn Fn(&mut NodeConfig),
+) -> Result<Opened<BuiltinNativeSchemas>, NativeSessionError> {
     let content = dir.join(format!("content-{id}"));
     std::fs::create_dir_all(&content).unwrap();
+    let mut node = config(id);
+    configure(&mut node);
     NativeSession::open(
         dir.join(format!("wal-{id}")),
-        config(id),
+        node,
         ledger(),
         RangeId(u128::from(id)),
         NativeContentProfile::ProjectionOnly,
@@ -80,6 +85,8 @@ struct Cluster {
     inbox: Vec<Message>,
     clock: u64,
     serial: u128,
+    /// The request generation fresh requests are minted in (F12).
+    epoch: u64,
     boundaries: Vec<NativeReadBoundary>,
     /// Nodes whose retryable refusals (memory, custody) are expected.
     retry_ok: Vec<u64>,
@@ -88,6 +95,9 @@ struct Cluster {
     failed: Vec<u64>,
     /// Flip one byte of every committed-record entry delivered to this node.
     corrupt_to: Option<u64>,
+    /// Deliver messages of this kind before the others of a round: the
+    /// leader's answer to a barrier ahead of the entries it names.
+    deliver_first: Option<MessageType>,
 }
 impl Cluster {
     fn new() -> Self {
@@ -96,6 +106,13 @@ impl Cluster {
     /// A cluster whose nodes open under per-node limits (the materializer's
     /// worker count differs per follower in the differential tests).
     fn with_limits(limits_for: impl Fn(u64) -> NativeSessionLimits) -> Self {
+        Self::configured(limits_for, &|_| {})
+    }
+    /// A cluster whose nodes' replica configuration `configure` amends.
+    fn configured(
+        limits_for: impl Fn(u64) -> NativeSessionLimits,
+        configure: &dyn Fn(&mut NodeConfig),
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let parents: Vec<MemoryBudget> = (1..=3u64)
             .map(|id| {
@@ -113,9 +130,14 @@ impl Cluster {
         let mut inbox = Vec::new();
         let nodes = (1..=3u64)
             .map(|id| {
-                let opened =
-                    open_node_with(dir.path(), id, &parents[id as usize - 1], limits_for(id))
-                        .unwrap();
+                let opened = open_node_configured(
+                    dir.path(),
+                    id,
+                    &parents[id as usize - 1],
+                    limits_for(id),
+                    configure,
+                )
+                .unwrap();
                 inbox.extend(opened.initial.consensus.messages);
                 Some(opened.session)
             })
@@ -127,11 +149,13 @@ impl Cluster {
             inbox,
             clock: 0,
             serial: 0,
+            epoch: 1,
             boundaries: Vec::new(),
             retry_ok: Vec::new(),
             fail_ok: Vec::new(),
             failed: Vec::new(),
             corrupt_to: None,
+            deliver_first: None,
         }
     }
     fn node(&mut self, id: u64) -> &mut Node {
@@ -150,18 +174,26 @@ impl Cluster {
         drop(self.nodes.get_mut(id as usize - 1).unwrap().take());
     }
     fn reopen(&mut self, id: u64) -> Result<(), NativeSessionError> {
+        self.reopen_with(id, limits())
+    }
+    /// Reopen a stopped node under `limits`, the ones it was opened with when
+    /// the cluster's differ from the defaults.
+    fn reopen_with(
+        &mut self,
+        id: u64,
+        limits: NativeSessionLimits,
+    ) -> Result<(), NativeSessionError> {
         assert!(self.nodes.get(id as usize - 1).unwrap().is_none());
-        let opened = open_node(self.dir.path(), id, &self.parents[id as usize - 1])?;
+        let opened = open_node_with(self.dir.path(), id, &self.parents[id as usize - 1], limits)?;
         self.inbox.extend(opened.initial.consensus.messages);
         *self.nodes.get_mut(id as usize - 1).unwrap() = Some(opened.session);
         Ok(())
     }
     fn corrupt(&self, message: &mut Message) {
-        if self.corrupt_to != Some(message.to) || message.msg_type != MessageType::MsgAppend as i32
-        {
+        if self.corrupt_to != Some(message.to) || message.msg_type != MessageType::MsgAppend {
             return;
         }
-        for entry in message.mut_entries().iter_mut() {
+        for entry in &mut message.entries {
             if entry.data.is_empty() {
                 continue;
             }
@@ -198,7 +230,18 @@ impl Cluster {
                     Err(error) => match error.class() {
                         FailureClass::Retryable if retry_ok.contains(&id) => {}
                         FailureClass::FailClosed if fail_ok.contains(&id) => {
-                            assert!(matches!(node.poll(), Err(NativeSessionError::Failed)));
+                            // Every refusal after names what the session
+                            // stopped on, not only that it stopped.
+                            let cause = error.to_string();
+                            match node.poll() {
+                                Err(NativeSessionError::Stopped(named)) => assert_eq!(
+                                    &*named,
+                                    &cause[..cause.floor_char_boundary(512)],
+                                    "node {id}"
+                                ),
+                                Err(other) => panic!("node {id} after failing closed: {other:?}"),
+                                Ok(_) => panic!("node {id} polled on after failing closed"),
+                            }
                             failed.push(id);
                             progressed = true;
                         }
@@ -209,6 +252,9 @@ impl Cluster {
             if messages.is_empty() && !progressed {
                 return;
             }
+            if let Some(kind) = self.deliver_first {
+                messages.sort_by_key(|message| message.msg_type != kind);
+            }
             for mut message in messages {
                 if isolated.contains(&message.from) || isolated.contains(&message.to) {
                     continue;
@@ -218,7 +264,7 @@ impl Cluster {
                     continue;
                 }
                 self.corrupt(&mut message);
-                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot;
                 let retry_ok = self.retry_ok.contains(&to);
                 match self.node(to).step(message) {
                     Ok(()) => {}
@@ -287,7 +333,7 @@ impl Cluster {
     }
     fn next(&mut self, actor: ParticipantId) -> RequestKey {
         self.serial = self.serial.saturating_add(1);
-        fx::request(actor, 1, self.serial)
+        fx::request(actor, self.epoch, self.serial)
     }
     fn propose(&mut self, id: u64, actor: ParticipantId, input: NativeInput) -> NativeSubmission {
         self.clock = self.clock.saturating_add(1);
@@ -498,6 +544,242 @@ fn a_conflicting_committed_prefix_discards_the_isolated_leaders_candidates() {
     );
 }
 
+/// A leader holding a batch (its host defers proposals until the batch ends)
+/// that flushes it after a newer term began elsewhere, before it heard of it:
+/// the batch enters its own log in the old term and never a quorum's, the
+/// newer term's entries replace it, and each held candidate is proven dead.
+/// Every request key is then free: each commits once under the new authority.
+#[test]
+fn a_batch_a_deposed_leader_flushes_before_it_hears_is_proven_dead() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    cluster.node(1).engine.set_proposals_deferred(true);
+    let before = cluster.node(1).consensus.last_index().unwrap();
+    let mut held = Vec::new();
+    for claim in 2..=4u128 {
+        let input = cluster.creation(claim);
+        held.push((input.request, claim));
+        let NativeSubmission::Pending { .. } = cluster.propose(1, PARTIES.issuer, input) else {
+            panic!("fresh candidates are pending");
+        };
+    }
+    cluster.pump(&[1]);
+    assert_eq!(cluster.node(1).pending_count(), 3);
+    assert_eq!(
+        cluster.node(1).consensus.last_index().unwrap(),
+        before,
+        "a held batch is not proposed"
+    );
+    cluster.elect(2, &[1]);
+    // The batch ends on the old leader, which has not heard of the new term.
+    let node = cluster.node(1);
+    assert!(node.engine.flush_deferred(&mut node.consensus).is_none());
+    node.engine.set_proposals_deferred(false);
+    assert_eq!(
+        cluster.node(1).consensus.last_index().unwrap(),
+        before + 3,
+        "proposed into its own log, in its old term"
+    );
+    cluster.pump(&[1]);
+    assert_eq!(
+        cluster.node(1).pending_count(),
+        3,
+        "unresolved while isolated"
+    );
+    cluster.settle(&[]);
+    assert_eq!(cluster.node(1).pending_count(), 0);
+    assert!(!cluster.node(1).is_authoritative());
+    for (key, claim) in &held {
+        assert_eq!(cluster.node(1).outcome(*key).unwrap(), None);
+        assert_eq!(
+            cluster.status(2, *claim),
+            None,
+            "claim {claim} never committed"
+        );
+    }
+    cluster.assert_same_state(&[1, 2]);
+    for (key, claim) in held {
+        let retried = cluster.commit(2, PARTIES.issuer, creation_for(key, claim), &[]);
+        assert_eq!(retried.invocation, NativeInvocation::Request(key));
+        for id in 1..=3 {
+            assert_eq!(
+                cluster.node(id).outcome(key).unwrap(),
+                Some(retried),
+                "node {id}"
+            );
+        }
+    }
+    cluster.settle(&[]);
+    cluster.assert_same_state(&[1, 2, 3, 4]);
+}
+
+/// A leader holding a batch that hears of a newer term before the batch ends:
+/// the role change alone does not discard its candidates, the batch's end
+/// proposes nothing on a replica that no longer leads, and the newer term's
+/// barrier, once applied, proves them dead. Nothing of them enters any log,
+/// and each request key commits once under the new authority.
+#[test]
+fn a_batch_held_past_its_leaders_deposition_is_never_proposed() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    cluster.node(1).engine.set_proposals_deferred(true);
+    let mut held = Vec::new();
+    for claim in 2..=4u128 {
+        let input = cluster.creation(claim);
+        held.push((input.request, claim));
+        let NativeSubmission::Pending { .. } = cluster.propose(1, PARTIES.issuer, input) else {
+            panic!("fresh candidates are pending");
+        };
+    }
+    cluster.pump(&[1]);
+    let before = cluster.node(1).consensus.last_index().unwrap();
+    cluster.elect(2, &[1]);
+    // The new leader's heartbeat alone reaches the old: it steps down, the
+    // newer term's barrier not yet in its log.
+    let mut heard = false;
+    for _ in 0..ELECTION_TICKS {
+        cluster.node(2).tick().unwrap();
+        let events = cluster.node(2).poll().unwrap();
+        for message in events.consensus.messages {
+            if message.to == 1 && message.msg_type == MessageType::MsgHeartbeat {
+                cluster.node(1).step(message).unwrap();
+                heard = true;
+            }
+        }
+        if heard {
+            break;
+        }
+    }
+    assert!(heard, "the new leader sent the old a heartbeat");
+    let _ = cluster.node(1).poll().unwrap();
+    assert_eq!(cluster.node(1).status().role, StateRole::Follower);
+    assert_eq!(
+        cluster.node(1).pending_count(),
+        3,
+        "a role change alone must not discard the candidates"
+    );
+    // The batch ends on a replica that no longer leads: nothing is proposed.
+    let node = cluster.node(1);
+    assert!(node.engine.flush_deferred(&mut node.consensus).is_none());
+    node.engine.set_proposals_deferred(false);
+    assert_eq!(cluster.node(1).consensus.last_index().unwrap(), before);
+    assert_eq!(cluster.node(1).pending_count(), 3);
+    cluster.settle(&[]);
+    assert_eq!(
+        cluster.node(1).pending_count(),
+        0,
+        "resolved by the applied barrier"
+    );
+    for (key, claim) in &held {
+        assert_eq!(cluster.node(1).outcome(*key).unwrap(), None);
+        assert_eq!(
+            cluster.status(2, *claim),
+            None,
+            "claim {claim} never committed"
+        );
+    }
+    cluster.assert_same_state(&[1, 2]);
+    for (key, claim) in held {
+        let retried = cluster.commit(2, PARTIES.issuer, creation_for(key, claim), &[]);
+        assert_eq!(retried.invocation, NativeInvocation::Request(key));
+        for id in 1..=3 {
+            assert_eq!(
+                cluster.node(id).outcome(key).unwrap(),
+                Some(retried),
+                "node {id}"
+            );
+        }
+    }
+    cluster.settle(&[]);
+    cluster.assert_same_state(&[1, 2, 3, 4]);
+}
+
+/// A batch the leader's log has no room for whole, beside a write it holds
+/// uncommitted, is proposed a candidate at a time, as many as there is room
+/// for. The rest wait and owe no drain (each would propose nothing until room
+/// is made); the flush after the earlier ones commit proposes them. Every
+/// candidate commits once, at the place it was admitted to.
+#[test]
+fn a_batch_the_log_has_no_room_for_is_proposed_as_room_is_made() {
+    const ROOM: u64 = 17 * 1024;
+    let mut cluster = Cluster::configured(|_| limits(), &|config| {
+        config.max_entry_bytes = 16 * 1024;
+        config.max_uncommitted_bytes = ROOM;
+    });
+    cluster.elect(1, &[]);
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    cluster.node(1).engine.set_proposals_deferred(true);
+    // One write proposed and held uncommitted, then a batch of nine.
+    let mut admitted = Vec::new();
+    let mut held = None;
+    for claim in 2..=11u128 {
+        let input = cluster.creation(claim);
+        let key = input.request;
+        let NativeSubmission::Pending { candidate, outcome } =
+            cluster.propose(1, PARTIES.issuer, input)
+        else {
+            panic!("fresh candidates are pending");
+        };
+        admitted.push((key, outcome));
+        if claim == 2 {
+            held = Some(candidate);
+            let node = cluster.node(1);
+            assert!(node.engine.flush_deferred(&mut node.consensus).is_none());
+        }
+    }
+    let before = cluster.node(1).consensus.last_index().unwrap();
+    // The batch does not fit beside the held write; its first does.
+    let sizes: Vec<u64> = {
+        let Some(engine::Domain::Active(owner, _)) = cluster.node(1).engine.domain.as_ref() else {
+            panic!("the leader's owner is active");
+        };
+        owner
+            .encoded_from(held.unwrap())
+            .unwrap()
+            .map(|record| record.len() as u64)
+            .collect()
+    };
+    assert_eq!(sizes.len(), 10);
+    assert!(
+        sizes.iter().sum::<u64>() > ROOM && sizes[0] + sizes[1] <= ROOM,
+        "records of {sizes:?} bytes do not exercise a partial batch in {ROOM}"
+    );
+    let node = cluster.node(1);
+    assert!(node.engine.flush_deferred(&mut node.consensus).is_none());
+    let proposed = cluster.node(1).consensus.last_index().unwrap() - before;
+    assert!(
+        (1..9).contains(&proposed),
+        "{proposed} of nine proposed beside the held write, records of {sizes:?} bytes"
+    );
+    assert!(
+        !cluster.node(1).engine.has_deferred(),
+        "what had no room owes no drain until a candidate is admitted"
+    );
+    // Room is made as the held write and the proposed ones commit; the next
+    // flush proposes the rest.
+    cluster.pump(&[]);
+    let node = cluster.node(1);
+    assert!(node.engine.flush_deferred(&mut node.consensus).is_none());
+    node.engine.set_proposals_deferred(false);
+    cluster.settle(&[]);
+    assert_eq!(cluster.node(1).pending_count(), 0);
+    for (key, outcome) in admitted {
+        for id in 1..=3 {
+            assert_eq!(
+                cluster.node(id).outcome(key).unwrap(),
+                Some(outcome),
+                "node {id}"
+            );
+        }
+    }
+    cluster.assert_same_state(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+}
+
 #[test]
 fn a_commit_before_the_reply_survives_the_leader_crash_and_exact_retry_finds_it() {
     let mut cluster = Cluster::new();
@@ -593,19 +875,67 @@ fn concurrent_correlated_read_barriers_return_their_own_correlation_at_an_applie
         assert_eq!(boundary.native_sequence, SessionSeq(1));
         assert!(cluster.node(1).read_at_least(boundary).is_ok());
     }
-    // Followers cannot serve a barrier; an isolated authority cannot complete one.
-    assert!(
-        cluster
-            .node(2)
-            .read_index(ReadCorrelation([3; 16]))
-            .is_err()
+    // A follower serves a barrier too (27 §5, follower reads): its core
+    // forwards the read to the leader, the answer names the leader's commit
+    // index, and the follower serves once it has applied it — here what the
+    // leader committed before, at the same sequence.
+    cluster
+        .node(2)
+        .read_index(ReadCorrelation([3; 16]))
+        .unwrap();
+    cluster.pump(&[]);
+    let seen = std::mem::take(&mut cluster.boundaries);
+    assert_eq!(
+        seen.iter()
+            .map(|boundary| boundary.correlation.0)
+            .collect::<Vec<_>>(),
+        vec![[3; 16]]
     );
+    for boundary in seen {
+        assert_eq!(boundary.native_sequence, SessionSeq(1));
+        assert!(cluster.node(2).read_at_least(boundary).is_ok());
+    }
+    // An isolated authority cannot complete one, nor can a follower with no
+    // leader to ask.
     cluster
         .node(1)
         .read_index(ReadCorrelation([4; 16]))
         .unwrap();
     cluster.pump(&[2, 3]);
     assert!(cluster.boundaries.is_empty());
+}
+
+/// A follower's barrier answered above its applied index waits for the
+/// entries it names — the leader's commit index — and is served once they
+/// are applied, at the sequence they made; it never fails closed.
+#[test]
+fn a_followers_barrier_answered_ahead_of_its_log_waits_for_the_entries() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    // Two commits the follower is cut off from.
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[2]);
+    let second = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, second, &[2]);
+    assert_eq!(cluster.sequence(2), SessionSeq(0));
+    // Back, it asks; the leader's answer reaches it before the entries do.
+    cluster.deliver_first = Some(MessageType::MsgReadIndexResp);
+    cluster
+        .node(2)
+        .read_index(ReadCorrelation([9; 16]))
+        .unwrap();
+    cluster.pump(&[]);
+    let seen = std::mem::take(&mut cluster.boundaries);
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let boundary = seen[0];
+    assert_eq!(boundary.correlation.0, [9; 16]);
+    assert_eq!(boundary.native_sequence, SessionSeq(2));
+    assert!(cluster.node(2).read_at_least(boundary).is_ok());
+    assert!(
+        cluster.node(2).reads_parked() >= 1,
+        "the answer came with the entries"
+    );
+    assert!(cluster.status(2, 2).is_some());
 }
 
 #[test]
@@ -726,9 +1056,10 @@ fn corrupted_record_bytes_stop_only_the_receiving_replica_and_never_apply() {
         cluster.node(2).outcome(committed.invocation).unwrap(),
         Some(committed)
     );
+    // It names what stopped it: the damaged record, not only that it stopped.
     assert!(matches!(
         cluster.node(3).outcome(committed.invocation),
-        Err(NativeSessionError::Failed)
+        Err(NativeSessionError::Stopped(cause)) if !cause.is_empty()
     ));
     // The healthy majority keeps committing; the damaged log is refused on reopen.
     cluster.corrupt_to = None;
@@ -1128,7 +1459,7 @@ fn committed_layout_changes_apply_on_every_replica_and_fence_proposals() {
     };
     assert!(matches!(
         cluster.node(1).propose_layout(split_one),
-        Err(NativeSessionError::Capacity)
+        Err(NativeSessionError::Capacity(_))
     ));
     for _ in 0..8 {
         cluster.pump(&[]);
@@ -1850,7 +2181,7 @@ fn committed_retirements_apply_on_every_replica_and_fence_proposals() {
         cluster
             .node(1)
             .propose_retirement(root, bundle, length, through),
-        Err(NativeSessionError::Capacity)
+        Err(NativeSessionError::Capacity(_))
     ));
     for _ in 0..8 {
         cluster.pump(&[]);
@@ -1916,6 +2247,7 @@ fn committed_retirements_apply_on_every_replica_and_fence_proposals() {
         assert_eq!(continuation.retired_at, SessionSeq(before.0 + 1));
         assert!(
             core.native_outcome(focal_core::native::NativeInvocation::Retirement(root))
+                .unwrap()
                 .is_some()
         );
     }
@@ -1962,6 +2294,393 @@ fn committed_retirements_apply_on_every_replica_and_fence_proposals() {
     assert_eq!(cluster.node(2).retired_families(), 1);
     assert_eq!(cluster.status(2, 1), None);
     assert_same_digest(&mut cluster, &[2, 3, 5, 6]);
+}
+
+/// The audit's F12: a seal is a session decision every replica applies
+/// alike. The issuer closes its first generation from its second; the
+/// authority derives the seal at the committed prefix and writes its
+/// bundle, as every replica derives it; only the authority proposes, a
+/// bundle that is none, a length that is none or a fold above the seal is
+/// refused, a pending candidate makes it wait and a plan from an older
+/// prefix is refused; while the record is in flight every other proposal
+/// is fenced. Every replica — one that receives the record in one delivery
+/// with what followed, one restarted from its own log, one caught up by a
+/// checkpoint — seals the same rows at the same prefix; the sealed
+/// request's exact retry and a fresh request of the closed generation are
+/// refused by name and never executed; the bundle answers what the request
+/// committed; the open generation's work goes on.
+#[test]
+fn committed_seals_apply_on_every_replica_fence_proposals_and_close_the_generation() {
+    use focal_core::native::record_codec::StructuralSeal;
+    use focal_core::native::seal::{
+        DEFAULT_SEAL_ROWS_PER_BUNDLE, Fold, SealBound, SealPlan, SealRefusal,
+    };
+    use focal_core::native::{NativeCommand, NativeInvocation, NativeOperation};
+    use focal_model::RequestEpoch;
+    let bound = |limits: focal_core::native::NativeLimits| SealBound {
+        principals: limits.principals,
+        rows: DEFAULT_SEAL_ROWS_PER_BUNDLE,
+    };
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    let create = cluster.creation(1);
+    let first = create.request;
+    let created = cluster.commit(1, PARTIES.issuer, create, &[]);
+    for claim in 2..=3u128 {
+        let creation = cluster.creation(claim);
+        cluster.commit(1, PARTIES.issuer, creation, &[]);
+    }
+    // Nothing is closed: nothing to seal.
+    {
+        let core = cluster.node(1).committed_core().unwrap();
+        assert_eq!(
+            core.seal_plan(&[], bound(core.native_limits()))
+                .unwrap_err(),
+            SealRefusal::Nothing
+        );
+    }
+    // The issuer closes generation one from generation two.
+    cluster.epoch = 2;
+    let advance = NativeInput {
+        request: cluster.next(PARTIES.issuer),
+        command: NativeCommand::AdvanceEpochFloor {
+            minimum: RequestEpoch(2),
+        },
+    };
+    let advanced = cluster.commit(1, PARTIES.issuer, advance, &[]);
+    assert_eq!(advanced.operation, NativeOperation::AdvanceEpochFloor);
+    // A fresh request of the closed generation is refused by name before
+    // anything is proposed.
+    cluster.serial = cluster.serial.saturating_add(1);
+    let stale = creation_for(fx::request(PARTIES.issuer, 1, cluster.serial), 9);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose(fx::context(PARTIES.issuer, clock), stale),
+        Err(NativeSessionError::Owner(NativeOwnerError::Native(
+            NativeError::Contract(ContractError::RequestHistoryExpired)
+        )))
+    ));
+    // The plan and its bundle from the committed state, as any replica
+    // derives them.
+    fn derive(cluster: &mut Cluster, id: u64) -> (SealPlan, ContentHash, u64, Vec<u8>) {
+        let core = cluster.node(id).committed_core().unwrap();
+        let floors = core
+            .pressure_floors(crate::native_session::seal::MAX_FLOORS)
+            .unwrap();
+        assert!(floors.is_empty());
+        let plan = core
+            .seal_plan(
+                &floors,
+                focal_core::native::seal::SealBound {
+                    principals: core.native_limits().principals,
+                    rows: focal_core::native::seal::DEFAULT_SEAL_ROWS_PER_BUNDLE,
+                },
+            )
+            .unwrap();
+        let quote = core.seal_quote(&plan, limits().encoding).unwrap();
+        let mut bytes = vec![0; quote.bytes];
+        let hash = core.seal_into(&plan, &mut bytes, quote.visits).unwrap();
+        assert!(bytes.starts_with(b"FCNSEAL1"));
+        assert_eq!(hash, quote.hash);
+        (plan, hash, bytes.len() as u64, bytes)
+    }
+    let (plan, bundle, length, _) = derive(&mut cluster, 1);
+    assert_eq!(
+        (plan.outcomes(), plan.principals.len(), plan.ordinal),
+        (3, 1, 1)
+    );
+    let (on_two, bundle_on_two, length_on_two, _) = derive(&mut cluster, 2);
+    assert_eq!(
+        (on_two, bundle_on_two, length_on_two),
+        (plan.clone(), bundle, length)
+    );
+    // Only the authority proposes; a bundle that is none, a length that is
+    // none, or a fold at or above the seal's own ordinal is refused, and
+    // nothing is in flight after a refusal.
+    assert!(matches!(
+        cluster.node(2).propose_seal(&plan, bundle, length, None),
+        Err(NativeSessionError::NotReady { .. })
+    ));
+    for (root, bytes, fold) in [
+        (ContentHash([0; 32]), length, None),
+        (bundle, 0, None),
+        (
+            bundle,
+            length,
+            Some(Fold {
+                first: 1,
+                last: 1,
+                bundle,
+                bytes: 1,
+            }),
+        ),
+    ] {
+        assert!(matches!(
+            cluster.node(1).propose_seal(&plan, root, bytes, fold),
+            Err(NativeSessionError::Native(NativeError::Contract(
+                ContractError::InvalidManifest
+            )))
+        ));
+        assert!(cluster.node(1).seal_in_flight().is_none());
+    }
+    // A pending candidate holds the prefix: the seal waits; once the prefix
+    // moved, the plan is from an older prefix and is refused: derive again.
+    let fourth = cluster.creation(4);
+    let request = fourth.request;
+    let NativeSubmission::Pending { outcome, .. } = cluster.propose(1, PARTIES.issuer, fourth)
+    else {
+        panic!("a fresh proposal is pending until the log commits it");
+    };
+    assert!(matches!(
+        cluster.node(1).propose_seal(&plan, bundle, length, None),
+        Err(NativeSessionError::Capacity(_))
+    ));
+    for _ in 0..8 {
+        cluster.pump(&[]);
+        if cluster.node(1).outcome(request).unwrap() == Some(outcome) {
+            break;
+        }
+    }
+    assert_eq!(cluster.node(1).outcome(request).unwrap(), Some(outcome));
+    assert!(matches!(
+        cluster.node(1).propose_seal(&plan, bundle, length, None),
+        Err(NativeSessionError::Native(NativeError::Contract(
+            ContractError::InvalidManifest
+        )))
+    ));
+    let (plan, bundle, length, bytes) = derive(&mut cluster, 1);
+    let before = cluster.sequence(1);
+    assert_eq!(plan.through, before);
+    // Node 3 misses the seal and what follows; in flight, the record fences
+    // another seal, a native proposal, a retirement and a layout change.
+    cluster
+        .node(1)
+        .propose_seal(&plan, bundle, length, None)
+        .unwrap();
+    assert_eq!(
+        cluster.node(1).seal_in_flight().map(|record| record.count),
+        Some(plan.rows() as u64)
+    );
+    assert!(matches!(
+        cluster.node(1).propose_seal(&plan, bundle, length, None),
+        Err(NativeSessionError::Sealing)
+    ));
+    let fifth = cluster.creation(5);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose(fx::context(PARTIES.issuer, clock), fifth),
+        Err(NativeSessionError::Sealing)
+    ));
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose_retirement(ClaimId::from_u128(1), bundle, length, before),
+        Err(NativeSessionError::Sealing)
+    ));
+    assert!(matches!(
+        cluster.node(1).propose_layout(LayoutOperation::Split {
+            at: ClaimId::from_u128(2).0,
+            id: RangeId(33),
+        }),
+        Err(NativeSessionError::Sealing)
+    ));
+    cluster.pump(&[3]);
+    assert!(cluster.node(1).seal_in_flight().is_none());
+    cluster.settle(&[3]);
+    assert_eq!(cluster.sequence(1), SessionSeq(before.0 + 1));
+    // Work goes on in the open generation while node 3 is still cut off;
+    // it receives the seal and the work in one delivery.
+    let fifth = cluster.creation(5);
+    cluster.commit(1, PARTIES.issuer, fifth, &[3]);
+    cluster.settle(&[]);
+    cluster.pump(&[]);
+    assert_eq!(cluster.sequence(3), cluster.sequence(1));
+    assert_same_digest(&mut cluster, &[1, 2, 3, 4, 5]);
+    for id in 1..=3u64 {
+        assert_eq!(cluster.node(id).seals_applied(), 1, "node {id}");
+        assert_eq!(cluster.node(id).seals_inert(), 0, "node {id}");
+        let core = cluster.node(id).committed_core().unwrap();
+        let (ordinal, row) = core.native_seal(1).unwrap();
+        assert_eq!(ordinal, 1);
+        assert_eq!(
+            (row.bundle, row.bytes, row.count),
+            (bundle, length, plan.rows() as u64)
+        );
+        assert_eq!(
+            (row.through, row.sealed_at, row.first),
+            (before, SessionSeq(before.0 + 1), 1)
+        );
+        assert_eq!(
+            core.native_outcome(NativeInvocation::Request(first))
+                .unwrap(),
+            None
+        );
+        assert!(
+            core.native_outcome(NativeInvocation::Seal(1))
+                .unwrap()
+                .is_some()
+        );
+        let window = core.native_epochs(PARTIES.issuer).unwrap();
+        assert_eq!(
+            (window.floor, window.sealed),
+            (RequestEpoch(2), RequestEpoch(2))
+        );
+        assert_eq!(window.seal_of(RequestEpoch(1)), Some(1));
+        assert!(core.native_claim(ClaimId::from_u128(1)).is_some());
+    }
+    // The sealed request's exact retry is refused by name on the authority
+    // and executes nothing; the bundle answers what it committed.
+    let sequence = cluster.sequence(1);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose(fx::context(PARTIES.issuer, clock), creation_for(first, 1)),
+        Err(NativeSessionError::Owner(NativeOwnerError::Native(
+            NativeError::Contract(ContractError::RequestHistoryExpired)
+        )))
+    ));
+    assert_eq!(cluster.sequence(1), sequence);
+    let inspected = StructuralSeal::inspect(&bytes, limits().inspection).unwrap();
+    assert_eq!(
+        inspected.outcome(NativeInvocation::Request(first)).unwrap(),
+        Some(created)
+    );
+    assert_eq!(
+        inspected
+            .header()
+            .member_of(PARTIES.issuer, RequestEpoch(1)),
+        Some(1)
+    );
+    // Nothing awaits a seal but the seal's own outcome; a second seal of
+    // generation one is not derivable.
+    {
+        let core = cluster.node(1).committed_core().unwrap();
+        let next = core.seal_plan(&[], bound(core.native_limits())).unwrap();
+        assert!(next.principals.is_empty());
+        assert_eq!((next.rows(), next.ordinal), (1, 2));
+    }
+    // A restart replays the record from its own log.
+    cluster.stop(2);
+    cluster.reopen(2).unwrap();
+    cluster.settle(&[]);
+    assert_eq!(cluster.node(2).seals_applied(), 1);
+    assert_same_digest(&mut cluster, &[1, 2, 3, 4, 5]);
+    // A follower caught up by the authority's checkpoint restores the seal
+    // row and the window, then replays the records after it.
+    let sixth = cluster.creation(6);
+    cluster.commit(1, PARTIES.issuer, sixth, &[3]);
+    cluster.node(1).begin_checkpoint().unwrap();
+    cluster.pump(&[3]);
+    assert!(!cluster.node(1).checkpoint_pending());
+    let seventh = cluster.creation(7);
+    cluster.commit(1, PARTIES.issuer, seventh, &[3]);
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(3), cluster.sequence(1));
+    assert_same_digest(&mut cluster, &[1, 2, 3, 4, 5, 6, 7]);
+    let core = cluster.node(3).committed_core().unwrap();
+    assert_eq!(core.native_seal(1).map(|(_, row)| row.bundle), Some(bundle));
+    assert_eq!(
+        core.native_epochs(PARTIES.issuer)
+            .unwrap()
+            .seal_of(RequestEpoch(1)),
+        Some(1)
+    );
+}
+
+/// Three voters one under the outcome bound: the authority retires the
+/// family at the bound, every replica that heard the record retires it
+/// alike, the record carries the bound, a follower that missed the release
+/// and the retirement is caught up by the authority's checkpoint and
+/// restores the retired state under the same bound, and a restart under
+/// that bound keeps it; an exact retry of the retired creation is still
+/// answered.
+#[test]
+fn a_cluster_at_the_outcome_bound_retires_and_a_lagging_follower_restores_under_it() {
+    use focal_core::native::NativeCommand;
+    let mut cluster = Cluster::with_limits(|_| limits_with_outcomes(4));
+    cluster.elect(1, &[]);
+    let create = cluster.creation(1);
+    let create_request = create.request;
+    let created = cluster.commit(1, PARTIES.issuer, create, &[]);
+    let expected = cluster.claim(1, 1);
+    let cancel = fx::cancel(cluster.next(PARTIES.issuer), expected);
+    cluster.commit(1, PARTIES.issuer, cancel, &[]);
+    // Node 3 misses the release and the retirement.
+    let expected = cluster.claim(1, 1);
+    let release = NativeInput {
+        request: cluster.next(PARTIES.issuer),
+        command: NativeCommand::ReleaseScope { expected },
+    };
+    cluster.commit(1, PARTIES.issuer, release, &[3]);
+    assert_eq!(cluster.sequence(1), SessionSeq(3));
+    let (root, bundle, length, through) = {
+        let core = cluster.node(1).committed_core().unwrap();
+        let family = core.retirement_family(ClaimId::from_u128(1)).unwrap();
+        let through = core.native_sequence();
+        let quote = core
+            .archive_family_quote(&family, through, limits().encoding)
+            .unwrap();
+        (family.root, quote.hash, quote.bytes as u64, through)
+    };
+    cluster
+        .node(1)
+        .propose_retirement(root, bundle, length, through)
+        .unwrap();
+    assert_eq!(
+        cluster
+            .node(1)
+            .retirement_in_flight()
+            .unwrap()
+            .outcome_limit,
+        Some(4)
+    );
+    cluster.pump(&[3]);
+    cluster.settle(&[3]);
+    for id in [1, 2] {
+        assert_eq!(cluster.sequence(id), SessionSeq(4), "node {id}");
+        assert_eq!(cluster.node(id).retired_families(), 1, "node {id}");
+        assert_eq!(cluster.node(id).retirements_inert(), 0, "node {id}");
+        assert_eq!(cluster.status(id, 1), None, "node {id}");
+    }
+    assert!(cluster.node(1).is_authoritative());
+    assert_eq!(cluster.sequence(3), SessionSeq(2));
+    // The authority's checkpoint carries the retired state at the bound;
+    // the follower restores it under the same bound.
+    cluster.node(1).begin_checkpoint().unwrap();
+    cluster.pump(&[3]);
+    assert!(!cluster.node(1).checkpoint_pending());
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(3), SessionSeq(4));
+    assert_eq!(cluster.node(3).retired_families(), 1);
+    assert_eq!(cluster.status(3, 1), None);
+    assert_same_digest(&mut cluster, &[1]);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert_eq!(
+        cluster
+            .node(1)
+            .propose(
+                fx::context(PARTIES.issuer, clock),
+                creation_for(create_request, 1)
+            )
+            .unwrap(),
+        NativeSubmission::Committed(created)
+    );
+    // A restart under the bound keeps it.
+    cluster.stop(3);
+    cluster.reopen_with(3, limits_with_outcomes(4)).unwrap();
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(3), SessionSeq(4));
+    assert_eq!(cluster.node(3).retired_families(), 1);
+    assert_same_digest(&mut cluster, &[1]);
 }
 
 /// A range split and a later merge are session decisions (25 §4): the authority
@@ -2074,4 +2793,938 @@ fn a_range_split_and_merge_replicate_and_every_voter_converges() {
         2,
         "the reopened follower recovered the merged layout"
     );
+}
+
+/// Hold every byte of `lane` the engine's budget would still give.
+fn exhaust_lane(
+    cluster: &mut Cluster,
+    id: u64,
+    lane: focal_memory::BudgetLane,
+) -> Vec<focal_memory::Allocation> {
+    let budget = cluster.node(id).engine.budget.clone();
+    let mut held = Vec::new();
+    for chunk in [1 << 20, 64 << 10, 4 << 10, 256, 16, 1] {
+        while let Ok(reservation) = budget.reserve(focal_memory::BudgetKind::Pending, lane, chunk) {
+            held.push(reservation.commit());
+        }
+    }
+    held
+}
+
+/// A committed layout record is completion work: an authority whose fresh
+/// admissions filled its ordinary memory still applies it, and one with no
+/// memory at all for the boundary pages keeps the delivery and applies it
+/// once memory returns — never stopping the session (2026-10-08: a leader at
+/// its allowance stopped on a committed split as `Corrupt`).
+#[test]
+fn a_committed_split_applies_on_an_authority_whose_memory_is_spoken_for() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    cluster.received_claim(1);
+    let ordinary = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Ordinary);
+    cluster
+        .node(1)
+        .propose_layout(LayoutOperation::Split {
+            at: ClaimId::from_u128(1).0,
+            id: RangeId(31),
+        })
+        .unwrap();
+    cluster.pump(&[]);
+    assert!(!cluster.node(1).engine.failed());
+    assert_same_layout(&mut cluster, 1);
+    drop(ordinary);
+    // Nothing left in either lane once it commits: the split waits, the
+    // session stays up.
+    cluster
+        .node(1)
+        .propose_layout(LayoutOperation::Split {
+            at: ClaimId::from_u128(2).0,
+            id: RangeId(32),
+        })
+        .unwrap();
+    let ordinary = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Ordinary);
+    let completion = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Completion);
+    // A retryable refusal is what the authority may answer here, and nothing else.
+    cluster.retry_ok = vec![1];
+    cluster.pump(&[]);
+    assert!(!cluster.node(1).engine.failed());
+    assert_eq!(epoch(&mut cluster, 1), 1, "the split waits for memory");
+    drop(completion);
+    drop(ordinary);
+    cluster.retry_ok.clear();
+    cluster.pump(&[]);
+    assert_same_layout(&mut cluster, 2);
+    let next = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, next, &[]);
+    assert_same_digest(&mut cluster, &[1, 2, 3]);
+}
+
+/// A replica applies what its session committed within its hold, not its share (doc 31 M3): a
+/// leader whose share is wider than a follower's admits past the follower's share. A follower
+/// whose share is spoken for (as such a leader's admissions fill it) still applies every
+/// committed record at once: a claim's lifecycle, a split, and, lagging, the leader's checkpoint
+/// and the tail after it; and it takes its own checkpoint. A follower that holds no more than its
+/// share keeps the delivery and applies it only once memory returns.
+#[test]
+fn a_follower_past_its_share_applies_what_committed_within_its_hold() {
+    let share = limits().memory_bytes;
+    let mut cluster = Cluster::with_limits(move |_| NativeSessionLimits {
+        hold_bytes: share.saturating_mul(2),
+        ..limits()
+    });
+    cluster.elect(1, &[]);
+    let filled = exhaust_lane(&mut cluster, 3, focal_memory::BudgetLane::Completion);
+    assert!(!filled.is_empty());
+    let budget = cluster.node(3).engine.budget.clone();
+    assert_eq!(budget.headroom(focal_memory::BudgetLane::Completion), 0);
+    cluster.received_claim(1);
+    assert_eq!(cluster.sequence(3), cluster.sequence(1));
+    cluster
+        .node(1)
+        .propose_layout(LayoutOperation::Split {
+            at: ClaimId::from_u128(1).0,
+            id: RangeId(31),
+        })
+        .unwrap();
+    cluster.pump(&[]);
+    assert_same_layout(&mut cluster, 1);
+    // The lifecycle and the split took it past its share. (Installing the leader's checkpoint
+    // later lets go of what its old state held, so its end use says nothing of this.)
+    assert!(
+        budget.stats().used > budget.limit(),
+        "what it applied took it past its share"
+    );
+    let second = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, second, &[3]);
+    cluster.node(1).begin_checkpoint().unwrap();
+    cluster.pump(&[3]);
+    assert!(!cluster.node(1).checkpoint_pending());
+    let third = cluster.creation(3);
+    cluster.commit(1, PARTIES.issuer, third, &[3]);
+    cluster.settle(&[]);
+    assert_eq!(
+        cluster.sequence(3),
+        cluster.sequence(1),
+        "installed and replayed"
+    );
+    cluster.node(3).begin_checkpoint().unwrap();
+    cluster.pump(&[]);
+    assert!(!cluster.node(3).checkpoint_pending());
+    assert!(!cluster.node(3).engine.failed());
+    cluster.assert_same_state(&[1, 2, 3]);
+    drop(filled);
+
+    // Holding no more than its share, the same follower waits for memory.
+    let mut plain = Cluster::new();
+    plain.elect(1, &[]);
+    let first = plain.creation(1);
+    plain.commit(1, PARTIES.issuer, first, &[]);
+    let filled = exhaust_lane(&mut plain, 3, focal_memory::BudgetLane::Completion);
+    plain.retry_ok = vec![3];
+    let second = plain.creation(2);
+    let committed = plain.commit(1, PARTIES.issuer, second, &[]);
+    plain.settle(&[]);
+    assert_eq!(plain.sequence(3), SessionSeq(1), "refused, not lost");
+    drop(filled);
+    plain.retry_ok.clear();
+    plain.settle(&[]);
+    assert_eq!(
+        plain.node(3).outcome(committed.invocation).unwrap(),
+        Some(committed)
+    );
+    plain.assert_same_state(&[1, 2]);
+}
+
+/// A full session's leader still checkpoints (doc 31 M3): fresh admissions that fill its ordinary
+/// lane leave the frozen image its checkpoint encodes from room in the committed one. The image's
+/// pins were charged as fresh work, so a session at its fill could take no checkpoint, and its log
+/// could not compact for as long as the fill lasted.
+#[test]
+fn a_leader_whose_fresh_admissions_filled_its_share_still_checkpoints() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    let ordinary = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Ordinary);
+    let budget = cluster.node(1).engine.budget.clone();
+    assert_eq!(budget.headroom(focal_memory::BudgetLane::Ordinary), 0);
+    cluster.node(1).begin_checkpoint().unwrap();
+    cluster.pump(&[]);
+    assert!(!cluster.node(1).checkpoint_pending());
+    assert!(!cluster.node(1).engine.failed());
+    drop(ordinary);
+    let second = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, second, &[]);
+    cluster.assert_same_state(&[1, 2]);
+}
+
+/// A leader admits within its share, never its hold (doc 31 M3): with its share spoken for, a
+/// fresh creation is refused for the owner's memory, typed, though its hold has room, and the
+/// session serves on.
+#[test]
+fn a_leader_admits_within_its_share_not_its_hold() {
+    let share = limits().memory_bytes;
+    let mut cluster = Cluster::with_limits(move |_| NativeSessionLimits {
+        hold_bytes: share.saturating_mul(2),
+        ..limits()
+    });
+    cluster.elect(1, &[]);
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    let ordinary = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Ordinary);
+    let completion = exhaust_lane(&mut cluster, 1, focal_memory::BudgetLane::Completion);
+    let budget = cluster.node(1).engine.budget.clone();
+    assert!(budget.headroom(focal_memory::BudgetLane::Committed) > 0);
+    let second = cluster.creation(2);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    let refused = cluster
+        .node(1)
+        .propose(fx::context(PARTIES.issuer, clock), second)
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            NativeSessionError::Native(focal_core::native::NativeError::Memory(_))
+                | NativeSessionError::Owner(focal_core::native::NativeOwnerError::Native(
+                    focal_core::native::NativeError::Memory(_)
+                ))
+                | NativeSessionError::Memory(_)
+        ),
+        "{refused:?}"
+    );
+    assert!(!cluster.node(1).engine.failed());
+    drop((ordinary, completion));
+    let again = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, again, &[]);
+    cluster.assert_same_state(&[1, 2]);
+}
+
+/// Under the anchored rule (F12, level 5) the seal the authority derived is
+/// put under custody while the session goes on committing: handed over
+/// with a candidate pending, it is held, admission holds behind it, and it
+/// is proposed once the pipeline drains — never refused for the commits its
+/// custody took — and applied alike on every replica, a follower cut off
+/// meanwhile included. As the window comes within a quarter of its bound
+/// the owner closes the least recent generation itself with a closing
+/// seal, before any client meets the bound: the next request of the closed
+/// generation is refused by name, the next generation is admitted, and the
+/// next seal takes the closed generation whole.
+#[test]
+fn an_anchored_seal_outlives_its_custody_and_pressure_closes_in_band() {
+    use focal_core::native::NativeCommand;
+    use focal_core::native::seal::{DEFAULT_SEAL_ROWS_PER_BUNDLE, SealBound, SealPlan};
+    use focal_model::RequestEpoch;
+    let anchored = |_| {
+        let mut limits = limits_with_outcomes(16);
+        limits.seal_rule = crate::SealRule::Anchored;
+        limits
+    };
+    let mut cluster = Cluster::with_limits(anchored);
+    cluster.elect(1, &[]);
+    for claim in 1..=3u128 {
+        let creation = cluster.creation(claim);
+        cluster.commit(1, PARTIES.issuer, creation, &[]);
+    }
+    cluster.epoch = 2;
+    let advance = NativeInput {
+        request: cluster.next(PARTIES.issuer),
+        command: NativeCommand::AdvanceEpochFloor {
+            minimum: RequestEpoch(2),
+        },
+    };
+    cluster.commit(1, PARTIES.issuer, advance, &[]);
+    // The plan and its bundle at four, derived as the archive agent does.
+    fn derive(cluster: &mut Cluster) -> (SealPlan, ContentHash, u64) {
+        let core = cluster.node(1).committed_core().unwrap();
+        let plan = core
+            .seal_plan(
+                &[],
+                SealBound {
+                    principals: core.native_limits().principals,
+                    rows: DEFAULT_SEAL_ROWS_PER_BUNDLE,
+                },
+            )
+            .unwrap();
+        let quote = core.seal_quote(&plan, limits().encoding).unwrap();
+        let mut bytes = vec![0; quote.bytes];
+        let hash = core.seal_into(&plan, &mut bytes, quote.visits).unwrap();
+        (plan, hash, bytes.len() as u64)
+    }
+    let (plan, bundle, length) = derive(&mut cluster);
+    assert_eq!(plan.through, SessionSeq(4));
+    // Custody takes a while: the issuer commits on, and hands the seal over
+    // with a candidate pending.
+    let fifth = cluster.creation(5);
+    cluster.commit(1, PARTIES.issuer, fifth, &[]);
+    let sixth = cluster.creation(6);
+    let sixth_request = sixth.request;
+    let NativeSubmission::Pending { outcome, .. } = cluster.propose(1, PARTIES.issuer, sixth)
+    else {
+        panic!("a fresh proposal is pending until the log commits it");
+    };
+    let owner = cluster.node(1).owner_incarnation();
+    assert!(owner.is_some());
+    cluster
+        .node(1)
+        .propose_seal(&plan, bundle, length, None)
+        .unwrap();
+    assert!(cluster.node(1).seal_wanted());
+    assert!(cluster.node(1).anchored_in_flight().is_none());
+    // Held for the drain: fresh work holds behind it.
+    let seventh = cluster.creation(7);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose(fx::context(PARTIES.issuer, clock), seventh),
+        Err(NativeSessionError::Sealing)
+    ));
+    // The candidate commits, the pipeline drains, the seal is proposed and
+    // applied; node 3 misses it and catches up in one delivery.
+    for _ in 0..16 {
+        cluster.pump(&[3]);
+        if cluster.node(1).seals_applied() == 1 {
+            break;
+        }
+    }
+    assert_eq!(
+        cluster.node(1).outcome(sixth_request).unwrap(),
+        Some(outcome)
+    );
+    assert_eq!(cluster.node(1).seals_applied(), 1);
+    assert!(!cluster.node(1).seal_wanted());
+    // The leader's owner took the seal in place and goes on: no rebuild, a walk of every row.
+    assert_eq!(cluster.node(1).owner_incarnation(), owner);
+    let seventh = cluster.creation(7);
+    cluster.commit(1, PARTIES.issuer, seventh, &[]);
+    cluster.settle(&[]);
+    for id in 1..=3u64 {
+        assert_eq!(cluster.node(id).seals_applied(), 1, "node {id}");
+        assert_eq!(cluster.node(id).seals_inert(), 0, "node {id}");
+        let core = cluster.node(id).committed_core().unwrap();
+        let (_, row) = core.native_seal(1).unwrap();
+        assert_eq!((row.bundle, row.through), (bundle, SessionSeq(4)));
+        assert_eq!(
+            core.native_epochs(PARTIES.issuer).unwrap().sealed,
+            RequestEpoch(2)
+        );
+    }
+    assert_same_digest(&mut cluster, &[1, 2, 3, 5, 6, 7]);
+    // Pressure: within a quarter of sixteen, past twelve resident. The
+    // admission that brings the window there holds the next behind a
+    // closing seal of the issuer's generation, which every replica applies.
+    let mut claim = 8u128;
+    // (The commit's own drive may carry the closing seal through.)
+    while !cluster.node(1).seal_wanted() && cluster.node(1).closes_applied() == 0 {
+        assert!(
+            cluster
+                .node(1)
+                .committed_core()
+                .unwrap()
+                .resident_outcomes()
+                < 16
+        );
+        let creation = cluster.creation(claim);
+        cluster.commit(1, PARTIES.issuer, creation, &[]);
+        claim += 1;
+    }
+    for _ in 0..16 {
+        cluster.pump(&[]);
+        if cluster.node(1).closes_applied() == 1 {
+            break;
+        }
+    }
+    cluster.settle(&[]);
+    for id in 1..=3u64 {
+        assert_eq!(cluster.node(id).closes_applied(), 1, "node {id}");
+        let core = cluster.node(id).committed_core().unwrap();
+        let window = core.native_epochs(PARTIES.issuer).unwrap();
+        assert_eq!(
+            (window.floor, window.sealed),
+            (RequestEpoch(3), RequestEpoch(2))
+        );
+        assert!(core.resident_outcomes() <= 16);
+    }
+    // The closed generation's next request is refused by name, not by the
+    // bound; the next generation is admitted.
+    let stale = cluster.creation(claim);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose(fx::context(PARTIES.issuer, clock), stale),
+        Err(NativeSessionError::Owner(NativeOwnerError::Native(
+            NativeError::Contract(ContractError::RequestHistoryExpired)
+        )))
+    ));
+    cluster.epoch = 3;
+    let fresh = cluster.creation(claim + 1);
+    cluster.commit(1, PARTIES.issuer, fresh, &[]);
+    // The next seal takes the closed generation whole, with both seals' own
+    // outcomes; the window is back under half.
+    let (plan, bundle, length) = derive(&mut cluster);
+    assert_eq!(
+        (
+            plan.ordinal,
+            plan.principals[0].first,
+            plan.principals[0].last
+        ),
+        (3, RequestEpoch(2), RequestEpoch(2))
+    );
+    cluster
+        .node(1)
+        .propose_seal(&plan, bundle, length, None)
+        .unwrap();
+    cluster.settle(&[]);
+    for id in 1..=3u64 {
+        assert_eq!(cluster.node(id).seals_applied(), 2, "node {id}");
+        let core = cluster.node(id).committed_core().unwrap();
+        assert!(core.resident_outcomes() < 8, "node {id}");
+    }
+    assert_same_digest(&mut cluster, &[1, 2, 3, 5, 6, 7]);
+}
+
+/// Under the derived rule a window at its bound still seals: a seal takes
+/// at least one outcome with it, so its own outcome is checked against the
+/// committed headroom, as its apply checks it, and not the bound — held to
+/// the bound, the seal that empties a full window was refused for good and
+/// the session refused every write after. Every replica replays past a
+/// window's worth of lifetime outcomes: the bound a record is replayed
+/// under is the resident window's, as admission's.
+#[test]
+fn a_full_window_seals_and_replicas_replay_past_a_window_of_lifetime_outcomes() {
+    use focal_core::native::seal::{DEFAULT_SEAL_ROWS_PER_BUNDLE, SealBound};
+    use focal_model::RequestEpoch;
+    let mut cluster = Cluster::with_limits(|_| limits_with_outcomes(6));
+    cluster.elect(1, &[]);
+    let mut claim = 1u128;
+    for round in 1..=3u64 {
+        // Fill the window in this round's generation.
+        cluster.epoch = round;
+        while cluster
+            .node(1)
+            .committed_core()
+            .unwrap()
+            .resident_outcomes()
+            < 6
+        {
+            let creation = cluster.creation(claim);
+            cluster.commit(1, PARTIES.issuer, creation, &[]);
+            claim += 1;
+        }
+        // Full: the next fresh request is refused by the bound.
+        let refused = cluster.creation(claim);
+        cluster.clock = cluster.clock.saturating_add(1);
+        let clock = cluster.clock;
+        assert!(matches!(
+            cluster
+                .node(1)
+                .propose(fx::context(PARTIES.issuer, clock), refused),
+            Err(NativeSessionError::Owner(NativeOwnerError::Native(
+                NativeError::Capacity("outcomes")
+            )))
+        ));
+        // The seal is proposable at the full window, and empties it on
+        // every replica.
+        cluster.node(1).check_seal().unwrap();
+        let (plan, hash, length) = {
+            let core = cluster.node(1).committed_core().unwrap();
+            let floors = core
+                .pressure_floors(crate::native_session::seal::MAX_FLOORS)
+                .unwrap();
+            assert_eq!(floors, vec![(PARTIES.issuer, RequestEpoch(round + 1))]);
+            let plan = core
+                .seal_plan(
+                    &floors,
+                    SealBound {
+                        principals: core.native_limits().principals,
+                        rows: DEFAULT_SEAL_ROWS_PER_BUNDLE,
+                    },
+                )
+                .unwrap();
+            let quote = core.seal_quote(&plan, limits().encoding).unwrap();
+            let mut bytes = vec![0; quote.bytes];
+            let hash = core.seal_into(&plan, &mut bytes, quote.visits).unwrap();
+            (plan, hash, bytes.len() as u64)
+        };
+        cluster
+            .node(1)
+            .propose_seal(&plan, hash, length, None)
+            .unwrap();
+        cluster.settle(&[]);
+        for id in 1..=3u64 {
+            assert_eq!(cluster.node(id).seals_applied(), round, "node {id}");
+            assert!(
+                cluster
+                    .node(id)
+                    .committed_core()
+                    .unwrap()
+                    .resident_outcomes()
+                    < 6,
+                "node {id}"
+            );
+        }
+    }
+    // Three windows' worth committed and replayed alike.
+    assert!(cluster.sequence(1).0 > 18);
+    assert_same_digest(&mut cluster, &[1, 2, 3]);
+}
+
+/// The two finished families `claims` (each created, cancelled and released) on `leader`, and
+/// what the archive agent would offer for them: each family's digest and a bundle.
+fn finished_offers(
+    cluster: &mut Cluster,
+    leader: u64,
+    claims: &[u128],
+) -> Vec<focal_core::native::retirement_batch::RetireOffer> {
+    use focal_core::native::NativeCommand;
+    use focal_core::native::retirement_batch::{RetireOffer, family_digest};
+    for &claim in claims {
+        let create = cluster.creation(claim);
+        cluster.commit(leader, PARTIES.issuer, create, &[]);
+        let expected = cluster.claim(leader, claim);
+        let cancel = fx::cancel(cluster.next(PARTIES.issuer), expected);
+        cluster.commit(leader, PARTIES.issuer, cancel, &[]);
+        let expected = cluster.claim(leader, claim);
+        let release = NativeInput {
+            request: cluster.next(PARTIES.issuer),
+            command: NativeCommand::ReleaseScope { expected },
+        };
+        cluster.commit(leader, PARTIES.issuer, release, &[]);
+    }
+    let core = cluster.node(leader).committed_core().unwrap();
+    claims
+        .iter()
+        .map(|claim| {
+            let family = core.retirement_family(ClaimId::from_u128(*claim)).unwrap();
+            RetireOffer {
+                root: ClaimId::from_u128(*claim),
+                family: family_digest(ledger(), &family).unwrap(),
+                bundle: ContentHash([u8::try_from(*claim).unwrap(); 32]),
+                bytes: 4096,
+            }
+        })
+        .collect()
+}
+
+/// Retirement in the pipeline (doc 31 M2): with a write in flight before it and one admitted
+/// after it, the leader retires a batch of two families as one candidate. Nothing waits for it,
+/// admission is not held behind it, and every replica commits the three in the leader's order,
+/// the followers deriving the families from their own rows: the same rows everywhere, each
+/// family gone behind its continuation. A restarted replica keeps it.
+#[test]
+fn a_retirement_batch_commits_among_the_writes_around_it_on_every_replica() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    let offers = finished_offers(&mut cluster, 1, &[1, 2]);
+    let before = cluster.creation(3);
+    let before_request = before.request;
+    assert!(matches!(
+        cluster.propose(1, PARTIES.issuer, before),
+        NativeSubmission::Pending { .. }
+    ));
+    let (batch, submission) = cluster.node(1).retire(&offers).unwrap();
+    assert_eq!(batch.families.len(), 2);
+    assert!(batch.deferred.is_empty() && batch.refused.is_empty());
+    let Some(NativeSubmission::Pending {
+        outcome: retired, ..
+    }) = submission
+    else {
+        panic!("a pending retirement: {submission:?}");
+    };
+    let after = cluster.creation(4);
+    let after_request = after.request;
+    assert!(
+        matches!(
+            cluster.propose(1, PARTIES.issuer, after),
+            NativeSubmission::Pending { .. }
+        ),
+        "admission is not held behind a retirement"
+    );
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    for id in [1, 2, 3] {
+        let node = cluster.node(id);
+        let before = node.outcome(before_request).unwrap().unwrap();
+        let after = node.outcome(after_request).unwrap().unwrap();
+        assert_eq!(before.sequence.0 + 1, retired.sequence.0, "node {id}");
+        assert_eq!(retired.sequence.0 + 1, after.sequence.0, "node {id}");
+        let core = node.committed_core().unwrap();
+        for claim in [1u128, 2] {
+            assert!(core.native_claim(ClaimId::from_u128(claim)).is_none());
+            let continuation = core.native_retired(ClaimId::from_u128(claim)).unwrap();
+            assert_eq!(continuation.retired_at, retired.sequence, "node {id}");
+        }
+    }
+    assert_same_digest(&mut cluster, &[3, 4]);
+    cluster.stop(3);
+    cluster.reopen(3).unwrap();
+    cluster.settle(&[]);
+    assert!(
+        cluster
+            .node(3)
+            .committed_core()
+            .unwrap()
+            .native_retired(ClaimId::from_u128(1))
+            .is_some()
+    );
+    assert_same_digest(&mut cluster, &[3, 4]);
+}
+
+/// Below the upgrade fence (`RetireRule::Exact`) an authority retires a family at a time: a batch
+/// is refused by name before anything is proposed, since a binary in its cluster may not read
+/// one, and the family retires alone at the prefix it was derived at, on every replica.
+#[test]
+fn below_the_fence_a_batch_is_refused_and_a_family_retires_alone() {
+    let exact = |_| {
+        let mut limits = limits();
+        limits.retire_rule = crate::RetireRule::Exact;
+        limits
+    };
+    let mut cluster = Cluster::with_limits(exact);
+    cluster.elect(1, &[]);
+    let offers = finished_offers(&mut cluster, 1, &[1]);
+    let before = cluster.sequence(1);
+    assert!(matches!(
+        cluster.node(1).retire(&offers),
+        Err(NativeSessionError::RetireExact)
+    ));
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(1), before, "nothing was proposed");
+    let (root, bundle, length, through) = {
+        let core = cluster.node(1).committed_core().unwrap();
+        let family = core.retirement_family(ClaimId::from_u128(1)).unwrap();
+        let through = core.native_sequence();
+        let quote = core
+            .archive_family_quote(&family, through, limits().encoding)
+            .unwrap();
+        (family.root, quote.hash, quote.bytes as u64, through)
+    };
+    cluster
+        .node(1)
+        .propose_retirement(root, bundle, length, through)
+        .unwrap();
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(1), SessionSeq(before.0 + 1));
+    assert_same_digest(&mut cluster, &[1, 2, 3]);
+    for id in 1..=3u64 {
+        let core = cluster.node(id).committed_core().unwrap();
+        assert!(core.native_claim(root).is_none(), "node {id}");
+        assert_eq!(
+            core.native_retired(root).unwrap().bundle,
+            bundle,
+            "node {id}"
+        );
+    }
+}
+
+/// A node's cold streams as its next checkpoint would name them (doc 31 M2, A2).
+fn cold_streams(cluster: &mut Cluster, id: u64) -> Option<focal_evidence::ColdStreams> {
+    let engine = &cluster.node(id).engine;
+    engine
+        .cold
+        .capture(engine.cold_source.as_ref(), &engine.budget)
+        .unwrap()
+        .map(|captured| captured.streams)
+}
+/// Every family of `claims` reads back on node `id` from the frame its stub names.
+fn assert_cold_frames(cluster: &mut Cluster, id: u64, claims: &[u128]) {
+    for claim in claims {
+        let retired = *cluster
+            .node(id)
+            .committed_core()
+            .unwrap()
+            .native_retired(ClaimId::from_u128(*claim))
+            .unwrap();
+        let frame = cluster
+            .node(id)
+            .cold_frame(retired.retired_at, retired.bundle)
+            .unwrap()
+            .unwrap_or_else(|| panic!("node {id} holds no frame for claim {claim}"));
+        let frame = frame.bytes();
+        assert_eq!(frame.len() as u64, retired.bytes, "node {id} claim {claim}");
+        assert!(frame.starts_with(b"FCNARCHV"));
+        assert!(
+            frame.ends_with(&retired.bundle.0),
+            "the frame is the one its digest names"
+        );
+    }
+}
+fn cold_limits() -> NativeSessionLimits {
+    let mut limits = limits();
+    limits.retire_rule = crate::RetireRule::Cold;
+    limits
+}
+
+/// Retirement to the cold stream (doc 31 M2, A2): batches retire among the writes, every replica
+/// appends each batch's frames where the record applies, from its own rows, so every replica's
+/// streams are the same bytes (chunks and a manifest chunk cut at the same offsets), and every
+/// family reads back from the frame its stub names by digest. A replica restarted from its log, and
+/// one restarted from its own checkpoint, hold the same streams again.
+#[test]
+fn a_cold_retirement_writes_the_same_streams_on_every_replica() {
+    let mut cluster = Cluster::with_limits(|_| cold_limits());
+    cluster.elect(1, &[]);
+    let claims: Vec<u128> = (1..=12).collect();
+    let offers = finished_offers(&mut cluster, 1, &claims);
+    for batch in offers.chunks(5) {
+        let (retired, submission) = cluster.node(1).retire(batch).unwrap();
+        assert_eq!(retired.families.len(), batch.len());
+        assert!(submission.is_some());
+        cluster.pump(&[]);
+        cluster.settle(&[]);
+    }
+    let streams = cold_streams(&mut cluster, 1).expect("the leader keeps cold streams");
+    assert!(
+        !streams.data.manifests.is_empty(),
+        "the data stream cut a manifest chunk"
+    );
+    assert_eq!(
+        streams.marks.length,
+        3 * 16,
+        "a mark for each of three batches"
+    );
+    for id in [2, 3] {
+        assert_eq!(
+            cold_streams(&mut cluster, id).as_ref(),
+            Some(&streams),
+            "node {id}"
+        );
+    }
+    for id in [1, 2, 3] {
+        assert_cold_frames(&mut cluster, id, &claims);
+    }
+    cluster.stop(3);
+    cluster.reopen(3).unwrap();
+    cluster.settle(&[]);
+    assert_eq!(cold_streams(&mut cluster, 3).as_ref(), Some(&streams));
+    assert_cold_frames(&mut cluster, 3, &claims);
+    cluster.node(2).begin_checkpoint().unwrap();
+    cluster.pump(&[]);
+    cluster.stop(2);
+    cluster.reopen(2).unwrap();
+    cluster.settle(&[]);
+    assert_eq!(cold_streams(&mut cluster, 2).as_ref(), Some(&streams));
+    assert_cold_frames(&mut cluster, 2, &claims);
+}
+
+/// A lagging replica installs a checkpoint naming cold streams only once every chunk they name
+/// is local: it names them, a peer serves them, each verified on the way in, and the streams it
+/// then keeps are the peer's, every family readable.
+#[test]
+fn a_lagging_replica_installs_cold_streams_once_their_chunks_are_pulled() {
+    let mut cluster = Cluster::with_limits(|_| cold_limits());
+    cluster.elect(1, &[]);
+    let claims: Vec<u128> = (1..=10).collect();
+    let offers = finished_offers(&mut cluster, 1, &claims);
+    for batch in offers.chunks(5) {
+        cluster.node(1).retire(batch).unwrap();
+        cluster.pump(&[3]);
+    }
+    cluster.node(1).begin_checkpoint().unwrap();
+    cluster.pump(&[3]);
+    let last = cluster.creation(99);
+    cluster.commit(1, PARTIES.issuer, last, &[3]);
+    let streams = cold_streams(&mut cluster, 1).unwrap();
+    cluster.retry_ok = vec![3];
+    cluster.settle(&[]);
+    let root = cluster
+        .node(1)
+        .engine
+        .cold_source
+        .as_ref()
+        .unwrap()
+        .root
+        .clone();
+    // The manifest chunks are named first, then the chunks behind them once they are local.
+    let mut rounds = 0;
+    while let Some(pending) = cluster.node(3).pending_seed() {
+        let missing = pending.missing_chunks().unwrap();
+        assert!(!missing.is_empty());
+        rounds += 1;
+        assert!(
+            rounds <= 3,
+            "an install names what it lacks in at most two rounds"
+        );
+        for hash in &missing {
+            let bytes = ["data", "marks"]
+                .iter()
+                .find_map(|part| {
+                    focal_evidence::ColdReader::open(root.join(part))
+                        .unwrap()
+                        .read(*hash, focal_evidence::SEED_CHUNK_BYTES)
+                        .ok()
+                })
+                .expect("the peer holds the chunk");
+            assert!(
+                cluster
+                    .node(3)
+                    .install_seed_chunk(*hash, b"forged")
+                    .is_err()
+            );
+            cluster.node(3).install_seed_chunk(*hash, &bytes).unwrap();
+        }
+        cluster.settle(&[]);
+    }
+    assert_eq!(rounds, 2, "manifest chunks, then the chunks behind them");
+    cluster.retry_ok.clear();
+    cluster.settle(&[]);
+    assert!(cluster.node(3).pending_seed().is_none());
+    assert_eq!(cold_streams(&mut cluster, 3).as_ref(), Some(&streams));
+    assert_cold_frames(&mut cluster, 3, &claims);
+}
+
+/// A volume whose free bytes a test sets: no headroom, never sampled.
+fn set_volume(free: u64) -> focal_memory::DiskBudget {
+    let volume = focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig {
+        headroom: 0,
+        completion_reserve: 0,
+        sample_interval: u32::MAX,
+    })
+    .unwrap();
+    volume.observe(free);
+    volume
+}
+
+/// A replica without room for a cold batch does not apply its record: the record is refused,
+/// retryably, with nothing changed (no family retired, nothing appended), while the others go
+/// on, and it applies once room returns, its streams then every other replica's. First its
+/// streams cannot open (the writer refused keeps what they were), then they open and the batch's
+/// room is refused: the order that once published the record and then failed its append.
+#[test]
+fn a_replica_without_room_for_a_cold_batch_applies_it_once_room_returns() {
+    let mut cluster = Cluster::with_limits(|_| cold_limits());
+    cluster.elect(1, &[]);
+    let claims: Vec<u128> = (1..=10).collect();
+    let offers = finished_offers(&mut cluster, 1, &claims);
+    let volume = set_volume(0);
+    cluster.node(3).engine.cold_source.as_mut().unwrap().disk = volume.clone();
+    cluster.retry_ok = vec![3];
+    let before = cluster.sequence(3);
+    for batch in offers.chunks(5) {
+        cluster.node(1).retire(batch).unwrap();
+        cluster.pump(&[]);
+        cluster.settle(&[]);
+    }
+    assert_eq!(cluster.sequence(2), cluster.sequence(1), "the others go on");
+    assert_eq!(cluster.sequence(3), before, "no room to open the streams");
+    assert!(cold_streams(&mut cluster, 3).is_none());
+    // Room for the open chunk alone: the streams open, and the batch's room is refused.
+    volume.observe(cold_limits().cold_geometry.chunk_bytes as u64);
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(3), before, "no room for the batch");
+    assert!(cold_streams(&mut cluster, 3).is_none(), "nothing appended");
+    for claim in &claims {
+        let core = cluster.node(3).committed_core().unwrap();
+        assert!(
+            core.native_claim(ClaimId::from_u128(*claim)).is_some(),
+            "nothing retired"
+        );
+    }
+    volume.observe(1 << 30);
+    cluster.settle(&[]);
+    cluster.retry_ok.clear();
+    assert_eq!(cluster.sequence(3), cluster.sequence(1));
+    let streams = cold_streams(&mut cluster, 1).unwrap();
+    assert_eq!(cold_streams(&mut cluster, 3).as_ref(), Some(&streams));
+    assert_cold_frames(&mut cluster, 3, &claims);
+}
+
+/// A replica whose cold stream fails on IO once a record has applied stops, naming why: the
+/// record applied and its batch is not in the stream, so it cannot go on. Here its open chunk is
+/// taken from under its writer, so the batch's first cut cannot rename it. Reopened, it restores
+/// its streams from its log, every other replica's again.
+#[test]
+fn a_replica_whose_cold_stream_fails_stops_and_a_reopen_restores_it() {
+    let mut cluster = Cluster::with_limits(|_| cold_limits());
+    cluster.elect(1, &[]);
+    let claims: Vec<u128> = (1..=10).collect();
+    let offers = finished_offers(&mut cluster, 1, &claims);
+    let (first, second) = offers.split_at(5);
+    cluster.node(1).retire(first).unwrap();
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    let data = cluster
+        .node(3)
+        .engine
+        .cold_source
+        .as_ref()
+        .unwrap()
+        .root
+        .join("data");
+    for entry in std::fs::read_dir(&data).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("open.")
+        {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    cluster.fail_ok = vec![3];
+    cluster.node(1).retire(second).unwrap();
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    assert_eq!(cluster.failed, vec![3], "the replica stopped");
+    assert!(matches!(
+        cluster.node(3).poll(),
+        Err(NativeSessionError::Stopped(cause)) if cause.contains("cold batch")
+    ));
+    let streams = cold_streams(&mut cluster, 1).unwrap();
+    assert_eq!(cold_streams(&mut cluster, 2).as_ref(), Some(&streams));
+    cluster.stop(3);
+    cluster.fail_ok.clear();
+    cluster.failed.clear();
+    cluster.reopen_with(3, cold_limits()).unwrap();
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(3), cluster.sequence(1));
+    assert_eq!(cold_streams(&mut cluster, 3).as_ref(), Some(&streams));
+    assert_cold_frames(&mut cluster, 3, &claims);
+}
+
+/// A retirement takes every offer that may leave now in one call: twelve families, past what one
+/// candidate's changes may hold here (a batch of 128 changes holds six of these families),
+/// retire as consecutive candidates, each its own record and its own mark, alike on every
+/// replica. One candidate a call once retired six of the twelve and deferred the rest to a later
+/// walk, which derived them again.
+#[test]
+fn a_retirement_takes_every_offer_across_candidates() {
+    let mut cluster = Cluster::with_limits(|_| cold_limits());
+    cluster.elect(1, &[]);
+    let claims: Vec<u128> = (1..=12).collect();
+    let offers = finished_offers(&mut cluster, 1, &claims);
+    let before = cluster.sequence(1);
+    let (retired, submission) = cluster.node(1).retire(&offers).unwrap();
+    assert_eq!(retired.families.len(), 12, "every offer at once");
+    assert!(
+        retired.ends.len() >= 2,
+        "more than one candidate: {:?}",
+        retired.ends
+    );
+    assert!(retired.deferred.is_empty() && retired.refused.is_empty());
+    assert!(submission.is_some());
+    cluster.pump(&[]);
+    cluster.settle(&[]);
+    let records = retired.ends.len() as u64;
+    assert_eq!(cluster.sequence(1).0, before.0 + records);
+    let streams = cold_streams(&mut cluster, 1).unwrap();
+    assert_eq!(streams.marks.length, 16 * records, "a mark a record");
+    for id in [2, 3] {
+        assert_eq!(
+            cold_streams(&mut cluster, id).as_ref(),
+            Some(&streams),
+            "node {id}"
+        );
+    }
+    for id in [1, 2, 3] {
+        assert_cold_frames(&mut cluster, id, &claims);
+    }
 }

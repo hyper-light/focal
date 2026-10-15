@@ -57,7 +57,7 @@ impl Fleet {
                     }
                 }
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
     }
     /// Every replica follows `node`, which serves.
@@ -78,12 +78,22 @@ impl Fleet {
                 return;
             }
             if let Err(spent) = wait.check(&self.periods()) {
+                // Each replica's progress, and its owner's periods: run, run
+                // without the replica's tick, and the longest.
                 panic!(
                     "leadership never reached {node}: {spent}; {:?}",
-                    self.hosts.iter().map(|h| h.progress()).collect::<Vec<_>>()
+                    self.hosts
+                        .iter()
+                        .map(|host| (
+                            host.progress(),
+                            host.periods(),
+                            host.refused_periods(),
+                            host.longest_period()
+                        ))
+                        .collect::<Vec<_>>()
                 );
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
     }
     /// `leader` hands leadership to its successor, once: until its term
@@ -103,7 +113,7 @@ impl Fleet {
             if let Err(spent) = wait.check(&self.periods()) {
                 panic!("leadership never left {leader}: {spent}");
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
     }
     fn returns(&self) -> (u64, u64) {
@@ -126,7 +136,7 @@ impl Fleet {
             if let Err(spent) = wait.check(&now) {
                 panic!("the owners stopped: {spent}");
             }
-            tokio::time::sleep(TICK).await;
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
     }
 }
@@ -159,175 +169,181 @@ impl Fleet {
 /// that is away or while no election is held, and no replica asks more
 /// often than its rest allows. That a hand-over is asked for when it is
 /// due, and only then, is what `leader_return` tests by itself.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn leadership_returns_to_the_preferred_leader_once_and_only_when_it_is_there() {
-    let directory = tempfile::tempdir().unwrap();
-    let fleet = Fleet::open(directory.path());
-    let first = fleet.leader(None).await;
-    // The placement prefers a member that does not lead.
-    let preferred = (first as u64 + 1) % 3 + 1;
-    let election = fleet.hosts[first].election_periods();
-    let began = fleet.periods();
-    fleet.prefer(preferred).await;
-    fleet.led_by(preferred).await;
-    // Where it is preferred it stays.
-    fleet.asks_nothing(election * 12).await;
-    fleet.led_by(preferred).await;
+#[test]
+fn leadership_returns_to_the_preferred_leader_once_and_only_when_it_is_there() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fleet = Fleet::open(directory.path());
+        let first = fleet.leader(None).await;
+        // The placement prefers a member that does not lead.
+        let preferred = (first as u64 + 1) % 3 + 1;
+        let election = fleet.hosts[first].election_periods();
+        let began = fleet.periods();
+        fleet.prefer(preferred).await;
+        fleet.led_by(preferred).await;
+        // Where it is preferred it stays.
+        fleet.asks_nothing(election * 12).await;
+        fleet.led_by(preferred).await;
 
-    // Moved away by hand, it comes back. It comes back within a few
-    // election timeouts, so the move is judged by the term it ended, not
-    // by who is found leading afterwards.
-    fleet.leave(preferred).await;
-    fleet.led_by(preferred).await;
+        // Moved away by hand, it comes back. It comes back within a few
+        // election timeouts, so the move is judged by the term it ended, not
+        // by who is found leading afterwards.
+        fleet.leave(preferred).await;
+        fleet.led_by(preferred).await;
 
-    // A preferred leader that cannot be reached is asked nothing: the
-    // others elect one of themselves and keep it.
-    fleet.isolated.store(preferred as u8, Ordering::SeqCst);
-    let stand_in = fleet.leader(Some(preferred as usize - 1)).await;
-    assert_ne!(stand_in as u64 + 1, preferred);
-    let asked = fleet.returns().0;
-    fleet.run(election * 12).await;
-    assert_eq!(
-        fleet.returns().0,
-        asked,
-        "nothing is asked of a member away"
-    );
-    let reply = fleet
-        .retry_exact(
-            fleet.leader(Some(preferred as usize - 1)).await,
-            &request(
-                7_001,
-                Operation::Read(ReadRequest {
-                    consistency: ReadConsistency::Linearizable,
-                    query: ReadQuery::Objects(vec![]),
-                    max_items: 1,
-                }),
-            ),
-        )
-        .await;
-    assert!(matches!(reply.result, Response::Read(_)), "{reply:?}");
-
-    // Back and current, it leads again.
-    fleet.isolated.store(0, Ordering::SeqCst);
-    fleet.led_by(preferred).await;
-    fleet.asks_nothing(election * 12).await;
-
-    // No storm: a replica asks once, and again after its rest at the
-    // soonest.
-    let rest = election * u64::from(crate::leader_return::REST);
-    for (host, began) in fleet.hosts.iter().zip(began) {
-        let progress = host.progress();
-        let periods = host.periods() - began;
-        assert!(
-            progress.returns.asked <= 1 + periods / rest,
-            "{progress:?} in {periods} periods"
+        // A preferred leader that cannot be reached is asked nothing: the
+        // others elect one of themselves and keep it.
+        fleet.isolated.store(preferred as u8, Ordering::SeqCst);
+        let stand_in = fleet.leader(Some(preferred as usize - 1)).await;
+        assert_ne!(stand_in as u64 + 1, preferred);
+        let asked = fleet.returns().0;
+        fleet.run(election * 12).await;
+        assert_eq!(
+            fleet.returns().0,
+            asked,
+            "nothing is asked of a member away"
         );
-        assert!(progress.returns.failed <= progress.returns.asked);
-    }
-    fleet.stop().await;
+        let reply = fleet
+            .retry_exact(
+                fleet.leader(Some(preferred as usize - 1)).await,
+                &request(
+                    7_001,
+                    Operation::Read(ReadRequest {
+                        consistency: ReadConsistency::Linearizable,
+                        query: ReadQuery::Objects(vec![]),
+                        max_items: 1,
+                    }),
+                ),
+            )
+            .await;
+        assert!(matches!(reply.result, Response::Read(_)), "{reply:?}");
+
+        // Back and current, it leads again.
+        fleet.isolated.store(0, Ordering::SeqCst);
+        fleet.led_by(preferred).await;
+        fleet.asks_nothing(election * 12).await;
+
+        // No storm: a replica asks once, and again after its rest at the
+        // soonest.
+        let rest = election * u64::from(crate::leader_return::REST);
+        for (host, began) in fleet.hosts.iter().zip(began) {
+            let progress = host.progress();
+            let periods = host.periods() - began;
+            assert!(
+                progress.returns.asked <= 1 + periods / rest,
+                "{progress:?} in {periods} periods"
+            );
+            assert!(progress.returns.failed <= progress.returns.asked);
+        }
+        fleet.stop().await;
+    })
+    .unwrap()
 }
 
 /// The voters in the preferred leader's zone outrank the rest: one of them
 /// leads while the preferred leader is away, elected or handed leadership
 /// by the voter that was, and the preferred leader leads again once it is
 /// back.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_voter_in_the_preferred_leaders_zone_leads_in_its_place() {
-    let directory = tempfile::tempdir().unwrap();
-    let fleet = Fleet::open(directory.path());
-    let first = fleet.leader(None).await as u64 + 1;
-    // The one that leads is preferred, the next is in its zone.
-    let (preferred, near, far) = (first, first % 3 + 1, (first + 1) % 3 + 1);
-    fleet.prefer(preferred).await;
-    for host in &fleet.hosts {
-        // What is said of the zone is not said of the leader itself.
-        assert!(matches!(
+#[test]
+fn a_voter_in_the_preferred_leaders_zone_leads_in_its_place() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fleet = Fleet::open(directory.path());
+        let first = fleet.leader(None).await as u64 + 1;
+        // The one that leads is preferred, the next is in its zone.
+        let (preferred, near, far) = (first, first % 3 + 1, (first + 1) % 3 + 1);
+        fleet.prefer(preferred).await;
+        for host in &fleet.hosts {
+            // What is said of the zone is not said of the leader itself.
+            assert!(matches!(
+                host.admit(
+                    vec![1, 2, 3],
+                    Near {
+                        leader: preferred,
+                        voters: vec![preferred],
+                    },
+                )
+                .await,
+                Err(focal_ledger::LedgerError::Capacity)
+            ));
             host.admit(
                 vec![1, 2, 3],
                 Near {
                     leader: preferred,
-                    voters: vec![preferred],
+                    voters: vec![near],
                 },
             )
-            .await,
-            Err(focal_ledger::LedgerError::Capacity)
-        ));
-        host.admit(
-            vec![1, 2, 3],
-            Near {
-                leader: preferred,
-                voters: vec![near],
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(host.progress().near.voters, vec![near]);
-    }
-    let ranks = |fleet: &Fleet| -> Vec<(u64, i64)> {
-        fleet
-            .hosts
-            .iter()
-            .map(|host| (host.progress().node, host.progress().priority))
-            .collect()
-    };
-    let mut expected = vec![
-        (preferred, PREFERRED_LEADER_PRIORITY),
-        (near, ZONE_PRIORITY),
-        (far, VOTER_PRIORITY),
-    ];
-    expected.sort_unstable();
-    let mut wait = fleet.deadline();
-    while ranks(&fleet) != expected {
-        if let Err(spent) = wait.check(&fleet.periods()) {
-            panic!("the ranks never followed: {spent}; {:?}", ranks(&fleet));
+            .await
+            .unwrap();
+            assert_eq!(host.progress().near.voters, vec![near]);
         }
-        tokio::time::sleep(TICK).await;
-    }
-    fleet.led_by(preferred).await;
-
-    // Away: whoever is elected, the voter of its zone leads.
-    fleet.isolated.store(preferred as u8, Ordering::SeqCst);
-    fleet.led_among(near, preferred).await;
-    // It has no one to hand to: the preferred leader is asked nothing
-    // while it is away.
-    let election = fleet.hosts[0].election_periods();
-    let asked = fleet.hosts[near as usize - 1].progress().returns.asked;
-    fleet.run(election * 12).await;
-    fleet.led_among(near, preferred).await;
-    assert_eq!(
-        fleet.hosts[near as usize - 1].progress().returns.asked,
-        asked,
-        "nothing is asked of a member away"
-    );
-
-    // Back: the voter of its zone hands leadership to it.
-    fleet.isolated.store(0, Ordering::SeqCst);
-    fleet.led_by(preferred).await;
-
-    // What the directory said of another leader ranks no one.
-    for host in &fleet.hosts {
-        host.admit(
-            vec![1, 2, 3],
-            Near {
-                leader: far,
-                voters: vec![near],
-            },
-        )
-        .await
-        .unwrap();
-    }
-    let mut expected = vec![
-        (preferred, PREFERRED_LEADER_PRIORITY),
-        (near, VOTER_PRIORITY),
-        (far, VOTER_PRIORITY),
-    ];
-    expected.sort_unstable();
-    let mut wait = fleet.deadline();
-    while ranks(&fleet) != expected {
-        if let Err(spent) = wait.check(&fleet.periods()) {
-            panic!("the ranks never followed: {spent}; {:?}", ranks(&fleet));
+        let ranks = |fleet: &Fleet| -> Vec<(u64, i64)> {
+            fleet
+                .hosts
+                .iter()
+                .map(|host| (host.progress().node, host.progress().priority))
+                .collect()
+        };
+        let mut expected = vec![
+            (preferred, PREFERRED_LEADER_PRIORITY),
+            (near, ZONE_PRIORITY),
+            (far, VOTER_PRIORITY),
+        ];
+        expected.sort_unstable();
+        let mut wait = fleet.deadline();
+        while ranks(&fleet) != expected {
+            if let Err(spent) = wait.check(&fleet.periods()) {
+                panic!("the ranks never followed: {spent}; {:?}", ranks(&fleet));
+            }
+            focal_rt::time::sleep(TICK).await.unwrap();
         }
-        tokio::time::sleep(TICK).await;
-    }
-    fleet.stop().await;
+        fleet.led_by(preferred).await;
+
+        // Away: whoever is elected, the voter of its zone leads.
+        fleet.isolated.store(preferred as u8, Ordering::SeqCst);
+        fleet.led_among(near, preferred).await;
+        // It has no one to hand to: the preferred leader is asked nothing
+        // while it is away.
+        let election = fleet.hosts[0].election_periods();
+        let asked = fleet.hosts[near as usize - 1].progress().returns.asked;
+        fleet.run(election * 12).await;
+        fleet.led_among(near, preferred).await;
+        assert_eq!(
+            fleet.hosts[near as usize - 1].progress().returns.asked,
+            asked,
+            "nothing is asked of a member away"
+        );
+
+        // Back: the voter of its zone hands leadership to it.
+        fleet.isolated.store(0, Ordering::SeqCst);
+        fleet.led_by(preferred).await;
+
+        // What the directory said of another leader ranks no one.
+        for host in &fleet.hosts {
+            host.admit(
+                vec![1, 2, 3],
+                Near {
+                    leader: far,
+                    voters: vec![near],
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let mut expected = vec![
+            (preferred, PREFERRED_LEADER_PRIORITY),
+            (near, VOTER_PRIORITY),
+            (far, VOTER_PRIORITY),
+        ];
+        expected.sort_unstable();
+        let mut wait = fleet.deadline();
+        while ranks(&fleet) != expected {
+            if let Err(spent) = wait.check(&fleet.periods()) {
+                panic!("the ranks never followed: {spent}; {:?}", ranks(&fleet));
+            }
+            focal_rt::time::sleep(TICK).await.unwrap();
+        }
+        fleet.stop().await;
+    })
+    .unwrap()
 }

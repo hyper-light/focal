@@ -31,15 +31,17 @@ mod tests;
 
 pub use compile::{Compiled, compile};
 pub use driver::{
-    CLAIM_EXPAND, DriveError, Lists, NativeReadOutcome, Preparation, READ_ITEMS, Reads, admissible,
-    list, list_request, outcome, prepare, read, resolve,
+    CLAIM_EXPAND, DriveError, Lists, NativeReadOutcome, Preparation, READ_ITEMS, RECOVERY_PROBES,
+    Reads, Submits, admissible, expired, list, list_request, maintain, outcome, outcome_by_id,
+    prepare, read, resolve,
 };
 pub use focal_core::native::NativeContentProfile;
 pub use frame::{FrameLimits, encode_frame, fingerprint};
 pub use observe::{LINEAGE_DEPTH, Pause, WAIT_PROBES, lineage, wait};
 pub use resolve::{
     EvaluationSelector, Requirement, Resolved, ResolvedArtifact, ResolvedClaim, ResolvedDiagnostic,
-    ResolvedEvaluation, ResolvedResponse, ResolvedResultTestament, ResolvedWork, requirements,
+    ResolvedEvaluation, ResolvedResponse, ResolvedResultTestament, ResolvedWork, parse_selector,
+    requirements,
 };
 
 use focal_client::input::InputError;
@@ -80,6 +82,7 @@ impl From<NativeError> for CompileError {
             NativeError::Memory(_) => Self::Capacity("memory"),
             NativeError::RequestConflict => Self::Unsupported("request identity conflict"),
             NativeError::Evidence(_) => Self::Unsupported("evidence"),
+            NativeError::Payload(_) => Self::Missing("a spilled row's bytes from the payload log"),
         }
     }
 }

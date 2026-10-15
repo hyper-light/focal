@@ -18,9 +18,12 @@ workspace = true
 test-support = []
 
 [dependencies]
+crc32fast.workspace = true
 focal-client = { version = "0.1.0", path = "../focal-client" }
 focal-mcp = { version = "0.1.0", path = "../focal-mcp" }
 focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
+focal-seal = { version = "0.1.0", path = "../focal-seal" }
+hyper-seal.workspace = true
 focal-core = { version = "0.1.0", path = "../focal-core" }
 focal-control = { version = "0.1.0", path = "../focal-control" }
 focal-directory = { version = "0.1.0", path = "../focal-directory" }
@@ -37,28 +40,30 @@ focal-runtime = { version = "0.1.0", path = "../focal-runtime" }
 focal-wire = { version = "0.1.0", path = "../focal-wire" }
 focal-timing = { version = "0.1.0", path = "../focal-timing" }
 focal-stream = { version = "0.1.0", path = "../focal-stream" }
+focal-tui = { version = "0.1.0", path = "../focal-tui" }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 blake3.workspace = true
 clap.workspace = true
 clap_complete = "=4.6.6"
 getrandom.workspace = true
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
+focal-rt = { version = "0.1.0", path = "../focal-rt" }
+hyper-rt.workspace = true
+mimalloc.workspace = true
 postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_saphyr = { workspace = true, features = ["serialize"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-std"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
-# Listener shutdown observes the final runtime owner. Reaudit Quinn's endpoint/
-# connection socket-before-runtime drop ordering before changing this version.
-quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+# hyper-raft's conformed rustls, as focal-wire names it.
+rustls = { package = "hyper-tls", version = "0.1.0", path = "../../vendor/hyper-tls" }
 zeroize = "1.8"
 
 [dev-dependencies]
 focal-node = { version = "0.1.0", path = ".", features = ["test-support"] }
 focal-sim = { version = "0.1.0", path = "../focal-sim" }
 focal-core = { version = "0.1.0", path = "../focal-core", features = ["test-support"] }
+focal-ledger = { version = "0.1.0", path = "../focal-ledger", features = ["test-support"] }
 focal-log = { version = "0.1.0", path = "../focal-log", features = ["test-support"] }
 tempfile.workspace = true
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "aws_lc_rs", "x509-parser"] }

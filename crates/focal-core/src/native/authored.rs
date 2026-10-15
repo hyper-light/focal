@@ -206,14 +206,19 @@ pub(super) fn check_postable(view: &View<'_>, claim: &ClaimState) -> Result<(), 
     if view.state.profile == NativeContentProfile::ProjectionOnly {
         return Ok(());
     }
-    let descriptor = super::authored_reads::content(
+    // The roles, read in place from the content's encoding (doc 31 M3).
+    let mut buffer = super::owned::ContentBuffer::new();
+    let roles = super::authored_reads::content_view(
         view.get(Key::ClaimContent(ClaimId(claim.binding().object.0))),
-    )
-    .ok_or(ContractError::InvalidPolicy)?;
-    descriptor.check_postable()?;
+        view.payloads(),
+        &mut buffer,
+    )?
+    .ok_or(ContractError::InvalidPolicy)?
+    .roles()?;
+    roles.check_postable()?;
     // No authenticated transfer capability exists in this owner profile yet.
     // A Handoff label by itself cannot authorize self-issued work.
-    if descriptor.issuer() == descriptor.subject() {
+    if roles.issuer == roles.subject {
         return Err(ContractError::InvalidPolicy.into());
     }
     Ok(())
@@ -233,9 +238,13 @@ fn retained_fingerprint(extras: &Extras) -> Result<ContentHash, NativeError> {
         match &extra.row {
             Row::ClaimContent(row) => {
                 hash.update(&[0]);
-                let body = row.get().ok_or(ContractError::InvalidPolicy)?;
+                // A candidate's rows are held until every check has read them (doc 31 M3).
+                let row = row.held().ok_or(ContractError::InvalidPolicy)?;
+                let intent = row
+                    .intent_fingerprint()
+                    .ok_or(ContractError::InvalidPolicy)?;
                 let profile = row.profile().ok_or(ContractError::InvalidPolicy)?;
-                hash.update(&body.intent_fingerprint().0);
+                hash.update(&intent.0);
                 hash.update(&profile.max_responses.to_le_bytes());
                 count(&mut hash, profile.scope_limits.scopes)?;
                 count(&mut hash, profile.scope_limits.roots)?;
@@ -259,8 +268,10 @@ fn retained_fingerprint(extras: &Extras) -> Result<ContentHash, NativeError> {
             }
             Row::CreationResult(row) => {
                 hash.update(&[2]);
-                count(&mut hash, row.get().entries().len())?;
-                for object in row.get().entries() {
+                // A candidate's rows are held until every check has read them (doc 31 M3).
+                let entries = row.held().ok_or(ContractError::InvalidPolicy)?.entries();
+                count(&mut hash, entries.len())?;
+                for object in entries {
                     hash.update(&object.ordinal.to_le_bytes());
                     hash.update(&[match object.family {
                         NativeCreatedFamily::Claim => 0,

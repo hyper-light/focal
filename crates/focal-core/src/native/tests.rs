@@ -220,9 +220,10 @@ fn root_parent_child_history_and_outcome_share_one_publication() {
     );
     assert_eq!(core.native_sequence(), SessionSeq(0));
     assert!(core.native_claim(ClaimId::from_u128(1)).is_none());
-    assert!(core.native_outcome(key(1)).is_none());
+    assert!(core.native_outcome(key(1)).unwrap().is_none());
     assert_eq!(
-        prepared
+        core.native_chain(&[&prepared])
+            .unwrap()
             .claim(ClaimId::from_u128(1))
             .unwrap()
             .scopes()
@@ -231,14 +232,20 @@ fn root_parent_child_history_and_outcome_share_one_publication() {
         1
     );
     assert_eq!(prepared.outcome().created, 2);
-    assert_eq!(prepared.recorded(key(1)), Some(prepared.outcome()));
+    assert_eq!(
+        core.native_chain(&[&prepared])
+            .unwrap()
+            .recorded(key(1))
+            .unwrap(),
+        Some(prepared.outcome())
+    );
     let outcome = core.publish_native(prepared).unwrap();
     assert_eq!(outcome.sequence, SessionSeq(1));
     assert_eq!(row(&core, 1).created(), SessionSeq(1));
     assert_eq!(row(&core, 2).created(), SessionSeq(1));
     assert_eq!(row(&core, 1).binding().revision, ObjectRevision(2));
     assert_eq!(row(&core, 2).status(), ClaimStatus::Generated);
-    assert_eq!(core.native_outcome(key(1)), Some(outcome));
+    assert_eq!(core.native_outcome(key(1)).unwrap(), Some(outcome));
     assert_eq!(
         core.native_event(SessionSeq(1), 0)
             .unwrap()
@@ -306,12 +313,21 @@ fn pending_child_is_cancelled_with_parent_and_unrelated_peer_survives() {
         create(2, vec![child(2, binding(1)), child(3, binding(2))]),
         &[&root],
     );
-    let parent = children.claim(ClaimId::from_u128(1)).unwrap().binding();
+    let parent = core
+        .native_chain(&[&root, &children])
+        .unwrap()
+        .claim(ClaimId::from_u128(1))
+        .unwrap()
+        .binding();
     let cancelled = prepare(&core, cancel(3, parent), &[&root, &children]);
     assert_eq!(cancelled.outcome().changed, 3);
     for id in [1, 2, 3] {
         assert_eq!(
-            cancelled.claim(ClaimId::from_u128(id)).unwrap().status(),
+            core.native_chain(&[&root, &children, &cancelled])
+                .unwrap()
+                .claim(ClaimId::from_u128(id))
+                .unwrap()
+                .status(),
             ClaimStatus::Cancelled
         );
     }
@@ -381,7 +397,11 @@ fn successor_and_predecessor_replace_atomically_with_exact_outcome() {
         &[],
     );
     assert_eq!(
-        next.claim(ClaimId::from_u128(1)).unwrap().status(),
+        core.native_chain(&[&next])
+            .unwrap()
+            .claim(ClaimId::from_u128(1))
+            .unwrap()
+            .status(),
         ClaimStatus::Superseded
     );
     assert_eq!(row(&core, 1).status(), ClaimStatus::Generated);
@@ -455,15 +475,15 @@ fn foreign_forks_stale_parents_and_reordered_publication_return_owned_candidates
     let root = prepare(&core, create(1, vec![proposal(1)]), &[]);
     let wrong = prepare(&foreign, create(1, vec![proposal(1)]), &[]);
     assert!(core.validate_native_chain(&[&wrong]).is_err());
-    let returned = core.publish_native(wrong).unwrap_err().prepared;
+    let returned = core.publish_native(wrong).unwrap_err().prepared.unwrap();
     assert_eq!(returned.outcome().sequence, SessionSeq(1));
     assert_eq!(core.native_sequence(), SessionSeq(0));
     let fork = prepare(&core, create(2, vec![proposal(2)]), &[]);
     let child = prepare(&core, create(3, vec![child(3, binding(1))]), &[&root]);
-    let child = core.publish_native(child).unwrap_err().prepared;
+    let child = core.publish_native(child).unwrap_err().prepared.unwrap();
     assert!(core.validate_native_chain(&[&fork, &child]).is_err());
     core.publish_native(root).unwrap();
-    let _fork = core.publish_native(fork).unwrap_err().prepared;
+    let _fork = core.publish_native(fork).unwrap_err().prepared.unwrap();
     core.publish_native(child).unwrap();
     assert!(matches!(
         core.prepare_native(
@@ -488,7 +508,7 @@ fn dropping_suffix_reclaims_charges_and_cannot_publish_orphaned_roots() {
     assert_eq!(core.native_budget(), base);
     drop(root);
     assert_eq!(core.native_budget(), initial);
-    assert!(core.native_outcome(key(1)).is_none());
+    assert!(core.native_outcome(key(1)).unwrap().is_none());
 }
 
 #[test]
@@ -585,7 +605,7 @@ fn late_batch_capacity_refusal_rolls_back_all_private_parent_changes() {
     assert_eq!(core.native_budget(), before);
     assert_eq!(row(&core, 1).binding(), binding);
     assert!(row(&core, 1).scopes().children().is_empty());
-    assert!(core.native_outcome(key(2)).is_none());
+    assert!(core.native_outcome(key(2)).unwrap().is_none());
     assert!(core.native_event(SessionSeq(2), 0).is_none());
 }
 
@@ -615,7 +635,10 @@ fn leases_keep_fixed_prefix_then_release_all_obsolete_pages() {
     );
     assert_eq!(core.advance_native_clock(10).unwrap(), 1);
     assert!(core.native_budget().used < pinned);
-    assert_eq!(read.recorded(key(1), 0), Err(MemoryError::LeaseExpired));
+    assert!(matches!(
+        read.recorded(key(1), 0),
+        Err(NativeError::Memory(MemoryError::LeaseExpired))
+    ));
 }
 
 #[test]
@@ -631,12 +654,14 @@ fn authentic_actor_and_request_principal_must_match_for_reads_and_control_admiss
 }
 
 #[test]
-fn retained_page_copy_failure_discards_partial_candidate_and_keeps_pinned_facts() {
+fn range_failure_discards_partial_candidate_and_keeps_pinned_facts() {
     let mut core = core();
     publish(&mut core, create(1, vec![proposal(1), proposal(2)]));
     let old = core.pin_native(0, 100).unwrap();
     let before = core.native_budget();
-    let failed = prepare::fail_copies_after(1, || {
+    // The write's range step fails, its last before it is a candidate: whatever it did
+    // before must leave no trace.
+    let failed = prepare::fail_range_after(0, || {
         core.prepare_native(
             context(Principal::Actor(ISSUER)),
             create(2, vec![proposal(3)]),
@@ -649,7 +674,7 @@ fn retained_page_copy_failure_discards_partial_candidate_and_keeps_pinned_facts(
     ));
     assert_eq!(core.native_budget(), before);
     assert_eq!(core.native_sequence(), SessionSeq(1));
-    assert!(core.native_outcome(key(2)).is_none());
+    assert!(core.native_outcome(key(2)).unwrap().is_none());
     assert!(core.native_event(SessionSeq(2), 0).is_none());
     assert_eq!(
         old.with_claim(ClaimId::from_u128(1), 1, ClaimState::binding)

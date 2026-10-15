@@ -20,8 +20,10 @@ struct Fixture {
     now: i64,
     sequence: u64,
     budget: MemoryBudget,
-    _replication: tokio::sync::mpsc::Receiver<ControlReplicationFrame>,
-    _wal: focal_log::SharedWal,
+    _replication: hyper_rt::sync::ChannelReceiver<ControlReplicationFrame>,
+    /// The node's storage, its log held open for the fixture's life as a node holds it for its
+    /// own (`OpenedStorage::log`): a handle on its groups alone does not keep the shell's log open.
+    _storage: focal_consensus::storage_open::OpenedStorage,
     directory: NodeDirectory,
 }
 impl Fixture {
@@ -32,7 +34,7 @@ impl Fixture {
         let FoundingNetwork {
             state,
             control,
-            wal,
+            storage,
             directory,
             ..
         } = FoundingNetwork::open(&settings).await.unwrap();
@@ -44,11 +46,11 @@ impl Fixture {
         ));
         options.authority.max_nodes = max_nodes;
         let budget = MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
-        let mut control = ControlReplica::open_on_wal(
+        let mut control = ControlReplica::open_on_storage(
             options,
             state.genesis.bootstrap.clone(),
             budget.clone(),
-            wal.clone(),
+            &storage.storage,
         )
         .unwrap();
         control.drain(&NoDirectoryAuthority).unwrap();
@@ -79,7 +81,7 @@ impl Fixture {
             sequence: 0,
             budget,
             _replication: replication,
-            _wal: wal,
+            _storage: storage,
             directory,
         };
         let observation = fixture.observe().await;
@@ -276,27 +278,26 @@ fn tls(
     server_name: &str,
 ) -> rustls::ClientConnection {
     // Rustls owns shared immutable connection configuration.
+    let mut client_config = invitation.client_config().unwrap();
     let mut client = rustls::ClientConnection::new(
-        std::sync::Arc::new(invitation.client_config().unwrap()),
+        &mut client_config,
         rustls::pki_types::ServerName::try_from(server_name.to_owned()).unwrap(),
     )
     .unwrap();
-    let mut server = rustls::ServerConnection::new(std::sync::Arc::new(
-        authority.server_identity().server_config().unwrap(),
-    ))
-    .unwrap();
+    let mut server_config = authority.server_identity().server_config().unwrap();
+    let mut server = rustls::ServerConnection::new(&server_config).unwrap();
     for _ in 0..32 {
         if client.wants_write() {
             let mut bytes = Vec::new();
             client.write_tls(&mut bytes).unwrap();
             server.read_tls(&mut std::io::Cursor::new(bytes)).unwrap();
-            server.process_new_packets().unwrap();
+            server.process_new_packets(&mut server_config).unwrap();
         }
         if server.wants_write() {
             let mut bytes = Vec::new();
             server.write_tls(&mut bytes).unwrap();
             client.read_tls(&mut std::io::Cursor::new(bytes)).unwrap();
-            client.process_new_packets().unwrap();
+            client.process_new_packets(&mut client_config).unwrap();
         }
         if !client.is_handshaking() && !server.is_handshaking() {
             return client;
@@ -305,262 +306,312 @@ fn tls(
     panic!("TLS handshake did not complete");
 }
 
-#[tokio::test]
-async fn withdrawn_grant_fences_a_reopened_journal_intent_without_consuming_its_request() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut fixture = Fixture::open(dir.path(), 1).await;
-    let receipt = fixture.enroll().await;
-    let node = receipt.identity.node_id.unwrap();
-    let grant = fixture.grant(&receipt).await;
-    fixture.install(grant.clone(), None).await;
-    let observation = fixture.observe().await;
-    let command = next_root_command(
-        &fixture.state,
-        &observation,
-        &BTreeSet::from([node]),
-        fixture.now,
-        &[],
-    )
-    .unwrap()
-    .unwrap();
-    assert!(matches!(command, ControlCommand::Membership(_)));
-    let mut admission = RootAdmission::open(&fixture.state, dir.path()).unwrap();
-    let intent = ControlRequest {
-        id: ControlRequestId {
-            client: admission.principal.0,
-            sequence: 1,
-        },
-        acknowledged_through: 0,
-        command,
-    };
-    admission.intent.pending = Some(intent.clone());
-    admission.save().unwrap();
-    drop(admission);
-    let mut admission = RootAdmission::open(&fixture.state, dir.path()).unwrap();
-    assert_eq!(admission.intent.pending.as_ref(), Some(&intent));
-    let mut withdrawn = grant.clone();
-    withdrawn.enrollment.generation = 2;
-    withdrawn.enrollment.eligible = false;
-    fixture.install(withdrawn, Some(1)).await;
-    let after_withdrawal = fixture.observe().await;
-    // Submit the old durable intent even with its old observation. The serialized
-    // owner must recheck the currently committed capability before proposing.
-    admission
-        .advance(
+#[test]
+fn withdrawn_grant_fences_a_reopened_journal_intent_without_consuming_its_request() {
+    focal_rt::block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::open(dir.path(), 1).await;
+        let receipt = fixture.enroll().await;
+        let node = receipt.identity.node_id.unwrap();
+        let grant = fixture.grant(&receipt).await;
+        fixture.install(grant.clone(), None).await;
+        let observation = fixture.observe().await;
+        let command = next_root_command(
             &fixture.state,
             &observation,
             &BTreeSet::from([node]),
-            &fixture.host,
-            &fixture.budget,
+            fixture.now,
+            &[],
         )
-        .await
+        .unwrap()
         .unwrap();
-    assert!(admission.intent.pending.is_none());
-    assert_eq!(admission.intent.completed, 0);
-    let rejected = fixture.observe().await;
-    assert_eq!(rejected.configuration(), after_withdrawal.configuration());
-    assert!(!rejected.configuration().configuration.contains(node));
-    drop(admission);
-    let mut admission = RootAdmission::open(&fixture.state, dir.path()).unwrap();
-    assert!(admission.intent.pending.is_none());
-    assert_eq!(admission.intent.completed, 0);
-
-    let mut restored = grant.clone();
-    restored.enrollment.generation = 3;
-    fixture.install(restored, Some(2)).await;
-    admission
-        .advance(
-            &fixture.state,
-            &fixture.observe().await,
-            &BTreeSet::from([node]),
-            &fixture.host,
-            &fixture.budget,
-        )
-        .await
-        .unwrap();
-    assert_eq!(admission.intent.completed, 1);
-    assert!(admission.intent.pending.is_none());
-    assert!(
-        fixture
-            .observe()
+        assert!(matches!(command, ControlCommand::Membership(_)));
+        let mut admission = RootAdmission::open(&fixture.state, dir.path()).unwrap();
+        let intent = ControlRequest {
+            id: ControlRequestId {
+                client: admission.principal.0,
+                sequence: 1,
+            },
+            acknowledged_through: 0,
+            command,
+        };
+        admission.intent.pending = Some(intent.clone());
+        admission.save().unwrap();
+        drop(admission);
+        let mut admission = RootAdmission::open(&fixture.state, dir.path()).unwrap();
+        assert_eq!(admission.intent.pending.as_ref(), Some(&intent));
+        let mut withdrawn = grant.clone();
+        withdrawn.enrollment.generation = 2;
+        withdrawn.enrollment.eligible = false;
+        fixture.install(withdrawn, Some(1)).await;
+        let after_withdrawal = fixture.observe().await;
+        // Submit the old durable intent even with its old observation. The serialized
+        // owner must recheck the currently committed capability before proposing.
+        admission
+            .advance(
+                &fixture.state,
+                &observation,
+                &BTreeSet::from([node]),
+                &fixture.host,
+                &fixture.budget,
+            )
             .await
-            .configuration()
-            .configuration
-            .learners
-            .contains(&node)
-    );
+            .unwrap();
+        assert!(admission.intent.pending.is_none());
+        assert_eq!(admission.intent.completed, 0);
+        let rejected = fixture.observe().await;
+        assert_eq!(rejected.configuration(), after_withdrawal.configuration());
+        assert!(!rejected.configuration().configuration.contains(node));
+        drop(admission);
+        let mut admission = RootAdmission::open(&fixture.state, dir.path()).unwrap();
+        assert!(admission.intent.pending.is_none());
+        assert_eq!(admission.intent.completed, 0);
 
-    // A later withdrawal cannot erase an already committed exact receipt.
-    let mut withdrawn = grant;
-    withdrawn.enrollment.generation = 4;
-    withdrawn.enrollment.eligible = false;
-    fixture.install(withdrawn, Some(3)).await;
-    let retry_peer = AuthenticatedPeer::local(PeerGrant {
-        principal: admission.principal,
-        tenants: BTreeSet::from([fixture.state.genesis.root_namespace.tenant]),
-        role: PeerRole::Runtime,
+        let mut restored = grant.clone();
+        restored.enrollment.generation = 3;
+        fixture.install(restored, Some(2)).await;
+        admission
+            .advance(
+                &fixture.state,
+                &fixture.observe().await,
+                &BTreeSet::from([node]),
+                &fixture.host,
+                &fixture.budget,
+            )
+            .await
+            .unwrap();
+        assert_eq!(admission.intent.completed, 1);
+        assert!(admission.intent.pending.is_none());
+        assert!(
+            fixture
+                .observe()
+                .await
+                .configuration()
+                .configuration
+                .learners
+                .contains(&node)
+        );
+
+        // A later withdrawal cannot erase an already committed exact receipt.
+        let mut withdrawn = grant;
+        withdrawn.enrollment.generation = 4;
+        withdrawn.enrollment.eligible = false;
+        fixture.install(withdrawn, Some(3)).await;
+        let retry_peer = AuthenticatedPeer::local(PeerGrant {
+            principal: admission.principal,
+            tenants: BTreeSet::from([fixture.state.genesis.root_namespace.tenant]),
+            role: PeerRole::Runtime,
+        })
+        .unwrap();
+        let retry = fixture.host.submit(retry_peer, intent).await.unwrap();
+        assert_eq!(retry.request.sequence, 1);
+        fixture.close().await;
     })
-    .unwrap();
-    let retry = fixture.host.submit(retry_peer, intent).await.unwrap();
-    assert_eq!(retry.request.sequence, 1);
-    fixture.close().await;
+    .unwrap()
 }
 
-#[tokio::test]
-async fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut fixture = Fixture::open(dir.path(), 1).await;
-    let receipt = fixture.enroll().await;
-    let node = receipt.identity.node_id.unwrap();
-    let mut grant = fixture.grant(&receipt).await;
-    let initial = fixture.observe().await;
-    for wrong_principal in [true, false] {
-        let mut malformed = grant.clone();
-        if wrong_principal {
-            malformed.principal = [123; 16];
-        } else {
-            malformed.enrollment.identity = ContentHash([124; 32]);
+#[test]
+fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
+    focal_rt::block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::open(dir.path(), 1).await;
+        let receipt = fixture.enroll().await;
+        let node = receipt.identity.node_id.unwrap();
+        let mut grant = fixture.grant(&receipt).await;
+        let initial = fixture.observe().await;
+        for wrong_principal in [true, false] {
+            let mut malformed = grant.clone();
+            if wrong_principal {
+                malformed.principal = [123; 16];
+            } else {
+                malformed.enrollment.identity = ContentHash([124; 32]);
+            }
+            let command = fixture
+                .authority_command(AuthorityOperation::GrantNode {
+                    grant: malformed,
+                    expected_generation: None,
+                })
+                .await;
+            assert_eq!(
+                fixture
+                    .host
+                    .submit(fixture.peer(), fixture.request(command))
+                    .await,
+                Err(ControlFailure::Unauthorized)
+            );
+            let observation = fixture.observe().await;
+            assert_eq!(observation.authority(), initial.authority());
+            assert_eq!(observation.configuration(), initial.configuration());
+            assert!(matches!(
+                next_root_command(
+                    &fixture.state,
+                    &observation,
+                    &BTreeSet::from([node]),
+                    fixture.now,
+                    &[]
+                )
+                .unwrap(),
+                Some(ControlCommand::Authority(_))
+            ));
         }
-        let command = fixture
+        grant.expires_at = fixture.now + 60;
+        fixture.install(grant.clone(), None).await;
+        let observation = fixture.observe().await;
+        // A grant that ends before the credential the registry holds is
+        // extended to it first, at its generation (24 §11), whether or not the
+        // grant has run out already: the capability lasts as the credential does.
+        for at in [grant.expires_at - 1, grant.expires_at] {
+            let Some(ControlCommand::Authority(command)) = next_root_command(
+                &fixture.state,
+                &observation,
+                &BTreeSet::from([node]),
+                at,
+                &[],
+            )
+            .unwrap() else {
+                panic!("the grant follows its credential")
+            };
+            let AuthorityOperation::GrantNode {
+                grant: extended,
+                expected_generation,
+            } = &command.operation
+            else {
+                panic!("the grant is extended")
+            };
+            assert_eq!(*expected_generation, Some(grant.enrollment.generation));
+            assert_eq!(extended.enrollment.generation, grant.enrollment.generation);
+            assert_eq!(extended.expires_at, receipt.expires_at);
+        }
+        // An expired credential extends nothing and selects no learner.
+        assert_eq!(
+            next_root_command(
+                &fixture.state,
+                &observation,
+                &BTreeSet::from([node]),
+                receipt.expires_at,
+                &[]
+            )
+            .unwrap(),
+            None
+        );
+        let generation = grant.enrollment.generation;
+        grant.expires_at = receipt.expires_at;
+        fixture.install(grant.clone(), Some(generation)).await;
+        let observation = fixture.observe().await;
+        assert!(matches!(
+            next_root_command(
+                &fixture.state,
+                &observation,
+                &BTreeSet::from([node]),
+                grant.expires_at - 1,
+                &[]
+            )
+            .unwrap(),
+            Some(ControlCommand::Membership(_))
+        ));
+        assert_eq!(
+            next_root_command(
+                &fixture.state,
+                &observation,
+                &BTreeSet::from([node]),
+                grant.expires_at,
+                &[]
+            )
+            .unwrap(),
+            None
+        );
+        // Advancing the committed authority clock also fences an already-built
+        // membership command at the owner, even without a controller refresh.
+        let command = next_root_command(
+            &fixture.state,
+            &observation,
+            &BTreeSet::from([node]),
+            fixture.now,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        fixture.now = grant.expires_at;
+        let advance = fixture
+            .authority_command(AuthorityOperation::AdvanceClock)
+            .await;
+        fixture.commit(advance).await;
+        assert_eq!(
+            fixture
+                .host
+                .submit(fixture.peer(), fixture.request(command))
+                .await,
+            Err(ControlFailure::CompareFailed)
+        );
+        assert!(
+            !fixture
+                .observe()
+                .await
+                .configuration()
+                .configuration
+                .contains(node)
+        );
+        fixture.close().await;
+    })
+    .unwrap()
+}
+
+#[test]
+fn full_capability_table_admits_an_existing_grant_before_an_ungranted_lower_id() {
+    focal_rt::block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fixture = Fixture::open(dir.path(), 1).await;
+        let lower = fixture.enroll().await;
+        let higher = fixture.enroll().await;
+        let lower_node = lower.identity.node_id.unwrap();
+        let higher_node = higher.identity.node_id.unwrap();
+        assert!(lower_node < higher_node);
+        let higher_grant = fixture.grant(&higher).await;
+        fixture.install(higher_grant, None).await;
+        let lower_grant = fixture.grant(&lower).await;
+        let overflow = fixture
             .authority_command(AuthorityOperation::GrantNode {
-                grant: malformed,
+                grant: lower_grant,
                 expected_generation: None,
             })
             .await;
         assert_eq!(
             fixture
                 .host
-                .submit(fixture.peer(), fixture.request(command))
+                .submit(fixture.peer(), fixture.request(overflow))
                 .await,
-            Err(ControlFailure::Unauthorized)
+            Err(ControlFailure::Capacity)
         );
         let observation = fixture.observe().await;
-        assert_eq!(observation.authority(), initial.authority());
-        assert_eq!(observation.configuration(), initial.configuration());
+        assert_eq!(observation.authority().unwrap().nodes.len(), 1);
+        let command = next_root_command(
+            &fixture.state,
+            &observation,
+            &BTreeSet::from([lower_node, higher_node]),
+            fixture.now,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert!(matches!(
-            next_root_command(
-                &fixture.state,
-                &observation,
-                &BTreeSet::from([node]),
-                fixture.now,
-                &[]
-            )
-            .unwrap(),
-            Some(ControlCommand::Authority(_))
+            command,
+            ControlCommand::Membership(ControlMembershipCommand {
+                change: MembershipChange::AddLearner { node },
+                ..
+            }) if node == higher_node
         ));
-    }
-    grant.expires_at = fixture.now + 60;
-    fixture.install(grant.clone(), None).await;
-    let observation = fixture.observe().await;
-    assert!(matches!(
-        next_root_command(
-            &fixture.state,
-            &observation,
-            &BTreeSet::from([node]),
-            grant.expires_at - 1,
-            &[]
-        )
-        .unwrap(),
-        Some(ControlCommand::Membership(_))
-    ));
-    assert_eq!(
-        next_root_command(
-            &fixture.state,
-            &observation,
-            &BTreeSet::from([node]),
-            grant.expires_at,
-            &[]
-        )
-        .unwrap(),
-        None
-    );
-    // Advancing the committed authority clock also fences an already-built
-    // membership command at the owner, even without a controller refresh.
-    let command = next_root_command(
-        &fixture.state,
-        &observation,
-        &BTreeSet::from([node]),
-        fixture.now,
-        &[],
-    )
+        fixture.commit(command).await;
+        let admitted = fixture.observe().await;
+        assert_eq!(admitted.authority().unwrap().nodes.len(), 1);
+        assert!(
+            admitted
+                .configuration()
+                .configuration
+                .learners
+                .contains(&higher_node)
+        );
+        assert!(!admitted.configuration().configuration.contains(lower_node));
+        fixture.close().await;
+    })
     .unwrap()
-    .unwrap();
-    fixture.now = grant.expires_at;
-    let advance = fixture
-        .authority_command(AuthorityOperation::AdvanceClock)
-        .await;
-    fixture.commit(advance).await;
-    assert_eq!(
-        fixture
-            .host
-            .submit(fixture.peer(), fixture.request(command))
-            .await,
-        Err(ControlFailure::CompareFailed)
-    );
-    assert!(
-        !fixture
-            .observe()
-            .await
-            .configuration()
-            .configuration
-            .contains(node)
-    );
-    fixture.close().await;
-}
-
-#[tokio::test]
-async fn full_capability_table_admits_an_existing_grant_before_an_ungranted_lower_id() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut fixture = Fixture::open(dir.path(), 1).await;
-    let lower = fixture.enroll().await;
-    let higher = fixture.enroll().await;
-    let lower_node = lower.identity.node_id.unwrap();
-    let higher_node = higher.identity.node_id.unwrap();
-    assert!(lower_node < higher_node);
-    let higher_grant = fixture.grant(&higher).await;
-    fixture.install(higher_grant, None).await;
-    let lower_grant = fixture.grant(&lower).await;
-    let overflow = fixture
-        .authority_command(AuthorityOperation::GrantNode {
-            grant: lower_grant,
-            expected_generation: None,
-        })
-        .await;
-    assert_eq!(
-        fixture
-            .host
-            .submit(fixture.peer(), fixture.request(overflow))
-            .await,
-        Err(ControlFailure::Capacity)
-    );
-    let observation = fixture.observe().await;
-    assert_eq!(observation.authority().unwrap().nodes.len(), 1);
-    let command = next_root_command(
-        &fixture.state,
-        &observation,
-        &BTreeSet::from([lower_node, higher_node]),
-        fixture.now,
-        &[],
-    )
-    .unwrap()
-    .unwrap();
-    assert!(matches!(
-        command,
-        ControlCommand::Membership(ControlMembershipCommand {
-            change: MembershipChange::AddLearner { node },
-            ..
-        }) if node == higher_node
-    ));
-    fixture.commit(command).await;
-    let admitted = fixture.observe().await;
-    assert_eq!(admitted.authority().unwrap().nodes.len(), 1);
-    assert!(
-        admitted
-            .configuration()
-            .configuration
-            .learners
-            .contains(&higher_node)
-    );
-    assert!(!admitted.configuration().configuration.contains(lower_node));
-    fixture.close().await;
 }

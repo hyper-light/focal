@@ -6,7 +6,7 @@
 //! No current parent, clock, principal or execution capability is replayed.
 use super::*;
 use crate::lifecycle::{
-    aggregation::{self, AcceptancePolicy, ArtifactOutcome, BlockingKind, ResponseOutcome},
+    aggregation::{self, Acceptance, ArtifactOutcome, BlockingKind, ResponseOutcome},
     artifact_descriptor::{ArtifactDescriptor, WorkProvenance, WorkRole},
     graph::VisitBudget,
 };
@@ -153,7 +153,7 @@ fn error_descriptor(source: &ArtifactDescriptor) -> Result<(), ContractError> {
             && source.schema_hash() != ContentHash([0; 32]),
     )
 }
-fn slot_visits(policy: &AcceptancePolicy) -> Result<usize, ContractError> {
+fn slot_visits(policy: Acceptance<'_>) -> Result<usize, ContractError> {
     // A binary search takes at most bit_length(n)+1 comparisons, including empty.
     usize::try_from(
         usize::BITS
@@ -195,11 +195,11 @@ impl WorkArtifact {
     }
     /// Fixed scalar/descriptor checks plus the immutable slot binary search.
     /// Descriptor lookup, decoding and custody verification are importer work.
-    pub fn hydration_visits(policy: &AcceptancePolicy) -> Result<usize, ContractError> {
+    pub fn hydration_visits(policy: Acceptance<'_>) -> Result<usize, ContractError> {
         bytes::add(192, slot_visits(policy)?)
     }
     pub fn hydrate_v1(
-        policy: &AcceptancePolicy,
+        policy: Acceptance<'_>,
         value: WorkArtifactSnapshotV1,
         source: &ArtifactDescriptor,
         diagnostic: Option<&ArtifactDescriptor>,

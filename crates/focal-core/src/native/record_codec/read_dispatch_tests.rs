@@ -95,7 +95,7 @@ fn limits() -> Limits {
 }
 fn wire(key: Key, row: &Row) -> Vec<u8> {
     let mut body = CountingSink::new(usize::MAX, usize::MAX);
-    rows::value(&mut body, row, f::binding(1).ledger).unwrap();
+    rows::value(&mut body, key, row, f::binding(1).ledger, None).unwrap();
     let write = |sink: &mut dyn bytes::Sink| -> Result<(), CodecError> {
         // Sized adapter avoids allocating a body buffer between measurement and
         // enclosing framing; this test intentionally exercises actual writers.
@@ -112,7 +112,7 @@ fn wire(key: Key, row: &Row) -> Vec<u8> {
         write_u8(&mut sink, 1)?;
         fixed::key(&mut sink, key)?;
         write_count(&mut sink, body.len())?;
-        rows::value(&mut sink, row, f::binding(1).ledger)
+        rows::value(&mut sink, key, row, f::binding(1).ledger, None)
     };
     let mut size = CountingSink::new(usize::MAX, usize::MAX);
     write(&mut size).unwrap();
@@ -328,7 +328,7 @@ fn unchanged_policy_and_issuer_borrow_actual_base_without_workspace_or_reconstru
     };
     let access = Access::new(&objects, &lookup);
     with_policy(claim_id, &context, &access, |policy, workspace| {
-        assert!(std::ptr::eq(policy, claim.acceptance()));
+        assert!(std::ptr::eq(policy.body(), claim.acceptance().body()));
         assert_eq!(workspace, 0);
         assert_eq!(budget.stats().used, 1);
         Ok(())
@@ -403,10 +403,7 @@ fn changed_claim_body_precedes_base_and_its_scoped_policy_refunds_workspace() {
     let base = f::running(&[]);
     let changed = f::running(&[(focal_model::ValidationMode::Required, true)]);
     let id = ClaimId::from_u128(1);
-    let bytes = wire(
-        Key::Claim(id),
-        changed.state.rows.get(&Key::Claim(id)).unwrap(),
-    );
+    let bytes = wire(Key::Claim(id), changed.state.row(&Key::Claim(id)).unwrap());
     let body = encoded(&bytes).body();
     let objects = ClaimOverlay {
         base: &base,
@@ -433,8 +430,8 @@ fn changed_claim_body_precedes_base_and_its_scoped_policy_refunds_workspace() {
     assert!(objects.get(Key::Claim(id), &lookup).unwrap().is_none());
     with_policy(id, &context, &access, |policy, workspace| {
         assert!(!std::ptr::eq(
-            policy,
-            base.native_claim(id).unwrap().acceptance()
+            policy.body(),
+            base.native_claim(id).unwrap().acceptance().body()
         ));
         assert_eq!(
             policy.declarations(),
@@ -476,10 +473,7 @@ fn changed_claim_body_precedes_base_and_its_scoped_policy_refunds_workspace() {
 fn deleted_malformed_or_substituted_claim_dependency_cannot_use_the_old_policy() {
     let core = f::running(&[]);
     let id = ClaimId::from_u128(1);
-    let bytes = wire(
-        Key::Claim(id),
-        core.state.rows.get(&Key::Claim(id)).unwrap(),
-    );
+    let bytes = wire(Key::Claim(id), core.state.row(&Key::Claim(id)).unwrap());
     let mut wrong_issuer = encoded(&bytes).body().to_vec();
     // Full binding is 88 bytes; the next 16 bytes are the claimant. Its
     // acceptance issuer remains unchanged, so this raw body must be rejected.

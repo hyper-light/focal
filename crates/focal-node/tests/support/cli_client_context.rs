@@ -12,7 +12,7 @@ impl PeerMcp {
         let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
             .arg("--data-dir")
             .arg(root)
-            .args(["mcp", "serve"])
+            .args(["serve", "mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -98,9 +98,8 @@ fn enrolled_named_context_reads_over_quic_and_mcp_survives_server_and_client_res
     success(
         founder.path(),
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -110,8 +109,8 @@ fn enrolled_named_context_reads_over_quic_and_mcp_survives_server_and_client_res
     success(
         client.path(),
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -120,8 +119,8 @@ fn enrolled_named_context_reads_over_quic_and_mcp_survives_server_and_client_res
     success(
         client.path(),
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -139,7 +138,7 @@ fn enrolled_named_context_reads_over_quic_and_mcp_survives_server_and_client_res
         ],
     );
     assert!(listed["results"].is_array(), "{listed}");
-    success(client.path(), &["context", "use", "alice"]);
+    success(client.path(), &["use", "context", "alice"]);
     // The enrolled certificate is an Actor. All peer transitions therefore
     // use the participant protocol and exact revision fencing, not Runtime.
     let cli = |args: &[&str]| {
@@ -151,12 +150,12 @@ fn enrolled_named_context_reads_over_quic_and_mcp_survives_server_and_client_res
     let validation_id = format!("{:032x}", 502);
     let claim = json!({"id":claim_id,"target":"self","action":"handoff","description":"Return an explicit participant response","validations":[{"id":validation_id,"kind":"receipt","phase":"whole_work","mode":"required","description":"Receive response","evaluator":"self"}]});
     cli(&["submit", "claim", "--json", &claim.to_string()]);
-    cli(&["claim", "post", &claim_id]);
-    let acquired = cli(&["receipt", "acquire", &claim_id]);
+    cli(&["post", "claim", &claim_id]);
+    let acquired = cli(&["acquire", "receipt", &claim_id]);
     let receipt = acquired["result"]["receipt"].as_str().unwrap();
     let begun = cli(&[
-        "evidence",
         "begin",
+        "evidence",
         "--claim",
         &claim_id,
         "--receipt",
@@ -186,9 +185,9 @@ fn enrolled_named_context_reads_over_quic_and_mcp_survives_server_and_client_res
         "complete",
     ]);
     let testament = closed["result"]["testament"].as_str().unwrap();
-    cli(&["testament", "receive", testament, "--claim", &claim_id]);
-    cli(&["validation", "begin", "--claim", &claim_id]);
-    cli(&["validation", "complete", "--claim", &claim_id]);
+    cli(&["receive", "testament", testament, "--claim", &claim_id]);
+    cli(&["begin", "validation", "--claim", &claim_id]);
+    cli(&["complete", "validation", "--claim", &claim_id]);
     let context = cli(&["get", "validation", &validation_id, "--context"]);
     let context: focal_client::validation_context::ValidationContext =
         serde_json::from_value(context["context"].clone()).unwrap();
@@ -218,46 +217,41 @@ fn enrolled_named_context_reads_over_quic_and_mcp_survives_server_and_client_res
         .collect::<String>();
     success(
         founder.path(),
-        &[
-            "cluster",
-            "credentials",
-            "revoke",
-            "--invitation",
-            &invitation_id,
-        ],
+        &["revoke", "credential", "--invitation", &invitation_id],
     );
     // The controller installs committed grants on its bounded refresh loop.
     // Keep using the same MCP connector/QUIC connection until that projection
     // observes the revoke, then require its next request to remain denied.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // Charged to the founder's root periods: its root applies the revoke,
+    // and the controller refreshes on the root's next applied index.
+    let mut wait = super::progress::Progress::begin(
+        vec![Box::new(root_periods(founder.path()))],
+        Duration::from_secs(5),
+    );
     loop {
         let result = mcp.response("claim.list", json!({}));
         if result["isError"] == true {
             assert!(
                 matches!(
                     result["structuredContent"]["result"]["code"].as_str(),
-                    Some("unauthorized" | "transport")
+                    // The redial the revoked certificate makes is refused at
+                    // its handshake, and said so (`unauthenticated`); a
+                    // request on the closed connection is `transport`.
+                    Some("unauthorized" | "unauthenticated" | "transport")
                 ),
                 "{result}"
             );
             break;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "revoked grant was retained"
-        );
+        if let Some(spent) = wait.spent() {
+            panic!("revoked grant was retained: {spent}");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(mcp.response("claim.list", json!({}))["isError"], true);
     let revoked = success(
         founder.path(),
-        &[
-            "cluster",
-            "credentials",
-            "get",
-            "--invitation",
-            &invitation_id,
-        ],
+        &["get", "credential", "--invitation", &invitation_id],
     )
     .0;
     assert_eq!(revoked["result"]["entries"][0]["revoked"], true);

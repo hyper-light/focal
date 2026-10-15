@@ -219,22 +219,16 @@ impl Fixture {
         }
     }
     fn view(&self) -> View<'_> {
-        View {
-            state: &self.core.state,
-            tail: None,
-        }
+        View::committed(&self.core.state)
     }
     fn registry(&self) -> &RegistrationSet {
-        match self.core.state.rows.get(&Key::Claim(ClaimId::from_u128(1))) {
+        match self.core.state.row(&Key::Claim(ClaimId::from_u128(1))) {
             Some(Row::Claim(row)) => row.registrations().unwrap(),
             _ => panic!("retained claim"),
         }
     }
     fn extras(&self) -> (Extras, Scratch) {
-        let mut scratch = Scratch {
-            used: 0,
-            max: 1024 * 1024,
-        };
+        let mut scratch = Scratch::bound(1024 * 1024);
         let mut extras = Extras::new(16, 128 * 1024).unwrap();
         extras.begin_journal(16, &mut scratch).unwrap();
         for _ in 0..3 {

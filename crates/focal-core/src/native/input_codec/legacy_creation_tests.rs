@@ -84,6 +84,10 @@ fn phase(agent: bool) -> validation::PhasePolicy<'static> {
     }
 }
 fn definition(claim: u128, index: u32) -> validation::Declaration {
+    definition_at(claim, index, 100 + claim * 10 + u128::from(index))
+}
+/// [`definition`]'s declaration, bound to `object` (its deadline's timer too).
+fn definition_at(claim: u128, index: u32, object: u128) -> validation::Declaration {
     let (target, declared, kind, program) = match index {
         0 => (
             validation::TargetDeclaration::Delivery,
@@ -122,7 +126,7 @@ fn definition(claim: u128, index: u32) -> validation::Declaration {
     validation::Declaration::new(
         Principal::Actor(ISSUER),
         validation::DeclarationSpec {
-            binding: binding(100 + claim * 10 + u128::from(index)),
+            binding: binding(object),
             claim: ClaimId::from_u128(claim),
             issuer: ISSUER,
             declaration_index: index,
@@ -132,7 +136,7 @@ fn definition(claim: u128, index: u32) -> validation::Declaration {
             target,
             program,
             deadline: Deadline {
-                timer: TimerId::from_u128(500 + claim * 10 + u128::from(index)),
+                timer: TimerId::from_u128(400 + object),
                 generation: 2,
                 at: 1000,
             },
@@ -342,6 +346,7 @@ fn complete_legacy_frame_reconstructs_global_cohort_and_preserves_original_nativ
         claim
             .definition
             .acceptance
+            .view()
             .check_declarations(
                 declarations
                     .iter()
@@ -507,7 +512,7 @@ fn streaming_creation_writer_refuses_incomplete_or_extra_values_without_changing
         subject: value.subject,
         deadline: value.deadline,
         max_responses: value.max_responses,
-        lineage_binding: value.lineage.binding(),
+        lineage_binding: value.binding,
         cause: value.lineage.cause(),
         acceptance: value.acceptance.intent_fingerprint(),
         scope_limits: value.scope_limits,
@@ -634,4 +639,63 @@ fn lineage_terminal_probe_cannot_reuse_the_header_or_last_value_budget() {
         Err(ContractError::Capacity)
     );
     assert_eq!(calls.get(), 1);
+}
+
+/// A claim's declarations are read from the frame once and replayed to its
+/// acceptance's passes when they fit what its cohort holds, and read from the
+/// frame at every pass when they do not: at the bound, one past it and past it
+/// by twice, the plan's intent is the typed input's and its build is the frame.
+#[test]
+fn a_cohort_held_or_read_at_every_pass_reconstructs_the_same_input() {
+    for count in [8u32, 9, 16] {
+        let declarations: Vec<_> = (0..count)
+            .rev()
+            .map(|index| definition_at(1, index, 1000 + u128::from(index)))
+            .collect();
+        let checks = [aggregation::CheckPolicy {
+            declaration_index: 1,
+            validation: ValidationId::from_u128(1001),
+            mode: ValidationMode::Required,
+        }];
+        let slots = [aggregation::SlotPolicy {
+            slot: 2,
+            missing_declaration_index: 40,
+            mode: ValidationMode::Required,
+            checks: &checks,
+        }];
+        let (mut claim, _) = proposal(1);
+        claim.definition.acceptance = aggregation::AcceptancePolicy::new(
+            binding(1),
+            ISSUER,
+            &slots,
+            &declarations,
+            limits().acceptance,
+        )
+        .unwrap();
+        let input = NativeInput {
+            request: RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(2),
+                id: RequestId([23; 16]),
+            },
+            command: NativeCommand::Create {
+                claims: vec![claim],
+                declarations,
+            },
+        };
+        let bytes = encode(&input);
+        let structural = inspect(&bytes);
+        let plan = structural
+            .prepare_legacy_creation(native(), limits())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.intent_fingerprint(),
+            crate::native::intent::fingerprint(ledger(), &input).unwrap(),
+            "{count} declarations"
+        );
+        let quote = plan.quote();
+        let built = plan.build(quote.bytes, quote.construction).unwrap();
+        assert_eq!(encode(&built), bytes, "{count} declarations");
+    }
 }

@@ -165,6 +165,7 @@ fn funded_admission_failure_publishes_complete_graph_and_monitor_effects_and_dis
         .candidate(error_candidate)
         .unwrap()
         .recorded(request(EVALUATOR, 90_010))
+        .unwrap()
         .unwrap();
     let error = assert_publication(&owner, claim_key(1, 1), error_outcome);
     assert_eq!(
@@ -185,12 +186,13 @@ fn funded_admission_failure_publishes_complete_graph_and_monitor_effects_and_dis
     let failed = report_claim(&owner, 1, 1, 90_011, VerdictValue::Fail);
     let retry = copy_report(&failed);
     let pressure = exhaust(&parent);
-    assert_eq!(parent.stats().used, parent.limit());
+    assert_eq!(parent.headroom(BudgetLane::Ordinary), 0);
     let failure_candidate = report_at(&mut owner, &mut store, failed, 41);
     let outcome = owner
         .candidate(failure_candidate)
         .unwrap()
         .recorded(request(EVALUATOR, 90_011))
+        .unwrap()
         .unwrap();
     let accepted = assert_publication(&owner, claim_key(1, 1), outcome);
     assert_eq!(accepted.result().verdict(), VerdictValue::Fail);
@@ -294,6 +296,7 @@ fn funded_admission_failure_publishes_complete_graph_and_monitor_effects_and_dis
         owner
             .effective()
             .recorded(request(EVALUATOR, 90_011))
+            .unwrap()
             .is_none()
     );
     let failure_candidate = report_at(&mut owner, &mut store, retry, 41);
@@ -302,6 +305,7 @@ fn funded_admission_failure_publishes_complete_graph_and_monitor_effects_and_dis
             .candidate(failure_candidate)
             .unwrap()
             .recorded(request(EVALUATOR, 90_011))
+            .unwrap()
             .unwrap(),
         outcome
     );
@@ -315,6 +319,7 @@ fn funded_admission_failure_publishes_complete_graph_and_monitor_effects_and_dis
         .candidate(late)
         .unwrap()
         .recorded(request(EVALUATOR, 90_012))
+        .unwrap()
         .unwrap();
     assert_publication(&owner, claim_key(1, 2), late_outcome);
     assert_eq!(late_outcome.events, 3);
@@ -391,6 +396,7 @@ fn begun_posted_admission_refuses_or_funds_new_incoming_dependency_and_monitor_b
             .candidate(candidate)
             .unwrap()
             .recorded(request(EVALUATOR, 91_003))
+            .unwrap()
             .unwrap();
         assert_publication(&owner, claim_key(1, 1), outcome);
         assert_eq!(
@@ -497,6 +503,7 @@ fn reconstructing_actual_begun_admission_restores_its_graph_promise_before_accep
         .candidate(candidate)
         .unwrap()
         .recorded(request(EVALUATOR, 92_003))
+        .unwrap()
         .unwrap();
     assert_publication(&owner, claim_key(1, 1), outcome);
     assert_eq!(

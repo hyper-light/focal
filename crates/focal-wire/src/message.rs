@@ -9,7 +9,12 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// Explicit syntax capability for independently registered request streams.
 /// Legacy envelopes and handshake structures retain their original encoding.
 pub const MANAGED_PROTOCOL_VERSION: u16 = 2;
-pub const ALPN: &[u8] = b"focal/1";
+/// The data protocol's name in the TLS handshake. Its second generation: every message is a
+/// hyper-transport exchange whose class its kind and its sender's role decide. A peer of the first
+/// (`focal/1`, focal's frames on QUIC streams of their own) shares no protocol with it, so the
+/// handshake refuses it (`no_application_protocol`, RFC 7301 §3.2) before either reads a byte the
+/// other could not.
+pub const ALPN: &[u8] = b"focal/2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadToken {
@@ -95,6 +100,7 @@ pub enum Operation {
     /// Consensus payload is interpreted only by authenticated node ingress.
     Raft {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         message: Vec<u8>,
     },
     /// Allocate/admit only the authenticated principal's requested epoch.
@@ -111,6 +117,7 @@ pub enum Operation {
     /// Bounded metadata RPC; interpreted only by the authenticated control owner.
     Control {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Node-only content custody protocol. A durable reply attests one disk,
@@ -119,6 +126,7 @@ pub enum Operation {
     /// Authenticated node discovery; the control owner accepts read RPCs only.
     PeerControl {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Announce only this authenticated Node's reachable endpoint. The root
@@ -146,6 +154,7 @@ pub enum Operation {
     EnrollmentControl {
         group: [u8; 16],
         genesis: [u8; 32],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     List(crate::ListRequest),
@@ -179,6 +188,7 @@ pub enum Operation {
     /// One borrowed native input frame (`FCNINPUT`), journaled and admitted
     /// exactly as sent; only the native profile carries it.
     Native {
+        #[serde(with = "focal_memory::serde_bytes")]
         frame: Vec<u8>,
     },
     NativeRead(crate::NativeReadRequest),
@@ -188,6 +198,7 @@ pub enum Operation {
     /// readiness. Never a plan, a fence, or another node's facts.
     PlacementControl {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Ask the authenticated node to sign one session fact it can witness from
@@ -195,6 +206,7 @@ pub enum Operation {
     /// signature alone; a quorum is assembled by the caller.
     SessionSign {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Node-only liveness probe: a direct probe of the receiver or an indirect
@@ -203,6 +215,7 @@ pub enum Operation {
     /// Answered from the receiver's published state without an owner round
     /// trip; it grants nothing and commits nothing.
     Probe {
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Ask the authenticated node for one range-movement fact its hosted
@@ -212,6 +225,7 @@ pub enum Operation {
     /// state and attests it before proposing it.
     RangeControl {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Ask the node that leads a session's log to state the session's facts
@@ -222,7 +236,24 @@ pub enum Operation {
     /// connection; the log applies it under its own committed rules.
     SessionControl {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
+    },
+    /// A group's message to a peer, stepped in the order the sender's bulk
+    /// frames left it (27 §12): `sequence` counts the sender's ordered
+    /// frames to this peer within `epoch`, the sender's incarnation. The
+    /// receiver holds a frame that overtook the one before it for the probe
+    /// timeout of the path as it measures it — past that the predecessor
+    /// was lost, and the leader is probing. Carried only on a connection
+    /// that negotiated the ordered profile
+    /// ([`crate::ORDERED_PROTOCOL_VERSION`]); the pool sends `Raft` on one
+    /// that did not.
+    RaftOrdered {
+        group: [u8; 16],
+        epoch: u64,
+        sequence: u64,
+        #[serde(with = "focal_memory::serde_bytes")]
+        message: Vec<u8>,
     },
 }
 /// What a request is to the connection that carries it; see
@@ -245,6 +276,37 @@ impl TrafficClass {
             Self::Bulk => -10,
             Self::Exchange => 0,
             Self::Control => 10,
+        }
+    }
+    /// The class's rank among the classes a connection carries under
+    /// strict priority: zero the most urgent. A body of a class may come
+    /// behind everything of a lower rank ([`crate::frame::Delivery`]).
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Control => 0,
+            Self::Exchange => 1,
+            Self::Bulk => 2,
+        }
+    }
+    /// How many ranks there are.
+    pub const RANKS: usize = 3;
+    /// The class of the operation registered as `tag` ([`Operation::registered_tag`]), or `None`
+    /// for a tag no operation has: what the transport classes a message by before any of its body
+    /// is read (the kind crosses the wire as the tag; hyper-transport's `Classes::class_of`). It agrees
+    /// with [`Operation::class`], which the compiler holds to every variant: the network owner refuses
+    /// a request whose decoded operation's tag or class is not the one it was carried as.
+    pub const fn of_tag(tag: u16) -> Option<Self> {
+        match tag {
+            // Raft, Control, PeerControl, NodeContact, EnrollmentControl, ManagedSupport,
+            // PlacementControl, SessionSign, Probe, RangeControl, SessionControl, RaftOrdered.
+            4 | 9 | 11 | 12 | 13 | 19 | 28 | 29 | 30 | 31 | 32 | 33 => Some(Self::Control),
+            // Upload, Download, Custody.
+            7 | 8 | 10 => Some(Self::Bulk),
+            // Submit, Read, Subscribe, OpenEpoch, Stream, List, Reconcile, Managed,
+            // RequestStreamControl, RequestStreamRead, Traverse, Validators, Summary, Monitor,
+            // Select, Native, NativeRead, NativeList.
+            1 | 2 | 3 | 5 | 6 | 14..=18 | 20..=27 => Some(Self::Exchange),
+            _ => None,
         }
     }
 }
@@ -298,6 +360,7 @@ impl Operation {
             Self::Probe { .. } => 30,
             Self::RangeControl { .. } => 31,
             Self::SessionControl { .. } => 32,
+            Self::RaftOrdered { .. } => 33,
         }
     }
     /// What goes first where one connection carries several requests at
@@ -308,6 +371,7 @@ impl Operation {
     pub fn class(&self) -> TrafficClass {
         match self {
             Self::Raft { .. }
+            | Self::RaftOrdered { .. }
             | Self::Probe { .. }
             | Self::Control { .. }
             | Self::PeerControl { .. }
@@ -500,6 +564,7 @@ pub enum UploadRequest {
     Append {
         upload: [u8; 16],
         offset: u64,
+        #[serde(with = "focal_memory::serde_bytes")]
         bytes: Vec<u8>,
     },
     Seal {
@@ -537,11 +602,13 @@ pub enum CustodyRequest {
         transfer: [u8; 16],
         policy_revision: u64,
         content: ContentRef,
+        #[serde(with = "focal_memory::serde_bytes")]
         manifest: Vec<u8>,
     },
     Chunk {
         transfer: [u8; 16],
         index: u32,
+        #[serde(with = "focal_memory::serde_bytes")]
         bytes: Vec<u8>,
     },
     Seal {
@@ -571,6 +638,46 @@ pub enum CustodyRequest {
         hash: ContentHash,
         max_bytes: u32,
     },
+    /// A part of a chunk, from `offset`: a chunk that would take its path
+    /// longer than a transfer's lease to cross goes in parts, each of which
+    /// renews the lease as it is taken (the audit's F49). Parts of one
+    /// chunk go in order; the receiver holds them until the chunk is whole
+    /// and verified, and answers with how much of the chunk it holds.
+    ChunkPart {
+        transfer: [u8; 16],
+        index: u32,
+        offset: u32,
+        #[serde(with = "focal_memory::serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// A part of a chunk the asker lacks, from `offset`, `max_bytes` at
+    /// most: the pull of a chunk too large for its path in one piece.
+    ReadChunkPart {
+        transfer: [u8; 16],
+        index: u32,
+        offset: u32,
+        max_bytes: u32,
+    },
+    /// `Open`, answered with what the copy holds of the object
+    /// (`OpenedHeld`), so a sender sends what the copy lacks and nothing it
+    /// holds (the audit's F50). Of the ordered profile and nothing else: a
+    /// copy of an older binary is asked `Open`.
+    OpenHeld {
+        transfer: [u8; 16],
+        policy_revision: u64,
+        content: ContentRef,
+        #[serde(with = "focal_memory::serde_bytes")]
+        manifest: Vec<u8>,
+    },
+}
+/// Whether an operation is of the ordered profile and nothing else
+/// (27 §12): a sender names the profile its request needs, and a receiver
+/// holds it to it.
+pub const fn ordered_profile_operation(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::RaftOrdered { .. } | Operation::Custody(CustodyRequest::OpenHeld { .. })
+    )
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CustodyReply {
@@ -588,21 +695,47 @@ pub enum CustodyReply {
     Cancelled,
     Manifest {
         content: ContentRef,
+        #[serde(with = "focal_memory::serde_bytes")]
         manifest: Vec<u8>,
     },
     Chunk {
         index: u32,
+        #[serde(with = "focal_memory::serde_bytes")]
         bytes: Vec<u8>,
     },
     SeedChunk {
         hash: ContentHash,
+        #[serde(with = "focal_memory::serde_bytes")]
         bytes: Vec<u8>,
+    },
+    /// How much of chunk `index` the receiver holds after a part: the
+    /// sender goes on from there. The last part is answered `ChunkStored`.
+    PartStored {
+        index: u32,
+        staged: u32,
+    },
+    /// A part of a chunk, from `offset`, of a chunk `length` long.
+    ChunkPart {
+        index: u32,
+        offset: u32,
+        length: u32,
+        #[serde(with = "focal_memory::serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// What the copy holds of the object `OpenHeld` named, verified: a bit
+    /// for each of the manifest's `chunks`, bit `i % 64` of word `i / 64`
+    /// set where chunk `i` is held. Bounded by the manifest: a word for
+    /// every sixty-four chunks it names.
+    OpenedHeld {
+        chunks: u32,
+        held: Vec<u64>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentChunk {
     pub offset: u64,
+    #[serde(with = "focal_memory::serde_bytes")]
     pub bytes: Vec<u8>,
     pub eof: bool,
 }
@@ -690,6 +823,7 @@ pub enum Response {
     Upload(UploadReply),
     Content(ContentChunk),
     Control {
+        #[serde(with = "focal_memory::serde_bytes")]
         response: Vec<u8>,
     },
     Custody(CustodyReply),
@@ -708,7 +842,7 @@ pub enum Response {
     NativeListed(crate::NativeListPage),
     /// The receiver's probe reply: its acknowledgement or relayed outcome,
     /// coordinate, health and piggyback.
-    Probe(Vec<u8>),
+    Probe(#[serde(with = "focal_memory::serde_bytes")] Vec<u8>),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
@@ -752,7 +886,27 @@ impl Negotiated {
                         | PEER_PROTOCOL_VERSION
                         | crate::NATIVE_PROTOCOL_VERSION
                 )
+                | (
+                    crate::ORDERED_PROTOCOL_VERSION,
+                    PROTOCOL_VERSION
+                        | MANAGED_PROTOCOL_VERSION
+                        | PEER_PROTOCOL_VERSION
+                        | crate::NATIVE_PROTOCOL_VERSION
+                        | crate::ORDERED_PROTOCOL_VERSION
+                )
+                | (
+                    crate::LANED_PROTOCOL_VERSION,
+                    PROTOCOL_VERSION
+                        | MANAGED_PROTOCOL_VERSION
+                        | PEER_PROTOCOL_VERSION
+                        | crate::NATIVE_PROTOCOL_VERSION
+                        | crate::ORDERED_PROTOCOL_VERSION
+                )
         )
+    }
+    /// Whether a connection that negotiated this profile carries replication frames on lanes.
+    pub fn laned(self) -> bool {
+        self.protocol >= crate::LANED_PROTOCOL_VERSION
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -767,7 +921,13 @@ pub struct WireLimits {
     pub max_items: u32,
     pub max_cost: u64,
     pub max_connections: usize,
+    /// The streams a connection holds at once: the probe's, the control
+    /// lane's and the content lane's ([`WireLimits::for_consensus`]).
     pub streams_per_connection: u32,
+    /// The control lane: consensus exchanges to the peer at once, the
+    /// leader's pipeline to one follower (`DEFAULT_INFLIGHT_WINDOW`), so the
+    /// wire is never narrower than the core.
+    pub control_streams: u32,
     pub request_timeout: std::time::Duration,
 }
 impl Default for WireLimits {
@@ -778,11 +938,26 @@ impl Default for WireLimits {
             max_cost: 4 * 1024 * 1024,
             max_connections: 128,
             streams_per_connection: 16,
+            control_streams: 2,
             request_timeout: std::time::Duration::from_secs(30),
         }
     }
 }
 impl WireLimits {
+    /// The lanes of a connection derived: one stream for the probe, the
+    /// consensus window for the control lane, and the content lane the
+    /// reference path fills ([`crate::content_streams`]).
+    pub fn for_consensus(window: u32) -> Self {
+        let streams = window
+            .saturating_add(crate::content_streams())
+            .saturating_add(1)
+            .min(1024);
+        Self {
+            streams_per_connection: streams,
+            control_streams: window.min(streams),
+            ..Self::default()
+        }
+    }
     pub fn validate(&self) -> Result<(), AccessError> {
         if !(1024..=16 * 1024 * 1024).contains(&self.max_frame_bytes)
             || self.max_items == 0
@@ -792,6 +967,8 @@ impl WireLimits {
             || self.max_connections > 65536
             || self.streams_per_connection == 0
             || self.streams_per_connection > 1024
+            || self.control_streams == 0
+            || self.control_streams > self.streams_per_connection
             || self.request_timeout.is_zero()
             || self.request_timeout > std::time::Duration::from_secs(120)
         {
@@ -828,10 +1005,50 @@ impl WireLimits {
         participant: bool,
         native: bool,
     ) -> Result<Negotiated, AccessError> {
+        self.negotiate_ordered(hello, managed, participant, native, false)
+    }
+    /// The ordered profile is offered by a handler that steps a peer's
+    /// frames in the order they left it (27 §12, [`Operation::RaftOrdered`]);
+    /// it implies every earlier profile.
+    pub fn negotiate_ordered(
+        &self,
+        hello: &Hello,
+        managed: bool,
+        participant: bool,
+        native: bool,
+        ordered: bool,
+    ) -> Result<Negotiated, AccessError> {
+        self.negotiate_laned(hello, [managed, participant, native, ordered, false])
+    }
+    /// The laned profile is offered by a handler that takes a peer's replication frames from
+    /// its lanes, each answered by nothing ([`crate::LANED_PROTOCOL_VERSION`]); it implies every
+    /// earlier profile. `capabilities` are the handler's: managed, participant, native, ordered
+    /// and laned.
+    pub fn negotiate_laned(
+        &self,
+        hello: &Hello,
+        capabilities: [bool; 5],
+    ) -> Result<Negotiated, AccessError> {
+        let [managed, participant, native, ordered, laned] = capabilities;
         if hello.versions.len() > 16 {
             return Err(AccessError::UnsupportedProtocol);
         }
         let protocol = if managed
+            && participant
+            && native
+            && ordered
+            && laned
+            && hello.versions.contains(&crate::LANED_PROTOCOL_VERSION)
+        {
+            crate::LANED_PROTOCOL_VERSION
+        } else if managed
+            && participant
+            && native
+            && ordered
+            && hello.versions.contains(&crate::ORDERED_PROTOCOL_VERSION)
+        {
+            crate::ORDERED_PROTOCOL_VERSION
+        } else if managed
             && participant
             && native
             && hello.versions.contains(&crate::NATIVE_PROTOCOL_VERSION)

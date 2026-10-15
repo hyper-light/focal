@@ -51,6 +51,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -155,7 +156,7 @@ fn created(result: &Value, kind: &str) -> Vec<String> {
         .collect()
 }
 fn gc_status(root: &Path) -> Value {
-    let shown = admin(root, &["cluster", "gc", "show"]);
+    let shown = admin(root, &["inspect", "node", "--gc"]);
     assert_eq!(shown["result"]["kind"], "gc", "{shown}");
     shown["result"]["gc"].clone()
 }
@@ -205,19 +206,18 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
-    let identity = admin(root, &["cluster", "node", "identity"])["result"]["identity"].clone();
+    let identity = admin(root, &["inspect", "node", "--identity"])["result"]["identity"].clone();
     let tenant = identity["tenant"].as_str().unwrap().to_owned();
     let invitation = client.path().join("alice.invite");
     admin(
         root,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -229,8 +229,8 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
             client.path(),
             None,
             &[
-                "context",
                 "enroll",
+                "context",
                 "alice",
                 "--invite-file",
                 invitation.to_str().unwrap()
@@ -239,7 +239,10 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
         .status
         .success()
     );
-    let alice_standing = admin(client.path(), &["--client-context", "alice", "status"]);
+    let alice_standing = admin(
+        client.path(),
+        &["--client-context", "alice", "inspect", "prefix"],
+    );
     let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
 
     // A claim whose work artifact's inline payload is sealed as an object.
@@ -260,17 +263,17 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
         &["submit", "claim", "--json", &document.to_string()],
     ));
     let claim = created(&result, "Claim").remove(0);
-    committed(&cli(root, None, &["claim", "post", &claim]));
+    committed(&cli(root, None, &["post", "claim", &claim]));
     committed(&cli(
         client.path(),
         Some("alice"),
-        &["receipt", "acquire", &claim],
+        &["acquire", "receipt", &claim],
     ));
     let (_, result) = committed(&cli(
         client.path(),
         Some("alice"),
         &[
-            "artifact", "submit", "--claim", &claim, "--slot", "0", "--text", PROOF,
+            "submit", "artifact", "--claim", &claim, "--slot", "0", "--text", PROOF,
         ],
     ));
     let artifact = created(&result, "Artifact").remove(0);
@@ -286,8 +289,8 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
         client.path(),
         Some("alice"),
         &[
-            "artifact",
             "submit",
+            "artifact",
             "--claim",
             &claim,
             "--slot",
@@ -326,35 +329,60 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     assert_eq!(config["grace_ms"], 1500);
     assert_eq!(config["quarantine_ms"], 600_000);
     assert_eq!(config["interval_ms"], 300);
-    // The orphan comes back on request, exactly once.
-    let restored = admin(
-        root,
-        &[
-            "cluster", "gc", "restore", "--domain", &tenant, "--root", &orphan,
-        ],
-    );
-    assert_eq!(restored["result"]["kind"], "gc_restored", "{restored}");
-    assert_eq!(restored["result"]["restored"], true);
-    all = manifests(root, &tenant);
-    assert!(all.contains(&orphan), "{all:?}");
-    let again = admin(
-        root,
-        &[
-            "cluster", "gc", "restore", "--domain", &tenant, "--root", &orphan,
-        ],
-    );
-    assert_eq!(again["result"]["restored"], false);
-    // A later pass takes it again; its bytes are still old.
-    let before = status["passes"].as_u64().unwrap();
+    // The orphan comes back on request, exactly once: a second request finds
+    // it back and restores nothing. A pass between the two would take it
+    // again — its bytes are old — and the second would truly bring it back,
+    // so the pair is judged across a window no pass entered: none completed
+    // and none was collecting at either end (a pass quarantines only while it
+    // shows itself collecting, and its completion clears that and counts it
+    // in one publication). A window a pass entered is asked again once a pass
+    // has taken the orphan back (a macOS runner put one between the two
+    // requests, 2026-10-03).
+    let restore = || {
+        admin(
+            root,
+            &["restore", "object", "--domain", &tenant, "--root", &orphan],
+        )
+    };
+    let mut window = Deadline::after(Duration::from_secs(60));
+    let settled = loop {
+        let opened = gc_status(root);
+        let restored = restore();
+        assert_eq!(restored["result"]["kind"], "gc_restored", "{restored}");
+        assert_eq!(restored["result"]["restored"], true, "{restored}");
+        all = manifests(root, &tenant);
+        assert!(all.contains(&orphan), "{all:?}");
+        let again = restore();
+        let closed = gc_status(root);
+        if opened["passes"] == closed["passes"]
+            && opened["collecting"] == false
+            && closed["collecting"] == false
+        {
+            assert_eq!(
+                again["result"]["restored"], false,
+                "{again}; collector {opened} then {closed}"
+            );
+            break closed["passes"].as_u64().unwrap();
+        }
+        assert!(
+            window.open(),
+            "no two requests fell between passes: {opened} then {closed}"
+        );
+        pass_where(root, |_| manifests(root, &tenant) == bound);
+    };
+    // A later pass takes it again; its bytes are still old. Counted from
+    // the window the restores were judged in: the pass after the one that
+    // may have begun its roots by then sees the orphan back.
     pass_where(root, |_| {
-        gc_status(root)["passes"].as_u64().unwrap() > before + 1
+        gc_status(root)["passes"].as_u64().unwrap() > settled + 1
     });
     assert_eq!(manifests(root, &tenant), bound);
-    // The claim retires: its family's bundle is a new object, the payload's
-    // object stays because the bundle's header names it, and the bundle
-    // still verifies after the collector ran over it.
-    committed(&cli(root, None, &["claim", "cancel", &claim]));
-    committed(&cli(root, None, &["claim", "release-scope", &claim]));
+    // The claim retires: its family's frame lies in the session's cold
+    // stream (doc 31 M2, A2), no new object; the payload's object stays
+    // because the frame names it, and the frame still verifies after the
+    // collector ran over it.
+    committed(&cli(root, None, &["cancel", "claim", &claim]));
+    committed(&cli(root, None, &["release", "scope", &claim]));
     let mut deadline = Deadline::after(Duration::from_secs(60));
     loop {
         let output = run(root, None, &["get", "claim", &claim, "--format", "json"]);
@@ -373,25 +401,25 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     });
     assert_eq!(status["last"]["bundles_unreadable"], 0, "{status}");
     assert!(
-        status["last"]["protected_objects"].as_u64().unwrap() >= 2,
+        status["last"]["protected_objects"].as_u64().unwrap() >= 1,
         "{status}"
     );
     let retired = manifests(root, &tenant);
-    assert_eq!(retired.len(), 2, "payload and bundle: {retired:?}");
-    assert!(retired.contains(&bound[0]));
-    let archive = admin(root, &["cluster", "archive", "show", "--claim", &claim]);
+    assert_eq!(retired, bound, "the payload alone: {retired:?}");
+    let archive = admin(root, &["inspect", "archive", "--claim", &claim]);
     assert_eq!(archive["result"]["archive"]["verified"], true, "{archive}");
     let bundle = archive["result"]["archive"]["bundle"].as_str().unwrap();
-    assert!(retired.contains(&bundle.to_owned()));
+    assert!(
+        !retired.contains(&bundle.to_owned()),
+        "a frame is no object"
+    );
     let _ = artifact;
     // A kill and restart keep the quarantine: the orphan still comes back.
     drop(server);
     let _server = start(root, &advertise);
     let restored = admin(
         root,
-        &[
-            "cluster", "gc", "restore", "--domain", &tenant, "--root", &orphan,
-        ],
+        &["restore", "object", "--domain", &tenant, "--root", &orphan],
     );
     assert_eq!(restored["result"]["restored"], true, "{restored}");
     assert!(manifests(root, &tenant).contains(&orphan));

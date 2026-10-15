@@ -90,18 +90,14 @@ fn find(context: &Context, id: ManagedOperationId) -> Result<ManagedRequests> {
     }
     retired.ok_or_else(|| ManagedStoreError::Missing.into())
 }
-fn maintain(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    requests: &ManagedRequests,
-) -> Result<()> {
+async fn maintain(context: &Context, requests: &ManagedRequests) -> Result<()> {
     // Slot discovery and exact pending controls are bounded by the coordinator;
     // cap total exchanges as an additional foreground operation budget.
     for _ in 0..4096 {
         let Some(request) = requests.maintenance(&mut random_id).map_err(other)? else {
             return Ok(());
         };
-        let reply = match runtime.block_on(context.client.request(request.clone())) {
+        let reply = match context.client.request(request.clone()).await {
             Ok(reply) => reply,
             // This typed rejection is not a committed fact. The coordinator
             // may schedule an authenticated fresh slot read after a CAS race.
@@ -138,23 +134,23 @@ fn recovery(context: &Context, id: ManagedOperationId, action: Recovery) {
         Recovery::Retry => {
             let _ = writeln!(
                 error,
-                "Recovery: {command} request retry --operation-id {id}"
+                "Recovery: {command} retry request --operation-id {id}"
             );
         }
         Recovery::Seal => {
             let _ = writeln!(
                 error,
-                "Recovery: {command} request seal --operation-id {id}"
+                "Recovery: {command} seal request --operation-id {id}"
             );
         }
         Recovery::Reserved => {
             let _ = writeln!(
                 error,
-                "Saved reservation: {id}\nRecovery: {command} request pending"
+                "Saved reservation: {id}\nRecovery: {command} list requests"
             );
             let _ = writeln!(
                 error,
-                "To abandon this request: {command} request seal --operation-id {id}"
+                "To abandon this request: {command} seal request --operation-id {id}"
             );
         }
     }
@@ -181,23 +177,17 @@ fn deferred(error: &CliError) {
         "Receipt cleanup deferred: {error}. Saved recovery remains available."
     );
 }
-fn delivered(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    requests: &ManagedRequests,
-    id: ManagedOperationId,
-) {
-    if let Err(error) = requests
-        .mark_delivered(id)
-        .map_err(other)
-        .and_then(|_| maintain(runtime, context, requests))
-    {
+async fn delivered(context: &Context, requests: &ManagedRequests, id: ManagedOperationId) {
+    let maintained = match requests.mark_delivered(id).map_err(other) {
+        Ok(_) => maintain(context, requests).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = maintained {
         deferred(&error);
     }
 }
 
-pub(super) fn submit(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn submit(
     context: &Context,
     authored: AuthoredOperation,
     options: MutationOptions,
@@ -211,7 +201,7 @@ pub(super) fn submit(
         (find(context, id)?, id)
     } else {
         let requests = open(context)?;
-        maintain(runtime, context, &requests)?;
+        maintain(context, &requests).await?;
         let id = requests
             .store()
             .map_err(other)?
@@ -243,12 +233,10 @@ pub(super) fn submit(
                     context,
                     id,
                     Recovery::Reserved,
-                    runtime
-                        .block_on(context.client.claim_revision(
-                            context.build.ledger,
-                            claim,
-                            id.key(context.operation).id,
-                        ))
+                    context
+                        .client
+                        .claim_revision(context.build.ledger, claim, id.key(context.operation).id)
+                        .await
                         .map_err(CliError::from)
                         .and_then(|revision| {
                             revision
@@ -306,18 +294,10 @@ pub(super) fn submit(
         context,
         id,
         Recovery::Retry,
-        drive(
-            runtime,
-            context,
-            &requests,
-            &store,
-            id,
-            options.output.format,
-        ),
+        drive(context, &requests, &store, id, options.output.format).await,
     )
 }
-fn drive(
-    runtime: &tokio::runtime::Runtime,
+async fn drive(
     context: &Context,
     requests: &ManagedRequests,
     store: &ManagedOperationStore,
@@ -328,11 +308,11 @@ fn drive(
         Some(receipt) => receipt,
         None => {
             let prepared = store.request(id)?;
-            match runtime.block_on(
-                context
-                    .client
-                    .submit_managed_outcome(prepared.request, context.operation),
-            ) {
+            match context
+                .client
+                .submit_managed_outcome(prepared.request, context.operation)
+                .await
+            {
                 Ok(focal_client::ManagedSubmitOutcome::Committed(reply)) => {
                     store.record_receipt(id, &reply.receipt)?;
                     reply.receipt
@@ -353,10 +333,9 @@ fn drive(
             }
         }
     };
-    show_receipt(runtime, context, requests, id, &receipt, format)
+    show_receipt(context, requests, id, &receipt, format).await
 }
-fn show_receipt(
-    runtime: &tokio::runtime::Runtime,
+async fn show_receipt(
     context: &Context,
     requests: &ManagedRequests,
     id: ManagedOperationId,
@@ -373,15 +352,10 @@ fn show_receipt(
         Some(receipt),
         format,
     )?;
-    delivered(runtime, context, requests, id);
+    delivered(context, requests, id).await;
     Ok(())
 }
-pub(super) fn retry(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    text: &str,
-    format: OutputFormat,
-) -> Result<()> {
+pub(super) async fn retry(context: &Context, text: &str, format: OutputFormat) -> Result<()> {
     let id = text.parse()?;
     let requests = find(context, id)?;
     let store = recovering(
@@ -391,7 +365,7 @@ pub(super) fn retry(
         requests.store().map_err(other),
     )?;
     if matches!(store.request(id), Err(ManagedStoreError::Unprepared))
-        && super::upload::resume_managed(runtime, context, id, format)?
+        && super::upload::resume_managed(context, id, format).await?
     {
         return Ok(());
     }
@@ -400,14 +374,13 @@ pub(super) fn retry(
         context,
         id,
         Recovery::Retry,
-        drive(runtime, context, &requests, &store, id, format),
+        drive(context, &requests, &store, id, format).await,
     )
 }
 
 /// Reserve only the existing managed request identity for a multipart authored
 /// submission; its artifact command is prepared after actual custody sealing.
-pub(super) fn reserve_for_submission(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn reserve_for_submission(
     context: &Context,
     options: &mut MutationOptions,
 ) -> Result<ManagedOperationId> {
@@ -417,7 +390,7 @@ pub(super) fn reserve_for_submission(
         return Ok(id);
     }
     let requests = open(context)?;
-    maintain(runtime, context, &requests)?;
+    maintain(context, &requests).await?;
     let id = requests
         .store()
         .map_err(other)?
@@ -425,8 +398,7 @@ pub(super) fn reserve_for_submission(
     options.operation_id = Some(id.to_string());
     Ok(id)
 }
-pub(super) fn inspect(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn inspect(
     context: &Context,
     text: &str,
     remote: bool,
@@ -453,11 +425,10 @@ pub(super) fn inspect(
             },
         })?;
         request.protocol = MANAGED_PROTOCOL_VERSION;
-        let reply = runtime.block_on(
-            context
-                .client
-                .request_stream_read(request, context.operation),
-        )?;
+        let reply = context
+            .client
+            .request_stream_read(request, context.operation)
+            .await?;
         if let RequestStreamReadResult::Receipt {
             resolution: ManagedReceiptResolution::Retained(receipt),
             ..
@@ -508,13 +479,9 @@ fn validate_remote_receipt(
     }
     Ok(())
 }
-pub(super) fn reserve(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    format: OutputFormat,
-) -> Result<()> {
+pub(super) async fn reserve(context: &Context, format: OutputFormat) -> Result<()> {
     let requests = open(context)?;
-    maintain(runtime, context, &requests)?;
+    maintain(context, &requests).await?;
     let id = requests
         .store()
         .map_err(other)?
@@ -611,38 +578,29 @@ pub(super) fn pending(context: &Context, format: OutputFormat) -> Result<()> {
     out.flush()?;
     Ok(())
 }
-pub(super) fn acknowledge(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    text: &str,
-    format: OutputFormat,
-) -> Result<()> {
+pub(super) async fn acknowledge(context: &Context, text: &str, format: OutputFormat) -> Result<()> {
     let id = text.parse()?;
     let requests = find(context, id)?;
     requests.mark_delivered(id).map_err(other)?;
-    maintain(runtime, context, &requests)?;
+    maintain(context, &requests).await?;
     render(id, "Acknowledged", None, format)
 }
-pub(super) fn seal(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    text: &str,
-    format: OutputFormat,
-) -> Result<()> {
+pub(super) async fn seal(context: &Context, text: &str, format: OutputFormat) -> Result<()> {
     let id = text.parse()?;
     let requests = find(context, id)?;
-    let result = (|| {
-        maintain(runtime, context, &requests)?;
+    let result = async {
+        maintain(context, &requests).await?;
         let store = requests.store().map_err(other)?;
-        let receipt = seal_receipt(&store, id, || maintain(runtime, context, &requests))?;
-        show_receipt(runtime, context, &requests, id, &receipt, format)
-    })();
+        let receipt = seal_receipt(&store, id, async || maintain(context, &requests).await).await?;
+        show_receipt(context, &requests, id, &receipt, format).await
+    }
+    .await;
     recovering(context, id, Recovery::Seal, result)
 }
-fn seal_receipt(
+async fn seal_receipt(
     store: &ManagedOperationStore,
     id: ManagedOperationId,
-    mut maintain: impl FnMut() -> Result<()>,
+    mut maintain: impl AsyncFnMut() -> Result<()>,
 ) -> Result<ManagedReceipt> {
     for _ in 0..8 {
         if let Some(receipt) = store.receipt(id)? {
@@ -655,7 +613,7 @@ fn seal_receipt(
             Ok(_) | Err(ManagedStoreError::ControlPending) => {}
             Err(error) => return Err(error.into()),
         }
-        maintain()?;
+        maintain().await?;
     }
     store
         .receipt(id)?
@@ -802,6 +760,7 @@ fn render_domain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
 
     fn create(root: &std::path::Path) -> ManagedOperationStore {
         let context = OperationContext {
@@ -919,10 +878,12 @@ mod tests {
         let other = store.reserve(RequestId::from_u128(22)).unwrap();
         store.prepare_seal(other, RequestId::from_u128(23)).unwrap();
         let mut controls = Vec::new();
-        let receipt = seal_receipt(&store, id, || {
+        let receipt = seal_receipt(&store, id, async || {
             controls.push(finish_seal(&store, 11 + controls.len() as u64));
             Ok(())
         })
+        .now_or_never()
+        .expect("the test's upkeep never waits")
         .unwrap();
         assert_eq!(
             controls.iter().map(|key| key.id).collect::<Vec<_>>(),
@@ -956,10 +917,12 @@ mod tests {
         let pending = store.prepare_seal(other, RequestId::from_u128(23)).unwrap();
         let mut calls = 0;
         assert!(matches!(
-            seal_receipt(&store, id, || {
+            seal_receipt(&store, id, async || {
                 calls += 1;
                 Ok(())
-            }),
+            })
+            .now_or_never()
+            .expect("the test's upkeep never waits"),
             Err(CliError::Managed(ManagedStoreError::ControlPending))
         ));
         assert_eq!(calls, 8);

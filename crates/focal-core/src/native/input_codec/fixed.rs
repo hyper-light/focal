@@ -326,6 +326,9 @@ fn command(cursor: &mut Cursor<'_>, tag: u8) -> Result<NativeCommand, Error> {
             receipt: optional_receipt(cursor)?,
             id: MonitorId(cursor.fixed()?),
         }),
+        28 => Ok(NativeCommand::AdvanceEpochFloor {
+            minimum: RequestEpoch(cursor.u64()?),
+        }),
         _ => Err(Error::InvalidTag("fixed command")),
     }
 }

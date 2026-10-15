@@ -29,23 +29,23 @@ fn acceptance_intent_rejects_same_binding_policy_substitution_and_omission() {
         |p| p.claim.object = ObjectId::from_u128(90),
         |p| p.claim.content = ContentHash([90; 32]),
         |p| p.issuer = ParticipantId::from_u128(90),
-        |p| p.declarations[0].definition = DefinitionStamp::fixture(),
-        |p| p.declarations[0].binding.revision = ObjectRevision(90),
-        |p| p.declarations[0].index = 90,
-        |p| p.declarations[0].mode = ValidationMode::Observe,
-        |p| p.declarations[0].target = ObligationTarget::Increment,
-        |p| p.declarations.reverse(),
+        |p| p.body.declarations[0].definition = DefinitionStamp::fixture(),
+        |p| p.body.declarations[0].binding.revision = ObjectRevision(90),
+        |p| p.body.declarations[0].index = 90,
+        |p| p.body.declarations[0].mode = ValidationMode::Observe,
+        |p| p.body.declarations[0].target = ObligationTarget::Increment,
+        |p| p.body.declarations.reverse(),
         |p| {
-            p.declarations.pop();
+            p.body.declarations.pop();
         },
-        |p| p.slots[0].slot = 90,
-        |p| p.slots[0].missing_declaration_index = 90,
-        |p| p.slots[0].mode = ValidationMode::Observe,
-        |p| p.slots[0].checks[0].declaration_index = 90,
-        |p| p.slots[0].checks[0].validation = ValidationId::from_u128(90),
-        |p| p.slots[0].checks[0].mode = ValidationMode::Observe,
-        |p| p.slots[0].checks.clear(),
-        |p| p.slots.clear(),
+        |p| p.body.slots[0].slot = 90,
+        |p| p.body.slots[0].missing_declaration_index = 90,
+        |p| p.body.slots[0].mode = ValidationMode::Observe,
+        |p| p.body.slots[0].checks[0].declaration_index = 90,
+        |p| p.body.slots[0].checks[0].validation = ValidationId::from_u128(90),
+        |p| p.body.slots[0].checks[0].mode = ValidationMode::Observe,
+        |p| p.body.slots[0].checks.clear(),
+        |p| p.body.slots.clear(),
     ];
     for (index, mutation) in mutations.iter().enumerate() {
         let mut changed = original.try_copy(original.copy_charge().unwrap()).unwrap();

@@ -223,6 +223,10 @@ impl<'a> authored::ValidationSource<'a> for ValidationView<'a> {
     fn contributors(&self) -> Self::Contributors<'_> {
         Values::new(self.contributors, &self.policies.meter, contributor)
     }
+    /// The frame's bytes are borrowed, and a view reads them by one decoder.
+    fn replays(&self) -> bool {
+        true
+    }
 }
 impl<'a> DeclarationView<'a> {
     pub(super) fn read(cursor: &mut Cursor<'a>) -> Result<Self, CodecError> {
@@ -297,15 +301,16 @@ impl<'a> ValidationView<'a> {
         self.policies.meter.remaining()
     }
     pub(super) fn build_visits(&self) -> Result<usize, CodecError> {
-        // The authored model rechecks the source, prepares/copies its underlying
-        // declaration, and copies contributors before validating owned output.
+        // The authored model prepares/copies the view's underlying declaration
+        // and copies its contributors before validating owned output; it does
+        // not recheck a view, which replays what its plan read (`replays`).
         self.policies
             .visits()?
-            .checked_mul(3)
+            .checked_mul(2)
             .and_then(|n| {
                 self.contributors
                     .count
-                    .checked_mul(34)
+                    .checked_mul(17)
                     .and_then(|c| n.checked_add(c))
             })
             .ok_or(CodecError::Capacity)

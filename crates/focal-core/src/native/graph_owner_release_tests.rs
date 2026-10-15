@@ -23,7 +23,7 @@ fn context(view: &View<'_>, max: usize) -> (ClaimCut, Scratch) {
             position: SessionSeq(view.prefix().0 + 1),
             cause: ContentHash([37; 32]),
         },
-        Scratch { used: 0, max },
+        Scratch::bound(max),
     )
 }
 
@@ -51,10 +51,7 @@ fn transition(
 #[test]
 fn real_owner_release_capability_preserves_terminal_truth_and_keeps_normal_guard_strict() {
     let core = terminal_core();
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let source = view.claim(ClaimId::from_u128(1)).unwrap();
     let (cut, mut scratch) = context(&view, core.limits.preparation_bytes);
     let plan = owner_release(&view, source, cut, core.limits, &mut scratch).unwrap();
@@ -113,10 +110,7 @@ fn pending_terminal_source_is_pinned_without_publishing_cancellation_or_release(
         },
         &[],
     ));
-    let view = View {
-        state: &core.state,
-        tail: Some(&pending),
-    };
+    let view = View::committed(&core.state).with_own(&pending).unwrap();
     let source = view.claim(ClaimId::from_u128(1)).unwrap();
     let (cut, mut scratch) = context(&view, core.limits.preparation_bytes);
     let plan = owner_release(&view, source, cut, core.limits, &mut scratch).unwrap();
@@ -140,7 +134,9 @@ fn pending_terminal_source_is_pinned_without_publishing_cancellation_or_release(
         SessionSeq(pending.outcome.sequence.0 + 1)
     );
     assert!(
-        !pending
+        !core
+            .native_chain(&[&pending])
+            .unwrap()
             .claim(ClaimId::from_u128(1))
             .unwrap()
             .scopes()
@@ -156,10 +152,7 @@ fn pending_terminal_source_is_pinned_without_publishing_cancellation_or_release(
 #[test]
 fn real_transition_with_different_cut_and_changed_copied_source_are_refused() {
     let core = terminal_core();
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let source = view.claim(ClaimId::from_u128(1)).unwrap();
     for changed_source in [false, true] {
         let (cut, mut scratch) = context(&view, core.limits.preparation_bytes);
@@ -188,19 +181,13 @@ fn real_transition_with_different_cut_and_changed_copied_source_are_refused() {
 fn live_owner_and_insufficient_source_workspace_refuse_without_source_changes() {
     let mut core = f::core();
     f::publish(&mut core, 1, f::creation(1, 1, &[], None));
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let source = view.claim(ClaimId::from_u128(1)).unwrap();
     let (cut, mut scratch) = context(&view, core.limits.preparation_bytes);
     assert!(owner_release(&view, source, cut, core.limits, &mut scratch).is_err());
     assert_eq!(scratch.used, 0);
     let core = terminal_core();
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let source = view.claim(ClaimId::from_u128(1)).unwrap();
     let (cut, mut scratch) = context(&view, 0);
     let before = core.native_budget();

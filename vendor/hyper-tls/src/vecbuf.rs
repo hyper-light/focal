@@ -1,0 +1,269 @@
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+use core::{cmp, mem};
+use std::io;
+use std::io::Read;
+
+use crate::msgs::message::OutboundChunks;
+
+/// This is a byte buffer that is built from a deque of byte vectors.
+///
+/// This avoids extra copies when appending a new byte vector,
+/// at the expense of more complexity when reading out.
+pub(crate) struct ChunkVecBuffer {
+    /// How many bytes have been consumed in the first chunk.
+    ///
+    /// Invariant: zero if `chunks.is_empty()`
+    /// Invariant: 0 <= `prefix_used` < `chunks[0].len()`
+    prefix_used: usize,
+
+    chunks: VecDeque<Vec<u8>>,
+
+    /// The total upper limit (in bytes) of this object.
+    limit: Option<usize>,
+}
+
+impl ChunkVecBuffer {
+    pub(crate) fn new(limit: Option<usize>) -> Self {
+        Self {
+            prefix_used: 0,
+            chunks: VecDeque::new(),
+            limit,
+        }
+    }
+
+    /// Sets the upper limit on how many bytes this
+    /// object can store.
+    ///
+    /// Setting a lower limit than the currently stored
+    /// data is not an error.
+    ///
+    /// A [`None`] limit is interpreted as no limit.
+    pub(crate) fn set_limit(&mut self, new_limit: Option<usize>) {
+        self.limit = new_limit;
+    }
+
+    /// If we're empty
+    pub(crate) fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    /// How many bytes we're storing
+    pub(crate) fn len(&self) -> usize {
+        // Lengths of buffers in memory: their sum stays below isize::MAX, and `prefix_used`
+        // lies within the first of them.
+        self.chunks
+            .iter()
+            .fold(0usize, |acc, chunk| acc.saturating_add(chunk.len()))
+            .saturating_sub(self.prefix_used)
+    }
+
+    /// For a proposed append of `len` bytes, how many
+    /// bytes should we actually append to adhere to the
+    /// currently set `limit`?
+    pub(crate) fn apply_limit(&self, len: usize) -> usize {
+        if let Some(limit) = self.limit {
+            let space = limit.saturating_sub(self.len());
+            cmp::min(len, space)
+        } else {
+            len
+        }
+    }
+
+    /// Take and append the given `bytes`.
+    pub(crate) fn append(&mut self, bytes: Vec<u8>) -> usize {
+        let len = bytes.len();
+
+        // `prefix_used` is zero whenever `chunks` is empty (`consume` keeps it so).
+        if !bytes.is_empty() {
+            self.chunks.push_back(bytes);
+        }
+
+        len
+    }
+
+    /// Take one of the chunks from this object.
+    ///
+    /// This function returns `None` if the object `is_empty`.
+    pub(crate) fn pop(&mut self) -> Option<Vec<u8>> {
+        let mut first = self.chunks.pop_front();
+
+        if let Some(first) = &mut first {
+            // slice off `prefix_used` if needed (uncommon)
+            let prefix = mem::take(&mut self.prefix_used);
+            first.drain(0..prefix);
+        }
+
+        first
+    }
+
+    /// Inspect the first chunk from this object.
+    pub(crate) fn peek(&self) -> Option<&[u8]> {
+        self.chunks.front().map(|ch| ch.as_slice())
+    }
+}
+
+impl ChunkVecBuffer {
+    pub(crate) fn is_full(&self) -> bool {
+        self.limit
+            .map(|limit| self.len() > limit)
+            .unwrap_or_default()
+    }
+
+    /// Append a copy of `bytes`, perhaps a prefix if
+    /// we're near the limit.
+    pub(crate) fn append_limited_copy(&mut self, payload: OutboundChunks<'_>) -> usize {
+        let take = self.apply_limit(payload.len());
+        self.append(payload.split_at(take).0.to_vec());
+        take
+    }
+
+    /// Read data out of this object, writing it into `buf`
+    /// and returning how many bytes were written there.
+    pub(crate) fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut offs = 0;
+
+        while offs < buf.len() {
+            let (Some(mut chunk), Some(room)) = (self.chunk(), buf.get_mut(offs..)) else {
+                break;
+            };
+            let used = chunk.read(room)?;
+
+            self.consume(used);
+            // At most `buf.len()`: each read fills part of the room left.
+            offs = offs.saturating_add(used);
+        }
+
+        Ok(offs)
+    }
+
+    pub(crate) fn consume_first_chunk(&mut self, used: usize) {
+        // this backs (infallible) `BufRead::consume`, where `used` is
+        // user-supplied. Like std's `BufReader`, consuming more than `fill_buf` returned
+        // consumes what it returned (upstream asserted).
+        let available = self.chunk().map(|ch| ch.len()).unwrap_or_default();
+        self.consume(used.min(available));
+    }
+
+    fn consume(&mut self, used: usize) {
+        // first, mark the rightmost extent of the used buffer; callers consume what they read,
+        // which lies within the buffers, so this does not saturate.
+        self.prefix_used = self.prefix_used.saturating_add(used);
+
+        // then reduce `prefix_used` by discarding wholly-covered
+        // buffers
+        while let Some(buf) = self.chunks.front() {
+            match self.prefix_used.checked_sub(buf.len()) {
+                None => return,
+                Some(rest) => {
+                    self.prefix_used = rest;
+                    self.chunks.pop_front();
+                }
+            }
+        }
+
+        // Consuming more than is held (upstream asserted in debug builds) leaves an empty
+        // buffer, whose invariant is a zero prefix.
+        self.prefix_used = 0;
+    }
+
+    /// Read data out of this object, passing it `wr`
+    pub(crate) fn write_to(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
+        if self.is_empty() {
+            return Ok(0);
+        }
+
+        let mut prefix = self.prefix_used;
+        let mut bufs = [io::IoSlice::new(&[]); 64];
+        for (iov, chunk) in bufs.iter_mut().zip(self.chunks.iter()) {
+            // `prefix_used` lies within the first chunk.
+            *iov = io::IoSlice::new(chunk.get(prefix..).unwrap_or_default());
+            prefix = 0;
+        }
+        let len = cmp::min(bufs.len(), self.chunks.len());
+        let bufs = bufs.split_at(len).0;
+        let used = wr.write_vectored(bufs)?;
+        let available_bytes = bufs.iter().map(|ch| ch.len()).sum();
+
+        if used > available_bytes {
+            // This is really unrecoverable, since the amount of data written
+            // is now unknown.  Consume all the potentially-written data in
+            // case the caller ignores the error.
+            // See <https://github.com/rustls/rustls/issues/2316> for background.
+            self.consume(available_bytes);
+            return Err(io::Error::other(std::format!(
+                "illegal write_vectored return value ({used} > {available_bytes})"
+            )));
+        }
+        self.consume(used);
+        Ok(used)
+    }
+
+    /// Returns the first contiguous chunk of data, or None if empty.
+    pub(crate) fn chunk(&self) -> Option<&[u8]> {
+        // `prefix_used` lies within the first chunk.
+        self.chunks
+            .front()
+            .map(|chunk| chunk.get(self.prefix_used..).unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::ChunkVecBuffer;
+
+    #[test]
+    fn short_append_copy_with_limit() {
+        let mut cvb = ChunkVecBuffer::new(Some(12));
+        assert_eq!(cvb.append_limited_copy(b"hello"[..].into()), 5);
+        assert_eq!(cvb.append_limited_copy(b"world"[..].into()), 5);
+        assert_eq!(cvb.append_limited_copy(b"hello"[..].into()), 2);
+        assert_eq!(cvb.append_limited_copy(b"world"[..].into()), 0);
+
+        let mut buf = [0u8; 12];
+        assert_eq!(cvb.read(&mut buf).unwrap(), 12);
+        assert_eq!(buf.to_vec(), b"helloworldhe".to_vec());
+    }
+
+    #[test]
+    fn read_byte_by_byte() {
+        let mut cvb = ChunkVecBuffer::new(None);
+        cvb.append(b"test fixture data".to_vec());
+        assert!(!cvb.is_empty());
+        for expect in b"test fixture data" {
+            let mut byte = [0];
+            assert_eq!(cvb.read(&mut byte).unwrap(), 1);
+            assert_eq!(byte[0], *expect);
+        }
+
+        assert_eq!(cvb.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn every_possible_chunk_interleaving() {
+        let input = (0..=0xffu8).cycle().take(4096).collect::<Vec<u8>>();
+
+        for input_chunk_len in 1..64usize {
+            for output_chunk_len in 1..65usize {
+                std::println!("check input={input_chunk_len} output={output_chunk_len}");
+                let mut cvb = ChunkVecBuffer::new(None);
+                for chunk in input.chunks(input_chunk_len) {
+                    cvb.append(chunk.to_vec());
+                }
+
+                assert_eq!(cvb.len(), input.len());
+                let mut buf = vec![0u8; output_chunk_len];
+
+                for expect in input.chunks(output_chunk_len) {
+                    assert_eq!(expect.len(), cvb.read(&mut buf).unwrap());
+                    assert_eq!(expect, &buf[..expect.len()]);
+                }
+
+                assert_eq!(cvb.read(&mut [0]).unwrap(), 0);
+            }
+        }
+    }
+}

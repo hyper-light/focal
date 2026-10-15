@@ -1,5 +1,8 @@
 use super::*;
-fn request(fixture: &mut Fixture, query: SelectionRequest) -> oneshot::Receiver<OwnedResponse> {
+fn request(
+    fixture: &mut Fixture,
+    query: SelectionRequest,
+) -> hyper_rt::sync::OneshotReceiver<OwnedResponse> {
     let owner = &mut fixture.owners[0];
     let request = RequestEnvelope {
         protocol: PROTOCOL_VERSION,
@@ -15,7 +18,7 @@ fn request(fixture: &mut Fixture, query: SelectionRequest) -> oneshot::Receiver<
         .reserve(BudgetKind::Query, BudgetLane::Ordinary, 4 * 1024 * 1024)
         .unwrap()
         .commit();
-    let (send, receive) = oneshot::channel();
+    let (send, receive) = hyper_rt::sync::oneshot().unwrap();
     owner.request(verified, send, charge, None, None);
     receive
 }
@@ -38,14 +41,11 @@ fn selection_quorum_prefix_residual_progress_and_changed_query_are_fenced() {
     for _ in 0..5 {
         fixture.owners[0].drain().unwrap();
     }
-    assert!(matches!(
-        response.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
+    assert!(matches!(response.try_recv(), Ok(None)));
     for _ in 0..10 {
         fixture.pump();
     }
-    let page = listed(response.try_recv().unwrap());
+    let page = listed(response.try_recv().unwrap().unwrap());
     assert!(page.objects.is_empty());
     assert_eq!(page.visited, 1);
     assert!(page.next.is_some());
@@ -68,13 +68,19 @@ fn selection_quorum_prefix_residual_progress_and_changed_query_are_fenced() {
         request(&mut fixture, changed)
             .try_recv()
             .unwrap()
+            .unwrap()
             .envelope()
             .result,
         Response::Error(AccessError::Unauthorized)
     ));
     let mut visited = 1;
     while query.query.cursor.is_some() {
-        let page = listed(request(&mut fixture, query.clone()).try_recv().unwrap());
+        let page = listed(
+            request(&mut fixture, query.clone())
+                .try_recv()
+                .unwrap()
+                .unwrap(),
+        );
         assert_eq!(page.token, original);
         assert!(page.objects.is_empty());
         visited += page.visited;

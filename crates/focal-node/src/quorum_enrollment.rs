@@ -7,6 +7,7 @@ use focal_enrollment::*;
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{ParticipantId, RequestId, TenantId};
 use focal_wire::{AuthenticatedPeer, PeerGrant, PeerRole};
+use hyper_rt::sync::{ChannelReceiver, OneshotSender, SyncError};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -15,15 +16,15 @@ use std::{
     pin::Pin,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, oneshot};
 
-pub type ControlFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, ControlFailure>> + Send + 'a>>;
+/// A control call's future: awaited by the signer on its shard, never moved
+/// to another thread.
+pub type ControlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ControlFailure>> + 'a>>;
 /// The router binds this private signer's dedicated sequence principal, using
 /// either local Runtime authority or the immutable founder's narrow remote
 /// enrollment grant. State reads must use the owner's ReadIndex API.
 /// Endpoint discovery never changes this pinned identity or grants membership.
-pub trait EnrollmentControl: Send + Sync {
+pub trait EnrollmentControl {
     fn identity(&self) -> ControlIdentity;
     fn principal(&self) -> ParticipantId;
     fn read_state(&self, request: RequestId) -> ControlFuture<'_, ControlSnapshot>;
@@ -74,6 +75,9 @@ pub enum QuorumEnrollmentError {
     Control(#[from] ControlFailure),
     #[error("signer, root authority, or authenticated principal does not match")]
     Identity,
+    /// The upgrade fence is below the level a behaviour needs (24 §21).
+    #[error("the upgrade fence ({level}) is below the level needed ({needed})")]
+    Fenced { level: u32, needed: u32 },
     #[error("invitation request identity conflicts with its saved intent")]
     IntentConflict,
     #[error("enrollment owner has stopped or its disk state is ambiguous")]
@@ -141,14 +145,22 @@ struct Answer<T> {
     _charge: Allocation,
 }
 enum Action {
-    Invite(RequestId, InviteIntent, oneshot::Sender<Answer<Invitation>>),
-    Redeem(JoinRequest, oneshot::Sender<Answer<EnrollmentReceipt>>),
-    Renew(RenewRequest, oneshot::Sender<Answer<EnrollmentReceipt>>),
-    Revoke(InvitationId, oneshot::Sender<Answer<()>>),
-    Authorize(Vec<u8>, oneshot::Sender<Answer<PeerGrant>>),
-    AdmitTenant([u8; 16], oneshot::Sender<Answer<()>>),
-    ActivateFence(u32, oneshot::Sender<Answer<focal_enrollment::UpgradeFence>>),
-    Stop(oneshot::Sender<()>),
+    Invite(RequestId, InviteIntent, OneshotSender<Answer<Invitation>>),
+    Redeem(JoinRequest, OneshotSender<Answer<EnrollmentReceipt>>),
+    Renew(RenewRequest, OneshotSender<Answer<EnrollmentReceipt>>),
+    Revoke(InvitationId, OneshotSender<Answer<()>>),
+    Authorize(Vec<u8>, OneshotSender<Answer<PeerGrant>>),
+    AdmitTenant([u8; 16], OneshotSender<Answer<()>>),
+    ActivateFence(u32, OneshotSender<Answer<focal_enrollment::UpgradeFence>>),
+    MaintainBootstrapServer(i64, OneshotSender<Answer<Option<CredentialMaterial>>>),
+    /// One step of the issuer succession (24 §11), staged now when the
+    /// operator asked (`true`).
+    MaintainIssuer(
+        i64,
+        bool,
+        OneshotSender<Answer<focal_enrollment::IssuerSuccession>>,
+    ),
+    Stop(OneshotSender<()>),
 }
 struct Work {
     action: Action,
@@ -156,7 +168,7 @@ struct Work {
 }
 #[derive(Clone)]
 pub struct QuorumEnrollmentHost {
-    sender: mpsc::Sender<Work>,
+    sender: hyper_rt::sync::Sender<Work>,
     budget: MemoryBudget,
     reply_allowance: usize,
 }
@@ -166,7 +178,7 @@ pub struct QuorumEnrollmentDriver {
     config: QuorumEnrollmentConfig,
     disk: PrivateJournal,
     journal: Journal,
-    receiver: mpsc::Receiver<Work>,
+    receiver: ChannelReceiver<Work>,
     budget: MemoryBudget,
     _state_charge: Allocation,
     failed: bool,
@@ -249,7 +261,8 @@ impl QuorumEnrollmentHost {
             .checked_mul(128)
             .ok_or(EnrollmentError::Capacity)?
             .max(64 * 1024);
-        let (sender, receiver) = mpsc::channel(config.queue_items);
+        let (sender, receiver) = hyper_rt::sync::channel(config.queue_items)
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         Ok((
             Self {
                 sender,
@@ -280,8 +293,8 @@ impl QuorumEnrollmentHost {
                 _charge: reserve(&self.budget, BudgetKind::Pending, charge)?,
             })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => EnrollmentError::Capacity.into(),
-                mpsc::error::TrySendError::Closed(_) => QuorumEnrollmentError::Stopped,
+                SyncError::Full(_) => EnrollmentError::Capacity.into(),
+                _ => QuorumEnrollmentError::Stopped,
             })
     }
     pub async fn invite(
@@ -292,7 +305,8 @@ impl QuorumEnrollmentHost {
         if request.is_zero() || intent.endpoint.len() > 512 {
             return Err(EnrollmentError::Invalid.into());
         }
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Invite(request, intent, send), 4096)?;
         receive
             .await
@@ -304,7 +318,8 @@ impl QuorumEnrollmentHost {
         request: JoinRequest,
     ) -> Result<EnrollmentReceipt, QuorumEnrollmentError> {
         let bytes = request.encode()?.len();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Redeem(request, send), bytes)?;
         receive
             .await
@@ -318,7 +333,8 @@ impl QuorumEnrollmentHost {
         request: RenewRequest,
     ) -> Result<EnrollmentReceipt, QuorumEnrollmentError> {
         let bytes = request.encode()?.len();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Renew(request, send), bytes)?;
         receive
             .await
@@ -326,7 +342,8 @@ impl QuorumEnrollmentHost {
             .result
     }
     pub async fn revoke(&self, invitation: InvitationId) -> Result<(), QuorumEnrollmentError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Revoke(invitation, send), 16)?;
         receive
             .await
@@ -340,7 +357,8 @@ impl QuorumEnrollmentHost {
         if tenant == [0; 16] {
             return Err(EnrollmentError::Invalid.into());
         }
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::AdmitTenant(tenant, send), 16)?;
         receive
             .await
@@ -357,8 +375,58 @@ impl QuorumEnrollmentHost {
         if level == 0 {
             return Err(EnrollmentError::Invalid.into());
         }
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::ActivateFence(level, send), 16)?;
+        receive
+            .await
+            .map_err(|_| QuorumEnrollmentError::Stopped)?
+            .result
+    }
+    /// One step of the bootstrap server certificate's succession (24 §11):
+    /// record the certificate held, stage a successor in the last third of
+    /// its lifetime, present the successor once every invitation open at
+    /// its staging has closed. Answers the identity to present when it
+    /// changed.
+    pub async fn maintain_bootstrap_server(
+        &self,
+        now: i64,
+    ) -> Result<Option<CredentialMaterial>, QuorumEnrollmentError> {
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        self.enqueue(Action::MaintainBootstrapServer(now, send), 4096)?;
+        receive
+            .await
+            .map_err(|_| QuorumEnrollmentError::Stopped)?
+            .result
+    }
+    /// One step of the issuer succession (24 §11): a successor staged in
+    /// the last third of the issuer's lifetime, activated once committed,
+    /// the predecessor retired once nothing live was issued under it. The
+    /// issuers as committed after the step.
+    pub async fn maintain_issuer(
+        &self,
+        now: i64,
+    ) -> Result<focal_enrollment::IssuerSuccession, QuorumEnrollmentError> {
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        self.enqueue(Action::MaintainIssuer(now, false, send), 8192)?;
+        receive
+            .await
+            .map_err(|_| QuorumEnrollmentError::Stopped)?
+            .result
+    }
+    /// Stage the issuer's successor now, as the operator asked (24 §11): a
+    /// successor already staged or committed is answered as it is; refused
+    /// `Fenced` while the upgrade fence is below the level that verifies an
+    /// endorsed chain.
+    pub async fn rotate_issuer(
+        &self,
+        now: i64,
+    ) -> Result<focal_enrollment::IssuerSuccession, QuorumEnrollmentError> {
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
+        self.enqueue(Action::MaintainIssuer(now, true, send), 8192)?;
         receive
             .await
             .map_err(|_| QuorumEnrollmentError::Stopped)?
@@ -372,7 +440,8 @@ impl QuorumEnrollmentHost {
             return Err(EnrollmentError::Capacity.into());
         }
         let bytes = certificate.len();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Authorize(certificate, send), bytes)?;
         receive
             .await
@@ -380,7 +449,8 @@ impl QuorumEnrollmentHost {
             .result
     }
     pub async fn stop(&self) -> Result<(), QuorumEnrollmentError> {
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot()
+            .map_err(|_| QuorumEnrollmentError::from(EnrollmentError::Capacity))?;
         self.enqueue(Action::Stop(send), 0)?;
         receive.await.map_err(|_| QuorumEnrollmentError::Stopped)
     }
@@ -414,11 +484,11 @@ impl QuorumEnrollmentDriver {
         mut self,
         control: &impl EnrollmentControl,
     ) -> Result<(), QuorumEnrollmentError> {
-        if tokio::runtime::Handle::try_current().is_err() {
+        if hyper_rt::futures::shard_id().is_none() {
             return Err(QuorumEnrollmentError::Stopped);
         }
         self.check_router(control)?;
-        while let Some(work) = self.receiver.recv().await {
+        while let Ok(work) = self.receiver.recv().await {
             match work.action {
                 Action::Invite(id, intent, send) => {
                     let result = self.invite(control, id, intent).await;
@@ -469,6 +539,20 @@ impl QuorumEnrollmentDriver {
                         _charge: work._charge,
                     });
                 }
+                Action::MaintainBootstrapServer(now, send) => {
+                    let result = self.maintain_bootstrap_server(control, now).await;
+                    let _ = send.send(Answer {
+                        result,
+                        _charge: work._charge,
+                    });
+                }
+                Action::MaintainIssuer(now, requested, send) => {
+                    let result = self.maintain_issuer(control, now, requested).await;
+                    let _ = send.send(Answer {
+                        result,
+                        _charge: work._charge,
+                    });
+                }
                 Action::Stop(send) => {
                     let _ = send.send(());
                     return Ok(());
@@ -491,16 +575,9 @@ impl QuorumEnrollmentDriver {
         control: &impl EnrollmentControl,
     ) -> Result<(EnrollmentRegistry, Allocation), QuorumEnrollmentError> {
         self.check_router(control)?;
-        let bytes = self
-            .config
-            .limits
-            .max_checkpoint_bytes
-            .checked_mul(4)
-            .ok_or(EnrollmentError::Capacity)?;
-        let charge = reserve(&self.budget, BudgetKind::Control, bytes)?;
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|_| EnrollmentError::Crypto)?;
-        let state = tokio::time::timeout(
+        let state = focal_rt::time::timeout(
             self.config.request_timeout,
             control.read_state(RequestId(id)),
         )
@@ -509,9 +586,21 @@ impl QuorumEnrollmentDriver {
         if state.identity != self.config.root {
             return Err(QuorumEnrollmentError::Identity);
         }
+        // The directory the read carried goes here; the registry's bytes
+        // stay until they are restored.
         let ControlBootstrap::Root { enrollment, .. } = state.state else {
             return Err(QuorumEnrollmentError::Identity);
         };
+        // What restoring the registry holds, known from its bytes before it
+        // is decoded, the bytes themselves while they are, and the one
+        // command a step prepares from the registry and its encoding.
+        let bytes = EnrollmentRegistry::restore_bound(enrollment.len())?
+            .checked_add(enrollment.len())
+            .and_then(|bytes| {
+                bytes.checked_add(focal_enrollment::MAX_MESSAGE_BYTES.checked_mul(2)?)
+            })
+            .ok_or(EnrollmentError::Capacity)?;
+        let charge = reserve(&self.budget, BudgetKind::Control, bytes)?;
         let registry = EnrollmentRegistry::restore(
             &enrollment,
             self.config.root.cluster.0,
@@ -538,7 +627,7 @@ impl QuorumEnrollmentDriver {
             return Ok(());
         };
         let result =
-            tokio::time::timeout(self.config.request_timeout, control.submit(request.clone()))
+            focal_rt::time::timeout(self.config.request_timeout, control.submit(request.clone()))
                 .await
                 .map_err(|_| ControlFailure::OutcomeUnknown)?;
         match result {
@@ -727,13 +816,15 @@ impl QuorumEnrollmentDriver {
         self.reconcile(control).await?;
         let (registry, charge) = self.registry(control).await?;
         let grace = crate::credential_renewal::grace_seconds(registry.limits().credential_lifetime);
-        let command = match registry.prepare_renew(&self.authority, request, now()?, grace)? {
+        let prepared = registry.prepare_renew(&self.authority, request, now()?, grace);
+        let command = match prepared? {
             RenewPreparation::Existing(receipt) => return Ok(receipt),
             RenewPreparation::Commit(command) => command,
         };
         drop(registry);
         drop(charge);
-        self.commit(control, command).await?;
+        let committed = self.commit(control, command).await;
+        committed?;
         let (registry, _charge) = self.registry(control).await?;
         Ok(registry.release_renewal(request, now()?)?)
     }
@@ -796,6 +887,123 @@ impl QuorumEnrollmentDriver {
             return Err(EnrollmentError::NotCommitted.into());
         }
         Ok(registry.fence())
+    }
+    /// The bootstrap server certificate's succession (24 §11), one step: an
+    /// activation the registry committed before this authority presented it
+    /// (a crash between the two) is presented now; a successor is staged in
+    /// the last third of the current certificate's lifetime; the registry
+    /// is told what the authority holds (the record, the staging, or the
+    /// activation once every invitation open at the staging has closed);
+    /// an activation just committed is presented.
+    async fn maintain_bootstrap_server(
+        &mut self,
+        control: &impl EnrollmentControl,
+        now: i64,
+    ) -> Result<Option<CredentialMaterial>, QuorumEnrollmentError> {
+        self.reconcile(control).await?;
+        let (registry, charge) = self.registry(control).await?;
+        let activated = |authority: &BootstrapAuthority, registry: &EnrollmentRegistry| {
+            authority.successor().is_some_and(|(certificate, _)| {
+                registry.bootstrap().current.fingerprint == server_fingerprint(certificate)
+            })
+        };
+        if activated(&self.authority, &registry) {
+            drop(registry);
+            drop(charge);
+            return Ok(Some(self.authority.activate_successor()?));
+        }
+        if self.authority.successor().is_none() && !registry.bootstrap().current.is_unknown() {
+            let (issued_at, expires_at) = self.authority.server_validity()?;
+            let window = crate::credential_renewal::window_of(issued_at, expires_at);
+            // Staged in the last third of its lifetime, or as soon as the
+            // issuer succeeded itself: the certificate presented is then
+            // under the issuer that retires, and must move under the one
+            // that issues before the retirement (24 §11).
+            let under_issuer = focal_wire::issued_by(
+                self.authority.server_certificate(),
+                self.authority.issuer_certificate(),
+            )
+            .unwrap_or(false);
+            if now >= expires_at.saturating_sub(window) || !under_issuer {
+                self.authority
+                    .stage_successor(now, registry.limits().credential_lifetime)?;
+            }
+        }
+        let Some(command) = registry.prepare_bootstrap_server(&self.authority, now)? else {
+            return Ok(None);
+        };
+        drop(registry);
+        drop(charge);
+        self.commit(control, command).await?;
+        let (registry, _charge) = self.registry(control).await?;
+        if activated(&self.authority, &registry) {
+            return Ok(Some(self.authority.activate_successor()?));
+        }
+        Ok(None)
+    }
+    /// The issuer's succession (24 §11), one step: an activation the
+    /// registry committed before this authority adopted it (a crash between
+    /// the two) is adopted now; a successor is staged in the last third of
+    /// the issuer's lifetime, or when the operator asks, once the upgrade
+    /// fence says every node verifies an endorsed chain; the registry is
+    /// told what the authority holds (the staging, the activation, or the
+    /// retirement once nothing live was issued under the predecessor); an
+    /// activation just committed is adopted. The issuers as committed after
+    /// the step.
+    async fn maintain_issuer(
+        &mut self,
+        control: &impl EnrollmentControl,
+        now: i64,
+        requested: bool,
+    ) -> Result<focal_enrollment::IssuerSuccession, QuorumEnrollmentError> {
+        self.reconcile(control).await?;
+        let (registry, charge) = self.registry(control).await?;
+        let activated = |authority: &BootstrapAuthority,
+                         registry: &EnrollmentRegistry|
+         -> Result<bool, EnrollmentError> {
+            Ok(authority
+                .issuer_successor()?
+                .is_some_and(|held| registry.issuers().current == held))
+        };
+        if activated(&self.authority, &registry)? {
+            drop(registry);
+            drop(charge);
+            self.authority.activate_issuer()?;
+            let (registry, _charge) = self.registry(control).await?;
+            return Ok(registry.issuers().clone());
+        }
+        let issuers = registry.issuers();
+        if self.authority.issuer_successor()?.is_none()
+            && issuers.successor.is_none()
+            && issuers.retiring.is_none()
+        {
+            let opened =
+                crate::upgrade::opened(registry.fence(), crate::upgrade::ISSUER_SUCCESSION_LEVEL);
+            let (issued_at, expires_at) = self.authority.issuer_validity()?;
+            let window = crate::credential_renewal::window_of(issued_at, expires_at);
+            let due = now >= expires_at.saturating_sub(window);
+            if requested && !opened {
+                return Err(QuorumEnrollmentError::Fenced {
+                    level: registry.fence().level,
+                    needed: crate::upgrade::ISSUER_SUCCESSION_LEVEL,
+                });
+            }
+            if opened && (requested || due) {
+                self.authority
+                    .stage_issuer(now, registry.limits().issuer_lifetime)?;
+            }
+        }
+        let Some(command) = registry.prepare_issuer(&self.authority, now)? else {
+            return Ok(registry.issuers().clone());
+        };
+        drop(registry);
+        drop(charge);
+        self.commit(control, command).await?;
+        let (registry, _charge) = self.registry(control).await?;
+        if activated(&self.authority, &registry)? {
+            self.authority.activate_issuer()?;
+        }
+        Ok(registry.issuers().clone())
     }
     /// The grant a certificate earns: the configured tenants and every tenant
     /// the committed registry admits, so admission never needs a restart and

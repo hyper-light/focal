@@ -82,10 +82,13 @@ impl<T: ClientTransport> Client<T> {
             _ => return Err(ClaimGetError::InvalidRequest),
         };
         let duration = self.retry_timeout().min(Duration::from_secs(30));
+        let deadline = crate::time::Instant::now()
+            .checked_add(duration)
+            .ok_or(ClientError::Transport)?;
         let future = async {
-            tokio::time::timeout(duration, self.claim_inner(request, exact))
-                .await
-                .map_err(|_| ClaimGetError::Incomplete)?
+            crate::time::within(duration, self.claim_inner(request, exact, deadline))
+                .await?
+                .ok_or(ClaimGetError::Incomplete)?
         };
         let mut future = pin!(future);
         poll_fn(
@@ -100,6 +103,7 @@ impl<T: ClientTransport> Client<T> {
         &self,
         mut request: RequestEnvelope,
         exact: bool,
+        deadline: crate::time::Instant,
     ) -> Result<ReadPage, ClaimGetError> {
         if exact {
             let page = self.read(request).await?;
@@ -116,6 +120,7 @@ impl<T: ClientTransport> Client<T> {
         let mut found = None;
         let seed = request.request_id;
         for page_number in 0u32..64 {
+            crate::time::ahead(deadline)?;
             let reply = self.request(request.clone()).await?;
             let Response::Listed(page) = reply.result else {
                 return Err(ClientError::InvalidResponse.into());

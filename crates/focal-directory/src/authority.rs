@@ -55,6 +55,27 @@ pub struct AuthorityCheckpoint {
     pub nodes: BTreeMap<u64, NodeTopologyGrant>,
     pub groups: BTreeMap<LogGroupId, GroupAuthorityGrant>,
 }
+impl AuthorityCheckpoint {
+    /// When a group's authorization ends: with the earliest of its members'
+    /// grants. A member's grant is extended as its credential is renewed
+    /// (24 §11), and the group follows it without a change of its own; the
+    /// expiry the grant was issued with bounds a member the checkpoint no
+    /// longer names.
+    pub fn group_expires_at(&self, group: &GroupAuthorityGrant) -> i64 {
+        group
+            .voters
+            .keys()
+            .chain(group.outgoing_voters.keys())
+            .chain(group.learners.keys())
+            .map(|node| {
+                self.nodes
+                    .get(node)
+                    .map_or(group.expires_at, |grant| grant.expires_at)
+            })
+            .min()
+            .unwrap_or(group.expires_at)
+    }
+}
 #[derive(Debug, Clone, Copy)]
 pub struct AuthorityConfig {
     pub max_nodes: usize,
@@ -107,6 +128,14 @@ pub enum AuthorityOperation {
     /// Old installed quorum must attest the exact committed configuration record.
     ChangeGroup {
         proof: AuthorityProof,
+    },
+    /// A partition group whose partition was merged away and absorbed is
+    /// released: its grant, and with it every seat, goes (24 §13). The
+    /// grant outlives the delegation until then, since the absorb needs the
+    /// group's majority. The controller intends it once the destination
+    /// caught up; a session's group is never released this way.
+    ReleaseGroup {
+        group: LogGroupId,
     },
 }
 struct AuthorityVersion {
@@ -204,6 +233,10 @@ impl AuthorityRegistry {
     pub fn group(&self, group: LogGroupId) -> Option<&GroupAuthorityGrant> {
         self.root.state.groups.get(&group)
     }
+    /// When `group`'s authorization ends (`AuthorityCheckpoint::group_expires_at`).
+    pub fn group_expires_at(&self, group: &GroupAuthorityGrant) -> i64 {
+        self.root.state.group_expires_at(group)
+    }
     pub(crate) fn config(&self) -> AuthorityConfig {
         self.config
     }
@@ -270,6 +303,11 @@ impl AuthorityRegistry {
                     _ => return Err(DirectoryError::WrongOperation),
                 }
             }
+            AuthorityOperation::ReleaseGroup { group } => match self.root.state.groups.get(group) {
+                Some(grant) if matches!(grant.scope, GroupScope::Partition { .. }) => 0,
+                Some(_) => return Err(DirectoryError::WrongOperation),
+                None => return Err(DirectoryError::Missing),
+            },
         };
         let allocation = self
             .budget
@@ -290,11 +328,29 @@ impl AuthorityRegistry {
                 if old.map(|entry| entry.enrollment.generation) != *expected_generation {
                     return Err(DirectoryError::CompareFailed);
                 }
-                if expected_generation.map_or(Some(1), |old| old.checked_add(1))
-                    != Some(grant.enrollment.generation)
-                    || old.is_some_and(|old| {
-                        grant.enrollment.authority_epoch < old.enrollment.authority_epoch
-                    })
+                // An extension keeps the grant as it stands — the same
+                // generation, enrollment and principal — and moves only its
+                // expiry later: the node's credential was renewed (24 §11),
+                // and its seats and proofs, keyed by the generation, stay.
+                // Every other change is a re-grant at the next generation.
+                let extension = old.is_some_and(|old| {
+                    grant.enrollment.generation == old.enrollment.generation
+                        && grant.enrollment.node == old.enrollment.node
+                        && grant.enrollment.region == old.enrollment.region
+                        && grant.enrollment.zone == old.enrollment.zone
+                        && grant.enrollment.endpoint == old.enrollment.endpoint
+                        && grant.enrollment.identity == old.enrollment.identity
+                        && grant.enrollment.authority_epoch == old.enrollment.authority_epoch
+                        && grant.enrollment.eligible == old.enrollment.eligible
+                        && grant.principal == old.principal
+                        && grant.expires_at > old.expires_at
+                });
+                if !extension
+                    && (expected_generation.map_or(Some(1), |old| old.checked_add(1))
+                        != Some(grant.enrollment.generation)
+                        || old.is_some_and(|old| {
+                            grant.enrollment.authority_epoch < old.enrollment.authority_epoch
+                        }))
                 {
                     return Err(DirectoryError::StaleNode);
                 }
@@ -323,6 +379,11 @@ impl AuthorityRegistry {
                 let mut grant = grant.clone();
                 grant.enrollment.attestation = node_digest(&next.anchor, &grant)?;
                 next.nodes.insert(grant.enrollment.node, grant);
+            }
+            AuthorityOperation::ReleaseGroup { group } => {
+                if next.groups.remove(group).is_none() {
+                    return Err(DirectoryError::Missing);
+                }
             }
             AuthorityOperation::BootstrapGroup { grant } => {
                 if next.groups.contains_key(&grant.group) {

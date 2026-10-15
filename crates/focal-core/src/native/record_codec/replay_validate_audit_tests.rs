@@ -122,7 +122,7 @@ fn check(
     let result = generated(
         TestamentId::from_u128(950),
         candidate
-            .result_testament(TestamentId::from_u128(950))
+            .written_result_testament(TestamentId::from_u128(950))
             .unwrap(),
         &read,
     );
@@ -171,7 +171,7 @@ fn every_actual_accepted_delivery_and_missing_publication_is_frozen_without_hist
         };
         let candidate = candidate(&core);
         let value = candidate
-            .result_testament(TestamentId::from_u128(950))
+            .written_result_testament(TestamentId::from_u128(950))
             .unwrap();
         for result in value.testament().results() {
             observed[match result.phase() {
@@ -238,7 +238,7 @@ fn actual_member_and_original_publication_cannot_be_replaced_with_other_valid_va
         .is_err()
     );
     let value = candidate
-        .result_testament(TestamentId::from_u128(950))
+        .written_result_testament(TestamentId::from_u128(950))
         .unwrap();
     for result in value.testament().results() {
         let key = NativeResultKey::of(*result);

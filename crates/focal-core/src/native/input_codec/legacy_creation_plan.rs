@@ -1,6 +1,6 @@
 use super::fields::{Frame, Projection, Projections};
 use super::*;
-use focal_model::lifecycle::{aggregation::AcceptanceSource, validation::DeclarationSource};
+use focal_model::lifecycle::validation::DeclarationSource;
 
 struct Summary {
     bytes: usize,
@@ -167,15 +167,11 @@ fn run(
             principal,
             limits: limits.declaration,
             work,
+            held: super::super::held::Held::none(),
         };
         let before = work.used()?;
-        let mut matched = 0;
-        for value in source.declarations() {
-            value?;
-            matched = sum(matched, 1)?;
-        }
+        source.hold()?;
         let declaration_pass = work.used()?.subtract(before)?;
-        source.count = matched;
         let acceptance = aggregation::AcceptancePolicy::prepare_source(
             projection.acceptance,
             projection.acceptance_issuer,

@@ -5,8 +5,11 @@
 //! about to complete. A round here ends on what it observes:
 //!
 //! - it has what it needs (the caller's test), or every peer has reported;
-//! - it **stalled**: its deadline's lookahead was reached and nothing new
-//!   arrived within the stall window;
+//! - nothing arrived by its deadline: a round that has gathered nothing is
+//!   given the whole of the deadline derived for its peers, since nothing
+//!   before it says that the answer it opened for will not come;
+//! - it **stalled**: something had arrived, the deadline's lookahead was
+//!   reached and nothing new arrived within the stall window;
 //! - it was **extended** as far as it may be: while replies keep arriving a
 //!   round past its lookahead is given more time, a bounded number of times.
 //!
@@ -27,8 +30,10 @@ fn nanos(duration: Duration) -> u64 {
 pub struct RoundBudget {
     /// When a round that made no progress ends.
     pub deadline_ns: u64,
-    /// The part of the deadline in force after which progress is judged, as
-    /// a ratio, so that no float enters a decision.
+    /// The part of the deadline in force after which progress is judged,
+    /// once there is progress to judge, as a ratio, so that no float enters
+    /// a decision. A round that has gathered nothing is judged at the
+    /// deadline itself.
     pub lookahead: (u64, u64),
     /// What one extension adds.
     pub extension_ns: u64,
@@ -50,11 +55,13 @@ impl RoundBudget {
     }
     /// From the owner's `period` and the `tail` of the slowest exchange
     /// measured with the round's peers, never past `ceiling` in all: a
-    /// round opens for one period or one tail, whichever is longer, is
-    /// judged at three quarters of that, is extended a period at a time
-    /// while replies arrive, and calls two periods (or one tail) without a
-    /// reply a stall. No measurement yet opens the round to its ceiling: a
-    /// peer nothing is known about is given the time it was always given.
+    /// round opens for one period or one tail, whichever is longer, and is
+    /// given all of it while nothing has arrived; once something has, it is
+    /// judged at three quarters of the deadline in force, extended a period
+    /// at a time while replies arrive, and two periods (or one tail) without
+    /// a reply are a stall. No measurement yet opens the round to its
+    /// ceiling: a peer nothing is known about is given the time it was
+    /// always given.
     pub fn derive(period: Duration, tail: Option<Duration>, ceiling: Duration) -> Self {
         let ceiling_ns = nanos(ceiling).max(1);
         let period_ns = nanos(period).clamp(1, ceiling_ns);
@@ -106,6 +113,10 @@ impl ProgressWitness {
             self.advanced_ns = Some(now_ns);
         }
     }
+    /// Whether anything has arrived at all.
+    pub fn has_advanced(&self) -> bool {
+        self.advanced_ns.is_some()
+    }
     /// A witness that never advanced is not progressing: being begun is not
     /// an advance.
     pub fn is_progressing(&self, now_ns: u64) -> bool {
@@ -116,7 +127,7 @@ impl ProgressWitness {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// The lookahead of the deadline in force is not reached.
+    /// The judgement of the deadline in force is not reached.
     Continue,
     /// Past the lookahead and progressing: the deadline moved to this.
     Extend { deadline_ns: u64 },
@@ -150,8 +161,21 @@ impl DeadlineExtender {
         let scaled = u128::from(self.deadline_ns).saturating_mul(u128::from(numerator));
         u64::try_from(scaled.div_ceil(u128::from(denominator.max(1)))).unwrap_or(u64::MAX)
     }
+    /// The elapsed time at which this round is judged: its lookahead once
+    /// something has arrived, its whole deadline while nothing has. The
+    /// deadline was derived from the tail of these peers' exchanges, so an
+    /// answer inside it is the answer the round opened for; ending the round
+    /// at three quarters of it lost every answer in the last quarter, and a
+    /// round asked again at a doubled deadline for it.
+    pub fn judgement_ns(&self, witness: &ProgressWitness) -> u64 {
+        if witness.has_advanced() {
+            self.lookahead_ns()
+        } else {
+            self.deadline_ns
+        }
+    }
     pub fn evaluate(&mut self, elapsed_ns: u64, witness: &ProgressWitness, now_ns: u64) -> Verdict {
-        if elapsed_ns < self.lookahead_ns() {
+        if elapsed_ns < self.judgement_ns(witness) {
             return Verdict::Continue;
         }
         if self.granted >= self.max_extensions || !witness.is_progressing(now_ns) {
@@ -194,7 +218,8 @@ impl RoundWait {
     /// The next instant at which a judgement can end the round: a round
     /// that waits for it, and for replies, never polls.
     pub fn next_judgement_ns(&self) -> u64 {
-        self.started_ns.saturating_add(self.extender.lookahead_ns())
+        self.started_ns
+            .saturating_add(self.extender.judgement_ns(&self.witness))
     }
 }
 
@@ -259,6 +284,28 @@ mod tests {
         assert!(witness.is_progressing(499 * MS));
     }
     #[test]
+    fn a_round_with_nothing_gathered_is_given_its_whole_deadline() {
+        // Opens for 100 ms. Nothing has arrived at three quarters of it: the
+        // deadline was derived for the tail of these peers, so the round
+        // waits it out, and expires there without an extension.
+        let mut wait = RoundWait::begin(&budget(), 0);
+        assert_eq!(wait.next_judgement_ns(), 100 * MS);
+        assert!(wait.judge(0, 75 * MS));
+        assert_eq!(wait.next_judgement_ns(), 100 * MS);
+        assert!(!wait.judge(0, 100 * MS));
+        // An answer in the last quarter is progress: from then on the round
+        // is judged at its lookahead, past already at 90 ms, so it is
+        // extended to 200 ms there and judged next at 150 ms.
+        let mut wait = RoundWait::begin(&budget(), 0);
+        assert!(wait.judge(0, 75 * MS));
+        assert!(wait.judge(1, 90 * MS));
+        assert_eq!(wait.next_judgement_ns(), 150 * MS);
+        assert!(wait.judge(2, 150 * MS));
+        assert_eq!(wait.next_judgement_ns(), 225 * MS);
+        // Nothing since 150 ms: at 400 ms that is a stall, and the end.
+        assert!(!wait.judge(2, 400 * MS));
+    }
+    #[test]
     fn a_witness_that_never_advanced_is_not_progressing() {
         let mut witness = ProgressWitness::new(200 * MS);
         assert!(!witness.is_progressing(0));
@@ -266,13 +313,13 @@ mod tests {
         assert!(!witness.is_progressing(1));
     }
     #[test]
-    fn before_the_lookahead_a_round_continues_whatever_it_gathered() {
+    fn before_its_judgement_a_round_continues_whatever_it_gathered() {
         let mut wait = RoundWait::begin(&budget(), 1_000 * MS);
-        assert_eq!(wait.next_judgement_ns(), 1_075 * MS);
+        // Nothing in hand: judged at the deadline, where it ends.
+        assert_eq!(wait.next_judgement_ns(), 1_100 * MS);
         assert!(wait.judge(0, 1_000 * MS));
-        assert!(wait.judge(0, 1_074 * MS));
-        // At the lookahead with nothing in hand it ends.
-        assert!(!wait.judge(0, 1_075 * MS));
+        assert!(wait.judge(0, 1_099 * MS));
+        assert!(!wait.judge(0, 1_100 * MS));
     }
     #[test]
     fn a_progressing_round_is_extended_and_a_stalled_one_ends() {

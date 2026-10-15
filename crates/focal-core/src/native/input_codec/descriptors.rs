@@ -388,7 +388,7 @@ pub(in crate::native) fn projection(
         )?;
         raw(sink, &obligation.target.0)?;
     }
-    types::binding(sink, definition.lineage.binding())?;
+    types::binding(sink, definition.binding)?;
     match definition.lineage.cause() {
         Cause::Root(id) => {
             write_u8(sink, 0)?;

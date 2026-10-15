@@ -120,7 +120,7 @@ impl<K, V> std::fmt::Debug for TraversalPage<K, V> {
     }
 }
 
-impl<K: Ord + Clone, V: Clone> SnapshotLease<K, V> {
+impl<K: crate::RangeKey + Clone, V: Clone> SnapshotLease<K, V> {
     /// Breadth-first traversal with keyset adjacency continuation. The adapter
     /// supplies the next strictly increasing neighbor after `after`, using the
     /// supplied immutable value (or another index pinned to this same prefix).

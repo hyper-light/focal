@@ -1,10 +1,15 @@
-//! One invitation redemption per TLS 1.3 connection. This endpoint deliberately
-//! requires server authentication before the client has a issued certificate.
-//! Its distinct ALPN exposes only the bounded enrollment handler.
+//! One enrollment message per connection — an invitation's redemption or a credential's renewal —
+//! carried on focal-wire's endpoint (hyper-transport on hyper-rt) as a message of the enrollment
+//! protocol, whose distinct ALPN exposes only the bounded enrollment handler. The server is
+//! authenticated before the client holds an issued certificate: TLS verifies its chain to the
+//! trust's issuers and its name, and the dial accepts only a leaf the trust pins, so no
+//! token-bearing request is made, let alone sent, for any other server.
 use crate::*;
-use quinn::{
-    Endpoint,
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
+use focal_memory::MemoryBudget;
+use focal_wire::net::{Inbound, Kind, Reply, Serve, ServeFuture, Served};
+use focal_wire::{
+    AdmissionLimits, ClientTls, EnrollmentProtocol, PeerRegistry, QuicConnector, QuicServer,
+    ServerTls, WireError, WireLimits,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,19 +17,27 @@ use std::{
     net::SocketAddr,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::{Pin, pin},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::Poll,
     time::Duration,
 };
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::Semaphore,
-    task::JoinSet,
-};
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 8] = b"FCLENR01";
-const HEADER: usize = 16;
+/// The enrollment protocol as a listener serves it: its name in the TLS handshake, and the most
+/// one of its messages carries — [`MAX_MESSAGE_BYTES`], what its encoder holds every message to.
+pub const ENROLLMENT_PROTOCOL: EnrollmentProtocol = EnrollmentProtocol {
+    alpn: ENROLLMENT_ALPN,
+    max_message_bytes: 16 * 1024,
+};
+/// A redemption's kind on the enrollment protocol: its message a [`JoinRequest`], its answer a
+/// [`JoinResponse`].
+pub const JOIN: u8 = 1;
+/// A renewal's kind on the enrollment protocol.
+pub const RENEW: u8 = 3;
+
 #[derive(Debug, Clone)]
 pub struct TransportLimits {
     pub max_connections: usize,
@@ -49,21 +62,36 @@ impl TransportLimits {
         }
         Ok(())
     }
-    // Quinn requires shared transport/TLS configuration for its internal tasks.
-    fn quic(&self) -> Result<Arc<quinn::TransportConfig>, EnrollmentError> {
+    /// An enrollment endpoint's limits: one message at a time on a connection, each at most the
+    /// protocol's bound, answered within `timeout`.
+    pub(crate) fn wire(&self) -> Result<WireLimits, EnrollmentError> {
         self.validate()?;
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_concurrent_bidi_streams(1u8.into());
-        transport.max_concurrent_uni_streams(0u8.into());
-        transport.stream_receive_window(((MAX_MESSAGE_BYTES + HEADER) as u32).into());
-        transport.receive_window(((MAX_MESSAGE_BYTES + HEADER) as u32).into());
-        transport.send_window((MAX_MESSAGE_BYTES + HEADER) as u64);
-        transport.max_idle_timeout(Some(
-            self.timeout
-                .try_into()
-                .map_err(|_| EnrollmentError::Invalid)?,
-        ));
-        Ok(Arc::new(transport))
+        let message = ENROLLMENT_PROTOCOL.max_message_bytes;
+        let limits = WireLimits {
+            max_frame_bytes: message,
+            max_items: 1,
+            max_cost: u64::from(message),
+            max_connections: self.max_connections,
+            streams_per_connection: 1,
+            control_streams: 1,
+            request_timeout: self.timeout,
+        };
+        limits.validate().map_err(|_| EnrollmentError::Capacity)?;
+        Ok(limits)
+    }
+    fn admission(&self) -> AdmissionLimits {
+        AdmissionLimits::for_connections(self.max_connections)
+    }
+    /// What an enrollment endpoint holds at most, funded: the transport's own on the ordinary
+    /// lane, and its messages — of the control class, as enrollment's are — on the completion
+    /// lane kept for them.
+    pub(crate) fn budget(&self) -> Result<MemoryBudget, EnrollmentError> {
+        let bytes = focal_wire::endpoint_bytes(&self.wire()?, &self.admission())
+            .map_err(|_| EnrollmentError::Capacity)?;
+        let limit = usize::try_from(bytes.transport.saturating_add(bytes.messages))
+            .map_err(|_| EnrollmentError::Capacity)?;
+        let reserve = usize::try_from(bytes.messages).map_err(|_| EnrollmentError::Capacity)?;
+        MemoryBudget::new(limit, reserve).map_err(|_| EnrollmentError::Capacity)
     }
 }
 
@@ -135,9 +163,6 @@ impl JoinHandler for Arc<dyn JoinHandler> {
         self.as_ref().renew(request)
     }
 }
-const FRAME_JOIN: u16 = 1;
-const FRAME_RESPONSE: u16 = 2;
-const FRAME_RENEW: u16 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JoinTransportError {
@@ -153,8 +178,128 @@ pub enum JoinTransportError {
     InvalidFrame,
 }
 
+/// A listener's service with the enrollment protocol beside `data`: a joiner's message goes to
+/// the [`JoinHandler`], every other request to `data`. The enrollment protocol carries no data
+/// peer's message, so one from a data peer is refused. At most `max_connections` enrollments are
+/// handled at once, a joiner having no identity whose share could bound it; one past them is
+/// refused, and its joiner told the sponsor is unavailable.
+pub struct EnrollmentService<S, H> {
+    data: S,
+    handler: H,
+    limits: TransportLimits,
+    /// The enrollments under way, shared with each one's answer, which gives its place back.
+    handling: Arc<AtomicUsize>,
+}
+impl<S: Serve, H: JoinHandler + Clone> EnrollmentService<S, H> {
+    /// `limits.timeout` is the most an enrollment's handling takes, past which its outcome is
+    /// unknown; `limits.max_connections` the enrollments handled at once.
+    pub fn new(data: S, handler: H, limits: TransportLimits) -> Result<Self, JoinTransportError> {
+        limits.validate()?;
+        Ok(Self {
+            data,
+            handler,
+            limits,
+            handling: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+}
+/// One enrollment under way, its place given back as it ends.
+struct Handling(Arc<AtomicUsize>);
+impl Drop for Handling {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(1))
+            });
+    }
+}
+impl<S: Serve, H: JoinHandler + Clone> Serve for EnrollmentService<S, H> {
+    fn capabilities(&self) -> [bool; 5] {
+        self.data.capabilities()
+    }
+    fn frame(&self, framed: focal_wire::net::Framed) -> bool {
+        self.data.frame(framed)
+    }
+    fn serve(&self, request: Served) -> ServeFuture {
+        match (request.kind, &request.from) {
+            (Kind::Enrollment(tag), Inbound::Joiner) => {
+                let body = Zeroizing::new(request.body);
+                let most = self.limits.max_connections;
+                if self
+                    .handling
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                        (held < most).then(|| held.saturating_add(1))
+                    })
+                    .is_err()
+                {
+                    return Box::pin(async { None });
+                }
+                let handling = Handling(self.handling.clone());
+                let handler = self.handler.clone();
+                let timeout = self.limits.timeout;
+                Box::pin(async move {
+                    let _handling = handling;
+                    answer(handler, tag, body, timeout)
+                        .await
+                        .map(Reply::uncharged)
+                })
+            }
+            (Kind::Enrollment(_), _) => Box::pin(async { None }),
+            _ => self.data.serve(request),
+        }
+    }
+}
+
+/// The data protocol of a listener that serves enrollment alone: nothing.
+struct NoData;
+impl Serve for NoData {
+    fn capabilities(&self) -> [bool; 5] {
+        [false; 5]
+    }
+    fn serve(&self, _request: Served) -> ServeFuture {
+        Box::pin(async { None })
+    }
+}
+
+/// The answer to one enrollment message: its request decoded, its handler's response encoded, all
+/// of it within `timeout` and behind an unwind boundary — a dependency's panic is an outcome
+/// unknown, never a partly processed enrollment resumed. `None` refuses the message: a malformed
+/// one, or one whose outcome the handler could not say in time.
+async fn answer<H: JoinHandler>(
+    handler: H,
+    tag: u8,
+    body: Zeroizing<Vec<u8>>,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let exchange = hyper_rt::futures::within(nanos(timeout), async {
+        let response = match tag {
+            JOIN => handler.handle(decode::<JoinRequest>(&body).ok()?).await,
+            RENEW => handler.renew(decode::<RenewRequest>(&body).ok()?).await,
+            _ => return None,
+        };
+        // A response past the bound is not sent: its outcome is unknown to the joiner, who retries
+        // the saved join identity.
+        encode(&response)
+            .or_else(|_| encode(&JoinResponse::Rejected(JoinFailure::OutcomeUnknown)))
+            .ok()
+    });
+    let mut exchange = pin!(exchange);
+    let polled = poll_fn(|context| {
+        match catch_unwind(AssertUnwindSafe(|| exchange.as_mut().poll(context))) {
+            Ok(poll) => poll.map(Some),
+            Err(_) => Poll::Ready(None),
+        }
+    })
+    .await;
+    polled.and_then(Result::ok).flatten().flatten()
+}
+
+/// An enrollment endpoint alone, its own socket: a sponsor's bootstrap listener in a test or a
+/// tool. A node serves enrollment beside its data protocol on one listener instead
+/// ([`EnrollmentService`]).
 pub struct EnrollmentServer {
-    endpoint: Endpoint,
+    server: QuicServer,
     limits: TransportLimits,
 }
 impl EnrollmentServer {
@@ -164,145 +309,61 @@ impl EnrollmentServer {
         limits: TransportLimits,
     ) -> Result<Self, JoinTransportError> {
         require_runtime()?;
-        let mut config = quinn::ServerConfig::with_crypto(Arc::new(
-            QuicServerConfig::try_from(identity.server_config()?)
-                .map_err(|_| EnrollmentError::Crypto)?,
-        ));
-        config.transport_config(limits.quic()?);
-        let endpoint =
-            Endpoint::server(config, address).map_err(|_| JoinTransportError::Unavailable)?;
-        Ok(Self { endpoint, limits })
+        let wire = limits.wire()?;
+        let server = QuicServer::bind_serving(
+            address,
+            ServerTls::from_config(identity.server_config()?),
+            // A listener of the enrollment protocol alone grants no certificate anything.
+            PeerRegistry::new(1).map_err(|_| JoinTransportError::Unavailable)?,
+            Some(ENROLLMENT_PROTOCOL),
+            wire,
+            limits.admission(),
+            limits.budget()?,
+        )
+        .map_err(|_| JoinTransportError::Unavailable)?;
+        Ok(Self { server, limits })
     }
     pub fn local_addr(&self) -> Result<SocketAddr, JoinTransportError> {
-        self.endpoint
+        self.server
             .local_addr()
             .map_err(|_| JoinTransportError::Unavailable)
     }
-    pub fn close(&self) {
-        self.endpoint.close(0u8.into(), b"shutdown");
+    /// Closes the endpoint and its connections; `serve` returns. Refused only when the shard has
+    /// no task left to queue it.
+    pub fn close(&self) -> Result<(), JoinTransportError> {
+        self.server
+            .close()
+            .map_err(|_| JoinTransportError::Unavailable)
     }
     pub async fn serve<H: JoinHandler + Clone>(
         &self,
         handler: H,
     ) -> Result<(), JoinTransportError> {
         require_runtime()?;
-        let mut tasks = JoinSet::new();
-        loop {
-            tokio::select! {
-                incoming = self.endpoint.accept() => {
-                    let Some(incoming) = incoming else { break };
-                    if tasks.len() >= self.limits.max_connections { incoming.refuse(); continue; }
-                    let handler = handler.clone();
-                    let timeout = self.limits.timeout;
-                    tasks.spawn(async move {
-                        let _ = tokio::time::timeout(timeout, async move {
-                            let connection = incoming.await.map_err(|_| JoinTransportError::Unavailable)?;
-                            serve_enrollment_connection(connection, handler, timeout).await
-                        }).await;
-                    });
-                }
-                _ = tasks.join_next(), if !tasks.is_empty() => {}
-            }
-        }
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
-        Ok(())
+        let service = EnrollmentService::new(NoData, handler, self.limits.clone())?;
+        self.server
+            .serve_with(service)
+            .await
+            .map_err(|_| JoinTransportError::Unavailable)
     }
 }
 
-/// Serve only enrollment on an already negotiated connection. A shared listener
-/// must route by the negotiated ALPN before invoking this bounded handler.
-pub async fn serve_enrollment_connection<H: JoinHandler>(
-    connection: quinn::Connection,
-    handler: H,
-    timeout: Duration,
-) -> Result<(), JoinTransportError> {
-    require_runtime()?;
-    if timeout.is_zero() || timeout > Duration::from_secs(120) {
-        return Err(EnrollmentError::Invalid.into());
-    }
-    let handshake = connection
-        .handshake_data()
-        .ok_or(JoinTransportError::InvalidFrame)?
-        .downcast::<quinn::crypto::rustls::HandshakeData>()
-        .map_err(|_| JoinTransportError::InvalidFrame)?;
-    if handshake.protocol.as_deref() != Some(ENROLLMENT_ALPN) {
-        connection.close(1u8.into(), b"wrong enrollment protocol");
-        return Err(JoinTransportError::InvalidFrame);
-    }
-    // Handle::try_current cannot detect a disabled time driver. Keep timeout
-    // construction inside the polled boundary; a dependency unwind must not
-    // escape this public adapter or resume a partly processed enrollment.
-    let exchange = async {
-        tokio::time::timeout(timeout, async {
-            let (mut send, mut receive) = connection
-                .accept_bi()
-                .await
-                .map_err(|_| JoinTransportError::Unavailable)?;
-            let (kind, bytes) = read_any_frame(&mut receive).await?;
-            // A FIN, not a partial request or stalled suffix, admits metadata work.
-            require_end(&mut receive).await?;
-            let response = match kind {
-                FRAME_JOIN => {
-                    let request: JoinRequest =
-                        decode(&bytes).map_err(|_| JoinTransportError::InvalidFrame)?;
-                    handler.handle(request).await
-                }
-                FRAME_RENEW => {
-                    let request: RenewRequest =
-                        decode(&bytes).map_err(|_| JoinTransportError::InvalidFrame)?;
-                    handler.renew(request).await
-                }
-                _ => return Err(JoinTransportError::InvalidFrame),
-            };
-            let response = if encode(&response).is_ok() {
-                response
-            } else {
-                JoinResponse::Rejected(JoinFailure::OutcomeUnknown)
-            };
-            write_frame(&mut send, FRAME_RESPONSE, &response).await?;
-            send.finish()
-                .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-            send.stopped()
-                .await
-                .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-            Ok(())
-        })
-        .await
-        .map_err(|_| JoinTransportError::OutcomeUnknown)?
-    };
-    let mut exchange = pin!(exchange);
-    let result = poll_fn(|context| {
-        match catch_unwind(AssertUnwindSafe(|| exchange.as_mut().poll(context))) {
-            Ok(poll) => poll.map(Ok),
-            Err(_) => Poll::Ready(Err(JoinTransportError::OutcomeUnknown)),
-        }
-    })
-    .await;
-    match result {
-        Ok(result) => result,
-        Err(error) => {
-            connection.close(1u8.into(), b"enrollment unavailable");
-            Err(error)
-        }
-    }
-}
-
+/// Redeems invitations and renews credentials at a sponsor: each exchange on an endpoint of its
+/// own at the client's address (a port of 0 lets exchanges run at once), under the TLS its trust
+/// verifies, at most `max_connections` at once.
 pub struct EnrollmentClient {
-    endpoint: Endpoint,
+    address: SocketAddr,
     limits: TransportLimits,
-    inflight: Semaphore,
+    inflight: AtomicUsize,
 }
 impl EnrollmentClient {
     pub fn bind(address: SocketAddr, limits: TransportLimits) -> Result<Self, JoinTransportError> {
         limits.validate()?;
         require_runtime()?;
-        let endpoint = Endpoint::client(address).map_err(|_| JoinTransportError::Unavailable)?;
-        let inflight = Semaphore::new(limits.max_connections);
         Ok(Self {
-            endpoint,
+            address,
             limits,
-            inflight,
+            inflight: AtomicUsize::new(0),
         })
     }
     pub async fn redeem(
@@ -313,45 +374,18 @@ impl EnrollmentClient {
         now: i64,
     ) -> Result<EnrollmentReceipt, JoinTransportError> {
         require_runtime()?;
-        let _permit = self
-            .inflight
-            .try_acquire()
-            .map_err(|_| JoinTransportError::Unavailable)?;
+        let _permit = self.permit()?;
         if invitation.cluster() != key.cluster() {
             return Err(EnrollmentError::WrongCluster.into());
         }
-        let mut tls = quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(invitation.client_config()?)
-                .map_err(|_| EnrollmentError::Crypto)?,
-        ));
-        tls.transport_config(self.limits.quic()?);
-        let connecting = self
-            .endpoint
-            .connect_with(tls, address, &invitation.trust().server_name)
-            .map_err(|_| JoinTransportError::Unavailable)?;
-        let connection = tokio::time::timeout(self.limits.timeout, connecting)
-            .await
-            .map_err(|_| JoinTransportError::Unavailable)?
-            .map_err(|_| JoinTransportError::Unavailable)?;
-        // No application stream or token-bearing buffer exists before both
-        // certificate validation and the operator-delivered leaf pin succeed.
-        let request = invitation.request_after_quic(&connection, key, now)?;
-        let response = tokio::time::timeout(self.limits.timeout, async {
-            let (mut send, mut receive) = connection
-                .open_bi()
-                .await
-                .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-            write_frame(&mut send, FRAME_JOIN, &request).await?;
-            send.finish()
-                .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-            let response = read_frame(&mut receive, FRAME_RESPONSE).await?;
-            require_end(&mut receive).await?;
-            Ok::<JoinResponse, JoinTransportError>(response)
-        })
-        .await
-        .map_err(|_| JoinTransportError::OutcomeUnknown)?
-        .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-        connection.close(0u8.into(), b"complete");
+        let trust = invitation.trust();
+        let response = self
+            .exchange(address, trust, invitation.client_config()?, JOIN, || {
+                // No token-bearing request exists before the server's chain and pinned leaf
+                // have both passed: it is made on the connection that will carry it.
+                encode(&invitation.request(key, now)?)
+            })
+            .await?;
         match response {
             JoinResponse::Rejected(JoinFailure::OutcomeUnknown) => {
                 Err(JoinTransportError::OutcomeUnknown)
@@ -365,7 +399,14 @@ impl EnrollmentClient {
                     || receipt.csr_hash != hash("focal.enrollment.csr.v1", key.csr())
                     || receipt.public_key != pki::csr_key_hash(key.csr())?
                     || receipt.expires_at <= now
-                    || pki::verify_issued(&receipt, &invitation.trust().ca_certificate).is_err()
+                    || pki::verify_issued(
+                        &receipt,
+                        trust
+                            .issuers
+                            .iter()
+                            .map(|issuer| issuer.certificate.as_slice()),
+                    )
+                    .is_err()
                 {
                     return Err(JoinTransportError::OutcomeUnknown);
                 }
@@ -383,43 +424,15 @@ impl EnrollmentClient {
         now: i64,
     ) -> Result<EnrollmentReceipt, JoinTransportError> {
         require_runtime()?;
-        let _permit = self
-            .inflight
-            .try_acquire()
-            .map_err(|_| JoinTransportError::Unavailable)?;
+        let _permit = self.permit()?;
         if trust.ca_certificate.is_empty() {
             return Err(EnrollmentError::Invalid.into());
         }
-        let mut tls = quinn::ClientConfig::new(Arc::new(
-            QuicClientConfig::try_from(trust.client_config()?)
-                .map_err(|_| EnrollmentError::Crypto)?,
-        ));
-        tls.transport_config(self.limits.quic()?);
-        let connecting = self
-            .endpoint
-            .connect_with(tls, address, &trust.server_name)
-            .map_err(|_| JoinTransportError::Unavailable)?;
-        let connection = tokio::time::timeout(self.limits.timeout, connecting)
-            .await
-            .map_err(|_| JoinTransportError::Unavailable)?
-            .map_err(|_| JoinTransportError::Unavailable)?;
-        trust.verify_quic(&connection, now)?;
-        let response = tokio::time::timeout(self.limits.timeout, async {
-            let (mut send, mut receive) = connection
-                .open_bi()
-                .await
-                .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-            write_frame(&mut send, FRAME_RENEW, &request).await?;
-            send.finish()
-                .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-            let response = read_frame(&mut receive, FRAME_RESPONSE).await?;
-            require_end(&mut receive).await?;
-            Ok::<JoinResponse, JoinTransportError>(response)
-        })
-        .await
-        .map_err(|_| JoinTransportError::OutcomeUnknown)?
-        .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-        connection.close(0u8.into(), b"complete");
+        let response = self
+            .exchange(address, trust, trust.client_config()?, RENEW, || {
+                encode(&request)
+            })
+            .await?;
         match response {
             JoinResponse::Rejected(JoinFailure::OutcomeUnknown) => {
                 Err(JoinTransportError::OutcomeUnknown)
@@ -428,10 +441,17 @@ impl EnrollmentClient {
             JoinResponse::Enrolled(receipt) => {
                 if receipt.invitation != request.invitation_id()
                     || receipt.request != request.request_id()
-                    || receipt.identity.cluster != trust_cluster(&request)
+                    || receipt.identity.cluster != request.cluster()
                     || receipt.expires_at <= now
                     || receipt.expires_at <= request.holds_until()
-                    || pki::verify_issued(&receipt, &trust.ca_certificate).is_err()
+                    || pki::verify_issued(
+                        &receipt,
+                        trust
+                            .issuers
+                            .iter()
+                            .map(|issuer| issuer.certificate.as_slice()),
+                    )
+                    .is_err()
                 {
                     return Err(JoinTransportError::OutcomeUnknown);
                 }
@@ -439,102 +459,90 @@ impl EnrollmentClient {
             }
         }
     }
-    pub fn close(&self) {
-        self.endpoint.close(0u8.into(), b"shutdown");
-    }
-}
-fn trust_cluster(request: &RenewRequest) -> ClusterId {
-    request.cluster()
-}
+    /// Nothing is held between exchanges: each closes its endpoint as it ends.
+    pub fn close(&self) {}
 
-async fn read_any_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> Result<(u16, Zeroizing<Vec<u8>>), JoinTransportError> {
-    let mut header = [0; HEADER];
-    reader
-        .read_exact(&mut header)
-        .await
-        .map_err(|_| JoinTransportError::InvalidFrame)?;
-    let kind = u16::from_be_bytes(
-        header[10..12]
-            .try_into()
-            .map_err(|_| JoinTransportError::InvalidFrame)?,
-    );
-    let length = u32::from_be_bytes(
-        header[12..16]
-            .try_into()
-            .map_err(|_| JoinTransportError::InvalidFrame)?,
-    ) as usize;
-    if &header[..8] != MAGIC || header[8..10] != 1u16.to_be_bytes() || length > MAX_MESSAGE_BYTES {
-        return Err(JoinTransportError::InvalidFrame);
+    /// One message of kind `tag` to the sponsor at `address`, made by `message` once the
+    /// connection is up and its leaf pinned, and its response. A connection that could not be
+    /// made, or whose leaf is not pinned, sent nothing; past that the outcome is unknown unless
+    /// the response says it.
+    async fn exchange(
+        &self,
+        address: SocketAddr,
+        trust: &ServerTrust,
+        tls: rustls::ClientConfig,
+        tag: u8,
+        message: impl FnOnce() -> Result<Vec<u8>, EnrollmentError>,
+    ) -> Result<JoinResponse, JoinTransportError> {
+        let connector = QuicConnector::bind(
+            self.address,
+            // A joiner: no grant yet, the enrollment protocol alone.
+            ClientTls::from_config(tls, focal_wire::net::Sender::Joiner),
+            self.limits.wire()?,
+            self.limits.budget()?,
+        )
+        .map_err(|_| JoinTransportError::Unavailable)?;
+        let timeout = self.limits.timeout;
+        let exchanged = hyper_rt::futures::within(nanos(timeout), async {
+            let link = connector
+                .enrollment(address, &trust.server_name, trust.pins())
+                .await
+                .map_err(|error| match error {
+                    WireError::Unpinned => {
+                        JoinTransportError::Enrollment(EnrollmentError::Unpinned)
+                    }
+                    _ => JoinTransportError::Unavailable,
+                })?;
+            // The link wipes the message however its exchange ends: it holds an invitation's
+            // secret.
+            let answer = link
+                .ask(tag, message()?, timeout)
+                .await
+                .map_err(|_| JoinTransportError::OutcomeUnknown)?;
+            decode::<JoinResponse>(&answer).map_err(|_| JoinTransportError::OutcomeUnknown)
+        })
+        .await;
+        // The endpoint goes with the exchange, answered or not.
+        let _ = connector.close();
+        match exchanged {
+            Ok(Some(response)) => response,
+            // Past its time the exchange may have been carried: its outcome is unknown.
+            Ok(None) => Err(JoinTransportError::OutcomeUnknown),
+            Err(_) => Err(JoinTransportError::Unavailable),
+        }
     }
-    let mut bytes = Zeroizing::new(vec![0; length]);
-    reader
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|_| JoinTransportError::InvalidFrame)?;
-    Ok((kind, bytes))
-}
 
-async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
-    writer: &mut W,
-    kind: u16,
-    value: &T,
-) -> Result<(), JoinTransportError> {
-    let bytes = Zeroizing::new(encode(value)?);
-    let mut header = [0; HEADER];
-    header[..8].copy_from_slice(MAGIC);
-    header[8..10].copy_from_slice(&1u16.to_be_bytes());
-    header[10..12].copy_from_slice(&kind.to_be_bytes());
-    header[12..].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
-    writer
-        .write_all(&header)
-        .await
-        .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-    writer
-        .write_all(&bytes)
-        .await
-        .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-    Ok(())
-}
-async fn read_frame<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
-    reader: &mut R,
-    kind: u16,
-) -> Result<T, JoinTransportError> {
-    let mut header = [0; HEADER];
-    reader
-        .read_exact(&mut header)
-        .await
-        .map_err(|_| JoinTransportError::InvalidFrame)?;
-    let length = u32::from_be_bytes(
-        header[12..16]
-            .try_into()
-            .map_err(|_| JoinTransportError::InvalidFrame)?,
-    ) as usize;
-    if &header[..8] != MAGIC
-        || header[8..10] != 1u16.to_be_bytes()
-        || header[10..12] != kind.to_be_bytes()
-        || length > MAX_MESSAGE_BYTES
-    {
-        return Err(JoinTransportError::InvalidFrame);
+    /// One of the exchanges the client runs at once, or `Unavailable` past its bound.
+    fn permit(&self) -> Result<Permit<'_>, JoinTransportError> {
+        let most = self.limits.max_connections;
+        self.inflight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < most).then(|| held.saturating_add(1))
+            })
+            .map_err(|_| JoinTransportError::Unavailable)?;
+        Ok(Permit(&self.inflight))
     }
-    let mut bytes = Zeroizing::new(vec![0; length]);
-    reader
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|_| JoinTransportError::InvalidFrame)?;
-    decode(&bytes).map_err(|_| JoinTransportError::InvalidFrame)
 }
-async fn require_end<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(), JoinTransportError> {
-    let mut byte = [0];
-    match reader.read(&mut byte).await {
-        Ok(0) => Ok(()),
-        _ => Err(JoinTransportError::InvalidFrame),
+/// An exchange in flight, given back as it ends.
+struct Permit<'a>(&'a AtomicUsize);
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(1))
+            });
     }
 }
 
+fn nanos(period: Duration) -> u64 {
+    u64::try_from(period.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// A network adapter runs on a hyper-rt shard: off one it is refused, typed, before any socket
+/// is made.
 fn require_runtime() -> Result<(), JoinTransportError> {
-    tokio::runtime::Handle::try_current()
+    hyper_rt::futures::shard_id()
         .map(|_| ())
-        .map_err(|_| JoinTransportError::Unavailable)
+        .ok_or(JoinTransportError::Unavailable)
 }

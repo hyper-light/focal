@@ -182,174 +182,179 @@ fn journal_files(root: &Path) -> Vec<String> {
     names
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn founder_agent_registers_its_session_reports_load_and_restarts_without_repeating() {
-    let directory = tempfile::tempdir().unwrap();
-    let settings = settings(directory.path());
-    let founder = Running::start(&settings).await;
-    assert_eq!(founder.status.condition, "Ready");
-    let ledger = founder.status.ledger;
-    let node = founder.status.node;
-    let host = partition_host(&founder).await;
-    let (checkpoint, _, _) = reached!(
-        founder,
-        wait_for(&founder, &host, "session registered with load", |state| {
-            state.sessions.contains_key(&ledger)
-                && state
-                    .nodes
-                    .get(&node)
-                    .is_some_and(|record| record.load.is_some())
-        })
-    );
-    let descriptor = &checkpoint.sessions[&ledger];
-    assert_eq!(descriptor.authority.kind, SessionFenceKind::Created);
-    assert_eq!(descriptor.route_epoch, RouteEpoch(1));
-    assert_eq!(descriptor.revision, 1);
-    assert_eq!(
-        descriptor.active.placement.voters,
-        BTreeMap::from([(node, 1)])
-    );
-    assert_eq!(descriptor.active.policy.durability.max_failures, 0);
-    assert!(descriptor.pending.is_none());
-    let record = &checkpoint.nodes[&node];
-    assert_eq!(record.enrollment.generation, 1);
-    let load = record.load.unwrap();
-    assert!(
-        load.disk_available > 0,
-        "disk headroom is sampled from the data directory"
-    );
-    assert!(load.available_memory > 0);
-    assert_eq!(load.active_weight, 1);
-    // The agent reports what the node hosts: its own tenant under the
-    // standard bound, and the volume envelope the load report came from.
-    let status = founder.handles.placement.status().await.unwrap();
-    let admission = &status.admission;
-    assert_eq!(
-        admission.max_tenants,
-        crate::admission::AdmissionPolicy::DEFAULT_MAX_TENANTS
-    );
-    assert_eq!(admission.tenants.len(), 1);
-    assert_eq!(admission.tenants[0].tenant, ledger.tenant);
-    assert_eq!(admission.tenants[0].weight, 1);
-    assert!(admission.tenants[0].memory_limit > 0);
-    // The envelope's sample moves with every committed write, so only its
-    // presence is stable across the two observations.
-    assert!(admission.disk_free.is_some_and(|free| free > 0));
-    assert_eq!(admission.disk_headroom, 64 * 1024 * 1024);
-    assert!(admission.memory_limit > admission.memory_used);
-    // The operator reads the same facts through the admin socket: one
-    // partition, this node alive and loaded, the session at its single-node
-    // guarantee with nothing blocking it, and no controller action pending.
-    {
-        use focal_client::admin::AdminResult;
-        let admin = crate::cluster_admin::ClusterAdmin::open(&settings).unwrap();
-        let placement = try_until(&[&founder], Duration::from_secs(30), async || {
-            match admin.placement().await {
-                Ok(AdminResult::Placement { placement })
-                    if placement.partitions.iter().any(|partition| {
-                        !partition.sessions.is_empty()
-                            && partition
-                                .nodes
-                                .iter()
-                                .any(|n| n.node == node && n.disk_available.is_some())
-                    }) =>
-                {
-                    Some(placement)
+#[test]
+fn founder_agent_registers_its_session_reports_load_and_restarts_without_repeating() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = settings(directory.path());
+        let founder = Running::start(&settings).await;
+        assert_eq!(founder.status.condition, "Ready");
+        let ledger = founder.status.ledger;
+        let node = founder.status.node;
+        let host = partition_host(&founder).await;
+        let (checkpoint, _, _) = reached!(
+            founder,
+            wait_for(&founder, &host, "session registered with load", |state| {
+                state.sessions.contains_key(&ledger)
+                    && state
+                        .nodes
+                        .get(&node)
+                        .is_some_and(|record| record.load.is_some())
+            })
+        );
+        let descriptor = &checkpoint.sessions[&ledger];
+        assert_eq!(descriptor.authority.kind, SessionFenceKind::Created);
+        assert_eq!(descriptor.route_epoch, RouteEpoch(1));
+        assert_eq!(descriptor.revision, 1);
+        assert_eq!(
+            descriptor.active.placement.voters,
+            BTreeMap::from([(node, 1)])
+        );
+        assert_eq!(descriptor.active.policy.durability.max_failures, 0);
+        assert!(descriptor.pending.is_none());
+        let record = &checkpoint.nodes[&node];
+        assert_eq!(record.enrollment.generation, 1);
+        let load = record.load.unwrap();
+        assert!(
+            load.disk_available > 0,
+            "disk headroom is sampled from the data directory"
+        );
+        assert!(load.available_memory > 0);
+        assert_eq!(load.active_weight, 1);
+        // The agent reports what the node hosts: its own tenant under the
+        // standard bound, and the volume envelope the load report came from.
+        let status = founder.handles.placement.status().await.unwrap();
+        let admission = &status.admission;
+        assert_eq!(
+            admission.max_tenants,
+            crate::admission::AdmissionPolicy::DEFAULT_MAX_TENANTS
+        );
+        assert_eq!(admission.tenants.len(), 1);
+        assert_eq!(admission.tenants[0].tenant, ledger.tenant);
+        assert_eq!(admission.tenants[0].weight, 1);
+        assert!(admission.tenants[0].memory_limit > 0);
+        // The envelope's sample moves with every committed write, so only its
+        // presence is stable across the two observations.
+        assert!(admission.disk_free.is_some_and(|free| free > 0));
+        assert_eq!(admission.disk_headroom, 64 * 1024 * 1024);
+        assert!(admission.memory_limit > admission.memory_used);
+        // The operator reads the same facts through the admin socket: one
+        // partition, this node alive and loaded, the session at its single-node
+        // guarantee with nothing blocking it, and no controller action pending.
+        {
+            use focal_client::admin::AdminResult;
+            let admin = crate::cluster_admin::ClusterAdmin::open(&settings).unwrap();
+            let placement = try_until(&[&founder], Duration::from_secs(30), async || {
+                match admin.placement().await {
+                    Ok(AdminResult::Placement { placement })
+                        if placement.partitions.iter().any(|partition| {
+                            !partition.sessions.is_empty()
+                                && partition
+                                    .nodes
+                                    .iter()
+                                    .any(|n| n.node == node && n.disk_available.is_some())
+                        }) =>
+                    {
+                        Some(placement)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        })
-        .await;
-        let placement = match placement {
-            Ok(placement) => placement,
-            Err(spent) => panic!(
-                "placement never reported: {spent}: {:?}; status {:?}",
-                admin.placement().await,
-                founder.handles.placement.status().await
-            ),
-        };
-        assert!(placement.observed_at > 0);
-        assert_eq!(placement.partitions.len(), 1);
-        let partition = &placement.partitions[0];
-        assert_eq!(partition.epoch, 1);
-        assert!(partition.sealed.is_none());
-        assert!(!partition.truncated);
-        assert_eq!(partition.namespace_start, "0".repeat(64));
-        assert!(partition.namespace_end.is_none());
-        let me = partition.nodes.iter().find(|n| n.node == node).unwrap();
-        assert!(me.eligible && me.alive);
-        assert_eq!(me.generation, 1);
-        assert!(me.disk_available.is_some_and(|bytes| bytes > 0));
-        assert_eq!(partition.sessions.len(), 1);
-        let session = &partition.sessions[0];
-        assert_eq!(session.tenant, ledger.tenant.to_string());
-        assert_eq!(session.session, ledger.session.to_string());
-        assert_eq!(session.route_epoch, 1);
-        assert_eq!(session.voters, vec![node]);
-        assert_eq!(session.preferred_leader, node);
-        assert_eq!(session.survive, "Node");
-        assert_eq!(session.max_failures, 0);
-        assert_eq!(session.achieved_max_failures, Some(0));
-        assert!(session.blocked_by.is_empty());
-        assert!(session.pending.is_none());
-        assert!(session.retiring.is_empty());
-        let Ok(AdminResult::Plan { actions }) = admin.plan().await else {
-            panic!("plan");
-        };
-        assert!(actions.is_empty(), "{actions:?}");
-    }
-    assert_eq!(
-        journal_files(directory.path()),
-        vec![
-            "placement-partition".to_owned(),
-            "placement-root".to_owned()
-        ]
-    );
-    assert!(
-        directory
-            .path()
-            .join("PLACEMENT-PARTITION.initialized")
-            .is_file()
-    );
-    // The registered session keeps serving.
-    let membership = founder
-        .handles
-        .ledger
-        .as_ref()
-        .unwrap()
-        .membership()
-        .await
-        .unwrap();
-    assert_eq!(membership.view().configuration.voters, vec![node]);
-    let revision = checkpoint.revision;
-    founder.stop().await;
+            })
+            .await;
+            let placement = match placement {
+                Ok(placement) => placement,
+                Err(spent) => panic!(
+                    "placement never reported: {spent}: {:?}; status {:?}",
+                    admin.placement().await,
+                    founder.handles.placement.status().await
+                ),
+            };
+            assert!(placement.observed_at > 0);
+            assert_eq!(placement.partitions.len(), 1);
+            let partition = &placement.partitions[0];
+            assert_eq!(partition.epoch, 1);
+            assert!(partition.sealed.is_none());
+            assert!(!partition.truncated);
+            assert_eq!(partition.namespace_start, "0".repeat(64));
+            assert!(partition.namespace_end.is_none());
+            let me = partition.nodes.iter().find(|n| n.node == node).unwrap();
+            assert!(me.eligible && me.alive);
+            assert_eq!(me.generation, 1);
+            assert!(me.disk_available.is_some_and(|bytes| bytes > 0));
+            assert_eq!(partition.sessions.len(), 1);
+            let session = &partition.sessions[0];
+            assert_eq!(session.tenant, ledger.tenant.to_string());
+            assert_eq!(session.session, ledger.session.to_string());
+            assert_eq!(session.route_epoch, 1);
+            assert_eq!(session.voters, vec![node]);
+            assert_eq!(session.preferred_leader, node);
+            assert_eq!(session.survive, "Node");
+            assert_eq!(session.max_failures, 0);
+            assert_eq!(session.achieved_max_failures, Some(0));
+            assert!(session.blocked_by.is_empty());
+            assert!(session.pending.is_none());
+            assert!(session.retiring.is_empty());
+            let Ok(AdminResult::Plan { actions }) = admin.plan().await else {
+                panic!("plan");
+            };
+            assert!(actions.is_empty(), "{actions:?}");
+        }
+        assert_eq!(
+            journal_files(directory.path()),
+            vec![
+                "placement-partition".to_owned(),
+                "placement-root".to_owned()
+            ]
+        );
+        assert!(
+            directory
+                .path()
+                .join("PLACEMENT-PARTITION.initialized")
+                .is_file()
+        );
+        // The registered session keeps serving.
+        let membership = founder
+            .handles
+            .ledger
+            .as_ref()
+            .unwrap()
+            .membership()
+            .await
+            .unwrap();
+        assert_eq!(membership.view().configuration.voters, vec![node]);
+        let revision = checkpoint.revision;
+        founder.stop().await;
 
-    let founder = Running::start(&settings).await;
-    let host = partition_host(&founder).await;
-    // A restart re-reads its journals and finds every registration fact already
-    // committed; the only new command is a fresh load report.
-    let (after, _, _) = reached!(
-        founder,
-        wait_for(&founder, &host, "fresh load report", |state| {
-            state.nodes[&node]
-                .load
-                .is_some_and(|reported| reported.report > load.report)
-        })
-    );
-    assert_eq!(after.revision, revision + 1);
-    assert_eq!(after.sessions[&ledger], checkpoint.sessions[&ledger]);
-    assert_eq!(
-        after.nodes[&node].enrollment,
-        checkpoint.nodes[&node].enrollment
-    );
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let (settled, _, _) = observe(&founder, &host, 7).await.unwrap();
-    assert_eq!(
-        settled.revision,
-        revision + 1,
-        "no further commands within the load interval"
-    );
-    founder.stop().await;
+        let founder = Running::start(&settings).await;
+        let host = partition_host(&founder).await;
+        // A restart re-reads its journals and finds every registration fact already
+        // committed; the only new command is a fresh load report.
+        let (after, _, _) = reached!(
+            founder,
+            wait_for(&founder, &host, "fresh load report", |state| {
+                state.nodes[&node]
+                    .load
+                    .is_some_and(|reported| reported.report > load.report)
+            })
+        );
+        assert_eq!(after.revision, revision + 1);
+        assert_eq!(after.sessions[&ledger], checkpoint.sessions[&ledger]);
+        assert_eq!(
+            after.nodes[&node].enrollment,
+            checkpoint.nodes[&node].enrollment
+        );
+        focal_rt::time::sleep(Duration::from_millis(1500))
+            .await
+            .unwrap();
+        let (settled, _, _) = observe(&founder, &host, 7).await.unwrap();
+        assert_eq!(
+            settled.revision,
+            revision + 1,
+            "no further commands within the load interval"
+        );
+        founder.stop().await;
+    })
+    .unwrap()
 }
 
 #[test]
@@ -424,349 +429,418 @@ fn install_records_before_created_sessions_decode_as_assigned_copies() {
     assert!(InstallRecord::decode(&postcard::to_stdvec(&future).unwrap()).is_err());
 }
 
+/// Schema 2 copies predate recorded allowances: every session was founded
+/// and registered under the standard one, which they decode with; a schema 3
+/// copy keeps its own.
+#[test]
+fn install_records_before_allowances_decode_with_the_standard_allowance() {
+    #[derive(Serialize)]
+    struct CopyV2 {
+        group: [u8; 16],
+        bootstrap_voters: Vec<u64>,
+        route_epoch: RouteEpoch,
+        policy_revision: u64,
+        voters: BTreeSet<u64>,
+        copies: BTreeSet<u64>,
+        created: bool,
+    }
+    #[derive(Serialize)]
+    struct RecordV2 {
+        schema: u16,
+        node: u64,
+        installed: BTreeMap<LedgerId, CopyV2>,
+    }
+    let ledger = LedgerId {
+        tenant: TenantId::from_u128(1),
+        session: focal_model::SessionId::from_u128(2),
+    };
+    let legacy = RecordV2 {
+        schema: 2,
+        node: 4,
+        installed: BTreeMap::from([(
+            ledger,
+            CopyV2 {
+                group: [3; 16],
+                bootstrap_voters: vec![1],
+                route_epoch: RouteEpoch(2),
+                policy_revision: 2,
+                voters: BTreeSet::from([1, 4]),
+                copies: BTreeSet::from([4]),
+                created: true,
+            },
+        )]),
+    };
+    let record = InstallRecord::decode(&postcard::to_stdvec(&legacy).unwrap()).unwrap();
+    assert_eq!(record.schema, INSTALL_RECORD_SCHEMA);
+    let copy = &record.installed[&ledger];
+    assert!(copy.created);
+    assert_eq!(copy.memory, standard_memory());
+    let mut current = record;
+    current.installed.get_mut(&ledger).unwrap().memory = 3 << 30;
+    let again = InstallRecord::decode(&postcard::to_stdvec(&current).unwrap()).unwrap();
+    assert_eq!(again.installed[&ledger].memory, 3 << 30);
+}
+
 /// Doc 24 §16: an operator admits a tenant as an enrollment fact and
 /// creates sessions by name; the agent hosts, registers and serves them,
 /// the local socket's grant follows the registry, and a restart reopens
 /// them with the same identities.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn operators_admit_tenants_and_create_sessions_that_register_serve_and_survive_restart() {
-    use crate::{
-        cluster_admin::ClusterAdmin,
-        placement_control::created_session_id,
-        route_cache_tests::{ask, envelope},
-    };
-    use focal_client::admin::AdminResult;
-    use focal_wire::{AccessError, Response, UnixRemote, WireLimits};
-    let directory = tempfile::tempdir().unwrap();
-    let settings = settings(directory.path());
-    let founder = Running::start(&settings).await;
-    let node = founder.status.node;
-    let (_, cluster) = founder.handles.fleet.identity();
-    let founder_ledger = founder.status.ledger;
-    let host = partition_host(&founder).await;
-    let admin = ClusterAdmin::open(&settings).unwrap();
-    let AdminResult::Tenants {
-        founder: founder_tenant,
-        admitted,
-        applied_index,
-        ..
-    } = admin.tenants().await.unwrap()
-    else {
-        panic!("tenants");
-    };
-    assert_eq!(founder_tenant, founder_ledger.tenant.to_string());
-    assert!(admitted.is_empty());
-    assert!(applied_index > 0);
-    let tenant = TenantId([9; 16]);
-    let name = "orders";
-    let ledger = LedgerId {
-        tenant,
-        session: created_session_id(cluster, tenant, name).unwrap(),
-    };
-    // A tenant the cluster does not serve gets no session, and the local
-    // socket's grant does not name it.
-    assert!(admin.create_session(tenant.0, name).await.is_err());
-    let local =
-        UnixRemote::new(directory.path().join("focal.sock"), WireLimits::default()).unwrap();
-    assert!(matches!(
-        local
-            .request(&envelope(ledger, 1, 601))
-            .await
-            .unwrap()
-            .result,
-        Response::Error(AccessError::Unauthorized)
-    ));
-    assert!(admin.admit_tenant([0; 16]).await.is_err());
-    let AdminResult::Tenants {
-        admitted, revision, ..
-    } = admin.admit_tenant(tenant.0).await.unwrap()
-    else {
-        panic!("admit");
-    };
-    assert_eq!(admitted, vec![tenant.to_string()]);
-    // A retry reads as done at the same committed revision.
-    let AdminResult::Tenants {
-        admitted: same,
-        revision: again,
-        ..
-    } = admin.admit_tenant(tenant.0).await.unwrap()
-    else {
-        panic!("admit again");
-    };
-    assert_eq!((same, again), (admitted.clone(), revision));
-    let AdminResult::Tenants {
-        admitted: listed, ..
-    } = admin.tenants().await.unwrap()
-    else {
-        panic!("list");
-    };
-    assert_eq!(listed, admitted);
-    // The same name is the same session; another name or tenant is another.
-    let AdminResult::SessionCreated {
-        session: created,
-        existing,
-        node: at,
-        group,
-        ..
-    } = admin.create_session(tenant.0, name).await.unwrap()
-    else {
-        panic!("create");
-    };
-    assert!(!existing);
-    assert_eq!(at, node);
-    assert_eq!(created, ledger.session.to_string());
-    assert_eq!(group, crate::cluster_admin::hex(&ledger.session.0));
-    let AdminResult::SessionCreated {
-        session: retried,
-        existing,
-        ..
-    } = admin.create_session(tenant.0, name).await.unwrap()
-    else {
-        panic!("retry");
-    };
-    assert!(existing);
-    assert_eq!(retried, created);
-    let other_ledger = LedgerId {
-        tenant: founder_ledger.tenant,
-        session: created_session_id(cluster, founder_ledger.tenant, "reports").unwrap(),
-    };
-    let AdminResult::SessionCreated {
-        session: other,
-        existing,
-        ..
-    } = admin
-        .create_session(founder_ledger.tenant.0, "reports")
-        .await
-        .unwrap()
-    else {
-        panic!("create other");
-    };
-    assert!(!existing);
-    assert_eq!(other, other_ledger.session.to_string());
-    assert!(admin.create_session(tenant.0, "").await.is_err());
-    assert!(founder.handles.fleet.current_host(ledger).is_ok());
-    assert!(founder.handles.fleet.current_host(other_ledger).is_ok());
-    // The agent registers both exactly as it did the founder's session,
-    // recording the founding node.
-    let (checkpoint, _, _) = reached!(
-        founder,
-        wait_for(&founder, &host, "created sessions registered", |state| {
-            state.sessions.contains_key(&ledger) && state.sessions.contains_key(&other_ledger)
-        })
-    );
-    for registered in [ledger, other_ledger, founder_ledger] {
-        let descriptor = &checkpoint.sessions[&registered];
-        assert_eq!(descriptor.founder, Some(node));
-        assert_eq!(descriptor.authority.kind, SessionFenceKind::Created);
-        assert_eq!(descriptor.route_epoch, RouteEpoch(1));
-        assert_eq!(
-            descriptor.active.placement.voters,
-            BTreeMap::from([(node, 1)])
-        );
-        assert_eq!(descriptor.log_group, LogGroupId(registered.session.0));
-        assert!(descriptor.pending.is_none());
-    }
-    // Served: through the node's data handler under a grant naming the
-    // tenant, and through the local socket once its grant follows the
-    // registry (no restart).
-    let served = ask(&founder, envelope(ledger, 1, 602)).await;
-    assert!(!matches!(served, Response::Error(_)), "{served:?}");
-    let served = until(
-        "the local grant follows the registry",
-        &[&founder],
-        Duration::from_secs(20),
-        async || {
-            let result = local
-                .request(&envelope(ledger, 1, 603))
+#[test]
+fn operators_admit_tenants_and_create_sessions_that_register_serve_and_survive_restart() {
+    focal_rt::block_on(async move {
+        use crate::{
+            cluster_admin::ClusterAdmin,
+            placement_control::created_session_id,
+            route_cache_tests::{ask, envelope},
+        };
+        use focal_client::admin::AdminResult;
+        use focal_wire::{AccessError, LocalRemote, Response, WireLimits};
+        let directory = tempfile::tempdir().unwrap();
+        let settings = settings(directory.path());
+        let founder = Running::start(&settings).await;
+        let node = founder.status.node;
+        let (_, cluster) = founder.handles.fleet.identity();
+        let founder_ledger = founder.status.ledger;
+        let host = partition_host(&founder).await;
+        let admin = ClusterAdmin::open(&settings).unwrap();
+        let AdminResult::Tenants {
+            founder: founder_tenant,
+            admitted,
+            applied_index,
+            ..
+        } = admin.tenants().await.unwrap()
+        else {
+            panic!("tenants");
+        };
+        assert_eq!(founder_tenant, founder_ledger.tenant.to_string());
+        assert!(admitted.is_empty());
+        assert!(applied_index > 0);
+        let tenant = TenantId([9; 16]);
+        let name = "orders";
+        let ledger = LedgerId {
+            tenant,
+            session: created_session_id(cluster, tenant, name).unwrap(),
+        };
+        // A tenant the cluster does not serve gets no session, and the local
+        // socket's grant does not name it.
+        assert!(admin.create_session(tenant.0, name).await.is_err());
+        let local =
+            LocalRemote::new(directory.path().join("focal.sock"), WireLimits::default()).unwrap();
+        assert!(matches!(
+            local
+                .request(&envelope(ledger, 1, 601))
                 .await
                 .unwrap()
-                .result;
-            (!matches!(result, Response::Error(AccessError::Unauthorized))).then_some(result)
-        },
-    )
-    .await;
-    assert!(!matches!(served, Response::Error(_)), "{served:?}");
-    // The session serves as soon as its local grant follows the registry;
-    // the operator's view reads the partition, which commits the session's
-    // registration a controller round later.
-    let view = until(
-        "the created session is in the operator view",
-        &[&founder],
-        Duration::from_secs(60),
-        async || {
-            let AdminResult::Placement { placement } = admin.placement().await.unwrap() else {
-                panic!("placement");
-            };
-            placement.partitions[0]
-                .sessions
-                .iter()
-                .find(|session| session.session == created)
-                .cloned()
-        },
-    )
-    .await;
-    assert_eq!(view.founder, Some(node));
-    assert_eq!(view.tenant, tenant.to_string());
-    founder.stop().await;
-
-    // A restart reopens every created session from the install record; the
-    // names still denote the same sessions and the tenant stays served.
-    let founder = Running::start(&settings).await;
-    // The founder's own session opens with the service; created sessions
-    // are reopened by the agent's first tick from the install record.
-    until(
-        "created sessions reopen at restart",
-        &[&founder],
-        Duration::from_secs(30),
-        async || {
-            (founder.handles.fleet.current_host(ledger).is_ok()
-                && founder.handles.fleet.current_host(other_ledger).is_ok())
-            .then_some(())
-        },
-    )
-    .await;
-    let admin = ClusterAdmin::open(&settings).unwrap();
-    let AdminResult::SessionCreated {
-        session: reopened,
-        existing,
-        ..
-    } = admin.create_session(tenant.0, name).await.unwrap()
-    else {
-        panic!("retry after restart");
-    };
-    assert!(existing);
-    assert_eq!(reopened, created);
-    let AdminResult::Tenants { admitted, .. } = admin.tenants().await.unwrap() else {
-        panic!("tenants after restart");
-    };
-    assert_eq!(admitted, vec![tenant.to_string()]);
-    // A reopened single-voter log serves once it has elected itself again.
-    let mut id = 603;
-    let served = until(
-        "the reopened session serves",
-        &[&founder],
-        Duration::from_secs(20),
-        async || {
-            id += 1;
-            let result = ask(&founder, envelope(ledger, 1, id)).await;
-            (!matches!(result, Response::Error(AccessError::Unavailable))).then_some(result)
-        },
-    )
-    .await;
-    assert!(!matches!(served, Response::Error(_)), "{served:?}");
-    let status = founder.handles.placement.status().await.unwrap();
-    assert!(status.installed.contains(&ledger));
-    assert!(status.installed.contains(&other_ledger));
-    assert_eq!(status.admission.tenants.len(), 2);
-    founder.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_controller_completes_a_plan_on_one_host_with_signed_readiness_and_fences() {
-    let directory = tempfile::tempdir().unwrap();
-    let settings = settings(directory.path());
-    let founder = Running::start(&settings).await;
-    let ledger = founder.status.ledger;
-    let node = founder.status.node;
-    let host = partition_host(&founder).await;
-    let (checkpoint, _, installed) = reached!(
-        founder,
-        wait_for(&founder, &host, "session registered with load", |state| {
-            state.sessions.contains_key(&ledger)
-                && state
-                    .nodes
-                    .get(&node)
-                    .is_some_and(|record| record.load.is_some())
-        })
-    );
-    let descriptor = checkpoint.sessions[&ledger].clone();
-    let desired = descriptor.active.clone();
-    let operation = OperationId::from_u128(2);
-    // The operator plans the (unchanged) placement; the controller does the
-    // rest: preparation, the log's cutover record, the founder's own signed
-    // readiness, promotion, the signed cutover fence and activation.
-    submit(
-        &founder,
-        &host,
-        1,
-        &checkpoint,
-        &installed,
-        PartitionOperation::Session {
-            ledger,
-            expected_revision: descriptor.revision,
-            change: SessionChange::Plan {
-                operation,
-                desired: desired.clone(),
-                observations: BTreeMap::new(),
+                .result,
+            Response::Error(AccessError::Unauthorized)
+        ));
+        assert!(admin.admit_tenant([0; 16]).await.is_err());
+        let AdminResult::Tenants {
+            admitted, revision, ..
+        } = admin.admit_tenant(tenant.0).await.unwrap()
+        else {
+            panic!("admit");
+        };
+        assert_eq!(admitted, vec![tenant.to_string()]);
+        // A retry reads as done at the same committed revision.
+        let AdminResult::Tenants {
+            admitted: same,
+            revision: again,
+            ..
+        } = admin.admit_tenant(tenant.0).await.unwrap()
+        else {
+            panic!("admit again");
+        };
+        assert_eq!((same, again), (admitted.clone(), revision));
+        let AdminResult::Tenants {
+            admitted: listed, ..
+        } = admin.tenants().await.unwrap()
+        else {
+            panic!("list");
+        };
+        assert_eq!(listed, admitted);
+        // The same name is the same session; another name or tenant is another.
+        let AdminResult::SessionCreated {
+            session: created,
+            existing,
+            node: at,
+            group,
+            ..
+        } = admin.create_session(tenant.0, name).await.unwrap()
+        else {
+            panic!("create");
+        };
+        assert!(!existing);
+        assert_eq!(at, node);
+        assert_eq!(created, ledger.session.to_string());
+        assert_eq!(group, crate::cluster_admin::hex(&ledger.session.0));
+        let AdminResult::SessionCreated {
+            session: retried,
+            existing,
+            ..
+        } = admin.create_session(tenant.0, name).await.unwrap()
+        else {
+            panic!("retry");
+        };
+        assert!(existing);
+        assert_eq!(retried, created);
+        let other_ledger = LedgerId {
+            tenant: founder_ledger.tenant,
+            session: created_session_id(cluster, founder_ledger.tenant, "reports").unwrap(),
+        };
+        let AdminResult::SessionCreated {
+            session: other,
+            existing,
+            ..
+        } = admin
+            .create_session(founder_ledger.tenant.0, "reports")
+            .await
+            .unwrap()
+        else {
+            panic!("create other");
+        };
+        assert!(!existing);
+        assert_eq!(other, other_ledger.session.to_string());
+        assert!(admin.create_session(tenant.0, "").await.is_err());
+        assert!(founder.handles.fleet.current_host(ledger).is_ok());
+        assert!(founder.handles.fleet.current_host(other_ledger).is_ok());
+        // The agent registers both exactly as it did the founder's session,
+        // recording the founding node.
+        let (checkpoint, _, _) = reached!(
+            founder,
+            wait_for(&founder, &host, "created sessions registered", |state| {
+                state.sessions.contains_key(&ledger) && state.sessions.contains_key(&other_ledger)
+            })
+        );
+        for registered in [ledger, other_ledger, founder_ledger] {
+            let descriptor = &checkpoint.sessions[&registered];
+            assert_eq!(descriptor.founder, Some(node));
+            assert_eq!(descriptor.authority.kind, SessionFenceKind::Created);
+            assert_eq!(descriptor.route_epoch, RouteEpoch(1));
+            assert_eq!(
+                descriptor.active.placement.voters,
+                BTreeMap::from([(node, 1)])
+            );
+            assert_eq!(descriptor.log_group, LogGroupId(registered.session.0));
+            assert!(descriptor.pending.is_none());
+        }
+        // Served: through the node's data handler under a grant naming the
+        // tenant, and through the local socket once its grant follows the
+        // registry (no restart).
+        let served = ask(&founder, envelope(ledger, 1, 602)).await;
+        assert!(!matches!(served, Response::Error(_)), "{served:?}");
+        let served = until(
+            "the local grant follows the registry",
+            &[&founder],
+            Duration::from_secs(20),
+            async || {
+                let result = local
+                    .request(&envelope(ledger, 1, 603))
+                    .await
+                    .unwrap()
+                    .result;
+                (!matches!(result, Response::Error(AccessError::Unauthorized))).then_some(result)
             },
-        },
-    )
-    .await;
-    let (checkpoint, _, _) = reached!(
-        founder,
-        wait_for(&founder, &host, "signed readiness", |state| {
-            state.sessions[&ledger]
-                .pending
-                .as_ref()
-                .is_some_and(|plan| plan.ready.contains_key(&node))
-        })
-    );
-    let plan = checkpoint.sessions[&ledger].pending.clone().unwrap();
-    let ready = &plan.ready[&node];
-    assert_eq!(ready.route_epoch, RouteEpoch(2));
-    assert_eq!(ready.operation, operation);
-    assert_ne!(ready.custody, ContentHash([0; 32]));
-    assert_ne!(ready.attestation, ContentHash([0; 32]));
-    assert_eq!(plan.progress[&node].custody_epoch, 2);
-    let (checkpoint, _, _) = reached!(
-        founder,
-        wait_for(&founder, &host, "placement activated", |state| {
-            state.sessions[&ledger].pending.is_none()
-                && state.sessions[&ledger].route_epoch == RouteEpoch(2)
-        })
-    );
-    let active = &checkpoint.sessions[&ledger];
-    assert_eq!(active.active, desired);
-    assert_eq!(active.authority.kind, SessionFenceKind::Activated);
-    assert_eq!(active.authority.operation, operation);
-    assert_eq!(active.membership_epoch, 1, "no voter changed");
-    assert_eq!(active.placement_epoch, 2);
-    assert!(active.retiring.is_empty());
-    // The founder's own log holds the activated record and serves it.
-    let replica = founder.handles.ledger.as_ref().unwrap();
-    let facts = replica.registration_facts().await.unwrap().value().clone();
-    assert_eq!(
-        facts.active.as_ref().map(|(fence, _)| fence.kind),
-        Some(SessionFenceKind::Activated)
-    );
-    // A restart finds nothing pending: only a load report follows.
-    let revision = checkpoint.revision;
-    founder.stop().await;
-    let founder = Running::start(&settings).await;
-    let host = partition_host(&founder).await;
-    let (after, _, _) = reached!(
-        founder,
-        wait_for(&founder, &host, "load after restart", |state| {
-            state.revision > revision
-        })
-    );
-    assert_eq!(after.revision, revision + 1);
-    assert_eq!(after.sessions[&ledger].authority, active.authority);
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    let (settled, _, _) = observe(&founder, &host, 11).await.unwrap();
-    assert_eq!(settled.revision, revision + 1);
-    founder.stop().await;
+        )
+        .await;
+        assert!(!matches!(served, Response::Error(_)), "{served:?}");
+        // The session serves as soon as its local grant follows the registry;
+        // the operator's view reads the partition, which commits the session's
+        // registration a controller round later.
+        let view = until(
+            "the created session is in the operator view",
+            &[&founder],
+            Duration::from_secs(60),
+            async || {
+                let AdminResult::Placement { placement } = admin.placement().await.unwrap() else {
+                    panic!("placement");
+                };
+                placement.partitions[0]
+                    .sessions
+                    .iter()
+                    .find(|session| session.session == created)
+                    .cloned()
+            },
+        )
+        .await;
+        assert_eq!(view.founder, Some(node));
+        assert_eq!(view.tenant, tenant.to_string());
+        founder.stop().await;
+
+        // A restart reopens every created session from the install record; the
+        // names still denote the same sessions and the tenant stays served.
+        let founder = Running::start(&settings).await;
+        // The founder's own session opens with the service; created sessions
+        // are reopened by the agent's first tick from the install record.
+        until(
+            "created sessions reopen at restart",
+            &[&founder],
+            Duration::from_secs(30),
+            async || {
+                (founder.handles.fleet.current_host(ledger).is_ok()
+                    && founder.handles.fleet.current_host(other_ledger).is_ok())
+                .then_some(())
+            },
+        )
+        .await;
+        let admin = ClusterAdmin::open(&settings).unwrap();
+        let AdminResult::SessionCreated {
+            session: reopened,
+            existing,
+            ..
+        } = admin.create_session(tenant.0, name).await.unwrap()
+        else {
+            panic!("retry after restart");
+        };
+        assert!(existing);
+        assert_eq!(reopened, created);
+        let AdminResult::Tenants { admitted, .. } = admin.tenants().await.unwrap() else {
+            panic!("tenants after restart");
+        };
+        assert_eq!(admitted, vec![tenant.to_string()]);
+        // A reopened single-voter log serves once it has elected itself again.
+        let mut id = 603;
+        let served = until(
+            "the reopened session serves",
+            &[&founder],
+            Duration::from_secs(20),
+            async || {
+                id += 1;
+                let result = ask(&founder, envelope(ledger, 1, id)).await;
+                (!matches!(result, Response::Error(AccessError::Unavailable))).then_some(result)
+            },
+        )
+        .await;
+        assert!(!matches!(served, Response::Error(_)), "{served:?}");
+        let status = founder.handles.placement.status().await.unwrap();
+        assert!(status.installed.contains(&ledger));
+        assert!(status.installed.contains(&other_ledger));
+        assert_eq!(status.admission.tenants.len(), 2);
+        founder.stop().await;
+    })
+    .unwrap()
 }
 
-/// Join a second host to a running founder and return its service.
-pub(crate) async fn join_peer(
+#[test]
+fn the_controller_completes_a_plan_on_one_host_with_signed_readiness_and_fences() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = settings(directory.path());
+        let founder = Running::start(&settings).await;
+        let ledger = founder.status.ledger;
+        let node = founder.status.node;
+        let host = partition_host(&founder).await;
+        let (checkpoint, _, installed) = reached!(
+            founder,
+            wait_for(&founder, &host, "session registered with load", |state| {
+                state.sessions.contains_key(&ledger)
+                    && state
+                        .nodes
+                        .get(&node)
+                        .is_some_and(|record| record.load.is_some())
+            })
+        );
+        let descriptor = checkpoint.sessions[&ledger].clone();
+        let desired = descriptor.active.clone();
+        let operation = OperationId::from_u128(2);
+        // The operator plans the (unchanged) placement; the controller does the
+        // rest: preparation, the log's cutover record, the founder's own signed
+        // readiness, promotion, the signed cutover fence and activation.
+        submit(
+            &founder,
+            &host,
+            1,
+            &checkpoint,
+            &installed,
+            PartitionOperation::Session {
+                ledger,
+                expected_revision: descriptor.revision,
+                change: SessionChange::Plan {
+                    operation,
+                    desired: desired.clone(),
+                    observations: BTreeMap::new(),
+                },
+            },
+        )
+        .await;
+        let (checkpoint, _, _) = reached!(
+            founder,
+            wait_for(&founder, &host, "signed readiness", |state| {
+                state.sessions[&ledger]
+                    .pending
+                    .as_ref()
+                    .is_some_and(|plan| plan.ready.contains_key(&node))
+            })
+        );
+        let plan = checkpoint.sessions[&ledger].pending.clone().unwrap();
+        let ready = &plan.ready[&node];
+        assert_eq!(ready.route_epoch, RouteEpoch(2));
+        assert_eq!(ready.operation, operation);
+        assert_ne!(ready.custody, ContentHash([0; 32]));
+        assert_ne!(ready.attestation, ContentHash([0; 32]));
+        assert_eq!(plan.progress[&node].custody_epoch, 2);
+        let (checkpoint, _, _) = reached!(
+            founder,
+            wait_for(&founder, &host, "placement activated", |state| {
+                state.sessions[&ledger].pending.is_none()
+                    && state.sessions[&ledger].route_epoch == RouteEpoch(2)
+            })
+        );
+        let active = &checkpoint.sessions[&ledger];
+        assert_eq!(active.active, desired);
+        assert_eq!(active.authority.kind, SessionFenceKind::Activated);
+        assert_eq!(active.authority.operation, operation);
+        assert_eq!(active.membership_epoch, 1, "no voter changed");
+        assert_eq!(active.placement_epoch, 2);
+        assert!(active.retiring.is_empty());
+        // The founder's own log holds the activated record and serves it.
+        let replica = founder.handles.ledger.as_ref().unwrap();
+        let facts = replica.registration_facts().await.unwrap().value().clone();
+        assert_eq!(
+            facts.active.as_ref().map(|(fence, _)| fence.kind),
+            Some(SessionFenceKind::Activated)
+        );
+        // A restart finds nothing pending: only a load report follows.
+        let revision = checkpoint.revision;
+        founder.stop().await;
+        let founder = Running::start(&settings).await;
+        let host = partition_host(&founder).await;
+        let (after, _, _) = reached!(
+            founder,
+            wait_for(&founder, &host, "load after restart", |state| {
+                state.revision > revision
+            })
+        );
+        assert_eq!(after.revision, revision + 1);
+        assert_eq!(after.sessions[&ledger].authority, active.authority);
+        focal_rt::time::sleep(Duration::from_millis(1000))
+            .await
+            .unwrap();
+        let (settled, _, _) = observe(&founder, &host, 11).await.unwrap();
+        assert_eq!(settled.revision, revision + 1);
+        founder.stop().await;
+    })
+    .unwrap()
+}
+
+/// Join a second host to a running founder and return its service. Boxed
+/// by a plain function, as `Running::start` is and for the same frame.
+pub(crate) fn join_peer<'a>(
+    founder: &'a Running,
+    founder_dir: &'a Path,
+    name: &'a str,
+    peer_settings: &'a crate::network_service::tests::TestSettings,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = (Running, u64)> + 'a>> {
+    Box::pin(join_peer_inner(founder, founder_dir, name, peer_settings))
+}
+async fn join_peer_inner(
     founder: &Running,
     founder_dir: &Path,
     name: &str,
     peer_settings: &crate::network_service::tests::TestSettings,
 ) -> (Running, u64) {
     let identity = crate::embedded::decode_identity(&founder_dir.join("IDENTITY")).unwrap();
-    let admin = focal_wire::UnixRemote::new(
+    let admin = focal_wire::LocalRemote::new(
         founder.status.admin_socket.as_ref().unwrap(),
         crate::network_admin::admin_wire_limits(),
     )
@@ -794,757 +868,800 @@ pub(crate) async fn join_peer(
     (Running::start(peer_settings).await, peer_node)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one_loss() {
-    let founder_dir = tempfile::tempdir().unwrap();
-    let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
-    let founder_settings = settings(founder_dir.path());
-    let peer_settings = [settings(dirs[0].path()), settings(dirs[1].path())];
-    let founder = Running::start(&founder_settings).await;
-    let (peer_a, node_a) =
-        join_peer(&founder, founder_dir.path(), "host-a", &peer_settings[0]).await;
-    let (peer_b, node_b) =
-        join_peer(&founder, founder_dir.path(), "host-b", &peer_settings[1]).await;
-    let ledger = founder.status.ledger;
-    let founder_node = founder.status.node;
-    let host = partition_host(&founder).await;
-    let observed = [&founder, &peer_a, &peer_b];
-    let enrolled = wait_among(
-        &observed,
-        Duration::from_secs(40),
-        &host,
-        "three hosts enrolled with load",
-        |state| {
-            state.sessions.contains_key(&ledger)
-                && [founder_node, node_a, node_b].iter().all(|node| {
-                    state
-                        .nodes
-                        .get(node)
-                        .is_some_and(|record| record.load.is_some())
-                })
-        },
-    );
-    let (checkpoint, _, installed) = match enrolled.await {
-        Ok(Some(observed)) => observed,
-        ended => panic!(
-            "enrollment: {:?}: a {:?}; b {:?}; founder {:?}",
-            ended.map(|_| "the service ended"),
-            peer_a.handles.placement.status().await,
-            peer_b.handles.placement.status().await,
-            founder.handles.placement.status().await
-        ),
-    };
-    let descriptor = checkpoint.sessions[&ledger].clone();
-    // The operator asks for one tolerated node loss; the planner picks the
-    // three hosts, and the controller executes the plan unattended.
-    let policy = focal_directory::PlacementPolicy {
-        durability: focal_directory::DurabilityIntent {
-            survive: focal_directory::FailureClass::Node,
-            max_failures: 1,
-        },
-        ..descriptor.active.policy.clone()
-    };
-    let proposal = focal_directory::propose_placement(&checkpoint.nodes, &policy, 31, 1).unwrap();
-    assert_eq!(proposal.spec.placement.voters.len(), 3);
-    // The planner's leader hint follows measured load; the log's leader stays
-    // where it is until a transfer, which this batch does not perform.
-    assert!(proposal.spec.placement.voters.contains_key(&founder_node));
-    let operation = OperationId::from_u128(2);
-    submit(
-        &founder,
-        &host,
-        1,
-        &checkpoint,
-        &installed,
-        PartitionOperation::Session {
-            ledger,
-            expected_revision: descriptor.revision,
-            change: SessionChange::Plan {
-                operation,
-                desired: proposal.spec.clone(),
-                observations: proposal.observations.clone(),
+#[test]
+fn the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one_loss() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let founder_settings = settings(founder_dir.path());
+        let peer_settings = [settings(dirs[0].path()), settings(dirs[1].path())];
+        let founder = Running::start(&founder_settings).await;
+        let (peer_a, node_a) =
+            join_peer(&founder, founder_dir.path(), "host-a", &peer_settings[0]).await;
+        let (peer_b, node_b) =
+            join_peer(&founder, founder_dir.path(), "host-b", &peer_settings[1]).await;
+        let ledger = founder.status.ledger;
+        let founder_node = founder.status.node;
+        let host = partition_host(&founder).await;
+        let observed = [&founder, &peer_a, &peer_b];
+        let enrolled = wait_among(
+            &observed,
+            Duration::from_secs(40),
+            &host,
+            "three hosts enrolled with load",
+            |state| {
+                state.sessions.contains_key(&ledger)
+                    && [founder_node, node_a, node_b].iter().all(|node| {
+                        state
+                            .nodes
+                            .get(node)
+                            .is_some_and(|record| record.load.is_some())
+                    })
             },
-        },
-    )
-    .await;
-    let observed = [&founder, &peer_a, &peer_b];
-    let activated = wait_among(
-        &observed,
-        Duration::from_secs(90),
-        &host,
-        "placement activated",
-        |state| {
-            state.sessions[&ledger].pending.is_none()
-                && state.sessions[&ledger].route_epoch == RouteEpoch(2)
-        },
-    );
-    let (checkpoint, _, _) = match activated.await {
-        Ok(Some(observed)) => observed,
-        ended => panic!(
-            "activation: {:?}: founder {:?}; a {:?}; b {:?}; membership {:?}; session {:?}",
-            ended.map(|_| "the service ended"),
-            founder.handles.placement.status().await,
-            peer_a.handles.placement.status().await,
-            peer_b.handles.placement.status().await,
-            founder
-                .handles
-                .ledger
-                .as_ref()
-                .unwrap()
-                .membership()
-                .await
-                .map(|view| view.view().clone()),
-            observe(&founder, &host, 999)
-                .await
-                .map(|(state, _, _)| state.sessions[&ledger].clone())
-        ),
-    };
-    // The session now has three voters, and its leader paces itself by the
-    // paths it measures to the other two (27 §3.1 P2): the pace in force is
-    // the derivation of what was measured, within its bounds.
-    {
-        let session = founder.handles.ledger.as_ref().unwrap();
-        let pace = try_until(
-            &[&founder, &peer_a, &peer_b],
-            Duration::from_secs(60),
-            async || {
-                let pace = session.current_pace();
-                (pace.samples > 0 && session.progress().voters.len() == 3).then_some(pace)
+        );
+        let (checkpoint, _, installed) = match enrolled.await {
+            Ok(Some(observed)) => observed,
+            ended => panic!(
+                "enrollment: {:?}: a {:?}; b {:?}; founder {:?}",
+                ended.map(|_| "the service ended"),
+                peer_a.handles.placement.status().await,
+                peer_b.handles.placement.status().await,
+                founder.handles.placement.status().await
+            ),
+        };
+        let descriptor = checkpoint.sessions[&ledger].clone();
+        // The operator asks for one tolerated node loss; the planner picks the
+        // three hosts, and the controller executes the plan unattended.
+        let policy = focal_directory::PlacementPolicy {
+            durability: focal_directory::DurabilityIntent {
+                survive: focal_directory::FailureClass::Node,
+                max_failures: 1,
+            },
+            ..descriptor.active.policy.clone()
+        };
+        let proposal = focal_directory::propose_placement(&checkpoint.nodes, &policy, 31, 1).unwrap();
+        assert_eq!(proposal.spec.placement.voters.len(), 3);
+        // The planner's leader hint follows measured load; the log's leader stays
+        // where it is until a transfer, which this batch does not perform.
+        assert!(proposal.spec.placement.voters.contains_key(&founder_node));
+        let operation = OperationId::from_u128(2);
+        submit(
+            &founder,
+            &host,
+            1,
+            &checkpoint,
+            &installed,
+            PartitionOperation::Session {
+                ledger,
+                expected_revision: descriptor.revision,
+                change: SessionChange::Plan {
+                    operation,
+                    desired: proposal.spec.clone(),
+                    observations: proposal.observations.clone(),
+                },
             },
         )
-        .await
-        .unwrap_or_else(|spent| {
-            panic!(
-                "the session leader never measured its voters: {spent}: {:?} {:?}",
-                session.current_pace(),
-                session.progress().voters
-            )
-        });
-        let configured = Duration::from_millis(100);
-        let ceiling = Duration::from_secs(2);
-        assert!(pace.broadcast_tail_ns > 0);
-        assert_eq!(
-            pace.period,
-            Duration::from_nanos(pace.broadcast_tail_ns).clamp(configured, ceiling),
-            "{pace:?}"
+        .await;
+        let observed = [&founder, &peer_a, &peer_b];
+        let activated = wait_among(
+            &observed,
+            Duration::from_secs(90),
+            &host,
+            "placement activated",
+            |state| {
+                state.sessions[&ledger].pending.is_none()
+                    && state.sessions[&ledger].route_epoch == RouteEpoch(2)
+            },
         );
-        assert!(session.tick_period() >= configured && session.tick_period() <= ceiling);
-    }
-    // Each voter's election priority follows the committed placement: the
-    // preferred leader outranks the others (27 §5).
-    {
-        let preferred = proposal.spec.placement.preferred_leader;
-        let hosts = [
-            (founder_node, founder.handles.ledger.clone().unwrap()),
-            (node_a, peer_a.handles.fleet.current_host(ledger).unwrap()),
-            (node_b, peer_b.handles.fleet.current_host(ledger).unwrap()),
-        ];
-        let settled = try_until(
+        let (checkpoint, _, _) = match activated.await {
+            Ok(Some(observed)) => observed,
+            ended => panic!(
+                "activation: {:?}: founder {:?}; a {:?}; b {:?}; membership {:?}; session {:?}",
+                ended.map(|_| "the service ended"),
+                founder.handles.placement.status().await,
+                peer_a.handles.placement.status().await,
+                peer_b.handles.placement.status().await,
+                founder
+                    .handles
+                    .ledger
+                    .as_ref()
+                    .unwrap()
+                    .membership()
+                    .await
+                    .map(|view| view.view().clone()),
+                observe(&founder, &host, 999)
+                    .await
+                    .map(|(state, _, _)| state.sessions[&ledger].clone())
+            ),
+        };
+        // The session now has three voters, and its leader paces itself by the
+        // paths it measures to the other two (27 §3.1 P2): the pace in force is
+        // the derivation of what was measured, within its bounds.
+        {
+            let session = founder.handles.ledger.as_ref().unwrap();
+            let pace = try_until(
+                &[&founder, &peer_a, &peer_b],
+                Duration::from_secs(60),
+                async || {
+                    let pace = session.current_pace();
+                    (pace.samples > 0 && session.progress().voters.len() == 3).then_some(pace)
+                },
+            )
+            .await
+            .unwrap_or_else(|spent| {
+                panic!(
+                    "the session leader never measured its voters: {spent}: {:?} {:?}",
+                    session.current_pace(),
+                    session.progress().voters
+                )
+            });
+            let configured = Duration::from_millis(100);
+            let ceiling = Duration::from_secs(2);
+            assert!(pace.broadcast_tail_ns > 0);
+            assert_eq!(
+                pace.period,
+                Duration::from_nanos(pace.broadcast_tail_ns).clamp(configured, ceiling),
+                "{pace:?}"
+            );
+            assert!(session.tick_period() >= configured && session.tick_period() <= ceiling);
+        }
+        // Each voter's election priority follows the committed placement: the
+        // preferred leader outranks the others (27 §5).
+        {
+            let preferred = proposal.spec.placement.preferred_leader;
+            let hosts = [
+                (founder_node, founder.handles.ledger.clone().unwrap()),
+                (node_a, peer_a.handles.fleet.current_host(ledger).unwrap()),
+                (node_b, peer_b.handles.fleet.current_host(ledger).unwrap()),
+            ];
+            let settled = try_until(
+                &[&founder, &peer_a, &peer_b],
+                Duration::from_secs(60),
+                async || {
+                    hosts
+                        .iter()
+                        .all(|(node, host)| {
+                            let expected = if *node == preferred {
+                                crate::fleet::PREFERRED_LEADER_PRIORITY
+                            } else {
+                                crate::fleet::VOTER_PRIORITY
+                            };
+                            host.progress().priority == expected
+                        })
+                        .then_some(())
+                },
+            )
+            .await;
+            if let Err(spent) = settled {
+                panic!(
+                    "priorities never followed the placement (preferred {preferred}): {spent}: {:?}",
+                    hosts
+                        .iter()
+                        .map(|(node, host)| (*node, host.progress().priority))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        // The route epoch moved to 2: a client still at epoch 1 is answered with
+        // the current epoch and the leader's endpoint by every host, and the
+        // leader serves a current client without redirecting it.
+        {
+            use crate::route_cache_tests::{ask, envelope, redirect_from};
+            let stale = redirect_from(&founder, envelope(ledger, 1, 9_001)).await;
+            assert_eq!(stale.epoch, RouteEpoch(2));
+            assert_eq!(stale.endpoint, founder.status.advertise.to_string());
+            let stale_at_a = redirect_from(&peer_a, envelope(ledger, 1, 9_002)).await;
+            assert_eq!(stale_at_a.epoch, RouteEpoch(2));
+            assert_eq!(stale_at_a.endpoint, founder.status.advertise.to_string());
+            // The founder re-fenced its replica to the activated route: a
+            // current client is served there, not refused or redirected.
+            let current = until(
+                "the founder serves the activated route",
+                &[&founder],
+                Duration::from_secs(20),
+                async || {
+                    let result = ask(&founder, envelope(ledger, 2, 9_003)).await;
+                    (!matches!(
+                        result,
+                        focal_wire::Response::Error(focal_wire::AccessError::Unavailable)
+                    ))
+                    .then_some(result)
+                },
+            )
+            .await;
+            assert!(
+                matches!(current, focal_wire::Response::Summary(_)),
+                "{current:?}; founder progress {:?}; agent {:?}",
+                founder
+                    .handles
+                    .fleet
+                    .current_host(ledger)
+                    .map(|host| host.progress()),
+                founder
+                    .handles
+                    .placement
+                    .status()
+                    .await
+                    .map(|s| s.last_error)
+            );
+        }
+        let active = &checkpoint.sessions[&ledger];
+        assert_eq!(active.active, proposal.spec);
+        assert_eq!(active.authority.kind, SessionFenceKind::Activated);
+        assert_eq!(
+            active.membership_epoch, 3,
+            "two promotions advanced the epoch twice"
+        );
+        assert_eq!(active.placement_epoch, 2);
+        assert!(active.retiring.is_empty());
+        let report = focal_directory::effective_guarantee(active, &checkpoint.nodes).unwrap();
+        assert_eq!(report.achieved, Some(policy.durability));
+        assert!(report.blocked_by.is_empty());
+        for peer in [&peer_a, &peer_b] {
+            assert!(peer.handles.fleet.hosts(ledger));
+            assert_eq!(peer.handles.fleet.status().installed, 1);
+        }
+        // The root grant names three voters at the epoch the fence carries.
+        let root = founder.handles.control.observe_root().await.unwrap();
+        let grant = root.authority().unwrap().groups[&LogGroupId(ledger.session.0)].clone();
+        assert_eq!(grant.membership_epoch, 3);
+        assert_eq!(grant.voters.len(), 3);
+        assert!(grant.learners.is_empty());
+        // Losing one host keeps a quorum: a voter that is still there leads, and
+        // answers a quorum read of its membership — a read only the leader
+        // serves, a follower naming it instead. Which one leads is the
+        // placement's: it prefers the node the planner put first by load, and the
+        // leader hands over to that one (27 §5), so the founder leads only where
+        // it is preferred or the preferred one is the host lost. Asked of the
+        // founder alone, the read failed wherever the planner put another first
+        // (three suites at once, 2026-10-03).
+        let preferred = active.active.placement.preferred_leader;
+        peer_b.stop().await;
+        let replica = founder.handles.ledger.as_ref().unwrap();
+        if let Err(spent) = try_until(&[&founder, &peer_a], Duration::from_secs(20), async || {
+            let leader = replica.progress().leader;
+            let answered = if leader == founder_node {
+                replica.membership().await.is_ok()
+            } else if leader == node_a {
+                match peer_a.handles.fleet.current_host(ledger) {
+                    Ok(host) => host.membership().await.is_ok(),
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+            answered.then_some(())
+        })
+        .await
+        {
+            panic!(
+                "the session lost its quorum after one host loss: {spent}: handle progress {:?}; fleet progress {:?}; membership {:?}; a fleet {:?}; a status {:?}; founder status {:?}",
+                replica.progress(),
+                founder
+                    .handles
+                    .fleet
+                    .current_host(ledger)
+                    .map(|host| host.progress()),
+                replica.membership().await.map(|view| view.view().clone()),
+                peer_a
+                    .handles
+                    .fleet
+                    .current_host(ledger)
+                    .map(|host| host.progress()),
+                peer_a
+                    .handles
+                    .placement
+                    .status()
+                    .await
+                    .map(|s| s.last_error),
+                founder
+                    .handles
+                    .placement
+                    .status()
+                    .await
+                    .map(|s| s.last_error),
+            );
+        }
+        // The lost host returns, reopens its copy and rejoins as a voter.
+        let peer_b = Running::start(&peer_settings[1]).await;
+        // Leadership settles on the placement's preferred leader by the return's
+        // own schedule (27 §5): that member fit for `FIT` windows, a quiet moment
+        // waited for up to `PATIENCE`, and a rest of `REST` windows after each
+        // ask, doubled after one that did not hold. Under load an ask may not
+        // hold twice: the wait is given the reopen's time and that schedule, in
+        // the session's election window, and not a guess at the sum.
+        let window = founder
+            .handles
+            .ledger
+            .as_ref()
+            .map(|host| {
+                host.tick_period()
+                    .saturating_mul(u32::try_from(host.election_periods()).unwrap_or(u32::MAX))
+            })
+            .unwrap_or(Duration::from_secs(1));
+        let returns = window.saturating_mul(
+            crate::leader_return::FIT
+                + crate::leader_return::PATIENCE
+                + crate::leader_return::REST * ((1 << 3) - 1),
+        );
+        if let Err(spent) = try_until(
             &[&founder, &peer_a, &peer_b],
-            Duration::from_secs(60),
+            Duration::from_secs(30).saturating_add(returns),
             async || {
-                hosts
-                    .iter()
-                    .all(|(node, host)| {
-                        let expected = if *node == preferred {
-                            crate::fleet::PREFERRED_LEADER_PRIORITY
-                        } else {
-                            crate::fleet::VOTER_PRIORITY
-                        };
-                        host.progress().priority == expected
-                    })
+                peer_b
+                    .handles
+                    .fleet
+                    .current_host(ledger)
+                    .is_ok_and(|copy| copy.progress().leader == preferred)
                     .then_some(())
             },
         )
-        .await;
-        if let Err(spent) = settled {
+        .await
+        {
             panic!(
-                "priorities never followed the placement (preferred {preferred}): {spent}: {:?}",
-                hosts
-                    .iter()
-                    .map(|(node, host)| (*node, host.progress().priority))
-                    .collect::<Vec<_>>()
+                "leadership never settled on the preferred leader {preferred} after the lost host returned: {spent}: hosts={} status={:?} founder={:?} peer_a={:?} progress={:?}",
+                peer_b.handles.fleet.hosts(ledger),
+                peer_b.handles.placement.status().await,
+                founder.handles.ledger.as_ref().map(ReplicaHost::progress),
+                peer_a
+                    .handles
+                    .fleet
+                    .current_host(ledger)
+                    .map(|host| host.progress()),
+                peer_b
+                    .handles
+                    .fleet
+                    .current_host(ledger)
+                    .map(|copy| copy.progress())
             );
         }
-    }
-    // The route epoch moved to 2: a client still at epoch 1 is answered with
-    // the current epoch and the leader's endpoint by every host, and the
-    // leader serves a current client without redirecting it.
-    {
-        use crate::route_cache_tests::{ask, envelope, redirect_from};
-        let stale = redirect_from(&founder, envelope(ledger, 1, 9_001)).await;
-        assert_eq!(stale.epoch, RouteEpoch(2));
-        assert_eq!(stale.endpoint, founder.status.advertise.to_string());
-        let stale_at_a = redirect_from(&peer_a, envelope(ledger, 1, 9_002)).await;
-        assert_eq!(stale_at_a.epoch, RouteEpoch(2));
-        assert_eq!(stale_at_a.endpoint, founder.status.advertise.to_string());
-        // The founder re-fenced its replica to the activated route: a
-        // current client is served there, not refused or redirected.
-        let current = until(
-            "the founder serves the activated route",
-            &[&founder],
-            Duration::from_secs(20),
-            async || {
-                let result = ask(&founder, envelope(ledger, 2, 9_003)).await;
-                (!matches!(
-                    result,
-                    focal_wire::Response::Error(focal_wire::AccessError::Unavailable)
-                ))
-                .then_some(result)
-            },
-        )
-        .await;
-        assert!(
-            matches!(current, focal_wire::Response::Summary(_)),
-            "{current:?}; founder progress {:?}; agent {:?}",
-            founder
-                .handles
-                .fleet
-                .current_host(ledger)
-                .map(|host| host.progress()),
-            founder
-                .handles
-                .placement
-                .status()
-                .await
-                .map(|s| s.last_error)
-        );
-    }
-    let active = &checkpoint.sessions[&ledger];
-    assert_eq!(active.active, proposal.spec);
-    assert_eq!(active.authority.kind, SessionFenceKind::Activated);
-    assert_eq!(
-        active.membership_epoch, 3,
-        "two promotions advanced the epoch twice"
-    );
-    assert_eq!(active.placement_epoch, 2);
-    assert!(active.retiring.is_empty());
-    let report = focal_directory::effective_guarantee(active, &checkpoint.nodes).unwrap();
-    assert_eq!(report.achieved, Some(policy.durability));
-    assert!(report.blocked_by.is_empty());
-    for peer in [&peer_a, &peer_b] {
-        assert!(peer.handles.fleet.hosts(ledger));
-        assert_eq!(peer.handles.fleet.status().installed, 1);
-    }
-    // The root grant names three voters at the epoch the fence carries.
-    let root = founder.handles.control.observe_root().await.unwrap();
-    let grant = root.authority().unwrap().groups[&LogGroupId(ledger.session.0)].clone();
-    assert_eq!(grant.membership_epoch, 3);
-    assert_eq!(grant.voters.len(), 3);
-    assert!(grant.learners.is_empty());
-    // Losing one host keeps a quorum: the founder still answers a quorum read
-    // of its membership, and a voter that is still there leads. Which one is
-    // the placement's: it prefers the node the planner put first by load,
-    // and the leader hands over to that one (27 §5), so the founder leads
-    // only where it is preferred or the preferred one is the host lost.
-    let preferred = active.active.placement.preferred_leader;
-    peer_b.stop().await;
-    let replica = founder.handles.ledger.as_ref().unwrap();
-    if let Err(spent) = try_until(&[&founder, &peer_a], Duration::from_secs(20), async || {
-        let leader = replica.progress().leader;
-        (replica.membership().await.is_ok() && (leader == founder_node || leader == node_a))
-            .then_some(())
-    })
-    .await
-    {
-        panic!(
-            "the session lost its quorum after one host loss: {spent}: handle progress {:?}; fleet progress {:?}; membership {:?}; a fleet {:?}; a status {:?}; founder status {:?}",
-            replica.progress(),
-            founder
-                .handles
-                .fleet
-                .current_host(ledger)
-                .map(|host| host.progress()),
-            replica.membership().await.map(|view| view.view().clone()),
-            peer_a
-                .handles
-                .fleet
-                .current_host(ledger)
-                .map(|host| host.progress()),
-            peer_a
-                .handles
-                .placement
-                .status()
-                .await
-                .map(|s| s.last_error),
-            founder
-                .handles
-                .placement
-                .status()
-                .await
-                .map(|s| s.last_error),
-        );
-    }
-    // The lost host returns, reopens its copy and rejoins as a voter.
-    let peer_b = Running::start(&peer_settings[1]).await;
-    // Leadership settles on the placement's preferred leader by the return's
-    // own schedule (27 §5): that member fit for `FIT` windows, a quiet moment
-    // waited for up to `PATIENCE`, and a rest of `REST` windows after each
-    // ask, doubled after one that did not hold. Under load an ask may not
-    // hold twice: the wait is given the reopen's time and that schedule, in
-    // the session's election window, and not a guess at the sum.
-    let window = founder
-        .handles
-        .ledger
-        .as_ref()
-        .map(|host| {
-            host.tick_period()
-                .saturating_mul(u32::try_from(host.election_periods()).unwrap_or(u32::MAX))
-        })
-        .unwrap_or(Duration::from_secs(1));
-    let returns = window.saturating_mul(
-        crate::leader_return::FIT
-            + crate::leader_return::PATIENCE
-            + crate::leader_return::REST * ((1 << 3) - 1),
-    );
-    if let Err(spent) = try_until(
-        &[&founder, &peer_a, &peer_b],
-        Duration::from_secs(30).saturating_add(returns),
-        async || {
-            peer_b
-                .handles
-                .fleet
-                .current_host(ledger)
-                .is_ok_and(|copy| copy.progress().leader == preferred)
-                .then_some(())
-        },
-    )
-    .await
-    {
-        panic!(
-            "leadership never settled on the preferred leader {preferred} after the lost host returned: {spent}: hosts={} status={:?} founder={:?} peer_a={:?} progress={:?}",
-            peer_b.handles.fleet.hosts(ledger),
-            peer_b.handles.placement.status().await,
-            founder.handles.ledger.as_ref().map(ReplicaHost::progress),
-            peer_a
-                .handles
-                .fleet
-                .current_host(ledger)
-                .map(|host| host.progress()),
-            peer_b
-                .handles
-                .fleet
-                .current_host(ledger)
-                .map(|copy| copy.progress())
-        );
-    }
-    assert_eq!(peer_b.handles.fleet.status().installed, 1);
-    peer_a.stop().await;
-    peer_b.stop().await;
-    founder.stop().await;
+        assert_eq!(peer_b.handles.fleet.status().installed, 1);
+        peer_a.stop().await;
+        peer_b.stop().await;
+        founder.stop().await;
+    }).unwrap()
 }
 
 /// Draining the host that leads a session (27 §5): the controller drives the
 /// session's log at the host that leads it, moves leadership to a voter that
 /// stays before the drained host is removed, and the session keeps a leader
 /// inside its configuration throughout.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_drained_session_leader_hands_leadership_on_and_the_session_heals() {
-    let founder_dir = tempfile::tempdir().unwrap();
-    let dirs = [
-        tempfile::tempdir().unwrap(),
-        tempfile::tempdir().unwrap(),
-        tempfile::tempdir().unwrap(),
-    ];
-    let founder_settings = settings(founder_dir.path());
-    let peer_settings = [
-        settings(dirs[0].path()),
-        settings(dirs[1].path()),
-        settings(dirs[2].path()),
-    ];
-    let founder = Running::start(&founder_settings).await;
-    let (peer_a, node_a) =
-        join_peer(&founder, founder_dir.path(), "host-a", &peer_settings[0]).await;
-    let (peer_b, node_b) =
-        join_peer(&founder, founder_dir.path(), "host-b", &peer_settings[1]).await;
-    let ledger = founder.status.ledger;
-    let founder_node = founder.status.node;
-    let host = partition_host(&founder).await;
-    let observed = [&founder, &peer_a, &peer_b];
-    let enrolled = wait_among(
-        &observed,
-        Duration::from_secs(60),
-        &host,
-        "three hosts enrolled with load",
-        |state| {
-            state.sessions.contains_key(&ledger)
-                && [founder_node, node_a, node_b].iter().all(|node| {
-                    state
-                        .nodes
-                        .get(node)
-                        .is_some_and(|record| record.load.is_some())
-                })
-        },
-    );
-    let (checkpoint, _, installed) = enrolled.await.unwrap().unwrap();
-    let descriptor = checkpoint.sessions[&ledger].clone();
-    let policy = focal_directory::PlacementPolicy {
-        durability: focal_directory::DurabilityIntent {
-            survive: focal_directory::FailureClass::Node,
-            max_failures: 1,
-        },
-        ..descriptor.active.policy.clone()
-    };
-    let proposal = focal_directory::propose_placement(&checkpoint.nodes, &policy, 31, 1).unwrap();
-    submit(
-        &founder,
-        &host,
-        1,
-        &checkpoint,
-        &installed,
-        PartitionOperation::Session {
-            ledger,
-            expected_revision: descriptor.revision,
-            change: SessionChange::Plan {
-                operation: OperationId::from_u128(2),
-                desired: proposal.spec.clone(),
-                observations: proposal.observations.clone(),
+#[test]
+fn a_drained_session_leader_hands_leadership_on_and_the_session_heals() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let dirs = [
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        ];
+        let founder_settings = settings(founder_dir.path());
+        let peer_settings = [
+            settings(dirs[0].path()),
+            settings(dirs[1].path()),
+            settings(dirs[2].path()),
+        ];
+        let founder = Running::start(&founder_settings).await;
+        let (peer_a, node_a) =
+            join_peer(&founder, founder_dir.path(), "host-a", &peer_settings[0]).await;
+        let (peer_b, node_b) =
+            join_peer(&founder, founder_dir.path(), "host-b", &peer_settings[1]).await;
+        let ledger = founder.status.ledger;
+        let founder_node = founder.status.node;
+        let host = partition_host(&founder).await;
+        let observed = [&founder, &peer_a, &peer_b];
+        let enrolled = wait_among(
+            &observed,
+            Duration::from_secs(60),
+            &host,
+            "three hosts enrolled with load",
+            |state| {
+                state.sessions.contains_key(&ledger)
+                    && [founder_node, node_a, node_b].iter().all(|node| {
+                        state
+                            .nodes
+                            .get(node)
+                            .is_some_and(|record| record.load.is_some())
+                    })
             },
-        },
-    )
-    .await;
-    let activated = wait_among(
-        &observed,
-        Duration::from_secs(120),
-        &host,
-        "placement activated",
-        |state| {
-            state.sessions[&ledger].pending.is_none()
-                && state.sessions[&ledger].route_epoch == RouteEpoch(2)
-        },
-    );
-    activated.await.unwrap().unwrap();
-
-    // Leadership moves to host a. A transfer is a request: it is asked
-    // again until every voter says it happened.
-    let replicas = [
-        founder.handles.ledger.clone().unwrap(),
-        peer_a.handles.fleet.current_host(ledger).unwrap(),
-        peer_b.handles.fleet.current_host(ledger).unwrap(),
-    ];
-    try_until(&observed, Duration::from_secs(60), async || {
-        if replicas
-            .iter()
-            .all(|replica| replica.progress().leader == node_a)
-        {
-            return Some(());
-        }
-        for replica in &replicas {
-            let progress = replica.progress();
-            if progress.leader == progress.node {
-                let _ = replica.transfer_leader(node_a).await;
-            }
-        }
-        None
-    })
-    .await
-    .unwrap_or_else(|spent| {
-        panic!(
-            "leadership never moved to host a: {spent}: {:?}",
-            replicas
-                .iter()
-                .map(|replica| replica.progress())
-                .collect::<Vec<_>>()
-        )
-    });
-
-    // A replacement joins and the host that leads is drained.
-    let (peer_c, node_c) =
-        join_peer(&founder, founder_dir.path(), "host-c", &peer_settings[2]).await;
-    let everyone = [&founder, &peer_a, &peer_b, &peer_c];
-    wait_among(
-        &everyone,
-        Duration::from_secs(60),
-        &host,
-        "the replacement enrolled with load",
-        |state| {
-            state
-                .nodes
-                .get(&node_c)
-                .is_some_and(|record| record.load.is_some())
-        },
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    use crate::cluster_admin::ClusterAdmin;
-    use focal_client::admin::AdminResult;
-    crate::set_test_mode(founder_dir.path(), 0o700);
-    let admin = ClusterAdmin::open(&founder_settings).unwrap();
-    let AdminResult::NodeEligibility { eligible, .. } =
-        admin.node_eligibility(node_a, false).await.unwrap()
-    else {
-        panic!("drain");
-    };
-    assert!(!eligible);
-    let healed = BTreeSet::from([founder_node, node_b, node_c]);
-    let settled = wait_among(
-        &everyone,
-        Duration::from_secs(300),
-        &host,
-        "the session healed without the drained host",
-        |state| {
-            let session = &state.sessions[&ledger];
-            session.pending.is_none()
-                && session.retiring.is_empty()
-                && session
-                    .active
-                    .placement
-                    .voters
-                    .keys()
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-                    == healed
-        },
-    )
-    .await;
-    if !matches!(settled, Ok(Some(_))) {
-        let mut seen = Vec::new();
-        for (name, running) in [
-            ("founder", &founder),
-            ("a", &peer_a),
-            ("b", &peer_b),
-            ("c", &peer_c),
-        ] {
-            seen.push(format!(
-                "{name}: replica {:?}; agent {:?}",
-                running
-                    .handles
-                    .fleet
-                    .current_host(ledger)
-                    .map(|replica| replica.progress()),
-                running
-                    .handles
-                    .placement
-                    .status()
-                    .await
-                    .map(|status| (status.last_error, status.last_refusal))
-            ));
-        }
-        panic!(
-            "the session never healed: {:?}: {seen:#?}; session {:#?}",
-            settled.map(|_| "the service ended"),
-            observe(&founder, &host, 998)
-                .await
-                .map(|(state, _, _)| state.sessions[&ledger].clone())
         );
-    }
-    // Every host that stays follows a leader that stays, and the log's
-    // configuration is the healed one.
-    let staying = [
-        founder.handles.ledger.clone().unwrap(),
-        peer_b.handles.fleet.current_host(ledger).unwrap(),
-        peer_c.handles.fleet.current_host(ledger).unwrap(),
-    ];
-    let waited = [&founder, &peer_b, &peer_c];
-    let leader = until(
-        "the hosts that stay agree on a leader that stays",
-        &waited,
-        Duration::from_secs(60),
-        async || {
-            let leader = staying.first()?.progress().leader;
-            (healed.contains(&leader)
-                && staying.iter().all(|replica| {
-                    let progress = replica.progress();
-                    progress.leader == leader
-                        && progress.voters.iter().copied().collect::<BTreeSet<_>>() == healed
-                }))
-            .then_some(leader)
-        },
-    )
-    .await;
-    assert_ne!(leader, node_a);
-    peer_a.stop().await;
-    peer_b.stop().await;
-    peer_c.stop().await;
-    founder.stop().await;
+        let (checkpoint, _, installed) = enrolled.await.unwrap().unwrap();
+        let descriptor = checkpoint.sessions[&ledger].clone();
+        let policy = focal_directory::PlacementPolicy {
+            durability: focal_directory::DurabilityIntent {
+                survive: focal_directory::FailureClass::Node,
+                max_failures: 1,
+            },
+            ..descriptor.active.policy.clone()
+        };
+        let proposal =
+            focal_directory::propose_placement(&checkpoint.nodes, &policy, 31, 1).unwrap();
+        submit(
+            &founder,
+            &host,
+            1,
+            &checkpoint,
+            &installed,
+            PartitionOperation::Session {
+                ledger,
+                expected_revision: descriptor.revision,
+                change: SessionChange::Plan {
+                    operation: OperationId::from_u128(2),
+                    desired: proposal.spec.clone(),
+                    observations: proposal.observations.clone(),
+                },
+            },
+        )
+        .await;
+        let activated = wait_among(
+            &observed,
+            Duration::from_secs(120),
+            &host,
+            "placement activated",
+            |state| {
+                state.sessions[&ledger].pending.is_none()
+                    && state.sessions[&ledger].route_epoch == RouteEpoch(2)
+            },
+        );
+        activated.await.unwrap().unwrap();
+
+        // Leadership moves to host a. A transfer is a request: it is asked
+        // again until every voter says it happened.
+        let replicas = [
+            founder.handles.ledger.clone().unwrap(),
+            peer_a.handles.fleet.current_host(ledger).unwrap(),
+            peer_b.handles.fleet.current_host(ledger).unwrap(),
+        ];
+        try_until(&observed, Duration::from_secs(60), async || {
+            if replicas
+                .iter()
+                .all(|replica| replica.progress().leader == node_a)
+            {
+                return Some(());
+            }
+            for replica in &replicas {
+                let progress = replica.progress();
+                if progress.leader == progress.node {
+                    let _ = replica.transfer_leader(node_a).await;
+                }
+            }
+            None
+        })
+        .await
+        .unwrap_or_else(|spent| {
+            panic!(
+                "leadership never moved to host a: {spent}: {:?}",
+                replicas
+                    .iter()
+                    .map(|replica| replica.progress())
+                    .collect::<Vec<_>>()
+            )
+        });
+
+        // A replacement joins and the host that leads is drained.
+        let (peer_c, node_c) =
+            join_peer(&founder, founder_dir.path(), "host-c", &peer_settings[2]).await;
+        let everyone = [&founder, &peer_a, &peer_b, &peer_c];
+        wait_among(
+            &everyone,
+            Duration::from_secs(60),
+            &host,
+            "the replacement enrolled with load",
+            |state| {
+                state
+                    .nodes
+                    .get(&node_c)
+                    .is_some_and(|record| record.load.is_some())
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        use crate::cluster_admin::ClusterAdmin;
+        use focal_client::admin::AdminResult;
+        crate::set_test_mode(founder_dir.path(), 0o700);
+        let admin = ClusterAdmin::open(&founder_settings).unwrap();
+        let AdminResult::NodeEligibility { eligible, .. } =
+            admin.node_eligibility(node_a, false).await.unwrap()
+        else {
+            panic!("drain");
+        };
+        assert!(!eligible);
+        let healed = BTreeSet::from([founder_node, node_b, node_c]);
+        let settled = wait_among(
+            &everyone,
+            Duration::from_secs(300),
+            &host,
+            "the session healed without the drained host",
+            |state| {
+                let session = &state.sessions[&ledger];
+                session.pending.is_none()
+                    && session.retiring.is_empty()
+                    && session
+                        .active
+                        .placement
+                        .voters
+                        .keys()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        == healed
+            },
+        )
+        .await;
+        if !matches!(settled, Ok(Some(_))) {
+            let mut seen = Vec::new();
+            for (name, running) in [
+                ("founder", &founder),
+                ("a", &peer_a),
+                ("b", &peer_b),
+                ("c", &peer_c),
+            ] {
+                seen.push(format!(
+                    "{name}: replica {:?}; agent {:?}",
+                    running
+                        .handles
+                        .fleet
+                        .current_host(ledger)
+                        .map(|replica| replica.progress()),
+                    running
+                        .handles
+                        .placement
+                        .status()
+                        .await
+                        .map(|status| (status.last_error, status.last_refusal))
+                ));
+            }
+            panic!(
+                "the session never healed: {:?}: {seen:#?}; session {:#?}",
+                settled.map(|_| "the service ended"),
+                observe(&founder, &host, 998)
+                    .await
+                    .map(|(state, _, _)| state.sessions[&ledger].clone())
+            );
+        }
+        // Every host that stays follows a leader that stays, and the log's
+        // configuration is the healed one.
+        let staying = [
+            founder.handles.ledger.clone().unwrap(),
+            peer_b.handles.fleet.current_host(ledger).unwrap(),
+            peer_c.handles.fleet.current_host(ledger).unwrap(),
+        ];
+        let waited = [&founder, &peer_b, &peer_c];
+        let leader = until(
+            "the hosts that stay agree on a leader that stays",
+            &waited,
+            Duration::from_secs(60),
+            async || {
+                let leader = staying.first()?.progress().leader;
+                (healed.contains(&leader)
+                    && staying.iter().all(|replica| {
+                        let progress = replica.progress();
+                        progress.leader == leader
+                            && progress.voters.iter().copied().collect::<BTreeSet<_>>() == healed
+                    }))
+                .then_some(leader)
+            },
+        )
+        .await;
+        assert_ne!(leader, node_a);
+        peer_a.stop().await;
+        peer_b.stop().await;
+        peer_c.stop().await;
+        founder.stop().await;
+    })
+    .unwrap()
 }
 
 /// A voter that stopped is drained and replaced (27 §3.1 P1): the rounds
 /// that collect signatures and change the membership ask the voters at
 /// once and end at a majority, so the one that answers nothing delays none
 /// of them.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dead_voter_is_drained_and_replaced_without_waiting_it_out() {
-    let founder_dir = tempfile::tempdir().unwrap();
-    let dirs = [
-        tempfile::tempdir().unwrap(),
-        tempfile::tempdir().unwrap(),
-        tempfile::tempdir().unwrap(),
-    ];
-    let founder_settings = settings(founder_dir.path());
-    let peer_settings = [
-        settings(dirs[0].path()),
-        settings(dirs[1].path()),
-        settings(dirs[2].path()),
-    ];
-    let founder = Running::start(&founder_settings).await;
-    let (peer_a, node_a) =
-        join_peer(&founder, founder_dir.path(), "host-a", &peer_settings[0]).await;
-    let (peer_b, node_b) =
-        join_peer(&founder, founder_dir.path(), "host-b", &peer_settings[1]).await;
-    let ledger = founder.status.ledger;
-    let founder_node = founder.status.node;
-    let host = partition_host(&founder).await;
-    let observed = [&founder, &peer_a, &peer_b];
-    let enrolled = wait_among(
-        &observed,
-        Duration::from_secs(60),
-        &host,
-        "three hosts enrolled with load",
-        |state| {
-            state.sessions.contains_key(&ledger)
-                && [founder_node, node_a, node_b].iter().all(|node| {
-                    state
-                        .nodes
-                        .get(node)
-                        .is_some_and(|record| record.load.is_some())
-                })
-        },
-    );
-    let (checkpoint, _, installed) = enrolled.await.unwrap().unwrap();
-    let descriptor = checkpoint.sessions[&ledger].clone();
-    let policy = focal_directory::PlacementPolicy {
-        durability: focal_directory::DurabilityIntent {
-            survive: focal_directory::FailureClass::Node,
-            max_failures: 1,
-        },
-        ..descriptor.active.policy.clone()
-    };
-    let proposal = focal_directory::propose_placement(&checkpoint.nodes, &policy, 31, 1).unwrap();
-    submit(
-        &founder,
-        &host,
-        1,
-        &checkpoint,
-        &installed,
-        PartitionOperation::Session {
-            ledger,
-            expected_revision: descriptor.revision,
-            change: SessionChange::Plan {
-                operation: OperationId::from_u128(2),
-                desired: proposal.spec.clone(),
-                observations: proposal.observations.clone(),
+#[test]
+fn a_dead_voter_is_drained_and_replaced_without_waiting_it_out() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let dirs = [
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+            tempfile::tempdir().unwrap(),
+        ];
+        let founder_settings = settings(founder_dir.path());
+        let peer_settings = [
+            settings(dirs[0].path()),
+            settings(dirs[1].path()),
+            settings(dirs[2].path()),
+        ];
+        let founder = Running::start(&founder_settings).await;
+        let (peer_a, node_a) =
+            join_peer(&founder, founder_dir.path(), "host-a", &peer_settings[0]).await;
+        let (peer_b, node_b) =
+            join_peer(&founder, founder_dir.path(), "host-b", &peer_settings[1]).await;
+        let ledger = founder.status.ledger;
+        let founder_node = founder.status.node;
+        let host = partition_host(&founder).await;
+        let observed = [&founder, &peer_a, &peer_b];
+        let enrolled = wait_among(
+            &observed,
+            Duration::from_secs(60),
+            &host,
+            "three hosts enrolled with load",
+            |state| {
+                state.sessions.contains_key(&ledger)
+                    && [founder_node, node_a, node_b].iter().all(|node| {
+                        state
+                            .nodes
+                            .get(node)
+                            .is_some_and(|record| record.load.is_some())
+                    })
             },
-        },
-    )
-    .await;
-    let activated = wait_among(
-        &observed,
-        Duration::from_secs(120),
-        &host,
-        "placement activated",
-        |state| {
-            state.sessions[&ledger].pending.is_none()
-                && state.sessions[&ledger].route_epoch == RouteEpoch(2)
-        },
-    );
-    activated.await.unwrap().unwrap();
-
-    // A replacement joins; then a voter stops, and is drained.
-    let (peer_c, node_c) =
-        join_peer(&founder, founder_dir.path(), "host-c", &peer_settings[2]).await;
-    wait_among(
-        &[&founder, &peer_a, &peer_b, &peer_c],
-        Duration::from_secs(60),
-        &host,
-        "the replacement enrolled with load",
-        |state| {
-            state
-                .nodes
-                .get(&node_c)
-                .is_some_and(|record| record.load.is_some())
-        },
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    peer_b.stop().await;
-    use crate::cluster_admin::ClusterAdmin;
-    use focal_client::admin::AdminResult;
-    crate::set_test_mode(founder_dir.path(), 0o700);
-    let admin = ClusterAdmin::open(&founder_settings).unwrap();
-    let AdminResult::NodeEligibility { eligible, .. } =
-        admin.node_eligibility(node_b, false).await.unwrap()
-    else {
-        panic!("drain");
-    };
-    assert!(!eligible);
-    // Every signature round and every membership change from here has a
-    // voter that answers nothing (27 §3.1 P1): the two that stay are a
-    // majority, and the plan completes on them.
-    let healed = BTreeSet::from([founder_node, node_a, node_c]);
-    let living = [&founder, &peer_a, &peer_c];
-    let settled = wait_among(
-        &living,
-        Duration::from_secs(300),
-        &host,
-        "the session healed without the dead voter",
-        |state| {
-            let session = &state.sessions[&ledger];
-            session.pending.is_none()
-                && session.retiring.is_empty()
-                && session
-                    .active
-                    .placement
-                    .voters
-                    .keys()
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-                    == healed
-        },
-    )
-    .await;
-    if !matches!(settled, Ok(Some(_))) {
-        let mut seen = Vec::new();
-        for (name, running) in [("founder", &founder), ("a", &peer_a), ("c", &peer_c)] {
-            seen.push(format!(
-                "{name}: replica {:?}; agent {:?}",
-                running
-                    .handles
-                    .fleet
-                    .current_host(ledger)
-                    .map(|replica| replica.progress()),
-                running
-                    .handles
-                    .placement
-                    .status()
-                    .await
-                    .map(|status| (status.last_error, status.last_refusal))
-            ));
-        }
-        panic!(
-            "the session never healed: {:?}: {seen:#?}; session {:#?}",
-            settled.map(|_| "the service ended"),
-            observe(&founder, &host, 998)
-                .await
-                .map(|(state, _, _)| state.sessions[&ledger].clone())
         );
-    }
-    let staying = [
-        founder.handles.ledger.clone().unwrap(),
-        peer_a.handles.fleet.current_host(ledger).unwrap(),
-        peer_c.handles.fleet.current_host(ledger).unwrap(),
-    ];
-    until(
-        "the hosts that stay agree on a leader and a configuration",
-        &living,
-        Duration::from_secs(60),
-        async || {
-            let leader = staying.first()?.progress().leader;
-            (healed.contains(&leader)
-                && staying.iter().all(|replica| {
-                    let progress = replica.progress();
-                    progress.leader == leader
-                        && progress.voters.iter().copied().collect::<BTreeSet<_>>() == healed
-                }))
-            .then_some(())
-        },
-    )
-    .await;
-    peer_a.stop().await;
-    peer_c.stop().await;
-    founder.stop().await;
+        let (checkpoint, _, installed) = enrolled.await.unwrap().unwrap();
+        let descriptor = checkpoint.sessions[&ledger].clone();
+        let policy = focal_directory::PlacementPolicy {
+            durability: focal_directory::DurabilityIntent {
+                survive: focal_directory::FailureClass::Node,
+                max_failures: 1,
+            },
+            ..descriptor.active.policy.clone()
+        };
+        let proposal =
+            focal_directory::propose_placement(&checkpoint.nodes, &policy, 31, 1).unwrap();
+        submit(
+            &founder,
+            &host,
+            1,
+            &checkpoint,
+            &installed,
+            PartitionOperation::Session {
+                ledger,
+                expected_revision: descriptor.revision,
+                change: SessionChange::Plan {
+                    operation: OperationId::from_u128(2),
+                    desired: proposal.spec.clone(),
+                    observations: proposal.observations.clone(),
+                },
+            },
+        )
+        .await;
+        let activated = wait_among(
+            &observed,
+            Duration::from_secs(120),
+            &host,
+            "placement activated",
+            |state| {
+                state.sessions[&ledger].pending.is_none()
+                    && state.sessions[&ledger].route_epoch == RouteEpoch(2)
+            },
+        )
+        .await;
+        if !matches!(activated, Ok(Some(_))) {
+            let mut seen = Vec::new();
+            for (name, running) in [("founder", &founder), ("a", &peer_a), ("b", &peer_b)] {
+                seen.push(format!(
+                    "{name}: replica {:?}; agent {:?}",
+                    running
+                        .handles
+                        .fleet
+                        .current_host(ledger)
+                        .map(|replica| replica.progress()),
+                    running.handles.placement.status().await
+                ));
+            }
+            panic!(
+                "the placement never activated: {:?}: {seen:#?}; session {:#?}",
+                activated.map(|_| "the service ended"),
+                observe(&founder, &host, 997)
+                    .await
+                    .map(|(state, _, _)| state.sessions[&ledger].clone())
+            );
+        }
+
+        // A replacement joins; then a voter stops, and is drained.
+        let (peer_c, node_c) =
+            join_peer(&founder, founder_dir.path(), "host-c", &peer_settings[2]).await;
+        wait_among(
+            &[&founder, &peer_a, &peer_b, &peer_c],
+            Duration::from_secs(60),
+            &host,
+            "the replacement enrolled with load",
+            |state| {
+                state
+                    .nodes
+                    .get(&node_c)
+                    .is_some_and(|record| record.load.is_some())
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        peer_b.stop().await;
+        use crate::cluster_admin::ClusterAdmin;
+        use focal_client::admin::AdminResult;
+        crate::set_test_mode(founder_dir.path(), 0o700);
+        let admin = ClusterAdmin::open(&founder_settings).unwrap();
+        let AdminResult::NodeEligibility { eligible, .. } =
+            admin.node_eligibility(node_b, false).await.unwrap()
+        else {
+            panic!("drain");
+        };
+        assert!(!eligible);
+        // Every signature round and every membership change from here has a
+        // voter that answers nothing (27 §3.1 P1): the two that stay are a
+        // majority, and the plan completes on them.
+        let healed = BTreeSet::from([founder_node, node_a, node_c]);
+        let living = [&founder, &peer_a, &peer_c];
+        let settled = wait_among(
+            &living,
+            Duration::from_secs(300),
+            &host,
+            "the session healed without the dead voter",
+            |state| {
+                let session = &state.sessions[&ledger];
+                session.pending.is_none()
+                    && session.retiring.is_empty()
+                    && session
+                        .active
+                        .placement
+                        .voters
+                        .keys()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        == healed
+            },
+        )
+        .await;
+        if !matches!(settled, Ok(Some(_))) {
+            let mut seen = Vec::new();
+            for (name, running) in [("founder", &founder), ("a", &peer_a), ("c", &peer_c)] {
+                seen.push(format!(
+                    "{name}: replica {:?}; agent {:?}",
+                    running
+                        .handles
+                        .fleet
+                        .current_host(ledger)
+                        .map(|replica| replica.progress()),
+                    running
+                        .handles
+                        .placement
+                        .status()
+                        .await
+                        .map(|status| (status.last_error, status.last_refusal))
+                ));
+            }
+            panic!(
+                "the session never healed: {:?}: {seen:#?}; session {:#?}",
+                settled.map(|_| "the service ended"),
+                observe(&founder, &host, 998)
+                    .await
+                    .map(|(state, _, _)| state.sessions[&ledger].clone())
+            );
+        }
+        let staying = [
+            founder.handles.ledger.clone().unwrap(),
+            peer_a.handles.fleet.current_host(ledger).unwrap(),
+            peer_c.handles.fleet.current_host(ledger).unwrap(),
+        ];
+        until(
+            "the hosts that stay agree on a leader and a configuration",
+            &living,
+            Duration::from_secs(60),
+            async || {
+                let leader = staying.first()?.progress().leader;
+                (healed.contains(&leader)
+                    && staying.iter().all(|replica| {
+                        let progress = replica.progress();
+                        progress.leader == leader
+                            && progress.voters.iter().copied().collect::<BTreeSet<_>>() == healed
+                    }))
+                .then_some(())
+            },
+        )
+        .await;
+        peer_a.stop().await;
+        peer_c.stop().await;
+        founder.stop().await;
+    })
+    .unwrap()
 }
 
 #[test]
@@ -1561,4 +1678,162 @@ fn a_death_stands_for_one_election_window_of_the_group() {
     assert_eq!(retirement_hold(Duration::ZERO, 0), 1);
     assert_eq!(retirement_hold(ms(100), 0), 1);
     assert_eq!(retirement_hold(Duration::MAX, u64::MAX), i64::MAX);
+}
+
+/// A session plan's waiters hear the intent's outcome, not its journaling
+/// (24 §16): `planned` once it committed, the partition's refusal by name,
+/// and nothing while the intent is still retried — so an operator told
+/// `planned` is never waiting on a plan the partition refused.
+#[test]
+fn a_plan_is_answered_by_its_commit_or_its_refusal_and_not_before() {
+    use crate::placement_journal::IntentOutcome;
+    let ledger = LedgerId {
+        tenant: focal_model::TenantId([3; 16]),
+        session: focal_model::SessionId([4; 16]),
+    };
+    let planned = (ledger, OperationId([5; 16]), vec![7, 8, 9]);
+    let receipt = focal_control::ControlReceipt {
+        request: ControlRequestId {
+            client: [1; 16],
+            sequence: 1,
+        },
+        request_hash: [2; 32],
+        committed_index: 10,
+        committed_term: 1,
+        revisions: focal_control::ControlRevisions::default(),
+    };
+    match plan_answer(&planned, &IntentOutcome::Committed(receipt)) {
+        Some(Ok(answer)) => {
+            assert_eq!(answer.ledger, ledger);
+            assert_eq!(answer.operation, OperationId([5; 16]));
+            assert_eq!(answer.voters, vec![7, 8, 9]);
+            assert_eq!(answer.state, PlanState::Planned);
+        }
+        other => panic!("a committed plan is planned: {other:?}"),
+    }
+    assert!(matches!(
+        plan_answer(
+            &planned,
+            &IntentOutcome::Refused(focal_control::ControlFailure::CompareFailed)
+        ),
+        Some(Err(AgentError::Control(
+            focal_control::ControlFailure::CompareFailed
+        )))
+    ));
+    assert!(
+        plan_answer(
+            &planned,
+            &IntentOutcome::Retry(focal_control::ControlFailure::OutcomeUnknown)
+        )
+        .is_none()
+    );
+}
+
+/// A load report the partition refuses on a stale compare — its evidence
+/// names an authority revision the owner has since replaced, as it does
+/// whenever the root commits after a restart — is planned again at the next
+/// pass, never held for the load interval; a committed one starts the
+/// interval; and the level the upgrade fence waits for (24 §21) is due until
+/// the directory holds this binary's, even when a report the previous
+/// process journaled commits after the restart with its own.
+#[test]
+fn a_refused_load_report_is_due_at_the_next_pass_and_a_committed_one_waits_its_interval() {
+    use crate::placement_journal::IntentOutcome;
+    let partition = PartitionId([3; 16]);
+    let load = |generation, capability, report| NodeLoad {
+        node: 7,
+        generation,
+        report,
+        available_memory: 1,
+        active_weight: 0,
+        disk_available: 1,
+        capability,
+    };
+    let receipt = focal_control::ControlReceipt {
+        request: ControlRequestId {
+            client: [1; 16],
+            sequence: 1,
+        },
+        request_hash: [2; 32],
+        committed_index: 10,
+        committed_term: 1,
+        revisions: focal_control::ControlRevisions::default(),
+    };
+    let mut last = BTreeMap::new();
+    // A restarted agent reports at its first pass.
+    assert!(load_due(None, Some(load(1, 1, 10)), 1, 2, 100));
+    // Refused on a stale compare: due again at the next pass.
+    note_load(
+        &mut last,
+        partition,
+        Some(1),
+        &IntentOutcome::Refused(ControlFailure::CompareFailed),
+        100,
+    );
+    assert!(load_due(
+        last.get(&partition).copied(),
+        Some(load(1, 1, 10)),
+        1,
+        2,
+        100
+    ));
+    // Undecided: asked again by the journal, nothing noted.
+    note_load(
+        &mut last,
+        partition,
+        Some(1),
+        &IntentOutcome::Retry(ControlFailure::OutcomeUnknown),
+        100,
+    );
+    assert_eq!(last.get(&partition), None);
+    // Committed with this binary's level: the interval runs from the commit.
+    note_load(
+        &mut last,
+        partition,
+        Some(1),
+        &IntentOutcome::Committed(receipt),
+        101,
+    );
+    assert_eq!(last.get(&partition), Some(&(101, 1)));
+    let committed = Some(load(1, 2, 102));
+    assert!(!load_due(
+        last.get(&partition).copied(),
+        committed,
+        1,
+        2,
+        101 + LOAD_INTERVAL - 1
+    ));
+    assert!(load_due(
+        last.get(&partition).copied(),
+        committed,
+        1,
+        2,
+        101 + LOAD_INTERVAL
+    ));
+    // The previous process's report committed with the level it announced:
+    // this binary's level is due at once.
+    assert!(load_due(
+        last.get(&partition).copied(),
+        Some(load(1, 1, 102)),
+        1,
+        2,
+        102
+    ));
+    // A new generation is due at once.
+    assert!(load_due(
+        last.get(&partition).copied(),
+        committed,
+        2,
+        2,
+        102
+    ));
+    // Another intent's outcome leaves the interval where it stands.
+    note_load(
+        &mut last,
+        partition,
+        None,
+        &IntentOutcome::Refused(ControlFailure::CompareFailed),
+        102,
+    );
+    assert_eq!(last.get(&partition), Some(&(101, 1)));
 }

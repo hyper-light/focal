@@ -145,10 +145,7 @@ fn stage_original(
     let mut meta = view.meta();
     meta.logical_time = outcome.logical_time;
     meta.outcomes += 1;
-    let mut scratch = Scratch {
-        used: 0,
-        max: limits.preparation_bytes,
-    };
+    let mut scratch = Scratch::bound(limits.preparation_bytes);
     let mut extras = Extras::new(limits.range.max_batch_entries, limits.preparation_bytes).unwrap();
     let plan = transactions::prepare(
         input.command,
@@ -340,10 +337,7 @@ fn checked(f: &Fixture, outcome: NativeOutcome, extras: &mut Extras) -> Result<(
             plan_edges: 2048,
             ..NativeLimits::default()
         },
-        &mut Scratch {
-            used: 0,
-            max: 1024 * 1024,
-        },
+        &mut Scratch::bound(1024 * 1024),
     )
 }
 
@@ -515,7 +509,7 @@ fn journal_index_requires_precharged_bytes_and_bounded_events() {
             outcome.operation,
             outcome.sequence,
             NativeLimits::default(),
-            &mut Scratch { used: 0, max: 0 }
+            &mut Scratch::bound(0)
         )
         .is_err()
     );
@@ -529,10 +523,7 @@ fn journal_index_requires_precharged_bytes_and_bounded_events() {
                 plan_edges: 0,
                 ..NativeLimits::default()
             },
-            &mut Scratch {
-                used: 0,
-                max: usize::MAX
-            }
+            &mut Scratch::bound(usize::MAX)
         )
         .is_err()
     );

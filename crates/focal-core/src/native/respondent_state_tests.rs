@@ -281,7 +281,7 @@ fn copied(f: &Fixture) -> Core<NativeState> {
         .map(|entry| {
             Change::Put(Entry::new(
                 entry.key,
-                prepare::copy(&entry.value).unwrap(),
+                prepare::copy(entry.value).unwrap(),
                 entry.heap_bytes,
             ))
         })
@@ -316,10 +316,7 @@ fn from_core(
     core: &Core<NativeState>,
     configured: NativeLimits,
 ) -> Result<Option<(RespondentKey, RespondentCredit)>, NativeError> {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     state::read(
         &view,
         core.native_claim(ClaimId::from_u128(1)).unwrap(),

@@ -1,7 +1,7 @@
 //! Trusted claim timers select a canonical deadlock victim before ordinary
 //! expiry. Graph evidence and all mutations read one effective owner prefix.
 //! Only expiry revokes evaluation authority; graph failures preserve begun work.
-use super::prepare::{Extras, Scratch, heap, within};
+use super::prepare::{Extras, Scratch, heap, terminal_growth, transition_heap, within};
 use super::*;
 use focal_model::lifecycle::{
     claim::{ClaimCut, ClaimTerminalCut},
@@ -48,11 +48,14 @@ pub(super) fn resolve(
     })
 }
 
+/// A copy of `source` for a transition that makes it terminal (every deadline consequence
+/// does): the copy, and the cut the transition adds, charged before it runs.
 pub(super) fn copy(source: &ClaimState, scratch: &mut Scratch) -> Result<ClaimState, NativeError> {
     let charge = heap(source)?;
     scratch.charge(charge)?;
     let copied = source.try_copy(source.retained_bytes()?)?;
     within(heap(&copied)?, charge)?;
+    scratch.charge(terminal_growth(source)?)?;
     Ok(copied)
 }
 
@@ -285,7 +288,8 @@ fn propagate(
             Err(error) => return Err(error.into()),
         };
         if let Some(next) = next {
-            within(heap(&next)?, heap(source)?)?;
+            // Both transitions make the claim terminal: it gains its cut's allocation.
+            within(heap(&next)?, transition_heap(source)?)?;
             if pending.len() == pending.capacity() {
                 return Err(ContractError::Capacity.into());
             }

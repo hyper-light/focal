@@ -33,12 +33,48 @@ for manifest in sorted(list((ROOT / "crates").glob("*/Cargo.toml")) + list((ROOT
         for crate, (ring_feature, aws_feature) in RING_FEATURES.items():
             if not re.match(rf"^{re.escape(crate)}\s*=", line):
                 continue
+            # hyper-raft's conformed rustls (vendor/hyper-tls) has no ring-backed feature to choose:
+            # it is built on aws-lc-rs alone, which its own manifest is held to below.
+            if crate == "rustls" and re.search(r'package\s*=\s*"hyper-tls"', line):
+                continue
             features = re.search(r"features\s*=\s*\[([^\]]*)\]", line)
             names = set(re.findall(r'"([^"]+)"', features[1])) if features else set()
             if ring_feature in names or aws_feature not in names:
                 errors.append(
                     f"{manifest.relative_to(ROOT)}: {crate} must use the {aws_feature} feature, not {ring_feature}"
                 )
+# The conformed rustls the crates name (vendor/hyper-tls) holds to F57 itself: no `ring`, its
+# certificate verification (webpki) on aws-lc-rs, and aws-lc-rs a dependency of its own.
+HYPER_TLS = ROOT / "vendor/hyper-tls/Cargo.toml"
+hyper_tls_lines = [line.split("#", 1)[0].strip() for line in HYPER_TLS.read_text().splitlines()]
+if any(re.match(r"^ring\s*=", line) or re.search(r'package\s*=\s*"ring"', line) for line in hyper_tls_lines):
+    errors.append("vendor/hyper-tls/Cargo.toml: depends on ring")
+if not any(re.match(r"^aws-lc-rs\s*=", line) for line in hyper_tls_lines):
+    errors.append("vendor/hyper-tls/Cargo.toml: aws-lc-rs is not its provider")
+webpki = [line for line in hyper_tls_lines if re.match(r"^webpki\s*=", line)]
+if not webpki or any('"aws-lc-rs"' not in line or '"ring"' in line for line in webpki):
+    errors.append("vendor/hyper-tls/Cargo.toml: webpki must use the aws-lc-rs feature, not ring")
+# Post-quantum key exchange only (decision F58, doc 07): every TLS
+# configuration in production code is built from `focal_wire::crypto_provider`
+# and every QUIC one from `focal_wire::quic_client` / `quic_server`, so no
+# site can rebuild aws-lc-rs's default provider, whose classical groups a
+# peer could pick. Test sources build classical peers on purpose and are
+# exempt.
+PROVIDER_HOME = ROOT / "crates/focal-wire/src/crypto.rs"
+PROVIDER_PATTERNS = (
+    r"\bdefault_provider\s*\(",
+    r"\bQuic(?:Client|Server)Config::try_from\b",
+    r"\bQuic(?:Client|Server)Config::with_initial\b",
+)
+for source in sorted(list((ROOT / "crates").glob("*/src/**/*.rs")) + list((ROOT / "tools").glob("*/src/**/*.rs"))):
+    if source == PROVIDER_HOME or source.name == "tests.rs" or source.stem.endswith("_tests") or "tests" in source.relative_to(ROOT).parts[3:-1]:
+        continue
+    text = source.read_text()
+    for pattern in PROVIDER_PATTERNS:
+        if re.search(pattern, text):
+            errors.append(
+                f"{source.relative_to(ROOT)}: builds a TLS provider or QUIC configuration outside focal_wire::crypto"
+            )
 for path in sorted(DOCS.glob("*.md")):
     for target in re.findall(r"(?<!!)\[[^\]]*\]\(([^)]+)\)", path.read_text()):
         target = target.split("#", 1)[0]
@@ -65,6 +101,23 @@ for entry in entries:
     actual = hashlib.sha256(path.read_bytes()).hexdigest()
     if actual != entry["sha256"]:
         errors.append(f"imported source changed: {path.relative_to(ROOT)}")
+
+# Every YAML document focal reads is parsed under a stated budget (no
+# aliases or anchors, bounded depth, events, nodes and scalar bytes), so no
+# document expands past the bytes it holds. serde-saphyr's unbudgeted entry
+# points take its liberal default budget (50,000 aliases, 250,000 nodes) and
+# are refused in production; an inline test module at the end of a file may
+# use them to compare against the default.
+YAML_UNBUDGETED = re.compile(r"\bserde_saphyr::from_(?:str|slice|reader)(?:::<[^>]*>)?\s*\(")
+INLINE_TESTS = re.compile(r"^#\[cfg\(test\)\]\s*\n\s*mod\s+\w+\s*\{", re.MULTILINE)
+for source in sorted(list((ROOT / "crates").glob("*/src/**/*.rs")) + list((ROOT / "tools").glob("*/src/**/*.rs"))):
+    if source.name == "tests.rs" or source.stem.endswith("_tests") or "tests" in source.relative_to(ROOT).parts[3:-1]:
+        continue
+    text = source.read_text()
+    inline = INLINE_TESTS.search(text)
+    production = text[: inline.start()] if inline else text
+    if YAML_UNBUDGETED.search(production):
+        errors.append(f"{source.relative_to(ROOT)}: parses YAML without a stated budget (serde_saphyr::from_str_with_options)")
 
 # The one audited unsafe file (decision 11, doc 10). The compiler denies
 # `unsafe_code` everywhere and it is allowed only in this file; this check is

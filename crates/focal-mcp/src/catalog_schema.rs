@@ -49,10 +49,7 @@ pub(crate) fn prune_definitions(schema: &mut Value) -> Result<(), ProtocolError>
         return Err(ProtocolError::Limits);
     }
     let mut needed = [false; MAX_DEFINITIONS];
-    mark_reference(root, &definitions, &mut needed, 0)?;
-    for value in root.values() {
-        mark(value, &definitions, &mut needed, 0)?;
-    }
+    mark_reachable(root, &definitions, &mut needed)?;
     let mut index = 0;
     definitions.retain(|_, _| {
         let keep = needed.get(index).copied().unwrap_or(false);
@@ -65,58 +62,82 @@ pub(crate) fn prune_definitions(schema: &mut Value) -> Result<(), ProtocolError>
     Ok(())
 }
 
-fn mark(
-    value: &Value,
+/// The deepest a value is reached, counting each `$ref` followed as a level.
+const MAX_SCHEMA_DEPTH: usize = 64;
+
+/// Marks in `needed` every definition the schema `root` reaches, through its
+/// values and the definitions they reference, each definition visited once.
+/// A walk over an explicit stack of the values still to visit (no recursion),
+/// in the order a depth-first walk visits them: an object's reference first,
+/// whole, then its values in order; a value deeper than
+/// [`MAX_SCHEMA_DEPTH`] is refused, as is a reference to no definition.
+fn mark_reachable(
+    root: &Map<String, Value>,
     definitions: &Map<String, Value>,
     needed: &mut [bool; MAX_DEFINITIONS],
-    depth: usize,
 ) -> Result<(), ProtocolError> {
-    if depth >= 64 {
-        return Err(ProtocolError::Limits);
-    }
-    let next = depth.checked_add(1).ok_or(ProtocolError::Limits)?;
-    match value {
-        Value::Object(object) => {
-            mark_reference(object, definitions, needed, next)?;
-            for child in object.values() {
-                mark(child, definitions, needed, next)?;
-            }
+    let mut pending: Vec<(&Value, usize)> = Vec::new();
+    stack_values(&mut pending, root.values(), root.len(), 0)?;
+    stack_reference(&mut pending, root, definitions, needed, 0)?;
+    while let Some((value, depth)) = pending.pop() {
+        if depth >= MAX_SCHEMA_DEPTH {
+            return Err(ProtocolError::Limits);
         }
-        Value::Array(array) => {
-            for child in array {
-                mark(child, definitions, needed, next)?;
+        let next = depth.checked_add(1).ok_or(ProtocolError::Limits)?;
+        match value {
+            Value::Object(object) => {
+                stack_values(&mut pending, object.values(), object.len(), next)?;
+                stack_reference(&mut pending, object, definitions, needed, next)?;
             }
+            Value::Array(array) => stack_values(&mut pending, array.iter(), array.len(), next)?,
+            _ => {}
         }
-        _ => {}
     }
     Ok(())
 }
 
-fn mark_reference(
+/// Stacks `count` values at `depth`, the last first, so the first is visited
+/// first.
+fn stack_values<'a>(
+    pending: &mut Vec<(&'a Value, usize)>,
+    values: impl DoubleEndedIterator<Item = &'a Value>,
+    count: usize,
+    depth: usize,
+) -> Result<(), ProtocolError> {
+    pending
+        .try_reserve(count)
+        .map_err(|_| ProtocolError::Limits)?;
+    pending.extend(values.rev().map(|value| (value, depth)));
+    Ok(())
+}
+
+/// Marks the definition `object` references, when it names one not yet
+/// marked, and stacks it at `depth` to be visited before the object's own
+/// values (stacked before it).
+fn stack_reference<'a>(
+    pending: &mut Vec<(&'a Value, usize)>,
     object: &Map<String, Value>,
-    definitions: &Map<String, Value>,
+    definitions: &'a Map<String, Value>,
     needed: &mut [bool; MAX_DEFINITIONS],
     depth: usize,
 ) -> Result<(), ProtocolError> {
-    if let Some(reference) = object
+    let Some(reference) = object
         .get("$ref")
         .and_then(Value::as_str)
         .and_then(|s| s.strip_prefix("#/$defs/"))
-    {
-        let index = definitions
-            .keys()
-            .position(|key| key == reference)
-            .ok_or(ProtocolError::Limits)?;
-        let slot = needed.get_mut(index).ok_or(ProtocolError::Limits)?;
-        if !*slot {
-            *slot = true;
-            mark(
-                definitions.get(reference).ok_or(ProtocolError::Limits)?,
-                definitions,
-                needed,
-                depth,
-            )?;
-        }
+    else {
+        return Ok(());
+    };
+    let index = definitions
+        .keys()
+        .position(|key| key == reference)
+        .ok_or(ProtocolError::Limits)?;
+    let slot = needed.get_mut(index).ok_or(ProtocolError::Limits)?;
+    if !*slot {
+        *slot = true;
+        let definition = definitions.get(reference).ok_or(ProtocolError::Limits)?;
+        pending.try_reserve(1).map_err(|_| ProtocolError::Limits)?;
+        pending.push((definition, depth));
     }
     Ok(())
 }
@@ -164,7 +185,9 @@ mod tests {
                     .any(|branch| branch["properties"]["kind"]["const"] == "error")
             );
             // Admin tools intentionally share their identical family schema.
-            if !tool.name.starts_with("cluster.") {
+            if focal_client::operations::surface_of(&tool.name)
+                != Some(focal_client::operations::Surface::Administration)
+            {
                 assert!(ids.insert(tool.output_schema["$id"].as_str().unwrap()));
             }
             if let Some(definitions) = tool.output_schema["$defs"].as_object() {

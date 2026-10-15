@@ -42,6 +42,8 @@ pub enum RowFamily {
     LegacyRun,
     LegacyDefinition,
     Index,
+    Epochs,
+    Seal,
 }
 
 pub(super) fn family(value: Key) -> Result<RowFamily, Error> {
@@ -64,6 +66,8 @@ pub(super) fn family(value: Key) -> Result<RowFamily, Error> {
         Key::Cycle(_) => RowFamily::Cycle,
         Key::RetiredCycleHead(_) => RowFamily::RetiredCycleHead,
         Key::Retired(_) => RowFamily::Retired,
+        Key::Epochs(_) => RowFamily::Epochs,
+        Key::Seal(_) => RowFamily::Seal,
         Key::RetiredCycle(_) => RowFamily::RetiredCycle,
         Key::Work(_) => RowFamily::Work,
         Key::WorkSlot(..) => RowFamily::WorkSlot,
@@ -152,6 +156,8 @@ pub(super) fn key(s: &mut impl Sink, key: Key) -> Result<(), Error> {
         Key::DueTimer(..) => 47,
         Key::ByObject(..) => 48,
         Key::Retired(_) => 49,
+        Key::Epochs(_) => 50,
+        Key::Seal(_) => 51,
         Key::End => return Err(Error::InvalidTag("sentinel key")),
     };
     write_u8(s, tag)?;
@@ -186,6 +192,8 @@ pub(super) fn key(s: &mut impl Sink, key: Key) -> Result<(), Error> {
         }
         Key::Response(id) | Key::ResultTestament(id) => raw(s, &id.0),
         Key::Outcome(k) | Key::CreationResult(k) => invocation(s, k),
+        Key::Epochs(principal) => raw(s, &principal.0),
+        Key::Seal(ordinal) => write_u64(s, ordinal),
         Key::Event(seq, ordinal) => {
             write_u64(s, seq.0)?;
             write_u32(s, ordinal)
@@ -311,6 +319,10 @@ pub(super) fn invocation(s: &mut impl Sink, v: NativeInvocation) -> Result<(), E
             write_u8(s, 5)?;
             raw(s, &root.0)
         }
+        NativeInvocation::Seal(ordinal) => {
+            write_u8(s, 6)?;
+            write_u64(s, ordinal)
+        }
     }
 }
 pub(super) fn outcome(s: &mut impl Sink, v: NativeOutcome) -> Result<(), Error> {
@@ -371,6 +383,8 @@ fn operation(v: NativeOperation) -> u8 {
         NativeOperation::ClaimDeadline => 29,
         NativeOperation::Import => 30,
         NativeOperation::Retire => 31,
+        NativeOperation::AdvanceEpochFloor => 32,
+        NativeOperation::Seal => 33,
     }
 }
 fn read_operation(c: &mut Cursor<'_>) -> Result<NativeOperation, Error> {
@@ -407,6 +421,8 @@ fn read_operation(c: &mut Cursor<'_>) -> Result<NativeOperation, Error> {
         29 => NativeOperation::ClaimDeadline,
         30 => NativeOperation::Import,
         31 => NativeOperation::Retire,
+        32 => NativeOperation::AdvanceEpochFloor,
+        33 => NativeOperation::Seal,
         _ => return Err(Error::InvalidTag("operation")),
     })
 }
@@ -471,6 +487,7 @@ pub(super) fn read_invocation(c: &mut Cursor<'_>) -> Result<NativeInvocation, Er
         }),
         4 => NativeInvocation::Import,
         5 => NativeInvocation::Retirement(ClaimId(c.fixed()?)),
+        6 => NativeInvocation::Seal(c.u64()?),
         _ => return Err(Error::InvalidTag("invocation namespace")),
     })
 }
@@ -553,7 +570,28 @@ pub(super) fn read_key(c: &mut Cursor<'_>) -> Result<Key, Error> {
         }
         48 => Key::ByObject(c.u16()?, focal_model::ObjectId(c.fixed()?)),
         49 => Key::Retired(ClaimId(c.fixed()?)),
+        50 => Key::Epochs(ParticipantId(c.fixed()?)),
+        51 => Key::Seal(c.u64()?),
         _ => return Err(Error::InvalidTag("row family")),
+    })
+}
+/// A seal row's body: six fixed fields.
+pub(super) fn seal_row(s: &mut impl Sink, v: &SealRow) -> Result<(), Error> {
+    raw(s, &v.bundle.0)?;
+    write_u64(s, v.bytes)?;
+    write_u64(s, v.through.0)?;
+    write_u64(s, v.count)?;
+    write_u64(s, v.sealed_at.0)?;
+    write_u64(s, v.first)
+}
+pub(super) fn read_seal_row(c: &mut Cursor<'_>) -> Result<SealRow, Error> {
+    Ok(SealRow {
+        bundle: ContentHash(c.fixed()?),
+        bytes: c.u64()?,
+        through: SessionSeq(c.u64()?),
+        count: c.u64()?,
+        sealed_at: SessionSeq(c.u64()?),
+        first: c.u64()?,
     })
 }
 pub(super) fn read_outcome(c: &mut Cursor<'_>) -> Result<NativeOutcome, Error> {

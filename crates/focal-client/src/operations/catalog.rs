@@ -672,13 +672,52 @@ pub enum OperationOutput {
     NativeWait {
         result: super::NativeWaitResult,
     },
+    NativeLineage {
+        lineage: Box<super::NativeLineage>,
+    },
+    /// A code-mode program's end and every call it made, in order
+    /// (19 §Code mode).
+    Code {
+        outcome: CodeOutcome,
+        calls: Vec<CodeCall>,
+    },
+}
+/// How a code-mode program ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "end", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CodeOutcome {
+    /// The value the program returned, as JSON.
+    Returned { value: serde_json::Value },
+    /// The program threw, or met one of its bounds (`code` names which); the
+    /// calls it made before are durable and listed beside this.
+    Failed { code: String, detail: String },
+}
+/// One call a code-mode program made: the tool, the condition its result
+/// carried and the operation identity it was journaled under, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodeCall {
+    pub tool: String,
+    pub condition: String,
+    pub operation_id: Option<String>,
 }
 impl ApplicationResult {
     pub fn is_error(&self) -> bool {
+        // An inspected capacity refusal is a pending request with its reason:
+        // nothing was admitted and the exact frame is kept for a retry.
+        if self.condition == "Pending"
+            && matches!(&self.result, OperationOutput::NativeRefused { .. })
+        {
+            return false;
+        }
         matches!(
             &self.result,
             OperationOutput::Error { .. }
                 | OperationOutput::NativeRefused { .. }
+                | OperationOutput::Code {
+                    outcome: CodeOutcome::Failed { .. },
+                    ..
+                }
                 | OperationOutput::Mutation {
                     reply: MutationReply::Pending(_)
                         | MutationReply::Domain(DomainOutcome::Refuse { .. })

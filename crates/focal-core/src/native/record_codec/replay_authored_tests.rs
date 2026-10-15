@@ -25,9 +25,10 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         ),
         (1, 1)
     );
-    let claim_body = recovered.native_claim_content(claim).unwrap();
+    // A claim's content is held as its encoding (doc 31 M3): every read decodes the same body.
+    let claim_body = recovered.native_claim_content(claim).unwrap().unwrap();
     let claim_hash = claim_body.content_hash();
-    let claim_pointer = claim_body.description().as_ptr();
+    let claim_description = claim_body.description().to_string();
     let definition = recovered.native_validation_descriptor(validation).unwrap();
     let definition_hash = definition.content_hash();
     let definition_pointer = definition.description().as_ptr();
@@ -51,9 +52,9 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         recovered
             .native_claim_content(claim)
             .unwrap()
-            .description()
-            .as_ptr(),
-        claim_pointer
+            .unwrap()
+            .description(),
+        claim_description
     );
     assert_eq!(
         recovered
@@ -96,8 +97,9 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         .unwrap()
         .map(|row| row.unwrap().key)
         .collect::<Vec<_>>();
-    assert_eq!(keys.len(), 3);
+    assert_eq!(keys.len(), 4);
     assert!(keys.contains(&Key::Meta));
+    assert!(keys.contains(&Key::Epochs(reuse_request.principal)));
     assert!(keys.contains(&Key::Outcome(NativeInvocation::from(reuse_request))));
     assert!(keys.contains(&Key::CreationResult(NativeInvocation::from(reuse_request))));
     assert!(!keys.iter().any(|key| matches!(key, Key::Event(..))));
@@ -120,6 +122,7 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         recovered
             .native_claim_content(claim)
             .unwrap()
+            .unwrap()
             .content_hash(),
         claim_hash
     );
@@ -134,9 +137,9 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         recovered
             .native_claim_content(claim)
             .unwrap()
-            .description()
-            .as_ptr(),
-        claim_pointer
+            .unwrap()
+            .description(),
+        claim_description
     );
     assert_eq!(
         recovered
@@ -152,14 +155,16 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
         Row::Meta(meta) => assert_eq!(meta.events, original_event_count),
         _ => panic!("missing metadata"),
     }
-    let original_mapping = recovered
+    let original_read = recovered
         .native_creation_result(creation_request)
         .unwrap()
-        .entries();
-    let reused_mapping = recovered
+        .unwrap();
+    let original_mapping = original_read.entries();
+    let reused_read = recovered
         .native_creation_result(reuse_request)
         .unwrap()
-        .entries();
+        .unwrap();
+    let reused_mapping = reused_read.entries();
     assert_eq!(original_mapping, reused_mapping);
     assert_eq!(reused_mapping.len(), 2);
     assert_eq!(reused_mapping[0].family, NativeCreatedFamily::Claim);

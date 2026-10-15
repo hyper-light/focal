@@ -699,8 +699,8 @@ fn pending_adoption_fences_actual_work_retry_but_discard_restores_funded_report_
     let pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
@@ -837,8 +837,8 @@ fn adoption_pressure_refusal_keeps_existing_work_responsibility_reportable() {
     let pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();

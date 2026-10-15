@@ -42,18 +42,8 @@ impl Family {
 fn entries_from<'a>(
     view: &'a View<'_>,
     key: &Key,
-) -> impl Iterator<Item = &'a focal_memory::Entry<Key, Row>> {
-    let committed = view
-        .tail
-        .is_none()
-        .then(|| view.state.rows.entries_from(key, false));
-    let pending = view
-        .tail
-        .map(|tail| tail.fragments.entries_from(key, false));
-    pending
-        .into_iter()
-        .flatten()
-        .chain(committed.into_iter().flatten())
+) -> impl Iterator<Item = super::ranges::RowEntry<'a>> {
+    view.entries_from(*key)
 }
 
 fn published(
@@ -121,11 +111,12 @@ fn published(
     }
     visits.take(2)?;
     let event = match view.get(Key::Event(sequence, ordinal)) {
-        Some(Row::Event(event)) => event.get().map(|row| row.expand(view.ledger())),
+        Some(Row::Event(event)) => event.get(view.ledger(), view.payloads()),
         _ => None,
     }
     .ok_or(ContractError::MissingEvidence)?;
-    let outcome = as_outcome(view.get(Key::Outcome(event.invocation)))
+    let outcome = view
+        .outcome(event.invocation)?
         .ok_or(ContractError::MissingEvidence)?;
     if event.fact != fact
         || event.sequence != sequence
@@ -189,7 +180,7 @@ pub(super) fn scan<'a>(
                 {
                     return Err(ContractError::InvalidManifest.into());
                 }
-                let (accepted, position) = published(view, family, address, &entry.value, visits)?;
+                let (accepted, position) = published(view, family, address, entry.value, visits)?;
                 if let Some((revision, prior)) = previous
                     && (address.revision <= revision || position <= prior)
                 {

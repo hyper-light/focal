@@ -5,7 +5,6 @@
 use super::super::index_rows::{self, IndexChange, Primary, TimerOutcomes};
 use super::replay_validate::{Overlay, ReplayRead, invalid, require};
 use super::*;
-use focal_model::lifecycle::claim_descriptor::ClaimDescriptor;
 
 /// A timer is consumed once its outcome row exists: before this record for
 /// the before side, after it (including this record's own outcome) for the
@@ -27,11 +26,18 @@ fn evaluation_of(row: Option<&Row>) -> Result<Option<&validation::EvaluationStat
     }
 }
 
+/// The content of claim `id`, read in place from its encoding (doc 31 M3), a spilled one through
+/// `buffer`.
 fn content<'a, O: Overlay>(
     id: ClaimId,
     read: &'a ReplayRead<'_, '_, O>,
-) -> Result<Option<&'a ClaimDescriptor>, NativeError> {
-    Ok(authored_reads::content(read.get(Key::ClaimContent(id))?))
+    buffer: &'a mut crate::native::owned::ContentBuffer,
+) -> Result<Option<crate::native::input_codec::ClaimBodyInput<'a>>, NativeError> {
+    authored_reads::content_view(
+        read.get(Key::ClaimContent(id))?,
+        read.overlay.payloads(),
+        buffer,
+    )
 }
 
 /// Run the derivation of the primary row `key` belongs to, in its after
@@ -52,7 +58,21 @@ fn derives<O: Overlay>(
         Primary::Claim(id) => {
             let after = read.claim(id)?;
             let before = as_claim(read.before(Key::Claim(id))?);
-            index_rows::claim(before, after, content(id, read)?, &outcomes, &mut sink)?;
+            // A claim's content names index rows only where it is created.
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let content = match before {
+                None => content(id, read, &mut buffer)?,
+                Some(_) => None,
+            };
+            index_rows::claim(
+                before,
+                after,
+                content
+                    .as_ref()
+                    .map(|content| content as &dyn crate::native::index_rows::ContentSource),
+                &outcomes,
+                &mut sink,
+            )?;
         }
         Primary::Evaluation(key) => {
             let after =
@@ -127,10 +147,22 @@ pub(super) fn claim_complete<O: Overlay>(
 ) -> Result<(), NativeError> {
     let after = row.claim().ok_or_else(invalid)?;
     let before = as_claim(read.before(Key::Claim(id))?);
-    let content = content(id, read)?;
+    let mut buffer = crate::native::owned::ContentBuffer::new();
+    let content = match before {
+        None => content(id, read, &mut buffer)?,
+        Some(_) => None,
+    };
     let outcomes = Outcomes(read);
     complete(read, |sink| {
-        index_rows::claim(before, after, content, &outcomes, sink)
+        index_rows::claim(
+            before,
+            after,
+            content
+                .as_ref()
+                .map(|content| content as &dyn crate::native::index_rows::ContentSource),
+            &outcomes,
+            sink,
+        )
     })
 }
 pub(super) fn evaluation_complete<O: Overlay>(
@@ -157,10 +189,10 @@ pub(super) fn consumption_complete<O: Overlay>(
             if !read.changed(Key::Claim(id))? =>
         {
             let claim = read.claim(id)?;
-            let content = content(id, read)?;
             let outcomes = Outcomes(read);
+            // Not a creation: the content names no index row here.
             complete(read, |sink| {
-                index_rows::claim(Some(claim), claim, content, &outcomes, sink)
+                index_rows::claim(Some(claim), claim, None, &outcomes, sink)
             })
         }
         NativeInvocation::EvaluationDeadline(key)

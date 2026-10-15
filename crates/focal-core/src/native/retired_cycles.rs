@@ -15,7 +15,7 @@ pub(super) fn head(
             count: 0,
             work_count: 0,
         },
-        Some(Row::RetiredCycleHead(row)) => *row,
+        Some(Row::RetiredCycleHead(row)) => **row,
         Some(_) => return Err(ContractError::InvalidManifest),
     };
     if row.head.is_some() != (row.count != 0)
@@ -75,7 +75,7 @@ pub(super) fn link(
     {
         return Err(ContractError::InvalidManifest);
     }
-    Ok((*link, *cycle))
+    Ok((**link, **cycle))
 }
 
 fn take(visits: &mut usize, count: usize) -> Result<(), NativeError> {
@@ -147,7 +147,7 @@ pub(super) fn stage(
     }
     let cycle = match view.get(Key::Cycle(key)) {
         None => return Ok(()),
-        Some(Row::Cycle(row)) => *row,
+        Some(Row::Cycle(row)) => **row,
         Some(_) => return Err(ContractError::InvalidManifest.into()),
     };
     if cycle.response.is_some()
@@ -216,20 +216,20 @@ pub(super) fn stage(
     within(required, limits.evaluations_per_claim)?;
     extras.push(Extra {
         key: Key::RetiredCycle(key),
-        row: Row::RetiredCycle(RetiredCycle {
+        row: Row::RetiredCycle(Box::new(RetiredCycle {
             holder: parent.holder,
             next: old.head,
-        }),
+        })),
         heap: 0,
         fact: None,
     })?;
     extras.push(Extra {
         key: Key::RetiredCycleHead(id),
-        row: Row::RetiredCycleHead(RetiredCycleHead {
+        row: Row::RetiredCycleHead(Box::new(RetiredCycleHead {
             head: Some(key),
             count,
             work_count,
-        }),
+        })),
         heap: 0,
         fact: None,
     })

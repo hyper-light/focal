@@ -4,8 +4,8 @@ use focal_client::watch::{
     WatchAction, WatchDelivery, WatchEngine, WatchJournal, WatchOptions, WatchPage, WatchStore,
 };
 use focal_wire::NativeObject;
+use hyper_rt::combine::{Either, race2};
 use std::{io, time::Duration};
-use tokio::io::AsyncWriteExt;
 #[derive(Subcommand)]
 pub(crate) enum WatchCommand {
     /// Watch claim facts. No --claim filter means all claims.
@@ -56,8 +56,7 @@ struct Follow {
 }
 /// `engine` is the ledger's engine as probed for this invocation; a saved
 /// watch keeps the engine it was created for.
-pub(super) fn run(
-    runtime: &tokio::runtime::Runtime,
+pub(super) async fn run(
     context: &Context,
     command: WatchCommand,
     engine: WatchEngine,
@@ -134,7 +133,7 @@ pub(super) fn run(
         }
     };
     let name = journal.status().name;
-    let result = follow_pages(runtime, context, &mut journal, follow);
+    let result = follow_pages(context, &mut journal, follow).await;
     match result {
         Ok(true) => {
             recovery(context, &name);
@@ -147,19 +146,29 @@ pub(super) fn run(
         }
     }
 }
-fn follow_pages(
-    runtime: &tokio::runtime::Runtime,
+async fn follow_pages(
     context: &Context,
     journal: &mut WatchJournal,
     follow: Follow,
 ) -> Result<bool> {
     let mut count = 0u64;
-    let mut stdout = tokio::io::stdout();
-    let mut interrupted = std::pin::pin!(tokio::signal::ctrl_c());
+    let mut stdout = super::streaming_stdout()?;
+    let interrupt = super::Interrupt::subscribe()?;
     loop {
         match journal.next_action(&mut random_id).map_err(other)? {
             WatchAction::Request(action) => {
-                let reply=runtime.block_on(async{tokio::select!{result=context.client.request(action.request.clone())=>result.map(Some).map_err(CliError::Client),signal=&mut interrupted=>{signal?;Ok(None)}}})?;
+                let reply = match race2(
+                    context.client.request(action.request.clone()),
+                    interrupt.wait(),
+                )
+                .await
+                {
+                    Either::First(result) => Some(result.map_err(CliError::Client)?),
+                    Either::Second(signal) => {
+                        signal?;
+                        None
+                    }
+                };
                 let Some(reply) = reply else {
                     return Ok(true);
                 };
@@ -168,8 +177,25 @@ fn follow_pages(
             WatchAction::Delivery => {
                 let delivery = journal.delivery().ok_or(CliError::InvalidResponse)?;
                 let id = delivery.id;
+                // An empty page: the source had nothing, and answered so
+                // only after waiting for something where it can wait.
+                let idle =
+                    matches!(&delivery.page, WatchPage::Events { page } if page.events.is_empty());
                 let bytes = encode_delivery(delivery, follow.output.format)?;
-                let flushed=runtime.block_on(async{tokio::select!{result=async{stdout.write_all(&bytes).await?;stdout.flush().await}=>{result?;Ok::<_,io::Error>(true)},signal=&mut interrupted=>{signal?;Ok(false)}}})?;
+                let written = async {
+                    stdout.write_all(&bytes).await?;
+                    stdout.flush().await
+                };
+                let flushed = match race2(written, interrupt.wait()).await {
+                    Either::First(result) => {
+                        result.map_err(io::Error::other)?;
+                        true
+                    }
+                    Either::Second(signal) => {
+                        signal?;
+                        false
+                    }
+                };
                 if !flushed {
                     return Ok(true);
                 }
@@ -180,7 +206,23 @@ fn follow_pages(
                 if follow.pages.is_some_and(|limit| count >= limit) {
                     return Ok(false);
                 }
-                let stopped=runtime.block_on(async{tokio::select!{_=tokio::time::sleep(Duration::from_millis(250))=>Ok::<_,io::Error>(false),signal=&mut interrupted=>{signal?;Ok(true)}}})?;
+                // A page with events is followed by the next poll at once;
+                // only an empty one is paced, for a source that answers
+                // empty pages without waiting.
+                if !idle {
+                    continue;
+                }
+                let paced = focal_rt::time::sleep(Duration::from_millis(250));
+                let stopped = match race2(paced, interrupt.wait()).await {
+                    Either::First(slept) => {
+                        slept.map_err(io::Error::other)?;
+                        false
+                    }
+                    Either::Second(signal) => {
+                        signal?;
+                        true
+                    }
+                };
                 if stopped {
                     return Ok(true);
                 }
@@ -215,6 +257,9 @@ fn native_seed_row(object: &NativeObject) -> (&'static str, String) {
         NativeObject::Legacy(row) => ("Legacy", format!("{:?}", row.key)),
         NativeObject::Missing(reference) => ("Missing", format!("{reference:?}")),
         NativeObject::Retired(value) => ("Retired", id(ObjectId(value.claim.0))),
+        NativeObject::Archived(value) => ("Archived", id(ObjectId(value.root.0))),
+        NativeObject::Epochs(value) => ("Epochs", id(ObjectId(value.principal.0))),
+        NativeObject::Sealed(value) => ("Sealed", format!("seal {}", value.ordinal)),
     }
 }
 /// The compact table label of one native fact: its kind and the object it
@@ -273,13 +318,13 @@ fn recovery(context: &Context, name: &str) {
     if let Some(invocation) = context.invocation.as_deref() {
         let _ = writeln!(
             err,
-            "Resume retained watch: {invocation} watch resume {}",
+            "Resume retained watch: {invocation} resume watch {}",
             quote(name)
         );
     } else {
         let _ = writeln!(
             err,
-            "Resume retained watch: focal watch resume {} (keep the original --data-dir/--client-context)",
+            "Resume retained watch: focal resume watch {} (keep the original --data-dir/--client-context)",
             quote(name)
         );
     }

@@ -20,8 +20,6 @@ const WALK_LIMIT: u32 = usize::BITS.saturating_mul(2).saturating_add(2);
 struct Node<T, K> {
     key: K,
     value: T,
-    weight: usize,
-    maximum: usize,
     height: u16,
     parent: Option<usize>,
     left: Option<usize>,
@@ -129,17 +127,6 @@ impl<T, K: Copy + Ord> CompletionIndex<T, K> {
             .and_then(|index| self.node(index))
             .map_or(0, |node| node.height)
     }
-    fn subtree_maximum(&self, index: Option<usize>) -> usize {
-        index
-            .and_then(|index| self.node(index))
-            .map_or(0, |node| node.maximum)
-    }
-    pub(super) fn maximum(&self) -> usize {
-        if self.check_health().is_err() {
-            return 0;
-        }
-        self.subtree_maximum(self.root)
-    }
 
     /// Returns a matching node, or the final parent of an absent key.
     fn locate(&self, key: K) -> Result<(Option<usize>, Option<usize>), NativeError> {
@@ -218,7 +205,7 @@ impl<T, K: Copy + Ord> CompletionIndex<T, K> {
 
     /// No allocation. Duplicate keys and insufficient prepared capacity refuse
     /// before modifying the tree or invoking any caller mutation.
-    pub(super) fn insert(&mut self, key: K, value: T, workspace: usize) -> Result<(), NativeError> {
+    pub(super) fn insert(&mut self, key: K, value: T) -> Result<(), NativeError> {
         let (found, parent) = self.locate(key)?;
         if found.is_some() {
             return Err(ContractError::ContentConflict.into());
@@ -242,8 +229,6 @@ impl<T, K: Copy + Ord> CompletionIndex<T, K> {
         let node = Node {
             key,
             value,
-            weight: workspace,
-            maximum: workspace,
             height: 1,
             parent,
             left: None,
@@ -279,28 +264,14 @@ impl<T, K: Copy + Ord> CompletionIndex<T, K> {
     }
 
     /// Keys live in the private node; the caller can mutate only the owned value.
-    /// The precomputed replacement weight repairs cached maxima up the same path.
-    pub(super) fn replace_weight(
+    pub(super) fn update(
         &mut self,
         key: K,
-        workspace: usize,
         mutate: impl FnOnce(&mut T),
     ) -> Result<(), NativeError> {
         let index = self.locate(key)?.0.ok_or(ContractError::StaleEvaluation)?;
         let node = self.node_mut(index).ok_or(ContractError::InvalidCut)?;
         mutate(&mut node.value);
-        node.weight = workspace;
-        let mut current = Some(index);
-        for _ in 0..WALK_LIMIT {
-            let Some(index) = current else {
-                break;
-            };
-            self.refresh(index);
-            current = self.node(index).and_then(|node| node.parent);
-        }
-        if current.is_some() {
-            self.poison();
-        }
         self.check_health()
     }
 
@@ -308,14 +279,10 @@ impl<T, K: Copy + Ord> CompletionIndex<T, K> {
         let Some(node) = self.node(index) else {
             return;
         };
-        let (left, right, weight) = (node.left, node.right, node.weight);
+        let (left, right) = (node.left, node.right);
         let height = self.height(left).max(self.height(right)).saturating_add(1);
-        let maximum = weight
-            .max(self.subtree_maximum(left))
-            .max(self.subtree_maximum(right));
         if let Some(node) = self.node_mut(index) {
             node.height = height;
-            node.maximum = maximum;
         }
     }
 
@@ -758,11 +725,6 @@ impl<T, K: Copy + Ord> CompletionIndex<T, K> {
                         .height(node.left)
                         .max(self.height(node.right))
                         .saturating_add(1)
-                || node.maximum
-                    != node
-                        .weight
-                        .max(self.subtree_maximum(node.left))
-                        .max(self.subtree_maximum(node.right))
             {
                 return Err(bad());
             }

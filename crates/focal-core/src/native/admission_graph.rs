@@ -1,7 +1,7 @@
 //! A real Posted-to-PostFailed model transition precedes all graph effects.
 //! Its private proof preserves the exact accepted report and intermediate claim
 //! identity while monitor releases may advance the final terminal row further.
-use super::prepare::{Extras, Scratch, add, heap, within};
+use super::prepare::{Extras, Scratch, add, heap, terminal_growth, within};
 use super::*;
 use focal_model::lifecycle::{
     aggregation,
@@ -68,6 +68,8 @@ impl Failure {
         scratch.charge(Proof::charge())?;
         let mut root = parent.try_copy(parent.retained_bytes()?)?;
         within(heap(&root)?, charge)?;
+        // The failed admission makes the claim terminal: the cut it adds.
+        scratch.charge(terminal_growth(parent)?)?;
         root.apply_admission(&expected, decision)?;
         let terminal = root.terminal_cut().ok_or(ContractError::InvalidCut)?;
         let proof = Proof {

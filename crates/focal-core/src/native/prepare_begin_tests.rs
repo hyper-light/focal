@@ -1,6 +1,6 @@
 use super::*;
 use crate::native::completion_book::{CandidateJournal, CompletionBook, JournalFunding};
-use crate::native::completion_envelope::{CompletionEnvelope, EvidenceBounds, descriptor_limits};
+use crate::native::completion_envelope::{CompletionEnvelope, descriptor_limits};
 use crate::native::completion_schemas::SchemaSet;
 use crate::native::report_tests as fixture;
 use focal_evidence::BuiltinNativeSchemas;
@@ -24,8 +24,7 @@ fn prefixes() -> (Core<NativeState>, NativePrepared, NativePrepared) {
 
 fn fresh<'a>(
     core: &'a Core<NativeState>,
-    created: &'a NativePrepared,
-    posted: &'a NativePrepared,
+    chain: &'a [&'a NativePrepared; 2],
     request: u128,
     time: u64,
 ) -> Fresh<'a> {
@@ -35,11 +34,19 @@ fn fresh<'a>(
             fixture::context(fixture::EVALUATOR, time),
             fixture::begin(
                 request,
-                posted.claim(key.claim).unwrap().binding(),
+                core.native_chain(chain)
+                    .unwrap()
+                    .claim(key.claim)
+                    .unwrap()
+                    .binding(),
                 1,
-                posted.evaluation(key).unwrap().binding(),
+                core.native_chain(chain)
+                    .unwrap()
+                    .evaluation(key)
+                    .unwrap()
+                    .binding(),
             ),
-            [created, posted].into_iter(),
+            crate::native::pending_index::Chain::listed(chain).unwrap(),
         )
         .unwrap()
     else {
@@ -64,28 +71,45 @@ fn transition<'a>(fresh: &Fresh<'a>) -> BeginTransition<'a> {
 fn begin_proof_outlives_consumed_fresh_and_rejects_other_request_and_time() {
     let (core, created, posted) = prefixes();
     let before = core.native_budget();
-    let checked = fresh(&core, &created, &posted, 3, 3);
+    let chain_1 = [&created, &posted];
+    let checked = fresh(&core, &chain_1, 3, 3);
     let proof = transition(&checked);
     assert_eq!(core.native_budget(), before);
     let original = checked.build(&core.state.budget, None).unwrap();
     proof.check(&original).unwrap();
-    assert_eq!(posted.evaluation(proof.key()), Some(&proof.previous()));
+    assert_eq!(
+        core.native_chain(&[&created, &posted])
+            .unwrap()
+            .evaluation(proof.key()),
+        Some(&proof.previous())
+    );
     assert!(!proof.previous().has_begun());
-    assert_eq!(original.evaluation(proof.key()), Some(&proof.next()));
+    assert_eq!(
+        core.native_chain(&[&created, &posted, &original])
+            .unwrap()
+            .evaluation(proof.key()),
+        Some(&proof.next())
+    );
     assert!(proof.next().has_begun());
-    let other_request = fresh(&core, &created, &posted, 4, 3)
+    let chain_2 = [&created, &posted];
+    let other_request = fresh(&core, &chain_2, 4, 3)
         .build(&core.state.budget, None)
         .unwrap();
     assert_eq!(
-        other_request.evaluation(proof.key()),
-        original.evaluation(proof.key())
+        core.native_chain(&[&created, &posted, &other_request])
+            .unwrap()
+            .evaluation(proof.key()),
+        core.native_chain(&[&created, &posted, &original])
+            .unwrap()
+            .evaluation(proof.key())
     );
     assert_ne!(
         other_request.outcome().invocation,
         original.outcome().invocation
     );
     assert!(proof.check(&other_request).is_err());
-    let other_time = fresh(&core, &created, &posted, 3, 4)
+    let chain_3 = [&created, &posted];
+    let other_time = fresh(&core, &chain_3, 3, 4)
         .build(&core.state.budget, None)
         .unwrap();
     assert_eq!(
@@ -93,8 +117,12 @@ fn begin_proof_outlives_consumed_fresh_and_rejects_other_request_and_time() {
         original.outcome().invocation
     );
     assert_eq!(
-        other_time.evaluation(proof.key()),
-        original.evaluation(proof.key())
+        core.native_chain(&[&created, &posted, &other_time])
+            .unwrap()
+            .evaluation(proof.key()),
+        core.native_chain(&[&created, &posted, &original])
+            .unwrap()
+            .evaluation(proof.key())
     );
     assert!(proof.check(&other_time).is_err());
     proof.check(&original).unwrap();
@@ -103,7 +131,8 @@ fn begin_proof_outlives_consumed_fresh_and_rejects_other_request_and_time() {
 #[test]
 fn equal_bindings_and_prefixes_do_not_replace_the_exact_pending_source_or_owner() {
     let (core, created, posted) = prefixes();
-    let checked = fresh(&core, &created, &posted, 3, 3);
+    let chain_4 = [&created, &posted];
+    let checked = fresh(&core, &chain_4, 3, 3);
     let proof = transition(&checked);
     let original = checked.build(&core.state.budget, None).unwrap();
     let sibling_post = fixture::prepared(core.prepare_native(
@@ -112,45 +141,43 @@ fn equal_bindings_and_prefixes_do_not_replace_the_exact_pending_source_or_owner(
         &[&created],
     ));
     assert_eq!(sibling_post.outcome(), posted.outcome());
-    let sibling = fresh(&core, &created, &sibling_post, 3, 3)
+    let chain_5 = [&created, &sibling_post];
+    let sibling = fresh(&core, &chain_5, 3, 3)
         .build(&core.state.budget, None)
         .unwrap();
     assert_eq!(sibling.outcome(), original.outcome());
     assert_eq!(
-        sibling.evaluation(proof.key()),
-        original.evaluation(proof.key())
+        core.native_chain(&[&created, &sibling_post, &sibling])
+            .unwrap()
+            .evaluation(proof.key()),
+        core.native_chain(&[&created, &posted, &original])
+            .unwrap()
+            .evaluation(proof.key())
     );
     assert!(matches!(
         proof.check(&sibling),
         Err(NativeError::Memory(MemoryError::WrongRange))
     ));
     let (other_core, other_created, other_posted) = prefixes();
-    let foreign = fresh(&other_core, &other_created, &other_posted, 3, 3)
+    let chain_6 = [&other_created, &other_posted];
+    let foreign = fresh(&other_core, &chain_6, 3, 3)
         .build(&other_core.state.budget, None)
         .unwrap();
     assert_eq!(foreign.outcome(), original.outcome());
     assert_eq!(
-        foreign.evaluation(proof.key()),
-        original.evaluation(proof.key())
+        other_core
+            .native_chain(&[&other_created, &other_posted, &foreign])
+            .unwrap()
+            .evaluation(proof.key()),
+        core.native_chain(&[&created, &posted, &original])
+            .unwrap()
+            .evaluation(proof.key())
     );
     assert!(matches!(
         proof.check(&foreign),
         Err(NativeError::Memory(MemoryError::WrongRange))
     ));
     proof.check(&original).unwrap();
-}
-
-fn copy_row(row: &Row) -> Result<Row, MemoryError> {
-    match row {
-        Row::Meta(value) => Ok(Row::Meta(*value)),
-        Row::Claim(value) => value.copy().map(Row::Claim),
-        Row::Definition(value) => value.copy().map(Row::Definition),
-        Row::Evaluation(value) => value.copy().map(Row::Evaluation),
-        Row::Outcome(value) => Ok(Row::Outcome(*value)),
-        Row::Event(value) => value.copy().map(Row::Event),
-        // The claim's other rows share its span under the storage layout.
-        other => crate::native::prepare::copy(other),
-    }
 }
 
 // Adversarial candidate rows still use the exact real parent Range root. This
@@ -167,7 +194,7 @@ fn altered(
     let Some(Row::Meta(meta)) = original.fragments.get(&Key::Meta) else {
         panic!("metadata")
     };
-    let mut meta = *meta;
+    let mut meta = **meta;
     let Some(Row::Meta(source_meta)) = source.fragments.get(&Key::Meta) else {
         panic!("metadata")
     };
@@ -175,10 +202,10 @@ fn altered(
     let row = OwnedEvaluation::new(state).unwrap();
     let heap = row.heap_charge().unwrap();
     let mut changes = vec![
-        Change::Put(Entry::new(Key::Meta, Row::Meta(meta), 0)),
+        Change::Put(Entry::new(Key::Meta, Row::Meta(Box::new(meta)), 0)),
         Change::Put(Entry::new(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(outcome),
+            Row::Outcome(OwnedOutcome::stored(&outcome, outcome.ledger).unwrap()),
             0,
         )),
         Change::Put(Entry::new(
@@ -188,7 +215,7 @@ fn altered(
         )),
     ];
     for (index, event) in events.into_iter().enumerate() {
-        let row = OwnedEvent::new(StoredEvent::pack(event).unwrap()).unwrap();
+        let row = OwnedEvent::new(event, outcome.ledger).unwrap();
         let heap = row.heap_charge().unwrap();
         changes.push(Change::Put(Entry::new(
             Key::Event(outcome.sequence, u32::try_from(index).unwrap()),
@@ -196,37 +223,48 @@ fn altered(
             heap,
         )));
     }
+    let encoded_added =
+        crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())
+            .unwrap();
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
     let range = core
         .state
         .rows
-        .plan_after(
-            &core.state.budget,
-            &source.fragments,
+        .forge(
+            Some(&source.fragments),
             outcome.sequence.0,
             changes,
             BudgetLane::Completion,
-            usize::MAX,
+            |key, row| removed.count(key, row),
         )
-        .unwrap()
-        .build_in_with(&core.state.budget, copy_row)
         .unwrap();
     NativePrepared {
         fragments: range,
         outcome,
         writes: crate::native::mutation::WriteSet::unrecorded(),
+        encoded_added,
+        encoded_removed: removed.bytes(),
+        _index: None,
+        events: None,
+        retire: None,
     }
 }
 
 #[test]
 fn collector_requires_complete_begun_history_and_exact_authorized_final_state() {
     let (core, created, posted) = prefixes();
-    let fresh = fresh(&core, &created, &posted, 3, 3);
+    let chain_7 = [&created, &posted];
+    let fresh = fresh(&core, &chain_7, 3, 3);
     let view = fresh.publication_source();
     let proof = transition(&fresh);
     let original = fresh.build(&core.state.budget, None).unwrap();
     let registered = crate::native::admission_authority::registered_any(
         &view,
-        posted.claim(proof.key().claim).unwrap().binding(),
+        core.native_chain(&[&created, &posted])
+            .unwrap()
+            .claim(proof.key().claim)
+            .unwrap()
+            .binding(),
         proof.key(),
     )
     .unwrap();
@@ -237,10 +275,6 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
         core.limits.plan_edges,
     )
     .unwrap();
-    let evidence = EvidenceBounds {
-        workspace_bytes: schemas.workspace_bytes() - schemas.custody_bytes(),
-        retained_bytes: schemas.custody_bytes(),
-    };
     let envelope = CompletionEnvelope::derive(
         &core.state.rows,
         core.limits,
@@ -248,7 +282,6 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
         registered.registry,
         registered.definition,
         descriptor_limits(core.limits, registered.parent, registered.registry).unwrap(),
-        evidence,
     )
     .unwrap();
     let mut book = CompletionBook::new(&core.state.budget, core.limits).unwrap();
@@ -263,14 +296,13 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
         )
         .unwrap();
     let expected_reports = book.remaining_reports(proof.key());
-    let capacity = book.funded_capacity();
     let Some(Row::Event(event)) = original
         .fragments
         .get(&Key::Event(original.outcome().sequence, 0))
     else {
         panic!("actual Begun event")
     };
-    let original_event = event.get().unwrap().expand(original.outcome().ledger);
+    let original_event = event.get(original.outcome().ledger, None).unwrap();
     assert!(matches!(
         original_event.fact,
         NativeFact::Evaluation {
@@ -329,7 +361,6 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
         );
         assert_eq!(core.native_budget(), baseline);
         assert_eq!(book.remaining_reports(proof.key()), expected_reports);
-        assert_eq!(book.funded_capacity(), capacity);
     }
     let update = book
         .apply_prepared(
@@ -354,7 +385,8 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
 #[test]
 fn a_fake_handler_free_begun_fact_cannot_hide_behind_an_unbegun_final_row() {
     let (core, created, posted) = prefixes();
-    let fresh = fresh(&core, &created, &posted, 3, 3);
+    let chain_8 = [&created, &posted];
+    let fresh = fresh(&core, &chain_8, 3, 3);
     let view = fresh.publication_source();
     let proof = transition(&fresh);
     let original = fresh.build(&core.state.budget, None).unwrap();
@@ -364,7 +396,7 @@ fn a_fake_handler_free_begun_fact_cannot_hide_behind_an_unbegun_final_row() {
     else {
         panic!("actual Begun event")
     };
-    let mut fake = event.get().unwrap().expand(original.outcome().ledger);
+    let mut fake = event.get(original.outcome().ledger, None).unwrap();
     let NativeFact::Evaluation {
         after,
         state,
@@ -383,7 +415,6 @@ fn a_fake_handler_free_begun_fact_cannot_hide_behind_an_unbegun_final_row() {
     proof.check(&malformed).unwrap();
     let mut book = CompletionBook::new(&core.state.budget, core.limits).unwrap();
     let budget = core.native_budget();
-    let capacity = book.funded_capacity();
     assert!(matches!(
         book.apply_prepared(
             &view,
@@ -399,8 +430,17 @@ fn a_fake_handler_free_begun_fact_cannot_hide_behind_an_unbegun_final_row() {
         Err(NativeError::Contract(ContractError::InvalidTransition))
     ));
     assert_eq!(core.native_budget(), budget);
-    assert_eq!(book.funded_capacity(), capacity);
     assert_eq!(book.remaining_reports(proof.key()), None);
-    assert_eq!(posted.evaluation(proof.key()), Some(&proof.previous()));
-    assert_eq!(original.evaluation(proof.key()), Some(&proof.next()));
+    assert_eq!(
+        core.native_chain(&[&created, &posted])
+            .unwrap()
+            .evaluation(proof.key()),
+        Some(&proof.previous())
+    );
+    assert_eq!(
+        core.native_chain(&[&created, &posted, &original])
+            .unwrap()
+            .evaluation(proof.key()),
+        Some(&proof.next())
+    );
 }

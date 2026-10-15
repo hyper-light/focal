@@ -1,4 +1,4 @@
-use super::{affinity, family};
+use super::{affinity, family, order_key};
 use crate::native::*;
 use std::cmp::Ordering;
 
@@ -166,6 +166,47 @@ fn the_order_is_total_agrees_with_equality_and_ends_at_the_sentinel() {
     }
 }
 
+/// Past an equal order prefix, the order is the whole order's: on every pair of the corpus whose
+/// affinities are equal (an object's rows, the control rows, an index's bucket),
+/// `cmp_past_prefix` is `cmp`, and the prefix agrees with the order everywhere.
+#[test]
+fn the_order_past_an_equal_prefix_is_the_whole_order() {
+    use focal_memory::RangeKey;
+    let keys = corpus();
+    let mut tied = 0usize;
+    for a in &keys {
+        for b in &keys {
+            if a.order_prefix() == b.order_prefix() {
+                tied += 1;
+                assert_eq!(a.cmp_past_prefix(b), a.cmp(b), "{a:?} vs {b:?}");
+            } else {
+                assert_eq!(
+                    a.order_prefix().cmp(&b.order_prefix()),
+                    a.cmp(b),
+                    "{a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+    // Not vacuous: the corpus holds many keys of one affinity.
+    assert!(
+        tied > keys.len() * 4,
+        "{tied} tied pairs of {} keys",
+        keys.len()
+    );
+}
+
+/// The comparison that stops at the first deciding field is the full order key's, on every pair of the corpus.
+#[test]
+fn the_early_comparison_is_the_order_keys() {
+    let keys = corpus();
+    for a in &keys {
+        for b in &keys {
+            assert_eq!(a.cmp(b), order_key(a).cmp(&order_key(b)), "{a:?} vs {b:?}");
+        }
+    }
+}
+
 #[test]
 fn one_objects_rows_are_contiguous_and_family_scans_stay_ordered() {
     let mut sorted = corpus();
@@ -228,4 +269,319 @@ fn one_objects_rows_are_contiguous_and_family_scans_stay_ordered() {
         .unwrap();
     assert!(meta < first_timer, "control rows order by family");
     assert_eq!(affinity(&Key::Meta), [0; 16]);
+}
+
+/// Every evaluation key of a corpus that varies every field: claims and
+/// validations whose ids are not monotonic in their number, every target
+/// variant with ids that disagree with the variant order, and generations
+/// spanning the range.
+fn evaluation_corpus() -> Vec<EvaluationKey> {
+    // Ids chosen so numeric order, byte order and insertion order disagree.
+    let ids: [[u8; 16]; 3] = [[9; 16], [2; 16], [0x7f; 16]];
+    let mut keys = Vec::new();
+    for claim_id in ids {
+        for validation_id in ids {
+            for response in ids {
+                for artifact in ids {
+                    for slot in [3u32, 0, 1] {
+                        let targets = [
+                            EvaluationTarget::Admission,
+                            EvaluationTarget::Increment {
+                                artifact: ArtifactId(artifact),
+                            },
+                            EvaluationTarget::Work {
+                                response: TestamentId(response),
+                                slot,
+                                artifact: ArtifactId(artifact),
+                            },
+                            EvaluationTarget::MissingSlot {
+                                response: TestamentId(response),
+                                slot,
+                            },
+                            EvaluationTarget::Delivery {
+                                response: TestamentId(response),
+                            },
+                        ];
+                        for target in targets {
+                            for generation in [0u64, 1, 2, u64::MAX] {
+                                keys.push(EvaluationKey {
+                                    claim: ClaimId(claim_id),
+                                    validation: ValidationId(validation_id),
+                                    target,
+                                    generation,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// The storage order of an evaluation row is the derived order of its core
+/// key, which is the derived order of its wire key: a cursor compared in
+/// either vocabulary names the same position in the scan (F07), and the
+/// conversion between the two loses nothing.
+#[test]
+fn evaluation_rows_are_stored_in_key_order_and_the_wire_key_orders_the_same() {
+    use super::event_record::{evaluation_key, evaluation_key_of};
+    let keys = evaluation_corpus();
+    assert!(keys.len() > 1_000, "{}", keys.len());
+    for a in &keys {
+        assert_eq!(evaluation_key_of(evaluation_key(*a)), *a, "{a:?}");
+        for b in &keys {
+            let core = a.cmp(b);
+            assert_eq!(
+                Key::Evaluation(*a).cmp(&Key::Evaluation(*b)),
+                core,
+                "storage order disagrees with the key order: {a:?} vs {b:?}"
+            );
+            assert_eq!(
+                evaluation_key(*a).cmp(&evaluation_key(*b)),
+                core,
+                "wire order disagrees with the key order: {a:?} vs {b:?}"
+            );
+        }
+    }
+    // One declaration's keys are one contiguous span of its claim's span, so a
+    // scan from the first key of a (claim, validation) that stops at the first
+    // key of another sees exactly that declaration's rows.
+    let mut stored: Vec<Key> = keys.iter().map(|key| Key::Evaluation(*key)).collect();
+    stored.sort();
+    for pair in stored.windows(2) {
+        let (Key::Evaluation(a), Key::Evaluation(b)) = (pair[0], pair[1]) else {
+            panic!("evaluation keys");
+        };
+        assert!((a.claim, a.validation) <= (b.claim, b.validation));
+    }
+    let claim = ClaimId([2; 16]);
+    let validation = ValidationId([9; 16]);
+    let span: Vec<usize> = stored
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| {
+            matches!(key, Key::Evaluation(key) if key.claim == claim && key.validation == validation)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert!(!span.is_empty());
+    assert_eq!(
+        span.last().copied(),
+        span.first().map(|first| first + span.len() - 1),
+        "a declaration's evaluations are interleaved with another's"
+    );
+}
+
+/// The keys `same_family` compares field by field, several of each family differing in each field
+/// in turn, each pair ordered as their slots order them: the fast comparison is the order.
+#[test]
+fn the_field_comparison_of_one_family_is_the_slot_order() {
+    let ids = |n: u8| [n; 16];
+    let request = |p: u8, e: u64, i: u8| RequestKey {
+        principal: ParticipantId(ids(p)),
+        epoch: RequestEpoch(e),
+        id: RequestId(ids(i)),
+    };
+    let mut keys = Vec::new();
+    for a in [1u8, 2, 200] {
+        for b in [1u8, 3, 255] {
+            let (x, y) = (claim(a), claim(b));
+            keys.extend([
+                Key::Claim(x),
+                Key::IncomingHead(x),
+                Key::ClaimContent(x),
+                Key::IncomingLink(x, y),
+                Key::MonitorLink(x, focal_model::MonitorId(ids(b))),
+                Key::ByIssuer(ParticipantId(ids(a)), y),
+                Key::BySubject(ParticipantId(ids(a)), y),
+                Key::ByStatus(u16::from(a), y),
+                Key::ByAction(u16::from(a), y),
+                Key::ByCreated(
+                    u16::from(a),
+                    SessionSeq(u64::from(b)),
+                    focal_model::ObjectId(ids(b)),
+                ),
+                Key::ByCreated(
+                    u16::from(a),
+                    SessionSeq(u64::from(b)),
+                    focal_model::ObjectId(ids(a)),
+                ),
+                Key::ByObject(u16::from(a), focal_model::ObjectId(ids(b))),
+                Key::Event(SessionSeq(u64::from(a)), u32::from(b)),
+                Key::Outcome(NativeInvocation::Request(request(a, u64::from(b), b))),
+                Key::Outcome(NativeInvocation::Request(request(a, u64::from(b), a))),
+                Key::Outcome(NativeInvocation::Request(request(b, u64::from(a), a))),
+                Key::CreationResult(NativeInvocation::Request(request(a, u64::from(b), b))),
+                Key::CreationResult(NativeInvocation::Request(request(b, 7, a))),
+            ]);
+        }
+    }
+    for a in &keys {
+        for b in &keys {
+            assert_eq!(a.cmp(b), order_key(a).cmp(&order_key(b)), "{a:?} vs {b:?}");
+        }
+    }
+}
+
+/// Identities and hashes that differ in their first byte against ones that differ in their last:
+/// the field comparison reads them most significant byte first, as the slots do, in every family
+/// whose fields are identities or hashes, nested enums included.
+#[test]
+fn the_field_comparison_reads_identities_from_their_first_byte() {
+    let ids: Vec<[u8; 16]> = vec![
+        [0; 16],
+        {
+            let mut id = [0; 16];
+            id[0] = 1;
+            id
+        },
+        {
+            let mut id = [0; 16];
+            id[15] = 2;
+            id
+        },
+        {
+            let mut id = [0xff; 16];
+            id[7] = 0;
+            id
+        },
+    ];
+    let hashes: Vec<ContentHash> = ids
+        .iter()
+        .flat_map(|low| {
+            ids.iter().map(move |high| {
+                let mut hash = [0; 32];
+                hash[..16].copy_from_slice(low);
+                hash[16..].copy_from_slice(high);
+                ContentHash(hash)
+            })
+        })
+        .collect();
+    let mut keys = Vec::new();
+    for a in &ids {
+        for b in &ids {
+            let (x, y) = (ClaimId(*a), ClaimId(*b));
+            let evaluation = EvaluationKey {
+                claim: x,
+                validation: ValidationId(*b),
+                target: EvaluationTarget::Work {
+                    response: focal_model::TestamentId(*a),
+                    slot: 1,
+                    artifact: focal_model::ArtifactId(*b),
+                },
+                generation: 1,
+            };
+            keys.extend([
+                Key::Claim(x),
+                Key::IncomingLink(x, y),
+                Key::ByIssuer(ParticipantId(*a), y),
+                Key::Evaluation(evaluation),
+                Key::Outcome(NativeInvocation::Request(RequestKey {
+                    principal: ParticipantId(*a),
+                    epoch: RequestEpoch(1),
+                    id: RequestId(*b),
+                })),
+                Key::Outcome(NativeInvocation::EvaluationDeadline(NativeDeadlineKey {
+                    evaluation,
+                    timer: focal_model::TimerId(*a),
+                    generation: 2,
+                })),
+                Key::DueTimer(3, TimerTarget::Monitor(x, focal_model::MonitorId(*b))),
+            ]);
+        }
+    }
+    for (index, hash) in hashes.iter().enumerate() {
+        let claim = ClaimId(*ids.get(index % ids.len()).unwrap());
+        keys.extend([
+            Key::ClaimIdentity(1, *hash),
+            Key::ArtifactIdentity(*hash),
+            Key::ByScope(2, *hash, claim),
+            Key::BySchema(*hash, focal_model::ArtifactId(claim.0)),
+        ]);
+    }
+    for a in &keys {
+        for b in &keys {
+            assert_eq!(a.cmp(b), order_key(a).cmp(&order_key(b)), "{a:?} vs {b:?}");
+        }
+    }
+}
+
+/// A packed key is its key's order as bytes (doc 31 M3): every key of the corpus and of the
+/// evaluation corpus reads back as itself, two keys' bytes compare as the keys do, and a claim's
+/// own families are held in place.
+#[test]
+fn a_packed_key_reads_back_whole_and_its_bytes_order_as_the_key_does() {
+    use super::{PACKED_INLINE, PackedKey};
+    let mut keys = corpus();
+    for evaluation in evaluation_corpus() {
+        let result = NativeResultKey {
+            evaluation,
+            revision: focal_model::ObjectRevision(7),
+        };
+        keys.extend([
+            Key::Evaluation(evaluation),
+            Key::MissingResult(result),
+            Key::Accepted(result),
+            Key::DeliveryResult(result),
+            Key::ByVerdict(3, result),
+            Key::DueTimer(11, TimerTarget::Evaluation(evaluation)),
+            Key::Outcome(NativeInvocation::EvaluationDeadline(NativeDeadlineKey {
+                evaluation,
+                timer: focal_model::TimerId([5; 16]),
+                generation: 2,
+            })),
+        ]);
+    }
+    let packed: Vec<PackedKey> = keys
+        .iter()
+        .map(|key| PackedKey::pack(key).unwrap())
+        .collect();
+    for (key, bytes) in keys.iter().zip(&packed) {
+        assert_eq!(bytes.unpack(), *key, "{key:?} reads back");
+        assert_eq!(bytes.affinity(), affinity(key), "{key:?}'s affinity leads");
+    }
+    for (a, x) in keys.iter().zip(&packed) {
+        for (b, y) in keys.iter().zip(&packed) {
+            assert_eq!(x.cmp(y), a.cmp(b), "{a:?} vs {b:?}");
+            // Past an equal prefix, the rest decides as the whole order does.
+            if affinity(a) == affinity(b) {
+                assert_eq!(
+                    focal_memory::RangeKey::cmp_past_prefix(x, y),
+                    a.cmp(b),
+                    "{a:?} vs {b:?} past the prefix"
+                );
+            }
+        }
+    }
+    // A claim's own families in place; only the validation and monitor timers' families on the
+    // heap.
+    for (key, bytes) in keys.iter().zip(&packed) {
+        let wide = matches!(bytes, PackedKey::Wide(_));
+        let validation = matches!(
+            key,
+            Key::Evaluation(_)
+                | Key::MissingResult(_)
+                | Key::Accepted(_)
+                | Key::DeliveryResult(_)
+                | Key::ByVerdict(..)
+                | Key::DueTimer(_, TimerTarget::Evaluation(_) | TimerTarget::Monitor(..))
+                | Key::Outcome(
+                    NativeInvocation::EvaluationDeadline(_) | NativeInvocation::MonitorDeadline(_)
+                )
+                | Key::CreationResult(
+                    NativeInvocation::EvaluationDeadline(_) | NativeInvocation::MonitorDeadline(_)
+                )
+        );
+        if !validation {
+            assert!(!wide, "{key:?} takes {} bytes", bytes.as_bytes().len());
+        }
+        assert_eq!(wide, bytes.as_bytes().len() > PACKED_INLINE, "{key:?}");
+        assert_eq!(bytes.heap_bytes() > 0, wide, "{key:?}");
+    }
+    // In place, a key is 56 bytes: its length is never zero, so the heap form fills that niche.
+    assert_eq!(std::mem::size_of::<PackedKey>(), 56);
 }

@@ -509,7 +509,6 @@ impl<'a> MonitorPlan<'a> {
         let transition = Transition {
             expected: self.owner.binding(),
             replacement: Registry {
-                owner: source.owner,
                 limits: source.limits,
                 scopes,
                 children,

@@ -6,8 +6,8 @@ optional contributor workflow, never a prerequisite for ordinary installation.
 
 ## 1. Product contract
 
-One downloaded `focal` executable contains the foreground server (`focal start`),
-human CLI, shell-script interface and stdio MCP server (`focal mcp serve`). Users
+One downloaded `focal` executable contains the foreground server (`focal start node`),
+human CLI, shell-script interface and stdio MCP server (`focal serve mcp`). Users
 need no Rust, protobuf compiler, Python, source tree or agent framework. A
 separate client machine installs the same executable and selects an authenticated
 context. Deployment size does not introduce a different client distribution.

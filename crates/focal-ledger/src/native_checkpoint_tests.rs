@@ -427,6 +427,75 @@ fn a_root_beyond_the_inline_bound_is_seeded_and_assembled_back_exactly() {
     ));
 }
 
+/// A frozen image's seeded encoding walked once is the measured plan's
+/// encoding byte for byte: the same frame, the same chunks. One that fits
+/// inline is none, and seals nothing.
+#[test]
+fn a_frozen_root_encoded_in_one_walk_is_the_measured_encoding() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut seeds = seed_store(directory.path());
+    let core = core(false, 31);
+    let frozen = core.freeze_native().unwrap();
+    let configuration = configuration();
+    let metadata = metadata(NativeContentProfile::ProjectionOnly);
+    let limits = Limits {
+        inline_bytes: 16,
+        ..Limits::default()
+    };
+    let measured = EncodingPlan::prepare_frozen_with_sections(
+        &frozen,
+        metadata,
+        &configuration,
+        Sections::default(),
+        limits,
+    )
+    .unwrap();
+    assert!(measured.seeded());
+    let (twice, commit) = measured
+        .encode_in_batch(&budget(), seeds.batch().unwrap())
+        .unwrap();
+    commit.run().unwrap();
+    let root = |limits| FrozenRoot {
+        frozen: &frozen,
+        metadata,
+        configuration: &configuration,
+        sections: Sections::default(),
+        limits,
+    };
+    let (once, commit) =
+        EncodingPlan::encode_frozen_in_batch(root(limits), &budget(), seeds.batch().unwrap())
+            .unwrap()
+            .expect("seeded");
+    // Its chunk was sealed by the first encoding: nothing new to write.
+    assert_eq!(commit.written(), 0);
+    commit.run().unwrap();
+    assert_eq!(once.bytes(), twice.bytes());
+    // Inline after all: none, and its batch seals nothing.
+    let empty = tempfile::tempdir().unwrap();
+    let mut elsewhere = seed_store(empty.path());
+    assert!(
+        EncodingPlan::encode_frozen_in_batch(
+            root(Limits::default()),
+            &budget(),
+            elsewhere.batch().unwrap()
+        )
+        .unwrap()
+        .is_none()
+    );
+    let manifest = Checkpoint::describe(once.bytes(), limits)
+        .unwrap()
+        .expect("seeded form");
+    let chunk = manifest.chunks().next().unwrap().unwrap();
+    assert!(!elsewhere.contains(chunk.hash));
+    assert!(
+        std::fs::read_dir(empty.path().join("seeds"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| entry.file_name() == "LOCK"),
+        "an abandoned batch leaves no files"
+    );
+}
+
 #[test]
 fn a_movement_section_rides_both_forms_and_every_forgery_of_it_is_refused() {
     let directory = tempfile::tempdir().unwrap();
@@ -549,8 +618,11 @@ fn a_retention_section_rides_both_forms_beside_the_movement_section() {
         &core,
         metadata(NativeContentProfile::ProjectionOnly),
         &configuration,
-        Some(&section),
-        Some(retention),
+        Sections {
+            movement: Some(&section),
+            retention: Some(retention),
+            cold: None,
+        },
         Limits::default(),
     )
     .unwrap();
@@ -579,8 +651,10 @@ fn a_retention_section_rides_both_forms_beside_the_movement_section() {
         &core,
         metadata(NativeContentProfile::ProjectionOnly),
         &configuration,
-        None,
-        Some(retention),
+        Sections {
+            retention: Some(retention),
+            ..Sections::default()
+        },
         Limits::default(),
     )
     .unwrap();
@@ -596,8 +670,10 @@ fn a_retention_section_rides_both_forms_beside_the_movement_section() {
         &core,
         metadata(NativeContentProfile::ProjectionOnly),
         &configuration,
-        None,
-        Some(retention),
+        Sections {
+            retention: Some(retention),
+            ..Sections::default()
+        },
         limits,
     )
     .unwrap();

@@ -13,10 +13,11 @@ pub(super) fn check(
     view: &impl aggregation::AdmissionView,
     limits: NativeLimits,
 ) -> Result<(), NativeError> {
-    // Reports need nine writes, or eleven when a Required result first makes
-    // the Posted parent PostFailed. Begin cannot admit only the success branch.
-    // Eleven primary rows plus the smallest report's index rows: a result
-    // artifact without inputs, its verdict, and the parent's status move.
+    // Reports need ten writes, or twelve when a Required result first makes
+    // the Posted parent PostFailed (the principal's window among them, F12).
+    // Begin cannot admit only the success branch. Twelve primary rows plus
+    // the smallest report's index rows: a result artifact without inputs,
+    // its verdict, and the parent's status move.
     if limits.range.max_batch_entries < super::index_rows::MINIMUM_FAILED_REPORT_ROWS {
         return Err(NativeError::Capacity("admission completion write set"));
     }

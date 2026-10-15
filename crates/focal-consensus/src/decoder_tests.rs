@@ -60,7 +60,7 @@ fn decoder_floor_requires_actual_application_confirmation_before_any_raft_partic
         term: 99,
         ..Default::default()
     };
-    vote.set_msg_type(MessageType::MsgRequestVote);
+    vote.msg_type = MessageType::MsgRequestVote;
     let term = reopened.status().term;
     assert!(matches!(
         reopened.step(vote),
@@ -249,7 +249,7 @@ fn ambiguous_floor_fsync_never_advertises_and_recovery_uses_the_actual_fence() {
             DurableNode::open(NodeConfig::single(1, [1; 16], [2; 16]), directory.path()).unwrap();
         node.confirm_decoder(HASH).unwrap();
         node.drain().unwrap();
-        node.inject_fault_once(point);
+        node.inject_fault_once(point).unwrap();
         node.begin_decoder_floor(HASH).unwrap();
         assert!(node.finish_decoder_floor().is_err());
         assert!(!node.decoder_floor_ready(HASH));

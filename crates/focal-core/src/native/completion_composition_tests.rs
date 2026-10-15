@@ -44,7 +44,6 @@ fn begin_and_mixed_update_rollback_restore_the_exact_pre_begin_pool_and_index() 
     }
     let baseline = source.stats();
     let capacity = book.entries.capacity();
-    let funding = book.funded_capacity();
     let totals = book.totals;
     let revision = book.revision;
     let old = [1, 3].map(|index| book.grant(fixture::key(index)).unwrap().credit);
@@ -54,10 +53,7 @@ fn begin_and_mixed_update_rollback_restore_the_exact_pre_begin_pool_and_index() 
     let request = input(&core, None, 951, 1, VerdictValue::Fail);
     let verified = fixture::verified(&mut custody, &request);
     let (prepared, report, seals) = with_seals(&core, None, request, &verified, &[2, 3]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let update = book
         .apply_prepared(
             &view,
@@ -86,7 +82,6 @@ fn begin_and_mixed_update_rollback_restore_the_exact_pre_begin_pool_and_index() 
     assert_eq!(book.revision, revision);
     assert_eq!(book.totals, totals);
     assert_eq!(book.entries.capacity(), capacity);
-    assert_eq!(book.funded_capacity(), funding);
     assert_eq!(source.stats(), baseline);
     assert!(book.grant(fixture::key(2)).is_err());
     assert_eq!(
@@ -113,10 +108,7 @@ fn composed_head_commit_preserves_the_new_grants_younger_pending_report() {
     let request = input(&core, None, 952, 1, VerdictValue::Fail);
     let verified = fixture::verified(&mut custody, &request);
     let (prepared, report, seals) = with_seals(&core, None, request, &verified, &[2, 3]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let update = book
         .apply_prepared(
             &view,
@@ -136,10 +128,7 @@ fn composed_head_commit_preserves_the_new_grants_younger_pending_report() {
     let request = input(&core, Some(&prepared), 953, 2, VerdictValue::Error);
     let verified = fixture::verified(&mut custody, &request);
     let later = fixture::report(&core, request, &[&prepared], &verified);
-    let view = View {
-        state: &core.state,
-        tail: Some(&prepared),
-    };
+    let view = View::committed(&core.state).with_own(&prepared).unwrap();
     let later_journal = book
         .apply_prepared(
             &view,
@@ -151,7 +140,10 @@ fn composed_head_commit_preserves_the_new_grants_younger_pending_report() {
             }),
             None,
             &[],
-            JournalFunding::HeldCompletion,
+            JournalFunding::External {
+                source: &source,
+                lane: BudgetLane::Completion,
+            },
         )
         .unwrap();
     let advanced = book.grant(fixture::key(2)).unwrap().credit;

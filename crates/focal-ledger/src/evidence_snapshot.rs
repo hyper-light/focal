@@ -109,10 +109,9 @@ impl Session {
     /// replication continues to use the separate nonblocking Ready path.
     pub fn checkpoint_evidence(
         &mut self,
-        now: u64,
         ttl: u64,
     ) -> Result<DurableEvidenceSnapshot, LedgerError> {
-        self.begin_checkpoint_evidence(now, ttl)?;
+        self.begin_checkpoint_evidence(ttl)?;
         if let Err(error) = self.consensus.finish_checkpoint() {
             self.cancel_checkpoint_evidence()?;
             return Err(error.into());
@@ -122,8 +121,11 @@ impl Session {
     }
     /// Prepare an immutable export while the existing disk owner performs the
     /// checkpoint rewrite. No witness escapes until its exact receipt completes.
-    pub fn begin_checkpoint_evidence(&mut self, now: u64, ttl: u64) -> Result<(), LedgerError> {
+    /// Its capture is pinned for `ttl` milliseconds of the read clock.
+    pub fn begin_checkpoint_evidence(&mut self, ttl: u64) -> Result<(), LedgerError> {
         self.check()?;
+        // One checkpoint at a time: a deferred one is finished first.
+        self.settle_deferred_checkpoint()?;
         if self.persistence_pending() {
             return Err(ConsensusError::PersistencePending.into());
         }
@@ -144,7 +146,7 @@ impl Session {
             .commit();
         let placement = CommittedPlacement {
             stored: stored.clone(),
-            node: self.status().node_id,
+            node: self.scalars().node_id,
             cluster: self.cluster_id(),
             _allocation: allocation,
         };
@@ -179,6 +181,7 @@ impl Session {
         } else {
             None
         };
+        let now = self.read_clock.now();
         let captured_at = std::time::Instant::now();
         let graph = self.graph.snapshot(now, ttl)?;
         let encoded = match self.encode_checkpoint(true) {
@@ -191,6 +194,8 @@ impl Session {
         let EncodedCheckpoint {
             bytes,
             retained,
+            native: _,
+            deferred: _,
             _scratch,
         } = encoded;
         let (checkpoint, allocation) = retained.ok_or(LedgerError::Corrupt)?;
@@ -285,6 +290,27 @@ impl Session {
                             }),
                         }
                     }
+                    // A cold family's frame is no custody object: every replica holds it in its
+                    // own cold stream, which an install takes with the checkpoint (doc 31 M2, A2).
+                    focal_core::native::ContentRoot::Cold { .. } => continue,
+                    // A seal's bundle (F12) is inventoried under an identity
+                    // derived from its ordinal: no claim names it.
+                    focal_core::native::ContentRoot::Seal {
+                        ordinal,
+                        root,
+                        bytes,
+                    } => ArtifactEvidence {
+                        artifact: ArtifactRef {
+                            id: seal_inventory_id(ordinal),
+                            hash: root,
+                        },
+                        content: Some(ContentRef {
+                            domain,
+                            root,
+                            length: bytes,
+                            class: ContentClass::Evidence,
+                        }),
+                    },
                 };
                 objects.push(entry);
             }
@@ -293,7 +319,7 @@ impl Session {
                 break;
             }
         }
-        objects.sort_by(|left, right| left.artifact.id.cmp(&right.artifact.id));
+        objects.sort_by_key(|left| left.artifact.id);
         if objects
             .windows(2)
             .any(|pair| pair.first().map(|e| e.artifact.id) == pair.get(1).map(|e| e.artifact.id))
@@ -353,4 +379,17 @@ impl Session {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+/// The inventory identity of a seal's bundle (F12): the low half of a keyed
+/// digest of its ordinal, distinct from every claim's and every other seal's.
+fn seal_inventory_id(ordinal: u64) -> ArtifactId {
+    let mut hasher = blake3::Hasher::new_derive_key("focal.native.seal.inventory.v1");
+    hasher.update(&ordinal.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut id = [0u8; 16];
+    for (target, source) in id.iter_mut().zip(digest.as_bytes().iter()) {
+        *target = *source;
+    }
+    ArtifactId(id)
 }

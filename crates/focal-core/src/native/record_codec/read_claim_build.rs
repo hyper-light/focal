@@ -186,7 +186,10 @@ fn process<D: Objects + ?Sized>(
         scopes.construction_heap_allocations(),
     )?;
     let history_heap = add(
-        claim::ClaimState::hydration_response_heap_charge_v1(fields.responses)?,
+        add(
+            claim::ClaimState::hydration_response_heap_charge_v1(fields.responses)?,
+            claim::ClaimState::hydration_terminal_heap_charge_v1(fields.terminal_cut.is_some())?,
+        )?,
         aggregation::RegistrationSet::hydration_heap_charge_v1(input.registrations.rows)?,
     )?;
     let heap = add(

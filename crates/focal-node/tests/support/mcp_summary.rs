@@ -57,7 +57,7 @@ fn cli_and_both_mcp_profiles_observe_six_committed_counts_without_mutation_or_gr
         let output = Command::new(env!("CARGO_BIN_EXE_focal"))
             .arg("--data-dir")
             .arg(root.path())
-            .args(["ledger", "summary", "--format", format])
+            .args(["inspect", "ledger", "--format", format])
             .output()
             .unwrap();
         assert!(

@@ -7,21 +7,17 @@ impl Core<NativeState> {
         &'a self,
         input: NativeMonitorDeadlineInput,
         logical_time: u64,
-        mut pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'p>>,
     ) -> Result<Checked<'a>, NativeError> {
-        let pending_count = pending.len();
-        if pending_count > self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
-        }
-        self.state
-            .rows
-            .validate_chain(pending.clone().map(|item| &item.fragments))?;
+        self.state.rows.validate_chain(
+            pending
+                .and_then(|chain| chain.head())
+                .map(|item| &item.fragments)
+                .into_iter(),
+        )?;
         let intent = intent::monitor_deadline_fingerprint(self.state.ledger, input)?;
-        let view = View {
-            state: &self.state,
-            tail: pending.next_back(),
-        };
-        if let Some(outcome) = as_outcome(view.get(Key::Outcome(input.key().into()))) {
+        let view = View::over(&self.state, pending);
+        if let Some(outcome) = view.outcome(input.key().into())? {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {
                     outcome,
@@ -30,9 +26,6 @@ impl Core<NativeState> {
             } else {
                 Err(NativeError::RequestConflict)
             };
-        }
-        if pending_count == self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
         }
         let mut meta = view.meta();
         if logical_time < meta.logical_time {

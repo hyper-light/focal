@@ -3,7 +3,7 @@ use super::super::report_tests::{
     report_for, running,
 };
 use super::*;
-use focal_evidence::{BuiltinNativeSchemas, ContentStore, StoreLimits, VerifiedNativeArtifact};
+use focal_evidence::{BuiltinNativeSchemas, ContentStore, StoreLimits};
 use focal_memory::{BudgetLane, Change, Entry};
 use focal_model::lifecycle::{
     aggregation,
@@ -22,7 +22,7 @@ mod admission_graph_tests;
 mod pending_journal_tests;
 
 fn parts(core: &Core<NativeState>) -> (&ClaimState, &RegistrationSet, &validation::Declaration) {
-    let Row::Claim(owner) = core.state.rows.get(&Key::Claim(key(1).claim)).unwrap() else {
+    let Row::Claim(owner) = core.state.row(&Key::Claim(key(1).claim)).unwrap() else {
         panic!("claim row");
     };
     (
@@ -30,13 +30,6 @@ fn parts(core: &Core<NativeState>) -> (&ClaimState, &RegistrationSet, &validatio
         owner.registrations().unwrap(),
         core.native_definition(key(1).validation).unwrap(),
     )
-}
-
-fn evidence() -> EvidenceBounds {
-    EvidenceBounds {
-        workspace_bytes: 16 * 1024 * 1024,
-        retained_bytes: size_of::<VerifiedNativeArtifact>(),
-    }
 }
 
 fn envelope(core: &Core<NativeState>) -> CompletionEnvelope {
@@ -48,7 +41,6 @@ fn envelope(core: &Core<NativeState>) -> CompletionEnvelope {
         registrations,
         declaration,
         descriptor_limits(core.limits, claim, registrations).unwrap(),
-        evidence(),
     )
     .unwrap()
 }
@@ -84,22 +76,9 @@ fn full_chain_prices_all_retained_versions_and_only_one_parent_failure() {
             assert_eq!(cohort.claims(), failure);
             assert_eq!(cohort.evaluations(), failure * 5);
             assert_eq!(envelope.reports(), reports);
-            assert_eq!(
-                envelope.slots(),
-                CompletionSlots {
-                    artifacts: reports as usize,
-                    identities: reports as usize,
-                    results: reports as usize,
-                    outcomes: reports as usize,
-                    sequences: u64::from(reports),
-                    events: 3 * reports as usize + failure + cohort.events(),
-                    // Seven primary rows and twenty-one index rows per report.
-                    new_rows: 28 * reports as usize + failure + cohort.events(),
-                    ..CompletionSlots::default()
-                }
-            );
-            // Nine primary writes, the report's twenty-one index rows and the
-            // due timers of the reported and every sealed cohort evaluation.
+            // Ten primary writes (the principal's window among them, F12),
+            // the report's twenty-one index rows and the due timers of the
+            // reported and every sealed cohort evaluation.
             let report_index = crate::native::index_rows::report_rows(16).unwrap();
             let regular_timers =
                 crate::native::index_rows::timer_rows(0, 1 + cohort.evaluations(), 0).unwrap();
@@ -109,26 +88,15 @@ fn full_chain_prices_all_retained_versions_and_only_one_parent_failure() {
                     .unwrap()
                     .limits()
                     .changed_keys,
-                9 + report_index + regular_timers
+                10 + report_index + regular_timers
             );
-            let regular = envelope
-                .per_report_retained_bytes(CompletionUse::Regular)
-                .unwrap();
-            assert_eq!(
-                regular,
-                envelope
-                    .report_storage(CompletionUse::Regular)
-                    .unwrap()
-                    .additional_retained_bytes()
-                    + crate::native::mutation::bytes(9 + report_index + regular_timers).unwrap(),
-                "a report keeps its write set and an inline credit update"
-            );
-            let expected = if failure != 0 {
-                // Eleven primary rows, the cohort's rows, the report's index
-                // rows, a status move for the parent and every sealed cohort
-                // claim, and the due timers of every moved claim and every
-                // affected evaluation.
-                let failed = 11
+            if failure != 0 {
+                // Twelve primary rows (the principal's window among them,
+                // F12), the cohort's rows, the report's index rows, a status
+                // move for the parent and every sealed cohort claim, and the
+                // due timers of every moved claim and every affected
+                // evaluation.
+                let failed = 12
                     + cohort.changed_keys()
                     + report_index
                     + crate::native::index_rows::STATUS_ROWS * (1 + cohort.claims())
@@ -142,36 +110,13 @@ fn full_chain_prices_all_retained_versions_and_only_one_parent_failure() {
                         .changed_keys,
                     failed
                 );
-                assert_eq!(
-                    envelope
-                        .per_report_retained_bytes(CompletionUse::AdmissionFailure)
-                        .unwrap(),
-                    envelope
-                        .report_storage(CompletionUse::AdmissionFailure)
-                        .unwrap()
-                        .additional_retained_bytes()
-                        + crate::native::mutation::bytes(failed).unwrap()
-                        + crate::native::completion_book::journal_bytes(1 + cohort.evaluations())
-                            .unwrap(),
-                    "a pending failure retains the full collected update buffer"
-                );
-                (reports as usize - 1) * regular
-                    + envelope
-                        .per_report_retained_bytes(CompletionUse::AdmissionFailure)
-                        .unwrap()
             } else {
                 assert!(
                     envelope
                         .report_storage(CompletionUse::AdmissionFailure)
                         .is_err()
                 );
-                reports as usize * regular
-            };
-            assert_eq!(envelope.total_retained_bytes(), expected);
-            assert_eq!(
-                envelope.required_bytes(),
-                expected + envelope.workspace_bytes()
-            );
+            }
         }
     }
 }
@@ -199,7 +144,6 @@ fn cohort_visit_boundary_is_distinct_from_the_unchanged_scratch_byte_limit() {
             registry,
             declaration,
             descriptor,
-            evidence(),
         ),
         Err(NativeError::Capacity("cohort seal writer visits"))
     ));
@@ -214,7 +158,6 @@ fn cohort_visit_boundary_is_distinct_from_the_unchanged_scratch_byte_limit() {
         registry,
         declaration,
         descriptor,
-        evidence(),
     )
     .unwrap();
     assert_eq!(exact.preparation_bytes, core.limits.preparation_bytes);
@@ -269,7 +212,11 @@ fn completion_use_follows_actual_admission_transition_not_changed_row_count() {
         );
         let verified = fixture::verified(&mut custody, &report);
         let prepared = fixture::report(&core, report, &[], &verified);
-        let after = prepared.claim(key(1).claim).unwrap();
+        let after = core
+            .native_chain(&[&prepared])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap();
         assert_eq!(
             captured
                 .completion_use(prepared.outcome().operation, Some(after))
@@ -327,7 +274,9 @@ fn admission_surcharge_refuses_other_control_and_foreign_changed_claims() {
         captured
             .completion_use(
                 NativeOperation::ReportAdmission,
-                cancelled.claim(key(1).claim)
+                core.native_chain(&[&cancelled])
+                    .unwrap()
+                    .claim(key(1).claim)
             )
             .is_err()
     );
@@ -340,35 +289,6 @@ fn admission_surcharge_refuses_other_control_and_foreign_changed_claims() {
             )
             .is_err()
     );
-}
-
-#[test]
-fn verification_and_construction_workspace_is_shared_across_attempts() {
-    let short = running(&[(ValidationMode::Required, false)]);
-    let long = running(&[(ValidationMode::Required, true)]);
-    let a = envelope(&short);
-    let b = envelope(&long);
-    assert_eq!(a.workspace_bytes(), b.workspace_bytes());
-    assert_eq!(
-        b.total_retained_bytes() - a.total_retained_bytes(),
-        a.per_report_retained_bytes(CompletionUse::Regular).unwrap()
-    );
-    let (claim, registrations, declaration) = parts(&short);
-    let extra = CompletionEnvelope::derive(
-        &short.state.rows,
-        short.limits,
-        claim,
-        registrations,
-        declaration,
-        a.descriptor_limits(),
-        EvidenceBounds {
-            workspace_bytes: evidence().workspace_bytes + 123,
-            retained_bytes: evidence().retained_bytes + 7,
-        },
-    )
-    .unwrap();
-    assert_eq!(extra.total_retained_bytes(), a.total_retained_bytes());
-    assert_eq!(extra.required_bytes() - a.required_bytes(), 130);
 }
 
 #[test]
@@ -424,7 +344,6 @@ fn each_pinned_descriptor_dimension_is_enforced_and_content_is_not_inline_bytes(
         registrations,
         declaration,
         narrow,
-        evidence(),
     )
     .unwrap();
     let wider = descriptor_limits(core.limits, claim, registrations).unwrap();
@@ -493,7 +412,6 @@ fn too_small_compound_or_entry_allowance_refuses_before_begin() {
         registrations,
         declaration,
         minimal,
-        evidence(),
     )
     .unwrap();
     let mut diagnostic = artifact_spec(900, EVALUATOR, VerdictValue::Error);
@@ -518,22 +436,6 @@ fn too_small_compound_or_entry_allowance_refuses_before_begin() {
             registrations,
             declaration,
             ordinary,
-            evidence()
-        )
-        .is_err()
-    );
-    assert!(
-        CompletionEnvelope::derive(
-            &core.state.rows,
-            core.limits,
-            claim,
-            registrations,
-            declaration,
-            ordinary,
-            EvidenceBounds {
-                workspace_bytes: usize::MAX,
-                retained_bytes: 1
-            }
         )
         .is_err()
     );
@@ -547,7 +449,6 @@ fn too_small_compound_or_entry_allowance_refuses_before_begin() {
             registrations,
             declaration,
             no_error_kind,
-            evidence()
         )
         .is_err()
     );
@@ -576,13 +477,13 @@ fn report_changes(
             continue;
         }
         let row = match &entry.value {
-            Row::Meta(row) => Row::Meta(*row),
+            Row::Meta(row) => Row::Meta(Box::new(**row)),
             Row::Claim(row) => Row::Claim(row.copy().unwrap()),
             Row::Evaluation(row) => Row::Evaluation(row.copy().unwrap()),
             Row::Artifact(row) => Row::Artifact(row.copy().unwrap()),
             Row::ArtifactIdentity(row) => Row::ArtifactIdentity(*row),
             Row::Accepted(row) => Row::Accepted(row.copy().unwrap()),
-            Row::Outcome(row) => Row::Outcome(*row),
+            Row::Outcome(row) => Row::Outcome(row.copy()),
             Row::Event(row) => Row::Event(row.copy().unwrap()),
             _ => panic!("unexpected report row"),
         };
@@ -668,8 +569,8 @@ fn admitted_scope_growth_and_actual_failed_report_fit_the_original_pinned_envelo
         panic!("actual registry seal fact")
     };
     assert!(
-        matches!(event.get().unwrap().expand(core.state.ledger).fact,
-        NativeFact::Registrations { claim } if claim == candidate.claim(key(1).claim).unwrap().binding())
+        matches!(event.get(core.state.ledger, core.state.payloads()).unwrap().fact,
+        NativeFact::Registrations { claim } if claim == core.native_chain(&[&candidate]).unwrap().claim(key(1).claim).unwrap().binding())
     );
     let plan = core
         .state
@@ -718,7 +619,7 @@ fn parent_cap_and_storage_envelope_reject_another_owner() {
             other.native_sequence().0 + 1,
             vec![Change::Put(Entry::new(
                 Key::Meta,
-                Row::Meta(Meta::default()),
+                Row::Meta(Box::default()),
                 0,
             ))],
             BudgetLane::Completion,
@@ -755,7 +656,6 @@ fn one_checked_parent_fact_set_serves_the_complete_mixed_grant_cohort() {
             registrations,
             declaration,
             descriptor_limits(core.limits, claim, registrations).unwrap(),
-            evidence(),
         )
         .unwrap();
         envelope.check_parent_facts(&facts).unwrap();
@@ -978,7 +878,9 @@ fn complete_response_history_must_fit_entry_and_quotes_need_no_free_budget() {
     let core = observed_with_response_cap(4);
     let (claim, registrations, _) = parts(&core);
     let history = charged_heap(claim.max_response_history_heap_bytes().unwrap(), 1).unwrap();
-    let minimum = heap(claim).unwrap() + history;
+    // The row as it is, its complete response history, and the terminal cut that settling it
+    // adds.
+    let minimum = heap(claim).unwrap() + terminal_growth(claim).unwrap() + history;
     let registry = registry_bound(core.limits, claim, registrations).unwrap().1;
     let exact_entry =
         size_of::<Entry<Key, Row>>() + OwnedClaim::container_charge() + registry + minimum;
@@ -995,8 +897,8 @@ fn complete_response_history_must_fit_entry_and_quotes_need_no_free_budget() {
     let occupied = budget
         .reserve(
             BudgetKind::Query,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap();
     let before = budget.stats();
@@ -1019,7 +921,6 @@ fn complete_response_history_must_fit_entry_and_quotes_need_no_free_budget() {
             registrations,
             declaration,
             bound.descriptor_limits(),
-            evidence(),
         )
         .is_err()
     );
@@ -1376,14 +1277,15 @@ pub(in crate::native) fn increment_fixture() -> (
 }
 
 #[test]
-fn required_increment_prices_nine_writes_per_attempt_without_a_claim_failure_allowance() {
+fn required_increment_prices_ten_writes_per_attempt_without_a_claim_failure_allowance() {
     let (core, registry, state) = increment_fixture();
     let (claim, _, _) = parts(&core);
     let declaration = core.native_definition(key(4).validation).unwrap();
     let mut limits = core.limits;
-    // Nine primary writes, the report's twenty-one index rows and its
-    // evaluation's due timer (doc 22 §7).
-    limits.range.max_batch_entries = 31;
+    // Ten primary writes (the principal's window among them, F12), the
+    // report's twenty-one index rows and its evaluation's due timer (doc 22
+    // §7).
+    limits.range.max_batch_entries = 32;
     let before = core.state.budget.stats();
     let quote = CompletionEnvelope::derive(
         &core.state.rows,
@@ -1392,10 +1294,8 @@ fn required_increment_prices_nine_writes_per_attempt_without_a_claim_failure_all
         &registry,
         declaration,
         descriptor_limits(limits, claim, &registry).unwrap(),
-        evidence(),
     )
     .unwrap();
-    let reports = declaration.attempt_bound() as usize;
     assert_eq!(declaration.mode(), ValidationMode::Required);
     assert!(quote.supports_target(EvaluationTarget::of(state.target())));
     assert!(!quote.supports_target(EvaluationTarget::Admission));
@@ -1412,16 +1312,7 @@ fn required_increment_prices_nine_writes_per_attempt_without_a_claim_failure_all
             .unwrap()
             .limits()
             .changed_keys,
-        9 + 21 + 1
-    );
-    assert_eq!(quote.slots().events, reports * 3);
-    assert_eq!(quote.slots().new_rows, reports * 28);
-    assert_eq!(
-        quote.total_retained_bytes(),
-        reports
-            * quote
-                .per_report_retained_bytes(CompletionUse::Regular)
-                .unwrap()
+        10 + 21 + 1
     );
     assert_eq!(core.state.budget.stats(), before);
     limits.range.max_batch_entries = 8;
@@ -1433,7 +1324,6 @@ fn required_increment_prices_nine_writes_per_attempt_without_a_claim_failure_all
             &registry,
             declaration,
             quote.descriptor_limits(),
-            evidence(),
         )
         .is_err()
     );
@@ -1453,7 +1343,6 @@ fn increment_envelope_requires_actual_registered_family_and_keeps_full_parent_bo
             admission_only,
             declaration,
             descriptor,
-            evidence(),
         )
         .is_err()
     );
@@ -1464,7 +1353,6 @@ fn increment_envelope_requires_actual_registered_family_and_keeps_full_parent_bo
         &registry,
         declaration,
         descriptor,
-        evidence(),
     )
     .unwrap();
     quote.check_parent(claim, &registry).unwrap();
@@ -1472,163 +1360,6 @@ fn increment_envelope_requires_actual_registered_family_and_keeps_full_parent_bo
     assert!(quote.max_registrations > quote.registrations);
     assert!(quote.parent_heap >= heap(claim).unwrap());
     assert!(quote.registry_heap >= transactions::registry_heap(&registry).unwrap());
-}
-
-#[test]
-fn remaining_slots_keep_admission_surcharge_until_used_and_zero_it_after_terminal() {
-    let core = running(&[(ValidationMode::Required, false)]);
-    let quote = envelope(&core);
-    assert_eq!(quote.remaining_slots(2, true).unwrap(), quote.slots());
-    assert_eq!(
-        quote.remaining_slots(1, true).unwrap(),
-        CompletionSlots {
-            artifacts: 1,
-            identities: 1,
-            results: 1,
-            outcomes: 1,
-            events: 4 + quote.cohort().events(),
-            sequences: 1,
-            new_rows: 29 + quote.cohort().events(),
-            ..CompletionSlots::default()
-        }
-    );
-    assert_eq!(
-        quote.remaining_slots(1, false).unwrap(),
-        CompletionSlots {
-            artifacts: 1,
-            identities: 1,
-            results: 1,
-            outcomes: 1,
-            events: 3,
-            sequences: 1,
-            // Seven primary rows and the report's twenty-one index rows.
-            new_rows: 28,
-            ..CompletionSlots::default()
-        }
-    );
-    assert_eq!(
-        quote.remaining_slots(0, true).unwrap(),
-        CompletionSlots::default()
-    );
-    assert!(quote.remaining_slots(3, false).is_err());
-    let observe = running(&[(ValidationMode::Observe, false)]);
-    assert!(envelope(&observe).remaining_slots(1, true).is_err());
-}
-
-#[test]
-fn finite_slot_arithmetic_checks_every_dimension_and_sequence_counter() {
-    let one = CompletionSlots {
-        claims: 1,
-        definitions: 1,
-        evaluations: 1,
-        artifacts: 1,
-        identities: 1,
-        results: 1,
-        responses: 1,
-        receipts: 1,
-        result_testaments: 1,
-        monitors: 1,
-        monitor_links: 1,
-        outcomes: 1,
-        events: 1,
-        sequences: 1,
-        new_rows: 1,
-    };
-    let zero = CompletionSlots::default();
-    for dimension in 0..15 {
-        let mut maximum = zero;
-        let mut unit = zero;
-        match dimension {
-            0 => {
-                maximum.artifacts = usize::MAX;
-                unit.artifacts = 1;
-            }
-            1 => {
-                maximum.identities = usize::MAX;
-                unit.identities = 1;
-            }
-            2 => {
-                maximum.results = usize::MAX;
-                unit.results = 1;
-            }
-            3 => {
-                maximum.outcomes = usize::MAX;
-                unit.outcomes = 1;
-            }
-            4 => {
-                maximum.events = usize::MAX;
-                unit.events = 1;
-            }
-            5 => {
-                maximum.sequences = u64::MAX;
-                unit.sequences = 1;
-            }
-            6 => {
-                maximum.new_rows = usize::MAX;
-                unit.new_rows = 1;
-            }
-            7 => {
-                maximum.claims = usize::MAX;
-                unit.claims = 1;
-            }
-            8 => {
-                maximum.definitions = usize::MAX;
-                unit.definitions = 1;
-            }
-            9 => {
-                maximum.evaluations = usize::MAX;
-                unit.evaluations = 1;
-            }
-            10 => {
-                maximum.responses = usize::MAX;
-                unit.responses = 1;
-            }
-            11 => {
-                maximum.receipts = usize::MAX;
-                unit.receipts = 1;
-            }
-            12 => {
-                maximum.result_testaments = usize::MAX;
-                unit.result_testaments = 1;
-            }
-            13 => {
-                maximum.monitors = usize::MAX;
-                unit.monitors = 1;
-            }
-            14 => {
-                maximum.monitor_links = usize::MAX;
-                unit.monitor_links = 1;
-            }
-            _ => unreachable!(),
-        }
-        assert_eq!(maximum.checked_add(zero).unwrap(), maximum);
-        assert_eq!(maximum.checked_scale(1).unwrap(), maximum);
-        assert_eq!(maximum.checked_scale(0).unwrap(), zero);
-        assert!(
-            maximum.checked_add(unit).is_err(),
-            "addition dimension {dimension}"
-        );
-        assert!(
-            maximum.checked_scale(2).is_err(),
-            "scaling dimension {dimension}"
-        );
-        assert!(
-            zero.checked_sub(unit).is_err(),
-            "subtraction dimension {dimension}"
-        );
-        assert_eq!(
-            maximum
-                .checked_sub(unit)
-                .unwrap()
-                .checked_add(unit)
-                .unwrap(),
-            maximum
-        );
-    }
-    assert_eq!(
-        one.checked_scale(3).unwrap().checked_sub(one).unwrap(),
-        one.checked_scale(2).unwrap()
-    );
 }
 
 #[test]
@@ -1678,7 +1409,6 @@ fn append_bound_refuses_dropped_rows_changed_limits_and_excess_actual_registry_c
         &wider,
         declaration,
         descriptor_limits(core.limits, claim, &wider).unwrap(),
-        evidence(),
     )
     .unwrap();
     assert_eq!(expanded.max_registrations, quote.max_registrations);

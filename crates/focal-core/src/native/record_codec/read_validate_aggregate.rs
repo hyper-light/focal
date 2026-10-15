@@ -4,6 +4,7 @@
 //! rather than changing an earlier response, artifact or claimant outcome.
 use super::read_validate::{ValidationRead, invalid};
 use super::*;
+use crate::native::ranges::KeyedRows as _;
 use focal_memory::{BudgetKind, BudgetLane};
 use focal_model::lifecycle::aggregation::{
     self, AggregateOutcome, ArtifactOutcome, ProjectionLimits, ProjectionShape,
@@ -152,7 +153,7 @@ impl WholeWorkView for Rows<'_, '_, '_> {
         })();
         let mut failed = seek.err().map(model);
         let mut cycles = if failed.is_none() {
-            Some(self.read.root.entries_from(&start, false))
+            Some(self.read.root.rows_from(&start, false))
         } else {
             None
         };
@@ -361,7 +362,7 @@ pub(super) fn validate_source(
     require(plan.construction_charge() <= quote.construction_charge())?;
     let reservation = read.budget().reserve(
         BudgetKind::Recovery,
-        BudgetLane::Completion,
+        BudgetLane::Committed,
         plan.construction_charge(),
     )?;
     let projection = plan.build();
@@ -425,7 +426,7 @@ fn seals(
 ) -> Result<(), NativeError> {
     let read = rows;
     let cut = claim.local_sealed_at();
-    let recorded = registry.snapshot_v1();
+    let recorded = registry.snapshot_v1(claim.binding());
     require(
         recorded.sealed == cut.is_some()
             && recorded.sealed_at == cut

@@ -53,6 +53,7 @@ pub(crate) fn invocation_of(value: NativeInvocationRef) -> core_native::NativeIn
         }
         NativeInvocationRef::Import => core_native::NativeInvocation::Import,
         NativeInvocationRef::Retirement { root } => core_native::NativeInvocation::Retirement(root),
+        NativeInvocationRef::Seal { ordinal } => core_native::NativeInvocation::Seal(ordinal),
     }
 }
 pub(crate) fn operation(value: core_native::NativeOperation) -> NativeOperationKind {
@@ -90,6 +91,8 @@ pub(crate) fn operation(value: core_native::NativeOperation) -> NativeOperationK
         O::ClaimDeadline => NativeOperationKind::ClaimDeadline,
         O::Import => NativeOperationKind::Import,
         O::Retire => NativeOperationKind::Retire,
+        O::AdvanceEpochFloor => NativeOperationKind::AdvanceEpochFloor,
+        O::Seal => NativeOperationKind::Seal,
     }
 }
 pub(crate) fn outcome(value: core_native::NativeOutcome) -> NativeReceipt {
@@ -305,6 +308,41 @@ pub(crate) fn claim_content(
     }
 }
 /// The continuation of a retired claim (26 §4).
+pub(crate) fn epoch_window(
+    principal: ParticipantId,
+    window: &core_native::EpochWindow,
+) -> NativeEpochWindow {
+    NativeEpochWindow {
+        principal,
+        floor: window.floor,
+        sealed: window.sealed,
+        open: window
+            .counts
+            .iter()
+            .take(usize::from(window.open))
+            .enumerate()
+            .map(|(at, count)| NativeOpenEpoch {
+                epoch: RequestEpoch(
+                    window
+                        .floor
+                        .0
+                        .saturating_add(u64::try_from(at).unwrap_or(u64::MAX)),
+                ),
+                outcomes: count.outcomes,
+                last_logical_time: count.last,
+            })
+            .collect(),
+        ranges: window
+            .ranges()
+            .iter()
+            .map(|range| NativeSealedRange {
+                first: range.first,
+                last: range.last,
+                seal: range.seal,
+            })
+            .collect(),
+    }
+}
 pub(crate) fn retired(claim: ClaimId, value: &core_native::RetiredClaim) -> NativeRetiredClaim {
     NativeRetiredClaim {
         claim,
@@ -317,14 +355,33 @@ pub(crate) fn retired(claim: ClaimId, value: &core_native::RetiredClaim) -> Nati
         events: value.events,
     }
 }
+/// A failure reading a claim's content held as its encoding (doc 31 M3).
+pub(crate) fn content_error(error: focal_core::native::NativeError) -> AccessError {
+    use focal_core::native::NativeError;
+    match error {
+        NativeError::Memory(_) | NativeError::Capacity(_) => AccessError::Capacity,
+        NativeError::Contract(_)
+        | NativeError::Evidence(_)
+        | NativeError::RequestConflict
+        | NativeError::Payload(_) => AccessError::Unavailable,
+    }
+}
 pub(crate) fn claim(
     core: &Core<NativeState>,
     state: &ClaimState,
     expand: NativeClaimExpand,
-) -> NativeClaim {
+) -> Result<NativeClaim, AccessError> {
     let id = ClaimId(state.binding().object.0);
     let lineage: &succession::Lineage = state.lineage();
-    NativeClaim {
+    // The content is decoded from its encoding only when asked for, charged while it is read.
+    let content = if expand.content {
+        core.native_claim_content(id)
+            .map_err(content_error)?
+            .map(|held| claim_content(&held))
+    } else {
+        None
+    };
+    Ok(NativeClaim {
         binding: binding(state.binding()),
         issuer: state.issuer(),
         subject: state.subject(),
@@ -369,12 +426,8 @@ pub(crate) fn claim(
             .collect(),
         acceptance: slot_policies(state.acceptance().slots()),
         scopes: expand.scopes.then(|| scopes(id, state.scopes())),
-        content: if expand.content {
-            core.native_claim_content(id).map(claim_content)
-        } else {
-            None
-        },
-    }
+        content,
+    })
 }
 fn phase_policy(value: validation::PhasePolicyView<'_>) -> NativePhasePolicy {
     NativePhasePolicy {

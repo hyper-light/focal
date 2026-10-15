@@ -52,6 +52,10 @@ pub struct PeerGrant {
 pub struct AuthenticatedPeer {
     grant: PeerGrant,
     fingerprint: Option<[u8; 32]>,
+    /// The enrolled key whose grant this certificate holds, when the grant
+    /// projection did not name the certificate itself: a renewal committed
+    /// elsewhere that this node has not applied yet.
+    renewal_of: Option<[u8; 32]>,
 }
 impl AuthenticatedPeer {
     /// Trusted local ingress may use this only after its OS credential checks.
@@ -60,7 +64,13 @@ impl AuthenticatedPeer {
         Ok(Self {
             grant,
             fingerprint: None,
+            renewal_of: None,
         })
+    }
+    /// The enrolled key this peer was admitted under when the projection
+    /// did not name its certificate (`PeerRegistry::authenticate_certificate`).
+    pub fn renewal_of(&self) -> Option<[u8; 32]> {
+        self.renewal_of
     }
     /// Borrowed scope check for trusted service routers before ledger lookup.
     /// A node peer is infrastructure: it replicates, hosts and drives the
@@ -82,18 +92,95 @@ impl AuthenticatedPeer {
     }
 }
 
+/// What the registry holds: the grants by certificate, and the word the
+/// listeners serving under them watch, so that a revocation closes the
+/// connections it no longer grants (the audit's F35: a grant withdrawn
+/// releases what waits on it) instead of leaving them to their idle timeout.
+struct Grants {
+    grants: BTreeMap<[u8; 32], PeerGrant>,
+    /// The enrolled keys, by their identity: what a renewal is admitted by.
+    keys: BTreeMap<[u8; 32], EnrolledKey>,
+    /// Certificates admitted as renewals of an enrolled key, by
+    /// fingerprint: each holds its key's grant until the projection names
+    /// it or drops the key. Bounded by `max_peers`.
+    provisional: BTreeMap<[u8; 32], [u8; 32]>,
+    /// Counted at every withdrawal of a grant: a listener's owner that sees
+    /// it move closes the connections of certificates no longer granted.
+    revision: u64,
+    /// The revision, as the listeners' owners watch it: each holds a
+    /// receiver, woken as it moves. A receiver is no hold on its owner, which
+    /// ends when its own handles are gone; the receivers are bounded by
+    /// [`MAX_WATCHERS`], and one past them still sees the revision as it
+    /// moves.
+    watch: hyper_rt::sync::WatchSender,
+    /// The receiver every listener's is cloned from.
+    watched: hyper_rt::sync::WatchReceiver,
+}
+/// The listeners one registry wakes at a withdrawal: a node's listener, its
+/// control and evidence servers, with room for a test's several (the
+/// receiver the others are cloned from among them).
+const MAX_WATCHERS: usize = 64;
+/// A key an enrollment holds. A certificate of it that the grant projection
+/// does not name — issued by the cluster's CA (the listener verified the
+/// chain) after the certificate the projection names — is a renewal
+/// committed elsewhere and not applied here yet, and is granted as the key
+/// is: a node that renews must still reach a peer that learns of the
+/// renewal only from it.
+#[derive(Debug, Clone)]
+pub struct EnrolledKey {
+    pub grant: PeerGrant,
+    /// The start of validity of the newest certificate of this key the
+    /// projection names; only a certificate valid from later is a renewal.
+    pub not_before: i64,
+}
+/// The identity of the key a certificate certifies, in the domain the
+/// enrollment registry names enrolled keys in, and the start of the
+/// certificate's validity in Unix seconds.
+pub fn certificate_key(der: &[u8]) -> Result<([u8; 32], i64), AccessError> {
+    let (rest, certificate) =
+        x509_parser::parse_x509_certificate(der).map_err(|_| AccessError::Unauthorized)?;
+    if !rest.is_empty() {
+        return Err(AccessError::Unauthorized);
+    }
+    Ok((
+        blake3::derive_key(
+            "focal.enrollment.public-key.v1",
+            certificate.public_key().raw,
+        ),
+        certificate.validity().not_before.timestamp(),
+    ))
+}
 /// Certificate grants and revocations are shared by active connection tasks.
 /// Clones must observe the same revocation table, so this Arc is intentional.
 #[derive(Clone)]
 pub struct PeerRegistry {
-    grants: Arc<RwLock<BTreeMap<[u8; 32], PeerGrant>>>,
+    grants: Arc<RwLock<Grants>>,
     max_peers: usize,
+}
+/// Wakes the listeners' owners to close what is no longer granted: the
+/// revision moves, and every owner watching it is woken.
+fn wake_watchers(grants: &mut Grants) {
+    grants.revision = grants.revision.wrapping_add(1);
+    let revision = grants.revision;
+    grants.watch.send(revision);
 }
 impl PeerRegistry {
     /// Replace a complete server-owned grant projection atomically. Validate
     /// before locking; existing requests must never see a partial rebuild.
+    /// The connections of a certificate the projection no longer grants are
+    /// closed.
     pub fn replace_grants(&self, next: BTreeMap<[u8; 32], PeerGrant>) -> Result<(), AccessError> {
-        if next.len() > self.max_peers {
+        self.replace_projection(next, BTreeMap::new())
+    }
+    /// [`replace_grants`](Self::replace_grants), with the enrolled keys a
+    /// renewal is admitted by. A certificate admitted as a renewal keeps its
+    /// key's grant while the projection neither names it nor drops the key.
+    pub fn replace_projection(
+        &self,
+        next: BTreeMap<[u8; 32], PeerGrant>,
+        keys: BTreeMap<[u8; 32], EnrolledKey>,
+    ) -> Result<(), AccessError> {
+        if next.len() > self.max_peers || keys.len() > self.max_peers {
             return Err(AccessError::Capacity);
         }
         for (fingerprint, grant) in &next {
@@ -102,9 +189,36 @@ impl PeerRegistry {
             }
             validate_grant(grant)?;
         }
+        for (key, enrolled) in &keys {
+            if *key == [0; 32] {
+                return Err(AccessError::InvalidRequest);
+            }
+            validate_grant(&enrolled.grant)?;
+        }
         let previous = {
-            let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
-            std::mem::replace(&mut *grants, next)
+            let mut guard = self.grants.write().map_err(|_| AccessError::Unavailable)?;
+            let grants = &mut *guard;
+            let previous = (
+                std::mem::replace(&mut grants.grants, next),
+                std::mem::replace(&mut grants.keys, keys),
+            );
+            for (fingerprint, key) in std::mem::take(&mut grants.provisional) {
+                if grants.grants.contains_key(&fingerprint) {
+                    continue;
+                }
+                if let Some(enrolled) = grants.keys.get(&key) {
+                    grants.grants.insert(fingerprint, enrolled.grant.clone());
+                    grants.provisional.insert(fingerprint, key);
+                }
+            }
+            let withdrawn = previous
+                .0
+                .keys()
+                .any(|fingerprint| !grants.grants.contains_key(fingerprint));
+            if withdrawn {
+                wake_watchers(grants);
+            }
+            previous
         };
         drop(previous);
         Ok(())
@@ -113,8 +227,17 @@ impl PeerRegistry {
         if max_peers == 0 || max_peers > 1_000_000 {
             return Err(AccessError::Capacity);
         }
+        let (watch, watched) =
+            hyper_rt::sync::watch(0, MAX_WATCHERS).map_err(|_| AccessError::Unavailable)?;
         Ok(Self {
-            grants: Arc::new(RwLock::new(BTreeMap::new())),
+            grants: Arc::new(RwLock::new(Grants {
+                grants: BTreeMap::new(),
+                keys: BTreeMap::new(),
+                provisional: BTreeMap::new(),
+                revision: 0,
+                watch,
+                watched,
+            })),
             max_peers,
         })
     }
@@ -126,30 +249,96 @@ impl PeerRegistry {
         validate_grant(&grant)?;
         let hash = certificate_fingerprint(der);
         let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
-        if !grants.contains_key(&hash) && grants.len() >= self.max_peers {
+        if !grants.grants.contains_key(&hash) && grants.grants.len() >= self.max_peers {
             return Err(AccessError::Capacity);
         }
-        grants.insert(hash, grant);
+        grants.grants.insert(hash, grant);
         Ok(hash)
     }
+    /// Withdraw a certificate's grant and close the connections it holds:
+    /// nothing more is received on them, and what was waiting for a body on
+    /// one ends with it.
     pub fn revoke(&self, fingerprint: [u8; 32]) -> Result<(), AccessError> {
-        self.grants
-            .write()
-            .map_err(|_| AccessError::Unavailable)?
-            .remove(&fingerprint);
+        let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
+        grants.grants.remove(&fingerprint);
+        grants.provisional.remove(&fingerprint);
+        wake_watchers(&mut grants);
         Ok(())
     }
-    pub fn authenticate(&self, fingerprint: [u8; 32]) -> Result<AuthenticatedPeer, AccessError> {
-        let grant = self
+    /// Counted at every withdrawal of a grant ([`Self::revoke`], a
+    /// projection that drops a certificate).
+    pub fn revision(&self) -> u64 {
+        self.grants
+            .read()
+            .map_or(u64::MAX, |grants| grants.revision)
+    }
+    /// The revision, watched: a listener's owner is woken by it at every
+    /// withdrawal, so it closes the connections it no longer grants. `None`
+    /// past [`MAX_WATCHERS`] listeners: such an owner still closes them at its
+    /// revision check, when it next moves.
+    pub(crate) fn watch(&self) -> Option<hyper_rt::sync::WatchReceiver> {
+        let grants = self.grants.read().ok()?;
+        grants.watched.try_clone().ok()
+    }
+    /// Whether the certificate is granted now, without copying its grant:
+    /// asked before anything is read for a stream.
+    pub fn granted(&self, fingerprint: [u8; 32]) -> Result<(), AccessError> {
+        if self
             .grants
             .read()
             .map_err(|_| AccessError::Unavailable)?
+            .grants
+            .contains_key(&fingerprint)
+        {
+            Ok(())
+        } else {
+            Err(AccessError::Unauthorized)
+        }
+    }
+    /// The grant current now, for a request about to be dispatched.
+    pub fn authenticate(&self, fingerprint: [u8; 32]) -> Result<AuthenticatedPeer, AccessError> {
+        let grants = self.grants.read().map_err(|_| AccessError::Unavailable)?;
+        let grant = grants
+            .grants
             .get(&fingerprint)
             .cloned()
             .ok_or(AccessError::Unauthorized)?;
         Ok(AuthenticatedPeer {
             grant,
             fingerprint: Some(fingerprint),
+            renewal_of: grants.provisional.get(&fingerprint).copied(),
+        })
+    }
+    /// The grant of the certificate a connection presented, after the
+    /// listener verified its chain to the cluster's CA: the grant the
+    /// projection names it with, or — when it names no such certificate —
+    /// the grant of the enrolled key it certifies, if it was issued after
+    /// the certificate of that key the projection knows ([`EnrolledKey`]).
+    pub fn authenticate_certificate(&self, der: &[u8]) -> Result<AuthenticatedPeer, AccessError> {
+        let fingerprint = certificate_fingerprint(der);
+        match self.authenticate(fingerprint) {
+            Err(AccessError::Unauthorized) => {}
+            answered => return answered,
+        }
+        let (key, not_before) = certificate_key(der)?;
+        let mut guard = self.grants.write().map_err(|_| AccessError::Unavailable)?;
+        let grants = &mut *guard;
+        let enrolled = grants.keys.get(&key).ok_or(AccessError::Unauthorized)?;
+        if not_before <= enrolled.not_before {
+            return Err(AccessError::Unauthorized);
+        }
+        if !grants.provisional.contains_key(&fingerprint)
+            && grants.provisional.len() >= self.max_peers
+        {
+            return Err(AccessError::Capacity);
+        }
+        let grant = enrolled.grant.clone();
+        grants.grants.insert(fingerprint, grant.clone());
+        grants.provisional.insert(fingerprint, key);
+        Ok(AuthenticatedPeer {
+            grant,
+            fingerprint: Some(fingerprint),
+            renewal_of: Some(key),
         })
     }
 }
@@ -181,6 +370,7 @@ pub fn capability(operation: &Operation) -> Capability {
     match operation {
         Operation::ManagedSupport { .. }
         | Operation::Raft { .. }
+        | Operation::RaftOrdered { .. }
         | Operation::EnrollmentControl { .. }
         | Operation::Custody(_)
         | Operation::PeerControl { .. }
@@ -229,10 +419,25 @@ pub fn capability(operation: &Operation) -> Capability {
 pub struct VerifiedRequest {
     peer: AuthenticatedPeer,
     request: RequestEnvelope,
+    /// The round trip of the connection the request came on, as this side
+    /// measures it when the request is read; zero for a request made
+    /// locally. What a receiver holds a frame that overtook another for
+    /// (27 §12): the probe timeout of the path.
+    path: std::time::Duration,
 }
 impl VerifiedRequest {
     pub fn peer(&self) -> &AuthenticatedPeer {
         &self.peer
+    }
+    /// The round trip of the path the request came by; zero where there is
+    /// no path (a local request).
+    pub fn path_round_trip(&self) -> std::time::Duration {
+        self.path
+    }
+    /// The request as it came by a path of `round_trip`.
+    pub fn with_path(mut self, round_trip: std::time::Duration) -> Self {
+        self.path = round_trip;
+        self
     }
     pub fn request(&self) -> &RequestEnvelope {
         &self.request
@@ -412,7 +617,16 @@ pub fn verify_request(
     );
     let participant = is_peer_request(&request);
     let native = request.protocol == crate::NATIVE_PROTOCOL_VERSION;
-    if native {
+    // An ordered frame, or an ask of what a copy holds, is of the ordered
+    // profile and nothing else is (27 §12): a sender names the profile its
+    // request needs, and a receiver holds it to it.
+    let ordered = crate::ordered_profile_operation(&request.operation);
+    if ordered != (request.protocol == crate::ORDERED_PROTOCOL_VERSION) {
+        return Err(AccessError::UnsupportedProtocol);
+    }
+    if ordered {
+        // Admitted by its capability below, as `Raft` is.
+    } else if native {
         if !crate::native_profile_operation(&request.operation) {
             return Err(AccessError::UnsupportedProtocol);
         }
@@ -486,7 +700,11 @@ pub fn verify_request(
         }
     }
     request_shape(&request, limits, Some(&peer))?;
-    Ok(VerifiedRequest { peer, request })
+    Ok(VerifiedRequest {
+        peer,
+        request,
+        path: std::time::Duration::ZERO,
+    })
 }
 
 /// Local syntax and resource validation only. This neither authenticates a
@@ -510,6 +728,7 @@ pub fn check_request_shape(
             | Operation::NodeContact { .. }
             | Operation::EnrollmentControl { .. }
             | Operation::Raft { .. }
+            | Operation::RaftOrdered { .. }
             | Operation::Custody(_)
             | Operation::Managed { .. }
             | Operation::RequestStreamControl { .. }
@@ -961,6 +1180,12 @@ fn request_shape(
                     policy_revision,
                     content,
                     manifest,
+                }
+                | CustodyRequest::OpenHeld {
+                    transfer,
+                    policy_revision,
+                    content,
+                    manifest,
                 } => {
                     if *transfer == [0; 16] || *policy_revision == 0 || manifest.is_empty() {
                         return Err(AccessError::InvalidRequest);
@@ -987,6 +1212,9 @@ fn request_shape(
                 }
                 CustodyRequest::Chunk {
                     transfer, bytes, ..
+                }
+                | CustodyRequest::ChunkPart {
+                    transfer, bytes, ..
                 } => {
                     if *transfer == [0; 16] || bytes.is_empty() {
                         return Err(AccessError::InvalidRequest);
@@ -994,7 +1222,8 @@ fn request_shape(
                 }
                 CustodyRequest::Seal { transfer }
                 | CustodyRequest::Cancel { transfer }
-                | CustodyRequest::ReadChunk { transfer, .. } => {
+                | CustodyRequest::ReadChunk { transfer, .. }
+                | CustodyRequest::ReadChunkPart { transfer, .. } => {
                     if *transfer == [0; 16] {
                         return Err(AccessError::InvalidRequest);
                     }
@@ -1007,6 +1236,7 @@ fn request_shape(
             }
             if let CustodyRequest::Manifest { max_bytes, .. }
             | CustodyRequest::ReadChunk { max_bytes, .. }
+            | CustodyRequest::ReadChunkPart { max_bytes, .. }
             | CustodyRequest::SeedChunk { max_bytes, .. } = custody
                 && (*max_bytes == 0
                     || *max_bytes > limits.max_frame_bytes.saturating_sub(256)

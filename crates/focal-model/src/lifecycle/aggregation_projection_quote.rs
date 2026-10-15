@@ -96,7 +96,7 @@ pub fn quote_projection(
     policy_visits.take(d)?;
     policy_visits.take(s)?;
     let mut k = 0;
-    for slot in &policy.slots {
+    for slot in &policy.body.slots {
         policy_visits.take(slot.checks.len())?;
         k = add(k, slot.checks.len())?;
     }

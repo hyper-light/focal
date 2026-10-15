@@ -5,17 +5,17 @@ fn custody_export_requires_applied_placement_and_pins_only_its_checkpoint_prefix
         Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
     elect(&mut session);
     assert!(matches!(
-        session.checkpoint_evidence(0, 30_000),
+        session.checkpoint_evidence(30_000),
         Err(LedgerError::PlacementConflict)
     ));
     let placement = placement_request(&session, SessionFenceKind::Created, 1);
     session.propose_placement(&placement).unwrap();
     assert!(matches!(
-        session.checkpoint_evidence(0, 30_000),
+        session.checkpoint_evidence(30_000),
         Err(LedgerError::Capacity)
     ));
     session.poll().unwrap();
-    let snapshot = session.checkpoint_evidence(0, 30_000).unwrap();
+    let snapshot = session.checkpoint_evidence(30_000).unwrap();
     assert_eq!(snapshot.prefix().sequence, SessionSeq(0));
     assert_eq!(snapshot.prefix().artifacts, 0);
     assert!(snapshot.prefix().index.0 > 0);
@@ -52,7 +52,7 @@ fn custody_export_requires_applied_placement_and_pins_only_its_checkpoint_prefix
             .is_none()
     );
     assert!(matches!(
-        snapshot.artifact_after(None, 30_000),
+        snapshot.artifact_after(None, snapshot.expires_at()),
         Err(LedgerError::Graph(GraphError::Memory(
             MemoryError::LeaseExpired
         )))
@@ -99,7 +99,7 @@ fn checkpoint_reserves_large_retained_placement_before_cloning_or_persistence() 
     assert!(!session.failed);
     assert_eq!(session.placement(), Some(prefix));
     drop(pressure);
-    let snapshot = session.checkpoint_evidence(0, 30_000).unwrap();
+    let snapshot = session.checkpoint_evidence(30_000).unwrap();
     assert_eq!(snapshot.prefix().route, RouteEpoch(2));
     assert_eq!(snapshot.prefix().artifacts, 0);
 }
@@ -114,19 +114,22 @@ fn snapshot_reader_clock_is_monotone_and_capture_ttl_cannot_be_restarted() {
         .propose_placement(&placement_request(&session, SessionFenceKind::Created, 1))
         .unwrap();
     session.poll().unwrap();
-    let snapshot = session.checkpoint_evidence(1_000, 30_000).unwrap();
+    let snapshot = session.checkpoint_evidence(30_000).unwrap();
+    // The capture's reader runs the common clock five seconds past the
+    // session's read clock.
     let advanced = snapshot.elapsed_clock().unwrap() + 5_000;
     snapshot.artifact_after(None, advanced).unwrap();
+    // A capture pinned now would be pinned at a time the common clock passed:
+    // refused, never revived.
     assert!(matches!(
-        session.checkpoint_evidence(1_000, 30_000),
+        session.checkpoint_evidence(30_000),
         Err(LedgerError::Graph(GraphError::Memory(
-            MemoryError::ClockRegression {
-                supplied: 1_000,
-                ..
-            }
+            MemoryError::ClockRegression { .. }
         )))
     ));
-    let mut next = session.checkpoint_evidence(advanced, 30_000).unwrap();
+    // Once the session's clock reaches the reader's, it captures again.
+    session.move_read_clock_ahead(std::time::Duration::from_millis(5_000));
+    let mut next = session.checkpoint_evidence(30_000).unwrap();
     assert_eq!(next.prefix().sequence, snapshot.prefix().sequence);
     // Deterministically age the private capture anchor instead of assuming a
     // complete checkpoint fsync will finish inside a tiny wall-clock timeout.

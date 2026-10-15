@@ -5,7 +5,7 @@ use crate::lifecycle::claim::{ClaimState, ReceiptAdoption};
 use crate::lifecycle::memory as bytes;
 use crate::lifecycle::validation::{Evaluation, Target};
 use crate::lifecycle::{Binding, ContractError};
-use crate::{ContentHash, SessionSeq};
+use crate::{ContentHash, ObjectRevision, SessionSeq};
 #[path = "registration_snapshot.rs"]
 mod snapshot;
 pub use snapshot::{
@@ -15,9 +15,11 @@ pub use snapshot::{
 
 const ALLOCATION: usize = 4 * std::mem::size_of::<usize>();
 
+/// The claim's evaluation registrations, held beside the claim in its row: the claim is its
+/// binding's holder, and the set keeps only the revision it was last adopted at (doc 31 M3).
 #[derive(Debug, PartialEq, Eq)]
 pub struct RegistrationSet {
-    claim: Binding,
+    revision: ObjectRevision,
     policy: ContentHash,
     rows: Vec<RegisteredEvaluation>,
     max_rows: usize,
@@ -67,7 +69,7 @@ impl RegistrationSet {
         claim.acceptance().check(claim.binding(), claim.issuer())?;
         bytes::fits(std::mem::size_of::<Self>(), max_bytes)?;
         Ok(Self {
-            claim: claim.binding(),
+            revision: claim.binding().revision,
             policy: claim.acceptance().intent_fingerprint(),
             rows: Vec::new(),
             max_rows,
@@ -77,12 +79,7 @@ impl RegistrationSet {
         })
     }
     pub fn check(&self, claim: &ClaimState) -> Result<(), ContractError> {
-        Binding {
-            revision: self.claim.revision,
-            ..claim.binding()
-        }
-        .check(&self.claim)?;
-        if claim.binding().revision < self.claim.revision {
+        if claim.binding().revision < self.revision {
             return Err(ContractError::StaleRevision);
         }
         claim.acceptance().check(claim.binding(), claim.issuer())?;
@@ -93,6 +90,17 @@ impl RegistrationSet {
     }
     pub fn rows(&self) -> &[RegisteredEvaluation] {
         &self.rows
+    }
+    /// The revision of its claim the set was last adopted at.
+    pub fn revision(&self) -> ObjectRevision {
+        self.revision
+    }
+    /// The claim's binding at that revision, from the claim's own.
+    pub fn claim_binding(&self, claim: Binding) -> Binding {
+        Binding {
+            revision: self.revision,
+            ..claim
+        }
     }
     pub fn max_rows(&self) -> usize {
         self.max_rows
@@ -124,7 +132,7 @@ impl RegistrationSet {
         bytes::fits(rows.capacity(), count)?;
         rows.extend_from_slice(&self.rows);
         let copied = Self {
-            claim: self.claim,
+            revision: self.revision,
             policy: self.policy,
             rows,
             max_rows: self.max_rows,
@@ -149,7 +157,7 @@ impl RegistrationSet {
         if self.sealed || self.sealed_at.is_some() {
             return Err(ContractError::InvalidTransition);
         }
-        self.claim = adoption.next_binding();
+        self.revision = adoption.next_binding().revision;
         self.increments_sealed = false;
         Ok(())
     }
@@ -287,7 +295,7 @@ impl RegistrationSet {
     pub fn try_copy(&self, max_bytes: usize) -> Result<Self, ContractError> {
         bytes::fits(self.copy_charge()?, max_bytes)?;
         let copied = Self {
-            claim: self.claim,
+            revision: self.revision,
             policy: self.policy,
             rows: bytes::copy(&self.rows)?,
             max_rows: self.max_rows,

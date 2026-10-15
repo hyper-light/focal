@@ -266,10 +266,7 @@ fn direct_core_cannot_accept_unfunded_work_responsibility() {
 
 #[test]
 fn reconstructed_work_owner_funds_remaining_attempt_after_recorded_retryable_error() {
-    use crate::native::completion_envelope::{
-        CompletionEnvelope, EvidenceBounds, descriptor_limits,
-    };
-    use crate::native::completion_schemas::SchemaSet;
+    use crate::native::completion_envelope::{CompletionEnvelope, descriptor_limits};
     use crate::native::prepare::Checked;
     use focal_memory::BudgetKind;
 
@@ -281,22 +278,11 @@ fn reconstructed_work_owner_funds_remaining_attempt_after_recorded_retryable_err
         let registered =
             crate::native::admission_authority::registered_any(&view, fixture.claim(), key)
                 .unwrap();
-        let pins = SchemaSet::new(
-            registered.definition,
-            &source,
-            &BuiltinNativeSchemas,
-            fixture.core.limits.plan_edges,
-        )
-        .unwrap();
         let (envelope, members) = CompletionEnvelope::derive_work(
             &view,
             fixture.core.limits,
             &registered,
             descriptor_limits(fixture.core.limits, registered.parent, registered.registry).unwrap(),
-            EvidenceBounds {
-                workspace_bytes: pins.workspace_bytes() - pins.custody_bytes(),
-                retained_bytes: pins.custody_bytes(),
-            },
         )
         .unwrap();
         drop(members);
@@ -315,7 +301,7 @@ fn reconstructed_work_owner_funds_remaining_attempt_after_recorded_retryable_err
     };
     let Checked::Fresh(fresh) = fixture
         .core
-        .check_native_chain(f::context(EVALUATOR, 100), input, std::iter::empty())
+        .check_native_chain(f::context(EVALUATOR, 100), input, None)
         .unwrap()
     else {
         panic!("fresh recorded Begin")
@@ -350,7 +336,7 @@ fn reconstructed_work_owner_funds_remaining_attempt_after_recorded_retryable_err
     };
     let Checked::Fresh(fresh) = fixture
         .core
-        .check_native_chain(f::context(EVALUATOR, 100), input, std::iter::empty())
+        .check_native_chain(f::context(EVALUATOR, 100), input, None)
         .unwrap()
     else {
         panic!("fresh recorded Error")
@@ -385,12 +371,12 @@ fn reconstructed_work_owner_funds_remaining_attempt_after_recorded_retryable_err
     let pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
-    assert_eq!(source.stats().used, source.limit());
+    assert_eq!(source.headroom(BudgetLane::Ordinary), 0);
     let input = report_input(&owner, key, 2302, VerdictValue::Pass);
     let staged = owner
         .prepare_with_custody(

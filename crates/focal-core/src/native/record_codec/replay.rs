@@ -45,7 +45,7 @@ impl<'bytes> Entries<'bytes> {
         let bytes = prepare::array::<EntrySlot<'bytes>>(count)?;
         prepare::within(bytes, limits.preparation_bytes)?;
         let allocation = budget
-            .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?
+            .reserve(BudgetKind::Pending, BudgetLane::Committed, bytes)?
             .commit();
         let mut slots = Vec::new();
         slots
@@ -98,12 +98,30 @@ impl<'bytes> Entries<'bytes> {
 /// materializer can answer from earlier staged rows and record what was read.
 pub(super) trait BaseRows {
     fn base_row(&self, key: Key) -> Option<&Row>;
+    /// Where a spilled base row's bytes are read from.
+    fn base_payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead>;
+    /// Where a row the record builds is spilled.
+    fn base_payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog>;
     /// The prefix the record must extend.
     fn base_prefix(&self) -> u64;
+    /// The first spilled base row the replay's reads could not take back (doc 31 M3).
+    fn base_read_failure(&self) -> Result<(), NativeError> {
+        Ok(())
+    }
 }
 impl BaseRows for Core<NativeState> {
+    /// The committed row at `key`, a spilled claim or definition read back (doc 31 M3).
     fn base_row(&self, key: Key) -> Option<&Row> {
-        self.state.rows.get(&key)
+        self.state.row(&key)
+    }
+    fn base_read_failure(&self) -> Result<(), NativeError> {
+        self.state.reads.failure()
+    }
+    fn base_payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        self.state.payloads()
+    }
+    fn base_payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog> {
+        self.state.payloads.as_deref()
     }
     fn base_prefix(&self) -> u64 {
         self.state.rows.prefix()
@@ -116,6 +134,9 @@ struct Overlay<'a, 'bytes, B> {
 impl<B: BaseRows> replay_validate::Overlay for Overlay<'_, '_, B> {
     fn before(&self, key: Key) -> Option<&Row> {
         self.base.base_row(key)
+    }
+    fn payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        self.base.base_payloads()
     }
     fn after(&self, key: Key) -> Option<&Row> {
         match self.entries.position(key) {
@@ -154,6 +175,14 @@ struct Objects<'a, 'bytes, B> {
 impl<B: BaseRows> read_dispatch::Objects for Objects<'_, '_, B> {
     fn ledger(&self) -> LedgerId {
         self.header.ledger
+    }
+    fn payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        self.overlay.base.base_payloads()
+    }
+    /// None: a record's rows are built held, read held by its validation, and spilled once it
+    /// is validated ([`stage`]), so validation reads back nothing it just wrote (doc 31 M3).
+    fn payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog> {
+        None
     }
     fn prefix(&self) -> SessionSeq {
         self.header.outcome.sequence
@@ -264,7 +293,7 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows> Decoder<'_, S
                 objects: &objects,
                 custody: &self.custody,
                 workspace: self.budget,
-                workspace_lane: BudgetLane::Completion,
+                workspace_lane: BudgetLane::Committed,
                 parsing: &self.meters.parsing,
                 source: &self.meters.source,
                 model: &self.meters.model,
@@ -272,24 +301,23 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows> Decoder<'_, S
                 limits: self.limits,
             };
             let quote = read_dispatch::prepare(&slot.encoded, &context)?;
+            // A wide row's box is charged to its entry beside the heap the
+            // codec quotes (`Row`): the key's family names the box it may take.
+            let heap = prepare::add(quote.heap_bytes, slot.encoded.key.boxed_heap())?;
             prepare::within(
-                prepare::add(size_of::<Entry<Key, Row>>(), quote.heap_bytes)?,
+                prepare::add(size_of::<Entry<Key, Row>>(), heap)?,
                 self.limits.native.range.max_entry_bytes,
             )?;
             prepare::within(
-                prepare::add(entries.allocation.bytes(), quote.heap_bytes)?,
+                prepare::add(entries.allocation.bytes(), heap)?,
                 self.limits.native.preparation_bytes,
             )?;
-            let mut funding = if quote.heap_bytes == 0 {
+            let mut funding = if heap == 0 {
                 None
             } else {
                 Some(
                     self.budget
-                        .reserve(
-                            BudgetKind::Pending,
-                            BudgetLane::Completion,
-                            quote.heap_bytes,
-                        )?
+                        .reserve(BudgetKind::Pending, BudgetLane::Committed, heap)?
                         .commit(),
                 )
             };
@@ -309,6 +337,7 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows> Decoder<'_, S
                 .slots
                 .get_mut(position)
                 .ok_or(ContractError::InvalidManifest)?;
+            // The box is added once, when the slot becomes an entry (`entry`).
             slot.value = Some(row);
             slot.heap_bytes = actual;
             count = count.checked_add(1).ok_or(ContractError::Capacity)?;
@@ -465,7 +494,7 @@ pub(super) fn stage<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows
         native.preparation_bytes,
     )?;
     let mut changes_allocation = budget
-        .reserve(BudgetKind::Pending, BudgetLane::Completion, change_bytes)?
+        .reserve(BudgetKind::Pending, BudgetLane::Committed, change_bytes)?
         .commit();
     let mut changes = Vec::new();
     changes
@@ -488,7 +517,7 @@ pub(super) fn stage<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows
         .map_err(read_evidence::codec)?;
     for slot in &mut entries.slots {
         let change = match (slot.encoded.deleted(), slot.value.take()) {
-            (false, Some(row)) => Change::Put(Entry::new(slot.encoded.key, row, slot.heap_bytes)),
+            (false, Some(row)) => Change::Put(entry(slot.encoded.key, row, slot.heap_bytes)),
             (true, None) => Change::Delete(slot.encoded.key),
             _ => return Err(ContractError::InvalidManifest.into()),
         };
@@ -498,6 +527,12 @@ pub(super) fn stage<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows
         changes.push(change);
     }
     entries.allocation.absorb(&mut changes_allocation)?;
+    // A spilled base row its checks could not take back was lent as it is stored: the record is
+    // validated only where none failed (doc 31 M3).
+    base.base_read_failure()?;
+    // Validated: the record's events, contents, posted claims and definitions go to the payload
+    // log, each charged as it is spilled (doc 31 M3).
+    crate::native::payloads::spill_changes(&mut changes, base.base_payload_log(), header.ledger)?;
     let write_bytes = mutation::bytes(changes.len())?;
     let writes = mutation::WriteSet::capture(
         header.profile,
@@ -505,7 +540,7 @@ pub(super) fn stage<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows
         changes.iter(),
         write_bytes,
         budget
-            .reserve(BudgetKind::Pending, BudgetLane::Completion, write_bytes)?
+            .reserve(BudgetKind::Pending, BudgetLane::Committed, write_bytes)?
             .commit(),
     )?;
     let slots_bytes = prepare::array::<EntrySlot<'_>>(entries.slots.capacity())?;
@@ -551,6 +586,31 @@ pub(super) fn stage_meta(
     Err(ContractError::InvalidManifest.into())
 }
 
+/// The principal's window row a request's record writes (F12), decoded
+/// ahead of the waves as the meta row is; its ranges fit `allowance`.
+pub(super) fn stage_window(
+    record: &StructuralRecord<'_>,
+    max_ranges: usize,
+    allowance: usize,
+    visits: usize,
+) -> Result<Row, NativeError> {
+    let quote = record.quote();
+    for row in record.rows(quote.visits).map_err(read_evidence::codec)? {
+        let row = row.map_err(read_evidence::codec)?;
+        if !matches!(row.key, Key::Epochs(_)) || row.deleted() {
+            continue;
+        }
+        let body = row.body();
+        let mut cursor =
+            bytes::Cursor::new(body, body.len(), visits).map_err(read_evidence::codec)?;
+        let plan = read_rows::EpochsPlan::read(row.key, &mut cursor, max_ranges)?;
+        cursor.finish().map_err(read_evidence::codec)?;
+        let (window, _) = plan.build(allowance, visits)?;
+        return Ok(window);
+    }
+    Err(ContractError::InvalidManifest.into())
+}
+
 /// Build the staged record's pages against the Core's published root. The
 /// record must extend the Core's current prefix; the remaining recovery work
 /// of its staging pays for the page copies.
@@ -585,35 +645,49 @@ pub(super) fn install(
     meters.lookup.charge(work).map_err(read_evidence::codec)?;
     // Dividing the input among a group's members takes a vector per touched
     // member beyond the one the record funded (25 §4).
+    let encoded_added =
+        crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())?;
     let extra = core.state.rows.input_extra_bytes(changes.len())?;
     if extra != 0 {
         let mut extra_allocation = core
             .state
             .budget
-            .reserve(BudgetKind::Pending, BudgetLane::Completion, extra)?
+            .reserve(BudgetKind::Pending, BudgetLane::Committed, extra)?
             .commit();
         allocation.absorb(&mut extra_allocation)?;
     }
-    let plan = core.state.rows.plan_batch(
-        &core.state.budget,
-        header.outcome.sequence.0,
-        changes,
-        BudgetLane::Completion,
-        usize::MAX,
-    )?;
-    let failure = std::cell::Cell::new(None);
-    let input_bytes = plan.input_pending_bytes();
+    // The changes alone, planned over the published members as the leader
+    // planned its write (doc 30 §9), funded from the record's own permit and
+    // never admitted a second time; each committed row a change replaces or
+    // deletes is counted out of a checkpoint's size as the plan reads it.
     let available = allocation
         .bytes()
         .checked_sub(slots_bytes)
         .ok_or(ContractError::Capacity)?;
-    prepare::within(input_bytes, available)?;
-    // The plan takes the existing exact input permit. Its drop-ordered owner
-    // retains that charge through every refusal and through destination-page
-    // construction; the incoming vector/payloads are not admitted a second time.
-    let input = allocation.split_off(input_bytes)?;
-    let fragments = plan
-        .build_in_funded_with(&core.state.budget, input, |row| {
+    let mut funding = allocation.split_off(available)?;
+    let mut removed = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
+    let mut counted = Ok(());
+    let fragments = core.state.rows.plan_sparse_funded(
+        &core.state.budget,
+        &mut funding,
+        header.outcome.sequence.0,
+        changes,
+        BudgetLane::Committed,
+        |key| {
+            let entry = core.state.rows.get_entry(key)?;
+            if counted.is_ok() {
+                counted = removed.count(key, entry.value);
+            }
+            Some(entry.heap_bytes)
+        },
+    )?;
+    counted?;
+    // A page something else still reads (a capture, a lease) is copied as
+    // the record publishes: every row it would copy is metered here, before
+    // anything changes, as the build that copied them metered each copy.
+    let failure = std::cell::Cell::new(None);
+    fragments
+        .visit_retained(&core.state.rows, |row| {
             let work = match read_dispatch::objects::copy_work(row) {
                 Ok(work) => work,
                 Err(error) => {
@@ -629,13 +703,33 @@ pub(super) fn install(
                     "native replay copy work exhausted",
                 ));
             }
-            prepare::copy(row)
+            Ok(())
         })
         .map_err(|error| failure.take().unwrap_or_else(|| error.into()))?;
     writes.check(&fragments)?;
+    // Its events' place in the event index (doc 31 M2): completion work, as the rest of it.
+    let events = match header.outcome.events {
+        0 => None,
+        count => Some(
+            core.state
+                .budget
+                .reserve(
+                    BudgetKind::Index,
+                    BudgetLane::Committed,
+                    crate::native::event_index::charge_for(count)?,
+                )?
+                .commit(),
+        ),
+    };
     Ok(NativePrepared {
         fragments,
         outcome: header.outcome,
         writes,
+        encoded_added,
+        encoded_removed: removed.bytes(),
+        // A replay is published at once, never held in a chain.
+        _index: None,
+        events,
+        retire: None,
     })
 }

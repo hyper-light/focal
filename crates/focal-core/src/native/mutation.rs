@@ -2,8 +2,8 @@
 //! storage plan supplies keys; final values remain in its one candidate root.
 //! This is not a WAL encoding, an imported root or an activation promise.
 use super::*;
-use focal_memory::{Allocation, Change, RangeWriteEnvelope};
-use prepare::{add, array, within};
+use focal_memory::Allocation;
+use prepare::{array, within};
 
 #[cfg(test)]
 #[path = "mutation_tests.rs"]
@@ -27,22 +27,13 @@ pub(super) fn bytes(count: usize) -> Result<usize, NativeError> {
     array::<MutationKey>(count)
 }
 
-/// Pending write-set storage is retained independently for each promised action.
-/// The range's own retained charge covers only pages and the persistent root.
-pub(super) fn retained(range: RangeWriteEnvelope) -> Result<usize, NativeError> {
-    add(
-        range.additional_retained_bytes(),
-        bytes(range.limits().changed_keys)?,
-    )
-}
-
 impl WriteSet {
     /// `count` is the number of `changes`, which arrive in key order
     /// (across a range group's members, each member's part in turn).
     pub(super) fn capture<'a>(
         profile: NativeContentProfile,
         count: usize,
-        changes: impl Iterator<Item = &'a Change<Key, Row>>,
+        changes: impl Iterator<Item = impl super::ranges::ChangeRead + 'a>,
         allowance: usize,
         funding: Allocation,
     ) -> Result<Self, NativeError> {
@@ -61,16 +52,16 @@ impl WriteSet {
         within(bytes(keys.capacity())?, required)?;
         let mut previous = None;
         for change in changes {
-            let key = *change.key();
+            let key = change.changed();
             if previous.is_some_and(|last| last >= key) || key == Key::End {
                 return Err(ContractError::InvalidManifest.into());
             }
-            let deleted = match change {
-                Change::Put(entry) => {
-                    check_family(key, &entry.value)?;
+            let deleted = match change.row() {
+                Some(row) => {
+                    check_family(key, row)?;
                     false
                 }
-                Change::Delete(_) => true,
+                None => true,
             };
             if keys.len() == keys.capacity() {
                 return Err(ContractError::Capacity.into());
@@ -154,6 +145,8 @@ pub(super) fn check_family(key: Key, row: &Row) -> Result<(), NativeError> {
             | (Key::Cycle(_), Row::Cycle(_))
             | (Key::RetiredCycleHead(_), Row::RetiredCycleHead(_))
             | (Key::Retired(_), Row::Retired(_))
+            | (Key::Epochs(_), Row::Epochs(_))
+            | (Key::Seal(_), Row::Seal(_))
             | (Key::RetiredCycle(_), Row::RetiredCycle(_))
             | (Key::Work(_), Row::Work(_))
             | (Key::WorkSlot(..), Row::WorkSlot(_))

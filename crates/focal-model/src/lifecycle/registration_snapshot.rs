@@ -66,9 +66,10 @@ impl RegistrationSet {
             overhead(usize::from(count != 0))?,
         )
     }
-    pub fn snapshot_v1(&self) -> RegistrationSnapshotV1 {
+    /// Its snapshot as the registrations of the claim bound to `claim`.
+    pub fn snapshot_v1(&self, claim: Binding) -> RegistrationSnapshotV1 {
         RegistrationSnapshotV1 {
-            claim: self.claim,
+            claim: self.claim_binding(claim),
             rows: self.rows.len(),
             max_rows: self.max_rows,
             sealed: self.sealed,
@@ -204,7 +205,7 @@ impl<S: RegistrationSnapshotSource + ?Sized> RegistrationHydrationPlan<'_, S> {
             }
         }
         let restored = RegistrationSet {
-            claim: self.fields.claim,
+            revision: self.fields.claim.revision,
             policy: self.policy,
             rows,
             max_rows: self.fields.max_rows,

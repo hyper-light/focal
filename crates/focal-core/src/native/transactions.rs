@@ -144,6 +144,9 @@ pub(super) fn prepare(
         NativeCommand::ReleaseScope { expected } => {
             super::scope_release::prepare(expected, context, cut, view, limits, extras, scratch)
         }
+        // Prepared against the principal's window beside every request's
+        // admission (`epochs::prepare_advance`), never here.
+        NativeCommand::AdvanceEpochFloor { .. } => Err(ContractError::InvalidTransition.into()),
         NativeCommand::AdoptReceipt {
             expected,
             previous,
@@ -258,7 +261,7 @@ pub(super) fn prepare(
                 )?)?;
             }
             for proposal in &claims {
-                proposal.definition.acceptance.check_declarations(
+                proposal.definition.acceptance.view().check_declarations(
                     declarations
                         .iter()
                         .filter(|row| row.claim().0 == proposal.definition.binding.object.0),
@@ -365,7 +368,8 @@ pub(super) fn prepare(
                 if !token.changes_state() {
                     continue;
                 }
-                scratch.charge(heap(token.claim())?)?;
+                // The copy, and the cut the cancellation adds as it makes the claim terminal.
+                scratch.charge(super::prepare::transition_heap(token.claim())?)?;
                 let mut row = token.claim().try_copy(token.claim().retained_bytes()?)?;
                 row.apply_cancellation(token)?;
                 rows.push(row);

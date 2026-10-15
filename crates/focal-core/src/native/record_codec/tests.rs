@@ -22,7 +22,13 @@ fn inspection(bytes: usize) -> InspectionLimits {
 pub(super) fn encode(prepared: &NativePrepared) -> Vec<u8> {
     let plan = EncodingPlan::prepare(prepared, limits()).unwrap();
     let mut bytes = vec![0; plan.quote().bytes];
-    assert_eq!(plan.write_into(&mut bytes).unwrap(), plan.quote().hash);
+    let hash = plan.write_into(&mut bytes).unwrap();
+    // The record's hash is its trailer, the digest of every byte before it.
+    let (body, trailer) = bytes.split_at(bytes.len() - 32);
+    let mut expected = blake3::Hasher::new_derive_key(HASH_DOMAIN);
+    expected.update(body);
+    assert_eq!(hash.0, *expected.finalize().as_bytes());
+    assert_eq!(trailer, &hash.0);
     bytes
 }
 fn created(core: &Core<NativeState>) -> NativePrepared {
@@ -120,7 +126,11 @@ fn real_records_preserve_exact_mutations_and_do_not_serialize_unchanged_rows() {
     );
     // A failed publication retains an identical record, ready to propose/retry.
     let mut foreign = fixture::core();
-    let refused = foreign.publish_native(posted).unwrap_err().prepared;
+    let refused = foreign
+        .publish_native(posted)
+        .unwrap_err()
+        .prepared
+        .unwrap();
     assert_eq!(encode(&refused), bytes);
     core.publish_native(refused).unwrap();
 }
@@ -297,8 +307,8 @@ fn held_report_records_include_original_result_artifact_and_event_without_new_ow
     let _pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
@@ -372,7 +382,7 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
         .map(|entry| {
             Change::Put(Entry::new(
                 entry.key,
-                prepare::copy(&entry.value).unwrap(),
+                prepare::copy(entry.value).unwrap(),
                 entry.heap_bytes,
             ))
         })
@@ -411,12 +421,24 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
         funding,
     )
     .unwrap();
+    let encoded_added =
+        crate::native::encoded_added(plan.changes(), core.state.ledger, core.state.payloads())
+            .unwrap();
+    let mut taken = crate::native::EncodedRemoved::new(core.state.ledger, core.state.payloads());
+    let fragments = plan
+        .build_in_replacing(&core.state.budget, prepare::copy, |key, row| {
+            taken.count(key, row)
+        })
+        .unwrap();
     let prepared = NativePrepared {
-        fragments: plan
-            .build_in_with(&core.state.budget, prepare::copy)
-            .unwrap(),
+        fragments,
         outcome,
         writes,
+        encoded_added,
+        encoded_removed: taken.bytes(),
+        _index: None,
+        events: None,
+        retire: None,
     };
     let bytes = encode(&prepared);
     let record = StructuralRecord::inspect(&bytes, inspection(bytes.len())).unwrap();
@@ -553,4 +575,54 @@ fn all_key_families_and_invocation_namespaces_roundtrip_without_collisions() {
     }
     assert!(fixed::key(&mut CountingSink::new(1024, 4096), Key::End).is_err());
     assert!(fixed::read_key(&mut bytes::Cursor::new(&[30], 1, 100).unwrap()).is_err());
+}
+
+/// A hash sink's digest is BLAKE3's of every byte written, however the
+/// writes divide the stream — single bytes, writes that cross a batch,
+/// writes of several batches, a tail short of one — and the sink behind it
+/// is given every byte, in order. The digest takes only whole batches until
+/// its end, so these divisions differ in cost and in nothing else.
+#[test]
+fn a_hash_sinks_digest_is_the_streams_however_it_is_written() {
+    let stream: Vec<u8> = (0..40_000u32)
+        .map(|i| u8::try_from(i.wrapping_mul(2_654_435_761) % 251).unwrap())
+        .collect();
+    let expected = *blake3::Hasher::new_derive_key(HASH_DOMAIN)
+        .update(&stream)
+        .finalize()
+        .as_bytes();
+    let divisions: [&[usize]; 6] = [
+        &[1, 7, 64, 4095, 1, 8192, 3],
+        &[HASH_BATCH],
+        &[5000, 3000, 3 * HASH_BATCH, 1],
+        &[40_000],
+        &[3],
+        &[HASH_BATCH - 1, 2],
+    ];
+    /// The sink behind the digest: every byte it is given, in order.
+    struct Recording(Vec<u8>);
+    impl Sink for Recording {
+        fn write(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+            self.0.extend_from_slice(bytes);
+            Ok(())
+        }
+        fn visit(&mut self, _: usize) -> Result<(), CodecError> {
+            Ok(())
+        }
+    }
+    for pieces in divisions {
+        let mut inner = Recording(Vec::new());
+        let mut sink = HashSink::new(&mut inner, blake3::Hasher::new_derive_key(HASH_DOMAIN));
+        let mut at = 0;
+        for take in pieces.iter().cycle() {
+            if at == stream.len() {
+                break;
+            }
+            let end = (at + take).min(stream.len());
+            sink.write(&stream[at..end]).unwrap();
+            at = end;
+        }
+        assert_eq!(sink.digest().0, expected, "{pieces:?}");
+        assert_eq!(inner.0, stream, "{pieces:?}");
+    }
 }

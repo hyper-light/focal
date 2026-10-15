@@ -25,12 +25,17 @@ fn claim_resolution(
             let Some(Row::ClaimContent(stored)) = view.get(Key::ClaimContent(*id)) else {
                 return Err(ContractError::InvalidPolicy.into());
             };
-            let body = stored.get().ok_or(ContractError::InvalidPolicy)?;
+            let mut buffer = super::super::owned::ContentBuffer::new();
+            let stored = stored.read(view.payloads(), &mut buffer)?;
+            // The stored content's hash, schema and binding, read in place: no body decoded.
+            let content = stored.content_hash().ok_or(ContractError::InvalidPolicy)?;
+            let schema = stored.schema().ok_or(ContractError::InvalidPolicy)?;
+            let binding = stored.binding().ok_or(ContractError::InvalidPolicy)?;
             let profile = stored.profile().ok_or(ContractError::InvalidPolicy)?;
             let state = view.claim(*id).ok_or(ContractError::InvalidTarget)?;
-            if body.content_hash() != descriptor.content_hash()
-                || body.schema() != descriptor.schema()
-                || !same_identity(body.binding(), state.binding())
+            if content != descriptor.content_hash()
+                || schema != descriptor.schema()
+                || !same_identity(binding, state.binding())
                 || profile.max_responses != proposal.max_responses
                 || profile.scope_limits != proposal.scope_limits
                 || profile.owner != proposal.owner
@@ -299,7 +304,12 @@ pub(in crate::native) fn prepare(
             let id = claim.content.id();
             let schema = claim.content.schema();
             let content = claim.content.content_hash();
-            scratch.charge(OwnedClaimContent::container_charge())?;
+            let profile = super::super::owned::ClaimContentProfile {
+                max_responses: claim.max_responses,
+                scope_limits: claim.scope_limits,
+                owner: claim.owner,
+            };
+            scratch.charge(OwnedClaimContent::charge_for(&claim.content, &profile)?)?;
             let owned = OwnedClaimContent::new(
                 claim.content,
                 claim.max_responses,

@@ -112,8 +112,7 @@ pub(crate) struct Inputs<'a> {
     pub data_dir_override: Option<PathBuf>,
 }
 
-pub(crate) fn run(
-    runtime: &tokio::runtime::Runtime,
+pub(crate) async fn run(
     settings: &Settings,
     inputs: Inputs<'_>,
     command: DeploymentCommand,
@@ -127,15 +126,15 @@ pub(crate) fn run(
             )?;
             Ok(())
         }
-        DeploymentCommand::Explain { inventory } => explain(runtime, settings, &inputs, inventory),
+        DeploymentCommand::Explain { inventory } => explain(settings, &inputs, inventory).await,
         DeploymentCommand::Plan { output, dry_run } => {
             if inputs.config.is_none() {
                 return Err(DeploymentError::NoConfig.into());
             }
-            plan(runtime, settings, output.as_deref(), dry_run)
+            plan(settings, output.as_deref(), dry_run).await
         }
-        DeploymentCommand::Apply { plan_file, wait } => apply(runtime, settings, &plan_file, wait),
-        DeploymentCommand::Status { plan } => status(runtime, settings, plan.as_deref()),
+        DeploymentCommand::Apply { plan_file, wait } => apply(settings, &plan_file, wait).await,
+        DeploymentCommand::Status { plan } => status(settings, plan.as_deref()).await,
         DeploymentCommand::Render { target } => {
             if inputs.config.is_none() {
                 return Err(DeploymentError::NoConfig.into());
@@ -248,8 +247,7 @@ fn observed_view(observation: &deployment::plan::Observation) -> serde_json::Val
     })
 }
 
-fn explain(
-    runtime: &tokio::runtime::Runtime,
+async fn explain(
     settings: &Settings,
     inputs: &Inputs<'_>,
     inventory: Option<PathBuf>,
@@ -260,13 +258,10 @@ fn explain(
     // level. A node that is not running, or runs no directory, is explained
     // against itself alone.
     let observation = match inventory {
-        None if network(settings).unwrap_or(false) => {
-            ClusterAdmin::open(settings).ok().and_then(|admin| {
-                runtime
-                    .block_on(deployment::observe::observe(&admin, true))
-                    .ok()
-            })
-        }
+        None if network(settings).unwrap_or(false) => match ClusterAdmin::open(settings) {
+            Ok(admin) => deployment::observe::observe(&admin, true).await.ok(),
+            Err(_) => None,
+        },
         _ => None,
     };
     let nodes: Vec<NodeFacts> = match (&inventory, &observation) {
@@ -361,12 +356,7 @@ fn network(settings: &Settings) -> crate::Result<bool> {
     ))
 }
 
-fn plan(
-    runtime: &tokio::runtime::Runtime,
-    settings: &Settings,
-    output: Option<&Path>,
-    dry_run: bool,
-) -> crate::Result<()> {
+async fn plan(settings: &Settings, output: Option<&Path>, dry_run: bool) -> crate::Result<()> {
     let network = network(settings)?;
     let admin = ClusterAdmin::open(settings)?;
     let requested = settings.policy_intent();
@@ -385,13 +375,61 @@ fn plan(
         )
         .map_err(DeploymentError::Unsatisfiable)?;
     }
-    let plan = runtime.block_on(async {
+    let plan = async {
+        use deployment::plan::ControlProposal;
         let observation = deployment::observe::observe(&admin, network).await?;
         let mut proposals = Vec::new();
         proposals
             .try_reserve_exact(observation.sessions.len())
             .map_err(|_| DeploymentError::Capacity)?;
         let survive = deployment::survive_code(requested.durability.survive);
+        // The root group first (F24): the voters the durability needs,
+        // proposed by the directory's solver and journaled nowhere.
+        let mut partitions = Vec::new();
+        let control = if network {
+            match admin
+                .plan_control_reply(survive, requested.durability.max_failures)
+                .await
+            {
+                Ok(reply) => {
+                    partitions
+                        .try_reserve_exact(reply.partitions.len())
+                        .map_err(|_| DeploymentError::Capacity)?;
+                    for group in reply.partitions {
+                        partitions.push(deployment::plan::PartitionProposal {
+                            partition: group.partition,
+                            group: group.group,
+                            proposal: match group.state {
+                                2 => ControlProposal::Satisfied,
+                                3 => ControlProposal::Refused(
+                                    "no set of enrolled, live nodes seats the partition group under the requested durability".into(),
+                                ),
+                                _ => ControlProposal::Planned {
+                                    voters: group.voters,
+                                    configuration_index: group.configuration_index,
+                                },
+                            },
+                        });
+                    }
+                    if reply.state == 2 {
+                        ControlProposal::Satisfied
+                    } else {
+                        ControlProposal::Planned {
+                            voters: reply.voters,
+                            configuration_index: reply.configuration_index,
+                        }
+                    }
+                }
+                Err(ClusterAdminError::Access(focal_wire::AccessError::InvalidRequest)) => {
+                    ControlProposal::Refused(
+                        "no set of enrolled, live nodes seats the root group under the requested durability".into(),
+                    )
+                }
+                Err(error) => return Err(DeploymentError::Admin(error)),
+            }
+        } else {
+            ControlProposal::Unobserved
+        };
         for session in &observation.sessions {
             // Dry runs: the agent proposes and journals nothing.
             let proposal = match admin
@@ -413,6 +451,11 @@ fn plan(
                         operation: reply.operation,
                         voters: reply.voters,
                     },
+                    // The partition refused the plan: its observation went
+                    // stale between the planning and the commit (24 §16).
+                    3 => deployment::plan::Proposal::Refused(
+                        "the partition's observation went stale while the plan was made; plan again".into(),
+                    ),
                     _ => deployment::plan::Proposal::Satisfied,
                 },
                 Err(ClusterAdminError::Access(focal_wire::AccessError::InvalidRequest)) => {
@@ -424,8 +467,15 @@ fn plan(
             };
             proposals.push(proposal);
         }
-        deployment::plan::compose(&observation, &requested, &proposals, deployment::now_ms()?)
-    })?;
+        deployment::plan::compose_with_partitions(
+            &observation,
+            &requested,
+            &proposals,
+            &control,
+            &partitions,
+            deployment::now_ms()?,
+        )
+    }.await?;
     if let Some(output) = output {
         write_new(output, &plan.encode()?)?;
     }
@@ -453,29 +503,16 @@ fn read_plan(path: &Path) -> crate::Result<DeploymentPlan> {
     Ok(DeploymentPlan::decode(&bytes)?)
 }
 
-fn apply(
-    runtime: &tokio::runtime::Runtime,
-    settings: &Settings,
-    plan_file: &Path,
-    wait: u64,
-) -> crate::Result<()> {
+async fn apply(settings: &Settings, plan_file: &Path, wait: u64) -> crate::Result<()> {
     let plan = read_plan(plan_file)?;
     let network = network(settings)?;
     let admin = ClusterAdmin::open(settings)?;
-    let report = runtime.block_on(deployment::apply::apply(
-        &admin,
-        network,
-        &plan,
-        Duration::from_secs(wait),
-    ))?;
+    let report =
+        deployment::apply::apply(&admin, network, &plan, Duration::from_secs(wait)).await?;
     crate::print_json(&serde_json::json!({"schema_version": 1, "result": report}))
 }
 
-fn status(
-    runtime: &tokio::runtime::Runtime,
-    settings: &Settings,
-    plan: Option<&str>,
-) -> crate::Result<()> {
+async fn status(settings: &Settings, plan: Option<&str>) -> crate::Result<()> {
     let plan_id = match plan {
         Some(text) => Some(
             focal_client::input::parse_id(text)
@@ -485,7 +522,7 @@ fn status(
     };
     let network = network(settings)?;
     let admin = ClusterAdmin::open(settings)?;
-    let reports = runtime.block_on(deployment::apply::status(&admin, network, plan_id))?;
+    let reports = deployment::apply::status(&admin, network, plan_id).await?;
     crate::print_json(&serde_json::json!({
         "schema_version": 1,
         "result": {"kind": "deployment_status", "plans": reports}

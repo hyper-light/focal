@@ -7,7 +7,7 @@
     clippy::disallowed_macros
 )]
 //! External MCP client qualification (REMAINING §9.5): third-party clients
-//! drive a real `focal mcp serve` adapter. The scripts live under
+//! drive a real `focal serve mcp` adapter. The scripts live under
 //! `crates/focal-mcp/tests/external` and run only with `FOCAL_EXTERNAL_MCP=1`,
 //! because they need tools from outside this repository; otherwise this test
 //! records the skip and passes.
@@ -39,6 +39,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -89,9 +90,8 @@ fn external_mcp_clients_complete_discovery_and_one_read_against_the_adapter() {
         .args([
             "--data-dir",
             root.path().to_str().unwrap(),
-            "cluster",
-            "replicas",
-            "activate-native",
+            "activate",
+            "native",
         ])
         .output()
         .unwrap();

@@ -69,7 +69,7 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         &laptop,
         "native engine",
         &["data directory"],
-        &["cluster", "replicas", "activate-native"],
+        &["activate", "native"],
     );
     let server = journey.start(
         &laptop,
@@ -94,7 +94,7 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
     // ---- DC02: a second writer of the same directory is refused while the
     // first lives; an unwritable directory is refused; a full volume
     // refuses the write that does not fit and acknowledges nothing.
-    let (code, report) = journey.failure(&laptop, None, "one writer", &[], &["start"]);
+    let (code, report) = journey.failure(&laptop, None, "one writer", &[], &["start", "node"]);
     assert_eq!(code, 6, "{report}");
     assert!(report.contains("[directory_owned]"), "{report}");
     let unwritable = Node::new("unwritable");
@@ -104,8 +104,13 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         &[],
         &["chmod", "0500", "<unwritable>"],
     );
-    let (code, report) =
-        journey.failure(&unwritable, None, "unwritable directory", &[], &["start"]);
+    let (code, report) = journey.failure(
+        &unwritable,
+        None,
+        "unwritable directory",
+        &[],
+        &["start", "node"],
+    );
     std::fs::set_permissions(unwritable.root(), std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(code, 2, "{report}");
     assert!(report.contains("[permission_denied]"), "{report}");
@@ -123,6 +128,7 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
             "--data-dir",
             "<laptop>",
             "start",
+            "node",
         ],
     );
     let server = start_limited(&laptop, &[], limit.div_ceil(512));
@@ -153,8 +159,12 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
     assert_ne!(later, claim);
     // Planning and explaining read the directory, which names the node
     // once it has installed.
-    let identity = journey.admin(&laptop, "identity", &[], &["cluster", "node", "identity"])
-        ["result"]["identity"]
+    let identity = journey.admin(
+        &laptop,
+        "identity",
+        &[],
+        &["inspect", "node", "--identity"],
+    )["result"]["identity"]
         .clone();
     let laptop_node = identity["node"].as_u64().unwrap();
     let tenant = identity["tenant"].as_str().unwrap().to_owned();
@@ -167,14 +177,14 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
                 && ids(&view["partitions"][0]["sessions"][0]["voters"]).contains(&laptop_node)
         },
     );
-    let view = journey.admin(&laptop, "placement view", &[], &["cluster", "placement"]);
+    let view = journey.admin(&laptop, "placement view", &[], &["inspect", "placement"]);
     assert!(
         node_row(&view["result"]["placement"], laptop_node).is_some(),
         "{view}"
     );
     // ---- DC15: explain names what was requested, what is effective and
     // where every value came from; the golden holds the shape.
-    let explained = journey.admin(&laptop, "explain", &[], &["deployment", "explain"]);
+    let explained = journey.admin(&laptop, "explain", &[], &["explain", "deployment"]);
     let golden: Value = serde_json::from_str(
         &std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/deployment/explain-laptop.json"),
@@ -218,8 +228,8 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         &[
             "--config",
             policy.to_str().unwrap(),
-            "deployment",
             "plan",
+            "deployment",
             "--dry-run",
         ],
     );
@@ -244,8 +254,8 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         &[
             "--config",
             policy.to_str().unwrap(),
-            "deployment",
             "plan",
+            "deployment",
             "--output",
             plan_file.to_str().unwrap(),
         ],
@@ -258,8 +268,8 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         "apply",
         &["plan file"],
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             plan_file.to_str().unwrap(),
         ],
@@ -278,8 +288,8 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         "apply",
         &["plan file"],
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             tampered_file.to_str().unwrap(),
         ],
@@ -295,13 +305,7 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         &laptop,
         "backup",
         &["backup directory"],
-        &[
-            "cluster",
-            "backup",
-            "create",
-            "--output",
-            backup.to_str().unwrap(),
-        ],
+        &["create", "backup", "--output", backup.to_str().unwrap()],
     );
     assert_eq!(created["result"]["kind"], "backup_created", "{created}");
     drop(server);
@@ -312,7 +316,7 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         &other,
         "native engine",
         &["data directory"],
-        &["cluster", "replicas", "activate-native"],
+        &["activate", "native"],
     );
     let _other_server = journey.start(
         &other,
@@ -326,8 +330,8 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         "apply",
         &["plan file"],
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             plan_file.to_str().unwrap(),
         ],
@@ -338,14 +342,14 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         &other,
         "tenant",
         &["tenant"],
-        &["cluster", "tenants", "admit", "--tenant", &tenant],
+        &["admit", "tenant", "--tenant", &tenant],
     );
     let (code, report) = journey.failure(
         &other,
         None,
         "restore",
         &["backup directory"],
-        &["cluster", "restore", "--input", backup.to_str().unwrap()],
+        &["restore", "session", "--input", backup.to_str().unwrap()],
     );
     assert_ne!(code, 0, "{report}");
     let restored = journey.admin(
@@ -353,8 +357,8 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         "restore",
         &["backup directory"],
         &[
-            "cluster",
             "restore",
+            "session",
             "--input",
             backup.to_str().unwrap(),
             "--new-incarnation",
@@ -379,8 +383,8 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         "connection",
         &["tenant", "session"],
         &[
-            "context",
             "add",
+            "context",
             "restored",
             "--node-data-dir",
             other.root().to_str().unwrap(),
@@ -439,7 +443,7 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         None,
         "start",
         &["invitation file"],
-        &["start", "--invite-file", garbage.to_str().unwrap()],
+        &["start", "node", "--invite-file", garbage.to_str().unwrap()],
     );
     assert_ne!(code, 0);
     assert!(!report.contains("not an invitation"), "{report}");

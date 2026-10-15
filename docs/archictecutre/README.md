@@ -49,6 +49,8 @@ states or mutations are already implemented.
 | [26 — Custody, archive, retention and restore](26-custody-archive-retention-and-restore.md) | Custody receipts per verified copy and the obligation a validation phase reads, then archive and retirement, retention floors, garbage collection, backup and restore |
 | [25 — Parallel materialization, ranges and movement](25-parallel-materialization-and-ranges.md) | Deterministic parallel materialization of committed records (staged in dependency waves, read-traced, barrier-checked, installed in order), then ranges and safe movement |
 | [24 — Placement execution and fleet control](24-placement-execution-and-fleet-control.md) | Committed assignment progress, plan phases derived from signed readiness, retiring copies, bounded refusals, the measured guarantee report, and the remaining controller, agent, admission and operator batches |
+| [30 — A write path ten times better: in memory first](30-in-memory-write-path.md) | Measured cost of a write by layer against NATS, the literature by layer, the in-place state structures, capture-scoped checkpoints and the per-write budget for an order of magnitude |
+| [31 — The message ledger: in memory, sharded, durable in the background](31-message-ledger.md) | Focal as a message ledger: partitions on owner shards, a contiguous one-probe hot state, pipelined replication without re-validation, durability classes, retirement into a Bε-tree cold tier, recency-ordered tiers, and the owner's open decisions |
 | [Hecate source snapshot](reference/README.md) | Imported architecture and supporting specs, original provenance and hashes |
 
 ## Authority and current status
@@ -69,4 +71,4 @@ The [network startup guide](../network-startup.md) documents the implemented fou
 
 The [manual CLI guide](../manual-cli.md) documents the implemented local submit/get/list commands, validation results, artifact downloads and durable operation recovery. The CLI uses shared typed Rust builders and the service's authenticated mutation/read boundary.
 
-The [MCP guide and agent skills](../mcp.md) document `focal mcp serve`, its implemented operation catalog, named local/authenticated remote contexts and exact retry contract. Native lifecycle activation, complete peer challenge/consult workflows and full deployment journeys remain required. Participants retain responsibility for executing tools and authoring any follow-up claims.
+The [MCP guide and agent skills](../mcp.md) document `focal serve mcp`, its implemented operation catalog, named local/authenticated remote contexts and exact retry contract. Native lifecycle activation, complete peer challenge/consult workflows and full deployment journeys remain required. Participants retain responsibility for executing tools and authoring any follow-up claims.

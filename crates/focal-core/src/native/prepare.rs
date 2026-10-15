@@ -23,7 +23,7 @@ impl View<'_> {
     /// Tie a candidate to this exact immutable source root. The comparison
     /// borrows existing handles; it does not copy roots or reserve resources.
     pub(super) fn check_successor(&self, prepared: &NativePrepared) -> Result<(), NativeError> {
-        match self.tail {
+        match self.tail() {
             Some(previous) => previous.fragments.validate_successor(&prepared.fragments)?,
             None => self
                 .state
@@ -65,6 +65,20 @@ pub(super) fn heap(row: &ClaimState) -> Result<usize, NativeError> {
             .ok_or(NativeError::Capacity("allocator charge"))?,
     )
 }
+/// What a transition that makes `row` terminal adds to its heap: the terminal cut's own
+/// allocation and the allocator's charge for it (doc 31 M3). Nothing once the claim is terminal.
+pub(super) fn terminal_growth(row: &ClaimState) -> Result<usize, NativeError> {
+    add(
+        row.terminal_growth_heap_bytes()?,
+        row.terminal_growth_heap_allocations()
+            .checked_mul(ALLOCATION)
+            .ok_or(NativeError::Capacity("allocator charge"))?,
+    )
+}
+/// The most `row` holds once a transition that may make it terminal has run on its copy.
+pub(super) fn transition_heap(row: &ClaimState) -> Result<usize, NativeError> {
+    add(heap(row)?, terminal_growth(row)?)
+}
 pub(super) fn within(bytes: usize, max: usize) -> Result<(), NativeError> {
     if bytes > max {
         Err(NativeError::Capacity("preparation bytes"))
@@ -94,18 +108,80 @@ pub(super) fn copy(row: &Row) -> Result<Row, MemoryError> {
             copy_failure()?;
             row.copy().map(Row::CreationResult)
         }
-        Row::Monitor(row) => Ok(Row::Monitor(*row)),
-        Row::MonitorHead(row) => Ok(Row::MonitorHead(*row)),
-        Row::MonitorLink(row) => Ok(Row::MonitorLink(*row)),
-        Row::IncomingHead(row) => Ok(Row::IncomingHead(*row)),
+        Row::Monitor(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Monitor(Box::new(**row)))
+        }
+        Row::MonitorHead(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::MonitorHead(Box::new(**row)))
+        }
+        Row::MonitorLink(row) => {
+            #[cfg(test)]
+            if row.is_some() {
+                copy_failure()?;
+            }
+            Ok(Row::MonitorLink(row.as_deref().copied().map(Box::new)))
+        }
+        Row::IncomingHead(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::IncomingHead(Box::new(**row)))
+        }
         Row::IncomingLink(row) => Ok(Row::IncomingLink(*row)),
         Row::MissingResult(row) => row.copy().map(Row::MissingResult),
-        Row::Meta(meta) => Ok(Row::Meta(*meta)),
-        Row::Receipt(receipt) => Ok(Row::Receipt(*receipt)),
-        Row::Cycle(cycle) => Ok(Row::Cycle(*cycle)),
-        Row::RetiredCycleHead(row) => Ok(Row::RetiredCycleHead(*row)),
-        Row::Retired(row) => Ok(Row::Retired(*row)),
-        Row::RetiredCycle(row) => Ok(Row::RetiredCycle(*row)),
+        Row::Meta(meta) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Meta(Box::new(**meta)))
+        }
+        Row::Receipt(receipt) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Receipt(Box::new(**receipt)))
+        }
+        Row::Cycle(cycle) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Cycle(Box::new(**cycle)))
+        }
+        Row::RetiredCycleHead(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::RetiredCycleHead(Box::new(**row)))
+        }
+        Row::Retired(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Retired(Box::new(**row)))
+        }
+        Row::Seal(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Seal(Box::new(**row)))
+        }
+        Row::Epochs(row) => {
+            #[cfg(test)]
+            copy_failure()?;
+            row.copy().map(|row| Row::Epochs(Box::new(row)))
+        }
+        Row::RetiredCycle(row) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::RetiredCycle(Box::new(**row)))
+        }
         Row::WorkSlot(id) => Ok(Row::WorkSlot(*id)),
         Row::ClaimResultTestament(id) => Ok(Row::ClaimResultTestament(*id)),
         Row::ResultTestament(row) => {
@@ -117,7 +193,12 @@ pub(super) fn copy(row: &Row) -> Result<Row, MemoryError> {
         Row::Diagnostic(row) => row.copy().map(Row::Diagnostic),
         Row::Response(row) => row.copy().map(Row::Response),
         Row::DeliveryResult(row) => row.copy().map(Row::DeliveryResult),
-        Row::Outcome(outcome) => Ok(Row::Outcome(*outcome)),
+        Row::Outcome(outcome) => {
+            // A box is an allocation, as an owned payload's copy is.
+            #[cfg(test)]
+            copy_failure()?;
+            Ok(Row::Outcome(outcome.copy()))
+        }
         Row::Event(event) => {
             #[cfg(test)]
             copy_failure()?;
@@ -158,7 +239,7 @@ std::thread_local! {
     static COPIES_REMAINING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 #[cfg(test)]
-fn copy_failure() -> Result<(), MemoryError> {
+pub(super) fn copy_failure() -> Result<(), MemoryError> {
     COPIES_REMAINING.with(|remaining| match remaining.get() {
         Some(0) => Err(MemoryError::AllocationFailed),
         Some(count) => {
@@ -168,8 +249,12 @@ fn copy_failure() -> Result<(), MemoryError> {
         None => Ok(()),
     })
 }
+/// Fails the `count + 1`th range step of `action`: a leader's write plans its
+/// range once, its last step before it is a candidate (`NativeRanges::plan_sparse`),
+/// and a built range copies each retained row (`copy`). What a write did before
+/// the failing step must leave no trace.
 #[cfg(test)]
-pub(super) fn fail_copies_after<T>(count: usize, action: impl FnOnce() -> T) -> T {
+pub(super) fn fail_range_after<T>(count: usize, action: impl FnOnce() -> T) -> T {
     struct Restore(Option<usize>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -180,18 +265,101 @@ pub(super) fn fail_copies_after<T>(count: usize, action: impl FnOnce() -> T) -> 
     action()
 }
 
-/// Temporary native heaps share one pre-reserved allowance. Every allocation is
-/// preflighted; allocator-reported capacities are reconciled before retention.
+/// Temporary native heaps are bounded by `max`, and every allocation is
+/// preflighted against it; allocator-reported capacities are reconciled before
+/// retention. A metered scratch is charged to its budget as it is used, never
+/// its bound up front: what a preparation holds is what it allocated (doc 27).
+/// Its charge ends with it, after the temporaries it counted.
 pub(super) struct Scratch {
     pub used: usize,
     pub max: usize,
+    /// Bytes charged to the meter under allowances of their own (a
+    /// preparation's change buffers), apart from this bound.
+    beside: usize,
+    meter: Option<Allocation>,
 }
+
+/// A metered scratch grows its charge at least this much at a time, so many
+/// small temporaries walk the budget a few times, never past the bound.
+const METER_STEP: usize = 16 * 1024;
+
 impl Scratch {
+    /// A bound alone: what it counts is charged where its allowance was.
+    pub const fn bound(max: usize) -> Self {
+        Self {
+            used: 0,
+            max,
+            beside: 0,
+            meter: None,
+        }
+    }
+    /// A bound charged to `budget` on `lane` as it is used.
+    pub fn metered(
+        budget: &focal_memory::MemoryBudget,
+        lane: BudgetLane,
+        max: usize,
+    ) -> Result<Self, NativeError> {
+        Ok(Self {
+            used: 0,
+            max,
+            beside: 0,
+            meter: Some(budget.reserve(BudgetKind::Pending, lane, 0)?.commit()),
+        })
+    }
+    /// Whether `bytes` more stay within the bound, changing nothing: for a
+    /// step that charges only once its allocation has passed its checks.
+    pub fn fits(&self, bytes: usize) -> Result<(), NativeError> {
+        within(add(self.used, bytes)?, self.max)
+    }
     pub fn charge(&mut self, bytes: usize) -> Result<(), NativeError> {
         let next = add(self.used, bytes)?;
         within(next, self.max)?;
+        self.meter_to(add(next, self.beside)?)?;
         self.used = next;
         Ok(())
+    }
+    /// Charges `bytes` held under an allowance of their own: the meter grows,
+    /// this bound's use does not.
+    pub fn hold(&mut self, bytes: usize) -> Result<(), NativeError> {
+        let beside = add(self.beside, bytes)?;
+        self.meter_to(add(self.used, beside)?)?;
+        self.beside = beside;
+        Ok(())
+    }
+    /// Grows the meter to `target`, in steps, never past the larger of the
+    /// target and the bound.
+    fn meter_to(&mut self, target: usize) -> Result<(), NativeError> {
+        let Some(meter) = self.meter.as_mut() else {
+            return Ok(());
+        };
+        let held = meter.bytes();
+        if target > held {
+            let step = target
+                .saturating_sub(held)
+                .max(METER_STEP)
+                .min(target.max(self.max).saturating_sub(held));
+            meter.grow(step)?;
+        }
+        Ok(())
+    }
+    /// What this scratch holds of its budget, for what outlives it.
+    pub fn into_meter(self) -> Option<Allocation> {
+        self.meter
+    }
+    /// A bound already partly used, for a test of what follows.
+    #[cfg(test)]
+    pub const fn with_used(used: usize, max: usize) -> Self {
+        Self {
+            used,
+            max,
+            beside: 0,
+            meter: None,
+        }
+    }
+    /// The charge this scratch holds now, for a test of its accounting.
+    #[cfg(test)]
+    pub fn held(&self) -> usize {
+        self.meter.as_ref().map_or(0, Allocation::bytes)
     }
     pub fn remaining(&self) -> Result<usize, NativeError> {
         self.max
@@ -228,6 +396,9 @@ pub(super) struct Extras {
     pub(super) admission_graph: Option<super::admission_graph::Proof>,
     max: usize,
     allowance: usize,
+    /// What the rows' buffer holds, charged as it grows; after the rows, so
+    /// they go first.
+    meter: Option<Allocation>,
 }
 impl Extras {
     pub(super) fn new(max: usize, allowance: usize) -> Result<Self, NativeError> {
@@ -240,7 +411,19 @@ impl Extras {
             admission_graph: None,
             max,
             allowance,
+            meter: None,
         })
+    }
+    /// Bounded as [`Self::new`], its buffer charged to `budget` as it grows.
+    pub(super) fn metered(
+        max: usize,
+        allowance: usize,
+        budget: &focal_memory::MemoryBudget,
+        lane: BudgetLane,
+    ) -> Result<Self, NativeError> {
+        let mut extras = Self::new(max, allowance)?;
+        extras.meter = Some(budget.reserve(BudgetKind::Pending, lane, 0)?.commit());
+        Ok(extras)
     }
     pub fn events(&self) -> usize {
         match &self.journal {
@@ -305,16 +488,24 @@ impl Extras {
                 .min(self.max);
             let old = array::<Extra>(self.rows.capacity())?;
             within(add(old, array::<Extra>(capacity)?)?, self.allowance)?;
+            // Charged while both are held: the replacement and the rows it takes.
+            if let Some(meter) = self.meter.as_mut() {
+                meter.grow(array::<Extra>(capacity)?)?;
+            }
             let mut replacement = Vec::new();
             replacement
                 .try_reserve_exact(capacity)
                 .map_err(|_| MemoryError::AllocationFailed)?;
-            within(
-                add(old, array::<Extra>(replacement.capacity())?)?,
-                self.allowance,
-            )?;
+            let given = array::<Extra>(replacement.capacity())?;
+            within(add(old, given)?, self.allowance)?;
+            if let Some(meter) = self.meter.as_mut() {
+                meter.grow(given.saturating_sub(array::<Extra>(capacity)?))?;
+            }
             replacement.append(&mut self.rows);
             self.rows = replacement;
+            if let Some(meter) = self.meter.as_mut() {
+                meter.shrink_to(given)?;
+            }
         }
         if self.journal.is_some()
             && let Some(fact) = row.fact.take()
@@ -407,7 +598,8 @@ impl Core<NativeState> {
         pending: &[&NativePrepared],
         evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
     ) -> Result<NativePreparation, NativeError> {
-        self.prepare_native_chain(source, context, input, pending.iter().copied(), evidence)
+        let chain = pending_index::Chain::listed(pending)?;
+        self.prepare_native_chain(source, context, input, chain, evidence)
     }
 
     /// The managed owner supplies its borrowed queue iterator directly. No
@@ -417,7 +609,7 @@ impl Core<NativeState> {
         source: &MemoryBudget,
         context: NativeContext,
         input: NativeInput,
-        pending: impl DoubleEndedIterator<Item = &'a NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'a>>,
         evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
     ) -> Result<NativePreparation, NativeError> {
         if !source.is_within(&self.state.budget) {
@@ -426,14 +618,16 @@ impl Core<NativeState> {
             )
             .into());
         }
-        match self.check_native_chain(context, input, pending)? {
+        let prepared = match self.check_native_chain(context, input, pending)? {
             Checked::Existing { outcome, committed } => {
-                Ok(NativePreparation::Existing { outcome, committed })
+                NativePreparation::Existing { outcome, committed }
             }
-            Checked::Fresh(fresh) => fresh
-                .build(source, evidence)
-                .map(NativePreparation::Prepared),
-        }
+            Checked::Fresh(fresh) => NativePreparation::Prepared(fresh.build(source, evidence)?),
+        };
+        // A spilled row its reads could not take back was lent as it is stored: the preparation
+        // stands only where none failed (doc 31 M3).
+        self.state.reads.failure()?;
+        Ok(prepared)
     }
 
     /// Resolve identity and the exact effective base before selecting resource
@@ -443,7 +637,7 @@ impl Core<NativeState> {
         &'a self,
         context: NativeContext,
         input: NativeInput,
-        pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'p>>,
     ) -> Result<Checked<'a>, NativeError> {
         context.principal.require_actor(input.request.principal)?;
         if input.request.principal.is_zero()
@@ -472,6 +666,7 @@ impl Core<NativeState> {
             NativeCommand::RebindMonitor { .. } => NativeOperation::RebindMonitor,
             NativeCommand::CancelMonitor { .. } => NativeOperation::CancelMonitor,
             NativeCommand::ReleaseScope { .. } => NativeOperation::ReleaseScope,
+            NativeCommand::AdvanceEpochFloor { .. } => NativeOperation::AdvanceEpochFloor,
             NativeCommand::GenerateResultTestament { .. } => {
                 NativeOperation::GenerateResultTestament
             }
@@ -500,12 +695,17 @@ impl Core<NativeState> {
             NativeCommand::BeginAdmission { .. } => NativeOperation::BeginAdmission,
             NativeCommand::ReportAdmission { .. } => NativeOperation::ReportAdmission,
         };
+        // Finishing work already taken (a cancel, a report, a respondent's diagnostic, close or
+        // post) is on the completion lane, which fresh work cannot take.
         let lane = if matches!(
             operation,
             NativeOperation::Cancel
                 | NativeOperation::ReportAdmission
                 | NativeOperation::ReportIncrement
                 | NativeOperation::ReportWork
+                | NativeOperation::SubmitDiagnostic
+                | NativeOperation::CloseResponse
+                | NativeOperation::PostResponse
         ) {
             BudgetLane::Completion
         } else {
@@ -530,21 +730,17 @@ impl Core<NativeState> {
         &'a self,
         input: NativeDeadlineInput,
         logical_time: u64,
-        mut pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'p>>,
     ) -> Result<Checked<'a>, NativeError> {
-        let pending_count = pending.len();
-        if pending_count > self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
-        }
-        self.state
-            .rows
-            .validate_chain(pending.clone().map(|item| &item.fragments))?;
+        self.state.rows.validate_chain(
+            pending
+                .and_then(|chain| chain.head())
+                .map(|item| &item.fragments)
+                .into_iter(),
+        )?;
         let intent = intent::deadline_fingerprint(self.state.ledger, input)?;
-        let view = View {
-            state: &self.state,
-            tail: pending.next_back(),
-        };
-        if let Some(outcome) = as_outcome(view.get(Key::Outcome(input.key().into()))) {
+        let view = View::over(&self.state, pending);
+        if let Some(outcome) = view.outcome(input.key().into())? {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {
                     outcome,
@@ -554,16 +750,15 @@ impl Core<NativeState> {
                 Err(NativeError::RequestConflict)
             };
         }
-        if pending_count == self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
-        }
         let mut meta = view.meta();
         if logical_time < meta.logical_time {
             return Err(ContractError::InvalidCut.into());
         }
         meta.logical_time = logical_time;
         meta.outcomes = add(meta.outcomes, 1)?;
-        within(meta.outcomes, self.limits.outcomes)?;
+        if meta.outcomes.saturating_sub(meta.sealed) > self.limits.outcomes {
+            return Err(NativeError::Capacity("outcomes"));
+        }
         let sequence = SessionSeq(
             view.prefix()
                 .0
@@ -619,24 +814,20 @@ impl Core<NativeState> {
         context: NativeContext,
         request: RequestKey,
         intent: ContentHash,
-        mut pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'p>>,
     ) -> Result<RequestCheck<'a>, NativeError> {
-        let count = pending.len();
-        if count > self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
-        }
-        self.state
-            .rows
-            .validate_chain(pending.clone().map(|item| &item.fragments))?;
+        self.state.rows.validate_chain(
+            pending
+                .and_then(|chain| chain.head())
+                .map(|item| &item.fragments)
+                .into_iter(),
+        )?;
         context.principal.require_actor(request.principal)?;
         if request.principal.is_zero() || request.id.is_zero() || request.epoch.0 == 0 {
             return Err(ContractError::InvalidTarget.into());
         }
-        let view = View {
-            state: &self.state,
-            tail: pending.next_back(),
-        };
-        if let Some(outcome) = as_outcome(view.get(Key::Outcome(request.into()))) {
+        let view = View::over(&self.state, pending);
+        if let Some(outcome) = view.outcome(request.into())? {
             return if outcome.intent == intent {
                 Ok(RequestCheck::Existing {
                     outcome,
@@ -646,18 +837,25 @@ impl Core<NativeState> {
                 Err(NativeError::RequestConflict)
             };
         }
-        if count == self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
-        }
         let mut meta = view.meta();
         if context.logical_time < meta.logical_time {
             return Err(ContractError::InvalidCut.into());
         }
         meta.logical_time = context.logical_time;
         meta.outcomes = add(meta.outcomes, 1)?;
-        if meta.outcomes > self.limits.outcomes {
+        // The generation fence (F12), after the exact-retry lookup and
+        // before the window's own bound: a request below its principal's
+        // floor is refused here by name, never executed — whatever the
+        // window holds, as that refusal is final and a full window's is
+        // not (a client retrying the bound's refusal would be refused by
+        // name the next time). Then the window's bound, then the
+        // principal's share of it; the window itself is written by the
+        // build.
+        super::epochs::fence(&view, request)?;
+        if meta.outcomes.saturating_sub(meta.sealed) > self.limits.outcomes {
             return Err(NativeError::Capacity("outcomes"));
         }
+        super::epochs::check(&view, meta, request, self.limits)?;
         let sequence = SessionSeq(
             view.prefix()
                 .0
@@ -684,21 +882,17 @@ impl Core<NativeState> {
         &'a self,
         input: NativeClaimDeadlineInput,
         logical_time: u64,
-        mut pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
+        pending: Option<pending_index::Chain<'p>>,
     ) -> Result<Checked<'a>, NativeError> {
-        let pending_count = pending.len();
-        if pending_count > self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
-        }
-        self.state
-            .rows
-            .validate_chain(pending.clone().map(|item| &item.fragments))?;
+        self.state.rows.validate_chain(
+            pending
+                .and_then(|chain| chain.head())
+                .map(|item| &item.fragments)
+                .into_iter(),
+        )?;
         let intent = intent::claim_deadline_fingerprint(self.state.ledger, input)?;
-        let view = View {
-            state: &self.state,
-            tail: pending.next_back(),
-        };
-        if let Some(outcome) = as_outcome(view.get(Key::Outcome(input.key().into()))) {
+        let view = View::over(&self.state, pending);
+        if let Some(outcome) = view.outcome(input.key().into())? {
             return if outcome.intent == intent {
                 Ok(Checked::Existing {
                     outcome,
@@ -708,16 +902,15 @@ impl Core<NativeState> {
                 Err(NativeError::RequestConflict)
             };
         }
-        if pending_count == self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
-        }
         let mut meta = view.meta();
         if logical_time < meta.logical_time {
             return Err(ContractError::InvalidCut.into());
         }
         meta.logical_time = logical_time;
         meta.outcomes = add(meta.outcomes, 1)?;
-        within(meta.outcomes, self.limits.outcomes)?;
+        if meta.outcomes.saturating_sub(meta.sealed) > self.limits.outcomes {
+            return Err(NativeError::Capacity("outcomes"));
+        }
         let sequence = SessionSeq(
             view.prefix()
                 .0
@@ -902,21 +1095,27 @@ impl BuiltNative {
     fn new(
         prepared: NativePrepared,
         seals: Vec<validation::SealTransition>,
-        funding: Allocation,
+        funding: Option<Allocation>,
     ) -> Result<Self, NativeError> {
         // Keep drop order explicit through the owned fields even on refusal:
         // pages and tokens are destroyed before their construction debit.
         let mut built = Self {
             prepared,
             seals,
-            funding: Some(funding),
+            funding,
         };
+        // What outlives the construction is its seals' buffer, charged as
+        // exactly that.
         let bytes = array::<validation::SealTransition>(built.seals.capacity())?;
-        built
-            .funding
-            .as_mut()
-            .ok_or(ContractError::InvalidManifest)?
-            .shrink_to(bytes)?;
+        match built.funding.as_mut() {
+            Some(funding) if funding.bytes() < bytes => {
+                let more = bytes.saturating_sub(funding.bytes());
+                funding.grow(more)?;
+            }
+            Some(funding) => funding.shrink_to(bytes)?,
+            None if bytes == 0 => {}
+            None => return Err(NativeError::Capacity("seal transition funding")),
+        }
         if bytes == 0 {
             drop(built.funding.take());
         }
@@ -1090,13 +1289,16 @@ impl<'a> Fresh<'a> {
     /// Borrow the same immutable effective prefix across construction. This
     /// copies only the two references, never a root, row, grant or authority.
     pub(super) fn publication_source(&self) -> View<'a> {
-        View {
-            state: self.view.state,
-            tail: self.view.tail,
-        }
+        self.view
     }
     pub(super) fn lane(&self) -> BudgetLane {
         self.lane
+    }
+    /// The candidate finishes work already taken (a respondent's diagnostic, close or post):
+    /// it is built on the completion lane, which fresh work cannot take.
+    pub(super) fn on_completion_lane(mut self) -> Self {
+        self.lane = BudgetLane::Completion;
+        self
     }
     pub(super) fn limits(&self) -> NativeLimits {
         self.limits
@@ -1328,14 +1530,16 @@ impl<'a> Fresh<'a> {
         } else {
             None
         };
-        let allocation = source
-            .reserve(BudgetKind::Pending, lane, construction.temporary_bytes()?)?
-            .commit();
-        let mut scratch = Scratch {
-            used: 0,
-            max: construction.scratch_bytes,
-        };
-        let mut extras = Extras::new(construction.extras_count, construction.extras_bytes)?;
+        // Each buffer is charged what it holds as it is taken, never the
+        // operation's bound (doc 27): a short message prepares in bytes.
+        let mut scratch = Scratch::metered(source, lane, construction.scratch_bytes)?;
+        let mut extras = Extras::metered(
+            construction.extras_count,
+            construction.extras_bytes,
+            source,
+            lane,
+        )?;
+        let mut window_scratch = Scratch::metered(source, lane, construction.window_bytes)?;
         let report_parent = match &dispatch {
             Dispatch::Request {
                 input:
@@ -1352,19 +1556,39 @@ impl<'a> Fresh<'a> {
             )),
             _ => None,
         };
+        let mut window = None;
         let plan = match dispatch {
-            Dispatch::Request { input, context } => transactions::prepare(
-                input.command,
-                input.request,
-                evidence,
-                context,
-                cut,
-                &view,
-                limits,
-                &mut meta,
-                &mut extras,
-                &mut scratch,
-            )?,
+            Dispatch::Request { input, context } => {
+                // The principal's window as this request leaves it (F12):
+                // admitted here again on the same facts the fence saw, and
+                // written beside the meta and the outcome.
+                let mut admitted = super::epochs::admit(
+                    &view,
+                    &mut meta,
+                    input.request,
+                    logical_time,
+                    limits,
+                    &mut window_scratch,
+                )?;
+                let plan = if let NativeCommand::AdvanceEpochFloor { minimum } = input.command {
+                    super::epochs::prepare_advance(context, input.request, minimum, &mut admitted)?
+                } else {
+                    transactions::prepare(
+                        input.command,
+                        input.request,
+                        evidence,
+                        context,
+                        cut,
+                        &view,
+                        limits,
+                        &mut meta,
+                        &mut extras,
+                        &mut scratch,
+                    )?
+                };
+                window = Some((input.request.principal, admitted));
+                plan
+            }
             Dispatch::Deadline { resolved, .. } => {
                 if resolved.begun && deadline_envelope.is_none() {
                     return Err(ContractError::InvalidPolicy.into());
@@ -1499,11 +1723,19 @@ impl<'a> Fresh<'a> {
             limits.events,
             "events",
         )?;
+        let control = if window.is_some() {
+            super::prepare_budget::REQUEST_CONTROL_ROWS
+        } else {
+            super::prepare_budget::TIMER_CONTROL_ROWS
+        };
         let original = claim_changes::OriginalPlan::check(
             plan,
             extras,
-            meta,
-            outcome,
+            claim_changes::Admitted {
+                meta,
+                outcome,
+                window,
+            },
             &view,
             limits,
             &mut scratch,
@@ -1523,63 +1755,99 @@ impl<'a> Fresh<'a> {
             usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("event count"))?;
         let final_extras = changes
             .len()
-            .checked_sub(add(add(changed, events)?, add(2, index)?)?)
+            .checked_sub(add(add(changed, events)?, add(control, index)?)?)
             .ok_or(ContractError::InvalidManifest)?;
         construction.check_counts(changed, final_extras, events, index)?;
         if final_meta.events != add(view.meta().events, events)? {
             return Err(ContractError::InvalidManifest.into());
         }
-        let range_plan = match view.tail {
-            Some(tail) => view.state.rows.plan_after(
-                source,
-                &tail.fragments,
-                sequence.0,
-                changes,
-                lane,
-                usize::MAX,
-            )?,
-            None => view
-                .state
-                .rows
-                .plan_batch(source, sequence.0, changes, lane, usize::MAX)?,
-        };
+        // The candidate's changes alone, each checked against the state it is
+        // prepared on, its publication's spending reserved (doc 30 §9): no
+        // page is built until it publishes, where the rows are.
+        let fragments = view.state.rows.plan_sparse(
+            source,
+            view.tail().map(|tail| &tail.fragments),
+            sequence.0,
+            changes,
+            lane,
+            |key| view.get_entry(key).map(|entry| entry.heap_bytes),
+        )?;
         if let Some(envelope) = envelope {
-            range_plan.check_envelope(&envelope)?;
+            fragments.check_envelope(&envelope)?;
         }
         if let Some(completion) = completion
             && operation != NativeOperation::BeginWork
         {
-            range_plan.check_envelope(&completion.report_storage(completion_use)?)?;
+            fragments.check_envelope(&completion.report_storage(completion_use)?)?;
         }
         if let Some(envelope) = deadline_envelope {
-            range_plan.check_envelope(&envelope)?;
+            fragments.check_envelope(&envelope)?;
         }
         if let Some(respondent) = respondent {
-            range_plan.check_envelope(&respondent.storage(operation)?)?;
+            fragments.check_envelope(&respondent.storage(operation)?)?;
         }
         // The actual shape is now fixed. Charging the maximum shape here would
         // exceed a regular report's smaller retained promise (e.g. 9 vs 11 rows).
-        let mutation_bytes = super::mutation::bytes(range_plan.changes_len())?;
+        let changed = fragments.changes().count();
+        let mutation_bytes = super::mutation::bytes(changed)?;
         within(mutation_bytes, construction.mutation_bytes()?)?;
         let writes = super::mutation::WriteSet::capture(
             view.state.profile,
-            range_plan.changes_len(),
-            range_plan.changes(),
+            changed,
+            fragments.changes().map(|(_, _, change)| change),
             construction.mutation_bytes()?,
             source
                 .reserve(BudgetKind::Pending, lane, mutation_bytes)?
                 .commit(),
         )?;
-        let fragments = range_plan.build_in_with(source, copy)?;
+        let encoded_added = super::encoded_added(
+            fragments.changes().map(|(_, _, change)| change),
+            view.state.ledger,
+            view.payloads(),
+        )?;
+        // What the rows this mutation replaces or deletes take in a checkpoint, as the state it
+        // is prepared on holds them, which is the root it publishes onto: published, it takes
+        // them away without looking each up again.
+        let mut removed = super::EncodedRemoved::new(view.state.ledger, view.payloads());
+        for (_, _, change) in fragments.changes() {
+            let key = change.key();
+            if let Some(old) = view.get_entry(&key) {
+                removed.count(&key, old.value)?;
+            }
+        }
+        let encoded_removed = removed.bytes();
         writes.check(&fragments)?;
+        // Its changes' place in an owner's pending index, funded as the rest of it is.
+        let index = super::pending_index::entry_charge()
+            .checked_mul(changed)
+            .ok_or(NativeError::Capacity("pending index charge"))?;
+        let index = source.reserve(BudgetKind::Pending, lane, index)?.commit();
+        // Its events' place in the event index (doc 31 M2), funded as the rest of it is.
+        let events = match outcome.events {
+            0 => None,
+            count => Some(
+                source
+                    .reserve(
+                        BudgetKind::Index,
+                        lane,
+                        super::event_index::charge_for(count)?,
+                    )?
+                    .commit(),
+            ),
+        };
         BuiltNative::new(
             NativePrepared {
                 fragments,
                 outcome,
                 writes,
+                encoded_added,
+                encoded_removed,
+                _index: Some(index),
+                events,
+                retire: None,
             },
             seals,
-            allocation,
+            scratch.into_meter(),
         )
     }
 }

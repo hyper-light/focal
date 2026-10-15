@@ -58,7 +58,7 @@ pub(super) fn claim(sink: &mut impl Sink, row: &OwnedClaim) -> Result<(), Error>
         },
     )?;
     graph(sink, value.graph())?;
-    lineage(sink, value.lineage())?;
+    lineage(sink, value.lineage(), value.creation_binding())?;
     acceptance(sink, value.acceptance())?;
     count(sink, snapshot.responses)?;
     let mut responses = value.response_snapshots_v1();
@@ -79,8 +79,8 @@ pub(super) fn claim(sink: &mut impl Sink, row: &OwnedClaim) -> Result<(), Error>
     if responses.next().is_some() {
         return Err(Error::InvalidTag("claim response count"));
     }
-    scopes(sink, value.scopes())?;
-    registration(sink, registrations)
+    scopes(sink, value.scope_snapshot_v1())?;
+    registration(sink, registrations, value.binding())
 }
 
 fn graph(sink: &mut impl Sink, value: &graph::Declaration) -> Result<(), Error> {
@@ -111,8 +111,12 @@ fn object_ref(sink: &mut impl Sink, value: ObjectRef) -> Result<(), Error> {
     )?;
     raw(sink, &value.id.0)
 }
-fn lineage(sink: &mut impl Sink, value: &succession::Lineage) -> Result<(), Error> {
-    types::binding(sink, value.binding())?;
+fn lineage(
+    sink: &mut impl Sink,
+    value: &succession::Lineage,
+    binding: focal_model::lifecycle::Binding,
+) -> Result<(), Error> {
+    types::binding(sink, binding)?;
     match value.cause() {
         Cause::Root(id) => {
             write_u8(sink, 0)?;
@@ -137,7 +141,7 @@ fn lineage(sink: &mut impl Sink, value: &succession::Lineage) -> Result<(), Erro
     }
     sink.visit(1)
 }
-fn acceptance(sink: &mut impl Sink, value: &aggregation::AcceptancePolicy) -> Result<(), Error> {
+fn acceptance(sink: &mut impl Sink, value: aggregation::Acceptance<'_>) -> Result<(), Error> {
     types::binding(sink, value.claim())?;
     raw(sink, &value.issuer().0)?;
     count(sink, value.slot_count())?;
@@ -184,9 +188,8 @@ fn predicate(sink: &mut impl Sink, value: WaitPredicate) -> Result<(), Error> {
     write_u8(sink, tag)?;
     raw(sink, &id.0)
 }
-fn scopes(sink: &mut impl Sink, value: &scope::Registry) -> Result<(), Error> {
+fn scopes(sink: &mut impl Sink, source: scope::RegistrySnapshotView<'_>) -> Result<(), Error> {
     sink.visit(1)?;
-    let source = value.snapshot_v1();
     let snapshot = source.fields();
     types::binding(sink, snapshot.owner)?;
     types::scope_limits(sink, snapshot.limits)?;
@@ -251,9 +254,13 @@ fn scopes(sink: &mut impl Sink, value: &scope::Registry) -> Result<(), Error> {
     }
     Ok(())
 }
-fn registration(sink: &mut impl Sink, value: &aggregation::RegistrationSet) -> Result<(), Error> {
+fn registration(
+    sink: &mut impl Sink,
+    value: &aggregation::RegistrationSet,
+    claim: focal_model::lifecycle::Binding,
+) -> Result<(), Error> {
     sink.visit(1)?;
-    let snapshot = value.snapshot_v1();
+    let snapshot = value.snapshot_v1(claim);
     types::binding(sink, snapshot.claim)?;
     count(sink, snapshot.max_rows)?;
     write_u8(sink, u8::from(snapshot.sealed))?;

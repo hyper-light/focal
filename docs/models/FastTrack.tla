@@ -12,8 +12,17 @@
 (* hears of, or one of its own.  It commits an index of its own term       *)
 (*   by the classic quorum: a majority holds its log through the index;    *)
 (*   by the fast quorum: the index is the one after its commit, and        *)
-(*     three quarters of the members hold the entry, by themselves or      *)
-(*     from the leader.                                                    *)
+(*     three quarters of the members hold the entry, from the leader, or   *)
+(*     by themselves beside a log that holds an entry of the leader's      *)
+(*     term.                                                               *)
+(*                                                                         *)
+(* The last clause is the round of a vote, kept where an election reads    *)
+(* it.  A member votes by its log alone, so one that holds the entry       *)
+(* beside a log of older terms votes for a candidate whose log fills the   *)
+(* index with an older entry, and that candidate keeps its own.  Once the  *)
+(* member's log is of the leader's term it refuses every such candidate.   *)
+(* Counts = "any" is the rule without the clause, kept to show that the    *)
+(* properties fail without it (FastTrackAnyRound.cfg).                     *)
 (*                                                                         *)
 (* A member votes for a candidate whose log is at least as current as its  *)
 (* own, and says with its vote what it holds by itself.  One that is       *)
@@ -33,12 +42,22 @@
 (* order, delay, repetition and loss.  A leader that was deposed and does  *)
 (* not know it goes on leading its term, and a member that stopped is one  *)
 (* that does nothing for a while: what is durable is all a member has      *)
-(* here.  A leader's own first entry is an entry it takes like any other.  *)
+(* here.  One that learns it was deposed campaigns again, with the log it  *)
+(* led with: without that step no member whose log holds what no other     *)
+(* took is ever elected again, and the model missed the run the round      *)
+(* rule is for.  A leader's own first entry is an entry it takes like any  *)
+(* other.                                                                  *)
+(*                                                                         *)
+(* Nothing here grows without a bound.  A configuration states how many    *)
+(* distinct states it has (StateBudget), the checker stops at one more     *)
+(* (WithinBudget), and scripts/check-model.sh gives the checker the memory *)
+(* that many states take and no more.  A change that makes a model larger  *)
+(* is refused until its states are counted and stated again.               *)
 (*                                                                         *)
 (* To keep the states few enough to visit them all, a member's word is     *)
-(* kept as the last it gave: what it last said it holds at an index, and   *)
-(* what it held when it last voted.  A leader sends its log through its    *)
-(* end.                                                                    *)
+(* kept as the last it gave: what it last said it holds at an index, when  *)
+(* it came to hold it, with its vote, or again in a later term.  A leader  *)
+(* sends its log through its end.  An election is one step (Elect).        *)
 (*                                                                         *)
 (* Checked:                                                                *)
 (*   Agreement     no two members commit entries that state different     *)
@@ -56,7 +75,8 @@ CONSTANTS Servers,   \* the voters
           Nothing,   \* no entry
           Nobody,    \* no vote
           MaxTerm,
-          MaxLen     \* how long a log grows
+          MaxLen,    \* how long a log grows
+          StateBudget \* the distinct states the checker may find
 
 Classic == {Q \in SUBSET Servers : 2 * Cardinality(Q) > Cardinality(Servers)}
 Fast    == {Q \in SUBSET Servers : 4 * Cardinality(Q) >= 3 * Cardinality(Servers)}
@@ -68,19 +88,18 @@ Entries == [term : 1..MaxTerm, value : Stated]
 VARIABLES
   term,     \* [Servers -> 0..MaxTerm]
   vote,     \* [Servers -> Servers \cup {Nobody}]
-  role,     \* [Servers -> {"follower", "candidate", "leader"}]
+  role,     \* [Servers -> {"follower", "leader"}]
   log,      \* [Servers -> Seq(Entries)]
   held,     \* [Servers -> [Indexes -> Values \cup {Nothing}]]
   commit,   \* [Servers -> 0..MaxLen]
   says,     \* [Servers -> [Indexes -> [term, value]]]: what a member last
-            \* said it holds by itself
+            \* said it holds by itself, when it came to hold it, with its
+            \* vote, or again in a later term
   acks,     \* [Servers -> [0..MaxTerm -> 0..MaxLen]]: through which index a
             \* member said it holds the log of the leader of a term
-  grants,   \* [Servers -> [Indexes -> value]]: what a member held when
-            \* it last voted
   chosen    \* [Indexes -> [value, term]]: what was first committed, and by a leader of which term
 
-vars == <<term, vote, role, log, held, commit, says, acks, grants, chosen>>
+vars == <<term, vote, role, log, held, commit, says, acks, chosen>>
 
 NotChosen == [value |-> Nothing, term |-> 0]
 
@@ -94,7 +113,7 @@ Release(h, length) == [i \in Indexes |-> IF i <= length THEN Nothing ELSE h[i]]
 TypeOK ==
   /\ term \in [Servers -> 0..MaxTerm]
   /\ vote \in [Servers -> Servers \cup {Nobody}]
-  /\ role \in [Servers -> {"follower", "candidate", "leader"}]
+  /\ role \in [Servers -> {"follower", "leader"}]
   /\ \A s \in Servers : /\ Len(log[s]) <= MaxLen
                         /\ \A i \in 1..Len(log[s]) : log[s][i] \in Entries
                         /\ commit[s] <= Len(log[s])
@@ -110,22 +129,26 @@ Init ==
   /\ commit = [s \in Servers |-> 0]
   /\ says   = [s \in Servers |-> [i \in Indexes |-> NotChosen]]
   /\ acks   = [s \in Servers |-> [t \in 0..MaxTerm |-> 0]]
-  /\ grants = [s \in Servers |-> [i \in Indexes |-> Nothing]]
   /\ chosen = [i \in Indexes |-> NotChosen]
 
 ----------------------------------------------------------------------------
-\* A proposal reaches a member, which holds it if it holds nothing there.
+\* A proposal reaches a member, which holds it if it holds nothing there,
+\* and says so as of its term.  What it says a leader may act on at any
+\* later time or never: one that holds and has not said is one whose word
+\* no leader has acted on.
 Hold(m, i, v) ==
   /\ i > Len(log[m])
   /\ held[m][i] = Nothing
   /\ held' = [held EXCEPT ![m][i] = v]
-  /\ UNCHANGED <<term, vote, role, log, commit, says, acks, grants, chosen>>
+  /\ says' = [says EXCEPT ![m][i] = [value |-> v, term |-> term[m]]]
+  /\ UNCHANGED <<term, vote, role, log, commit, acks, chosen>>
 
-\* A member says what it holds, as of its term.
+\* A member says again what it holds, as of a term it has come to since.
 Say(m, i) ==
   /\ held[m][i] # Nothing
+  /\ says[m][i].term # term[m]
   /\ says' = [says EXCEPT ![m][i] = [value |-> held[m][i], term |-> term[m]]]
-  /\ UNCHANGED <<term, vote, role, log, held, commit, acks, grants, chosen>>
+  /\ UNCHANGED <<term, vote, role, log, held, commit, acks, chosen>>
 
 \* A leader takes an entry for the next index of its log.
 Take(l, v) ==
@@ -133,13 +156,19 @@ Take(l, v) ==
   /\ Len(log[l]) < MaxLen
   /\ log' = [log EXCEPT ![l] = Append(@, [term |-> term[l], value |-> v])]
   /\ held' = [held EXCEPT ![l] = Release(@, Len(log[l]) + 1)]
-  /\ UNCHANGED <<term, vote, role, commit, says, acks, grants, chosen>>
+  /\ UNCHANGED <<term, vote, role, commit, says, acks, chosen>>
 
+CONSTANT Counts   \* "round" | "any"
+\* A member's log is of the leader's round: it said it holds the leader's
+\* log through an entry of the leader's term.
+OfTheRound(l, m) ==
+  LET a == acks[m][term[l]]
+  IN a >= 1 /\ a <= Len(log[l]) /\ log[l][a].term = term[l]
 \* Who holds the entry a leader has at an index, as the leader was told.
+\* "round" is what the core does.
 HoldsByItself(l, m, i) ==
-  \/ says[m][i] = [value |-> log[l][i].value, term |-> term[l]]
-  \/ /\ vote[m] = l /\ term[m] = term[l]
-     /\ grants[m][i] = log[l][i].value
+  /\ Counts = "any" \/ OfTheRound(l, m)
+  /\ says[m][i] = [value |-> log[l][i].value, term |-> term[l]]
 HoldsFromLeader(l, m, i) ==
   \/ m = l
   \/ acks[m][term[l]] >= i
@@ -157,7 +186,7 @@ FastCommit(l) ==
   /\ {m \in Servers : HoldsByItself(l, m, i) \/ HoldsFromLeader(l, m, i)} \in Fast
   /\ commit' = [commit EXCEPT ![l] = i]
   /\ chosen' = Choose(i, l)
-  /\ UNCHANGED <<term, vote, role, log, held, says, acks, grants>>
+  /\ UNCHANGED <<term, vote, role, log, held, says, acks>>
 
 ClassicCommit(l, i) ==
   /\ role[l] = "leader"
@@ -170,7 +199,7 @@ ClassicCommit(l, i) ==
                  IF j > commit[l] /\ j <= i /\ chosen[j] = NotChosen
                  THEN [value |-> log[l][j].value, term |-> term[l]]
                  ELSE chosen[j]]
-  /\ UNCHANGED <<term, vote, role, log, held, says, acks, grants>>
+  /\ UNCHANGED <<term, vote, role, log, held, says, acks>>
 
 \* A member takes from a leader what follows the point p, through k.
 Replicate(l, m, p) ==
@@ -195,68 +224,78 @@ Replicate(l, m, p) ==
   /\ vote' = [vote EXCEPT ![m] = IF term[m] = term[l] THEN @ ELSE Nobody]
   /\ role' = [role EXCEPT ![m] = "follower"]
   /\ acks' = [acks EXCEPT ![m][term[l]] = Max(@, k)]
-  /\ UNCHANGED <<says, grants, chosen>>
-
-Campaign(c) ==
-  /\ role[c] # "leader"
-  /\ term[c] < MaxTerm
-  /\ term' = [term EXCEPT ![c] = @ + 1]
-  /\ vote' = [vote EXCEPT ![c] = c]
-  /\ role' = [role EXCEPT ![c] = "candidate"]
-  /\ grants' = [grants EXCEPT ![c] = held[c]]
-  /\ UNCHANGED <<log, held, commit, says, acks, chosen>>
+  /\ UNCHANGED <<says, chosen>>
 
 Current(c, m) ==
   \/ LastTerm(log[c]) > LastTerm(log[m])
   \/ LastTerm(log[c]) = LastTerm(log[m]) /\ Len(log[c]) >= Len(log[m])
 
-Grant(m, c) ==
-  /\ m # c
-  /\ role[c] = "candidate"
-  /\ term[m] <= term[c]
-  /\ term[m] < term[c] \/ vote[m] \in {Nobody, c}
-  /\ Current(c, m)
-  /\ term' = [term EXCEPT ![m] = term[c]]
-  /\ vote' = [vote EXCEPT ![m] = c]
-  /\ role' = [role EXCEPT ![m] = "follower"]
-  /\ grants' = [grants EXCEPT ![m] = held[m]]
-  /\ UNCHANGED <<log, held, commit, says, acks, chosen>>
-
-\* How many of the voters Q said they hold v at i, by their votes for c.
-Count(c, Q, i, v) ==
-  Cardinality({m \in Q : grants[m][i] = v})
-\* MostHeld is what the core does.  LeastHeld and AnyHeld are what it does
-\* not, kept to show that the properties fail without the rule.
-MostHeld(c, Q, i, v) ==
-  /\ Count(c, Q, i, v) > 0
-  /\ \A w \in Values : Count(c, Q, i, w) <= Count(c, Q, i, v)
-LeastHeld(c, Q, i, v) ==
-  /\ Count(c, Q, i, v) > 0
-  /\ \A w \in Values : Count(c, Q, i, w) > 0 => Count(c, Q, i, v) <= Count(c, Q, i, w)
+\* How many of the voters V hold v at i by themselves, as their votes say.
+Count(V, i, v) ==
+  Cardinality({m \in V : held[m][i] = v})
+\* MostHeld is what the core does.  LeastHeld is what it does not, kept to
+\* show that the properties fail without the rule.
+MostHeld(V, i, v) ==
+  /\ Count(V, i, v) > 0
+  /\ \A w \in Values : Count(V, i, w) <= Count(V, i, v)
+LeastHeld(V, i, v) ==
+  /\ Count(V, i, v) > 0
+  /\ \A w \in Values : Count(V, i, w) > 0 => Count(V, i, v) <= Count(V, i, w)
 
 CONSTANT Rule   \* "most" | "least"
-Recovered(c, Q, i, v) ==
-  IF \A w \in Values : Count(c, Q, i, w) = 0
+Recovered(V, i, v) ==
+  IF \A w \in Values : Count(V, i, w) = 0
   THEN v = Noop
-  ELSE IF Rule = "most" THEN MostHeld(c, Q, i, v) ELSE LeastHeld(c, Q, i, v)
+  ELSE IF Rule = "most" THEN MostHeld(V, i, v) ELSE LeastHeld(V, i, v)
 
-Lead(c, Q) ==
-  /\ role[c] = "candidate"
-  /\ Q \in Classic
-  /\ \A m \in Q : vote[m] = c /\ term[m] = term[c]
-  /\ LET length == Len(log[c])
-         reported == {i \in Indexes : /\ i > length
-                                      /\ \E v \in Values : Count(c, Q, i, v) > 0}
-         top == IF reported = {} THEN length
-                ELSE CHOOSE i \in reported : \A j \in reported : j <= i
-     IN \E taken \in [(length + 1)..top -> Stated] :
-             /\ \A i \in (length + 1)..top : Recovered(c, Q, i, taken[i])
-             /\ log' = [log EXCEPT ![c] =
-                          @ \o [i \in 1..(top - length) |->
-                                 [term |-> term[c], value |-> taken[length + i]]]]
+\* A member campaigns in the next term, whatever it was: one that led has
+\* heard of a later term, or lost its members, and leads no longer; it
+\* keeps its log.  The voters of Q give it their votes, each saying what it
+\* holds by itself, and it leads if it counts a classic quorum V of them
+\* and itself; a vote of Q that is not of V came after the count.  V is
+\* empty for a campaign that counts no quorum, whose voters are left in
+\* its term.
+\*
+\* The votes are one step.  Taken one by one, with other steps between,
+\* they reach nothing more: a voter that has voted takes nothing from an
+\* older leader, what it comes to hold after its vote the candidate does
+\* not hear of with the vote and hears of when the voter says it, and a
+\* step of a member that has not yet voted is the same step taken before
+\* the campaign.  One step for four and more is what lets every state of
+\* two indexes be visited (StateBudget).
+Elect(c, Q, V) ==
+  LET t == term[c] + 1
+      voted == Q \cup {c}
+  IN
+  /\ term[c] < MaxTerm
+  /\ c \notin Q
+  /\ \A m \in Q : /\ term[m] < t \/ (term[m] = t /\ vote[m] = Nobody)
+                  /\ Current(c, m)
+  /\ V = {} \/ (c \in V /\ V \subseteq voted /\ V \in Classic)
+  /\ term'   = [m \in Servers |-> IF m \in voted THEN t ELSE term[m]]
+  /\ vote'   = [m \in Servers |-> IF m \in voted THEN c ELSE vote[m]]
+  /\ says'   = [m \in Servers |-> [i \in Indexes |->
+                 IF m \in voted /\ held[m][i] # Nothing
+                 THEN [value |-> held[m][i], term |-> t]
+                 ELSE says[m][i]]]
+  /\ IF V = {}
+     THEN /\ role' = [m \in Servers |-> IF m \in voted THEN "follower" ELSE role[m]]
+          /\ UNCHANGED <<log, held>>
+     ELSE LET length == Len(log[c])
+              reported == {i \in Indexes : /\ i > length
+                                           /\ \E v \in Values : Count(V, i, v) > 0}
+              top == IF reported = {} THEN length
+                     ELSE CHOOSE i \in reported : \A j \in reported : j <= i
+          IN /\ \E taken \in [(length + 1)..top -> Stated] :
+                  /\ \A i \in (length + 1)..top : Recovered(V, i, taken[i])
+                  /\ log' = [log EXCEPT ![c] =
+                               @ \o [i \in 1..(top - length) |->
+                                      [term |-> t, value |-> taken[length + i]]]]
              /\ held' = [held EXCEPT ![c] = Release(@, top)]
-  /\ role' = [role EXCEPT ![c] = "leader"]
-  /\ UNCHANGED <<term, vote, commit, says, acks, grants, chosen>>
+             /\ role' = [m \in Servers |-> IF m = c THEN "leader"
+                                           ELSE IF m \in voted THEN "follower"
+                                           ELSE role[m]]
+  /\ UNCHANGED <<commit, acks, chosen>>
 
 Next ==
   \/ \E m \in Servers, i \in Indexes, v \in Values : Hold(m, i, v)
@@ -265,9 +304,8 @@ Next ==
   \/ \E l \in Servers : FastCommit(l)
   \/ \E l \in Servers, i \in Indexes : ClassicCommit(l, i)
   \/ \E l, m \in Servers, p \in 0..MaxLen : Replicate(l, m, p)
-  \/ \E c \in Servers : Campaign(c)
-  \/ \E m, c \in Servers : Grant(m, c)
-  \/ \E c \in Servers, Q \in SUBSET Servers : Lead(c, Q)
+  \/ \E c \in Servers : \E Q \in SUBSET (Servers \ {c}) :
+       \E V \in SUBSET (Q \cup {c}) : Elect(c, Q, V)
 
 Spec == Init /\ [][Next]_vars
 
@@ -290,6 +328,24 @@ LeaderHolds ==
 OneLeader ==
   \A l, m \in Servers :
     (role[l] = "leader" /\ role[m] = "leader" /\ term[l] = term[m]) => l = m
+
+\* A leader committed an index of its term that no classic quorum holds
+\* from it: it counted what members hold by themselves.  A configuration
+\* that checks the fast track must reach this, or it checks nothing of it
+\* (FastTrackReached.cfg, which the checker must refuse): with the round
+\* rule and one index it is never reached, for a member whose log is of the
+\* leader's term then holds the index from the leader.
+FastByHeld ==
+  \E l \in Servers, i \in Indexes :
+    /\ role[l] = "leader"
+    /\ commit[l] >= i
+    /\ chosen[i].term = term[l]
+    /\ {m \in Servers : HoldsFromLeader(l, m, i)} \notin Classic
+NoFastByHeld == ~FastByHeld
+
+\* For the checker: it has found no more states than the configuration
+\* states it has.
+WithinBudget == TLCGet("distinct") <= StateBudget
 
 \* For the checker: the servers are alike.
 Alike == Permutations(Servers) \cup Permutations(Values)

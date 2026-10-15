@@ -1,15 +1,19 @@
 //! Client-composed observations of the native engine: one claim's lineage as
-//! a bounded page of committed claims, and a bounded wait for a predicate on
-//! one claim. Both are reads only; neither mints an identity, registers a
+//! one bounded observation at one prefix, and a bounded wait for a predicate
+//! on one claim. Both are reads only; neither mints an identity, registers a
 //! monitor or touches a journal.
 use crate::CompileError;
 use crate::driver::{CLAIM_EXPAND, DriveError, Lists, READ_ITEMS, Reads};
 use focal_client::ClientError;
 use focal_client::claim_wait::{ClaimObservation, ClaimWaitCondition};
 use focal_client::input::{BuildContext, InputError, parse_id};
-use focal_client::operations::{NativeObjectDocument, NativeWaitDocument, NativeWaitResult};
+use focal_client::operations::{
+    NativeFollowersBeyond, NativeLineage, NativeObjectDocument, NativeWaitDocument,
+    NativeWaitResult,
+};
 use focal_model::*;
 use focal_wire::*;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 /// How many `caused_by` ancestors a lineage page follows.
@@ -19,8 +23,16 @@ pub const LINEAGE_DEPTH: usize = 16;
 const LINEAGE_RELATED: usize = 64;
 /// The wait observer's probe bound, one second apart under one deadline.
 pub const WAIT_PROBES: u32 = 31;
-/// The host's bounded, cancellable sleep between wait probes.
-pub type Pause<'a> = dyn FnMut(Duration) -> Result<(), DriveError> + 'a;
+/// The host's bounded, cancellable sleep between wait probes. A synchronous
+/// closure is one, ended as it returns.
+pub trait Pause {
+    fn pause(&mut self, period: Duration) -> impl Future<Output = Result<(), DriveError>>;
+}
+impl<F: FnMut(Duration) -> Result<(), DriveError>> Pause for F {
+    fn pause(&mut self, period: Duration) -> impl Future<Output = Result<(), DriveError>> {
+        std::future::ready(self(period))
+    }
+}
 
 const CONTENT_ONLY: NativeClaimExpand = NativeClaimExpand {
     content: true,
@@ -37,7 +49,7 @@ const STATE_ONLY: NativeClaimExpand = NativeClaimExpand {
     history: false,
 };
 
-fn claim_of(page: &NativeReadPage) -> Option<&NativeClaim> {
+pub(crate) fn claim_of(page: &NativeReadPage) -> Option<&NativeClaim> {
     page.objects.iter().find_map(|object| match object {
         NativeObject::Claim(claim) => Some(&**claim),
         _ => None,
@@ -57,26 +69,34 @@ fn add(a: u32, b: u32) -> Result<u32, DriveError> {
     a.checked_add(b).ok_or_else(|| InputError::Capacity.into())
 }
 
-/// One claim's lineage: the claim itself (full expansion), its `caused_by`
-/// ancestors up to `LINEAGE_DEPTH`, then the committed claims that
-/// invalidate it, refine it or are caused by it (each with its content, up to
-/// `LINEAGE_RELATED`). The page carries the first read's token; every later
-/// read is at least at that token, so nothing shown predates the claim shown.
-pub fn lineage(
+/// One claim's lineage as one observation at one prefix (the audit's F10):
+/// the claim itself (full expansion), its `caused_by` ancestors up to
+/// `LINEAGE_DEPTH`, then the committed claims that invalidate it, refine it
+/// or are caused by it (each with its content, up to `LINEAGE_RELATED`). The
+/// first read is linearizable and every later read is exact at its token, so
+/// the observation is of one prefix; what its bounds left out — the next
+/// ancestor past the depth, an ancestor unreadable at the prefix, followers
+/// listed past the bound, a relation list that did not reach its end — is
+/// named beside what they took (`NativeLineage`), never mistaken for a
+/// complete lineage.
+pub async fn lineage(
     document: &NativeObjectDocument,
     build: &BuildContext,
-    reads: &mut Reads<'_>,
-    lists: &mut Lists<'_>,
-) -> Result<NativeReadPage, DriveError> {
+    reads: &mut impl Reads,
+    lists: &mut impl Lists,
+) -> Result<NativeLineage, DriveError> {
     let id = ClaimId(parse_id(&document.id)?);
-    let first = reads(NativeReadRequest {
-        consistency: ReadConsistency::Linearizable,
-        query: NativeReadQuery::Claim {
-            id,
-            expand: CLAIM_EXPAND,
-        },
-        max_items: READ_ITEMS,
-    })?;
+    let first = reads
+        .read(NativeReadRequest {
+            consistency: ReadConsistency::Linearizable,
+            query: NativeReadQuery::Claim {
+                id,
+                expand: CLAIM_EXPAND,
+                after: None,
+            },
+            max_items: READ_ITEMS,
+        })
+        .await?;
     let token = first.token;
     let native_sequence = first.native_sequence;
     let logical_time = first.logical_time;
@@ -85,92 +105,136 @@ pub fn lineage(
         .ok_or(CompileError::Missing("claim"))?
         .cause
         .clone();
-    let mut objects = Vec::new();
-    push(
-        &mut objects,
-        take_claim(first).ok_or(CompileError::Missing("claim"))?,
-    )?;
-    let mut at_least = |query: NativeReadQuery| {
-        reads(NativeReadRequest {
-            consistency: ReadConsistency::AtLeast(token),
-            query,
-            max_items: READ_ITEMS,
-        })
-    };
+    let claim = take_claim(first).ok_or(CompileError::Missing("claim"))?;
     // Ancestors, nearest first.
-    for _ in 0..LINEAGE_DEPTH {
-        let Cause::Claim(parent) = cause else {
+    let mut ancestors = Vec::new();
+    let mut ancestors_beyond = None;
+    let mut ancestors_missing = None;
+    while let Cause::Claim(parent) = cause {
+        if ancestors.len() >= LINEAGE_DEPTH {
+            ancestors_beyond = Some(parent);
             break;
-        };
-        let page = at_least(NativeReadQuery::Claim {
-            id: parent,
-            expand: CONTENT_ONLY,
-        })?;
+        }
+        let page = exact(
+            reads,
+            token,
+            NativeReadQuery::Claim {
+                id: parent,
+                expand: CONTENT_ONLY,
+                after: None,
+            },
+        )
+        .await?;
         visited = add(visited, page.visited)?;
         let Some(ancestor) = claim_of(&page) else {
+            ancestors_missing = Some(parent);
             break;
         };
         cause = ancestor.cause.clone();
         push(
-            &mut objects,
+            &mut ancestors,
             take_claim(page).ok_or(CompileError::Missing("claim"))?,
         )?;
     }
     // Followers: corrections, refinements and children, by relation index.
     let mut related: Vec<ClaimId> = Vec::new();
+    let mut followers_beyond = Vec::new();
     for kind in [
         RelationKind::Invalidates,
         RelationKind::Refines,
         RelationKind::CausedBy,
     ] {
-        let page = lists(NativeListRequest {
-            filter: NativeListFilter::Claims {
-                issuer: None,
-                subject: None,
-                status: None,
-                action: None,
-                scope: None,
-                relation: Some(Relation {
-                    kind,
-                    target: RelationTarget::Object(ObjectRef::claim(build.ledger, id)),
-                }),
-                created_after: None,
-            },
-            cursor: None,
-            max_items: READ_ITEMS,
-            max_visits: 1024,
-        })?;
+        let page = lists
+            .list(NativeListRequest {
+                filter: NativeListFilter::Claims {
+                    issuer: None,
+                    subject: None,
+                    status: None,
+                    action: None,
+                    scope: None,
+                    relation: Some(Relation {
+                        kind,
+                        target: RelationTarget::Object(ObjectRef::claim(build.ledger, id)),
+                    }),
+                    created_after: None,
+                },
+                cursor: None,
+                max_items: READ_ITEMS,
+                max_visits: 1024,
+            })
+            .await?;
         visited = add(visited, page.visited)?;
+        let mut listed_not_read = 0u32;
         for object in &page.objects {
             let NativeObject::Claim(claim) = object else {
                 continue;
             };
             let follower = ClaimId(claim.binding.object.0);
-            if follower == id || related.contains(&follower) || related.len() >= LINEAGE_RELATED {
+            if follower == id || related.contains(&follower) {
+                continue;
+            }
+            if related.len() >= LINEAGE_RELATED {
+                listed_not_read = add(listed_not_read, 1)?;
                 continue;
             }
             related.try_reserve(1).map_err(|_| InputError::Capacity)?;
             related.push(follower);
         }
-    }
-    for follower in related {
-        let page = at_least(NativeReadQuery::Claim {
-            id: follower,
-            expand: CONTENT_ONLY,
-        })?;
-        visited = add(visited, page.visited)?;
-        if let Some(object) = take_claim(page) {
-            push(&mut objects, object)?;
+        if listed_not_read > 0 || page.next.is_some() {
+            followers_beyond
+                .try_reserve(1)
+                .map_err(|_| InputError::Capacity)?;
+            followers_beyond.push(NativeFollowersBeyond {
+                kind,
+                listed_not_read,
+                cursor: page.next,
+            });
         }
     }
-    Ok(NativeReadPage {
+    let mut followers = Vec::new();
+    for follower in related {
+        let page = exact(
+            reads,
+            token,
+            NativeReadQuery::Claim {
+                id: follower,
+                expand: CONTENT_ONLY,
+                after: None,
+            },
+        )
+        .await?;
+        visited = add(visited, page.visited)?;
+        if let Some(object) = take_claim(page) {
+            push(&mut followers, object)?;
+        }
+    }
+    Ok(NativeLineage {
         token,
         native_sequence,
         logical_time,
-        objects,
-        next: None,
+        claim,
+        ancestors,
+        ancestors_beyond,
+        ancestors_missing,
+        followers,
+        followers_beyond,
         visited,
     })
+}
+
+/// One page of `query` at exactly `token`'s prefix.
+async fn exact(
+    reads: &mut impl Reads,
+    token: ReadToken,
+    query: NativeReadQuery,
+) -> Result<NativeReadPage, DriveError> {
+    reads
+        .read(NativeReadRequest {
+            consistency: ReadConsistency::Exact(token),
+            query,
+            max_items: READ_ITEMS,
+        })
+        .await
 }
 
 /// Observe one claim until the predicate holds: at most `WAIT_PROBES` fresh
@@ -178,10 +242,10 @@ pub fn lineage(
 /// seconds, keeping only the latest observation. An observation that moves
 /// backwards (an older prefix, a lower revision, a terminal status that
 /// changes) is an invalid response, never a met predicate.
-pub fn wait(
+pub async fn wait(
     document: &NativeWaitDocument,
-    reads: &mut Reads<'_>,
-    pause: &mut Pause<'_>,
+    reads: &mut impl Reads,
+    pause: &mut impl Pause,
 ) -> Result<NativeWaitResult, DriveError> {
     if !(1..=30_000).contains(&document.timeout_ms) {
         return Err(InputError::Invalid("timeout_ms must be in 1..=30000").into());
@@ -195,14 +259,17 @@ pub fn wait(
         if Instant::now() >= deadline {
             break;
         }
-        let page = reads(NativeReadRequest {
-            consistency: ReadConsistency::Linearizable,
-            query: NativeReadQuery::Claim {
-                id,
-                expand: STATE_ONLY,
-            },
-            max_items: 1,
-        })?;
+        let page = reads
+            .read(NativeReadRequest {
+                consistency: ReadConsistency::Linearizable,
+                query: NativeReadQuery::Claim {
+                    id,
+                    expand: STATE_ONLY,
+                    after: None,
+                },
+                max_items: 1,
+            })
+            .await?;
         let claim = claim_of(&page).ok_or(CompileError::Missing("claim"))?;
         let observation = ClaimObservation {
             token: page.token,
@@ -249,7 +316,7 @@ pub fn wait(
         if remaining.is_zero() {
             break;
         }
-        pause(Duration::from_secs(1).min(remaining))?;
+        pause.pause(Duration::from_secs(1).min(remaining)).await?;
     }
     latest.ok_or_else(|| ClientError::Transport.into())
 }

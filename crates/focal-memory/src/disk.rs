@@ -28,8 +28,10 @@ pub enum DiskKind {
     Content,
     Archive,
     Staging,
+    /// A replica's payload log (doc 31 M3).
+    Payload,
 }
-pub const DISK_KIND_COUNT: usize = 5;
+pub const DISK_KIND_COUNT: usize = 6;
 
 /// The volume policy: `headroom` is never spent (the watermark below which
 /// the node refuses fresh work), `completion_reserve` is spendable only by
@@ -192,7 +194,7 @@ impl DiskBudget {
             return if config.headroom == 0 { u64::MAX } else { 0 };
         }
         let protected = match lane {
-            BudgetLane::Completion => config.headroom,
+            BudgetLane::Completion | BudgetLane::Committed => config.headroom,
             BudgetLane::Ordinary => config.headroom.saturating_add(config.completion_reserve),
         };
         free.saturating_sub(outstanding).saturating_sub(protected)
@@ -256,13 +258,14 @@ impl DiskBudget {
         }
     }
     fn kind_counter(&self, kind: DiskKind) -> &AtomicU64 {
-        let [wal, checkpoint, content, archive, staging] = &self.0.kinds;
+        let [wal, checkpoint, content, archive, staging, payload] = &self.0.kinds;
         match kind {
             DiskKind::Wal => wal,
             DiskKind::Checkpoint => checkpoint,
             DiskKind::Content => content,
             DiskKind::Archive => archive,
             DiskKind::Staging => staging,
+            DiskKind::Payload => payload,
         }
     }
     fn release(&self, kind: DiskKind, lane: BudgetLane, bytes: u64, committed: bool) {
@@ -315,6 +318,25 @@ impl DiskReservation {
     pub fn commit(mut self) {
         let bytes = std::mem::replace(&mut self.bytes, 0);
         self.budget.release(self.kind, self.lane, bytes, true);
+    }
+    /// Carve `bytes` of this promise into a reservation of its own, of the
+    /// same kind and lane, leaving the rest here: for an owner that admitted
+    /// several writes as they came and finishes them one at a time. Refused,
+    /// nothing changed, past what this one holds.
+    pub fn split_off(&mut self, bytes: u64) -> Result<DiskReservation, MemoryError> {
+        let rest = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or(MemoryError::InvalidConfiguration(
+                "a disk reservation split past what it holds",
+            ))?;
+        self.bytes = rest;
+        Ok(DiskReservation {
+            budget: self.budget.clone(),
+            kind: self.kind,
+            lane: self.lane,
+            bytes,
+        })
     }
     /// Keep only `bytes` of the promise (a write that turned out smaller).
     pub fn shrink_to(&mut self, bytes: u64) -> Result<(), MemoryError> {

@@ -4,7 +4,6 @@
 use super::*;
 use crate::directory_bootstrap::{DirectoryBootstrapError, PartitionBootstrapPermit};
 use focal_directory::PartitionCheckpoint;
-use focal_log::SharedWal;
 
 const DIRECTORY_STACK_BYTES: usize = 2 * 1024 * 1024;
 
@@ -12,18 +11,26 @@ const DIRECTORY_STACK_BYTES: usize = 2 * 1024 * 1024;
 /// owner, host clones and egress. This receiver cannot be detached from its
 /// allowance; frames additionally retain their individual transport permits.
 pub struct DirectoryReplication {
-    receiver: async_mpsc::Receiver<ControlReplicationFrame>,
+    receiver: ChannelReceiver<ControlReplicationFrame>,
     _progress: watch::Receiver<ControlProgressState>,
 }
 impl DirectoryReplication {
+    /// The next frame; `None` once the owner's egress has ended (or no
+    /// wait could be kept: off a shard).
     pub async fn recv(&mut self) -> Option<ControlReplicationFrame> {
-        self.receiver.recv().await
+        self.receiver.recv().await.ok()
     }
-    pub fn try_recv(&mut self) -> Result<ControlReplicationFrame, async_mpsc::error::TryRecvError> {
-        self.receiver.try_recv()
+    /// A frame already queued, without waiting.
+    pub fn try_recv(&mut self) -> Option<ControlReplicationFrame> {
+        self.receiver.try_recv().ok().flatten()
     }
-    pub fn close(&mut self) {
-        self.receiver.close();
+    /// Polls for the next frame as the replication driver does: `Closed`
+    /// once the owner's egress has ended and nothing is queued.
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<ControlReplicationFrame, hyper_rt::sync::SyncError<()>>> {
+        std::future::Future::poll(std::pin::pin!(self.receiver.recv()), cx)
     }
 }
 impl ControlHost {
@@ -33,7 +40,7 @@ impl ControlHost {
     /// marks progress stopped and closes queued callers without granting success.
     pub fn spawn_directory(
         permit: PartitionBootstrapPermit,
-        wal: SharedWal,
+        storage: focal_consensus::NodeStorage,
         budget: MemoryBudget,
         image: Option<PartitionCheckpoint>,
     ) -> Result<(Self, ControlOwner, DirectoryReplication), DirectoryBootstrapError> {
@@ -66,23 +73,32 @@ impl ControlHost {
             .commit();
         let (sender, receiver) = mpsc::sync_channel(config.queue_items);
         let (peers, incoming) = mpsc::sync_channel(config.replication_queue);
-        let (outbound, outgoing) = async_mpsc::channel(config.replication_queue);
+        let (outbound, outgoing) = hyper_rt::sync::channel(config.replication_queue)
+            .map_err(|_| DirectoryBootstrapError::Capacity)?;
         let (progress, changes) = watch::channel(ControlProgressState {
             value: ControlProgress {
                 identity,
-                node: plan.founder_node(),
+                node: plan.host(),
                 leader: 0,
                 term: 0,
                 applied_index: 0,
                 revisions: ControlRevisions::default(),
                 dropped_replication: 0,
+                peers_unreachable: 0,
+                appends_rejected: 0,
+                frames_held: 0,
+                frames_let_go: 0,
+                frames_stale: 0,
+                peer_reports_coalesced: 0,
+                peer_reports_dropped: 0,
                 stopped: false,
                 snapshot_index: 0,
                 peers: Vec::new(),
                 failure: None,
             },
             _allocation: Some(allocation),
-        });
+        })
+        .map_err(|_| DirectoryBootstrapError::Capacity)?;
         let pace = crate::control_host::TickPeriod::default();
         let owner_pace = pace.clone();
         let host = Self {
@@ -95,17 +111,24 @@ impl ControlHost {
             pace,
         };
         let thread = std::thread::Builder::new()
-            .name(format!("focal-directory-{}", plan.founder_node()))
+            .name(format!("focal-directory-{}", plan.host()))
             .stack_size(DIRECTORY_STACK_BYTES)
             .spawn(move || {
                 let _outcome = catch_unwind(AssertUnwindSafe(
                     || -> Result<(), DirectoryBootstrapError> {
-                        let opened = permit.open(wal, &budget, image)?;
+                        let opened = permit.open(storage, &budget, image)?;
+                        let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
                         let owner = Owner {
                             replica: opened.into_replica(),
                             initial: None,
                             verifier: crate::cluster::NoDirectoryAuthority,
                             config,
+                            stopping: None,
+                            lost_sender: lost.0,
+                            lost: lost.1,
+                            lost_peers: Vec::new(),
+                            lost_coalesced: 0,
+                            lost_dropped: 0,
                             limits,
                             budget,
                             pending: VecDeque::new(),
@@ -116,6 +139,20 @@ impl ControlHost {
                             progress: progress.clone(),
                             nonce: 0,
                             dropped: 0,
+                            ordered: std::collections::BTreeMap::new(),
+                            resequencer: crate::resequence::Resequencer::new(
+                                focal_consensus::DEFAULT_INFLIGHT_WINDOW,
+                                crate::fleet::LOST_PEERS,
+                            ),
+                            stepped: Vec::new(),
+                            waiting_frames: std::collections::VecDeque::new(),
+                            appends_rejected: 0,
+                            frames_held: 0,
+                            frames_let_go: 0,
+                            frames_stale: 0,
+                            acks: crate::ack_clock::AckClock::default(),
+                            took_turn: false,
+                            unreachable: 0,
                             failure: None,
                             pace: owner_pace,
                         };

@@ -1,13 +1,22 @@
 use super::*;
+use crate::native::layout::PackedKey;
 use focal_memory::{Entry, RangeHydrationLookup, RangeHydrationSource};
 
 struct Objects<'a, 'root, 'bytes, C> {
-    dependencies: &'a RangeHydrationLookup<'root, Key, Row>,
+    dependencies: &'a RangeHydrationLookup<'root, PackedKey, Row>,
     shared: &'a Shared<'a, 'bytes, C>,
 }
 impl<C> read_dispatch::Objects for Objects<'_, '_, '_, C> {
     fn ledger(&self) -> LedgerId {
         self.shared.header.ledger
+    }
+    fn payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        self.shared
+            .log
+            .map(|log| -> &dyn crate::native::payloads::PayloadRead { log })
+    }
+    fn payload_log(&self) -> Option<&dyn crate::native::payloads::PayloadLog> {
+        self.shared.log
     }
     fn prefix(&self) -> SessionSeq {
         self.shared.header.prefix
@@ -16,7 +25,7 @@ impl<C> read_dispatch::Objects for Objects<'_, '_, '_, C> {
         meter
             .charge(read_index::lookup_work()?)
             .map_err(read_evidence::codec)?;
-        Ok(self.dependencies.get(&key))
+        Ok(self.dependencies.get(&PackedKey::probe(&key)))
     }
     fn claim_dependency(
         &self,
@@ -44,7 +53,7 @@ fn context<'a, O, C>(
         objects,
         custody: shared.custody,
         workspace: shared.budget,
-        workspace_lane: BudgetLane::Completion,
+        workspace_lane: BudgetLane::Committed,
         parsing: &shared.meters.parsing,
         source: &shared.meters.source,
         model: &shared.meters.model,
@@ -54,29 +63,31 @@ fn context<'a, O, C>(
 }
 pub(super) struct Source<'a, 'bytes, C> {
     row: EncodedRow<'bytes>,
+    /// The row's key as the store holds it (doc 31 M3), packed once as the row is read.
+    key: PackedKey,
     shared: &'a Shared<'a, 'bytes, C>,
 }
 pub(super) struct Plan<'p, 'a, 'bytes, C> {
     source: &'p Source<'a, 'bytes, C>,
-    dependencies: RangeHydrationLookup<'p, Key, Row>,
+    dependencies: RangeHydrationLookup<'p, PackedKey, Row>,
     quote: read_dispatch::Quote,
 }
-impl<'s, 'bytes, C: read_evidence::Custody> RangeHydrationSource<Key, Row>
+impl<'s, 'bytes, C: read_evidence::Custody> RangeHydrationSource<PackedKey, Row>
     for Source<'s, 'bytes, C>
 {
     type Plan<'a>
         = Plan<'a, 's, 'bytes, C>
     where
         Self: 'a;
-    fn key(&self) -> &Key {
-        &self.row.key
+    fn key(&self) -> &PackedKey {
+        &self.key
     }
     fn prepare<'a>(
         &'a self,
-        dependencies: RangeHydrationLookup<'a, Key, Row>,
-    ) -> Result<Entry<Key, Self::Plan<'a>>, MemoryError>
+        dependencies: RangeHydrationLookup<'a, PackedKey, Row>,
+    ) -> Result<Entry<PackedKey, Self::Plan<'a>>, MemoryError>
     where
-        Key: 'a,
+        PackedKey: 'a,
         Row: 'a,
     {
         let objects = Objects {
@@ -86,13 +97,19 @@ impl<'s, 'bytes, C: read_evidence::Custody> RangeHydrationSource<Key, Row>
         let quote = read_dispatch::prepare(&self.row, &context(&objects, self.shared))
             .map_err(|error| self.shared.refuse(error))?;
         Ok(Entry::new(
-            self.row.key,
+            self.key.clone(),
             Plan {
                 source: self,
                 dependencies,
                 quote,
             },
-            quote.heap_bytes,
+            // A wide row's box is charged to its entry (`Row`): the key's
+            // family names the box it may take; and so is a wide key's heap.
+            quote
+                .heap_bytes
+                .checked_add(self.row.key.boxed_heap())
+                .and_then(|bytes| bytes.checked_add(self.key.heap_bytes()))
+                .ok_or(MemoryError::AllocationFailed)?,
         ))
     }
     fn build<'a>(plan: Self::Plan<'a>, allowance: usize) -> Result<(Row, usize), MemoryError>
@@ -109,7 +126,10 @@ impl<'s, 'bytes, C: read_evidence::Custody> RangeHydrationSource<Key, Row>
             &context(&objects, shared),
             plan.quote,
             allowance,
-            |row, actual| Ok((row, actual)),
+            |row, actual| {
+                let boxed = row.boxed_heap();
+                Ok((row, crate::native::prepare::add(actual, boxed)?))
+            },
         )
         .map_err(|error| shared.refuse(error))
     }
@@ -156,8 +176,32 @@ impl<'a, 'bytes, C> Iterator for Sources<'a, 'bytes, C> {
                 if read_index::phase(row.key)? != self.phase {
                     return Ok(None);
                 }
+                let key = PackedKey::pack(&row.key)?;
+                if crate::native::ranges::indexed(&key) {
+                    // Its member's key set holds it (doc 31 M3): checked as
+                    // every fixed row is, its key given to the set in order.
+                    read_dispatch::index_row(
+                        &row,
+                        &self.shared.meters.parsing,
+                        &self.shared.meters.model,
+                        self.shared.header.ledger,
+                    )?;
+                    self.shared
+                        .keys
+                        .try_borrow_mut()
+                        .map_err(|_| {
+                            MemoryError::InvalidConfiguration("index keys borrowed twice")
+                        })?
+                        .as_mut()
+                        .ok_or(MemoryError::InvalidConfiguration(
+                            "index keys finished early",
+                        ))?
+                        .push(key.as_bytes())?;
+                    return Ok(None);
+                }
                 Ok(Some(Source {
                     row,
+                    key,
                     shared: self.shared,
                 }))
             })();

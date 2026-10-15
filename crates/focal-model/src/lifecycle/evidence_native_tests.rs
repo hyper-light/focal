@@ -522,9 +522,9 @@ fn zero_check_output_slots_remain_declared_and_close_allocations_are_fallible_an
         },
     )
     .unwrap();
-    assert!(policy.has_slot(7));
-    assert!(!policy.has_slot(0));
-    assert!(!policy.has_slot(10));
+    assert!(policy.view().has_slot(7));
+    assert!(!policy.view().has_slot(0));
+    assert!(!policy.view().has_slot(10));
 
     let original = rich(&parent);
     let current: Vec<_> = original

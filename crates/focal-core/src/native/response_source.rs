@@ -335,10 +335,7 @@ fn build(
     header: Header<'_>,
     maximum: usize,
 ) -> Result<NativeResponseInput, NativeError> {
-    let mut scratch = Scratch {
-        used: 0,
-        max: maximum,
-    };
+    let mut scratch = Scratch::bound(maximum);
     let mut summary = scratch.reserve::<u8>(header.shape.summary)?;
     summary.extend_from_slice(header.summary.as_bytes());
     let summary = String::from_utf8(summary).map_err(|_| ContractError::InvalidManifest)?;
@@ -489,10 +486,7 @@ impl<S: NativeMonitorSource> NativeMonitorSourcePlan<S> {
         if self.source.len() != self.count {
             return Err(invalid());
         }
-        let mut scratch = Scratch {
-            used: 0,
-            max: self.quote.bytes,
-        };
+        let mut scratch = Scratch::bound(self.quote.bytes);
         let mut roots = scratch.reserve(self.count)?;
         for index in 0..self.count {
             roots.push(self.source.root(index)?.ok_or_else(invalid)?);

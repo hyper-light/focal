@@ -4,7 +4,7 @@
 //! not offered because the owner refuses their wire profile; the catalogue is
 //! decided once per connection by the engine probe.
 use crate::{ProtocolError, Tool, catalog};
-use focal_client::operations::{OperationDescriptor, native_descriptors};
+use focal_client::operations::{OperationDescriptor, WireProfile, application};
 use focal_wire::{NativeProfile, NativeStanding};
 use serde_json::{Map, Value};
 
@@ -26,7 +26,7 @@ pub(crate) fn permitted(standing: &NativeStanding, descriptor: &OperationDescrip
 }
 
 pub(crate) fn tool_count(standing: &NativeStanding) -> Result<usize, ProtocolError> {
-    native_descriptors()
+    application(WireProfile::Native)
         .iter()
         .filter(|descriptor| permitted(standing, descriptor))
         .count()
@@ -39,7 +39,7 @@ pub(crate) fn catalog(standing: &NativeStanding) -> Result<Vec<Tool>, ProtocolEr
     tools
         .try_reserve_exact(tool_count(standing)?)
         .map_err(|_| ProtocolError::Capacity)?;
-    for descriptor in native_descriptors()
+    for descriptor in application(WireProfile::Native)
         .iter()
         .filter(|descriptor| permitted(standing, descriptor))
     {
@@ -59,6 +59,8 @@ pub(crate) fn catalog(standing: &NativeStanding) -> Result<Vec<Tool>, ProtocolEr
             &["native_list", "error"]
         } else if descriptor.name == "claim.wait" {
             &["native_wait", "error"]
+        } else if descriptor.name == "claim.lineage" {
+            &["native_lineage", "error"]
         } else {
             &["native_read", "error"]
         };
@@ -237,7 +239,7 @@ mod tests {
         let tools = catalog(&standing(NativeProfile::AuthoredV1)).unwrap();
         assert_eq!(
             tools.len(),
-            native_descriptors().len() + RECOVERY_TOOLS,
+            focal_client::operations::native_descriptors().len() + RECOVERY_TOOLS,
             "{tools:?}"
         );
         assert_eq!(
@@ -297,6 +299,9 @@ mod tests {
                         assert!(operation_id.is_none());
                     } else if descriptor.name == "claim.wait" {
                         assert_eq!(kinds, ["native_wait", "error"].into());
+                        assert!(operation_id.is_none());
+                    } else if descriptor.name == "claim.lineage" {
+                        assert_eq!(kinds, ["native_lineage", "error"].into());
                         assert!(operation_id.is_none());
                     } else {
                         assert_eq!(kinds, ["native_read", "error"].into());

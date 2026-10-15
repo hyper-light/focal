@@ -1,0 +1,8 @@
+# What the comparison asks of focal's three nodes: each session on all three,
+# surviving one zone's loss (docs/qualification/competitive-p99.md, "Equal terms").
+version: 1
+topology:
+  region: "bench"
+durability:
+  survive: zone
+  max_failures: 1

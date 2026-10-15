@@ -11,6 +11,8 @@ enum Step {
     Committed,
     Duplicate,
     Capacity,
+    /// No connection could be made for the request: nothing was sent.
+    NotConnected,
 }
 struct Script<'a> {
     seen: &'a Mutex<Vec<RequestEnvelope>>,
@@ -33,6 +35,7 @@ impl ClientTransport for Script<'_> {
             let result = match step {
                 Step::Timeout => return Err(WireError::Timeout),
                 Step::Allocation => return Err(WireError::Allocation),
+                Step::NotConnected => return Err(WireError::Access(AccessError::Unavailable)),
                 Step::Redirect(epoch) => Response::Error(AccessError::RouteChanged(RouteHint {
                     epoch: RouteEpoch(epoch),
                     endpoint: "127.0.0.1:7777".into(),
@@ -58,8 +61,14 @@ impl ClientTransport for Script<'_> {
     }
 }
 
-#[tokio::test]
-async fn later_route_or_domain_rejection_cannot_replace_an_unknown_write_identity() {
+#[test]
+fn later_route_or_domain_rejection_cannot_replace_an_unknown_write_identity() {
+    focal_rt::block_on(
+        later_route_or_domain_rejection_cannot_replace_an_unknown_write_identity_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn later_route_or_domain_rejection_cannot_replace_an_unknown_write_identity_on_a_shard() {
     for steps in [
         vec![Step::Timeout, Step::Redirect(2), Step::Redirect(2)],
         vec![Step::Timeout, Step::Redirect(2), Step::Redirect(1)],
@@ -98,8 +107,14 @@ async fn later_route_or_domain_rejection_cannot_replace_an_unknown_write_identit
     }
 }
 
-#[tokio::test]
-async fn definite_admission_response_and_exact_committed_retry_remain_distinct() {
+#[test]
+fn definite_admission_response_and_exact_committed_retry_remain_distinct() {
+    focal_rt::block_on(
+        definite_admission_response_and_exact_committed_retry_remain_distinct_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn definite_admission_response_and_exact_committed_retry_remain_distinct_on_a_shard() {
     for steps in [
         vec![Step::Refuse],
         vec![Step::Inform],
@@ -144,8 +159,76 @@ async fn definite_admission_response_and_exact_committed_retry_remain_distinct()
     }
 }
 
-#[tokio::test]
-async fn capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_unknown_outcomes() {
+/// A write that found no connection to be sent on (its listener refused the
+/// connection at admission, or could not be reached) had no effect: it is
+/// sent again, and if no attempt reached the listener it is reported as the
+/// refusal, never as an unknown outcome. A write already uncertain stays so.
+#[test]
+fn a_write_that_found_no_connection_is_a_refusal_not_an_unknown_outcome() {
+    focal_rt::block_on(
+        a_write_that_found_no_connection_is_a_refusal_not_an_unknown_outcome_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn a_write_that_found_no_connection_is_a_refusal_not_an_unknown_outcome_on_a_shard() {
+    let quick = RetryPolicy {
+        max_attempts: 4,
+        max_elapsed: Duration::from_secs(5),
+        base_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(2),
+    };
+    let client = |steps: Vec<Step>, seen| {
+        Client::new(
+            Script { seen, steps },
+            quick.clone(),
+            WireLimits::default(),
+            1,
+        )
+        .unwrap()
+    };
+    // Connected at the third attempt: committed, the same request each time.
+    let seen = Mutex::new(Vec::new());
+    let reply = client(
+        vec![Step::NotConnected, Step::NotConnected, Step::Committed],
+        &seen,
+    )
+    .request(request())
+    .await
+    .unwrap();
+    assert!(matches!(
+        reply.result,
+        Response::Submitted(MutationReply::Committed(_))
+    ));
+    assert_eq!(seen.lock().unwrap().len(), 3);
+    // Never connected: the refusal it was.
+    let seen = Mutex::new(Vec::new());
+    assert!(matches!(
+        client(vec![Step::NotConnected; 80], &seen)
+            .request(request())
+            .await,
+        Err(ClientError::Access(AccessError::Unavailable))
+    ));
+    // Sent once and lost, then not connected: still unknown.
+    let seen = Mutex::new(Vec::new());
+    assert!(matches!(
+        client(
+            std::iter::once(Step::Timeout)
+                .chain(std::iter::repeat_n(Step::NotConnected, 80))
+                .collect(),
+            &seen
+        )
+        .request(request())
+        .await,
+        Err(ClientError::OutcomeUnknown { .. })
+    ));
+}
+
+#[test]
+fn capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_unknown_outcomes() {
+    focal_rt::block_on(capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_unknown_outcomes_on_a_shard()).unwrap();
+}
+async fn capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_unknown_outcomes_on_a_shard()
+ {
     let quick = RetryPolicy {
         max_attempts: 4,
         max_elapsed: Duration::from_secs(5),
@@ -218,4 +301,59 @@ async fn capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_
         client.request(request()).await,
         Err(ClientError::OutcomeUnknown { .. })
     ));
+}
+
+/// Capacity resends are throttled by the client's budget (gRFC A6): under a
+/// lasting overload the resends thin to none, every refusal reported, and
+/// answers refill the budget.
+#[test]
+fn capacity_resends_are_throttled_by_the_clients_budget() {
+    focal_rt::block_on(capacity_resends_are_throttled_by_the_clients_budget_on_a_shard()).unwrap();
+}
+async fn capacity_resends_are_throttled_by_the_clients_budget_on_a_shard() {
+    let quick = RetryPolicy {
+        max_attempts: 4,
+        max_elapsed: Duration::from_secs(5),
+        base_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(2),
+    };
+    // Four refused requests, then forty answered, then a refused one.
+    let mut steps = vec![Step::Capacity; 4 + 2 + 1 + 1];
+    steps.extend([Step::Committed; 40]);
+    steps.extend([Step::Capacity; 2]);
+    let seen = Mutex::new(Vec::new());
+    let client = Client::new(
+        Script { seen: &seen, steps },
+        quick.clone(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    let mut sends = Vec::new();
+    for _ in 0..4 {
+        let before = seen.lock().unwrap().len();
+        assert!(matches!(
+            client.request(request()).await,
+            Err(ClientError::Access(AccessError::Capacity))
+        ));
+        sends.push(seen.lock().unwrap().len() - before);
+    }
+    // Ten tokens, a refusal spending one, a resend while more than half
+    // remain: three resends, then one, then none.
+    assert_eq!(sends, vec![4, 2, 1, 1]);
+    assert_eq!(client.retry_tokens(), 2_000);
+    for _ in 0..40 {
+        assert!(matches!(
+            client.request(request()).await.unwrap().result,
+            Response::Submitted(MutationReply::Committed(_))
+        ));
+    }
+    // A tenth of a token an answer: six tokens, one resend again.
+    assert_eq!(client.retry_tokens(), 6_000);
+    let before = seen.lock().unwrap().len();
+    assert!(matches!(
+        client.request(request()).await,
+        Err(ClientError::Access(AccessError::Capacity))
+    ));
+    assert_eq!(seen.lock().unwrap().len() - before, 2);
 }

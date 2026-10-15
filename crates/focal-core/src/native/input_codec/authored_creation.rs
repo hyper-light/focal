@@ -212,6 +212,13 @@ impl<'a> StructuralInput<'a> {
                 tail: group.declarations,
                 budget: &budget,
             };
+            // A cohort that its hold fits takes each body's checked declaration
+            // from this loop's plan of it, where its read planned every body
+            // again; the checking is charged here and kept out of the build's
+            // quote, which does not check.
+            let hand_over = group.count <= super::held::HELD;
+            let mut planned = super::held::Held::none();
+            let mut checking = AuthoredCreationWork::default();
             for _ in 0..group.count {
                 budget.native.charge(DECLARATION_WORK)?;
                 let mut input = rows.validation()?;
@@ -224,6 +231,11 @@ impl<'a> StructuralInput<'a> {
                     &mut batch,
                     descriptor.intent_fingerprint(),
                 );
+                if hand_over {
+                    let unchecked = budget.remaining();
+                    planned.push(checks::checked(descriptor, &budget)?);
+                    checking = checking.add(unchecked.subtract(budget.remaining())?)?;
+                }
             }
             rows.finish()?;
             native_authored::fingerprint_profile(
@@ -235,8 +247,9 @@ impl<'a> StructuralInput<'a> {
             if bytes > native.preparation_bytes {
                 return Err(CodecError::Capacity.into());
             }
-            construction = construction.add(before.subtract(budget.remaining())?)?;
-            checks::cohort(&group, claim, issuer, principal, limits, &budget)?;
+            construction =
+                construction.add(before.subtract(budget.remaining())?.subtract(checking)?)?;
+            checks::cohort(&group, claim, issuer, principal, limits, &budget, planned)?;
         }
         reader.finish()?;
         checks::batch_ids(self.bytes(), count, native, &budget)?;

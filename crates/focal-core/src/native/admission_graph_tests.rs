@@ -29,10 +29,7 @@ fn source() -> Core<NativeState> {
     core
 }
 fn view(core: &Core<NativeState>) -> View<'_> {
-    View {
-        state: &core.state,
-        tail: None,
-    }
+    View::committed(&core.state)
 }
 fn stage(core: &Core<NativeState>) -> Staged {
     let mut custody = f::Custody::new();
@@ -50,10 +47,7 @@ fn stage(core: &Core<NativeState>) -> Staged {
         core.limits.preparation_bytes,
     )
     .unwrap();
-    let mut scratch = Scratch {
-        used: 0,
-        max: core.limits.preparation_bytes,
-    };
+    let mut scratch = Scratch::bound(core.limits.preparation_bytes);
     let mut plan = transactions::prepare(
         input.command,
         input.request,

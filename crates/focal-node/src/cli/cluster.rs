@@ -9,11 +9,6 @@ use std::path::PathBuf;
 
 #[derive(Subcommand)]
 pub(crate) enum ClusterCommand {
-    /// Read this physical owner's identity, local health or listener configuration.
-    Node {
-        #[command(subcommand)]
-        command: NodeCommand,
-    },
     /// Administer already installed application replicas; this does not assign placement.
     Replicas {
         #[command(subcommand)]
@@ -73,15 +68,16 @@ pub(crate) enum ClusterCommand {
         #[command(subcommand)]
         command: LeaderCommand,
     },
+    /// Inspect or change a directory partition group's configuration, or
+    /// hand its leadership on (24 §13).
+    Partitions {
+        #[command(subcommand)]
+        command: PartitionsCommand,
+    },
     /// Inspect or retry the exact latest durable local admin intent.
     Request {
         #[command(subcommand)]
         command: RequestCommand,
-    },
-    /// A native session's retention floor and archive counts.
-    Retention {
-        #[command(subcommand)]
-        command: RetentionCommand,
     },
     /// A retired claim's archive bundle as this node holds and verifies it.
     Archive {
@@ -97,12 +93,6 @@ pub(crate) enum ClusterCommand {
     Backup {
         #[command(subcommand)]
         command: BackupCommand,
-    },
-    /// The storage view of this node: the volume envelope, what is staged,
-    /// the agents, and every hosted session's oldest retained prefix.
-    Storage {
-        #[command(subcommand)]
-        command: StorageCommand,
     },
     /// Restore a session from a verified backup onto this node. The old
     /// incarnation continues only when its source is fenced; otherwise
@@ -156,13 +146,6 @@ pub(crate) enum UpgradeCommand {
     },
 }
 #[derive(Subcommand)]
-pub(crate) enum StorageCommand {
-    /// Disk pressure by kind, staged uploads, the archive agent's and the
-    /// collector's settings and progress, and each hosted session's
-    /// retention floor; no reclamation is initiated.
-    Show,
-}
-#[derive(Subcommand)]
 pub(crate) enum BackupCommand {
     /// Write a backup of a hosted native session into a new directory on
     /// this node: its durable envelope, seed chunks, every object its prefix
@@ -185,9 +168,6 @@ pub(crate) enum BackupCommand {
 }
 #[derive(Subcommand)]
 pub(crate) enum GcCommand {
-    /// The collector's settings, whether a pass is in progress, how many
-    /// completed, and the last pass's report.
-    Show,
     /// Bring a quarantined content object back by its domain and root, while
     /// its quarantine round has not expired.
     Restore {
@@ -195,16 +175,6 @@ pub(crate) enum GcCommand {
         domain: String,
         #[arg(long)]
         root: String,
-    },
-}
-#[derive(Subcommand)]
-pub(crate) enum RetentionCommand {
-    /// The published prefix, what registered consumers still need, what the
-    /// archive reports holding, the floor and what holds it there, and the
-    /// families retired; no reclamation is initiated.
-    Show {
-        #[arg(long)]
-        session: Option<String>,
     },
 }
 #[derive(Subcommand)]
@@ -217,24 +187,6 @@ pub(crate) enum ArchiveCommand {
         session: Option<String>,
         #[arg(long)]
         claim: String,
-    },
-}
-#[derive(Subcommand)]
-pub(crate) enum NodeCommand {
-    Identity,
-    Health,
-    Config,
-    /// The four readiness probes with the facts they derive from.
-    Readiness,
-    /// The node's metrics as Prometheus text: memory and volume envelopes,
-    /// WAL, replicas and their lags, peers, liveness, credential expiry,
-    /// placement and the upgrade fence, sampled every five seconds.
-    Metrics,
-    /// One readiness probe for a supervisor: exit 0 when it holds, 1
-    /// (`probe_failed`) otherwise.
-    Probe {
-        #[arg(long, value_parser = ["alive", "catching-up", "authoritative", "policy"])]
-        check: String,
     },
 }
 #[derive(Subcommand)]
@@ -352,6 +304,13 @@ pub(crate) enum CredentialCommand {
     /// Rotate this node's own credential to a fresh key under the same
     /// identity; the previous certificate authorizes through the grace.
     Rotate,
+    /// The issuers the cluster's credentials chain to, as committed: the
+    /// one issuing, one staged, the one retiring, and the upgrade fence.
+    Issuers,
+    /// Stage the issuer's successor now (founder only): committed so every
+    /// node trusts it, then activated; the current issuer retires once
+    /// nothing live was issued under it.
+    RotateIssuer,
 }
 #[derive(Subcommand)]
 pub(crate) enum MembershipCommand {
@@ -380,6 +339,45 @@ pub(crate) enum MembershipCommand {
     },
 }
 #[derive(Subcommand)]
+pub(crate) enum PartitionsCommand {
+    Show {
+        #[arg(long)]
+        partition: String,
+    },
+    AddLearner {
+        #[arg(long)]
+        partition: String,
+        #[arg(long)]
+        node: u64,
+        #[arg(long)]
+        expected_configuration_index: Option<u64>,
+    },
+    Promote {
+        #[arg(long)]
+        partition: String,
+        #[arg(long)]
+        node: u64,
+        #[arg(long)]
+        expected_configuration_index: Option<u64>,
+    },
+    Remove {
+        #[arg(long)]
+        partition: String,
+        #[arg(long)]
+        node: u64,
+        #[arg(long)]
+        expected_configuration_index: Option<u64>,
+    },
+    Transfer {
+        #[arg(long)]
+        partition: String,
+        #[arg(long)]
+        node: u64,
+        #[arg(long)]
+        expected_configuration_index: Option<u64>,
+    },
+}
+#[derive(Subcommand)]
 pub(crate) enum LeaderCommand {
     Transfer {
         #[arg(long)]
@@ -387,6 +385,66 @@ pub(crate) enum LeaderCommand {
         #[arg(long)]
         expected_configuration_index: Option<u64>,
     },
+}
+/// What the selected node and the replicas it hosts report about
+/// themselves; nothing here changes anything.
+#[derive(Subcommand)]
+pub(crate) enum DiagnoseCommand {
+    /// The node itself: exactly one read.
+    Node(NodeReads),
+    /// The replicas this node hosts: exactly one read.
+    Cluster(ClusterReads),
+}
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+pub(crate) struct NodeReads {
+    /// This physical owner's identity.
+    #[arg(long)]
+    identity: bool,
+    /// Local health: the root and fleet owners and the listener.
+    #[arg(long)]
+    health: bool,
+    /// The listener's configuration (`--config` names the configuration
+    /// file the command itself reads).
+    #[arg(long)]
+    listener: bool,
+    /// The four readiness probes with the facts they derive from.
+    #[arg(long)]
+    readiness: bool,
+    /// The node's metrics as Prometheus text, sampled every five seconds:
+    /// aggregates over every hosted session, root member, measured peer and
+    /// tenant, then those listed one by one within one page.
+    #[arg(long)]
+    metrics: bool,
+    /// The storage view: the volume envelope, what is staged, the agents,
+    /// and every hosted session's oldest retained prefix.
+    #[arg(long)]
+    storage: bool,
+    /// The collector's settings, whether a pass is in progress, how many
+    /// completed, and the last pass's report.
+    #[arg(long)]
+    gc: bool,
+    /// One readiness probe for a supervisor: exit 0 when it holds, 1
+    /// (`probe_failed`) otherwise.
+    #[arg(long, value_name = "CHECK", value_parser = ["alive", "serving", "catching-up", "authoritative", "policy"])]
+    probe: Option<String>,
+}
+#[derive(clap::Args)]
+#[group(skip)]
+#[command(group(clap::ArgGroup::new("read").required(true).multiple(false).args(["replicas", "retention"])))]
+pub(crate) struct ClusterReads {
+    /// A replica's persisted prefix and decoder floor, without starting an
+    /// upgrade.
+    #[arg(long)]
+    replicas: bool,
+    /// A native session's published prefix, what consumers still need, the
+    /// archive's holding, the floor and what holds it; no reclamation is
+    /// initiated.
+    #[arg(long)]
+    retention: bool,
+    /// The session read; this node's original session when omitted.
+    #[arg(long)]
+    session: Option<String>,
 }
 #[derive(Subcommand)]
 pub(crate) enum RequestCommand {
@@ -396,11 +454,6 @@ pub(crate) enum RequestCommand {
 }
 #[derive(Subcommand)]
 pub(crate) enum ReplicaCommand {
-    /// Observe local persisted prefix and decoder floor without starting an upgrade.
-    Diagnostics {
-        #[arg(long)]
-        session: Option<String>,
-    },
     /// Initiate transfer under an exact application configuration fence.
     Transfer {
         #[arg(long)]
@@ -468,13 +521,12 @@ pub(crate) enum RangesCommand {
     },
 }
 
-pub(crate) fn run(
-    runtime: &tokio::runtime::Runtime,
+pub(crate) async fn run(
     settings: &focal_node::config::Settings,
     command: ClusterCommand,
 ) -> crate::Result<()> {
     if let ClusterCommand::Invite { node, output } = command {
-        return runtime.block_on(crate::invite(settings, &node, &output));
+        return crate::invite(settings, &node, &output).await;
     }
     // Verification reads only the backup: it runs anywhere the binary does.
     if let ClusterCommand::Backup {
@@ -511,51 +563,28 @@ pub(crate) fn run(
         }));
     }
     let admin = ClusterAdmin::open(settings)?;
-    if let ClusterCommand::Node {
-        command: NodeCommand::Metrics,
-    } = &command
-    {
-        // Exposition text goes out as it is: a scraper reads it, not a
-        // JSON consumer.
-        let result =
-            runtime.block_on(admin.operator(focal_node::network_admin::OperatorRead::Metrics))?;
-        let focal_client::admin::AdminResult::Metrics { text } = result else {
-            return Err(ClusterAdminError::Invalid.into());
-        };
-        return crate::print_text(&text);
-    }
     let result = match command {
-        ClusterCommand::Node {
-            command: NodeCommand::Probe { check },
-        } => runtime.block_on(admin.probe(&check)),
-        ClusterCommand::Node { command } => runtime.block_on(admin.operator(match command {
-            NodeCommand::Identity => focal_node::network_admin::OperatorRead::Identity,
-            NodeCommand::Health => focal_node::network_admin::OperatorRead::Health,
-            NodeCommand::Config => focal_node::network_admin::OperatorRead::Configuration,
-            NodeCommand::Readiness => focal_node::network_admin::OperatorRead::Readiness,
-            NodeCommand::Metrics | NodeCommand::Probe { .. } => {
-                return Err(ClusterAdminError::Invalid.into());
-            }
-        })),
-        ClusterCommand::Replicas { command } => replicas(runtime, &admin, command),
-        ClusterCommand::Retention {
-            command: RetentionCommand::Show { session },
-        } => runtime.block_on(admin.retention(session_of(&admin, session)?)),
+        ClusterCommand::Replicas { command } => replicas(&admin, command).await,
         ClusterCommand::Archive {
             command: ArchiveCommand::Show { session, claim },
-        } => runtime.block_on(admin.archive(
-            session_of(&admin, session)?,
-            focal_model::ClaimId(focal_client::input::parse_id(&claim)?),
-        )),
-        ClusterCommand::Gc {
-            command: GcCommand::Show,
-        } => runtime.block_on(admin.gc()),
+        } => {
+            admin
+                .archive(
+                    session_of(&admin, session)?,
+                    focal_model::ClaimId(focal_client::input::parse_id(&claim)?),
+                )
+                .await
+        }
         ClusterCommand::Gc {
             command: GcCommand::Restore { domain, root },
-        } => runtime.block_on(admin.gc_restore(
-            focal_model::ContentDomainId(focal_client::input::parse_id(&domain)?),
-            focal_client::input::parse_hash(&root)?,
-        )),
+        } => {
+            admin
+                .gc_restore(
+                    focal_model::ContentDomainId(focal_client::input::parse_id(&domain)?),
+                    focal_client::input::parse_hash(&root)?,
+                )
+                .await
+        }
         ClusterCommand::Backup {
             command:
                 BackupCommand::Create {
@@ -570,7 +599,7 @@ pub(crate) fn run(
                 })?,
                 session: session_of(&admin, session)?,
             };
-            runtime.block_on(admin.backup_create(ledger, &output))
+            admin.backup_create(ledger, &output).await
         }
         ClusterCommand::Backup {
             command: BackupCommand::Verify { .. },
@@ -578,7 +607,7 @@ pub(crate) fn run(
         ClusterCommand::Restore {
             input,
             new_incarnation,
-        } => runtime.block_on(admin.restore(&input, new_incarnation)),
+        } => admin.restore(&input, new_incarnation).await,
         ClusterCommand::Repair {
             tenant,
             session,
@@ -594,123 +623,160 @@ pub(crate) fn run(
             let after = after
                 .map(|after| focal_client::input::parse_id(&after))
                 .transpose()?;
-            runtime.block_on(admin.repair(ledger, after, limit))
+            admin.repair(ledger, after, limit).await
         }
         ClusterCommand::Upgrade {
             command: UpgradeCommand::Status,
-        } => runtime.block_on(admin.upgrade_status()),
+        } => admin.upgrade_status().await,
         ClusterCommand::Upgrade {
             command: UpgradeCommand::Activate { fence },
-        } => runtime.block_on(admin.activate_fence(fence)),
-        ClusterCommand::Storage {
-            command: StorageCommand::Show,
-        } => runtime.block_on(admin.storage()),
-        ClusterCommand::Status => runtime.block_on(admin.read(AdminRead::Membership)),
-        ClusterCommand::Placement => runtime.block_on(admin.placement()),
-        ClusterCommand::Plan => runtime.block_on(admin.plan()),
+        } => admin.activate_fence(fence).await,
+        ClusterCommand::Status => admin.read(AdminRead::Membership).await,
+        ClusterCommand::Placement => admin.placement().await,
+        ClusterCommand::Plan => admin.plan().await,
         ClusterCommand::Tenants { command } => match command {
             TenantCommand::Admit { tenant } => {
-                runtime.block_on(admin.admit_tenant(focal_client::input::parse_id(&tenant)?))
+                admin
+                    .admit_tenant(focal_client::input::parse_id(&tenant)?)
+                    .await
             }
-            TenantCommand::List => runtime.block_on(admin.tenants()),
+            TenantCommand::List => admin.tenants().await,
         },
         ClusterCommand::Sessions { command } => match command {
-            SessionCommand::Create { tenant, name } => runtime
-                .block_on(admin.create_session(focal_client::input::parse_id(&tenant)?, &name)),
+            SessionCommand::Create { tenant, name } => {
+                admin
+                    .create_session(focal_client::input::parse_id(&tenant)?, &name)
+                    .await
+            }
             SessionCommand::Plan {
                 tenant,
                 session,
                 survive,
                 max_failures,
                 dry_run,
-            } => runtime.block_on(admin.plan_session(
-                focal_client::input::parse_id(&tenant)?,
-                focal_client::input::parse_id(&session)?,
-                &survive,
-                max_failures,
-                dry_run,
-            )),
+            } => {
+                admin
+                    .plan_session(
+                        focal_client::input::parse_id(&tenant)?,
+                        focal_client::input::parse_id(&session)?,
+                        &survive,
+                        max_failures,
+                        dry_run,
+                    )
+                    .await
+            }
         },
         ClusterCommand::Nodes { command } => match command {
-            NodesCommand::List => runtime.block_on(admin.read(AdminRead::Contacts)),
-            NodesCommand::Drain { node } => runtime.block_on(admin.node_eligibility(node, false)),
-            NodesCommand::Undrain { node } => runtime.block_on(admin.node_eligibility(node, true)),
-            NodesCommand::Remove { node } => runtime.block_on(admin.remove_node(node)),
+            NodesCommand::List => admin.read(AdminRead::Contacts).await,
+            NodesCommand::Drain { node } => admin.node_eligibility(node, false).await,
+            NodesCommand::Undrain { node } => admin.node_eligibility(node, true).await,
+            NodesCommand::Remove { node } => admin.remove_node(node).await,
             NodesCommand::Replace { node, replacement } => {
-                runtime.block_on(admin.replace_node(node, replacement))
+                admin.replace_node(node, replacement).await
             }
         },
         ClusterCommand::Client {
             command: ClientCommand::Invite { name, output },
-        } => runtime.block_on(admin.invite_client(&name, &output)),
+        } => admin.invite_client(&name, &output).await,
         ClusterCommand::Invitations { command } => match command {
             InvitationCommand::List {
                 after,
                 limit,
                 expected_revision,
-            } => runtime.block_on(
-                admin.read(AdminRead::Invitations {
-                    after: after
-                        .as_deref()
-                        .map(focal_client::input::parse_id)
-                        .transpose()?,
-                    limit,
-                    expected_revision,
-                }),
-            ),
-            InvitationCommand::Get { id } => runtime.block_on(admin.read(AdminRead::Invitation {
-                id: focal_client::input::parse_id(&id)?,
-            })),
+            } => {
+                admin
+                    .read(AdminRead::Invitations {
+                        after: after
+                            .as_deref()
+                            .map(focal_client::input::parse_id)
+                            .transpose()?,
+                        limit,
+                        expected_revision,
+                    })
+                    .await
+            }
+            InvitationCommand::Get { id } => {
+                admin
+                    .read(AdminRead::Invitation {
+                        id: focal_client::input::parse_id(&id)?,
+                    })
+                    .await
+            }
             InvitationCommand::Revoke {
                 id,
                 expected_revision,
-            } => runtime
-                .block_on(admin.revoke(focal_client::input::parse_id(&id)?, expected_revision)),
+            } => {
+                admin
+                    .revoke(focal_client::input::parse_id(&id)?, expected_revision)
+                    .await
+            }
         },
         ClusterCommand::Credentials { command } => match command {
             CredentialCommand::Get { invitation } => {
-                runtime.block_on(admin.read(AdminRead::Invitation {
-                    id: focal_client::input::parse_id(&invitation)?,
-                }))
+                admin
+                    .read(AdminRead::Invitation {
+                        id: focal_client::input::parse_id(&invitation)?,
+                    })
+                    .await
             }
             CredentialCommand::Revoke {
                 invitation,
                 expected_revision,
-            } => runtime.block_on(admin.revoke(
-                focal_client::input::parse_id(&invitation)?,
-                expected_revision,
-            )),
-            CredentialCommand::Renew => runtime.block_on(admin.renew_credential()),
-            CredentialCommand::Rotate => runtime.block_on(admin.rotate_credential()),
+            } => {
+                admin
+                    .revoke(
+                        focal_client::input::parse_id(&invitation)?,
+                        expected_revision,
+                    )
+                    .await
+            }
+            CredentialCommand::Renew => admin.renew_credential().await,
+            CredentialCommand::Rotate => admin.rotate_credential().await,
+            CredentialCommand::Issuers => admin.issuers().await,
+            CredentialCommand::RotateIssuer => admin.rotate_issuer().await,
         },
         ClusterCommand::Membership { command } => match command {
-            MembershipCommand::Show => runtime.block_on(admin.read(AdminRead::Configuration)),
+            MembershipCommand::Show => admin.read(AdminRead::Configuration).await,
             MembershipCommand::AddLearner {
                 node,
                 expected_configuration_index,
-            } => runtime.block_on(admin.membership(
-                MembershipChange::AddLearner { node },
-                expected_configuration_index,
-            )),
+            } => {
+                admin
+                    .membership(
+                        MembershipChange::AddLearner { node },
+                        expected_configuration_index,
+                    )
+                    .await
+            }
             MembershipCommand::Promote {
                 node,
                 expected_configuration_index,
-            } => runtime.block_on(admin.membership(
-                MembershipChange::Promote { node },
-                expected_configuration_index,
-            )),
+            } => {
+                admin
+                    .membership(
+                        MembershipChange::Promote { node },
+                        expected_configuration_index,
+                    )
+                    .await
+            }
             MembershipCommand::Remove {
                 node,
                 expected_configuration_index,
-            } => runtime.block_on(admin.membership(
-                MembershipChange::Remove { node },
-                expected_configuration_index,
-            )),
+            } => {
+                admin
+                    .membership(
+                        MembershipChange::Remove { node },
+                        expected_configuration_index,
+                    )
+                    .await
+            }
             MembershipCommand::LeaveJoint {
                 expected_configuration_index,
-            } => runtime.block_on(
-                admin.membership(MembershipChange::LeaveJoint, expected_configuration_index),
-            ),
+            } => {
+                admin
+                    .membership(MembershipChange::LeaveJoint, expected_configuration_index)
+                    .await
+            }
         },
         ClusterCommand::Leader {
             command:
@@ -718,22 +784,130 @@ pub(crate) fn run(
                     node,
                     expected_configuration_index,
                 },
-        } => runtime.block_on(admin.transfer(node, expected_configuration_index)),
+        } => admin.transfer(node, expected_configuration_index).await,
+        ClusterCommand::Partitions { command } => match command {
+            PartitionsCommand::Show { partition } => {
+                let partition = focal_client::input::parse_id(&partition)?;
+                admin.partition_show(partition).await
+            }
+            PartitionsCommand::AddLearner {
+                partition,
+                node,
+                expected_configuration_index,
+            } => {
+                let partition = focal_client::input::parse_id(&partition)?;
+                admin
+                    .partition_change(
+                        partition,
+                        MembershipChange::AddLearner { node },
+                        expected_configuration_index,
+                    )
+                    .await
+            }
+            PartitionsCommand::Promote {
+                partition,
+                node,
+                expected_configuration_index,
+            } => {
+                let partition = focal_client::input::parse_id(&partition)?;
+                admin
+                    .partition_change(
+                        partition,
+                        MembershipChange::Promote { node },
+                        expected_configuration_index,
+                    )
+                    .await
+            }
+            PartitionsCommand::Remove {
+                partition,
+                node,
+                expected_configuration_index,
+            } => {
+                let partition = focal_client::input::parse_id(&partition)?;
+                admin
+                    .partition_change(
+                        partition,
+                        MembershipChange::Remove { node },
+                        expected_configuration_index,
+                    )
+                    .await
+            }
+            PartitionsCommand::Transfer {
+                partition,
+                node,
+                expected_configuration_index,
+            } => {
+                let partition = focal_client::input::parse_id(&partition)?;
+                admin
+                    .partition_transfer(partition, node, expected_configuration_index)
+                    .await
+            }
+        },
         ClusterCommand::Request {
             command: RequestCommand::Inspect,
         } => admin.inspect(),
         ClusterCommand::Request {
             command: RequestCommand::Retry { operation_id },
-        } => runtime.block_on(admin.retry(&operation_id)),
+        } => admin.retry(&operation_id).await,
         ClusterCommand::Request {
             command: RequestCommand::Reconcile { operation_id },
-        } => runtime.block_on(admin.reconcile(&operation_id)),
+        } => admin.reconcile(&operation_id).await,
         ClusterCommand::Invite { .. } => return Err("invalid invitation dispatch".into()),
     }?;
     crate::print_json(&serde_json::json!({"schema_version":1,"result":result}))
 }
 
 /// The session an operator named, else the node identity's original one.
+/// `focal diagnose`: what the selected node and its replicas report about
+/// themselves, one read a command, read through the node's admin socket.
+pub(crate) async fn diagnose(
+    settings: &focal_node::config::Settings,
+    command: DiagnoseCommand,
+) -> crate::Result<()> {
+    use focal_node::network_admin::OperatorRead;
+    let admin = ClusterAdmin::open(settings)?;
+    let result = match command {
+        DiagnoseCommand::Node(reads) => {
+            if reads.metrics {
+                // Exposition text goes out as it is: a scraper reads it, not
+                // a JSON consumer.
+                let result = admin.operator(OperatorRead::Metrics).await?;
+                let focal_client::admin::AdminResult::Metrics { text } = result else {
+                    return Err(ClusterAdminError::Invalid.into());
+                };
+                return crate::print_text(&text);
+            }
+            if let Some(check) = reads.probe {
+                admin.probe(&check).await
+            } else if reads.identity {
+                admin.operator(OperatorRead::Identity).await
+            } else if reads.health {
+                admin.operator(OperatorRead::Health).await
+            } else if reads.listener {
+                admin.operator(OperatorRead::Configuration).await
+            } else if reads.readiness {
+                admin.operator(OperatorRead::Readiness).await
+            } else if reads.storage {
+                admin.storage().await
+            } else if reads.gc {
+                admin.gc().await
+            } else {
+                return Err(ClusterAdminError::Invalid.into());
+            }
+        }
+        DiagnoseCommand::Cluster(reads) => {
+            let session = session_of(&admin, reads.session)?;
+            if reads.replicas {
+                admin.operator(OperatorRead::Replica { session }).await
+            } else if reads.retention {
+                admin.retention(session).await
+            } else {
+                return Err(ClusterAdminError::Invalid.into());
+            }
+        }
+    }?;
+    crate::print_json(&serde_json::json!({"schema_version":1,"result":result}))
+}
 fn session_of(
     admin: &ClusterAdmin,
     value: Option<String>,
@@ -747,8 +921,7 @@ fn session_of(
         .transpose()
         .map(|session| session.unwrap_or(admin.identity().ledger.session))
 }
-fn replicas(
-    runtime: &tokio::runtime::Runtime,
+async fn replicas(
     admin: &ClusterAdmin,
     command: ReplicaCommand,
 ) -> Result<focal_client::admin::AdminResult, focal_node::cluster_admin::ClusterAdminError> {
@@ -764,48 +937,43 @@ fn replicas(
             .map(|s| s.unwrap_or(admin.identity().ledger.session))
     };
     match command {
-        ReplicaCommand::Diagnostics { session: value } => runtime.block_on(admin.operator(
-            focal_node::network_admin::OperatorRead::Replica {
-                session: session(value)?,
-            },
-        )),
         ReplicaCommand::Transfer {
             session: value,
             node,
             expected_configuration_index,
-        } => runtime.block_on(admin.replica_transfer(
-            session(value)?,
-            node,
-            expected_configuration_index,
-        )),
+        } => {
+            admin
+                .replica_transfer(session(value)?, node, expected_configuration_index)
+                .await
+        }
         ReplicaCommand::ActivateNative { session: value } => {
-            runtime.block_on(admin.replica_activate_native(session(value)?))
+            admin.replica_activate_native(session(value)?).await
         }
         ReplicaCommand::Checkpoint { session: value } => {
-            runtime.block_on(admin.replica_checkpoint(session(value)?))
+            admin.replica_checkpoint(session(value)?).await
         }
-        ReplicaCommand::List { after, limit } => runtime.block_on(
-            admin.replica_list(
-                after
-                    .map(|value| {
-                        focal_client::input::parse_id(&value)
-                            .map(focal_model::SessionId)
-                            .map_err(|_| ClusterAdminError::Invalid)
-                    })
-                    .transpose()?,
-                limit,
-            ),
-        ),
-        ReplicaCommand::Show { session: value } => {
-            runtime.block_on(admin.replica_show(session(value)?))
+        ReplicaCommand::List { after, limit } => {
+            admin
+                .replica_list(
+                    after
+                        .map(|value| {
+                            focal_client::input::parse_id(&value)
+                                .map(focal_model::SessionId)
+                                .map_err(|_| ClusterAdminError::Invalid)
+                        })
+                        .transpose()?,
+                    limit,
+                )
+                .await
         }
+        ReplicaCommand::Show { session: value } => admin.replica_show(session(value)?).await,
         ReplicaCommand::Membership {
             session: value,
             command,
         } => {
             let session = session(value)?;
             let (change, index) = match command {
-                MembershipCommand::Show => return runtime.block_on(admin.replica_show(session)),
+                MembershipCommand::Show => return admin.replica_show(session).await,
                 MembershipCommand::AddLearner {
                     node,
                     expected_configuration_index,
@@ -831,7 +999,7 @@ fn replicas(
                     expected_configuration_index,
                 } => (MembershipChange::LeaveJoint, expected_configuration_index),
             };
-            runtime.block_on(admin.replica_change(session, change, index))
+            admin.replica_change(session, change, index).await
         }
         ReplicaCommand::Ranges {
             session: value,
@@ -839,25 +1007,25 @@ fn replicas(
         } => {
             let session = session(value)?;
             match command {
-                RangesCommand::List => runtime.block_on(admin.replica_ranges(session)),
-                RangesCommand::Move { member, node } => runtime.block_on(
-                    admin.move_range(
-                        admin.tenant().0,
-                        session.0,
-                        focal_client::input::parse_id(&member)
-                            .map_err(|_| ClusterAdminError::Invalid)?,
-                        node,
-                    ),
-                ),
+                RangesCommand::List => admin.replica_ranges(session).await,
+                RangesCommand::Move { member, node } => {
+                    admin
+                        .move_range(
+                            admin.tenant().0,
+                            session.0,
+                            focal_client::input::parse_id(&member)
+                                .map_err(|_| ClusterAdminError::Invalid)?,
+                            node,
+                        )
+                        .await
+                }
             }
         }
         ReplicaCommand::Request { command } => match command {
             RequestCommand::Inspect => admin.replica_inspect(),
-            RequestCommand::Retry { operation_id } => {
-                runtime.block_on(admin.replica_retry(&operation_id))
-            }
+            RequestCommand::Retry { operation_id } => admin.replica_retry(&operation_id).await,
             RequestCommand::Reconcile { operation_id } => {
-                runtime.block_on(admin.replica_reconcile(&operation_id))
+                admin.replica_reconcile(&operation_id).await
             }
         },
     }

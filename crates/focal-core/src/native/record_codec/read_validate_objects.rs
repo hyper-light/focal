@@ -215,7 +215,7 @@ pub(super) fn claim(
         last_registration = Some(recorded);
         Ok(())
     })?;
-    let registration_header = registrations.snapshot_v1();
+    let registration_header = registrations.snapshot_v1(claim.binding());
     if (registration_header.sealed || registration_header.increments_sealed)
         && last_registration.is_none()
     {
@@ -285,10 +285,10 @@ pub(super) fn claim(
                     return Err(invalid());
                 }
             }
-            NativeEventKind::Imported(legacy) => {
-                if event.invocation != NativeInvocation::Import || legacy.0 == 0 {
-                    return Err(invalid());
-                }
+            NativeEventKind::Imported(legacy)
+                if (event.invocation != NativeInvocation::Import || legacy.0 == 0) =>
+            {
+                return Err(invalid());
             }
             _ => (),
         }
@@ -304,7 +304,7 @@ pub(super) fn claim(
         Ok(())
     })?;
     read.charge(1)?;
-    let scopes = claim.scopes().snapshot_v1().fields();
+    let scopes = claim.scope_snapshot_v1().fields();
     if last != Some(binding)
         || status != Some(claim.status())
         || children != claim.scopes().children().len()
@@ -330,7 +330,10 @@ pub(super) fn claim(
         let Row::ClaimContent(content) = read.require(Key::ClaimContent(id))? else {
             return Err(invalid());
         };
-        let body = content.get().ok_or_else(invalid)?;
+        let mut buffer = crate::native::owned::ContentBuffer::new();
+        let content = content.read(read.payloads, &mut buffer)?;
+        let held = content.body(read.budget, focal_memory::BudgetLane::Committed)?;
+        let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
         read.meter.budget(|visits| {
             authored::check_recorded_claim(
                 body,
@@ -394,7 +397,11 @@ pub(super) fn definition(
             else {
                 return Err(invalid());
             };
-            let body = body.get().ok_or_else(invalid)?;
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let held = body
+                .read(read.payloads, &mut buffer)?
+                .body(read.budget, focal_memory::BudgetLane::Committed)?;
+            let body: &focal_model::lifecycle::claim_descriptor::ClaimDescriptor = &held;
             read.meter.budget(|visits| {
                 authored::check_recorded_declaration(body, claim, descriptor, visits).map_err(model)
             })?;
@@ -433,7 +440,9 @@ pub(super) fn legacy(
     let Row::Outcome(outcome) = read.require(Key::Outcome(NativeInvocation::Import))? else {
         return Err(invalid());
     };
-    if outcome.operation != NativeOperation::Import || outcome.ledger != read.ledger {
+    let outcome = outcome.row(read.ledger, NativeInvocation::Import, read.payloads)?;
+    // The row's ledger is the store's (`OutcomeRow`).
+    if outcome.operation != NativeOperation::Import {
         return Err(invalid());
     }
     let claim = match key {
@@ -492,21 +501,31 @@ pub(super) fn authored(
     }
     match (key, row) {
         (Key::ClaimContent(id), Row::ClaimContent(value)) => {
-            let body = value.get().ok_or_else(invalid)?;
-            if body.id() != id || body.ledger() != read.ledger {
+            use focal_model::lifecycle::claim_descriptor::ClaimSource;
+            // Read in place from the content's encoding (doc 31 M3), a spilled one read back.
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let value = value.read(read.payloads, &mut buffer)?;
+            let body = value.view()?;
+            let fields = body.fields();
+            let hash = value.content_hash().ok_or_else(invalid)?;
+            if fields.id != id || fields.ledger != read.ledger {
                 return Err(invalid());
             }
-            pinned(body.binding(), read.claim(id)?.binding())?;
-            if !matches!(read.require(Key::ClaimIdentity(body.schema(), body.content_hash()))?, Row::ClaimIdentity(actual) if *actual == id)
+            pinned(
+                value.binding().ok_or_else(invalid)?,
+                read.claim(id)?.binding(),
+            )?;
+            if !matches!(read.require(Key::ClaimIdentity(fields.schema, hash))?, Row::ClaimIdentity(actual) if *actual == id)
             {
                 return Err(invalid());
             }
-            read.charge(sum(body.requirements().len(), 1)?)?;
-            for requirement in body.requirements() {
-                read.definition(requirement.id)?;
+            read.charge(sum(body.requirement_count(), 1)?)?;
+            for requirement in body.view().requirements() {
+                read.definition(requirement?.id)?;
             }
-            read.charge(sum(body.relations().len(), 1)?)?;
-            for relation in body.relations() {
+            read.charge(sum(body.view().relation_count(), 1)?)?;
+            for relation in body.view().relations() {
+                let relation = relation?;
                 if let RelationTarget::Object(target) = relation.target {
                     if target.ledger != read.ledger || target.kind != ObjectKind::Claim {
                         return Err(invalid());
@@ -519,8 +538,9 @@ pub(super) fn authored(
             let Row::ClaimContent(value) = read.require(Key::ClaimContent(*id))? else {
                 return Err(invalid());
             };
-            let body = value.get().ok_or_else(invalid)?;
-            if body.schema() != schema || body.content_hash() != hash {
+            let mut buffer = crate::native::owned::ContentBuffer::new();
+            let value = value.read(read.payloads, &mut buffer)?;
+            if value.schema() != Some(schema) || value.content_hash() != Some(hash) {
                 return Err(invalid());
             }
         }
@@ -537,15 +557,22 @@ pub(super) fn authored(
             let Row::Outcome(outcome) = read.require(Key::Outcome(invocation))? else {
                 return Err(invalid());
             };
+            let outcome = outcome.row(read.ledger, invocation, read.payloads)?;
             if outcome.operation != NativeOperation::Create {
                 return Err(invalid());
             }
-            read.charge(sum(value.get().entries().len(), 1)?)?;
+            // A spilled result is read back, decoded and charged while it is checked (doc 31 M3).
+            let value = value.read(
+                read.payloads,
+                read.budget,
+                focal_memory::BudgetLane::Committed,
+            )?;
+            read.charge(sum(value.entries().len(), 1)?)?;
             // A created claim that retired (26 §4) left its identity with
             // the family; its continuation vouches for the entry, and the
             // definitions created beside it left with their claim.
             let mut retired = false;
-            for object in value.get().entries() {
+            for object in value.entries() {
                 if object.family == NativeCreatedFamily::Claim
                     && matches!(
                         read.get(Key::Retired(ClaimId(object.resolved.0)))?,
@@ -555,7 +582,7 @@ pub(super) fn authored(
                     retired = true;
                 }
             }
-            for object in value.get().entries() {
+            for object in value.entries() {
                 let resolved = match object.family {
                     NativeCreatedFamily::Claim => {
                         match read.get(Key::ClaimIdentity(object.schema, object.content))? {
@@ -950,6 +977,7 @@ fn terminal(
                 let Row::Outcome(outcome) = read.require(Key::Outcome(event.invocation))? else {
                     return Err(invalid());
                 };
+                let outcome = outcome.row(read.ledger, event.invocation, read.payloads)?;
                 if actual != deadline || outcome.logical_time != fired || fired < deadline.at {
                     return Err(invalid());
                 }
@@ -1050,7 +1078,7 @@ fn blocking(
         revision: ObjectRevision(0),
     });
     read.charge(const { (usize::BITS as usize + 1) * 64 })?;
-    let mut results = read.root.entries_from(&start, false);
+    let mut results = read.root.rows_from(&start, false);
     let mut found = false;
     loop {
         read.charge(128)?;

@@ -369,13 +369,17 @@ fn typed_fixed_decoding_does_not_grant_missing_claim_authority_or_accept_invalid
     let FixedFrame::Request {
         ledger,
         profile,
-        input,
+        mut input,
     } = decoded
     else {
         panic!("actor frame")
     };
     assert_eq!(ledger, LEDGER);
     assert_eq!(profile, NativeContentProfile::ProjectionOnly);
+    // The vector's generation is not one a principal never seen may open
+    // (F12): the owner refuses the generation before it looks at the
+    // target. The target's refusal is asked in the first generation.
+    input.request.epoch = RequestEpoch(1);
     let key = input.request;
     let core = Core::new_native(
         ledger,
@@ -403,7 +407,7 @@ fn typed_fixed_decoding_does_not_grant_missing_claim_authority_or_accept_invalid
     assert_eq!(owner.pending_len(), 0);
     assert_eq!(owner.budget_stats(), budget);
     assert_eq!(owner.range_stats(), range);
-    assert!(owner.effective().recorded(key).is_none());
+    assert!(owner.effective().recorded(key).unwrap().is_none());
     assert!(owner.effective().claim(ClaimId::from_u128(10)).is_none());
 
     let invalid = NativeDeadlineInput {

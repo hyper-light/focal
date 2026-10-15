@@ -1,5 +1,5 @@
 use super::*;
-use crate::native::completion_envelope::{EvidenceBounds, descriptor_limits};
+use crate::native::completion_envelope::descriptor_limits;
 use crate::native::report_tests as fixture;
 use focal_evidence::BuiltinNativeSchemas;
 use focal_model::ValidationMode;
@@ -20,20 +20,13 @@ fn parts(
     index: u32,
 ) -> (Binding, CompletionEnvelope, SchemaSet) {
     let key = fixture::key(index);
-    let Some(Row::Claim(owner)) = core.state.rows.get(&Key::Claim(key.claim)) else {
+    let Some(Row::Claim(owner)) = core.state.row(&Key::Claim(key.claim)) else {
         panic!("actual owner claim");
     };
     let parent = owner.claim().unwrap();
     let registrations = owner.registrations().unwrap();
     let declaration = core.native_definition(key.validation).unwrap();
     let schemas = SchemaSet::new(declaration, source, &BuiltinNativeSchemas, 16).unwrap();
-    let evidence = EvidenceBounds {
-        workspace_bytes: schemas
-            .workspace_bytes()
-            .checked_sub(schemas.custody_bytes())
-            .unwrap(),
-        retained_bytes: schemas.custody_bytes(),
-    };
     let envelope = CompletionEnvelope::derive(
         &core.state.rows,
         core.limits,
@@ -41,7 +34,6 @@ fn parts(
         registrations,
         declaration,
         descriptor_limits(core.limits, parent, registrations).unwrap(),
-        evidence,
     )
     .unwrap();
     (
@@ -70,7 +62,7 @@ fn install(
 
 fn registration(core: &Core<NativeState>, index: u32) -> usize {
     let key = fixture::key(index);
-    let Some(Row::Claim(claim)) = core.state.rows.get(&Key::Claim(key.claim)) else {
+    let Some(Row::Claim(claim)) = core.state.row(&Key::Claim(key.claim)) else {
         panic!("claim")
     };
     claim
@@ -83,7 +75,7 @@ fn registration(core: &Core<NativeState>, index: u32) -> usize {
 }
 
 #[test]
-fn tail_begin_restores_exact_grant_buffer_and_added_funding_with_older_pending() {
+fn tail_begin_restores_exact_grant_buffer_with_older_pending() {
     let core = fixture::running(&[(ValidationMode::Observe, false); 2]);
     let source = source();
     let mut book = CompletionBook::new(&source, core.limits).unwrap();
@@ -91,24 +83,18 @@ fn tail_begin_restores_exact_grant_buffer_and_added_funding_with_older_pending()
     let first = install(&mut book, &core, &source, 1);
     let before_second = source.stats();
     let capacity = book.entries.capacity();
-    let backing = book.funded_capacity();
     let second = install(&mut book, &core, &source, 2);
     assert!(book.entries.capacity() > capacity);
-    assert!(book.funded_capacity() > backing);
     assert_eq!(book.journals, 2);
 
     book.rollback(second).unwrap();
     assert_eq!(source.stats(), before_second);
     assert_eq!(book.entries.capacity(), capacity);
-    assert_eq!(book.funded_capacity(), backing);
     assert_eq!(book.len(), 1);
-    assert!(book.trim_idle().is_err());
 
     book.rollback(first).unwrap();
     assert_eq!(source.stats(), empty);
     assert_eq!(book.entries.capacity(), 0);
-    assert_eq!(book.funded_capacity(), 0);
-    book.trim_idle().unwrap();
     drop(book);
     assert_eq!(source.stats().used, 0);
 }
@@ -138,11 +124,10 @@ fn committing_begin_head_preserves_later_update_and_rollback_restores_credit() {
     assert_eq!(book.remaining_reports(key), Some(2));
     assert_eq!(book.grant(key).unwrap().credit.binding, before);
     assert_eq!(book.journals, 0);
-    book.trim_idle().unwrap();
 }
 
 #[test]
-fn published_terminal_head_and_discarded_replacement_preserve_issued_pages() {
+fn published_terminal_head_and_discarded_replacement_leave_no_grant_or_charge() {
     let core = fixture::running(&[(ValidationMode::Observe, false); 2]);
     let source = source();
     let mut book = CompletionBook::new(&source, core.limits).unwrap();
@@ -150,11 +135,6 @@ fn published_terminal_head_and_discarded_replacement_preserve_issued_pages() {
     book.commit(begin).unwrap();
     let first_key = fixture::key(1);
     let binding = core.native_evaluation(first_key).unwrap().binding();
-    let retained = book
-        .source()
-        .reserve(BudgetKind::Pages, BudgetLane::Completion, 128)
-        .unwrap()
-        .commit();
     let report = book
         .advance(
             first_key,
@@ -164,64 +144,13 @@ fn published_terminal_head_and_discarded_replacement_preserve_issued_pages() {
             CompletionUse::Regular,
         )
         .unwrap();
-    assert_eq!(book.totals.workspace, 0);
-    let before_second_capacity = book.funded_capacity();
     let second = install(&mut book, &core, &source, 2);
-    let added = match &second.change {
-        Change::Begin { added_funding, .. } => *added_funding,
-        _ => panic!("begin"),
-    };
-    // The second generation can reuse previously promised idle credit; only
-    // actual issued pages can force any small additional contribution.
-    assert!(added <= retained.bytes());
     book.commit(report).unwrap();
     assert!(book.remaining_reports(first_key).is_none());
     book.rollback(second).unwrap();
-    assert_eq!(book.funded_capacity(), before_second_capacity);
-    assert_eq!(book.source().stats().used, retained.bytes());
     assert_eq!(book.len(), 0);
-    book.trim_idle().unwrap();
-    assert_eq!(book.funded_capacity(), retained.bytes());
-    drop(retained);
-    book.trim_idle().unwrap();
-    assert_eq!(book.funded_capacity(), 0);
     drop(book);
     assert_eq!(source.stats().used, 0);
-}
-
-#[test]
-fn trim_waits_for_pending_report_rollback_and_never_refunds_issued_debit() {
-    let core = fixture::running(&[(ValidationMode::Observe, false)]);
-    let source = source();
-    let mut book = CompletionBook::new(&source, core.limits).unwrap();
-    let begin = install(&mut book, &core, &source, 1);
-    book.commit(begin).unwrap();
-    let key = fixture::key(1);
-    let binding = core.native_evaluation(key).unwrap().binding();
-    let backing = book.funded_capacity();
-    let allocation = book
-        .source()
-        .reserve(BudgetKind::Pages, BudgetLane::Completion, 256)
-        .unwrap()
-        .commit();
-    let report = book
-        .advance(
-            key,
-            binding,
-            binding.next().unwrap(),
-            true,
-            CompletionUse::Regular,
-        )
-        .unwrap();
-    assert!(book.trim_idle().is_err());
-    assert_eq!(book.funded_capacity(), backing);
-    // Owner ordering: dispose the candidate's pages before restoring credit.
-    drop(allocation);
-    book.rollback(report).unwrap();
-    assert_eq!(book.remaining_reports(key), Some(2));
-    assert_eq!(book.funded_capacity(), backing);
-    book.trim_idle().unwrap();
-    assert_eq!(book.funded_capacity(), backing);
 }
 
 #[test]
@@ -249,20 +178,20 @@ fn foreign_and_non_tail_journals_are_refused_without_changing_credits() {
 }
 
 #[test]
-fn failed_pool_growth_restores_existing_metadata_and_parent_exactly() {
+fn failed_index_growth_restores_existing_metadata_and_parent_exactly() {
     let core = fixture::running(&[(ValidationMode::Observe, false)]);
     let source = source();
     let mut book = CompletionBook::new(&source, core.limits).unwrap();
     let baseline = source.stats();
     let (binding, envelope, schemas) = parts(&core, &source, 1);
-    // Leave exactly the grant-vector allocation available, forcing failure only
-    // after new metadata was allocated and before the grant was installed.
+    // Leave one byte less than the grant vector's growth: the install is
+    // refused at its only allocation, nothing installed or charged.
     let metadata = CompletionIndex::<Grant>::slot_charge(1).unwrap();
     let pressure = source
         .reserve(
             BudgetKind::Index,
             BudgetLane::Ordinary,
-            source.reservation_limit(BudgetLane::Ordinary) - source.stats().used - metadata,
+            source.reservation_limit(BudgetLane::Ordinary) - source.stats().used - metadata + 1,
         )
         .unwrap()
         .commit();
@@ -279,27 +208,32 @@ fn failed_pool_growth_restores_existing_metadata_and_parent_exactly() {
     );
     assert_eq!(source.stats().used, before);
     assert_eq!(book.entries.capacity(), 0);
-    assert_eq!(book.funded_capacity(), 0);
     assert_eq!(book.journals, 0);
     drop(pressure);
     assert_eq!(source.stats(), baseline);
 }
 
 #[test]
-fn serial_and_outcome_margins_include_reports_and_one_control() {
+fn serial_margin_includes_reports_and_outcomes_one_control() {
     let core = fixture::running(&[(ValidationMode::Observe, false)]);
     let source = source();
     let mut book = CompletionBook::new(&source, core.limits).unwrap();
     let begin = install(&mut book, &core, &source, 1);
     assert!(book.check_serial(u64::MAX - 2).is_err());
     book.check_serial(u64::MAX - 3).unwrap();
+    // Resident outcomes keep one for an authority control while a grant lives,
+    // nothing for the reports it may yet make.
     let mut meta = Meta {
-        outcomes: book.limits.outcomes - 3,
+        outcomes: book.limits.outcomes - 1,
         ..Meta::default()
     };
-    book.check_slots(meta, SessionSeq(u64::MAX - 3), 0).unwrap();
+    book.check_slots(meta, SessionSeq(u64::MAX - 1), 0, BudgetLane::Ordinary)
+        .unwrap();
     meta.outcomes += 1;
-    assert!(book.check_slots(meta, SessionSeq(0), 0).is_err());
+    assert!(
+        book.check_slots(meta, SessionSeq(0), 0, BudgetLane::Completion)
+            .is_err()
+    );
     book.rollback(begin).unwrap();
     book.check_serial(u64::MAX).unwrap();
 }
@@ -321,10 +255,6 @@ fn increment_grant_funds_exact_target_family_and_journals_terminal_report_withou
         &registry,
         declaration,
         descriptor_limits(core.limits, parent, &registry).unwrap(),
-        EvidenceBounds {
-            workspace_bytes: schemas.workspace_bytes() - schemas.custody_bytes(),
-            retained_bytes: schemas.custody_bytes(),
-        },
     )
     .unwrap();
     drop(schemas);
@@ -357,7 +287,6 @@ fn increment_grant_funds_exact_target_family_and_journals_terminal_report_withou
         Some(declaration.attempt_bound())
     );
     assert!(!book.grant(key).unwrap().credit.failure_available);
-    assert_eq!(book.totals.slots.events, 3);
     let before_report = source.stats();
     assert!(
         book.advance(
@@ -395,9 +324,7 @@ fn increment_grant_funds_exact_target_family_and_journals_terminal_report_withou
         )
         .unwrap();
     book.commit(report).unwrap();
-    book.trim_idle().unwrap();
     assert_eq!(book.len(), 0);
-    assert_eq!(book.funded_capacity(), 0);
     drop(book);
     assert_eq!(source.stats().used, 0);
 }
@@ -426,192 +353,14 @@ fn admission_envelope_cannot_fund_an_increment_identity_even_with_the_same_defin
     );
     assert_eq!(source.stats(), baseline);
     assert_eq!(book.entries.capacity(), 0);
-    assert_eq!(book.funded_capacity(), 0);
 }
 
 #[test]
-fn unequal_envelope_demands_survive_partial_reports_head_commits_and_tail_rollback() {
-    // Synthetic finite-record profiles exercise the accounting seam; no new
-    // WholeWork target or mismatched physical report is admitted by this test.
-    let core = fixture::running(&[
-        (ValidationMode::Required, false),
-        (ValidationMode::Observe, true),
-    ]);
-    let source = source();
-    let mut book = CompletionBook::new(&source, core.limits).unwrap();
-    let (a_binding, a, a_schemas) = parts(&core, &source, 1);
-    let a = a
-        .with_slot_demand_for_test(
-            CompletionSlots {
-                artifacts: 2,
-                identities: 2,
-                results: 2,
-                outcomes: 1,
-                events: 11,
-                sequences: 1,
-                new_rows: 20,
-                ..CompletionSlots::default()
-            },
-            Some(CompletionSlots {
-                events: 3,
-                new_rows: 4,
-                ..CompletionSlots::default()
-            }),
-        )
-        .unwrap();
-    let (b_binding, b, b_schemas) = parts(&core, &source, 2);
-    let b = b
-        .with_slot_demand_for_test(
-            CompletionSlots {
-                artifacts: 1,
-                identities: 1,
-                results: 1,
-                outcomes: 1,
-                events: 6,
-                sequences: 1,
-                new_rows: 10,
-                ..CompletionSlots::default()
-            },
-            None,
-        )
-        .unwrap();
-    let a_begin = book
-        .install_begin(
-            fixture::key(1),
-            a_binding,
-            a,
-            a_schemas,
-            registration(&core, 1),
-        )
-        .unwrap();
-    let b_begin = book
-        .install_begin(
-            fixture::key(2),
-            b_binding,
-            b,
-            b_schemas,
-            registration(&core, 2),
-        )
-        .unwrap();
-    let full = book.totals;
-    assert_eq!(
-        full.slots,
-        CompletionSlots {
-            artifacts: 7,
-            identities: 7,
-            results: 7,
-            outcomes: 5,
-            events: 43,
-            sequences: 5,
-            new_rows: 74,
-            ..CompletionSlots::default()
-        }
-    );
-    assert_eq!(full.reports, 5);
-    let first = book
-        .advance(
-            fixture::key(1),
-            a_binding,
-            a_binding.next().unwrap(),
-            false,
-            CompletionUse::Regular,
-        )
-        .unwrap();
-    let after_first = book.totals;
-    assert_eq!(
-        after_first.slots,
-        CompletionSlots {
-            artifacts: 5,
-            identities: 5,
-            results: 5,
-            outcomes: 4,
-            events: 32,
-            sequences: 4,
-            new_rows: 54,
-            ..CompletionSlots::default()
-        }
-    );
-    let second = book
-        .advance(
-            fixture::key(2),
-            b_binding,
-            b_binding.next().unwrap(),
-            false,
-            CompletionUse::Regular,
-        )
-        .unwrap();
-    assert_eq!(
-        book.totals.slots,
-        CompletionSlots {
-            artifacts: 4,
-            identities: 4,
-            results: 4,
-            outcomes: 3,
-            events: 26,
-            sequences: 3,
-            new_rows: 44,
-            ..CompletionSlots::default()
-        }
-    );
-    book.commit(a_begin).unwrap();
-    book.commit(b_begin).unwrap();
-    book.rollback(second).unwrap();
-    assert_eq!(book.totals, after_first);
-    book.rollback(first).unwrap();
-    assert_eq!(book.totals, full);
-    let failed = book
-        .advance(
-            fixture::key(1),
-            a_binding,
-            a_binding.next().unwrap(),
-            true,
-            CompletionUse::AdmissionFailure,
-        )
-        .unwrap();
-    assert_eq!(book.totals.slots, b.slots());
-    book.commit(failed).unwrap();
-    book.check_slots(Meta::default(), SessionSeq(0), 0).unwrap();
-    let done = book
-        .advance(
-            fixture::key(2),
-            b_binding,
-            b_binding.next().unwrap(),
-            true,
-            CompletionUse::Regular,
-        )
-        .unwrap();
-    book.commit(done).unwrap();
-    assert_eq!(book.totals.slots, CompletionSlots::default());
-    assert_eq!(book.totals.reports, 0);
-    book.trim_idle().unwrap();
-    assert_eq!(book.funded_capacity(), 0);
-}
-
-#[test]
-fn recovered_partial_credit_uses_its_envelope_profile_instead_of_full_original_count() {
+fn recovered_partial_credit_counts_only_its_remaining_reports() {
     let core = fixture::running(&[(ValidationMode::Required, true)]);
     let source = source();
     let mut book = CompletionBook::new(&source, core.limits).unwrap();
     let (binding, envelope, schemas) = parts(&core, &source, 1);
-    let envelope = envelope
-        .with_slot_demand_for_test(
-            CompletionSlots {
-                artifacts: 1,
-                identities: 1,
-                results: 2,
-                outcomes: 1,
-                events: 9,
-                sequences: 1,
-                new_rows: 15,
-                ..CompletionSlots::default()
-            },
-            Some(CompletionSlots {
-                events: 2,
-                new_rows: 3,
-                ..CompletionSlots::default()
-            }),
-        )
-        .unwrap();
     assert_eq!(envelope.reports(), 3);
     book.install_recovered(
         fixture::key(1),
@@ -622,89 +371,5 @@ fn recovered_partial_credit_uses_its_envelope_profile_instead_of_full_original_c
         registration(&core, 1),
     )
     .unwrap();
-    assert_eq!(
-        book.totals.slots,
-        CompletionSlots {
-            artifacts: 1,
-            identities: 1,
-            results: 2,
-            outcomes: 1,
-            events: 11,
-            sequences: 1,
-            new_rows: 18,
-            ..CompletionSlots::default()
-        }
-    );
     assert_eq!(book.totals.reports, 1);
-    let mut meta = Meta {
-        events: book.limits.events - 11,
-        ..Meta::default()
-    };
-    book.check_slots(meta, SessionSeq(0), 0).unwrap();
-    meta.events += 1;
-    assert!(book.check_slots(meta, SessionSeq(0), 0).is_err());
-}
-
-#[test]
-fn summed_slot_overflow_refuses_before_metadata_growth_or_funding_changes() {
-    let core = fixture::running(&[
-        (ValidationMode::Required, false),
-        (ValidationMode::Observe, false),
-    ]);
-    let source = source();
-    let mut book = CompletionBook::new(&source, core.limits).unwrap();
-    let (binding, envelope, schemas) = parts(&core, &source, 1);
-    let envelope = envelope
-        .with_slot_demand_for_test(
-            CompletionSlots {
-                artifacts: 1,
-                identities: 1,
-                results: 1,
-                outcomes: 1,
-                events: usize::MAX / 2,
-                sequences: 1,
-                new_rows: 7,
-                ..CompletionSlots::default()
-            },
-            Some(CompletionSlots {
-                events: 1,
-                new_rows: 1,
-                ..CompletionSlots::default()
-            }),
-        )
-        .unwrap();
-    let first = book
-        .install_begin(
-            fixture::key(1),
-            binding,
-            envelope,
-            schemas,
-            registration(&core, 1),
-        )
-        .unwrap();
-    assert_eq!(book.totals.slots.events, usize::MAX);
-    let before = source.stats();
-    let totals = book.totals;
-    let capacity = book.entries.capacity();
-    let funding = book.funded_capacity();
-    let (binding, envelope, schemas) = parts(&core, &source, 2);
-    assert!(
-        book.install_begin(
-            fixture::key(2),
-            binding,
-            envelope,
-            schemas,
-            registration(&core, 2)
-        )
-        .is_err()
-    );
-    assert_eq!(source.stats(), before);
-    assert_eq!(book.totals, totals);
-    assert_eq!(book.entries.capacity(), capacity);
-    assert_eq!(book.funded_capacity(), funding);
-    assert_eq!(book.len(), 1);
-    assert_eq!(book.journals, 1);
-    book.rollback(first).unwrap();
-    assert_eq!(book.totals.slots, CompletionSlots::default());
-    assert_eq!(book.funded_capacity(), 0);
 }

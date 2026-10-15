@@ -11,6 +11,10 @@ use focal_enrollment::PrivateJournal;
 use serde::{Deserialize, Serialize};
 use std::{future::Future, path::Path};
 
+#[cfg(test)]
+#[path = "placement_journal_tests.rs"]
+mod tests;
+
 #[derive(Debug, thiserror::Error)]
 pub enum IntentError {
     #[error("placement intent journal is inconsistent with this node")]
@@ -29,8 +33,28 @@ pub enum IntentError {
     Persistence(#[from] focal_enrollment::EnrollmentError),
 }
 
+/// The clients one journal may be named by: a node's local client where it
+/// leads the owner, its enrolled principal where it submits through the
+/// leader (24 §16), and nothing else.
+const MAX_CLIENTS: usize = 4;
 #[derive(Serialize, Deserialize)]
 struct Saved {
+    schema: u16,
+    target: ControlIdentity,
+    client: [u8; 16],
+    completed: u64,
+    pending: Option<ControlRequest>,
+    /// The retry window of every other client this journal was named by:
+    /// the last sequence each completed, resumed when it is named again
+    /// (schema 2; the audit's F24 — a founder that follows its partition
+    /// after a restart submits through its leader as its principal, and
+    /// leads it again later).
+    #[serde(default)]
+    windows: std::collections::BTreeMap<[u8; 16], u64>,
+}
+/// What schema 1 wrote: one client, one window.
+#[derive(Deserialize)]
+struct SavedV1 {
     schema: u16,
     target: ControlIdentity,
     client: [u8; 16],
@@ -46,13 +70,33 @@ pub enum IntentOutcome {
     /// Refused before admission (a stale compare); the sequence stays free.
     /// The failure names why, for the agent's diagnostics.
     Refused(ControlFailure),
-    /// No decision yet: not leader, not ready, capacity or an unknown outcome.
-    Retry,
+    /// No decision yet: not leader, not ready, capacity or an unknown
+    /// outcome, named for the agent's diagnostics; asked again next pass.
+    Retry(ControlFailure),
 }
 
 pub(crate) struct IntentJournal {
     journal: Option<PrivateJournal>,
     saved: Saved,
+    /// The client this journal was opened with, adopted once nothing is pending.
+    wanted: [u8; 16],
+}
+
+/// Names `saved` by `client`, keeping the window of the client it was named by: the owner's
+/// retry floor for a client is never crossed when the client comes back.
+fn adopt(saved: &mut Saved, client: [u8; 16]) -> Result<(), IntentError> {
+    if saved.client == client {
+        return Ok(());
+    }
+    if saved.windows.len() >= MAX_CLIENTS && !saved.windows.contains_key(&client) {
+        return Err(IntentError::Capacity);
+    }
+    let previous = saved.client;
+    let previous_completed = saved.completed;
+    saved.completed = saved.windows.remove(&client).unwrap_or(0);
+    saved.windows.insert(previous, previous_completed);
+    saved.client = client;
+    Ok(())
 }
 impl IntentJournal {
     /// `name` is the journal directory under `<root>/cluster/`; a marker file
@@ -73,37 +117,73 @@ impl IntentJournal {
         let mut journal = PrivateJournal::open(path)?;
         let saved = match journal.read()? {
             Some(bytes) => {
-                let (mut value, rest): (Saved, _) = postcard::take_from_bytes(&bytes)?;
-                if !rest.is_empty() {
-                    return Err(IntentError::Identity);
-                }
-                // A journal that never carried an intent adopts the client it
-                // is opened with: a host's root journal was named by a local
+                let mut value = match postcard::take_from_bytes::<Saved>(&bytes) {
+                    Ok((value, rest)) if rest.is_empty() && value.schema == 2 => value,
+                    _ => {
+                        let (old, rest): (SavedV1, _) = postcard::take_from_bytes(&bytes)?;
+                        if !rest.is_empty() || old.schema != 1 {
+                            return Err(IntentError::Identity);
+                        }
+                        Saved {
+                            schema: 2,
+                            target: old.target,
+                            client: old.client,
+                            completed: old.completed,
+                            pending: old.pending,
+                            windows: std::collections::BTreeMap::new(),
+                        }
+                    }
+                };
+                // A journal with nothing pending adopts the client it is
+                // opened with — a host's root journal was named by a local
                 // client before hosts submitted root intents through the
-                // root leader as their enrolled principal (24 §16).
-                if value.client != client && value.completed == 0 && value.pending.is_none() {
-                    value.client = client;
+                // root leader as their enrolled principal (24 §16); a node
+                // names its partition intents by its local client where it
+                // leads the partition and by its principal where it follows
+                // (F24) — keeping each client's window where it stood, so
+                // the owner's retry floor for it is never crossed.
+                if value.client != client && value.pending.is_none() {
+                    adopt(&mut value, client)?;
                     journal.replace(&postcard::to_stdvec(&value)?)?;
                 }
                 value
             }
             None => {
                 let value = Saved {
-                    schema: 1,
+                    schema: 2,
                     target,
                     client,
                     completed: 0,
                     pending: None,
+                    windows: std::collections::BTreeMap::new(),
                 };
                 journal.replace(&postcard::to_stdvec(&value)?)?;
                 value
             }
         };
-        if saved.schema != 1
+        // A journal holding an intent keeps the client it was journaled under
+        // until the intent resolves, whichever client it is opened with now:
+        // both ways in present an intent as its own client (the local ingress
+        // builds its peer from it, and the owners' placement ingress admits a
+        // node's local client beside its principal, 24 §16), so an intent
+        // journaled while the node led resolves through the node that leads
+        // after a restart. Refusing the journal instead, as it had been, left
+        // the node unable to place anything in that partition until it led it
+        // again (a founder restarted into a partition its seated peer came to
+        // lead never merged it back: Windows CI, run 38201579852). It adopts the
+        // client it is opened with once the intent resolves.
+        if saved.client != client
+            && saved.windows.len() >= MAX_CLIENTS
+            && !saved.windows.contains_key(&client)
+        {
+            return Err(IntentError::Capacity);
+        }
+        if saved.schema != 2
+            || saved.windows.len() > MAX_CLIENTS
             || saved.target != target
-            || saved.client != client
+            || (saved.client != client && saved.pending.is_none())
             || saved.pending.as_ref().is_some_and(|request| {
-                request.id.client != client
+                request.id.client != saved.client
                     || Some(request.id.sequence) != saved.completed.checked_add(1)
                     || request.acknowledged_through != saved.completed
             })
@@ -116,10 +196,23 @@ impl IntentJournal {
         Ok(Self {
             journal: Some(journal),
             saved,
+            wanted: client,
         })
     }
     pub(crate) fn pending(&self) -> Option<&ControlRequest> {
         self.saved.pending.as_ref()
+    }
+    /// What this journal holds in memory: its pending request (at the bytes
+    /// it encodes to, which every heap field of it is no larger than, and its
+    /// own size) and the other clients' retry windows.
+    pub(crate) fn held_bytes(&self) -> Option<usize> {
+        let pending = match &self.saved.pending {
+            Some(request) => postcard::experimental::serialized_size(request)
+                .ok()?
+                .checked_add(size_of::<ControlRequest>())?,
+            None => 0,
+        };
+        focal_memory::map_bytes::<[u8; 16], u64>(self.saved.windows.len())?.checked_add(pending)
     }
     pub(crate) fn completed(&self) -> u64 {
         self.saved.completed
@@ -174,7 +267,7 @@ impl IntentJournal {
                     return Err(IntentError::Identity);
                 }
                 self.saved.completed = receipt.request.sequence;
-                self.saved.pending = None;
+                self.resolved()?;
                 self.save_on(host).await?;
                 Ok(IntentOutcome::Committed(receipt))
             }
@@ -187,19 +280,25 @@ impl IntentJournal {
                 | ControlFailure::Invalid
                 | ControlFailure::WrongOwner),
             ) => {
-                self.saved.pending = None;
+                self.resolved()?;
                 self.save_on(host).await?;
                 Ok(IntentOutcome::Refused(failure))
             }
             Err(
-                ControlFailure::NotLeader { .. }
+                failure @ (ControlFailure::NotLeader { .. }
                 | ControlFailure::NotReady
                 | ControlFailure::Capacity
                 | ControlFailure::Unavailable
-                | ControlFailure::OutcomeUnknown,
-            ) => Ok(IntentOutcome::Retry),
+                | ControlFailure::OutcomeUnknown),
+            ) => Ok(IntentOutcome::Retry(failure)),
             Err(error) => Err(error.into()),
         }
+    }
+    /// The pending intent is resolved: nothing is pending, and the journal is named by the
+    /// client it was opened with.
+    fn resolved(&mut self) -> Result<(), IntentError> {
+        self.saved.pending = None;
+        adopt(&mut self.saved, self.wanted)
     }
     async fn save_on(&mut self, host: &ControlHost) -> Result<(), IntentError> {
         crate::control_host::save_local_intent(

@@ -3,6 +3,8 @@ use super::*;
 
 #[path = "adoption_increment_tests.rs"]
 mod adoption_tests;
+#[path = "increment_scan_tests.rs"]
+mod scan_tests;
 use focal_memory::{BudgetKind, BudgetLane};
 use focal_model::lifecycle::artifact_descriptor::ResultProvenance;
 use focal_model::{
@@ -347,8 +349,8 @@ fn complete_retry_fallback_and_quality_chain_uses_funded_capacity_under_full_par
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
@@ -716,6 +718,7 @@ fn pending_work_begin_and_report_discard_restore_full_registry_and_reserved_cred
         f.owner
             .effective()
             .recorded(report_outcome.invocation)
+            .unwrap()
             .is_none()
     );
     assert_eq!(f.owner.discard_from(work).unwrap(), 1);
@@ -732,6 +735,7 @@ fn pending_work_begin_and_report_discard_restore_full_registry_and_reserved_cred
         f.owner
             .effective()
             .recorded(work_outcome.invocation)
+            .unwrap()
             .is_none()
     );
     assert_eq!(
@@ -1142,7 +1146,7 @@ fn submission_refuses_unreportable_visibility_before_custody_or_required_evaluat
             .work(ArtifactId::from_u128(801))
             .is_none()
     );
-    assert!(f.owner.effective().recorded(request_key).is_none());
+    assert!(f.owner.effective().recorded(request_key).unwrap().is_none());
     assert!(
         f.owner
             .effective()
@@ -1466,8 +1470,8 @@ fn reconstruction_refunds_refusal_then_funds_live_increment_after_received_respo
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
@@ -1485,8 +1489,8 @@ fn reconstruction_refunds_refusal_then_funds_live_increment_after_received_respo
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();

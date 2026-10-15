@@ -41,154 +41,166 @@ async fn read_authority(host: &ControlHost, plan: FirstDirectoryPlan) -> Control
     authority
 }
 
-#[tokio::test]
-async fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_stale_or_expired_permits()
- {
-    let directory = tempfile::tempdir().unwrap();
-    let (mut network, plan) = prepared_network(directory.path()).await;
-    let budget = budget();
-    let now = unix_time().unwrap();
-    drop(network.enrollment_driver);
-    let authority = BootstrapAuthority::open_or_create(
-        directory.path().join("cluster/network/authority"),
-        plan.identity().unwrap().cluster.0,
-        vec![network.state.sponsor.server_name.clone()],
-        now,
-    )
-    .unwrap();
-    let draft = network
-        .control
-        .enrollment()
-        .unwrap()
-        .prepare_invitation(
-            &authority,
-            InviteOptions {
-                endpoint: "127.0.0.1:7443".into(),
-                server_name: network.state.sponsor.server_name.clone(),
-                role: EnrollmentRole::Client,
-                expires_at: now + 60,
-            },
+#[test]
+fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_stale_or_expired_permits()
+{
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut network, plan) = prepared_network(directory.path()).await;
+        let budget = budget();
+        let now = unix_time().unwrap();
+        drop(network.enrollment_driver);
+        let authority = BootstrapAuthority::open_or_create(
+            directory.path().join("cluster/network/authority"),
+            plan.identity().unwrap().cluster.0,
+            vec![network.state.sponsor.server_name.clone()],
             now,
         )
         .unwrap();
-    commit(
-        &mut network.control,
-        5,
-        ControlCommand::Enrollment(draft.command().clone()),
-    );
-    let invitation = draft
-        .release(network.control.enrollment().unwrap())
+        let draft = network
+            .control
+            .enrollment()
+            .unwrap()
+            .prepare_invitation(
+                &authority,
+                InviteOptions {
+                    endpoint: "127.0.0.1:7443".into(),
+                    server_name: network.state.sponsor.server_name.clone(),
+                    role: EnrollmentRole::Client,
+                    expires_at: now + 60,
+                },
+                now,
+            )
+            .unwrap();
+        commit(
+            &mut network.control,
+            5,
+            ControlCommand::Enrollment(draft.command().clone()),
+        );
+        let invitation = draft
+            .release(network.control.enrollment().unwrap())
+            .unwrap();
+        let initial = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
+        let stale = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
+        let opened = initial
+            .open(network.storage.storage.clone(), &budget, None)
+            .unwrap();
+        let expires_at = network
+            .control
+            .authority()
+            .unwrap()
+            .group(plan.group())
+            .unwrap()
+            .expires_at;
+        let expired = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
+        assert!(matches!(
+            expired.prepare_refresh(opened.replica(), expires_at, &budget),
+            Err(DirectoryBootstrapError::Unauthorized)
+        ));
+        let (host, owner, outgoing) = ControlHost::spawn(
+            opened.into_replica(),
+            NoDirectoryAuthority,
+            ControlHostConfig::new(plan.namespace()),
+            budget.clone(),
+        )
         .unwrap();
-    let initial = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
-    let stale = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
-    let opened = initial.open(network.wal.clone(), &budget, None).unwrap();
-    let expires_at = network
-        .control
-        .authority()
-        .unwrap()
-        .group(plan.group())
-        .unwrap()
-        .expires_at;
-    let expired = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
-    assert!(matches!(
-        expired.prepare_refresh(opened.replica(), expires_at, &budget),
-        Err(DirectoryBootstrapError::Unauthorized)
-    ));
-    let (host, owner, outgoing) = ControlHost::spawn(
-        opened.into_replica(),
-        NoDirectoryAuthority,
-        ControlHostConfig::new(plan.namespace()),
-        budget.clone(),
-    )
-    .unwrap();
-    let before = read_authority(&host, plan).await;
-    let registry = EnrollmentRegistry::restore(
-        &before.enrollment,
-        plan.identity().unwrap().cluster.0,
-        EnrollmentLimits::default(),
-    )
-    .unwrap();
-    assert!(!registry.invitation_revoked(invitation.id()).unwrap());
-    host.submit(
-        runtime(plan),
-        ControlRequest {
-            id: ControlRequestId {
-                client: runtime(plan).principal().0,
-                sequence: 1,
-            },
-            acknowledged_through: 0,
-            command: ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
-                command: focal_directory::PartitionCommand {
-                    expected_revision: 0,
-                    delegation_epoch: 1,
-                    operation: focal_directory::PartitionOperation::Enroll {
-                        node: before.authority.nodes[&plan.founder_node()]
-                            .enrollment
-                            .clone(),
-                        expected_generation: None,
+        let before = read_authority(&host, plan).await;
+        let registry = EnrollmentRegistry::restore(
+            &before.enrollment,
+            plan.identity().unwrap().cluster.0,
+            EnrollmentLimits::default(),
+        )
+        .unwrap();
+        assert!(!registry.invitation_revoked(invitation.id()).unwrap());
+        host.submit(
+            runtime(plan),
+            ControlRequest {
+                id: ControlRequestId {
+                    client: runtime(plan).principal().0,
+                    sequence: 1,
+                },
+                acknowledged_through: 0,
+                command: ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
+                    command: focal_directory::PartitionCommand {
+                        expected_revision: 0,
+                        delegation_epoch: 1,
+                        operation: focal_directory::PartitionOperation::Enroll {
+                            node: before.authority.nodes[&plan.founder_node()]
+                                .enrollment
+                                .clone(),
+                            expected_generation: None,
+                        },
                     },
-                },
-                evidence: ControlEvidence {
-                    authority_revision: before.authority.revision,
-                    enrollment_revision: registry.revision(),
-                    decided_at: unix_time().unwrap(),
-                    proofs: vec![],
-                },
-            }),
-        },
-    )
-    .await
-    .unwrap();
-    let revoke = network
-        .control
-        .enrollment()
-        .unwrap()
-        .prepare_revoke(invitation.id(), now)
+                    evidence: ControlEvidence {
+                        authority_revision: before.authority.revision,
+                        enrollment_revision: registry.revision(),
+                        decided_at: unix_time().unwrap(),
+                        proofs: vec![],
+                    },
+                }),
+            },
+        )
+        .await
         .unwrap();
-    commit(&mut network.control, 6, ControlCommand::Enrollment(revoke));
-    let permit = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
-    let receipt = tokio::time::timeout(Duration::from_secs(5), host.refresh_directory(permit))
+        let revoke = network
+            .control
+            .enrollment()
+            .unwrap()
+            .prepare_revoke(invitation.id(), now)
+            .unwrap();
+        commit(&mut network.control, 6, ControlCommand::Enrollment(revoke));
+        let permit = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
+        let receipt = crate::test_waits::charged(
+            || vec![host.periods()],
+            Duration::from_secs(5),
+            crate::test_waits::CONTROL_TICK,
+            host.refresh_directory(permit),
+        )
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(receipt.root_index, network.control.applied_index());
-    assert_eq!(receipt.receipt.request.sequence, 2);
-    assert!(receipt.applied_index >= receipt.receipt.committed_index);
-    let installed = read_authority(&host, plan).await;
-    let registry = EnrollmentRegistry::restore(
-        &installed.enrollment,
-        plan.identity().unwrap().cluster.0,
-        EnrollmentLimits::default(),
-    )
-    .unwrap();
-    assert!(registry.invitation_revoked(invitation.id()).unwrap());
-    assert_eq!(installed.source_index, receipt.root_index);
-    assert_eq!(host.progress().revisions.partition, 1);
-    assert!(matches!(
-        host.refresh_directory(stale).await,
-        Err(DirectoryBootstrapError::Unauthorized)
-    ));
-    let again = host
-        .refresh_directory(authorize_first_directory(&network.control, plan, now, &budget).unwrap())
-        .await
+        assert_eq!(receipt.root_index, network.control.applied_index());
+        assert_eq!(receipt.receipt.request.sequence, 2);
+        assert!(receipt.applied_index >= receipt.receipt.committed_index);
+        let installed = read_authority(&host, plan).await;
+        let registry = EnrollmentRegistry::restore(
+            &installed.enrollment,
+            plan.identity().unwrap().cluster.0,
+            EnrollmentLimits::default(),
+        )
         .unwrap();
-    assert_eq!(again.receipt, receipt.receipt);
-    assert_eq!(again.root_index, receipt.root_index);
-    host.stop().await.unwrap();
-    owner.join().unwrap();
-    drop(host);
-    drop(outgoing);
-    assert_eq!(budget.stats().used, 0);
-    let reopened = authorize_first_directory(&network.control, plan, now, &budget)
-        .unwrap()
-        .open(network.wal.clone(), &budget, None)
-        .unwrap();
-    assert_eq!(
-        reopened.replica().receipt(receipt.receipt.request).unwrap(),
-        Some(receipt.receipt)
-    );
-    drop(reopened);
-    assert_eq!(budget.stats().used, 0);
+        assert!(registry.invitation_revoked(invitation.id()).unwrap());
+        assert_eq!(installed.source_index, receipt.root_index);
+        assert_eq!(host.progress().revisions.partition, 1);
+        assert!(matches!(
+            host.refresh_directory(stale).await,
+            Err(DirectoryBootstrapError::Unauthorized)
+        ));
+        let again = host
+            .refresh_directory(
+                authorize_first_directory(&network.control, plan, now, &budget).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.receipt, receipt.receipt);
+        assert_eq!(again.root_index, receipt.root_index);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        drop(host);
+        drop(outgoing);
+        assert_eq!(budget.stats().used, 0);
+        let reopened = authorize_first_directory(&network.control, plan, now, &budget)
+            .unwrap()
+            .open(network.storage.storage.clone(), &budget, None)
+            .unwrap();
+        assert_eq!(
+            reopened.replica().receipt(receipt.receipt.request).unwrap(),
+            Some(receipt.receipt)
+        );
+        drop(reopened);
+        assert_eq!(budget.stats().used, 0);
+    })
+    .unwrap()
 }
 
 fn owner(
@@ -197,7 +209,7 @@ fn owner(
     budget: MemoryBudget,
 ) -> Owner<NoDirectoryAuthority> {
     let status = replica.status();
-    let (outbound, _outgoing) = async_mpsc::channel(8);
+    let (outbound, _outgoing) = hyper_rt::sync::channel(8).unwrap();
     let (progress, _changes) = watch::channel(ControlProgressState {
         value: ControlProgress {
             identity: replica.identity(),
@@ -207,14 +219,24 @@ fn owner(
             applied_index: replica.applied_index(),
             revisions: replica.revisions(),
             dropped_replication: 0,
+            peers_unreachable: 0,
+            appends_rejected: 0,
+            frames_held: 0,
+            frames_let_go: 0,
+            frames_stale: 0,
+            peer_reports_coalesced: 0,
+            peer_reports_dropped: 0,
             stopped: false,
             snapshot_index: 0,
             peers: Vec::new(),
             failure: None,
         },
         _allocation: None,
-    });
+    })
+    .unwrap();
+    let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
     Owner {
+        stopping: None,
         replica,
         initial: None,
         verifier: NoDirectoryAuthority,
@@ -229,207 +251,240 @@ fn owner(
         progress,
         nonce: 0,
         dropped: 0,
+        ordered: std::collections::BTreeMap::new(),
+        resequencer: crate::resequence::Resequencer::new(
+            focal_consensus::DEFAULT_INFLIGHT_WINDOW,
+            crate::fleet::LOST_PEERS,
+        ),
+        stepped: Vec::new(),
+        waiting_frames: std::collections::VecDeque::new(),
+        appends_rejected: 0,
+        frames_held: 0,
+        frames_let_go: 0,
+        frames_stale: 0,
+        acks: crate::ack_clock::AckClock::default(),
+        took_turn: false,
+        unreachable: 0,
+        lost_sender: lost.0,
+        lost: lost.1,
+        lost_peers: Vec::new(),
+        lost_coalesced: 0,
+        lost_dropped: 0,
         failure: None,
         pace: Default::default(),
     }
 }
 
-#[tokio::test]
-async fn stop_commits_admitted_refresh_without_starting_a_postcommit_read_before_checkpoint() {
-    let directory = tempfile::tempdir().unwrap();
-    let (mut network, plan) = prepared_network(directory.path()).await;
-    let budget = budget();
-    let opened = authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
-        .unwrap()
-        .open(network.wal.clone(), &budget, None)
-        .unwrap();
-    let revision = network.control.authority().unwrap().revision();
-    commit(
-        &mut network.control,
-        5,
-        ControlCommand::Authority(AuthorityCommand {
-            expected_revision: revision,
-            enrollment_revision: 1,
-            decided_at: unix_time().unwrap(),
-            operation: AuthorityOperation::AdvanceClock,
-        }),
-    );
-    let permit =
-        authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget).unwrap();
-    let mut owner = owner(opened.into_replica(), plan, budget.clone());
-    let change = Box::new(
-        permit
-            .prepare_refresh(&owner.replica, unix_time().unwrap(), &budget)
-            .unwrap(),
-    );
-    let request = change.request.as_ref().unwrap().clone();
-    assert_eq!(
-        owner
-            .replica
-            .submit(request.clone(), &NoDirectoryAuthority)
-            .unwrap(),
-        ControlSubmission::Pending(request.id)
-    );
-    assert!(owner.replica.receipt(request.id).unwrap().is_none());
-    let mut input = budget
-        .reserve(BudgetKind::Control, BudgetLane::Completion, 2048)
-        .unwrap()
-        .commit();
-    let reply_charge = input.split_off(512).unwrap();
-    let (response, receive) = oneshot::channel();
-    owner.authority_refresh = Some(PendingAuthority {
-        phase: Some(RefreshPhase::Writing(change)),
-        context: None,
-        term: owner.replica.status().term,
-        deadline: u64::MAX,
-        response: Some(response),
-        reply_charge: Some(reply_charge),
-        _input: input,
-    });
-    // Exactly the production Stop path: the final drain commits the admitted
-    // write. It must not start the refresh's additional ReadIndex afterward,
-    // which would leave RawNode Ready and invalidate the following checkpoint.
-    let (response, stopped) = oneshot::channel();
-    assert!(owner.work(Work::Stop(response)).unwrap());
-    assert_eq!(stopped.await.unwrap(), Ok(()));
-    let (reply, charge) = receive.await.unwrap();
-    assert!(matches!(reply, Err(DirectoryBootstrapError::Unavailable)));
-    drop(charge);
-    let receipt = owner.replica.receipt(request.id).unwrap().unwrap();
-    assert_eq!(receipt.request, request.id);
-    drop(owner);
-    assert_eq!(budget.stats().used, 0);
-    let mut reopened =
-        authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
+#[test]
+fn stop_commits_admitted_refresh_without_starting_a_postcommit_read_before_checkpoint() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut network, plan) = prepared_network(directory.path()).await;
+        let budget = budget();
+        let opened =
+            authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
+                .unwrap()
+                .open(network.storage.storage.clone(), &budget, None)
+                .unwrap();
+        let revision = network.control.authority().unwrap().revision();
+        commit(
+            &mut network.control,
+            5,
+            ControlCommand::Authority(AuthorityCommand {
+                expected_revision: revision,
+                enrollment_revision: 1,
+                decided_at: unix_time().unwrap(),
+                operation: AuthorityOperation::AdvanceClock,
+            }),
+        );
+        let permit =
+            authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
+                .unwrap();
+        let mut owner = owner(opened.into_replica(), plan, budget.clone());
+        let change = Box::new(
+            permit
+                .prepare_refresh(&owner.replica, unix_time().unwrap(), &budget)
+                .unwrap(),
+        );
+        let request = change.request.as_ref().unwrap().clone();
+        assert_eq!(
+            owner
+                .replica
+                .submit(request.clone(), &NoDirectoryAuthority)
+                .unwrap(),
+            ControlSubmission::Pending(request.id)
+        );
+        assert!(owner.replica.receipt(request.id).unwrap().is_none());
+        let mut input = budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 2048)
             .unwrap()
-            .open(network.wal.clone(), &budget, None)
-            .unwrap()
-            .into_replica();
-    assert_eq!(reopened.receipt(request.id).unwrap(), Some(receipt));
-    assert_eq!(
-        reopened.submit(request, &NoDirectoryAuthority).unwrap(),
-        ControlSubmission::Existing(receipt)
-    );
-    drop(reopened);
-    assert_eq!(budget.stats().used, 0);
+            .commit();
+        let reply_charge = input.split_off(512).unwrap();
+        let (response, receive) = hyper_rt::sync::oneshot().unwrap();
+        owner.authority_refresh = Some(PendingAuthority {
+            phase: Some(RefreshPhase::Writing(change)),
+            context: None,
+            term: owner.replica.status().term,
+            deadline: u64::MAX,
+            response: Some(response),
+            reply_charge: Some(reply_charge),
+            _input: input,
+        });
+        // Exactly the production Stop path: the final drain commits the admitted
+        // write. It must not start the refresh's additional ReadIndex afterward,
+        // which would leave RawNode Ready and invalidate the following checkpoint.
+        let (response, stopped) = hyper_rt::sync::oneshot().unwrap();
+        assert!(owner.work(Work::Stop(response)).unwrap());
+        assert_eq!(stopped.await.unwrap(), Ok(()));
+        let (reply, charge) = receive.await.unwrap();
+        assert!(matches!(reply, Err(DirectoryBootstrapError::Unavailable)));
+        drop(charge);
+        let receipt = owner.replica.receipt(request.id).unwrap().unwrap();
+        assert_eq!(receipt.request, request.id);
+        drop(owner);
+        assert_eq!(budget.stats().used, 0);
+        let mut reopened =
+            authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
+                .unwrap()
+                .open(network.storage.storage.clone(), &budget, None)
+                .unwrap()
+                .into_replica();
+        assert_eq!(reopened.receipt(request.id).unwrap(), Some(receipt));
+        assert_eq!(
+            reopened.submit(request, &NoDirectoryAuthority).unwrap(),
+            ControlSubmission::Existing(receipt)
+        );
+        drop(reopened);
+        assert_eq!(budget.stats().used, 0);
+    })
+    .unwrap()
 }
 
-#[tokio::test]
-async fn canceled_admitted_refresh_keeps_exact_intent_and_recovers_unknown_commit() {
-    let directory = tempfile::tempdir().unwrap();
-    let (mut network, plan) = prepared_network(directory.path()).await;
-    let budget = budget();
-    let opened = authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
-        .unwrap()
-        .open(network.wal.clone(), &budget, None)
-        .unwrap();
-    let revision = network.control.authority().unwrap().revision();
-    commit(
-        &mut network.control,
-        5,
-        ControlCommand::Authority(AuthorityCommand {
-            expected_revision: revision,
-            enrollment_revision: 1,
-            decided_at: unix_time().unwrap(),
-            operation: AuthorityOperation::AdvanceClock,
-        }),
-    );
-    let permit =
-        authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget).unwrap();
-    let replacement =
-        authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget).unwrap();
-    let mut owner = owner(opened.into_replica(), plan, budget.clone());
-    let change = Box::new(
-        permit
-            .prepare_refresh(&owner.replica, unix_time().unwrap(), &budget)
-            .unwrap(),
-    );
-    let request = change.request.as_ref().unwrap().clone();
-    assert_eq!(
+#[test]
+fn canceled_admitted_refresh_keeps_exact_intent_and_recovers_unknown_commit() {
+    // focal-log's fault points: a node below the storage level.
+    let _level = crate::upgrade::announce_for_test(crate::upgrade::BELOW_STORAGE_LEVEL);
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut network, plan) = prepared_network(directory.path()).await;
+        let budget = budget();
+        let opened =
+            authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
+                .unwrap()
+                .open(network.storage.storage.clone(), &budget, None)
+                .unwrap();
+        let revision = network.control.authority().unwrap().revision();
+        commit(
+            &mut network.control,
+            5,
+            ControlCommand::Authority(AuthorityCommand {
+                expected_revision: revision,
+                enrollment_revision: 1,
+                decided_at: unix_time().unwrap(),
+                operation: AuthorityOperation::AdvanceClock,
+            }),
+        );
+        let permit =
+            authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
+                .unwrap();
+        let replacement =
+            authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
+                .unwrap();
+        let mut owner = owner(opened.into_replica(), plan, budget.clone());
+        let change = Box::new(
+            permit
+                .prepare_refresh(&owner.replica, unix_time().unwrap(), &budget)
+                .unwrap(),
+        );
+        let request = change.request.as_ref().unwrap().clone();
+        assert_eq!(
+            owner
+                .replica
+                .submit(request.clone(), &NoDirectoryAuthority)
+                .unwrap(),
+            ControlSubmission::Pending(request.id)
+        );
+        let mut input = budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 2048)
+            .unwrap()
+            .commit();
+        let reply_charge = input.split_off(512).unwrap();
+        let (send, receive) = hyper_rt::sync::oneshot().unwrap();
+        owner.authority_refresh = Some(PendingAuthority {
+            phase: Some(RefreshPhase::Writing(change)),
+            context: None,
+            term: owner.replica.status().term,
+            deadline: u64::MAX,
+            response: Some(send),
+            reply_charge: Some(reply_charge),
+            _input: input,
+        });
+        drop(receive);
+        let mut pending = owner.authority_refresh.take().unwrap();
+        let events = ControlEvents::default();
+        assert!(
+            owner
+                .advance_authority_refresh(&mut pending, &events)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(pending.phase, Some(RefreshPhase::Writing(_))));
+        assert!(pending.response.is_none());
+        owner.authority_refresh = Some(pending);
+        let mut input = budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 2048)
+            .unwrap()
+            .commit();
+        let charge = input.split_off(512).unwrap();
+        let (send, receive) = hyper_rt::sync::oneshot().unwrap();
+        owner.refresh_directory(Box::new(replacement), send, input, charge);
+        let (result, charge) = receive.await.unwrap();
+        assert!(matches!(result, Err(DirectoryBootstrapError::Capacity)));
+        drop(charge);
+        assert!(matches!(
+            owner.authority_refresh.as_ref().unwrap().phase,
+            Some(RefreshPhase::Writing(_))
+        ));
         owner
             .replica
-            .submit(request.clone(), &NoDirectoryAuthority)
-            .unwrap(),
-        ControlSubmission::Pending(request.id)
-    );
-    let mut input = budget
-        .reserve(BudgetKind::Control, BudgetLane::Completion, 2048)
-        .unwrap()
-        .commit();
-    let reply_charge = input.split_off(512).unwrap();
-    let (send, receive) = oneshot::channel();
-    owner.authority_refresh = Some(PendingAuthority {
-        phase: Some(RefreshPhase::Writing(change)),
-        context: None,
-        term: owner.replica.status().term,
-        deadline: u64::MAX,
-        response: Some(send),
-        reply_charge: Some(reply_charge),
-        _input: input,
-    });
-    drop(receive);
-    let mut pending = owner.authority_refresh.take().unwrap();
-    let events = ControlEvents::default();
-    assert!(
-        owner
-            .advance_authority_refresh(&mut pending, &events)
-            .unwrap()
-            .is_none()
-    );
-    assert!(matches!(pending.phase, Some(RefreshPhase::Writing(_))));
-    assert!(pending.response.is_none());
-    owner.authority_refresh = Some(pending);
-    let mut input = budget
-        .reserve(BudgetKind::Control, BudgetLane::Completion, 2048)
-        .unwrap()
-        .commit();
-    let charge = input.split_off(512).unwrap();
-    let (send, receive) = oneshot::channel();
-    owner.refresh_directory(Box::new(replacement), send, input, charge);
-    let (result, charge) = receive.await.unwrap();
-    assert!(matches!(result, Err(DirectoryBootstrapError::Capacity)));
-    drop(charge);
-    assert!(matches!(
-        owner.authority_refresh.as_ref().unwrap().phase,
-        Some(RefreshPhase::Writing(_))
-    ));
-    owner
-        .replica
-        .inject_fault_once(focal_consensus::FaultPoint::AfterFenceInstall);
-    assert!(owner.drain().is_err());
-    drop(owner);
-    drop(network);
-    assert_eq!(budget.stats().used, 0);
+            .inject_fault_once(focal_consensus::FaultPoint::AfterFenceInstall)
+            .unwrap();
+        assert!(owner.drain().is_err());
+        drop(owner);
+        drop(network);
+        assert_eq!(budget.stats().used, 0);
 
-    let mut settings = crate::config::Settings::default();
-    settings.node.data_dir = Some(directory.path().into());
-    let network = crate::network_bootstrap::FoundingNetwork::open(&settings)
-        .await
+        let mut settings = crate::config::Settings::default();
+        settings.node.data_dir = Some(directory.path().into());
+        let network = crate::network_bootstrap::FoundingNetwork::open(&settings)
+            .await
+            .unwrap();
+        let mut replica = ControlReplica::open_on_storage(
+            ControlOptions::new(focal_consensus::NodeConfig::single(
+                plan.founder_node(),
+                plan.identity().unwrap().cluster.0,
+                plan.group().0,
+            )),
+            plan.bootstrap(None).unwrap(),
+            budget.clone(),
+            &network.storage.storage,
+        )
         .unwrap();
-    let mut replica = ControlReplica::open_on_wal(
-        ControlOptions::new(focal_consensus::NodeConfig::single(
-            plan.founder_node(),
-            plan.identity().unwrap().cluster.0,
-            plan.group().0,
-        )),
-        plan.bootstrap(None).unwrap(),
-        budget.clone(),
-        network.wal.clone(),
-    )
-    .unwrap();
-    for _ in 0..8 {
-        replica.drain(&NoDirectoryAuthority).unwrap();
-    }
-    replica.campaign().unwrap();
-    for _ in 0..8 {
-        replica.drain(&NoDirectoryAuthority).unwrap();
-    }
-    let recovered = replica.receipt(request.id).unwrap().unwrap();
-    assert_eq!(recovered.request, request.id);
-    assert_eq!(
-        replica.submit(request, &NoDirectoryAuthority).unwrap(),
-        ControlSubmission::Existing(recovered)
-    );
-    drop(replica);
-    assert_eq!(budget.stats().used, 0);
+        for _ in 0..8 {
+            replica.drain(&NoDirectoryAuthority).unwrap();
+        }
+        replica.campaign().unwrap();
+        for _ in 0..8 {
+            replica.drain(&NoDirectoryAuthority).unwrap();
+        }
+        let recovered = replica.receipt(request.id).unwrap().unwrap();
+        assert_eq!(recovered.request, request.id);
+        assert_eq!(
+            replica.submit(request, &NoDirectoryAuthority).unwrap(),
+            ControlSubmission::Existing(recovered)
+        );
+        drop(replica);
+        assert_eq!(budget.stats().used, 0);
+    })
+    .unwrap()
 }

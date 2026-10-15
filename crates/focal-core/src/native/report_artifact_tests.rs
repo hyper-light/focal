@@ -188,10 +188,7 @@ fn assert_envelope(descriptor: &impl report_artifact::ArtifactView) {
 #[test]
 fn actual_source_plan_and_owned_admission_authority_share_fields_and_exact_envelope() {
     let core = running(&[(ValidationMode::Required, false)]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let inputs = [ObjectRef::claim(ledger(), key(1).claim)];
     let before = core.native_budget();
     let sequence = core.native_sequence();
@@ -227,10 +224,7 @@ fn actual_source_plan_and_owned_admission_authority_share_fields_and_exact_envel
 #[test]
 fn borrowed_admission_checks_exact_actor_receipt_evidence_and_registered_provenance() {
     let core = running(&[(ValidationMode::Required, false)]);
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     for case in 0..12 {
         let mut spec = specification(&view, 702, VerdictValue::Pass, &[], &["internal"]);
         let expected = match case {
@@ -327,19 +321,25 @@ fn borrowed_reports_resolve_pending_inputs_inherit_visibility_and_refuse_collisi
     );
     let token = verified(&mut custody, &input);
     let first = report(&core, input, &[], &token);
-    let view = View {
-        state: &core.state,
-        tail: Some(&first),
-    };
+    let view = View::committed(&core.state).with_own(&first).unwrap();
     let inputs = [ObjectRef {
         ledger: ledger(),
         kind: ObjectKind::Artifact,
         id: ObjectId::from_u128(741),
     }];
     let before = core.native_budget();
-    let original = *first.evaluation(key(1)).unwrap();
+    let original = *core
+        .native_chain(&[&first])
+        .unwrap()
+        .evaluation(key(1))
+        .unwrap();
     assert!(core.native_artifact(ArtifactId::from_u128(741)).is_none());
-    assert!(first.artifact(ArtifactId::from_u128(741)).is_some());
+    assert!(
+        core.native_chain(&[&first])
+            .unwrap()
+            .artifact(ArtifactId::from_u128(741))
+            .is_some()
+    );
     assert_authority(
         &view,
         specification(&view, 742, VerdictValue::Pass, &inputs, &["internal"]),
@@ -375,6 +375,18 @@ fn borrowed_reports_resolve_pending_inputs_inherit_visibility_and_refuse_collisi
         Err(ContractError::ContentConflict),
     );
     assert_eq!(core.native_budget(), before);
-    assert_eq!(*first.evaluation(key(1)).unwrap(), original);
-    assert!(first.artifact(ArtifactId::from_u128(742)).is_none());
+    assert_eq!(
+        *core
+            .native_chain(&[&first])
+            .unwrap()
+            .evaluation(key(1))
+            .unwrap(),
+        original
+    );
+    assert!(
+        core.native_chain(&[&first])
+            .unwrap()
+            .artifact(ArtifactId::from_u128(742))
+            .is_none()
+    );
 }

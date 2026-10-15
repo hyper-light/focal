@@ -96,10 +96,7 @@ impl Rows {
             .unwrap()
     }
     fn view(&self) -> View<'_> {
-        View {
-            state: &self.core.state,
-            tail: None,
-        }
+        View::committed(&self.core.state)
     }
     fn prepare(&mut self, actor: ParticipantId, command: NativeCommand) -> NativePrepared {
         self.serial += 1;
@@ -268,10 +265,9 @@ fn work_iteration_includes_pending_open_and_reverse_closed_cycles_at_authored_li
         },
     );
     let before = rows.core.state.budget.stats();
-    let view = View {
-        state: &rows.core.state,
-        tail: Some(&pending),
-    };
+    let view = View::committed(&rows.core.state)
+        .with_own(&pending)
+        .unwrap();
     let found: Vec<_> =
         super::super::projection_work::works(&view, ClaimId::from_u128(1), rows.core.limits)
             .map(|row| row.unwrap().reference().id)
@@ -421,13 +417,13 @@ fn malformed_cycle_links_are_refused_once_before_any_duplicate_is_yielded() {
             let Some(Row::Cycle(cycle)) = rows.view().get(Key::Cycle(key)) else {
                 panic!("cycle")
             };
-            let mut cycle = *cycle;
+            let mut cycle = **cycle;
             match malformed {
                 0 => cycle.work_count = 1,
                 1 => cycle.work_count = 3,
                 _ => cycle.work_head = Some(ArtifactId::from_u128(999)),
             }
-            rows.replace(Key::Cycle(key), Row::Cycle(cycle), 0);
+            rows.replace(Key::Cycle(key), Row::Cycle(Box::new(cycle)), 0);
         } else {
             let id = if malformed == 3 { first.id } else { second.id };
             let mut work = *rows.core.native_work(id).unwrap();
@@ -474,9 +470,9 @@ fn wrong_slot_identity_and_closed_cycle_response_links_cannot_hide_work() {
                 let Some(Row::Cycle(cycle)) = rows.view().get(Key::Cycle(key)) else {
                     panic!("cycle")
                 };
-                let mut cycle = *cycle;
+                let mut cycle = **cycle;
                 cycle.response = Some(TestamentId::from_u128(999));
-                rows.replace(Key::Cycle(key), Row::Cycle(cycle), 0);
+                rows.replace(Key::Cycle(key), Row::Cycle(Box::new(cycle)), 0);
             }
         }
         let view = rows.view();
@@ -597,7 +593,7 @@ fn provisional_overlay_comparisons_share_the_same_lookup_allowance() {
     extras
         .push(crate::native::prepare::Extra {
             key: Key::Meta,
-            row: Row::Meta(view.meta()),
+            row: Row::Meta(Box::new(view.meta())),
             heap: 0,
             fact: None,
         })
@@ -643,7 +639,7 @@ fn measured_projection(rows: &Rows, quote: NativeProjectionQuote) -> usize {
         extras
             .push(crate::native::prepare::Extra {
                 key: Key::Meta,
-                row: Row::Meta(view.meta()),
+                row: Row::Meta(Box::new(view.meta())),
                 heap: 0,
                 fact: None,
             })

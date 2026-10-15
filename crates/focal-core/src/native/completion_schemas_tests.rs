@@ -154,9 +154,6 @@ fn full_fallback_quality_schema_set_is_sorted_unique_and_keeps_spare_capacity_ch
     assert_eq!(source.stats().used, bytes);
     assert_eq!(source.stats().ordinary_used, bytes);
     assert_eq!(source.stats().by_kind[BudgetKind::Index as usize], bytes);
-    let quote = NativeVerificationBudget::for_schema(hash(4), &registry).unwrap();
-    assert_eq!(set.workspace_bytes(), quote.peak_bytes());
-    assert_eq!(set.custody_bytes(), quote.retained_bytes());
     for schema in [hash(1), hash(2), hash(3), hash(4)] {
         assert_eq!(set.budget_for(schema, &registry).unwrap().schema(), schema);
     }
@@ -258,7 +255,6 @@ fn delivery_and_visit_overflow_refuse_without_expanding_attempt_counts() {
         set.budget_for(hash(1), &registry).unwrap().maximum_bytes(),
         0
     );
-    assert!(set.workspace_bytes() > set.custody_bytes());
 }
 
 #[test]

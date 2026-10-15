@@ -375,8 +375,10 @@ impl AcceptancePlan<'_> {
         let policy = AcceptancePolicy {
             claim: self.claim,
             issuer: self.issuer,
-            slots,
-            declarations,
+            body: PolicyBody {
+                slots,
+                declarations,
+            },
         };
         visits.charge(self.slots.len())?;
         bytes::fits(policy.retained_bytes()?, self.shape.charge)?;

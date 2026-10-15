@@ -29,14 +29,16 @@ pub struct AdmissionPolicy {
 impl AdmissionPolicy {
     pub const DEFAULT_MAX_TENANTS: usize = 8;
     pub const MAX_TENANTS: usize = 1024;
-    /// The standard allowance under the operator's tenant bound.
-    pub fn standard(max_tenants: Option<usize>) -> Self {
+    /// The standard allowance under the operator's tenant bound on a node
+    /// whose envelope is `node_bytes`: one tenant may use it all, the node
+    /// budget arbitrating their live use, as it does every child.
+    pub fn standard(max_tenants: Option<usize>, node_bytes: usize) -> Self {
         Self {
             max_tenants: max_tenants
                 .unwrap_or(Self::DEFAULT_MAX_TENANTS)
                 .clamp(1, Self::MAX_TENANTS),
-            tenant_memory: 512 * 1024 * 1024,
-            tenant_completion_reserve: 128 * 1024 * 1024,
+            tenant_memory: node_bytes,
+            tenant_completion_reserve: node_bytes / 4,
             weight: 1,
         }
     }

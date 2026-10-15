@@ -17,6 +17,54 @@ const CAPACITY_RESENDS: u32 = 3;
 /// service still opening) before the refusal is reported: at the largest
 /// backoff these span the default policy's clock, which bounds them all.
 const UNAVAILABLE_RESENDS: u32 = 64;
+/// The client's capacity resends, in thousandths of a token: ten tokens,
+/// gRPC's retry throttling (gRFC A6) at its example service config's values.
+const RETRY_TOKENS: u64 = 10_000;
+/// What an answered request earns the budget: a tenth of a token (A6's
+/// `tokenRatio` of 0.1).
+const RETRY_EARNED: u64 = 100;
+/// What a capacity refusal spends: one token (A6: a failed attempt).
+const RETRY_SPENT: u64 = 1_000;
+/// The resends a client makes after capacity refusals, throttled as gRPC
+/// throttles retries (gRFC A6). A node that refuses for capacity is
+/// overloaded, and a resend that it refuses again only adds to its load: in
+/// the comparison at 1,000 writes a second the leader refused 73,318
+/// requests at its sessions' doors while the generator gave up on 27,448, its
+/// clients asking each about three times over (compare run 38141716895). Each
+/// capacity refusal spends a token, each answer earns a tenth of one, and a
+/// refused request is resent only while more than half the tokens remain:
+/// under a lasting overload each request is asked once and its refusal
+/// reported, and the budget refills as answers come back.
+struct RetryBudget(std::sync::atomic::AtomicU64);
+impl RetryBudget {
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(RETRY_TOKENS))
+    }
+    /// A capacity refusal: spends a token, and says whether the budget still
+    /// allows the resend.
+    fn refused(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = self
+            .0
+            .fetch_update(Relaxed, Relaxed, |tokens| {
+                Some(tokens.saturating_sub(RETRY_SPENT))
+            })
+            .unwrap_or(0);
+        before > RETRY_TOKENS / 2
+    }
+    /// An answered request: earns a tenth of a token, up to the budget.
+    fn answered(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self.0.fetch_update(Relaxed, Relaxed, |tokens| {
+            Some(tokens.saturating_add(RETRY_EARNED).min(RETRY_TOKENS))
+        });
+    }
+    /// The tokens left, in thousandths.
+    #[cfg(test)]
+    fn tokens(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
@@ -25,6 +73,55 @@ impl Default for RetryPolicy {
             base_backoff: Duration::from_millis(20),
             max_backoff: Duration::from_millis(500),
         }
+    }
+}
+impl RetryPolicy {
+    /// The pause before the attempt that follows `backoffs` refusals, as
+    /// this client takes it: the exponential step from the base, capped,
+    /// spread by full jitter over a fresh draw (`jittered`). For a caller
+    /// that resends outside the client — a transport's own tests — so that
+    /// it backs off as the client does, never in step with other callers.
+    pub fn pause(&self, backoffs: u32) -> Duration {
+        jittered(self, backoffs, Duration::MAX, entropy())
+    }
+}
+/// One past the largest draw: what a draw is measured against.
+const DRAWS: u128 = 1 << 64;
+/// The pause before the next attempt: the exponential step from the base,
+/// capped, then spread by full jitter — a wait drawn uniformly between
+/// nothing and the whole step (the audit's F64). Callers that failed
+/// together — a leader lost, a service opening, one capacity refusal for
+/// all — would otherwise return together at every step, each wave as tall
+/// as the last; a uniform draw over the step spreads a wave across it, and
+/// among the spreads of AWS's analysis (Brooker, 2015) it finishes the
+/// same work in the fewest calls. The attempt, elapsed and refusal budgets
+/// bound the retries as before: the draw never adds an attempt, and a
+/// pause never outlasts what remains of the clock.
+pub(crate) fn jittered(
+    policy: &RetryPolicy,
+    backoffs: u32,
+    remaining: Duration,
+    random: u64,
+) -> Duration {
+    let step = policy
+        .base_backoff
+        .saturating_mul(1u32 << backoffs.min(16))
+        .min(policy.max_backoff);
+    let drawn = step
+        .as_nanos()
+        .saturating_mul(u128::from(random))
+        .checked_div(DRAWS)
+        .unwrap_or(0);
+    Duration::from_nanos(u64::try_from(drawn).unwrap_or(u64::MAX)).min(remaining)
+}
+/// Sixty-four random bits from the operating system — and when it has none
+/// to give, the largest draw: the whole step, the pause without its spread,
+/// never a shorter one.
+pub(crate) fn entropy() -> u64 {
+    let mut bytes = [0; 8];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => u64::from_le_bytes(bytes),
+        Err(_) => u64::MAX,
     }
 }
 
@@ -63,7 +160,7 @@ impl std::fmt::Display for ClientError {
             ),
             Self::InvalidResponse => write!(f, "invalid server response"),
             Self::Transport => write!(f, "transport unavailable"),
-            Self::Configuration => write!(f, "invalid client limits"),
+            Self::Configuration => write!(f, "invalid client configuration"),
         }
     }
 }
@@ -90,9 +187,16 @@ impl Routes {
         entry.used = self.clock;
         Some(entry.hint.clone())
     }
+    /// Hold `hint` for `ledger`. A hint at the epoch held that names
+    /// another endpoint replaces it: a route epoch names a placement, and
+    /// within one the session's leader moves (a drained leader hands
+    /// leadership on, 24 §19; leaders are spread over the voters, 27 §5),
+    /// so the node asked last knows where it went. A hint from an older
+    /// epoch is never adopted. What follows a hint is counted against the
+    /// request's attempts, so hints that lead in a circle end with them.
     fn insert(&mut self, ledger: LedgerId, hint: RouteHint) -> Result<(), ClientError> {
         if let Some(old) = self.entries.get(&ledger)
-            && (hint.epoch < old.hint.epoch || (hint.epoch == old.hint.epoch && hint != old.hint))
+            && hint.epoch < old.hint.epoch
         {
             return Err(ClientError::InvalidResponse);
         }
@@ -129,6 +233,8 @@ pub struct Client<T: ClientTransport> {
     /// Per-client call counter, stamped onto each traced exchange to order and
     /// pair concurrent invocations. Untouched when `trace` is `None`.
     calls: std::sync::atomic::AtomicU64,
+    /// What this client may still resend after capacity refusals (`RetryBudget`).
+    retries: RetryBudget,
 }
 
 /// Single-host wall-clock nanoseconds for trace timestamps; a clock that runs
@@ -235,6 +341,7 @@ impl<T: ClientTransport> Client<T> {
             }),
             trace: None,
             calls: std::sync::atomic::AtomicU64::new(0),
+            retries: RetryBudget::new(),
         })
     }
 
@@ -523,9 +630,9 @@ impl<T: ClientTransport> Client<T> {
             )
         });
         let mut write_uncertain = false;
-        // A missing Tokio driver or a transport dependency failure must not
-        // unwind through an SDK caller. After entering a mutation exchange,
-        // failure cannot establish that no bytes reached the authority.
+        // A dependency's panic must not unwind through an SDK caller. After
+        // entering a mutation exchange, failure cannot establish that no bytes
+        // reached the authority.
         let result = {
             let mut exchange =
                 std::pin::pin!(self.request_inner(&mut request, &mut write_uncertain));
@@ -563,12 +670,25 @@ impl<T: ClientTransport> Client<T> {
         }
         outcome
     }
+    /// The client's capacity resend budget left, in thousandths of a token.
+    #[cfg(test)]
+    pub(crate) fn retry_tokens(&self) -> u64 {
+        self.retries.tokens()
+    }
+    /// A capacity refusal after `refusals` before it: spent from the budget,
+    /// and resent only within the resends a request is given and while the
+    /// budget allows (`RetryBudget`). The refusal not resent is reported.
+    fn resend_capacity(&self, refusals: u32) -> bool {
+        let allowed = self.retries.refused();
+        allowed && refusals < CAPACITY_RESENDS
+    }
     async fn request_inner(
         &self,
         request: &mut RequestEnvelope,
         write_uncertain: &mut bool,
     ) -> Result<ResponseEnvelope, ClientError> {
-        if tokio::runtime::Handle::try_current().is_err() {
+        // Off a shard no deadline or backoff can be kept: refused before anything is sent.
+        if !crate::time::on_a_shard() {
             return Err(ClientError::Transport);
         }
         // Reject an oversized request before the retry loop. `payload_len`
@@ -588,7 +708,7 @@ impl<T: ClientTransport> Client<T> {
                 route = None;
             }
         }
-        let start = tokio::time::Instant::now();
+        let start = crate::time::Instant::now();
         let mut uncertain = false;
         // A capacity or availability refusal has no effect (nothing was
         // admitted), so bounded backed-off resends ride out a full ingress
@@ -607,8 +727,9 @@ impl<T: ClientTransport> Client<T> {
             }
             let mut refused = false;
             let response =
-                tokio::time::timeout(remaining, self.transport.request(route.as_ref(), request))
-                    .await;
+                crate::time::within(remaining, self.transport.request(route.as_ref(), request))
+                    .await?
+                    .ok_or(());
             match response {
                 Ok(Ok(response)) => {
                     if validate_response(request, &response, None, &self.limits).is_err() {
@@ -651,7 +772,7 @@ impl<T: ClientTransport> Client<T> {
                             refused = true;
                         }
                         Response::Error(AccessError::Capacity)
-                            if capacity_refusals < CAPACITY_RESENDS =>
+                            if self.resend_capacity(capacity_refusals) =>
                         {
                             capacity_refusals = capacity_refusals.saturating_add(1);
                             last_refusal = Some(AccessError::Capacity);
@@ -663,8 +784,36 @@ impl<T: ClientTransport> Client<T> {
                             }
                             return Err(ClientError::Access(error.clone()));
                         }
-                        _ => return Ok(response),
+                        Response::Native(NativeMutationReply::Refused(refusal))
+                            if matches!(refusal.kind, NativeRefusalKind::Capacity) =>
+                        {
+                            // The owner's own capacity, reported to the caller as it
+                            // is, and spent from the budget as a refusal is.
+                            let _ = self.retries.refused();
+                            return Ok(response);
+                        }
+                        _ => {
+                            self.retries.answered();
+                            return Ok(response);
+                        }
                     }
+                }
+                // Refused before anything was sent (no connection to send it
+                // on, or a body the listener would not admit): without effect,
+                // and resent as a refusal in a reply is.
+                Ok(Err(WireError::Access(AccessError::Unavailable)))
+                    if unavailable_refusals < UNAVAILABLE_RESENDS =>
+                {
+                    unavailable_refusals = unavailable_refusals.saturating_add(1);
+                    last_refusal = Some(AccessError::Unavailable);
+                    refused = true;
+                }
+                Ok(Err(WireError::Access(AccessError::Capacity)))
+                    if self.resend_capacity(capacity_refusals) =>
+                {
+                    capacity_refusals = capacity_refusals.saturating_add(1);
+                    last_refusal = Some(AccessError::Capacity);
+                    refused = true;
                 }
                 Ok(Err(WireError::Access(error))) => {
                     if uncertain && request.operation.is_mutation() {
@@ -678,11 +827,19 @@ impl<T: ClientTransport> Client<T> {
                     }
                     return Err(ClientError::InvalidResponse);
                 }
-                Ok(Err(WireError::Authentication)) => {
+                Ok(Err(WireError::Authentication | WireError::Unpinned)) => {
                     if uncertain && request.operation.is_mutation() {
                         break;
                     }
                     return Err(ClientError::Unauthenticated);
+                }
+                // A local socket's path no address holds: refused before
+                // anything was sent, as every later attempt would be.
+                Ok(Err(WireError::SocketPath { .. })) => {
+                    if uncertain && request.operation.is_mutation() {
+                        break;
+                    }
+                    return Err(ClientError::Configuration);
                 }
                 Ok(Err(
                     WireError::Io(_)
@@ -701,14 +858,14 @@ impl<T: ClientTransport> Client<T> {
                     break;
                 }
             }
-            let backoff = self
-                .policy
-                .base_backoff
-                .saturating_mul(1u32 << backoffs.min(16))
-                .min(self.policy.max_backoff)
-                .min(self.policy.max_elapsed.saturating_sub(start.elapsed()));
+            let backoff = jittered(
+                &self.policy,
+                backoffs,
+                self.policy.max_elapsed.saturating_sub(start.elapsed()),
+                entropy(),
+            );
             backoffs = backoffs.saturating_add(1);
-            tokio::time::sleep(backoff).await;
+            crate::time::sleep(backoff).await?;
         }
         if !uncertain && let Some(refusal) = last_refusal {
             // Every attempt was a definite refusal without effect: report

@@ -137,10 +137,18 @@ pub(crate) fn limits() -> NativeSessionLimits {
         },
         memory_bytes: 128 << 20,
         completion_reserve_bytes: 16 << 20,
+        hold_bytes: 128 << 20,
         content_domain: ContentDomainId::from_u128(1),
         disk_headroom_bytes: 1 << 20,
         materializer: record::materialize::MaterializerLimits::default(),
         ranges: focal_ranges::RangeLimits::default(),
+        seal_rule: SealRule::Derived,
+        retire_rule: RetireRule::Pipeline,
+        // Chunks of 4 KiB and a manifest chunk every 4: the production cut, scaled to tests.
+        cold_geometry: focal_evidence::ColdGeometry {
+            chunk_bytes: 4096,
+            manifest_names: 4,
+        },
     }
 }
 fn definition(binding: Binding) -> validation::Declaration {
@@ -601,8 +609,11 @@ fn borrowed_frames_share_identity_with_typed_input_and_timer_namespaces_are_refu
     assert!(session.read_at_least(boundary).is_ok());
 }
 
+/// The pending queue grows as the session's memory funds it, from the headroom it began at: a
+/// queue at its one slot whose growth the memory cannot fund refuses the next fresh candidate,
+/// which holds no slot and no memory, and admits it once the memory returns and a slot frees.
 #[test]
-fn pending_queue_bound_refuses_the_next_fresh_candidate_until_a_slot_frees() {
+fn a_pending_queue_its_memory_cannot_grow_refuses_the_next_fresh_candidate_until_a_slot_frees() {
     let dir = tempfile::tempdir().unwrap();
     let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
     let mut bounded = limits();
@@ -614,6 +625,17 @@ fn pending_queue_bound_refuses_the_next_fresh_candidate_until_a_slot_frees() {
     else {
         panic!("fresh")
     };
+    // The session's memory, taken: the queue's one slot cannot grow.
+    let budget = session.budget_for_test();
+    let stats = budget.stats();
+    let pressure = budget
+        .reserve(
+            BudgetKind::Payload,
+            BudgetLane::Completion,
+            stats.limit - stats.used,
+        )
+        .unwrap()
+        .commit();
     let before = session.budget_for_test().stats();
     let refused = session.propose(context(), create(2, 2)).unwrap_err();
     assert_eq!(refused.class(), FailureClass::Retryable, "{refused:?}");
@@ -629,6 +651,7 @@ fn pending_queue_bound_refuses_the_next_fresh_candidate_until_a_slot_frees() {
         session.propose(context(), create(1, 1)).unwrap(),
         NativeSubmission::Pending { outcome, .. } if outcome == first
     ));
+    drop(pressure);
     let mut committed = false;
     for _ in 0..16 {
         let events = session.poll().unwrap();
@@ -742,7 +765,7 @@ fn disk_headroom_watermark_refuses_fresh_admission_but_answers_exact_retries() {
     let before = session.budget_for_test().stats();
     assert!(matches!(
         session.propose(context(), create(2, 2)),
-        Err(NativeSessionError::Capacity)
+        Err(NativeSessionError::Capacity(_))
     ));
     assert_eq!(session.pending_count(), 0);
     assert_eq!(session.budget_for_test().stats(), before);
@@ -909,4 +932,670 @@ fn recovered_prefix_is_a_linearizable_publication_history() {
         focal_sim::history::check(&initial, &premature, 64),
         Err(focal_sim::history::HistoryError::PrematureSuccess)
     );
+}
+
+/// The test limits with the outcome bound set to `outcomes`.
+pub(crate) fn limits_with_outcomes(outcomes: usize) -> NativeSessionLimits {
+    let mut limits = limits();
+    limits.recovery.native.outcomes = outcomes;
+    limits
+}
+fn cancel(request: u128, expected: Binding) -> NativeInput {
+    NativeInput {
+        request: key(request),
+        command: NativeCommand::Cancel { expected },
+    }
+}
+fn release(request: u128, expected: Binding) -> NativeInput {
+    NativeInput {
+        request: key(request),
+        command: NativeCommand::ReleaseScope { expected },
+    }
+}
+/// Create, cancel and release claim `claim` on an authoritative session:
+/// a family of one whose three outcomes are the prefix. Returns the
+/// creation's outcome, what an exact retry must keep answering.
+fn finished_family(
+    session: &mut NativeSession<BuiltinNativeSchemas>,
+    request: u128,
+    claim: u128,
+) -> NativeOutcome {
+    let created = commit(session, create(request, claim), "create");
+    let (_, expected) = claim_status(session, claim);
+    commit(session, cancel(request + 1, expected), "cancel");
+    let (_, expected) = claim_status(session, claim);
+    commit(session, release(request + 2, expected), "release");
+    created
+}
+/// Drive the session until the retirement it proposed has applied.
+fn apply_retirement(session: &mut NativeSession<BuiltinNativeSchemas>) {
+    for _ in 0..16 {
+        let _ = session.poll().unwrap();
+        if session.retirement_in_flight().is_none() {
+            return;
+        }
+    }
+    panic!("the retirement never applied");
+}
+
+/// At the outcome bound a retirement is refused at proposal with a typed
+/// refusal: nothing is proposed, nothing fenced, and the session goes on
+/// answering exact retries; a reopen finds the prefix unchanged and no
+/// family retired.
+#[test]
+fn a_retirement_at_the_outcome_bound_is_refused_and_nothing_is_fenced() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let created;
+    {
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(3)).unwrap();
+        lead(&mut session);
+        created = finished_family(&mut session, 1, 100);
+        assert_eq!(session.sequence().unwrap(), SessionSeq(3));
+        let through = session.sequence().unwrap();
+        let refused = session
+            .propose_retirement(ClaimId::from_u128(100), ContentHash([9; 32]), 1, through)
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                NativeSessionError::Retirement(
+                    focal_core::native::retirement::RetirementRefusal::OutcomeCapacity
+                )
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.class(), FailureClass::Request);
+        assert!(session.retirement_in_flight().is_none());
+        assert_eq!(session.retired_families(), 0);
+        // Nothing is fenced: an exact retry is answered, and a fresh
+        // request meets the bound itself, not a retirement in flight.
+        assert_eq!(
+            session.propose(context(), create(1, 100)).unwrap(),
+            NativeSubmission::Committed(created)
+        );
+        assert!(matches!(
+            session.propose(context(), create(4, 101)),
+            Err(NativeSessionError::Owner(NativeOwnerError::Native(
+                NativeError::Capacity("outcomes")
+            )))
+        ));
+        let _ = session.poll().unwrap();
+        assert_eq!(session.sequence().unwrap(), SessionSeq(3));
+    }
+    let mut session = open_with(dir.path(), &parent, limits_with_outcomes(3)).unwrap();
+    assert_eq!(session.sequence().unwrap(), SessionSeq(3));
+    assert_eq!(session.retired_families(), 0);
+    lead(&mut session);
+    assert_eq!(
+        session.propose(context(), create(1, 100)).unwrap(),
+        NativeSubmission::Committed(created)
+    );
+}
+
+/// The bundle of claim `claim`'s family from the committed core: the root,
+/// the digest, the length and the prefix it claims.
+fn bundle_of(
+    session: &NativeSession<BuiltinNativeSchemas>,
+    claim: u128,
+) -> (ClaimId, ContentHash, u64, SessionSeq) {
+    let core = session.committed_core().unwrap();
+    let family = core.retirement_family(ClaimId::from_u128(claim)).unwrap();
+    let through = core.native_sequence();
+    let quote = core
+        .archive_family_quote(&family, through, limits().encoding)
+        .unwrap();
+    (family.root, quote.hash, quote.bytes as u64, through)
+}
+
+/// One under the outcome bound a retirement is allowed: it publishes the
+/// bound's last outcome, the record carries the bound it was checked
+/// against, exact retries are still answered, and a reopen from the log
+/// alone and from a checkpoint under the same bound both restore it.
+#[test]
+fn a_retirement_that_fits_the_outcome_bound_reopens_under_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let created;
+    {
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+        lead(&mut session);
+        created = finished_family(&mut session, 1, 100);
+        let (root, bundle, length, through) = bundle_of(&session, 100);
+        session
+            .propose_retirement(root, bundle, length, through)
+            .unwrap();
+        let record = session.retirement_in_flight().unwrap();
+        assert_eq!(record.outcome_limit, Some(4));
+        assert_eq!(record.expected_prefix, SessionSeq(3));
+        apply_retirement(&mut session);
+        assert_eq!(session.sequence().unwrap(), SessionSeq(4));
+        assert_eq!(session.retired_families(), 1);
+        assert_eq!(session.retirements_inert(), 0);
+        for _ in 0..4 {
+            let _ = session.poll().unwrap();
+            if session.is_authoritative() {
+                break;
+            }
+        }
+        assert!(
+            session.is_authoritative(),
+            "the owner rebuilds under the bound after the retirement"
+        );
+        assert_eq!(
+            session.propose(context(), create(1, 100)).unwrap(),
+            NativeSubmission::Committed(created)
+        );
+    }
+    // From the log alone.
+    {
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+        assert_eq!(session.sequence().unwrap(), SessionSeq(4));
+        assert_eq!(session.retired_families(), 1);
+        assert!(
+            session
+                .committed_core()
+                .unwrap()
+                .native_retired(ClaimId::from_u128(100))
+                .is_some()
+        );
+        lead(&mut session);
+        assert_eq!(
+            session.propose(context(), create(1, 100)).unwrap(),
+            NativeSubmission::Committed(created)
+        );
+        session.begin_checkpoint().unwrap();
+        let _ = session.poll().unwrap();
+        assert!(!session.checkpoint_pending());
+    }
+    // From the checkpoint, under the same bound.
+    let mut session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+    assert_eq!(session.sequence().unwrap(), SessionSeq(4));
+    assert_eq!(session.retired_families(), 1);
+    lead(&mut session);
+    assert_eq!(
+        session.propose(context(), create(1, 100)).unwrap(),
+        NativeSubmission::Committed(created)
+    );
+}
+
+/// The record carries the bound the authority checked: a replica opened
+/// under a lower bound that cannot hold the retirement's outcome fails
+/// closed on the record, with the two bounds named, instead of applying
+/// nothing where the authority retired.
+#[test]
+fn a_replica_below_the_committed_outcome_bound_fails_closed_on_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    {
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+        lead(&mut session);
+        finished_family(&mut session, 1, 100);
+        let (root, bundle, length, through) = bundle_of(&session, 100);
+        session
+            .propose_retirement(root, bundle, length, through)
+            .unwrap();
+        apply_retirement(&mut session);
+        assert_eq!(session.retired_families(), 1);
+    }
+    let Err(refused) = open_with(dir.path(), &parent, limits_with_outcomes(3)) else {
+        panic!("a replica below the committed bound opened")
+    };
+    assert!(
+        matches!(
+            refused,
+            NativeSessionError::OutcomeBound {
+                committed: 4,
+                local: 3
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(refused.class(), FailureClass::FailClosed);
+    // Reopened under the bound the record carries, the replica applies it.
+    let session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+    assert_eq!(session.sequence().unwrap(), SessionSeq(4));
+    assert_eq!(session.retired_families(), 1);
+}
+
+/// A version-1 record, from a log written before the bound was carried:
+/// applied where its family fits the replica's bound, inert and counted
+/// where it does not — never a stop, since the authority that wrote it
+/// checked nothing.
+#[test]
+fn a_version_one_record_applies_where_it_fits_and_is_inert_where_it_does_not() {
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let v1 = |through: SessionSeq| {
+        let record = RetirementRecord {
+            ledger: ledger(),
+            expected_prefix: through,
+            root: ClaimId::from_u128(100),
+            bundle: ContentHash([9; 32]),
+            bytes: 1,
+            through,
+            outcome_limit: None,
+        };
+        let mut bytes = [0u8; retirement::BYTES_V1];
+        record.write_v1_into(&mut bytes);
+        bytes
+    };
+    let apply_raw = |session: &mut NativeSession<BuiltinNativeSchemas>, bytes: &[u8]| {
+        let applied = session.applied_raft();
+        session
+            .consensus
+            .propose_borrowed_in(bytes, BudgetLane::Completion)
+            .unwrap();
+        for _ in 0..16 {
+            let _ = session.poll().unwrap();
+            if session.applied_raft() > applied {
+                return;
+            }
+        }
+        panic!("the record never applied");
+    };
+    // Beyond the bound: inert, counted, the session live.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(3)).unwrap();
+        lead(&mut session);
+        let created = finished_family(&mut session, 1, 100);
+        apply_raw(&mut session, &v1(SessionSeq(3)));
+        assert_eq!(session.sequence().unwrap(), SessionSeq(3));
+        assert_eq!(session.retired_families(), 0);
+        assert_eq!(session.retirements_inert(), 1);
+        assert!(
+            session
+                .committed_core()
+                .unwrap()
+                .native_claim(ClaimId::from_u128(100))
+                .is_some()
+        );
+        for _ in 0..4 {
+            let _ = session.poll().unwrap();
+            if session.is_authoritative() {
+                break;
+            }
+        }
+        assert_eq!(
+            session.propose(context(), create(1, 100)).unwrap(),
+            NativeSubmission::Committed(created)
+        );
+    }
+    // Within the bound: applied as any record.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+        lead(&mut session);
+        finished_family(&mut session, 1, 100);
+        apply_raw(&mut session, &v1(SessionSeq(3)));
+        assert_eq!(session.sequence().unwrap(), SessionSeq(4));
+        assert_eq!(session.retired_families(), 1);
+        assert_eq!(session.retirements_inert(), 0);
+        let continuation = *session
+            .committed_core()
+            .unwrap()
+            .native_retired(ClaimId::from_u128(100))
+            .unwrap();
+        assert_eq!(continuation.bundle, ContentHash([9; 32]));
+        assert_eq!(continuation.bytes, 1);
+    }
+}
+
+/// The standard configuration's recovery work is the envelope of the largest
+/// checkpoint it admits, derived from its own checkpoint bounds — no chosen
+/// constant (the audit's F57).
+#[test]
+fn the_standard_recovery_work_is_derived_from_the_checkpoint_bounds() {
+    let limits = NativeSessionLimits::standard(ContentDomainId::from_u128(93));
+    let checkpoint = limits.checkpoint;
+    assert_eq!(
+        limits.recovery.work,
+        focal_core::native::record_codec::recovery::Work::for_limits(
+            checkpoint.visits,
+            checkpoint.assembled_bytes,
+            checkpoint.rows
+        )
+    );
+    assert!(limits.recovery.work.model > 1 << 30);
+}
+
+/// What a session admits it can always checkpoint (rule 2). A ledger whose
+/// rows reach its checkpoint's bound refuses the next fresh creation, typed and
+/// retryable, and still checkpoints and serves. Before the admission check a
+/// ledger was admitted past the bound, its checkpoint failed with the codec's
+/// Capacity, and the session stopped for good (a node did at 4,200 claims).
+#[test]
+fn a_ledger_at_its_checkpoint_bound_refuses_fresh_rows_and_still_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let mut bounded = limits();
+    bounded.checkpoint.rows = 200;
+    let mut session = open_with(dir.path(), &parent, bounded).unwrap();
+    lead(&mut session);
+    let mut last = None;
+    let mut request = 0u128;
+    let refused = loop {
+        request += 1;
+        assert!(request < 1_000, "200 rows never refused a creation");
+        match session.propose(context(), create(request, 1_000 + request)) {
+            Ok(NativeSubmission::Pending { outcome, .. }) => {
+                let committed = (0..16).any(|_| {
+                    session
+                        .poll()
+                        .unwrap()
+                        .committed
+                        .iter()
+                        .any(|commit| commit.outcome == outcome)
+                });
+                assert!(committed, "creation {request} never committed");
+                last = Some((request, outcome));
+            }
+            Ok(other) => panic!("a fresh creation was {other:?}"),
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(refused, NativeSessionError::Capacity(_)),
+        "{refused:?}"
+    );
+    assert_eq!(refused.class(), FailureClass::Retryable);
+    assert!(request > 2, "the bound refused before any claim fit");
+    // What it admitted, it checkpoints.
+    session.begin_checkpoint().unwrap();
+    for _ in 0..16 {
+        if !session.checkpoint_pending() {
+            break;
+        }
+        let _ = session.poll().unwrap();
+    }
+    assert!(
+        !session.checkpoint_pending(),
+        "the checkpoint did not finish"
+    );
+    // And it still answers: an exact retry of committed work is never refused.
+    let (retried, outcome) = last.unwrap();
+    assert_eq!(
+        session
+            .propose(context(), create(retried, 1_000 + retried))
+            .unwrap(),
+        NativeSubmission::Committed(outcome)
+    );
+}
+
+#[test]
+#[ignore = "measurement"]
+fn measure_the_checkpoint_of_a_ledger_of_thousands_of_claims() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(1 << 30, 64 << 20).unwrap();
+    let standard = NativeSessionLimits::standard(focal_model::ContentDomainId([7; 16]));
+    let mut session = open_with(dir.path(), &parent, standard).unwrap();
+    lead(&mut session);
+    let mut request = 0u128;
+    let target: u128 = std::env::var("CLAIMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4_500);
+    while request < target {
+        request += 1;
+        match session.propose(context(), create(request, 1_000_000 + request)) {
+            Ok(NativeSubmission::Pending { .. }) => {
+                let _ = session.poll().unwrap();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("refused at {request}: {error:?}\n"),
+                )
+                .unwrap();
+                break;
+            }
+        }
+    }
+    for _ in 0..64 {
+        let _ = session.poll().unwrap();
+    }
+    if let Some(super::engine::Domain::Active(owner, _)) = session.engine.domain.as_ref() {
+        let stats = owner.budget_stats();
+        let kinds = [
+            "Arena", "Payload", "Index", "Pages", "Roots", "ReadPins", "Pending", "Query",
+            "Monitor", "Dedup", "Timer", "Recovery", "Control", "Reserved",
+        ];
+        let per = |bytes: usize| bytes as f64 / request as f64;
+        std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "owner budget: limit {} used {} ({:.0} B/claim over {request} claims)\n",
+                stats.limit,
+                stats.used,
+                per(stats.used)
+            ),
+        )
+        .unwrap();
+        for (name, bytes) in kinds.iter().zip(stats.by_kind) {
+            if bytes > 0 {
+                std::io::Write::write_fmt(
+                    &mut std::io::stderr(),
+                    format_args!("  {name:<9} {bytes:>12} ({:.0} B/claim)\n", per(bytes)),
+                )
+                .unwrap();
+            }
+        }
+    }
+    let core = session.committed_core().unwrap();
+    let rows = core.native_stats().entries;
+    let quote = focal_core::native::record_codec::checkpoint::EncodingPlan::prepare(
+        core,
+        focal_core::native::record_codec::EncodingLimits {
+            bytes: usize::MAX,
+            visits: usize::MAX,
+            rows: usize::MAX,
+        },
+    )
+    .map(|plan| plan.quote());
+    // The root's encoding, timed by stage: the plan (its measuring pass),
+    // then the write (its walk, encoding and hashing) into a sink that keeps
+    // nothing.
+    let limits = focal_core::native::record_codec::EncodingLimits {
+        bytes: usize::MAX,
+        visits: usize::MAX,
+        rows: usize::MAX,
+    };
+    let frozen = core.freeze_native().unwrap();
+    // As many walks as asked (`WALKS`), for a profiler to sample them.
+    let walks: usize = std::env::var("WALKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    for _ in 0..walks {
+        let mut bytes = 0usize;
+        let started = std::time::Instant::now();
+        focal_core::native::record_codec::checkpoint::EncodingPlan::write_frozen(
+            &frozen,
+            limits,
+            |chunk: &[u8]| -> Result<(), ()> {
+                bytes += chunk.len();
+                Ok(())
+            },
+        )
+        .unwrap();
+        std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "frozen root {bytes} B in one walk: {:?}\n",
+                started.elapsed()
+            ),
+        )
+        .unwrap();
+        // The same walk into what a seeded checkpoint writes to: each piece
+        // copied into a chunk of its seed size, a full chunk hashed.
+        let mut chunk: Vec<u8> = Vec::with_capacity(focal_evidence::SEED_CHUNK_BYTES);
+        let mut chunks = 0usize;
+        let started = std::time::Instant::now();
+        focal_core::native::record_codec::checkpoint::EncodingPlan::write_frozen(
+            &frozen,
+            limits,
+            |mut piece: &[u8]| -> Result<(), ()> {
+                while !piece.is_empty() {
+                    let room = focal_evidence::SEED_CHUNK_BYTES - chunk.len();
+                    let (head, tail) = piece.split_at(room.min(piece.len()));
+                    chunk.extend_from_slice(head);
+                    piece = tail;
+                    if chunk.len() == focal_evidence::SEED_CHUNK_BYTES {
+                        std::hint::black_box(blake3::hash(&chunk));
+                        chunk.clear();
+                        chunks += 1;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        std::hint::black_box(blake3::hash(&chunk));
+        std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "frozen root into {chunks} sealed chunks: {:?}\n",
+                started.elapsed()
+            ),
+        )
+        .unwrap();
+    }
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let plan =
+            focal_core::native::record_codec::checkpoint::EncodingPlan::prepare(core, limits)
+                .unwrap();
+        let prepared = started.elapsed();
+        let mut bytes = 0usize;
+        let started = std::time::Instant::now();
+        plan.write_with(|chunk: &[u8]| -> Result<(), ()> {
+            bytes += chunk.len();
+            Ok(())
+        })
+        .unwrap();
+        let written = started.elapsed();
+        std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "root {bytes} B: prepare {prepared:?}, write {written:?} ({:.0} MB/s)\n",
+                bytes as f64 / written.as_secs_f64() / 1e6
+            ),
+        )
+        .unwrap();
+    }
+    std::io::Write::write_fmt(
+        &mut std::io::stderr(),
+        format_args!(
+            "entry bytes {} derived rows {} | ledger rows {rows} | quote {quote:?} | limits {:?}\n",
+            focal_core::native::NATIVE_ENTRY_BYTES,
+            standard.checkpoint.rows,
+            standard.checkpoint
+        ),
+    )
+    .unwrap();
+}
+
+/// Measurement, not a check: a session's work per claim as a node's owner
+/// does it, from each request's frame (decoded, prepared, made durable and
+/// published) on the standard limits. The frames are made first, as a client
+/// makes them. `CLAIMS` claims a session (5,000 unless set), `ROUNDS` sessions
+/// for a profiler to sample; the time includes the log's writes and syncs.
+#[test]
+#[ignore = "measurement"]
+fn measure_time_per_claim_from_its_frame() {
+    let claims: u128 = std::env::var("CLAIMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000);
+    let rounds: u32 = std::env::var("ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = MemoryBudget::new(1 << 30, 64 << 20).unwrap();
+        let standard = NativeSessionLimits::standard(focal_model::ContentDomainId([7; 16]));
+        let mut session = open_with(dir.path(), &parent, standard).unwrap();
+        lead(&mut session);
+        let frames: Vec<Vec<u8>> = (1..=claims)
+            .map(|request| frame(&create(request, 1_000_000 + request)))
+            .collect();
+        // As a loaded owner runs: claims pending together share the log's
+        // syncs, and a claim refused while too many are pending waits for
+        // the session to make progress.
+        let started = std::time::Instant::now();
+        let mut refused = 0u64;
+        for (index, bytes) in frames.iter().enumerate() {
+            let mut attempts = 0;
+            loop {
+                match session.propose_native_frame(context(), bytes) {
+                    Ok(_) => {
+                        let _ = session.try_poll().unwrap();
+                        break;
+                    }
+                    Err(error) => {
+                        attempts += 1;
+                        refused += 1;
+                        assert!(attempts < 1_000, "claim {index}: {error:?}");
+                        let _ = session.poll().unwrap();
+                    }
+                }
+            }
+        }
+        for _ in 0..64 {
+            let _ = session.poll().unwrap();
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "round {round}: {claims} claims, {:.1} µs a claim, {refused} refusals waited out",
+            elapsed.as_secs_f64() * 1e6 / claims as f64
+        );
+    }
+}
+
+/// A session's native engine admits within its share and holds within the whole allowance (doc 31
+/// M3): half below the share level, the allowance less its completion reserve at it. Its
+/// checkpoints' bounds follow what it holds, what admission projects follows its share, and its
+/// budget holds each lane to its own: fresh work to the share less its reserve, completing work to
+/// the share, committed work to the allowance.
+#[test]
+fn a_native_engine_admits_within_its_share_and_holds_its_sessions_allowance() {
+    let session = crate::SessionLimits::within(800 << 20);
+    assert_eq!(session.native_memory_bytes(NativeShare::Half), 400 << 20);
+    assert_eq!(session.native_memory_bytes(NativeShare::Wide), 700 << 20);
+    let domain = ContentDomainId::from_u128(1);
+    let wide = NativeSessionLimits::standard_within(domain, 700 << 20, 800 << 20);
+    assert_eq!(
+        (
+            wide.memory_bytes,
+            wide.completion_reserve_bytes,
+            wide.hold_bytes
+        ),
+        (700 << 20, (700 << 20) / 8, 800 << 20)
+    );
+    assert_eq!(wide.checkpoint.assembled_bytes, 800 << 20);
+    assert_eq!(
+        wide.checkpoint.rows,
+        (800 << 20) / focal_core::native::NATIVE_ENTRY_BYTES
+    );
+    assert_eq!(
+        wide.admission_checkpoint(),
+        (
+            (700 << 20) / focal_core::native::NATIVE_ENTRY_BYTES,
+            700 << 20
+        )
+    );
+    // A hold below the share is the share.
+    let narrow = NativeSessionLimits::standard_within(domain, 400 << 20, 0);
+    assert_eq!(narrow.hold_bytes, 400 << 20);
+    assert_eq!(narrow.admission_checkpoint().1, 400 << 20);
+    let parent = MemoryBudget::new(1 << 30, 0).unwrap();
+    let budget = wide.budget_within(&parent).unwrap();
+    assert_eq!(
+        budget.reservation_limit(BudgetLane::Ordinary),
+        (700 << 20) - (700 << 20) / 8
+    );
+    assert_eq!(budget.reservation_limit(BudgetLane::Completion), 700 << 20);
+    assert_eq!(budget.reservation_limit(BudgetLane::Committed), 800 << 20);
 }

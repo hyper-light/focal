@@ -84,10 +84,9 @@ fn pending_adoption_exposes_retired_work_and_drop_preserves_original_prefix() {
     let before = rows.core.native_sequence();
     let statistics = rows.core.native_budget();
     let candidate = rows.prepare(ISSUER, adoption(&rows, 1511));
-    let view = View {
-        state: &rows.core.state,
-        tail: Some(&candidate),
-    };
+    let view = View::committed(&rows.core.state)
+        .with_own(&candidate)
+        .unwrap();
     let works =
         crate::native::projection_work::works(&view, ClaimId::from_u128(1), rows.core.limits)
             .map(|work| work.unwrap().reference())
@@ -142,10 +141,10 @@ fn diagnostic_only_retired_cycles_consume_quote_and_exact_chain_budget() {
     assert!(measured_projection(&rows, quoted) <= quoted.lookup_visits());
     rows.replace(
         Key::RetiredCycleHead(ClaimId::from_u128(1)),
-        Row::RetiredCycleHead(RetiredCycleHead {
+        Row::RetiredCycleHead(Box::new(RetiredCycleHead {
             work_count: 1,
             ..head
-        }),
+        })),
         0,
     );
     let view = rows.view();
@@ -164,10 +163,10 @@ fn repeated_retired_link_refuses_once_without_hiding_the_tail() {
     let key = head.head.unwrap();
     rows.replace(
         Key::RetiredCycle(key),
-        Row::RetiredCycle(RetiredCycle {
+        Row::RetiredCycle(Box::new(RetiredCycle {
             holder: SUBJECT,
             next: Some(key),
-        }),
+        })),
         0,
     );
     let view = rows.view();

@@ -37,18 +37,13 @@ pub(crate) struct TraverseArgs {
     #[command(flatten)]
     output: OutputOptions,
 }
-pub(super) fn run(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    command: LedgerCommand,
-) -> Result<()> {
+pub(super) async fn run(context: &Context, command: LedgerCommand) -> Result<()> {
     match command {
         LedgerCommand::Summary(output) => {
-            let summary = runtime.block_on(
-                context
-                    .client
-                    .ledger_summary(context.envelope(focal_wire::Operation::Summary)?),
-            )?;
+            let summary = context
+                .client
+                .ledger_summary(context.envelope(focal_wire::Operation::Summary)?)
+                .await?;
             match output.format {
                 super::args::OutputFormat::Json | super::args::OutputFormat::Yaml => {
                     super::output::structured(
@@ -93,7 +88,7 @@ pub(super) fn run(
             }
             .build(&context.build)?;
             let request = context.envelope(focal_wire::Operation::Traverse(query))?;
-            let page = runtime.block_on(context.client.traverse(request))?;
+            let page = context.client.traverse(request).await?;
             super::output::traversal(page, args.output.format)
         }
     }

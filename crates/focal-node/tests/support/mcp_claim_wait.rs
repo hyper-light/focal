@@ -29,8 +29,8 @@ fn claim_wait_cli_and_both_mcp_profiles_observe_without_mutation_and_survive_res
         let out = cli(
             root.path(),
             &[
-                "claim",
                 "wait",
+                "claim",
                 &id(100),
                 "--until",
                 "satisfied",
@@ -67,8 +67,8 @@ fn claim_wait_cli_and_both_mcp_profiles_observe_without_mutation_and_survive_res
     let out = cli(
         root.path(),
         &[
-            "claim",
             "wait",
+            "claim",
             "--yaml",
             &format!("claim: '{}'\nuntil: terminal\ntimeout_ms: 250\n", id(100)),
             "--format",
@@ -85,8 +85,8 @@ fn claim_wait_cli_and_both_mcp_profiles_observe_without_mutation_and_survive_res
         .arg("--data-dir")
         .arg(root.path())
         .args([
-            "claim",
             "wait",
+            "claim",
             &id(100),
             "--until",
             "terminal",
@@ -105,9 +105,11 @@ fn claim_wait_cli_and_both_mcp_profiles_observe_without_mutation_and_survive_res
         "claim.cancel",
         json!({"claim":id(100),"reason":"completed elsewhere"}),
     );
+    // The wait ends by its own timeout at the latest: this bound is only
+    // for a wedge.
     let began = Instant::now();
     while waiting.try_wait().unwrap().is_none() {
-        assert!(began.elapsed() < Duration::from_secs(7));
+        assert!(began.elapsed() < super::owners::FROZEN);
         std::thread::sleep(Duration::from_millis(10));
     }
     let out = waiting.wait_with_output().unwrap();
@@ -173,8 +175,8 @@ fn claim_wait_cancellation_stops_observation_and_mcp_remains_responsive() {
         .arg("--data-dir")
         .arg(root.path())
         .args([
-            "claim",
             "wait",
+            "claim",
             &id(100),
             "--until",
             "satisfied",
@@ -193,9 +195,11 @@ fn claim_wait_cancellation_stops_observation_and_mcp_remains_responsive() {
             .unwrap()
             .success()
     );
+    // Interrupted, or ended by its own timeout at the latest: this bound
+    // is only for a wedge.
     let began = Instant::now();
     while waiting.try_wait().unwrap().is_none() {
-        assert!(began.elapsed() < Duration::from_secs(5));
+        assert!(began.elapsed() < super::owners::FROZEN);
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(!waiting.wait_with_output().unwrap().status.success());

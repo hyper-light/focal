@@ -29,6 +29,7 @@ mod delivery;
 mod delivery_owned;
 #[cfg(test)]
 mod event_budget_tests;
+mod event_index;
 pub mod event_record;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fixtures;
@@ -47,6 +48,7 @@ pub mod input_codec;
 mod intent;
 mod layout;
 pub use layout::NativeLocation;
+mod epochs;
 #[cfg(test)]
 mod layout_tests;
 mod missing_owned;
@@ -60,6 +62,8 @@ mod owned;
 mod owner;
 #[cfg(test)]
 mod owner_record_buffer_tests;
+pub mod payloads;
+mod pending_index;
 mod prepare;
 mod prepare_budget;
 mod projection;
@@ -67,6 +71,7 @@ mod projection_quote;
 mod projection_visits;
 mod projection_work;
 pub mod ranges;
+mod read_back;
 mod receipt;
 #[cfg(test)]
 mod receipt_tests;
@@ -87,12 +92,23 @@ mod responses;
 mod result_owned;
 mod retired_cycles;
 pub mod retirement;
+pub mod retirement_batch;
+mod young;
+pub use epochs::{EpochWindow, OPEN_EPOCHS, OpenEpoch, SealedRange};
+pub mod seal;
+pub use seal::SealRow;
+#[cfg(test)]
+#[path = "native/retirement_batch_tests.rs"]
+mod retirement_batch_tests;
 #[cfg(test)]
 #[path = "native/retirement_tests.rs"]
 mod retirement_tests;
 mod scope_release;
 #[cfg(test)]
 mod scope_release_tests;
+#[cfg(test)]
+#[path = "native/seal_tests.rs"]
+mod seal_tests;
 #[cfg(test)]
 mod tests;
 mod transactions;
@@ -112,7 +128,9 @@ pub use audit_bundle::NativeResultTestament;
 use audit_bundle::OwnedResultTestament;
 pub use authored::{NativeAuthoredProposal, NativeContentProfile};
 use creation_result::OwnedCreationResult;
-pub use creation_result::{NativeCreatedFamily, NativeCreatedObject, NativeCreationResult};
+pub use creation_result::{
+    NativeCreatedFamily, NativeCreatedObject, NativeCreationRead, NativeCreationResult,
+};
 pub use delivery_owned::NativeDeliveryResult;
 use delivery_owned::OwnedDeliveryResult;
 pub use event_record::delta as native_delta;
@@ -134,7 +152,6 @@ use focal_model::{
     ReceiptFence, ReceiptId, RequestEpoch, RequestId, RequestKey, SessionSeq, TestamentId, TimerId,
     ValidationId, WaitPredicate,
 };
-use history::StoredEvent;
 pub use import::{ImportError, ImportRequest, Imported, InlinePayload, import, inline_payloads};
 pub use index_rows::{artifact_kind_hash, scope_key_hash};
 pub use index_scan::{NativeIndexHit, NativeIndexScan};
@@ -144,10 +161,17 @@ use owned::{
     OwnedClaim, OwnedClaimContent, OwnedDeclaration, OwnedEvaluation, OwnedEvent, OwnedLegacy,
 };
 pub use owner::{
-    NativeCandidate, NativeOwner, NativeOwnerError, NativeOwnerInitError, NativeOwnerIntoCoreError,
-    NativeStaging, NativeView,
+    CheckpointProjection, NativeCandidate, NativeOwner, NativeOwnerError, NativeOwnerInitError,
+    NativeOwnerIntoCoreError, NativeStaging, NativeView,
 };
 pub use projection_quote::NativeProjectionQuote;
+/// The least memory one row of a native root holds resident: its key and its
+/// row, inline. A root charged to a budget of `n` bytes holds at most
+/// `n / NATIVE_ENTRY_BYTES` rows, which is the most a session's checkpoint
+/// must be able to carry.
+pub const NATIVE_ENTRY_BYTES: usize = size_of::<(Key, Row)>();
+pub use index_rows::ContentSource as NativeClaimContentRead;
+pub use owned::HeldClaimBody;
 pub use response_input::{
     NativeMonitorSource, NativeMonitorSourcePlan, NativeResponseInput, NativeResponsePlan,
     NativeResponseSource, NativeResponseSourcePlan, NativeResponseSpec, NativeSourceQuote,
@@ -170,7 +194,13 @@ pub struct NativeLimits {
     pub plan_edges: usize,
     pub preparation_bytes: usize,
     pub claims: usize,
+    /// Resident outcomes: the open obligations and the unsealed tail, never
+    /// the ledger's lifetime (F12).
     pub outcomes: usize,
+    /// Principals with a request generation window: the enrollment bound.
+    pub principals: usize,
+    /// Resident seal rows; at the bound the oldest half fold into one.
+    pub seals: usize,
     pub events: usize,
     pub definitions: usize,
     pub evaluations: usize,
@@ -213,6 +243,8 @@ impl Default for NativeLimits {
             preparation_bytes: 4 * 1024 * 1024,
             claims: 1_000_000,
             outcomes: 1_000_000,
+            principals: 4096,
+            seals: seal::DEFAULT_SEAL_ROWS,
             events: 16_000_000,
             definitions: 4_000_000,
             evaluations: 8_000_000,
@@ -240,6 +272,228 @@ pub struct NativeState {
     profile: NativeContentProfile,
     rows: ranges::NativeRanges,
     budget: MemoryBudget,
+    /// What the rows take in a checkpoint, exactly (`record_codec::checkpoint::row_bytes`
+    /// summed): kept as each mutation publishes, and summed once where a root is built whole.
+    /// What admission projects a checkpoint to is this and the frame, never a bound inferred
+    /// from the memory the rows are charged.
+    encoded_rows: usize,
+    /// Each object's events by where they were published (doc 31 M2): derived from the rows,
+    /// never encoded, kept as each publication commits.
+    events: event_index::EventIndex,
+    /// The replica's payload log, where a row written once and read rarely is spilled where it
+    /// is built (doc 31 M3). A core without one keeps every row's bytes.
+    payloads: Option<Box<dyn payloads::PayloadLog>>,
+    /// The spilled claims and definitions reads have taken back since the state last changed
+    /// (doc 31 M3).
+    reads: read_back::ReadBack,
+    /// The newest spillable claims and definitions, held until newer ones push them out
+    /// (doc 31 M3, [`young`]).
+    young: young::Young,
+}
+impl NativeState {
+    /// Where a spilled row's bytes are read from.
+    pub(crate) fn payloads(&self) -> Option<&dyn payloads::PayloadRead> {
+        self.payloads
+            .as_deref()
+            .map(|log| -> &dyn payloads::PayloadRead { log })
+    }
+    /// The committed row at `key` as a read takes it: a spilled claim or definition read back
+    /// (doc 31 M3).
+    fn row(&self, key: &Key) -> Option<&Row> {
+        let stored = self.rows.get(key)?;
+        Some(self.read_back(&self.reads, key, stored, &StateRows(self, &self.reads)))
+    }
+    /// `stored`, the row at `key` of a state `rows` reads, as a read takes it into `reads`: a
+    /// spilled claim or definition read back, else itself. One that cannot be read back is lent
+    /// as it is stored, which holds nothing a reader can take, and its failure kept in `reads`
+    /// for the operation ([`read_back::ReadBack::failure`]).
+    fn read_back<'s, R: record_codec::ClaimRows + ?Sized>(
+        &'s self,
+        reads: &'s read_back::ReadBack,
+        key: &Key,
+        stored: &'s Row,
+        rows: &R,
+    ) -> &'s Row {
+        let read = match stored {
+            Row::Claim(claim) => match (key, claim.logged()) {
+                (Key::Claim(id), Some(at)) => self.read_back_claim(reads, *id, at, rows),
+                (_, Some(_)) => Err(ContractError::InvalidManifest.into()),
+                (_, None) => return stored,
+            },
+            Row::Definition(definition) => match definition.logged() {
+                Some(at) => self.read_back_definition(reads, at),
+                None => return stored,
+            },
+            _ => return stored,
+        };
+        match read {
+            Ok(row) => row,
+            Err(error) => {
+                reads.fail(error);
+                stored
+            }
+        }
+    }
+    fn read_back_claim<'s, R: record_codec::ClaimRows + ?Sized>(
+        &'s self,
+        reads: &'s read_back::ReadBack,
+        id: ClaimId,
+        at: payloads::PayloadRef,
+        rows: &R,
+    ) -> Result<&'s Row, NativeError> {
+        if let Some(row) = reads.find(at) {
+            return Ok(row);
+        }
+        let fund = |bytes| reads.fund(&self.budget, bytes);
+        let (claim, charge) = self.with_spilled(at, |bytes| {
+            record_codec::decode_claim(id, bytes, self.ledger, rows, reads.limits(), &fund)
+        })?;
+        reads.hold(&self.budget, at, Row::Claim(claim), charge)
+    }
+    fn read_back_definition<'s>(
+        &'s self,
+        reads: &'s read_back::ReadBack,
+        at: payloads::PayloadRef,
+    ) -> Result<&'s Row, NativeError> {
+        read_back_definition(reads, self.payloads(), &self.budget, at)
+    }
+    /// The spilled bytes at `at`, read into a stack buffer and handed to `read`.
+    fn with_spilled<T>(
+        &self,
+        at: payloads::PayloadRef,
+        read: impl FnOnce(&[u8]) -> Result<T, NativeError>,
+    ) -> Result<T, NativeError> {
+        with_spilled(self.payloads(), at, read)
+    }
+    /// A definition at `key` of the committed rows, a spilled one read back into `reads`.
+    fn stored_definition<'s>(
+        &'s self,
+        reads: &'s read_back::ReadBack,
+        id: ValidationId,
+    ) -> Option<&'s validation::Declaration> {
+        let stored = self.rows.get(&Key::Definition(id))?;
+        as_definition(Some(self.read_back_held_definition(reads, stored)))
+    }
+    /// `stored` a definition's row as a read takes it into `reads`, without reading a claim back.
+    fn read_back_held_definition<'s>(
+        &'s self,
+        reads: &'s read_back::ReadBack,
+        stored: &'s Row,
+    ) -> &'s Row {
+        let Row::Definition(definition) = stored else {
+            return stored;
+        };
+        let Some(at) = definition.logged() else {
+            return stored;
+        };
+        match self.read_back_definition(reads, at) {
+            Ok(row) => row,
+            Err(error) => {
+                reads.fail(error);
+                stored
+            }
+        }
+    }
+}
+/// The spilled bytes at `at` in `payloads`, read into a stack buffer and handed to `read`.
+fn with_spilled<T>(
+    payloads: Option<&dyn payloads::PayloadRead>,
+    at: payloads::PayloadRef,
+    read: impl FnOnce(&[u8]) -> Result<T, NativeError>,
+) -> Result<T, NativeError> {
+    let mut buffer = [0u8; payloads::SPILLED_BYTES];
+    let bytes = buffer
+        .get_mut(..at.len())
+        .ok_or(payloads::PayloadError::Corrupt)?;
+    payloads
+        .ok_or(payloads::PayloadError::Unavailable)?
+        .read(at, bytes)?;
+    read(bytes)
+}
+/// The definition spilled at `at` in `payloads`, read back into `reads` and charged to `budget`.
+fn read_back_definition<'s>(
+    reads: &'s read_back::ReadBack,
+    payloads: Option<&dyn payloads::PayloadRead>,
+    budget: &MemoryBudget,
+    at: payloads::PayloadRef,
+) -> Result<&'s Row, NativeError> {
+    if let Some(row) = reads.find(at) {
+        return Ok(row);
+    }
+    let fund = |bytes| reads.fund(budget, bytes);
+    let (definition, charge) = with_spilled(payloads, at, |bytes| {
+        record_codec::decode_definition(bytes, &fund)
+    })?;
+    reads.hold(budget, at, Row::Definition(definition), charge)
+}
+/// A read back through a lease that failed: its memory refusal, or a row that could not be.
+fn lease_read_back(error: NativeError) -> MemoryError {
+    match error {
+        NativeError::Memory(error) => error,
+        _ => MemoryError::InvalidConfiguration("a spilled row could not be read back"),
+    }
+}
+/// The rows a spilled claim read through a lease names, read in the same leased prefix, a
+/// spilled definition read back into the read's own arena.
+struct LeaseRows<'r> {
+    rows: &'r ranges::LeasedRows<'r>,
+    reads: &'r read_back::ReadBack,
+    payloads: Option<&'r dyn payloads::PayloadRead>,
+    budget: &'r MemoryBudget,
+}
+impl LeaseRows<'_> {
+    fn definition(&self, id: ValidationId) -> Option<&Row> {
+        let stored = self.rows.get(&Key::Definition(id))?;
+        match stored {
+            Row::Definition(definition) => match definition.logged() {
+                Some(at) => read_back_definition(self.reads, self.payloads, self.budget, at).ok(),
+                None => Some(stored),
+            },
+            _ => Some(stored),
+        }
+    }
+}
+impl record_codec::ClaimRows for LeaseRows<'_> {
+    fn declaration(&self, id: ValidationId) -> Option<&validation::Declaration> {
+        as_definition(self.definition(id))
+    }
+    fn response(&self, id: TestamentId) -> Option<&focal_model::lifecycle::evidence::Response> {
+        match self.rows.get(&Key::Response(id)) {
+            Some(Row::Response(row)) => row.get(),
+            _ => None,
+        }
+    }
+    fn evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
+        as_evaluation(self.rows.get(&Key::Evaluation(key)))
+    }
+}
+/// A new core's payload log: none, but in tests run with `FOCAL_TEST_SPILL` set, where every
+/// core spills to one held in memory, so every reader meets the rows spilled (doc 31 M3).
+#[cfg(not(test))]
+fn test_payloads() -> Option<Box<dyn payloads::PayloadLog>> {
+    None
+}
+#[cfg(test)]
+fn test_payloads() -> Option<Box<dyn payloads::PayloadLog>> {
+    std::env::var_os("FOCAL_TEST_SPILL")
+        .map(|_| -> Box<dyn payloads::PayloadLog> { Box::new(payloads::MemoryPayloads::default()) })
+}
+/// The rows a spilled claim of the committed rows names, read there, a spilled definition read
+/// back into the same reads.
+struct StateRows<'s>(&'s NativeState, &'s read_back::ReadBack);
+impl record_codec::ClaimRows for StateRows<'_> {
+    fn declaration(&self, id: ValidationId) -> Option<&validation::Declaration> {
+        self.0.stored_definition(self.1, id)
+    }
+    fn response(&self, id: TestamentId) -> Option<&focal_model::lifecycle::evidence::Response> {
+        match self.0.rows.get(&Key::Response(id)) {
+            Some(Row::Response(row)) => row.get(),
+            _ => None,
+        }
+    }
+    fn evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
+        as_evaluation(self.0.rows.get(&Key::Evaluation(key)))
+    }
 }
 impl std::fmt::Debug for NativeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -345,6 +599,9 @@ pub enum NativeInvocation {
     /// named claim to the archive; a session decision, never a request or
     /// a timer, owning the native sequence its publication consumed.
     Retirement(ClaimId),
+    /// A committed seal of closed outcomes (F12), by its ordinal: a session
+    /// decision owning the native sequence its publication consumed.
+    Seal(u64),
 }
 /// Custody request identity of an imported artifact (23 §5.2): derived from
 /// the ledger and artifact under a private domain, principal = producer, epoch
@@ -418,6 +675,11 @@ pub enum NativeCommand {
     /// This does not terminalize children or invent evaluation results.
     ReleaseScope {
         expected: Binding,
+    },
+    /// Advance the principal's own request generation floor (F12): the
+    /// generations below `minimum` close; their outcomes leave for a seal.
+    AdvanceEpochFloor {
+        minimum: RequestEpoch,
     },
     GenerateResultTestament {
         claim: Binding,
@@ -582,6 +844,10 @@ pub enum NativeOperation {
     Import,
     /// A family of claims retired to the archive (26 §4).
     Retire,
+    /// A principal advanced its request generation floor (F12).
+    AdvanceEpochFloor,
+    /// Closed outcomes sealed into a bundle (F12): a session decision.
+    Seal,
 }
 /// Address of one frozen legacy row retained by import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -610,6 +876,222 @@ pub struct NativeOutcome {
     pub responses: u32,
     pub result_testaments: u32,
     pub events: u32,
+}
+/// An outcome as its row holds it: the ledger is its store's and the invocation is its row's key, so the row
+/// keeps neither. A whole outcome is 232 bytes and set the size of every row of every family (a unit index
+/// row among them); this is under half of it. The record and checkpoint bytes are unchanged: the codec
+/// writes the whole outcome, expanded from the key and the store's ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OutcomeRow {
+    pub(super) sequence: SessionSeq,
+    pub(super) logical_time: u64,
+    pub(super) operation: NativeOperation,
+    pub(super) intent: ContentHash,
+    pub(super) created: u32,
+    pub(super) changed: u32,
+    pub(super) definitions: u32,
+    pub(super) evaluations: u32,
+    pub(super) artifacts: u32,
+    pub(super) results: u32,
+    pub(super) receipts: u32,
+    pub(super) responses: u32,
+    pub(super) result_testaments: u32,
+    pub(super) events: u32,
+}
+impl OutcomeRow {
+    /// The row of `outcome` in a store of `ledger`; an outcome of another ledger is refused, never kept as
+    /// this one's.
+    pub(super) fn stored(outcome: &NativeOutcome, ledger: LedgerId) -> Result<Self, ContractError> {
+        if outcome.ledger != ledger {
+            return Err(ContractError::WrongLedger);
+        }
+        Ok(Self {
+            sequence: outcome.sequence,
+            logical_time: outcome.logical_time,
+            operation: outcome.operation,
+            intent: outcome.intent,
+            created: outcome.created,
+            changed: outcome.changed,
+            definitions: outcome.definitions,
+            evaluations: outcome.evaluations,
+            artifacts: outcome.artifacts,
+            results: outcome.results,
+            receipts: outcome.receipts,
+            responses: outcome.responses,
+            result_testaments: outcome.result_testaments,
+            events: outcome.events,
+        })
+    }
+    /// The whole outcome, from the store's ledger and the row's key.
+    pub(super) fn expand_held(
+        &self,
+        ledger: LedgerId,
+        invocation: NativeInvocation,
+    ) -> NativeOutcome {
+        NativeOutcome {
+            ledger,
+            invocation,
+            sequence: self.sequence,
+            logical_time: self.logical_time,
+            operation: self.operation,
+            intent: self.intent,
+            created: self.created,
+            changed: self.changed,
+            definitions: self.definitions,
+            evaluations: self.evaluations,
+            artifacts: self.artifacts,
+            results: self.results,
+            receipts: self.receipts,
+            responses: self.responses,
+            result_testaments: self.result_testaments,
+            events: self.events,
+        }
+    }
+}
+/// An outcome as its row holds it (doc 31 M3): boxed, or spilled to the replica's payload log as
+/// its record encoding. A spilled one keeps beside where it is the two fields walks across many
+/// outcomes read (a seal's sequence and events, a retirement's events), so no walk reads one back,
+/// in twenty-four bytes: a row is no wider for it.
+#[derive(Debug)]
+pub(super) enum OwnedOutcome {
+    Held(Box<OutcomeRow>),
+    Logged(LoggedOutcome),
+}
+/// Where a spilled outcome's record encoding is, and the fields its walks read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LoggedOutcome {
+    sequence: SessionSeq,
+    segment: u32,
+    offset: u32,
+    len: u16,
+    events: u16,
+    check: std::num::NonZeroU32,
+}
+impl LoggedOutcome {
+    pub(super) fn at(self) -> payloads::PayloadRef {
+        payloads::PayloadRef::from_parts(
+            self.segment,
+            self.offset,
+            u32::from(self.len),
+            self.check.get(),
+        )
+    }
+}
+impl OwnedOutcome {
+    /// `outcome`'s row in a store of `ledger`, held.
+    pub(super) fn stored(outcome: &NativeOutcome, ledger: LedgerId) -> Result<Self, ContractError> {
+        Ok(Self::Held(Box::new(OutcomeRow::stored(outcome, ledger)?)))
+    }
+    pub(super) fn sequence(&self) -> SessionSeq {
+        match self {
+            Self::Held(row) => row.sequence,
+            Self::Logged(at) => at.sequence,
+        }
+    }
+    pub(super) fn events(&self) -> u32 {
+        match self {
+            Self::Held(row) => row.events,
+            Self::Logged(at) => u32::from(at.events),
+        }
+    }
+    /// The whole outcome, from the store's ledger and the row's key, a spilled one read back
+    /// through `payloads` and refused unless it is the outcome of that ledger and invocation.
+    pub(super) fn expand(
+        &self,
+        ledger: LedgerId,
+        invocation: NativeInvocation,
+        payloads: Option<&dyn payloads::PayloadRead>,
+    ) -> Result<NativeOutcome, NativeError> {
+        match self {
+            Self::Held(row) => Ok(row.expand_held(ledger, invocation)),
+            Self::Logged(logged) => {
+                let at = logged.at();
+                let mut buffer = [0u8; payloads::SPILLED_BYTES];
+                let bytes = buffer
+                    .get_mut(..at.len())
+                    .ok_or(payloads::PayloadError::Corrupt)?;
+                payloads
+                    .ok_or(payloads::PayloadError::Unavailable)?
+                    .read(at, bytes)?;
+                let outcome = record_codec::decode_outcome(bytes)
+                    .map_err(|_| payloads::PayloadError::Corrupt)?;
+                if outcome.ledger != ledger
+                    || outcome.invocation != invocation
+                    || outcome.sequence != logged.sequence
+                    || outcome.events != u32::from(logged.events)
+                {
+                    return Err(payloads::PayloadError::Corrupt.into());
+                }
+                Ok(outcome)
+            }
+        }
+    }
+    /// A held row's fields: none for a spilled one.
+    pub(super) fn held(&self) -> Option<&OutcomeRow> {
+        match self {
+            Self::Held(row) => Some(row),
+            Self::Logged(_) => None,
+        }
+    }
+    /// The row's fields, a spilled one read back through `payloads`.
+    pub(super) fn row(
+        &self,
+        ledger: LedgerId,
+        invocation: NativeInvocation,
+        payloads: Option<&dyn payloads::PayloadRead>,
+    ) -> Result<OutcomeRow, NativeError> {
+        match self {
+            Self::Held(row) => Ok(**row),
+            Self::Logged(_) => Ok(OutcomeRow::stored(
+                &self.expand(ledger, invocation, payloads)?,
+                ledger,
+            )?),
+        }
+    }
+    /// This row spilled to `log` as its record encoding, where it is held, the log takes it and
+    /// its events fit the spilled row's count: what a candidate's rows become once every check
+    /// has read them.
+    pub(super) fn spill(
+        &self,
+        ledger: LedgerId,
+        invocation: NativeInvocation,
+        log: &dyn payloads::PayloadLog,
+    ) -> Result<Option<Self>, NativeError> {
+        let Self::Held(row) = self else {
+            return Ok(None);
+        };
+        let Ok(events) = u16::try_from(row.events) else {
+            return Ok(None);
+        };
+        let mut buffer = [0u8; payloads::SPILLED_BYTES];
+        let len = record_codec::encode_outcome(row.expand_held(ledger, invocation), &mut buffer)
+            .map_err(|_| NativeError::Capacity("outcome row"))?;
+        let (Ok(short), Some(bytes)) = (u16::try_from(len), buffer.get(..len)) else {
+            return Ok(None);
+        };
+        let Some(at) = log.append(bytes) else {
+            return Ok(None);
+        };
+        let Some(check) = std::num::NonZeroU32::new(at.check()) else {
+            // A check of zero has no spilled form: the row stays held.
+            return Ok(None);
+        };
+        Ok(Some(Self::Logged(LoggedOutcome {
+            sequence: row.sequence,
+            segment: at.segment(),
+            offset: at.offset(),
+            len: short,
+            events,
+            check,
+        })))
+    }
+    /// A copy of the row: a held one's box, a spilled one's place.
+    pub(super) fn copy(&self) -> Self {
+        match self {
+            Self::Held(row) => Self::Held(Box::new(**row)),
+            Self::Logged(at) => Self::Logged(*at),
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeEventKind {
@@ -1029,6 +1511,11 @@ enum Key {
     /// written where the claim's rows were, so a reference resolves to the
     /// bundle that holds them rather than to nothing.
     Retired(ClaimId),
+    /// A principal's request generations (F12): under the control affinity.
+    Epochs(ParticipantId),
+    /// A seal of closed outcomes, by ordinal (F12): under the control
+    /// affinity; a fold's row is keyed by the last ordinal it covers.
+    Seal(u64),
     End,
 }
 
@@ -1068,35 +1555,23 @@ impl TimerTarget {
     }
 }
 
-/// Separate immutable definition/descriptor pages from frequently rewritten
-/// lifecycle rows. This is an owner-local storage layout, not a wire partition
-/// or placement choice. Creating another immutable object may rewrite its own
-/// namespace; a lifecycle-only mutation must share those retained pages.
-fn page_partition(key: &Key) -> u64 {
-    match key {
-        Key::Definition(_) | Key::DefinitionIdentity(..) => 1,
-        Key::Artifact(_) | Key::ArtifactIdentity(_) => 2,
-        Key::ClaimContent(_) | Key::ClaimIdentity(..) => 3,
-        Key::CreationResult(_) => 4,
-        Key::LegacyTestament(_)
-        | Key::LegacyEvidenceSet(_)
-        | Key::LegacyRun(..)
-        | Key::LegacyDefinition(_) => 5,
-        Key::ByIssuer(..)
-        | Key::BySubject(..)
-        | Key::ByStatus(..)
-        | Key::ByAction(..)
-        | Key::ByScope(..)
-        | Key::ByRelation(..)
-        | Key::ByProducer(..)
-        | Key::ByArtifactKind(..)
-        | Key::BySchema(..)
-        | Key::ArtifactInput(..)
-        | Key::ByEvaluator(..)
-        | Key::ByVerdict(..)
-        | Key::ByCreated(..)
-        | Key::DueTimer(..)
-        | Key::ByObject(..) => 6,
+/// The page class of a row: the session's counters apart from every other row. The counters are
+/// rewritten by every mutation; sharing class 0 with the events put them on the oldest events'
+/// page, so every mutation deep-copied that page's rows (the 2026-09-29 allocation audit's R4:
+/// about a hundred 504-byte event copies a claim). On a page of their own a rewrite copies one row.
+///
+/// Every other family shares one class (doc 31 M3). Classes were also kept for the immutable
+/// payloads (definitions, artifacts, content, creation results) so a lifecycle rewrite would not
+/// copy them, but a claim's own rows sit together in the key order (its state beside its
+/// content, an outcome beside its creation result), so the classes alternated row by row and
+/// cut a page at nearly every row: 2.3 rows a page at the node's 4 KiB leaves, a fixed charge
+/// each, 400 bytes a claim. A leaf is bounded by its bytes, heap included, so what a copy-on-write
+/// copies is a page's worth whichever rows share it, and a page is copied only where a capture or
+/// a lease still reads it: publication edits it in place.
+fn page_partition(key: &layout::PackedKey) -> u64 {
+    // By the key's family (its bytes after the affinity), as the store places every key.
+    match key.family() {
+        6 => 1,
         _ => 0,
     }
 }
@@ -1116,6 +1591,16 @@ struct Meta {
     monitor_links: usize,
     creation_results: usize,
     legacy: usize,
+    /// Outcomes that left the core into a seal or a retirement bundle
+    /// (F12): resident outcomes are `outcomes - sealed`.
+    sealed: usize,
+    /// Event rows of the outcomes that left: what the resident events and
+    /// the retired continuations reconcile against.
+    sealed_events: usize,
+    /// Seals applied: the next seal's ordinal is one more.
+    seals: usize,
+    /// Principals with a request generation window.
+    principals: usize,
     logical_time: u64,
 }
 /// A resumable position in the committed rows, opaque to callers.
@@ -1143,13 +1628,30 @@ pub enum ContentRoot {
         root: ContentHash,
         bytes: u64,
     },
+    /// A seal's bundle (F12), by the seal's ordinal, content root and
+    /// length: the proof of the outcomes that left the core.
+    Seal {
+        ordinal: u64,
+        root: ContentHash,
+        bytes: u64,
+    },
+    /// A family retired to every replica's cold stream (doc 31 M2, A2), by the retired claim:
+    /// its frame's digest and length and the retirement's sequence, where the stream's marks find
+    /// it. Not a content object: what custody must keep of it is what its frame names.
+    Cold {
+        claim: ClaimId,
+        digest: ContentHash,
+        bytes: u64,
+        retired_at: SessionSeq,
+    },
 }
 impl ContentRoot {
-    /// The object's content root.
+    /// The object's content root: a cold family's frame digest, which names no content object.
     pub fn root(&self) -> ContentHash {
         match self {
             Self::Artifact { pointer, .. } | Self::Inline { pointer, .. } => pointer.root,
-            Self::Bundle { root, .. } => *root,
+            Self::Bundle { root, .. } | Self::Seal { root, .. } => *root,
+            Self::Cold { digest, .. } => *digest,
         }
     }
 }
@@ -1179,15 +1681,19 @@ pub struct RetiredClaim {
     /// counting them, so validation reconciles the two.
     pub events: u32,
 }
+/// A row of the native store. Every entry is as wide as its widest row, and a claim
+/// writes mostly index rows that carry nothing (`Index`) or a pointer (`Owned*`): a
+/// payload wider than a pointer is kept behind one, charged to its entry's heap
+/// (`wide_heap`), so that the commonest rows are not 160 bytes each (2.3 KB a claim).
 #[derive(Debug)]
 enum Row {
-    IncomingHead(incoming_graph::IncomingHead),
+    IncomingHead(Box<incoming_graph::IncomingHead>),
     IncomingLink(incoming_graph::IncomingLink),
-    Monitor(monitor_index::MonitorAllocation),
-    MonitorHead(monitor_index::MonitorHead),
-    MonitorLink(Option<monitor_index::MonitorLink>),
+    Monitor(Box<monitor_index::MonitorAllocation>),
+    MonitorHead(Box<monitor_index::MonitorHead>),
+    MonitorLink(Option<Box<monitor_index::MonitorLink>>),
     MissingResult(OwnedMissingResult),
-    Meta(Meta),
+    Meta(Box<Meta>),
     Claim(OwnedClaim),
     Definition(OwnedDeclaration),
     Evaluation(OwnedEvaluation),
@@ -1195,17 +1701,17 @@ enum Row {
     ArtifactIdentity(ArtifactId),
     Accepted(OwnedAccepted),
     DeliveryResult(OwnedDeliveryResult),
-    Receipt(NativeReceipt),
-    Cycle(NativeCycle),
-    RetiredCycleHead(RetiredCycleHead),
-    RetiredCycle(RetiredCycle),
+    Receipt(Box<NativeReceipt>),
+    Cycle(Box<NativeCycle>),
+    RetiredCycleHead(Box<RetiredCycleHead>),
+    RetiredCycle(Box<RetiredCycle>),
     Work(OwnedWork),
     WorkSlot(ArtifactId),
     Diagnostic(OwnedDiagnostic),
     Response(OwnedResponse),
     ResultTestament(OwnedResultTestament),
     ClaimResultTestament(TestamentId),
-    Outcome(NativeOutcome),
+    Outcome(OwnedOutcome),
     Event(OwnedEvent),
     ClaimContent(OwnedClaimContent),
     ClaimIdentity(ClaimId),
@@ -1217,7 +1723,91 @@ enum Row {
     LegacyDefinition(OwnedLegacy),
     /// The unit value of every secondary index row.
     Index,
-    Retired(RetiredClaim),
+    Retired(Box<RetiredClaim>),
+    Epochs(Box<EpochWindow>),
+    Seal(Box<SealRow>),
+}
+
+/// The heap a row's boxed payload of type `T` takes: its bytes and the allocator's own.
+const fn wide_heap<T>() -> usize {
+    match size_of::<T>().checked_add(focal_memory::ALLOCATOR_OVERHEAD) {
+        Some(bytes) => bytes,
+        None => usize::MAX,
+    }
+}
+
+/// The most heap any one row's box takes: the widest boxed payload's.
+fn wide_heap_max() -> usize {
+    [
+        wide_heap::<incoming_graph::IncomingHead>(),
+        wide_heap::<monitor_index::MonitorAllocation>(),
+        wide_heap::<monitor_index::MonitorHead>(),
+        wide_heap::<monitor_index::MonitorLink>(),
+        wide_heap::<Meta>(),
+        wide_heap::<NativeReceipt>(),
+        wide_heap::<NativeCycle>(),
+        wide_heap::<RetiredCycleHead>(),
+        wide_heap::<RetiredCycle>(),
+        wide_heap::<OutcomeRow>(),
+        wide_heap::<RetiredClaim>(),
+        wide_heap::<EpochWindow>(),
+        wide_heap::<SealRow>(),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0)
+}
+
+impl Key {
+    /// The most heap the row under this key may take in a box (`Row`): what a
+    /// quote made before the row is built allows for it.
+    fn boxed_heap(&self) -> usize {
+        match self {
+            Key::IncomingHead(..) => wide_heap::<incoming_graph::IncomingHead>(),
+            Key::Monitor(..) => wide_heap::<monitor_index::MonitorAllocation>(),
+            Key::MonitorHead(..) => wide_heap::<monitor_index::MonitorHead>(),
+            Key::MonitorLink(..) => wide_heap::<monitor_index::MonitorLink>(),
+            Key::Meta => wide_heap::<Meta>(),
+            Key::Receipt(..) => wide_heap::<NativeReceipt>(),
+            Key::Cycle(..) => wide_heap::<NativeCycle>(),
+            Key::RetiredCycleHead(..) => wide_heap::<RetiredCycleHead>(),
+            Key::RetiredCycle(..) => wide_heap::<RetiredCycle>(),
+            Key::Outcome(..) => wide_heap::<OutcomeRow>(),
+            Key::Retired(..) => wide_heap::<RetiredClaim>(),
+            Key::Epochs(..) => wide_heap::<EpochWindow>(),
+            Key::Seal(..) => wide_heap::<SealRow>(),
+            _ => 0,
+        }
+    }
+}
+
+impl Row {
+    /// The heap this row's boxed payload takes, if it has one.
+    fn boxed_heap(&self) -> usize {
+        match self {
+            Row::IncomingHead(_) => wide_heap::<incoming_graph::IncomingHead>(),
+            Row::Monitor(_) => wide_heap::<monitor_index::MonitorAllocation>(),
+            Row::MonitorHead(_) => wide_heap::<monitor_index::MonitorHead>(),
+            Row::MonitorLink(Some(_)) => wide_heap::<monitor_index::MonitorLink>(),
+            Row::Meta(_) => wide_heap::<Meta>(),
+            Row::Receipt(_) => wide_heap::<NativeReceipt>(),
+            Row::Cycle(_) => wide_heap::<NativeCycle>(),
+            Row::RetiredCycleHead(_) => wide_heap::<RetiredCycleHead>(),
+            Row::RetiredCycle(_) => wide_heap::<RetiredCycle>(),
+            Row::Outcome(OwnedOutcome::Held(_)) => wide_heap::<OutcomeRow>(),
+            Row::Retired(_) => wide_heap::<RetiredClaim>(),
+            Row::Epochs(_) => wide_heap::<EpochWindow>(),
+            Row::Seal(_) => wide_heap::<SealRow>(),
+            _ => 0,
+        }
+    }
+}
+
+/// A store entry: `heap` is what the row's own owned bytes take; a boxed payload's
+/// allocation is added here, once, for every row however it was made.
+fn entry(key: Key, row: Row, heap: usize) -> focal_memory::Entry<Key, Row> {
+    let boxed = row.boxed_heap();
+    focal_memory::Entry::new(key, row, heap.saturating_add(boxed))
 }
 
 /// All allocated candidate rows, outcomes and events have one immutable root.
@@ -1226,6 +1816,23 @@ pub struct NativePrepared {
     fragments: ranges::Fragments,
     outcome: NativeOutcome,
     writes: mutation::WriteSet,
+    /// What the rows this mutation puts take in a checkpoint: its whole addition, before what
+    /// it replaces or deletes is taken away at publication.
+    encoded_added: usize,
+    /// What the committed rows this mutation replaces or deletes take in a checkpoint, as its
+    /// build took them out of their pages: what its publication takes away. Built on the root
+    /// its predecessors leave, which is the root it publishes onto.
+    encoded_removed: usize,
+    /// What its changes may take in an owner's pending index
+    /// ([`pending_index::entry_charge`]), funded with the rest of it.
+    _index: Option<focal_memory::Allocation>,
+    /// What its events take in the event index (doc 31 M2,
+    /// [`event_index::entry_charge`]), funded with the rest of it and handed to
+    /// the index as it publishes.
+    events: Option<focal_memory::Allocation>,
+    /// A retirement's families and their bundles (doc 31 M2): what its record
+    /// carries in place of its rows, every replica deriving the rest.
+    retire: Option<retirement_batch::RetireBody>,
 }
 impl std::fmt::Debug for NativePrepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1248,35 +1855,61 @@ impl NativePrepared {
     pub fn mutation_heap_bytes(&self) -> usize {
         self.writes.heap_bytes()
     }
+    /// What it holds of the `Pending` kind besides its write set: its batch,
+    /// its merge staging and its place in an owner's pending index.
+    #[cfg(test)]
+    pub(crate) fn held_pending_bytes(&self) -> usize {
+        self.fragments.pending_bytes()
+            + self
+                ._index
+                .as_ref()
+                .map_or(0, focal_memory::Allocation::bytes)
+    }
     pub fn content_profile(&self) -> NativeContentProfile {
         self.writes.profile()
     }
     pub fn outcome(&self) -> NativeOutcome {
         self.outcome
     }
-    pub fn claim(&self, id: ClaimId) -> Option<&ClaimState> {
+    pub fn written_claim(&self, id: ClaimId) -> Option<&ClaimState> {
         as_claim(self.fragments.get(&Key::Claim(id)))
     }
-    pub fn receipt(&self, id: ReceiptId) -> Option<NativeReceipt> {
+    pub fn written_receipt(&self, id: ReceiptId) -> Option<NativeReceipt> {
         as_receipt(self.fragments.get(&Key::Receipt(id)))
     }
-    pub fn artifact(&self, id: ArtifactId) -> Option<&NativeArtifact> {
+    pub fn written_artifact(&self, id: ArtifactId) -> Option<&NativeArtifact> {
         as_artifact(self.fragments.get(&Key::Artifact(id)))
     }
-    pub fn result(&self, key: NativeResultKey) -> Option<&NativeAccepted> {
+    pub fn written_result(&self, key: NativeResultKey) -> Option<&NativeAccepted> {
         as_result(self.fragments.get(&Key::Accepted(key)))
     }
-    pub fn recorded(&self, key: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
-        as_outcome(self.fragments.get(&Key::Outcome(key.into())))
+    /// The outcome this candidate records for `key`, read back through `payloads` (its core's,
+    /// [`Core::native_payloads`]) where it is spilled.
+    pub fn written_recorded(
+        &self,
+        key: impl Into<NativeInvocation>,
+        payloads: Option<&dyn payloads::PayloadRead>,
+    ) -> Result<Option<NativeOutcome>, NativeError> {
+        let invocation = key.into();
+        as_outcome(
+            self.fragments.get(&Key::Outcome(invocation)),
+            self.outcome.ledger,
+            invocation,
+            payloads,
+        )
     }
-    pub fn definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
+    pub fn written_definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
         as_definition(self.fragments.get(&Key::Definition(id)))
     }
-    pub fn evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
+    pub fn written_evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
         as_evaluation(self.fragments.get(&Key::Evaluation(key)))
     }
 }
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "moved once, from a preparation into its owner's chain or a publication"
+)]
 pub enum NativePreparation {
     Prepared(NativePrepared),
     /// A pending match must await the original candidate's durability barrier.
@@ -1297,12 +1930,17 @@ pub enum NativeError {
     RequestConflict,
     #[error("native owner bound exceeded: {0}")]
     Capacity(&'static str),
+    /// A spilled row's bytes could not be read back from the replica's payload log (doc 31 M3).
+    #[error("native payload log: {0}")]
+    Payload(#[from] payloads::PayloadError),
 }
-/// Publication refusal retains ownership of the entire prepared candidate.
+/// A refused publication. Refused before any row moved, the candidate is
+/// returned whole; failed past that point (an invariant broken, its store
+/// poisoned), it is gone and the owner must be reconstructed.
 #[derive(Debug)]
 pub struct NativePublishError {
     pub error: MemoryError,
-    pub prepared: NativePrepared,
+    pub prepared: Option<NativePrepared>,
 }
 impl std::fmt::Display for NativePublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1311,13 +1949,110 @@ impl std::fmt::Display for NativePublishError {
 }
 impl std::error::Error for NativePublishError {}
 
+/// A native core's committed rows frozen at one prefix ([`Core::freeze_native`]):
+/// read-only and sendable, so a checkpoint encodes from it off the owner's
+/// thread. Its pages stay charged until it drops; its holder bounds its life.
+pub struct NativeFrozen {
+    ledger: LedgerId,
+    profile: NativeContentProfile,
+    rows: ranges::FrozenRanges,
+    /// A reader of the payload log the frozen rows' spilled bytes are in.
+    payloads: Option<Box<dyn payloads::PayloadRead + Send>>,
+}
+impl std::fmt::Debug for NativeFrozen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeFrozen")
+            .field("ledger", &self.ledger)
+            .field("prefix", &self.rows.prefix())
+            .field("entries", &self.rows.len())
+            .finish_non_exhaustive()
+    }
+}
+impl NativeFrozen {
+    pub fn native_sequence(&self) -> SessionSeq {
+        SessionSeq(self.rows.prefix())
+    }
+    /// Where the frozen rows' spilled bytes are read from.
+    pub(crate) fn payloads(&self) -> Option<&dyn payloads::PayloadRead> {
+        self.payloads
+            .as_deref()
+            .map(|reader| -> &dyn payloads::PayloadRead { reader })
+    }
+}
+
 /// Expiring capability to a fixed native prefix. Borrowed rows cannot escape a
 /// projection call. No Clone implementation is needed on native claim rows.
 #[derive(Debug)]
 pub struct NativeRead {
     lease: ranges::RangeLeases,
+    /// The store's ledger, which an outcome row does not repeat.
+    ledger: LedgerId,
+    /// A reader of the payload log the leased rows' spilled bytes are in, with handles of its
+    /// own: a sweep after the lease was taken never breaks its reads (doc 31 M3).
+    payloads: Option<Box<dyn payloads::PayloadRead + Send>>,
+    /// The bounds a spilled claim read back through the lease is built under, and the budget
+    /// what it reads back is charged to while its projection runs (doc 31 M3).
+    limits: NativeLimits,
+    budget: MemoryBudget,
 }
 impl NativeRead {
+    fn payload_source(&self) -> Option<&dyn payloads::PayloadRead> {
+        self.payloads
+            .as_deref()
+            .map(|read| -> &dyn payloads::PayloadRead { read })
+    }
+    /// The row the lease holds at `key`, projected; a spilled claim or definition read back for
+    /// the projection (doc 31 M3): the leased prefix held while it is decoded and projected, what
+    /// it names read there, and everything read back let go with the call.
+    fn project_row<T>(
+        &self,
+        key: Key,
+        now: u64,
+        project: impl FnOnce(&Row) -> T,
+    ) -> Result<Option<T>, NativeError> {
+        let mut project = Some(project);
+        let found = self
+            .lease
+            .project_next(&key, false, &Key::End, now, |entry| {
+                if entry.key != key {
+                    return Ok(None);
+                }
+                let spilled = match entry.value {
+                    Row::Claim(claim) => claim.logged(),
+                    Row::Definition(definition) => definition.logged(),
+                    _ => None,
+                };
+                match spilled {
+                    Some(at) => Err(at),
+                    None => Ok(project.take().map(|project| project(entry.value))),
+                }
+            })?;
+        let (at, project) = match (found, project) {
+            (Some(Err(at)), Some(project)) => (at, project),
+            (Some(Ok(projected)), _) => return Ok(projected),
+            _ => return Ok(None),
+        };
+        let rows = self.lease.hold(now, &self.budget)?;
+        let reads = read_back::ReadBack::new(self.limits);
+        let names = LeaseRows {
+            rows: &rows,
+            reads: &reads,
+            payloads: self.payload_source(),
+            budget: &self.budget,
+        };
+        let row = match key {
+            Key::Claim(id) => {
+                let fund = |bytes| reads.fund(&self.budget, bytes);
+                let (claim, charge) = with_spilled(self.payload_source(), at, |bytes| {
+                    record_codec::decode_claim(id, bytes, self.ledger, &names, self.limits, &fund)
+                })?;
+                reads.hold(&self.budget, at, Row::Claim(claim), charge)?
+            }
+            _ => read_back_definition(&reads, self.payload_source(), &self.budget, at)?,
+        };
+        reads.failure()?;
+        Ok(Some(project(row)))
+    }
     pub fn sequence(&self) -> SessionSeq {
         SessionSeq(self.lease.prefix())
     }
@@ -1327,30 +2062,31 @@ impl NativeRead {
         now: u64,
         project: impl FnOnce(&ClaimState) -> T,
     ) -> Result<Option<T>, MemoryError> {
-        let key = Key::Claim(id);
-        self.lease
-            .project_next(&key, false, &Key::End, now, |entry| {
-                if entry.key == key {
-                    as_claim(Some(&entry.value)).map(project)
-                } else {
-                    None
-                }
-            })
+        self.project_row(Key::Claim(id), now, |row| as_claim(Some(row)).map(project))
             .map(Option::flatten)
+            .map_err(lease_read_back)
     }
     pub fn recorded(
         &self,
         request: impl Into<NativeInvocation>,
         now: u64,
-    ) -> Result<Option<NativeOutcome>, MemoryError> {
-        let key = Key::Outcome(request.into());
-        self.lease
+    ) -> Result<Option<NativeOutcome>, NativeError> {
+        let invocation = request.into();
+        let key = Key::Outcome(invocation);
+        let payloads = self
+            .payloads
+            .as_deref()
+            .map(|read| -> &dyn payloads::PayloadRead { read });
+        let projected = self
+            .lease
             .project_next(&key, false, &Key::End, now, |entry| {
-                (entry.key == key)
-                    .then(|| as_outcome(Some(&entry.value)))
-                    .flatten()
-            })
-            .map(Option::flatten)
+                if entry.key == key {
+                    as_outcome(Some(entry.value), self.ledger, invocation, payloads)
+                } else {
+                    Ok(None)
+                }
+            })?;
+        projected.transpose().map(Option::flatten)
     }
     pub fn with_definition<T>(
         &self,
@@ -1358,16 +2094,11 @@ impl NativeRead {
         now: u64,
         project: impl FnOnce(&validation::Declaration) -> T,
     ) -> Result<Option<T>, MemoryError> {
-        let key = Key::Definition(id);
-        self.lease
-            .project_next(&key, false, &Key::End, now, |entry| {
-                if entry.key == key {
-                    as_definition(Some(&entry.value)).map(project)
-                } else {
-                    None
-                }
-            })
-            .map(Option::flatten)
+        self.project_row(Key::Definition(id), now, |row| {
+            as_definition(Some(row)).map(project)
+        })
+        .map(Option::flatten)
+        .map_err(lease_read_back)
     }
     pub fn with_evaluation<T>(
         &self,
@@ -1379,7 +2110,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_evaluation(Some(&entry.value)).map(project)
+                    as_evaluation(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -1402,6 +2133,8 @@ fn checked_native_limits(
         || limits.preparation_bytes == 0
         || limits.claims == 0
         || limits.outcomes == 0
+        || limits.principals == 0
+        || limits.seals < 2
         || limits.events == 0
         || limits.definitions == 0
         || limits.evaluations == 0
@@ -1434,7 +2167,10 @@ fn checked_native_limits(
         )?,
         size_of::<focal_memory::Entry<Key, Row>>(),
     )?;
-    limits.range.page_bytes = limits.range.page_bytes.min(64 * 1024);
+    // Without a tighter bound from the node, a leaf of rows with heap costs no more to rebuild than a full
+    // leaf of inline rows.
+    let inline_leaf = limits.range.inline_leaf_bytes::<Key, Row>()?;
+    limits.range.page_bytes = limits.range.page_bytes.min(inline_leaf);
     limits.range.max_entry_bytes = limits.range.max_entry_bytes.min(entry_ceiling);
     Ok(limits)
 }
@@ -1479,18 +2215,141 @@ impl Core<NativeState> {
     ) -> Result<Self, NativeError> {
         limits = checked_native_limits(ledger, limits)?;
         let rows = ranges::NativeRanges::new(range, limits.range, &budget, page_partition)?;
+        let events = event_index::EventIndex::empty(&budget)?;
+        let payloads = test_payloads();
+        let mut reads = read_back::ReadBack::new(limits);
+        if payloads.is_some() {
+            reads.hold_floor(&budget);
+        }
         Ok(Self {
             state: NativeState {
                 ledger,
                 profile,
                 rows,
                 budget,
+                encoded_rows: 0,
+                events,
+                payloads,
+                reads,
+                young: young::Young::none(),
             },
             limits,
         })
     }
+    /// Spill the rows this core builds from now on to `log` (doc 31 M3), where the replica keeps
+    /// its payloads. Rows already held keep their bytes.
+    /// As [`Self::attach_payload_log`], the young generation `bound` rows (none at zero: each
+    /// spillable row spills where it is published).
+    #[cfg(test)]
+    pub(crate) fn attach_payload_log_with_young(
+        &mut self,
+        log: Box<dyn payloads::PayloadLog>,
+        bound: usize,
+    ) {
+        self.attach_payload_log(log);
+        self.state.young = young::Young::bounded(&self.state.budget, bound).unwrap();
+    }
+    pub fn attach_payload_log(&mut self, log: Box<dyn payloads::PayloadLog>) {
+        self.state.reads.release();
+        self.state.reads.hold_floor(&self.state.budget);
+        // A generation the budget refuses leaves none: each row spills where it is published.
+        self.state.young =
+            young::Young::for_budget(&self.state.budget).unwrap_or_else(|_| young::Young::none());
+        self.state.payloads = Some(log);
+    }
+    /// The payload log this core spills to, given back (for the core that replaces this one).
+    pub fn detach_payload_log(&mut self) -> Option<Box<dyn payloads::PayloadLog>> {
+        self.state.reads.release();
+        self.state.payloads.take()
+    }
+    /// Lets go of the spilled rows reads have taken back since the core last changed (doc 31
+    /// M3), and what they were charged: what a session does between its operations when it is
+    /// not publishing, so reads alone never keep them.
+    pub fn release_native_reads(&mut self) {
+        self.state.reads.release();
+    }
+    /// The first spilled row reads failed to take back since this was last asked (doc 31 M3),
+    /// which the operation that read fails with: a read that met one was lent no row.
+    pub fn native_read_failure(&self) -> Result<(), NativeError> {
+        self.state.reads.failure()
+    }
+    /// Whether the session is short of memory (doc 31 M3): its ordinary headroom below an eighth
+    /// of its allowance, where its young generation spills its oldest rows.
+    pub fn native_memory_short(&self) -> bool {
+        young::short(&self.state.budget)
+    }
+    /// Whether the session is pressed for memory (doc 31 §4.8): its ordinary headroom below a
+    /// quarter of its allowance, where its finished families retire without waiting out their
+    /// grace ([`Self::retirement_due`]), before its young generation spills.
+    pub fn native_memory_pressed(&self) -> bool {
+        young::pressed(&self.state.budget)
+    }
+    /// Whether a family that may retire is due to at logical time `now` under a grace of
+    /// `grace_ms` (26 §4): the session is pressed for memory, which waives the grace, since a
+    /// finished family is the first memory a session gets back (doc 31 §4.8), or its last event
+    /// settled that long ago or longer, `settled` bounding from above when it did (none where that
+    /// is not known yet). The outcome that settled it is no witness: a seal takes it out of the
+    /// core within seconds of its close, long before a grace ends. The grace is the offering
+    /// authority's alone: a replica checks what a family holds, never its age.
+    pub fn retirement_due(&self, settled: Option<u64>, now: u64, grace_ms: u64) -> bool {
+        self.native_memory_pressed() || settled.is_some_and(|at| now.saturating_sub(at) >= grace_ms)
+    }
+    /// The young generation (doc 31 M3): the keys it tracks, the spills it put off and kept to
+    /// try again, and the keys it could not keep, since it was made.
+    pub fn native_young(&self) -> (usize, u64, u64) {
+        let (put_off, untracked) = self.state.young.counts();
+        (self.state.young.len(), put_off, untracked)
+    }
+    /// Rows reads have taken back since the core last changed, and the bytes they hold.
+    pub fn native_read_backs(&self) -> (usize, usize) {
+        (self.state.reads.rows(), self.state.reads.bytes())
+    }
+    /// The payload log this core spills to, lent (to a restore that spills to it as well).
+    pub fn payload_log(&self) -> Option<&dyn payloads::PayloadLog> {
+        self.state.payloads.as_deref()
+    }
+    /// Where this core's spilled rows' bytes are read from: what a candidate's own reads take
+    /// ([`NativePrepared::written_claim_content`]).
+    pub fn native_payloads(&self) -> Option<&dyn payloads::PayloadRead> {
+        self.state.payloads()
+    }
+    /// The segments of the payload log a committed row references, added to `live`.
+    pub(crate) fn live_payload_segments(&self, live: &mut std::collections::BTreeSet<u32>) {
+        payloads::segments_of(
+            self.state
+                .rows
+                .entries_from(&Key::Event(SessionSeq(0), 0), false)
+                .take_while(|entry| matches!(entry.key, Key::Event(..)))
+                .map(|entry| entry.value),
+            live,
+        );
+    }
+    /// Let go of the payload log's sealed segments no committed row references (doc 31 M3):
+    /// for a core with no candidates pending. How many it let go.
+    pub fn sweep_payloads(&self) -> usize {
+        let Some(log) = self.state.payloads.as_deref() else {
+            return 0;
+        };
+        let mut live = std::collections::BTreeSet::new();
+        self.live_payload_segments(&mut live);
+        log.sweep(&live)
+    }
     pub fn native_sequence(&self) -> SessionSeq {
         SessionSeq(self.state.rows.prefix())
+    }
+    /// The committed rows frozen at this prefix, for a checkpoint to encode
+    /// on another thread while this core goes on (`record_codec::checkpoint`).
+    pub fn freeze_native(&self) -> Result<NativeFrozen, MemoryError> {
+        let payloads = match self.state.payloads.as_deref() {
+            Some(log) => Some(log.reader().map_err(|_| MemoryError::AllocationFailed)?),
+            None => None,
+        };
+        Ok(NativeFrozen {
+            ledger: self.state.ledger,
+            profile: self.state.profile,
+            rows: self.state.rows.freeze(&self.state.budget)?,
+            payloads,
+        })
     }
     /// The trusted clock of the last committed record; zero before any record.
     pub fn native_logical_time(&self) -> u64 {
@@ -1518,28 +2377,41 @@ impl Core<NativeState> {
         }
     }
     pub fn native_claim(&self, id: ClaimId) -> Option<&ClaimState> {
-        as_claim(self.state.rows.get(&Key::Claim(id)))
+        as_claim(self.state.row(&Key::Claim(id)))
     }
-    pub fn native_outcome(&self, request: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
-        as_outcome(self.state.rows.get(&Key::Outcome(request.into())))
+    /// The outcome recorded for `request`, a spilled one read back (doc 31 M3): an outcome that
+    /// cannot be read is an error, never taken for none.
+    pub fn native_outcome(
+        &self,
+        request: impl Into<NativeInvocation>,
+    ) -> Result<Option<NativeOutcome>, NativeError> {
+        let invocation = request.into();
+        as_outcome(
+            self.state.rows.get(&Key::Outcome(invocation)),
+            self.state.ledger,
+            invocation,
+            self.state.payloads(),
+        )
     }
     /// Every committed native outcome (the retry-dedup records that survive a
     /// checkpoint) in native-sequence order — one per committed record. The
     /// offline publications reader projects these to the linearizability
     /// checker's receipts; each carries its `invocation`, `sequence` and
     /// `intent`.
-    pub fn native_outcomes(&self) -> Vec<NativeOutcome> {
+    pub fn native_outcomes(&self) -> Result<Vec<NativeOutcome>, NativeError> {
         let mut outcomes: Vec<NativeOutcome> = self
             .state
             .rows
             .entries()
-            .filter_map(|entry| match &entry.value {
-                Row::Outcome(outcome) => Some(*outcome),
+            .filter_map(|entry| match (&entry.key, &entry.value) {
+                (Key::Outcome(invocation), Row::Outcome(outcome)) => {
+                    Some(outcome.expand(self.state.ledger, *invocation, self.state.payloads()))
+                }
                 _ => None,
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         outcomes.sort_by_key(|outcome| outcome.sequence.0);
-        outcomes
+        Ok(outcomes)
     }
     /// The continuation of a claim that retired to the archive (26 §4).
     pub fn native_retired(&self, id: ClaimId) -> Option<&RetiredClaim> {
@@ -1568,13 +2440,13 @@ impl Core<NativeState> {
             roots.push(root);
             Ok(())
         };
-        let mut walk = |entry: &focal_memory::Entry<Key, Row>| -> Result<bool, NativeError> {
+        let mut walk = |entry: ranges::RowEntry<'_>| -> Result<bool, NativeError> {
             if visited >= max_visits {
                 return Ok(false);
             }
             visited = visited.saturating_add(1);
             last = Some(entry.key);
-            match (&entry.key, &entry.value) {
+            match (&entry.key, entry.value) {
                 (Key::Artifact(id), Row::Artifact(owned)) => {
                     use focal_model::lifecycle::artifact_descriptor::PayloadSpec;
                     if let Some(artifact) = owned.get() {
@@ -1596,11 +2468,29 @@ impl Core<NativeState> {
                         }
                     }
                 }
+                // A continuation claiming its own retirement's sequence is a cold family's
+                // (doc 31 M2, A2); one claiming less names a custody bundle.
+                (Key::Retired(claim), Row::Retired(value)) if value.through == value.retired_at => {
+                    push(ContentRoot::Cold {
+                        claim: *claim,
+                        digest: value.bundle,
+                        bytes: value.bytes,
+                        retired_at: value.retired_at,
+                    })?
+                }
                 (Key::Retired(claim), Row::Retired(value)) => push(ContentRoot::Bundle {
                     claim: *claim,
                     root: value.bundle,
                     bytes: value.bytes,
                 })?,
+                // A closing seal's row names no bundle (F12 level 5).
+                (Key::Seal(ordinal), Row::Seal(value)) if !value.is_closing(*ordinal) => {
+                    push(ContentRoot::Seal {
+                        ordinal: *ordinal,
+                        root: value.bundle,
+                        bytes: value.bytes,
+                    })?
+                }
                 _ => {}
             }
             Ok(true)
@@ -1634,7 +2524,7 @@ impl Core<NativeState> {
         })
     }
     pub fn native_definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
-        as_definition(self.state.rows.get(&Key::Definition(id)))
+        as_definition(self.state.row(&Key::Definition(id)))
     }
     pub fn native_evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
         as_evaluation(self.state.rows.get(&Key::Evaluation(key)))
@@ -1650,7 +2540,7 @@ impl Core<NativeState> {
     }
     pub fn native_event(&self, sequence: SessionSeq, ordinal: u32) -> Option<NativeEvent> {
         match self.state.rows.get(&Key::Event(sequence, ordinal)) {
-            Some(Row::Event(event)) => event.get().map(|row| row.expand(self.state.ledger)),
+            Some(Row::Event(event)) => event.get(self.state.ledger, self.state.payloads()),
             _ => None,
         }
     }
@@ -1660,45 +2550,343 @@ impl Core<NativeState> {
     pub fn native_stats(&self) -> RangeStats {
         self.state.rows.stats()
     }
+    /// The state as of the last of `pending`, candidates prepared on this core
+    /// in order ([`Self::prepare_native`]'s chain): each one's changes over
+    /// the ones before it over the published rows. A candidate holds its
+    /// changes alone, so what it leaves of a row it does not write is read
+    /// here.
+    pub fn native_chain<'a>(
+        &'a self,
+        pending: &[&'a NativePrepared],
+    ) -> Result<NativeView<'a>, NativeError> {
+        Ok(NativeView(View::over(
+            &self.state,
+            pending_index::Chain::listed(pending)?,
+        )))
+    }
+    /// Audits a chain of candidates a caller holds, every link: each built on the one before it,
+    /// the first on the published prefix. An owner's own preparations check only its chain's head
+    /// (`check_native_chain`): it builds each candidate on its tail, so the head's link is the one
+    /// a publication can have moved, and a walk of every link on every preparation cost each the
+    /// chain's length.
     pub fn validate_native_chain(&self, pending: &[&NativePrepared]) -> Result<(), NativeError> {
-        if pending.len() > self.limits.pending {
-            return Err(NativeError::Capacity("pending candidates"));
-        }
         self.state
             .rows
             .validate_chain(pending.iter().map(|item| &item.fragments))?;
         Ok(())
     }
-    /// The external log owner calls this only after durability. This method has
-    /// no codec or IO; it performs no allocation, including producing its result.
+    /// The external log owner calls this only after durability. The publication
+    /// has no codec or IO and performs no allocation, including producing its
+    /// result. Once it stands, the events it published are filed in the event
+    /// index (doc 31 M2), which may grow; a refusal there drops the index, never
+    /// the publication. Then the claims it left waiting to be delivered and the
+    /// definitions it wrote are spilled where it left them (doc 31 M3,
+    /// `spill_published`), which never undoes it either.
     #[allow(clippy::result_large_err)] // Return the owned candidate without allocating on refusal.
     pub fn publish_native(
         &mut self,
         prepared: NativePrepared,
     ) -> Result<NativeOutcome, NativePublishError> {
+        // The rows change: nothing borrows what reads took back (doc 31 M3).
+        self.state.reads.release();
+        // What the rows take in a checkpoint after this mutation: what it puts, less what it
+        // replaces or deletes as the committed root holds it now, every predecessor published.
+        // Computed before anything is published, so a refusal leaves the root as it was.
+        let encoded = match self
+            .state
+            .encoded_rows
+            .checked_sub(prepared.encoded_removed)
+            .and_then(|rest| rest.checked_add(prepared.encoded_added))
+        {
+            Some(encoded) => encoded,
+            None => {
+                return Err(NativePublishError {
+                    error: MemoryError::CounterExhausted("checkpoint bytes"),
+                    prepared: Some(prepared),
+                });
+            }
+        };
         let NativePrepared {
             fragments,
             outcome,
             writes,
+            encoded_added,
+            encoded_removed,
+            _index,
+            events,
+            retire,
         } = prepared;
-        self.state
-            .rows
-            .publish_recoverable(fragments)
-            .map_err(|(error, fragments)| NativePublishError {
+        // A retirement's events leave with their families: unfiled while their rows still say
+        // where they are filed (doc 31 M2).
+        if retire.is_some() {
+            self.unfile_deleted_events(&fragments);
+        }
+        if let Err((error, fragments)) = self.state.rows.publish_recoverable(fragments) {
+            if retire.is_some() {
+                self.state.events.drop_all();
+            }
+            return Err(NativePublishError {
                 error,
-                prepared: NativePrepared {
+                prepared: fragments.map(|fragments| NativePrepared {
                     fragments,
                     outcome,
                     writes,
-                },
-            })?;
+                    encoded_added,
+                    encoded_removed,
+                    _index,
+                    events,
+                    retire,
+                }),
+            });
+        }
+        self.state.encoded_rows = encoded;
+        self.file_events(outcome, events);
+        self.spill_published(&writes);
         Ok(outcome)
     }
-    pub fn pin_native(&mut self, now: u64, ttl: u64) -> Result<NativeRead, MemoryError> {
+    /// Spills the claims a publication left waiting to be delivered, and the authored
+    /// definitions it wrote, where it left them (doc 31 M3): each row's record encoding goes to
+    /// the payload log and the row is rewritten where it stands to hold where its bytes are, its
+    /// page's charge let go by the heap it held. A read takes one back where it touches it
+    /// (`read_back`). The publication has stood, and its pages are the store's own: a row the log
+    /// refuses, or one that cannot be rewritten, keeps its bytes, and nothing here undoes it. How
+    /// many rows it spilled.
+    fn spill_published(&mut self, writes: &mutation::WriteSet) -> usize {
+        // A measurement's control: the same core with its claims held.
+        #[cfg(test)]
+        if std::env::var_os("FOCAL_MEASURE_HELD_CLAIMS").is_some() {
+            return 0;
+        }
+        let NativeState {
+            rows,
+            payloads,
+            young,
+            budget,
+            ..
+        } = &mut self.state;
+        let Some(log) = payloads.as_deref() else {
+            return 0;
+        };
+        let mut spilled = 0usize;
+        // The rows this publication wrote join the generation first, each that may spill (its
+        // claim taken or tied into work since, a row stays held). One the generation cannot keep
+        // spills now.
+        let mut admitted = 0usize;
+        for (key, deleted) in writes.entries() {
+            if deleted || !matches!(key, Key::Claim(_) | Key::Definition(_)) {
+                continue;
+            }
+            let spillable = match rows.get(&key) {
+                Some(Row::Claim(claim)) => claim.spillable(),
+                Some(Row::Definition(definition)) => definition.spillable(),
+                _ => false,
+            };
+            if !spillable {
+                continue;
+            }
+            admitted = admitted.saturating_add(1);
+            let Some(now) = young.admit(key) else {
+                continue;
+            };
+            match spill_row(rows, log, &now) {
+                RowSpill::Spilled => spilled = spilled.saturating_add(1),
+                RowSpill::Stays => {}
+                RowSpill::PutOff => young.lost(),
+            }
+        }
+        // Then its oldest, while it tracks more than it holds by choice or memory is short, a
+        // bounded number a publication; one whose spill is put off is kept to try again.
+        let mut pass = young::Pass::new(admitted);
+        while let Some(oldest) = young.next(budget, &mut pass) {
+            match spill_row(rows, log, &oldest) {
+                RowSpill::Spilled => spilled = spilled.saturating_add(1),
+                RowSpill::Stays => {}
+                RowSpill::PutOff => young.put_off(oldest, &mut pass),
+            }
+        }
+        // Rows it lost track of are found again by a walk of the rows, a bounded step a
+        // publication while memory is short.
+        if young.walk_due(budget) {
+            spilled = spilled.saturating_add(walk_step(rows, log, young));
+        }
+        spilled
+    }
+    /// Unfile every event `fragments` deletes from the event index (doc 31 M2).
+    fn unfile_deleted_events(&mut self, fragments: &ranges::Fragments) {
+        let NativeState {
+            rows,
+            events,
+            ledger,
+            payloads: log,
+            ..
+        } = &mut self.state;
+        for (_, _, change) in fragments.changes() {
+            let ranges::RowChange::Delete(key) = change else {
+                continue;
+            };
+            let Key::Event(sequence, ordinal) = key else {
+                continue;
+            };
+            if !events.complete() {
+                return;
+            }
+            let event = match rows.get(&key) {
+                Some(Row::Event(stored)) => stored.get(*ledger, payloads::source(log)),
+                _ => None,
+            };
+            match event {
+                Some(event) => events.unfile(
+                    event_index::home(event),
+                    event_index::Position { sequence, ordinal },
+                ),
+                None => events.drop_all(),
+            }
+        }
+    }
+    /// File the events `outcome` published, every one at its sequence, on the charge its
+    /// preparation funded (doc 31 M2). A publication not funded for them, or a row that is not
+    /// the event it should be, lets the index go, for the rows to build again.
+    fn file_events(&mut self, outcome: NativeOutcome, funding: Option<focal_memory::Allocation>) {
+        let NativeState {
+            rows,
+            events,
+            ledger,
+            payloads: log,
+            ..
+        } = &mut self.state;
+        if outcome.events == 0 || !events.complete() {
+            return;
+        }
+        let funded = event_index::charge_for(outcome.events)
+            .ok()
+            .is_some_and(|wanted| {
+                funding
+                    .as_ref()
+                    .is_some_and(|funding| funding.bytes() == wanted)
+            });
+        match funding {
+            Some(funding) if funded => events.fund(funding),
+            _ => {
+                events.drop_all();
+                return;
+            }
+        }
+        for ordinal in 0..outcome.events {
+            let event = match rows.get(&Key::Event(outcome.sequence, ordinal)) {
+                Some(Row::Event(stored)) => stored.get(*ledger, payloads::source(log)),
+                _ => None,
+            };
+            let Some(event) = event else {
+                events.drop_all();
+                return;
+            };
+            events.file(
+                event_index::home(event),
+                event_index::Position {
+                    sequence: outcome.sequence,
+                    ordinal,
+                },
+            );
+        }
+    }
+    /// Build the event index from the committed rows where it is not built (a restored core's,
+    /// or one whose memory was refused): a walk of every event, once.
+    pub fn build_event_index(&mut self) {
+        if !self.state.events.complete() {
+            self.state.events = event_index::EventIndex::build(
+                &self.state.rows,
+                self.state.ledger,
+                self.state.payloads(),
+                &self.state.budget,
+            );
+        }
+    }
+    /// What the rows take in a checkpoint once `prepared` publishes, each replaced or deleted row
+    /// looked up in the committed root: what the preparation's own count must equal.
+    #[cfg(test)]
+    pub(crate) fn encoded_after_by_lookup(
+        &self,
+        prepared: &NativePrepared,
+    ) -> Result<usize, MemoryError> {
+        let unencodable = |_| MemoryError::InvalidConfiguration("a committed row does not encode");
+        let mut removed = 0usize;
+        for (key, _) in prepared.writes.entries() {
+            if let Some(row) = self.state.rows.get(&key) {
+                removed = removed
+                    .checked_add(
+                        record_codec::checkpoint::row_bytes(
+                            key,
+                            row,
+                            self.state.ledger,
+                            self.state.payloads(),
+                        )
+                        .map_err(unencodable)?,
+                    )
+                    .ok_or(MemoryError::CounterExhausted("checkpoint bytes"))?;
+            }
+        }
         self.state
-            .rows
-            .pin(now, ttl)
-            .map(|lease| NativeRead { lease })
+            .encoded_rows
+            .checked_sub(removed)
+            .and_then(|rest| rest.checked_add(prepared.encoded_added))
+            .ok_or(MemoryError::CounterExhausted("checkpoint bytes"))
+    }
+    /// What the rows take in a checkpoint once `changes` are published straight to the root (a
+    /// seal's): each put's row added, every touched key's committed row taken away.
+    pub(in crate::native) fn encoded_after_changes(
+        &self,
+        changes: &[focal_memory::Change<Key, Row>],
+    ) -> Result<usize, NativeError> {
+        let mut removed = 0usize;
+        for change in changes {
+            let key = match change {
+                focal_memory::Change::Put(entry) => entry.key,
+                focal_memory::Change::Delete(key) => *key,
+            };
+            if let Some(row) = self.state.rows.get(&key) {
+                removed = removed
+                    .checked_add(
+                        record_codec::checkpoint::row_bytes(
+                            key,
+                            row,
+                            self.state.ledger,
+                            self.state.payloads(),
+                        )
+                        .map_err(|_| NativeError::Capacity("a committed row does not encode"))?,
+                    )
+                    .ok_or(NativeError::Capacity("checkpoint bytes"))?;
+            }
+        }
+        self.state
+            .encoded_rows
+            .checked_sub(removed)
+            .and_then(|rest| {
+                rest.checked_add(
+                    encoded_added(changes.iter(), self.state.ledger, self.state.payloads()).ok()?,
+                )
+            })
+            .ok_or(NativeError::Capacity("checkpoint bytes"))
+    }
+    /// What a checkpoint of the committed root encodes to, exactly: its frame and its rows.
+    pub fn checkpoint_bytes(&self) -> Result<usize, NativeError> {
+        record_codec::checkpoint::frame_bytes(&self.state)
+            .map_err(|_| NativeError::Capacity("checkpoint frame"))?
+            .checked_add(self.state.encoded_rows)
+            .ok_or(NativeError::Capacity("checkpoint bytes"))
+    }
+    pub fn pin_native(&mut self, now: u64, ttl: u64) -> Result<NativeRead, MemoryError> {
+        // A reader that cannot be made (its handles) refuses the lease, as a frozen image's does.
+        let payloads = match self.state.payloads.as_deref() {
+            Some(log) => Some(log.reader().map_err(|_| MemoryError::AllocationFailed)?),
+            None => None,
+        };
+        self.state.rows.pin(now, ttl).map(|lease| NativeRead {
+            lease,
+            ledger: self.state.ledger,
+            payloads,
+            limits: self.limits,
+            budget: self.state.budget.clone(),
+        })
     }
     pub fn release_native(&mut self, read: &NativeRead) -> Result<(), MemoryError> {
         self.state.rows.release(&read.lease)
@@ -1744,11 +2932,15 @@ impl Core<NativeState> {
         at: ranges::Affinity,
         id: RangeId,
     ) -> Result<(), NativeError> {
+        self.state.reads.release();
         self.state.rows.split(
             at,
             id,
             self.limits.max_ranges,
-            focal_memory::BudgetLane::Ordinary,
+            // A layout change applies a committed record: committed work, held
+            // to what the replica holds, never refused because fresh admissions
+            // filled the ordinary lane or a leader admitted under a wider share.
+            focal_memory::BudgetLane::Committed,
             prepare::copy,
         )
     }
@@ -1756,27 +2948,60 @@ impl Core<NativeState> {
     /// does once its genesis is known, so every replica names its origin
     /// member alike.
     pub fn rename_native_member(&mut self, index: usize, id: RangeId) -> Result<(), NativeError> {
+        self.state.reads.release();
         self.state.rows.rename_member(index, id)
     }
     /// Remove the boundary after member `index`, joining it with the next
     /// under its identity.
     pub fn merge_native_range(&mut self, index: usize) -> Result<(), NativeError> {
+        self.state.reads.release();
         self.state
             .rows
-            .merge(index, focal_memory::BudgetLane::Ordinary)
+            .merge(index, focal_memory::BudgetLane::Committed)
     }
 }
 
+/// The rows a spilled claim a view reads names, read in the same view.
+struct ViewRows<'a>(View<'a>);
+impl record_codec::ClaimRows for ViewRows<'_> {
+    fn declaration(&self, id: ValidationId) -> Option<&validation::Declaration> {
+        self.0.stored_definition(id)
+    }
+    fn response(&self, id: TestamentId) -> Option<&focal_model::lifecycle::evidence::Response> {
+        match self
+            .0
+            .stored_entry(&Key::Response(id))
+            .map(|entry| entry.value)
+        {
+            Some(Row::Response(row)) => row.get(),
+            _ => None,
+        }
+    }
+    fn evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
+        as_evaluation(
+            self.0
+                .stored_entry(&Key::Evaluation(key))
+                .map(|entry| entry.value),
+        )
+    }
+}
 fn as_claim(row: Option<&Row>) -> Option<&ClaimState> {
     match row {
         Some(Row::Claim(claim)) => claim.claim(),
         _ => None,
     }
 }
-fn as_outcome(row: Option<&Row>) -> Option<NativeOutcome> {
+/// The outcome `row` holds, a spilled one read back through `payloads`: one that cannot be read
+/// is an error, never taken for none (an exact retry would run again).
+fn as_outcome(
+    row: Option<&Row>,
+    ledger: LedgerId,
+    invocation: NativeInvocation,
+    payloads: Option<&dyn payloads::PayloadRead>,
+) -> Result<Option<NativeOutcome>, NativeError> {
     match row {
-        Some(Row::Outcome(outcome)) => Some(*outcome),
-        _ => None,
+        Some(Row::Outcome(outcome)) => outcome.expand(ledger, invocation, payloads).map(Some),
+        _ => Ok(None),
     }
 }
 fn as_definition(row: Option<&Row>) -> Option<&validation::Declaration> {
@@ -1791,20 +3016,149 @@ fn as_evaluation(row: Option<&Row>) -> Option<&validation::EvaluationState> {
         _ => None,
     }
 }
+/// A state as a read sees it: the committed rows, the pending chain's changes
+/// over them as of one candidate, and over those a candidate being prepared
+/// (doc 30 §9). A candidate holds its changes alone, so a key's row is its
+/// newest change here, else the committed row.
+#[derive(Clone, Copy)]
 struct View<'a> {
     state: &'a NativeState,
-    tail: Option<&'a NativePrepared>,
+    chain: Option<pending_index::Chain<'a>>,
+    own: Option<&'a NativePrepared>,
+    /// Where this view's reads take spilled rows back: the state's own, or one a walk lets go of
+    /// row by row (doc 31 M3).
+    reads: Option<&'a read_back::ReadBack>,
 }
 impl<'a> View<'a> {
-    fn get(&self, key: Key) -> Option<&'a Row> {
-        match self.tail {
-            Some(tail) => tail.fragments.get(&key),
-            None => self.state.rows.get(&key),
+    /// This view, its spilled rows read back into `reads`, which the caller lets go of (and asks
+    /// for its failures) where it is done with what was read: a walk of every row does so a row
+    /// at a time, so what it reads back never outgrows one row's.
+    fn with_reads(self, reads: &'a read_back::ReadBack) -> Self {
+        Self {
+            reads: Some(reads),
+            ..self
         }
+    }
+    /// Where this view's reads take spilled rows back.
+    fn arena(&self) -> &'a read_back::ReadBack {
+        self.reads.unwrap_or(&self.state.reads)
+    }
+    /// Where a spilled row's bytes are read from: the committed rows' log, which every row of
+    /// the chain is spilled to as well.
+    pub(super) fn payloads(&self) -> Option<&'a dyn payloads::PayloadRead> {
+        self.state.payloads()
+    }
+    /// Where a row built on this view is spilled (doc 31 M3).
+    pub(super) fn payload_log(&self) -> Option<&'a dyn payloads::PayloadLog> {
+        self.state.payloads.as_deref()
+    }
+    /// The committed rows alone.
+    fn committed(state: &'a NativeState) -> Self {
+        Self {
+            state,
+            chain: None,
+            own: None,
+            reads: None,
+        }
+    }
+    /// The committed rows under `chain`.
+    fn over(state: &'a NativeState, chain: Option<pending_index::Chain<'a>>) -> Self {
+        Self {
+            state,
+            chain,
+            own: None,
+            reads: None,
+        }
+    }
+    /// The committed rows with `tail`, a candidate prepared on them, over
+    /// them: a fixture's view.
+    #[cfg(test)]
+    fn with_tail(state: &'a NativeState, tail: Option<&'a NativePrepared>) -> Self {
+        Self {
+            state,
+            chain: None,
+            own: tail,
+            reads: None,
+        }
+    }
+    /// This view with `own`, a candidate prepared on it, over it. A view that
+    /// already has its own candidate takes it into its chain first: a caller's
+    /// chain holds it as its newest; an owner's chain, which holds only its
+    /// pending candidates, and a full caller's chain refuse.
+    fn with_own(self, own: &'a NativePrepared) -> Result<Self, NativeError> {
+        let chain = match (self.own, self.chain) {
+            (None, chain) => chain,
+            (Some(previous), None) => pending_index::Chain::listed(&[previous])?,
+            (Some(previous), Some(chain)) => Some(chain.then(previous)?),
+        };
+        Ok(Self {
+            state: self.state,
+            chain,
+            own: Some(own),
+            reads: self.reads,
+        })
+    }
+    /// The newest candidate this view reads: its own, else its chain's.
+    fn tail(&self) -> Option<&'a NativePrepared> {
+        self.own
+            .or_else(|| self.chain.and_then(|chain| chain.tail()))
+    }
+    fn get(&self, key: Key) -> Option<&'a Row> {
+        self.get_entry(&key).map(|entry| entry.value)
+    }
+    /// The row this view holds at `key`, whole: a spilled claim or definition read back (doc 31
+    /// M3).
+    fn get_entry(&self, key: &Key) -> Option<ranges::RowEntry<'a>> {
+        self.stored_entry(key).map(|entry| self.read_back(entry))
+    }
+    /// `entry` as a read takes it: a spilled claim or definition read back, the rows a claim's
+    /// encoding names read in this view.
+    fn read_back(&self, entry: ranges::RowEntry<'a>) -> ranges::RowEntry<'a> {
+        let value = self
+            .state
+            .read_back(self.arena(), &entry.key, entry.value, &ViewRows(*self));
+        ranges::RowEntry { value, ..entry }
+    }
+    /// A definition this view holds, a spilled one read back.
+    fn stored_definition(&self, id: ValidationId) -> Option<&'a validation::Declaration> {
+        let entry = self.stored_entry(&Key::Definition(id))?;
+        as_definition(Some(
+            self.state
+                .read_back_held_definition(self.arena(), entry.value),
+        ))
+    }
+    /// The row this view holds at `key` as it is stored: a spilled one as it is spilled.
+    fn stored_entry(&self, key: &Key) -> Option<ranges::RowEntry<'a>> {
+        if let Some(own) = self.own {
+            if !own.fragments.is_sparse() {
+                // A built candidate holds its whole state.
+                return own.fragments.get_entry(key);
+            }
+            if let Some(change) = own.fragments.change(key) {
+                return change;
+            }
+        }
+        if let Some(change) = self.chain.and_then(|chain| chain.get(key)) {
+            return change;
+        }
+        self.state.rows.get_entry(key)
+    }
+    /// The outcome recorded for `invocation`, whole: one that cannot be read back is an error.
+    fn outcome(&self, invocation: NativeInvocation) -> Result<Option<NativeOutcome>, NativeError> {
+        as_outcome(
+            self.get(Key::Outcome(invocation)),
+            self.state.ledger,
+            invocation,
+            self.payloads(),
+        )
+    }
+    /// Whether an outcome is recorded for `invocation`, its row's key alone: nothing read back.
+    fn has_outcome(&self, invocation: NativeInvocation) -> bool {
+        self.get(Key::Outcome(invocation)).is_some()
     }
     fn meta(&self) -> Meta {
         match self.get(Key::Meta) {
-            Some(Row::Meta(meta)) => *meta,
+            Some(Row::Meta(meta)) => **meta,
             _ => Meta::default(),
         }
     }
@@ -1820,20 +3174,39 @@ impl<'a> View<'a> {
     fn evaluation(&self, key: EvaluationKey) -> Result<&validation::EvaluationState, NativeError> {
         as_evaluation(self.get(Key::Evaluation(key))).ok_or(ContractError::InvalidTarget.into())
     }
-    /// Ordered rows of the effective prefix at or after `start`. The caller
-    /// bounds what it consumes; nothing is allocated per row.
-    fn entries_from(
-        &self,
-        start: Key,
-    ) -> impl Iterator<Item = &'a focal_memory::Entry<Key, Row>> + use<'a> {
-        let (committed, tail) = match self.tail {
-            Some(tail) => (None, Some(tail.fragments.entries_from(&start, false))),
-            None => (Some(self.state.rows.entries_from(&start, false)), None),
-        };
-        committed
+    /// Ordered rows of the effective prefix at or after `start`: its own
+    /// changes over the chain's over the committed rows, merged as they are
+    /// walked. The caller bounds what it consumes; nothing is allocated.
+    fn entries_from(&self, start: Key) -> impl Iterator<Item = ranges::RowEntry<'a>> + use<'a> {
+        let built = self.own.filter(|own| !own.fragments.is_sparse());
+        let whole = built.map(|own| own.fragments.entries_from(&start, false));
+        let merged = built.is_none().then(|| {
+            let own = self
+                .own
+                .into_iter()
+                .flat_map(move |own| own.fragments.changes_from(&start, false))
+                .map(|change| match change {
+                    ranges::RowChange::Put(entry) => (entry.key, Some(entry)),
+                    ranges::RowChange::Delete(key) => (key, None),
+                });
+            let chain = self
+                .chain
+                .into_iter()
+                .flat_map(move |chain| chain.changes_from(&start, false));
+            let committed = self
+                .state
+                .rows
+                .entries_from(&start, false)
+                .map(|entry| (entry.key, Some(entry)));
+            pending_index::Overlay::new(own, pending_index::Overlay::new(chain, committed))
+                .filter_map(|(_, entry)| entry)
+        });
+        let view = *self;
+        whole
             .into_iter()
             .flatten()
-            .chain(tail.into_iter().flatten())
+            .chain(merged.into_iter().flatten())
+            .map(move |entry| view.read_back(entry))
     }
     /// Committed claims whose authored `kind` relation targets `target`
     /// (the relation index of 22 §7), in identity order.
@@ -1876,7 +3249,7 @@ impl EffectiveClaims for View<'_> {
         self.state.ledger
     }
     fn prefix(&self) -> SessionSeq {
-        self.tail
+        self.tail()
             .map_or(SessionSeq(self.state.rows.prefix()), |tail| {
                 SessionSeq(tail.fragments.prefix())
             })
@@ -1884,14 +3257,33 @@ impl EffectiveClaims for View<'_> {
     fn claim(&self, id: ClaimId) -> Option<&ClaimState> {
         as_claim(self.get(Key::Claim(id)))
     }
+    // Both read the parent's content in place (doc 31 M3). Its encoding was checked when it was
+    // written, so a read fails only on corruption or a spilled row the payload log cannot give
+    // back, where each answers what refuses: the holder's escalation, and no designation.
     fn cause_escalation(&self, parent: ClaimId) -> focal_model::Escalation {
-        authored_reads::content(self.get(Key::ClaimContent(parent)))
-            .and_then(|content| content.policy())
-            .map_or(focal_model::Escalation::Holder, |policy| policy.escalation)
+        let mut buffer = owned::ContentBuffer::new();
+        authored_reads::content_view(
+            self.get(Key::ClaimContent(parent)),
+            self.payloads(),
+            &mut buffer,
+        )
+        .ok()
+        .flatten()
+        .and_then(|content| content.fields().policy)
+        .map_or(focal_model::Escalation::Holder, |policy| policy.escalation)
     }
     fn is_designated_evaluator(&self, parent: ClaimId, actor: ParticipantId) -> bool {
-        authored_reads::content(self.get(Key::ClaimContent(parent))).is_some_and(|content| {
-            content.requirements().iter().any(|pin| {
+        use focal_model::lifecycle::claim_descriptor::ClaimSource;
+        let mut buffer = owned::ContentBuffer::new();
+        let Ok(Some(content)) = authored_reads::content_view(
+            self.get(Key::ClaimContent(parent)),
+            self.payloads(),
+            &mut buffer,
+        ) else {
+            return false;
+        };
+        content.view().requirements().any(|pin| {
+            pin.is_ok_and(|pin| {
                 as_definition(self.get(Key::Definition(pin.id)))
                     .is_some_and(|definition| definition.designates(actor))
             })
@@ -1922,7 +3314,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_artifact(Some(&entry.value)).map(project)
+                    as_artifact(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -1939,7 +3331,7 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_result(Some(&entry.value)).map(project)
+                    as_result(Some(entry.value)).map(project)
                 } else {
                     None
                 }
@@ -1950,7 +3342,7 @@ impl NativeRead {
 
 fn as_receipt(row: Option<&Row>) -> Option<NativeReceipt> {
     match row {
-        Some(Row::Receipt(value)) => Some(*value),
+        Some(Row::Receipt(value)) => Some(**value),
         _ => None,
     }
 }
@@ -1960,11 +3352,195 @@ impl NativeRead {
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 if entry.key == key {
-                    as_receipt(Some(&entry.value))
+                    as_receipt(Some(entry.value))
                 } else {
                     None
                 }
             })
             .map(Option::flatten)
+    }
+}
+
+/// What `rows` take in a checkpoint, summed row by row: for a root built whole (a checkpoint
+/// restored, an archive read), whose rows were never published one mutation at a time.
+pub(in crate::native) fn encoded_rows_of(
+    rows: &ranges::NativeRanges,
+    ledger: LedgerId,
+    payloads: Option<&dyn payloads::PayloadRead>,
+) -> Result<usize, NativeError> {
+    rows.entries().try_fold(0usize, |sum, entry| {
+        let bytes = record_codec::checkpoint::row_bytes(entry.key, entry.value, ledger, payloads)
+            .map_err(|_| NativeError::Capacity("a restored row does not encode"))?;
+        sum.checked_add(bytes)
+            .ok_or(NativeError::Capacity("checkpoint bytes"))
+    })
+}
+
+/// What the committed rows a build replaces or deletes take in a checkpoint, counted as the build
+/// takes each out of its page (`RangesPlan::build_in_replacing`): what publishing the build takes
+/// away from the running total, with no row looked up again.
+#[derive(Debug)]
+pub(in crate::native) struct EncodedRemoved<'a> {
+    ledger: LedgerId,
+    /// Where a committed row's spilled bytes are read from.
+    payloads: Option<&'a dyn payloads::PayloadRead>,
+    bytes: usize,
+}
+
+impl<'a> EncodedRemoved<'a> {
+    pub(in crate::native) fn new(
+        ledger: LedgerId,
+        payloads: Option<&'a dyn payloads::PayloadRead>,
+    ) -> Self {
+        Self {
+            ledger,
+            payloads,
+            bytes: 0,
+        }
+    }
+    pub(in crate::native) fn count(&mut self, key: &Key, row: &Row) -> Result<(), MemoryError> {
+        let bytes = record_codec::checkpoint::row_bytes(*key, row, self.ledger, self.payloads)
+            .map_err(|_| MemoryError::InvalidConfiguration("a committed row does not encode"))?;
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(MemoryError::CounterExhausted("checkpoint bytes"))?;
+        Ok(())
+    }
+    pub(in crate::native) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// What the rows `changes` put take in a checkpoint: each put's row, as it will be written.
+pub(in crate::native) fn encoded_added(
+    mut changes: impl Iterator<Item = impl ranges::ChangeRead>,
+    ledger: LedgerId,
+    payloads: Option<&dyn payloads::PayloadRead>,
+) -> Result<usize, NativeError> {
+    changes.try_fold(0usize, |sum, change| match change.row() {
+        Some(row) => {
+            let bytes =
+                record_codec::checkpoint::row_bytes(change.changed(), row, ledger, payloads)
+                    .map_err(|_| NativeError::Capacity("a row that does not encode"))?;
+            sum.checked_add(bytes)
+                .ok_or(NativeError::Capacity("checkpoint bytes"))
+        }
+        None => Ok(sum),
+    })
+}
+
+/// One step of the walk that finds again the rows a young generation lost track of (doc 31 M3):
+/// from where the last stopped, [`young::WALK_VISITS`] rows at most, every held row it meets
+/// that may spill spilled ([`young::WALK_SPILLS`] at most), one put off counted to be found by a
+/// later walk. What it spilled.
+fn walk_step(
+    rows: &mut ranges::NativeRanges,
+    log: &dyn payloads::PayloadLog,
+    young: &mut young::Young,
+) -> usize {
+    let mut found = [None; young::WALK_SPILLS];
+    let (count, last, ended) = match young.walk_from() {
+        Some(after) => walk_visit(rows.entries_from(&after, true), &mut found),
+        None => walk_visit(rows.entries(), &mut found),
+    };
+    young.walked(if ended { None } else { last });
+    let mut spilled = 0usize;
+    for tracked in found.iter().take(count).flatten() {
+        match spill_row(rows, log, &tracked.key()) {
+            RowSpill::Spilled => spilled = spilled.saturating_add(1),
+            RowSpill::Stays => {}
+            RowSpill::PutOff => young.found_put_off(),
+        }
+    }
+    spilled
+}
+
+/// The held rows that may spill among `entries`, into `found`: how many, the last row visited,
+/// and whether the rows ended before the step's bounds did.
+fn walk_visit<'a>(
+    entries: impl Iterator<Item = ranges::RowEntry<'a>>,
+    found: &mut [Option<young::Tracked>; young::WALK_SPILLS],
+) -> (usize, Option<Key>, bool) {
+    let mut count = 0usize;
+    let mut last = None;
+    for (visited, entry) in entries.enumerate() {
+        if visited >= young::WALK_VISITS || count >= young::WALK_SPILLS {
+            return (count, last, false);
+        }
+        last = Some(entry.key);
+        let spillable = match entry.value {
+            Row::Claim(claim) => claim.spillable(),
+            Row::Definition(definition) => definition.spillable(),
+            _ => false,
+        };
+        if spillable
+            && let Some(tracked) = young::Tracked::of(entry.key)
+            && let Some(slot) = found.get_mut(count)
+        {
+            *slot = Some(tracked);
+            count = count.saturating_add(1);
+        }
+    }
+    (count, last, true)
+}
+
+/// What spilling one row where it stands came to ([`spill_row`]).
+enum RowSpill {
+    Spilled,
+    /// Held for what it is: another claim depends on it, it may not spill, its encoding is wider
+    /// than a spilled row's, or it is gone. Only a change to it alters that.
+    Stays,
+    /// Put off: its page is shared with a frozen image or a lease, or the log refuses payloads
+    /// for now.
+    PutOff,
+}
+
+/// Spill the row at `key` where it stands (doc 31 M3): its payload appended to `log` only once its
+/// page is the store's own, so a page shared with a frozen image or a lease costs the log nothing.
+fn spill_row(
+    rows: &mut ranges::NativeRanges,
+    log: &dyn payloads::PayloadLog,
+    key: &Key,
+) -> RowSpill {
+    // A claim another depends on is reached by work on that one: it stays held.
+    if let Key::Claim(id) = key
+        && rows.get(&Key::IncomingHead(*id)).is_some()
+    {
+        return RowSpill::Stays;
+    }
+    let mut refused = false;
+    let rewritten = rows.rewrite(key, |row| {
+        let spill = match row {
+            Row::Claim(claim) => claim.spill(log).map(|spill| match spill {
+                payloads::Spill::Spilled(claim) => payloads::Spill::Spilled(Row::Claim(claim)),
+                payloads::Spill::Stays => payloads::Spill::Stays,
+                payloads::Spill::Refused => payloads::Spill::Refused,
+            }),
+            Row::Definition(definition) => definition.spill(log).map(|spill| match spill {
+                payloads::Spill::Spilled(definition) => {
+                    payloads::Spill::Spilled(Row::Definition(definition))
+                }
+                payloads::Spill::Stays => payloads::Spill::Stays,
+                payloads::Spill::Refused => payloads::Spill::Refused,
+            }),
+            _ => Ok(payloads::Spill::Stays),
+        };
+        Ok(match spill {
+            Ok(payloads::Spill::Spilled(row)) => Some((row, 0)),
+            Ok(payloads::Spill::Refused) => {
+                refused = true;
+                None
+            }
+            Ok(payloads::Spill::Stays) | Err(_) => None,
+        })
+    });
+    match rewritten {
+        Ok(focal_memory::Rewrite::Rewritten) => RowSpill::Spilled,
+        Ok(focal_memory::Rewrite::Shared) => RowSpill::PutOff,
+        Ok(focal_memory::Rewrite::Unchanged) if refused => RowSpill::PutOff,
+        Ok(focal_memory::Rewrite::Unchanged | focal_memory::Rewrite::Absent) => RowSpill::Stays,
+        // The store refused to look: tried again, within a publication's bound.
+        Err(_) => RowSpill::PutOff,
     }
 }

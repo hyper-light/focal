@@ -77,7 +77,7 @@ fn start(root: &Path, config: Option<&Path>, address: Option<&str>) -> (Server, 
     if let Some(config) = config {
         command.args(["--config", config.to_str().unwrap()]);
     }
-    command.arg("start");
+    command.args(["start", "node"]);
     if let Some(address) = address {
         command.args(["--advertise", address]);
     }
@@ -124,7 +124,7 @@ fn start(root: &Path, config: Option<&Path>, address: Option<&str>) -> (Server, 
     (server, status)
 }
 fn placement(root: &Path) -> Option<Value> {
-    let output = command(root, None, &["cluster", "placement"]);
+    let output = command(root, None, &["inspect", "placement"]);
     if !output.status.success() {
         return None;
     }
@@ -170,8 +170,8 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
         founder,
         None,
         &[
-            "cluster",
             "invite",
+            "node",
             "--node",
             name,
             "--output",
@@ -184,6 +184,7 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
         None,
         &[
             "join",
+            "cluster",
             "--invite-file",
             invitation.to_str().unwrap(),
             "--advertise",
@@ -192,10 +193,10 @@ fn join(founder: &Path, host: &Path, name: &str, advertise: &str) -> u64 {
     );
     joined["node"].as_u64().unwrap()
 }
-/// The committed policy revision `deployment explain` reports; the report
+/// The committed policy revision `explain deployment` reports; the report
 /// carries it whether or not the local inventory satisfies the policy.
 fn explain(root: &Path, config: Option<&Path>) -> Value {
-    let output = command(root, config, &["deployment", "explain"]);
+    let output = command(root, config, &["explain", "deployment"]);
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
         panic!(
             "{error}: {} / {}",
@@ -251,7 +252,7 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     let addresses: Vec<String> = (0..3).map(|_| address()).collect();
     let (founder_server, status) = start(founder, Some(&founder_config), Some(&addresses[0]));
     assert_eq!(status["condition"], "Ready");
-    let identity = success(founder, None, &["identity"]);
+    let identity = success(founder, None, &["inspect", "identity"]);
     let founder_node = identity["node"].as_u64().unwrap();
     let node_a = join(founder, dirs[1].path(), "host-a", &addresses[1]);
     let node_b = join(founder, dirs[2].path(), "host-b", &addresses[2]);
@@ -277,15 +278,17 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(committed_revision(founder, None), 1);
 
     // Planning needs the requested configuration.
-    let (code, report) = failure(founder, None, &["deployment", "plan", "--dry-run"]);
+    let (code, report) = failure(founder, None, &["plan", "deployment", "--dry-run"]);
     assert_eq!(code, 2, "{report}");
     assert!(report.contains("[invalid_input]"), "{report}");
 
-    // A dry run prints the plan: the policy commit first, then the session's
-    // placement request, the guarantee before and after; nothing is created
-    // and the directory journals nothing.
+    // A dry run prints the plan: the policy commit first, then the root
+    // group's voters the durability needs (F24), then the session's
+    // placement request, the guarantee before and after for the data and
+    // for the control plane; nothing is created and the directory journals
+    // nothing.
     let dry =
-        success(founder, Some(&node_1), &["deployment", "plan", "--dry-run"])["result"].clone();
+        success(founder, Some(&node_1), &["plan", "deployment", "--dry-run"])["result"].clone();
     assert_eq!(dry["dry_run"], true);
     assert_eq!(dry["output"], Value::Null);
     assert_eq!(dry["empty"], false);
@@ -296,32 +299,53 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(plan["requested"]["durability"]["max_failures"], 1);
     assert_eq!(plan["blocked"], serde_json::json!([]));
     let changes = plan["changes"].as_array().unwrap();
-    assert_eq!(changes.len(), 2, "{plan}");
+    assert_eq!(changes.len(), 4, "{plan}");
     assert_eq!(changes[0]["change"], "commit_policy");
     assert_eq!(changes[0]["from_revision"], 1);
     assert_eq!(changes[0]["to_revision"], 2);
-    assert_eq!(changes[1]["change"], "plan_session");
-    assert_eq!(changes[1]["tenant"], tenant);
-    assert_eq!(changes[1]["session"], ledger);
-    assert_eq!(changes[1]["pending"], false);
-    assert_eq!(changes[1]["expected_route_epoch"], 1);
-    let mut voters: Vec<u64> = changes[1]["voters"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_u64().unwrap())
-        .collect();
-    voters.sort_unstable();
-    assert_eq!(voters, {
+    let sorted = |value: &Value| {
+        let mut ids: Vec<u64> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    let all = {
         let mut all = vec![founder_node, node_a, node_b];
         all.sort_unstable();
         all
-    });
-    let operation = changes[1]["operation"].as_str().unwrap().to_owned();
+    };
+    assert_eq!(changes[1]["change"], "plan_root");
+    assert_eq!(sorted(&changes[1]["voters"]), all, "{plan}");
+    // The directory's partition group is seated after the root and before
+    // the session (F24): a session is routed and placed by both.
+    assert_eq!(changes[2]["change"], "plan_partition", "{plan}");
+    assert_eq!(sorted(&changes[2]["voters"]), all, "{plan}");
+    assert_eq!(
+        changes[2]["partition"], plan["observed"]["control"]["partitions"][0]["partition"],
+        "{plan}"
+    );
+    assert_eq!(changes[3]["change"], "plan_session");
+    assert_eq!(changes[3]["tenant"], tenant);
+    assert_eq!(changes[3]["session"], ledger);
+    assert_eq!(changes[3]["pending"], false);
+    assert_eq!(changes[3]["expected_route_epoch"], 1);
+    assert_eq!(sorted(&changes[3]["voters"]), all);
+    let operation = changes[3]["operation"].as_str().unwrap().to_owned();
     assert_eq!(plan["guarantee"]["before"]["max_failures"], 0);
     assert_eq!(plan["guarantee"]["during"]["max_failures"], 0);
     assert_eq!(plan["guarantee"]["after"]["max_failures"], 1);
     assert_eq!(plan["guarantee"]["after"]["survive"], "node");
+    assert_eq!(plan["control_guarantee"]["before"]["max_failures"], 0);
+    assert_eq!(plan["control_guarantee"]["after"]["max_failures"], 1);
+    assert_eq!(plan["blocked_control"], Value::Null);
+    assert_eq!(
+        plan["observed"]["control"]["voters"],
+        serde_json::json!([founder_node])
+    );
     let plan_id = plan["plan_id"].as_str().unwrap().to_owned();
     assert!(!founder.join("cluster/apply").exists());
     assert_eq!(committed_revision(founder, None), 1);
@@ -330,7 +354,7 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(after_dry["pending"], Value::Null, "{after_dry}");
     assert_eq!(after_dry["route_epoch"], 1);
     assert_eq!(after_dry["max_failures"], 0);
-    let status = success(founder, None, &["deployment", "status"])["result"].clone();
+    let status = success(founder, None, &["inspect", "deployment"])["result"].clone();
     assert_eq!(status["plans"], serde_json::json!([]));
 
     // Too few independent domains: the session is blocked, the guarantee
@@ -340,8 +364,8 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         founder,
         Some(&node_2),
         &[
-            "deployment",
             "plan",
+            "deployment",
             "--output",
             blocked_file.to_str().unwrap(),
         ],
@@ -354,13 +378,19 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     );
     assert_eq!(blocked["plan"]["blocked"][0]["session"], ledger);
     assert_eq!(blocked["plan"]["guarantee"]["after"]["max_failures"], 0);
+    // Nor can the root be seated for two losses among three hosts.
+    assert!(blocked["plan"]["blocked_control"].is_string(), "{blocked}");
+    assert_eq!(
+        blocked["plan"]["control_guarantee"]["after"]["max_failures"],
+        0
+    );
     assert!(blocked_file.is_file());
     let (code, report) = failure(
         founder,
         None,
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             blocked_file.to_str().unwrap(),
         ],
@@ -376,8 +406,8 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         founder,
         Some(&node_1),
         &[
-            "deployment",
             "plan",
+            "deployment",
             "--output",
             plan_file.to_str().unwrap(),
         ],
@@ -393,8 +423,8 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         founder,
         Some(&node_1),
         &[
-            "deployment",
             "plan",
+            "deployment",
             "--output",
             plan_file.to_str().unwrap(),
         ],
@@ -407,8 +437,8 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         founder,
         Some(&node_1_home),
         &[
-            "deployment",
             "plan",
+            "deployment",
             "--output",
             later_file.to_str().unwrap(),
         ],
@@ -427,8 +457,8 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         founder,
         None,
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             tampered_file.to_str().unwrap(),
         ],
@@ -448,8 +478,8 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         laptop,
         Some(&laptop_home),
         &[
-            "deployment",
             "plan",
+            "deployment",
             "--output",
             laptop_plan_file.to_str().unwrap(),
         ],
@@ -465,8 +495,8 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         founder,
         None,
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             laptop_plan_file.to_str().unwrap(),
         ],
@@ -477,14 +507,25 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         laptop,
         None,
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             laptop_plan_file.to_str().unwrap(),
         ],
     )["result"]
         .clone();
-    assert_eq!(applied["outcome"], "Complete", "{applied}");
+    if applied["outcome"] != "Complete" {
+        // What the placement and the hosts say when an apply runs out of
+        // its allowance: the session's plan phase and progress, and each
+        // node's health (macOS CI, 2026-10-02: root and partition seated,
+        // the session step committed and not complete at 300 s).
+        let view = placement(founder);
+        let health = command(founder, None, &["inspect", "node", "--health"]);
+        panic!(
+            "apply not complete: {applied}\nplacement: {view:?}\nhealth: {}",
+            String::from_utf8_lossy(&health.stdout)
+        );
+    }
     assert_eq!(committed_revision(laptop, Some(&laptop_config)), 2);
     drop(laptop_server);
     // The laptop restarts under its committed policy with the file that
@@ -492,41 +533,73 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     // committed home region needs, and the old file is refused by name.
     let (laptop_server, _) = start(laptop, Some(&laptop_home), None);
     drop(laptop_server);
-    let (code, report) = failure(laptop, None, &["demo"]);
+    let (code, report) = failure(laptop, None, &["run", "demo"]);
     assert_eq!(code, 1, "{report}");
     assert!(report.contains("no ordering home"), "{report}");
     let old_laptop = write(
         "laptop-old.yaml",
         &format!("{topology}placement:\n  home_regions: []\n"),
     );
-    let (code, report) = failure(laptop, Some(&old_laptop), &["identity"]);
+    let (code, report) = failure(laptop, Some(&old_laptop), &["inspect", "identity"]);
     assert_eq!(code, 2, "{report}");
     assert!(report.contains("[committed_policy]"), "{report}");
 
-    // Apply the fleet plan: the policy commits, the session's placement
-    // request is journaled, and waiting sees it activated.
+    // Apply the fleet plan: the policy commits, the root's and the
+    // partition group's voters are seated (two learners hosted, caught up
+    // and promoted each, F24), the session's placement request is
+    // journaled, and waiting sees it activated. The allowance covers that
+    // whole sequence on a starved runner (macOS CI ran out of 180 s with
+    // the session step committed, 2026-10-02).
     let applied = success(
         founder,
         None,
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             plan_file.to_str().unwrap(),
             "--wait",
-            "180",
+            "300",
         ],
     )["result"]
         .clone();
     assert_eq!(applied["kind"], "deployment_applied");
     assert_eq!(applied["plan_id"], plan_id);
-    assert_eq!(applied["outcome"], "Complete", "{applied}");
+    if applied["outcome"] != "Complete" {
+        // What the placement and the hosts say when an apply runs out of
+        // its allowance: the session's plan phase and progress, and each
+        // node's health (macOS CI, 2026-10-02: root and partition seated,
+        // the session step committed and not complete at 300 s).
+        let view = placement(founder);
+        let health = command(founder, None, &["inspect", "node", "--health"]);
+        panic!(
+            "apply not complete: {applied}\nplacement: {view:?}\nhealth: {}",
+            String::from_utf8_lossy(&health.stdout)
+        );
+    }
     let steps = applied["steps"].as_array().unwrap();
-    assert_eq!(steps.len(), 2);
+    assert_eq!(steps.len(), 4);
     assert_eq!(steps[0]["phase"], "Complete");
     assert_eq!(steps[1]["phase"], "Complete");
-    assert_eq!(steps[1]["operation"], operation);
+    assert_eq!(steps[1]["change"]["change"], "plan_root");
+    assert_eq!(steps[2]["phase"], "Complete", "{applied}");
+    assert_eq!(steps[2]["change"]["change"], "plan_partition");
+    assert_eq!(steps[3]["phase"], "Complete");
+    assert_eq!(steps[3]["operation"], operation);
     assert_eq!(committed_revision(founder, None), 2);
+    // The root's voters are the three, and the view says what they survive.
+    let configuration =
+        success(founder, None, &["inspect", "membership"])["result"]["configuration"].clone();
+    assert_eq!(sorted(&configuration["voters"]), all, "{configuration}");
+    let control = placement(founder).unwrap()["control"].clone();
+    assert_eq!(control["root"]["tolerates_node"], 1, "{control}");
+    // The partition group's voters are the three as well, and said to be.
+    assert_eq!(
+        sorted(&control["partitions"][0]["voters"]),
+        all,
+        "{control}"
+    );
+    assert_eq!(control["partitions"][0]["tolerates_node"], 1, "{control}");
     let journal = founder.join("cluster/apply").join(&plan_id);
     assert!(journal.join("JOURNAL").is_file());
     assert_eq!(std::fs::read(journal.join("PLAN")).unwrap(), bytes);
@@ -540,8 +613,8 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         founder,
         None,
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             plan_file.to_str().unwrap(),
         ],
@@ -549,7 +622,7 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         .clone();
     assert_eq!(again["outcome"], "Complete");
     assert_eq!(committed_revision(founder, None), 2);
-    let status = success(founder, None, &["deployment", "status"])["result"].clone();
+    let status = success(founder, None, &["inspect", "deployment"])["result"].clone();
     assert_eq!(status["plans"].as_array().unwrap().len(), 1);
     assert_eq!(status["plans"][0]["kind"], "deployment_status");
     assert_eq!(status["plans"][0]["plan_id"], plan_id);
@@ -557,7 +630,7 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     let one = success(
         founder,
         None,
-        &["deployment", "status", "--plan", plan_id.as_str()],
+        &["inspect", "deployment", "--plan", plan_id.as_str()],
     )["result"]
         .clone();
     assert_eq!(one["plans"][0]["plan_id"], plan_id);
@@ -567,8 +640,8 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         founder,
         None,
         &[
-            "deployment",
             "apply",
+            "deployment",
             "--plan-file",
             later_file.to_str().unwrap(),
         ],
@@ -579,7 +652,7 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(committed_revision(founder, None), 2);
     // The same request now plans nothing: satisfied at the committed policy.
     let settled =
-        success(founder, Some(&node_1), &["deployment", "plan", "--dry-run"])["result"].clone();
+        success(founder, Some(&node_1), &["plan", "deployment", "--dry-run"])["result"].clone();
     assert_eq!(settled["empty"], true, "{settled}");
     assert_eq!(settled["plan"]["observed"]["policy_revision"], 2);
     assert_eq!(settled["plan"]["guarantee"]["before"]["max_failures"], 1);
@@ -602,13 +675,13 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     // The original file omitted durability, so it still starts the node
     // (omitted fields are the committed values); one that states the old
     // value is refused by name.
-    let identity_again = success(founder, Some(&founder_config), &["identity"]);
+    let identity_again = success(founder, Some(&founder_config), &["inspect", "identity"]);
     assert_eq!(identity_again["node"], founder_node);
     let old_founder = write(
         "founder-old.yaml",
         &format!("{topology}durability:\n  survive: node\n  max_failures: 0\n"),
     );
-    let (code, report) = failure(founder, Some(&old_founder), &["identity"]);
+    let (code, report) = failure(founder, Some(&old_founder), &["inspect", "identity"]);
     assert_eq!(code, 2, "{report}");
     assert!(report.contains("[committed_policy]"), "{report}");
     assert!(report.contains("durability.max_failures"), "{report}");
@@ -616,8 +689,33 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     // provides the committed `max_failures` 1 and the session has applied
     // it, so the plan is valid and the guarantee is active. The observed
     // section names every node and the session's achieved level.
-    let explained = explain(founder, None);
-    assert_eq!(explained["condition"], "PlanValid", "{explained}");
+    // The restart without a topology moved the founder to the unknown
+    // region, which re-grants it at its next generation (24 §22); its seats
+    // stay its own and the controller re-seats every group it votes in at
+    // the generation it signs at now (24 §19), so the guarantee is active
+    // again once that has committed.
+    let explained = {
+        let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
+        let mut last = explain(founder, None);
+        while last["activated"] != true && deadline.open() {
+            std::thread::sleep(Duration::from_millis(250));
+            last = explain(founder, None);
+        }
+        last
+    };
+    assert_eq!(
+        explained["condition"],
+        "PlanValid",
+        "{explained}; founder health {}; placement {}; nodes {}; routes {}",
+        String::from_utf8_lossy(&command(founder, None, &["inspect", "node", "--health"]).stdout),
+        String::from_utf8_lossy(&command(founder, None, &["inspect", "placement"]).stdout),
+        String::from_utf8_lossy(&command(founder, None, &["list", "nodes"]).stdout),
+        String::from_utf8_lossy(&command(founder, None, &["inspect", "node", "--metrics"]).stdout)
+            .lines()
+            .filter(|line| line.contains("route") || line.contains("peer"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
     assert_eq!(explained["activated"], true, "{explained}");
     assert_eq!(explained["committed_revision"], 2);
     assert_eq!(explained["effective"]["durability"]["max_failures"], 1);
@@ -643,8 +741,8 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
         founder,
         None,
         &[
-            "deployment",
             "explain",
+            "deployment",
             "--inventory",
             inventory.to_str().unwrap(),
         ],

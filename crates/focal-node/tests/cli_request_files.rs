@@ -27,7 +27,7 @@ impl Drop for Server {
 fn start(root: &Path) -> Server {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut child = command(root, &["start"])
+    let mut child = command(root, &["start", "node"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -91,8 +91,8 @@ fn strict_shape_validation_is_offline_and_selected_preflight_never_silently_fall
         &[
             "--config",
             "/not/a/config",
-            "schema",
             "validate",
+            "document",
             "claim.submit",
             "--shape-only",
             "--json",
@@ -103,7 +103,7 @@ fn strict_shape_validation_is_offline_and_selected_preflight_never_silently_fall
     assert!(
         !run(
             root.path(),
-            &["schema", "validate", "claim.submit", "--json", &text]
+            &["validate", "document", "claim.submit", "--json", &text]
         )
         .status
         .success()
@@ -117,8 +117,8 @@ fn strict_shape_validation_is_offline_and_selected_preflight_never_silently_fall
         let out = run(
             root.path(),
             &[
-                "schema",
                 "validate",
+                "document",
                 "claim.submit",
                 "--shape-only",
                 "--json",
@@ -135,8 +135,8 @@ fn strict_shape_validation_is_offline_and_selected_preflight_never_silently_fall
         !run(
             root.path(),
             &[
-                "schema",
                 "validate",
+                "document",
                 "claim.submit",
                 "--shape-only",
                 "--file",
@@ -165,8 +165,8 @@ fn offline_build_freezes_ids_checks_private_no_clobber_and_rejects_unknown_wire_
         !run(
             root.path(),
             &[
-                "request",
                 "build",
+                "request",
                 "claim.submit",
                 "--json",
                 &text,
@@ -180,20 +180,20 @@ fn offline_build_freezes_ids_checks_private_no_clobber_and_rejects_unknown_wire_
     assert!(!file.exists());
     success(run(
         root.path(),
-        &["schema", "validate", "claim.submit", "--json", &text],
+        &["validate", "document", "claim.submit", "--json", &text],
     ));
     let yaml = serde_saphyr::to_string(&claim()).unwrap();
     success(run(
         root.path(),
-        &["schema", "validate", "claim.submit", "--yaml", &yaml],
+        &["validate", "document", "claim.submit", "--yaml", &yaml],
     ));
     let authored = output.path().join("claim.yaml");
     std::fs::write(&authored, yaml).unwrap();
     success(run(
         root.path(),
         &[
-            "request",
             "build",
+            "request",
             "claim.submit",
             "--file",
             authored.to_str().unwrap(),
@@ -215,8 +215,8 @@ fn offline_build_freezes_ids_checks_private_no_clobber_and_rejects_unknown_wire_
         !run(
             root.path(),
             &[
-                "request",
                 "build",
+                "request",
                 "claim.submit",
                 "--json",
                 &text,
@@ -232,7 +232,7 @@ fn offline_build_freezes_ids_checks_private_no_clobber_and_rejects_unknown_wire_
     assert_eq!(std::fs::read(&file).unwrap(), bytes);
     let checked = success(run(
         root.path(),
-        &["--config", "/missing", "request", "check", path],
+        &["--config", "/missing", "check", "request", path],
     ));
     assert!(String::from_utf8_lossy(&checked.stdout).contains("server acceptance unchecked"));
     assert!(!root.path().join("CLI.requests").exists());
@@ -241,7 +241,7 @@ fn offline_build_freezes_ids_checks_private_no_clobber_and_rejects_unknown_wire_
     let bad = output.path().join("bad.json");
     std::fs::write(&bad, serde_json::to_vec(&invalid).unwrap()).unwrap();
     assert!(
-        !run(root.path(), &["request", "check", bad.to_str().unwrap()])
+        !run(root.path(), &["check", "request", bad.to_str().unwrap()])
             .status
             .success()
     );
@@ -249,7 +249,7 @@ fn offline_build_freezes_ids_checks_private_no_clobber_and_rejects_unknown_wire_
     invalid.request_id = RequestId([0; 16]);
     std::fs::write(&bad, serde_json::to_vec(&invalid).unwrap()).unwrap();
     assert!(
-        !run(root.path(), &["request", "check", bad.to_str().unwrap()])
+        !run(root.path(), &["check", "request", bad.to_str().unwrap()])
             .status
             .success()
     );
@@ -257,7 +257,7 @@ fn offline_build_freezes_ids_checks_private_no_clobber_and_rejects_unknown_wire_
     malformed.extend_from_slice(b"{}");
     std::fs::write(&bad, malformed).unwrap();
     assert!(
-        !run(root.path(), &["request", "check", bad.to_str().unwrap()])
+        !run(root.path(), &["check", "request", bad.to_str().unwrap()])
             .status
             .success()
     );
@@ -265,8 +265,8 @@ fn offline_build_freezes_ids_checks_private_no_clobber_and_rejects_unknown_wire_
     success(run(
         root.path(),
         &[
-            "request",
             "build",
+            "request",
             "claim.get",
             "--json",
             "{\"id\":\"00000000000000000000000000000001\"}",
@@ -282,8 +282,8 @@ fn offline_build_freezes_ids_checks_private_no_clobber_and_rejects_unknown_wire_
         !run(
             root.path(),
             &[
-                "request",
                 "build",
+                "request",
                 "validation.context",
                 "--json",
                 "{\"id\":\"00000000000000000000000000000001\"}",
@@ -302,8 +302,8 @@ fn offline_build_freezes_ids_checks_private_no_clobber_and_rejects_unknown_wire_
             &[
                 "--client-context",
                 "missing",
-                "schema",
                 "validate",
+                "document",
                 "claim.submit",
                 "--json",
                 &text
@@ -328,8 +328,8 @@ fn raw_send_and_legacy_path_retry_reuse_exact_file_across_server_restart() {
     success(run(
         root.path(),
         &[
-            "request",
             "build",
+            "request",
             "claim.submit",
             "--json",
             &text,
@@ -358,24 +358,27 @@ fn raw_send_and_legacy_path_retry_reuse_exact_file_across_server_restart() {
     assert!(
         !run(
             root.path(),
-            &["request", "check", managed_file.to_str().unwrap()]
+            &["check", "request", managed_file.to_str().unwrap()]
         )
         .status
         .success()
     );
     let current = json(
         root.path(),
-        &["request", "send", managed_file.to_str().unwrap()],
+        &["send", "request", managed_file.to_str().unwrap()],
     );
     assert!(
         current["result"]["RequestStreamRead"].is_object(),
         "{current}"
     );
     assert_eq!(
-        json(root.path(), &["request", managed_file.to_str().unwrap()]),
+        json(
+            root.path(),
+            &["send", "request", managed_file.to_str().unwrap()]
+        ),
         current
     );
-    let before = json(root.path(), &["status"]);
+    let before = json(root.path(), &["inspect", "prefix"]);
     let open = RequestEnvelope {
         request_id: RequestId::from_u128(900),
         operation: Operation::OpenEpoch {
@@ -385,16 +388,19 @@ fn raw_send_and_legacy_path_retry_reuse_exact_file_across_server_restart() {
     };
     let epoch = output.path().join("epoch.json");
     std::fs::write(&epoch, serde_json::to_vec(&open).unwrap()).unwrap();
-    let _opened = json(root.path(), &["request", "send", epoch.to_str().unwrap()]);
-    let committed = json(root.path(), &["request", "send", path]);
-    let state = json(root.path(), &["status"]);
+    let _opened = json(root.path(), &["send", "request", epoch.to_str().unwrap()]);
+    let committed = json(root.path(), &["send", "request", path]);
+    let state = json(root.path(), &["inspect", "prefix"]);
     assert_ne!(state["result"], before["result"]);
     assert!(committed["result"]["Submitted"].is_object(), "{committed}");
     drop(server);
     let _server = start(root.path());
-    let retry = json(root.path(), &["request", path]);
+    let retry = json(root.path(), &["send", "request", path]);
     assert_eq!(retry["request_id"], committed["request_id"]);
     assert_eq!(retry["request_epoch"], committed["request_epoch"]);
-    assert_eq!(json(root.path(), &["status"])["result"], state["result"]);
+    assert_eq!(
+        json(root.path(), &["inspect", "prefix"])["result"],
+        state["result"]
+    );
     assert_eq!(std::fs::read(&file).unwrap(), bytes);
 }

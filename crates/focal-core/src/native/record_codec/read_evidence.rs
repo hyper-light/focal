@@ -8,13 +8,14 @@ use super::{
 use crate::native::{NativeError, Row};
 use focal_memory::MemoryError;
 use focal_model::lifecycle::{
-    ContractError, aggregation::AcceptancePolicy, artifact_descriptor::ArtifactDescriptor,
+    ContractError, aggregation::Acceptance, artifact_descriptor::ArtifactDescriptor,
     validation::Declaration,
 };
 use focal_model::{ArtifactRef, ClaimId, ValidationId};
 
 #[path = "read_evidence_content.rs"]
 mod content;
+pub(in crate::native) use content::{content_profile, decode_definition};
 #[path = "read_evidence_creation.rs"]
 mod creation;
 #[path = "read_evidence_response.rs"]
@@ -23,6 +24,7 @@ mod response;
 mod scalar;
 pub(super) use content::{Custody, artifact, claim_content, definition};
 pub(super) use creation::creation;
+pub(in crate::native) use creation::{creation_decode_bound, decode_creation};
 pub(super) use response::response;
 pub(super) use scalar::{ScalarInput, accepted, delivery, diagnostic, missing, work};
 
@@ -40,7 +42,7 @@ pub(super) struct Quote {
 }
 pub(super) trait Dependencies {
     /// May be independently restored policy workspace; never fabricate a Claim.
-    fn policy(&self, claim: ClaimId) -> Result<&AcceptancePolicy, ContractError>;
+    fn policy(&self, claim: ClaimId) -> Result<Acceptance<'_>, ContractError>;
     fn artifact(&self, reference: ArtifactRef) -> Result<&ArtifactDescriptor, ContractError>;
     fn declaration(&self, id: ValidationId) -> Result<&Declaration, ContractError>;
 }

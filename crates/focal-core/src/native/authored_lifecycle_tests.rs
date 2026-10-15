@@ -1,14 +1,8 @@
 use super::*;
 
-fn claim_buffers(content: &ClaimDescriptor) -> Vec<*const ()> {
-    let mut buffers = vec![
-        content.description().as_ptr().cast(),
-        content.relations().as_ptr().cast(),
-        content.requirements().as_ptr().cast(),
-    ];
-    buffers.extend(content.scopes().map(|scope| scope.key.as_ptr().cast()));
-    buffers.extend(content.slots().map(|slot| slot.checks.as_ptr().cast()));
-    buffers
+/// A budget a test's reads of a claim's content are charged to while they hold it.
+fn read_budget() -> focal_memory::MemoryBudget {
+    focal_memory::MemoryBudget::new(1 << 26, 1 << 24).unwrap()
 }
 
 fn validation_buffers(descriptor: &ValidationDescriptor) -> Vec<*const ()> {
@@ -25,7 +19,6 @@ fn validation_buffers(descriptor: &ValidationDescriptor) -> Vec<*const ()> {
 struct AuthoredSnapshot {
     content: ClaimDescriptor,
     descriptor: ValidationDescriptor,
-    claim_buffers: Vec<*const ()>,
     validation_buffers: Vec<*const ()>,
     resolution: [NativeCreatedObject; 2],
 }
@@ -46,7 +39,6 @@ impl AuthoredSnapshot {
             descriptor: descriptor
                 .try_copy(descriptor.retained_bytes().unwrap())
                 .unwrap(),
-            claim_buffers: claim_buffers(&proposal.content),
             validation_buffers: validation_buffers(descriptor),
             resolution: [
                 NativeCreatedObject {
@@ -77,9 +69,10 @@ impl AuthoredSnapshot {
         ValidationId(self.descriptor.binding().object.0)
     }
 
+    // A claim's content is held as its encoding (doc 31 M3): it reads back equal, decoded
+    // afresh, where a declaration's body is still the buffers it moved in with.
     fn check_claim(&self, content: &ClaimDescriptor) {
         assert_eq!(content, &self.content);
-        assert_eq!(claim_buffers(content), self.claim_buffers);
     }
 
     fn check_validation(&self, descriptor: &ValidationDescriptor) {
@@ -112,7 +105,7 @@ impl AuthoredSnapshot {
         let claim = view.claim(self.claim()).unwrap();
         assert_eq!(claim.status(), status);
         assert_eq!(claim.binding().content, self.content.content_hash());
-        self.check_claim(view.claim_content(self.claim()).unwrap());
+        self.check_claim(&view.claim_content(self.claim()).unwrap().unwrap());
         let descriptor = view.validation_descriptor(self.validation()).unwrap();
         self.check_validation(descriptor);
         assert!(std::ptr::eq(
@@ -120,14 +113,17 @@ impl AuthoredSnapshot {
             view.definition(self.validation()).unwrap()
         ));
         assert_eq!(
-            view.creation_result(key(request)).unwrap().entries(),
+            view.creation_result(key(request))
+                .unwrap()
+                .unwrap()
+                .entries(),
             self.resolution
         );
     }
 
     fn check_pinned(&self, read: &NativeRead, request: u128) {
         assert_eq!(
-            read.with_authored_claim(self.claim(), 0, |content, state| {
+            read.with_authored_claim(self.claim(), 0, &read_budget(), |content, state| {
                 self.check_claim(content);
                 assert_eq!(state.binding(), self.content.binding());
                 state.status()
@@ -144,7 +140,7 @@ impl AuthoredSnapshot {
             Some(self.descriptor.content_hash())
         );
         assert_eq!(
-            read.with_creation_result(key(request), 0, |result| {
+            read.with_creation_result(key(request), 0, &read_budget(), |result| {
                 assert_eq!(result.entries(), self.resolution);
                 result.entries().len()
             })
@@ -165,18 +161,28 @@ fn stage(owner: &mut NativeOwner, input: NativeInput) -> (NativeCandidate, Nativ
 fn authored_owner_keeps_full_bodies_and_pinned_creation_through_post_and_cancel() {
     let proposed = proposal(100, 200);
     let snapshot = AuthoredSnapshot::capture(&proposed);
-    let mut owner = NativeOwner::new(core()).unwrap();
+    // Bodies kept where they were moved are what held rows show: rows spilled to a log (doc 31
+    // M3) are read back, decoded where they are read.
+    let mut held = core();
+    drop(held.detach_payload_log());
+    let mut owner = NativeOwner::new(held).unwrap();
     let (created, creation) = stage(&mut owner, create(1, vec![proposed]));
     assert_eq!(owner.committed().sequence(), SessionSeq(0));
     assert!(owner.committed().claim(snapshot.claim()).is_none());
-    assert!(owner.committed().claim_content(snapshot.claim()).is_none());
+    assert!(
+        owner
+            .committed()
+            .claim_content(snapshot.claim())
+            .unwrap()
+            .is_none()
+    );
     assert!(
         owner
             .committed()
             .validation_descriptor(snapshot.validation())
             .is_none()
     );
-    assert!(owner.committed().creation_result(key(1)).is_none());
+    assert!(owner.committed().creation_result(key(1)).unwrap().is_none());
     assert_eq!(owner.effective().sequence(), creation.sequence);
     snapshot.check_view(&owner.effective(), 1, ClaimStatus::Generated);
     snapshot.check_view(
@@ -220,7 +226,10 @@ fn authored_owner_keeps_full_bodies_and_pinned_creation_through_post_and_cancel(
 fn self_work_draft_is_retained_but_post_refuses_without_mutating_the_owner() {
     let proposed = proposal_with(300, 400, ISSUER, ActionType::Work, &[]);
     let snapshot = AuthoredSnapshot::capture(&proposed);
-    let mut owner = NativeOwner::new(core()).unwrap();
+    // Bodies kept where they were moved are what held rows show (doc 31 M3).
+    let mut held = core();
+    drop(held.detach_payload_log());
+    let mut owner = NativeOwner::new(held).unwrap();
     let (candidate, creation) = stage(&mut owner, create(10, vec![proposed]));
     snapshot.check_view(&owner.effective(), 10, ClaimStatus::Generated);
     assert_eq!(owner.publish_after_durable(candidate).unwrap(), creation);
@@ -248,8 +257,14 @@ fn self_work_draft_is_retained_but_post_refuses_without_mutating_the_owner() {
         owner.effective().claim(snapshot.claim()).unwrap().binding(),
         expected
     );
-    assert!(owner.effective().recorded(key(11)).is_none());
-    assert!(owner.effective().creation_result(key(11)).is_none());
+    assert!(owner.effective().recorded(key(11)).unwrap().is_none());
+    assert!(
+        owner
+            .effective()
+            .creation_result(key(11))
+            .unwrap()
+            .is_none()
+    );
     snapshot.check_view(&owner.effective(), 10, ClaimStatus::Generated);
     snapshot.check_view(&owner.committed(), 10, ClaimStatus::Generated);
 }

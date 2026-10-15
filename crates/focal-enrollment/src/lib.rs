@@ -11,8 +11,8 @@
     )
 )]
 //! Durable, single-use enrollment with client-owned keys and constrained X.509 identity.
-//! Network adapters require a Tokio runtime with enabled IO and time drivers;
-//! absent runtime context returns a typed transport error before socket work.
+//! Network adapters run on a hyper-rt shard, on focal-wire's endpoint; off one
+//! they return a typed transport error before socket work.
 mod files;
 mod founding;
 mod invitation;
@@ -33,7 +33,11 @@ pub type ClusterId = [u8; 16];
 pub type InvitationId = [u8; 16];
 pub type JoinId = [u8; 16];
 pub type Fingerprint = [u8; 32];
-pub const ENROLLMENT_ALPN: &[u8] = b"focal-enroll/1";
+/// The enrollment protocol's name in the TLS handshake. Its second generation: each message is a
+/// hyper-transport exchange of an enrollment kind on focal-wire's endpoint. A peer of the first
+/// (`focal-enroll/1`, framed messages on a QUIC stream of their own) shares no protocol with it and
+/// is refused at the handshake.
+pub const ENROLLMENT_ALPN: &[u8] = b"focal-enroll/2";
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +50,11 @@ pub enum EnrollmentError {
     WrongCluster,
     #[error("invitation or identity authentication failed")]
     Unauthorized,
+    /// An endpoint's certificate chains to an issuer the trust holds and is
+    /// not one it pins: the sponsor may present a successor the holder has
+    /// not learned of yet (24 §11).
+    #[error("the endpoint presented a certificate the trust does not pin")]
+    Unpinned,
     #[error("invitation or credential has expired")]
     Expired,
     #[error("invitation or enrollment is revoked")]
@@ -91,13 +100,30 @@ fn random<const N: usize>() -> Result<[u8; N], EnrollmentError> {
 fn hash(domain: &'static str, bytes: &[u8]) -> Fingerprint {
     blake3::derive_key(domain, bytes)
 }
+/// A message as bytes, held in exactly the room it takes: the whole message
+/// bound was once zeroed for each and kept as the result's capacity.
 fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, EnrollmentError> {
-    let mut bytes = vec![0; MAX_MESSAGE_BYTES];
+    let mut bytes = vec![0; encoded_len(value)?];
     let used = postcard::to_slice(value, &mut bytes)
         .map_err(|_| EnrollmentError::Capacity)?
         .len();
-    bytes.truncate(used);
+    if used != bytes.len() {
+        return Err(EnrollmentError::Capacity);
+    }
     Ok(bytes)
+}
+/// The length of `encode(value)`, counted without making the bytes; a
+/// message past the bound is refused as `encode` refuses it.
+fn encoded_len<T: serde::Serialize>(value: &T) -> Result<usize, EnrollmentError> {
+    let size = postcard::serialize_with_flavor::<T, _, usize>(
+        value,
+        postcard::ser_flavors::Size::default(),
+    )
+    .map_err(|_| EnrollmentError::Capacity)?;
+    if size > MAX_MESSAGE_BYTES {
+        return Err(EnrollmentError::Capacity);
+    }
+    Ok(size)
 }
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, EnrollmentError> {
     if bytes.len() > MAX_MESSAGE_BYTES {

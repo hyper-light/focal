@@ -18,15 +18,8 @@ pub(super) fn contract(
         .registrations()
         .ok_or(ContractError::InvalidTarget)?;
     let descriptor = descriptor_limits(limits, claim, registry)?;
-    let evidence = EvidenceBounds {
-        workspace_bytes: verification
-            .peak_bytes()
-            .checked_sub(verification.retained_bytes())
-            .ok_or(NativeError::Capacity("respondent verification workspace"))?,
-        retained_bytes: verification.retained_bytes(),
-    };
     Ok((
-        RespondentEnvelope::derive(view, claim, limits, descriptor, evidence)?,
+        RespondentEnvelope::derive(view, claim, limits, descriptor)?,
         verification,
     ))
 }
@@ -176,6 +169,11 @@ pub(super) fn build(
     key: RespondentKey,
     spend: RespondentSpend,
 ) -> Result<(NativePrepared, CandidateJournal), NativeError> {
+    // The action finishes work already taken: built on the completion lane, which fresh work
+    // cannot take, and charged what it holds as it is written, as every other write is. Nothing
+    // was set aside for it when its receipt was taken.
+    let fresh = fresh.on_completion_lane();
+    let budget = fresh.source();
     let source = fresh.publication_source();
     let loan = book.respondent_contract(key, spend, fresh.view(), schemas)?;
     let verified = match (&fresh.input()?.command, custody) {
@@ -184,18 +182,14 @@ pub(super) fn build(
                 fresh.input()?.request,
                 artifact.get().ok_or(ContractError::MissingEvidence)?,
                 domain,
-                loan.source(),
+                budget,
                 schemas,
                 loan.verification(),
             )?)
         }
         _ => None,
     };
-    let built = fresh.build_respondent(
-        loan.source(),
-        verified.as_ref().or(evidence),
-        loan.envelope(),
-    )?;
+    let built = fresh.build_respondent(budget, verified.as_ref().or(evidence), loan.envelope())?;
     drop(verified);
     let journal = book.apply_prepared(
         &source,
@@ -203,7 +197,10 @@ pub(super) fn build(
         None,
         None,
         built.seals(),
-        JournalFunding::HeldCompletion,
+        JournalFunding::External {
+            source: budget,
+            lane: BudgetLane::Completion,
+        },
     )?;
     Ok((built.into_prepared(), CandidateJournal::single(journal)))
 }
@@ -228,7 +225,7 @@ fn install_new(
     )?;
     let mut acquired = None;
     for ordinal in 0..prepared.outcome.events {
-        let event = CompletionBook::event(prepared, ordinal)?;
+        let event = CompletionBook::event(prepared, ordinal, view.payloads())?;
         let binding = match event.fact {
             NativeFact::Receipt { claim, .. } | NativeFact::ReceiptAdopted { claim, .. } => claim,
             _ => continue,
@@ -256,33 +253,29 @@ pub(super) fn attach(
     schemas: &impl NativeSchemaVerifier,
 ) -> Result<(NativePrepared, CandidateJournal), NativeError> {
     let operation = prepared.outcome.operation;
-    let held = matches!(
-        operation,
-        NativeOperation::ReportAdmission
-            | NativeOperation::ReportIncrement
-            | NativeOperation::ReportWork
-            | NativeOperation::SubmitDiagnostic
-            | NativeOperation::CloseResponse
-            | NativeOperation::PostResponse
-    );
+    // Every journal is charged to the state's budget as it is made: completion work (a report,
+    // a respondent's action, a due timer, a cancel) on the completion lane fresh work cannot
+    // take. Nothing was set aside for it when its evaluation began or its receipt was taken.
     let lane = if matches!(
         operation,
         NativeOperation::Cancel
             | NativeOperation::ClaimDeadline
             | NativeOperation::MonitorDeadline
             | NativeOperation::EvaluationDeadline
+            | NativeOperation::ReportAdmission
+            | NativeOperation::ReportIncrement
+            | NativeOperation::ReportWork
+            | NativeOperation::SubmitDiagnostic
+            | NativeOperation::CloseResponse
+            | NativeOperation::PostResponse
     ) {
         BudgetLane::Completion
     } else {
         BudgetLane::Ordinary
     };
-    let funding = if held {
-        JournalFunding::HeldCompletion
-    } else {
-        JournalFunding::External {
-            source: &source.state.budget,
-            lane,
-        }
+    let funding = JournalFunding::External {
+        source: &source.state.budget,
+        lane,
     };
     let update = match book.apply_respondents(source, &prepared, funding) {
         Ok(update) => update,
@@ -292,11 +285,10 @@ pub(super) fn attach(
             return Err(error);
         }
     };
-    let view = View {
-        state: source.state,
-        tail: Some(&prepared),
-    };
-    let install = match install_new(&view, &prepared, book, limits, schemas) {
+    let install = match source
+        .with_own(&prepared)
+        .and_then(|view| install_new(&view, &prepared, book, limits, schemas))
+    {
         Ok(install) => install,
         Err(error) => {
             drop(prepared);

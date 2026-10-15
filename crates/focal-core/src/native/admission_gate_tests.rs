@@ -12,6 +12,7 @@ fn checked_pending_input_builds_from_selected_funding_after_parent_exhaustion() 
         creation(1, 1, &[(ValidationMode::Required, false)], None),
         &[],
     ));
+    let first_chain = [&first];
     let parent = core.state.budget.clone();
     let pool = parent
         .funded_child(BudgetLane::Ordinary, 8 * 1024 * 1024)
@@ -19,8 +20,8 @@ fn checked_pending_input_builds_from_selected_funding_after_parent_exhaustion() 
     let pressure = parent
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            parent.limit() - parent.stats().used,
+            BudgetLane::Ordinary,
+            parent.headroom(BudgetLane::Ordinary),
         )
         .unwrap();
     let before = parent.stats();
@@ -29,7 +30,7 @@ fn checked_pending_input_builds_from_selected_funding_after_parent_exhaustion() 
         .check_native_chain(
             context(ISSUER, 2),
             post(2, binding(1)),
-            std::iter::once(&first),
+            crate::native::pending_index::Chain::listed(&first_chain).unwrap(),
         )
         .unwrap();
     assert_eq!(parent.stats(), before);
@@ -49,7 +50,10 @@ fn checked_pending_input_builds_from_selected_funding_after_parent_exhaustion() 
         .unwrap();
     core.publish_native(first).unwrap();
     let outcome = core.publish_native(second).unwrap();
-    assert_eq!(core.native_outcome(request(ISSUER, 2)), Some(outcome));
+    assert_eq!(
+        core.native_outcome(request(ISSUER, 2)).unwrap(),
+        Some(outcome)
+    );
     assert_eq!(
         core.native_claim(ClaimId::from_u128(1)).unwrap().status(),
         ClaimStatus::Posted
@@ -68,11 +72,7 @@ fn checked_fresh_source_refusal_retains_base_and_does_not_spend_either_budget() 
     let before = parent.stats();
     let other_before = unrelated.stats();
     let Checked::Fresh(fresh) = core
-        .check_native_chain(
-            context(ISSUER, 1),
-            creation(1, 1, &[], None),
-            std::iter::empty(),
-        )
+        .check_native_chain(context(ISSUER, 1), creation(1, 1, &[], None), None)
         .unwrap()
     else {
         panic!("expected a fresh request")
@@ -93,33 +93,37 @@ fn checked_retries_resolve_before_full_queue_memory_and_new_logical_time() {
     let mut core = core();
     core.limits.pending = 1;
     let first = prepared(core.prepare_native(context(ISSUER, 5), creation(1, 1, &[], None), &[]));
+    let first_chain = [&first];
     let outcome = first.outcome();
     let parent = core.state.budget.clone();
     let pressure = parent
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            parent.limit() - parent.stats().used,
+            BudgetLane::Ordinary,
+            parent.headroom(BudgetLane::Ordinary),
         )
         .unwrap();
     let before = parent.stats();
     assert!(matches!(core.check_native_chain(
-        context(ISSUER, 0), creation(1, 1, &[], None), std::iter::once(&first),
+        context(ISSUER, 0), creation(1, 1, &[], None), crate::native::pending_index::Chain::listed(&first_chain).unwrap(),
     ).unwrap(), Checked::Existing { outcome: found, committed: false } if found == outcome));
     assert_eq!(parent.stats(), before);
+    // A fresh request is checked whatever the pending count: how many candidates a leader holds
+    // is its owner's, as its memory funds them (`NativeOwner::reserve_pending`), never the core's
+    // check. The check takes nothing of the memory.
     assert!(matches!(
         core.check_native_chain(
             context(ISSUER, 6),
             creation(2, 2, &[], None),
-            std::iter::once(&first),
+            crate::native::pending_index::Chain::listed(&first_chain).unwrap(),
         ),
-        Err(NativeError::Capacity("pending candidates"))
+        Ok(Checked::Fresh(_))
     ));
     assert_eq!(parent.stats(), before);
     core.publish_native(first).unwrap();
     let committed = parent.stats();
     assert!(matches!(core.check_native_chain(
-        context(ISSUER, 0), creation(1, 1, &[], None), std::iter::empty(),
+        context(ISSUER, 0), creation(1, 1, &[], None), None,
     ).unwrap(), Checked::Existing { outcome: found, committed: true } if found == outcome));
     assert_eq!(parent.stats(), committed);
     drop(pressure);
@@ -162,7 +166,13 @@ fn begin_uses_its_small_construction_shape_under_parent_pressure() {
     assert_eq!(outcome.changed, 0);
     assert_eq!(outcome.evaluations, 1);
     assert_eq!(outcome.events, 1);
-    assert!(candidate.evaluation(key(1)).unwrap().has_begun());
+    assert!(
+        core.native_chain(&[&candidate])
+            .unwrap()
+            .evaluation(key(1))
+            .unwrap()
+            .has_begun()
+    );
     assert!(!core.native_evaluation(key(1)).unwrap().has_begun());
     assert!(parent.stats().used - before.used < free);
     core.publish_native(candidate).unwrap();

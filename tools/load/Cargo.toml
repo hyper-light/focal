@@ -2,7 +2,7 @@
 name = "focal-load"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.98.1"
 license = "MIT"
 publish = false
 
@@ -17,13 +17,21 @@ path = "src/main.rs"
 focal-client = { version = "0.1.0", path = "../../crates/focal-client" }
 focal-core = { version = "0.1.0", path = "../../crates/focal-core" }
 focal-ledger = { version = "0.1.0", path = "../../crates/focal-ledger" }
+focal-memory = { version = "0.1.0", path = "../../crates/focal-memory" }
 focal-model = { version = "0.1.0", path = "../../crates/focal-model" }
+focal-native-client = { version = "0.1.0", path = "../../crates/focal-native-client" }
 focal-node = { version = "0.1.0", path = "../../crates/focal-node" }
 focal-wire = { version = "0.1.0", path = "../../crates/focal-wire" }
+focal-rt = { version = "0.1.0", path = "../../crates/focal-rt" }
+hyper-rt.workspace = true
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 clap = { workspace = true }
 getrandom = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_saphyr = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
+
+[[bench]]
+name = "allocs"
+harness = false

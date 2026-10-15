@@ -337,7 +337,8 @@ fn release_requires_original_actor_and_current_binding_and_only_exact_retries_re
 }
 
 #[test]
-fn release_pressure_and_copy_failure_preserve_tree_and_suffix_discard_restores_child_obligations() {
+fn release_pressure_and_range_failure_preserve_tree_and_suffix_discard_restores_child_obligations()
+{
     let mut owner = cancelled_tree();
     let originals = [copy(&owner, 1), copy(&owner, 2), copy(&owner, 3)];
     let budget = owner.budget_stats();
@@ -346,14 +347,14 @@ fn release_pressure_and_copy_failure_preserve_tree_and_suffix_discard_restores_c
     let pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
     refused(&mut owner, release(originals[2].binding(), f::ISSUER, 30));
     drop(pressure);
-    let failed = crate::native::prepare::fail_copies_after(0, || {
+    let failed = crate::native::prepare::fail_range_after(0, || {
         owner.prepare(
             f::context(f::ISSUER, 100),
             release(originals[2].binding(), f::ISSUER, 30),
@@ -534,8 +535,8 @@ fn scope_release_preserves_begun_late_observe_authority_and_its_reserved_report_
     let pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();

@@ -374,11 +374,11 @@ pub(in crate::native) fn check_journal(
                 put(
                     &mut expected,
                     Key::Monitor(event.id()),
-                    Row::Monitor(MonitorAllocation {
+                    Row::Monitor(Box::new(MonitorAllocation {
                         owner: binding,
                         registered: scope.registered(),
                         deadline: scope.deadline(),
-                    }),
+                    })),
                     &mut visits,
                     overlay,
                 )?;
@@ -425,10 +425,10 @@ pub(in crate::native) fn check_journal(
                         put(
                             &mut expected,
                             Key::MonitorLink(target, event.id()),
-                            Row::MonitorLink(Some(MonitorLink {
+                            Row::MonitorLink(Some(Box::new(MonitorLink {
                                 stamp: stamp(scope),
                                 ..link
-                            })),
+                            }))),
                             &mut visits,
                             overlay,
                         )?;

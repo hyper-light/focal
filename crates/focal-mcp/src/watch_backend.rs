@@ -1,10 +1,7 @@
 use super::*;
 use focal_client::watch::{WatchAction, WatchEngine, WatchOptions};
 use serde::Deserialize;
-use std::{
-    panic::AssertUnwindSafe,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Open {
@@ -51,11 +48,13 @@ fn decode<T: serde::de::DeserializeOwned>(call: &ToolCall) -> Result<T, BackendE
         .map_err(|_| InputError::Invalid("invalid watch arguments").into())
 }
 impl<T: ClientTransport> Backend<T> {
-    pub(super) fn watch(
+    pub(super) fn watch<'a>(&'a self, call: &'a ToolCall, cancel: &'a mut Cancel) -> Branch<'a> {
+        Box::pin(self.watch_inner(call, cancel))
+    }
+    async fn watch_inner(
         &self,
-        runtime: &Runtime,
         call: &ToolCall,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> Result<(&'static str, OperationOutput), BackendError> {
         let store = self.watches.as_ref().ok_or(BackendError::Configuration)?;
         let mut journal = match call.tool.as_str() {
@@ -150,9 +149,21 @@ impl<T: ClientTransport> Backend<T> {
                 }
                 .into());
             }
-            let reply=std::panic::catch_unwind(AssertUnwindSafe(||runtime.block_on(async{
-                tokio::select!{result=tokio::time::timeout(remaining,self.client.request(action.request.clone()))=>result.map_err(|_|BackendError::Client(ClientError::OutcomeUnknown{request:Box::new(action.request.clone())}))?.map_err(BackendError::Client),_=&mut *cancel=>Err(BackendError::Cancelled)}
-            }))).map_err(|_|BackendError::Client(ClientError::Transport))??;
+            let request = within(
+                remaining,
+                async {
+                    self.client
+                        .request(action.request.clone())
+                        .await
+                        .map_err(BackendError::Client)
+                },
+                || {
+                    BackendError::Client(ClientError::OutcomeUnknown {
+                        request: Box::new(action.request.clone()),
+                    })
+                },
+            );
+            let reply = contained(cancellable(cancel, request)).await?;
             journal.accept(action, reply)?;
         }
         Err(focal_client::watch::WatchError::Capacity.into())

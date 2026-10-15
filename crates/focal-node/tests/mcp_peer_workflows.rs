@@ -45,6 +45,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -105,9 +106,8 @@ fn enroll(root: &Path, client: &Path, name: &str) {
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             name,
             "--output",
@@ -118,8 +118,8 @@ fn enroll(root: &Path, client: &Path, name: &str) {
         client,
         None,
         &[
-            "context",
             "enroll",
+            "context",
             name,
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -146,7 +146,7 @@ impl Mcp {
             command.args(["--client-context", context]);
         }
         let mut child = command
-            .args(["mcp", "serve"])
+            .args(["serve", "mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -221,11 +221,20 @@ impl Mcp {
             &objects(&self.read("artifact.get", json!({"id": id})))[0]["Artifact"]["binding"]["content"],
         )
     }
+    /// The lineage's claims in order — the claim, its ancestors, its
+    /// followers — of an observation complete at its one prefix.
     fn lineage(&mut self, id: &str) -> Vec<String> {
-        let page = self.read("claim.lineage", json!({"id": id}));
-        assert_eq!(page["condition"], "Read", "{page}");
-        objects(&page)
-            .iter()
+        let value = self.call("claim.lineage", json!({"id": id}));
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["condition"], "Lineage", "{value}");
+        assert_eq!(value["result"]["kind"], "native_lineage", "{value}");
+        let lineage = &value["result"]["lineage"];
+        assert!(lineage["ancestors_beyond"].is_null(), "{lineage}");
+        assert!(lineage["ancestors_missing"].is_null(), "{lineage}");
+        assert_eq!(lineage["followers_beyond"], json!([]), "{lineage}");
+        std::iter::once(&lineage["claim"])
+            .chain(lineage["ancestors"].as_array().unwrap())
+            .chain(lineage["followers"].as_array().unwrap())
             .map(|object| hex_hash(&object["Claim"]["binding"]["object"]))
             .collect()
     }
@@ -327,7 +336,7 @@ fn peer_workflows_run_through_mcp_with_typed_refusals_identity_cancellation_and_
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);

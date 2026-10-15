@@ -25,7 +25,7 @@ impl Drop for Server {
 fn start(root: &Path) -> Server {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut child = command(root, &["start"])
+    let mut child = command(root, &["start", "node"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -93,11 +93,11 @@ fn broken_output_retains_exact_page_and_resume_flushes_before_ack() {
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
-    assert!(error.contains("watch resume 'broken'"), "{error}");
+    assert!(error.contains("resume watch 'broken'"), "{error}");
     assert!(error.contains("--data-dir"));
     let before = json(
         root.path(),
-        &["watch", "inspect", "broken", "--format", "json"],
+        &["inspect", "watch", "broken", "--format", "json"],
     );
     assert_eq!(before["status"]["acknowledged"], 0);
     let retained = before["delivery"].clone();
@@ -107,7 +107,7 @@ fn broken_output_retains_exact_page_and_resume_flushes_before_ack() {
     let reply = run(
         root.path(),
         &[
-            "watch", "resume", "broken", "--pages", "1", "--format", "json",
+            "resume", "watch", "broken", "--pages", "1", "--format", "json",
         ],
     );
     assert!(
@@ -120,14 +120,14 @@ fn broken_output_retains_exact_page_and_resume_flushes_before_ack() {
     assert_eq!(delivered, retained);
     let after = json(
         root.path(),
-        &["watch", "inspect", "broken", "--format", "json"],
+        &["inspect", "watch", "broken", "--format", "json"],
     );
     assert_eq!(after["status"]["acknowledged"], 1);
     assert!(after["delivery"].is_null());
     let out = run(
         root.path(),
         &[
-            "watch", "resume", "broken", "--pages", "6", "--format", "json",
+            "resume", "watch", "broken", "--pages", "6", "--format", "json",
         ],
     );
     assert!(
@@ -138,13 +138,13 @@ fn broken_output_retains_exact_page_and_resume_flushes_before_ack() {
     assert!(out.stderr.is_empty());
     assert_eq!(String::from_utf8(out.stdout).unwrap().lines().count(), 6);
     assert_eq!(
-        json(root.path(), &["watch", "inspect", "--format", "json"])["names"],
+        json(root.path(), &["inspect", "watch", "--format", "json"])["names"],
         serde_json::json!(["broken"])
     );
     let yaml = run(
         root.path(),
         &[
-            "watch", "resume", "broken", "--pages", "2", "--format", "yaml",
+            "resume", "watch", "broken", "--pages", "2", "--format", "yaml",
         ],
     );
     assert!(
@@ -163,7 +163,7 @@ fn ctrl_c_preserves_retained_page_and_prints_context_bound_recovery() {
         root.path(),
         &[
             "watch",
-            "all",
+            "everything",
             "--name",
             "interrupt",
             "--no-seed",
@@ -207,11 +207,11 @@ fn ctrl_c_preserves_retained_page_and_prints_context_bound_recovery() {
     assert!(
         String::from_utf8(result.stderr)
             .unwrap()
-            .contains("watch resume 'interrupt'")
+            .contains("resume watch 'interrupt'")
     );
     let status = json(
         root.path(),
-        &["watch", "inspect", "interrupt", "--format", "json"],
+        &["inspect", "watch", "interrupt", "--format", "json"],
     );
     assert!(status["status"]["acknowledged"].as_u64().unwrap() >= 1);
 }

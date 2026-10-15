@@ -21,6 +21,8 @@ pub enum NativeInputKind {
     ObjectId,
     /// No fields: `{}`.
     Empty,
+    /// The journal's generation floor: `{ "minimum": N }` (F12).
+    Epoch,
     ClaimList,
     ArtifactList,
     ValidationList,
@@ -44,6 +46,9 @@ pub enum NativeInputKind {
     Correction,
     FollowUp,
     Wait,
+    /// A family's member by the claim and the identity kept: `{ "claim": ID,
+    /// "object": { "artifact": { "id": ID } } }`.
+    Archive,
 }
 macro_rules! native_descriptor {
     ($symbol:ident,$name:literal,$input:ident,$family:expr,$destructive:expr,$description:literal) => {
@@ -111,6 +116,13 @@ native_read!(
     ObjectId,
     Some(ObjectKind::Claim),
     "Read one claim's lineage as a bounded page of committed claims: the claim itself with its content, its cause ancestors up the caused_by chain, the corrections that invalidate it, the consultations that refine it and the children it caused. Every object is an exact fixed-prefix claim read at or after the first read's token; roles follow from each claim's cause and relations."
+);
+native_read!(
+    NATIVE_ARCHIVE_GET,
+    "archive.get",
+    Archive,
+    Some(ObjectKind::Claim),
+    "Read one object of a claim's family wherever the family is: the claim itself, or an artifact, work artifact, diagnostic, validation, testament or receipt of it by the identity you kept. A live family answers from the ledger; a retired one is read from the archive bundle its continuation names — verified, hydrated and read as the live core was — and returned as an archived object with the bundle and the prefix it claims. Denied tenant access, custody this node lacks and an object the bundle never held are told apart."
 );
 native_read!(
     NATIVE_CLAIM_WAIT,
@@ -337,6 +349,17 @@ native_descriptor!(
     false,
     "Report the begun attempt's verdict (pass, fail, incomplete or error) with its typed result artifact bound to the exact target, generation and attempt. Error and incomplete verdicts carry an error report; the owner derives acceptance."
 );
+// The journal's own protocol operation (F12): not among the descriptors a
+// host lists, so it is neither a tool nor an example; a request file may
+// carry it, and the journal issues it itself.
+native_descriptor!(
+    NATIVE_EPOCH_ADVANCE,
+    "epoch.advance",
+    Epoch,
+    None,
+    false,
+    "Advance the principal's request generation floor: every generation below the minimum is closed, its outcomes leave for a seal, and a request in one is refused as expired. The journal issues this itself once every operation of the earlier generations was reported."
+);
 native_descriptor!(
     NATIVE_CLAIM_RELEASE_SCOPE,
     "claim.release_scope",
@@ -436,6 +459,7 @@ native_descriptor!(
 /// Name order is part of catalog pagination and digest stability.
 pub fn native_descriptors() -> &'static [OperationDescriptor] {
     &[
+        NATIVE_ARCHIVE_GET,
         NATIVE_ARTIFACT_DIAGNOSTIC,
         NATIVE_ARTIFACT_FAIL,
         NATIVE_ARTIFACT_GET,

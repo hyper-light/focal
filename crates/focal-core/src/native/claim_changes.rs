@@ -1,6 +1,6 @@
 use super::prepare::*;
 use super::*;
-use focal_memory::{Change, Entry};
+use focal_memory::Change;
 use focal_model::ObjectRevision;
 
 #[path = "history_assembly.rs"]
@@ -9,7 +9,7 @@ pub(super) use history_assembly::visit_history;
 
 #[path = "original_plan.rs"]
 mod original_plan;
-pub(super) use original_plan::{OriginalPlan, SealedChanges};
+pub(super) use original_plan::{Admitted, OriginalPlan, SealedChanges};
 
 #[derive(Clone, Copy)]
 pub(super) struct History {
@@ -70,9 +70,11 @@ fn record_fact(
     if *ordinal >= outcome.events || changes.len() == changes.capacity() {
         return Err(NativeError::Capacity("event preparation"));
     }
-    let stored = OwnedEvent::new(StoredEvent::pack(item)?)?;
+    // Held while the plan's checks read it; spilled with the plan's other rows once they have
+    // (doc 31 M3, `payloads::spill_changes`).
+    let stored = OwnedEvent::new(item, outcome.ledger)?;
     let heap = stored.heap_charge()?;
-    changes.push(Change::Put(Entry::new(
+    changes.push(Change::Put(entry(
         Key::Event(outcome.sequence, *ordinal),
         Row::Event(stored),
         heap,
@@ -88,15 +90,27 @@ fn record_fact(
 pub(super) fn changes(
     plan: transactions::Plan,
     extras: Extras,
-    meta: Meta,
+    mut meta: Meta,
     outcome: NativeOutcome,
     view: &View<'_>,
     limits: NativeLimits,
     allowance: usize,
     scratch: &mut Scratch,
 ) -> Result<Vec<Change<Key, Row>>, NativeError> {
-    original_plan::OriginalPlan::check(plan, extras, meta, outcome, view, limits, scratch)?
-        .into_changes(allowance, scratch)
+    let window = super::epochs::staged(view, &mut meta, outcome, limits);
+    original_plan::OriginalPlan::check(
+        plan,
+        extras,
+        Admitted {
+            meta,
+            outcome,
+            window,
+        },
+        view,
+        limits,
+        scratch,
+    )?
+    .into_changes(allowance, scratch)
 }
 
 fn append_rows(
@@ -107,7 +121,7 @@ fn append_rows(
         if changes.len() == changes.capacity() {
             return Err(NativeError::Capacity("extra row preparation"));
         }
-        changes.push(Change::Put(Entry::new(extra.key, extra.row, extra.heap)));
+        changes.push(Change::Put(entry(extra.key, extra.row, extra.heap)));
     }
     Ok(())
 }

@@ -1,7 +1,7 @@
 use super::*;
 use crate::lifecycle::memory as bytes;
 
-impl AcceptancePolicy {
+impl PolicyBody {
     pub fn copy_heap_allocations(&self) -> Result<usize, ContractError> {
         let mut count = bytes::add(
             bytes::allocation::<OwnedSlot>(self.slots.len()),
@@ -45,14 +45,9 @@ impl AcceptancePolicy {
         }
         Ok(size)
     }
-    pub fn copy_charge(&self) -> Result<usize, ContractError> {
-        bytes::total::<Self>(self.copy_heap_bytes()?)
-    }
-    pub fn retained_bytes(&self) -> Result<usize, ContractError> {
-        bytes::total::<Self>(self.retained_heap_bytes()?)
-    }
-    pub fn try_copy(&self, max_bytes: usize) -> Result<Self, ContractError> {
-        bytes::fits(self.copy_charge()?, max_bytes)?;
+    /// A copy within `max_heap` bytes of heap, every buffer exactly its length.
+    pub fn try_copy(&self, max_heap: usize) -> Result<Self, ContractError> {
+        bytes::fits(self.copy_heap_bytes()?, max_heap)?;
         let mut slots = bytes::reserve(self.slots.len())?;
         for slot in &self.slots {
             slots.push(OwnedSlot {
@@ -63,10 +58,57 @@ impl AcceptancePolicy {
             });
         }
         let copied = Self {
-            claim: self.claim,
-            issuer: self.issuer,
             slots,
             declarations: bytes::copy(&self.declarations)?,
+        };
+        bytes::fits(copied.retained_heap_bytes()?, max_heap)?;
+        Ok(copied)
+    }
+}
+impl AcceptancePolicy {
+    pub fn copy_heap_allocations(&self) -> Result<usize, ContractError> {
+        self.body.copy_heap_allocations()
+    }
+    pub fn heap_allocations(&self) -> Result<usize, ContractError> {
+        self.body.heap_allocations()
+    }
+    pub fn copy_heap_bytes(&self) -> Result<usize, ContractError> {
+        self.body.copy_heap_bytes()
+    }
+    pub fn retained_heap_bytes(&self) -> Result<usize, ContractError> {
+        self.body.retained_heap_bytes()
+    }
+    pub fn copy_charge(&self) -> Result<usize, ContractError> {
+        bytes::total::<Self>(self.copy_heap_bytes()?)
+    }
+    pub fn retained_bytes(&self) -> Result<usize, ContractError> {
+        bytes::total::<Self>(self.retained_heap_bytes()?)
+    }
+    pub fn try_copy(&self, max_bytes: usize) -> Result<Self, ContractError> {
+        self.view().try_copy(max_bytes)
+    }
+}
+impl Acceptance<'_> {
+    pub fn retained_heap_bytes(&self) -> Result<usize, ContractError> {
+        self.body.retained_heap_bytes()
+    }
+    pub fn heap_allocations(&self) -> Result<usize, ContractError> {
+        self.body.heap_allocations()
+    }
+    /// What an owned copy of this manifest takes: the policy and its body's heap.
+    pub fn copy_charge(&self) -> Result<usize, ContractError> {
+        bytes::total::<AcceptancePolicy>(self.body.copy_heap_bytes()?)
+    }
+    /// An owned copy of this manifest, bound to its claim and issuer, within `max_bytes`.
+    pub fn try_copy(&self, max_bytes: usize) -> Result<AcceptancePolicy, ContractError> {
+        bytes::fits(self.copy_charge()?, max_bytes)?;
+        let heap = max_bytes
+            .checked_sub(std::mem::size_of::<AcceptancePolicy>())
+            .ok_or(ContractError::Capacity)?;
+        let copied = AcceptancePolicy {
+            claim: self.claim,
+            issuer: self.issuer,
+            body: self.body.try_copy(heap)?,
         };
         bytes::fits(copied.retained_bytes()?, max_bytes)?;
         Ok(copied)
@@ -135,9 +177,9 @@ impl AcceptancePolicy {
             },
         )
         .unwrap();
-        policy.slots.reserve_exact(8);
-        policy.slots[0].checks.reserve_exact(8);
-        policy.declarations.reserve_exact(8);
+        policy.body.slots.reserve_exact(8);
+        policy.body.slots[0].checks.reserve_exact(8);
+        policy.body.declarations.reserve_exact(8);
         policy
     }
 }

@@ -5,13 +5,9 @@ impl<T: ClientTransport> Backend<T> {
     fn managed_requests(&self) -> Result<&ManagedRequests, BackendError> {
         self.managed.as_ref().ok_or(BackendError::Configuration)
     }
-    // All filesystem calls occur on this blocking owner, between network waits.
+    // All filesystem calls occur on this owner's task, between network waits.
     // The coordinator releases its short lock before yielding an exact request.
-    fn maintain_managed(
-        &self,
-        runtime: &Runtime,
-        cancel: &mut oneshot::Receiver<()>,
-    ) -> Result<(), BackendError> {
+    async fn maintain_managed(&self, cancel: &mut Cancel) -> Result<(), BackendError> {
         let requests = self.managed_requests()?;
         for _ in 0..128 {
             if cancelled(cancel) {
@@ -20,16 +16,14 @@ impl<T: ClientTransport> Backend<T> {
             let Some(request) = requests.maintenance(&mut random_id)? else {
                 return Ok(());
             };
-            let reply = runtime.block_on(async {
-                tokio::select! {
-                    result=self.client.request(request.clone())=>match result {
-                        Ok(reply)=>Ok(reply),
-                        Err(ClientError::Access(error))=>Ok(request.reply(Response::Error(error))),
-                        Err(error)=>Err(BackendError::Client(error)),
-                    },
-                    _=&mut *cancel=>Err(BackendError::Cancelled),
+            let reply = cancellable(cancel, async {
+                match self.client.request(request.clone()).await {
+                    Ok(reply) => Ok(reply),
+                    Err(ClientError::Access(error)) => Ok(request.reply(Response::Error(error))),
+                    Err(error) => Err(BackendError::Client(error)),
                 }
-            })?;
+            })
+            .await?;
             match requests.accept_maintenance(&request, reply) {
                 Ok(()) | Err(ManagedRequestsError::Stale) => {}
                 Err(error) => return Err(error.into()),
@@ -37,11 +31,18 @@ impl<T: ClientTransport> Backend<T> {
         }
         Err(BackendError::ManagedStore(ManagedStoreError::Capacity))
     }
-    pub(super) fn managed_control(
+    pub(super) fn managed_control<'a>(
+        &'a self,
+        call: &'a mut ToolCall,
+        cancel: &'a mut Cancel,
+        operation_id: &'a mut Option<String>,
+    ) -> Branch<'a> {
+        Box::pin(self.managed_control_inner(call, cancel, operation_id))
+    }
+    async fn managed_control_inner(
         &self,
-        runtime: &Runtime,
         call: &mut ToolCall,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
         operation_id: &mut Option<String>,
     ) -> Result<(&'static str, OperationOutput), BackendError> {
         let id = if matches!(call.tool.as_str(), "request.acknowledge" | "request.seal") {
@@ -82,7 +83,7 @@ impl<T: ClientTransport> Backend<T> {
                 OperationOutput::ManagedRequests { operation_ids },
             ));
         }
-        self.maintain_managed(runtime, cancel)?;
+        self.maintain_managed(cancel).await?;
         let store = requests.store()?;
         match call.tool.as_str() {
             "request.reserve" => {
@@ -101,7 +102,7 @@ impl<T: ClientTransport> Backend<T> {
                     return Ok(state("Retired"));
                 }
                 requests.mark_delivered(id)?;
-                self.maintain_managed(runtime, cancel)?;
+                self.maintain_managed(cancel).await?;
                 match store.receipt(id) {
                     Err(ManagedStoreError::Retired) => Ok(state("Retired")),
                     Ok(Some(_)) => Ok(state("Consumed")),
@@ -125,7 +126,7 @@ impl<T: ClientTransport> Backend<T> {
                         Ok(_) | Err(ManagedStoreError::ControlPending) => {}
                         Err(error) => return Err(error.into()),
                     }
-                    self.maintain_managed(runtime, cancel)?;
+                    self.maintain_managed(cancel).await?;
                 }
                 if store.receipt(id)?.is_some() {
                     managed_result(&store, id)
@@ -136,14 +137,23 @@ impl<T: ClientTransport> Backend<T> {
             _ => Err(BackendError::Configuration),
         }
     }
-    pub(super) fn managed_mutation(
+    pub(super) fn managed_mutation<'a>(
+        &'a self,
+        id: &'a str,
+        authored: AuthoredOperation,
+        expected_revision: Option<ObjectRevision>,
+        canonical: &'a [u8],
+        cancel: &'a mut Cancel,
+    ) -> Branch<'a> {
+        Box::pin(self.managed_mutation_inner(id, authored, expected_revision, canonical, cancel))
+    }
+    async fn managed_mutation_inner(
         &self,
-        runtime: &Runtime,
         id: &str,
         authored: AuthoredOperation,
         expected_revision: Option<ObjectRevision>,
         canonical: &[u8],
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> Result<(&'static str, OperationOutput), BackendError> {
         let id = id.parse::<ManagedOperationId>()?;
         let descriptor = authored.descriptor();
@@ -164,12 +174,10 @@ impl<T: ClientTransport> Backend<T> {
                         } => expected_revision,
                         _ => return Err(ManagedStoreError::Conflict.into()),
                     },
-                    Err(ManagedStoreError::Unprepared) => Some(self.participant_revision(
-                        runtime,
-                        claim,
-                        id.key(self.context).id,
-                        cancel,
-                    )?),
+                    Err(ManagedStoreError::Unprepared) => Some(
+                        self.participant_revision(claim, id.key(self.context).id, cancel)
+                            .await?,
+                    ),
                     Err(error) => return Err(error.into()),
                 }
             } else {
@@ -209,16 +217,24 @@ impl<T: ClientTransport> Backend<T> {
                 })
             },
         )?;
-        self.drive_managed(runtime, &store, id, cancel)?;
+        self.drive_managed(&store, id, cancel).await?;
         managed_result(&store, id)
     }
-    pub(super) fn managed_recovery(
+    pub(super) fn managed_recovery<'a>(
+        &'a self,
+        id: &'a str,
+        retry: bool,
+        remote: bool,
+        cancel: &'a mut Cancel,
+    ) -> Branch<'a> {
+        Box::pin(self.managed_recovery_inner(id, retry, remote, cancel))
+    }
+    async fn managed_recovery_inner(
         &self,
-        runtime: &Runtime,
         id: &str,
         retry: bool,
         remote: bool,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> Result<(&'static str, OperationOutput), BackendError> {
         let id = id.parse::<ManagedOperationId>()?;
         let store = self.managed_requests()?.store()?;
@@ -242,12 +258,13 @@ impl<T: ClientTransport> Backend<T> {
                 },
             )?;
             request.protocol = MANAGED_PROTOCOL_VERSION;
-            let reply = runtime.block_on(async {
-                tokio::select! {
-                    result=self.client.request_stream_read(request,self.context)=>result.map_err(BackendError::Client),
-                    _=cancel=>Err(BackendError::Cancelled),
-                }
-            })?;
+            let reply = cancellable(cancel, async {
+                self.client
+                    .request_stream_read(request, self.context)
+                    .await
+                    .map_err(BackendError::Client)
+            })
+            .await?;
             if let RequestStreamReadResult::Receipt {
                 resolution: ManagedReceiptResolution::Retained(receipt),
                 ..
@@ -268,7 +285,7 @@ impl<T: ClientTransport> Backend<T> {
             return Ok(("Reconciled", OperationOutput::ManagedReconcile { reply }));
         }
         if retry {
-            self.drive_managed(runtime, &store, id, cancel)?;
+            self.drive_managed(&store, id, cancel).await?;
         }
         match managed_result(&store, id) {
             Err(BackendError::ManagedStore(ManagedStoreError::Retired)) if !retry => {
@@ -277,12 +294,11 @@ impl<T: ClientTransport> Backend<T> {
             result => result,
         }
     }
-    fn drive_managed(
+    async fn drive_managed(
         &self,
-        runtime: &Runtime,
         store: &ManagedOperationStore,
         id: ManagedOperationId,
-        cancel: &mut oneshot::Receiver<()>,
+        cancel: &mut Cancel,
     ) -> Result<(), BackendError> {
         if store.receipt(id)?.is_some() {
             return Ok(());
@@ -291,12 +307,13 @@ impl<T: ClientTransport> Backend<T> {
         if cancelled(cancel) {
             return Err(BackendError::Cancelled);
         }
-        let outcome = runtime.block_on(async {
-            tokio::select! {
-                result=self.client.submit_managed_outcome(prepared.request,self.context)=>result.map_err(BackendError::Client),
-                _=cancel=>Err(BackendError::Cancelled),
-            }
-        })?;
+        let outcome = cancellable(cancel, async {
+            self.client
+                .submit_managed_outcome(prepared.request, self.context)
+                .await
+                .map_err(BackendError::Client)
+        })
+        .await?;
         match outcome {
             ManagedSubmitOutcome::Committed(reply) => {
                 store.record_receipt(id, &reply.receipt).map_err(Into::into)

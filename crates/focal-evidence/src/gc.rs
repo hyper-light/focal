@@ -224,12 +224,11 @@ impl Phase {
         }
     }
 }
-/// One collector phase transition: advance to the next phase, or the pass is
-/// complete.
-enum Step {
-    Advance(Phase),
-    Done,
-}
+/// One collector phase transition: the next phase, or `None` when the pass is
+/// complete. (A phase holds an open directory, which on Windows carries its
+/// find data inline, some 600 bytes: the step is the phase or nothing, never
+/// a second, wider enum around it.)
+type Step = Option<Phase>;
 
 pub(super) struct CollectorState {
     phase: Phase,
@@ -284,6 +283,11 @@ fn split_name(entry: &fs::DirEntry) -> Option<(String, String)> {
     let (stem, extension) = name.rsplit_once('.')?;
     Some((stem.to_owned(), extension.to_owned()))
 }
+
+/// The directories a quarantine round holds below its root, deepest: the kind
+/// (`objects`) and a domain under it, its files under that (`quarantine`'s
+/// `objects/<domain>`; a custody record's kind holds its files directly).
+const ROUND_DIRECTORIES: usize = 2;
 
 impl ContentStore {
     fn quarantine_root(&self) -> PathBuf {
@@ -359,8 +363,8 @@ impl ContentStore {
             // re-entry, only scalar progress is preserved.
             let resume = phase.resume_point();
             match self.advance_phase(phase, protection, config, now_ms, &mut budget) {
-                Ok(Step::Advance(next)) => self.collector.phase = next,
-                Ok(Step::Done) => {
+                Ok(Some(next)) => self.collector.phase = next,
+                Ok(None) => {
                     self.collector.report.complete = true;
                     let report = self.collector.report;
                     self.collector.phase = Phase::Idle;
@@ -386,20 +390,20 @@ impl ContentStore {
             Phase::Idle => {
                 self.collector.report = CollectorReport::default();
                 self.collector.round = None;
-                Step::Advance(Phase::Uploads)
+                Some(Phase::Uploads)
             }
             Phase::Uploads => {
                 self.expire_uploads(config, now_ms, budget)?;
-                Step::Advance(Phase::Terminals(None))
+                Some(Phase::Terminals(None))
             }
             Phase::Terminals(dir) => match self.release_terminals(dir, config, now_ms, budget)? {
-                Some(dir) => Step::Advance(Phase::Terminals(Some(dir))),
+                Some(dir) => Some(Phase::Terminals(Some(dir))),
                 None => {
                     let domains = self.domains()?;
-                    Step::Advance(Phase::Domains { domains, index: 0 })
+                    Some(Phase::Domains { domains, index: 0 })
                 }
             },
-            Phase::Domains { domains, index } => Step::Advance(match domains.get(index).copied() {
+            Phase::Domains { domains, index } => Some(match domains.get(index).copied() {
                 None => Phase::Records { kinds: 0 },
                 Some(domain) if protection.is_opaque(domain) => {
                     self.collector.report.opaque_domains =
@@ -438,7 +442,7 @@ impl ContentStore {
                     now_ms,
                     budget,
                 )?;
-                Step::Advance(if exhausted {
+                Some(if exhausted {
                     if overflow {
                         self.collector.report.chunks_deferred =
                             self.collector.report.chunks_deferred.saturating_add(1);
@@ -474,7 +478,7 @@ impl ContentStore {
                 let domain = *domains.get(index).ok_or(ContentError::Invalid)?;
                 let exhausted =
                     self.sweep_chunks(domain, &mut dir, &marks, config, now_ms, budget)?;
-                Step::Advance(if exhausted {
+                Some(if exhausted {
                     Phase::Domains {
                         domains,
                         index: index.saturating_add(1),
@@ -491,7 +495,7 @@ impl ContentStore {
             Phase::Records { kinds } => {
                 const KINDS: [CustodyRecordKind; 2] =
                     [CustodyRecordKind::Checkpoint, CustodyRecordKind::Manifest];
-                Step::Advance(match KINDS.get(kinds) {
+                Some(match KINDS.get(kinds) {
                     Some(kind) => {
                         self.sweep_records(*kind, protection, config, now_ms, budget)?;
                         Phase::Records {
@@ -502,10 +506,10 @@ impl ContentStore {
                 })
             }
             Phase::Receipts(dir) => match self.sweep_receipts(dir, config, now_ms, budget)? {
-                Some(dir) => Step::Advance(Phase::Receipts(Some(dir))),
+                Some(dir) => Some(Phase::Receipts(Some(dir))),
                 None => {
                     let rounds = self.expired_rounds(config, now_ms)?;
-                    Step::Advance(Phase::Quarantine {
+                    Some(Phase::Quarantine {
                         rounds,
                         index: 0,
                         dir: None,
@@ -513,10 +517,10 @@ impl ContentStore {
                 }
             },
             Phase::Quarantine { rounds, index, dir } => match rounds.get(index).copied() {
-                None => Step::Done,
+                None => None,
                 Some(round) => {
                     let done = self.delete_round(round, dir, budget)?;
-                    Step::Advance(match done {
+                    Some(match done {
                         None => Phase::Quarantine {
                             rounds,
                             index: index.saturating_add(1),
@@ -605,15 +609,23 @@ impl ContentStore {
             if extension != "meta" {
                 continue;
             }
-            let bytes = read_bounded(
+            let Some(bytes) = read_listed(
                 &entry.path(),
                 self.limits.max_manifest_bytes.max(terminal::RECORD_BYTES),
-            )?;
+            )?
+            else {
+                continue;
+            };
             let Some(id) = terminal::decode(&bytes)? else {
                 continue;
             };
-            if hex(&id.0) != stem || age_ms(&entry.metadata()?, now_ms)? < config.terminal_grace_ms
-            {
+            if hex(&id.0) != stem {
+                continue;
+            }
+            let Some(metadata) = still_there(&entry)? else {
+                continue;
+            };
+            if age_ms(&metadata, now_ms)? < config.terminal_grace_ms {
                 continue;
             }
             fs::remove_file(entry.path())?;
@@ -680,7 +692,9 @@ impl ContentStore {
             let Some(root) = parse_hash(&stem) else {
                 continue;
             };
-            let metadata = entry.metadata()?;
+            let Some(metadata) = still_there(&entry)? else {
+                continue;
+            };
             // A single unreadable/oversized/corrupt manifest must not abort the
             // whole GC pass — an aborted pass resets to Idle and restarts,
             // re-hitting the poison file and never reaching quarantine deletion.
@@ -688,8 +702,9 @@ impl ContentStore {
             // is skipped, exactly as sweep_receipts skips an undecodable receipt.
             // Leaving its chunks unmarked is correct: an object whose manifest is
             // unreadable is already unrecoverable.
-            let bytes = match read_bounded(&entry.path(), MAX_TRANSFER_MANIFEST_BYTES) {
-                Ok(bytes) => bytes,
+            let bytes = match read_listed(&entry.path(), MAX_TRANSFER_MANIFEST_BYTES) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
                 Err(ContentError::Io(error)) => return Err(ContentError::Io(error)),
                 Err(_) => continue,
             };
@@ -756,7 +771,13 @@ impl ContentStore {
             let Some(hash) = parse_hash(&stem) else {
                 continue;
             };
-            if marks.contains(&hash) || age_ms(&entry.metadata()?, now_ms)? < config.grace_ms {
+            if marks.contains(&hash) {
+                continue;
+            }
+            let Some(metadata) = still_there(&entry)? else {
+                continue;
+            };
+            if age_ms(&metadata, now_ms)? < config.grace_ms {
                 continue;
             }
             self.quarantine(
@@ -803,7 +824,10 @@ impl ContentStore {
             records
                 .try_reserve_exact(1)
                 .map_err(|_| ContentError::Capacity)?;
-            records.push((age_ms(&entry.metadata()?, now_ms)?, hash, entry.path()));
+            let Some(metadata) = still_there(&entry)? else {
+                continue;
+            };
+            records.push((age_ms(&metadata, now_ms)?, hash, entry.path()));
         }
         // Youngest first; the first `keep_records` stay whatever their age.
         // The listing is bounded by the mark bound, so the whole kind is
@@ -858,7 +882,10 @@ impl ContentStore {
             if extension != "record" {
                 continue;
             }
-            let bytes = read_bounded(&entry.path(), CustodyRecordKind::Receipt.limit())?;
+            let Some(bytes) = read_listed(&entry.path(), CustodyRecordKind::Receipt.limit())?
+            else {
+                continue;
+            };
             let Ok(receipt) = crate::CustodyReceipt::decode(&bytes) else {
                 continue;
             };
@@ -868,7 +895,13 @@ impl ContentStore {
                 .join(hex(&receipt.domain.0))
                 .join(format!("{}.manifest", receipt.root))
                 .is_file();
-            if present || age_ms(&entry.metadata()?, now_ms)? < config.grace_ms {
+            if present {
+                continue;
+            }
+            let Some(metadata) = still_there(&entry)? else {
+                continue;
+            };
+            if age_ms(&metadata, now_ms)? < config.grace_ms {
                 continue;
             }
             self.quarantine(
@@ -943,18 +976,49 @@ impl ContentStore {
         }
         Ok(Some(walk))
     }
+    /// Delete one kind's tree of a round: a walk over an explicit stack of the
+    /// directories open, each removed once its entries are, every entry
+    /// visited and every file counted as deleted. A round is at most
+    /// [`ROUND_DIRECTORIES`] deep below its root, so a deeper tree is not a
+    /// round's and is refused; no call recurses.
     fn delete_tree(&mut self, path: &Path, budget: &mut usize) -> Result<(), ContentError> {
         let metadata = fs::symlink_metadata(path)?;
-        if metadata.is_dir() {
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                self.visit(budget);
-                self.delete_tree(&entry.path(), budget)?;
-            }
-            fs::remove_dir(path)?;
-            return Ok(());
+        if !metadata.is_dir() {
+            return self.delete_file(path, metadata.len());
         }
-        let bytes = metadata.len();
+        let mut open: Vec<(PathBuf, ReadDir)> = Vec::new();
+        open.try_reserve_exact(ROUND_DIRECTORIES)
+            .map_err(|_| ContentError::Capacity)?;
+        open.push((path.to_path_buf(), fs::read_dir(path)?));
+        loop {
+            let next = match open.last_mut() {
+                Some((_, entries)) => entries.next(),
+                None => return Ok(()),
+            };
+            match next {
+                Some(entry) => {
+                    let child = entry?.path();
+                    self.visit(budget);
+                    let metadata = fs::symlink_metadata(&child)?;
+                    if !metadata.is_dir() {
+                        self.delete_file(&child, metadata.len())?;
+                    } else if open.len() < ROUND_DIRECTORIES {
+                        let entries = fs::read_dir(&child)?;
+                        open.push((child, entries));
+                    } else {
+                        return Err(ContentError::Invalid);
+                    }
+                }
+                None => {
+                    if let Some((directory, _)) = open.pop() {
+                        fs::remove_dir(&directory)?;
+                    }
+                }
+            }
+        }
+    }
+    /// Delete one file of a round, counted with its bytes.
+    fn delete_file(&mut self, path: &Path, bytes: u64) -> Result<(), ContentError> {
         fs::remove_file(path)?;
         self.collector.report.deleted = self.collector.report.deleted.saturating_add(1);
         self.collector.report.bytes_deleted =
@@ -1042,6 +1106,28 @@ pub struct SeedReport {
     pub bytes_removed: u64,
     pub complete: bool,
 }
+/// What a walk's entry is now, none where it is gone since the walk listed it. A walk resumes
+/// across steps while the store's writers rename and remove what it walks, so what it lists may
+/// be seconds old, and a file no longer there is nothing to collect or mark, never an I/O failure:
+/// taken for one, a seed sweep failed its store while a checkpoint's commit renamed its batch,
+/// and the session's next checkpoint stopped the session.
+fn still_there(entry: &fs::DirEntry) -> Result<Option<fs::Metadata>, ContentError> {
+    match entry.metadata() {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ContentError::Io(error)),
+    }
+}
+/// [`read_bounded`] of a walk's entry, none where it is gone since the walk listed it
+/// ([`still_there`]).
+fn read_listed(path: &Path, max_bytes: usize) -> Result<Option<Vec<u8>>, ContentError> {
+    match read_bounded(path, max_bytes) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 impl SeedStore {
     /// Remove seeds nothing protects that stood past the grace, at most
     /// `max_items` visits; seeds are copies of checkpoint bytes a peer can
@@ -1078,20 +1164,29 @@ impl SeedStore {
             let Some((stem, extension)) = split_name(&entry) else {
                 continue;
             };
-            if extension != "seed" {
+            // An unnamed file a crash left behind (an install's or a batch's,
+            // never synced into a chunk) is removed past the same grace; a live
+            // batch commits in far less than it, so nothing in use is taken.
+            let unnamed = matches!(extension.as_str(), "install" | "batch");
+            if extension != "seed" && !unnamed {
                 continue;
             }
-            let Some(hash) = parse_hash(&stem) else {
-                continue;
-            };
-            if protected.binary_search(&hash).is_ok() {
-                continue;
+            if !unnamed {
+                let Some(hash) = parse_hash(&stem) else {
+                    continue;
+                };
+                if protected.binary_search(&hash).is_ok() {
+                    continue;
+                }
             }
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
+            // Gone since the walk listed it (`still_there`): here a checkpoint's commit, on its
+            // own thread, renames its batch's files under their hashes while the walk goes on.
+            let metadata = match still_there(&entry) {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => continue,
                 Err(error) => {
                     self.failed = true;
-                    return Err(ContentError::Io(error));
+                    return Err(error);
                 }
             };
             if age_ms(&metadata, now_ms)? < grace_ms {

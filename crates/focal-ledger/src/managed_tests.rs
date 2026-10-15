@@ -466,6 +466,14 @@ fn managed_all_voter_support_and_partitioned_seal_survive_leader_change_and_rest
     let mut wrong = facts[1].clone();
     wrong.cluster = [8; 16];
     assert!(sessions[0].record_managed_support(2, wrong).is_err());
+    // A promise made at a configuration this replica has not applied yet is
+    // not refused: the replica is behind, and is asked again.
+    let mut later = facts[1].clone();
+    later.configuration_index += 1;
+    assert!(matches!(
+        sessions[0].record_managed_support(2, later),
+        Err(LedgerError::NotReady { .. })
+    ));
     assert!(
         sessions[0]
             .record_managed_support(3, facts[1].clone())
@@ -666,7 +674,7 @@ fn pump_learner_floor(
     snapshot_attempts: &mut usize,
     rejected: &mut usize,
 ) {
-    use focal_consensus::{PbMessageExt, SnapshotStatus};
+    use focal_consensus::{SnapshotStatus};
     for _ in 0..64 {
         let messages = sessions
             .iter_mut()
@@ -676,15 +684,15 @@ fn pump_learner_floor(
             return;
         }
         for message in messages {
-            let snapshot = !message.get_snapshot().is_empty();
+            let snapshot = message.snapshot.as_deref().is_some_and(|snapshot| !focal_consensus::snapshot_is_empty(snapshot));
             if snapshot {
                 *snapshot_attempts += 1;
             }
             let from = message.from;
             let to = message.to;
             let term = message.term;
-            let index = message.get_snapshot().get_metadata().index;
-            let encoded = message.write_to_bytes().unwrap();
+            let index = message.snapshot.as_deref().map_or(0, focal_consensus::snapshot_index);
+            let encoded = focal_consensus::encode_message(&message).unwrap();
             let receiver = &mut sessions[to as usize - 1];
             if receiver.consensus.required_decoder().is_none() && !receiver.persistence_pending() {
                 let demanded = receiver.managed_support_demanded();
@@ -698,7 +706,7 @@ fn pump_learner_floor(
             }
             let result = sessions[to as usize - 1].step_authenticated(from, &encoded);
             let status = match result {
-                Ok(()) => SnapshotStatus::Finish,
+                Ok(_) => SnapshotStatus::Finish,
                 Err(LedgerError::Consensus(ConsensusError::PersistencePending)) => {
                     *rejected += 1;
                     assert!(!sessions[to as usize - 1].managed_protocol_active());

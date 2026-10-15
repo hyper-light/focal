@@ -49,6 +49,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -104,7 +105,7 @@ fn admin(root: &Path, context: Option<&str>, args: &[&str]) -> Value {
     })
 }
 
-/// One `mcp serve` process on the modern profile for one participant.
+/// One `serve mcp` process on the modern profile for one participant.
 struct Mcp {
     _process: Server,
     input: ChildStdin,
@@ -119,7 +120,7 @@ impl Mcp {
             command.args(["--client-context", context]);
         }
         let mut child = command
-            .args(["mcp", "serve"])
+            .args(["serve", "mcp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -226,6 +227,7 @@ fn start_with(root: &Path, advertise: &str, env: &[(&str, &str)]) -> Server {
             "--data-dir",
             root.to_str().unwrap(),
             "start",
+            "node",
             "--advertise",
             advertise,
         ])
@@ -265,7 +267,7 @@ fn claim_document(target: &str, description: &str) -> Value {
     })
 }
 fn sequence(root: &Path) -> u64 {
-    admin(root, None, &["status"])["result"]["page"]["native_sequence"]
+    admin(root, None, &["inspect", "prefix"])["result"]["page"]["native_sequence"]
         .as_u64()
         .unwrap()
 }
@@ -315,7 +317,7 @@ fn concurrent_adapters_cancelled_calls_lost_replies_and_exhausted_capacity_recon
     private(founder.path());
     private(client.path());
     let root = founder.path();
-    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
     let server = start(root, &advertise);
@@ -324,9 +326,8 @@ fn concurrent_adapters_cancelled_calls_lost_replies_and_exhausted_capacity_recon
         root,
         None,
         &[
-            "cluster",
-            "client",
             "invite",
+            "client",
             "--name",
             "alice",
             "--output",
@@ -337,8 +338,8 @@ fn concurrent_adapters_cancelled_calls_lost_replies_and_exhausted_capacity_recon
         client.path(),
         None,
         &[
-            "context",
             "enroll",
+            "context",
             "alice",
             "--invite-file",
             invitation.to_str().unwrap(),
@@ -506,7 +507,7 @@ fn concurrent_adapters_cancelled_calls_lost_replies_and_exhausted_capacity_recon
         assert!(
             deadline.open(),
             "the commit did not survive the cut: {}",
-            admin(root, None, &["status"])
+            admin(root, None, &["inspect", "prefix"])
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -555,7 +556,17 @@ fn concurrent_adapters_cancelled_calls_lost_replies_and_exhausted_capacity_recon
         claim_document(&alice_id, "Refused under pressure."),
     );
     assert_eq!(condition, "Error", "{refused}");
-    assert_eq!(refused["result"]["code"], "capacity", "{refused}");
+    assert_eq!(refused["result"]["kind"], "native_refused", "{refused}");
+    assert_eq!(
+        refused["result"]["refusal"]["kind"], "Capacity",
+        "{refused}"
+    );
+    assert!(
+        refused["result"]["refusal"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.starts_with("native session capacity: ")),
+        "the refusal names its bound: {refused}"
+    );
     let refused_id = refused["operation_id"].as_str().unwrap().to_string();
     assert_eq!(sequence(root), before);
     let retried = issuer.call("request.retry", json!({"operation_id": post_id}));
@@ -572,6 +583,10 @@ fn concurrent_adapters_cancelled_calls_lost_replies_and_exhausted_capacity_recon
     );
     let inspected = issuer.call("request.inspect", json!({"operation_id": refused_id}));
     assert_eq!(inspected["condition"], "Pending", "{inspected}");
+    assert_eq!(
+        inspected["result"]["refusal"], refused["result"]["refusal"],
+        "the pending request keeps the reason it was refused: {inspected}"
+    );
     assert_eq!(sequence(root), before);
     drop(server);
     let server = start(root, &advertise);

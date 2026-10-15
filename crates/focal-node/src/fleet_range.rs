@@ -4,6 +4,8 @@
 //! from its committed rows, and the operator's view names every member.
 use super::*;
 use focal_core::native::retirement::{RetirementCandidates, RetirementCursor};
+use focal_core::native::retirement_batch::{RetireBatch, RetireOffer};
+use focal_core::native::seal::{Fold, FoldPlan, SealPlan};
 use focal_core::native::{ContentRootsPage, NativeRowCursor, RetiredClaim};
 use focal_ledger::LedgerRangeVerifier;
 use focal_memory::RangeId;
@@ -102,45 +104,45 @@ pub enum RangeControlReply {
 pub(super) enum RangeCall {
     View {
         digests: bool,
-        reply: oneshot::Sender<Result<RangeView, LedgerError>>,
+        reply: OneshotSender<Result<RangeView, LedgerError>>,
     },
     Propose {
         operation: Box<RangeOperation>,
-        reply: oneshot::Sender<Result<(), LedgerError>>,
+        reply: OneshotSender<Result<(), LedgerError>>,
     },
     Move {
         member: RangeId,
         replica: ReplicaId,
-        reply: oneshot::Sender<Result<TransferId, LedgerError>>,
+        reply: OneshotSender<Result<TransferId, LedgerError>>,
     },
     Fact {
         request: RangeFactRequest,
-        reply: oneshot::Sender<Result<RangeFact, LedgerError>>,
+        reply: OneshotSender<Result<RangeFact, LedgerError>>,
     },
     Activate {
         unchanged: Vec<RangeProgress>,
-        reply: oneshot::Sender<Result<(), LedgerError>>,
+        reply: OneshotSender<Result<(), LedgerError>>,
     },
     Layout {
         operation: focal_ledger::LayoutOperation,
-        reply: oneshot::Sender<Result<(), LedgerError>>,
+        reply: OneshotSender<Result<(), LedgerError>>,
     },
     SplitPoint {
         member: RangeId,
-        reply: oneshot::Sender<Result<Option<[u8; 16]>, LedgerError>>,
+        reply: OneshotSender<Result<Option<[u8; 16]>, LedgerError>>,
     },
     /// Terminal, released claims from the status index (26 §4).
     Candidates {
         cursor: Option<RetirementCursor>,
         max_visits: usize,
-        reply: oneshot::Sender<Result<RetirementCandidates, LedgerError>>,
+        reply: OneshotSender<Result<RetirementCandidates, LedgerError>>,
     },
     /// One family's bundle, when it may leave now: eligible, past the
     /// retention floor, and settled at least `min_age_ms` ago.
     Archive {
         root: ClaimId,
         min_age_ms: u64,
-        reply: oneshot::Sender<Result<Option<ArchivedFamily>, LedgerError>>,
+        reply: OneshotSender<Result<Option<ArchivedFamily>, LedgerError>>,
     },
     /// Propose one family's retirement (26 §4).
     Retire {
@@ -148,26 +150,106 @@ pub(super) enum RangeCall {
         bundle: ContentHash,
         bytes: u64,
         through: SessionSeq,
-        reply: oneshot::Sender<Result<(), LedgerError>>,
+        reply: OneshotSender<Result<(), LedgerError>>,
+    },
+    /// Retire a batch of families as the authority's next candidate, among its writes
+    /// (doc 31 M2).
+    RetireBatch {
+        offers: Vec<RetireOffer>,
+        reply: OneshotSender<Result<RetireBatch, LedgerError>>,
+    },
+    /// A cold family's frame, read from the replica's own cold stream (doc 31 M2, A2).
+    ColdFrame {
+        retired_at: focal_model::SessionSeq,
+        digest: ContentHash,
+        reply: OneshotSender<Result<Option<focal_ledger::ColdFrame>, LedgerError>>,
+    },
+    /// What a cold family's frame names of the ledger's content (doc 31 M2, A2).
+    ColdContent {
+        retired_at: focal_model::SessionSeq,
+        digest: ContentHash,
+        reply: OneshotSender<Result<Option<focal_ledger::ColdContent>, LedgerError>>,
+    },
+    /// One walk of the status index for a cold retirement, its offers retired (doc 31 M2, A2).
+    ColdWalk {
+        cursor: Option<focal_core::native::retirement::RetirementCursor>,
+        min_age_ms: u64,
+        visits: usize,
+        reply: OneshotSender<Result<crate::archive_derive::ColdWalk, LedgerError>>,
+    },
+    /// How the authority retires: a family at a time below the upgrade fence, in batches at it
+    /// (doc 31 M2).
+    RetireRule {
+        reply: OneshotSender<Result<focal_ledger::RetireRule, LedgerError>>,
     },
     /// The continuation of a retired claim.
     Retired {
         claim: ClaimId,
-        reply: oneshot::Sender<Result<Option<RetiredClaim>, LedgerError>>,
+        reply: OneshotSender<Result<Option<RetiredClaim>, LedgerError>>,
+    },
+    /// The seal the committed state yields now, with its bundle (F12).
+    SealBundle {
+        reply: OneshotSender<Result<crate::archive_derive::SealOffer, LedgerError>>,
+    },
+    /// Propose one seal (F12).
+    Seal {
+        plan: Box<SealPlan>,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<Fold>,
+        reply: OneshotSender<Result<(), LedgerError>>,
     },
     /// One page of the content roots the committed rows name (26 §5).
     ContentRoots {
         cursor: Option<NativeRowCursor>,
         max_visits: usize,
-        reply: oneshot::Sender<Result<ContentRootsPage, LedgerError>>,
+        reply: OneshotSender<Result<ContentRootsPage, LedgerError>>,
     },
     /// One bounded sweep of this replica's seed store (26 §5).
     CollectSeeds {
         grace_ms: u64,
         now_ms: u64,
         max_items: usize,
-        reply: oneshot::Sender<Result<focal_evidence::SeedReport, LedgerError>>,
+        reply: OneshotSender<Result<focal_evidence::SeedReport, LedgerError>>,
     },
+}
+impl RangeCall {
+    /// What the owner was doing, for its slow steps (`SlowSteps`).
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            Self::View { .. } => "range: view",
+            Self::Propose { .. } => "range: propose",
+            Self::Move { .. } => "range: move",
+            Self::Fact { .. } => "range: fact",
+            Self::Activate { .. } => "range: activate",
+            Self::Layout { .. } => "range: layout",
+            Self::SplitPoint { .. } => "range: split point",
+            Self::Candidates { .. } => "range: retirement candidates",
+            Self::Archive { .. } => "range: archive family",
+            Self::Retire { .. } => "range: retire",
+            Self::RetireBatch { .. } => "range: retire batch",
+            Self::RetireRule { .. } => "range: retire rule",
+            Self::ColdWalk { .. } => "range: cold walk",
+            Self::ColdContent { .. } => "range: cold content",
+            Self::ColdFrame { .. } => "range: cold frame",
+            Self::Retired { .. } => "range: retired claim",
+            Self::SealBundle { .. } => "range: seal bundle",
+            Self::Seal { .. } => "range: seal",
+            Self::ContentRoots { .. } => "range: content roots",
+            Self::CollectSeeds { .. } => "range: collect seeds",
+        }
+    }
+}
+/// One seal of closed outcomes as the committed core wrote it (F12): the
+/// plan it was derived from, its bundle, and a fold of older seal rows with
+/// its directory bundle when the index reached its bound. The bytes stay
+/// charged to the replica's budget until the agent is done with them.
+pub struct SealedOutcomes {
+    pub plan: SealPlan,
+    pub bundle: Vec<u8>,
+    pub digest: ContentHash,
+    pub fold: Option<(FoldPlan, Vec<u8>, ContentHash)>,
+    pub(crate) _allocation: Allocation,
 }
 /// One family's archive bundle as the committed core wrote it (26 §4):
 /// what the archive agent seals as content before it proposes the
@@ -180,6 +262,9 @@ pub struct ArchivedFamily {
     pub through: SessionSeq,
     /// The frame's own digest, verified again wherever the bundle is read.
     pub digest: ContentHash,
+    /// What the family is (`retirement_batch::family_digest`): its batch's owner refuses it
+    /// unless the family it derives is this one (doc 31 M2).
+    pub family: ContentHash,
     pub rows: usize,
     pub bundle: Vec<u8>,
     pub(crate) _allocation: Allocation,
@@ -230,13 +315,13 @@ fn derive(
 impl ReplicaHost {
     async fn range_call<T>(
         &self,
-        make: impl FnOnce(oneshot::Sender<Result<T, LedgerError>>) -> RangeCall,
+        make: impl FnOnce(OneshotSender<Result<T, LedgerError>>) -> RangeCall,
     ) -> Result<T, LedgerError> {
         let charge = self
             .budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 256 * 1024)?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Range(Box::new(make(send)), charge))
             .map_err(|error| match error {
@@ -331,6 +416,62 @@ impl ReplicaHost {
         })
         .await
     }
+    /// Retire the families `offers` name, each under custody already, as the authority's next
+    /// candidate among its writes (doc 31 M2): what its owner made of them.
+    pub async fn retire(&self, offers: Vec<RetireOffer>) -> Result<RetireBatch, LedgerError> {
+        self.range_call(|reply| RangeCall::RetireBatch { offers, reply })
+            .await
+    }
+    /// A cold family's frame from the replica's own cold stream (doc 31 M2, A2): `None` when no
+    /// cold record applied at `retired_at`.
+    pub async fn cold_frame(
+        &self,
+        retired_at: focal_model::SessionSeq,
+        digest: ContentHash,
+    ) -> Result<Option<focal_ledger::ColdFrame>, LedgerError> {
+        self.range_call(|reply| RangeCall::ColdFrame {
+            retired_at,
+            digest,
+            reply,
+        })
+        .await
+    }
+    /// What a cold family's frame names of the ledger's content (doc 31 M2, A2): `None` when no
+    /// cold record applied at `retired_at`.
+    pub async fn cold_content(
+        &self,
+        retired_at: focal_model::SessionSeq,
+        digest: ContentHash,
+    ) -> Result<Option<focal_ledger::ColdContent>, LedgerError> {
+        self.range_call(|reply| RangeCall::ColdContent {
+            retired_at,
+            digest,
+            reply,
+        })
+        .await
+    }
+    /// One walk of the status index from `cursor` for a cold retirement (doc 31 M2, A2), on the
+    /// replica's own thread: every family that may retire now offered and retired, nothing
+    /// encoded and nothing sealed, at most `visits` rows a call.
+    pub(crate) async fn cold_walk(
+        &self,
+        cursor: Option<focal_core::native::retirement::RetirementCursor>,
+        min_age_ms: u64,
+        visits: usize,
+    ) -> Result<crate::archive_derive::ColdWalk, LedgerError> {
+        self.range_call(|reply| RangeCall::ColdWalk {
+            cursor,
+            min_age_ms,
+            visits,
+            reply,
+        })
+        .await
+    }
+    /// How the authority retires (doc 31 M2): what the archive agent offers it under.
+    pub async fn retire_rule(&self) -> Result<focal_ledger::RetireRule, LedgerError> {
+        self.range_call(|reply| RangeCall::RetireRule { reply })
+            .await
+    }
     /// Propose one family's retirement as a session decision (26 §4).
     pub async fn propose_retirement(
         &self,
@@ -344,6 +485,29 @@ impl ReplicaHost {
             bundle,
             bytes,
             through,
+            reply,
+        })
+        .await
+    }
+    /// The seal the committed state yields now and its bundle, when this
+    /// replica is the authority and a seal is worth proposing (F12).
+    pub async fn seal_bundle(&self) -> Result<crate::archive_derive::SealOffer, LedgerError> {
+        self.range_call(|reply| RangeCall::SealBundle { reply })
+            .await
+    }
+    /// Propose one seal as a session decision (F12).
+    pub async fn propose_seal(
+        &self,
+        plan: SealPlan,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<Fold>,
+    ) -> Result<(), LedgerError> {
+        self.range_call(|reply| RangeCall::Seal {
+            plan: Box::new(plan),
+            bundle,
+            bytes,
+            fold,
             reply,
         })
         .await
@@ -469,11 +633,72 @@ impl Owner {
                 drop(charge);
                 let _ = reply.send(result);
             }
+            RangeCall::RetireBatch { offers, reply } => {
+                let result = self.session.native_retire(&offers).map(|(batch, _)| batch);
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::ColdFrame {
+                retired_at,
+                digest,
+                reply,
+            } => {
+                let result = self.session.native_cold_frame(retired_at, digest);
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::ColdContent {
+                retired_at,
+                digest,
+                reply,
+            } => {
+                let result = self.session.native_cold_content(retired_at, digest);
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::ColdWalk {
+                cursor,
+                min_age_ms,
+                visits,
+                reply,
+            } => {
+                let result = crate::archive_derive::cold_walk(
+                    &mut self.session,
+                    &self.budget,
+                    &mut self.settled,
+                    cursor,
+                    min_age_ms,
+                    visits,
+                );
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::RetireRule { reply } => {
+                let result = self.session.native_retire_rule();
+                drop(charge);
+                let _ = reply.send(result);
+            }
             RangeCall::Retired { claim, reply } => {
                 let result = self
                     .session
                     .native_core()
                     .map(|core| core.native_retired(claim).copied());
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::SealBundle { reply } => {
+                let result = self.seal_bundle();
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::Seal {
+                plan,
+                bundle,
+                bytes,
+                fold,
+                reply,
+            } => {
+                let result = self.session.native_propose_seal(&plan, bundle, bytes, fold);
                 drop(charge);
                 let _ = reply.send(result);
             }
@@ -500,67 +725,25 @@ impl Owner {
             }
         }
     }
-    /// One family's bundle from the committed core (26 §4): only on the
-    /// authority, only when the family is eligible, every registered
-    /// consumer has read past its last event, and that event settled at
-    /// least `min_age_ms` of the node's logical time ago (a finished claim
-    /// stays readable in the core for the grace the operator sets); the
-    /// bytes are charged here.
+    /// One family's bundle from the committed core (26 §4), derived as
+    /// `archive_derive::archived_family` says.
     fn archive_family(
-        &self,
+        &mut self,
         root: ClaimId,
         min_age_ms: u64,
     ) -> Result<Option<ArchivedFamily>, LedgerError> {
-        if !self.session.native_authoritative() {
-            return Ok(None);
-        }
-        let now = crate::native_ingress::logical_time(&self.session)
-            .map_err(|_| LedgerError::NotReady { leader: 0 })?;
-        let report = self.session.native_retention()?;
-        let limits = self.session.native_encoding_limits()?;
-        let core = self.session.native_core()?;
-        let Ok(family) = core.retirement_family(root) else {
-            return Ok(None);
-        };
-        if !report.allows_family(family.through) {
-            return Ok(None);
-        }
-        // The family's last event was published by the outcome at its
-        // sequence; the outcome carries the logical time it settled at.
-        let settled = core
-            .native_event(family.through, 0)
-            .and_then(|event| core.native_outcome(event.invocation))
-            .map(|outcome| outcome.logical_time)
-            .ok_or(LedgerError::Corrupt)?;
-        if now.saturating_sub(settled) < min_age_ms {
-            return Ok(None);
-        }
-        let through = core.native_sequence();
-        let quote = core
-            .archive_family_quote(&family, through, limits)
-            .map_err(|error| LedgerError::Native(error.into()))?;
-        let allocation = self
-            .budget
-            .reserve(BudgetKind::Payload, BudgetLane::Ordinary, quote.bytes)?
-            .commit();
-        let mut bundle = Vec::new();
-        bundle
-            .try_reserve_exact(quote.bytes)
-            .map_err(|_| LedgerError::Capacity)?;
-        bundle.resize(quote.bytes, 0);
-        let digest = core
-            .archive_family_into(&family, through, &mut bundle, quote.visits)
-            .map_err(|error| LedgerError::Native(error.into()))?;
-        let rows = family.rows();
-        Ok(Some(ArchivedFamily {
+        crate::archive_derive::archived_family(
+            &self.session,
+            &self.budget,
+            &mut self.settled,
             root,
-            members: family.members,
-            through,
-            digest,
-            rows,
-            bundle,
-            _allocation: allocation,
-        }))
+            min_age_ms,
+        )
+    }
+    /// The seal the committed state yields now (F12), derived as
+    /// `archive_derive::sealed_outcomes` says.
+    fn seal_bundle(&self) -> Result<crate::archive_derive::SealOffer, LedgerError> {
+        crate::archive_derive::sealed_outcomes(&self.session, &self.budget)
     }
     fn range_view(&self, digests: bool) -> Result<RangeView, LedgerError> {
         let map = self.session.native_range_map()?;

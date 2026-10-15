@@ -581,7 +581,7 @@ pub(super) fn inspect(
     let mut visits = Visits::new(limits.visits);
     visits.take(policy.declarations().len())?;
     visits.take(policy.slot_count())?;
-    for slot in &policy.slots {
+    for slot in &policy.body.slots {
         visits.take(slot.checks.len())?;
     }
     registry.check(claim)?;

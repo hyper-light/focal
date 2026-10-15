@@ -131,27 +131,24 @@ fn decode(
 }
 
 /// The bounded walk of one page: items are consumed until the visit allowance
-/// or the page is full; the resume position is the last visited item.
-struct Walk {
-    objects: Vec<NativeObject>,
+/// or the page is full, or the read cannot fund the next object
+/// (`native_reads::PageObjects`); the resume position is the last item consumed.
+struct Walk<'c> {
+    objects: crate::native_reads::PageObjects<'c>,
     visited: u32,
     max_items: u32,
     max_visits: u32,
     next: Option<Position>,
 }
-impl Walk {
-    fn new(request: &NativeListRequest) -> Result<Self, AccessError> {
-        let mut objects = Vec::new();
-        objects
-            .try_reserve_exact(request.max_items as usize)
-            .map_err(|_| AccessError::Capacity)?;
-        Ok(Self {
-            objects,
+impl<'c> Walk<'c> {
+    fn new(request: &NativeListRequest, charge: &'c mut focal_memory::Allocation) -> Self {
+        Self {
+            objects: crate::native_reads::PageObjects::new(charge),
             visited: 0,
             max_items: request.max_items,
             max_visits: request.max_visits,
             next: None,
-        })
+        }
     }
     /// Consume `items` in order. `accept` returns the object an item yields
     /// once every residual predicate holds, or nothing for a visited miss.
@@ -168,13 +165,24 @@ impl Walk {
                 return Ok(());
             }
             self.visited = self.visited.saturating_add(1);
-            last = Some(position(&item));
+            let at = position(&item);
             if let Some(object) = accept(item)? {
-                self.objects.push(object);
+                if !self.objects.take(object)? {
+                    // Not funded: the page ends before it, resumed at it. A page that consumed
+                    // nothing could only send its reader back where it started.
+                    if last.is_none() {
+                        return Err(AccessError::Capacity);
+                    }
+                    self.next = last;
+                    return Ok(());
+                }
+                last = Some(at);
                 if self.objects.len() >= self.max_items as usize {
                     self.next = last;
                     return Ok(());
                 }
+            } else {
+                last = Some(at);
             }
         }
         self.next = None;
@@ -214,9 +222,9 @@ struct ClaimPredicates<'a> {
     created_after: Option<SessionSeq>,
 }
 impl ClaimPredicates<'_> {
-    fn holds(&self, core: &Core<NativeState>, id: ClaimId) -> bool {
+    fn holds(&self, core: &Core<NativeState>, id: ClaimId) -> Result<bool, AccessError> {
         let Some(state) = core.native_claim(id) else {
-            return false;
+            return Ok(false);
         };
         if self.issuer.is_some_and(|issuer| state.issuer() != issuer)
             || self
@@ -227,34 +235,52 @@ impl ClaimPredicates<'_> {
                 .created_after
                 .is_some_and(|after| state.created() <= after)
         {
-            return false;
+            return Ok(false);
         }
         if self.action.is_none() && self.scope.is_none() && self.relation.is_none() {
-            return true;
+            return Ok(true);
         }
-        let Some(content) = core.native_claim_content(id) else {
-            return false;
-        };
-        !(self.action.is_some_and(|action| content.action() != action)
-            || self.scope.is_some_and(|scope| {
-                !content
-                    .scopes()
-                    .any(|found| found.kind == scope.kind && found.key == scope.key)
+        // The content read in place from its encoding (doc 31 M3).
+        let held = core
+            .with_native_claim_content(id, |content| {
+                if self
+                    .action
+                    .map(|action| content.action().map(|found| found == action))
+                    .transpose()?
+                    == Some(false)
+                {
+                    return Ok(false);
+                }
+                let mut scope = self.scope.is_none();
+                if let Some(wanted) = self.scope {
+                    content.each_scope(&mut |kind, key| {
+                        scope |= kind == wanted.kind && key == wanted.key;
+                        Ok(())
+                    })?;
+                }
+                let mut related = self.relation.is_none();
+                if let Some(relation) = self.relation {
+                    content.each_relation(&mut |found| {
+                        related |= found.kind == relation.kind
+                            && match (&found.target, &relation.target) {
+                                // A filter on evidence names the artifact; a zero
+                                // hash matches any committed hash of it.
+                                (
+                                    RelationTarget::Evidence(found),
+                                    RelationTarget::Evidence(wanted),
+                                ) => {
+                                    found.id == wanted.id
+                                        && (wanted.hash.0 == [0; 32] || found.hash == wanted.hash)
+                                }
+                                (found, wanted) => found == wanted,
+                            };
+                        Ok(())
+                    })?;
+                }
+                Ok(scope && related)
             })
-            || self.relation.is_some_and(|relation| {
-                !content.relations().iter().any(|found| {
-                    found.kind == relation.kind
-                        && match (&found.target, &relation.target) {
-                            // A filter on evidence names the artifact; a zero
-                            // hash matches any committed hash of it.
-                            (RelationTarget::Evidence(found), RelationTarget::Evidence(wanted)) => {
-                                found.id == wanted.id
-                                    && (wanted.hash.0 == [0; 32] || found.hash == wanted.hash)
-                            }
-                            (found, wanted) => found == wanted,
-                        }
-                })
-            }))
+            .map_err(docs::content_error)?;
+        Ok(held.unwrap_or(false))
     }
     /// The most selective indexed predicate: an exact relation or scope, then
     /// a participant, then the action or status family, then creation order.
@@ -295,13 +321,13 @@ impl ClaimPredicates<'_> {
 
 fn claims(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     predicates: &ClaimPredicates<'_>,
 ) -> Result<(), AccessError> {
     let core = reader.core;
     let accept = |id: ClaimId| -> Result<Option<NativeObject>, AccessError> {
-        if !predicates.holds(core, id) {
+        if !predicates.holds(core, id)? {
             return Ok(None);
         }
         let Some(state) = core.native_claim(id) else {
@@ -311,7 +337,7 @@ fn claims(
             core,
             state,
             NativeClaimExpand::default(),
-        )))))
+        )?))))
     };
     match predicates.scan()? {
         Some(scan @ NativeIndexScan::Created { .. }) => {
@@ -377,7 +403,7 @@ fn claims(
 
 fn artifacts(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     producer: Option<ParticipantId>,
     kind: Option<&str>,
@@ -437,7 +463,7 @@ fn artifacts(
 
 fn definitions(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     claim: Option<ClaimId>,
     evaluator: Option<ParticipantId>,
@@ -504,7 +530,7 @@ fn definitions(
 
 fn evaluations(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     claim: Option<ClaimId>,
     validation: Option<ValidationId>,
@@ -590,7 +616,7 @@ fn evaluations(
 
 fn responses(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     claim: ClaimId,
 ) -> Result<(), AccessError> {
@@ -604,7 +630,11 @@ fn responses(
         walk.visited = 1;
         return Ok(());
     };
-    // The response chain runs from the latest cycle back to the first.
+    // The response chain runs from the latest cycle back to the first. The
+    // rows above a resumed page's cursor are the way to it, not the page's
+    // work: they are passed before the walk, uncharged, so a page of one
+    // reaches the end of the chain and a response committed since the last
+    // page is never sent again.
     let mut cursor = state.latest_response().map(|link| link.testament);
     let chain = std::iter::from_fn(move || {
         let id = cursor?;
@@ -612,14 +642,12 @@ fn responses(
         let identity = response.identity();
         cursor = identity.prior;
         Some((identity.cycle, response))
-    });
+    })
+    .skip_while(move |(cycle, _)| below.is_some_and(|below| *cycle >= below));
     walk.run(
         chain,
         |(cycle, _)| Position::Cycle(*cycle),
-        |(cycle, response)| {
-            if below.is_some_and(|below| cycle >= below) {
-                return Ok(None);
-            }
+        |(_, response)| {
             Ok(Some(NativeObject::Response(Box::new(docs::response(
                 response,
             )))))
@@ -629,7 +657,7 @@ fn responses(
 
 fn receipts(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     holder: Option<ParticipantId>,
     claim: Option<ClaimId>,
@@ -655,7 +683,7 @@ fn receipts(
 
 fn monitors(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     claim: ClaimId,
 ) -> Result<(), AccessError> {
@@ -686,7 +714,7 @@ fn monitors(
 
 fn events(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     from: Option<(SessionSeq, u32)>,
 ) -> Result<(), AccessError> {
@@ -740,6 +768,7 @@ pub(crate) fn serve(
     reader: &Reader<'_>,
     key: &[u8; 32],
     request: &NativeListRequest,
+    charge: &mut focal_memory::Allocation,
 ) -> Result<NativeListPage, AccessError> {
     let filter = filter_bytes(&request.filter)?;
     let after = request
@@ -747,7 +776,7 @@ pub(crate) fn serve(
         .as_ref()
         .map(|cursor| decode(reader, key, &filter, cursor))
         .transpose()?;
-    let mut walk = Walk::new(request)?;
+    let mut walk = Walk::new(request, charge);
     match &request.filter {
         NativeListFilter::Claims {
             issuer,
@@ -820,7 +849,7 @@ pub(crate) fn serve(
             route_epoch: reader.route,
         },
         native_sequence: reader.core.native_sequence(),
-        objects: walk.objects,
+        objects: walk.objects.into_vec(),
         next,
         visited: walk.visited,
     })
@@ -834,6 +863,7 @@ pub(crate) fn local(
     request: &NativeListRequest,
     route: RouteEpoch,
     limits: &WireLimits,
+    charge: &mut focal_memory::Allocation,
 ) -> Result<NativeListPage, AccessError> {
     request.validate(limits)?;
     let profile = crate::native_reads::profile(session)?;
@@ -851,5 +881,6 @@ pub(crate) fn local(
         },
         &key,
         request,
+        charge,
     )
 }

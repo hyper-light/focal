@@ -18,11 +18,15 @@ use focal_node::{
     config::Settings,
     embedded::{EmbeddedNode, decode_identity},
     host::LocalHost,
-    network_admin::{ADMIN_SOCKET, AdminCommand, admin_wire_limits},
+    network_admin::{
+        ADMIN_SOCKET, AdminCommand, LOCAL_SOCKET, admin_wire_limits, local_sockets_fit,
+    },
     network_join::{NodeInvitation, PendingJoin},
     network_state::{network_requested, resolve_addresses},
 };
 use focal_wire::*;
+use hyper_rt::combine::{Either3, race3};
+use hyper_rt::signal::Signal;
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
@@ -33,6 +37,13 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// The binary's allocator is mimalloc (Leijen, Zorn and de Moura, "Mimalloc: Free List Sharding
+/// in Action", APLAS 2019), the same on every platform. The release links musl, whose allocator
+/// took 4–11% of every node's CPU in the comparison, and a follower about 10% more in the page
+/// faults of memory it handed back and took again (cluster profile run 38187112271).
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +68,18 @@ struct Args {
     #[command(subcommand)]
     command: Commands,
 }
+/// What `create` makes.
+#[derive(Subcommand)]
+enum CreateCommand {
+    /// A node's root key (29 §10): 32 random bytes in a new owner-only file at `--output`,
+    /// never over a file that is there. Keep it in the deployment's secret store and name it in
+    /// `node.root_key`; never inside the data directory.
+    RootKey {
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Save and select authenticated client connections independently of node enrollment.
@@ -69,6 +92,11 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Run a program against focal's tools, as the MCP server's code mode does.
+    Code {
+        #[command(subcommand)]
+        command: cli::CodeCommand,
+    },
     /// Run the durable service, using saved network settings on restart.
     Start {
         #[arg(long)]
@@ -80,6 +108,13 @@ enum Commands {
         /// supervised or packaged host.
         #[arg(long)]
         invite_file: Option<PathBuf>,
+    },
+    /// What the selected node and the replicas it hosts report about
+    /// themselves, read through its local socket; nothing here changes
+    /// anything.
+    Diagnose {
+        #[command(subcommand)]
+        command: cli::cluster::DiagnoseCommand,
     },
     /// Inspect and administer the selected physical node through its local socket.
     Cluster {
@@ -101,6 +136,12 @@ enum Commands {
     PrepareVolume {
         #[arg(long)]
         owner: String,
+    },
+    /// Make something a deployment keeps outside the node: `create root-key --output FILE` makes
+    /// a node's root key (29 §10), 32 random bytes in a new owner-only file, for a secret store.
+    Create {
+        #[command(subcommand)]
+        command: CreateCommand,
     },
     /// Run/resume the real claim/testament/validator example with exclusive local ownership.
     Demo,
@@ -134,42 +175,94 @@ enum McpCommand {
     Serve,
 }
 fn main() {
-    let mut matches = match cli::command_tree::command().try_get_matches() {
-        Ok(matches) => matches,
-        Err(error) => error.exit(),
+    let words: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // Help is focal's own page, read before any parsing.
+    let page = match cli::grammar::asked(&words) {
+        cli::grammar::Asked::Top => Some(cli::look::top(&mut std::io::stdout().lock())),
+        cli::grammar::Asked::Action(action) => {
+            Some(cli::look::action(action, &mut std::io::stdout().lock()))
+        }
+        cli::grammar::Asked::Command(used) => {
+            Some(cli::look::command(used, &mut std::io::stdout().lock()))
+        }
+        cli::grammar::Asked::Run => None,
     };
-    let format = cli::errors::format(&matches);
+    if let Some(written) = page {
+        std::process::exit(if written.is_ok() { 0 } else { 1 });
+    }
+    // The parser people use names what was typed, and every mistake in its words.
+    let typed = match cli::grammar::command().try_get_matches_from(&words) {
+        Ok(matches) => matches,
+        Err(error) => parse_failure(&error),
+    };
+    let format = cli::errors::format(&typed);
+    let Some(used) = cli::grammar::chosen(&typed) else {
+        let _ = cli::look::error("", "no command was given", &["focal lists every command"]);
+        std::process::exit(2);
+    };
+    drop(typed);
+    // The command, said as its derived command, whose handler runs.
+    let tree = cli::command_tree::command();
+    let derived = cli::grammar::internal(&tree, &words, used.path);
+    let mut matches = match tree.try_get_matches_from(derived) {
+        Ok(matches) => matches,
+        Err(error) => parse_failure(&error),
+    };
     let args = match Args::from_arg_matches_mut(&mut matches) {
         Ok(args) => args,
-        Err(error) => error.exit(),
+        Err(error) => parse_failure(&error),
     };
     drop(matches);
     cli::trace::configure(args.trace_file.clone());
     if let Err(error) = execute(args) {
-        let _ = cli::errors::report(error.as_ref(), format, &mut std::io::stderr().lock());
-        std::process::exit(cli::errors::classification(error.as_ref()).exit_code);
+        let failure = cli::errors::classification(error.as_ref());
+        if matches!(format, cli::OutputFormat::Table) && cli::look::styled_errors() {
+            let mut causes = Vec::new();
+            let mut source = error.source();
+            // A foreign Error implementation may expose a cyclic source chain.
+            for _ in 0..16 {
+                let Some(cause) = source else {
+                    break;
+                };
+                causes.push(format!("caused by: {cause}"));
+                source = cause.source();
+            }
+            let hints: Vec<&str> = causes.iter().map(String::as_str).collect();
+            let title = format!("{} {}", used.action, used.thing);
+            let message = format!("[{}] {error}", failure.code);
+            let _ = cli::look::error(&title, &message, &hints);
+        } else {
+            let _ = cli::errors::report(error.as_ref(), format, &mut std::io::stderr().lock());
+        }
+        std::process::exit(failure.exit_code);
     }
+}
+/// A parse failure: help and the version print as the parser has them; a mistake is
+/// named in focal's panel on a colour terminal, as the parser says it elsewhere.
+fn parse_failure(error: &clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    let printed = matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    );
+    if !printed && cli::look::styled_errors() {
+        let _ = cli::look::parse_error(error);
+        std::process::exit(error.exit_code());
+    }
+    error.exit()
 }
 fn execute(args: Args) -> Result<()> {
     let args = match args.command {
+        // Context-backed validation probes the ledger's engine, so it runs
+        // where a runtime exists, with the other manual commands.
         Commands::Schema {
             command:
                 cli::discovery::SchemaCommand::Validate {
-                    operation,
-                    input,
-                    shape_only: false,
+                    shape_only: false, ..
                 },
-        } => {
-            let settings =
-                load_settings(args.config.as_deref(), args.data_dir, Resolution::Command)?;
-            return cli::schema_validate(
-                &settings,
-                args.client_context.as_deref(),
-                &operation,
-                input,
-            )
-            .map_err(Into::into);
-        }
+        } => args,
         Commands::Schema { command } => return cli::discovery::schema(command).map_err(Into::into),
         Commands::Completion { shell } => {
             return cli::discovery::completion(shell).map_err(Into::into);
@@ -180,35 +273,30 @@ fn execute(args: Args) -> Result<()> {
         }) => return cli::check_request_file(&file).map_err(Into::into),
         _ => args,
     };
-    if matches!(&args.command, Commands::Mcp { .. }) {
+    // Code mode, like the MCP adapter, owns its own worker runtime.
+    if matches!(&args.command, Commands::Mcp { .. } | Commands::Code { .. }) {
         let settings = load_settings(args.config.as_deref(), args.data_dir, Resolution::Command)?;
-        return cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into);
-    }
-    let service = matches!(&args.command, Commands::Start { .. });
-    // Tokio's fallible builder can still unwind when an OS worker cannot be
-    // started. Contain that dependency boundary before acquiring node state.
-    let runtime = std::panic::catch_unwind(|| {
-        // A manual invocation owns one sequential network conversation. Avoid
-        // starting a worker pool for every get/list/submit process.
-        let mut builder = if service {
-            tokio::runtime::Builder::new_multi_thread()
-        } else {
-            tokio::runtime::Builder::new_current_thread()
+        return match args.command {
+            Commands::Code { command } => {
+                cli::code(&settings, args.client_context.as_deref(), command).map_err(Into::into)
+            }
+            _ => cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into),
         };
-        builder.enable_all().build()
-    })
-    .map_err(|_| "async runtime initialization failed")??;
-    let result = run(&runtime, args);
-    // A timed-out blocking owner must not make Runtime::drop wait forever.
-    // Normal service shutdown has already joined its owner before returning.
-    runtime.shutdown_background();
-    result
+    }
+    // The command is one root task on one shard of this thread: its
+    // connections' endpoints live on that shard for as long as it runs, and
+    // whatever it spawned is cancelled and joined when it returns. A runtime
+    // whose tables cannot be reserved refuses, typed, before any node state
+    // is touched.
+    focal_rt::block_on(run(args)).map_err(|error| format!("async runtime: {error}"))?
 }
 /// Resolve the settings for this invocation (doc 08 §2). On an initialized
 /// store the committed policy fills every policy field the file omits; a
 /// file that sets one to another value is refused by name, except for a
-/// policy request (`deployment plan`/`explain`), where the file is what the
-/// operator asks for.
+/// policy request (`plan deployment`, `explain deployment`, `render`), where
+/// the file is what the operator asks for: a render touches no node, so the
+/// policy of whatever store sits at the default data directory is not its
+/// business.
 /// How the invoked command resolves a policy the committed store already
 /// holds: the pod's own `start` yields to the committed policy, a policy
 /// request keeps the file's values, and every other command is refused if
@@ -267,13 +355,14 @@ fn load_settings(
     };
     Ok(resolved.settings)
 }
-fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
+async fn run(args: Args) -> Result<()> {
     let data_dir_override = args.data_dir.clone();
     let resolution = if matches!(
         &args.command,
         Commands::Deployment {
             command: cli::deployment::DeploymentCommand::Plan { .. }
                 | cli::deployment::DeploymentCommand::Explain { .. }
+                | cli::deployment::DeploymentCommand::Render { .. }
         }
     ) {
         Resolution::Request
@@ -287,9 +376,12 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
         Commands::Mcp {
             command: McpCommand::Serve,
         } => cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into),
-        Commands::Context { command } => {
-            cli::context::run(runtime, &settings, command).map_err(Into::into)
+        Commands::Code { command } => {
+            cli::code(&settings, args.client_context.as_deref(), command).map_err(Into::into)
         }
+        Commands::Context { command } => cli::context::run(&settings, command)
+            .await
+            .map_err(Into::into),
         Commands::Start {
             advertise,
             listen,
@@ -302,19 +394,35 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
                 settings.node.listen = Some(listen);
             }
             settings.validate()?;
+            // Sockets that could not be bound are refused before the directory is
+            // initialized or an invitation spent on it.
+            local_sockets_fit(&settings.data_dir()?)?;
             // An uninitialized directory enrolls first; an initialized one
             // keeps its identity and ignores the invitation.
             if let Some(invite_file) = invite_file
                 && !settings.data_dir()?.join("IDENTITY").exists()
             {
-                runtime.block_on(join(&settings, &invite_file))?;
+                join(&settings, &invite_file).await?;
             }
-            runtime.block_on(start(settings))
+            start(settings).await
         }
         Commands::PrepareVolume { owner } => prepare_volume(&settings.data_dir()?, &owner),
+        Commands::Create {
+            command: CreateCommand::RootKey { output },
+        } => {
+            focal_seal::create_root_key(&output)?;
+            print_json(&serde_json::json!({
+                "condition": "Created",
+                "root_key": output,
+            }))
+        }
+        Commands::Diagnose { command } => {
+            let selected = cli::context::admin_settings(&settings, args.client_context.as_deref())?;
+            cli::cluster::diagnose(&selected, command).await
+        }
         Commands::Cluster { command } => {
             let selected = cli::context::admin_settings(&settings, args.client_context.as_deref())?;
-            cli::cluster::run(runtime, &selected, command)
+            cli::cluster::run(&selected, command).await
         }
         Commands::Join {
             invite_file,
@@ -325,7 +433,8 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             if let Some(listen) = listen {
                 settings.node.listen = Some(listen);
             }
-            runtime.block_on(join(&settings, &invite_file))
+            local_sockets_fit(&settings.data_dir()?)?;
+            join(&settings, &invite_file).await
         }
         Commands::Demo => {
             let mut node = EmbeddedNode::open(&settings)?;
@@ -334,32 +443,45 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             print_json(&report)
         }
         Commands::Identity => print_json(&decode_identity(&settings.data_dir()?.join("IDENTITY"))?),
+        Commands::Schema {
+            command:
+                cli::discovery::SchemaCommand::Validate {
+                    operation,
+                    input,
+                    shape_only: false,
+                    native,
+                },
+        } => cli::schema_validate(
+            &settings,
+            args.client_context.as_deref(),
+            &operation,
+            input,
+            native,
+        )
+        .await
+        .map_err(Into::into),
         Commands::Schema { command } => cli::discovery::schema(command).map_err(Into::into),
         Commands::Completion { shell } => cli::discovery::completion(shell).map_err(Into::into),
-        Commands::Status => {
-            cli::status(runtime, &settings, args.client_context.as_deref()).map_err(Into::into)
+        Commands::Status => cli::status(&settings, args.client_context.as_deref())
+            .await
+            .map_err(Into::into),
+        Commands::Request(command) => {
+            Ok(cli::request(&settings, command, args.client_context.as_deref()).await?)
         }
-        Commands::Request(command) => Ok(cli::request(
-            runtime,
-            &settings,
-            command,
-            args.client_context.as_deref(),
-        )?),
-        Commands::Manual(command) => Ok(cli::run(
-            runtime,
-            &settings,
-            *command,
-            args.client_context.as_deref(),
-        )?),
-        Commands::Deployment { command } => cli::deployment::run(
-            runtime,
-            &settings,
-            cli::deployment::Inputs {
-                config: args.config.as_deref(),
-                data_dir_override,
-            },
-            command,
-        ),
+        Commands::Manual(command) => {
+            Ok(cli::run(&settings, *command, args.client_context.as_deref()).await?)
+        }
+        Commands::Deployment { command } => {
+            cli::deployment::run(
+                &settings,
+                cli::deployment::Inputs {
+                    config: args.config.as_deref(),
+                    data_dir_override,
+                },
+                command,
+            )
+            .await
+        }
     }
 }
 fn output_response(reply: ResponseEnvelope) -> Result<()> {
@@ -381,11 +503,14 @@ fn output_response(reply: ResponseEnvelope) -> Result<()> {
     }
 }
 async fn start(settings: Settings) -> Result<()> {
+    // On a colour terminal the node's status is drawn, its lenses moving until it is
+    // ready; elsewhere it is printed as JSON.
+    let show = cli::startup::Show::begin("start node");
     if network_requested(&settings.data_dir()?, &settings) {
-        return start_network(settings).await;
+        return start_network(settings, show).await;
     }
     let node = EmbeddedNode::open(&settings)?;
-    let path = node.root().join("focal.sock");
+    let path = node.root().join(LOCAL_SOCKET);
     // The exclusive data-directory owner may clean its socket after a crash, but
     // it must never remove an ordinary file or a symlink at that location.
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
@@ -416,21 +541,25 @@ async fn start(settings: Settings) -> Result<()> {
         role: PeerRole::Runtime,
     };
     let limits = WireLimits::default();
-    let server = UnixServer::bind(&path, grant, limits.clone())?;
+    let server = LocalServer::bind(&path, grant, limits.clone())?;
     let identity = node.identity.clone();
     let (host, owner) = LocalHost::spawn(node, limits)?;
-    let serving = server.serve(host.clone());
-    tokio::pin!(serving);
-    print_json(
-        &serde_json::json!({"condition":"Ready","ledger":identity.ledger,"node":identity.node,"socket":path,"durability":{"survive":"node","max_failures":0},"meaning":"Acknowledged writes are synced to this disk; loss of this disk can lose the ledger."}),
-    )?;
+    let mut serving = std::pin::pin!(server.serve(host.clone()));
+    let ready = serde_json::json!({"condition":"Ready","ledger":identity.ledger,"node":identity.node,"socket":path,"durability":{"survive":"node","max_failures":0},"meaning":"Acknowledged writes are synced to this disk; loss of this disk can lose the ledger."});
+    match &show {
+        Some(show) => show.status(&ready),
+        None => print_json(&ready)?,
+    }
     // An ingress task failure is a shutdown trigger as well as a signal. Do
     // not advertise readiness forever after the listening service has failed.
     let mut finished = None;
-    let signal_result = tokio::select! {
-        result = shutdown_signal() => result,
-        result = &mut serving => { finished = Some(result); Ok(()) }
-        _ = host.closed() => Err(std::io::Error::other("node owner stopped")),
+    let signal_result = match race3(shutdown_signal(), serving.as_mut(), host.closed()).await {
+        Either3::First(result) => result,
+        Either3::Second(result) => {
+            finished = Some(result);
+            Ok(())
+        }
+        Either3::Third(()) => Err(std::io::Error::other("node owner stopped")),
     };
     server.close();
     // Dropping a timed-out filesystem future would not stop its blocking owner.
@@ -448,16 +577,24 @@ async fn start(settings: Settings) -> Result<()> {
         signal_result?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     };
-    tokio::time::timeout(focal_node::network_service::SHUTDOWN_DEADLINE, cleanup)
+    let stopped = focal_rt::time::timeout(focal_node::network_service::SHUTDOWN_DEADLINE, cleanup)
         .await
-        .map_err(|_| "shutdown deadline exceeded; recovery will replay the durable log")?
+        .map_err(|_| "shutdown deadline exceeded; recovery will replay the durable log")?;
+    if let Some(show) = show {
+        let mut card = ready;
+        if let Some(fields) = card.as_object_mut() {
+            fields.insert("condition".into(), "Stopped".into());
+        }
+        show.finish(&card);
+    }
+    stopped
 }
 async fn invite(settings: &Settings, name: &str, output: &Path) -> Result<()> {
     let root = settings.data_dir()?;
     let identity = decode_identity(&root.join("IDENTITY"))?;
     let command = AdminCommand::invitation(name)?;
     let request = command.request(&identity)?;
-    let reply = UnixRemote::new(root.join(ADMIN_SOCKET), admin_wire_limits())?
+    let reply = LocalRemote::new(root.join(ADMIN_SOCKET), admin_wire_limits())?
         .request(&request)
         .await?;
     let bytes = match reply.result {
@@ -491,27 +628,50 @@ fn prepare_volume(root: &Path, owner: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::os::unix::fs::chown(root, Some(uid), Some(gid))?;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (uid, gid);
-        return Err("prepare-volume needs a Unix filesystem".into());
-    }
-    #[cfg(unix)]
-    {
         File::open(root)?.sync_all()?;
         print_json(&serde_json::json!({"condition":"VolumePrepared","path":root,"owner":owner}))
     }
+    #[cfg(not(unix))]
+    {
+        let _ = (uid, gid, owner);
+        Err("prepare volume needs a Unix filesystem".into())
+    }
 }
-async fn start_network(settings: Settings) -> Result<()> {
+async fn start_network(settings: Settings, show: Option<cli::startup::Show>) -> Result<()> {
     let service = focal_node::network_service::NetworkService::open(&settings).await?;
-    service
+    let mut last = serde_json::Value::Null;
+    let stopped = service
         .run_until(shutdown_signal(), |status| {
-            let json = serde_json::to_string_pretty(status).map_err(std::io::Error::other)?;
-            writeln!(std::io::stdout().lock(), "{json}")
+            let value = serde_json::to_value(status).map_err(std::io::Error::other)?;
+            match &show {
+                Some(show) => show.status(&value),
+                None => {
+                    let json =
+                        serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
+                    writeln!(std::io::stdout().lock(), "{json}")?;
+                }
+            }
+            last = value;
+            Ok(())
         })
         .await?;
-    Ok(())
+    // The last line a planned stop prints: what this node led, and what it
+    // handed off before it went (27 §5).
+    let summary = serde_json::json!({
+        "condition": "Stopped",
+        "sessions_led": stopped.sessions_led,
+        "sessions_handed_off": stopped.sessions_handed_off,
+    });
+    match show {
+        Some(show) => {
+            if let Some(fields) = last.as_object_mut() {
+                fields.insert("condition".into(), "Stopped".into());
+            }
+            show.finish(&last);
+            Ok(())
+        }
+        None => print_json(&summary),
+    }
 }
 async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
     let bundle = NodeInvitation::load(invite_file)?;
@@ -569,28 +729,25 @@ async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
     let joined = pending.install(receipt?, focal_node::network_bootstrap::unix_time()?)?;
     print_json(joined.directory.identity())
 }
+/// The signals that stop a node: Ctrl-C and `SIGTERM` (a supervisor's stop)
+/// on Unix; Ctrl-C, Ctrl-Break, the console's close and the system's
+/// shutdown on Windows.
+#[cfg(not(windows))]
+const STOP_SIGNALS: &[Signal] = &[Signal::Interrupt, Signal::Terminate];
+#[cfg(windows)]
+const STOP_SIGNALS: &[Signal] = &[
+    Signal::Interrupt,
+    Signal::Break,
+    Signal::Close,
+    Signal::Shutdown,
+];
 async fn shutdown_signal() -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! { result=tokio::signal::ctrl_c()=>result, _=terminate.recv()=>Ok(()) }
-    }
-    #[cfg(windows)]
-    {
-        use tokio::signal::windows;
-        let mut ctrl_break = windows::ctrl_break()?;
-        let mut ctrl_close = windows::ctrl_close()?;
-        let mut ctrl_shutdown = windows::ctrl_shutdown()?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = ctrl_break.recv() => Ok(()),
-            _ = ctrl_close.recv() => Ok(()),
-            _ = ctrl_shutdown.recv() => Ok(()),
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    tokio::signal::ctrl_c().await
+    let signals = hyper_rt::signal::subscribe(STOP_SIGNALS).map_err(std::io::Error::other)?;
+    signals
+        .recv()
+        .await
+        .map(|_| ())
+        .map_err(std::io::Error::other)
 }
 fn read_file(path: &Path, max: usize) -> Result<Vec<u8>> {
     let file = File::open(path)?;

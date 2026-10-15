@@ -11,6 +11,21 @@ use focal_model::{
     ArtifactRef, ContentDomainId, ObjectRevision, ReceiptId, ValidationMode, VerdictValue,
 };
 
+/// A held creation result's encoding: it reads no payload log.
+fn held_creation(sink: &mut impl Sink, row: &OwnedCreationResult) -> Result<(), Error> {
+    creation(sink, row, None)
+}
+
+/// A held content row's encoding: it reads no payload log.
+fn held_content(sink: &mut impl Sink, row: &OwnedClaimContent) -> Result<(), Error> {
+    claim_content(sink, row, None)
+}
+
+/// A held definition's encoding: it reads no payload log.
+fn held_definition(sink: &mut impl Sink, row: &OwnedDeclaration) -> Result<(), Error> {
+    definition(sink, row, None)
+}
+
 macro_rules! encoded {
     ($writer:path, $value:expr) => {{
         let value = $value;
@@ -546,7 +561,9 @@ fn actual_peer_report_result_keeps_attempt_artifact_and_accepted_ordinal() {
     );
     let token = f::verified(&mut custody, &input);
     let prepared = f::report(&core, input, &[], &token);
-    let result = prepared
+    let result = core
+        .native_chain(&[&prepared])
+        .unwrap()
         .evaluation(f::key(1))
         .unwrap()
         .last_result()
@@ -789,7 +806,7 @@ fn authored_and_legacy_definitions_keep_distinct_bodies_and_original_claim_profi
     };
     let body = encoded!(descriptors::validation, &descriptor);
     let authored = OwnedDeclaration::new_authored(descriptor).unwrap();
-    let bytes = encoded!(definition, &authored);
+    let bytes = encoded!(held_definition, &authored);
     assert_eq!(bytes[0], 1);
     assert_eq!(&bytes[1..], &body);
     let legacy = authored
@@ -798,7 +815,7 @@ fn authored_and_legacy_definitions_keep_distinct_bodies_and_original_claim_profi
         .try_copy(authored.get().unwrap().retained_bytes().unwrap())
         .unwrap();
     let legacy = OwnedDeclaration::new(legacy).unwrap();
-    let bytes = encoded!(definition, &legacy);
+    let bytes = encoded!(held_definition, &legacy);
     assert_eq!(bytes[0], 0);
     assert_eq!(
         &bytes[1..],
@@ -819,7 +836,7 @@ fn authored_and_legacy_definitions_keep_distinct_bodies_and_original_claim_profi
         children: 11,
     };
     let row = OwnedClaimContent::new(descriptor, 7, profile, Some(owner)).unwrap();
-    let bytes = encoded!(claim_content, &row);
+    let bytes = encoded!(held_content, &row);
     assert_eq!(&bytes[..body.len()], &body);
     let mut cursor = Cursor::new(&bytes[body.len()..], bytes.len(), usize::MAX).unwrap();
     assert_eq!(cursor.u32().unwrap(), 7);
@@ -835,7 +852,7 @@ fn authored_and_legacy_definitions_keep_distinct_bodies_and_original_claim_profi
     );
     assert_eq!(cursor.u64().unwrap(), 6);
     cursor.finish().unwrap();
-    assert_eq!(encoded!(claim_content, &row.copy().unwrap()), bytes);
+    assert_eq!(encoded!(held_content, &row.copy().unwrap()), bytes);
 }
 
 #[test]
@@ -870,7 +887,7 @@ fn creation_mapping_vector_retains_order_family_schema_requested_and_resolved_id
     }
     let value = NativeCreationResult::from_owned(entries, 2, 3, usize::MAX).unwrap();
     let row = OwnedCreationResult::new(value).unwrap();
-    assert_eq!(encoded!(creation, &row), expected);
+    assert_eq!(encoded!(held_creation, &row), expected);
 }
 
 #[test]

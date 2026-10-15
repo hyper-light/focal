@@ -24,34 +24,38 @@ use crate::{
     quorum_enrollment::{QuorumEnrollmentDriver, QuorumEnrollmentHost},
     replication::{drive_control_replication, drive_fleet_replication},
 };
-use focal_consensus::{DurableNode, NodeConfig};
+use focal_consensus::NodeConfig;
 use focal_control::{
     ControlEvents, ControlOptions, ControlRead, ControlReadResult, ControlReplica,
 };
 use focal_enrollment::{CredentialMaterial, EnrollmentReceipt};
 use focal_evidence::{ContentStore, StoreLimits};
 use focal_ledger::{Session, SessionLimits};
-use focal_log::{SharedWal, WalIdentity, WalOptions, WalWriterLimits};
+use focal_log::WalIdentity;
 use focal_memory::{
-    Allocation, BudgetKind, BudgetLane, DiskBudget, DiskBudgetConfig, MemoryBudget,
+    Allocation, BudgetKind, BudgetLane, DiskBudget, DiskBudgetConfig, MemoryBudget, MemoryError,
 };
 use focal_model::*;
+use focal_rt::time::Instant;
 use focal_wire::*;
 use futures_util::FutureExt;
+use hyper_rt::sync::{ChannelReceiver, OneshotReceiver};
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
     future::Future,
     path::{Path, PathBuf},
     sync::mpsc,
+    task::Poll,
     time::Duration,
 };
-use tokio::sync::{mpsc as async_mpsc, oneshot};
 
 #[path = "network_directory.rs"]
 mod network_directory;
 use network_directory::DirectoryStartup;
-pub use network_directory::{DirectoryHandle, HostRequest, HostedPartition, MAX_HOSTED_PARTITIONS};
+pub use network_directory::{
+    DirectoryHandle, HostRequest, HostedPartition, HostingAttempt, MAX_HOSTED_PARTITIONS,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -93,6 +97,10 @@ pub enum ServiceError {
     Wal(#[from] focal_log::LogError),
     #[error("IO: {0}")]
     Io(#[from] std::io::Error),
+    #[error("runtime: {0}")]
+    Rt(#[from] focal_rt::RtError),
+    #[error("blocking work: {0}")]
+    Pool(#[from] focal_rt::PoolError),
     #[error("network owner stopped: {0}")]
     Owner(&'static str),
     #[error("network controller: {0}")]
@@ -114,6 +122,56 @@ pub enum ServiceError {
 /// this long and then that the node kept its word.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
+/// What stopping the owners returned, kept apart so that what ended the
+/// service is reported as the cause and a stop's failure beside it.
+struct StoppedOwners {
+    fleet: Result<crate::fleet::FleetStopReport, ServiceError>,
+    directory: Result<(), ServiceError>,
+    hosted: Result<(), ServiceError>,
+    control: Result<(), ServiceError>,
+}
+/// How a service stopped: the sessions this node led when it was told to
+/// stop, and how many of those it handed off before it went (27 §5). The
+/// node prints it as its last status line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ServiceStopped {
+    pub sessions_led: u32,
+    pub sessions_handed_off: u32,
+}
+/// Stop the owners that speak to peers: the fleet's sessions, the directory
+/// and every hosted partition, the control groups. Run while the drivers
+/// that carry their messages and the listener that receives their peers'
+/// still run (27 §5): a leader among them hands its log off first, which is
+/// messages both ways, and a stop that had already ended the egress made
+/// every hand-off a silence its survivors waited out.
+async fn stop_owners(handles: &NetworkHandles) -> StoppedOwners {
+    let fleet = handles.fleet.stop_all().await.map_err(ServiceError::from);
+    // The founder hosts the first partition in its own slot; a member hosts
+    // it, when seated, as a replica like any other, and it stops below.
+    let founder_slot = handles.directory.host();
+    let directory = match &founder_slot {
+        Some(host) => host.stop().await.map_err(ServiceError::from),
+        None => Ok(()),
+    };
+    // Every partition this node hosts stops, but the founder's slot it
+    // stopped above.
+    let mut hosted = Ok(());
+    let first = handles.directory.plan().partition();
+    for partition in handles.directory.hosted() {
+        if (partition.plan.partition() != first || founder_slot.is_none())
+            && let Err(error) = partition.host.stop().await
+        {
+            hosted = Err(ServiceError::from(error));
+        }
+    }
+    let control = handles.control.stop().await.map_err(ServiceError::from);
+    StoppedOwners {
+        fleet,
+        directory,
+        hosted,
+        control,
+    }
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct NetworkServiceStatus {
     pub condition: &'static str,
@@ -213,6 +271,30 @@ impl RequestHandler for DataService {
     fn supports_native_requests(&self) -> bool {
         true
     }
+    fn supports_ordered_replication(&self) -> bool {
+        true
+    }
+    fn supports_lane_frames(&self) -> bool {
+        true
+    }
+    /// A peer's frame from its lane, to the host of its group as its request would go: the
+    /// root's, a directory group's, or a session's.
+    fn take_frame(&self, request: VerifiedRequest) -> Result<(), AccessError> {
+        let group = match &request.request().operation {
+            Operation::Raft { group, .. } | Operation::RaftOrdered { group, .. } => *group,
+            _ => return Err(AccessError::InvalidRequest),
+        };
+        if group == self.root_group {
+            return self.control.take_frame(request);
+        }
+        if let Some(directory) = self.directory.host_of_group(group) {
+            return directory.take_frame(request);
+        }
+        if group == self.directory.group() {
+            return Err(AccessError::Unavailable);
+        }
+        self.ledger.take_frame(request)
+    }
     fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
@@ -224,7 +306,8 @@ impl RequestHandler for DataService {
                 | Operation::PlacementControl { group, .. }
                 | Operation::NodeContact { group, .. }
                 | Operation::EnrollmentControl { group, .. }
-                | Operation::Raft { group, .. } => Some(*group),
+                | Operation::Raft { group, .. }
+                | Operation::RaftOrdered { group, .. } => Some(*group),
                 _ => None,
             };
             if group == Some(self.root_group) {
@@ -290,10 +373,10 @@ impl PhysicalOwner {
 const OWNER_SLOTS: usize = 4 + network_directory::MAX_HOSTED_PARTITIONS;
 struct OwnerGate {
     sender: Option<mpsc::SyncSender<OwnerRegistration>>,
-    finished: oneshot::Receiver<Result<(), ServiceError>>,
+    finished: OneshotReceiver<Result<(), ServiceError>>,
 }
 struct OwnerRegistration {
-    storage: Option<(NodeDirectory, SharedWal)>,
+    storage: Option<(NodeDirectory, focal_consensus::storage_open::OpenedStorage)>,
     owner: Option<PhysicalOwner>,
 }
 impl OwnerGate {
@@ -310,7 +393,7 @@ impl OwnerGate {
             .try_reserve_exact(OWNER_SLOTS)
             .map_err(|_| ServiceError::Owner("owner registry capacity"))?;
         let (sender, receiver) = mpsc::sync_channel::<OwnerRegistration>(5);
-        let (done, finished) = oneshot::channel();
+        let (done, finished) = hyper_rt::sync::oneshot()?;
         std::thread::Builder::new()
             .name("focal-node-owners".into())
             .stack_size(2 * 1024 * 1024)
@@ -336,8 +419,26 @@ impl OwnerGate {
                         result = Err(error);
                     }
                 }
-                if let Some((directory, wal)) = storage {
-                    drop(wal);
+                // Every owner has stopped: nothing writes through the storage any longer, and
+                // the shell's log closes before its directory's lock is let go.
+                if let Some((directory, opened)) = storage {
+                    let focal_consensus::storage_open::OpenedStorage {
+                        storage,
+                        log,
+                        cache,
+                        // The store keys beside the log are taken by the stores sealed next
+                        // (29 §8); until then they are wiped here.
+                        keys: _,
+                    } = opened;
+                    drop(storage);
+                    if let Some(log) = log
+                        && let Err(error) = log.close()
+                    {
+                        result = Err(ServiceError::Node(
+                            focal_consensus::storage_open::OpenError::Log(error).into(),
+                        ));
+                    }
+                    drop(cache);
                     drop(directory);
                 }
                 let _ = done.send(result);
@@ -357,12 +458,16 @@ impl OwnerGate {
             })
             .map_err(|_| ServiceError::Owner("owner registry stopped"))
     }
-    fn hold(&self, directory: NodeDirectory, wal: SharedWal) -> Result<(), ServiceError> {
+    fn hold(
+        &self,
+        directory: NodeDirectory,
+        storage: focal_consensus::storage_open::OpenedStorage,
+    ) -> Result<(), ServiceError> {
         self.sender
             .as_ref()
             .ok_or(ServiceError::Owner("closed owner registry"))?
             .send(OwnerRegistration {
-                storage: Some((directory, wal)),
+                storage: Some((directory, storage)),
                 owner: None,
             })
             .map_err(|_| ServiceError::Owner("owner registry stopped"))
@@ -380,12 +485,12 @@ pub struct NetworkService {
     handles: NetworkHandles,
     data: DataService,
     listener: NetworkListener,
-    local: UnixServer,
-    admin: Option<(UnixServer, LocalNetworkAdmin)>,
+    local: LocalServer,
+    admin: Option<(LocalServer, LocalNetworkAdmin)>,
     pool: PeerConnectionPool,
     registry: PeerRegistry,
     controller: Option<NetworkController>,
-    credential_requests: Option<async_mpsc::Receiver<crate::credential_renewal::CredentialRequest>>,
+    credential_requests: Option<ChannelReceiver<crate::credential_renewal::CredentialRequest>>,
     agent: Option<crate::placement_agent::PlacementAgent>,
     /// The collector agent (26 §5), taken by `run`.
     gc_agent: Option<crate::gc::GcAgent>,
@@ -393,26 +498,28 @@ pub struct NetworkService {
     liveness: Option<crate::liveness::LivenessDriver>,
     routes: Option<crate::route_cache_host::RouteCacheDriver>,
     directory_startup: Option<DirectoryStartup>,
-    control_output: Option<async_mpsc::Receiver<ControlReplicationFrame>>,
+    control_output: Option<ChannelReceiver<ControlReplicationFrame>>,
     ledger_output: Option<FleetReplication>,
     evidence: Option<EvidenceDriver>,
     signer: Option<QuorumEnrollmentDriver>,
     enrollment: Option<RegisteredEnrollment>,
     authority: FounderControlAuthority,
-    founder_fingerprint: [u8; 32],
+    /// The fingerprint of the certificate the founder presents now, as its
+    /// controller publishes it (24 §11).
+    presented: focal_rt::watch::Receiver<[u8; 32]>,
     budget: MemoryBudget,
     _configuration: Allocation,
     /// The cluster this node belongs to, for restoring the enrollment
     /// registry the metrics sampler reads the fence from.
     cluster: [u8; 16],
-    /// The WAL writer, for its statistics in the metrics snapshot.
-    wal: SharedWal,
+    /// The node's storage, for its statistics in the metrics snapshot.
+    storage: focal_consensus::NodeStorage,
     /// The fixed labels of this node's metrics and the latest snapshot the
     /// sampler published (24 §23).
     metrics_labels: crate::metrics::MetricLabels,
-    metrics: tokio::sync::watch::Sender<Option<crate::metrics::MetricsSnapshot>>,
+    metrics: focal_rt::watch::Sender<Option<crate::metrics::MetricsPage>>,
     /// The loopback endpoint bound at open when `node.metrics_listen` names one.
-    metrics_listener: Option<tokio::net::TcpListener>,
+    metrics_listener: Option<hyper_rt::tcp::TcpListener>,
     // All service handles and futures drop before registration closes. The
     // reaper retains LOCK even if a caller cancels run_until or keeps a handle.
     owners: Option<OwnerGate>,
@@ -428,13 +535,18 @@ struct Prepared {
     control: ControlReplica,
     recovered: ControlEvents,
     budget: MemoryBudget,
-    wal: SharedWal,
+    /// The node's storage as its start opened it (`storage_start`).
+    storage: focal_consensus::storage_open::OpenedStorage,
     allocation: Allocation,
     directory: NodeDirectory,
 }
 impl Prepared {
-    async fn open(settings: &Settings) -> Result<Self, ServiceError> {
-        Box::pin(Self::open_inner(settings)).await
+    /// Boxed by a plain function, as [`NetworkService::open_with_socket`]
+    /// is and for the same frame.
+    fn open(
+        settings: &Settings,
+    ) -> std::pin::Pin<Box<impl Future<Output = Result<Self, ServiceError>> + '_>> {
+        Box::pin(Self::open_inner(settings))
     }
     async fn open_inner(settings: &Settings) -> Result<Self, ServiceError> {
         settings.validate().map_err(NodeError::from)?;
@@ -453,20 +565,22 @@ impl Prepared {
             if startup.changed {
                 state.install(&joined.directory)?;
             }
-            let budget = MemoryBudget::new(1024 * 1024 * 1024, 256 * 1024 * 1024)?;
+            let budget = crate::memory_envelope::node_budget(settings)?;
             let allocation = budget
                 .reserve(BudgetKind::Recovery, BudgetLane::Completion, 256 * 1024)?
                 .commit();
-            let wal = SharedWal::open_with_budgets(
-                joined.directory.root().join("wal"),
-                WalOptions::new(WalIdentity {
+            let storage = crate::storage_start::open(
+                joined.directory.root(),
+                WalIdentity {
                     cluster: state.genesis.founder.cluster,
                     node: state.node,
                     stream: 0,
-                }),
-                WalWriterLimits::default(),
-                budget.child(256 * 1024 * 1024, 64 * 1024 * 1024)?,
-                disk_budget()?,
+                },
+                &budget,
+                &settings
+                    .root_key_file(state.node)
+                    .map_err(NodeError::Config)?,
+                crate::network_join::genesis_fence(&state.genesis)?.level,
             )?;
             let options = ControlOptions::new(NodeConfig::joining(
                 state.node,
@@ -475,12 +589,13 @@ impl Prepared {
                 vec![state.genesis.founder.node],
                 vec![],
             ));
-            let mut control = ControlReplica::open_on_wal(
+            let mut control = ControlReplica::open_on_storage(
                 options,
                 state.genesis.bootstrap.clone(),
                 budget.child(192 * 1024 * 1024, 64 * 1024 * 1024)?,
-                wal.clone(),
+                &storage.storage,
             )?;
+            control.set_raft_wire(crate::storage_level::member_wire(joined.directory.root())?)?;
             if control.identity() != state.genesis.root {
                 return Err(NodeError::Identity.into());
             }
@@ -497,7 +612,7 @@ impl Prepared {
                 control,
                 recovered,
                 budget,
-                wal,
+                storage,
                 allocation,
                 directory: joined.directory,
             })
@@ -512,7 +627,7 @@ impl Prepared {
                 enrollment,
                 enrollment_driver,
                 budget,
-                wal,
+                storage,
                 _bootstrap_allocation,
                 directory,
             } = FoundingNetwork::prepare(settings).await?;
@@ -526,7 +641,7 @@ impl Prepared {
                 control,
                 recovered,
                 budget,
-                wal,
+                storage,
                 allocation: _bootstrap_allocation,
                 directory,
             })
@@ -541,7 +656,7 @@ impl NetworkService {
     pub fn handles(&self) -> NetworkHandles {
         self.handles.clone()
     }
-    /// Open physical owners on a Tokio runtime with IO and time enabled. Their
+    /// Open physical owners on a hyper-rt shard. Their
     /// directory lock remains owned until every worker has joined, even if this
     /// future is canceled after the first worker starts.
     pub async fn open(settings: &Settings) -> Result<Self, ServiceError> {
@@ -552,11 +667,19 @@ impl NetworkService {
     /// The startup state machine (every recovered owner, registry and handle
     /// across its awaits) lives on the heap, so a caller's stack carries one
     /// frame however many services it opens.
-    async fn open_with_socket(
+    /// The open, boxed by a plain function. An `async fn` that awaits a
+    /// boxed inner still holds the inner's whole state as a temporary of
+    /// its own poll frame in a debug build, where no two temporaries share
+    /// a slot: this wrapper's frame was 110 KiB on macOS as an `async fn`,
+    /// the inner's is 483 KiB, and under a test body's frame a Windows test
+    /// thread of 2 MiB overflowed. A function that returns the boxed future
+    /// leaves its caller a pointer, and its own frame is gone before the
+    /// future is polled.
+    fn open_with_socket(
         settings: &Settings,
         socket: Option<std::net::UdpSocket>,
-    ) -> Result<Self, ServiceError> {
-        Box::pin(Self::open_with_socket_inner(settings, socket)).await
+    ) -> std::pin::Pin<Box<impl Future<Output = Result<Self, ServiceError>> + '_>> {
+        Box::pin(Self::open_with_socket_inner(settings, socket))
     }
     async fn open_with_socket_inner(
         settings: &Settings,
@@ -596,17 +719,20 @@ impl NetworkService {
             control,
             recovered,
             budget,
-            wal,
+            storage: opened,
             allocation,
             directory,
         } = prepared;
-        owners.hold(directory, wal.clone())?;
+        // Every owner of the node's groups opens them through one handle (27 §15.11); the
+        // registry holds what was opened, and closes the shell's log after every owner.
+        let storage = opened.storage.clone();
+        owners.hold(directory, opened)?;
         let founder = identity.node == state.genesis.founder.node;
         let (directory, directory_startup) = DirectoryStartup::new(
-            founder,
+            identity.node,
             state.genesis.founder.cluster,
             state.genesis.founder.node,
-            wal.clone(),
+            storage.clone(),
             budget.child(192 * 1024 * 1024, 64 * 1024 * 1024)?,
             root.clone(),
         )?;
@@ -619,7 +745,9 @@ impl NetworkService {
             &registry,
             unix_time()?,
         )?;
-        let founder_fingerprint = founder_fingerprint(&state)?;
+        // The founder's own credential as it presents it now (24 §11).
+        let (presented_sender, presented) =
+            focal_rt::watch::channel(certificate_fingerprint(&receipt.certificate))?;
         // A sponsor named rather than addressed resolves at each start
         // (24 §24); an unresolvable name is not fatal here.
         let sponsor_address = crate::network_state::resolve_endpoint(&state.sponsor.endpoint)
@@ -646,18 +774,28 @@ impl NetworkService {
                 .cloned()
                 .collect(),
         );
+        // The founder renews its own credential through the enrollment host
+        // it runs (24 §11).
+        if let Some(sponsor) = &enrollment {
+            controller = controller
+                .with_local_sponsor(sponsor.clone())
+                .with_presented(presented_sender);
+        }
+        if let Some(identity) = &signing_identity {
+            controller = controller.with_enrollment_identity(identity.clone());
+        }
         let (credential_handle, credential_requests) =
-            crate::credential_renewal::CredentialHandle::channel(4);
+            crate::credential_renewal::CredentialHandle::channel(4)?;
         let limits = ControlHost::wire_limits();
         let socket = match socket {
             Some(socket) => socket,
             None => std::net::UdpSocket::bind(state.listen).map_err(WireError::from)?,
         };
-        let listener = NetworkListener::from_socket(
+        let listener = NetworkListener::bind(
             socket,
             &credentials,
             signing_identity.as_ref(),
-            &state.sponsor.ca_certificate,
+            &state.sponsor.root_certificates(),
             registry.clone(),
             limits.clone(),
             budget.child(64 * 1024 * 1024, 16 * 1024 * 1024)?,
@@ -669,6 +807,7 @@ impl NetworkService {
         }
         .parse()
         .map_err(|_| ServiceError::Owner("invalid internal bind"))?;
+        // The peer pool's endpoint is charged to the node's budget.
         let connector = QuicConnector::bind(
             bind,
             client_tls(
@@ -676,17 +815,22 @@ impl NetworkService {
                     credentials.certificate_chain().to_vec(),
                     credentials.private_key_der().to_vec(),
                 ),
-                vec![state.sponsor.ca_certificate.clone()],
+                state.sponsor.root_certificates(),
                 &limits,
+                focal_wire::net::Sender::Node,
             )?,
             limits.clone(),
+            focal_wire::endpoint_budget(&limits, Some(&budget))?,
         )?;
-        let pool = PeerConnectionPool::new(connector, PeerPoolLimits::default())?;
-        let socket = root.join("focal.sock");
+        let pool = PeerConnectionPool::new(
+            connector,
+            PeerPoolLimits::for_consensus(focal_consensus::DEFAULT_INFLIGHT_WINDOW),
+        )?;
+        let socket = root.join(crate::network_admin::LOCAL_SOCKET);
         clean_socket(&socket, &root)?;
         // The local grant follows the committed registry: the controller
         // adds every admitted tenant on each refresh (doc 24 §16).
-        let (local_grant, local_grant_watch) = tokio::sync::watch::channel(PeerGrant {
+        let local_grant = LocalGrant::new(PeerGrant {
             principal: if founder {
                 identity.issuer
             } else {
@@ -703,13 +847,13 @@ impl NetworkService {
                 PeerRole::Actor
             },
         });
-        let local = UnixServer::bind_watched(&socket, local_grant_watch, WireLimits::default())?;
+        let local = LocalServer::bind_watched(&socket, local_grant.clone(), WireLimits::default())?;
         controller.follow_local_grant(local_grant);
         let mut admin = if let Some(handler) = admin_handler {
             let path = root.join(ADMIN_SOCKET);
             clean_socket(&path, &root)?;
             Some((
-                UnixServer::bind(
+                LocalServer::bind(
                     path,
                     PeerGrant {
                         principal: identity.issuer,
@@ -723,7 +867,10 @@ impl NetworkService {
         } else {
             None
         };
-        let tenant = budget.child(512 * 1024 * 1024, 128 * 1024 * 1024)?;
+        // The founder's tenant may use the whole node; the node budget still
+        // arbitrates its live use against every other tenant's.
+        let node_bytes = crate::memory_envelope::node_bytes(settings);
+        let tenant = budget.child(node_bytes, node_bytes / 4)?;
         // The content store and the founder's durable application session both
         // recover by replaying the WAL - unbounded CPU- and IO-blocking work
         // that must not run on the async executor (it would stall the runtime
@@ -734,10 +881,11 @@ impl NetworkService {
         // durable owner of the data directory.
         let (content, session) = {
             let root = root.clone();
-            let wal = wal.clone();
+            let storage = storage.clone();
             let identity = identity.clone();
             let tenant = tenant.clone();
-            tokio::task::spawn_blocking(move || -> Result<_, ServiceError> {
+            let settings = settings.clone();
+            focal_rt::on_pool(&focal_rt::FILES, move || -> Result<_, ServiceError> {
                 let content = ContentStore::open_with_disk(
                     root.join("content"),
                     StoreLimits {
@@ -747,33 +895,44 @@ impl NetworkService {
                         chunk_bytes: 1024 * 1024,
                         max_manifest_bytes: 1024 * 1024,
                     },
-                    wal.disk_budget(),
+                    storage.disk_budget(),
                 )?;
                 let session = if founder {
-                    let consensus = DurableNode::open_on_wal_in(
+                    let mut consensus = storage.open_member(
                         NodeConfig::single(
                             identity.node,
                             identity.cluster,
                             identity.ledger.session.0,
                         ),
-                        wal.clone(),
                         &tenant,
+                        focal_ledger::entry_needs,
                     )?;
+                    consensus.set_raft_wire(crate::storage_level::member_wire(&root)?)?;
+                    let limits = crate::memory_envelope::found_limits(&root, &settings, &consensus)
+                        .map_err(ServiceError::from)?;
+                    let hosting = native_hosting(
+                        &root,
+                        &identity,
+                        storage.disk_budget(),
+                        &limits,
+                        crate::storage_level::seal_rule(&root)?,
+                        crate::storage_level::retire_rule(&root)?,
+                        crate::storage_level::native_share(&root)?,
+                    )
+                    .map_err(NodeError::Content)?;
                     Some(Session::from_node_in_hosted(
                         identity.ledger,
                         consensus,
-                        SessionLimits::default(),
+                        limits,
                         &tenant,
-                        native_hosting(&root, &identity, wal.disk_budget())
-                            .map_err(NodeError::Content)?,
+                        hosting,
                     )?)
                 } else {
                     None
                 };
                 Ok((content, session))
             })
-            .await
-            .map_err(|_| ServiceError::Owner("store recovery task failed to join"))??
+            .await??
         };
         // The founder's custody and serving scope follow the placement its
         // session has committed; a fresh session starts at the single-node
@@ -804,7 +963,8 @@ impl NetworkService {
             }),
             (None, false) => None,
         };
-        let (placement_handle, agent_jobs) = crate::placement_control::PlacementHandle::channel(16);
+        let (placement_handle, agent_jobs) =
+            crate::placement_control::PlacementHandle::channel(16)?;
         let (liveness_handle, liveness_driver) = crate::liveness::LivenessHandle::channel(
             &budget,
             crate::liveness::LivenessConfig::default(),
@@ -836,11 +996,14 @@ impl NetworkService {
                 node_budget: budget.clone(),
                 admission: crate::admission::TenantAdmission::new(
                     budget.clone(),
-                    crate::admission::AdmissionPolicy::standard(settings.node.max_tenants),
+                    crate::admission::AdmissionPolicy::standard(
+                        settings.node.max_tenants,
+                        crate::memory_envelope::node_bytes(settings),
+                    ),
                     identity.ledger.tenant,
                     tenant.clone(),
                 ),
-                wal: wal.clone(),
+                storage: storage.clone(),
                 jobs: agent_jobs,
             },
             budget.child(64 * 1024 * 1024, 16 * 1024 * 1024)?,
@@ -905,6 +1068,7 @@ impl NetworkService {
         };
         let mut custody_config = CustodyConfig::new(identity.node);
         custody_config.seed_root = Some(root.join("seeds"));
+        custody_config.cold_root = Some(root.join("cold"));
         let (content, content_owner) = ContentHost::spawn(
             content,
             custody_config,
@@ -965,7 +1129,7 @@ impl NetworkService {
         let (fleet, owner, ledger_output) = ReplicaFleet::spawn_managed(
             identity.node,
             identity.cluster,
-            vec![wal.clone()],
+            vec![storage.clone()],
             vec![FleetTenant {
                 tenant: identity.ledger.tenant,
                 weight: 1,
@@ -987,7 +1151,7 @@ impl NetworkService {
                 )
                 .await
                 .map_err(|failure| failure.error)?;
-            Some(installed.value().host().clone())
+            Some(fleet.host_of(installed.value())?)
         } else {
             None
         };
@@ -998,10 +1162,10 @@ impl NetworkService {
             budget.child(128 * 1024 * 1024, 32 * 1024 * 1024)?,
             4,
         )?;
-        let (gc_agent, gc_handle) = crate::gc::GcAgent::from_env(identity.node);
-        let (archive_agent, archive_handle) = crate::archive_agent::ArchiveAgent::from_env();
+        let (gc_agent, gc_handle) = crate::gc::GcAgent::from_env(identity.node)?;
+        let (archive_agent, archive_handle) = crate::archive_agent::ArchiveAgent::from_env()?;
         let (metrics, metrics_view) =
-            tokio::sync::watch::channel::<Option<crate::metrics::MetricsSnapshot>>(None);
+            focal_rt::watch::channel::<Option<crate::metrics::MetricsPage>>(None)?;
         let metrics_labels = crate::metrics::MetricLabels {
             node: identity.node,
             cluster: crate::cluster_admin::hex(&identity.cluster),
@@ -1014,7 +1178,10 @@ impl NetworkService {
             role: if founder { "founder" } else { "host" },
         };
         let metrics_listener = match settings.node.metrics_listen {
-            Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+            Some(address) => Some(hyper_rt::tcp::TcpListener::bind(
+                address,
+                crate::metrics::loopback_backlog(),
+            )?),
             None => None,
         };
         if let Some((server, handler)) = admin.take() {
@@ -1023,6 +1190,7 @@ impl NetworkService {
                 handler
                     .with_control(control.clone())?
                     .with_fleet(fleet.clone())?
+                    .with_directory(directory.clone())
                     .with_content(content.clone())
                     .with_credentials(credential_handle.clone())
                     .with_placement(placement_handle.clone())
@@ -1038,7 +1206,7 @@ impl NetworkService {
             directory: directory.clone(),
             liveness: liveness_handle.clone(),
             ledger: ManagedService::new(fleet.clone(), content.clone(), coordinator.clone())
-                .with_signing(control.clone(), placement_handle.clone())
+                .with_signing(control.clone(), placement_handle.clone(), directory.clone())
                 .with_liveness(liveness_handle.clone())
                 .with_routes(
                     route_handle.clone(),
@@ -1078,33 +1246,40 @@ impl NetworkService {
             archive_agent: Some(archive_agent),
             liveness: Some(liveness_driver),
             routes: Some(route_driver),
-            directory_startup,
+            directory_startup: Some(directory_startup),
             control_output: Some(control_output),
             ledger_output: Some(ledger_output),
             evidence: Some(evidence),
             signer,
             enrollment: enrollment_service,
             authority,
-            founder_fingerprint,
+            presented,
             budget,
             _configuration: allocation,
             cluster: identity.cluster,
-            wal,
+            storage: storage.clone(),
             metrics_labels,
             metrics,
             metrics_listener,
             owners: Some(owners),
         })
     }
-    /// One metrics sample of everything this node knows about itself (24 §23).
-    async fn sample_metrics(&self) -> crate::metrics::MetricsSnapshot {
+    /// One metrics sample of everything this node knows about itself (24 §23):
+    /// every family aggregated whole, and the entities this round lists one
+    /// by one within one page (the audit's F26, `metrics::rounds`).
+    async fn sample_metrics(
+        &self,
+        started: Instant,
+        rounds: &mut crate::metrics::rounds::Rounds,
+    ) -> Result<crate::metrics::MetricsSnapshot, MemoryError> {
         fn count(value: usize) -> u64 {
             u64::try_from(value).unwrap_or(u64::MAX)
         }
         use crate::metrics::{
-            AgentMetrics, CredentialMetrics, LivenessMetrics, MetricsSnapshot, RootMetrics,
-            SessionMetrics,
+            AgentMetrics, CredentialMetrics, Listing, Listings, LivenessMetrics, MetricsSnapshot,
+            RootMetrics, RootPeerAggregates, RttAggregates, SessionMetrics, TenantAggregates,
         };
+        let round = rounds.begin();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
@@ -1114,7 +1289,7 @@ impl NetworkService {
             Ok((disk, uploads, bytes)) => (Some(disk), count(uploads), bytes),
             Err(_) => (None, 0, 0),
         };
-        let root = self.handles.control.progress();
+        let mut root = self.handles.control.progress();
         let pace = self.handles.control.current_pace();
         let view = self.handles.liveness.view();
         let mut liveness = LivenessMetrics {
@@ -1127,15 +1302,6 @@ impl NetworkService {
             refutations: view.counters.refutations,
             ..LivenessMetrics::default()
         };
-        let mut peer_rtts = Vec::new();
-        for (node, member) in &view.members {
-            if let Some(rtt_ms) = member.rtt_ms {
-                peer_rtts.push(crate::metrics::PeerRtt {
-                    peer: *node,
-                    rtt_ms,
-                });
-            }
-        }
         for member in view.members.values() {
             match member.status {
                 crate::liveness::MemberStatus::Alive => {
@@ -1160,13 +1326,14 @@ impl NetworkService {
                 renewals: summary.renewals,
                 rotations: summary.rotations,
             });
-        let (directory, agent) = match (
+        let (directory, mut agent) = match (
             self.handles.placement.directory().await,
             self.handles.placement.status().await,
         ) {
             (Ok(directory), Ok(status)) => (
                 Some(directory),
                 Some(AgentMetrics {
+                    tenant_aggregates: TenantAggregates::default(),
                     root_intents: status.root_intents,
                     partition_intents: status.partition_intents,
                     installed: count(status.installed.len()),
@@ -1178,21 +1345,194 @@ impl NetworkService {
             (Ok(directory), Err(_)) => (Some(directory), None),
             (Err(_), _) => (None, None),
         };
-        let mut sessions = Vec::new();
-        let mut truncated = false;
-        let mut after = None;
-        while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
-            after = Some(ledger);
-            if sessions.len() >= crate::metrics::MAX_SESSIONS || sessions.try_reserve(1).is_err() {
-                truncated = true;
-                break;
+
+        // Every hosted session, read in place with no ask of its owner: the
+        // aggregates count each one, and what each counted is kept across
+        // rounds, so the node's counters never fall as sessions come and go.
+        let survey = rounds.survey(
+            |visit| {
+                self.handles
+                    .fleet
+                    .visit_hosted(|ledger, incarnation, host| {
+                        visit(ledger, incarnation.sequence(), host)
+                    })
+            },
+            self.handles.fleet.status().installed,
+            self.status.node,
+        )?;
+        let sessions = survey.aggregates;
+        let flags = &survey.flags;
+
+        // The root leader's members, the liveness view's measured paths and
+        // the admitted tenants: each family aggregated whole, its flagged
+        // entities found.
+        let mut members = RootPeerAggregates::default();
+        for peer in &root.peers {
+            members.members = members.members.saturating_add(1);
+            match peer.state {
+                focal_consensus::PEER_PROBE => members.probing = members.probing.saturating_add(1),
+                focal_consensus::PEER_REPLICATE => {
+                    members.replicating = members.replicating.saturating_add(1)
+                }
+                _ => members.snapshotting = members.snapshotting.saturating_add(1),
             }
-            let progress = host.progress();
-            let Ok(reply) = host.diagnostics().await else {
-                continue;
-            };
-            let diagnostics = reply.value();
-            let listed = directory.as_ref().and_then(|report| {
+            if !peer.recent_active {
+                members.inactive = members.inactive.saturating_add(1);
+            }
+            if peer.paused {
+                members.paused = members.paused.saturating_add(1);
+            }
+            members.lag_max = members
+                .lag_max
+                .max(root.applied_index.saturating_sub(peer.matched));
+        }
+        root.peers.sort_unstable_by_key(|peer| peer.node);
+        let mut member_flags: Vec<(u64, bool)> = Vec::new();
+        member_flags
+            .try_reserve_exact(root.peers.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        member_flags.extend(root.peers.iter().map(|peer| {
+            (
+                peer.node,
+                peer.state != focal_consensus::PEER_REPLICATE
+                    || !peer.recent_active
+                    || peer.paused
+                    || peer.pending_snapshot != 0,
+            )
+        }));
+        let mut rtts = RttAggregates::default();
+        let mut rtt_flags: Vec<(u64, bool)> = Vec::new();
+        rtt_flags
+            .try_reserve_exact(view.members.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        for (node, member) in &view.members {
+            if let Some(rtt_ms) = member.rtt_ms {
+                rtts.min_ms = if rtts.measured == 0 {
+                    rtt_ms
+                } else {
+                    rtts.min_ms.min(rtt_ms)
+                };
+                rtts.max_ms = rtts.max_ms.max(rtt_ms);
+                rtts.measured = rtts.measured.saturating_add(1);
+                rtt_flags.push((
+                    *node,
+                    !matches!(member.status, crate::liveness::MemberStatus::Alive),
+                ));
+            }
+        }
+        let mut tenant_flags: Vec<(focal_model::TenantId, bool)> = Vec::new();
+        if let Some(agent) = &mut agent {
+            let tenants = &mut agent.admission.tenants;
+            tenants.sort_unstable_by_key(|tenant| tenant.tenant);
+            tenant_flags
+                .try_reserve_exact(tenants.len())
+                .map_err(|_| MemoryError::AllocationFailed)?;
+            for tenant in tenants.iter() {
+                let at_limit = tenant.memory_used >= tenant.memory_limit;
+                let totals = &mut agent.tenant_aggregates;
+                totals.queued_items = totals
+                    .queued_items
+                    .saturating_add(count(tenant.queued_items));
+                totals.queued_bytes = totals.queued_bytes.saturating_add(tenant.queued_bytes);
+                if at_limit {
+                    totals.at_limit = totals.at_limit.saturating_add(1);
+                }
+                tenant_flags.push((tenant.tenant, at_limit));
+            }
+        }
+
+        // What this round lists: within one page, each family's flagged
+        // entities first, then the next of the rest.
+        let [session_room, member_room, rtt_room, tenant_room] = rounds.budget().capacities([
+            flags.len(),
+            member_flags.len(),
+            rtt_flags.len(),
+            tenant_flags.len(),
+        ]);
+        fn listing<K>(flags: &[(K, bool)], listed: usize) -> Listing {
+            Listing {
+                total: count(flags.len()),
+                flagged: count(flags.iter().filter(|(_, flagged)| *flagged).count()),
+                listed: count(listed),
+            }
+        }
+        let chosen_sessions = rounds.choose_sessions(flags, session_room)?;
+        let chosen_members = rounds.choose_root_peers(&member_flags, member_room)?;
+        let chosen_rtts = rounds.choose_peer_rtts(&rtt_flags, rtt_room)?;
+        let chosen_tenants = rounds.choose_tenants(&tenant_flags, tenant_room)?;
+        let mut listings = Listings {
+            sessions: listing(flags, chosen_sessions.len()),
+            root_peers: listing(&member_flags, chosen_members.len()),
+            peer_rtts: listing(&rtt_flags, chosen_rtts.len()),
+            tenants: listing(&tenant_flags, chosen_tenants.len()),
+        };
+        // The aggregates count every hosted session; one installed after the
+        // round was charged is counted there and listed in a later round.
+        listings.sessions.total = sessions.hosted;
+        root.peers
+            .retain(|peer| chosen_members.binary_search(&peer.node).is_ok());
+        let mut peer_rtts = Vec::new();
+        peer_rtts
+            .try_reserve_exact(chosen_rtts.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        for node in &chosen_rtts {
+            if let Some(rtt_ms) = view.members.get(node).and_then(|member| member.rtt_ms) {
+                peer_rtts.push(crate::metrics::PeerRtt {
+                    peer: *node,
+                    rtt_ms,
+                });
+            }
+        }
+        if let Some(agent) = &mut agent {
+            agent
+                .admission
+                .tenants
+                .retain(|tenant| chosen_tenants.binary_search(&tenant.tenant).is_ok());
+        }
+
+        // Only the sessions listed are asked, all at once, the round closed
+        // at the cadence (the audit's F65): an owner that is refused, gone
+        // or late costs its entry the owner-side numbers, never another
+        // entry and never the round.
+        let deadline = started
+            .checked_add(crate::metrics::SAMPLE_INTERVAL)
+            .unwrap_or(started);
+        let mut hosts = Vec::new();
+        hosts
+            .try_reserve_exact(chosen_sessions.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        self.handles.fleet.visit_hosted(|ledger, _, host| {
+            if hosts.len() < chosen_sessions.len() && chosen_sessions.binary_search(&ledger).is_ok()
+            {
+                hosts.push((ledger, host.clone()));
+            }
+        });
+        let mut asks = Vec::new();
+        asks.try_reserve_exact(hosts.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        for (_, host) in &hosts {
+            let host = host.clone();
+            asks.push(async move { host.diagnostics().await.ok() });
+        }
+        let answers = crate::metrics::collect(asks, deadline).await;
+        let mut listed = Vec::new();
+        listed
+            .try_reserve_exact(hosts.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut asked = Vec::new();
+        asked
+            .try_reserve_exact(hosts.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut unobserved = 0u64;
+        for (index, (ledger, host)) in hosts.iter().enumerate() {
+            let ledger = *ledger;
+            let diagnostics = answers.get(index).and_then(Option::as_ref);
+            asked.push((ledger, diagnostics.is_some()));
+            if diagnostics.is_none() {
+                unobserved = unobserved.saturating_add(1);
+            }
+            let diagnostics = diagnostics.map(|reply| reply.value());
+            let directory_listed = directory.as_ref().and_then(|report| {
                 report.partitions.iter().find_map(|(_, checkpoint)| {
                     checkpoint.sessions.get(&ledger).map(|descriptor| {
                         let guarantee =
@@ -1213,38 +1553,57 @@ impl NetworkService {
                     })
                 })
             });
-            sessions.push(SessionMetrics {
+            let (leader, term, peers_unreachable, peer_reports_coalesced, peer_reports_dropped) =
+                host.observe(|progress| {
+                    (
+                        progress.leader,
+                        progress.term,
+                        progress.peers_unreachable,
+                        progress.peer_reports_coalesced,
+                        progress.peer_reports_dropped,
+                    )
+                });
+            listed.push(SessionMetrics {
                 tenant: ledger.tenant.to_string(),
                 session: ledger.session.to_string(),
-                leader: progress.leader,
-                term: progress.term,
-                committed_index: diagnostics.committed_index,
-                applied_index: diagnostics.applied_index,
-                sequence: diagnostics.sequence,
-                pending: count(diagnostics.pending),
-                authoritative: diagnostics.authoritative,
-                preferred_leader: diagnostics.preferred_leader,
-                leader_returns: diagnostics.leader_returns,
-                leader_returns_failed: diagnostics.leader_returns_failed,
-                native_authoritative: diagnostics.native_authoritative,
-                log_entries_since_checkpoint: diagnostics.log_entries_since_checkpoint,
-                retention: diagnostics.retention.clone(),
-                seed_chunks_missing: diagnostics.seed_chunks_missing.map(count),
-                custody_objects_missing: diagnostics.custody_objects_missing.map(count),
-                delivery_retained: diagnostics.delivery_retained,
-                route_epoch: listed.map(|listed| listed.0),
-                placement_epoch: listed.map(|listed| listed.1),
-                desired_max_failures: listed.map(|listed| listed.2),
-                achieved_max_failures: listed.and_then(|listed| listed.3),
-                blocked: listed.and_then(|listed| listed.4),
+                observed: diagnostics.is_some(),
+                leader,
+                term,
+                committed_index: diagnostics.map_or(0, |d| d.committed_index),
+                applied_index: diagnostics.map_or(0, |d| d.applied_index),
+                sequence: diagnostics.map_or(0, |d| d.sequence),
+                pending: diagnostics.map_or(0, |d| count(d.pending)),
+                authoritative: diagnostics.is_some_and(|d| d.authoritative),
+                preferred_leader: diagnostics.and_then(|d| d.preferred_leader),
+                leader_returns: diagnostics.map_or(0, |d| d.leader_returns),
+                leader_returns_failed: diagnostics.map_or(0, |d| d.leader_returns_failed),
+                native_authoritative: diagnostics.is_some_and(|d| d.native_authoritative),
+                log_entries_since_checkpoint: diagnostics
+                    .map_or(0, |d| d.log_entries_since_checkpoint),
+                retention: diagnostics.and_then(|d| d.retention.clone()),
+                seed_chunks_missing: diagnostics.and_then(|d| d.seed_chunks_missing.map(count)),
+                custody_objects_missing: diagnostics
+                    .and_then(|d| d.custody_objects_missing.map(count)),
+                delivery_retained: diagnostics.is_some_and(|d| d.delivery_retained),
+                route_epoch: directory_listed.map(|listed| listed.0),
+                placement_epoch: directory_listed.map(|listed| listed.1),
+                desired_max_failures: directory_listed.map(|listed| listed.2),
+                achieved_max_failures: directory_listed.and_then(|listed| listed.3),
+                blocked: directory_listed.and_then(|listed| listed.4),
                 tick_period_ms: u64::try_from(host.tick_period().as_millis()).unwrap_or(u64::MAX),
                 broadcast_tail_us: host.current_pace().broadcast_tail_ns / 1_000,
                 pace_samples: host.current_pace().samples,
+                periods: host.periods(),
                 refused_periods: host.refused_periods(),
+                peers_unreachable,
+                peer_reports_coalesced,
+                peer_reports_dropped,
                 longest_period_ms: u64::try_from(host.longest_period().as_millis())
                     .unwrap_or(u64::MAX),
+                memory: diagnostics.and_then(|d| d.memory),
             });
         }
+        rounds.answered(&asked);
         let fence_level = self
             .handles
             .control
@@ -1264,16 +1623,24 @@ impl NetworkService {
                 _ => None,
             })
             .unwrap_or(0);
-        MetricsSnapshot {
+        Ok(MetricsSnapshot {
             sampled_ms: now,
             labels: self.metrics_labels.clone(),
             memory: self.budget.stats(),
             disk,
             staged_uploads,
             staged_bytes,
-            wal: self.wal.stats().ok(),
+            storage: match self.storage.backend() {
+                focal_consensus::StorageBackend::Wal(wal) => {
+                    wal.stats().ok().map(crate::metrics::StorageMetrics::Wal)
+                }
+                focal_consensus::StorageBackend::Shell(shell) => shell.log_stats().map(|stats| {
+                    crate::metrics::StorageMetrics::Log(focal_consensus::LogMetrics::of(&stats))
+                }),
+            },
             fleet: self.handles.fleet.status(),
             root: RootMetrics {
+                peer_aggregates: members,
                 leader: root.leader,
                 term: root.term,
                 applied_index: root.applied_index,
@@ -1286,25 +1653,57 @@ impl NetworkService {
                 refused_periods: self.handles.control.refused_periods(),
                 longest_period_ms: u64::try_from(self.handles.control.longest_period().as_millis())
                     .unwrap_or(u64::MAX),
-                peers: root.peers.clone(),
+                peers: root.peers,
+                peers_unreachable: root.peers_unreachable,
+                peer_reports_coalesced: root.peer_reports_coalesced,
+                peer_reports_dropped: root.peer_reports_dropped,
             },
             peers: self.pool.stats(),
-            listener: self.listener.admission(),
+            listener: self.listener.admission().await,
+            sockets: crate::metrics::SocketMetrics {
+                listener: self.listener.io().await,
+                peers: self.pool.io().await,
+            },
             peer_rtts,
             liveness,
             credential,
-            sessions,
-            sessions_truncated: truncated,
+            session_aggregates: sessions,
+            rtt_aggregates: rtts,
+            listings,
+            rounds: round,
+            sessions: listed,
+            sessions_unobserved: unobserved,
+            collection_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             agent,
+            rounds_refused: rounds.refused_rounds(),
             fence_level,
             announced_level: crate::upgrade::announced_level(),
-        }
+        })
     }
 
-    /// Drive borrowed ingress and egress on a runtime with IO and time enabled.
-    /// Shutdown closes admission and joins disk owners; cancellation keeps the
-    /// directory locked while any externally retained physical handle is live.
-    pub async fn run_until<F, R>(mut self, shutdown: F, on_status: R) -> Result<(), ServiceError>
+    /// Drive borrowed ingress and egress on a hyper-rt shard. Shutdown closes
+    /// admission and joins disk owners; cancellation keeps the directory
+    /// locked while any externally retained physical handle is live. Boxed by
+    /// a plain function, as [`Self::open_with_socket`] is: a caller's frame,
+    /// and every future that awaits this one, holds a pointer to the run, not
+    /// its state (in a debug build a test's 2 MiB thread overflowed on the
+    /// copies of it each frame held).
+    pub fn run_until<F, R>(
+        self,
+        shutdown: F,
+        on_status: R,
+    ) -> std::pin::Pin<Box<impl Future<Output = Result<ServiceStopped, ServiceError>>>>
+    where
+        F: Future<Output = std::io::Result<()>>,
+        R: FnMut(&NetworkServiceStatus) -> std::io::Result<()>,
+    {
+        Box::pin(self.run_until_inner(shutdown, on_status))
+    }
+    async fn run_until_inner<F, R>(
+        mut self,
+        shutdown: F,
+        on_status: R,
+    ) -> Result<ServiceStopped, ServiceError>
     where
         F: Future<Output = std::io::Result<()>>,
         R: FnMut(&NetworkServiceStatus) -> std::io::Result<()>,
@@ -1313,43 +1712,34 @@ impl NetworkService {
         // The task set's state (every pinned driver future) lives on the heap
         // for the service's life, so the caller's stack carries only this
         // frame however many drivers the service composes.
-        let running = std::panic::AssertUnwindSafe(Box::pin(self.run_tasks(shutdown, on_status)))
-            .catch_unwind()
-            .await
-            .unwrap_or(Err(ServiceError::Runtime));
+        let (running, stopped) =
+            match std::panic::AssertUnwindSafe(Box::pin(self.run_tasks(shutdown, on_status)))
+                .catch_unwind()
+                .await
+                .unwrap_or(Err(ServiceError::Runtime))
+            {
+                Ok(stopped) => (Ok(()), stopped),
+                Err(error) => (Err(error), None),
+            };
         self.listener.close();
         self.local.close();
         if let Some((server, _)) = &self.admin {
             server.close();
         }
-        self.pool.close();
         let cleanup = async {
-            let fleet = self
-                .handles
-                .fleet
-                .stop_all()
-                .await
-                .map_err(ServiceError::from);
-            let directory = match self.handles.directory.host() {
-                Some(host) => host.stop().await.map_err(ServiceError::from),
-                None => Ok(()),
+            // An orderly shutdown stopped the owners while the drivers ran;
+            // a run that a driver's end cut short stops them here, with no
+            // one to carry a hand-off.
+            let StoppedOwners {
+                fleet,
+                directory,
+                hosted,
+                control,
+            } = match stopped {
+                Some(stopped) => stopped,
+                None => stop_owners(&self.handles).await,
             };
-            // Every partition a split added on this node stops with the first.
-            let mut hosted = Ok(());
-            let first = self.handles.directory.plan().partition();
-            for partition in self.handles.directory.hosted() {
-                if partition.plan.partition() != first
-                    && let Err(error) = partition.host.stop().await
-                {
-                    hosted = Err(ServiceError::from(error));
-                }
-            }
-            let control = self
-                .handles
-                .control
-                .stop()
-                .await
-                .map_err(ServiceError::from);
+            self.pool.close();
             let content = self
                 .handles
                 .content
@@ -1363,20 +1753,23 @@ impl NetworkService {
                 .finish()
                 .await;
             joined?;
-            fleet?;
+            let fleet = fleet?;
             directory?;
             hosted?;
             control?;
             content?;
             self.listener.shutdown().await;
-            Ok::<(), ServiceError>(())
+            Ok::<ServiceStopped, ServiceError>(ServiceStopped {
+                sessions_led: fleet.sessions_led,
+                sessions_handed_off: fleet.sessions_handed_off,
+            })
         };
         // A future may be moved to another runtime between polls. Contain the
         // timer dependency here too, after the earlier run boundary has ended.
         let cleaned = std::panic::AssertUnwindSafe(async {
-            tokio::time::timeout(SHUTDOWN_DEADLINE, cleanup)
-                .await
-                .map_err(|_| ServiceError::ShutdownTimeout)?
+            focal_rt::time::within(SHUTDOWN_DEADLINE, cleanup)
+                .await?
+                .ok_or(ServiceError::ShutdownTimeout)?
         })
         .catch_unwind()
         .await
@@ -1387,11 +1780,20 @@ impl NetworkService {
         // cleanly) must not replace it.
         running.and(cleaned)
     }
-    async fn run_tasks<F, R>(&mut self, shutdown: F, mut on_status: R) -> Result<(), ServiceError>
+    /// Runs until `shutdown` resolves or a driver ends. On shutdown the
+    /// owners are stopped here, while the listener and the replication
+    /// drivers still run, and what their stops returned is handed back for
+    /// the cleanup; a driver's end returns its error and no stops.
+    async fn run_tasks<F, R>(
+        &mut self,
+        shutdown: F,
+        mut on_status: R,
+    ) -> Result<Option<StoppedOwners>, ServiceError>
     where
         F: Future<Output = std::io::Result<()>>,
         R: FnMut(&NetworkServiceStatus) -> std::io::Result<()>,
     {
+        // What the run consumes is taken first; from then on the service is only read.
         let controller = self
             .controller
             .take()
@@ -1400,271 +1802,460 @@ impl NetworkService {
             .control_output
             .take()
             .ok_or(ServiceError::Owner("egress already consumed"))?;
-        // Concurrent sends are bounded by the pool's own admission: a peer
-        // that stopped answering holds at most `per_peer_inflight` of them
-        // for one dial and then fails fast, so the driver's cap only has to
-        // exceed what the unreachable peers of a moment can hold at once,
-        // never leaving live followers' appends queued behind dead ones.
-        let inflight = self.pool.limits().max_inflight.min(1024);
-        let control_driver = drive_control_replication(output, &self.pool, inflight);
         let directory_startup = self.directory_startup.take();
-        let owners = self
+        let ledger_output = self.ledger_output.take();
+        let metrics_listener = self.metrics_listener.take();
+        let evidence = self.evidence.take();
+        let signer = self.signer.take();
+        let agent = self.agent.take();
+        let archive_agent = self.archive_agent.take();
+        let gc_agent = self.gc_agent.take();
+        let liveness_driver = self.liveness.take();
+        let route_driver = self.routes.take();
+        let requests = self
+            .credential_requests
+            .take()
+            .ok_or(ServiceError::Owner("credential requests already consumed"))?;
+        let this: &Self = self;
+        let owners = this
             .owners
             .as_ref()
             .ok_or(ServiceError::Owner("missing node owner"))?;
-        let directory_driver = async {
-            match directory_startup {
-                Some(startup) => startup.run(&self.handles.control, &self.pool, owners).await,
-                None => std::future::pending().await,
-            }
-        };
-        let ledger_output = self.ledger_output.take();
-        let metrics_listener = self.metrics_listener.take();
-        let ledger_driver = async {
+        // The drivers hold what the pool itself admits: every connection's
+        // lane at once. A send is started only when its peer's lane has a
+        // place for it (`replication::drive`), so a peer that stopped
+        // answering holds its own lane and nothing of another's (the
+        // audit's F42).
+        let inflight = this.pool.limits().max_inflight;
+        // Every driver below is made inside `boxed`, never in this function's own frame: a debug
+        // build keeps each future made here as a temporary of its own, at once, and the drivers
+        // together were 605 KiB of this frame, which with the frames beneath it overflowed a 2 MiB
+        // thread. Here each is a pointer.
+        let mut control_driver =
+            focal_rt::boxed(|| drive_control_replication(output, &this.pool, inflight));
+        let mut ledger_driver = focal_rt::boxed(|| async move {
             match ledger_output {
-                Some(output) => drive_fleet_replication(output, &self.pool, inflight)
+                Some(output) => drive_fleet_replication(output, &this.pool, inflight)
                     .await
                     .map(|_| ()),
                 None => std::future::pending().await,
             }
-        };
-        let evidence = self.evidence.take();
-        let evidence_driver = async {
-            match evidence {
-                Some(driver) => driver.run(&self.pool).await,
-                None => std::future::pending().await,
-            }
-        };
-        let signer = self.signer.take();
+        });
         let signer_control = if signer.is_some() {
             Some(NetworkEnrollmentControl::new(
-                &self.pool,
-                &self.handles.control,
-                self.authority.clone(),
-                self.registry.authenticate(self.founder_fingerprint)?,
+                &this.pool,
+                &this.handles.control,
+                this.authority.clone(),
+                &this.registry,
+                this.presented.clone(),
                 RouteEpoch(1),
-                &self.budget,
+                &this.budget,
             )?)
         } else {
             None
         };
-        let signer_driver = async {
-            match (signer, signer_control.as_ref()) {
-                (Some(driver), Some(control)) => driver.run(control).await,
-                _ => std::future::pending().await,
-            }
-        };
-        let network = self
-            .listener
-            .serve(self.data.clone(), self.enrollment.clone());
-        let local = self.local.serve(self.data.clone());
-        let admin = async {
-            match &self.admin {
-                Some((server, handler)) => server.serve(handler.clone()).await,
-                None => std::future::pending().await,
-            }
-        };
+        let signer_control = signer_control.as_ref();
+        let mut network = focal_rt::boxed(|| {
+            this.listener
+                .serve(this.data.clone(), this.enrollment.clone())
+        });
         let swap = crate::credential_renewal::CredentialSwap {
-            listener: Some(self.listener.identity().map_err(ServiceError::Wire)?),
-            placement: self.handles.placement.clone(),
-            requests: self
-                .credential_requests
-                .take()
-                .ok_or(ServiceError::Owner("credential requests already consumed"))?,
+            listener: Some(this.listener.identity().map_err(ServiceError::Wire)?),
+            placement: this.handles.placement.clone(),
+            requests,
         };
-        let controller = controller.run(&self.pool, &self.handles.control, &self.registry, swap);
-        let agent = self.agent.take();
-        let placement_agent = async {
-            match agent {
-                Some(agent) => agent.run(&self.handles, &self.pool).await,
-                None => std::future::pending().await,
-            }
-        };
-        let archive_agent = self.archive_agent.take();
-        let archive_agent = async {
-            match archive_agent {
-                Some(agent) => agent.run(&self.handles).await,
-                None => std::future::pending().await,
-            }
-        };
-        let gc_agent = self.gc_agent.take();
-        let gc_agent = async {
-            match gc_agent {
-                Some(agent) => agent.run(&self.handles).await,
-                None => std::future::pending().await,
-            }
-        };
-        let liveness_driver = self.liveness.take();
-        let liveness = async {
-            match liveness_driver {
-                Some(driver) => driver.run(&self.pool).await,
-                None => std::future::pending().await,
-            }
-        };
-        let route_driver = self.routes.take();
-        let routes = async {
-            match route_driver {
-                Some(driver) => driver.run(&self.handles, &self.pool).await,
-                None => std::future::pending().await,
-            }
-        };
-        let managed_support = crate::managed_support::drive(
-            &self.handles.fleet,
-            &self.pool,
-            &self.budget,
-            &self.handles.content,
-        );
-        // The metrics sampler publishes a fresh snapshot on a fixed cadence
-        // (24 §23); the admin socket and the loopback endpoint render the
-        // latest one, never sampling on a caller's behalf.
-        let metrics_sampler = async {
-            loop {
-                let snapshot = self.sample_metrics().await;
-                self.metrics.send_replace(Some(snapshot));
-                tokio::time::sleep(crate::metrics::SAMPLE_INTERVAL).await;
-            }
-        };
-        // The root group's tick period follows the round trips this node
-        // measures to the group's other voters (27 §3.1 P2). A group inside
-        // one period keeps the configured period; a far one is stretched so
-        // its election timeout stays ten round-trip tails of its slowest
-        // voter. While the root cannot be observed the last pace stands.
-        let pacer = async {
-            loop {
-                if let Ok(observation) = self.handles.control.observe_root().await {
-                    let local = self.status.node;
-                    let paths: Vec<focal_timing::PathRtt> = observation
-                        .configuration()
-                        .configuration
-                        .voters
-                        .iter()
-                        .filter(|voter| **voter != local)
-                        .filter_map(|voter| self.pool.path(*voter))
-                        .collect();
-                    self.handles.control.pace(paths.iter());
-                }
-                // Every hosted session paces itself by its own voters: a
-                // session whose voters are near keeps the configured period
-                // beside one whose voters are far.
-                let local = self.status.node;
-                let pace_session = |host: &ReplicaHost| {
-                    let paths: Vec<focal_timing::PathRtt> = host
-                        .progress()
-                        .voters
-                        .iter()
-                        .filter(|voter| **voter != local)
-                        .filter_map(|voter| self.pool.path(*voter))
-                        .collect();
-                    host.pace(paths.iter());
-                };
-                if let Some(host) = &self.handles.ledger {
-                    pace_session(host);
-                }
-                let mut after = None;
-                while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
-                    pace_session(&host);
-                    after = Some(ledger);
-                    tokio::task::yield_now().await;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        };
-        let metrics_view = self.metrics.subscribe();
-        let metrics_endpoint = async {
-            match metrics_listener {
-                Some(listener) => crate::metrics::serve_loopback(listener, metrics_view).await,
-                None => std::future::pending().await,
-            }
-        };
-        let ready = async {
-            if let Some(ledger) = &self.handles.ledger {
-                loop {
-                    let peer = AuthenticatedPeer::local(PeerGrant {
-                        principal: signer_principal(self.authority.identity().cluster.0),
-                        tenants: BTreeSet::from([self.status.ledger.tenant]),
-                        role: PeerRole::Runtime,
-                    })?;
-                    if matches!(
-                        self.handles
-                            .control
-                            .read(peer, RequestId::from_u128(1), ControlRead::Membership)
-                            .await,
-                        Ok(ControlReadResult::Membership(_))
-                    ) && {
-                        // The founder's replica is running with a known
-                        // leader: itself, or another voter of the group it
-                        // rejoined after a restart (it follows then, and its
-                        // local socket routes to the leader as any node's).
-                        let progress = ledger.progress();
-                        !progress.stopped && progress.leader != 0
-                    } && self.handles.directory.host().is_some_and(|host| {
-                        let progress = host.progress();
-                        !progress.stopped
-                            && progress.applied_index > 0
-                            && progress.leader == progress.node
-                    }) {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                let mut status = self.status.clone();
-                status.condition = "Ready";
-                on_status(&status)?;
-            } else {
-                on_status(&self.status)?;
-            }
-            std::future::pending::<Result<(), ServiceError>>().await
-        };
-        tokio::pin!(
-            network,
-            local,
-            admin,
-            controller,
-            placement_agent,
-            archive_agent,
-            gc_agent,
-            liveness,
-            routes,
-            directory_driver,
-            managed_support,
-            control_driver,
-            ledger_driver,
-            evidence_driver,
-            signer_driver,
-            ready,
-            shutdown,
-            metrics_sampler,
-            metrics_endpoint,
-            pacer
-        );
-        tokio::select! {
-            result=&mut shutdown=>result.map_err(ServiceError::Io),
-            result=&mut ready=>result,
-            result=&mut network=>result.map_err(ServiceError::Wire).and(Err(ServiceError::Owner("network listener ended"))),
-            result=&mut local=>result.map_err(ServiceError::Wire).and(Err(ServiceError::Owner("local listener ended"))),
-            result=&mut admin=>result.map_err(ServiceError::Wire).and(Err(ServiceError::Owner("admin listener ended"))),
-            result=&mut controller=>result.map_err(ServiceError::Controller).and(Err(ServiceError::Owner("controller ended"))),
-            result=&mut placement_agent=>result.map_err(ServiceError::Agent).and(Err(ServiceError::Owner("placement agent ended"))),
-            result=&mut archive_agent=>result.map_err(ServiceError::Access).and(Err(ServiceError::Owner("archive agent ended"))),
-            result=&mut gc_agent=>result.map_err(ServiceError::Access).and(Err(ServiceError::Owner("collector agent ended"))),
-            result=&mut directory_driver=>result,
-            ()=&mut liveness=>Err(ServiceError::Owner("liveness driver ended")),
-            ()=&mut routes=>Err(ServiceError::Owner("route cache driver ended")),
-            _=&mut managed_support=>Err(ServiceError::Owner("managed capability driver ended")),
-            result=&mut control_driver=>result.map_err(ServiceError::from).and(Err(ServiceError::Owner("control egress ended"))),
-            result=&mut ledger_driver=>result.map_err(ServiceError::from).and(Err(ServiceError::Owner("ledger egress ended"))),
-            _=&mut evidence_driver=>Err(ServiceError::Owner("evidence driver ended")),
-            _=&mut signer_driver=>Err(ServiceError::Owner("enrollment driver ended")),
-            ()=&mut metrics_sampler=>Err(ServiceError::Owner("metrics sampler ended")),
-            ()=&mut pacer=>Err(ServiceError::Owner("pace driver ended")),
-            result=&mut metrics_endpoint=>result.map_err(ServiceError::Io).and(Err(ServiceError::Owner("metrics endpoint ended"))),
-            _=self.handles.control.closed()=>Err(match self.handles.control.progress().failure {
-                Some(failure) => ServiceError::ControlOwner(failure),
-                None => ServiceError::Owner("control owner ended"),
+        let metrics_view = this.metrics.subscribe();
+        let on_status = &mut on_status;
+        let handles = &this.handles;
+        // Every other driver, each mapped to how its end ends the run: a shutdown signalled
+        // (`true`), the run over with nothing to stop (`false`), or why it failed.
+        let mut drivers: [Ending<'_>; 19] = [
+            focal_rt::boxed(
+                || async move { shutdown.await.map_err(ServiceError::Io).map(|()| true) },
+            ),
+            focal_rt::boxed(|| async move { this.ready(on_status).await.map(|()| false) }),
+            focal_rt::boxed(|| async move {
+                this.local
+                    .serve(this.data.clone())
+                    .await
+                    .map_err(ServiceError::Wire)
+                    .and(Err(ServiceError::Owner("local listener ended")))
             }),
+            focal_rt::boxed(|| async move {
+                match &this.admin {
+                    Some((server, handler)) => server.serve(handler.clone()).await,
+                    None => std::future::pending().await,
+                }
+                .map_err(ServiceError::Wire)
+                .and(Err(ServiceError::Owner("admin listener ended")))
+            }),
+            focal_rt::boxed(|| async move {
+                controller
+                    .run(&this.pool, &this.handles.control, &this.registry, swap)
+                    .await
+                    .map_err(ServiceError::Controller)
+                    .and(Err(ServiceError::Owner("controller ended")))
+            }),
+            focal_rt::boxed(|| async move {
+                match agent {
+                    Some(agent) => agent.run(&this.handles, &this.pool).await,
+                    None => std::future::pending().await,
+                }
+                .map_err(ServiceError::Agent)
+                .and(Err(ServiceError::Owner("placement agent ended")))
+            }),
+            focal_rt::boxed(|| async move {
+                match archive_agent {
+                    Some(agent) => agent.run(&this.handles).await,
+                    None => std::future::pending().await,
+                }
+                .map_err(ServiceError::Access)
+                .and(Err(ServiceError::Owner("archive agent ended")))
+            }),
+            focal_rt::boxed(|| async move {
+                match gc_agent {
+                    Some(agent) => agent.run(&this.handles).await,
+                    None => std::future::pending().await,
+                }
+                .map_err(ServiceError::Access)
+                .and(Err(ServiceError::Owner("collector agent ended")))
+            }),
+            focal_rt::boxed(|| async move {
+                match directory_startup {
+                    Some(startup) => startup.run(&this.handles.control, &this.pool, owners).await,
+                    None => std::future::pending().await,
+                }
+                .map(|()| false)
+            }),
+            focal_rt::boxed(|| async move {
+                if let Some(driver) = liveness_driver {
+                    driver.run(&this.pool).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+                Err(ServiceError::Owner("liveness driver ended"))
+            }),
+            focal_rt::boxed(|| async move {
+                if let Some(driver) = route_driver {
+                    driver.run(&this.handles, &this.pool).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+                Err(ServiceError::Owner("route cache driver ended"))
+            }),
+            focal_rt::boxed(|| async move {
+                crate::managed_support::drive(
+                    &this.handles.fleet,
+                    &this.pool,
+                    &this.budget,
+                    &this.handles.content,
+                )
+                .await;
+                Err(ServiceError::Owner("managed capability driver ended"))
+            }),
+            focal_rt::boxed(|| async move {
+                let _ = match evidence {
+                    Some(driver) => driver.run(&this.pool).await,
+                    None => std::future::pending().await,
+                };
+                Err(ServiceError::Owner("evidence driver ended"))
+            }),
+            focal_rt::boxed(|| async move {
+                let _ = match (signer, signer_control) {
+                    (Some(driver), Some(control)) => driver.run(control).await,
+                    _ => std::future::pending().await,
+                };
+                Err(ServiceError::Owner("enrollment driver ended"))
+            }),
+            focal_rt::boxed(|| async move {
+                this.sample_on_cadence().await;
+                Err(ServiceError::Owner("metrics sampler ended"))
+            }),
+            focal_rt::boxed(|| async move {
+                this.pace().await;
+                Err(ServiceError::Owner("pace driver ended"))
+            }),
+            focal_rt::boxed(|| async move {
+                this.size_stream_pool().await;
+                Err(ServiceError::Owner("stream pool sizer ended"))
+            }),
+            focal_rt::boxed(|| async move {
+                match metrics_listener {
+                    Some(listener) => crate::metrics::serve_loopback(listener, metrics_view).await,
+                    None => std::future::pending().await,
+                }
+                .map_err(ServiceError::Rt)
+                .and(Err(ServiceError::Owner("metrics endpoint ended")))
+            }),
+            focal_rt::boxed(|| async move {
+                handles.control.closed().await;
+                Err(match handles.control.progress().failure {
+                    Some(failure) => ServiceError::ControlOwner(failure),
+                    None => ServiceError::Owner("control owner ended"),
+                })
+            }),
+        ];
+        // The first of them to end ends the race; each registers its own wakes as it is polled.
+        let signalled = std::future::poll_fn(|context| {
+            if let Poll::Ready(result) = network.as_mut().poll(context) {
+                return Poll::Ready(
+                    result
+                        .map_err(ServiceError::Wire)
+                        .and(Err(ServiceError::Owner("network listener ended"))),
+                );
+            }
+            if let Poll::Ready(result) = control_driver.as_mut().poll(context) {
+                return Poll::Ready(
+                    result
+                        .map_err(ServiceError::from)
+                        .and(Err(ServiceError::Owner("control egress ended"))),
+                );
+            }
+            if let Poll::Ready(result) = ledger_driver.as_mut().poll(context) {
+                return Poll::Ready(
+                    result
+                        .map_err(ServiceError::from)
+                        .and(Err(ServiceError::Owner("ledger egress ended"))),
+                );
+            }
+            for driver in &mut drivers {
+                if let Poll::Ready(ended) = driver.as_mut().poll(context) {
+                    return Poll::Ready(ended);
+                }
+            }
+            Poll::Pending
+        })
+        .await;
+        if !signalled? {
+            return Ok(None);
+        }
+        // The stop phase: the owners stop while the listener that receives their peers' messages
+        // and the drivers that carry theirs are still polled — a leader among them hands its log
+        // off first (27 §5), which is messages both ways. A driver that ends here was closed by an
+        // owner that stopped; it is not what ends the service.
+        let mut stops = focal_rt::boxed(|| stop_owners(handles));
+        let (mut network_ended, mut control_ended, mut ledger_ended) = (false, false, false);
+        let stopped = std::future::poll_fn(|context| {
+            if let Poll::Ready(stopped) = stops.as_mut().poll(context) {
+                return Poll::Ready(stopped);
+            }
+            if !network_ended && network.as_mut().poll(context).is_ready() {
+                network_ended = true;
+            }
+            if !control_ended && control_driver.as_mut().poll(context).is_ready() {
+                control_ended = true;
+            }
+            if !ledger_ended && ledger_driver.as_mut().poll(context).is_ready() {
+                ledger_ended = true;
+            }
+            Poll::Pending
+        })
+        .await;
+        // The other drivers are held, unpolled, until the owners have stopped: what one of them
+        // holds while it runs (its registrations, its sockets) is the stopping owners' as well, and
+        // a hand-off, messages both ways, must find them where they were.
+        drop(drivers);
+        Ok(Some(stopped))
+    }
+    /// Publishes a fresh metrics snapshot on a fixed cadence (24 §23); the
+    /// admin socket and the loopback endpoint render the latest one, never
+    /// sampling on a caller's behalf.
+    async fn sample_on_cadence(&self) {
+        // Where each family's listing resumes, and what every session
+        // counted (the audit's F26); none when no page could list each
+        // family, and then no page is published.
+        let mut rounds =
+            crate::metrics::rounds::Rounds::new(&self.metrics_labels, self.budget.clone());
+        loop {
+            // A round has the cadence to observe its sessions: a slow
+            // or stuck owner costs its entry, never the round, and the
+            // next round starts on the cadence whatever this one took
+            // (the audit's F65). The text is rendered here, once. A
+            // round refused its room keeps the last page, whose sample
+            // time says its age, and the next page counts it.
+            let started = Instant::now();
+            if let Some(rounds) = rounds.as_mut() {
+                let page = match focal_rt::boxed(|| self.sample_metrics(started, rounds)).await {
+                    Ok(snapshot) => crate::metrics::MetricsPage::new(snapshot, &self.budget).ok(),
+                    Err(_) => None,
+                };
+                match page {
+                    Some(page) => {
+                        self.metrics.send_replace(Some(page));
+                    }
+                    None => rounds.refused(),
+                }
+            }
+            // A sleep refused (no wheel to keep it) ends the sampler, never spins it.
+            if focal_rt::time::sleep_until(
+                started
+                    .checked_add(crate::metrics::SAMPLE_INTERVAL)
+                    .unwrap_or(started),
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
         }
     }
+    /// Sizes the stream pool the listener's participants share (hyper-transport's
+    /// `StreamCredit::Pooled`, docs/archictecutre/27 §17) to twice the writes the sessions this
+    /// node leads take at once, and never under one connection's streams, so a node that leads
+    /// nothing still answers redirects and reads. A session holds about its write window queued
+    /// and as many in its pipeline before its door holds the rest, so participants granted twice
+    /// it send little the door must hold, and what they would send past it waits for a stream on
+    /// their side; and a window is the most writes answered in one bound, so twice it leaves it
+    /// room to grow, a doubling a bound as a slow start's. It is sized again
+    /// each least bound of those sessions, what a window is counted within, and never more often
+    /// than the transport's timer granularity; with none led, at the metrics cadence.
+    async fn size_stream_pool(&self) {
+        let floor = u64::from(self.listener.streams_per_connection());
+        let mut sized = None;
+        loop {
+            let mut admission = self.handles.fleet.led_admission();
+            if let Some(host) = &self.handles.ledger
+                && let Some(led) = host.led_admission()
+            {
+                admission = crate::fleet::add_admission(admission, led);
+            }
+            let (windows, least) = admission;
+            let streams = u32::try_from(windows.saturating_mul(2).max(floor)).unwrap_or(u32::MAX);
+            if sized != Some(streams) && self.listener.set_stream_pool(streams).is_ok() {
+                sized = Some(streams);
+            }
+            // Never more often than the transport's timers are judged at: a bound of a few hundred
+            // microseconds on a fast device would wake it for nothing in between.
+            let next = least
+                .unwrap_or(crate::metrics::SAMPLE_INTERVAL)
+                .max(focal_wire::TIMER_GRANULARITY);
+            if focal_rt::time::sleep(next).await.is_err() {
+                return;
+            }
+        }
+    }
+    /// The root group's tick period follows the round trips this node
+    /// measures to the group's other voters (27 §3.1 P2). A group inside
+    /// one period keeps the configured period; a far one is stretched so
+    /// its election timeout stays ten round-trip tails of its slowest
+    /// voter. While the root cannot be observed the last pace stands.
+    async fn pace(&self) {
+        loop {
+            if let Ok(observation) = self.handles.control.observe_root().await {
+                let local = self.status.node;
+                let paths: Vec<focal_timing::PathRtt> = observation
+                    .configuration()
+                    .configuration
+                    .voters
+                    .iter()
+                    .filter(|voter| **voter != local)
+                    .filter_map(|voter| self.pool.path(*voter))
+                    .collect();
+                self.handles.control.pace(paths.iter());
+                // What the root's commits wait on among its voters is timed
+                // by its owner, from their answers (27 §8.4).
+            }
+            // Every hosted session paces itself by its own voters: a
+            // session whose voters are near keeps the configured period
+            // beside one whose voters are far.
+            let local = self.status.node;
+            let pace_session = |host: &ReplicaHost| {
+                let progress = host.progress();
+                let paths: Vec<focal_timing::PathRtt> = progress
+                    .voters
+                    .iter()
+                    .filter(|voter| **voter != local)
+                    .filter_map(|voter| self.pool.path(*voter))
+                    .collect();
+                host.pace(paths.iter());
+                // And what each path holds in flight bounds the bytes
+                // a leader sends its peer ahead of its answers (27 §11):
+                // the voters, and the members the directory admitted,
+                // which a leader catches up before they vote.
+                let windows: Vec<(u64, u64, u64)> = progress
+                    .voters
+                    .iter()
+                    .chain(progress.admitted.iter())
+                    .filter(|peer| **peer != local)
+                    .filter_map(|peer| {
+                        Some((
+                            *peer,
+                            self.pool.window(*peer)?,
+                            self.pool.path(*peer)?.smoothed_ns(),
+                        ))
+                    })
+                    // A path nothing was measured on says nothing: the
+                    // peer keeps what it has.
+                    .filter(|(_, _, round_trip_ns)| *round_trip_ns > 0)
+                    .collect();
+                host.inflight_windows(windows);
+            };
+            if let Some(host) = &self.handles.ledger {
+                pace_session(host);
+            }
+            let mut after = None;
+            while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
+                pace_session(&host);
+                after = Some(ledger);
+                hyper_rt::futures::yield_now().await;
+            }
+            if focal_rt::time::sleep(Duration::from_secs(1)).await.is_err() {
+                return;
+            }
+        }
+    }
+    /// Says the node is ready once its founder's replica serves writes and its partition serves
+    /// with a known leader; a host that runs no session says so at once. Then holds until the run
+    /// ends.
+    async fn ready<R>(&self, on_status: &mut R) -> Result<(), ServiceError>
+    where
+        R: FnMut(&NetworkServiceStatus) -> std::io::Result<()>,
+    {
+        if let Some(ledger) = &self.handles.ledger {
+            loop {
+                let peer = AuthenticatedPeer::local(PeerGrant {
+                    principal: signer_principal(self.authority.identity().cluster.0),
+                    tenants: BTreeSet::from([self.status.ledger.tenant]),
+                    role: PeerRole::Runtime,
+                })?;
+                let membership = matches!(
+                    self.handles
+                        .control
+                        .read(peer, RequestId::from_u128(1), ControlRead::Membership)
+                        .await,
+                    Ok(ControlReadResult::Membership(_))
+                );
+                // The founder's replica serves (`ReplicaProgress::serves`): it
+                // leads a term it is ready in, or follows another voter of the
+                // group it rejoined after a restart (its local socket routes to
+                // the leader as any node's). A known leader alone was not
+                // enough: one not yet ready in its term refuses a write.
+                if membership
+                    && ledger.observe(crate::fleet::ReplicaProgress::serves)
+                    && self.handles.directory.host().is_some_and(|host| {
+                        // The partition's replica: it leads, or it follows a
+                        // known leader among the voters the group grew to
+                        // (F24); readiness never requires leadership.
+                        let progress = host.progress();
+                        !progress.stopped && progress.applied_index > 0 && progress.leader != 0
+                    })
+                {
+                    break;
+                }
+                focal_rt::time::sleep(Duration::from_millis(25)).await?;
+            }
+            let mut status = self.status.clone();
+            status.condition = "Ready";
+            on_status(&status)?;
+        } else {
+            on_status(&self.status)?;
+        }
+        std::future::pending::<Result<(), ServiceError>>().await
+    }
 }
+/// A driver of the service's run, boxed beside the others it races, mapped to how its end ends
+/// the run.
+type Ending<'a> = std::pin::Pin<Box<dyn Future<Output = Result<bool, ServiceError>> + 'a>>;
 fn clean_socket(path: &Path, root: &Path) -> Result<(), ServiceError> {
     #[cfg(unix)]
     {
@@ -1702,28 +2293,13 @@ fn clean_socket(path: &Path, root: &Path) -> Result<(), ServiceError> {
         Ok(())
     }
 }
-fn founder_fingerprint(state: &NetworkState) -> Result<[u8; 32], ServiceError> {
-    let focal_control::ControlBootstrap::Root { enrollment, .. } = &state.genesis.bootstrap else {
-        return Err(NodeError::Identity.into());
-    };
-    let registry = focal_enrollment::EnrollmentRegistry::restore(
-        enrollment,
-        state.genesis.founder.cluster,
-        focal_enrollment::EnrollmentLimits::default(),
-    )
-    .map_err(NetworkError::from)?;
-    let founder = registry.enrollments().next().ok_or(NodeError::Identity)?;
-    Ok(certificate_fingerprint(&founder.certificate))
-}
-
 #[cfg(test)]
 #[path = "network_service_tests.rs"]
 pub(crate) mod tests;
 
+/// The service's tasks are a hyper-rt shard's: off one, nothing it serves could wait.
 fn require_runtime() -> Result<(), ServiceError> {
-    tokio::runtime::Handle::try_current().map_err(|_| NetworkError::RuntimeRequired)?;
-    std::panic::catch_unwind(|| drop(tokio::time::sleep(Duration::ZERO)))
-        .map_err(|_| ServiceError::Runtime)?;
+    hyper_rt::futures::shard_id().ok_or(NetworkError::RuntimeRequired)?;
     Ok(())
 }
 
@@ -1734,14 +2310,37 @@ pub(crate) fn native_hosting(
     root: &Path,
     identity: &crate::embedded::NodeIdentity,
     disk: focal_memory::DiskBudget,
+    session: &SessionLimits,
+    seal_rule: focal_ledger::SealRule,
+    retire_rule: focal_ledger::RetireRule,
+    share: focal_ledger::NativeShare,
 ) -> Result<focal_ledger::NativeHosting, focal_evidence::ContentError> {
+    let mut limits = native_limits(
+        focal_model::ContentDomainId(identity.ledger.tenant.0),
+        session.native_memory_bytes(share),
+        session.memory_bytes,
+    )?;
+    limits.seal_rule = seal_rule;
+    limits.retire_rule = retire_rule;
     Ok(focal_ledger::NativeHosting {
-        limits: native_limits(focal_model::ContentDomainId(identity.ledger.tenant.0))?,
+        limits,
         reader: focal_evidence::ContentReader::open(root.join("content"))?,
         seeds: focal_evidence::SeedStore::open(
             crate::custody::seed_directory(&root.join("seeds"), identity.ledger),
-            disk,
+            disk.clone(),
         )?,
+        // Every binary at the cold level keeps the session's cold streams, whatever the fence:
+        // it follows a leader that retires cold (doc 31 M2, A2).
+        cold: Some(focal_ledger::ColdSource {
+            root: crate::custody::seed_directory(&root.join("cold"), identity.ledger),
+            disk: disk.clone(),
+            geometry: focal_evidence::ColdGeometry::STANDARD,
+        }),
+        // The replica's payload log (doc 31 M3): its rows' payloads off the heap.
+        payloads: Some(focal_ledger::PayloadSource {
+            root: crate::custody::seed_directory(&root.join("payloads"), identity.ledger),
+            disk,
+        }),
         range: focal_memory::RangeId(u128::from(identity.node)),
     })
 }
@@ -1754,6 +2353,26 @@ pub(crate) const DISK_HEADROOM_ENV: &str = "FOCAL_DISK_HEADROOM_BYTES";
 /// travels as seeds (25 §5). Unset keeps the standard 4 MiB; a campaign
 /// lowers it so every checkpoint is seeded.
 pub(crate) const SEED_INLINE_ENV: &str = "FOCAL_SEED_INLINE_BYTES";
+/// The resident outcome window of a native session (F12): the outcomes the
+/// live core keeps for exact retries and open obligations before the
+/// closed generations' outcomes seal into bundles under custody. Unset
+/// keeps the standard window; a campaign lowers it so the seals, the
+/// generation floors they force and the sealed reads run within a test's
+/// lifetime. It sizes memory: every replica of a session must run under
+/// the same window, or a seal record derived under one is refused by name
+/// under the other (`OutcomeBound`).
+pub(crate) const NATIVE_OUTCOMES_ENV: &str = "FOCAL_NATIVE_OUTCOMES";
+pub(crate) fn native_outcomes() -> Result<Option<usize>, focal_evidence::ContentError> {
+    match std::env::var_os(NATIVE_OUTCOMES_ENV) {
+        Some(value) => value
+            .to_str()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .filter(|outcomes| *outcomes != 0)
+            .map(Some)
+            .ok_or(focal_evidence::ContentError::Invalid),
+        None => Ok(None),
+    }
+}
 pub(crate) fn seed_inline_bytes() -> Result<usize, focal_evidence::ContentError> {
     match std::env::var_os(SEED_INLINE_ENV) {
         Some(value) => value
@@ -1783,13 +2402,22 @@ pub(crate) fn disk_headroom_bytes() -> Result<u64, focal_evidence::ContentError>
 pub(crate) fn disk_budget() -> Result<DiskBudget, focal_evidence::ContentError> {
     DiskBudget::new(DiskBudgetConfig::default()).map_err(|_| focal_evidence::ContentError::Invalid)
 }
-/// The standard native session limits with the operator's disk headroom.
+/// The standard native session limits for an engine that admits within `memory_bytes` and holds
+/// within `hold_bytes` (its session's allowance), with the operator's disk headroom.
 pub(crate) fn native_limits(
     domain: focal_model::ContentDomainId,
+    memory_bytes: usize,
+    hold_bytes: usize,
 ) -> Result<focal_ledger::NativeSessionLimits, focal_evidence::ContentError> {
-    let mut limits = focal_ledger::NativeSessionLimits::standard(domain);
+    let mut limits =
+        focal_ledger::NativeSessionLimits::standard_within(domain, memory_bytes, hold_bytes);
     limits.disk_headroom_bytes = disk_headroom_bytes()?;
     limits.checkpoint.inline_bytes = seed_inline_bytes()?;
+    // The work bound follows the inline bound it is derived from.
+    limits.checkpoint = limits.checkpoint.derived();
+    if let Some(outcomes) = native_outcomes()? {
+        limits.recovery.native.outcomes = outcomes;
+    }
     // Committed records this node did not author are materialized in
     // dependency waves on up to four workers (doc 25 §2); the result is
     // byte-identical to the serial replay at any count.

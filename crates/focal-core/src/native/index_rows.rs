@@ -26,12 +26,12 @@
 //! transitions never pay for claim timers. All other families are written
 //! once at creation.
 use super::*;
-use focal_memory::{Change, Entry};
+use focal_memory::Change;
 use focal_model::lifecycle::artifact_descriptor::{self, ArtifactDescriptor};
 use focal_model::lifecycle::claim_descriptor::ClaimDescriptor;
 use focal_model::lifecycle::scope;
 use focal_model::lifecycle::validation::{PhasePolicyView, ProgramView};
-use focal_model::{Deadline, ObjectId, ObjectKind, RelationTarget};
+use focal_model::{ActionType, Deadline, ObjectId, ObjectKind, RelationTarget, ScopeKind};
 
 /// One derived index change: a unit row to write or a stale key to delete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +47,7 @@ impl IndexChange {
     }
     pub(super) fn into_change(self) -> Change<Key, Row> {
         match self {
-            Self::Put(key) => Change::Put(Entry::new(key, Row::Index, 0)),
+            Self::Put(key) => Change::Put(entry(key, Row::Index, 0)),
             Self::Delete(key) => Change::Delete(key),
         }
     }
@@ -211,11 +211,12 @@ pub(super) fn timer_bound(
 pub(super) const STATUS_ROWS: usize = 2;
 /// Index rows one accepted result adds beyond its artifact.
 pub(super) const ACCEPTED_ROWS: usize = 1;
-/// The smallest failed admission report: eleven primary rows, a result
-/// artifact without inputs (four rows: identity, producer, kind and schema),
-/// its verdict and the parent claim's status move.
+/// The smallest failed admission report: twelve primary rows (the
+/// principal's window among them, F12), a result artifact without inputs
+/// (four rows: identity, producer, kind and schema), its verdict and the
+/// parent claim's status move.
 pub(super) const MINIMUM_FAILED_REPORT_ROWS: usize =
-    11 + ARTIFACT_FIXED_ROWS + ACCEPTED_ROWS + STATUS_ROWS;
+    12 + ARTIFACT_FIXED_ROWS + ACCEPTED_ROWS + STATUS_ROWS;
 /// The most inputs one artifact admitted under `limits` can cite: the
 /// configured allowance, never above the model's fixed ceiling.
 pub(super) fn input_bound(limits: NativeLimits) -> usize {
@@ -296,10 +297,90 @@ pub(super) fn is_index(key: Key) -> bool {
 /// when the ledger carries one; scopes and relations index only authored
 /// content, so an imported projection-only claim carries the participant,
 /// status and creation rows alone.
+/// What index rows read of a claim's content: its action, scopes and relations, whether the
+/// descriptor is built or read in place from its encoding (doc 31 M3).
+pub trait ContentSource {
+    fn action(&self) -> Result<ActionType, NativeError>;
+    fn each_scope(
+        &self,
+        each: &mut dyn FnMut(ScopeKind, &str) -> Result<(), NativeError>,
+    ) -> Result<(), NativeError>;
+    fn each_relation(
+        &self,
+        each: &mut dyn FnMut(&focal_model::Relation) -> Result<(), NativeError>,
+    ) -> Result<(), NativeError>;
+}
+impl<T: ContentSource + ?Sized> ContentSource for &T {
+    fn action(&self) -> Result<ActionType, NativeError> {
+        (**self).action()
+    }
+    fn each_scope(
+        &self,
+        each: &mut dyn FnMut(ScopeKind, &str) -> Result<(), NativeError>,
+    ) -> Result<(), NativeError> {
+        (**self).each_scope(each)
+    }
+    fn each_relation(
+        &self,
+        each: &mut dyn FnMut(&focal_model::Relation) -> Result<(), NativeError>,
+    ) -> Result<(), NativeError> {
+        (**self).each_relation(each)
+    }
+}
+impl ContentSource for ClaimDescriptor {
+    fn action(&self) -> Result<ActionType, NativeError> {
+        Ok(ClaimDescriptor::action(self))
+    }
+    fn each_scope(
+        &self,
+        each: &mut dyn FnMut(ScopeKind, &str) -> Result<(), NativeError>,
+    ) -> Result<(), NativeError> {
+        for scope in self.scopes() {
+            each(scope.kind, scope.key)?;
+        }
+        Ok(())
+    }
+    fn each_relation(
+        &self,
+        each: &mut dyn FnMut(&focal_model::Relation) -> Result<(), NativeError>,
+    ) -> Result<(), NativeError> {
+        for relation in self.relations() {
+            each(relation)?;
+        }
+        Ok(())
+    }
+}
+impl ContentSource for super::input_codec::ClaimBodyInput<'_> {
+    fn action(&self) -> Result<ActionType, NativeError> {
+        Ok(self.roles()?.action)
+    }
+    fn each_scope(
+        &self,
+        each: &mut dyn FnMut(ScopeKind, &str) -> Result<(), NativeError>,
+    ) -> Result<(), NativeError> {
+        use focal_model::lifecycle::claim_descriptor::ClaimSource;
+        for scope in self.view().scopes() {
+            let scope = scope?;
+            each(scope.kind, scope.key)?;
+        }
+        Ok(())
+    }
+    fn each_relation(
+        &self,
+        each: &mut dyn FnMut(&focal_model::Relation) -> Result<(), NativeError>,
+    ) -> Result<(), NativeError> {
+        use focal_model::lifecycle::claim_descriptor::ClaimSource;
+        for relation in self.view().relations() {
+            each(&relation?)?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn claim(
     before: Option<&ClaimState>,
     after: &ClaimState,
-    content: Option<&ClaimDescriptor>,
+    content: Option<&dyn ContentSource>,
     outcomes: &dyn TimerOutcomes,
     sink: &mut dyn FnMut(IndexChange) -> Result<(), NativeError>,
 ) -> Result<(), NativeError> {
@@ -317,15 +398,18 @@ pub(super) fn claim(
             ObjectId(id.0),
         )))?;
         if let Some(content) = content {
-            sink(IndexChange::Put(Key::ByAction(content.action().code(), id)))?;
-            for scope in content.scopes() {
+            sink(IndexChange::Put(Key::ByAction(
+                content.action()?.code(),
+                id,
+            )))?;
+            content.each_scope(&mut |kind, key| {
                 sink(IndexChange::Put(Key::ByScope(
-                    scope.kind.code(),
-                    scope_key_hash(scope.key),
+                    kind.code(),
+                    scope_key_hash(key),
                     id,
-                )))?;
-            }
-            for relation in content.relations() {
+                )))
+            })?;
+            content.each_relation(&mut |relation| {
                 // The target column holds the target object's identity: a
                 // claim's, or an exact evidence artifact's.
                 let target = match &relation.target {
@@ -344,7 +428,8 @@ pub(super) fn claim(
                         id,
                     )))?;
                 }
-            }
+                Ok(())
+            })?;
         }
     }
     let status = after.status().code();
@@ -552,20 +637,27 @@ impl Collector {
 }
 
 /// The authored body of `id` as this plan sees it: a body written by this
-/// same plan (creation) or the retained body of an existing claim.
+/// same plan (creation) or the retained body of an existing claim, read in place from its
+/// encoding (doc 31 M3), a spilled one through `buffer`.
 fn content_of<'a>(
     id: ClaimId,
     view: &'a View<'_>,
     extras: &'a prepare::Extras,
-) -> Option<&'a ClaimDescriptor> {
-    extras
+    buffer: &'a mut super::owned::ContentBuffer,
+) -> Result<Option<super::input_codec::ClaimBodyInput<'a>>, NativeError> {
+    let written = extras
         .rows
         .iter()
         .find_map(|extra| match (extra.key, &extra.row) {
-            (Key::ClaimContent(owner), Row::ClaimContent(body)) if owner == id => body.get(),
+            (Key::ClaimContent(owner), row @ Row::ClaimContent(_)) if owner == id => Some(row),
             _ => None,
-        })
-        .or_else(|| authored_reads::content(view.get(Key::ClaimContent(id))))
+        });
+    match written {
+        Some(row) => authored_reads::content_view(Some(row), view.payloads(), buffer),
+        None => {
+            authored_reads::content_view(view.get(Key::ClaimContent(id)), view.payloads(), buffer)
+        }
+    }
 }
 
 /// The declaration of `id` as this plan sees it: written by this plan or
@@ -602,12 +694,21 @@ fn derive_into(
         view,
         current: invocation,
     };
+    let mut buffer = super::owned::ContentBuffer::new();
     for row in rows {
         let id = ClaimId(row.binding().object.0);
+        let before = view.claim(id);
+        // A claim's content names its index rows only where it is created.
+        let content = match before {
+            None => content_of(id, view, extras, &mut buffer)?,
+            Some(_) => None,
+        };
         claim(
-            view.claim(id),
+            before,
             row,
-            content_of(id, view, extras),
+            content
+                .as_ref()
+                .map(|content| content as &dyn ContentSource),
             &outcomes,
             sink,
         )?;
@@ -677,13 +778,8 @@ fn derive_into(
             if !rows.iter().any(|row| row.binding().object.0 == id.0) =>
         {
             if let Some(state) = view.claim(id) {
-                claim(
-                    Some(state),
-                    state,
-                    content_of(id, view, extras),
-                    &outcomes,
-                    sink,
-                )?;
+                // Not a creation: the content names no index row here.
+                claim(Some(state), state, None, &outcomes, sink)?;
             }
         }
         NativeInvocation::EvaluationDeadline(key)

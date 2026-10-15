@@ -25,7 +25,7 @@ impl ReplicaHost {
                 DIAGNOSTICS_BYTES,
             )?
             .commit();
-        let (send, receive) = oneshot::channel();
+        let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| LedgerError::Capacity)?;
         self.sender
             .try_send(Work::Diagnostics(send, charge))
             .map_err(|error| match error {
@@ -78,6 +78,9 @@ impl Owner {
                 .map(|pending| pending.missing.len()),
             delivery_retained: self.session.delivery_retained(),
             log_entries_since_checkpoint: self.log_entries_since_checkpoint(),
+            promises_at: self.session.promises().0,
+            managed_promises: self.session.promises().1.to_vec(),
+            native_promises: self.session.promises().2.to_vec(),
             retention: self.session.native_retention().ok().map(|report| {
                 focal_client::admin::AdminRetention {
                     published: report.published.0,
@@ -92,11 +95,77 @@ impl Owner {
                     retiring: report.retiring,
                 }
             }),
+            checkpoints: self
+                .session
+                .recent_checkpoints()
+                .map(|timing| focal_client::admin::AdminCheckpointTiming {
+                    index: timing.index,
+                    bytes: timing.bytes,
+                    native_micros: timing.native_micros,
+                    envelope_micros: timing.envelope_micros,
+                    deferred_micros: timing.deferred_micros,
+                    write_micros: timing.write_micros,
+                    commit_micros: timing.commit_micros,
+                    chunks: timing.chunks,
+                    written_chunks: timing.written_chunks,
+                })
+                .collect(),
+            slow_steps: self
+                .slow
+                .kept()
+                .into_iter()
+                .map(|step| focal_client::admin::AdminSlowStep {
+                    what: step.what.to_owned(),
+                    micros: step.micros,
+                    at_ms: step.at_ms,
+                })
+                .collect(),
+            sealing: self.sealing(),
+            memory: self.session.native_memory_stats().map(|native| {
+                let session = self.session.memory_stats();
+                let width = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+                let payloads = self.session.native_payload_log().unwrap_or_default();
+                let mut native_by_kind = [0; focal_client::admin::NATIVE_MEMORY_KINDS];
+                for (slot, kind) in native_by_kind.iter_mut().zip(focal_memory::BudgetKind::ALL) {
+                    *slot = width(native.used_by(kind));
+                }
+                focal_client::admin::AdminSessionMemory {
+                    used: width(session.used),
+                    limit: width(session.limit),
+                    native_used: width(native.used),
+                    native_limit: width(native.limit),
+                    payload_segments: width(payloads.segments),
+                    payload_bytes: payloads.bytes,
+                    payload_open_refusals: payloads.open_refusals,
+                    native_by_kind,
+                }
+            }),
         };
         ReplicaDiagnosticsReply {
             value,
             _charge: charge,
         }
+    }
+}
+impl Owner {
+    /// The live window and its seals (F12), when the session is native.
+    fn sealing(&self) -> Option<Box<focal_client::admin::AdminSealing>> {
+        let core = self.session.native_core().ok()?;
+        let (seals_applied, seals_inert) = self.session.native_seals().ok()?;
+        let (closes_applied, seals_dropped) = self.session.native_closes().ok()?;
+        Some(Box::new(focal_client::admin::AdminSealing {
+            rule: match self.session.native_seal_rule().ok()? {
+                focal_ledger::SealRule::Derived => "derived".to_owned(),
+                focal_ledger::SealRule::Anchored => "anchored".to_owned(),
+            },
+            resident_outcomes: u64::try_from(core.resident_outcomes()).unwrap_or(u64::MAX),
+            outcome_bound: u64::try_from(core.native_limits().outcomes).unwrap_or(u64::MAX),
+            seals_applied,
+            closes_applied,
+            seals_inert,
+            seals_dropped,
+            busy: self.session.native_seal_busy().unwrap_or(false),
+        }))
     }
 }
 fn hex(bytes: &[u8]) -> String {
@@ -126,7 +195,7 @@ mod tests {
         .unwrap();
         let budget = MemoryBudget::new(64 * 1024 * 1024, 24 * 1024 * 1024).unwrap();
         let (sender, _receiver) = mpsc::sync_channel(4);
-        let (outbound, _outgoing) = async_mpsc::channel(16);
+        let (outbound, _outgoing) = hyper_rt::sync::channel(16).unwrap();
         let (_host, mut owner) = ReplicaHost::assemble(
             session,
             ReplicaConfig::new(RootCommandId::from_u128(503)),
@@ -139,7 +208,7 @@ mod tests {
         .unwrap();
         assert!(!owner.session.managed_support_demanded());
         let baseline = budget.stats().used;
-        let (send, receive) = oneshot::channel();
+        let (send, mut receive) = hyper_rt::sync::oneshot().unwrap();
         let charge = budget
             .reserve(
                 BudgetKind::Control,

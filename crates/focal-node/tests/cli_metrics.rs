@@ -44,7 +44,7 @@ fn start(root: &Path, config: &Path, advertise: &str) -> Server {
     deadline::observe(root);
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args(["--config", config.to_str().unwrap()])
-        .args(["--data-dir", root.to_str().unwrap(), "start"])
+        .args(["--data-dir", root.to_str().unwrap(), "start", "node"])
         .args(["--advertise", advertise])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -104,7 +104,7 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
     // The operator surface is the network node's admin socket; a laptop
     // node without an address has none.
     let _server = start(root, &config, &advertise);
-    let identity = run(root, &config, &["cluster", "node", "identity"]);
+    let identity = run(root, &config, &["inspect", "node", "--identity"]);
     assert!(identity.status.success());
     let identity: serde_json::Value = serde_json::from_slice(&identity.stdout).unwrap();
     let node = identity["result"]["identity"]["node"].as_u64().unwrap();
@@ -116,7 +116,7 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
     // labels and the founder's session, once the sampler has run.
     let mut deadline = deadline::Deadline::after(Duration::from_secs(30));
     let text = loop {
-        let output = run(root, &config, &["cluster", "node", "metrics"]);
+        let output = run(root, &config, &["inspect", "node", "--metrics"]);
         assert!(
             output.status.success(),
             "{}",
@@ -136,28 +136,58 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
     let base = format!("node=\"{node}\",cluster=\"");
     assert!(text.contains(&format!("focal_node_info{{{base}")), "{text}");
     assert!(
-        text.contains("role=\"founder\",region=\"eu-a\",zone=\"eu-a-1\",capability=\"1\"} 1"),
+        text.contains(&format!(
+            "role=\"founder\",region=\"eu-a\",zone=\"eu-a-1\",capability=\"{}\"}} 1",
+            focal_node::upgrade::CAPABILITY_LEVEL
+        )),
         "{text}"
     );
+    // The node's identity is on `focal_node_info` alone; a series carries its
+    // own labels, or none.
+    assert_eq!(
+        text.lines()
+            .filter(|line| !line.starts_with('#') && line.contains("node=\""))
+            .count(),
+        1,
+        "{text}"
+    );
+    let has = |text: &str, name: &str| {
+        text.lines().any(|line| {
+            line.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('{'))
+        })
+    };
     for series in [
-        "focal_memory_used_bytes{",
-        "focal_memory_limit_bytes{",
-        "focal_disk_outstanding_bytes{",
-        "focal_wal_appended_records_total{",
-        "focal_fleet_installed{",
-        "focal_root_applied_index{",
-        "focal_peer_messages_delivered_total{",
-        "focal_liveness_members{",
-        "focal_upgrade_fence_level{",
-        "focal_upgrade_announced_level{",
-        "focal_placement_installed{",
-        "focal_admission_tenants{",
-        "# TYPE focal_session_apply_lag gauge",
+        "focal_memory_used_bytes",
+        "focal_memory_limit_bytes",
+        "focal_disk_outstanding_bytes",
+        // A node founded at this binary's level writes its groups through hyper-log's log
+        // under the shell (`upgrade::STORAGE_LEVEL`): its log's frames, not focal-log's records.
+        "focal_log_frames_total",
+        "focal_fleet_installed",
+        "focal_root_applied_index",
+        "focal_peer_messages_delivered_total",
+        "focal_liveness_members",
+        "focal_upgrade_fence_level",
+        "focal_upgrade_announced_level",
+        "focal_placement_installed",
+        "focal_admission_tenants",
     ] {
-        assert!(text.contains(series), "missing {series}: {text}");
+        assert!(has(&text, series), "missing {series}: {text}");
+    }
+    assert!(
+        text.contains("# TYPE focal_session_apply_lag gauge"),
+        "{text}"
+    );
+    // The node's charge, kind by kind.
+    for kind in focal_memory::BudgetKind::ALL {
+        let series = format!(
+            "focal_memory_used_by_kind_bytes{{kind=\"{}\"}} ",
+            kind.label()
+        );
+        assert!(text.contains(&series), "missing {series}: {text}");
     }
     assert!(text.contains(&format!("session=\"{session}\"")), "{text}");
-    assert!(text.contains("focal_upgrade_fence_level{") && text.contains("} 0\n"));
     assert!(text.ends_with('\n'));
     // The loopback endpoint serves the same exposition to GET /metrics, and
     // nothing else.
@@ -185,5 +215,5 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
     // A second scrape still answers after the refused ones.
     let (head, body) = http(&listen, "GET /metrics HTTP/1.0\r\n\r\n");
     assert!(head.starts_with("HTTP/1.0 200 OK"), "{head}");
-    assert!(body.contains("focal_metrics_sampled_milliseconds{"));
+    assert!(has(&body, "focal_metrics_sampled_milliseconds"), "{body}");
 }

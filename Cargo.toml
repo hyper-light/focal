@@ -1,11 +1,27 @@
 [workspace]
 members = ["crates/*", "tools/*"]
+# The shared crates vendored from hyper-raft are roots of their own (SNAPSHOT in each).
+exclude = [
+    "vendor/hyper-block",
+    "vendor/hyper-datagram",
+    "vendor/hyper-durable",
+    "vendor/hyper-liveness",
+    "vendor/hyper-log",
+    "vendor/hyper-quic",
+    "vendor/hyper-raft",
+    "vendor/hyper-rt",
+    "vendor/hyper-rt-transport",
+    "vendor/hyper-seal",
+    "vendor/hyper-timing",
+    "vendor/hyper-tls",
+    "vendor/hyper-transport",
+]
 resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.98.1"
 license = "MIT"
 repository = "https://github.com/hyper-light/focal"
 
@@ -14,19 +30,50 @@ blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
 crc32fast = "1.5"
 getrandom = "0.3"
+# The focal binary's allocator: musl's, which the release links, cost every node of the
+# comparison 4–11% of its CPU and a follower ~10% more in page-fault churn (cluster profile
+# run 38187112271). mimalloc: Leijen, Zorn and de Moura, "Mimalloc: Free List Sharding in
+# Action", APLAS 2019; its v2 line.
+mimalloc = { version = "=0.1.52", default-features = false, features = ["v2"] }
+rquickjs = { version = "0.14", default-features = false, features = ["std"] }
 postcard = { version = "1.1", features = ["alloc", "use-std"] }
-# Upstream PR #578: native Prost compatibility + maintained rustc-hash.
-# Exact commit provenance and validation: docs/dependencies/raft-upstream.md.
-raft = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
-# The message and entry types alone, for focal's own core (27 §4.2): the same
-# revision as `raft`, so both speak one wire and one log format.
+# Pin projection for focal-rt's named waits (`timeout`): the work held in place,
+# once, with no `unsafe` of focal's own (hyper-rt's choice for its combinators).
+pin-project-lite = "0.2.17"
+# The durable shell around the core, vendored from hyper-raft with the log and
+# block layers and the liveness stream it builds on (vendor/*/SNAPSHOT; 27 §15).
+hyper-block = { version = "0.1.0", path = "vendor/hyper-block" }
+hyper-durable = { version = "0.1.0", path = "vendor/hyper-durable" }
+hyper-log = { version = "0.1.0", path = "vendor/hyper-log" }
+# Sealing at rest, vendored from hyper-raft (vendor/hyper-seal/SNAPSHOT;
+# docs/archictecutre/29-sealing-at-rest.md).
+hyper-seal = { version = "0.1.0", path = "vendor/hyper-seal" }
+# The consensus core, vendored from hyper-raft (vendor/hyper-raft/SNAPSHOT;
+# 27 §4.2): focal's core moved there and is shared with mantle and slates.
+hyper-raft = { version = "0.1.0", path = "vendor/hyper-raft" }
+# The runtime and the transport, vendored from hyper-raft (vendor/*/SNAPSHOT): the
+# thread-per-core runtime every async task runs on (hyper-rt), the sans-io
+# application layer over QUIC (hyper-transport over hyper-quic and hyper-tls),
+# the sealed datagram plane (hyper-datagram), and the driver that runs the
+# endpoint and the plane on a hyper-rt shard (hyper-rt-transport).
+hyper-datagram = { version = "0.1.0", path = "vendor/hyper-datagram" }
+hyper-quic = { version = "0.1.0", path = "vendor/hyper-quic" }
+hyper-rt = { version = "0.1.0", path = "vendor/hyper-rt" }
+hyper-rt-transport = { version = "0.1.0", path = "vendor/hyper-rt-transport" }
+hyper-tls = { version = "0.1.0", path = "vendor/hyper-tls" }
+hyper-transport = { version = "0.1.0", path = "vendor/hyper-transport" }
+# raft-rs 0.7's message and log types, for focal-consensus's tests alone: the
+# oracle its envelope codec is held to byte for byte, since focal's WAL and
+# wire keep raft-rs's protobuf encoding (focal-consensus/src/envelope.rs).
+# Upstream PR #578; provenance: docs/dependencies/raft-upstream.md.
 raft-proto = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_saphyr = { package = "serde-saphyr", version = "1.2", default-features = false, features = ["deserialize"] }
-slog = "2.7"
 tempfile = "3.20"
 thiserror = "2.0"
+# tools/compare alone: the competitors' canonical clients it drives (async-nats, redis) run on
+# tokio. No focal crate uses it; focal runs on hyper-rt (vendor/hyper-rt).
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "fs"] }
 
 [workspace.lints.rust]
@@ -70,3 +117,9 @@ incremental = false
 [profile.test]
 debug = 0
 incremental = false
+
+# The build `scripts/check_recursion.py` reads (CLAUDE.md §1a): unoptimised, so every call is an
+# explicit `call`, and one codegen unit, so each crate's IR is one file.
+[profile.recursion-ir]
+inherits = "dev"
+codegen-units = 1

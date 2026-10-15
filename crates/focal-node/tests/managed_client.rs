@@ -19,7 +19,6 @@ use focal_node::{
 };
 use focal_wire::*;
 use std::{collections::BTreeSet, time::Duration};
-use tokio::runtime::Runtime;
 
 const CLAIM: ClaimId = ClaimId::from_u128(700);
 const CONSUMER: ConsumerId = ConsumerId::from_u128(701);
@@ -73,8 +72,8 @@ impl Harness {
         drop(self.host);
         self.owner.join().unwrap();
     }
-    fn checkpoint_and_stop(self, runtime: &Runtime) {
-        runtime.block_on(self.host.stop()).unwrap();
+    async fn checkpoint_and_stop(self) {
+        self.host.stop().await.unwrap();
         drop(self.client);
         drop(self.host);
         self.owner.join().unwrap();
@@ -105,23 +104,21 @@ fn control_request(input: &RequestStreamControlInput) -> RequestEnvelope {
         },
     )
 }
-fn control(
-    runtime: &Runtime,
+async fn control(
     harness: &Harness,
     input: &RequestStreamControlInput,
 ) -> RequestStreamControlReceipt {
-    runtime
-        .block_on(
-            harness
-                .client
-                .request_stream_control(control_request(input), harness.context()),
-        )
+    harness
+        .client
+        .request_stream_control(control_request(input), harness.context())
+        .await
         .unwrap()
         .receipt
 }
-fn read(runtime: &Runtime, harness: &Harness, query: RequestStreamQuery) -> RequestStreamRead {
-    runtime
-        .block_on(harness.client.request_stream_read(
+async fn read(harness: &Harness, query: RequestStreamQuery) -> RequestStreamRead {
+    harness
+        .client
+        .request_stream_read(
             envelope(
                 harness.context(),
                 RequestId::from_u128(9000),
@@ -131,11 +128,12 @@ fn read(runtime: &Runtime, harness: &Harness, query: RequestStreamQuery) -> Requ
                 },
             ),
             harness.context(),
-        ))
+        )
+        .await
         .unwrap()
         .page
 }
-fn assert_legacy(runtime: &Runtime, harness: &Harness, expected: &MutationReceipt) {
+async fn assert_legacy(harness: &Harness, expected: &MutationReceipt) {
     let mut request = envelope(
         harness.context(),
         RequestId::from_u128(9001),
@@ -145,8 +143,10 @@ fn assert_legacy(runtime: &Runtime, harness: &Harness, expected: &MutationReceip
         }),
     );
     request.protocol = PROTOCOL_VERSION;
-    let reply = runtime
-        .block_on(harness.client.reconcile(request, harness.identity.issuer))
+    let reply = harness
+        .client
+        .reconcile(request, harness.identity.issuer)
+        .await
         .unwrap();
     assert!(matches!(reply.page.result, ReconcileResult::Receipt {
         resolution: ReceiptResolution::Committed(ref actual), ..
@@ -229,318 +229,54 @@ fn limits() -> ManagedStoreLimits {
 
 #[test]
 fn actual_client_store_reconciles_lost_replies_retires_both_families_and_keeps_legacy_receipts() {
-    // Store fsyncs run on this synchronous caller; only transport waits enter the runtime.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(temp.path().join("node"));
-    let harness = Harness::start(EmbeddedNode::open(&settings).unwrap());
-    let context = harness.context();
-    let original_identity = harness.identity.clone();
-    let mut legacy_request = envelope(
-        context,
-        RequestId::from_u128(1000),
-        Operation::OpenEpoch {
-            epoch: RequestEpoch(1),
-        },
-    );
-    legacy_request.protocol = PROTOCOL_VERSION;
-    let MutationReply::Committed(legacy) = runtime
-        .block_on(harness.client.submit(legacy_request))
-        .unwrap()
-    else {
-        panic!("legacy receipt")
-    };
-
-    let store_root = temp.path().join("managed");
-    let register = registration(context, 0, 2000);
-    let store =
-        ManagedOperationStore::create(&store_root, context, limits(), register.clone()).unwrap();
-    let original_registration = control(&runtime, &harness, &store.registration().unwrap());
-    // Registration committed, but its response never entered the private journal.
-    drop(store);
-    harness.drop_without_checkpoint();
-    let harness = Harness::start(EmbeddedNode::open(&settings).unwrap());
-    assert_eq!(harness.identity, original_identity);
-    let store = ManagedOperationStore::open(&store_root, context, limits()).unwrap();
-    assert!(!store.status().unwrap().registered);
-    let retried_registration = control(&runtime, &harness, &store.registration().unwrap());
-    assert_eq!(retried_registration, original_registration);
-    store.record_registration(retried_registration).unwrap();
-
-    // Same RequestId as the legacy receipt is a distinct real scoped key.
-    let domain = store.reserve(RequestId::from_u128(1000)).unwrap();
-    let authored = new_claim(&harness.identity);
-    let domain_intent = OperationIntent {
-        name: "claim.submit",
-        version: 1,
-        canonical: br#"{"description":"durable managed request"}"#,
-    };
-    let prepared = store
-        .prepare(domain, domain_intent, |key| {
-            Ok(envelope(
-                context,
-                key.id,
-                Operation::Managed {
-                    key,
-                    operation: ManagedOperation::Submit {
-                        expected_revision: None,
-                        command: Command::GenerateClaim { claim: authored },
-                    },
-                },
-            ))
-        })
-        .unwrap();
-    let exact_domain_request = prepared.request;
-    let original_domain = runtime
-        .block_on(
-            harness
-                .client
-                .submit_managed(exact_domain_request.clone(), context),
-        )
-        .unwrap()
-        .receipt;
-    assert_eq!(original_domain.sequence, SessionSeq(legacy.sequence.0 + 1));
-    assert!(
-        matches!(&original_domain.outcome, ManagedReceiptOutcome::Domain(CommandResult::Generated(ids)) if ids == &[CLAIM])
-    );
-    assert_eq!(store.receipt(domain).unwrap(), None);
-    drop(store);
-    harness.drop_without_checkpoint();
-
-    let node = EmbeddedNode::open(&settings).unwrap();
-    assert_eq!(node.session.sequence(), original_domain.sequence);
-    assert_eq!(
-        node.session
-            .read_at_least(original_domain.sequence)
+    focal_rt::block_on(async move {
+        // Store fsyncs run on this synchronous caller; only transport waits enter the runtime.
+        let temp = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(temp.path().join("node"));
+        let harness = Harness::start(EmbeddedNode::open(&settings).unwrap());
+        let context = harness.context();
+        let original_identity = harness.identity.clone();
+        let mut legacy_request = envelope(
+            context,
+            RequestId::from_u128(1000),
+            Operation::OpenEpoch {
+                epoch: RequestEpoch(1),
+            },
+        );
+        legacy_request.protocol = PROTOCOL_VERSION;
+        let MutationReply::Committed(legacy) = harness.client.submit(legacy_request).await
             .unwrap()
-            .claims
-            .len(),
-        1
-    );
-    let harness = Harness::start(node);
-    let store = ManagedOperationStore::open(&store_root, context, limits()).unwrap();
-    let retried = store
-        .prepare(domain, domain_intent, |_| {
-            panic!("unknown operation expanded twice")
-        })
-        .unwrap();
-    assert_eq!(retried.request, exact_domain_request);
-    let recovered = runtime
-        .block_on(harness.client.submit_managed(retried.request, context))
-        .unwrap()
-        .receipt;
-    assert_eq!(recovered, original_domain);
-    store.record_receipt(domain, &recovered).unwrap();
+        else {
+            panic!("legacy receipt")
+        };
 
-    let cursor = store.reserve(RequestId::from_u128(1001)).unwrap();
-    let prepared = store
-        .prepare(
-            cursor,
-            OperationIntent {
-                name: "stream.open",
-                version: 1,
-                canonical: br#"{"filter":"all","seed":false}"#,
-            },
-            |key| {
-                Ok(envelope(
-                    context,
-                    key.id,
-                    Operation::Managed {
-                        key,
-                        operation: ManagedOperation::Cursor(StreamRequest::Open {
-                            consumer: CONSUMER,
-                            filter: DeltaFilter::All,
-                            start: None,
-                            seed: false,
-                            credits: Credits {
-                                items: 16,
-                                bytes: 64 * 1024,
-                            },
-                        }),
-                    },
-                ))
-            },
-        )
-        .unwrap();
-    let cursor_request = prepared.request;
-    let opened = runtime
-        .block_on(
-            harness
-                .client
-                .submit_managed(cursor_request.clone(), context),
-        )
-        .unwrap();
-    let cursor_delivery = opened.stream.unwrap();
-    assert_eq!(
-        opened.receipt.sequence, original_domain.sequence,
-        "cursor metadata is not a domain mutation"
-    );
-    assert!(opened.receipt.raft_index > original_domain.raft_index);
-    assert!(matches!(
-        opened.receipt.outcome,
-        ManagedReceiptOutcome::Cursor {
-            record: Some(_),
-            ..
-        }
-    ));
-    assert_eq!(
-        cursor_delivery.acknowledged.position,
-        Position::origin(context.ledger)
-    );
-    store.record_receipt(cursor, &opened.receipt).unwrap();
-    assert!(matches!(
-        store.reserve(RequestId::from_u128(1002)),
-        Err(ManagedStoreError::Capacity)
-    ));
-    let before_ack = read(&runtime, &harness, RequestStreamQuery::Slot { slot: 0 });
-    assert!(
-        matches!(
-            before_ack.result,
-            RequestStreamReadResult::Slot(RequestStreamState::Active {
-                revision: 1,
-                acknowledged_through: 0,
-                ..
-            })
-        ),
-        "ordinary outcomes do not change the control CAS revision"
-    );
+        let store_root = temp.path().join("managed");
+        let register = registration(context, 0, 2000);
+        let store =
+            ManagedOperationStore::create(&store_root, context, limits(), register.clone()).unwrap();
+        let original_registration = control(&harness, &store.registration().unwrap()).await;
+        // Registration committed, but its response never entered the private journal.
+        drop(store);
+        harness.drop_without_checkpoint();
+        let harness = Harness::start(EmbeddedNode::open(&settings).unwrap());
+        assert_eq!(harness.identity, original_identity);
+        let store = ManagedOperationStore::open(&store_root, context, limits()).unwrap();
+        assert!(!store.status().unwrap().registered);
+        let retried_registration = control(&harness, &store.registration().unwrap()).await;
+        assert_eq!(retried_registration, original_registration);
+        store.record_registration(retried_registration).unwrap();
 
-    let acknowledgment = store
-        .prepare_acknowledgment(RequestId::from_u128(2002), 2)
-        .unwrap();
-    let RequestStreamCommand::Acknowledge {
-        through, receipts, ..
-    } = &acknowledgment.command
-    else {
-        panic!("ack")
-    };
-    assert_eq!(*through, 2);
-    assert_eq!(
-        receipts,
-        &vec![
-            ManagedReceiptAck {
-                key: original_domain.key,
-                receipt_hash: original_domain.content_hash().unwrap()
-            },
-            ManagedReceiptAck {
-                key: opened.receipt.key,
-                receipt_hash: opened.receipt.content_hash().unwrap()
-            },
-        ]
-    );
-    let original_ack = control(&runtime, &harness, &acknowledgment);
-    drop(store);
-    harness.drop_without_checkpoint();
-    let node = EmbeddedNode::open(&settings).unwrap();
-    assert_eq!(node.session.sequence(), original_domain.sequence);
-    assert_eq!(
-        node.session.cursor(CONSUMER).unwrap().token.position,
-        cursor_delivery.acknowledged.position,
-        "request-history ACK must never acknowledge consumer delta progress"
-    );
-    let harness = Harness::start(node);
-    let store = ManagedOperationStore::open(&store_root, context, limits()).unwrap();
-    assert_eq!(store.status().unwrap().retired_through, 0);
-    assert_eq!(
-        store.pending_control().unwrap(),
-        Some(acknowledgment.clone())
-    );
-    let retried_ack = control(&runtime, &harness, &acknowledgment);
-    assert_eq!(retried_ack, original_ack);
-    store.record_control(retried_ack).unwrap();
-    assert_eq!(store.status().unwrap().retired_through, 2);
-    assert!(!store_root.join("0000000000000001.prepared").exists());
-    assert!(!store_root.join("0000000000000002.receipt").exists());
-    assert!(matches!(
-        store.prepare(domain, domain_intent, |_| panic!(
-            "retired identity expanded"
-        )),
-        Err(ManagedStoreError::Retired)
-    ));
-    for (request, key) in [
-        (exact_domain_request.clone(), original_domain.key),
-        (cursor_request, opened.receipt.key),
-    ] {
-        assert!(matches!(
-            runtime.block_on(harness.client.submit_managed(request, context)),
-            Err(ClientError::Access(AccessError::ManagedRetired {
-                through: 2
-            }))
-        ));
-        assert!(matches!(
-            read(&runtime, &harness, RequestStreamQuery::Receipt { key }).result,
-            RequestStreamReadResult::Receipt {
-                resolution: ManagedReceiptResolution::Retired { through: 2 },
-                ..
-            }
-        ));
-    }
-    assert_legacy(&runtime, &harness, &legacy);
-    assert_eq!(store.stop_issuance().unwrap(), 2);
-    let close = store.prepare_close(RequestId::from_u128(2003)).unwrap();
-    store
-        .record_control(control(&runtime, &harness, &close))
-        .unwrap();
-    assert!(store.status().unwrap().closed);
-    harness.checkpoint_and_stop(&runtime);
-
-    let node = EmbeddedNode::open(&settings).unwrap();
-    assert_eq!(node.session.sequence(), original_domain.sequence);
-    assert_eq!(
-        node.session.cursor(CONSUMER).unwrap().token.position,
-        Position::origin(context.ledger)
-    );
-    let harness = Harness::start(node);
-    assert_legacy(&runtime, &harness, &legacy);
-    assert!(matches!(
-        read(
-            &runtime,
-            &harness,
-            RequestStreamQuery::Receipt {
-                key: original_domain.key
-            }
-        )
-        .result,
-        RequestStreamReadResult::Receipt {
-            resolution: ManagedReceiptResolution::StreamClosed { generation: 1 },
-            ..
-        }
-    ));
-    let next = ManagedOperationStore::create(
-        temp.path().join("next"),
-        context,
-        limits(),
-        registration(context, 1, 2010),
-    )
-    .unwrap();
-    next.record_registration(control(&runtime, &harness, &next.registration().unwrap()))
-        .unwrap();
-    assert!(matches!(
-        next.request(domain),
-        Err(ManagedStoreError::Retired)
-    ));
-    assert!(matches!(
-        runtime.block_on(harness.client.submit_managed(exact_domain_request, context)),
-        Err(ClientError::Access(AccessError::ManagedClosed {
-            generation: 1
-        }))
-    ));
-    let next_id = next.reserve(RequestId::from_u128(1000)).unwrap();
-    assert_eq!(next_id.key(context).ordinal, 1);
-    assert_eq!(next_id.key(context).stream.generation, 2);
-    let prepared = next
-        .prepare(
-            next_id,
-            OperationIntent {
-                name: "claim.post",
-                version: 1,
-                canonical: b"post existing claim",
-            },
-            |key| {
+        // Same RequestId as the legacy receipt is a distinct real scoped key.
+        let domain = store.reserve(RequestId::from_u128(1000)).unwrap();
+        let authored = new_claim(&harness.identity);
+        let domain_intent = OperationIntent {
+            name: "claim.submit",
+            version: 1,
+            canonical: br#"{"description":"durable managed request"}"#,
+        };
+        let prepared = store
+            .prepare(domain, domain_intent, |key| {
                 Ok(envelope(
                     context,
                     key.id,
@@ -548,65 +284,248 @@ fn actual_client_store_reconciles_lost_replies_retires_both_families_and_keeps_l
                         key,
                         operation: ManagedOperation::Submit {
                             expected_revision: None,
-                            command: Command::PostClaim { claim: CLAIM },
+                            command: Command::GenerateClaim { claim: authored },
                         },
                     },
                 ))
-            },
+            })
+            .unwrap();
+        let exact_domain_request = prepared.request;
+        let original_domain = harness
+                    .client
+                    .submit_managed(exact_domain_request.clone(), context).await
+            .unwrap()
+            .receipt;
+        assert_eq!(original_domain.sequence, SessionSeq(legacy.sequence.0 + 1));
+        assert!(
+            matches!(&original_domain.outcome, ManagedReceiptOutcome::Domain(CommandResult::Generated(ids)) if ids == &[CLAIM])
+        );
+        assert_eq!(store.receipt(domain).unwrap(), None);
+        drop(store);
+        harness.drop_without_checkpoint();
+
+        let node = EmbeddedNode::open(&settings).unwrap();
+        assert_eq!(node.session.sequence(), original_domain.sequence);
+        assert_eq!(
+            node.session
+                .read_at_least(original_domain.sequence)
+                .unwrap()
+                .claims
+                .len(),
+            1
+        );
+        let harness = Harness::start(node);
+        let store = ManagedOperationStore::open(&store_root, context, limits()).unwrap();
+        let retried = store
+            .prepare(domain, domain_intent, |_| {
+                panic!("unknown operation expanded twice")
+            })
+            .unwrap();
+        assert_eq!(retried.request, exact_domain_request);
+        let recovered = harness.client.submit_managed(retried.request, context).await
+            .unwrap()
+            .receipt;
+        assert_eq!(recovered, original_domain);
+        store.record_receipt(domain, &recovered).unwrap();
+
+        let cursor = store.reserve(RequestId::from_u128(1001)).unwrap();
+        let prepared = store
+            .prepare(
+                cursor,
+                OperationIntent {
+                    name: "stream.open",
+                    version: 1,
+                    canonical: br#"{"filter":"all","seed":false}"#,
+                },
+                |key| {
+                    Ok(envelope(
+                        context,
+                        key.id,
+                        Operation::Managed {
+                            key,
+                            operation: ManagedOperation::Cursor(StreamRequest::Open {
+                                consumer: CONSUMER,
+                                filter: DeltaFilter::All,
+                                start: None,
+                                seed: false,
+                                credits: Credits {
+                                    items: 16,
+                                    bytes: 64 * 1024,
+                                },
+                            }),
+                        },
+                    ))
+                },
+            )
+            .unwrap();
+        let cursor_request = prepared.request;
+        let opened = harness
+                    .client
+                    .submit_managed(cursor_request.clone(), context).await
+            .unwrap();
+        let cursor_delivery = opened.stream.unwrap();
+        assert_eq!(
+            opened.receipt.sequence, original_domain.sequence,
+            "cursor metadata is not a domain mutation"
+        );
+        assert!(opened.receipt.raft_index > original_domain.raft_index);
+        assert!(matches!(
+            opened.receipt.outcome,
+            ManagedReceiptOutcome::Cursor {
+                record: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            cursor_delivery.acknowledged.position,
+            Position::origin(context.ledger)
+        );
+        store.record_receipt(cursor, &opened.receipt).unwrap();
+        assert!(matches!(
+            store.reserve(RequestId::from_u128(1002)),
+            Err(ManagedStoreError::Capacity)
+        ));
+        let before_ack = read(&harness, RequestStreamQuery::Slot { slot: 0 }).await;
+        assert!(
+            matches!(
+                before_ack.result,
+                RequestStreamReadResult::Slot(RequestStreamState::Active {
+                    revision: 1,
+                    acknowledged_through: 0,
+                    ..
+                })
+            ),
+            "ordinary outcomes do not change the control CAS revision"
+        );
+
+        let acknowledgment = store
+            .prepare_acknowledgment(RequestId::from_u128(2002), 2)
+            .unwrap();
+        let RequestStreamCommand::Acknowledge {
+            through, receipts, ..
+        } = &acknowledgment.command
+        else {
+            panic!("ack")
+        };
+        assert_eq!(*through, 2);
+        assert_eq!(
+            receipts,
+            &vec![
+                ManagedReceiptAck {
+                    key: original_domain.key,
+                    receipt_hash: original_domain.content_hash().unwrap()
+                },
+                ManagedReceiptAck {
+                    key: opened.receipt.key,
+                    receipt_hash: opened.receipt.content_hash().unwrap()
+                },
+            ]
+        );
+        let original_ack = control(&harness, &acknowledgment).await;
+        drop(store);
+        harness.drop_without_checkpoint();
+        let node = EmbeddedNode::open(&settings).unwrap();
+        assert_eq!(node.session.sequence(), original_domain.sequence);
+        assert_eq!(
+            node.session.cursor(CONSUMER).unwrap().token.position,
+            cursor_delivery.acknowledged.position,
+            "request-history ACK must never acknowledge consumer delta progress"
+        );
+        let harness = Harness::start(node);
+        let store = ManagedOperationStore::open(&store_root, context, limits()).unwrap();
+        assert_eq!(store.status().unwrap().retired_through, 0);
+        assert_eq!(
+            store.pending_control().unwrap(),
+            Some(acknowledgment.clone())
+        );
+        let retried_ack = control(&harness, &acknowledgment).await;
+        assert_eq!(retried_ack, original_ack);
+        store.record_control(retried_ack).unwrap();
+        assert_eq!(store.status().unwrap().retired_through, 2);
+        assert!(!store_root.join("0000000000000001.prepared").exists());
+        assert!(!store_root.join("0000000000000002.receipt").exists());
+        assert!(matches!(
+            store.prepare(domain, domain_intent, |_| panic!(
+                "retired identity expanded"
+            )),
+            Err(ManagedStoreError::Retired)
+        ));
+        for (request, key) in [
+            (exact_domain_request.clone(), original_domain.key),
+            (cursor_request, opened.receipt.key),
+        ] {
+            assert!(matches!(
+                harness.client.submit_managed(request, context).await,
+                Err(ClientError::Access(AccessError::ManagedRetired {
+                    through: 2
+                }))
+            ));
+            assert!(matches!(
+                read(&harness, RequestStreamQuery::Receipt { key }).await.result,
+                RequestStreamReadResult::Receipt {
+                    resolution: ManagedReceiptResolution::Retired { through: 2 },
+                    ..
+                }
+            ));
+        }
+        assert_legacy(&harness, &legacy).await;
+        assert_eq!(store.stop_issuance().unwrap(), 2);
+        let close = store.prepare_close(RequestId::from_u128(2003)).unwrap();
+        store
+            .record_control(control(&harness, &close).await)
+            .unwrap();
+        assert!(store.status().unwrap().closed);
+        harness.checkpoint_and_stop().await;
+
+        let node = EmbeddedNode::open(&settings).unwrap();
+        assert_eq!(node.session.sequence(), original_domain.sequence);
+        assert_eq!(
+            node.session.cursor(CONSUMER).unwrap().token.position,
+            Position::origin(context.ledger)
+        );
+        let harness = Harness::start(node);
+        assert_legacy(&harness, &legacy).await;
+        assert!(matches!(
+            read(&harness,
+                RequestStreamQuery::Receipt {
+                    key: original_domain.key
+                }
+            ).await
+            .result,
+            RequestStreamReadResult::Receipt {
+                resolution: ManagedReceiptResolution::StreamClosed { generation: 1 },
+                ..
+            }
+        ));
+        let next = ManagedOperationStore::create(
+            temp.path().join("next"),
+            context,
+            limits(),
+            registration(context, 1, 2010),
         )
         .unwrap();
-    let posted = runtime
-        .block_on(harness.client.submit_managed(prepared.request, context))
-        .unwrap()
-        .receipt;
-    assert_eq!(posted.sequence, SessionSeq(original_domain.sequence.0 + 1));
-    assert!(matches!(
-        posted.outcome,
-        ManagedReceiptOutcome::Domain(CommandResult::Claim {
-            claim: CLAIM,
-            status: ClaimStatus::Posted
-        })
-    ));
-    next.record_receipt(next_id, &posted).unwrap();
-    assert_legacy(&runtime, &harness, &legacy);
-    harness.checkpoint_and_stop(&runtime);
-}
-
-#[test]
-fn managed_domain_negatives_stay_pending_and_monitor_success_has_a_managed_receipt() {
-    use focal_client::ManagedSubmitOutcome;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let directory = tempfile::tempdir().unwrap();
-    let mut settings = Settings::default();
-    settings.node.data_dir = Some(directory.path().join("node"));
-    let harness = Harness::start(EmbeddedNode::open(&settings).unwrap());
-    let context = harness.context();
-    let mut registration = registration(context, 0, 3000);
-    if let RequestStreamCommand::Register { window, .. } = &mut registration.command {
-        *window = 4;
-    }
-    let store_limits = ManagedStoreLimits {
-        window: 4,
-        ..ManagedStoreLimits::default()
-    };
-    let root = directory.path().join("requests");
-    let store =
-        ManagedOperationStore::create(&root, context, store_limits, registration.clone()).unwrap();
-    store
-        .record_registration(control(&runtime, &harness, &registration))
-        .unwrap();
-    let prepare = |id, command| {
-        let reserved = store.reserve(RequestId::from_u128(id)).unwrap();
-        let value = store
+        next.record_registration(control(&harness, &next.registration().unwrap()).await)
+            .unwrap();
+        assert!(matches!(
+            next.request(domain),
+            Err(ManagedStoreError::Retired)
+        ));
+        assert!(matches!(
+            harness.client.submit_managed(exact_domain_request, context).await,
+            Err(ClientError::Access(AccessError::ManagedClosed {
+                generation: 1
+            }))
+        ));
+        let next_id = next.reserve(RequestId::from_u128(1000)).unwrap();
+        assert_eq!(next_id.key(context).ordinal, 1);
+        assert_eq!(next_id.key(context).stream.generation, 2);
+        let prepared = next
             .prepare(
-                reserved,
+                next_id,
                 OperationIntent {
-                    name: "test.command",
+                    name: "claim.post",
                     version: 1,
-                    canonical: b"unchanged authored intent",
+                    canonical: b"post existing claim",
                 },
                 |key| {
                     Ok(envelope(
@@ -616,122 +535,196 @@ fn managed_domain_negatives_stay_pending_and_monitor_success_has_a_managed_recei
                             key,
                             operation: ManagedOperation::Submit {
                                 expected_revision: None,
-                                command,
+                                command: Command::PostClaim { claim: CLAIM },
                             },
                         },
                     ))
                 },
             )
             .unwrap();
-        (reserved, value.request)
-    };
-    let (generated, request) = prepare(
-        3001,
-        Command::GenerateClaim {
-            claim: new_claim(&harness.identity),
-        },
-    );
-    let ManagedSubmitOutcome::Committed(committed) = runtime
-        .block_on(harness.client.submit_managed_outcome(request, context))
-        .unwrap()
-    else {
-        panic!("committed generation")
-    };
-    let sequence = committed.receipt.sequence;
-    store.record_receipt(generated, &committed.receipt).unwrap();
-    let (refused, refusal) = prepare(
-        3002,
-        Command::PostClaim {
-            claim: ClaimId::from_u128(9999),
-        },
-    );
-    let (informed, information) = prepare(
-        3003,
-        Command::AcquireReceipt {
-            claim: CLAIM,
-            receipt: ReceiptId::from_u128(3004),
-            epoch: 1,
-        },
-    );
-    for (operation, request) in [(refused, refusal.clone()), (informed, information.clone())] {
-        let outcome = runtime
-            .block_on(
-                harness
-                    .client
-                    .submit_managed_outcome(request.clone(), context),
-            )
-            .unwrap();
-        match outcome {
-            ManagedSubmitOutcome::Domain(DomainOutcome::Refuse {
-                code: ErrorCode::UnknownObject,
-                ..
-            }) if operation == refused => {}
-            ManagedSubmitOutcome::Domain(DomainOutcome::Inform {
-                claim: Some(CLAIM),
-                reason: InformReason::Status(ClaimStatus::Generated),
-            }) if operation == informed => {}
-            other => panic!("unexpected transient outcome: {other:?}"),
+        let posted = harness.client.submit_managed(prepared.request, context).await
+            .unwrap()
+            .receipt;
+        assert_eq!(posted.sequence, SessionSeq(original_domain.sequence.0 + 1));
+        assert!(matches!(
+            posted.outcome,
+            ManagedReceiptOutcome::Domain(CommandResult::Claim {
+                claim: CLAIM,
+                status: ClaimStatus::Posted
+            })
+        ));
+        next.record_receipt(next_id, &posted).unwrap();
+        assert_legacy(&harness, &legacy).await;
+        harness.checkpoint_and_stop().await;
+    })
+    .unwrap()
+}
+
+#[test]
+fn managed_domain_negatives_stay_pending_and_monitor_success_has_a_managed_receipt() {
+    focal_rt::block_on(async move {
+        use focal_client::ManagedSubmitOutcome;
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(directory.path().join("node"));
+        let harness = Harness::start(EmbeddedNode::open(&settings).unwrap());
+        let context = harness.context();
+        let mut registration = registration(context, 0, 3000);
+        if let RequestStreamCommand::Register { window, .. } = &mut registration.command {
+            *window = 4;
         }
-        assert_eq!(store.request(operation).unwrap().request, request);
-        let observed = read(
-            &runtime,
-            &harness,
-            RequestStreamQuery::Receipt {
-                key: operation.key(context),
+        let store_limits = ManagedStoreLimits {
+            window: 4,
+            ..ManagedStoreLimits::default()
+        };
+        let root = directory.path().join("requests");
+        let store =
+            ManagedOperationStore::create(&root, context, store_limits, registration.clone())
+                .unwrap();
+        store
+            .record_registration(control(&harness, &registration).await)
+            .unwrap();
+        let prepare = |id, command| {
+            let reserved = store.reserve(RequestId::from_u128(id)).unwrap();
+            let value = store
+                .prepare(
+                    reserved,
+                    OperationIntent {
+                        name: "test.command",
+                        version: 1,
+                        canonical: b"unchanged authored intent",
+                    },
+                    |key| {
+                        Ok(envelope(
+                            context,
+                            key.id,
+                            Operation::Managed {
+                                key,
+                                operation: ManagedOperation::Submit {
+                                    expected_revision: None,
+                                    command,
+                                },
+                            },
+                        ))
+                    },
+                )
+                .unwrap();
+            (reserved, value.request)
+        };
+        let (generated, request) = prepare(
+            3001,
+            Command::GenerateClaim {
+                claim: new_claim(&harness.identity),
             },
         );
-        assert_eq!(observed.sequence, sequence);
-        assert!(matches!(
-            observed.result,
-            RequestStreamReadResult::Receipt {
-                resolution: ManagedReceiptResolution::Unknown,
-                ..
-            }
-        ));
-    }
-    // Existing success-only API stays source-compatible; use the typed API to
-    // preserve the refusal without marking the journal or freeing its ordinal.
-    assert!(matches!(
-        runtime.block_on(harness.client.submit_managed(refusal.clone(), context)),
-        Err(ClientError::InvalidResponse)
-    ));
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let monitor = MonitorId::from_u128(3005);
-    let (parked, request) = prepare(
-        3005,
-        Command::RegisterMonitor {
-            monitor,
-            owner: CLAIM,
-            roots: BTreeSet::from([WaitPredicate::Satisfied(CLAIM)]),
-            deadline: Deadline {
-                generation: 1,
-                at: now + 600,
-                timer: TimerId::from_u128(3006),
+        let ManagedSubmitOutcome::Committed(committed) = harness
+            .client
+            .submit_managed_outcome(request, context)
+            .await
+            .unwrap()
+        else {
+            panic!("committed generation")
+        };
+        let sequence = committed.receipt.sequence;
+        store.record_receipt(generated, &committed.receipt).unwrap();
+        let (refused, refusal) = prepare(
+            3002,
+            Command::PostClaim {
+                claim: ClaimId::from_u128(9999),
             },
-        },
-    );
-    let ManagedSubmitOutcome::Committed(parked_receipt) = runtime
-        .block_on(harness.client.submit_managed_outcome(request, context))
-        .unwrap()
-    else {
-        panic!("monitor receipt")
-    };
-    assert_eq!(parked_receipt.receipt.sequence, SessionSeq(sequence.0 + 1));
-    assert_eq!(
-        parked_receipt.receipt.outcome,
-        ManagedReceiptOutcome::Domain(CommandResult::Monitor(monitor))
-    );
-    store
-        .record_receipt(parked, &parked_receipt.receipt)
-        .unwrap();
-    assert_eq!(store.status().unwrap().retired_through, 0);
-    drop(store);
-    harness.drop_without_checkpoint();
-    let reopened = ManagedOperationStore::open(&root, context, store_limits).unwrap();
-    assert_eq!(reopened.request(refused).unwrap().request, refusal);
-    assert_eq!(reopened.request(informed).unwrap().request, information);
-    assert_eq!(reopened.status().unwrap().retired_through, 0);
+        );
+        let (informed, information) = prepare(
+            3003,
+            Command::AcquireReceipt {
+                claim: CLAIM,
+                receipt: ReceiptId::from_u128(3004),
+                epoch: 1,
+            },
+        );
+        for (operation, request) in [(refused, refusal.clone()), (informed, information.clone())] {
+            let outcome = harness
+                .client
+                .submit_managed_outcome(request.clone(), context)
+                .await
+                .unwrap();
+            match outcome {
+                ManagedSubmitOutcome::Domain(DomainOutcome::Refuse {
+                    code: ErrorCode::UnknownObject,
+                    ..
+                }) if operation == refused => {}
+                ManagedSubmitOutcome::Domain(DomainOutcome::Inform {
+                    claim: Some(CLAIM),
+                    reason: InformReason::Status(ClaimStatus::Generated),
+                }) if operation == informed => {}
+                other => panic!("unexpected transient outcome: {other:?}"),
+            }
+            assert_eq!(store.request(operation).unwrap().request, request);
+            let observed = read(
+                &harness,
+                RequestStreamQuery::Receipt {
+                    key: operation.key(context),
+                },
+            )
+            .await;
+            assert_eq!(observed.sequence, sequence);
+            assert!(matches!(
+                observed.result,
+                RequestStreamReadResult::Receipt {
+                    resolution: ManagedReceiptResolution::Unknown,
+                    ..
+                }
+            ));
+        }
+        // Existing success-only API stays source-compatible; use the typed API to
+        // preserve the refusal without marking the journal or freeing its ordinal.
+        assert!(matches!(
+            harness
+                .client
+                .submit_managed(refusal.clone(), context)
+                .await,
+            Err(ClientError::InvalidResponse)
+        ));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let monitor = MonitorId::from_u128(3005);
+        let (parked, request) = prepare(
+            3005,
+            Command::RegisterMonitor {
+                monitor,
+                owner: CLAIM,
+                roots: BTreeSet::from([WaitPredicate::Satisfied(CLAIM)]),
+                deadline: Deadline {
+                    generation: 1,
+                    at: now + 600,
+                    timer: TimerId::from_u128(3006),
+                },
+            },
+        );
+        let ManagedSubmitOutcome::Committed(parked_receipt) = harness
+            .client
+            .submit_managed_outcome(request, context)
+            .await
+            .unwrap()
+        else {
+            panic!("monitor receipt")
+        };
+        assert_eq!(parked_receipt.receipt.sequence, SessionSeq(sequence.0 + 1));
+        assert_eq!(
+            parked_receipt.receipt.outcome,
+            ManagedReceiptOutcome::Domain(CommandResult::Monitor(monitor))
+        );
+        store
+            .record_receipt(parked, &parked_receipt.receipt)
+            .unwrap();
+        assert_eq!(store.status().unwrap().retired_through, 0);
+        drop(store);
+        harness.drop_without_checkpoint();
+        let reopened = ManagedOperationStore::open(&root, context, store_limits).unwrap();
+        assert_eq!(reopened.request(refused).unwrap().request, refusal);
+        assert_eq!(reopened.request(informed).unwrap().request, information);
+        assert_eq!(reopened.status().unwrap().retired_through, 0);
+    })
+    .unwrap()
 }

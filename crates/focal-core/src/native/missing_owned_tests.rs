@@ -376,7 +376,9 @@ fn externally_reported_outcomes_cannot_impersonate_a_missing_slot() {
         );
         let verified = fixture::verified(&mut custody, &input);
         let prepared = fixture::report(&core, input, &[], &verified);
-        let result = prepared
+        let result = core
+            .native_chain(&[&prepared])
+            .unwrap()
             .evaluation(fixture::key(1))
             .unwrap()
             .last_result()

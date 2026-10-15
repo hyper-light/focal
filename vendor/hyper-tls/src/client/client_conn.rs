@@ -1,0 +1,1178 @@
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
+use core::{fmt, mem};
+
+use pki_types::{ServerName, UnixTime};
+
+use super::handy::NoClientSessionStorage;
+use super::hs::{self, ClientHelloInput};
+use crate::builder::ConfigBuilder;
+use crate::client::{EchMode, EchStatus};
+use crate::common_state::{CommonState, Protocol, Side};
+use crate::conn::{ConnectionCore, SideConfig, UnbufferedConnectionCommon};
+use crate::crypto::{CryptoProvider, SupportedKxGroup};
+use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
+use crate::error::Error;
+use crate::identity::Identity;
+use crate::kernel::KernelConnection;
+use crate::log::trace;
+use crate::msgs::enums::NamedGroup;
+use crate::msgs::handshake::ClientExtensionsInput;
+use crate::msgs::persist;
+use crate::suites::{ExtractedSecrets, SupportedCipherSuite};
+use crate::time_provider::DefaultTimeProvider;
+use crate::time_provider::TimeProvider;
+use crate::unbuffered::{EncryptError, TransmitTlsData};
+use crate::WantsVerifier;
+use crate::{compress, sign, verify, versions, KeyLog, WantsVersions};
+#[cfg(doc)]
+use crate::{crypto, DistinguishedName};
+
+/// A trait for the ability to store client session data, so that sessions
+/// can be resumed in future connections.
+///
+/// Generally all data in this interface should be treated as
+/// **highly sensitive**, containing enough key material to break all security
+/// of the corresponding session.
+///
+/// A store is owned by its [`ClientConfig`], and the `set_`, `insert_`, `remove_` and `take_`
+/// operations take `&mut self`: the calls that may change it take the configuration mutably.
+pub trait ClientSessionStore: fmt::Debug + Send + Sync {
+    /// Remember what `NamedGroup` the given server chose.
+    fn set_kx_hint(&mut self, server_name: ServerName<'static>, group: NamedGroup);
+
+    /// This should return the value most recently passed to `set_kx_hint`
+    /// for the given `server_name`.
+    ///
+    /// If `None` is returned, the caller chooses the first configured group,
+    /// and an extra round trip might happen if that choice is unsatisfactory
+    /// to the server.
+    fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup>;
+
+    /// Remember a TLS1.2 session, displacing the current one for `server_name`.
+    ///
+    /// At most one of these is current at a time, per `server_name`.
+    fn set_tls12_session(
+        &mut self,
+        server_name: ServerName<'static>,
+        value: persist::Tls12ClientSessionValue,
+    );
+
+    /// Lend the most recently saved TLS1.2 session for `server_name` to the ClientHello that
+    /// offers it.
+    ///
+    /// The connection copies out of it only what its ClientHello sends, and keeps the session's
+    /// [`SessionStamp`](persist::SessionStamp). When the server answers, a later call finds the
+    /// session again through [`lent_tls12_session`](Self::lent_tls12_session). A store should
+    /// keep a session it displaces after lending it findable there for a stated bound; a
+    /// connection whose server resumes a session its store no longer holds fails with
+    /// [`Error::ResumedSessionLost`](crate::Error::ResumedSessionLost).
+    fn tls12_session(
+        &mut self,
+        server_name: &ServerName<'static>,
+    ) -> Option<&persist::Tls12ClientSessionValue>;
+
+    /// The TLS1.2 session `stamp` this store lent for `server_name`, if it still holds it: the
+    /// current session, or one displaced since it was lent and kept.
+    fn lent_tls12_session(
+        &self,
+        server_name: &ServerName<'static>,
+        stamp: persist::SessionStamp,
+    ) -> Option<&persist::Tls12ClientSessionValue>;
+
+    /// The current TLS1.2 session for `server_name` if it is `stamp`: a connection that resumed
+    /// it renews it in place.
+    fn current_tls12_session(
+        &mut self,
+        server_name: &ServerName<'static>,
+        stamp: persist::SessionStamp,
+    ) -> Option<&mut persist::Tls12ClientSessionValue>;
+
+    /// Remove and forget any saved TLS1.2 session for `server_name`.
+    fn remove_tls12_session(&mut self, server_name: &ServerName<'static>);
+
+    /// Remember a TLS1.3 ticket that might be retrieved later from `take_tls13_ticket`, allowing
+    /// resumption of this session.
+    ///
+    /// This can be called multiple times for a given session, allowing multiple independent tickets
+    /// to be valid at once.  The number of times this is called is controlled by the server, so
+    /// implementations of this trait should apply a reasonable bound of how many items are stored
+    /// simultaneously.
+    fn insert_tls13_ticket(
+        &mut self,
+        server_name: ServerName<'static>,
+        value: persist::Tls13ClientSessionValue,
+    );
+
+    /// Return a TLS1.3 ticket previously provided to `add_tls13_ticket`.
+    ///
+    /// Implementations of this trait must return each value provided to `add_tls13_ticket` _at most once_.
+    fn take_tls13_ticket(
+        &mut self,
+        server_name: &ServerName<'static>,
+    ) -> Option<persist::Tls13ClientSessionValue>;
+}
+
+/// A trait for the ability to choose a certificate chain and
+/// private key for the purposes of client authentication.
+pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
+    /// Resolve a client certificate chain/private key to use as the client's
+    /// identity.
+    ///
+    /// `root_hint_subjects` is an optional list of certificate authority
+    /// subject distinguished names that the client can use to help
+    /// decide on a client certificate the server is likely to accept. If
+    /// the list is empty, the client should send whatever certificate it
+    /// has. The hints are expected to be DER-encoded X.500 distinguished names,
+    /// per [RFC 5280 A.1]. See [`DistinguishedName`] for more information
+    /// on decoding with external crates like `x509-parser`.
+    ///
+    /// `sigschemes` is the list of the [`SignatureScheme`]s the server
+    /// supports.
+    ///
+    /// Return `None` to continue the handshake without any client
+    /// authentication.  The server may reject the handshake later
+    /// if it requires authentication.
+    ///
+    /// The key is borrowed from the resolver for the call that signs with it: the client
+    /// resolves its certificate when it sends its `Certificate` and `CertificateVerify`.
+    ///
+    /// [RFC 5280 A.1]: https://www.rfc-editor.org/rfc/rfc5280#appendix-A.1
+    fn resolve(
+        &self,
+        root_hint_subjects: &[&[u8]],
+        sigschemes: &[SignatureScheme],
+    ) -> Option<&sign::CertifiedKey>;
+
+    /// Return true if the client only supports raw public keys.
+    ///
+    /// See [RFC 7250](https://www.rfc-editor.org/rfc/rfc7250).
+    fn only_raw_public_keys(&self) -> bool {
+        false
+    }
+
+    /// Return true if any certificates at all are available.
+    fn has_certs(&self) -> bool;
+}
+
+/// Common configuration for (typically) all connections made by a program.
+///
+/// Making one of these is cheap, though one of the inputs may be expensive: gathering trust roots
+/// from the operating system to add to the [`RootCertStore`] passed to `with_root_certificates()`
+/// (the rustls-native-certs crate is often used for this) may take on the order of a few hundred
+/// milliseconds.
+///
+/// These must be created via the [`ClientConfig::builder()`] or [`ClientConfig::builder_with_provider()`]
+/// function.
+///
+/// Note that using [`ConfigBuilder<ClientConfig, WantsVersions>::with_ech()`] will produce a common
+/// configuration specific to the provided [`crate::client::EchConfig`] that may not be appropriate
+/// for all connections made by the program. In this case the configuration should only be shared
+/// by connections intended for domains that offer the provided [`crate::client::EchConfig`] in
+/// their DNS zone.
+///
+/// # Ownership
+///
+/// A configuration owns everything it is built from: its verifier, its certificate resolver, its
+/// session store, its key log and its compression cache. A connection holds none of it. Each call
+/// that may advance a handshake takes the configuration, mutably, because the session store, the
+/// key log and the compression cache are written as the handshake runs. Connections that share a
+/// configuration are driven with the same value, one call at a time.
+///
+/// The settings a handshake only reads are a [`ClientSettings`], reached through `Deref`, so
+/// `config.alpn_protocols` and the like name them directly.
+///
+/// # Defaults
+///
+/// * [`ClientSettings::max_fragment_size`]: the default is `None` (meaning 16kB).
+/// * [`ClientConfig::resumption`]: supports resumption with up to 256 server names, using session
+///   ids or tickets, with a max of eight tickets per server.
+/// * [`ClientSettings::alpn_protocols`]: the default is empty -- no ALPN protocol is negotiated.
+/// * [`ClientConfig::key_log`]: key material is not logged.
+/// * [`ClientSettings::cert_decompressors`]: depends on the crate features, see [`compress::default_cert_decompressors()`].
+/// * [`ClientSettings::cert_compressors`]: depends on the crate features, see [`compress::default_cert_compressors()`].
+/// * [`ClientConfig::cert_compression_cache`]: caches the most recently used 4 compressions
+///
+/// [`RootCertStore`]: crate::RootCertStore
+#[derive(Debug)]
+pub struct ClientConfig {
+    settings: ClientSettings,
+
+    /// How and when the client can resume a previous session.
+    ///
+    /// Resumption is only allowed under the server certificate verifier and the client
+    /// certificate resolver a session was made under. Installing another verifier
+    /// ([`DangerousClientConfig::set_certificate_verifier`]) or resolver
+    /// ([`ClientSettings::set_client_auth_cert_resolver`]) makes the stored sessions
+    /// unresumable, as does moving the store to another configuration.
+    ///
+    /// To illustrate, imagine two `ClientConfig`s `A` and `B`.  `A` fully validates
+    /// the server certificate, `B` does not.  If a session originated by `B` were
+    /// resumed by `A`, this would give a false impression to the user of `A` that the
+    /// server certificate is fully validated.
+    ///
+    /// [`DangerousClientConfig::set_certificate_verifier`]: crate::client::danger::DangerousClientConfig::set_certificate_verifier
+    pub resumption: Resumption,
+
+    /// How to output key material for debugging.  The default
+    /// does nothing.
+    pub key_log: Box<dyn KeyLog>,
+
+    /// Caching for compressed certificates.
+    ///
+    /// This is optional: [`compress::CompressionCache::Disabled`] gives
+    /// a cache that does no caching.
+    pub cert_compression_cache: compress::CompressionCache,
+}
+
+/// The settings of a [`ClientConfig`] that a handshake only reads.
+///
+/// A `ClientConfig` dereferences to its settings, so these fields are set and read through the
+/// configuration.
+#[derive(Debug)]
+pub struct ClientSettings {
+    /// Which ALPN protocols we include in our client hello.
+    /// If empty, no ALPN extension is sent.
+    pub alpn_protocols: Vec<Vec<u8>>,
+
+    /// Whether to check the selected ALPN was offered.
+    ///
+    /// The default is true.
+    pub check_selected_alpn: bool,
+
+    /// The maximum size of plaintext input to be emitted in a single TLS record.
+    /// A value of None is equivalent to the [TLS maximum] of 16 kB.
+    ///
+    /// rustls enforces an arbitrary minimum of 32 bytes for this field.
+    /// Out of range values are reported as errors from [ClientConnection::new].
+    ///
+    /// Setting this value to a little less than the TCP MSS may improve latency
+    /// for stream-y workloads.
+    ///
+    /// [TLS maximum]: https://datatracker.ietf.org/doc/html/rfc8446#section-5.1
+    /// [ClientConnection::new]: crate::client::ClientConnection::new
+    pub max_fragment_size: Option<usize>,
+
+    /// How to decide what client auth certificate/keys to use.
+    ///
+    /// Set with [`Self::set_client_auth_cert_resolver`], which gives the resolver a new
+    /// identity so that sessions made under another resolver do not resume.
+    pub(super) client_auth_cert_resolver: Box<dyn ResolvesClientCert>,
+
+    /// The installation of `client_auth_cert_resolver` that stored sessions are checked against.
+    pub(super) client_auth_cert_resolver_identity: Identity,
+
+    /// Whether to send the Server Name Indication (SNI) extension
+    /// during the client handshake.
+    ///
+    /// The default is true.
+    pub enable_sni: bool,
+
+    /// Allows traffic secrets to be extracted after the handshake,
+    /// e.g. for kTLS setup.
+    pub enable_secret_extraction: bool,
+
+    /// Whether to send data on the first flight ("early data") in
+    /// TLS 1.3 handshakes.
+    ///
+    /// The default is false.
+    pub enable_early_data: bool,
+
+    /// If set to `true`, requires the server to support the extended
+    /// master secret extraction method defined in [RFC 7627].
+    ///
+    /// The default is `true` if the configured [`CryptoProvider`] is
+    /// FIPS-compliant (i.e., [`CryptoProvider::fips()`] returns `true`),
+    /// `false` otherwise.
+    ///
+    /// It must be set to `true` to meet FIPS requirement mentioned in section
+    /// **D.Q Transition of the TLS 1.2 KDF to Support the Extended Master
+    /// Secret** from [FIPS 140-3 IG.pdf].
+    ///
+    /// [RFC 7627]: https://datatracker.ietf.org/doc/html/rfc7627
+    /// [FIPS 140-3 IG.pdf]: https://csrc.nist.gov/csrc/media/Projects/cryptographic-module-validation-program/documents/fips%20140-3/FIPS%20140-3%20IG.pdf
+    pub require_ems: bool,
+
+    /// Provides the current system time
+    pub time_provider: Box<dyn TimeProvider>,
+
+    /// Source of randomness and other crypto.
+    pub(super) provider: &'static CryptoProvider,
+
+    /// Supported versions, in no particular order.  The default
+    /// is all supported versions.
+    pub(super) versions: versions::EnabledVersions,
+
+    /// How to verify the server certificate chain.
+    pub(super) verifier: Box<dyn verify::ServerCertVerifier>,
+
+    /// The installation of `verifier` that stored sessions are checked against.
+    pub(super) verifier_identity: Identity,
+
+    /// How to decompress the server's certificate chain.
+    ///
+    /// If this is non-empty, the [RFC8779] certificate compression
+    /// extension is offered, and any compressed certificates are
+    /// transparently decompressed during the handshake.
+    ///
+    /// This only applies to TLS1.3 connections.  It is ignored for
+    /// TLS1.2 connections.
+    ///
+    /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
+    pub cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
+
+    /// How to compress the client's certificate chain.
+    ///
+    /// If a server supports this extension, and advertises support
+    /// for one of the compression algorithms included here, the
+    /// client certificate will be compressed according to [RFC8779].
+    ///
+    /// This only applies to TLS1.3 connections.  It is ignored for
+    /// TLS1.2 connections.
+    ///
+    /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
+    pub cert_compressors: Vec<&'static dyn compress::CertCompressor>,
+
+    /// How to offer Encrypted Client Hello (ECH). The default is to not offer ECH.
+    pub(super) ech_mode: Option<EchMode>,
+
+    /// Request a specific number of TLS 1.3 session tickets via [RFC 9149].
+    ///
+    /// Set to `None` to disable sending the extension (the default).
+    ///
+    /// [RFC 9149]: https://datatracker.ietf.org/doc/html/rfc9149
+    pub send_ticket_request: Option<TicketRequest>,
+}
+
+/// The parts of a [`ClientConfig`] a handshake writes, borrowed for one call.
+#[derive(Debug)]
+pub struct ClientStores<'a> {
+    pub(crate) resumption: &'a mut Resumption,
+    pub(crate) key_log: &'a mut Box<dyn KeyLog>,
+    pub(crate) cert_compression_cache: &'a mut compress::CompressionCache,
+}
+
+impl Deref for ClientConfig {
+    type Target = ClientSettings;
+
+    fn deref(&self) -> &ClientSettings {
+        &self.settings
+    }
+}
+
+impl DerefMut for ClientConfig {
+    fn deref_mut(&mut self) -> &mut ClientSettings {
+        &mut self.settings
+    }
+}
+
+/// Desired session ticket counts for the RFC 9149 `ticket_request` extension.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TicketRequest {
+    /// Tickets desired when the server negotiates a new connection.
+    pub new_session_count: u8,
+    /// Tickets desired when the server resumes using a presented ticket.
+    pub resumption_count: u8,
+}
+
+impl ClientConfig {
+    /// Create a builder for a client configuration with
+    /// [the process-default `CryptoProvider`][CryptoProvider#using-the-per-process-default-cryptoprovider]
+    /// and safe protocol version defaults.
+    ///
+    /// Fails as [`Self::builder_with_protocol_versions`] does.
+    ///
+    /// For more information, see the [`ConfigBuilder`] documentation.
+    pub fn builder() -> Result<ConfigBuilder<Self, WantsVerifier>, Error> {
+        Self::builder_with_protocol_versions(versions::DEFAULT_VERSIONS)
+    }
+
+    /// Create a builder for a client configuration with
+    /// [the process-default `CryptoProvider`][CryptoProvider#using-the-per-process-default-cryptoprovider]
+    /// and the provided protocol versions.
+    ///
+    /// Fails if the supported versions are not compatible with the process-default provider
+    /// (eg. the combination of ciphersuites supported by the provider and supported versions
+    /// lead to zero cipher suites being usable). Upstream panicked.
+    ///
+    /// For more information, see the [`ConfigBuilder`] documentation.
+    pub fn builder_with_protocol_versions(
+        versions: &[&'static versions::SupportedProtocolVersion],
+    ) -> Result<ConfigBuilder<Self, WantsVerifier>, Error> {
+        Self::builder_with_provider(CryptoProvider::get_default_or_install_from_crate_features())
+            .with_protocol_versions(versions)
+    }
+
+    /// Create a builder for a client configuration with a specific [`CryptoProvider`].
+    ///
+    /// This will use the provider's configured ciphersuites. You must additionally choose
+    /// which protocol versions to enable, using `with_protocol_versions` or
+    /// `with_safe_default_protocol_versions` and handling the `Result` in case a protocol
+    /// version is not supported by the provider's ciphersuites.
+    ///
+    /// For more information, see the [`ConfigBuilder`] documentation.
+    pub fn builder_with_provider(
+        provider: &'static CryptoProvider,
+    ) -> ConfigBuilder<Self, WantsVersions> {
+        ConfigBuilder {
+            state: WantsVersions {},
+            provider,
+            time_provider: Box::new(DefaultTimeProvider),
+            side: PhantomData,
+        }
+    }
+    /// Create a builder for a client configuration with no default implementation details.
+    ///
+    /// This API must be used by `no_std` users.
+    ///
+    /// You must provide a specific [`TimeProvider`].
+    ///
+    /// You must provide a specific [`CryptoProvider`].
+    ///
+    /// This will use the provider's configured ciphersuites. You must additionally choose
+    /// which protocol versions to enable, using `with_protocol_versions` or
+    /// `with_safe_default_protocol_versions` and handling the `Result` in case a protocol
+    /// version is not supported by the provider's ciphersuites.
+    ///
+    /// For more information, see the [`ConfigBuilder`] documentation.
+    pub fn builder_with_details(
+        provider: &'static CryptoProvider,
+        time_provider: Box<dyn TimeProvider>,
+    ) -> ConfigBuilder<Self, WantsVersions> {
+        ConfigBuilder {
+            state: WantsVersions {},
+            provider,
+            time_provider,
+            side: PhantomData,
+        }
+    }
+
+    /// Assemble a configuration from its settings and its default stores.
+    pub(super) fn from_settings(settings: ClientSettings) -> Self {
+        Self {
+            settings,
+            resumption: Resumption::default(),
+            key_log: Box::new(crate::key_log::NoKeyLog {}),
+            cert_compression_cache: compress::CompressionCache::default(),
+        }
+    }
+
+    /// Access configuration options whose use is dangerous and requires
+    /// extra care.
+    pub fn dangerous(&mut self) -> danger::DangerousClientConfig<'_> {
+        danger::DangerousClientConfig { cfg: self }
+    }
+}
+
+impl ClientSettings {
+    /// Return true if connections made with this `ClientConfig` will
+    /// operate in FIPS mode.
+    ///
+    /// This is different from [`CryptoProvider::fips()`]: [`CryptoProvider::fips()`]
+    /// is concerned only with cryptography, whereas this _also_ covers TLS-level
+    /// configuration that NIST recommends, as well as ECH HPKE suites if applicable.
+    pub fn fips(&self) -> bool {
+        let mut is_fips = self.provider.fips();
+
+        {
+            is_fips = is_fips && self.require_ems
+        }
+
+        if let Some(ech_mode) = &self.ech_mode {
+            is_fips = is_fips && ech_mode.fips();
+        }
+
+        is_fips
+    }
+
+    /// Return the crypto provider used to construct this client configuration.
+    pub fn crypto_provider(&self) -> &'static CryptoProvider {
+        self.provider
+    }
+
+    /// Replace the client certificate resolver.
+    ///
+    /// Sessions stored under the previous resolver no longer resume.
+    pub fn set_client_auth_cert_resolver(&mut self, resolver: Box<dyn ResolvesClientCert>) {
+        self.client_auth_cert_resolver = resolver;
+        self.client_auth_cert_resolver_identity = Identity::fresh();
+    }
+
+    pub(super) fn needs_key_share(&self) -> bool {
+        self.supports_version(ProtocolVersion::TLSv1_3, Protocol::Tcp)
+    }
+
+    /// We support a given TLS version if it's quoted in the configured
+    /// versions *and* at least one ciphersuite for this version is
+    /// also configured.
+    pub(crate) fn supports_version(&self, v: ProtocolVersion, protocol: Protocol) -> bool {
+        self.versions.contains(v)
+            && self
+                .provider
+                .cipher_suites
+                .iter()
+                .any(|cs| cs.version().version == v)
+            && protocol.supports_version(v)
+    }
+
+    pub(crate) fn supports_protocol(&self, proto: Protocol) -> bool {
+        self.provider
+            .cipher_suites
+            .iter()
+            .any(|cs| cs.usable_for_protocol(proto))
+    }
+
+    pub(super) fn find_cipher_suite(
+        &self,
+        suite: CipherSuite,
+        protocol: Protocol,
+    ) -> Option<SupportedCipherSuite> {
+        self.provider
+            .cipher_suites
+            .iter()
+            .copied()
+            .find(|&scs| scs.suite() == suite && scs.usable_for_protocol(protocol))
+    }
+
+    pub(super) fn find_kx_group(
+        &self,
+        group: NamedGroup,
+        version: ProtocolVersion,
+    ) -> Option<&'static dyn SupportedKxGroup> {
+        self.provider
+            .kx_groups
+            .iter()
+            .copied()
+            .find(|skxg| skxg.usable_for_version(version) && skxg.name() == group)
+    }
+
+    pub(super) fn current_time(&self) -> Result<UnixTime, Error> {
+        self.time_provider
+            .current_time()
+            .ok_or(Error::FailedToGetCurrentTime)
+    }
+}
+
+/// Configuration for how/when a client is allowed to resume a previous session.
+#[derive(Debug)]
+pub struct Resumption {
+    /// How we store session data or tickets. The default is to use an in-memory
+    /// [super::handy::ClientSessionMemoryCache].
+    pub(super) store: Box<dyn ClientSessionStore>,
+
+    /// What mechanism is used for resuming a TLS 1.2 session.
+    pub(super) tls12_resumption: Tls12Resumption,
+}
+
+impl Resumption {
+    /// Create a new `Resumption` that stores data for the given number of sessions in memory.
+    ///
+    /// This is the default `Resumption` choice, and enables resuming a TLS 1.2 session with
+    /// a session id or RFC 5077 ticket.
+    pub fn in_memory_sessions(num: usize) -> Self {
+        Self {
+            store: Box::new(super::handy::ClientSessionMemoryCache::new(num)),
+            tls12_resumption: Tls12Resumption::SessionIdOrTickets,
+        }
+    }
+
+    /// Use a custom [`ClientSessionStore`] implementation to store sessions.
+    ///
+    /// By default, enables resuming a TLS 1.2 session with a session id or RFC 5077 ticket.
+    pub fn store(store: Box<dyn ClientSessionStore>) -> Self {
+        Self {
+            store,
+            tls12_resumption: Tls12Resumption::SessionIdOrTickets,
+        }
+    }
+
+    /// Disable all use of session resumption.
+    pub fn disabled() -> Self {
+        Self {
+            store: Box::new(NoClientSessionStorage),
+            tls12_resumption: Tls12Resumption::Disabled,
+        }
+    }
+
+    /// Configure whether TLS 1.2 sessions may be resumed, and by what mechanism.
+    ///
+    /// This is meaningless if you've disabled resumption entirely, which is the case in `no-std`
+    /// contexts.
+    pub fn tls12_resumption(mut self, tls12: Tls12Resumption) -> Self {
+        self.tls12_resumption = tls12;
+        self
+    }
+}
+
+impl Default for Resumption {
+    /// Create an in-memory session store resumption with up to 256 server names, allowing
+    /// a TLS 1.2 session to resume with a session id or RFC 5077 ticket.
+    fn default() -> Self {
+        Self::in_memory_sessions(256)
+    }
+}
+
+/// What mechanisms to support for resuming a TLS 1.2 session.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tls12Resumption {
+    /// Disable 1.2 resumption.
+    Disabled,
+    /// Support 1.2 resumption using session ids only.
+    SessionIdOnly,
+    /// Support 1.2 resumption using session ids or RFC 5077 tickets.
+    ///
+    /// See[^1] for why you might like to disable RFC 5077 by instead choosing the `SessionIdOnly`
+    /// option. Note that TLS 1.3 tickets do not have those issues.
+    ///
+    /// [^1]: <https://words.filippo.io/we-need-to-talk-about-session-tickets/>
+    SessionIdOrTickets,
+}
+
+/// Container for unsafe APIs
+pub(super) mod danger {
+    use alloc::boxed::Box;
+
+    use super::verify::ServerCertVerifier;
+    use super::ClientConfig;
+    use crate::identity::Identity;
+
+    /// Accessor for dangerous configuration options.
+    #[derive(Debug)]
+    pub struct DangerousClientConfig<'a> {
+        /// The underlying ClientConfig
+        pub cfg: &'a mut ClientConfig,
+    }
+
+    impl DangerousClientConfig<'_> {
+        /// Overrides the default `ServerCertVerifier` with something else.
+        ///
+        /// Sessions stored under the previous verifier no longer resume.
+        pub fn set_certificate_verifier(&mut self, verifier: Box<dyn ServerCertVerifier>) {
+            self.cfg.verifier = verifier;
+            self.cfg.verifier_identity = Identity::fresh();
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum EarlyDataState {
+    Disabled,
+    Ready,
+    Accepted,
+    AcceptedFinished,
+    Rejected,
+}
+
+#[derive(Debug)]
+pub(super) struct EarlyData {
+    state: EarlyDataState,
+    left: usize,
+}
+
+impl EarlyData {
+    fn new() -> Self {
+        Self {
+            left: 0,
+            state: EarlyDataState::Disabled,
+        }
+    }
+
+    pub(super) fn is_enabled(&self) -> bool {
+        matches!(self.state, EarlyDataState::Ready | EarlyDataState::Accepted)
+    }
+
+    fn is_accepted(&self) -> bool {
+        matches!(
+            self.state,
+            EarlyDataState::Accepted | EarlyDataState::AcceptedFinished
+        )
+    }
+
+    pub(super) fn enable(&mut self, max_data: usize) -> Result<(), Error> {
+        if self.state != EarlyDataState::Disabled {
+            return Err(Error::Internal("early data enabled twice"));
+        }
+        self.state = EarlyDataState::Ready;
+        self.left = max_data;
+        Ok(())
+    }
+
+    pub(super) fn rejected(&mut self) {
+        trace!("EarlyData rejected");
+        self.state = EarlyDataState::Rejected;
+    }
+
+    pub(super) fn accepted(&mut self) -> Result<(), Error> {
+        trace!("EarlyData accepted");
+        if self.state != EarlyDataState::Ready {
+            return Err(Error::Internal("early data accepted without being offered"));
+        }
+        self.state = EarlyDataState::Accepted;
+        Ok(())
+    }
+
+    pub(super) fn finished(&mut self) -> Result<(), Error> {
+        trace!("EarlyData finished");
+        self.state = match self.state {
+            EarlyDataState::Accepted => EarlyDataState::AcceptedFinished,
+            _ => {
+                return Err(Error::Internal(
+                    "early data finished without being accepted",
+                ))
+            }
+        };
+        Ok(())
+    }
+
+    /// The prefix of `data` that the remaining early-data allowance admits, counted against it;
+    /// `None` once early data is refused. A disabled state admits nothing: no writer for early
+    /// data is handed out until it is enabled (upstream's `unreachable!`).
+    fn admit<'d>(&mut self, data: &'d [u8]) -> Option<&'d [u8]> {
+        match self.state {
+            EarlyDataState::Disabled
+            | EarlyDataState::Rejected
+            | EarlyDataState::AcceptedFinished => None,
+            EarlyDataState::Ready | EarlyDataState::Accepted => {
+                let take = match self.left.checked_sub(data.len()) {
+                    Some(rest) => {
+                        self.left = rest;
+                        data.len()
+                    }
+                    None => mem::replace(&mut self.left, 0),
+                };
+                data.get(..take)
+            }
+        }
+    }
+}
+
+mod connection {
+    use alloc::vec::Vec;
+    use core::fmt;
+    use core::ops::{Deref, DerefMut};
+    use std::io;
+
+    use pki_types::ServerName;
+
+    use super::{ClientConnectionData, ClientExtensionsInput};
+    use crate::client::EchStatus;
+    use crate::common_state::Protocol;
+    use crate::conn::{ConnectionCommon, ConnectionCore};
+    use crate::error::Error;
+    use crate::suites::ExtractedSecrets;
+    use crate::ClientConfig;
+
+    /// Stub that implements io::Write and dispatches to `write_early_data`.
+    pub struct WriteEarlyData<'a> {
+        sess: &'a mut ClientConnection,
+    }
+
+    impl<'a> WriteEarlyData<'a> {
+        fn new(sess: &'a mut ClientConnection) -> Self {
+            WriteEarlyData { sess }
+        }
+
+        /// How many bytes you may send.  Writes will become short
+        /// once this reaches zero.
+        pub fn bytes_left(&self) -> usize {
+            self.sess.inner.core.data.early_data.bytes_left()
+        }
+    }
+
+    impl io::Write for WriteEarlyData<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.sess.write_early_data(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl super::EarlyData {
+        fn admit_or_refuse<'d>(&mut self, data: &'d [u8]) -> io::Result<&'d [u8]> {
+            self.admit(data)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
+        }
+
+        fn bytes_left(&self) -> usize {
+            self.left
+        }
+    }
+
+    /// This represents a single TLS client connection.
+    pub struct ClientConnection {
+        inner: ConnectionCommon<ClientConnectionData>,
+    }
+
+    impl fmt::Debug for ClientConnection {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("ClientConnection").finish()
+        }
+    }
+
+    impl ClientConnection {
+        /// Make a new ClientConnection.  `config` controls how
+        /// we behave in the TLS protocol, `name` is the
+        /// name of the server we want to talk to.
+        ///
+        /// The configuration is taken for this call only: it may supply a stored session to
+        /// resume. Later calls that may advance the handshake take it again.
+        pub fn new(config: &mut ClientConfig, name: ServerName<'static>) -> Result<Self, Error> {
+            let alpn_protocols = config.alpn_protocols.clone();
+            Self::new_with_alpn(config, name, alpn_protocols)
+        }
+
+        /// Make a new ClientConnection with custom ALPN protocols.
+        pub fn new_with_alpn(
+            config: &mut ClientConfig,
+            name: ServerName<'static>,
+            alpn_protocols: Vec<Vec<u8>>,
+        ) -> Result<Self, Error> {
+            Ok(Self {
+                inner: ConnectionCommon::from(ConnectionCore::for_client(
+                    config,
+                    name,
+                    ClientExtensionsInput::from_alpn(alpn_protocols),
+                    Protocol::Tcp,
+                )?),
+            })
+        }
+        /// Returns an `io::Write` implementer you can write bytes to
+        /// to send TLS1.3 early data (a.k.a. "0-RTT data") to the server.
+        ///
+        /// This returns None in many circumstances when the capability to
+        /// send early data is not available, including but not limited to:
+        ///
+        /// - The server hasn't been talked to previously.
+        /// - The server does not support resumption.
+        /// - The server does not support early data.
+        /// - The resumption data for the server has expired.
+        ///
+        /// The server specifies a maximum amount of early data.  You can
+        /// learn this limit through the returned object, and writes through
+        /// it will process only this many bytes.
+        ///
+        /// The server can choose not to accept any sent early data --
+        /// in this case the data is lost but the connection continues.  You
+        /// can tell this happened using `is_early_data_accepted`.
+        pub fn early_data(&mut self) -> Option<WriteEarlyData<'_>> {
+            if self.inner.core.data.early_data.is_enabled() {
+                Some(WriteEarlyData::new(self))
+            } else {
+                None
+            }
+        }
+
+        /// Returns True if the server signalled it will process early data.
+        ///
+        /// If you sent early data and this returns false at the end of the
+        /// handshake then the server will not process the data.  This
+        /// is not an error, but you may wish to resend the data.
+        pub fn is_early_data_accepted(&self) -> bool {
+            self.inner.core.is_early_data_accepted()
+        }
+
+        /// Extract secrets, so they can be used when configuring kTLS, for example.
+        /// Should be used with care as it exposes secret key material.
+        pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
+            self.inner.dangerous_extract_secrets()
+        }
+
+        /// Return the connection's Encrypted Client Hello (ECH) status.
+        pub fn ech_status(&self) -> EchStatus {
+            self.inner.core.data.ech_status
+        }
+
+        /// Returns the number of TLS1.3 tickets that have been received.
+        pub fn tls13_tickets_received(&self) -> u32 {
+            self.inner.tls13_tickets_received
+        }
+
+        /// Return true if the connection was made with a `ClientConfig` that is FIPS compatible.
+        ///
+        /// This is different from [`crate::crypto::CryptoProvider::fips()`]:
+        /// it is concerned only with cryptography, whereas this _also_ covers TLS-level
+        /// configuration that NIST recommends, as well as ECH HPKE suites if applicable.
+        pub fn fips(&self) -> bool {
+            self.inner.core.common_state.fips
+        }
+
+        fn write_early_data(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.inner
+                .core
+                .data
+                .early_data
+                .admit_or_refuse(data)
+                .map(|admitted| self.inner.send_early_plaintext(admitted))
+        }
+    }
+
+    impl Deref for ClientConnection {
+        type Target = ConnectionCommon<ClientConnectionData>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+
+    impl DerefMut for ClientConnection {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.inner
+        }
+    }
+
+    #[doc(hidden)]
+    impl<'a> TryFrom<&'a mut crate::Connection> for &'a mut ClientConnection {
+        type Error = ();
+
+        fn try_from(value: &'a mut crate::Connection) -> Result<Self, Self::Error> {
+            use crate::Connection::*;
+            match value {
+                Client(conn) => Ok(conn),
+                Server(_) => Err(()),
+            }
+        }
+    }
+
+    impl From<ClientConnection> for crate::Connection {
+        fn from(conn: ClientConnection) -> Self {
+            Self::Client(conn)
+        }
+    }
+}
+pub use connection::{ClientConnection, WriteEarlyData};
+
+impl ConnectionCore<ClientConnectionData> {
+    pub(crate) fn for_client(
+        config: &mut ClientConfig,
+        name: ServerName<'static>,
+        extra_exts: ClientExtensionsInput<'static>,
+        proto: Protocol,
+    ) -> Result<Self, Error> {
+        let mut common_state = CommonState::new(Side::Client);
+        common_state.set_max_fragment_size(config.max_fragment_size)?;
+        common_state.protocol = proto;
+        common_state.enable_secret_extraction = config.enable_secret_extraction;
+        common_state.fips = config.fips();
+        let mut data = ClientConnectionData::new();
+
+        let (settings, stores) = ClientConnectionData::split(config);
+        let mut cx = hs::ClientContext {
+            common: &mut common_state,
+            data: &mut data,
+            // `start_handshake` won't produce plaintext
+            sendable_plaintext: None,
+            config: settings,
+            stores,
+        };
+
+        let input = ClientHelloInput::new(name, &extra_exts, &mut cx)?;
+        let state = input.start_handshake(extra_exts, &mut cx)?;
+        Ok(Self::new(state, data, common_state))
+    }
+
+    pub(crate) fn is_early_data_accepted(&self) -> bool {
+        self.data.early_data.is_accepted()
+    }
+}
+
+/// Unbuffered version of `ClientConnection`
+///
+/// See the [`crate::unbuffered`] module docs for more details
+pub struct UnbufferedClientConnection {
+    inner: UnbufferedConnectionCommon<ClientConnectionData>,
+}
+
+impl UnbufferedClientConnection {
+    /// Make a new ClientConnection. `config` controls how we behave in the TLS protocol, `name` is
+    /// the name of the server we want to talk to.
+    pub fn new(config: &mut ClientConfig, name: ServerName<'static>) -> Result<Self, Error> {
+        let alpn_protocols = config.alpn_protocols.clone();
+        Self::new_with_extensions(
+            config,
+            name,
+            ClientExtensionsInput::from_alpn(alpn_protocols),
+        )
+    }
+
+    /// Make a new UnbufferedClientConnection with custom ALPN protocols.
+    pub fn new_with_alpn(
+        config: &mut ClientConfig,
+        name: ServerName<'static>,
+        alpn_protocols: Vec<Vec<u8>>,
+    ) -> Result<Self, Error> {
+        Self::new_with_extensions(
+            config,
+            name,
+            ClientExtensionsInput::from_alpn(alpn_protocols),
+        )
+    }
+
+    fn new_with_extensions(
+        config: &mut ClientConfig,
+        name: ServerName<'static>,
+        extensions: ClientExtensionsInput<'static>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            inner: UnbufferedConnectionCommon::from(ConnectionCore::for_client(
+                config,
+                name,
+                extensions,
+                Protocol::Tcp,
+            )?),
+        })
+    }
+
+    /// Extract secrets, so they can be used when configuring kTLS, for example.
+    /// Should be used with care as it exposes secret key material.
+    #[deprecated = "dangerous_extract_secrets() does not support session tickets or \
+                    key updates, use dangerous_into_kernel_connection() instead"]
+    pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
+        self.inner.dangerous_extract_secrets()
+    }
+
+    /// Extract secrets and a [`KernelConnection`] object.
+    ///
+    /// This allows you use rustls to manage keys and then manage encryption and
+    /// decryption yourself (e.g. for kTLS).
+    ///
+    /// Should be used with care as it exposes secret key material.
+    ///
+    /// See the [`crate::kernel`] documentations for details on prerequisites
+    /// for calling this method.
+    pub fn dangerous_into_kernel_connection(
+        self,
+    ) -> Result<(ExtractedSecrets, KernelConnection<ClientConnectionData>), Error> {
+        self.inner.core.dangerous_into_kernel_connection()
+    }
+
+    /// Returns the number of TLS1.3 tickets that have been received.
+    pub fn tls13_tickets_received(&self) -> u32 {
+        self.inner.tls13_tickets_received
+    }
+}
+
+impl Deref for UnbufferedClientConnection {
+    type Target = UnbufferedConnectionCommon<ClientConnectionData>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for UnbufferedClientConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl TransmitTlsData<'_, ClientConnectionData> {
+    /// returns an adapter that allows encrypting early (RTT-0) data before transmitting the
+    /// already encoded TLS data
+    ///
+    /// IF allowed by the protocol
+    pub fn may_encrypt_early_data(&mut self) -> Option<MayEncryptEarlyData<'_>> {
+        if self.conn.core.data.early_data.is_enabled() {
+            Some(MayEncryptEarlyData { conn: self.conn })
+        } else {
+            None
+        }
+    }
+}
+
+/// Allows encrypting early (RTT-0) data
+pub struct MayEncryptEarlyData<'c> {
+    conn: &'c mut UnbufferedConnectionCommon<ClientConnectionData>,
+}
+
+impl MayEncryptEarlyData<'_> {
+    /// Encrypts `application_data` into the `outgoing_tls` buffer
+    ///
+    /// returns the number of bytes that were written into `outgoing_tls`, or an error if
+    /// the provided buffer was too small. In the error case, `outgoing_tls` is not modified
+    pub fn encrypt(
+        &mut self,
+        early_data: &[u8],
+        outgoing_tls: &mut [u8],
+    ) -> Result<usize, EarlyDataError> {
+        let Some(allowed) = self.conn.core.data.early_data.admit(early_data) else {
+            return Err(EarlyDataError::ExceededAllowedEarlyData);
+        };
+
+        self.conn
+            .core
+            .common_state
+            .write_plaintext(allowed.into(), outgoing_tls)
+            .map_err(|e| e.into())
+    }
+}
+
+/// Errors that may arise when encrypting early (RTT-0) data
+#[derive(Debug)]
+pub enum EarlyDataError {
+    /// Cannot encrypt more early data due to imposed limits
+    ExceededAllowedEarlyData,
+    /// Encryption error
+    Encrypt(EncryptError),
+}
+
+impl From<EncryptError> for EarlyDataError {
+    fn from(v: EncryptError) -> Self {
+        Self::Encrypt(v)
+    }
+}
+
+impl fmt::Display for EarlyDataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExceededAllowedEarlyData => f.write_str("cannot send any more early data"),
+            Self::Encrypt(e) => fmt::Display::fmt(e, f),
+        }
+    }
+}
+
+impl core::error::Error for EarlyDataError {}
+
+/// State associated with a client connection.
+#[derive(Debug)]
+pub struct ClientConnectionData {
+    pub(super) early_data: EarlyData,
+    pub(super) ech_status: EchStatus,
+}
+
+impl ClientConnectionData {
+    fn new() -> Self {
+        Self {
+            early_data: EarlyData::new(),
+            ech_status: EchStatus::NotOffered,
+        }
+    }
+}
+
+impl crate::conn::SideData for ClientConnectionData {}
+
+impl SideConfig for ClientConnectionData {
+    type Config = ClientConfig;
+    type Settings = ClientSettings;
+    type Stores<'a> = ClientStores<'a>;
+
+    fn split(config: &mut ClientConfig) -> (&ClientSettings, ClientStores<'_>) {
+        let ClientConfig {
+            settings,
+            resumption,
+            key_log,
+            cert_compression_cache,
+        } = config;
+        (
+            settings,
+            ClientStores {
+                resumption,
+                key_log,
+                cert_compression_cache,
+            },
+        )
+    }
+}

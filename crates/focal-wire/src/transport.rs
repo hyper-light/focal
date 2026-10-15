@@ -1,13 +1,19 @@
-//! Mutually authenticated TLS 1.3 over Quinn. One bounded request occupies one
-//! bidirectional stream; slow work on one stream does not serialize other streams.
-use crate::*;
-use quinn::{
-    Connection, Endpoint,
-    crypto::rustls::{QuicClientConfig, QuicServerConfig},
+//! Mutually authenticated TLS 1.3 over QUIC: hyper-transport's endpoint over hyper-quic and
+//! hyper-tls, driven on hyper-rt by one owner task per socket ([`crate::net`], 27 §15). One
+//! request is one exchange, its kind the operation's registered tag and its body the envelope;
+//! slow work on one exchange does not hold up another, and the connection's credit is taken in the
+//! order of the classes' urgency.
+use crate::net::{
+    Answer, Asked, Command, Driver, Failed, FocalClasses, Framed, Inbound, Kind, LeafPins, Linked,
+    NetBudget, NetDirectory, Network, Reply, Sender, Serve, ServeFuture, Served,
 };
+use crate::*;
+use focal_memory::MemoryBudget;
+use hyper_transport::congestion::{BbrConfig, Congestion};
+use hyper_transport::tls::Tls;
+use hyper_transport::{Classes, Config, Endpoint, Limits, PathFacts, PeerId};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::{net::SocketAddr, sync::Arc};
-use tokio::{sync::Semaphore, task::JoinSet};
+use std::{net::SocketAddr, time::Duration};
 
 /// DER credentials supplied by the deployment's existing PKI. Private keys are
 /// never Debug/Serialize and are never accepted in a request envelope.
@@ -26,36 +32,43 @@ impl TlsIdentity {
         }
     }
 }
-fn roots(certificates: Vec<Vec<u8>>) -> Result<rustls::RootCertStore, WireError> {
-    let mut roots = rustls::RootCertStore::empty();
-    for certificate in certificates {
-        roots
-            .add(CertificateDer::from(certificate))
-            .map_err(|_| WireError::Authentication)?;
-    }
-    if roots.is_empty() {
-        return Err(WireError::Authentication);
-    }
-    Ok(roots)
-}
-// Quinn/rustls retain shared configurations across their internal connection
-// tasks; these Arc types are required by those libraries' public APIs.
-/// Longest silence before a QUIC connection is considered dead.
-const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// The most a stream is given to send ahead of what its reader has taken.
-///
-/// quinn keeps what arrives out of order as the spans it arrived in, and
-/// closes a connection whose stream holds more than 1,024 of them once it
-/// has merged what it merges (`too many gaps in stream buffer`): spans next
-/// to each other of less than a 1,024th of what is held. A megabyte holds
-/// no more than 1,024 spans that are not merged, however it arrived. With
-/// the 10 MiB of a frame as its window, a sender that overshot a fast and
-/// long path in its first round trips, as every law does that probes for
-/// the rate, lost every second datagram to the bottleneck's queue and its
-/// connection with them (`tests/congestion.rs`). A frame longer than the
-/// window is read as it arrives, so the window bounds what is in flight
-/// and not what is sent.
+/// Longest silence before a QUIC connection is considered dead: what the
+/// transport reclaims a vanished peer's connection by, with a keep-alive every
+/// quarter of it, so a live peer is heard from several times in every window
+/// however late its scheduler runs it. It is never a request's deadline. The
+/// connection's liveness is its own: a request ends by its own progress
+/// deadline and the connection carrying it stays; a restarted peer is told
+/// sooner by its stateless reset (RFC 9000 §10.3), and node death is the
+/// membership's to decide (SWIM with Lifeguard), not the transport's.
+/// Bounding the idle period by the request timeout made a short deadline a
+/// short liveness window: a process stalled for half a second under load lost
+/// every connection it held (a busy machine's focal-wire run, 2026-10-07).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The most a stream is given to send ahead of what its reader has taken: a
+/// megabyte, hyper-transport's stream window bound is the QUIC assembler's
+/// span limit made explicit (`hyper_transport::stream_window_ceiling`), and
+/// focal's content lane is sized in megabyte streams ([`content_streams`]).
 pub const STREAM_WINDOW_CEILING: u32 = 1024 * 1024;
+/// The path the content lane is sized for: what one gigabit per second
+/// holds in flight over a hundred milliseconds (27 §7), a wide-area link
+/// between data centres; a nearer path fills fewer of its streams and a
+/// further one is not carried faster by more of them than the window
+/// the law opens.
+pub const REFERENCE_PATH_BITS_PER_SECOND: u64 = 1_000_000_000;
+pub const REFERENCE_PATH_ROUND_TRIP: Duration = Duration::from_millis(100);
+/// The streams a transfer to one peer may hold at once: what the
+/// reference path holds in flight, a stream's window at a time, and one
+/// ([`bulk_width`]): thirteen.
+pub fn content_streams() -> u32 {
+    let in_flight = REFERENCE_PATH_BITS_PER_SECOND
+        .saturating_mul(u64::try_from(REFERENCE_PATH_ROUND_TRIP.as_millis()).unwrap_or(u64::MAX))
+        .checked_div(8_000)
+        .unwrap_or(0);
+    let streams = in_flight
+        .div_ceil(u64::from(STREAM_WINDOW_CEILING))
+        .saturating_add(1);
+    u32::try_from(streams).unwrap_or(u32::MAX)
+}
 
 /// By how many streams a transfer goes on a connection whose law holds
 /// `window` bytes in flight, `most` at most: one for every megabyte the
@@ -63,7 +76,7 @@ pub const STREAM_WINDOW_CEILING: u32 = 1024 * 1024;
 /// round trip ([`STREAM_WINDOW_CEILING`]), so a window of less is filled by
 /// one; and the law opens its window no further than what is sent fills
 /// it, so the stream that is one more is what lets it find that the path
-/// holds more (`tests/congestion.rs`).
+/// holds more.
 pub fn bulk_width(window: u64, most: usize) -> usize {
     usize::try_from(
         window
@@ -74,149 +87,223 @@ pub fn bulk_width(window: u64, most: usize) -> usize {
     .saturating_add(1)
     .min(most.max(1))
 }
-/// What the exchanges under way on a connection have to send, in bytes.
-#[derive(Default)]
-struct Held(std::sync::atomic::AtomicU64);
-/// What one exchange has to send, held until it ends.
-struct Sending<'a> {
-    held: &'a Held,
-    bytes: u64,
+
+/// The most exchanges one endpoint holds at once, both ways: its exchange table is allocated to
+/// its bound, so the bound is stated rather than taken from the product of the connection and
+/// stream bounds, which reaches 2^26. Sixty-four thousand is the most a node's listener carries:
+/// `WireLimits::max_connections` at its largest default, a hundred and twenty-eight, each with the
+/// consensus window's five hundred and twelve exchanges in flight.
+pub const MAX_ENDPOINT_EXCHANGES: usize = 1 << 16;
+
+/// The commands a handle may queue for its owner: one for each exchange it may have in flight,
+/// so a handle never waits for the queue while the owner is moving.
+fn command_queue(limits: &WireLimits) -> usize {
+    endpoint_exchanges(limits).max(1)
 }
-impl Held {
-    fn send(&self, bytes: usize) -> (Sending<'_>, u64) {
-        use std::sync::atomic::Ordering;
-        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-        // A count that would not fit is held at what fits.
-        let mut before = self.0.load(Ordering::Acquire);
-        loop {
-            let after = before.saturating_add(bytes);
-            match self
-                .0
-                .compare_exchange_weak(before, after, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    let sending = Sending {
-                        held: self,
-                        bytes: after.saturating_sub(before),
-                    };
-                    return (sending, after);
-                }
-                Err(found) => before = found,
-            }
-        }
-    }
-    fn now(&self) -> u64 {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
-    }
+
+fn endpoint_exchanges(limits: &WireLimits) -> usize {
+    limits
+        .max_connections
+        .saturating_mul(limits.streams_per_connection as usize)
+        .clamp(1, MAX_ENDPOINT_EXCHANGES)
 }
-impl Drop for Sending<'_> {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        let mut before = self.held.0.load(Ordering::Acquire);
-        while let Err(found) = self.held.0.compare_exchange_weak(
-            before,
-            before.saturating_sub(self.bytes),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            before = found;
-        }
-    }
+
+/// The replication lanes a node opens to a peer that speaks the laned profile
+/// ([`crate::LANED_PROTOCOL_VERSION`]): the urgent lane and the bulk lane.
+pub const REPLICATION_LANES: u32 = 2;
+/// The lane that carries what a group cannot do without: a heartbeat, a vote, an answer.
+pub const URGENT_LANE: hyper_transport::LaneId = 0;
+/// The lane that carries a group's bulk appends, in the order they left their sender.
+pub const BULK_LANE: hyper_transport::LaneId = 1;
+/// A lane's window, in consensus windows: the frames one group may have in flight to the peer,
+/// for a few groups at once.
+const LANE_WINDOW_ROUNDS: usize = 4;
+/// The frames one replication lane queues under `limits` ([`LANE_WINDOW_ROUNDS`] consensus
+/// windows), and the frames that may wait for room on it beside them (`net::owner`).
+pub(crate) fn lane_window(limits: &WireLimits) -> usize {
+    usize::try_from(limits.control_streams)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(LANE_WINDOW_ROUNDS)
+        .max(1)
 }
-/// Wait for `work`, which sends `bytes` over `connection`, as long as the
-/// path takes to carry them. Every `period` that ends without it is
-/// charged what the connection sent in it and has not found lost. The
-/// work is given up at the end of a period in which less than a datagram
-/// was sent ([`LEAST_PROGRESS`]), and at the end of one that began when
-/// all the exchanges on the connection had to send beside it (`held`) and
-/// `bytes` more had been sent: the peer had the request and a period to
-/// answer it. So a megabyte is given eight seconds and more on a path
-/// that carries a megabit in a second, and an exchange whose peer
-/// stopped taking it one period or two on any path.
-///
-/// What is held is no more than the frames of the streams of a
-/// connection, and every period but the last sends a datagram of it: the
-/// wait ends.
-async fn carried<T>(
-    connection: &Connection,
-    held: &Held,
-    bytes: usize,
-    period: std::time::Duration,
-    work: impl Future<Output = Result<T, WireError>>,
-) -> Result<T, WireError> {
-    let sent = || {
-        let stats = connection.stats();
-        stats.udp_tx.bytes.saturating_sub(stats.path.lost_bytes)
-    };
-    let (_sending, mut owed) = held.send(bytes);
-    let mut charged = 0_u64;
-    let mut before = sent();
-    let mut work = std::pin::pin!(work);
-    loop {
-        let had = charged >= owed;
-        if let Ok(done) = tokio::time::timeout(period, work.as_mut()).await {
-            return done;
-        }
-        let now = sent();
-        let moved = now.saturating_sub(before);
-        before = now;
-        if had || moved < u64::try_from(LEAST_PROGRESS).unwrap_or(u64::MAX) {
-            return Err(WireError::Timeout);
-        }
-        charged = charged.saturating_add(moved);
-        // What came to the connection since is sent in turn with this.
-        owed = owed.max(held.now());
-    }
-}
-fn transport(limits: &WireLimits) -> Result<Arc<quinn::TransportConfig>, WireError> {
-    quic_transport(limits).map(Arc::new)
-}
-/// What focal's connections are set to, for a caller that measures them.
-pub fn quic_transport(limits: &WireLimits) -> Result<quinn::TransportConfig, WireError> {
+
+/// The bounds of an endpoint carrying focal's traffic under `limits`, admitting by `admission`.
+pub fn endpoint_limits(
+    limits: &WireLimits,
+    admission: &AdmissionLimits,
+) -> Result<Limits, WireError> {
     limits.validate()?;
-    let streams = limits
-        .streams_per_connection
-        .checked_add(2)
-        .ok_or(WireError::Limit)?;
-    let frame = limits
-        .max_frame_bytes
-        .checked_add(HEADER_BYTES as u32)
-        .ok_or(WireError::Limit)?
-        .min(STREAM_WINDOW_CEILING);
-    let window = u64::from(frame)
-        .checked_mul(u64::from(streams))
-        .ok_or(WireError::Limit)?;
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(streams.into());
-    transport.max_concurrent_uni_streams(0u8.into());
-    transport.stream_receive_window(frame.into());
-    transport.receive_window(quinn::VarInt::from_u64(window).map_err(|_| WireError::Limit)?);
-    transport.send_window(window);
-    // A peer that died or restarted is noticed within the idle bound rather
-    // than the full request timeout: keep-alive pings hold a healthy
-    // connection open across long requests, and a silent one is closed so
-    // the next attempt reconnects instead of waiting on a dead connection.
-    let idle = limits.request_timeout.min(IDLE_TIMEOUT);
-    transport.max_idle_timeout(Some(idle.try_into().map_err(|_| WireError::Limit)?));
-    transport.keep_alive_interval(Some(idle.checked_div(4).ok_or(WireError::Limit)?));
-    // Chosen by measurement against the laws quinn brings
-    // (`tests/congestion.rs`, 27 §3.1 P10): the one that stalled on no path
-    // and kept what is asked beside a transfer from waiting for a full
-    // queue.
-    transport.congestion_controller_factory(Arc::new(crate::congestion::CopaConfig::default()));
-    Ok(transport)
+    let streams = limits.streams_per_connection;
+    // A connection's receive window grows to what its streams hold at once, a stream's window
+    // each, and never past the assembler's bound for a stream.
+    let stream = u64::from(limits.max_frame_bytes)
+        .min(hyper_transport::stream_window_ceiling())
+        .min(u64::from(STREAM_WINDOW_CEILING));
+    let window_ceiling =
+        stream
+            .saturating_mul(u64::from(streams))
+            .max(hyper_transport::initial_window(
+                hyper_transport::MIN_DATAGRAM,
+            ));
+    let receive_chunks = usize::try_from(window_ceiling)
+        .unwrap_or(usize::MAX)
+        .checked_div(hyper_transport::RECEIVE_CHUNK)
+        .unwrap_or(0)
+        .saturating_add(1);
+    Ok(Limits {
+        admission: hyper_transport::AdmissionLimits {
+            pending: admission.pending.max(1),
+            identities: admission.identities.max(1),
+            connections: admission.connections.max(1),
+            // An identity alone may hold the endpoint's connections; as others come each is left
+            // a fair share (hyper-transport's max-min admission), and a connection is replaced
+            // only when idle.
+            per_identity: admission.connections.max(1),
+        },
+        streams_per_connection: streams,
+        // A connection's handshake grants one stream, its greeting's: a participant is granted
+        // more from the node's pool as it is blocked (`FocalClasses::pooled`), and any other
+        // peer every stream once its role is known (docs/archictecutre/27 §17).
+        stream_credit: hyper_transport::StreamCredit::Pooled { initial: 1 },
+        // Every ask waits for a stream as long as its connection's queue moves: a participant's
+        // as a node's own. A node holds what it cannot take yet at its sessions' doors rather
+        // than refusing it, so an ask refused here for a queue past a round of its credit would
+        // be the one refusal left, of a request the node would have served.
+        ask_queue: hyper_transport::AskQueue::Table,
+        exchanges: endpoint_exchanges(limits),
+        // Replication frames to a peer that speaks the laned profile go on two lanes: what a
+        // group cannot do without (a heartbeat, a vote, an answer) on one, its bulk appends on
+        // the other, so neither waits behind the other. A lane holds the consensus window's
+        // frames for each of the groups a connection carries at once, a few times over.
+        lanes_per_peer: REPLICATION_LANES,
+        lane_window: lane_window(limits),
+        // focal's messages are their bodies: a head is refused from its prefix.
+        max_head: 0,
+        window_ceiling,
+        serve_period: limits.request_timeout,
+        idle_timeout: IDLE_TIMEOUT,
+        keep_alive: IDLE_TIMEOUT.checked_div(4),
+        max_responses: admission.pending.max(1),
+        receive_chunks,
+    })
+}
+
+/// What an endpoint under `limits` and `admission` holds of its budget at most, bytes, in two
+/// parts: the transport's own — its socket's buffers, its receive pool and each connection's
+/// receive window, charged to the ordinary lane — and its messages', a body each way on each
+/// stream of each connection at the frame bound, charged to the lane its class is funded from. A budget of both funds the endpoint
+/// so that the transport's own bounds refuse before the budget does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndpointBytes {
+    pub transport: u64,
+    pub messages: u64,
+}
+pub fn endpoint_bytes(
+    limits: &WireLimits,
+    admission: &AdmissionLimits,
+) -> Result<EndpointBytes, WireError> {
+    let endpoint = endpoint_limits(limits, admission)?;
+    let connections = u64::try_from(endpoint.admission.connections).unwrap_or(u64::MAX);
+    let pool = u64::try_from(endpoint.receive_chunks)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(hyper_transport::RECEIVE_CHUNK).unwrap_or(u64::MAX));
+    let messages = u64::from(limits.max_frame_bytes)
+        .saturating_mul(2)
+        .saturating_mul(u64::from(endpoint.streams_per_connection))
+        .saturating_mul(connections);
+    let socket = u64::try_from(endpoint_socket_bytes()).unwrap_or(u64::MAX);
+    Ok(EndpointBytes {
+        transport: endpoint
+            .window_ceiling
+            .saturating_mul(connections)
+            .saturating_add(pool)
+            .saturating_add(socket),
+        messages,
+    })
+}
+
+/// What an endpoint's socket is charged for its life, bytes: the most it holds, its receive
+/// buffers and its outbox (`hyper_rt::udp::Io::held_bound`).
+pub fn endpoint_socket_bytes() -> usize {
+    hyper_rt::udp::Io { batch: IO_BATCH }.held_bound()
+}
+
+/// What one endpoint of `limits` may hold, as an allowance: [`endpoint_bytes`] at the admission
+/// a connector of these limits keeps (`AdmissionLimits::for_connections`), its messages on the
+/// completion lane kept for them. A child of `parent` where the endpoint is charged to its owner's
+/// budget (a node's), a budget of its own where the endpoint is its own owner (a client's, a
+/// join's); either way the transport's bounds refuse before the allowance does.
+pub fn endpoint_budget(
+    limits: &WireLimits,
+    parent: Option<&MemoryBudget>,
+) -> Result<MemoryBudget, WireError> {
+    let admission = crate::AdmissionLimits::for_connections(limits.max_connections);
+    let bytes = endpoint_bytes(limits, &admission)?;
+    let limit = usize::try_from(bytes.transport.saturating_add(bytes.messages))
+        .map_err(|_| WireError::Limit)?;
+    let reserve = usize::try_from(bytes.messages).map_err(|_| WireError::Limit)?;
+    match parent {
+        Some(parent) => parent.child(limit, reserve),
+        None => MemoryBudget::new(limit, reserve),
+    }
+    .map_err(|_| WireError::Limit)
+}
+
+/// The server side of focal's TLS: what a listener presents and verifies its clients by.
+pub struct ServerTls(rustls::ServerConfig);
+/// The client side of focal's TLS: what a dial presents and verifies its server by, and the role
+/// its identity is granted as. A message's class is its kind's for its sender's role, decided alike
+/// by the server, which knows the role from the grant, and by the dialer, which sends it in that
+/// class (`net::classes`): a connector of a node's identity is a node's, any other a participant's,
+/// a join's a joiner's. A connector told a role its identity is not granted has its exchanges
+/// refused for their classes.
+pub struct ClientTls {
+    config: rustls::ClientConfig,
+    role: Sender,
+}
+impl ServerTls {
+    /// A configuration the caller built: its certificate resolver, client verifier and protocols
+    /// (a listener that serves enrollment beside the data protocol). The endpoint holds it to the
+    /// transport's rules: no early data, a protocol named.
+    pub fn from_config(config: rustls::ServerConfig) -> Self {
+        Self(config)
+    }
+    /// The configuration, for an endpoint a test drives itself.
+    #[cfg(test)]
+    pub(crate) fn into_config(self) -> rustls::ServerConfig {
+        self.0
+    }
+}
+impl ClientTls {
+    /// A configuration the caller built (an enrollment's pinned verifier, without client auth),
+    /// for an identity granted as `role`.
+    pub fn from_config(config: rustls::ClientConfig, role: Sender) -> Self {
+        Self { config, role }
+    }
+    /// The role the identity is granted as.
+    pub fn role(&self) -> Sender {
+        self.role
+    }
+    /// The configuration, for an endpoint a test drives itself.
+    #[cfg(test)]
+    pub(crate) fn into_config(self) -> rustls::ClientConfig {
+        self.config
+    }
 }
 
 pub fn server_tls(
     identity: TlsIdentity,
     client_roots: Vec<Vec<u8>>,
     limits: &WireLimits,
-) -> Result<quinn::ServerConfig, WireError> {
+) -> Result<ServerTls, WireError> {
     limits.validate()?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = crate::crypto_provider();
+    // A client's chain is verified against the roots this server knows;
+    // a successor issuer's endorsement by one of them is an ordinary
+    // intermediate to it (`trust`).
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-        Arc::new(roots(client_roots)?),
-        provider.clone(),
+        crate::TrustRoots::new(client_roots)?.store()?,
+        provider,
     )
     .build()
     .map_err(|_| WireError::Authentication)?;
@@ -227,375 +314,599 @@ pub fn server_tls(
         .with_single_cert(identity.certificate_chain, identity.private_key)
         .map_err(|_| WireError::Authentication)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
-    server_transport(tls, limits)
-}
-
-/// Apply the shared stream/window policy to an already configured TLS server.
-/// Multiplexed listeners supply their certificate resolver and client verifier
-/// once instead of constructing and discarding a second TLS configuration.
-pub fn server_transport(
-    mut tls: rustls::ServerConfig,
-    limits: &WireLimits,
-) -> Result<quinn::ServerConfig, WireError> {
-    let transport = transport(limits)?;
-    tls.max_early_data_size = 0;
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(
-        QuicServerConfig::try_from(tls).map_err(|_| WireError::Authentication)?,
-    ));
-    config.transport_config(transport);
-    Ok(config)
+    Ok(ServerTls(tls))
 }
 pub fn client_tls(
     identity: TlsIdentity,
     server_roots: Vec<Vec<u8>>,
     limits: &WireLimits,
-) -> Result<quinn::ClientConfig, WireError> {
+    role: Sender,
+) -> Result<ClientTls, WireError> {
     limits.validate()?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+    let provider = crate::crypto_provider();
+    // The server's chain is verified against the roots this client knows;
+    // a successor issuer's endorsement by one of them is an ordinary
+    // intermediate to it (`trust`).
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        crate::TrustRoots::new(server_roots)?.store()?,
+        provider,
+    )
+    .build()
+    .map_err(|_| WireError::Authentication)?;
+    client_tls_with(identity, verifier, limits, role)
+}
+/// [`client_tls`] for a client that adopts an issuer a verified chain
+/// carried endorsed and it did not hold (24 §11): the configuration, and
+/// where the adoption is read.
+pub fn client_tls_adopting(
+    identity: TlsIdentity,
+    server_roots: Vec<Vec<u8>>,
+    limits: &WireLimits,
+    role: Sender,
+) -> Result<(ClientTls, crate::AdoptedRoots), WireError> {
+    limits.validate()?;
+    let (verifier, adopted) = crate::AdoptingServerVerifier::new(
+        crate::TrustRoots::new(server_roots)?,
+        crate::crypto_provider(),
+    )?;
+    Ok((client_tls_with(identity, verifier, limits, role)?, adopted))
+}
+fn client_tls_with(
+    identity: TlsIdentity,
+    verifier: Box<dyn rustls::client::danger::ServerCertVerifier>,
+    limits: &WireLimits,
+    role: Sender,
+) -> Result<ClientTls, WireError> {
+    limits.validate()?;
+    let mut tls = rustls::ClientConfig::builder_with_provider(crate::crypto_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| WireError::Authentication)?
-        .with_root_certificates(roots(server_roots)?)
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(identity.certificate_chain, identity.private_key)
         .map_err(|_| WireError::Authentication)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
-    tls.enable_early_data = false;
-    let mut config = quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(tls).map_err(|_| WireError::Authentication)?,
-    ));
-    config.transport_config(transport(limits)?);
-    Ok(config)
+    Ok(ClientTls { config: tls, role })
+}
+/// The client side of a listener, which never dials: no root, so no server verifies, and the
+/// data protocol named so the endpoint takes it.
+pub(crate) fn listener_client() -> Result<rustls::ClientConfig, WireError> {
+    let mut tls = rustls::ClientConfig::builder_with_provider(crate::crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| WireError::Authentication)?
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    Ok(tls)
+}
+
+/// The congestion law focal's connections run: BBR (27 §3.1 P10, §7). Copa was chosen over
+/// focal's network grids (F39), where it stalled on no path and kept what is asked beside a
+/// transfer from waiting for a full queue; on hyper-rt it reads a busy machine as a full queue. Its
+/// round trips count the peer's held acknowledgement and the time a datagram waits in a socket
+/// for its shard, so at 100 writes a second its window sat at two datagrams on every path: frames
+/// arrived late and out of order, followers fell behind and asked for elections, and the
+/// comparison acknowledged 86% of its writes at a p99 of 2.5 s. BBR, measured on the same runner,
+/// acknowledged every write with a p99 of 5.1 ms at 100 a second and 25.4 ms at 200, and stalled
+/// on none of the network grids' paths (CUBIC stalled on five of them).
+fn congestion() -> Congestion {
+    Congestion::Bbr(BbrConfig::default())
+}
+
+/// The datagrams one system call carries each way: hyper-rt's batch bound, at most the 64
+/// segments of a Linux GSO/GRO send or receive.
+const IO_BATCH: usize = 32;
+
+/// An endpoint on `address`, its owner started on the current shard, woken at every withdrawal of
+/// a grant by `revocations` when it serves under a registry.
+#[allow(clippy::too_many_arguments)]
+fn start(
+    bind: Bind,
+    (tls, role): (Tls, Sender),
+    directory: NetDirectory,
+    limits: &WireLimits,
+    admission: &AdmissionLimits,
+    budget: MemoryBudget,
+    revocations: Option<hyper_rt::sync::WatchReceiver>,
+    enrollment: Option<u32>,
+) -> Result<(Network, SocketAddr), WireError> {
+    let driver = endpoint_driver(bind, (tls, role), directory, limits, admission, budget)?;
+    let local = driver.local_addr().map_err(|_| WireError::Connection)?;
+    let network = Network::start(
+        (driver, role),
+        limits.clone(),
+        command_queue(limits),
+        revocations,
+        enrollment,
+    )?;
+    Ok((network, local))
+}
+
+/// The enrollment protocol a listener serves beside the data protocol: its name in the TLS
+/// handshake and the most one of its messages carries — what its own frames were held to, never
+/// the data protocol's frame bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnrollmentProtocol {
+    pub alpn: &'static [u8],
+    pub max_message_bytes: u32,
+}
+
+/// Where an endpoint's socket comes from: an address bound for it on the current shard, or a socket
+/// its caller bound and held from the moment it learnt the port (`hyper_rt::udp::UdpSocket::adopt`:
+/// binding by number again would give the port up between the check and the use).
+#[derive(Debug)]
+pub enum Bind {
+    Address(SocketAddr),
+    Socket(std::net::UdpSocket),
+}
+impl From<SocketAddr> for Bind {
+    fn from(address: SocketAddr) -> Self {
+        Self::Address(address)
+    }
+}
+impl From<std::net::UdpSocket> for Bind {
+    fn from(socket: std::net::UdpSocket) -> Self {
+        Self::Socket(socket)
+    }
+}
+
+/// An endpoint carrying focal's traffic on `bind`, its socket the current shard's, and not yet
+/// driven: what [`start`] gives an owner. `role` is what the endpoint's identity is granted as,
+/// which with a message's kind gives the class it sends it in.
+pub(crate) fn endpoint_driver(
+    bind: impl Into<Bind>,
+    (tls, role): (Tls, Sender),
+    directory: NetDirectory,
+    limits: &WireLimits,
+    admission: &AdmissionLimits,
+    budget: MemoryBudget,
+) -> Result<Driver, WireError> {
+    let endpoint_limits = endpoint_limits(limits, admission)?;
+    let config = Config {
+        tls,
+        role,
+        limits: endpoint_limits,
+        congestion: congestion(),
+    };
+    let io = hyper_rt::udp::Io { batch: IO_BATCH };
+    // The socket's buffers are the endpoint's from the start: charged their bound now.
+    let budget = NetBudget::new(budget, endpoint_socket_bytes()).map_err(|_| WireError::Limit)?;
+    // Made the instant before the driver anchors its clock to the shard's: every later instant
+    // the driver gives it is that anchor's or after.
+    let endpoint: Endpoint<FocalClasses, NetBudget, NetDirectory> =
+        Endpoint::new(config, budget, directory, std::time::Instant::now())
+            .map_err(|_| WireError::Authentication)?;
+    match bind.into() {
+        Bind::Address(address) => Driver::bind(endpoint, address, io),
+        Bind::Socket(socket) => hyper_rt::udp::UdpSocket::adopt(socket.into())
+            .and_then(|socket| hyper_rt::udp::Batched::new(socket, io, false))
+            .and_then(|socket| Driver::new(endpoint, socket)),
+    }
+    .map_err(|_| WireError::Connection)
 }
 
 pub struct QuicServer {
-    endpoint: Endpoint,
+    network: Network,
+    address: SocketAddr,
     registry: PeerRegistry,
     limits: WireLimits,
-    admission: crate::Admission,
 }
 impl QuicServer {
+    /// `budget` funds what the server reads (the audit's F03): every body is reserved from it
+    /// before any of it is read, against its sender's share.
     pub fn bind(
-        address: SocketAddr,
-        tls: quinn::ServerConfig,
+        address: impl Into<Bind>,
+        tls: ServerTls,
         registry: PeerRegistry,
         limits: WireLimits,
+        budget: MemoryBudget,
     ) -> Result<Self, WireError> {
-        let admission = crate::AdmissionLimits::for_connections(limits.max_connections);
-        Self::bind_admitting(address, tls, registry, limits, admission)
+        let admission = crate::AdmissionLimits::for_connections(limits.max_connections)
+            .replacing_after(limits.request_timeout);
+        Self::bind_admitting(address, tls, registry, limits, admission, budget)
     }
     /// [`Self::bind`] with the admission bounds stated.
     pub fn bind_admitting(
-        address: SocketAddr,
-        tls: quinn::ServerConfig,
+        address: impl Into<Bind>,
+        tls: ServerTls,
         registry: PeerRegistry,
         limits: WireLimits,
         admission: crate::AdmissionLimits,
+        budget: MemoryBudget,
+    ) -> Result<Self, WireError> {
+        Self::bind_serving(address, tls, registry, None, limits, admission, budget)
+    }
+    /// [`Self::bind_admitting`] for a listener that also serves the `enrollment` protocol (its
+    /// `tls` names it beside the data protocol): a joiner on it is a peer of its own, whose role
+    /// lets it send the enrollment kinds and nothing else, each message held to the protocol's
+    /// bound.
+    pub fn bind_serving(
+        address: impl Into<Bind>,
+        tls: ServerTls,
+        registry: PeerRegistry,
+        enrollment: Option<EnrollmentProtocol>,
+        limits: WireLimits,
+        admission: crate::AdmissionLimits,
+        budget: MemoryBudget,
     ) -> Result<Self, WireError> {
         limits.validate()?;
-        let admission = crate::Admission::new(admission).map_err(|_| WireError::Limit)?;
-        let endpoint = transport_setup(|| Ok(Endpoint::server(tls, address)?))?;
+        // The directory names every identity the admission holds and every handshake in flight,
+        // so the admission is what refuses an identity past its bound — typed, retryable — and
+        // never the directory, which would tell a granted certificate it is refused.
+        let directory = NetDirectory::serving(
+            registry.clone(),
+            enrollment.map(|protocol| protocol.alpn),
+            admission.identities.saturating_add(admission.pending),
+        );
+        let tls = Tls {
+            server: Some(tls.0),
+            client: listener_client()?,
+        };
+        // A listener is a node's: what it sends, it sends as one.
+        let (network, address) = start(
+            address.into(),
+            (tls, Sender::Node),
+            directory,
+            &limits,
+            &admission,
+            budget,
+            registry.watch(),
+            enrollment.map(|protocol| protocol.max_message_bytes),
+        )?;
         Ok(Self {
-            endpoint,
+            network,
+            address,
             registry,
             limits,
-            admission,
         })
     }
+    /// The server's owner, for a test that fills its queue.
+    #[cfg(test)]
+    pub(crate) fn network(&self) -> &Network {
+        &self.network
+    }
+    /// What this server's endpoint holds, refused and carried ([`crate::net::NetStats`]).
+    pub async fn stats(&self) -> crate::net::NetStats {
+        self.network
+            .call(|reply| Command::Stats { reply })
+            .await
+            .unwrap_or_default()
+    }
+    /// What this server's socket did ([`crate::net::NetStats::io`]).
+    pub async fn io(&self) -> hyper_rt::udp::IoStats {
+        self.network
+            .call(|reply| Command::Stats { reply })
+            .await
+            .unwrap_or_default()
+            .io
+    }
     /// Who holds this server's connections, and what it refused.
-    pub fn admission(&self) -> crate::AdmissionStats {
-        self.admission.stats()
+    pub async fn admission(&self) -> AdmissionStats {
+        let stats = self
+            .network
+            .call(|reply| Command::Stats { reply })
+            .await
+            .unwrap_or_default();
+        AdmissionStats::of(&stats)
     }
     pub fn local_addr(&self) -> Result<SocketAddr, WireError> {
-        Ok(self.endpoint.local_addr()?)
+        Ok(self.address)
     }
-    pub fn close(&self) {
-        self.endpoint.close(0u8.into(), b"shutdown");
+    /// Present `tls` to every handshake from now on: a renewed identity, roots that changed.
+    pub async fn replace_tls(&self, tls: ServerTls) -> Result<(), WireError> {
+        self.identity().replace(tls).await
     }
-    pub async fn serve<H: RequestHandler + Clone>(&self, handler: H) -> Result<(), WireError> {
-        require_runtime()?;
-        // The connections borrow this server and its admission; each
-        // serves its streams on tasks of its own.
-        let mut connections = futures_util::stream::FuturesUnordered::new();
-        loop {
-            tokio::select! {
-                Some(())=futures_util::StreamExt::next(&mut connections),if !connections.is_empty()=>{},
-                incoming=self.endpoint.accept()=>{
-                    let Some(incoming)=incoming else{break};
-                    if connections.len() >= self.limits.max_connections {incoming.refuse();continue;}
-                    let Ok(pending)=self.admission.begin() else {incoming.refuse();continue;};
-                    let registry=self.registry.clone();let limits=self.limits.clone();let handler=handler.clone();
-                    connections.push(async move {
-                        let _ = transport_exchange(async {
-                            let connection = tokio::time::timeout(limits.request_timeout, incoming)
-                                .await.map_err(|_| WireError::Timeout)?
-                                .map_err(|_| WireError::Connection)?;
-                            serve_admitted_connection(connection, registry, limits, handler, pending).await
-                        }).await;
-                    });
-                }
-            }
+    /// Size the stream pool this server's participants share: the exchanges they may have open
+    /// here at once, all their connections' together (hyper-transport's `StreamCredit::Pooled`).
+    /// Its owner hears it as soon as its queue has room.
+    pub fn set_stream_pool(&self, streams: u32) -> Result<(), WireError> {
+        self.network.send_now(Command::StreamPool { streams })
+    }
+    /// A handle that presents another identity to this server's next handshakes, held apart from
+    /// the server (a credential's renewal swaps it while the server serves).
+    pub fn identity(&self) -> ServerIdentity {
+        ServerIdentity {
+            network: self.network.clone(),
         }
-        drop(connections);
+    }
+    /// Waits until the server has ended — closed, its endpoint and socket gone, so an address it
+    /// held is free again.
+    pub async fn ended(&self) {
+        let Ok((done, ended)) = hyper_rt::sync::oneshot() else {
+            return;
+        };
+        if self.network.send(Command::Ended { done }).await.is_ok() {
+            // Told as the owner ends, or dropped by an owner that ended first.
+            let _ = ended.await;
+        }
+    }
+    /// Closes the server: its connections close and `serve` returns. Refused only when the shard
+    /// has no task left to queue it (`Limit`); a server already closed is closed.
+    pub fn close(&self) -> Result<(), WireError> {
+        match self.network.send_now(Command::Close) {
+            Err(WireError::Connection) => Ok(()),
+            closed => closed,
+        }
+    }
+    /// Serves requests with `handler` until the server is closed.
+    pub async fn serve<H: RequestHandler + Clone>(&self, handler: H) -> Result<(), WireError> {
+        self.serve_with(DataService::new(
+            handler,
+            self.registry.clone(),
+            self.limits.clone(),
+        ))
+        .await
+    }
+    /// Serves with `serve`, which answers the data protocol and whatever else the listener
+    /// carries, until the server is closed.
+    pub async fn serve_with<S: Serve>(&self, serve: S) -> Result<(), WireError> {
+        // Off a shard nothing could be served: refused, before an ended owner is told apart.
+        crate::require_runtime()?;
+        let (done, ended) = hyper_rt::sync::oneshot().map_err(|_| WireError::Connection)?;
+        match self
+            .network
+            .send(Command::Serve {
+                serve: Box::new(serve),
+                done,
+            })
+            .await
+        {
+            // A server closed before it served has ended all the same.
+            Err(WireError::Connection) => return Ok(()),
+            sent => sent?,
+        }
+        // The owner ending without a word is an end all the same.
+        let _ = ended.await;
         Ok(())
     }
 }
-/// Serve an already established connection selected by an ALPN multiplexer.
-/// The data protocol still requires a verified client certificate registered in
-/// PeerRegistry; optional client authentication on another ALPN grants no access.
-pub async fn serve_authenticated_connection<H: RequestHandler + Clone>(
-    connection: Connection,
-    registry: PeerRegistry,
-    limits: WireLimits,
-    handler: H,
-) -> Result<(), WireError> {
-    transport_exchange(serve_authenticated_connection_inner(
-        connection, registry, limits, handler, None,
-    ))
-    .await
-}
-/// [`serve_authenticated_connection`] for a listener that admits by identity
-/// (27 §3.1 P5): `pending` is the place the handshake held, exchanged for a
-/// charge to the identity the certificate authenticates as.
-pub async fn serve_admitted_connection<H: RequestHandler + Clone>(
-    connection: Connection,
-    registry: PeerRegistry,
-    limits: WireLimits,
-    handler: H,
-    pending: crate::Pending<'_>,
-) -> Result<(), WireError> {
-    transport_exchange(serve_authenticated_connection_inner(
-        connection,
-        registry,
-        limits,
-        handler,
-        Some(pending),
-    ))
-    .await
-}
-async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
-    connection: Connection,
-    registry: PeerRegistry,
-    limits: WireLimits,
-    handler: H,
-    pending: Option<crate::Pending<'_>>,
-) -> Result<(), WireError> {
-    limits.validate()?;
-    let authenticated = (|| {
-        let handshake = connection
-            .handshake_data()
-            .ok_or(WireError::Authentication)?
-            .downcast::<quinn::crypto::rustls::HandshakeData>()
-            .map_err(|_| WireError::Authentication)?;
-        if handshake.protocol.as_deref() != Some(ALPN) {
-            return Err(WireError::Authentication);
-        }
-        let identity = connection
-            .peer_identity()
-            .ok_or(WireError::Authentication)?
-            .downcast::<Vec<CertificateDer<'static>>>()
-            .map_err(|_| WireError::Authentication)?;
-        let fingerprint =
-            certificate_fingerprint(identity.first().ok_or(WireError::Authentication)?.as_ref());
-        let peer = registry
-            .authenticate(fingerprint)
-            .map_err(|_| WireError::Authentication)?;
-        Ok((fingerprint, peer))
-    })();
-    let (fingerprint, peer) = match authenticated {
-        Ok(authenticated) => authenticated,
-        Err(error) => {
-            connection.close(1u8.into(), b"unauthorized");
-            return Err(error);
-        }
-    };
-    // Charged to the identity from here until this connection is served.
-    let admitted = match pending
-        .map(|pending| pending.authenticated(peer.principal(), peer.role(), &connection))
-        .transpose()
-    {
-        Ok(admitted) => admitted,
-        Err(_) => {
-            connection.close(4u8.into(), b"capacity");
-            return Err(WireError::Access(AccessError::Capacity));
-        }
-    };
-    let handshake = async {
-        let (mut send, mut recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|_| WireError::Connection)?;
-        let hello: Hello = read_frame(&mut recv, FrameKind::Hello, 4096).await?;
-        require_end(&mut recv).await?;
-        let negotiated = match limits.negotiate_native(
-            &hello,
-            handler.supports_managed_requests(),
-            handler.supports_participant_requests(),
-            handler.supports_native_requests(),
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                write_frame(
-                    &mut send,
-                    FrameKind::HelloReply,
-                    &HelloReply::Rejected(error.clone()),
-                    4096,
-                )
-                .await?;
-                send.finish().map_err(|_| WireError::Connection)?;
-                // Preserve the typed rejection until the peer acknowledges the
-                // stream; dropping the last connection handle immediately can
-                // otherwise race the response and expose only a connection loss.
-                send.stopped().await.map_err(|_| WireError::Connection)?;
-                return Err(WireError::Access(error));
-            }
-        };
-        write_frame(
-            &mut send,
-            FrameKind::HelloReply,
-            &HelloReply::Accepted(negotiated),
-            4096,
-        )
-        .await?;
-        send.finish().map_err(|_| WireError::Connection)?;
-        Ok(negotiated)
-    };
-    let negotiated = tokio::time::timeout(limits.request_timeout, handshake)
-        .await
-        .map_err(|_| WireError::Timeout)??;
-    let mut limits = limits;
-    limits.max_frame_bytes = negotiated.max_frame_bytes;
-    limits.max_items = negotiated.max_items;
-    let task_limit = (limits.streams_per_connection as usize).saturating_add(2);
-    let mut tasks = JoinSet::new();
-    // What the answers under way on this connection have to send.
-    let held = Arc::new(Held::default());
-    loop {
-        tokio::select! {
-            Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
-            streams=connection.accept_bi()=>{
-                let Ok((mut send,mut recv))=streams else{break};
-                if let Some(admitted) = &admitted { admitted.used(); }
-                if tasks.len() >= task_limit {let _=send.reset(2u8.into());let _=recv.stop(2u8.into());continue;}
-                let registry=registry.clone();let limits=limits.clone();let handler=handler.clone();let carrying=connection.clone();let held=held.clone();
-                tasks.spawn(async move {
-                    // Each part of an exchange has its own wait: what is
-                    // asked as it arrives, its handler the time of a
-                    // request (`dispatch`), and its answer as long as the
-                    // path takes to carry it.
-                    let work=async {
-                        // Recheck registry on every stream, so revocation applies
-                        // to already established authenticated connections.
-                        let peer=registry.authenticate(fingerprint)?;
-                        let header=tokio::time::timeout(limits.request_timeout,read_frame_header(&mut recv,FrameKind::Request,limits.max_frame_bytes))
-                            .await.map_err(|_|WireError::Timeout)??;
-                        let request:RequestEnvelope=read_payload_arriving(&mut recv,header,limits.request_timeout).await?;
-                        tokio::time::timeout(limits.request_timeout,require_end(&mut recv))
-                            .await.map_err(|_|WireError::Timeout)??;
-                        send.set_priority(request.operation.class().priority()).map_err(|_|WireError::Connection)?;
-                        let response = if negotiated.accepts_protocol(request.protocol) {
-                            dispatch_accounted(&handler,peer,request,&limits).await
-                        } else {
-                            OwnedResponse::new(request.reply(Response::Error(AccessError::UnsupportedProtocol)))
-                        };
-                        let bytes=postcard::experimental::serialized_size(response.envelope()).map_err(|_|WireError::InvalidFrame)?;
-                        carried(&carrying,&held,bytes,limits.request_timeout,send_owned_response(send,response,limits.max_frame_bytes)).await
-                    };
-                    let _=transport_exchange(work).await;
-                });
-            }
-        }
-    }
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-    Ok(())
-}
 
-/// Reset buffered transport data before releasing its allowance on timeout,
-/// cancellation or peer loss. Successful delivery disarms the reset after ACK.
-struct ResponseDelivery {
-    stream: quinn::SendStream,
-    response: OwnedResponse,
-    acknowledged: bool,
+/// focal's data protocol served by a [`RequestHandler`]: a request is decoded, held to the kind
+/// and the profile it came under and to the grant current now, dispatched, and its answer
+/// encoded under the profile.
+#[derive(Clone)]
+pub struct DataService<H> {
+    handler: H,
+    registry: PeerRegistry,
+    limits: WireLimits,
 }
-impl Drop for ResponseDelivery {
-    fn drop(&mut self) {
-        if !self.acknowledged {
-            let _ = self.stream.reset(3u8.into());
+impl<H: RequestHandler + Clone> DataService<H> {
+    pub fn new(handler: H, registry: PeerRegistry, limits: WireLimits) -> Self {
+        Self {
+            handler,
+            registry,
+            limits,
         }
     }
-}
-async fn send_owned_response(
-    stream: quinn::SendStream,
-    response: OwnedResponse,
-    limit: u32,
-) -> Result<(), WireError> {
-    let mut delivery = ResponseDelivery {
-        stream,
-        response,
-        acknowledged: false,
-    };
-    write_frame(
-        &mut delivery.stream,
-        FrameKind::Response,
-        delivery.response.envelope(),
-        limit,
-    )
-    .await?;
-    delivery
-        .stream
-        .finish()
-        .map_err(|_| WireError::Connection)?;
-    if delivery
-        .stream
-        .stopped()
-        .await
-        .map_err(|_| WireError::Connection)?
-        .is_some()
-    {
-        return Err(WireError::Connection);
+    /// A replication frame from a peer's lane: checked as the same request is — its kind the
+    /// operation's, its class the one its sender's role carries it in, its profile negotiated, its
+    /// sender authenticated by the grant current now, the request verified — then handed to the
+    /// handler at once ([`RequestHandler::take_frame`]): no task, no reply, nothing that waits for
+    /// one. Only a node's replication may come on a lane; anything else is let go. Whether the
+    /// handler took it.
+    pub fn take_frame(&self, framed: Framed) -> bool {
+        let Inbound::Data {
+            fingerprint,
+            peer: authenticated,
+        } = framed.from
+        else {
+            return false;
+        };
+        let (Kind::Operation(tag), Some(negotiated)) = (framed.kind, framed.negotiated) else {
+            return false;
+        };
+        if !negotiated.laned() || !matches!(Sender::of(authenticated.role()), Sender::Node) {
+            return false;
+        }
+        let Ok(request) = decode_payload::<RequestEnvelope>(&framed.body) else {
+            return false;
+        };
+        let carried = FocalClasses::class_of(
+            Kind::Operation(request.operation.registered_tag()),
+            Sender::Node,
+        );
+        if request.operation.registered_tag() != tag
+            || carried != Some(framed.class)
+            || !matches!(
+                request.operation,
+                Operation::Raft { .. } | Operation::RaftOrdered { .. }
+            )
+            || !negotiated.accepts_protocol(request.protocol)
+        {
+            return false;
+        }
+        let Ok(peer) = self.registry.authenticate(fingerprint) else {
+            return false;
+        };
+        let mut limits = self.limits.clone();
+        limits.max_frame_bytes = negotiated.max_frame_bytes;
+        limits.max_items = negotiated.max_items;
+        let Ok(verified) = crate::verify_request(peer, request, &limits) else {
+            return false;
+        };
+        self.handler
+            .take_frame(verified.with_path(framed.path))
+            .is_ok()
     }
-    delivery.acknowledged = true;
-    Ok(())
+    /// The answer to `served`, a request of the data protocol: `None` resets the exchange.
+    pub fn answer(&self, served: Served) -> ServeFuture {
+        let this = self.clone();
+        Box::pin(async move { this.answer_now(served).await })
+    }
+    async fn answer_now(self, served: Served) -> Option<Reply> {
+        let Inbound::Data {
+            fingerprint,
+            peer: authenticated,
+        } = served.from
+        else {
+            return None;
+        };
+        let Kind::Operation(tag) = served.kind else {
+            return None;
+        };
+        let negotiated = served.negotiated?;
+        let request: RequestEnvelope = decode_payload(&served.body).ok()?;
+        // The operation is the one its kind named, of the class its sender's role carries it in.
+        let carried = FocalClasses::class_of(
+            Kind::Operation(request.operation.registered_tag()),
+            Sender::of(authenticated.role()),
+        );
+        if request.operation.registered_tag() != tag || carried != Some(served.class) {
+            return None;
+        }
+        let mut limits = self.limits.clone();
+        limits.max_frame_bytes = negotiated.max_frame_bytes;
+        limits.max_items = negotiated.max_items;
+        let response = if negotiated.accepts_protocol(request.protocol) {
+            // What is dispatched is authorized by the grant current now, never by one captured
+            // before its body arrived (the audit's F35).
+            let peer = self.registry.authenticate(fingerprint).ok()?;
+            dispatch_accounted_by(
+                &self.handler,
+                peer,
+                request,
+                &limits,
+                (served.path, served.arrived_ns),
+            )
+            .await
+        } else {
+            OwnedResponse::new(request.reply(Response::Error(AccessError::UnsupportedProtocol)))
+        };
+        let body = encode_payload(response.envelope(), negotiated.max_frame_bytes).ok()?;
+        // The envelope goes; what its handler charged for it stays with the encoding until the
+        // endpoint has taken its last byte.
+        Some(Reply {
+            body,
+            charge: Some(response.into_charge()),
+        })
+    }
+}
+impl<H: RequestHandler + Clone> Serve for DataService<H> {
+    fn capabilities(&self) -> [bool; 5] {
+        // Lanes carry frames that left in order and are stepped in it: only a handler that takes
+        // the ordered profile is offered them.
+        let ordered = self.handler.supports_ordered_replication();
+        [
+            self.handler.supports_managed_requests(),
+            self.handler.supports_participant_requests(),
+            self.handler.supports_native_requests(),
+            ordered,
+            ordered && self.handler.supports_lane_frames(),
+        ]
+    }
+    fn serve(&self, request: Served) -> ServeFuture {
+        self.answer(request)
+    }
+    fn frame(&self, framed: Framed) -> bool {
+        self.take_frame(framed)
+    }
 }
 
 pub struct QuicConnector {
-    endpoint: Endpoint,
+    network: Network,
     limits: WireLimits,
-    /// The identity presented on every connection opened from now on; a
-    /// renewal replaces it without rebinding the endpoint.
-    tls: std::sync::RwLock<quinn::ClientConfig>,
+    /// What the connector's identity is granted as: a replacement identity must be the same.
+    role: Sender,
+    /// The profiles offered in every Hello, the newest first: all this
+    /// binary speaks, unless [`Self::offering`] made it an older one.
+    offers: Vec<u16>,
 }
+/// Every profile this binary speaks, the newest first: what a connector
+/// offers in its Hello.
+pub const OFFERED_PROTOCOLS: [u16; 6] = [
+    crate::LANED_PROTOCOL_VERSION,
+    crate::ORDERED_PROTOCOL_VERSION,
+    crate::NATIVE_PROTOCOL_VERSION,
+    PEER_PROTOCOL_VERSION,
+    MANAGED_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+];
 impl QuicConnector {
     pub fn limits(&self) -> &WireLimits {
         &self.limits
     }
+    /// A connector on `address`, its endpoint's owner on the current shard. `budget` funds the
+    /// answers it reads; a connector dials at most `limits.max_connections` routes at once.
     pub fn bind(
         address: SocketAddr,
-        tls: quinn::ClientConfig,
+        tls: ClientTls,
         limits: WireLimits,
+        budget: MemoryBudget,
     ) -> Result<Self, WireError> {
         limits.validate()?;
-        let endpoint = transport_setup(|| Ok(Endpoint::client(address)?))?;
+        let admission = crate::AdmissionLimits::for_connections(limits.max_connections);
+        let directory = NetDirectory::dialing(limits.max_connections);
+        let role = tls.role;
+        let tls = Tls {
+            server: None,
+            client: tls.config,
+        };
+        let (network, _) = start(
+            Bind::Address(address),
+            (tls, role),
+            directory,
+            &limits,
+            &admission,
+            budget,
+            None,
+            None,
+        )?;
         Ok(Self {
-            endpoint,
+            network,
             limits,
-            tls: std::sync::RwLock::new(tls),
+            role,
+            offers: OFFERED_PROTOCOLS.to_vec(),
         })
+    }
+    /// A connector that is its own owner — a client's, a join's — its endpoint funded by a budget
+    /// of its own sized to `limits` ([`endpoint_budget`]).
+    pub fn bind_standalone(
+        address: SocketAddr,
+        tls: ClientTls,
+        limits: WireLimits,
+    ) -> Result<Self, WireError> {
+        let budget = endpoint_budget(&limits, None)?;
+        Self::bind(address, tls, limits, budget)
+    }
+    /// A connector that offers only `versions` in its Hello: what a
+    /// connector of an older binary offers, for a fleet's tests of a mixed
+    /// window (27 §12). The base profile is always among them.
+    pub fn offering(mut self, versions: &[u16]) -> Result<Self, WireError> {
+        if versions.is_empty()
+            || versions.len() > OFFERED_PROTOCOLS.len()
+            || !versions.contains(&PROTOCOL_VERSION)
+            || versions
+                .iter()
+                .any(|version| !OFFERED_PROTOCOLS.contains(version))
+        {
+            return Err(WireError::Limit);
+        }
+        self.offers = versions.to_vec();
+        Ok(self)
     }
     /// Present another client identity on every connection opened from now
     /// on; connections already open keep the identity they were opened with.
-    pub fn replace_tls(&self, tls: quinn::ClientConfig) -> Result<(), WireError> {
-        *self.tls.write().map_err(|_| WireError::Connection)? = tls;
-        Ok(())
+    /// The identity is granted as the one it replaces (a renewal), or it is
+    /// refused: the connector's messages are sent in its role's classes.
+    pub async fn replace_tls(&self, tls: ClientTls) -> Result<(), WireError> {
+        if tls.role != self.role {
+            return Err(WireError::Limit);
+        }
+        let tls = Box::new(Tls {
+            server: None,
+            client: tls.config,
+        });
+        self.network
+            .call(|reply| Command::SetTls { tls, reply })
+            .await?
     }
-    /// A clonable handle that opens connections with the identity presented
-    /// now; a peer pool's detached dial holds one so a caller giving up under
-    /// its own deadline neither abandons the dial nor keeps the connector.
+    /// A clonable handle that opens connections on this connector's endpoint, with the identity
+    /// it presents when each is opened.
     pub fn dialer(&self) -> Result<QuicDialer, WireError> {
         Ok(QuicDialer {
-            endpoint: self.endpoint.clone(),
+            network: self.network.clone(),
             limits: self.limits.clone(),
-            tls: self.tls.read().map_err(|_| WireError::Connection)?.clone(),
+            offers: self.offers.clone(),
         })
     }
     pub async fn connect(
@@ -603,25 +914,151 @@ impl QuicConnector {
         address: SocketAddr,
         server_name: &str,
     ) -> Result<QuicRemote, WireError> {
-        let tls = self.tls.read().map_err(|_| WireError::Connection)?.clone();
-        transport_exchange(open_remote(
-            &self.endpoint,
-            tls,
+        open_remote(
+            &self.network,
             &self.limits,
+            &self.offers,
             address,
             server_name,
-        ))
+            false,
+        )
         .await
     }
+    /// A connection to `address` of the caller's alone: never the route's to `address` that
+    /// [`Self::connect`] shares, never found by another call, and forgotten once it closes — a
+    /// probe of exactly an address that closes its connection after (24 §24) leaves the route's
+    /// alone.
+    pub async fn connect_alone(
+        &self,
+        address: SocketAddr,
+        server_name: &str,
+    ) -> Result<QuicRemote, WireError> {
+        open_remote(
+            &self.network,
+            &self.limits,
+            &self.offers,
+            address,
+            server_name,
+            true,
+        )
+        .await
+    }
+    /// A connection of the enrollment protocol to the server at `address` named `server_name`:
+    /// the caller's alone, and ungreeted, its joiner sending the enrollment kinds alone. The
+    /// server must present a leaf `pins` accepts beside the chain and name the connector's TLS
+    /// verified: one that chains but is not pinned is refused [`WireError::Unpinned`], and no
+    /// message is made for it.
+    pub async fn enrollment(
+        &self,
+        address: SocketAddr,
+        server_name: &str,
+        pins: LeafPins,
+    ) -> Result<EnrollmentLink, WireError> {
+        if server_name.len() > 253 {
+            return Err(WireError::Limit);
+        }
+        let name = server_name.to_owned();
+        let linked: Linked = self
+            .network
+            .call(|reply| Command::Connect {
+                address,
+                name,
+                pin: Some(pins),
+                offers: Vec::new(),
+                alone: true,
+                greet: false,
+                reply,
+            })
+            .await??;
+        Ok(EnrollmentLink {
+            network: self.network.clone(),
+            peer: linked.peer,
+            epoch: linked.epoch,
+        })
+    }
+    /// What the connector's endpoint holds and refused.
+    pub async fn stats(&self) -> crate::net::NetStats {
+        self.network
+            .call(|reply| Command::Stats { reply })
+            .await
+            .unwrap_or_default()
+    }
+    /// Closes the connector's endpoint, its connections with it. Refused only when the shard has
+    /// no task left to queue it (`Limit`); an endpoint already closed is closed.
+    pub fn close(&self) -> Result<(), WireError> {
+        match self.network.send_now(Command::Close) {
+            Err(WireError::Connection) => Ok(()),
+            closed => closed,
+        }
+    }
 }
-/// The identity and limits a [`QuicConnector`] presented when the handle was
-/// taken; connections it opens are the connector's own (same endpoint, same
-/// certificate check by `server_name`).
+/// A connection of the enrollment protocol ([`QuicConnector::enrollment`]), closed as it is
+/// dropped. A close its shard cannot queue (its tasks all taken) leaves the connection to its idle
+/// timeout, as an abandoned connection is.
+pub struct EnrollmentLink {
+    network: Network,
+    peer: PeerId,
+    epoch: hyper_transport::Epoch,
+}
+impl EnrollmentLink {
+    /// One message of the enrollment protocol, `body` of kind `tag`, and its answer's body, held
+    /// to the connector's `max_frame_bytes`; `period` is the server's time to answer once it has
+    /// the message. The message is wiped however the exchange ends.
+    pub async fn ask(
+        &self,
+        tag: u8,
+        body: Vec<u8>,
+        period: Duration,
+    ) -> Result<Vec<u8>, WireError> {
+        let kind = Kind::Enrollment(tag);
+        let body = Asked::of(kind, body);
+        let answered: Result<Answer, Failed> = self
+            .network
+            .call(|reply| Command::Ask {
+                peer: self.peer,
+                epoch: self.epoch,
+                kind,
+                body,
+                period,
+                reply,
+            })
+            .await?;
+        answered
+            .map(|answer| answer.body)
+            .map_err(|failed| failed.error)
+    }
+}
+impl Drop for EnrollmentLink {
+    fn drop(&mut self) {
+        let _ = self
+            .network
+            .send_now(Command::Disconnect { peer: self.peer });
+    }
+}
+/// A handle that presents another TLS identity to a server's next handshakes; clones share it.
+#[derive(Clone)]
+pub struct ServerIdentity {
+    network: Network,
+}
+impl ServerIdentity {
+    /// Present `tls` to every handshake from now on: a renewed identity, roots that changed.
+    pub async fn replace(&self, tls: ServerTls) -> Result<(), WireError> {
+        let tls = Box::new(Tls {
+            server: Some(tls.0),
+            client: listener_client()?,
+        });
+        self.network
+            .call(|reply| Command::SetTls { tls, reply })
+            .await?
+    }
+}
+/// The connector's endpoint, as a handle: connections it opens are the connector's own (same
+/// endpoint, same certificate check by `server_name`).
 #[derive(Clone)]
 pub struct QuicDialer {
-    endpoint: Endpoint,
+    network: Network,
     limits: WireLimits,
-    tls: quinn::ClientConfig,
+    offers: Vec<u16>,
 }
 impl QuicDialer {
     pub async fn connect(
@@ -629,169 +1066,353 @@ impl QuicDialer {
         address: SocketAddr,
         server_name: &str,
     ) -> Result<QuicRemote, WireError> {
-        transport_exchange(open_remote(
-            &self.endpoint,
-            self.tls.clone(),
+        open_remote(
+            &self.network,
             &self.limits,
+            &self.offers,
             address,
             server_name,
-        ))
+            false,
+        )
         .await
     }
 }
 async fn open_remote(
-    endpoint: &Endpoint,
-    tls: quinn::ClientConfig,
+    network: &Network,
     limits: &WireLimits,
+    offers: &[u16],
     address: SocketAddr,
     server_name: &str,
+    alone: bool,
 ) -> Result<QuicRemote, WireError> {
-    let connecting = endpoint
-        .connect_with(tls, address, server_name)
-        .map_err(|_| WireError::Connection)?;
-    let connection = tokio::time::timeout(limits.request_timeout, connecting)
-        .await
-        .map_err(|_| WireError::Timeout)?
-        .map_err(|_| WireError::Authentication)?;
-    let handshake = async {
-        let (mut send, mut recv) = connection
-            .open_bi()
-            .await
-            .map_err(|_| WireError::Connection)?;
-        let hello = Hello {
-            versions: vec![
-                crate::NATIVE_PROTOCOL_VERSION,
-                PEER_PROTOCOL_VERSION,
-                MANAGED_PROTOCOL_VERSION,
-                PROTOCOL_VERSION,
-            ],
-            max_frame_bytes: limits.max_frame_bytes,
-            max_items: limits.max_items,
-        };
-        write_frame(&mut send, FrameKind::Hello, &hello, 4096).await?;
-        send.finish().map_err(|_| WireError::Connection)?;
-        let reply: HelloReply = read_frame(&mut recv, FrameKind::HelloReply, 4096).await?;
-        require_end(&mut recv).await?;
-        match reply {
-            HelloReply::Accepted(value) => Ok(value),
-            HelloReply::Rejected(error) => Err(WireError::Access(error)),
-        }
-    };
-    let negotiated = tokio::time::timeout(limits.request_timeout, handshake)
-        .await
-        .map_err(|_| WireError::Timeout)??;
+    if server_name.len() > 253 {
+        return Err(WireError::Limit);
+    }
+    let name = server_name.to_owned();
+    let offers = offers.to_vec();
+    let linked: Linked = network
+        .call(|reply| Command::Connect {
+            address,
+            name,
+            pin: None,
+            offers,
+            alone,
+            greet: true,
+            reply,
+        })
+        .await??;
+    let negotiated = linked.negotiated.ok_or(WireError::InvalidFrame)?;
     if !matches!(
         negotiated.protocol,
         PROTOCOL_VERSION
             | MANAGED_PROTOCOL_VERSION
             | PEER_PROTOCOL_VERSION
             | crate::NATIVE_PROTOCOL_VERSION
-    ) || negotiated.max_frame_bytes > limits.max_frame_bytes
-        || negotiated.max_items > limits.max_items
-    {
+            | crate::ORDERED_PROTOCOL_VERSION
+            | crate::LANED_PROTOCOL_VERSION
+    ) {
         return Err(WireError::InvalidFrame);
     }
     Ok(QuicRemote {
-        connection,
+        network: network.clone(),
+        peer: linked.peer,
+        epoch: linked.epoch,
         negotiated,
         limits: limits.clone(),
-        _endpoint: endpoint.clone(),
-        capacity: Arc::new(RemoteCapacity {
-            data: Semaphore::new(limits.streams_per_connection as usize),
-            control: Semaphore::new(2),
-            held: Held::default(),
-        }),
     })
 }
+
+/// An exchange's answer, and what the path to its peer measured when it came.
+#[derive(Debug)]
+pub struct Exchanged {
+    pub response: ResponseEnvelope,
+    pub path: Option<PathFacts>,
+}
+/// Why an exchange ended unanswered, and whether its connection is gone with it.
+#[derive(Debug)]
+pub struct Unanswered {
+    pub error: WireError,
+    pub closed: bool,
+}
+
+/// A greeted connection to a peer, as a handle: clones share it.
 #[derive(Clone)]
 pub struct QuicRemote {
-    connection: Connection,
+    network: Network,
+    peer: PeerId,
+    epoch: hyper_transport::Epoch,
     negotiated: Negotiated,
     limits: WireLimits,
-    _endpoint: Endpoint,
-    // All clones of one physical connection must share its stream admission.
-    capacity: Arc<RemoteCapacity>,
-}
-struct RemoteCapacity {
-    data: Semaphore,
-    control: Semaphore,
-    /// What the requests under way on the connection have to send.
-    held: Held,
 }
 impl QuicRemote {
     pub fn negotiated(&self) -> Negotiated {
         self.negotiated
     }
-    pub fn close(&self) {
-        self.connection.close(0u8.into(), b"client closed");
+    /// Queues `request`, a replication frame, on lane `lane` of this connection, behind the
+    /// lane's earlier frames: answered by nothing, `Ok` once it is queued, with what the path
+    /// measures then. Refused when the connection does not speak the laned profile, is gone, or
+    /// its lane is full.
+    pub async fn send_lane(
+        &self,
+        lane: hyper_transport::LaneId,
+        request: &RequestEnvelope,
+    ) -> Result<Option<PathFacts>, WireError> {
+        if !self.negotiated.laned() || !self.negotiated.accepts_protocol(request.protocol) {
+            return Err(WireError::Access(AccessError::UnsupportedProtocol));
+        }
+        let body = encode_payload(request, self.negotiated.max_frame_bytes)?;
+        let kind = Kind::Operation(request.operation.registered_tag());
+        self.network
+            .call(|reply| Command::Lane {
+                peer: self.peer,
+                epoch: self.epoch,
+                lane,
+                kind,
+                body,
+                reply,
+            })
+            .await?
     }
-    /// What the law of the connection holds in flight, in bytes.
-    pub fn window(&self) -> u64 {
-        self.connection.stats().path.cwnd
+    /// Closes the connection; exchanges under way on it are refused. Refused only when the shard
+    /// has no task left to queue it (`Limit`); a connection already gone is closed.
+    pub fn close(&self) -> Result<(), WireError> {
+        match self
+            .network
+            .send_now(Command::Disconnect { peer: self.peer })
+        {
+            Err(WireError::Connection) => Ok(()),
+            closed => closed,
+        }
+    }
+    /// What the path to the peer measures now, while the connection is up.
+    pub async fn path(&self) -> Option<PathFacts> {
+        self.network
+            .call(|reply| Command::Path {
+                peer: self.peer,
+                reply,
+            })
+            .await
+            .ok()
+            .flatten()
     }
     pub async fn request(&self, request: &RequestEnvelope) -> Result<ResponseEnvelope, WireError> {
         self.request_within(request, self.limits.request_timeout)
             .await
     }
-    /// An exchange whose peer is given `period` to answer what it has
-    /// been asked, and whose request and answer are given as long as the
-    /// path takes to carry them ([`carried`], [`read_payload_arriving`]).
+    /// An exchange whose peer is given `period` to answer what it has been asked once it has it:
+    /// judged by its progress (hyper-transport's `Progress`), never by a wall-clock bound on the
+    /// whole.
     pub async fn request_within(
         &self,
         request: &RequestEnvelope,
-        period: std::time::Duration,
+        period: Duration,
     ) -> Result<ResponseEnvelope, WireError> {
-        transport_exchange(self.request_inner(request, period)).await
+        self.exchange_within(request, period)
+            .await
+            .map(|exchanged| exchanged.response)
+            .map_err(|unanswered| unanswered.error)
     }
-    async fn request_inner(
+    /// [`Self::request_within`], with what the path measured when the answer came, or whether
+    /// the connection went with the exchange.
+    pub async fn exchange_within(
         &self,
         request: &RequestEnvelope,
-        period: std::time::Duration,
-    ) -> Result<ResponseEnvelope, WireError> {
+        period: Duration,
+    ) -> Result<Exchanged, Unanswered> {
+        let unanswered = |error| Unanswered {
+            error,
+            closed: false,
+        };
         if !self.negotiated.accepts_protocol(request.protocol) {
-            return Err(WireError::Access(AccessError::UnsupportedProtocol));
+            return Err(unanswered(WireError::Access(
+                AccessError::UnsupportedProtocol,
+            )));
         }
-        let lane = if matches!(request.operation, Operation::Raft { .. }) {
-            &self.capacity.control
-        } else {
-            &self.capacity.data
-        };
-        let _permit = lane.try_acquire().map_err(|_| WireError::Limit)?;
-        let bytes = postcard::experimental::serialized_size(request)
-            .map_err(|_| WireError::InvalidFrame)?;
-        // The answer begins once the request has been carried and the
-        // peer has answered it.
-        let asked = async {
-            let (mut send, mut recv) = self
-                .connection
-                .open_bi()
-                .await
-                .map_err(|_| WireError::Connection)?;
-            send.set_priority(request.operation.class().priority())
-                .map_err(|_| WireError::Connection)?;
-            write_frame(
-                &mut send,
-                FrameKind::Request,
-                request,
-                self.negotiated.max_frame_bytes,
-            )
-            .await?;
-            send.finish().map_err(|_| WireError::Connection)?;
-            let header = read_frame_header(
-                &mut recv,
-                FrameKind::Response,
-                self.negotiated.max_frame_bytes,
-            )
-            .await?;
-            Ok((recv, header))
-        };
-        let (mut recv, header) =
-            carried(&self.connection, &self.capacity.held, bytes, period, asked).await?;
-        let response: ResponseEnvelope = read_payload_arriving(&mut recv, header, period).await?;
-        tokio::time::timeout(period, require_end(&mut recv))
+        let body = encode_payload(request, self.negotiated.max_frame_bytes).map_err(unanswered)?;
+        let kind = Kind::Operation(request.operation.registered_tag());
+        let answered: Result<Answer, Failed> = self
+            .network
+            .call(|reply| Command::Ask {
+                peer: self.peer,
+                epoch: self.epoch,
+                kind,
+                body: Asked::of(kind, body),
+                period,
+                reply,
+            })
             .await
-            .map_err(|_| WireError::Timeout)??;
-        validate_response(request, &response, None, &self.limits)?;
-        Ok(response)
+            .map_err(|error| Unanswered {
+                error,
+                closed: true,
+            })?;
+        let answer = answered.map_err(|failed| Unanswered {
+            error: failed.error,
+            closed: failed.closed,
+        })?;
+        let response: ResponseEnvelope = decode_payload(&answer.body).map_err(unanswered)?;
+        validate_response(request, &response, None, &self.limits).map_err(unanswered)?;
+        Ok(Exchanged {
+            response,
+            path: answer.path,
+        })
     }
+}
+
+/// The connections a participant keeps to the routes it reaches — its initial endpoint and the
+/// hints its requests are redirected to — one per route, dialed once (the audit's F60): its
+/// connector's endpoint keeps them, and concurrent cold calls to one route wait on the one dial
+/// in flight. A route's name is resolved afresh on each dial. The connection last handed out for
+/// each route is remembered, so a failure its caller reports closes that connection and no later
+/// one.
+pub struct RouteConnections {
+    connector: QuicConnector,
+    max_routes: usize,
+    /// The connection each route was last handed, by its endpoint and server name; at most
+    /// `max_routes`, the one handed longest ago going first.
+    handed: std::sync::Mutex<std::collections::VecDeque<((String, String), QuicRemote)>>,
+    /// Connections it closed whose close their endpoint could not queue (the shard's tasks all
+    /// taken): each idles out at its connection's idle timeout instead.
+    closes_refused: std::sync::atomic::AtomicU64,
+}
+/// A connection the cache handed out.
+pub struct Connected {
+    pub remote: QuicRemote,
+    pub generation: u64,
+}
+/// The addresses a name resolves to that a dial tries: the resolver's first.
+const RESOLVED: usize = 1;
+impl RouteConnections {
+    pub fn new(connector: QuicConnector, max_routes: usize) -> Result<Self, WireError> {
+        if max_routes == 0 || max_routes > 1024 {
+            return Err(WireError::Limit);
+        }
+        Ok(Self {
+            connector,
+            max_routes,
+            handed: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            closes_refused: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+    pub fn limits(&self) -> &WireLimits {
+        self.connector.limits()
+    }
+    /// The dials the routes' endpoint started: a route's first, and each after its connection
+    /// went.
+    pub async fn dials(&self) -> u64 {
+        self.connector.stats().await.dials
+    }
+    /// Connections it closed whose close their endpoint could not queue.
+    pub fn closes_refused(&self) -> u64 {
+        self.closes_refused
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Closes `remote`, counting a close its endpoint could not queue.
+    fn close(&self, remote: &QuicRemote) {
+        if remote.close().is_err() {
+            let _ = self.closes_refused.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |count| Some(count.saturating_add(1)),
+            );
+        }
+    }
+    /// The routes this cache may hold.
+    pub fn max_routes(&self) -> usize {
+        self.max_routes
+    }
+    /// The connection to `endpoint` under `server_name`.
+    pub async fn connect(&self, endpoint: &str, server_name: &str) -> Result<Connected, WireError> {
+        if endpoint.len() > 512 || server_name.len() > 253 {
+            return Err(WireError::Limit);
+        }
+        let address = resolve(endpoint, self.limits().request_timeout).await?;
+        let remote = self.connector.connect(address, server_name).await?;
+        let route = (endpoint.to_owned(), server_name.to_owned());
+        if let Ok(mut handed) = self.handed.lock() {
+            handed.retain(|(held, _)| *held != route);
+            if handed.len() >= self.max_routes {
+                handed.pop_front();
+            }
+            handed.push_back((route, remote.clone()));
+        }
+        Ok(Connected {
+            generation: remote.epoch,
+            remote,
+        })
+    }
+    /// `request` on the route's connection, dialed if none is up. The connection is closed only
+    /// when it is what failed — closed, or not speaking the protocol
+    /// ([`crate::connection_failed`], the peer pool's rule); a request that timed out or was
+    /// refused on a connection that carries the caller's other requests failed alone.
+    pub async fn request(
+        &self,
+        endpoint: &str,
+        server_name: &str,
+        request: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope, WireError> {
+        let connected = self.connect(endpoint, server_name).await?;
+        let result = connected
+            .remote
+            .exchange_within(request, self.limits().request_timeout)
+            .await;
+        match result {
+            Ok(exchanged) => Ok(exchanged.response),
+            Err(unanswered) => {
+                if crate::connection_failed(unanswered.closed, &unanswered.error, true) {
+                    self.close(&connected.remote);
+                }
+                Err(unanswered.error)
+            }
+        }
+    }
+    /// Close the route's connection of `generation`, which its caller found failed: the next call
+    /// dials anew. A failure of a connection no longer the route's forgets nothing.
+    pub fn forget(&self, endpoint: &str, server_name: &str, generation: u64) {
+        let Ok(mut handed) = self.handed.lock() else {
+            return;
+        };
+        let at = handed.iter().position(|((held, name), remote)| {
+            held == endpoint && name == server_name && remote.epoch == generation
+        });
+        if let Some((_, remote)) = at.and_then(|at| handed.remove(at)) {
+            self.close(&remote);
+        }
+    }
+}
+
+/// `endpoint` as an address: itself when it is one, else its host resolved, waited for no longer
+/// than `period`.
+async fn resolve(endpoint: &str, period: Duration) -> Result<SocketAddr, WireError> {
+    resolve_all(endpoint, RESOLVED, period)
+        .await?
+        .first()
+        .copied()
+        .ok_or(WireError::Connection)
+}
+/// `endpoint` (`host:port`) as at most `most` addresses: itself when it is one, else what the
+/// platform's resolver gives its host, in its order, waited for no longer than `period`
+/// (`Timeout` past it). The resolver runs on the process's blocking pool under its DNS share.
+pub async fn resolve_all(
+    endpoint: &str,
+    most: usize,
+    period: Duration,
+) -> Result<Vec<SocketAddr>, WireError> {
+    if let Ok(address) = endpoint.parse::<SocketAddr>() {
+        return Ok(vec![address]);
+    }
+    let (host, port) = endpoint.rsplit_once(':').ok_or(WireError::Connection)?;
+    let port: u16 = port.parse().map_err(|_| WireError::Connection)?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    // Off a shard the wait for an answer cannot be kept: refused before any lookup is asked of
+    // the pool, which would run it for nobody.
+    crate::require_runtime()?;
+    // Resolution runs on the process's blocking pool, under its share: started here once, so no
+    // caller of a name depends on another having started it.
+    focal_rt::blocking().map_err(|_| WireError::Connection)?;
+    let nanos = u64::try_from(period.as_nanos()).unwrap_or(u64::MAX);
+    hyper_rt::futures::within(nanos, hyper_rt::dns::resolve(host, port, most))
+        .await
+        .map_err(|_| WireError::Connection)?
+        .ok_or(WireError::Timeout)?
+        .map_err(|_| WireError::Connection)
 }

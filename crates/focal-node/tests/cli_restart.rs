@@ -27,7 +27,7 @@ impl Drop for Server {
 }
 fn start(root: &Path) -> Server {
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
-        .args(["--data-dir", root.to_str().unwrap(), "start"])
+        .args(["--data-dir", root.to_str().unwrap(), "start", "node"])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -72,7 +72,7 @@ fn request(root: &Path, identity: &Value, operation: Value, id: u8) -> Value {
     key[15] = id;
     let value = json!({"protocol":1,"ledger":identity["ledger"],"route_epoch":1,"request_epoch":1,"request_id":key,"operation":operation});
     std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-    cli(root, &["request", path.to_str().unwrap()])
+    cli(root, &["send", "request", path.to_str().unwrap()])
 }
 #[test]
 fn acknowledged_request_survives_kill_and_same_key_retry() {
@@ -81,23 +81,23 @@ fn acknowledged_request_survives_kill_and_same_key_retry() {
         .tempdir_in("/tmp")
         .unwrap();
     let server = start(root.path());
-    let identity = cli(root.path(), &["identity"]);
+    let identity = cli(root.path(), &["inspect", "identity"]);
     let request = json!({"protocol":1,"ledger":identity["ledger"],"route_epoch":1,"request_epoch":1,"request_id":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"operation":{"Submit":{"expected_revision":null,"command":{"NegotiateEpoch":{"epoch":1}}}}});
     let path = root.path().join("request.json");
     std::fs::write(&path, serde_json::to_vec(&request).unwrap()).unwrap();
-    let first = cli(root.path(), &["request", path.to_str().unwrap()]);
+    let first = cli(root.path(), &["send", "request", path.to_str().unwrap()]);
     assert_eq!(first["result"]["Submitted"]["Committed"]["sequence"], 1);
     let refused_owner = Command::new(env!("CARGO_BIN_EXE_focal"))
-        .args(["--data-dir", root.path().to_str().unwrap(), "start"])
+        .args(["--data-dir", root.path().to_str().unwrap(), "start", "node"])
         .output()
         .unwrap();
     assert!(!refused_owner.status.success());
     drop(server); // kill, no graceful checkpoint or shutdown callback
     let _server = start(root.path());
-    assert_eq!(identity, cli(root.path(), &["identity"]));
-    let retried = cli(root.path(), &["request", path.to_str().unwrap()]);
+    assert_eq!(identity, cli(root.path(), &["inspect", "identity"]));
+    let retried = cli(root.path(), &["send", "request", path.to_str().unwrap()]);
     assert_eq!(first, retried);
-    let status = cli(root.path(), &["status"]);
+    let status = cli(root.path(), &["inspect", "prefix"]);
     assert_eq!(status["result"]["Read"]["token"]["sequence"], 1);
 }
 
@@ -108,7 +108,7 @@ fn upload_offsets_and_sealed_evidence_survive_process_kills() {
         .tempdir_in("/tmp")
         .unwrap();
     let server = start(root.path());
-    let identity = cli(root.path(), &["identity"]);
+    let identity = cli(root.path(), &["inspect", "identity"]);
     let upload = vec![7; 16];
     let bytes = b"abcdefghij";
     let begin = json!({"Upload":{"Begin":{"upload":upload,"length":bytes.len(),"digest":blake3::hash(bytes).as_bytes(),"class":2}}});
@@ -172,9 +172,9 @@ fn stream_ack_and_unacknowledged_delivery_survive_process_kills() {
         .prefix("focal-stream-")
         .tempdir_in("/tmp")
         .unwrap();
-    cli(root.path(), &["demo"]);
+    cli(root.path(), &["run", "demo"]);
     let server = start(root.path());
-    let identity = cli(root.path(), &["identity"]);
+    let identity = cli(root.path(), &["inspect", "identity"]);
     let operation = json!({"Stream":{"Open":{"consumer":vec![8;16],"filter":"All","start":null,"seed":false,"credits":{"items":1,"bytes":65536}}}});
     let first = request(root.path(), &identity, operation.clone(), 201);
     let cursor = first["result"]["Stream"]["cursor"].clone();

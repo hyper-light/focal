@@ -302,7 +302,7 @@ impl Index {
         charge(work, mul(mul(capacity, add(levels(capacity)?, 1)?)?, 1024)?)?;
         let bytes = crate::native::prepare::array::<EventSlot>(capacity)?;
         let allocation = budget
-            .reserve(BudgetKind::Recovery, BudgetLane::Completion, bytes)?
+            .reserve(BudgetKind::Recovery, BudgetLane::Committed, bytes)?
             .commit();
         let mut indexed = Vec::new();
         indexed

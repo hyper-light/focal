@@ -1,6 +1,6 @@
 # Agent tools, skills, consults, and challenges
 
-Status: researched architecture with partial implementation, updated for the peer-to-peer execution boundary on 2026-09-06. The local `focal mcp serve` adapter now exposes the shared authored-operation registry and durable operation recovery. The executable surface and thin skills are documented in [the MCP guide](../mcp.md). Authenticated remote MCP, generated capability-specific skill publication, agent continuation storage, and exchange/remediation policy remain required work.
+Status: researched architecture with partial implementation, updated for the peer-to-peer execution boundary on 2026-09-06. The local `focal serve mcp` adapter now exposes the shared authored-operation registry and durable operation recovery. The executable surface and thin skills are documented in [the MCP guide](../mcp.md). Authenticated remote MCP, generated capability-specific skill publication, agent continuation storage, and exchange/remediation policy remain required work.
 
 The [protocol-specific research](14-mcp-protocol-research.md) pins the current MCP revision, defines narrow legacy compatibility, and records the bounded Rust transport and interoperability gates for these proposed tools. The [manual CLI](../manual-cli.md) supplies the currently executable path.
 

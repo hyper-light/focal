@@ -152,7 +152,9 @@ fn weighted_deficit_charges_work_cost_and_rotates_classes_without_starvation() {
     assert_eq!(served.iter().filter(|id| **id == tenant(2)).count(), 30);
     assert!(
         served
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .all(|chunk| chunk[0] == tenant(1) && chunk[1..].iter().all(|id| *id == tenant(2)))
     );
 
@@ -383,4 +385,36 @@ fn cancelled_jobs_and_dropped_scheduler_preserve_running_work_charge() {
     assert_eq!(*dispatch.payload(), 5);
     drop(dispatch);
     assert_eq!(node.stats().used, 0);
+}
+
+/// Eligibility judged per session and class: a session whose writes are held still has its
+/// reads served, its writes kept with every quota held, and taken in their order once
+/// eligible again.
+#[test]
+fn a_session_holding_its_writes_still_has_its_reads_served() {
+    let mut scheduler = FairScheduler::new(config(), budget()).unwrap();
+    scheduler.register_tenant(tenant(1), quota(1)).unwrap();
+    for item in [
+        job(1, 1, 1, WorkClass::Append, 10),
+        job(1, 1, 2, WorkClass::Query, 10),
+        job(1, 1, 3, WorkClass::Append, 10),
+        job(1, 1, 4, WorkClass::Query, 10),
+    ] {
+        scheduler.enqueue(item, item.key.id, 512).unwrap();
+    }
+    let mut served = Vec::new();
+    for _ in 0..10 {
+        match scheduler
+            .schedule_where(|_, class| class != WorkClass::Append)
+            .unwrap()
+        {
+            ScheduleOutcome::Work(work) => served.push(work.metadata.key.id),
+            ScheduleOutcome::Continue => {}
+            ScheduleOutcome::Idle => break,
+        }
+    }
+    assert_eq!(served, [WorkId::from_u128(2), WorkId::from_u128(4)]);
+    assert_eq!(scheduler.active_items(), 2);
+    assert_eq!(next(&mut scheduler).metadata.key.id, WorkId::from_u128(1));
+    assert_eq!(next(&mut scheduler).metadata.key.id, WorkId::from_u128(3));
 }

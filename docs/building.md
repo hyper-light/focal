@@ -10,7 +10,7 @@ after every required platform and release check succeeds. No first tagged releas
 has been published by this work. See [release procedures and checksums](../scripts/release/README.md).
 
 Building from source is optional, for contributors or a custom build. The
-workspace pins Rust 1.94.1 and edition 2024. `Cargo.lock` records the resolved
+workspace pins Rust 1.98.1 and edition 2024. `Cargo.lock` records the resolved
 dependency graph. Install Rust through rustup and a native protobuf compiler
 (`brew install protobuf` on macOS; `apt-get install protobuf-compiler` on
 Debian/Ubuntu), then run from the checkout. The cryptographic provider, aws-lc-rs, compiles AWS-LC from the

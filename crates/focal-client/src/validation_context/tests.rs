@@ -233,6 +233,10 @@ impl Fixture {
 struct Mock {
     replies: Mutex<VecDeque<(Response, Duration)>>,
     calls: Mutex<Vec<RequestEnvelope>>,
+    /// A reply that holds the shard's thread before it is ready: which call's, and for how
+    /// long. The shard is then busy elsewhere, as a loaded machine keeps it, and its next
+    /// poll finds the reply ready and the call's deadline passed at once.
+    stall: Mutex<Option<(usize, Duration)>>,
 }
 impl Mock {
     fn pages(pages: Vec<ReadPage>) -> Self {
@@ -242,6 +246,7 @@ impl Mock {
         Self {
             replies: Mutex::new(replies.into_iter().map(|r| (r, Duration::ZERO)).collect()),
             calls: Mutex::new(vec![]),
+            stall: Mutex::new(None),
         }
     }
     fn calls(&self) -> Vec<RequestEnvelope> {
@@ -255,7 +260,16 @@ impl ClientTransport for &Mock {
         request: &'a RequestEnvelope,
     ) -> TransportFuture<'a> {
         Box::pin(async move {
-            self.calls.lock().unwrap().push(request.clone());
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(request.clone());
+                calls.len() - 1
+            };
+            if let Some((stalled, period)) = *self.stall.lock().unwrap()
+                && stalled == call
+            {
+                std::thread::sleep(period);
+            }
             let (response, delay) = self
                 .replies
                 .lock()
@@ -263,7 +277,9 @@ impl ClientTransport for &Mock {
                 .pop_front()
                 .expect("at most three logical read calls");
             if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                hyper_rt::futures::sleep(crate::time::nanos(delay))
+                    .await
+                    .unwrap();
             }
             Ok(request.reply(response))
         })
@@ -293,8 +309,14 @@ fn invalid_response(error: ValidationContextError) -> bool {
     )
 }
 
-#[tokio::test]
-async fn context_pins_all_objects_and_preserves_old_runs_original_manifest_and_cursor() {
+#[test]
+fn context_pins_all_objects_and_preserves_old_runs_original_manifest_and_cursor() {
+    focal_rt::block_on(
+        context_pins_all_objects_and_preserves_old_runs_original_manifest_and_cursor_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn context_pins_all_objects_and_preserves_old_runs_original_manifest_and_cursor_on_a_shard() {
     let fixture = Fixture::new();
     let mock = Mock::pages(fixture.pages());
     let context = normal(&mock).validation_context(request()).await.unwrap();
@@ -322,8 +344,11 @@ async fn context_pins_all_objects_and_preserves_old_runs_original_manifest_and_c
     assert!(!encoded.is_empty());
 }
 
-#[tokio::test]
-async fn no_closing_testament_uses_only_two_reads() {
+#[test]
+fn no_closing_testament_uses_only_two_reads() {
+    focal_rt::block_on(no_closing_testament_uses_only_two_reads_on_a_shard()).unwrap();
+}
+async fn no_closing_testament_uses_only_two_reads_on_a_shard() {
     let mut fixture = Fixture::new();
     let mut lifecycle = fixture.claim.lifecycle().clone();
     lifecycle.testament = None;
@@ -336,8 +361,16 @@ async fn no_closing_testament_uses_only_two_reads() {
     assert_eq!(mock.calls().len(), 2);
 }
 
-#[tokio::test]
-async fn receipt_adoption_keeps_the_original_closing_testament_and_never_rebinds_old_runs() {
+#[test]
+fn receipt_adoption_keeps_the_original_closing_testament_and_never_rebinds_old_runs() {
+    focal_rt::block_on(
+        receipt_adoption_keeps_the_original_closing_testament_and_never_rebinds_old_runs_on_a_shard(
+        ),
+    )
+    .unwrap();
+}
+async fn receipt_adoption_keeps_the_original_closing_testament_and_never_rebinds_old_runs_on_a_shard()
+ {
     let mut fixture = Fixture::new();
     let mut lifecycle = fixture.claim.lifecycle().clone();
     let receipt = lifecycle.receipt.as_mut().unwrap();
@@ -356,8 +389,12 @@ async fn receipt_adoption_keeps_the_original_closing_testament_and_never_rebinds
     assert_eq!(context.records, fixture.records);
 }
 
-#[tokio::test]
-async fn continuation_preserves_exact_token_and_position_even_when_envelope_route_is_default() {
+#[test]
+fn continuation_preserves_exact_token_and_position_even_when_envelope_route_is_default() {
+    focal_rt::block_on(continuation_preserves_exact_token_and_position_even_when_envelope_route_is_default_on_a_shard()).unwrap();
+}
+async fn continuation_preserves_exact_token_and_position_even_when_envelope_route_is_default_on_a_shard()
+ {
     let fixture = Fixture::new();
     let mut pages = fixture.pages();
     let after = fixture.records[0].position;
@@ -395,8 +432,14 @@ async fn continuation_preserves_exact_token_and_position_even_when_envelope_rout
     );
 }
 
-#[tokio::test]
-async fn nonexistent_requirement_is_distinct_from_a_missing_referenced_parent() {
+#[test]
+fn nonexistent_requirement_is_distinct_from_a_missing_referenced_parent() {
+    focal_rt::block_on(
+        nonexistent_requirement_is_distinct_from_a_missing_referenced_parent_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn nonexistent_requirement_is_distinct_from_a_missing_referenced_parent_on_a_shard() {
     let mock = Mock::pages(vec![ReadPage {
         token: token(),
         objects: vec![],
@@ -421,8 +464,15 @@ async fn nonexistent_requirement_is_distinct_from_a_missing_referenced_parent() 
     }
 }
 
-#[tokio::test]
-async fn rejects_mismatched_membership_hash_parent_manifest_scope_and_future_lifecycle() {
+#[test]
+fn rejects_mismatched_membership_hash_parent_manifest_scope_and_future_lifecycle() {
+    focal_rt::block_on(
+        rejects_mismatched_membership_hash_parent_manifest_scope_and_future_lifecycle_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn rejects_mismatched_membership_hash_parent_manifest_scope_and_future_lifecycle_on_a_shard()
+{
     for case in 0..10 {
         let mut fixture = Fixture::new();
         match case {
@@ -496,8 +546,14 @@ async fn rejects_mismatched_membership_hash_parent_manifest_scope_and_future_lif
     }
 }
 
-#[tokio::test]
-async fn transport_route_retry_preserves_the_old_exact_token_and_read_identity() {
+#[test]
+fn transport_route_retry_preserves_the_old_exact_token_and_read_identity() {
+    focal_rt::block_on(
+        transport_route_retry_preserves_the_old_exact_token_and_read_identity_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn transport_route_retry_preserves_the_old_exact_token_and_read_identity_on_a_shard() {
     let first = Fixture::new().pages().remove(0);
     let mock = Mock::responses([
         Response::Read(first),
@@ -537,8 +593,14 @@ async fn transport_route_retry_preserves_the_old_exact_token_and_read_identity()
     }
 }
 
-#[tokio::test]
-async fn expiry_route_change_and_wrong_prefix_never_restart_at_a_fresh_snapshot() {
+#[test]
+fn expiry_route_change_and_wrong_prefix_never_restart_at_a_fresh_snapshot() {
+    focal_rt::block_on(
+        expiry_route_change_and_wrong_prefix_never_restart_at_a_fresh_snapshot_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn expiry_route_change_and_wrong_prefix_never_restart_at_a_fresh_snapshot_on_a_shard() {
     for error in [
         AccessError::SnapshotExpired,
         AccessError::RouteChanged(RouteHint {
@@ -572,8 +634,14 @@ async fn expiry_route_change_and_wrong_prefix_never_restart_at_a_fresh_snapshot(
     assert_eq!(mock.calls().len(), 2);
 }
 
-#[tokio::test]
-async fn rejects_wrong_query_stale_modes_cursor_without_exact_and_bad_scope_before_io() {
+#[test]
+fn rejects_wrong_query_stale_modes_cursor_without_exact_and_bad_scope_before_io() {
+    focal_rt::block_on(
+        rejects_wrong_query_stale_modes_cursor_without_exact_and_bad_scope_before_io_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn rejects_wrong_query_stale_modes_cursor_without_exact_and_bad_scope_before_io_on_a_shard() {
     for case in 0..6 {
         let mut input = request();
         let Operation::Read(read) = &mut input.operation else {
@@ -612,8 +680,14 @@ async fn rejects_wrong_query_stale_modes_cursor_without_exact_and_bad_scope_befo
     }
 }
 
-#[tokio::test]
-async fn aggregate_json_bound_rejects_a_combination_even_when_each_page_fits() {
+#[test]
+fn aggregate_json_bound_rejects_a_combination_even_when_each_page_fits() {
+    focal_rt::block_on(
+        aggregate_json_bound_rejects_a_combination_even_when_each_page_fits_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn aggregate_json_bound_rejects_a_combination_even_when_each_page_fits_on_a_shard() {
     let fixture = Fixture::new();
     let pages = fixture.pages();
     let largest = pages
@@ -640,8 +714,12 @@ async fn aggregate_json_bound_rejects_a_combination_even_when_each_page_fits() {
     assert!(mock.calls().len() <= 3);
 }
 
-#[tokio::test]
-async fn whole_call_deadline_bounds_three_individually_valid_waits() {
+#[test]
+fn whole_call_deadline_bounds_three_individually_valid_waits() {
+    focal_rt::block_on(whole_call_deadline_bounds_three_individually_valid_waits_on_a_shard())
+        .unwrap();
+}
+async fn whole_call_deadline_bounds_three_individually_valid_waits_on_a_shard() {
     let mock = Mock::pages(Fixture::new().pages());
     for (_, delay) in mock.replies.lock().unwrap().iter_mut() {
         *delay = Duration::from_millis(25);
@@ -656,17 +734,31 @@ async fn whole_call_deadline_bounds_three_individually_valid_waits() {
     assert!(mock.calls().len() <= 2);
 }
 
+/// A wake past the whole call's deadline finds the second reply ready and the deadline passed at
+/// once (`within` polls its work first): the call ends there, and no read is sent past its
+/// deadline. Before, the third read was sent and the call answered after its time was up (macOS
+/// CI flagged the timed version of this, run 38086325072).
 #[test]
-fn missing_time_driver_and_missing_runtime_are_typed_read_failures() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
+fn a_late_wake_past_the_whole_call_deadline_sends_no_further_read() {
+    focal_rt::block_on(async {
+        let mock = Mock::pages(Fixture::new().pages());
+        *mock.stall.lock().unwrap() = Some((1, Duration::from_millis(60)));
+        let result = client(&mock, WireLimits::default(), Duration::from_millis(40))
+            .validation_context(request())
+            .await;
+        assert!(matches!(
+            result,
+            Err(ValidationContextError::Client(ClientError::Transport))
+        ));
+        assert_eq!(mock.calls().len(), 2);
+    })
+    .unwrap();
+}
+
+/// Off a shard, where no deadline could be kept, a read is a typed failure and nothing is sent.
+#[test]
+fn a_read_off_a_shard_is_a_typed_read_failure() {
     let mock = Mock::pages(Fixture::new().pages());
-    assert!(matches!(
-        runtime.block_on(normal(&mock).validation_context(request())),
-        Err(ValidationContextError::Client(ClientError::Transport))
-    ));
-    assert!(mock.calls().is_empty());
     let client = normal(&mock);
     let mut future = pin!(client.validation_context(request()));
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -674,4 +766,5 @@ fn missing_time_driver_and_missing_runtime_are_typed_read_failures() {
         future.as_mut().poll(&mut cx),
         Poll::Ready(Err(ValidationContextError::Client(ClientError::Transport)))
     ));
+    assert!(mock.calls().is_empty());
 }

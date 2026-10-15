@@ -528,3 +528,72 @@ fn concurrent_mixed_kind_spend_shrink_split_and_drop_never_underflow_held_credit
     drop(pool);
     assert_eq!(parent.stats(), baseline);
 }
+
+/// What `headroom` reports is what one reservation on its lane can take: at a
+/// budget, under a parent whose limits bind before its own, and in a funded
+/// pool, exactly that much is granted and a byte more refused. Each refusal
+/// is counted at the budget the reservation was made at, with its lane, its
+/// request and what was available where it was refused, whichever level
+/// refused it.
+#[test]
+fn headroom_is_what_one_reservation_takes_and_its_refusal_is_recorded() {
+    let parent = MemoryBudget::new(1_000_000, 100_000).unwrap();
+    let child = parent.child(2_000_000, 0).unwrap();
+    let held = parent
+        .reserve(BudgetKind::Payload, BudgetLane::Completion, 50_000)
+        .unwrap();
+    // The ordinary lane stops at the parent's ordinary limit, the completion
+    // lane at its total, the child's larger limits never binding.
+    assert_eq!(parent.headroom(BudgetLane::Ordinary), 900_000);
+    assert_eq!(parent.headroom(BudgetLane::Completion), 950_000);
+    assert_eq!(child.headroom(BudgetLane::Ordinary), 900_000);
+    assert_eq!(child.headroom(BudgetLane::Completion), 950_000);
+    for (budget, lane) in [
+        (&parent, BudgetLane::Ordinary),
+        (&parent, BudgetLane::Completion),
+        (&child, BudgetLane::Ordinary),
+        (&child, BudgetLane::Completion),
+    ] {
+        let headroom = budget.headroom(lane);
+        let (before, parent_before) = (budget.refusals(), parent.refusals());
+        let refused = budget
+            .reserve(BudgetKind::Pending, lane, headroom + 1)
+            .unwrap_err();
+        let MemoryError::Capacity {
+            requested,
+            available,
+        } = refused
+        else {
+            panic!("{refused:?}");
+        };
+        assert_eq!((requested, available), (headroom + 1, headroom));
+        let after = budget.refusals();
+        assert_eq!(after.count, before.count + 1);
+        assert_eq!(
+            (after.lane, after.requested, after.available),
+            (lane, requested, available)
+        );
+        if std::ptr::eq(budget, &child) {
+            // Refused at the parent, counted where it was made.
+            assert_eq!(parent.refusals(), parent_before);
+        }
+        let all = budget.reserve(BudgetKind::Pending, lane, headroom).unwrap();
+        assert_eq!(budget.headroom(lane), 0);
+        drop(all);
+        assert_eq!(budget.headroom(lane), headroom);
+    }
+    // A funded pool's headroom is its own: its ancestors' credit is held for it.
+    let pool = parent.funded_child(BudgetLane::Ordinary, 4096).unwrap();
+    let completion = parent.funded_child(BudgetLane::Completion, 4096).unwrap();
+    assert_eq!(pool.headroom(BudgetLane::Ordinary), 4096);
+    assert_eq!(pool.headroom(BudgetLane::Completion), 4096);
+    assert_eq!(completion.headroom(BudgetLane::Completion), 4096);
+    assert_eq!(completion.headroom(BudgetLane::Ordinary), 0);
+    let all = pool
+        .reserve(BudgetKind::Pages, BudgetLane::Ordinary, 4096)
+        .unwrap();
+    assert_eq!(pool.headroom(BudgetLane::Ordinary), 0);
+    drop((all, pool, completion, held));
+    assert_eq!(parent.headroom(BudgetLane::Ordinary), 900_000);
+    assert_eq!(parent.headroom(BudgetLane::Completion), 1_000_000);
+}

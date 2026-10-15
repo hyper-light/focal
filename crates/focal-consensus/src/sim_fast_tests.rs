@@ -7,7 +7,7 @@
 //! By the classic track the member sends its proposal to the leader, which
 //! is what a node does for a client today. By the fast track it sends it to
 //! every voter.
-use crate::{DurableNode, Message, PbMessageExt as _, StateRole, tests::config};
+use crate::{DurableNode, Message, StateRole, tests::config};
 use focal_sim::path::{Fabric, Fate, Loss, Path};
 
 const PERIOD: u64 = 100_000_000;
@@ -75,7 +75,7 @@ impl Sim {
             .displaced
             .extend(events.displaced.into_iter().map(|entry| entry.data));
         for message in events.messages {
-            let bytes = message.compute_size() as usize;
+            let bytes = crate::envelope::message_len(&message).unwrap();
             let (from, to) = (message.from, message.to);
             let _: Fate = self
                 .fabric

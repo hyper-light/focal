@@ -26,7 +26,13 @@ fn optional_cycle(s: &mut impl Sink, value: Option<NativeCycleKey>) -> Result<()
         }
     }
 }
-pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<(), Error> {
+pub(super) fn value(
+    s: &mut impl Sink,
+    key: Key,
+    row: &Row,
+    ledger: LedgerId,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), Error> {
     // Row body schemas version independently from both input and V1 envelopes.
     // No body uses serde enum order or process-local allocation capacities.
     match row {
@@ -59,7 +65,7 @@ pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<()
         Row::Meta(v) => {
             // Cumulative ledger counters are u64, never host-size integers or
             // u32 collection lengths. The decoder must checked-convert them.
-            s.visit(15)?;
+            s.visit(19)?;
             for value in [
                 v.claims,
                 v.outcomes,
@@ -75,13 +81,21 @@ pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<()
                 v.monitor_links,
                 v.creation_results,
                 v.legacy,
+                v.sealed,
+                v.sealed_events,
+                v.seals,
+                v.principals,
             ] {
                 write_u64(s, u64::try_from(value).map_err(|_| Error::Capacity)?)?;
             }
             write_u64(s, v.logical_time)
         }
-        Row::Claim(v) => lifecycle::claim(s, v),
-        Row::Definition(v) => evidence::definition(s, v),
+        // A spilled claim or definition holds its record encoding (doc 31 M3).
+        Row::Claim(v) => match v.logged() {
+            Some(at) => spilled(s, at, 0, payloads),
+            None => lifecycle::claim(s, v),
+        },
+        Row::Definition(v) => evidence::definition(s, v, payloads),
         Row::Evaluation(v) => lifecycle::evaluation(s, v),
         Row::Artifact(v) => evidence::artifact(s, v),
         Row::ArtifactIdentity(id) | Row::WorkSlot(id) => raw(s, &id.0),
@@ -126,22 +140,48 @@ pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<()
         Row::Response(v) => evidence::response(s, v),
         Row::ResultTestament(v) => lifecycle::result_testament(s, v),
         Row::ClaimResultTestament(id) => raw(s, &id.0),
-        Row::Outcome(v) => fixed::outcome(s, *v),
+        // The record carries the whole outcome; the row keeps neither its ledger nor its invocation,
+        // and a spilled one holds its record encoding (doc 31 M3).
+        Row::Outcome(crate::native::OwnedOutcome::Logged(at)) => spilled(s, at.at(), 0, payloads),
+        Row::Outcome(crate::native::OwnedOutcome::Held(v)) => {
+            let Key::Outcome(invocation) = key else {
+                return Err(Error::InvalidTag("outcome row key"));
+            };
+            fixed::outcome(s, v.expand_held(ledger, invocation))
+        }
+        // A spilled event holds its record encoding (doc 31 M3).
+        Row::Event(crate::native::OwnedEvent::Logged(at)) => spilled(s, *at, 0, payloads),
         Row::Event(v) => events::event(
             s,
-            v.get()
-                .ok_or(Error::InvalidTag("event row"))?
-                .expand(ledger),
+            v.get(ledger, None).ok_or(Error::InvalidTag("event row"))?,
         ),
-        Row::ClaimContent(v) => evidence::claim_content(s, v),
+        Row::ClaimContent(v) => evidence::claim_content(s, v, payloads),
         Row::ClaimIdentity(id) => raw(s, &id.0),
         Row::DefinitionIdentity(id) => raw(s, &id.0),
-        Row::CreationResult(v) => evidence::creation(s, v),
+        Row::CreationResult(v) => evidence::creation(s, v, payloads),
         Row::LegacyTestament(v)
         | Row::LegacyEvidenceSet(v)
         | Row::LegacyRun(v)
         | Row::LegacyDefinition(v) => legacy(s, v),
         Row::Index => write_u8(s, 1),
+        Row::Epochs(v) => {
+            write_u64(s, v.floor.0)?;
+            write_u64(s, v.sealed.0)?;
+            write_u8(s, v.open)?;
+            for count in &v.counts {
+                write_u32(s, count.outcomes)?;
+                write_u64(s, count.last)?;
+            }
+            s.visit(v.ranges().len().checked_add(1).ok_or(Error::Capacity)?)?;
+            bytes::write_count(s, v.ranges().len())?;
+            for range in v.ranges() {
+                write_u64(s, range.first.0)?;
+                write_u64(s, range.last.0)?;
+                write_u64(s, range.seal)?;
+            }
+            Ok(())
+        }
+        Row::Seal(v) => fixed::seal_row(s, v),
     }
 }
 /// Frozen legacy bytes, count-prefixed; the decoder bounds the count by the
@@ -150,4 +190,34 @@ fn legacy(s: &mut impl Sink, v: &OwnedLegacy) -> Result<(), Error> {
     s.visit(1)?;
     bytes::write_count(s, v.bytes().len())?;
     raw(s, v.bytes())
+}
+
+/// A spilled row's record encoding, which its payload holds from byte `from` on as the record and
+/// the checkpoint carry it (doc 31 M3): counted by its length where `s` only measures, so a size
+/// reads nothing back; else read back and copied, never decoded.
+pub(super) fn spilled(
+    s: &mut impl Sink,
+    at: crate::native::payloads::PayloadRef,
+    from: usize,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), Error> {
+    let len = at
+        .len()
+        .checked_sub(from)
+        .ok_or(Error::InvalidTag("spilled row"))?;
+    if s.measures() {
+        return s.count_unwritten(len);
+    }
+    let mut buffer = [0u8; crate::native::payloads::SPILLED_BYTES];
+    let bytes = buffer
+        .get_mut(..at.len())
+        .ok_or(Error::InvalidTag("spilled row"))?;
+    payloads
+        .ok_or(Error::InvalidTag("spilled row"))?
+        .read(at, bytes)
+        .map_err(|_| Error::InvalidTag("spilled row"))?;
+    raw(
+        s,
+        bytes.get(from..).ok_or(Error::InvalidTag("spilled row"))?,
+    )
 }

@@ -15,6 +15,9 @@ pub(in crate::native) struct OriginalPlan<'source> {
     meta: Meta,
     outcome: NativeOutcome,
     limits: NativeLimits,
+    /// The principal's request generation window as this request leaves it
+    /// (F12): written beside the meta and the outcome; a timer has none.
+    window: Option<(ParticipantId, EpochWindow)>,
 }
 
 pub(in crate::native) struct SealedPlan<'source> {
@@ -46,16 +49,38 @@ impl SealedPlan<'_> {
     }
 }
 
+/// What admission left for the plan to check: the Meta as the record will
+/// write it, the outcome, and — for a request — its principal's window as
+/// admission left it (F12); a timer leaves none.
+pub(in crate::native) struct Admitted {
+    pub(in crate::native) meta: Meta,
+    pub(in crate::native) outcome: NativeOutcome,
+    pub(in crate::native) window: Option<(ParticipantId, EpochWindow)>,
+}
+
 impl<'source> OriginalPlan<'source> {
     pub(in crate::native) fn check(
         mut plan: transactions::Plan,
         mut extras: Extras,
-        meta: Meta,
-        outcome: NativeOutcome,
+        admitted: Admitted,
         view: &View<'source>,
         limits: NativeLimits,
         scratch: &mut Scratch,
     ) -> Result<Self, NativeError> {
+        let Admitted {
+            meta,
+            outcome,
+            window,
+        } = admitted;
+        // A request writes its principal's window, a timer none (F12).
+        if window.as_ref().map(|(principal, _)| *principal)
+            != match outcome.invocation {
+                NativeInvocation::Request(request) => Some(request.principal),
+                _ => None,
+            }
+        {
+            return Err(ContractError::InvalidTransition.into());
+        }
         plan.rows.sort_unstable_by_key(|row| row.binding().object);
         plan.registry.check_rows(&plan.rows)?;
         crate::native::authored::check_plan(&plan, &extras, view, meta, outcome, limits)?;
@@ -135,13 +160,11 @@ impl<'source> OriginalPlan<'source> {
         Ok(Self {
             plan,
             extras,
-            source: View {
-                state: view.state,
-                tail: view.tail,
-            },
+            source: *view,
             meta,
             outcome,
             limits,
+            window,
         })
     }
 
@@ -235,13 +258,18 @@ impl<'source> OriginalPlan<'source> {
         let event_charge = event_containers(
             usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("events"))?,
         )?;
+        let control = if self.window.is_some() {
+            super::prepare_budget::REQUEST_CONTROL_ROWS
+        } else {
+            super::prepare_budget::TIMER_CONTROL_ROWS
+        };
         let count = add(
             add(
                 rows.len(),
                 usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("events"))?,
             )?,
             add(
-                add(add(2, extras.rows.len())?, additional_evaluations)?,
+                add(add(control, extras.rows.len())?, additional_evaluations)?,
                 index.changes.len(),
             )?,
         )?;
@@ -268,16 +296,16 @@ impl<'source> OriginalPlan<'source> {
         history
             .try_reserve_exact(rows.len())
             .map_err(|_| MemoryError::AllocationFailed)?;
-        within(
+        let held = add(
             add(
-                add(
-                    array::<Change<Key, Row>>(changes.capacity())?,
-                    array::<History>(history.capacity())?,
-                )?,
-                add(add(containers(rows.len())?, event_charge)?, index_bytes)?,
+                array::<Change<Key, Row>>(changes.capacity())?,
+                array::<History>(history.capacity())?,
             )?,
-            allowance,
+            add(add(containers(rows.len())?, event_charge)?, index_bytes)?,
         )?;
+        within(held, allowance)?;
+        // Charged as held, under this allowance rather than the scratch's.
+        scratch.hold(held)?;
         let mut ordinal = 0;
         let visited = visit_history(
             rows,
@@ -308,6 +336,7 @@ impl<'source> OriginalPlan<'source> {
             plan,
             mut extras,
             source,
+            window,
             ..
         } = self;
         let view = &source;
@@ -325,7 +354,7 @@ impl<'source> OriginalPlan<'source> {
                 };
                 let row = OwnedClaim::new(row, registrations)?;
                 let heap_bytes = row.heap_charge()?;
-                changes.push(Change::Put(Entry::new(
+                changes.push(Change::Put(entry(
                     Key::Claim(id),
                     Row::Claim(row),
                     heap_bytes,
@@ -347,15 +376,26 @@ impl<'source> OriginalPlan<'source> {
             }
             changes.push(change.into_change());
         }
-        if changes.len().checked_add(2) != Some(count) || count > changes.capacity() {
+        if changes.len().checked_add(control) != Some(count) || count > changes.capacity() {
             return Err(ContractError::InvalidManifest.into());
         }
-        changes.push(Change::Put(Entry::new(Key::Meta, Row::Meta(meta), 0)));
-        changes.push(Change::Put(Entry::new(
+        changes.push(Change::Put(entry(Key::Meta, Row::Meta(Box::new(meta)), 0)));
+        changes.push(Change::Put(entry(
             Key::Outcome(outcome.invocation),
-            Row::Outcome(outcome),
+            Row::Outcome(OwnedOutcome::stored(&outcome, view.ledger())?),
             0,
         )));
+        if let Some((principal, window)) = window {
+            let heap = window.heap_charge()?;
+            changes.push(Change::Put(entry(
+                Key::Epochs(principal),
+                Row::Epochs(Box::new(window)),
+                heap,
+            )));
+        }
+        // Every check and the index derivation have read the plan's rows held: its events and
+        // contents go to the payload log now, each charged as it is spilled (doc 31 M3).
+        crate::native::payloads::spill_changes(&mut changes, view.payload_log(), view.ledger())?;
         Ok(SealedChanges {
             changes,
             outcome,

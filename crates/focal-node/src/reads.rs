@@ -3,13 +3,12 @@ use focal_ledger::Session;
 use focal_memory::{MemoryError, ReadBudget};
 use focal_model::*;
 use focal_wire::*;
-use std::{collections::BTreeMap, time::Instant};
+use std::collections::BTreeMap;
 
 /// Fixed-size serving metadata. The graph store separately accounts every pinned
 /// page and expires its owning root even if a client keeps an old token forever.
 pub(crate) struct ReadViews {
     views: BTreeMap<(ParticipantId, SessionSeq), GraphSnapshot>,
-    started: Instant,
     route_epoch: RouteEpoch,
     list_key: Option<zeroize::Zeroizing<[u8; 32]>>,
     traversals: BTreeMap<u64, traversal::SavedTraversal>,
@@ -20,17 +19,12 @@ impl ReadViews {
     pub(crate) fn traversal_count(&self) -> usize {
         self.traversals.len()
     }
-    #[cfg(test)]
-    pub(crate) fn expire_test_views(&mut self) {
-        self.started = Instant::now() - std::time::Duration::from_secs(31);
-    }
     pub fn new() -> Self {
         Self::with_route_epoch(RouteEpoch(1))
     }
     pub fn with_route_epoch(route_epoch: RouteEpoch) -> Self {
         Self {
             views: BTreeMap::new(),
-            started: Instant::now(),
             route_epoch,
             list_key: None,
             traversals: BTreeMap::new(),
@@ -38,9 +32,8 @@ impl ReadViews {
         }
     }
     /// Serve at a newer route: every pinned view and saved traversal carried
-    /// the old epoch in its token and is dropped; the read clock and the
-    /// list key continue, since a clock that ran backwards would stop the
-    /// session's read expiry.
+    /// the old epoch in its token and is dropped; the list key continues, and
+    /// the read clock is the session's.
     pub(crate) fn set_route_epoch(&mut self, route_epoch: RouteEpoch) {
         if route_epoch == self.route_epoch {
             return;
@@ -60,12 +53,11 @@ impl ReadViews {
         }
         self.list_key.as_deref().ok_or(AccessError::Unavailable)
     }
+    /// The session's read clock moved to now (`Session::advance_read_clock`),
+    /// and the views and traversals it passed dropped: every reader of a
+    /// session times its views by the session's clock, not its own.
     pub fn advance(&mut self, session: &mut Session) -> Result<u64, AccessError> {
-        let now = u64::try_from(self.started.elapsed().as_millis())
-            .map_err(|_| AccessError::Unavailable)?;
-        session
-            .advance_read_clock(now)
-            .map_err(super::host::access)?;
+        let now = session.advance_read_clock().map_err(super::host::access)?;
         self.views.retain(|_, view| view.expires_at() > now);
         self.traversals.retain(|_, saved| saved.expires_at() > now);
         Ok(now)
@@ -84,7 +76,7 @@ impl ReadViews {
             context.extend_from_slice(&request_id.0);
             session
                 .read_index(context.clone())
-                .map_err(super::host::access)?;
+                .map_err(super::host::barrier_refused)?;
             let mut complete = false;
             for _ in 0..4 {
                 let events = session.poll().map_err(super::host::access)?;
@@ -115,7 +107,7 @@ impl ReadViews {
                 return Err(AccessError::Capacity);
             }
             let view = session
-                .graph_snapshot(sequence, now, 30_000)
+                .graph_snapshot(sequence, 30_000)
                 .map_err(super::host::access)?;
             self.views.insert(key, view);
         }
@@ -131,9 +123,8 @@ impl ReadViews {
                 return Err(AccessError::Unavailable);
             };
             let object = convert(*kind, *id, object)?;
-            let size = encode_payload(&object, limits.max_frame_bytes)
-                .map_err(|_| AccessError::Capacity)?
-                .len();
+            let size =
+                payload_len(&object, limits.max_frame_bytes).map_err(|_| AccessError::Capacity)?;
             bytes = bytes.checked_add(size).ok_or(AccessError::Capacity)?;
             if bytes > limits.max_frame_bytes as usize {
                 return Err(AccessError::Capacity);
@@ -393,7 +384,8 @@ mod tests {
             ),
             Err(AccessError::SnapshotExpired)
         );
-        views.started -= std::time::Duration::from_secs(31);
+        node.session
+            .move_read_clock_ahead(std::time::Duration::from_secs(31));
         assert_eq!(
             views.read(
                 &mut node.session,
@@ -404,6 +396,27 @@ mod tests {
             ),
             Err(AccessError::SnapshotExpired)
         );
+    }
+    /// Every reader of a session times its views by the session's read clock,
+    /// so a reader made after another one served is served too. Each reader
+    /// timed from its own start until 2026-10-13: a reader made after another
+    /// had served for a few milliseconds handed the session a time behind the
+    /// one it held, and was refused (`ClockRegression`, a reply's
+    /// `OutcomeUnknown`), on Linux CI and under contention.
+    #[test]
+    fn a_reader_made_after_another_served_reads_by_the_sessions_clock() {
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.path().to_owned());
+        let mut node = EmbeddedNode::open(&settings).unwrap();
+        let mut first = ReadViews::new();
+        // The first reader serves once time has passed since it was made: the
+        // passing of time is the fact under test, so the wait is for it alone.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let served = first.advance(&mut node.session).unwrap();
+        let mut later = ReadViews::new();
+        assert!(later.advance(&mut node.session).unwrap() >= served);
+        assert!(first.advance(&mut node.session).unwrap() >= served);
     }
     #[test]
     fn object_scan_pages_are_typed_and_reuse_the_same_snapshot() {

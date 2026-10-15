@@ -85,9 +85,10 @@ pub struct Limits {
 pub struct ValidationDescriptor {
     schema: u16,
     declaration: validation::Declaration,
-    description: String,
-    quality_bar: Option<String>,
-    contributed_by: Vec<ParticipantId>,
+    // Each exactly its length: a held descriptor never grows them (doc 31 M3).
+    description: Box<str>,
+    quality_bar: Option<Box<str>>,
+    contributed_by: Box<[ParticipantId]>,
     policy_revision: u64,
     specification_hash: ContentHash,
 }

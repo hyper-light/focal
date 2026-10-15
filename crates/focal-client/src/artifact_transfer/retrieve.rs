@@ -122,13 +122,18 @@ impl<T: crate::ClientTransport> crate::Client<T> {
             task::Poll,
             time::Duration,
         };
+        let duration = self.retry_timeout().min(Duration::from_secs(30));
+        let deadline = crate::time::Instant::now()
+            .checked_add(duration)
+            .ok_or(TransferError::Client(crate::ClientError::Transport))?;
         let future = async {
-            tokio::time::timeout(
-                self.retry_timeout().min(Duration::from_secs(30)),
-                self.payload_bytes_inner(request, payload, max_bytes),
+            crate::time::within(
+                duration,
+                self.payload_bytes_inner(request, payload, max_bytes, deadline),
             )
             .await
-            .map_err(|_| TransferError::Client(crate::ClientError::Transport))?
+            .map_err(TransferError::Client)?
+            .ok_or(TransferError::Client(crate::ClientError::Transport))?
         };
         let mut future = pin!(future);
         poll_fn(|cx| {
@@ -144,6 +149,7 @@ impl<T: crate::ClientTransport> crate::Client<T> {
         mut request: RequestEnvelope,
         payload: &ArtifactPayload,
         max_bytes: u32,
+        deadline: crate::time::Instant,
     ) -> Result<Vec<u8>, TransferError> {
         let cap = max_bytes.min(self.wire_limits().max_frame_bytes);
         let length = match payload {
@@ -168,6 +174,7 @@ impl<T: crate::ClientTransport> crate::Client<T> {
                     .min(TRANSFER_CHUNK_BYTES as u32);
                 let mut download = PayloadDownload::new(reference.clone(), u64::from(cap), chunk)?;
                 while let Some(operation) = download.operation() {
+                    crate::time::ahead(deadline).map_err(TransferError::Client)?;
                     request.operation = operation;
                     let reply = self.download(request.clone()).await?;
                     download.accept(&reply, &mut output)?;

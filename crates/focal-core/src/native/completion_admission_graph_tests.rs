@@ -12,10 +12,7 @@ fn quote(
     ),
     NativeError,
 > {
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     let registered = crate::native::admission_authority::registered_any(
         &view,
         core.native_claim(key(1).claim).unwrap().binding(),
@@ -26,7 +23,6 @@ fn quote(
         limits,
         &registered,
         descriptor_limits(limits, registered.parent, registered.registry)?,
-        evidence(),
     )
 }
 fn peer(core: &mut Core<NativeState>, id: u128, target: u128) {
@@ -57,47 +53,28 @@ fn isolated_required_parent_is_protected_and_failure_credit_is_still_one_time() 
     let failure = envelope
         .report_storage(CompletionUse::AdmissionFailure)
         .unwrap();
-    // Eleven primary rows, the cohort's rows, the report artifact's index
-    // rows and verdict, a status move for the parent and every sealed
-    // cohort claim, and the due timers the failure can retire: every
-    // deleted key beyond the status moves (doc 22 §7).
+    // Twelve primary rows (the principal's window among them, F12), the
+    // cohort's rows, the report artifact's index rows and verdict, a status
+    // move for the parent and every sealed cohort claim, and the due timers
+    // the failure can retire: every deleted key beyond the status moves
+    // (doc 22 §7).
     let cohort = envelope.cohort();
     let timers = failure.limits().deleted_keys - (1 + cohort.claims());
     assert!(timers > 1 + cohort.claims() + cohort.evaluations());
     assert_eq!(
         failure.limits().changed_keys,
-        11 + cohort.changed_keys()
+        12 + cohort.changed_keys()
             + crate::native::index_rows::report_rows(16).unwrap()
             + crate::native::index_rows::STATUS_ROWS * (1 + cohort.claims())
             + timers
     );
-    assert_eq!(
-        envelope.slots().events,
-        3 * envelope.reports() as usize + 1 + envelope.cohort().events()
-    );
-    assert_eq!(
-        envelope.total_retained_bytes(),
-        (envelope.reports() as usize - 1)
-            * envelope
-                .per_report_retained_bytes(CompletionUse::Regular)
-                .unwrap()
-            + envelope
-                .per_report_retained_bytes(CompletionUse::AdmissionFailure)
-                .unwrap()
-    );
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     envelope
         .check_graph_with_members(
             &view,
             core.limits,
             members.ids(),
-            &mut prepare::Scratch {
-                used: 0,
-                max: envelope.graph_check_bytes(),
-            },
+            &mut prepare::Scratch::bound(envelope.graph_check_bytes()),
         )
         .unwrap();
     drop(members);
@@ -128,7 +105,7 @@ fn actual_dependency_failure_and_automatic_seals_fit_held_range_and_construction
     let verified = f::verified(&mut custody, &input);
     let before = ReportParent::capture(core.native_claim(key(1).claim).unwrap());
     let prepare::Checked::Fresh(fresh) = core
-        .check_native_chain(context(EVALUATOR, 100), input, std::iter::empty())
+        .check_native_chain(context(EVALUATOR, 100), input, None)
         .unwrap()
     else {
         panic!("fresh")
@@ -137,11 +114,19 @@ fn actual_dependency_failure_and_automatic_seals_fit_held_range_and_construction
         .build_with_completion(&core.state.budget, Some(&verified), Some(&envelope))
         .unwrap();
     assert_eq!(
-        candidate.claim(key(1).claim).unwrap().status(),
+        core.native_chain(&[&candidate])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .status(),
         ClaimStatus::PostFailed
     );
     assert_eq!(
-        candidate.claim(ClaimId::from_u128(2)).unwrap().status(),
+        core.native_chain(&[&candidate])
+            .unwrap()
+            .claim(ClaimId::from_u128(2))
+            .unwrap()
+            .status(),
         ClaimStatus::DependencyFailed
     );
     let Some(Row::Event(event)) = candidate
@@ -150,14 +135,18 @@ fn actual_dependency_failure_and_automatic_seals_fit_held_range_and_construction
     else {
         panic!("failure fact")
     };
-    let NativeFact::Claim(event) = event.get().unwrap().expand(core.state.ledger).fact else {
+    let NativeFact::Claim(event) = event
+        .get(core.state.ledger, core.state.payloads())
+        .unwrap()
+        .fact
+    else {
         panic!("claim fact")
     };
     assert_eq!(
         before
             .completion_use_prepared(
                 candidate.outcome().operation,
-                candidate.claim(key(1).claim),
+                candidate.written_claim(key(1).claim),
                 Some(event)
             )
             .unwrap(),
@@ -169,12 +158,11 @@ fn actual_dependency_failure_and_automatic_seals_fit_held_range_and_construction
         before
             .completion_use_prepared(
                 candidate.outcome().operation,
-                candidate.claim(key(1).claim),
+                candidate.written_claim(key(1).claim),
                 Some(wrong)
             )
             .is_err()
     );
-    assert!(candidate.outcome().events as usize <= envelope.slots().events);
 }
 
 #[test]
@@ -183,20 +171,14 @@ fn new_incoming_member_and_insufficient_failure_shape_refuse_without_changing_bu
     let (envelope, members) = quote(&core, core.limits).unwrap();
     peer(&mut core, 2, 1);
     let baseline = core.state.budget.stats();
-    let view = View {
-        state: &core.state,
-        tail: None,
-    };
+    let view = View::committed(&core.state);
     assert!(
         envelope
             .check_graph_with_members(
                 &view,
                 core.limits,
                 members.as_ref().unwrap().ids(),
-                &mut prepare::Scratch {
-                    used: 0,
-                    max: envelope.graph_check_bytes()
-                }
+                &mut prepare::Scratch::bound(envelope.graph_check_bytes())
             )
             .is_err()
     );

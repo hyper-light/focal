@@ -16,221 +16,239 @@ fn settings(root: &std::path::Path) -> Settings {
     settings
 }
 
-#[tokio::test]
-async fn local_expansion_keeps_identity_log_genesis_and_credentials_on_restart() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut settings = settings(directory.path());
-    settings.node.advertise = None;
-    let local = EmbeddedNode::open(&settings).unwrap();
-    let identity = local.identity.clone();
-    let local_term = local.session.status().term;
-    drop(local);
-    settings.node.advertise = Some("127.0.0.1:7443".into());
-    let network = FoundingNetwork::open(&settings).await.unwrap();
-    assert_eq!(network.directory.identity(), &identity);
-    assert_eq!(network.state.genesis.founder, identity);
-    let consensus = focal_consensus::DurableNode::open_on_wal(
-        focal_consensus::NodeConfig::single(
-            identity.node,
-            identity.cluster,
-            identity.ledger.session.0,
-        ),
-        network.wal.clone(),
-    )
-    .unwrap();
-    assert_eq!(consensus.status().term, local_term);
-    drop(consensus);
-    let state = network.state.clone();
-    let certificate = network.credentials.certificate_chain().to_vec();
-    let budget = network.budget.clone();
-    assert!(budget.stats().used >= 256 * 1024);
-    assert!(matches!(
-        FoundingNetwork::open(&settings).await,
-        Err(NetworkError::Node(NodeError::Locked))
-    ));
-    drop(network);
-    assert_eq!(budget.stats().used, 0);
-    settings.node.advertise = None;
-    let recovered = FoundingNetwork::open(&settings).await.unwrap();
-    assert_eq!(recovered.state, state);
-    assert_eq!(recovered.credentials.certificate_chain(), certificate);
-    drop(recovered);
-    assert!(matches!(
-        EmbeddedNode::open(&settings),
-        Err(NodeError::NetworkRequired)
-    ));
-}
-
-#[tokio::test]
-async fn committed_revocation_cannot_be_undone_by_reopening_the_genesis_draft() {
-    let directory = tempfile::tempdir().unwrap();
-    let settings = settings(directory.path());
-    let mut network = FoundingNetwork::open(&settings).await.unwrap();
-    let registry = network.control.enrollment().unwrap();
-    let founder = registry.enrollments().next().unwrap();
-    let command = registry
-        .prepare_revoke(founder.invitation, unix_time().unwrap())
-        .unwrap();
-    let id = ControlRequestId {
-        client: [7; 16],
-        sequence: 1,
-    };
-    network
-        .control
-        .submit(
-            ControlRequest {
-                id,
-                acknowledged_through: 0,
-                command: ControlCommand::Enrollment(command),
-            },
-            &NoDirectoryAuthority,
+#[test]
+fn local_expansion_keeps_identity_log_genesis_and_credentials_on_restart() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = settings(directory.path());
+        settings.node.advertise = None;
+        let local = EmbeddedNode::open(&settings).unwrap();
+        let identity = local.identity.clone();
+        let local_term = local.session.status().term;
+        drop(local);
+        settings.node.advertise = Some("127.0.0.1:7443".into());
+        let network = FoundingNetwork::open(&settings).await.unwrap();
+        assert_eq!(network.directory.identity(), &identity);
+        assert_eq!(network.state.genesis.founder, identity);
+        let consensus = crate::storage_start::test_member(
+            focal_consensus::NodeConfig::single(
+                identity.node,
+                identity.cluster,
+                identity.ledger.session.0,
+            ),
+            &network.storage.storage,
         )
         .unwrap();
-    network.control.drain(&NoDirectoryAuthority).unwrap();
-    assert!(network.control.receipt(id).unwrap().is_some());
-    drop(network);
-    assert!(matches!(
-        FoundingNetwork::open(&settings).await,
-        Err(NetworkError::Enrollment(EnrollmentError::Revoked))
-    ));
+        assert_eq!(consensus.status().term, local_term);
+        drop(consensus);
+        let state = network.state.clone();
+        let certificate = network.credentials.certificate_chain().to_vec();
+        let budget = network.budget.clone();
+        assert!(budget.stats().used >= 256 * 1024);
+        assert!(matches!(
+            FoundingNetwork::open(&settings).await,
+            Err(NetworkError::Node(NodeError::Locked))
+        ));
+        drop(network);
+        assert_eq!(budget.stats().used, 0);
+        settings.node.advertise = None;
+        let recovered = FoundingNetwork::open(&settings).await.unwrap();
+        assert_eq!(recovered.state, state);
+        assert_eq!(recovered.credentials.certificate_chain(), certificate);
+        drop(recovered);
+        assert!(matches!(
+            EmbeddedNode::open(&settings),
+            Err(NodeError::NetworkRequired)
+        ));
+    })
+    .unwrap()
 }
 
-#[tokio::test]
-async fn expansion_rejects_missing_policy_before_creating_network_credentials() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut settings = settings(directory.path());
-    settings.node.advertise = None;
-    let local = EmbeddedNode::open(&settings).unwrap();
-    let identity = local.identity.clone();
-    drop(local);
-    fs::remove_file(directory.path().join("POLICY")).unwrap();
-    settings.node.advertise = Some("127.0.0.1:7443".into());
-    assert!(matches!(
-        FoundingNetwork::open(&settings).await,
-        Err(NetworkError::Node(NodeError::Config(
-            crate::config::ConfigError::PolicyMissing
-        )))
-    ));
-    assert!(!directory.path().join("POLICY").exists());
-    assert!(!directory.path().join("cluster/network").exists());
-    assert_eq!(
-        crate::embedded::decode_identity(&directory.path().join("IDENTITY")).unwrap(),
-        identity
-    );
+#[test]
+fn committed_revocation_cannot_be_undone_by_reopening_the_genesis_draft() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = settings(directory.path());
+        let mut network = FoundingNetwork::open(&settings).await.unwrap();
+        let registry = network.control.enrollment().unwrap();
+        let founder = registry.enrollments().next().unwrap();
+        let command = registry
+            .prepare_revoke(founder.invitation, unix_time().unwrap())
+            .unwrap();
+        let id = ControlRequestId {
+            client: [7; 16],
+            sequence: 1,
+        };
+        network
+            .control
+            .submit(
+                ControlRequest {
+                    id,
+                    acknowledged_through: 0,
+                    command: ControlCommand::Enrollment(command),
+                },
+                &NoDirectoryAuthority,
+            )
+            .unwrap();
+        network.control.drain(&NoDirectoryAuthority).unwrap();
+        assert!(network.control.receipt(id).unwrap().is_some());
+        drop(network);
+        assert!(matches!(
+            FoundingNetwork::open(&settings).await,
+            Err(NetworkError::Enrollment(EnrollmentError::Revoked))
+        ));
+    })
+    .unwrap()
 }
 
-#[tokio::test]
-async fn interrupted_manifest_install_reuses_private_intent_and_refuses_missing_keys() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut settings = settings(directory.path());
-    let network = FoundingNetwork::open(&settings).await.unwrap();
-    let state = network.state.clone();
-    drop(network);
-    // Crash before the final public installation: the private founding intent
-    // and committed root still require exact recovery, even without NETWORK.
-    fs::remove_file(directory.path().join("NETWORK.initialized")).unwrap();
-    fs::remove_file(directory.path().join("NETWORK")).unwrap();
-    settings.node.advertise = None;
-    assert!(matches!(
-        EmbeddedNode::open(&settings),
-        Err(NodeError::NetworkRequired)
-    ));
-    settings.node.advertise = Some(state.advertise.to_string());
-    let recovered = FoundingNetwork::open(&settings).await.unwrap();
-    assert_eq!(recovered.state, state);
-    drop(recovered);
-    // A durable descendant must never cause open_or_create to replace a lost key.
-    fs::remove_file(directory.path().join("NETWORK.initialized")).unwrap();
-    fs::remove_file(directory.path().join("NETWORK")).unwrap();
-    let key = directory
-        .path()
-        .join("cluster/network/node-key/join-key.bin");
-    fs::remove_file(&key).unwrap();
-    assert!(matches!(
-        FoundingNetwork::open(&settings).await,
-        Err(NetworkError::MissingCredentials)
-    ));
-    assert!(!key.exists());
+#[test]
+fn expansion_rejects_missing_policy_before_creating_network_credentials() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = settings(directory.path());
+        settings.node.advertise = None;
+        let local = EmbeddedNode::open(&settings).unwrap();
+        let identity = local.identity.clone();
+        drop(local);
+        fs::remove_file(directory.path().join("POLICY")).unwrap();
+        settings.node.advertise = Some("127.0.0.1:7443".into());
+        assert!(matches!(
+            FoundingNetwork::open(&settings).await,
+            Err(NetworkError::Node(NodeError::Config(
+                crate::config::ConfigError::PolicyMissing
+            )))
+        ));
+        assert!(!directory.path().join("POLICY").exists());
+        assert!(!directory.path().join("cluster/network").exists());
+        assert_eq!(
+            crate::embedded::decode_identity(&directory.path().join("IDENTITY")).unwrap(),
+            identity
+        );
+    })
+    .unwrap()
 }
 
-#[tokio::test]
-async fn manifest_validates_ca_genesis_and_exact_framing_before_installation() {
-    let directory = tempfile::tempdir().unwrap();
-    let settings = settings(directory.path());
-    let network = FoundingNetwork::open(&settings).await.unwrap();
-    let mut bad = network.state.clone();
-    let other = tempfile::tempdir().unwrap();
-    let authority = BootstrapAuthority::open_or_create(
-        other.path().join("ca"),
-        [9; 16],
-        vec!["other.internal".into()],
-        unix_time().unwrap(),
-    )
-    .unwrap();
-    bad.sponsor.ca_certificate = authority.ca_certificate().to_vec();
-    assert!(bad.validate(network.directory.identity()).is_err());
-    let mut bad = network.state.clone();
-    if let ControlBootstrap::Root { directory, .. } = &mut bad.genesis.bootstrap {
-        directory.revision = 1;
-    }
-    // Even a recomputed digest cannot turn a live root checkpoint into genesis.
-    let identity = network.directory.identity();
-    bad.genesis.root = bad
-        .genesis
-        .bootstrap
-        .identity(&ControlOptions::new(focal_consensus::NodeConfig::single(
-            identity.node,
-            identity.cluster,
-            bad.genesis.root.group,
-        )))
+#[test]
+fn interrupted_manifest_install_reuses_private_intent_and_refuses_missing_keys() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = settings(directory.path());
+        let network = FoundingNetwork::open(&settings).await.unwrap();
+        let state = network.state.clone();
+        drop(network);
+        // Crash before the final public installation: the private founding intent
+        // and committed root still require exact recovery, even without NETWORK.
+        fs::remove_file(directory.path().join("NETWORK.initialized")).unwrap();
+        fs::remove_file(directory.path().join("NETWORK")).unwrap();
+        settings.node.advertise = None;
+        assert!(matches!(
+            EmbeddedNode::open(&settings),
+            Err(NodeError::NetworkRequired)
+        ));
+        settings.node.advertise = Some(state.advertise.to_string());
+        let recovered = FoundingNetwork::open(&settings).await.unwrap();
+        assert_eq!(recovered.state, state);
+        drop(recovered);
+        // A durable descendant must never cause open_or_create to replace a lost key.
+        fs::remove_file(directory.path().join("NETWORK.initialized")).unwrap();
+        fs::remove_file(directory.path().join("NETWORK")).unwrap();
+        let key = directory
+            .path()
+            .join("cluster/network/node-key/join-key.bin");
+        fs::remove_file(&key).unwrap();
+        assert!(matches!(
+            FoundingNetwork::open(&settings).await,
+            Err(NetworkError::MissingCredentials)
+        ));
+        assert!(!key.exists());
+    })
+    .unwrap()
+}
+
+#[test]
+fn manifest_validates_ca_genesis_and_exact_framing_before_installation() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = settings(directory.path());
+        let network = FoundingNetwork::open(&settings).await.unwrap();
+        let mut bad = network.state.clone();
+        let other = tempfile::tempdir().unwrap();
+        let authority = BootstrapAuthority::open_or_create(
+            other.path().join("ca"),
+            [9; 16],
+            vec!["other.internal".into()],
+            unix_time().unwrap(),
+        )
         .unwrap();
-    assert!(bad.validate(identity).is_err());
-    assert!(bad.install(&network.directory).is_err());
-    assert_eq!(
-        NetworkState::load(&network.directory).unwrap(),
-        Some(network.state.clone())
-    );
-    let path = directory.path().join("NETWORK");
-    let mut payload = postcard::to_stdvec(&network.state).unwrap();
-    payload.push(0);
-    let mut bytes = b"FCLNET01".to_vec();
-    bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
-    bytes.extend_from_slice(&payload);
-    fs::write(&path, bytes).unwrap();
-    assert!(NetworkState::load(&network.directory).is_err());
-    fs::remove_file(path).unwrap();
-    assert!(matches!(
-        NetworkState::load(&network.directory),
-        Err(NodeError::Identity)
-    ));
+        bad.sponsor.ca_certificate = authority.ca_certificate().to_vec();
+        assert!(bad.validate(network.directory.identity()).is_err());
+        let mut bad = network.state.clone();
+        if let ControlBootstrap::Root { directory, .. } = &mut bad.genesis.bootstrap {
+            directory.revision = 1;
+        }
+        // Even a recomputed digest cannot turn a live root checkpoint into genesis.
+        let identity = network.directory.identity();
+        bad.genesis.root = bad
+            .genesis
+            .bootstrap
+            .identity(&ControlOptions::new(focal_consensus::NodeConfig::single(
+                identity.node,
+                identity.cluster,
+                bad.genesis.root.group,
+            )))
+            .unwrap();
+        assert!(bad.validate(identity).is_err());
+        assert!(bad.install(&network.directory).is_err());
+        assert_eq!(
+            NetworkState::load(&network.directory).unwrap(),
+            Some(network.state.clone())
+        );
+        let path = directory.path().join("NETWORK");
+        let mut payload = postcard::to_stdvec(&network.state).unwrap();
+        payload.push(0);
+        let mut bytes = b"FCLNET01".to_vec();
+        bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
+        bytes.extend_from_slice(&payload);
+        fs::write(&path, bytes).unwrap();
+        assert!(NetworkState::load(&network.directory).is_err());
+        fs::remove_file(path).unwrap();
+        assert!(matches!(
+            NetworkState::load(&network.directory),
+            Err(NodeError::Identity)
+        ));
+    })
+    .unwrap()
 }
 
-#[tokio::test]
-async fn invalid_guarantees_and_endpoints_do_not_initialize_private_network_state() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut settings = settings(directory.path());
-    settings.durability.max_failures = 1;
-    assert!(matches!(
-        FoundingNetwork::open(&settings).await,
-        Err(NetworkError::Placement(_))
-    ));
-    assert!(!directory.path().join("cluster/network").exists());
-    assert!(!directory.path().join("POLICY").exists());
-    settings.durability.max_failures = 0;
-    for address in [
-        "0.0.0.0:7443",
-        "224.0.0.1:7443",
-        "255.255.255.255:7443",
-        "127.0.0.1:0",
-    ] {
-        settings.node.advertise = Some(address.into());
-        assert!(resolve_addresses(&settings).await.is_err(), "{address}");
-    }
-    settings.node.advertise = Some("127.0.0.1:7443".into());
-    settings.node.listen = Some("0.0.0.0:7443".parse().unwrap());
-    assert!(resolve_addresses(&settings).await.is_ok());
-    settings.node.listen = Some("224.0.0.1:7443".parse().unwrap());
-    assert!(resolve_addresses(&settings).await.is_err());
+#[test]
+fn invalid_guarantees_and_endpoints_do_not_initialize_private_network_state() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let mut settings = settings(directory.path());
+        settings.durability.max_failures = 1;
+        assert!(matches!(
+            FoundingNetwork::open(&settings).await,
+            Err(NetworkError::Placement(_))
+        ));
+        assert!(!directory.path().join("cluster/network").exists());
+        assert!(!directory.path().join("POLICY").exists());
+        settings.durability.max_failures = 0;
+        for address in [
+            "0.0.0.0:7443",
+            "224.0.0.1:7443",
+            "255.255.255.255:7443",
+            "127.0.0.1:0",
+        ] {
+            settings.node.advertise = Some(address.into());
+            assert!(resolve_addresses(&settings).await.is_err(), "{address}");
+        }
+        settings.node.advertise = Some("127.0.0.1:7443".into());
+        settings.node.listen = Some("0.0.0.0:7443".parse().unwrap());
+        assert!(resolve_addresses(&settings).await.is_ok());
+        settings.node.listen = Some("224.0.0.1:7443".parse().unwrap());
+        assert!(resolve_addresses(&settings).await.is_err());
+    })
+    .unwrap()
 }
 
 #[test]
@@ -254,16 +272,132 @@ fn missing_runtime_is_a_typed_error_before_filesystem_or_dns_work() {
     ));
 }
 
+/// A founder whose recorded fence opens the storage level (27 §15.8) founds on the shell: its
+/// root's member is served from the node's hyper-log log, a restart reopens it there, and what
+/// the storage held is given back when the network is dropped.
 #[test]
-fn missing_timer_driver_is_contained_during_endpoint_resolution() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut settings = settings(directory.path());
-    settings.node.advertise = Some("localhost:7443".into());
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    assert!(matches!(
-        runtime.block_on(resolve_addresses(&settings)),
-        Err(NodeError::Io(_))
-    ));
+fn a_founder_at_the_storage_level_founds_and_restarts_on_the_shell() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = settings(directory.path());
+        crate::storage_level::record(directory.path(), crate::upgrade::STORAGE_LEVEL).unwrap();
+        let network = FoundingNetwork::open(&settings).await.unwrap();
+        assert!(matches!(
+            network.storage.storage.backend(),
+            focal_consensus::StorageBackend::Shell(_)
+        ));
+        assert!(network.storage.log.is_some());
+        assert!(
+            directory
+                .path()
+                .join(focal_consensus::convert::LOG_FILE)
+                .exists()
+        );
+        assert_eq!(
+            network.control.wire(),
+            focal_consensus::Wire::Kept,
+            "a member opened under a fence at the storage level carries the fields beyond raft-rs's"
+        );
+        let state = network.state.clone();
+        let term = network.control.status().term;
+        assert!(term > 0, "the root elected its founder on the shell");
+        let budget = network.budget.clone();
+        drop(network);
+        assert_eq!(budget.stats().used, 0);
+        let again = FoundingNetwork::open(&settings).await.unwrap();
+        assert!(matches!(
+            again.storage.storage.backend(),
+            focal_consensus::StorageBackend::Shell(_)
+        ));
+        assert_eq!(again.state, state);
+        assert!(again.control.status().term >= term);
+        assert_eq!(again.control.wire(), focal_consensus::Wire::Kept);
+        drop(again);
+    })
+    .unwrap()
+}
+
+/// A founder whose fence is below `RAFT_KEPT_LEVEL` opens its root on raft-rs's fields alone, as a
+/// cluster that began before the level was opened, and keeps them across a restart; one founded
+/// at the level carries the fields beyond them from genesis, on focal-log's WAL as on the shell
+/// (27 §15.9).
+#[test]
+fn a_founders_root_carries_the_wire_its_genesis_fence_opens() {
+    focal_rt::block_on(async move {
+        let below = tempfile::tempdir().unwrap();
+        let settings_below = settings(below.path());
+        let network = {
+            let _level = crate::upgrade::announce_for_test(crate::upgrade::RAFT_KEPT_LEVEL - 1);
+            FoundingNetwork::open(&settings_below).await.unwrap()
+        };
+        assert_eq!(network.control.wire(), focal_consensus::Wire::Frozen);
+        drop(network);
+        let again = FoundingNetwork::open(&settings_below).await.unwrap();
+        assert_eq!(
+            again.control.wire(),
+            focal_consensus::Wire::Frozen,
+            "a restart opens the root under the fence the cluster holds, not the binary's level"
+        );
+        drop(again);
+
+        let at = tempfile::tempdir().unwrap();
+        let network = {
+            let _level = crate::upgrade::announce_for_test(crate::upgrade::RAFT_KEPT_LEVEL);
+            FoundingNetwork::open(&settings(at.path())).await.unwrap()
+        };
+        assert!(matches!(
+            network.storage.storage.backend(),
+            focal_consensus::StorageBackend::Wal(_)
+        ));
+        assert_eq!(network.control.wire(), focal_consensus::Wire::Kept);
+        drop(network);
+    })
+    .unwrap()
+}
+
+/// A node that ran on focal-log's WAL below the storage level is converted at its first start at
+/// it: its WAL's fence then names the log, and every later start reads it as the shell's.
+#[test]
+fn a_wal_node_is_converted_at_its_first_start_at_the_storage_level() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = settings(directory.path());
+        // Founded below the storage level, as a cluster that began before it was opened.
+        let below = {
+            let _level = crate::upgrade::announce_for_test(crate::upgrade::BELOW_STORAGE_LEVEL);
+            FoundingNetwork::open(&settings).await.unwrap()
+        };
+        assert!(matches!(
+            below.storage.storage.backend(),
+            focal_consensus::StorageBackend::Wal(_)
+        ));
+        let term = below.control.status().term;
+        let identity = below.directory.identity().clone();
+        drop(below);
+        crate::storage_level::record(directory.path(), crate::upgrade::STORAGE_LEVEL).unwrap();
+        let wal_identity = focal_log::WalIdentity {
+            cluster: identity.cluster,
+            node: identity.node,
+            stream: 0,
+        };
+        assert_eq!(
+            focal_consensus::convert::start(directory.path(), wal_identity, true).unwrap(),
+            focal_consensus::convert::Start::Convert
+        );
+        let converted = FoundingNetwork::open(&settings).await.unwrap();
+        assert!(matches!(
+            converted.storage.storage.backend(),
+            focal_consensus::StorageBackend::Shell(_)
+        ));
+        assert!(
+            converted.control.status().term >= term,
+            "the root kept its history"
+        );
+        drop(converted);
+        assert_eq!(
+            focal_consensus::convert::start(directory.path(), wal_identity, true).unwrap(),
+            focal_consensus::convert::Start::Shell
+        );
+    })
+    .unwrap()
 }

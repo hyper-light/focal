@@ -141,8 +141,8 @@ fn case(name: OsString) {
         &execute(
             &root,
             &[
-                OsStr::new("request"),
                 OsStr::new("inspect"),
+                OsStr::new("request"),
                 operation.as_os_str(),
                 OsStr::new("--format"),
                 OsStr::new("json"),
@@ -163,8 +163,8 @@ fn case(name: OsString) {
         &execute(
             &root,
             &[
-                OsStr::new("request"),
                 OsStr::new("retry"),
+                OsStr::new("request"),
                 operation.as_os_str(),
                 OsStr::new("--format"),
                 OsStr::new("json"),
@@ -195,4 +195,51 @@ fn macos_rejects_non_utf8_operation_path_before_creating_or_sending_a_request() 
 #[test]
 fn data_directory_and_operation_spaces_survive_inspection_and_pending_retry() {
     case(OsString::from("operation with spaces"));
+}
+
+/// A data directory too long for its local sockets' addresses is refused by
+/// name before anything is written in it, and before an invitation is read
+/// (one would otherwise be spent on a node that cannot start): the system
+/// cannot bind the sockets there, and its refusal had read as an unavailable
+/// connection after the directory was initialized.
+#[test]
+fn a_data_directory_too_long_for_its_sockets_is_refused_before_it_is_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("d".repeat(focal_wire::SOCKET_PATH_BYTES));
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let missing = base.path().join("missing.invite");
+    for args in [
+        vec![OsStr::new("start"), OsStr::new("node")],
+        vec![
+            OsStr::new("start"),
+            OsStr::new("node"),
+            OsStr::new("--advertise"),
+            OsStr::new("127.0.0.1:9"),
+            OsStr::new("--invite-file"),
+            missing.as_os_str(),
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_focal"))
+            .arg("--data-dir")
+            .arg(&root)
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let report = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {report}");
+        assert!(report.contains("[invalid_input]"), "{report}");
+        assert!(
+            report.contains(&*root.join("focal.sock").to_string_lossy()),
+            "{report}"
+        );
+        assert!(
+            report.contains("choose a shorter data directory"),
+            "{report}"
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0, "{args:?}");
+        assert!(!missing.exists());
+    }
 }

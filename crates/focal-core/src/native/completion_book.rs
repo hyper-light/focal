@@ -1,24 +1,24 @@
-//! Exclusive native-owner completion accounting. A grant prices future reports;
-//! issued pages retain their own pool debit independently of that grant. Only
-//! the owner lends the one shared source, after checking actual authority.
+//! Exclusive native-owner completion accounting. A grant counts an evaluation's
+//! outstanding reports; it sets no bytes or record slots aside for them: each
+//! count's bound keeps a completion share instead ([`CompletionBook::check_slots`]). Each
+//! report is charged what it holds as it is written, on the completion lane that
+//! fresh work cannot take (doc 27): nothing is prepaid for a report that may
+//! never come, so an in-flight message costs the bytes it holds.
 //!
 //! Journals follow the owner's candidate chain. Discard must drop prepared pages
-//! before rolling its journal back. Rollback returns exactly a Begin's newly
-//! added backing. General excess credit is trimmed only with an empty pending
-//! queue: continuous speculation can therefore retain its successful peak.
-//! This is a RAM and record-slot contract, not a disk-space reservation.
+//! before rolling its journal back.
 //!
-//! A uniquely owned balanced index keeps stable grant slots and exact subtree
-//! workspace maxima. Inserts, updates and removals touch logarithmic paths;
-//! charged buffer growth is geometric and journaled for exact rollback.
+//! A uniquely owned balanced index keeps stable grant slots. Inserts, updates and
+//! removals touch logarithmic paths; charged buffer growth is geometric and
+//! journaled for exact rollback.
 
-use super::completion_envelope::{CompletionEnvelope, CompletionSlots, CompletionUse, ParentFacts};
+use super::completion_envelope::{CompletionEnvelope, CompletionUse, ParentFacts};
 use super::completion_index::{CompletionIndex, IndexGrowth};
 use super::completion_schemas::SchemaSet;
 use super::prepare::{add, array, within};
 use super::*;
 use focal_evidence::{NativeSchemaVerifier, NativeVerificationBudget};
-use focal_memory::{Allocation, BudgetKind, BudgetLane, ElasticFundedPool, MemoryBudget, OwnerId};
+use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget, OwnerId};
 
 #[path = "completion_protection.rs"]
 mod protections;
@@ -34,8 +34,8 @@ pub(super) use composition::CandidateJournal;
 #[path = "respondent_book.rs"]
 mod respondents;
 use super::respondent_state::RespondentKey;
+pub(super) use respondents::respondent_journal_visits;
 use respondents::{RespondentGrant, RespondentUpdate};
-pub(super) use respondents::{respondent_journal_bytes, respondent_journal_visits};
 
 #[cfg(test)]
 #[path = "completion_book_tests.rs"]
@@ -66,10 +66,7 @@ struct Grant {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Totals {
-    retained: usize,
-    workspace: usize,
     reports: usize,
-    slots: CompletionSlots,
     live: usize,
     graphs: usize,
 }
@@ -102,7 +99,6 @@ enum Change {
         key: EvaluationKey,
         credit: Credit,
         growth: Option<IndexGrowth<Grant>>,
-        added_funding: usize,
         protections: Option<protections::Journal>,
     },
     One(Update),
@@ -114,7 +110,6 @@ enum Change {
         key: RespondentKey,
         credit: super::respondent_state::RespondentCredit,
         growth: Option<IndexGrowth<RespondentGrant, RespondentKey>>,
-        added_funding: usize,
     },
     RespondentOne(RespondentUpdate),
     RespondentMany {
@@ -146,15 +141,13 @@ impl Journal {
     }
 }
 
+/// What a report is checked against: its evaluation's contract and verification budget. The
+/// report itself is charged to the state's budget, on the completion lane.
 pub(super) struct ReportLoan<'a> {
-    source: &'a MemoryBudget,
     envelope: &'a CompletionEnvelope,
     verification: &'a NativeVerificationBudget,
 }
 impl ReportLoan<'_> {
-    pub(super) fn source(&self) -> &MemoryBudget {
-        self.source
-    }
     pub(super) fn envelope(&self) -> &CompletionEnvelope {
         self.envelope
     }
@@ -165,14 +158,10 @@ impl ReportLoan<'_> {
 
 /// The owner has independently checked a due timer against the actual retained
 /// evaluation. This loan requires no external reporter, schema or evidence.
-pub(super) struct DeadlineLoan<'a> {
-    source: &'a MemoryBudget,
+pub(super) struct DeadlineLoan {
     storage: focal_memory::RangeWriteEnvelope,
 }
-impl DeadlineLoan<'_> {
-    pub(super) fn source(&self) -> &MemoryBudget {
-        self.source
-    }
+impl DeadlineLoan {
     pub(super) fn storage(&self) -> focal_memory::RangeWriteEnvelope {
         self.storage
     }
@@ -184,7 +173,6 @@ pub(super) struct CompletionBook {
     entries: CompletionIndex<Grant>,
     respondents: CompletionIndex<RespondentGrant, RespondentKey>,
     protections: protections::Protections,
-    pool: ElasticFundedPool,
     parent: MemoryBudget,
     limits: NativeLimits,
     totals: Totals,
@@ -192,6 +180,10 @@ pub(super) struct CompletionBook {
     owner: OwnerId,
     revision: u64,
 }
+
+/// Each count's bound keeps this share of itself (a sixteenth) for completing work already
+/// admitted: fresh work admits within the rest ([`CompletionBook::check_slots`]).
+const COMPLETION_SHARE: usize = 16;
 
 fn sub(left: usize, right: usize) -> Result<usize, NativeError> {
     left.checked_sub(right)
@@ -202,26 +194,17 @@ fn mul(left: usize, right: usize) -> Result<usize, NativeError> {
         .ok_or(NativeError::Capacity("completion credit accounting"))
 }
 
+/// What an evaluation's outstanding reports count against the book: their identities. Nothing is
+/// set aside for the bytes or the records they may take: each report is charged what it holds as
+/// it is written, and counted within the bounds' completion share, on the completion lane.
 fn demand(envelope: CompletionEnvelope, credit: Credit) -> Result<Totals, NativeError> {
     if credit.remaining_reports == 0 {
         return Ok(Totals::default());
     }
     let reports = usize::try_from(credit.remaining_reports)
         .map_err(|_| NativeError::Capacity("completion report count"))?;
-    let regular = envelope.per_report_retained_bytes(CompletionUse::Regular)?;
-    let failure = if credit.failure_available {
-        sub(
-            envelope.per_report_retained_bytes(CompletionUse::AdmissionFailure)?,
-            regular,
-        )?
-    } else {
-        0
-    };
     Ok(Totals {
-        retained: add(mul(reports, regular)?, failure)?,
-        workspace: envelope.workspace_bytes(),
         reports,
-        slots: envelope.remaining_slots(credit.remaining_reports, credit.failure_available)?,
         live: 1,
         graphs: usize::from(envelope.has_graph()),
     })
@@ -230,10 +213,7 @@ fn demand(envelope: CompletionEnvelope, credit: Credit) -> Result<Totals, Native
 impl Totals {
     fn replace(self, old: Self, new: Self) -> Result<Self, NativeError> {
         Ok(Self {
-            retained: add(sub(self.retained, old.retained)?, new.retained)?,
-            workspace: self.workspace.max(new.workspace),
             reports: add(sub(self.reports, old.reports)?, new.reports)?,
-            slots: self.slots.checked_sub(old.slots)?.checked_add(new.slots)?,
             live: add(sub(self.live, old.live)?, new.live)?,
             graphs: add(sub(self.graphs, old.graphs)?, new.graphs)?,
         })
@@ -243,14 +223,11 @@ impl Totals {
 impl CompletionBook {
     pub(super) fn new(source: &MemoryBudget, limits: NativeLimits) -> Result<Self, NativeError> {
         let owner = OwnerId::new()?;
-        let ceiling = source.reservation_limit(BudgetLane::Ordinary);
-        let pool = source.elastic_funded_child(BudgetLane::Ordinary, ceiling, 0)?;
         Ok(Self {
             record_buffers: None,
             entries: CompletionIndex::new(),
             respondents: CompletionIndex::new(),
             protections: protections::Protections::new(),
-            pool,
             parent: source.clone(),
             limits,
             totals: Totals::default(),
@@ -260,9 +237,6 @@ impl CompletionBook {
         })
     }
 
-    pub(super) fn source(&self) -> &MemoryBudget {
-        self.pool.budget()
-    }
     pub(super) fn with_record_buffers(mut self, limits: record_codec::EncodingLimits) -> Self {
         self.record_buffers = Some(limits);
         self
@@ -285,14 +259,6 @@ impl CompletionBook {
     #[cfg(test)]
     pub(super) fn envelope_for_test(&self, key: EvaluationKey) -> Option<&CompletionEnvelope> {
         self.entries.get(key).map(|entry| &entry.envelope)
-    }
-    #[cfg(test)]
-    pub(super) fn funded_capacity(&self) -> usize {
-        self.pool.funded_capacity()
-    }
-
-    fn maximum_workspace(&self) -> usize {
-        self.entries.maximum().max(self.respondents.maximum())
     }
 
     fn grant(&self, key: EvaluationKey) -> Result<&Grant, NativeError> {
@@ -422,22 +388,8 @@ impl CompletionBook {
                 .report_storage(CompletionUse::AdmissionFailure)
                 .is_ok(),
         };
-        let full = demand(
-            envelope,
-            Credit {
-                remaining_reports: envelope.reports(),
-                ..credit
-            },
-        )?;
-        if full.retained != envelope.total_retained_bytes()
-            || add(full.retained, full.workspace)? != envelope.required_bytes()
-            || full.slots != envelope.slots()
-        {
-            return Err(NativeError::Capacity("completion envelope accounting"));
-        }
         let before = self.totals;
         let totals = before.replace(Totals::default(), demand(envelope, credit)?)?;
-        let needed = add(totals.retained, totals.workspace)?;
         let journals = add(self.journals, 1)?;
         let revision = self.next_revision()?;
         let protection_limit = if members.is_some() {
@@ -446,13 +398,6 @@ impl CompletionBook {
             0
         };
         let growth = self.entries.grow(&self.parent, self.limits.evaluations)?;
-        let new_funding = needed.saturating_sub(self.pool.available());
-        if let Err(error) = self.pool.grow(new_funding) {
-            if let Some(growth) = growth {
-                self.entries.restore_growth(growth)?;
-            }
-            return Err(error.into());
-        }
         let protections = if let Some(members) = &members {
             match self
                 .protections
@@ -460,7 +405,6 @@ impl CompletionBook {
             {
                 Ok(journal) => Some(journal),
                 Err(error) => {
-                    self.pool.trim_unused(new_funding)?;
                     if let Some(growth) = growth {
                         self.entries.restore_growth(growth)?;
                     }
@@ -470,7 +414,7 @@ impl CompletionBook {
         } else {
             None
         };
-        // Growth and funding precede tree mutation; insert allocates nothing.
+        // Growth precedes tree mutation; insert allocates nothing.
         if let Err(error) = self.entries.insert(
             key,
             Grant {
@@ -481,12 +425,10 @@ impl CompletionBook {
                 members,
                 growth_checked: std::cell::Cell::new(false),
             },
-            envelope.workspace_bytes(),
         ) {
             if let Some(protections) = protections {
                 self.protections.rollback(protections)?;
             }
-            self.pool.trim_unused(new_funding)?;
             if let Some(growth) = growth {
                 self.entries.restore_growth(growth)?;
             }
@@ -504,7 +446,6 @@ impl CompletionBook {
                 key,
                 credit,
                 growth,
-                added_funding: new_funding,
                 protections,
             },
             before,
@@ -584,7 +525,6 @@ impl CompletionBook {
         check_descriptor(&grant.envelope)?;
         let verification = grant.schemas.budget_for(schema, verifier)?;
         Ok(ReportLoan {
-            source: self.source(),
             envelope: &grant.envelope,
             verification,
         })
@@ -594,7 +534,7 @@ impl CompletionBook {
         &self,
         key: EvaluationKey,
         binding: Binding,
-    ) -> Result<DeadlineLoan<'_>, NativeError> {
+    ) -> Result<DeadlineLoan, NativeError> {
         self.check_health()?;
         let grant = self.grant(key)?;
         grant.credit.binding.check(&binding)?;
@@ -602,7 +542,6 @@ impl CompletionBook {
             return Err(ContractError::InvalidTransition.into());
         }
         Ok(DeadlineLoan {
-            source: self.source(),
             storage: grant.envelope.deadline_storage(self.limits)?,
         })
     }
@@ -667,15 +606,8 @@ impl CompletionBook {
         let journals = add(self.journals, 1)?;
         let revision = self.next_revision()?;
         let before = self.totals;
-        let workspace = if next.remaining_reports == 0 {
-            0
-        } else {
-            grant.envelope.workspace_bytes()
-        };
-        self.entries
-            .replace_weight(key, workspace, |grant| grant.credit = next)?;
+        self.entries.update(key, |grant| grant.credit = next)?;
         self.totals = totals;
-        self.totals.workspace = self.maximum_workspace();
         self.check_health()?;
         self.journals = journals;
         let before_revision = self.revision;
@@ -692,14 +624,15 @@ impl CompletionBook {
     pub(super) fn event(
         prepared: &NativePrepared,
         ordinal: u32,
+        payloads: Option<&dyn crate::native::payloads::PayloadRead>,
     ) -> Result<NativeEvent, NativeError> {
         match prepared
             .fragments
             .get(&Key::Event(prepared.outcome.sequence, ordinal))
         {
+            // A candidate's events are spilled as they are built (doc 31 M3).
             Some(Row::Event(event)) => event
-                .get()
-                .map(|row| row.expand(prepared.outcome.ledger))
+                .get(prepared.outcome.ledger, payloads)
                 .ok_or(ContractError::InvalidCut.into()),
             _ => Err(ContractError::InvalidCut.into()),
         }
@@ -709,18 +642,19 @@ impl CompletionBook {
     /// seals. Resolve that publication instead of inferring it from a final row.
     pub(super) fn admission_failure_event(
         prepared: &NativePrepared,
+        payloads: Option<&dyn crate::native::payloads::PayloadRead>,
     ) -> Result<Option<NativeClaimEvent>, NativeError> {
         if prepared.outcome.operation != NativeOperation::ReportAdmission
             || prepared.outcome.events <= 3
         {
             return Ok(None);
         }
-        let publication = Self::event(prepared, 3)?;
+        let publication = Self::event(prepared, 3, payloads)?;
         let NativeFact::Claim(event) = publication.fact else {
             return Err(ContractError::InvalidCut.into());
         };
         let parent = prepared
-            .claim(ClaimId(event.after.object.0))
+            .written_claim(ClaimId(event.after.object.0))
             .ok_or(ContractError::InvalidTarget)?;
         if publication.sequence != prepared.outcome.sequence
             || publication.ordinal != 3
@@ -743,17 +677,17 @@ impl CompletionBook {
         prepared: &NativePrepared,
     ) -> Result<(), NativeError> {
         self.check_health()?;
-        if view.tail.is_none_or(|tail| !std::ptr::eq(tail, prepared)) {
+        if view.tail().is_none_or(|tail| !std::ptr::eq(tail, prepared)) {
             return Err(MemoryError::WrongRange.into());
         }
         let mut previous = None;
         for ordinal in 0..prepared.outcome.events {
-            let after = match Self::event(prepared, ordinal)?.fact {
+            let after = match Self::event(prepared, ordinal, view.payloads())?.fact {
                 NativeFact::Claim(event) => event.after,
                 NativeFact::Registrations { claim } => claim,
                 NativeFact::Evaluation { key, .. } => {
                     let state = prepared
-                        .evaluation(key)
+                        .written_evaluation(key)
                         .ok_or(ContractError::InvalidTarget)?;
                     // Complete source cohorts were checked before accepting a
                     // responsibility. Every later evaluation mutation has a
@@ -773,7 +707,9 @@ impl CompletionBook {
             let Some(Row::Claim(owned)) = prepared.fragments.get(&Key::Claim(id)) else {
                 return Err(ContractError::InvalidTarget.into());
             };
-            let parent = prepared.claim(id).ok_or(ContractError::InvalidTarget)?;
+            let parent = prepared
+                .written_claim(id)
+                .ok_or(ContractError::InvalidTarget)?;
             // One batch may append several child facts for the same parent.
             // Only its final revision matches the actual retained row; every
             // changed claim emits that final event before candidate creation.
@@ -821,55 +757,52 @@ impl CompletionBook {
         self.check_health()
     }
 
-    /// Check the candidate's actual effective counts AFTER its credit journal is
-    /// applied. Ordinary admission cannot consume promised reports' slots. One
-    /// additional outcome/sequence remains available for an authority control.
+    /// Check the candidate's actual effective counts after its credit journal is
+    /// applied, on its lane: each count's bound keeps a completion share (doc 27),
+    /// so fresh work admits within the bound less its share and work already
+    /// admitted completes within the rest. Nothing is set aside for a grant's
+    /// future reports. Resident outcomes have no share: a seal under pressure is
+    /// what makes room for them, for fresh work and completion alike. One more
+    /// outcome and sequence stay for an authority control.
     pub(super) fn check_slots(
         &self,
         meta: Meta,
         sequence: SessionSeq,
         rows: usize,
+        lane: BudgetLane,
     ) -> Result<(), NativeError> {
         self.check_health()?;
-        let slots = self.totals.slots;
-        within(add(meta.claims, slots.claims)?, self.limits.claims)?;
-        within(
-            add(meta.definitions, slots.definitions)?,
-            self.limits.definitions,
-        )?;
-        within(
-            add(meta.evaluations, slots.evaluations)?,
-            self.limits.evaluations,
-        )?;
-        within(add(meta.artifacts, slots.artifacts)?, self.limits.artifacts)?;
-        within(add(meta.results, slots.results)?, self.limits.results)?;
-        within(add(meta.responses, slots.responses)?, self.limits.responses)?;
-        within(add(meta.receipts, slots.receipts)?, self.limits.receipts)?;
+        let ceiling = |limit: usize| match lane {
+            BudgetLane::Ordinary => {
+                limit.saturating_sub(limit.checked_div(COMPLETION_SHARE).unwrap_or(0))
+            }
+            BudgetLane::Completion | BudgetLane::Committed => limit,
+        };
+        within(meta.claims, ceiling(self.limits.claims))?;
+        within(meta.definitions, ceiling(self.limits.definitions))?;
+        within(meta.evaluations, ceiling(self.limits.evaluations))?;
+        within(meta.artifacts, ceiling(self.limits.artifacts))?;
+        within(meta.results, ceiling(self.limits.results))?;
+        within(meta.responses, ceiling(self.limits.responses))?;
+        within(meta.receipts, ceiling(self.limits.receipts))?;
         // Exactly one claimant result testament may be generated per claim.
         // Its native admission path shares the configured claim-count ceiling.
-        within(
-            add(meta.result_testaments, slots.result_testaments)?,
-            self.limits.claims,
-        )?;
-        within(add(meta.monitors, slots.monitors)?, self.limits.monitors)?;
-        within(
-            add(meta.monitor_links, slots.monitor_links)?,
-            self.limits.monitor_links,
-        )?;
-        within(add(meta.events, slots.events)?, self.limits.events)?;
+        within(meta.result_testaments, ceiling(self.limits.claims))?;
+        within(meta.monitors, ceiling(self.limits.monitors))?;
+        within(meta.monitor_links, ceiling(self.limits.monitor_links))?;
+        within(meta.events, ceiling(self.limits.events))?;
         let control = usize::from(self.totals.live != 0);
+        // Resident outcomes (F12): the lifetime count less what left into
+        // seals and retirement bundles.
         within(
-            add(add(meta.outcomes, slots.outcomes)?, control)?,
+            add(meta.outcomes.saturating_sub(meta.sealed), control)?,
             self.limits.outcomes,
         )?;
         sequence
             .0
-            .checked_add(slots.sequences)
-            .and_then(|value| value.checked_add(u64::from(control != 0)))
+            .checked_add(u64::from(control != 0))
             .ok_or(NativeError::Capacity("completion sequence margin"))?;
-        // Identities have one matching artifact; their count is priced in new
-        // rows. There is no separate configurable total-row ceiling today.
-        add(add(rows, slots.new_rows)?, control)?;
+        add(rows, control)?;
         Ok(())
     }
 
@@ -947,14 +880,6 @@ impl CompletionBook {
             }
             Change::None => {}
         }
-        if let Change::Begin { added_funding, .. }
-        | Change::RespondentInstall { added_funding, .. } = &journal.change
-        {
-            // Only this Begin's new parent contribution is returned. The owner
-            // has dropped its prepared pages and every later spender first;
-            // pre-Begin promises and rollback backing remain fully funded.
-            self.pool.trim_unused(*added_funding)?;
-        }
         match journal.change {
             Change::Begin {
                 key,
@@ -1001,20 +926,13 @@ impl CompletionBook {
         self.totals = journal.before;
         self.journals = journals;
         self.revision = journal.before_revision;
-        // General excess is retained: earlier pending reports may roll back
-        // into credit that a dependent Begin temporarily reused.
         Ok(())
     }
 
     fn restore_credit(&mut self, update: Update) -> Result<(), NativeError> {
-        let grant = self.grant(update.key)?;
-        let workspace = if update.before.remaining_reports == 0 {
-            0
-        } else {
-            grant.envelope.workspace_bytes()
-        };
+        self.grant(update.key)?;
         self.entries
-            .replace_weight(update.key, workspace, |grant| grant.credit = update.before)
+            .update(update.key, |grant| grant.credit = update.before)
     }
 
     fn remove_grant(&mut self, key: EvaluationKey) -> Result<(), NativeError> {
@@ -1083,7 +1001,7 @@ impl CompletionBook {
         }
         self.journals = journals;
         // Dropping journal releases only its old empty buffer / retirement
-        // bookkeeping; the pool keeps all still-issued page/custody debits.
+        // bookkeeping.
         Ok(())
     }
 
@@ -1098,18 +1016,5 @@ impl CompletionBook {
         self.revision
             .checked_add(1)
             .ok_or(NativeError::Capacity("completion journal revision"))
-    }
-
-    /// Owner must additionally ensure its pending queue is empty, including
-    /// candidates whose journal is empty. Return only unissued, unpromised bytes.
-    pub(super) fn trim_idle(&mut self) -> Result<(), NativeError> {
-        self.check_health()?;
-        if self.journals != 0 {
-            return Err(ContractError::InvalidTransition.into());
-        }
-        let required = add(self.totals.retained, self.totals.workspace)?;
-        let unused = self.pool.available().saturating_sub(required);
-        self.pool.trim_unused(unused)?;
-        Ok(())
     }
 }

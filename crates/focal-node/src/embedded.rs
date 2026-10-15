@@ -6,12 +6,12 @@ use crate::{
 };
 use focal_consensus::{DurableNode, NodeConfig};
 use focal_evidence::{ContentStore, StoreLimits};
-use focal_ledger::{LedgerError, Session, SessionLimits};
+use focal_ledger::{LedgerError, Session};
 use focal_log::{SharedWal, WalIdentity, WalOptions};
 use focal_model::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io::{Read, Write},
     path::Path,
 };
@@ -57,6 +57,10 @@ pub enum NodeError {
     Ledger(#[from] LedgerError),
     #[error("consensus: {0}")]
     Consensus(#[from] focal_consensus::ConsensusError),
+    /// Boxed: what opening the storage refuses carries the log's and the conversion's errors,
+    /// which every other `NodeError` need not be the size of.
+    #[error("the node's storage: {0}")]
+    Storage(Box<focal_consensus::storage_open::OpenError>),
     #[error("WAL: {0}")]
     Wal(#[from] focal_log::LogError),
     #[error("content: {0}")]
@@ -65,10 +69,22 @@ pub enum NodeError {
     Encoding(#[from] postcard::Error),
     #[error("canonical content: {0}")]
     Canonical(#[from] focal_model::CanonicalError),
+    /// The data directory is not this user's, or another user may write to
+    /// it and so replace the node's identity or a journal's entry: refused
+    /// at start, before anything is kept there. One others may read is the
+    /// node's: what it keeps private it opens private.
+    #[error(
+        "data directory {} must be this user's and writable by no other user (`focal prepare volume --owner UID:GID`)",
+        .0.display()
+    )]
+    NotPrivate(std::path::PathBuf),
     #[error("data directory already has a live owner")]
     Locked,
     #[error("node identity or stored policy is corrupt or incompatible")]
     Identity,
+    /// A record of the data directory that is there and does not read whole.
+    #[error("corrupt node record: {0}")]
+    Corrupt(&'static str),
     #[error("deployment cannot satisfy its configured guarantee: {0}")]
     Placement(String),
     #[error("this embedded owner requires local operation; use the network host for peers")]
@@ -77,6 +93,11 @@ pub enum NodeError {
     Entropy(String),
     #[error("domain refused the operation: {0}")]
     Domain(String),
+}
+impl From<focal_consensus::storage_open::OpenError> for NodeError {
+    fn from(error: focal_consensus::storage_open::OpenError) -> Self {
+        Self::Storage(Box::new(error))
+    }
 }
 
 pub struct EmbeddedNode {
@@ -139,12 +160,25 @@ impl EmbeddedNode {
             },
             wal.disk_budget(),
         )?;
-        let mut session = Session::from_node_hosted(
-            identity.ledger,
-            consensus,
-            SessionLimits::default(),
-            crate::network_service::native_hosting(root, &identity, wal.disk_budget())?,
+        let limits = crate::memory_envelope::found_limits(root, settings, &consensus)?;
+        // An embedded node is its own cluster: the level its binary announces is its fence.
+        let level = crate::upgrade::announced_level();
+        let rule = if level >= crate::upgrade::SEAL_LEVEL {
+            focal_ledger::SealRule::Anchored
+        } else {
+            focal_ledger::SealRule::Derived
+        };
+        let retire = crate::storage_level::retire_rule_at(level);
+        let hosting = crate::network_service::native_hosting(
+            root,
+            &identity,
+            wal.disk_budget(),
+            &limits,
+            rule,
+            retire,
+            crate::storage_level::native_share_at(level),
         )?;
+        let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;
         session.campaign()?;
         // One voter can establish the committed current-term read barrier locally.
         for _ in 0..4 {
@@ -253,7 +287,7 @@ pub(crate) fn install_policy(
 }
 /// The committed policy of an initialized store; `None` for a fresh
 /// directory that has no policy yet. A committed policy is authoritative:
-/// it is what the fleet already carries, and `deployment apply` may have
+/// it is what the fleet already carries, and `apply deployment` may have
 /// committed stronger durability than the file's first-start seed, so a
 /// differing `settings` value is not a refusal (that would keep the node
 /// from ever restarting after a sanctioned apply). Config resolution
@@ -265,24 +299,7 @@ pub(crate) fn check_policy(
     Ok(crate::config::policy::read_committed(root)?)
 }
 pub(crate) fn durable_dir(path: &Path) -> Result<(), std::io::Error> {
-    if path.is_dir() {
-        return Ok(());
-    }
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        durable_dir(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().mode(0o700).create(path)?;
-    }
-    #[cfg(not(unix))]
-    fs::create_dir(path)?;
-    focal_platform::sync_dir(path)?;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        focal_platform::sync_dir(parent)?;
-    }
-    Ok(())
+    focal_platform::fs::create_dir_all_private(path)
 }
 pub(crate) fn atomic_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     let temporary = path.with_extension("install");
@@ -302,6 +319,7 @@ pub(crate) fn atomic_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     #[test]
     fn identity_and_owner_survive_restart() {
         let dir = tempfile::tempdir().unwrap();

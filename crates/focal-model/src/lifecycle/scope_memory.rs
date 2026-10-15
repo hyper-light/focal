@@ -65,7 +65,6 @@ impl Registry {
             });
         }
         let copied = Self {
-            owner: self.owner,
             limits: self.limits,
             scopes,
             children: bytes::copy(&self.children)?,
@@ -118,7 +117,6 @@ impl Registry {
             registered: SessionSeq(3),
         });
         Self {
-            owner,
             limits: ScopeLimits {
                 scopes: 8,
                 roots: 16,

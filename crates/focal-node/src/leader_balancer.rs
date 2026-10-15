@@ -111,6 +111,14 @@ impl LeaderBalancer {
     pub fn config(&self) -> LeaderBalancerConfig {
         self.config
     }
+    /// What this balancer's observations hold, by their entries.
+    pub(crate) fn held_bytes(&self) -> Option<usize> {
+        focal_memory::map_bytes::<LedgerId, Observed>(self.seen.len())
+    }
+    /// What one session's observation adds to them at most.
+    pub(crate) fn row_bytes() -> Option<usize> {
+        focal_memory::map_entry_bytes::<LedgerId, Observed>()
+    }
     pub fn stats(&self) -> LeaderBalancerStats {
         self.stats
     }

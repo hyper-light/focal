@@ -1,6 +1,6 @@
 use super::report_tests::{
     Custody, EVALUATOR, ISSUER, artifact_spec, begin, binding, context, creation, descriptor, key,
-    post, prepared, publish, report_for, request, verified,
+    post, prepared, publish, report_for, report_for_chain, request, verified,
 };
 use super::*;
 use focal_memory::{Entry, MemoryError};
@@ -32,8 +32,8 @@ fn new_core(limits: NativeLimits) -> Core<NativeState> {
     .unwrap()
 }
 
-fn entry_bytes(entry: &Entry<Key, Row>) -> usize {
-    size_of::<Entry<Key, Row>>() + entry.heap_bytes
+fn entry_bytes(entry: crate::native::ranges::RowEntry<'_>) -> usize {
+    size_of::<Entry<crate::native::layout::PackedKey, Row>>() + entry.heap_bytes
 }
 
 fn check_entries(core: &Core<NativeState>) {
@@ -58,7 +58,9 @@ fn native_default_layout_has_finite_page_and_complete_owned_entry_caps() {
         + OwnedEvent::container_charge()
         + size_of::<Entry<Key, Row>>();
     let core = new_core(original);
-    assert_eq!(core.limits.range.page_bytes, 64 * 1024);
+    // Without a node's bound, a leaf costs at most a full leaf of inline rows.
+    let inline_leaf = original.range.inline_leaf_bytes::<Key, Row>().unwrap();
+    assert_eq!(core.limits.range.page_bytes, inline_leaf);
     assert_eq!(core.limits.range.max_entry_bytes, expected);
     assert_eq!(core.native_sequence(), SessionSeq(0));
     check_entries(&core);
@@ -69,8 +71,9 @@ fn tighter_supplied_page_and_entry_caps_are_preserved_while_wider_caps_are_clamp
     for page_bytes in [2048, 4096, 64 * 1024, usize::MAX] {
         let mut config = limits(page_bytes);
         config.range.max_entry_bytes = 32 * 1024;
+        let inline_leaf = config.range.inline_leaf_bytes::<Key, Row>().unwrap();
         let mut core = new_core(config);
-        assert_eq!(core.limits.range.page_bytes, page_bytes.min(64 * 1024));
+        assert_eq!(core.limits.range.page_bytes, page_bytes.min(inline_leaf));
         assert_eq!(core.limits.range.max_entry_bytes, 32 * 1024);
         publish(&mut core, 10, creation(1, 1, &[], None));
         check_entries(&core);
@@ -89,16 +92,26 @@ fn real_pending_claim_admission_and_custody_report_publish_with_small_byte_bound
         ));
         let posted =
             prepared(core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[&created]));
-        let claim = posted.claim(key(1).claim).unwrap().binding();
-        let evaluation = posted.evaluation(key(1)).unwrap().binding();
+        let claim = core
+            .native_chain(&[&created, &posted])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .binding();
+        let evaluation = core
+            .native_chain(&[&created, &posted])
+            .unwrap()
+            .evaluation(key(1))
+            .unwrap()
+            .binding();
         let begun = prepared(core.prepare_native(
             context(EVALUATOR, 30),
             begin(3, claim, 1, evaluation),
             &[&created, &posted],
         ));
-        let input = report_for(
+        let input = report_for_chain(
             &core,
-            Some(&begun),
+            &[&created, &posted, &begun],
             4,
             1,
             VerdictValue::Pass,
@@ -119,17 +132,29 @@ fn real_pending_claim_admission_and_custody_report_publish_with_small_byte_bound
         assert_eq!(core.native_sequence(), SessionSeq(0));
         assert!(core.native_artifact(artifact.id).is_none());
         assert_eq!(
-            reported
+            core.native_chain(&[&created, &posted, &begun, &reported])
+                .unwrap()
                 .artifact(artifact.id)
                 .unwrap()
                 .descriptor()
                 .content_hash(),
             artifact.hash
         );
-        let result_key =
-            NativeResultKey::of(reported.evaluation(key(1)).unwrap().last_result().unwrap());
+        let result_key = NativeResultKey::of(
+            core.native_chain(&[&created, &posted, &begun, &reported])
+                .unwrap()
+                .evaluation(key(1))
+                .unwrap()
+                .last_result()
+                .unwrap(),
+        );
         assert_eq!(
-            reported.result(result_key).unwrap().result().verdict(),
+            core.native_chain(&[&created, &posted, &begun, &reported])
+                .unwrap()
+                .result(result_key)
+                .unwrap()
+                .result()
+                .verdict(),
             VerdictValue::Pass
         );
         let outcomes = [
@@ -161,7 +186,10 @@ fn real_pending_claim_admission_and_custody_report_publish_with_small_byte_bound
             None
         );
         for outcome in outcomes {
-            assert_eq!(core.native_outcome(outcome.invocation), Some(outcome));
+            assert_eq!(
+                core.native_outcome(outcome.invocation).unwrap(),
+                Some(outcome)
+            );
             for ordinal in 0..outcome.events {
                 assert_eq!(
                     core.native_event(outcome.sequence, ordinal)
@@ -194,15 +222,28 @@ fn large_native_claim_remains_at_the_same_owned_address_when_an_adjacent_claim_i
     let candidate =
         prepared(core.prepare_native(context(ISSUER, 20), creation(2, 2, &[], None), &[]));
     assert_eq!(
-        std::ptr::from_ref(candidate.claim(key(1).claim).unwrap()),
+        std::ptr::from_ref(
+            core.native_chain(&[&candidate])
+                .unwrap()
+                .claim(key(1).claim)
+                .unwrap()
+        ),
         pointer
     );
     assert_eq!(
-        candidate.definition(key(1).validation).unwrap().binding(),
+        core.native_chain(&[&candidate])
+            .unwrap()
+            .definition(key(1).validation)
+            .unwrap()
+            .binding(),
         definition
     );
     assert_eq!(
-        candidate.claim(key(1).claim).unwrap().status(),
+        core.native_chain(&[&candidate])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .status(),
         ClaimStatus::Generated
     );
     core.publish_native(candidate).unwrap();
@@ -235,17 +276,47 @@ fn small_immutable_definitions_keep_their_owned_addresses_through_pending_lifecy
     let pinned = core.pin_native(0, 1000).unwrap();
     let before = core.state.budget.stats();
     let posted = prepared(core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[]));
-    assert_eq!(std::ptr::from_ref(posted.definition(id).unwrap()), original);
-    let claim = posted.claim(key(1).claim).unwrap().binding();
-    let evaluation = posted.evaluation(key(1)).unwrap().binding();
+    assert_eq!(
+        std::ptr::from_ref(
+            core.native_chain(&[&posted])
+                .unwrap()
+                .definition(id)
+                .unwrap()
+        ),
+        original
+    );
+    let claim = core
+        .native_chain(&[&posted])
+        .unwrap()
+        .claim(key(1).claim)
+        .unwrap()
+        .binding();
+    let evaluation = core
+        .native_chain(&[&posted])
+        .unwrap()
+        .evaluation(key(1))
+        .unwrap()
+        .binding();
     let begun = prepared(core.prepare_native(
         context(EVALUATOR, 30),
         begin(3, claim, 1, evaluation),
         &[&posted],
     ));
-    assert_eq!(std::ptr::from_ref(begun.definition(id).unwrap()), original);
     assert_eq!(
-        begun.definition(id).unwrap().intent_fingerprint(),
+        std::ptr::from_ref(
+            core.native_chain(&[&posted, &begun])
+                .unwrap()
+                .definition(id)
+                .unwrap()
+        ),
+        original
+    );
+    assert_eq!(
+        core.native_chain(&[&posted, &begun])
+            .unwrap()
+            .definition(id)
+            .unwrap()
+            .intent_fingerprint(),
         original_intent
     );
     assert_eq!(
@@ -256,18 +327,36 @@ fn small_immutable_definitions_keep_their_owned_addresses_through_pending_lifecy
     drop(posted);
     assert_eq!(core.state.budget.stats(), before);
     assert_eq!(core.native_sequence(), SessionSeq(1));
-    assert!(core.native_outcome(request(ISSUER, 2)).is_none());
+    assert!(core.native_outcome(request(ISSUER, 2)).unwrap().is_none());
     let posted = prepared(core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[]));
     core.publish_native(posted).unwrap();
+    // The pinned read keeps the definition it read. Every family but the counters shares one
+    // page class (doc 31 M3), so the publication copied the page the definition shares with the
+    // claim while the pin held it: the live definition is the same declaration, copied.
     assert_eq!(
-        std::ptr::from_ref(core.native_definition(id).unwrap()),
-        original
+        pinned.with_definition(id, 1, std::ptr::from_ref).unwrap(),
+        Some(original)
+    );
+    assert_eq!(
+        core.native_definition(id).unwrap().intent_fingerprint(),
+        original_intent
     );
     assert_eq!(
         pinned
             .with_claim(key(1).claim, 1, |row| row.status())
             .unwrap(),
         Some(ClaimStatus::Generated)
+    );
+    // With no pin, a lifecycle write edits its page where it stands: the definition is not
+    // copied.
+    core.release_native(&pinned).unwrap();
+    let live = std::ptr::from_ref(core.native_definition(id).unwrap());
+    let claim = core.native_claim(key(1).claim).unwrap().binding();
+    let evaluation = core.native_evaluation(key(1)).unwrap().binding();
+    publish(&mut core, 30, begin(3, claim, 1, evaluation));
+    assert_eq!(
+        std::ptr::from_ref(core.native_definition(id).unwrap()),
+        live
     );
     check_entries(&core);
 }
@@ -318,15 +407,29 @@ fn small_immutable_artifact_descriptor_survives_control_writes_without_copying()
     };
     let cancelled = prepared(core.prepare_native(context(ISSUER, 50), cancel(), &[]));
     assert_eq!(
-        std::ptr::from_ref(cancelled.artifact(artifact.id).unwrap()),
+        std::ptr::from_ref(
+            core.native_chain(&[&cancelled])
+                .unwrap()
+                .artifact(artifact.id)
+                .unwrap()
+        ),
         original
     );
     assert_eq!(
-        std::ptr::from_ref(cancelled.definition(key(1).validation).unwrap()),
+        std::ptr::from_ref(
+            core.native_chain(&[&cancelled])
+                .unwrap()
+                .definition(key(1).validation)
+                .unwrap()
+        ),
         definition
     );
     assert_eq!(
-        cancelled.claim(key(1).claim).unwrap().status(),
+        core.native_chain(&[&cancelled])
+            .unwrap()
+            .claim(key(1).claim)
+            .unwrap()
+            .status(),
         ClaimStatus::Cancelled
     );
     drop(cancelled);
@@ -334,9 +437,13 @@ fn small_immutable_artifact_descriptor_survives_control_writes_without_copying()
     assert_eq!(core.native_claim(key(1).claim).unwrap().binding(), expected);
     let cancelled = prepared(core.prepare_native(context(ISSUER, 50), cancel(), &[]));
     core.publish_native(cancelled).unwrap();
+    // The pinned read keeps the descriptor it read; the live one is the same descriptor, copied
+    // where the pin held the page it shares with the claim (one page class, doc 31 M3).
     assert_eq!(
-        std::ptr::from_ref(core.native_artifact(artifact.id).unwrap()),
-        original
+        pinned
+            .with_artifact(artifact.id, 1, std::ptr::from_ref)
+            .unwrap(),
+        Some(original)
     );
     assert_eq!(
         pinned
@@ -373,13 +480,16 @@ fn inline_only_entry_allowance_refuses_claim_heap_without_publishing_any_partial
         core.native_definition(focal_model::ValidationId::from_u128(100))
             .is_none()
     );
-    assert!(core.native_outcome(request(ISSUER, 1)).is_none());
+    assert!(core.native_outcome(request(ISSUER, 1)).unwrap().is_none());
     assert!(core.native_event(SessionSeq(1), 0).is_none());
 }
 
 #[test]
 fn strict_entry_rejection_preserves_existing_rows_and_allows_smaller_same_request_retry() {
+    // Entry sizes as rows are held: a spilled row's entry is not what its candidate's was
+    // (doc 31 M3).
     let mut reference = new_core(limits(2048));
+    drop(reference.detach_payload_log());
     publish(&mut reference, 10, creation(1, 1, &[], None));
     let accepted_maximum = reference
         .state
@@ -391,6 +501,7 @@ fn strict_entry_rejection_preserves_existing_rows_and_allows_smaller_same_reques
     let mut config = limits(2048);
     config.range.max_entry_bytes = accepted_maximum;
     let mut core = new_core(config);
+    drop(core.detach_payload_log());
     publish(&mut core, 10, creation(1, 1, &[], None));
     let read = core.pin_native(0, 1000).unwrap();
     let before = core.native_budget();
@@ -408,7 +519,7 @@ fn strict_entry_rejection_preserves_existing_rows_and_allows_smaller_same_reques
     assert_eq!(core.native_sequence(), SessionSeq(1));
     assert_eq!(core.native_claim(key(1).claim).unwrap().binding(), original);
     assert!(core.native_claim(ClaimId::from_u128(2)).is_none());
-    assert!(core.native_outcome(request(ISSUER, 2)).is_none());
+    assert!(core.native_outcome(request(ISSUER, 2)).unwrap().is_none());
     assert!(core.native_event(SessionSeq(2), 0).is_none());
     let accepted = publish(&mut core, 20, creation(2, 2, &[], None));
     assert_eq!(accepted.sequence, SessionSeq(2));
@@ -418,6 +529,9 @@ fn strict_entry_rejection_preserves_existing_rows_and_allows_smaller_same_reques
             .unwrap(),
         None
     );
-    assert_eq!(core.native_outcome(request(ISSUER, 2)), Some(accepted));
+    assert_eq!(
+        core.native_outcome(request(ISSUER, 2)).unwrap(),
+        Some(accepted)
+    );
     check_entries(&core);
 }

@@ -10,6 +10,12 @@ pub(super) struct PendingCheckpoint {
     // All pending payloads precede their staging permit in drop order.
     _allocation: Allocation,
 }
+impl PendingCheckpoint {
+    /// Whether the log took the checkpoint's write.
+    pub(super) fn taken(&self) -> bool {
+        self.receipt.is_some()
+    }
+}
 
 // The source buffer always dies before its funding, including validation
 // refusal. Consensus snapshot/WAL copies have their own staging allowance.
@@ -18,7 +24,25 @@ struct FundedCheckpointInput {
     allocation: Allocation,
 }
 
-impl DurableNode {
+/// Whether a funded checkpoint input's permit covers its buffer.
+fn funded(input: &FundedCheckpointInput) -> Result<(), ConsensusError> {
+    let overhead = if input.data.capacity() == 0 {
+        0
+    } else {
+        const { 4 * size_of::<usize>() }
+    };
+    let required = input
+        .data
+        .capacity()
+        .checked_add(overhead)
+        .ok_or(ConsensusError::Capacity)?;
+    if input.allocation.bytes() < required {
+        return Err(ConsensusError::Capacity);
+    }
+    Ok(())
+}
+
+impl LogNode {
     pub fn checkpoint_pending(&self) -> bool {
         self.checkpoint.is_some()
     }
@@ -36,20 +60,38 @@ impl DurableNode {
         allocation: Allocation,
     ) -> Result<(), ConsensusError> {
         let mut input = FundedCheckpointInput { data, allocation };
-        let overhead = if input.data.capacity() == 0 {
-            0
-        } else {
-            const { 4 * size_of::<usize>() }
-        };
-        let required = input
-            .data
-            .capacity()
-            .checked_add(overhead)
-            .ok_or(ConsensusError::Capacity)?;
-        if input.allocation.bytes() < required {
-            return Err(ConsensusError::Capacity);
-        }
+        funded(&input)?;
         self.begin_checkpoint(index, std::mem::take(&mut input.data))
+    }
+
+    /// `begin_checkpoint_from` for a funded buffer, as `begin_checkpoint_funded`
+    /// is for the delivered prefix.
+    pub fn begin_checkpoint_from_funded(
+        &mut self,
+        point: CheckpointPoint,
+        data: Vec<u8>,
+        allocation: Allocation,
+    ) -> Result<(), ConsensusError> {
+        let mut input = FundedCheckpointInput { data, allocation };
+        funded(&input)?;
+        self.begin_checkpoint_from(point, std::mem::take(&mut input.data))
+    }
+
+    /// The point a checkpoint of the delivered prefix is taken at: its index,
+    /// the term of its entry and the configuration applied through it. The
+    /// owner captures it with the state it encodes, so that a checkpoint made
+    /// durable later (`begin_checkpoint_from`) names exactly that prefix.
+    pub fn checkpoint_point(&self) -> Result<CheckpointPoint, ConsensusError> {
+        self.check()?;
+        let index = self.delivered_index;
+        if index == 0 || index > self.raw.store().hard_state.commit {
+            return Err(ConsensusError::CheckpointIndex);
+        }
+        Ok(CheckpointPoint {
+            index,
+            term: self.raw.store().term(index)?,
+            configuration: self.raw.store().conf_state.clone(),
+        })
     }
 
     /// Prepare an exact published-prefix checkpoint without waiting for disk.
@@ -57,17 +99,46 @@ impl DurableNode {
     /// unadmitted checkpoint is explicitly canceled.
     pub fn begin_checkpoint(&mut self, index: u64, data: Vec<u8>) -> Result<(), ConsensusError> {
         self.check()?;
+        if index != self.delivered_index {
+            return Err(ConsensusError::CheckpointIndex);
+        }
+        let point = self.checkpoint_point()?;
+        self.begin_checkpoint_from(point, data)
+    }
+
+    /// As `begin_checkpoint`, for a prefix captured earlier (`checkpoint_point`)
+    /// whose state was made durable while the replica went on: the snapshot is
+    /// of `point`, and every entry after it stays in the log behind it, so a
+    /// restart replays them over the image exactly as a member installing it
+    /// does (Ongaro's thesis §5.1). Refused, retryably, when a snapshot past
+    /// the point already supersedes it, when the point's entry is no longer the one
+    /// captured, or when the configuration changed after it: compaction would
+    /// otherwise set the live configuration back to the point's.
+    pub fn begin_checkpoint_from(
+        &mut self,
+        point: CheckpointPoint,
+        data: Vec<u8>,
+    ) -> Result<(), ConsensusError> {
+        self.check()?;
         if self.persistence_pending() {
             return Err(ConsensusError::PersistencePending);
         }
+        let CheckpointPoint {
+            index,
+            term: point_term,
+            configuration,
+        } = point;
         if index == 0
-            || index != self.delivered_index
+            || index > self.delivered_index
             || index > self.raw.store().hard_state.commit
+            || index < proto::snapshot_index(&self.raw.store().snapshot)
             || self.raw.has_ready()
+            || configuration != self.raw.store().conf_state
+            || self.raw.store().term(index)? != point_term
         {
             return Err(ConsensusError::CheckpointIndex);
         }
-        if data.len() > 8 * 1024 * 1024 {
+        if data.len() > IMAGE_BYTES {
             return Err(ConsensusError::Capacity);
         }
         let bytes = memory::staging_bytes(&self.raw, &self.config, data.capacity(), 0)?;
@@ -78,14 +149,15 @@ impl DurableNode {
             bytes,
         )?;
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let term = self.raw.store().term(index)?;
-            let mut snapshot = Snapshot::default();
-            snapshot.mut_metadata().index = index;
-            snapshot.mut_metadata().term = term;
-            snapshot
-                .mut_metadata()
-                .set_conf_state(self.raw.store().conf_state.clone());
-            snapshot.data = data;
+            let term = point_term;
+            let snapshot = Snapshot {
+                data,
+                metadata: Some(SnapshotMetadata {
+                    conf_state: Some(configuration),
+                    index,
+                    term,
+                }),
+            };
             let prepared = self.raw.store().prepare_snapshot(&snapshot)?;
             let mut records = Vec::new();
             let count = self
@@ -97,9 +169,13 @@ impl DurableNode {
                 .count()
                 .checked_add(3)
                 .and_then(|count| count.checked_add(self.raw.store().proposals.len()))
+                // The fast track's record, and its release.
                 .and_then(|count| count.checked_add(usize::from(self.config.fast)))
-                .and_then(|count| count.checked_add(usize::from(self.required_decoder.is_some())))
-                .and_then(|count| count.checked_add(usize::from(self.decoder_transition.is_some())))
+                .and_then(|count| count.checked_add(usize::from(self.config.fast)))
+                .and_then(|count| count.checked_add(usize::from(self.decoders.required.is_some())))
+                .and_then(|count| {
+                    count.checked_add(usize::from(self.decoders.transition.is_some()))
+                })
                 .ok_or(ConsensusError::Capacity)?;
             records
                 .try_reserve_exact(count)
@@ -108,10 +184,10 @@ impl DurableNode {
             if self.config.fast {
                 records.push(fast_track_record(&self.config));
             }
-            if let Some(hash) = self.required_decoder {
+            if let Some(hash) = self.decoders.required {
                 records.push(decoder::floor_record(self.config.group_id, hash)?);
             }
-            if let Some(pair) = self.decoder_transition {
+            if let Some(pair) = self.decoders.transition {
                 records.push(decoder::transition_record(self.config.group_id, pair)?);
             }
             records.push(proto_record(
@@ -136,13 +212,15 @@ impl DurableNode {
                     entry,
                 )?);
             }
-            for (proposal, _) in self
-                .raw
-                .store()
-                .proposals
-                .iter()
-                .filter(|(proposal, _)| proposal.index > index)
-            {
+            // The release the stream stated, then every proposal held: a checkpoint ends none
+            // (hyper-raft `Ready::released`), so the member opens holding what it held.
+            if self.config.fast && self.raw.store().released > 0 {
+                records.push(crate::released_record(
+                    &self.config,
+                    self.raw.store().released,
+                ));
+            }
+            for (proposal, _) in self.raw.store().proposals.iter() {
                 records.push(proto_record(
                     self.config.group_id,
                     RecordKind::Proposal,
@@ -226,10 +304,12 @@ impl DurableNode {
     fn checkpoint_progress(&mut self, blocking: bool) -> Result<bool, ConsensusError> {
         let mut pending = self.checkpoint.take().ok_or(ConsensusError::Failed)?;
         if pending.receipt.is_none() {
-            match self
-                .wal
-                .rewrite_checkpoint_async_in(&pending.records, BudgetLane::Completion)
-            {
+            let persisted = self.persisted.as_ref().map(|signal| signal());
+            match self.wal.rewrite_checkpoint_async_notified(
+                &pending.records,
+                BudgetLane::Completion,
+                persisted,
+            ) {
                 Ok(receipt) => pending.receipt = Some(receipt),
                 Err(focal_log::LogError::Capacity) => {
                     // Completion-lane back-pressure is retryable in both modes;
@@ -262,6 +342,10 @@ impl DurableNode {
         drop(records);
         drop(receipt);
         self.raw.store_mut().compact_prepared(prepared)?;
+        // The checkpoint wrote the stored hard state, and no commit moved
+        // while it was written.
+        self.commit_unwritten = false;
+        self.commit_durable = self.commit_durable.max(self.raw.store().hard_state.commit);
         _allocation
             .shrink_to(memory::raw_bytes(&self.raw)?)
             .map_err(|_| ConsensusError::Capacity)?;
@@ -314,7 +398,7 @@ mod tests {
             node.drain().unwrap();
             node.propose(b"retained-published-entry".to_vec()).unwrap();
             let index = node.drain().unwrap().applied_index;
-            node.inject_fault_once(point);
+            node.inject_fault_once(point).unwrap();
             node.begin_checkpoint(index, b"durable-application-prefix".to_vec())
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

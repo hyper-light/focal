@@ -23,7 +23,6 @@ impl Lineage {
     pub fn try_copy(&self, max_bytes: usize) -> Result<Self, ContractError> {
         bytes::fits(self.copy_charge()?, max_bytes)?;
         let copied = Self {
-            binding: self.binding,
             cause: match self.cause {
                 Cause::Root(id) => Cause::Root(id),
                 Cause::Claim(id) => Cause::Claim(id),

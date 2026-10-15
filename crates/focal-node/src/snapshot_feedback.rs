@@ -3,8 +3,8 @@
 //! replacement owner or a newer flight. No ingress queue can lose a failure.
 use focal_consensus::{Message, MessageType, SnapshotStatus};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
+use hyper_rt::sync::{OneshotReceiver, OneshotSender};
 use std::collections::BTreeMap;
-use tokio::sync::oneshot;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SnapshotFeedbackError {
@@ -16,7 +16,7 @@ pub(crate) enum SnapshotFeedbackError {
 struct Flight {
     term: u64,
     index: u64,
-    receiver: oneshot::Receiver<SnapshotStatus>,
+    receiver: OneshotReceiver<SnapshotStatus>,
     completed: Option<SnapshotStatus>,
     _charge: Allocation,
 }
@@ -31,11 +31,17 @@ impl SnapshotFeedback {
         &mut self,
         message: &Message,
         budget: &MemoryBudget,
-    ) -> Result<Option<oneshot::Sender<SnapshotStatus>>, SnapshotFeedbackError> {
-        if message.msg_type != MessageType::MsgSnapshot as i32 {
+    ) -> Result<Option<OneshotSender<SnapshotStatus>>, SnapshotFeedbackError> {
+        if message.msg_type != MessageType::MsgSnapshot {
             return Ok(None);
         }
-        if message.to == 0 || message.term == 0 || message.get_snapshot().get_metadata().index == 0
+        if message.to == 0
+            || message.term == 0
+            || message
+                .snapshot
+                .as_deref()
+                .map_or(0, focal_consensus::snapshot_index)
+                == 0
         {
             return Err(SnapshotFeedbackError::Invalid);
         }
@@ -53,12 +59,16 @@ impl SnapshotFeedback {
             .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)
             .map_err(|_| SnapshotFeedbackError::Capacity)?
             .commit();
-        let (sender, receiver) = oneshot::channel();
+        let (sender, receiver) =
+            hyper_rt::sync::oneshot().map_err(|_| SnapshotFeedbackError::Capacity)?;
         self.flights.insert(
             message.to,
             Flight {
                 term: message.term,
-                index: message.get_snapshot().get_metadata().index,
+                index: message
+                    .snapshot
+                    .as_deref()
+                    .map_or(0, focal_consensus::snapshot_index),
                 receiver,
                 completed: None,
                 _charge: charge,
@@ -84,9 +94,9 @@ impl SnapshotFeedback {
             let status = match flight.completed {
                 Some(status) => status,
                 None => match flight.receiver.try_recv() {
-                    Ok(status) => status,
-                    Err(oneshot::error::TryRecvError::Closed) => SnapshotStatus::Failure,
-                    Err(oneshot::error::TryRecvError::Empty) => return true,
+                    Ok(Some(status)) => status,
+                    Ok(None) => return true,
+                    Err(_) => SnapshotStatus::Failure,
                 },
             };
             flight.completed = Some(status);
@@ -105,7 +115,7 @@ impl SnapshotFeedback {
     }
 }
 
-pub(crate) fn complete(sender: &mut Option<oneshot::Sender<SnapshotStatus>>, accepted: bool) {
+pub(crate) fn complete(sender: &mut Option<OneshotSender<SnapshotStatus>>, accepted: bool) {
     if let Some(sender) = sender.take() {
         let _ = sender.send(if accepted {
             SnapshotStatus::Finish

@@ -68,11 +68,11 @@ fn skills_require_only_real_advertised_tools_and_exact_recovery_contract() {
         assert_eq!(
             skill.version,
             match skill.name.as_str() {
-                "focal-claims" => 10,
-                "focal-evidence" => 8,
-                "focal-validation" => 4,
-                "focal-peers" => 1,
-                "focal-cluster" => 18,
+                "focal-claims" => 11,
+                "focal-evidence" => 10,
+                "focal-validation" => 5,
+                "focal-peers" => 3,
+                "focal-cluster" => 22,
                 _ => 2,
             }
         );
@@ -85,7 +85,7 @@ fn skills_require_only_real_advertised_tools_and_exact_recovery_contract() {
                 .iter()
                 .find(|tool| tool.name == operation.name)
                 .unwrap();
-            assert!(tool.name.starts_with("cluster."));
+            assert!(tool.name.starts_with("cluster.") || tool.name.starts_with("diagnose."));
             assert_eq!(tool.input_schema["additionalProperties"], false);
             assert!(tool.input_schema["properties"].get("authority").is_none());
             if let Some(id) = tool.input_schema["properties"].get("operation_id") {

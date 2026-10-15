@@ -238,8 +238,16 @@ pub(super) fn missing(sink: &mut impl Sink, owned: &OwnedMissingResult) -> Resul
         },
     )
 }
-pub(super) fn definition(sink: &mut impl Sink, owned: &OwnedDeclaration) -> Result<(), Error> {
+pub(super) fn definition(
+    sink: &mut impl Sink,
+    owned: &OwnedDeclaration,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), Error> {
     sink.visit(2)?;
+    // A spilled one holds its record encoding (doc 31 M3).
+    if let Some(at) = owned.logged() {
+        return super::rows::spilled(sink, at, 0, payloads);
+    }
     let value = owned.get().ok_or(Error::InvalidTag("definition row"))?;
     match owned.descriptor() {
         None => {
@@ -252,20 +260,48 @@ pub(super) fn definition(sink: &mut impl Sink, owned: &OwnedDeclaration) -> Resu
         }
     }
 }
-pub(super) fn claim_content(sink: &mut impl Sink, owned: &OwnedClaimContent) -> Result<(), Error> {
+/// A claim content row as a record and a checkpoint write it: the descriptor's encoding, which
+/// the row holds as it was written (doc 31 M3), then its creation profile.
+pub(super) fn claim_content(
+    sink: &mut impl Sink,
+    owned: &OwnedClaimContent,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), Error> {
     sink.visit(2)?;
-    let value = owned.get().ok_or(Error::InvalidTag("claim content row"))?;
-    let profile = owned
-        .profile()
-        .ok_or(Error::InvalidTag("claim content profile"))?;
-    descriptors::claim(sink, value)?;
+    match owned {
+        // Spilled, it holds the same bytes after its head (doc 31 M3).
+        OwnedClaimContent::Logged(at) => {
+            super::rows::spilled(sink, *at, crate::native::owned::CONTENT_HEAD, payloads)
+        }
+        OwnedClaimContent::Held(_) => raw(
+            sink,
+            owned
+                .held()
+                .ok_or(Error::InvalidTag("claim content row"))?
+                .encoded(),
+        ),
+    }
+}
+/// A claim content row's creation profile, after its descriptor in the row's encoding.
+pub(in crate::native) fn content_profile(
+    sink: &mut impl Sink,
+    profile: &crate::native::owned::ClaimContentProfile,
+) -> Result<(), Error> {
     write_u32(sink, profile.max_responses)?;
     types::scope_limits(sink, profile.scope_limits)?;
     types::owner(sink, profile.owner)
 }
-pub(super) fn creation(sink: &mut impl Sink, owned: &OwnedCreationResult) -> Result<(), Error> {
+pub(super) fn creation(
+    sink: &mut impl Sink,
+    owned: &OwnedCreationResult,
+    payloads: Option<&dyn crate::native::payloads::PayloadRead>,
+) -> Result<(), Error> {
     sink.visit(1)?;
-    let entries = owned.get().entries();
+    // A spilled one holds its record encoding (doc 31 M3).
+    let entries = match owned {
+        OwnedCreationResult::Logged(at) => return super::rows::spilled(sink, *at, 0, payloads),
+        OwnedCreationResult::Held(result) => result.entries(),
+    };
     sink.visit(entries.len().checked_add(1).ok_or(Error::Capacity)?)?;
     count(sink, entries.len())?;
     for entry in entries {

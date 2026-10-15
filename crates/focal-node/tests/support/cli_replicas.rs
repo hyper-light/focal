@@ -10,26 +10,26 @@ fn actual_cli_and_mcp_administer_installed_data_membership_with_distinct_restart
     let listen = address();
     let (server, _) = start(founder.path(), Some(&listen));
     let mut mcp = super::client_context::PeerMcp::open(founder.path());
-    let identity = success(founder.path(), &["identity"]).0;
-    let inspected = mcp.call("cluster.node.identity", json!({}));
+    let identity = success(founder.path(), &["inspect", "identity"]).0;
+    let inspected = mcp.call("diagnose.node.identity", json!({}));
     assert_eq!(
         inspected["result"]["result"]["identity"]["node"],
         identity["node"]
     );
     assert_eq!(
-        success(founder.path(), &["cluster", "node", "identity"]).0["result"],
+        success(founder.path(), &["inspect", "node", "--identity"]).0["result"],
         inspected["result"]["result"]
     );
-    let config = mcp.call("cluster.node.config", json!({}));
+    let config = mcp.call("diagnose.node.listener", json!({}));
     assert_eq!(
         config["result"]["result"]["configuration"]["advertise"],
         listen
     );
     assert_eq!(
-        success(founder.path(), &["cluster", "node", "config"]).0["result"],
+        success(founder.path(), &["inspect", "node", "--listener"]).0["result"],
         config["result"]["result"]
     );
-    let health = mcp.call("cluster.node.health", json!({}));
+    let health = mcp.call("diagnose.node.health", json!({}));
     assert_eq!(health["result"]["result"]["health"]["root_stopped"], false);
     assert_eq!(health["result"]["result"]["health"]["running"], 1);
     let listed = mcp.call("cluster.replicas.list", json!({}));
@@ -37,7 +37,7 @@ fn actual_cli_and_mcp_administer_installed_data_membership_with_distinct_restart
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["sequence"], 0);
     let session = rows[0]["session"].as_str().unwrap().to_owned();
-    let diagnostics = mcp.call("cluster.replicas.diagnostics", json!({"session":session}));
+    let diagnostics = mcp.call("diagnose.cluster.replicas", json!({"session":session}));
     let observed = &diagnostics["result"]["result"]["diagnostics"];
     assert_eq!(observed["session"], session);
     assert_eq!(observed["sequence"], 0);
@@ -47,14 +47,14 @@ fn actual_cli_and_mcp_administer_installed_data_membership_with_distinct_restart
         observed["compiled_managed_decoder"].as_str().unwrap().len(),
         64
     );
-    let cli_diagnostics = success(founder.path(), &["cluster", "replicas", "diagnostics"]).0;
+    let cli_diagnostics = success(founder.path(), &["inspect", "replicas", "--replicas"]).0;
     assert_eq!(
         cli_diagnostics["result"]["diagnostics"]["required_decoder"],
         serde_json::Value::Null
     );
     let shown = mcp.call("cluster.replicas.show", json!({"session":session}));
     let config = shown["result"]["result"]["membership"].clone();
-    let root = success(founder.path(), &["cluster", "membership", "show"]).0;
+    let root = success(founder.path(), &["inspect", "membership"]).0;
     assert_ne!(config["group"], root["result"]["configuration"]["group"]);
     let invitation = peer.path().join("peer.invite");
     let invited = mcp.call(
@@ -72,23 +72,22 @@ fn actual_cli_and_mcp_administer_installed_data_membership_with_distinct_restart
         peer.path(),
         &[
             "join",
+            "cluster",
             "--invite-file",
             invitation.to_str().unwrap(),
             "--advertise",
             &address(),
         ],
     );
-    let identity = success(peer.path(), &["identity"]).0;
+    let identity = success(peer.path(), &["inspect", "identity"]).0;
     let node = identity["node"].as_u64().unwrap();
     let admitted = success(
         founder.path(),
         &[
-            "cluster",
-            "replicas",
-            "membership",
+            "add",
+            "replica-learner",
             "--session",
             &session,
-            "add-learner",
             "--node",
             &node.to_string(),
             "--expected-configuration-index",
@@ -113,22 +112,15 @@ fn actual_cli_and_mcp_administer_installed_data_membership_with_distinct_restart
     let reference = committed["operation_id"].as_str().unwrap().to_owned();
     assert_ne!(reference, previous);
     assert_eq!(
-        success(
-            founder.path(),
-            &["cluster", "replicas", "request", "inspect"]
-        )
-        .0["result"],
+        success(founder.path(), &["inspect", "replica-request"]).0["result"],
         committed
     );
     assert!(
-        !command(
-            founder.path(),
-            &["cluster", "replicas", "request", "retry", &previous]
-        )
-        .status
-        .success()
+        !command(founder.path(), &["retry", "replica-request", &previous])
+            .status
+            .success()
     );
-    let inventory = success(founder.path(), &["cluster", "replicas", "list"]).0;
+    let inventory = success(founder.path(), &["list", "replicas"]).0;
     assert_eq!(
         inventory["result"]["replicas"][0]["sequence"], 0,
         "membership metadata never consumes domain sequence"
@@ -137,17 +129,13 @@ fn actual_cli_and_mcp_administer_installed_data_membership_with_distinct_restart
     drop(server);
     let (_restart, _) = start(founder.path(), None);
     assert_eq!(
-        success(
-            founder.path(),
-            &["cluster", "replicas", "request", "retry", &reference]
-        )
-        .0["result"],
+        success(founder.path(), &["retry", "replica-request", &reference]).0["result"],
         committed
     );
     assert_eq!(
         success(
             founder.path(),
-            &["cluster", "replicas", "request", "reconcile", &reference]
+            &["reconcile", "replica-request", &reference]
         )
         .0["result"],
         committed

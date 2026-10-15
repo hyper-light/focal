@@ -20,8 +20,9 @@ pub const NATIVE_FRAME_VERSION: u16 = 1;
 pub const NATIVE_ACTOR_HEADER_BYTES: usize = 84;
 /// The actor header and its command byte: the least a request frame carries.
 pub const NATIVE_REQUEST_MIN_BYTES: usize = 85;
-/// Command tags 0..=27 are registered by the input format; timers use namespaces.
-pub const NATIVE_COMMAND_TAGS: u8 = 28;
+/// Command tags 0..=28 are registered by the input format (28 is the
+/// client protocol's generation floor, F12); timers use namespaces.
+pub const NATIVE_COMMAND_TAGS: u8 = 29;
 pub const NATIVE_ACTOR_NAMESPACE: u8 = 0;
 pub const MAX_NATIVE_LIST_CURSOR_BYTES: usize = 256;
 /// Residual filtering may visit this many rows for one page.
@@ -176,9 +177,13 @@ pub enum NativeOperationKind {
     ClaimDeadline,
     Import,
     Retire,
+    /// A principal advanced its request generation floor (F12).
+    AdvanceEpochFloor,
+    /// Closed outcomes sealed into a bundle (F12): a session decision.
+    Seal,
 }
 impl NativeOperationKind {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 34] = [
         Self::RegisterMonitor,
         Self::RebindMonitor,
         Self::CancelMonitor,
@@ -211,6 +216,8 @@ impl NativeOperationKind {
         Self::ClaimDeadline,
         Self::Import,
         Self::Retire,
+        Self::AdvanceEpochFloor,
+        Self::Seal,
     ];
     pub const fn registered_tag(self) -> u8 {
         match self {
@@ -246,6 +253,8 @@ impl NativeOperationKind {
             Self::ClaimDeadline => 29,
             Self::Import => 30,
             Self::Retire => 31,
+            Self::AdvanceEpochFloor => 32,
+            Self::Seal => 33,
         }
     }
     /// Trusted operations never arrive as participant frames.
@@ -257,6 +266,7 @@ impl NativeOperationKind {
                 | Self::ClaimDeadline
                 | Self::Import
                 | Self::Retire
+                | Self::Seal
         )
     }
     pub const fn name(self) -> &'static str {
@@ -293,6 +303,8 @@ impl NativeOperationKind {
             Self::ClaimDeadline => "claim_deadline",
             Self::Import => "import",
             Self::Retire => "retire",
+            Self::AdvanceEpochFloor => "advance_epoch_floor",
+            Self::Seal => "seal",
         }
     }
 }
@@ -356,6 +368,12 @@ pub enum NativeErrorCode {
     /// completion operation.
     Legacy,
     Unsupported,
+    /// The request's generation is below its principal's floor: its history
+    /// is sealed, readable from the archive, and never executed again.
+    RequestHistoryExpired,
+    /// The request's generation is not open: generations open in order, two
+    /// at a time, until the floor advances.
+    EpochNotAdmitted,
 }
 /// Closed refusal categories mapped to stable client exit codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,12 +452,69 @@ pub struct NativeContextQuery {
     pub results_after: Option<ObjectRevision>,
     pub limit: u32,
 }
+/// Which current evaluation of one declaration a verb or a context read
+/// addresses. This is the one copy of the selection rule: the compiler, the
+/// context read and the owner's selection query all ask `selects`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeEvaluationSelector {
+    /// The whole-work evaluation of a manifest slot (any slot when `None`).
+    WholeWork {
+        slot: Option<u32>,
+    },
+    Admission,
+    /// The increment evaluation of one work artifact (any when `None`).
+    Increment {
+        artifact: Option<ArtifactId>,
+    },
+}
+impl NativeEvaluationSelector {
+    /// Whether an evaluation of `target` is one the selector names. A missing
+    /// slot and a delivery are never selected: a verb addresses a slot's
+    /// artifact, an admission or an increment.
+    pub fn selects(self, target: NativeEvaluationTarget) -> bool {
+        match (self, target) {
+            (Self::WholeWork { slot: None }, NativeEvaluationTarget::Work { .. }) => true,
+            (Self::WholeWork { slot: Some(wanted) }, NativeEvaluationTarget::Work { slot, .. }) => {
+                slot == wanted
+            }
+            (Self::Admission, NativeEvaluationTarget::Admission) => true,
+            (
+                Self::Increment { artifact: wanted },
+                NativeEvaluationTarget::Increment { artifact },
+            ) => wanted.is_none_or(|wanted| wanted == artifact),
+            _ => false,
+        }
+    }
+}
+/// The owner's selection of the current evaluation of one declaration at one
+/// prefix: over the declaration's whole evaluation span (bounded by the
+/// core's evaluations per claim, never by a page), the evaluations the
+/// selector names, at `generation` when one is named, live (not terminal)
+/// when `live`, and of those the ones at the highest generation. The page
+/// holds that tie set: one object is the unique current evaluation, several
+/// are an ambiguity the caller must narrow, none is a missing current
+/// evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSelectionQuery {
+    pub claim: ClaimId,
+    pub validation: ValidationId,
+    pub selector: NativeEvaluationSelector,
+    pub generation: Option<u64>,
+    pub live: bool,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeReadQuery {
     Objects(Vec<NativeObjectRef>),
+    /// One claim and its expansion. The expansion is ordered: the responses
+    /// from the latest cycle back, then the evaluations in key order; a page
+    /// that fills before it ends carries the position to resume at, and a
+    /// resumed page (`after`, an exact read at the same prefix) holds only
+    /// the rest of the expansion.
     Claim {
         id: ClaimId,
         expand: NativeClaimExpand,
+        after: Option<NativeContinuation>,
     },
     Outcome(NativeInvocationRef),
     Receipt(ReceiptId),
@@ -451,7 +526,11 @@ pub enum NativeReadQuery {
         claim: ClaimId,
         after: Option<u32>,
     },
+    /// The evaluations of one declaration under its claim in key order, a
+    /// page at a time. `after` is the last key the previous page consumed;
+    /// the next page starts strictly after it, at the same exact prefix.
     Evaluations {
+        claim: ClaimId,
         validation: ValidationId,
         after: Option<NativeEvaluationKey>,
     },
@@ -465,6 +544,98 @@ pub enum NativeReadQuery {
         limit: u32,
     },
     Standing,
+    SelectEvaluation(NativeSelectionQuery),
+    /// One object of a retired family, read from its archive bundle (the
+    /// audit's F11): the bundle a `Retired` continuation names, hydrated
+    /// as a checkpoint is restored and read at the prefix it claims. The
+    /// answer is an `Archived` object, or `Missing` when the bundle holds
+    /// no such row.
+    Archived(NativeArchiveQuery),
+    /// A principal's request generation window (F12): its own, or any for
+    /// a node. A principal never seen answers with the first window.
+    Epochs(ParticipantId),
+    /// The outcome of a request whose generation was sealed (F12), read
+    /// from the seal's bundle by the content owner: the bundle a `Sealed`
+    /// reference named, and the request. The answer is the outcome, or
+    /// `Missing` when the seal never held it.
+    Sealed(NativeSealQuery),
+    /// One object of a retired claim's family, read where the replica's own
+    /// continuation of the claim says the family went (doc 31 M2, A2): the
+    /// replica's cold stream for a family retired there, its custody for one
+    /// retired before. The answer is an `Archived` object, `Missing` when the
+    /// family holds no such row or the claim never retired.
+    Cold(NativeColdQuery),
+}
+/// An object of a retired claim's family (doc 31 M2, A2): the claim whose
+/// continuation the client holds, and the object wanted from its family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeColdQuery {
+    pub claim: ClaimId,
+    pub object: NativeObjectRef,
+}
+impl NativeColdQuery {
+    /// Whether it names a claim and an object a family can hold.
+    pub fn valid(&self) -> bool {
+        !self.claim.is_zero()
+            && NativeArchiveQuery {
+                bundle: ContentHash([1; 32]),
+                bytes: 1,
+                object: self.object,
+            }
+            .valid()
+    }
+}
+/// The sealed outcome a read names (F12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSealQuery {
+    pub bundle: ContentHash,
+    pub bytes: u64,
+    pub request: RequestKey,
+}
+impl NativeSealQuery {
+    pub fn valid(&self) -> bool {
+        self.bundle.0 != [0; 32]
+            && self.bytes != 0
+            && !self.request.principal.is_zero()
+            && !self.request.id.is_zero()
+            && self.request.epoch.0 != 0
+    }
+}
+/// The bundle a retired claim's continuation names — its content root and
+/// length, an object of the ledger's tenant domain — and the object wanted
+/// from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeArchiveQuery {
+    pub bundle: ContentHash,
+    pub bytes: u64,
+    pub object: NativeObjectRef,
+}
+impl NativeArchiveQuery {
+    /// Whether the query names a bundle and an object a bundle can hold: a
+    /// family's rows, never the accounting, the events' index or legacy
+    /// frames.
+    pub fn valid(&self) -> bool {
+        self.bundle.0 != [0; 32]
+            && self.bytes != 0
+            && matches!(
+                self.object,
+                NativeObjectRef::Claim(_)
+                    | NativeObjectRef::Definition(_)
+                    | NativeObjectRef::Evaluation(_)
+                    | NativeObjectRef::Result(_)
+                    | NativeObjectRef::Artifact(_)
+                    | NativeObjectRef::Work(_)
+                    | NativeObjectRef::Diagnostic(_)
+                    | NativeObjectRef::Response(_)
+                    | NativeObjectRef::ResultTestament(_)
+                    | NativeObjectRef::Receipt(_)
+                    | NativeObjectRef::Monitor { .. }
+                    | NativeObjectRef::Event { .. }
+            )
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -479,20 +650,48 @@ impl NativeReadRequest {
             return Err(AccessError::InvalidRequest);
         }
         let within = |count: u32| count != 0 && count <= self.max_items;
+        // A continuation names a position in one exact prefix: a resumed page
+        // is served only at the prefix the previous page was.
+        let exact = matches!(self.consistency, ReadConsistency::Exact(_));
         let valid = match &self.query {
             NativeReadQuery::Objects(objects) => u32::try_from(objects.len()).is_ok_and(within),
-            NativeReadQuery::Claim { id, .. } => !id.is_zero(),
+            NativeReadQuery::Claim { id, after, .. } => {
+                !id.is_zero()
+                    && match after {
+                        None => true,
+                        Some(NativeContinuation::Responses { .. }) => exact,
+                        Some(NativeContinuation::Evaluations(key)) => exact && key.claim == *id,
+                        Some(_) => false,
+                    }
+            }
             NativeReadQuery::Receipt(id) => !id.is_zero(),
             NativeReadQuery::Monitor { claim, id } => !claim.is_zero() && !id.is_zero(),
             NativeReadQuery::Responses { claim, .. } => !claim.is_zero(),
-            NativeReadQuery::Evaluations { validation, .. } => !validation.is_zero(),
+            NativeReadQuery::Evaluations {
+                claim,
+                validation,
+                after,
+            } => {
+                !claim.is_zero()
+                    && !validation.is_zero()
+                    && after.is_none_or(|after| {
+                        exact && after.claim == *claim && after.validation == *validation
+                    })
+            }
             NativeReadQuery::Results { evaluation, .. } => {
                 !evaluation.claim.is_zero() && !evaluation.validation.is_zero()
             }
             NativeReadQuery::ValidationContext(query) => {
                 !query.validation.is_zero() && !query.claim.is_zero() && within(query.limit)
             }
+            NativeReadQuery::SelectEvaluation(query) => {
+                !query.claim.is_zero() && !query.validation.is_zero()
+            }
             NativeReadQuery::Events { limit, .. } => within(*limit),
+            NativeReadQuery::Archived(query) => query.valid(),
+            NativeReadQuery::Epochs(principal) => !principal.is_zero(),
+            NativeReadQuery::Sealed(query) => query.valid(),
+            NativeReadQuery::Cold(query) => query.valid(),
             NativeReadQuery::Outcome(_) | NativeReadQuery::Standing => true,
         };
         if valid {
@@ -872,7 +1071,7 @@ pub struct NativeResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativePayload {
-    Inline(Vec<u8>),
+    Inline(#[serde(with = "focal_memory::serde_bytes")] Vec<u8>),
     Content(ContentRef),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -921,6 +1120,7 @@ pub struct NativeArtifact {
     pub schema: u16,
     pub kind: String,
     pub schema_hash: ContentHash,
+    #[serde(with = "focal_memory::serde_bytes")]
     pub metadata: Vec<u8>,
     pub payload: NativePayload,
     pub producer: ParticipantId,
@@ -1119,10 +1319,25 @@ pub struct NativeStanding {
 #[serde(deny_unknown_fields)]
 pub struct NativeLegacyRow {
     pub key: NativeObjectRef,
+    #[serde(with = "focal_memory::serde_bytes")]
     pub bytes: Vec<u8>,
 }
+/// An object a native read answers with: one of the core's, an archived one, or what stands in
+/// for one.
+pub type NativeObject = NativeObjectIn<Box<NativeArchivedObject>>;
+/// An object of a retired family's archive bundle: any object but an archived one, since a bundle
+/// holds its family's core rows and never another bundle's. The type nests one archive deep at
+/// most, so encoding, decoding, cloning and dropping an object never recurse through it.
+pub type NativeBundledObject = NativeObjectIn<NoArchive>;
+/// What a bundled object holds where an object holds an archived one: nothing, as a bundle holds
+/// no archive. Decoding a bundled object that names one refuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoArchive {}
+/// The objects a native read answers with, `A` what an archived one holds: [`NativeObject`]'s an
+/// archived object, [`NativeBundledObject`]'s none. Both encode alike, variant for variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NativeObject {
+#[serde(rename = "NativeObject")]
+pub enum NativeObjectIn<A> {
     Claim(Box<NativeClaim>),
     Definition(Box<NativeDefinition>),
     Evaluation(Box<NativeEvaluation>),
@@ -1145,6 +1360,94 @@ pub enum NativeObject {
     /// The claim retired to the archive (26 §4): its rows left the core
     /// behind this continuation; the bundle holds them.
     Retired(NativeRetiredClaim),
+    /// An object read from a retired family's archive bundle (the audit's
+    /// F11): the object as the family's core held it at the prefix the
+    /// bundle claims, and the bundle it came from.
+    Archived(A),
+    /// A principal's request generation window (F12).
+    Epochs(Box<NativeEpochWindow>),
+    /// The outcome asked for left the live core into a seal (F12): where to
+    /// read it. A `Sealed` read of the bundle answers with the outcome.
+    Sealed(NativeSealedRef),
+}
+/// A principal's request generation window (F12): generations below the
+/// floor are closed, `sealed..floor` await a seal, `floor..floor + open`
+/// are open with their resident outcomes, and the sealed generations name
+/// the seal holding their outcomes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeEpochWindow {
+    pub principal: ParticipantId,
+    pub floor: RequestEpoch,
+    pub sealed: RequestEpoch,
+    pub open: Vec<NativeOpenEpoch>,
+    pub ranges: Vec<NativeSealedRange>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeOpenEpoch {
+    pub epoch: RequestEpoch,
+    pub outcomes: u32,
+    pub last_logical_time: u64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSealedRange {
+    pub first: RequestEpoch,
+    pub last: RequestEpoch,
+    pub seal: u64,
+}
+/// Where a sealed outcome is (F12): the seal row covering the generation
+/// (a fold's, when the seal was folded) and its bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSealedRef {
+    pub request: RequestKey,
+    pub ordinal: u64,
+    pub bundle: ContentHash,
+    pub bytes: u64,
+}
+/// One object of a retired family, read from its bundle: the bundle's
+/// content root and length, the family's root claim, the prefix the bundle
+/// claims (every object in it is at or below it), and the object as it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeArchivedObject {
+    pub bundle: ContentHash,
+    pub bytes: u64,
+    pub root: ClaimId,
+    pub through: SessionSeq,
+    pub object: NativeBundledObject,
+}
+/// An object as a bundle holds it; an archived object, which no bundle holds, is given back.
+impl TryFrom<NativeObject> for NativeBundledObject {
+    type Error = NativeObject;
+    fn try_from(object: NativeObject) -> Result<Self, NativeObject> {
+        Ok(match object {
+            NativeObjectIn::Claim(object) => NativeObjectIn::Claim(object),
+            NativeObjectIn::Definition(object) => NativeObjectIn::Definition(object),
+            NativeObjectIn::Evaluation(object) => NativeObjectIn::Evaluation(object),
+            NativeObjectIn::Result(object) => NativeObjectIn::Result(object),
+            NativeObjectIn::Artifact(object) => NativeObjectIn::Artifact(object),
+            NativeObjectIn::Work(object) => NativeObjectIn::Work(object),
+            NativeObjectIn::Diagnostic(object) => NativeObjectIn::Diagnostic(object),
+            NativeObjectIn::Response(object) => NativeObjectIn::Response(object),
+            NativeObjectIn::ResultTestament(object) => NativeObjectIn::ResultTestament(object),
+            NativeObjectIn::Receipt(object) => NativeObjectIn::Receipt(object),
+            NativeObjectIn::Monitor(object) => NativeObjectIn::Monitor(object),
+            NativeObjectIn::Outcome(object) => NativeObjectIn::Outcome(object),
+            NativeObjectIn::CreationResult(object) => NativeObjectIn::CreationResult(object),
+            NativeObjectIn::Event(object) => NativeObjectIn::Event(object),
+            NativeObjectIn::Context(object) => NativeObjectIn::Context(object),
+            NativeObjectIn::Standing(object) => NativeObjectIn::Standing(object),
+            NativeObjectIn::Legacy(object) => NativeObjectIn::Legacy(object),
+            NativeObjectIn::Missing(reference) => NativeObjectIn::Missing(reference),
+            NativeObjectIn::Retired(object) => NativeObjectIn::Retired(object),
+            NativeObjectIn::Epochs(object) => NativeObjectIn::Epochs(object),
+            NativeObjectIn::Sealed(object) => NativeObjectIn::Sealed(object),
+            archived @ NativeObjectIn::Archived(_) => return Err(archived),
+        })
+    }
 }
 /// The continuation of a retired claim: its final binding and status, the
 /// archive bundle holding its family's rows (an object of the ledger's
@@ -1260,7 +1563,7 @@ impl NativeListFilter {
 /// Opaque node-authenticated continuation; a changed filter, principal or
 /// route epoch makes it invalid rather than silently repositioning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeListCursor(pub Vec<u8>);
+pub struct NativeListCursor(#[serde(with = "focal_memory::serde_bytes")] pub Vec<u8>);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeListRequest {

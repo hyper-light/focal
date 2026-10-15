@@ -140,9 +140,8 @@ fn retry_and_quality_deadlines_spend_held_credit_with_ancestor_full_and_old_page
         assert!(credit > 0);
         let pressure = exhaust(&parent);
         let full = parent.stats();
-        assert_eq!(full.used, full.limit);
+        assert_eq!(parent.headroom(BudgetLane::Ordinary), 0);
         let (candidate, outcome) = stage_deadline(&mut owner, input, input.deadline.at);
-        assert_eq!(parent.stats().used, full.used);
         assert_eq!(parent.stats().ordinary_used, full.ordinary_used);
         assert_eq!((outcome.artifacts, outcome.results), (0, 0));
         assert_eq!(owner.book.remaining_reports(key(1)), Some(0));
@@ -200,11 +199,11 @@ fn pending_deadline_blocks_a_report_and_discard_restores_exact_attempt_credit_an
     let credit = owner.book.remaining_reports(key(1));
     let pressure = exhaust(&parent);
     let before = parent.stats();
-    let source = owner.book.source().stats();
+    let source = owner.core.state.budget.stats();
     let (deadline, _) = stage_deadline(&mut owner, input, input.deadline.at);
     assert_eq!(owner.book.remaining_reports(key(1)), Some(0));
     let after_deadline = parent.stats();
-    let after_source = owner.book.source().stats();
+    let after_source = owner.core.state.budget.stats();
     let mut store = Store::new();
     assert!(
         owner
@@ -219,11 +218,11 @@ fn pending_deadline_blocks_a_report_and_discard_restores_exact_attempt_credit_an
     );
     assert_eq!(owner.pending_len(), 1);
     assert_eq!(parent.stats(), after_deadline);
-    assert_eq!(owner.book.source().stats(), after_source);
+    assert_eq!(owner.core.state.budget.stats(), after_source);
     assert_eq!(owner.discard_from(deadline).unwrap(), 1);
     assert_eq!(*owner.effective().evaluation(key(1)).unwrap(), original);
     assert_eq!(owner.book.remaining_reports(key(1)), credit);
-    assert_eq!(owner.book.source().stats(), source);
+    assert_eq!(owner.core.state.budget.stats(), source);
     assert_eq!(parent.stats(), before);
     assert_eq!(owner.effective().logical_time(), 30);
     let reported = report_stage(&mut owner, &mut store, retry);
@@ -255,7 +254,7 @@ fn deadline_after_pending_error_fences_the_new_revision_and_suffix_discard_resto
     let original_credit = owner.book.remaining_reports(key(1));
     let pressure = exhaust(&parent);
     let parent_before = parent.stats();
-    let source_before = owner.book.source().stats();
+    let source_before = owner.core.state.budget.stats();
     let mut store = Store::new();
     let reported = report_stage(&mut owner, &mut store, report);
     let reported_state = *owner.effective().evaluation(key(1)).unwrap();
@@ -263,7 +262,7 @@ fn deadline_after_pending_error_fences_the_new_revision_and_suffix_discard_resto
     let result_key = NativeResultKey::of(result);
     let accepted = *owner.effective().result(result_key).unwrap();
     let report_credit = owner.book.remaining_reports(key(1));
-    let source_reported = owner.book.source().stats();
+    let source_reported = owner.core.state.budget.stats();
     let (deadline, _) = stage_deadline(&mut owner, input, input.deadline.at);
     assert_fenced_without_result(
         reported_state,
@@ -277,7 +276,7 @@ fn deadline_after_pending_error_fences_the_new_revision_and_suffix_discard_resto
         reported_state
     );
     assert_eq!(owner.book.remaining_reports(key(1)), report_credit);
-    assert_eq!(owner.book.source().stats(), source_reported);
+    assert_eq!(owner.core.state.budget.stats(), source_reported);
     assert_eq!(owner.oldest(), Some(reported));
     let (deadline_again, _) = stage_deadline(&mut owner, input, input.deadline.at);
     assert_ne!(deadline_again, deadline);
@@ -291,7 +290,7 @@ fn deadline_after_pending_error_fences_the_new_revision_and_suffix_discard_resto
             .is_none()
     );
     assert_eq!(owner.book.remaining_reports(key(1)), original_credit);
-    assert_eq!(owner.book.source().stats(), source_before);
+    assert_eq!(owner.core.state.budget.stats(), source_before);
     assert_eq!(parent.stats(), parent_before);
     let replacement = report_stage(&mut owner, &mut store, retry);
     owner.publish_after_durable(replacement).unwrap();
@@ -664,9 +663,9 @@ fn work_deadline_retirement_and_discard_restore_the_actual_reverse_protections()
     let pinned = owner.pin(0, 5000).unwrap();
     let pressure = exhaust(&parent);
     let before = parent.stats();
-    let source_before = owner.book.source().stats();
+    let source_before = owner.core.state.budget.stats();
     let (deadline, _) = stage_deadline(&mut owner, input, input.deadline.at);
-    assert_eq!(parent.stats().used, before.used);
+    assert_eq!(parent.stats().ordinary_used, before.ordinary_used);
     assert_eq!(owner.book.remaining_reports(evaluation), Some(0));
     assert_fenced_without_result(
         old,
@@ -675,7 +674,7 @@ fn work_deadline_retirement_and_discard_restore_the_actual_reverse_protections()
     );
     assert_eq!(owner.discard_from(deadline).unwrap(), 1);
     assert_eq!(owner.book.remaining_reports(evaluation), credit);
-    assert_eq!(owner.book.source().stats(), source_before);
+    assert_eq!(owner.core.state.budget.stats(), source_before);
     assert_eq!(parent.stats(), before);
     drop(pressure);
     assert!(

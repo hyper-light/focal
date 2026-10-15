@@ -27,22 +27,14 @@ pub(super) fn validation_cursor(
     Ok(output::hex(&bytes))
 }
 
-fn fetch(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    request: Operation,
-) -> Result<ListPage> {
+async fn fetch(context: &Context, request: Operation) -> Result<ListPage> {
     let envelope = context.envelope(request)?;
-    match runtime.block_on(context.client.request(envelope))?.result {
+    match context.client.request(envelope).await?.result {
         Response::Listed(page) => Ok(page),
         _ => Err(CliError::InvalidResponse),
     }
 }
-pub(super) fn list(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    command: ListCommand,
-) -> Result<()> {
+pub(super) async fn list(context: &Context, command: ListCommand) -> Result<()> {
     let (kind, args) = match command {
         ListCommand::Claims(args) => (ObjectKind::Claim, args),
         ListCommand::Testaments(args) => (ObjectKind::Testament, args),
@@ -68,16 +60,11 @@ pub(super) fn list(
     document.max_visits = args.max_visits;
     let request = document.build_operation(kind, &context.build)?;
     if args.all {
-        return list_all(runtime, context, request, args.output.format);
+        return list_all(context, request, args.output.format).await;
     }
-    output::page(fetch(runtime, context, request)?, args.output.format)
+    output::page(fetch(context, request).await?, args.output.format)
 }
-fn exact(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    kind: ObjectKind,
-    id: &str,
-) -> Result<(ReadToken, ReadObject)> {
+async fn exact(context: &Context, kind: ObjectKind, id: &str) -> Result<(ReadToken, ReadObject)> {
     let read = GetDocument {
         id: id.to_owned(),
         prefix: None,
@@ -90,7 +77,7 @@ fn exact(
     };
     let id = references.first().ok_or(CliError::InvalidResponse)?.id;
     let request = context.envelope(Operation::Read(read))?;
-    let page = runtime.block_on(context.client.read(request))?;
+    let page = context.client.read(request).await?;
     let mut objects = page.objects.into_iter();
     let object = objects.next().ok_or(CliError::NotFound)?;
     if objects.next().is_some() || output::key(&object) != (kind, id) || page.next.is_some() {
@@ -98,11 +85,7 @@ fn exact(
     }
     Ok((page.token, object))
 }
-fn validation(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    args: GetValidationArgs,
-) -> Result<()> {
+async fn validation(context: &Context, args: GetValidationArgs) -> Result<()> {
     let id = ValidationId(parse_id(&args.id)?);
     let (consistency, after) = match args.cursor {
         None => (ReadConsistency::Linearizable, None),
@@ -139,12 +122,14 @@ fn validation(
     }
     let request = context.envelope(Operation::Read(read))?;
     if args.context {
-        let view = runtime
-            .block_on(context.client.validation_context(request))
+        let view = context
+            .client
+            .validation_context(request)
+            .await
             .map_err(super::validation_context_error)?;
         return output::validation_context(&view, args.output.format);
     }
-    let page = runtime.block_on(context.client.read(request))?;
+    let page = context.client.read(request).await?;
     let mut objects = page.objects.into_iter();
     let object = objects.next().ok_or(CliError::NotFound)?;
     if objects.next().is_some()
@@ -155,11 +140,7 @@ fn validation(
     }
     output::object(page.token, &object, args.output.format)
 }
-pub(super) fn get(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    command: GetCommand,
-) -> Result<()> {
+pub(super) async fn get(context: &Context, command: GetCommand) -> Result<()> {
     let (token, object, format) = match command {
         GetCommand::Claim(args) => {
             if let Some(flag) = args.filters.native_only() {
@@ -188,8 +169,10 @@ pub(super) fn get(
                 }
                 None => selection,
             };
-            let page = runtime
-                .block_on(context.client.claim_get(context.envelope(operation)?))
+            let page = context
+                .client
+                .claim_get(context.envelope(operation)?)
+                .await
                 .map_err(|error| match error {
                     focal_client::claim_get::ClaimGetError::Client(error) => {
                         CliError::Client(error)
@@ -211,17 +194,22 @@ pub(super) fn get(
             (pair.0, pair.1, args.output.format)
         }
         GetCommand::Testament(args) => {
-            let (token, object) = exact(runtime, context, ObjectKind::Testament, &args.id)?;
+            let (token, object) = exact(context, ObjectKind::Testament, &args.id).await?;
             (token, object, args.output.format)
         }
-        GetCommand::Validation(args) => return validation(runtime, context, args),
+        GetCommand::Validation(args) => return validation(context, args).await,
+        GetCommand::Archived(_) => {
+            return Err(CliError::Input(
+                "get archived reads a native ledger's archive; this ledger runs V1 history".into(),
+            ));
+        }
         GetCommand::Artifact(args) => {
-            let (token, object) = exact(runtime, context, ObjectKind::Artifact, &args.id)?;
+            let (token, object) = exact(context, ObjectKind::Artifact, &args.id).await?;
             if let Some(path) = args.output {
                 let ReadObject::Artifact { value, .. } = &object else {
                     return Err(CliError::InvalidResponse);
                 };
-                super::download::artifact(runtime, context, value, &path)?;
+                super::download::artifact(context, value, &path).await?;
             }
             (token, object, args.display.format)
         }
@@ -231,46 +219,66 @@ pub(super) fn get(
 
 /// Stream one authenticated fixed-prefix page at a time. A sink failure never
 /// advances past the page that could not be completely flushed.
-fn list_all(
-    runtime: &tokio::runtime::Runtime,
-    context: &Context,
-    mut request: Operation,
-    format: OutputFormat,
-) -> Result<()> {
+async fn list_all(context: &Context, mut request: Operation, format: OutputFormat) -> Result<()> {
+    use hyper_rt::combine::{Either, race2};
     use std::io::{self, Write};
-    use tokio::io::AsyncWriteExt;
     let mut pages = 0u64;
     let mut prefix = None;
-    let mut stdout = tokio::io::stdout();
-    let mut interrupted = std::pin::pin!(tokio::signal::ctrl_c());
-    let result=runtime.block_on(async {
+    let mut stdout = super::streaming_stdout()?;
+    let interrupt = super::Interrupt::subscribe()?;
+    let interrupted = || {
+        CliError::Io(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "list output interrupted",
+        ))
+    };
+    let result = async {
         loop {
-            let envelope=context.envelope(request.clone())?;
-            let response=tokio::select! {
-                reply=context.client.request(envelope)=>reply?,
-                signal=&mut interrupted=>{signal?;return Err(CliError::Io(io::Error::new(io::ErrorKind::Interrupted,"list output interrupted")));}
+            let envelope = context.envelope(request.clone())?;
+            let response = match race2(context.client.request(envelope), interrupt.wait()).await {
+                Either::First(reply) => reply?,
+                Either::Second(signal) => {
+                    signal?;
+                    return Err(interrupted());
+                }
             };
-            let Response::Listed(page)=response.result else {return Err(CliError::InvalidResponse);};
-            if prefix.is_some_and(|token|token!=page.token)
-                || page.next.as_ref().is_some_and(|next|Some(next)==selection_request(&request).and_then(|query|query.cursor.as_ref()))
-                || (page.next.is_some() && page.visited==0) {
+            let Response::Listed(page) = response.result else {
+                return Err(CliError::InvalidResponse);
+            };
+            if prefix.is_some_and(|token| token != page.token)
+                || page.next.as_ref().is_some_and(|next| {
+                    Some(next)
+                        == selection_request(&request).and_then(|query| query.cursor.as_ref())
+                })
+                || (page.next.is_some() && page.visited == 0)
+            {
                 return Err(CliError::InvalidResponse);
             }
-            prefix=Some(page.token);
-            let mut bytes=ListOutput(Vec::new());
-            output::page_stream_to(&page,&mut bytes,format)?;
-            tokio::select! {
-                result=async {stdout.write_all(&bytes.0).await?;stdout.flush().await}=>result?,
-                signal=&mut interrupted=>{signal?;return Err(CliError::Io(io::Error::new(io::ErrorKind::Interrupted,"list output interrupted")));}
+            prefix = Some(page.token);
+            let mut bytes = ListOutput(Vec::new());
+            output::page_stream_to(&page, &mut bytes, format)?;
+            let written = async {
+                stdout.write_all(&bytes.0).await?;
+                stdout.flush().await
+            };
+            match race2(written, interrupt.wait()).await {
+                Either::First(result) => result.map_err(io::Error::other)?,
+                Either::Second(signal) => {
+                    signal?;
+                    return Err(interrupted());
+                }
             }
-            pages=pages.checked_add(1).ok_or(InputError::Capacity)?;
+            pages = pages.checked_add(1).ok_or(InputError::Capacity)?;
             // Drop both the page and its encoded buffer before admitting another
             // network response. Empty matching pages still carry continuation.
-            let query=selection_request_mut(&mut request).ok_or(CliError::InvalidResponse)?;
-            query.cursor=page.next;
-            if query.cursor.is_none() {return Ok(());}
+            let query = selection_request_mut(&mut request).ok_or(CliError::InvalidResponse)?;
+            query.cursor = page.next;
+            if query.cursor.is_none() {
+                return Ok(());
+            }
         }
-    });
+    }
+    .await;
     if result.is_err() {
         let mut error = io::stderr().lock();
         let _ = writeln!(

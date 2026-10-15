@@ -129,7 +129,7 @@ impl<'a> ResponseInput<'a> {
     }
     pub(in crate::native::record_codec) fn prepare<'s, A: ResponseArtifacts>(
         &'s self,
-        policy: &'s AcceptancePolicy,
+        policy: Acceptance<'s>,
         artifacts: &'s A,
         limits: ResponseLimits,
         max_model_visits: usize,

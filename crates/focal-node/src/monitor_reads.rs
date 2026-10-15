@@ -1,5 +1,5 @@
 //! Owned current-prefix monitor reads; no independent mutable wait registry.
-use crate::host::access;
+use crate::host::{access, barrier_refused};
 use focal_ledger::Session;
 use focal_model::*;
 use focal_wire::*;
@@ -63,7 +63,9 @@ pub(crate) fn local(
     let mut context = b"focal.local.monitor.v1\0".to_vec();
     context.extend_from_slice(&principal.0);
     context.extend_from_slice(&request.0);
-    session.read_index(context.clone()).map_err(access)?;
+    session
+        .read_index(context.clone())
+        .map_err(barrier_refused)?;
     let events = session.poll().map_err(access)?;
     if !session.is_authoritative() || session.status().term != status.term {
         return Err(AccessError::Unavailable);

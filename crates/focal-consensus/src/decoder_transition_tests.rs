@@ -150,7 +150,7 @@ fn transitioned_recovery_requires_the_complete_pair_before_any_participation() {
         term: 99,
         ..Default::default()
     };
-    vote.set_msg_type(MessageType::MsgRequestVote);
+    vote.msg_type = MessageType::MsgRequestVote;
     assert!(matches!(
         node.step(vote),
         Err(ConsensusError::DecoderUnconfirmed)
@@ -322,7 +322,7 @@ fn ambiguous_transition_failure_never_advertises_and_recovery_obeys_actual_fence
         let directory = tempfile::tempdir().unwrap();
         let mut node = activated(directory.path());
         node.confirm_decoder_pair(BEFORE, AFTER).unwrap();
-        node.inject_fault_once(point);
+        node.inject_fault_once(point).unwrap();
         node.begin_decoder_transition().unwrap();
         assert!(node.finish_decoder_floor().is_err());
         assert!(!node.decoder_floor_ready(BEFORE));

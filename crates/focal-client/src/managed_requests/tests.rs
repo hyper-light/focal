@@ -340,6 +340,7 @@ fn undelivered_prefix_blocks_ack_and_lost_ack_never_forgets_saved_outcomes() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn committed_child_initialization_resumes_but_ready_child_loss_never_reinitializes() {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -472,9 +473,12 @@ fn route_refresh_binds_token_principal_and_original_control_payload() {
 }
 
 fn private_dir() -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     dir
 }
 

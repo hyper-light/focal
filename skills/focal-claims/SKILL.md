@@ -6,7 +6,7 @@ description: >-
   Use focal-evidence when delivering artifacts and closing a testament.
 ---
 
-Use the connected Focal MCP server. Read [the shared workflow contract](../references/workflow-contract.md) before the first call; it defines exact retries, authoritative outcomes, and bounded reads. Discover `tools/list`, including every `nextCursor` page, and use the returned schemas. The required operation versions are pinned in [the skill manifest](../manifest.json).
+Use the connected Focal MCP server. Read [the shared workflow contract](references/workflow-contract.md) before the first call; it defines exact retries, authoritative outcomes, and bounded reads. Discover `tools/list`, including every `nextCursor` page, and use the returned schemas. The required operation versions are pinned in Focal's skill manifest (`skills/manifest.json`; over MCP, `skills/list`).
 
 ## Find the obligation
 
@@ -25,7 +25,7 @@ For an atomic group of 1–64 authored claims, use `claim.submit_batch` with one
 
 3. Post the generated claim with `claim.post`, using a separate operation ID. Completion: its committed result and a subsequent authoritative claim read establish the actual posted state. Generation alone does not dispatch work. For an authorized replacement obligation, use `claim.supersede` with its predecessor and complete successor; retain both identities and the committed lineage.
 
-For a **consultation or challenge**, first read the [peer-work branch](../references/workflow-contract.md#consultations-and-challenges). The action vocabulary is available through ordinary `claim.submit`; on a native ledger the typed peer verbs, corrections, follow-ups, lineage and the `testament` wait live in `focal-peers`. Automated peer routing and policy templates are not provided by this skill.
+For a **consultation or challenge**, first read the [peer-work branch](references/workflow-contract.md#consultations-and-challenges). The action vocabulary is available through ordinary `claim.submit`; on a native ledger the typed peer verbs, corrections, follow-ups, lineage and the `testament` wait live in `focal-peers`. Automated peer routing and policy templates are not provided by this skill.
 
 ## Accept and perform assigned work
 
@@ -51,7 +51,7 @@ satisfy the requested satisfaction predicate. This read does not reserve a
 mutation ID, create a monitor or acknowledge any evidence. Prefer a durable
 watch for longer observation rather than repeatedly restarting short waits.
 
-When the task needs ongoing observation, follow the [watch consumption branch](../references/workflow-contract.md#consume-watch-pages). Use `watch.open`, `watch.next`, `watch.acknowledge` and `watch.inspect` only when discovered. Completion: the destination consumes each exact page before acknowledgment; unknown output remains retained and recoverable by name.
+When the task needs ongoing observation, follow the [watch consumption branch](references/workflow-contract.md#consume-watch-pages). Use `watch.open`, `watch.next`, `watch.acknowledge` and `watch.inspect` only when discovered. Completion: the destination consumes each exact page before acknowledgment; unknown output remains retained and recoverable by name.
 
 For a durable dependency wait owned by an active claim you issued, use
 `monitor.register` with the exact owner, required `satisfied`, `terminal` or
@@ -66,10 +66,10 @@ use a bounded ordinary read or watch instead of fabricating timer authority.
 
 ## On a native ledger
 
-Read `ledger.standing` first; when it reports the native engine, follow the [native branch](../references/workflow-contract.md#native-engine) of the shared contract: no reservation, `n1:` references returned by each mutation, `request.pending`/`request.inspect`/`request.retry`/`request.acknowledge` for recovery, and codes for frozen vocabularies.
+Read `ledger.standing` first; when it reports the native engine, follow the [native branch](references/workflow-contract.md#native-engine) of the shared contract: no reservation, `n1:` references returned by each mutation, `request.pending`/`request.inspect`/`request.retry`/`request.acknowledge` for recovery, and codes for frozen vocabularies.
 
 1. Author with `claim.submit` (version 2): `description`, `target` (the subject's participant ID, or `self` only for a legal handoff), `validations` (a required `receipt` delivery check plus each `test`/`inspection`/… check with its `target` slot, `phase` `admission`, `increment` or `whole_work`, `evaluator`, pinned `handlers` with their `attempts`, and a logical-millisecond `deadline`), `slots` binding checks to manifest slots, optional `max_responses`, and optional `parent` for a follow-up caused by a committed claim you issued or currently hold the receipt of. Completion: the receipt's `created` names the claim and every validation ID; retain them before acknowledging. Then `claim.post`. `claim.cancel` remains the explicit business cancellation and cancels the claim's pending children.
 2. Accept assigned work with `receipt.acquire` (`claim` only; the owner fences the epoch). The issuer replaces a holder with `receipt.adopt` (`holder` participant or `self`), which fences the old receipt; later testimony under it is refused as stale. `receipt.list` shows holders by claim.
 3. Follow the claim with `claim.get` (its responses and evaluations at one prefix), `claim.list` (`issuer`, `subject`, `status`, `action`, `scope`, `relation`, `created_after`), `validation.list`/`validation.get`, and `event.list` for the publication history after a position. Delivery, evaluation and satisfaction remain separate facts; `status` `8` is satisfaction.
 4. Wait durably with `monitor.register` (`claim` you issued, `roots` with `satisfied`/`terminal`/`released` predicates, a `deadline`), move a wait to a superseding claim with `monitor.rebind`, and cancel with `monitor.cancel` once the owning claim is terminal; `monitor.list` shows registrations, rebindings and dispositions. Deadlines fire from the node's clock; a local timeout never fires them.
-5. Release a terminal claim's owned scope with `claim.release_scope`. Watches follow the [watch branch](../references/workflow-contract.md#consume-watch-pages) unchanged.
+5. Release a terminal claim's owned scope with `claim.release_scope`. Watches follow the [watch branch](references/workflow-contract.md#consume-watch-pages) unchanged.

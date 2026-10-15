@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 /// than silently pretending POSIX mode bits protect a different platform.
 pub(crate) struct PrivateDirectory {
     path: PathBuf,
-    _lock: File,
+    _lock: focal_platform::FileLock,
     /// A shared owner reads beside other readers and never writes; a writer
     /// holds the directory exclusively.
     shared: bool,
@@ -46,11 +46,11 @@ impl PrivateDirectory {
         let lock = focal_platform::fs::open_private(&lock_path, true, true, true)?;
         check_file(&lock_path, &owner)?;
         let acquired = if shared {
-            focal_platform::try_lock_shared(&lock)
+            focal_platform::FileLock::shared(lock)
         } else {
-            focal_platform::try_lock_exclusive(&lock)
+            focal_platform::FileLock::exclusive(lock)
         };
-        acquired.map_err(|error| {
+        let lock = acquired.map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 EnrollmentError::Locked
             } else {
@@ -58,7 +58,8 @@ impl PrivateDirectory {
             }
         })?;
         if !shared {
-            lock.sync_all()
+            lock.file()
+                .sync_all()
                 .map_err(|e| io_ctx("lock sync_all", &lock_path, e))?;
             sync_dir(path)?;
         }

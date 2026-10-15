@@ -29,6 +29,10 @@ mod graph_proofs;
 /// Every put must be completely decoded before final validation is called.
 pub(super) trait Overlay {
     fn before(&self, key: Key) -> Option<&Row>;
+    /// Where a spilled row's bytes are read from; none where every row holds its bytes.
+    fn payloads(&self) -> Option<&dyn crate::native::payloads::PayloadRead> {
+        None
+    }
     fn after(&self, key: Key) -> Option<&Row>;
     fn changes(&self) -> impl ExactSizeIterator<Item = (Key, Option<&Row>)>;
     fn changes_from(&self, key: Key) -> impl Iterator<Item = (Key, Option<&Row>)>;
@@ -110,7 +114,9 @@ impl<O: Overlay> ReplayRead<'_, '_, O> {
         let Row::Event(value) = self.require(Key::Event(self.outcome.sequence, ordinal))? else {
             return Err(invalid());
         };
-        let value = value.get().ok_or_else(invalid)?.expand(self.ledger);
+        let value = value
+            .get(self.ledger, self.overlay.payloads())
+            .ok_or_else(invalid)?;
         require(
             value.sequence == self.outcome.sequence
                 && value.invocation == self.outcome.invocation
@@ -306,7 +312,7 @@ fn affected_claims<O: Overlay>(
         .budget
         .reserve(
             focal_memory::BudgetKind::Recovery,
-            focal_memory::BudgetLane::Completion,
+            focal_memory::BudgetLane::Committed,
             quote,
         )?
         .commit();

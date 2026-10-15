@@ -6,11 +6,11 @@ four object families. Registration does not post a claim, execute participant
 work, or make a tool timeout into a business outcome.
 
 ```sh
-focal monitor register \
+focal register monitor \
   --owner OWNER_CLAIM_ID \
   --root satisfied:WAITED_CLAIM_ID \
   --timer TIMER_ID --generation 1 --at UNIX_SECONDS
-focal monitor get MONITOR_ID --format json
+focal get monitor MONITOR_ID --format json
 ```
 
 The owner and every waited claim must already exist in the selected ledger.
@@ -25,7 +25,7 @@ deadline are explicit. The node adapter uses Unix seconds for ledger logical
 time; the reducer requires the deadline to be in the future at admission.
 Registration alone does not promise that a timer executor is installed. The
 ordinary participant tools do not expose trusted timer firing or impersonate
-the runtime. Observe actual committed facts with `monitor get` or durable watch.
+the runtime. Observe actual committed facts with `get monitor` or durable watch.
 
 The equivalent MCP calls are `monitor.register` and `monitor.get`:
 
@@ -46,7 +46,7 @@ The equivalent MCP calls are `monitor.register` and `monitor.get`:
 
 Replace example identities and the deadline with the intended values. Optional
 `monitor` supplies an exact monitor ID; otherwise preparation generates and
-persists it. `focal schema show monitor.register` describes the shared strict
+persists it. `focal get schema monitor.register` describes the shared strict
 input. CLI `--json`, `--yaml`, and `--file` use that same document; they cannot be
 mixed with authored field flags.
 
