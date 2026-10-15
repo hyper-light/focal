@@ -2683,6 +2683,11 @@ impl Core<NativeState> {
                 RowSpill::PutOff => young.put_off(oldest, &mut pass),
             }
         }
+        // Rows it lost track of are found again by a walk of the rows, a bounded step a
+        // publication while memory is short.
+        if young.walk_due(budget) {
+            spilled = spilled.saturating_add(walk_step(rows, log, young));
+        }
         spilled
     }
     /// Unfile every event `fragments` deletes from the event index (doc 31 M2).
@@ -3402,6 +3407,61 @@ pub(in crate::native) fn encoded_added(
         }
         None => Ok(sum),
     })
+}
+
+/// One step of the walk that finds again the rows a young generation lost track of (doc 31 M3):
+/// from where the last stopped, [`young::WALK_VISITS`] rows at most, every held row it meets
+/// that may spill spilled ([`young::WALK_SPILLS`] at most), one put off counted to be found by a
+/// later walk. What it spilled.
+fn walk_step(
+    rows: &mut ranges::NativeRanges,
+    log: &dyn payloads::PayloadLog,
+    young: &mut young::Young,
+) -> usize {
+    let mut found = [None; young::WALK_SPILLS];
+    let (count, last, ended) = match young.walk_from() {
+        Some(after) => walk_visit(rows.entries_from(&after, true), &mut found),
+        None => walk_visit(rows.entries(), &mut found),
+    };
+    young.walked(if ended { None } else { last });
+    let mut spilled = 0usize;
+    for tracked in found.iter().take(count).flatten() {
+        match spill_row(rows, log, &tracked.key()) {
+            RowSpill::Spilled => spilled = spilled.saturating_add(1),
+            RowSpill::Stays => {}
+            RowSpill::PutOff => young.found_put_off(),
+        }
+    }
+    spilled
+}
+
+/// The held rows that may spill among `entries`, into `found`: how many, the last row visited,
+/// and whether the rows ended before the step's bounds did.
+fn walk_visit<'a>(
+    entries: impl Iterator<Item = ranges::RowEntry<'a>>,
+    found: &mut [Option<young::Tracked>; young::WALK_SPILLS],
+) -> (usize, Option<Key>, bool) {
+    let mut count = 0usize;
+    let mut last = None;
+    for (visited, entry) in entries.enumerate() {
+        if visited >= young::WALK_VISITS || count >= young::WALK_SPILLS {
+            return (count, last, false);
+        }
+        last = Some(entry.key);
+        let spillable = match entry.value {
+            Row::Claim(claim) => claim.spillable(),
+            Row::Definition(definition) => definition.spillable(),
+            _ => false,
+        };
+        if spillable
+            && let Some(tracked) = young::Tracked::of(entry.key)
+            && let Some(slot) = found.get_mut(count)
+        {
+            *slot = Some(tracked);
+            count = count.saturating_add(1);
+        }
+    }
+    (count, last, true)
 }
 
 /// What spilling one row where it stands came to ([`spill_row`]).

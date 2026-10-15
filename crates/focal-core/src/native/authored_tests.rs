@@ -1407,6 +1407,57 @@ fn a_spill_put_off_while_a_frozen_image_shares_its_page_is_done_once_the_image_i
     drop(squeezed);
 }
 
+/// A row the generation could not keep (it tracks twice its bound already) whose spill the log
+/// refused is counted, not forgotten: once the log takes payloads again, a walk of the rows (a
+/// bounded step a publication while memory is short) spills every row it lost track of. Each
+/// reads as a holding core's.
+#[test]
+fn a_row_the_generation_could_not_keep_is_found_again_once_it_may_spill() {
+    static REFUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let mut plain = core();
+    let mut young = core();
+    // A generation of one row by choice, two tracked at most.
+    young.attach_payload_log_with_young(
+        Box::new(Switched {
+            log: crate::native::payloads::MemoryPayloads::default(),
+            refuse: &REFUSE,
+        }),
+        1,
+    );
+    let squeezed = squeeze(&young);
+    REFUSE.store(true, std::sync::atomic::Ordering::SeqCst);
+    for id in 1..=4 {
+        let held = prepare(&plain, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        plain.publish_native(held).unwrap();
+        let prepared = prepare(&young, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        young.publish_native(prepared).unwrap();
+    }
+    // Four claims and their definitions: two tracked, six lost, none spilled.
+    let (tracked, _, untracked) = young.native_young();
+    assert_eq!((tracked, untracked), (2, 6));
+    assert!((1..=4).all(|id| !claim_logged(&young, id)));
+    REFUSE.store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut publications = 0;
+    for request in 0..8u128 {
+        if (1..=4).all(|id| claim_logged(&young, id)) {
+            break;
+        }
+        let id = 100 + request;
+        let prepared = prepare(&young, create(id, vec![proposal(id, id + 10_000)]), &[]);
+        young.publish_native(prepared).unwrap();
+        publications += 1;
+    }
+    assert!(
+        (1..=4).all(|id| claim_logged(&young, id)),
+        "every lost row spilled, within {publications} publications"
+    );
+    for id in 1..=4u128 {
+        let claim = ClaimId::from_u128(id);
+        assert_eq!(young.native_claim(claim), plain.native_claim(claim));
+    }
+    drop(squeezed);
+}
+
 /// As above, with each spilling replica's log refusing appends once it holds a few events:
 /// the events past its bound stay held, and every encoding is unchanged.
 #[test]
