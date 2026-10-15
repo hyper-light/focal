@@ -412,3 +412,88 @@ fn unnamed_files_a_crash_left_are_removed_past_the_grace() {
     assert!(!stale_batch.exists());
     assert!(young_batch.exists());
 }
+
+/// A seed sweep walks the directory across calls while a checkpoint's commit, on another thread,
+/// renames its batch's files under their hashes: an entry the walk listed that is gone when the
+/// sweep looks at it was renamed or removed, not an I/O failure, and the store goes on serving.
+/// Taken for one, the sweep failed the store and the session's next checkpoint stopped it.
+#[test]
+fn a_seed_the_sweep_listed_that_is_gone_when_it_looks_fails_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("seeds");
+    let mut seeds =
+        SeedStore::open(&root, DiskBudget::new(DiskBudgetConfig::default()).unwrap()).unwrap();
+    let name = |n: u32| {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&n.to_be_bytes());
+        ContentHash(hash)
+    };
+    for n in 0..256 {
+        std::fs::write(root.join(format!("{}.9.batch", name(n))), b"chunk").unwrap();
+    }
+    // The sweep looks at one entry and keeps its walk for the next call.
+    assert!(!seeds.collect(&[], DAY, now_ms(), 1).unwrap().complete);
+    // The batch commits: every file is renamed under its hash.
+    for n in 0..256 {
+        std::fs::rename(
+            root.join(format!("{}.9.batch", name(n))),
+            root.join(format!("{}.seed", name(n))),
+        )
+        .unwrap();
+    }
+    let report = seeds.collect(&[], DAY, now_ms(), 4096).unwrap();
+    assert!(report.complete);
+    assert_eq!(report.removed, 0, "young seeds stay");
+    assert!(seeds.batch().is_ok(), "the store still serves");
+    for n in 0..256 {
+        assert!(root.join(format!("{}.seed", name(n))).exists());
+    }
+}
+
+/// A collector's walk resumes across steps while the store's writer renames and removes what it
+/// walks: files gone when the walk reaches them are passed over, the pass completes, and the store
+/// goes on serving. Taken for an I/O failure, a vanished file failed the store.
+#[test]
+fn a_file_gone_since_the_walk_listed_it_is_passed_over() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let mut store = open(root);
+    let tenant = domain(2);
+    let mut sealed = Vec::new();
+    for id in 1..=64u8 {
+        sealed.push(seal(&mut store, id, tenant, &[id, id, id, id, 0, 0, 0, id]));
+    }
+    let objects = root.join("objects").join(hex(&tenant.0));
+    let mut protection = ProtectionSet::new();
+    protection.protect_object(tenant, sealed[0].root).unwrap();
+    protection.finish();
+    age_everything(root, 2 * DAY);
+    let now = now_ms();
+    // Step until the walk has listed the domain's manifests, and taken one.
+    let mut steps = 0;
+    while !matches!(store.collector.phase, Phase::Manifests { .. }) {
+        assert!(
+            !store
+                .collect_step(&protection, config(), now, 1)
+                .unwrap()
+                .complete
+        );
+        steps += 1;
+        assert!(steps < 1_000, "the walk never reached the manifests");
+    }
+    // Every other object's files go: the walk's listing names what is no longer there.
+    for entry in fs::read_dir(&objects).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.starts_with(&sealed[0].root.to_string()) && !name.ends_with(".chunk") {
+            fs::remove_file(&path).unwrap();
+        }
+    }
+    let report = pass(&mut store, &protection, config(), now, 1);
+    assert!(report.complete);
+    assert_eq!(
+        store.read_bytes(&sealed[0], 64).unwrap(),
+        [1, 1, 1, 1, 0, 0, 0, 1]
+    );
+    seal(&mut store, 99, tenant, b"STILLSERVES");
+}

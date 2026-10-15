@@ -609,15 +609,23 @@ impl ContentStore {
             if extension != "meta" {
                 continue;
             }
-            let bytes = read_bounded(
+            let Some(bytes) = read_listed(
                 &entry.path(),
                 self.limits.max_manifest_bytes.max(terminal::RECORD_BYTES),
-            )?;
+            )?
+            else {
+                continue;
+            };
             let Some(id) = terminal::decode(&bytes)? else {
                 continue;
             };
-            if hex(&id.0) != stem || age_ms(&entry.metadata()?, now_ms)? < config.terminal_grace_ms
-            {
+            if hex(&id.0) != stem {
+                continue;
+            }
+            let Some(metadata) = still_there(&entry)? else {
+                continue;
+            };
+            if age_ms(&metadata, now_ms)? < config.terminal_grace_ms {
                 continue;
             }
             fs::remove_file(entry.path())?;
@@ -684,7 +692,9 @@ impl ContentStore {
             let Some(root) = parse_hash(&stem) else {
                 continue;
             };
-            let metadata = entry.metadata()?;
+            let Some(metadata) = still_there(&entry)? else {
+                continue;
+            };
             // A single unreadable/oversized/corrupt manifest must not abort the
             // whole GC pass — an aborted pass resets to Idle and restarts,
             // re-hitting the poison file and never reaching quarantine deletion.
@@ -692,8 +702,9 @@ impl ContentStore {
             // is skipped, exactly as sweep_receipts skips an undecodable receipt.
             // Leaving its chunks unmarked is correct: an object whose manifest is
             // unreadable is already unrecoverable.
-            let bytes = match read_bounded(&entry.path(), MAX_TRANSFER_MANIFEST_BYTES) {
-                Ok(bytes) => bytes,
+            let bytes = match read_listed(&entry.path(), MAX_TRANSFER_MANIFEST_BYTES) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
                 Err(ContentError::Io(error)) => return Err(ContentError::Io(error)),
                 Err(_) => continue,
             };
@@ -760,7 +771,13 @@ impl ContentStore {
             let Some(hash) = parse_hash(&stem) else {
                 continue;
             };
-            if marks.contains(&hash) || age_ms(&entry.metadata()?, now_ms)? < config.grace_ms {
+            if marks.contains(&hash) {
+                continue;
+            }
+            let Some(metadata) = still_there(&entry)? else {
+                continue;
+            };
+            if age_ms(&metadata, now_ms)? < config.grace_ms {
                 continue;
             }
             self.quarantine(
@@ -807,7 +824,10 @@ impl ContentStore {
             records
                 .try_reserve_exact(1)
                 .map_err(|_| ContentError::Capacity)?;
-            records.push((age_ms(&entry.metadata()?, now_ms)?, hash, entry.path()));
+            let Some(metadata) = still_there(&entry)? else {
+                continue;
+            };
+            records.push((age_ms(&metadata, now_ms)?, hash, entry.path()));
         }
         // Youngest first; the first `keep_records` stay whatever their age.
         // The listing is bounded by the mark bound, so the whole kind is
@@ -862,7 +882,10 @@ impl ContentStore {
             if extension != "record" {
                 continue;
             }
-            let bytes = read_bounded(&entry.path(), CustodyRecordKind::Receipt.limit())?;
+            let Some(bytes) = read_listed(&entry.path(), CustodyRecordKind::Receipt.limit())?
+            else {
+                continue;
+            };
             let Ok(receipt) = crate::CustodyReceipt::decode(&bytes) else {
                 continue;
             };
@@ -872,7 +895,13 @@ impl ContentStore {
                 .join(hex(&receipt.domain.0))
                 .join(format!("{}.manifest", receipt.root))
                 .is_file();
-            if present || age_ms(&entry.metadata()?, now_ms)? < config.grace_ms {
+            if present {
+                continue;
+            }
+            let Some(metadata) = still_there(&entry)? else {
+                continue;
+            };
+            if age_ms(&metadata, now_ms)? < config.grace_ms {
                 continue;
             }
             self.quarantine(
@@ -1077,6 +1106,28 @@ pub struct SeedReport {
     pub bytes_removed: u64,
     pub complete: bool,
 }
+/// What a walk's entry is now, none where it is gone since the walk listed it. A walk resumes
+/// across steps while the store's writers rename and remove what it walks, so what it lists may
+/// be seconds old, and a file no longer there is nothing to collect or mark, never an I/O failure:
+/// taken for one, a seed sweep failed its store while a checkpoint's commit renamed its batch,
+/// and the session's next checkpoint stopped the session.
+fn still_there(entry: &fs::DirEntry) -> Result<Option<fs::Metadata>, ContentError> {
+    match entry.metadata() {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ContentError::Io(error)),
+    }
+}
+/// [`read_bounded`] of a walk's entry, none where it is gone since the walk listed it
+/// ([`still_there`]).
+fn read_listed(path: &Path, max_bytes: usize) -> Result<Option<Vec<u8>>, ContentError> {
+    match read_bounded(path, max_bytes) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 impl SeedStore {
     /// Remove seeds nothing protects that stood past the grace, at most
     /// `max_items` visits; seeds are copies of checkpoint bytes a peer can
@@ -1128,11 +1179,14 @@ impl SeedStore {
                     continue;
                 }
             }
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
+            // Gone since the walk listed it (`still_there`): here a checkpoint's commit, on its
+            // own thread, renames its batch's files under their hashes while the walk goes on.
+            let metadata = match still_there(&entry) {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => continue,
                 Err(error) => {
                     self.failed = true;
-                    return Err(ContentError::Io(error));
+                    return Err(error);
                 }
             };
             if age_ms(&metadata, now_ms)? < grace_ms {
