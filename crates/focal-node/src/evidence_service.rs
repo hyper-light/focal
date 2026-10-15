@@ -1624,9 +1624,7 @@ async fn archive(
     let scope = placement.scope;
     let (chunk_bytes, _) = content.import_chunking();
     let domain = ContentDomainId(scope.ledger.tenant.0);
-    let reference = content
-        .seal_import_inline(domain, bytes, chunk_bytes)
-        .await?;
+    let reference = content.seal_bundle(domain, bytes, chunk_bytes).await?;
     let request = RequestId(
         reference
             .root

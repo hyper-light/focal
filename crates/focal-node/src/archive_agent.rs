@@ -648,7 +648,7 @@ impl EmbeddedArchive {
     ) -> Result<focal_model::ContentRef, crate::embedded::NodeError> {
         let domain = focal_model::ContentDomainId(node.identity.ledger.tenant.0);
         let chunk = node.content.upload_chunk_bytes();
-        Ok(node.content.seal_import_inline(domain, &bytes, chunk)?)
+        Ok(node.content.seal_bundle(domain, &bytes, chunk)?)
     }
     /// Poll the session until the record it proposed has applied, a bounded
     /// number of times; what has not applied by then applies under the

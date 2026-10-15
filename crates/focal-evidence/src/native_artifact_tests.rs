@@ -1098,3 +1098,43 @@ fn complete_manifest_header_is_preflighted_before_installing_any_chunk() {
     assert_eq!(reference(verified.custody().payload()), expected);
     assert_eq!(current.read_bytes(&expected, REPORT.len()).unwrap(), REPORT);
 }
+
+/// A bundle the node made itself (a seal's, an archive's) is sealed by what the store holds,
+/// not by an inline payload's bound: a 3 MiB bundle is refused as an inline payload, sealed as
+/// a bundle, and read back whole. Bounded as an inline payload was, every seal bundle worth
+/// proposing was refused and no outcome was ever sealed.
+#[test]
+fn a_node_bundle_past_the_inline_bound_seals_and_reads_back() {
+    let root = tempfile::tempdir().unwrap();
+    // A node's store: 64 KiB chunks, 64 MiB of content.
+    let mut store = ContentStore::open(
+        root.path(),
+        StoreLimits {
+            max_content_bytes: 64 << 20,
+            max_staging_bytes: 64 << 20,
+            max_uploads: 8,
+            chunk_bytes: 64 << 10,
+            max_manifest_bytes: 128 << 10,
+        },
+    )
+    .unwrap();
+    let bytes: Vec<u8> = (0..3usize << 20).map(|index| (index % 251) as u8).collect();
+    assert!(bytes.len() > MAX_TRANSFER_MANIFEST_BYTES);
+    let chunk = store.limits.chunk_bytes;
+    assert!(matches!(
+        store.seal_import_inline(domain(), &bytes, chunk),
+        Err(ContentError::Capacity)
+    ));
+    let reference = store.seal_bundle(domain(), &bytes, chunk).unwrap();
+    assert_eq!(reference.length, bytes.len() as u64);
+    assert_eq!(
+        store.read_bytes(&reference, bytes.len()).unwrap(),
+        bytes,
+        "the sealed bundle reads back whole"
+    );
+    // Sealing it again installs nothing new and names the same object.
+    assert_eq!(
+        store.seal_bundle(domain(), &bytes, chunk).unwrap(),
+        reference
+    );
+}

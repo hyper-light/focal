@@ -52,6 +52,8 @@ enum Command {
     Seal(CustodyScope, Box<VerifiedRequest>),
     /// Seal an inline legacy payload with the canonical import chunking.
     SealImport(focal_model::ContentDomainId, Vec<u8>, usize),
+    /// A bundle this node made, sealed in its own store (`seal_bundle`).
+    SealBundle(focal_model::ContentDomainId, Vec<u8>, usize),
     /// The custody policy installed for a ledger, if any.
     Policy(focal_model::LedgerId),
     /// The peers of a placement being prepared for a ledger (seed reads only).
@@ -489,6 +491,24 @@ impl ContentHost {
             _ => Err(AccessError::Unavailable),
         }
     }
+    /// Seal a bundle this node made (an archive's, a seal's) in its own store
+    /// ([`focal_evidence::ContentStore::seal_bundle`]): bounded by what the store holds, not by
+    /// an inline payload's bound. Idempotent as an import's seal is.
+    pub async fn seal_bundle(
+        &self,
+        domain: focal_model::ContentDomainId,
+        bytes: Vec<u8>,
+        chunk_bytes: usize,
+    ) -> Result<focal_model::ContentRef, AccessError> {
+        let size = bytes.len();
+        match self
+            .call(Command::SealBundle(domain, bytes, chunk_bytes), size, true)
+            .await?
+        {
+            Output::LocalSeal(value) => Ok(value),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
     /// The custody policy installed for `ledger`: its scope and the peers
     /// that hold its content and seeds.
     pub async fn policy(
@@ -850,6 +870,22 @@ fn execute(
             owner
                 .content_mut()
                 .seal_import_inline(domain, &bytes, chunk_bytes)
+                .map(Output::LocalSeal)
+                .map_err(content_error)
+        }
+        Command::SealBundle(domain, bytes, chunk_bytes) => {
+            let amount = bytes
+                .len()
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(owner.content().max_manifest_bytes()))
+                .and_then(|n| n.checked_add(4096))
+                .ok_or(AccessError::Capacity)?;
+            let _scan = budget
+                .reserve(BudgetKind::Payload, BudgetLane::Completion, amount)
+                .map_err(|_| AccessError::Capacity)?;
+            owner
+                .content_mut()
+                .seal_bundle(domain, &bytes, chunk_bytes)
                 .map(Output::LocalSeal)
                 .map_err(content_error)
         }

@@ -497,7 +497,25 @@ impl ContentStore {
         chunk_bytes: usize,
     ) -> Result<ContentRef, ContentError> {
         self.check()?;
-        let result = self.seal_inline_with(domain, bytes, chunk_bytes);
+        let result = self.seal_inline_with(domain, bytes, chunk_bytes, MAX_TRANSFER_MANIFEST_BYTES);
+        self.mark_failure(&result);
+        result
+    }
+    /// Seal a bundle this node made itself (an archive's, 26 §4; a seal's, F12), its bytes
+    /// already charged by the caller, as [`Self::seal_import_inline`] seals a payload, bounded by
+    /// what the store holds and a transfer moves rather than by the inline payload's bound: a
+    /// seal bundle is up to 6 MiB (`SEAL_BUNDLE_BYTES`), and bounded as an inline payload is, at
+    /// 1 MiB, every bundle worth proposing was refused and no outcome was ever sealed (a session
+    /// stopped at its millionth write, 2026-10-14).
+    pub fn seal_bundle(
+        &mut self,
+        domain: ContentDomainId,
+        bytes: &[u8],
+        chunk_bytes: usize,
+    ) -> Result<ContentRef, ContentError> {
+        self.check()?;
+        let bound = usize::try_from(MAX_TRANSFER_CONTENT_BYTES).unwrap_or(usize::MAX);
+        let result = self.seal_inline_with(domain, bytes, chunk_bytes, bound);
         self.mark_failure(&result);
         result
     }
@@ -506,16 +524,23 @@ impl ContentStore {
         domain: ContentDomainId,
         bytes: &[u8],
     ) -> Result<ContentRef, ContentError> {
-        self.seal_inline_with(domain, bytes, self.limits.chunk_bytes)
+        self.seal_inline_with(
+            domain,
+            bytes,
+            self.limits.chunk_bytes,
+            MAX_TRANSFER_MANIFEST_BYTES,
+        )
     }
+    /// Seal `bytes` in one step, at most `bound` of them and the store's content bound.
     fn seal_inline_with(
         &self,
         domain: ContentDomainId,
         bytes: &[u8],
         chunk_bytes: usize,
+        bound: usize,
     ) -> Result<ContentRef, ContentError> {
         let length = u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?;
-        if length > self.limits.max_content_bytes || bytes.len() > MAX_TRANSFER_MANIFEST_BYTES {
+        if length > self.limits.max_content_bytes || bytes.len() > bound {
             return Err(ContentError::Capacity);
         }
         let (manifest, encoded, root) = inline_manifest(
