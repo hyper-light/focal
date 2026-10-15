@@ -20,7 +20,7 @@ hyper-durable is new code. It is not extracted from one project's shell: its des
 |---|---|---|
 | The shared device log as the store; a group's handle that reads where the replica is | mantle | `GroupStore` over hyper-log's `GroupLog` (`src/hyperlog.rs`); entries encoded as mantle's store encodes them (`encode_entry`, `ENTRY_OVERHEAD`) |
 | A leader sends before its own write | mantle R31, thesis §10.2.1 | the core gives them (`Ready::messages`), `Replica::take_ready` emits them at once |
-| A write refused for room waits whole; the replica takes no part while it does | mantle (audit S04) | `Replica::refused`, `make_again` (with the fast track's proposals, `RawNode::issued_proposals`), `ReplicaError::Stalled`; campaigns held (`RawNode::hold_campaigns`) |
+| A write refused for room waits whole; the replica takes no part while it does | mantle (audit S04) | `Replica::refused`, `make_again` (with the fast track's proposals, `RawNode::issued_proposals`), `ReplicaError::Stalled`; campaigns held (`RawNode::hold_campaigns`); a refused write's messages made again only while the core's log holds the entry it ended at (`Out::tip`, the shell's simulation, 2026-10-15) |
 | A snapshot report kept while stalled | mantle (a simulation seed) | `Replica::report_snapshot`, one a member of the configuration |
 | A failed write fences the replica | mantle; Rebello et al. | `Cause::Write`; every call answers `Fenced` |
 | Open: finish an install the log never recorded; raise the commit to what the state machine holds | mantle (`complete_install`, `commit_applied`) | `repair_at_open`, with the state machine's point's term from `StateMachine::durable`, so mantle's `Damaged` inference is gone |

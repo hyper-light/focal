@@ -96,11 +96,26 @@ fn region(expected_revision: u64, id: u128) -> ControlCommand {
         },
     })
 }
+/// Elects the one voter and drains until it takes writes: it leads once the hard state naming its
+/// vote is durable (hyper-raft's I9), and takes writes once its term's first entry is committed
+/// and applied, which may be a drain more on the shell. Each drain moves it on, or the wait fails.
 fn leader(replica: &mut ControlReplica) {
     replica.drain(&Evidence).unwrap();
+    let before = replica.scalars();
     replica.campaign().unwrap();
-    replica.drain(&Evidence).unwrap();
-    assert_eq!(replica.status().role, StateRole::Leader);
+    let mut last = replica.scalars();
+    loop {
+        replica.drain(&Evidence).unwrap();
+        let now = replica.scalars();
+        if now.role == StateRole::Leader
+            && now.committed_index > before.committed_index
+            && now.applied_index == now.committed_index
+        {
+            return;
+        }
+        assert_ne!(now, last, "a drain moved the one voter nowhere");
+        last = now;
+    }
 }
 fn commit(replica: &mut ControlReplica, request: ControlRequest) -> ControlReceipt {
     let id = request.id;

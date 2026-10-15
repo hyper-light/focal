@@ -48,6 +48,10 @@ pub struct Constants {
     pub tick_ns: Derived<u64>,
     /// The latency budget the loop's batch is sized against.
     pub batch_budget_ns: Derived<u64>,
+    /// The consumer's latency objective for one loop step, where it is tighter than the mean wake: a step's
+    /// batch reads its inputs again by it as well as by the shard's quantum (docs/runtime.md §3.3). `None`
+    /// where the wake is the tighter, or the consumer stated none.
+    pub latency_objective_ns: Option<u64>,
     /// The control queue's depth.
     pub control_entries: Derived<u64>,
     /// Where the shards run.
@@ -111,6 +115,9 @@ impl Calibration {
                 "min(wake.mean, the consumer's latency objective) (a batch delays a woken task no longer than a park would)",
                 ["wake.mean_ns", "policy.latency_objective_ns"]
             ),
+            latency_objective_ns: policy
+                .latency_objective_ns
+                .filter(|&objective| objective < wake_mean),
             control_entries: derived!(
                 wake_p99
                     .checked_div(syscall)

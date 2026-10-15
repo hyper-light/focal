@@ -79,7 +79,7 @@ impl<T> UnsafeCell<T> {
 /// silicon's 128 bytes): producers write the tail, the consumer the head.
 #[repr(align(128))]
 #[derive(Debug)]
-struct Padded<T>(T);
+pub(super) struct Padded<T>(pub(super) T);
 
 /// One slot: the position it is free for or full at, and its value while full.
 #[derive(Debug)]
@@ -275,6 +275,32 @@ impl<T> Ring<T> {
 }
 
 impl<T> Ring<T> {
+    /// Takes the value at the head as the ring's one taker: the primitives here take only through their one
+    /// receiver until it closes the ring (`close`, in the receiver's drop), and a drain, the only other taker,
+    /// begins only after that close, so while this end may take, the head is its alone and moves by a plain
+    /// store where [`Ring::pop`] claims it by a compare-and-swap. A drain that follows reads the head this end
+    /// left, or an older one it walks past as it walks past another taker's ([`Ring::pop`]).
+    pub(crate) fn pop_owned(&self) -> Option<T> {
+        let head = self.head.0.load(Ordering::Relaxed);
+        let slot = self.slot(head)?;
+        // Anything but the publication of `head` reads as empty: a position claimed and not yet published, or a
+        // stamp this thread reads old, which a waiting receiver's fence before its second look rules out
+        // (`crate::handoff`).
+        if slot.stamp.load(Ordering::Acquire) != head.wrapping_add(1) {
+            return None;
+        }
+        // SAFETY: the stamp read (Acquire) says a producer wrote this slot and published it at `head`, and the
+        // head is this taker's alone (the function's contract: no other end takes while it may), so the value is
+        // initialized and read once; the store below releases the slot for the next lap only after the read.
+        let value = slot.value.with(|cell| unsafe { cell.read().assume_init() });
+        slot.stamp
+            .store(head.wrapping_add(self.one_lap), Ordering::Release);
+        self.head.0.store(self.next(head), Ordering::Relaxed);
+        Some(value)
+    }
+}
+
+impl<T> Ring<T> {
     /// Refuses every push that has not claimed its place yet; one that has still lands. The mark, then a
     /// fence, so this thread's next look at the slots and a producer's look at the mark after its own fence
     /// cannot both miss the other's write (the store-buffering outcome both fences forbid).
@@ -315,6 +341,10 @@ impl<T> Drop for Ring<T> {
 pub(crate) struct Shared<S> {
     block: NonNull<S>,
     cell: CellRef,
+    /// The cell's words, looked up once: this end holds one of the cell's handles, so the cell keeps its
+    /// generation while the end lives, and the table lookup [`CellRef::cell`] makes at each use would find
+    /// these same words.
+    words: Option<&'static super::cell::Cell>,
 }
 
 // SAFETY: an end reaches the block only through `&S`, and the block is freed only by the end whose release
@@ -330,6 +360,7 @@ impl<S> Shared<S> {
         Self {
             block: NonNull::from(Box::leak(Box::new(state))),
             cell,
+            words: cell.cell(),
         }
     }
 
@@ -339,6 +370,7 @@ impl<S> Shared<S> {
         Self {
             block: self.block,
             cell: self.cell,
+            words: self.words,
         }
     }
 
@@ -352,6 +384,11 @@ impl<S> Shared<S> {
     /// The primitive's cell.
     pub(crate) fn cell(&self) -> CellRef {
         self.cell
+    }
+
+    /// The primitive's cell's words, as [`CellRef::cell`] finds them for a live end.
+    pub(crate) fn words(&self) -> Option<&'static super::cell::Cell> {
+        self.words
     }
 }
 
@@ -517,6 +554,69 @@ mod loom_tests {
             out.sort_unstable();
             assert_eq!(out, accepted, "out {out:?}, accepted {accepted:?}");
             assert!(!accepted.is_empty(), "an empty slot refused both pushes");
+        });
+    }
+
+    /// Two producers each push once while the ring's one taker takes once with [`Ring::pop_owned`], each a
+    /// thread of its own, on a ring of one slot; then the taker, joined, takes the rest the same way: every
+    /// accepted value comes out once and only accepted values come out, the head moved by the taker's stores
+    /// alone.
+    #[test]
+    fn two_producers_and_the_owned_taker_move_each_value_once_through_one_slot() {
+        loom_bounds::explore("ring: two producers, the owned taker, one slot", || {
+            let ring: &'static Ring<u32> = Box::leak(Box::new(Ring::new(1).unwrap()));
+            let producers: Vec<_> = (0..2u32)
+                .map(|value| loom::thread::spawn(move || ring.push(value).is_ok()))
+                .collect();
+            let taker = loom::thread::spawn(move || ring.pop_owned());
+            let accepted: Vec<u32> = producers
+                .into_iter()
+                .zip(0..2u32)
+                .filter_map(|(producer, value)| producer.join().unwrap().then_some(value))
+                .collect();
+            let mut out: Vec<u32> = taker.join().unwrap().into_iter().collect();
+            while let Some(value) = ring.pop_owned() {
+                out.push(value);
+            }
+            out.sort_unstable();
+            assert_eq!(out, accepted, "out {out:?}, accepted {accepted:?}");
+        });
+    }
+
+    /// The receiver's life on one thread: an owned take, then its drop's close and drain, while a producer
+    /// pushes and, finding the close after a fence, drains too, as the primitives' senders do. The drains are
+    /// two takers after the owned one ended, each claiming by compare-and-swap from the head the owned take
+    /// left. Once both have joined the ring holds nothing, each accepted value came out once, and a push refused
+    /// kept its value.
+    #[test]
+    fn an_owned_take_then_a_close_racing_a_push_leaves_nothing() {
+        loom_bounds::explore("ring: the owned taker's close against a push", || {
+            let ring: &'static Ring<u32> = Box::leak(Box::new(Ring::new(1).unwrap()));
+            ring.push(1).unwrap();
+            let producer = loom::thread::spawn(move || {
+                let pushed = ring.push(2);
+                if pushed.is_ok() {
+                    fence(Ordering::SeqCst);
+                    if ring.is_closed() {
+                        ring.drain();
+                    }
+                }
+                pushed
+            });
+            let receiver = loom::thread::spawn(move || {
+                let taken = ring.pop_owned();
+                ring.close();
+                ring.drain();
+                taken
+            });
+            let pushed = producer.join().unwrap();
+            let taken = receiver.join().unwrap();
+            assert_eq!(taken, Some(1), "the owned take found the first value");
+            assert!(ring.pop().is_none(), "a value was left in the closed ring");
+            assert!(
+                matches!(pushed, Ok(()) | Err(Refused::Closed(2) | Refused::Full(2))),
+                "{pushed:?}"
+            );
         });
     }
 

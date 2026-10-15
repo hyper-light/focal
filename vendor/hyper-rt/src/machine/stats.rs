@@ -344,6 +344,61 @@ pub fn converged_mean(interval: &MeanInterval) -> bool {
     interval.width_permille() <= CONVERGED_WIDTH_PERMILLE
 }
 
+/// The median of `values` as the median-of-means estimator defines it, sorting them in place: the middle
+/// value of an odd count, the smaller of the two middle ones of an even count (the smallest value with at
+/// least half the values on each side [A: Lugosi & Mendelson, "Mean estimation and regression under
+/// heavy-tailed distributions: a survey", Found. Comput. Math. 19, 2019, §2.1]); `None` when empty.
+pub fn median_of(values: &mut [u64]) -> Option<u64> {
+    values.sort_unstable();
+    let middle = values.len().checked_sub(1)?.checked_div(2)?;
+    values.get(middle).copied()
+}
+
+/// The median of the blocks' means, each block's mean over its own values, empty blocks left out; `None`
+/// when every block is empty. The median-of-means estimator [A: Nemirovsky & Yudin 1983; Jerrum, Valiant &
+/// Vazirani 1986; Alon, Matias & Szegedy 1996; through Lugosi & Mendelson 2019, §2.1]: an estimate of the
+/// mean, not of the median, whose error under any finite variance is sub-Gaussian (with `k` blocks of `m`
+/// values, more than `σ·√(4/m)` with probability at most `e^(−k/8)`, their Theorem 2), and which values
+/// confined to fewer than half the blocks cannot move outside the other blocks' means (DERIVED: the median
+/// of `k` values, fewer than half of them arbitrary, lies between two of the others).
+pub fn median_of_means(blocks: &[Vec<u64>]) -> Option<u64> {
+    let mut means: Vec<u64> = blocks.iter().filter_map(|block| mean(block)).collect();
+    median_of(&mut means)
+}
+
+/// The 95% bootstrap interval around [`median_of_means`], resampled within each block so the blocks stay
+/// what they are (a stratified bootstrap): each of [`BOOTSTRAP_RESAMPLES`] resamples draws every block's own
+/// count from that block, with the seeded resampling of [`bootstrap_interval`], so a recorded sample
+/// reproduces its interval exactly. The interval is widened to hold the estimate where the resampled
+/// medians all fall to one side of it (blocks of one repeated value make every resample the estimate
+/// itself). `None` when every block is empty.
+pub fn bootstrap_median_of_means(blocks: &[Vec<u64>], rng: &mut Xorshift) -> Option<MeanInterval> {
+    let point = median_of_means(blocks)?;
+    let blocks: Vec<&Vec<u64>> = blocks.iter().filter(|block| !block.is_empty()).collect();
+    let mut means: Vec<u64> = Vec::with_capacity(blocks.len());
+    let mut medians: Vec<u64> = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+    for _ in 0..BOOTSTRAP_RESAMPLES {
+        means.clear();
+        for block in &blocks {
+            let count = u128::try_from(block.len()).unwrap_or(u128::MAX);
+            let mut sum: u128 = 0;
+            for _ in 0..block.len() {
+                let drawn = block.get(rng.below(block.len())).copied().unwrap_or(0);
+                sum = sum.saturating_add(u128::from(drawn));
+            }
+            means.push(u64::try_from(sum.checked_div(count).unwrap_or(0)).unwrap_or(u64::MAX));
+        }
+        medians.extend(median_of(&mut means));
+    }
+    medians.sort_unstable();
+    let edge = |p: Percentile| medians.get(p.index(medians.len())).copied();
+    Some(MeanInterval {
+        mean: point,
+        lower: edge(Percentile::LOWER_95).unwrap_or(point).min(point),
+        upper: edge(Percentile::UPPER_95).unwrap_or(point).max(point),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +491,58 @@ mod tests {
         assert_eq!(standard_deviation(&[7, 7, 7]), Some(0));
         assert_eq!(standard_deviation(&[10, 30]), Some(10));
         assert_eq!(standard_deviation(&[]), None);
+    }
+
+    /// The estimator's median: the middle of an odd count, the smaller middle of an even one, none of
+    /// nothing.
+    #[test]
+    fn the_median_of_means_takes_the_smaller_middle_of_an_even_count() {
+        assert_eq!(median_of(&mut [9, 1, 5]), Some(5));
+        assert_eq!(median_of(&mut [9, 1, 5, 7]), Some(5));
+        assert_eq!(median_of(&mut [4]), Some(4));
+        assert_eq!(median_of(&mut []), None);
+    }
+
+    /// Do: five blocks, three of them wakes about three microseconds long and two a burst's, a hundred
+    /// times longer, one of whose wakes was held 13 ms. Expect: the median of the means is the largest
+    /// of the three quiet blocks' means, exactly, where the pooled mean is a burst's sum spread over
+    /// everything; an empty block is left out; with one block the estimate is that block's mean; and the
+    /// stratified bootstrap reproduces its interval from the seed, holding the estimate.
+    #[test]
+    fn a_burst_in_fewer_than_half_the_blocks_cannot_move_the_median_of_means() {
+        let quiet = |mean: u64| -> Vec<u64> {
+            (0..60)
+                .map(|k| if k % 2 == 0 { mean / 2 } else { mean * 3 / 2 })
+                .collect()
+        };
+        let burst = |mean: u64| -> Vec<u64> {
+            (0..60)
+                .map(|k| if k == 0 { 13_000_000 } else { mean })
+                .collect()
+        };
+        let blocks = vec![
+            quiet(2_900),
+            burst(228_000),
+            quiet(3_100),
+            Vec::new(),
+            quiet(3_000),
+            burst(230_000),
+        ];
+        assert_eq!(median_of_means(&blocks), Some(3_100));
+        let pooled: Vec<u64> = blocks.iter().flatten().copied().collect();
+        assert!(mean(&pooled).unwrap() > 30 * 3_100, "{:?}", mean(&pooled));
+        assert_eq!(median_of_means(&[quiet(3_000)]), Some(3_000));
+        assert_eq!(median_of_means(&[Vec::new()]), None);
+        let a = bootstrap_median_of_means(&blocks, &mut Xorshift::new(Xorshift::SEED)).unwrap();
+        let b = bootstrap_median_of_means(&blocks, &mut Xorshift::new(Xorshift::SEED)).unwrap();
+        assert_eq!(a, b);
+        assert!(
+            a.lower <= a.mean && a.mean == 3_100 && a.mean <= a.upper,
+            "{a:?}"
+        );
+        let flat = bootstrap_median_of_means(&[vec![500; 8], vec![500; 3]], &mut Xorshift::new(7))
+            .unwrap();
+        assert_eq!((flat.lower, flat.mean, flat.upper), (500, 500, 500));
     }
 
     #[test]

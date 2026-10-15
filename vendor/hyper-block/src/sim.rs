@@ -1,17 +1,13 @@
-//! A simulated file with power-loss semantics, for testing what a storage engine does when
-//! the machine loses power, the disk returns errors, or the bytes come back wrong.
-//!
-//! The model follows what the literature shows a real stack does. A write lands in a
-//! volatile cache and is durable only after a successful flush; at a crash each sector
-//! written since the last flush independently survives or not, so a multi-sector write can
-//! tear and later writes can persist without earlier ones (Pillai et al., OSDI 2014). A
-//! failed flush leaves each of those sectors durable or not while the cache still returns
-//! the new bytes, as Linux does after marking the pages clean (Rebello et al., ATC 2020).
-//! Reads can fail or return flipped bits, the single-block faults of Ganesan et al.
-//! (FAST 2017). Everything random comes from one seed, so a failing run replays exactly.
+//! A simulated file with power-loss semantics, for testing what a storage engine does when the
+//! machine loses power, the disk returns errors, or the bytes come back wrong: a [`BlockFile`] over
+//! hyper-sim's block device (`hyper_sim::storage`, `docs/sim.md` §3.5), which holds the model, its
+//! faults and its crash states. What this layer adds is a direct-I/O file's refusals (alignment, the
+//! largest file) and hyper-block's errors. Everything random comes from one seed, so a failing run
+//! replays exactly.
 
 use std::cell::{RefCell, RefMut};
-use std::collections::BTreeSet;
+
+use hyper_sim::storage::{Device, StorageError};
 
 use crate::DiskError;
 use crate::block::BlockFile;
@@ -20,84 +16,10 @@ use crate::buf::Alignment;
 mod shared;
 pub use shared::{SimDevice, SimHandle};
 
+pub use hyper_sim::storage::{Crash, Fault, Stats as SimStats};
+
 /// The largest simulated file: tests hold two copies of it in memory.
-pub const MAX_SIM_LEN: u64 = 1 << 30;
-
-/// A fault the next matching operation suffers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Fault {
-    /// Reads overlapping `[offset, offset + len)` fail with EIO.
-    ReadError {
-        /// Where the failing range begins.
-        offset: u64,
-        /// Its length.
-        len: u64,
-    },
-    /// Reads of the byte at `offset` return it with bit `bit` inverted; the stored byte is
-    /// intact, as with a transient transfer error, unless `stored` is set.
-    BitFlip {
-        /// The byte's file offset.
-        offset: u64,
-        /// The bit flipped, 0 to 7.
-        bit: u8,
-        /// The flip is on the medium, healed only by a write over it.
-        stored: bool,
-    },
-    /// The next write fails with EIO before changing anything.
-    WriteError,
-    /// The next flush fails with EIO; each unflushed sector is left durable or not.
-    SyncError,
-    /// Writes that would grow the file past `len` fail with ENOSPC.
-    Capacity {
-        /// The file's capacity.
-        len: u64,
-    },
-    /// Power is cut after `ops` more writes and flushes: that operation and every one after
-    /// it fails, until the test crashes the file and clears its faults.
-    PowerCut {
-        /// Writes and flushes that still succeed.
-        ops: u64,
-    },
-}
-
-/// What a crash does with sectors written since the last successful flush.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Crash {
-    /// Each such sector independently survives with probability one half.
-    Random,
-    /// None survives.
-    LoseAll,
-    /// Every one survives.
-    KeepAll,
-}
-
-#[derive(Debug)]
-struct State {
-    /// What reads return: the durable image plus writes not yet flushed.
-    visible: Vec<u8>,
-    /// What survives a crash.
-    durable: Vec<u8>,
-    /// Sectors written since the last flush.
-    dirty: BTreeSet<u64>,
-    faults: Vec<Fault>,
-    rng: SplitMix64,
-    stats: SimStats,
-}
-
-/// Operation counts, so a test can assert what an engine did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SimStats {
-    /// Reads issued.
-    pub reads: u64,
-    /// Writes issued.
-    pub writes: u64,
-    /// Flushes issued.
-    pub syncs: u64,
-    /// Writes made durable on their own (`BlockFile::write_durable_at`), each also counted a write.
-    pub durable_writes: u64,
-    /// Crashes the test made.
-    pub crashes: u64,
-}
+pub const MAX_SIM_LEN: u64 = hyper_sim::storage::MAX_LEN;
 
 /// A simulated file with power-loss semantics. It has one owner, as every [`BlockFile`] does: a
 /// log's device thread while the log runs, the test once the log has given it back. Several threads
@@ -140,12 +62,12 @@ impl SimFile {
 
     /// The operations counted so far.
     pub fn stats(&self) -> Result<SimStats, DiskError> {
-        Ok(self.lock()?.state.stats)
+        Ok(self.lock()?.stats())
     }
 
     /// A copy of what would survive a crash that kept nothing unflushed.
     pub fn durable_image(&self) -> Result<Vec<u8>, DiskError> {
-        Ok(self.lock()?.state.durable.clone())
+        Ok(self.lock()?.durable_image())
     }
 
     /// The file's state, for one operation: no operation runs inside another, so it is never
@@ -157,14 +79,13 @@ impl SimFile {
     }
 }
 
-/// The simulated device itself: its images, faults, generator and counts, and the operations on
-/// them, each taking a transfer [`check`] has already accepted. [`SimFile`] holds one in a cell for
-/// its single owner; [`SimDevice`]'s device thread owns one and serves every handle from it, so the
-/// two behave alike by construction.
+/// The simulated device itself (hyper-sim's) and the name its errors carry. [`SimFile`] holds one in
+/// a cell for its single owner; [`SimDevice`]'s device thread owns one and serves every handle from
+/// it, so the two behave alike by construction. Every transfer reaching it is one [`check`] has
+/// already accepted.
 #[derive(Debug)]
 pub(crate) struct Disk {
-    state: State,
-    sector: u64,
+    device: Device,
     name: std::path::PathBuf,
 }
 
@@ -173,209 +94,97 @@ impl Disk {
         if sector > align {
             return Err(sim_error("sector larger than the alignment"));
         }
+        let sector = u64::try_from(sector.get()).map_err(|_| sim_error("sector"))?;
         Ok(Self {
-            state: State {
-                visible: Vec::new(),
-                durable: Vec::new(),
-                dirty: BTreeSet::new(),
-                faults: Vec::new(),
-                rng: SplitMix64::new(seed),
-                stats: SimStats::default(),
-            },
-            sector: u64::try_from(sector.get()).unwrap_or(u64::MAX),
+            device: Device::new(sector, seed).map_err(|e| sim_error(&e.to_string()))?,
             name: std::path::PathBuf::from(format!("sim-{seed:016x}")),
         })
     }
 
     pub(crate) fn inject(&mut self, fault: Fault) {
-        self.state.faults.push(fault);
+        self.device.inject(fault);
     }
 
     pub(crate) fn clear_faults(&mut self) {
-        self.state.faults.clear();
+        self.device.clear_faults();
     }
 
     pub(crate) fn crash(&mut self, crash: Crash) {
-        let state = &mut self.state;
-        let dirty: Vec<u64> = std::mem::take(&mut state.dirty).into_iter().collect();
-        for sector in dirty {
-            let keep = match crash {
-                Crash::Random => state.rng.next_u64() & 1 == 1,
-                Crash::LoseAll => false,
-                Crash::KeepAll => true,
-            };
-            if keep {
-                persist_sector(state, sector, self.sector);
-            }
-        }
-        state.visible = state.durable.clone();
-        state.stats.crashes = state.stats.crashes.saturating_add(1);
+        self.device.crash(crash);
     }
 
     pub(crate) fn stats(&self) -> SimStats {
-        self.state.stats
+        self.device.stats()
     }
 
     pub(crate) fn durable_image(&self) -> Vec<u8> {
-        self.state.durable.clone()
+        self.device.durable_image().to_vec()
     }
 
     pub(crate) fn len(&self) -> Result<u64, DiskError> {
-        u64::try_from(self.state.visible.len()).map_err(|_| sim_error("length"))
+        Ok(self.device.len())
     }
 
-    fn io(&self, op: &'static str, kind: std::io::ErrorKind) -> DiskError {
-        DiskError::Io {
+    /// The device's refusal as the file's: an EIO or ENOSPC as the OS would give it, a read past
+    /// the end as a short read, the rest as the simulation's own.
+    fn error(&self, error: StorageError) -> DiskError {
+        let io = |op, kind| DiskError::Io {
             op,
             path: self.name.clone(),
             source: std::io::Error::from(kind),
-        }
-    }
-
-    /// Fills `buf`, which [`check`] found ends at `end`, from `offset`.
-    pub(crate) fn read(&mut self, buf: &mut [u8], offset: u64, end: u64) -> Result<(), DiskError> {
-        let state = &mut self.state;
-        state.stats.reads = state.stats.reads.saturating_add(1);
-        let len = u64::try_from(buf.len()).map_err(|_| sim_error("length"))?;
-        let failed = state.faults.iter().any(|f| {
-            matches!(f, Fault::ReadError { offset: o, len: l } if overlaps(offset, len, *o, *l))
-        });
-        if failed {
-            return Err(self.io("read", std::io::ErrorKind::Other));
-        }
-        let (start, stop) = (
-            usize::try_from(offset).map_err(|_| sim_error("offset"))?,
-            usize::try_from(end).map_err(|_| sim_error("offset"))?,
-        );
-        let Some(src) = self.state.visible.get(start..stop) else {
-            return Err(DiskError::ShortRead {
+        };
+        match error {
+            StorageError::Io { op } => io(op, std::io::ErrorKind::Other),
+            StorageError::NoSpace => io("write", std::io::ErrorKind::StorageFull),
+            StorageError::ShortRead { offset, missing } => DiskError::ShortRead {
                 path: self.name.clone(),
                 offset,
-                missing: stop.saturating_sub(self.state.visible.len().max(start)),
-            });
-        };
-        buf.copy_from_slice(src);
-        for fault in &self.state.faults {
-            if let Fault::BitFlip {
-                offset: at, bit, ..
-            } = fault
-                && (offset..end).contains(at)
-            {
-                let index = usize::try_from(at.saturating_sub(offset)).unwrap_or(usize::MAX);
-                if let Some(byte) = buf.get_mut(index) {
-                    *byte ^= 1u8.checked_shl(u32::from(*bit % 8)).unwrap_or(0);
-                }
-            }
+                missing,
+            },
+            other => sim_error(&other.to_string()),
         }
-        Ok(())
     }
 
-    /// Writes `buf`, which [`check`] found ends at `end`, at `offset`, into the volatile cache.
-    pub(crate) fn write(&mut self, buf: &[u8], offset: u64, end: u64) -> Result<(), DiskError> {
-        let state = &mut self.state;
-        state.stats.writes = state.stats.writes.saturating_add(1);
-        if power_cut(state) {
-            return Err(self.io("write", std::io::ErrorKind::Other));
-        }
-        if let Some(i) = state.faults.iter().position(|f| *f == Fault::WriteError) {
-            state.faults.remove(i);
-            return Err(self.io("write", std::io::ErrorKind::Other));
-        }
-        let capacity = state.faults.iter().find_map(|f| match f {
-            Fault::Capacity { len } => Some(*len),
-            _ => None,
-        });
-        if capacity.is_some_and(|cap| end > cap) {
-            return Err(self.io("write", std::io::ErrorKind::StorageFull));
-        }
-        let (start, stop) = (
-            usize::try_from(offset).map_err(|_| sim_error("offset"))?,
-            usize::try_from(end).map_err(|_| sim_error("offset"))?,
-        );
-        if state.visible.len() < stop {
-            state.visible.resize(stop, 0);
-        }
-        if let Some(dst) = state.visible.get_mut(start..stop) {
-            dst.copy_from_slice(buf);
-        }
-        let first = offset.checked_div(self.sector).unwrap_or(0);
-        let last = end.saturating_sub(1).checked_div(self.sector).unwrap_or(0);
-        if !buf.is_empty() {
-            state.dirty.extend(first..=last);
-        }
-        // A stored bit flip is re-applied on every read of its byte; a write over it heals it.
-        state.faults.retain(|f| {
-            !matches!(f, Fault::BitFlip { offset: at, stored: true, .. } if (offset..end).contains(at))
-        });
-        Ok(())
+    /// Fills `buf` from `offset`.
+    pub(crate) fn read(&mut self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
+        self.device.read(buf, offset).map_err(|e| self.error(e))
+    }
+
+    /// Writes `buf` at `offset` into the volatile cache.
+    pub(crate) fn write(&mut self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
+        self.device.write(buf, offset).map_err(|e| self.error(e))
     }
 
     /// The write, durable on its own as a FUA write is: its sectors reach the medium before it
-    /// returns, and every other sector not yet flushed stays as it was, durable at the next flush
-    /// or not at a crash. One operation, as a power cut counts it.
+    /// returns, and every other sector not yet flushed stays as it was. One operation, as a power
+    /// cut counts it.
     pub(crate) fn write_durable(
         &mut self,
         buf: &[u8],
         offset: u64,
-        end: u64,
     ) -> Result<crate::block::Durable, DiskError> {
-        self.write(buf, offset, end)?;
-        let state = &mut self.state;
-        state.stats.durable_writes = state.stats.durable_writes.saturating_add(1);
-        if buf.is_empty() {
-            return Ok(crate::block::Durable::Written);
-        }
-        let first = offset.checked_div(self.sector).unwrap_or(0);
-        let last = end.saturating_sub(1).checked_div(self.sector).unwrap_or(0);
-        for sector in first..=last {
-            state.dirty.remove(&sector);
-            persist_sector(state, sector, self.sector);
-        }
-        Ok(crate::block::Durable::Written)
+        self.device
+            .write_durable(buf, offset)
+            .map(|()| crate::block::Durable::Written)
+            .map_err(|e| self.error(e))
     }
 
     /// Makes every sector the device holds unflushed durable, whichever handle wrote it: a flush
-    /// is the file's and the device's, not the descriptor's (fdatasync(2): "all modified in-core
-    /// data of the file referred to by fd"; fcntl(2) on macOS, F_FULLFSYNC: the drive flushes all
-    /// buffered data to permanent storage).
+    /// is the file's and the device's, not the descriptor's.
     pub(crate) fn sync(&mut self) -> Result<(), DiskError> {
-        let state = &mut self.state;
-        state.stats.syncs = state.stats.syncs.saturating_add(1);
-        if power_cut(state) {
-            return Err(self.io("sync_data", std::io::ErrorKind::Other));
-        }
-        let dirty: Vec<u64> = std::mem::take(&mut state.dirty).into_iter().collect();
-        if let Some(i) = state.faults.iter().position(|f| *f == Fault::SyncError) {
-            state.faults.remove(i);
-            // The kernel has marked these pages clean; whether they reached the medium is
-            // unknown, and a later flush will not write them again.
-            for sector in dirty {
-                if state.rng.next_u64() & 1 == 1 {
-                    persist_sector(state, sector, self.sector);
-                }
-            }
-            return Err(self.io("sync_data", std::io::ErrorKind::Other));
-        }
-        for sector in dirty {
-            persist_sector(state, sector, self.sector);
-        }
-        if state.durable.len() < state.visible.len() {
-            let len = state.visible.len();
-            state.durable.resize(len, 0);
-        }
-        Ok(())
+        self.device.sync().map_err(|e| self.error(e))
     }
 }
 
 /// Refuses what a direct-I/O file would refuse: misaligned offsets, lengths and buffer
-/// addresses, so tests catch an engine that would fail on a real `O_DIRECT` file. The transfer's
-/// end on success.
+/// addresses, so tests catch an engine that would fail on a real `O_DIRECT` file, and transfers
+/// past the largest simulated file.
 pub(crate) fn check(
     align: Alignment,
     addr: usize,
     offset: u64,
     len: usize,
-) -> Result<u64, DiskError> {
+) -> Result<(), DiskError> {
     // A transfer of no bytes has no first byte to align (`DeviceFile::check_address`).
     if !align.is_aligned_u64(offset)
         || !align.is_aligned(len)
@@ -392,50 +201,7 @@ pub(crate) fn check(
     if end > MAX_SIM_LEN {
         return Err(sim_error("simulated file larger than MAX_SIM_LEN"));
     }
-    Ok(end)
-}
-
-/// Copies one sector from the visible image to the durable one, growing it as needed.
-fn persist_sector(state: &mut State, sector: u64, size: u64) {
-    let Some(start) = sector
-        .checked_mul(size)
-        .and_then(|s| usize::try_from(s).ok())
-    else {
-        return;
-    };
-    let size = usize::try_from(size).unwrap_or(0);
-    let end = start.saturating_add(size).min(state.visible.len());
-    if start >= end {
-        return;
-    }
-    if state.durable.len() < end {
-        state.durable.resize(end, 0);
-    }
-    if let (Some(dst), Some(src)) = (
-        state.durable.get_mut(start..end),
-        state.visible.get(start..end),
-    ) {
-        dst.copy_from_slice(src);
-    }
-}
-
-/// Counts one write or flush against an armed power cut; true once the power is off.
-fn power_cut(state: &mut State) -> bool {
-    for fault in &mut state.faults {
-        if let Fault::PowerCut { ops } = fault {
-            if *ops == 0 {
-                return true;
-            }
-            *ops = ops.saturating_sub(1);
-        }
-    }
-    false
-}
-
-fn overlaps(offset: u64, len: u64, start: u64, span: u64) -> bool {
-    let end = offset.saturating_add(len);
-    let fault_end = start.saturating_add(span);
-    offset < fault_end && start < end
+    Ok(())
 }
 
 pub(crate) fn sim_error(what: &str) -> DiskError {
@@ -443,25 +209,6 @@ pub(crate) fn sim_error(what: &str) -> DiskError {
         op: "sim",
         path: std::path::PathBuf::from("sim"),
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, what.to_owned()),
-    }
-}
-
-/// SplitMix64 (Steele, Lea and Flood, "Fast Splittable Pseudorandom Number Generators",
-/// OOPSLA 2014): one word of state, so that every crash and fault replays from its seed.
-#[derive(Debug, Clone)]
-struct SplitMix64(u64);
-
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
     }
 }
 
@@ -475,13 +222,13 @@ impl BlockFile for SimFile {
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
-        let end = check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
-        self.lock()?.read(buf, offset, end)
+        check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
+        self.lock()?.read(buf, offset)
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
-        let end = check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
-        self.lock()?.write(buf, offset, end)
+        check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
+        self.lock()?.write(buf, offset)
     }
 
     /// The sim stands for a direct file on Linux, so that one run's bytes are every platform's.
@@ -495,8 +242,8 @@ impl BlockFile for SimFile {
         buf: &[u8],
         offset: u64,
     ) -> Result<crate::block::Durable, DiskError> {
-        let end = check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
-        self.lock()?.write_durable(buf, offset, end)
+        check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
+        self.lock()?.write_durable(buf, offset)
     }
 
     fn sync_data(&self) -> Result<(), DiskError> {

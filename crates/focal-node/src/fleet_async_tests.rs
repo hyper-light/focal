@@ -1410,17 +1410,18 @@ fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_full() {
     })
     .unwrap()
 }
-/// A session that leads a term it is not yet ready in does not serve: its progress names it leader,
-/// not authoritative (`ReplicaProgress::serves`), until the term's first entry is durable and the
-/// barrier asked behind it answered. A write sent meanwhile waits for the term, held by its owner
-/// while the entry persists, and commits. A node's Ready waits on the same fact: said on a known
-/// leader alone, it was said before the term was ready in 11 of about 140 starts under load
+/// A session that campaigned and is not yet ready in its term does not serve: its progress names
+/// it not authoritative (`ReplicaProgress::serves`) until the term's first entry is durable and the
+/// barrier asked behind it answered; the one voter leads only once the hard state naming its vote
+/// is durable as well (hyper-raft's I9). A write sent meanwhile waits for the term, held by its
+/// owner while the writes persist, and commits. A node's Ready waits on the same fact: said on a
+/// known leader alone, it was said before the term was ready in 11 of about 140 starts under load
 /// (2026-10-12).
 #[test]
 fn a_leader_serves_once_its_term_is_ready() {
     focal_rt::block_on(async move {
         let path = tempfile::tempdir().unwrap();
-        // The paused writer holds the campaign's first entry: the session leads, not ready.
+        // The paused writer holds the campaign's first write: the session is not ready.
         let (fixture, (resume, disk)) = fixture_with(
             path.path(),
             1,
@@ -1431,7 +1432,6 @@ fn a_leader_serves_once_its_term_is_ready() {
         );
         let host = fixture.hosts[&ledger(1)].clone();
         let progress = host.progress();
-        assert_eq!(progress.leader, progress.node, "{progress:?}");
         assert!(
             !progress.authoritative && !progress.serves(),
             "{progress:?}"

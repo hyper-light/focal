@@ -87,6 +87,7 @@ pub fn local_config() -> RuntimeConfig {
         page_bytes: LOCAL_PAGE_BYTES,
         spin_ns: 0,
         wake_tracking: None,
+        latency_objective_ns: None,
     }
 }
 

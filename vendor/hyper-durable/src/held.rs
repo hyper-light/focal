@@ -9,6 +9,7 @@ use hyper_raft::{InitialState, Storage, StorageError};
 use crate::store::LogStore;
 
 /// The core's view of what is durable.
+#[derive(Clone)]
 pub struct Held<L> {
     pub(crate) log: L,
     /// The configuration the state machine opened at.

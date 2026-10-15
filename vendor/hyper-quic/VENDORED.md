@@ -817,3 +817,301 @@ rows.
   - Upstream quinn-proto gates the same pieces behind its own `qlog` feature.
 - **Checked.** Clippy -D warnings and the 392 unit tests pass in both builds, with the feature and
   without it.
+
+## 21. BBR starts at RFC 9002's initial window (2026-10-11)
+
+- **Patch Q10: `BbrConfig`'s initial window is RFC 9002 §7.2's unless one is set.**
+  - Upstream's default was 200 datagrams of 1,200 bytes, 240,000 bytes. That number is Chromium's
+    `kMaxInitialCongestionWindow`, its bound on a window resumed from a cached bandwidth, not a
+    start. RFC 9002 §7.2 starts a sender at ten datagrams, at most 14,720 bytes; CUBIC, NewReno and
+    Copa here already did, by the path's datagram size.
+  - The path's warm-up (§15) measures to four initial windows a round trip and spends at most
+    sixteen, by the law's own initial window. Under BBR those were 960 kB and 3.84 MB a connection,
+    for every remote a connection measured, once a lifetime.
+  - Found by focal. Its three metadata owners in one process, their endpoints on one thread, spent
+    that thread on warm-up padding: one connection sent 2,546 warm-up packets (3.7 MB), where
+    RFC 9002's window makes the budget 160. Their votes and appends waited behind it, and the
+    quorum test failed 9 runs of 10 under BBR. With RFC 9002's window it passed 10 of 10.
+  - `BbrConfig::initial_window` is now `None` unless set. Unset, it is RFC 9002's for the path's
+    current datagram size, recalculated as that changes; a value set is kept, as CUBIC's is.
+- **Tests.**
+  - `congestion::bbr::tests::the_initial_window_is_rfc_9002s_by_the_datagram_size_unless_set`.
+  - `every_law_warms_its_path_up_within_sixteen_initial_windows` (`tests/geo.rs`): each law's
+    warm-up, counted from each side's `PathStats::sent_warm_up_packets`, stays within sixteen
+    initial windows. Before the patch BBR's client sent 3,200 warm-up packets where at most 193
+    fit.
+  - The geo harness's scenarios name the law both endpoints run: CUBIC, their default, unless a
+    check is of the laws.
+- **Checked.** Clippy -D warnings with and without default features; the 393 unit tests and the
+  integration suites pass.
+
+## 22. A run of PADDING is one frame (2026-10-11)
+
+- **Patch Q11: `frame::Iter` takes a run of PADDING whole.**
+  - Each PADDING frame is one zero byte of no meaning (RFC 9000 §19.1). Upstream decoded each
+    as a frame of its own: a frame type read, a match, a `Frame::Padding` that every reader
+    then passes over (`process_payload`, `process_while_closed`, the frame statistics).
+  - A datagram padded to the path's MTU therefore cost its receiver about 1,450 frames. A path's
+    warm-up (§15) and its MTU probes send such datagrams. So does a padded Initial. A server
+    that five hundred fresh connections warm up receives up to sixteen initial windows of them
+    from each: a benchmark of 512 connections had to wait seconds for the warm-ups before its
+    timing meant anything (hyper-rt-transport's `benches/connections.rs`).
+  - The iterator now scans the run to its first non-zero byte and yields one `Frame::Padding`.
+    Every reader already skips it, so nothing else changes.
+- **Measured** (`frame::test::measure_a_padded_datagram`, release, a PING padded to 1,452 bytes):
+  4,019 ns and 1,452 frames before, 472 ns and 2 frames after, before the per-frame work of the
+  connection's readers, which the patch also spares.
+- **Tests.** `frame::test::a_run_of_padding_is_one_frame`: 100 bytes of padding, a PING, 50
+  more, decode as three frames (151 before). The 394 unit tests and the integration suites pass.
+
+## 23. The warm-up is background traffic (2026-10-11)
+
+- **Patch Q12: the path's warm-up (§15) ends at its own queue, as LEDBAT++'s slow start does.**
+  - A warm-up measures to four initial windows a round trip. Over a path that carries far less,
+    its packets queued, and where the queue held them all no loss ended it: it ran to its budget
+    of sixteen initial windows, on a 128 kbit/s path some twelve seconds of padding that every
+    other packet waited behind. focal's 128 kbit/s crossing test (a relay of 32 datagrams each way)
+    found no leader within ten seconds in 4 of 6 runs on Linux CI with the warm-up on, its election
+    votes queued behind it, and in none of 6 with it off (focal's diag run 38171360767).
+  - RFC 9406's delay increase (HyStart++), tried first, compares each round trip's least RTT with
+    the last's. A warm-up's round trip begins with an empty queue, so its least sample stays at the
+    base however fast the others rise, and on a slow path a round trip lasts as long as the queue:
+    on the pair below it ended only in its third round trip.
+  - A warm-up is traffic of use to no one but the next connection, LEDBAT's case (RFC 6817). It now
+    runs as LEDBAT++'s slow start (draft-irtf-iccrg-ledbat-plus-plus §4.1, §4.5):
+    - it begins with two packets ("LEDBAT++ sender limits the initial window to 2 packets"), sent
+      once nothing of the connection is in flight, so its first sample is its own packets' alone;
+    - its window grows by what each acknowledgement acknowledges;
+    - it ends once its queueing delay is larger than three quarters of the 60 ms target: the least
+      of its four most recent RTT samples, none older than a round trip (RFC 6817 §2.5), past the
+      least of all its samples.
+  - Only its own packets judge it (`SentPacket::warm_up`). A smaller packet's RTT is shorter by the
+    time the path takes to carry the difference (91 ms of a 1,452-byte datagram at 128 kbit/s), and
+    a packet sent before the warm-up began met another flight's queue (the handshake's, at its end).
+  - **Departure from LEDBAT++.** The window grows by all an acknowledgement acknowledges, not by
+    LEDBAT++'s GAIN of it (§4.2: as little as 1/16 on a short path). The GAIN shares congestion
+    avoidance among background flows, which a warm-up never enters; and the warm-up's budget is
+    slow start's geometric sum, which growth at a sixteenth would spend before the target on a
+    short path.
+  - `PathStats::warm_up_end` says why a warm-up ended (`WarmUpEnd`: measured, queued, congestion,
+    budget, path changed).
+- **Measured** (the pair, 128 kbit/s each way, 10 ms one way, a queue without bound):
+  - before the patch: 160 and 163 warm-up packets, each side ending at its budget, the smoothed RTT
+    7.3 s;
+  - with RFC 9406's exit alone: 41 and 35, the smoothed RTT 1.9 s and 1.3 s, the pair idle after
+    8.4 s;
+  - with the patch: 6 a side, each ending queued at its second sample, the smoothed RTT 172 ms and
+    192 ms, the pair idle after 1.9 s.
+  - Without a rate on the path, the warm-up still measures.
+- **Tests.**
+  - `tests::a_warm_up_over_a_slow_path_ends_once_its_packets_queue_and_over_a_fast_one_measures_it`
+    fails before the patch (the warm-up ended at its budget). It runs on the pair's new link rate,
+    `Pair::rate`: each direction carries so many bytes a second, with a queue without bound behind
+    it.
+  - `resume::tests::a_queue_is_the_least_recent_sample_past_the_least_by_three_quarters_of_60_ms`,
+    `a_warm_up_begins_with_two_packets_and_grows_by_what_is_acknowledged` and
+    `a_warm_up_whose_packets_queue_ends_as_an_attempt`; the existing warm-up tests check each end's
+    cause.
+  - The 398 unit tests and the integration suites pass, and hyper-transport's suites with them.
+
+## 24. A warm-up that cannot meet its target stops, and one that can keeps what it measured (2026-10-11)
+
+- **Patch Q13: the warm-up's end at its budget, a plateau, and its own byte count.**
+  Measured on focal's three-node fleet:
+  - **Where it ran.** Loopback paths of about 0.1–1 ms and relay paths of 5 ms at 100 Mbit/s,
+    every warm-up's start, rounds and end printed.
+  - **How the warm-ups ended.** Most ran to their budget of 160 packets (232 KB each), measuring
+    nothing.
+  - **Why, on loopback.** BBR's window sat at its floor of four datagrams (the bandwidth-delay
+    product of an 86 µs path is a few kilobytes). Every round trip after that delivered three
+    datagrams, while the warm-up's own window kept doubling.
+  - **What it broke.** On Linux CI, padding from a warm-up that ran in an idle gap was counted as
+    bytes of a copy: `evidence_quic`'s copy test failed 2 of 3 runs with the warm-up on and none of
+    3 with it off.
+  - **The budget ended the warm-up as it sent.** The round trip in flight then, the one that met
+    the target, was acknowledged to an ended warm-up, and the measurement was lost. Now the budget
+    stops the sending: the warm-up ends once its last packet is acknowledged, short of the target,
+    and a round trip that met it is published.
+  - **A plateau ends it.** BBR's full-pipe test (draft-ietf-ccwg-bbr §4.3.1.2): three round trips
+    that each deliver less than a quarter more than the last one that grew, short of the target,
+    end the warm-up as an attempt (`WarmUpEnd::Plateau`).
+    - Only the warm-up's own acknowledged bytes are judged (`SentPacket::warm_up`). A reply the
+      application had in flight as the warm-up began set the bar its slow start from two packets
+      had to clear. On the 500 ms geo path, 12,647 bytes of a reply, then the warm-up's 1,200,
+      3,600 and 9,600 were counted as no growth, and the warm-up ended short of the measurement
+      that path's test needs.
+    - Only a round trip in which a window held the warm-up back is judged, its own or the
+      connection's (with its pacer). A round trip spent waiting for a quiet connection says
+      nothing of the path, as BBR judges no application-limited round trip.
+  - **Its own bytes are counted.** `PathStats::sent_warm_up_bytes` counts the warm-up's datagrams,
+    each its own. hyper-transport's `PathFacts::warm_up_bytes` carries the count, so a count of
+    what crossed a path can take the warm-up's padding out.
+  - **Whether a warm-up is still to come.** `PathStats::warm_up_pending` (hyper-transport's
+    `PathFacts::warming_up`) says whether the warm-up is yet to end: measuring, or waiting for an
+    idle connection. A connection warms its path up at most once, so a count of what crosses a
+    path can wait until no warm-up is pending and see the application's bytes alone.
+    - Taking the padding out by the sender's count does not work. The sender counts a datagram as
+      it sends it; a relay counts it once it has carried it, or never if it drops it.
+    - On Linux CI, in 1 run of 6, a copy then counted 27,218 bytes for a chunk of 65,536.
+- **Tests.**
+  - `resume::tests::a_warm_up_whose_round_trips_stop_growing_ends_as_an_attempt`: a plateau short
+    of the target ends it, a round trip no window held is not judged, and a plateau past the target
+    publishes.
+  - The budget test now checks that the warm-up ends once its last packet is acknowledged, and
+    that a last round trip meeting the target is published.
+  - `tests::a_warm_up_keeps_what_its_last_round_trip_measures`: under BBR at 100 Mbit/s and 40 µs
+    one way. It fails with the old budget (ended at the budget).
+  - The slow-path test checks the byte count.
+  - The 400 unit tests and the congestion, e2e, geo and handshake suites pass, with
+    hyper-transport's.
+
+## 25. Acknowledgments alone are not padded to the MTU (2026-10-12)
+
+- **Patch Q14: `pad_to_mtu` pads ack-eliciting packets only.**
+  - Upstream pads every 1-RTT datagram when `pad_to_mtu` is on, a packet of acknowledgments alone
+    included. A padded packet is in flight and counts against the congestion window: RFC 9002 §2
+    ("in flight when they are ack-eliciting or contain a PADDING frame") and §3. But a packet of
+    acknowledgments is never checked against the window (`start_datagram` checks ack-eliciting
+    packets), so padded it went past the window, which RFC 9002 §7 forbids ("MUST NOT send a
+    packet if it would cause bytes_in_flight ... to be larger than the congestion window").
+  - Nothing frees it either. A peer acknowledges a non-ack-eliciting packet only along with an
+    ack-eliciting packet of its own (RFC 9000 §13.2.1: "An endpoint that is only sending ACK frames
+    will not receive acknowledgments from its peer"). A client that only acknowledges a server's
+    flight holds the window its padded acknowledgments took until a later exchange.
+  - Found on windows-2025 CI, `tests::pad_to_mtu` (run 38316593172): the client sent nothing,
+    "blocked by congestion control". The server's warm-up (§15) ran to its budget of about 160
+    padded PINGs, and the client acknowledged them in twelve packets padded to 1,333 bytes (its
+    packet numbers 3 to 14), three of them drawn at once by packet numbers the server skipped
+    (RFC 9000 §21.4, §13.2.1), none checked against the window. How many the skips add is random,
+    so the test passed in most runs.
+  - The padding hides the size of what the application sends, the option's stated purpose. A
+    packet of acknowledgments carries none of it. The flag is now set once a packet is certain to
+    be sent, and only for an ack-eliciting one, so a congestion check that held a packet back
+    sets nothing either.
+- **Tests.** `tests::padding_to_the_mtu_leaves_acknowledgments_unpadded_and_out_of_flight`: a client
+  padding to its MTU acknowledges more server pings than its window holds padded datagrams; every
+  acknowledgment is an ACK frame alone and nothing of the client is left in flight. It fails before
+  the patch, 1,333 bytes in flight. `tests::pad_to_mtu` and the unit and integration suites pass.
+
+## 26. A stream holds the spans its window pays for (2026-10-13)
+
+- **Patch Q15: the assembler's span bound follows the peer's window** (`connection/assembler.rs`,
+  `max_spans`).
+  - Upstream bounds the spans a stream holds out of order at a fixed 1,024
+    (`MAX_CHUNKS`: "ngtcp2 uses a threshold of 4000 -- try to be a little more conservative?"),
+    and closes the connection with INTERNAL_ERROR, "too many gaps in stream buffer", past it. A
+    legitimate sender reaches it: a window of frames of `d` bytes with every other frame lost
+    holds `window / (2d)` spans, so any stream window past `2 · 1,024 · d`, 2.3 MB at the smallest
+    datagram, can be closed by its own sender's losses. slates' congestion bake-off found it on
+    hyper-quic's harness (`docs/benchmarks.md`, "slates' congestion bake-off on hyper-quic"):
+    at 100 Mbit/s and 100 ms with no random loss, a slow start overshot the drop-tail queue, which
+    then lost every other datagram of the round trip, and the receiver refused its 1,025th span
+    1.36 s in, 2.4 MB buffered in a 4.8 MB reach. NewReno and CUBIC carried nothing after that at
+    100 and 300 ms, BBR nothing at 300 ms. focal met the same limit with a 10 MiB window, and
+    hyper-transport capped its stream window at `2 · 1,024 · d` for it (patch Q5). Upstream's
+    issue #2809 is its contiguous form, closed by PR #2814, which this crate carries.
+  - The bound is now the spans whose own memory, a `Buffer` each, fits in the window the peer
+    holds at their most (twice the bound, the compaction's slack), and never under the 1,024
+    upstream kept. The window is what the peer may send past what the application has read: the
+    stream's `sent_max_stream_data` for a stream, the crypto buffer for CRYPTO frames (where the
+    floor stays the bound: 16 KiB pays for under 1,024). So what a peer makes the receiver hold
+    for disorder stays within the memory the window already grants, Linux's budget for a receive
+    buffer's overhead (`tcp_adv_win_scale` = 1, Documentation/networking/ip-sysctl.rst), and a
+    sender whose frames carry at least a `Buffer`'s size is never refused for its losses. A peer
+    of one-byte frames past gaps is refused once its spans pass the bound, as before.
+  - `MAX_STREAM_CHUNKS` stays exported, now the floor: hyper-transport's stream window ceiling,
+    derived from it, is still never refused, and is no longer what keeps the connection open.
+- **Tests.**
+  - `assembler::test::a_window_with_every_other_frame_lost_is_held`: 10 MiB of 1,134-byte frames,
+    every other one lost, held and read back byte for byte once the lost ones come. It fails
+    under the fixed bound at its 1,025th span.
+  - `assembler::test::spans_past_what_the_window_pays_for_are_refused`: one-byte frames past
+    gaps are refused once past the bound, the spans held never costing more than the window.
+  - `tests/congestion.rs`, `a_slow_starts_overshoot_at_a_large_window_keeps_its_connection`:
+    NewReno at 100 Mbit/s and 100 ms for 2 s with a window of four times the path and its queue
+    keeps its connection; under the fixed bound the server closed it at 1.36 s.
+  - The assembler's earlier tests keep upstream's bound through a limit at the floor.
+
+## 27. The copies' scan looks at the handshake's flights alone (2026-10-13)
+
+Measured by `benches/vs_upstream.rs` (hyper-quic against upstream quinn-proto 0.11.18 in one process,
+the same TLS on both sides; `docs/benchmarks.md`, "hyper-quic against upstream quinn-proto"). With its
+defaults, hyper-quic took 1.58 times upstream's instructions a mebibyte of bulk transfer and 1.30
+times an exchange of 64 bytes each way; with the handshake's copies and Careful Resume off, 1.07 and
+1.18. A profile of the bulk transfer (`sample`) put 41% of hyper-quic's samples in
+`Connection::poll_transmit`'s own code against 8% with both off, and turning the features off one at a
+time put the cost on the copies.
+
+- **`PacketSpace::queue_copies` visited every packet in flight at every transmission.** Only packets
+  of the handshake's flights are ever copied (§13, §17), all sent while the handshake runs or in the
+  application's first round trip, but the scan walked the whole `sent_packets` map: a window of
+  thousands of packets was walked for each datagram sent. A space now keeps `flights_end`, one past
+  the largest packet number it sent as one of the flights, and the scan walks `..flights_end`.
+  `Connection::queue_copies` returns before working out the copies' spacing (the burst estimate and
+  its fixed-point logarithm) when no space holds a flight in flight (`PacketSpace::holds_flights`).
+- **`Connection::after_fill` read every space's pending frames at every transmission**, to stop a
+  space sending copies once its queue had emptied. It now reads them only for a space that is sending
+  copies.
+- After the change (three rounds at load 10–12), instructions against upstream's: a mebibyte 1.068
+  (copies and Careful Resume off, 1.059), an exchange of 64 bytes each way 1.121 (1.089), of 4 KiB
+  1.072, of 64 KiB 1.060; a full handshake 0.805, a resumed one 0.738. What remains is spread over the
+  patches' per-packet work (`finish_and_track`, the receive side's reads, `initial_window`), no one
+  site above a few percent of the samples.
+- **Tests.** `tests::the_copies_look_at_the_handshakes_flights_alone`: after the handshake, a client
+  with a window of packets of a bulk stream in flight has no flight left to scan. The copies' own
+  tests (`tests/geo.rs`, `connection::copies`) pass unchanged.
+
+## 28. STREAMS_BLOCKED sent when the peer's stream limit stops an open, and kept when heard (2026-10-13)
+
+Upstream never sent STREAMS_BLOCKED. `Streams::open` returned `None` at the peer's limit and left a
+`TODO: Queue STREAM_ID_BLOCKED if this fails`. A received STREAMS_BLOCKED was logged and dropped.
+RFC 9000 §4.6 says a sender SHOULD send STREAMS_BLOCKED when it wishes to open a stream but cannot
+because of the peer's maximum stream limit. A peer that grants streams as they are wanted, holding
+back what it cannot take (hyper-transport's stream pool, admission credit as Breakwater's, Cho et
+al., OSDI 2020), has no other word that this side wants more.
+
+- **Sent.** An open refused at the peer's limit queues the frame once for that limit
+  (`StreamsState::streams_blocked_limit`), as DATA_BLOCKED is queued once for each connection
+  limit. It is written while the limit stands (`can_send_streams_blocked`), with the limit the
+  peer last sent, and retransmitted on loss like any control frame (`Retransmits::streams_blocked`)
+  unless the peer has raised the limit since. `Streams` now carries the data space's pending
+  frames, as `SendStream` does, so `open` can queue it.
+- **Heard.** The limit the peer reports is kept per direction. `Connection::peer_streams_blocked`
+  says whether the peer is blocked with no more streams on their way: it reported the limit it was
+  last sent, and no greater limit is sent or waiting to be (a raise not yet sent is on its way, so a
+  side granting streams does not grant twice for one report).
+- **What is left to open.** `Streams::remaining` says the streams this side may still open in a
+  direction, its peer's limit less those opened: with the streams it holds, what its peer grants
+  it, by which an asker bounds what it queues for streams (hyper-transport's `AskQueue::Credit`).
+- **Test.** `an_open_at_the_peers_limit_says_so_once_for_each_limit`: one frame for each limit, none
+  written once the limit is raised, the frame again at the new limit, and the receiving side
+  blocked only at the limit it last sent with none greater on its way.
+
+## 29. A finished reply gives its stream's credit back with it (2026-10-13)
+
+A peer-initiated bidirectional stream gave its credit back (`stream_freed`: its count among the
+allocated taken out, so `ensure_remote_streams` raises the limit within the window) only once both
+halves were freed: its request read whole, and its reply's last frames acknowledged. The raised
+MAX_STREAMS then went out alone, a round trip after the reply, since a server has nothing more
+for that peer once its reply is acknowledged. hyper-transport's pooled credit
+(docs/transport.md §4g) grants a pooled peer streams one at a time, so every exchange cost the
+server that datagram, and the peer the wait for it.
+
+A stream's credit now goes back at the first of: its request read whole with its reply finished
+(`StreamsState::return_credit_early`, from `SendStream::finish` and `stream_recv_freed`), or its
+freeing as before. The stream's send half records that it did (`Send::credit_returned`), so its
+freeing, by the reply's acknowledgement or by a reset's, gives none again. Once returned at the
+finish, the raised limit is queued at once (`queue_max_stream_id`), and it goes out in the reply's
+datagrams.
+
+RFC 9000 §4.6 lets an endpoint raise MAX_STREAMS at any time; it must be prepared for what it
+allows. The streams over the window at once are those whose reply waits for its acknowledgement,
+which their state already holds: Breakwater's overcommit of credit issued in its responses (Cho et
+al., OSDI 2020). An application that manages the window (`set_max_concurrent_streams`) sets
+it before it finishes a reply, so the credit goes back within what it decided.
+
+Tests: `a_finished_response_gives_its_streams_credit_back_once_before_its_acknowledgement` (it fails
+without the change, at "announced with the response"); hyper-transport's
+`a_pooled_servers_stream_goes_back_with_the_reply` (20 exchanges through a pool of one: 40
+datagrams of each side, where they took 59) and `a_pool_sized_to_nothing_holds_its_peer_until_sized_again`
+(the pool settled before the finish).

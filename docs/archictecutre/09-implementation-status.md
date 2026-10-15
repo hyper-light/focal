@@ -15240,3 +15240,54 @@ warnings`, `bash scripts/check-production.sh` (1184 production sources, no polic
 no runtime recursion), `cargo deny check advisories bans licenses sources`, and `bash
 scripts/cargo.sh test --workspace --locked --no-fail-fast -- --test-threads=4`: 167 test
 binaries, 3463 passed, 0 failed, 31 ignored.
+
+### 2026-10-15 — The shared crates at hyper-raft 80c1f82, one revision for all thirteen
+
+All thirteen `hyper-*` snapshots move to hyper-raft main's `80c1f82`. Until now twelve came from
+`5007f44` (focal's admission credit on main's `bb10fb3`) and `hyper-transport` from `81af6b3` (that
+and a lane's room event), both branches of the shared repository. Main now holds both, and every
+crate comes from one revision of it again.
+
+What main brings to focal besides them:
+- hyper-raft: a candidate counts its vote for itself once the hard state naming it is durable
+  (the shared repository's `docs/durable.md` I9, etcd's rule). Counted at once, a sole voter whose
+  writes ran behind its decisions could lead a term on a vote it then lost to a crash, and that term
+  could have a second leader (the shell's simulation, seed 206). A sole voter now leads after the
+  write that holds its vote: a proposal made before its owner drives that write is refused
+  `NoLeader`, as any proposal without a leader is, and its term's first entry is written by the
+  drain after. Three of focal's tests counted on the vote counting at once, and now drain until the
+  member leads: `a_change_of_membership_is_applied_only_once_the_log_holds_its_commit` (the founder
+  reopened alone leads at the drain after the one that gives what its log replayed),
+  durable_control's `leader` (it drains until the one voter leads and its term's first entry is
+  committed and applied, each drain moving it on), and `a_leader_serves_once_its_term_is_ready`
+  (the paused writer now holds the vote's write: the session is not ready, and serves once the
+  writes are durable). focal's own founders already drain until authoritative or a counted number
+  of times past the write. On ticks, as focal elects, a candidate's election timeout stands as
+  before; by suspicion a sole voter campaigns once a term.
+- hyper-durable: a write refused for room is made again with the messages it held only while the
+  core's log still holds the entry it ended at. A follower that acknowledged entries in a write the
+  log refused, and took a later leader's append cutting them away before the refusal came, released
+  that acknowledgement over a log made durable without them (I2; the shell's simulation, seed 3828).
+- hyper-rt's poll, wake and channel paths, redesigned (the shared repository's
+  `docs/research/event-loop.md`), and a consumer's latency objective for one loop step
+  (`RuntimeConfig::latency_objective_ns`). focal's local shards keep their fixed quanta, so
+  `focal_rt::local_config` states none. The machine's wake probe keeps a wake slower than its
+  round's share, where it gave the wake up and could refuse on a loaded host.
+- hyper-quic's patch Q15: a stream holds the out-of-order spans its window pays for, where
+  upstream's fixed 1,024 closed a connection under its own sender's losses. The copies of the
+  handshake's flights scan only those flights.
+- hyper-liveness: a pair's report states the interval its own heartbeats go at and when the next
+  is due (`PairReport::sending`, `sending_due_ns`).
+- hyper-block's simulated file now lives in hyper-sim (its `sim` feature, which focal does not
+  enable).
+
+The gate on this tree, on focal main's `95294367` (macOS 26.4.1 arm64, load average 8 to 12 under
+other sessions' builds and tests), exit 0: `cargo fmt --all --check`, `python3
+scripts/check-contracts.py` (1564 links, 37 source hashes, 15 vocabularies), `bash scripts/cargo.sh
+clippy --workspace --all-targets --locked -- -D warnings`, `bash scripts/check-production.sh` (1185
+production sources, no policy allowance, no runtime recursion), `cargo deny check advisories bans
+licenses sources`, and `bash scripts/cargo.sh test --workspace --locked --no-fail-fast --
+--test-threads=4`: 167 test binaries, 3469 passed, 0 failed, 31 ignored. The same gate on main's
+`28d2382b` with the crates at hyper-raft's `6d76f3c` (the vote alike), before the three tests drained
+to their leader: 3460 passed, those three failed (each its member still a candidate, or its term's
+first entry not yet committed); with them and the crates at `80c1f82`, 3463 passed.

@@ -1455,43 +1455,54 @@ fn a_followers_answer_waits_for_the_write_that_holds_what_it_says() {
     assert_eq!(light.messages()[0].index, 5);
 }
 
-/// I1: a leader whose term and vote are not durable sends nothing at once,
-/// even to a learner it replicates to; once they are, it does.
+/// Election Safety across a crash: a candidate counts its vote for itself only once the hard state
+/// naming it is durable, so a sole voter leads only from then. Counted at once, the sole voter led on
+/// a vote it could lose: hyper-durable's simulation, seed 206 of its first shape, had member 3 elected
+/// alone in term 3 under a configuration it held unwritten, crash with its vote and that
+/// configuration unwritten, and vote for member 1 in term 3 once restarted, which led term 3 too.
+/// Each step the leader takes from then waits as before: it sends at once only while its term and
+/// vote are durable (I1), and commits only what it made durable (I3).
 #[test]
-fn a_leader_sends_nothing_at_once_before_its_term_is_durable() {
+fn a_sole_voter_leads_only_once_its_vote_is_durable() {
     let mut store = Memory::with_voters(&[1]);
     store.configuration.learners = vec![2];
     let mut node = RawNode::new(&with_depth(1, 2), store).unwrap();
     node.campaign().unwrap();
-    assert_eq!(node.raft.state(), StateRole::Leader);
+    assert_eq!(node.raft.state(), StateRole::Candidate);
     let mut ready = node.ready().unwrap();
-    assert_eq!(ready.hard_state().map(|hard| hard.term), Some(1));
+    assert_eq!(
+        ready.hard_state().map(|hard| (hard.term, hard.vote)),
+        Some((1, 1))
+    );
     assert!(ready.messages().is_empty());
-    assert_eq!(sent(&ready.take_persisted_messages(), 2), vec![1]);
-    let written = ready.entries().to_vec();
+    assert!(ready.take_persisted_messages().is_empty());
     node.advance_issued(ready).unwrap();
-    // The one voter is elected and proposes before its write is durable;
-    // it commits nothing it has not made durable (I3).
+    // Its vote out and not durable, it leads nothing: a proposal is refused.
+    assert!(node.propose(vec![], b"early".to_vec()).is_err());
+    assert_eq!(node.raft.state(), StateRole::Candidate);
+    node.store_mut().hard_state.term = 1;
+    node.store_mut().hard_state.vote = 1;
+    let light = node.on_persist(1).unwrap();
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    // Its term and vote durable, its append to the learner leaves at once.
+    assert_eq!(sent(light.messages(), 2), vec![1]);
+    // It commits nothing it has not made durable (I3).
+    let mut ready = node.ready().unwrap();
+    let written = ready.entries().to_vec();
+    ready.take_persisted_messages();
+    node.advance_issued(ready).unwrap();
     node.propose(vec![], b"x".to_vec()).unwrap();
     let mut ready = node.ready().unwrap();
-    assert!(ready.messages().is_empty());
     ready.take_persisted_messages();
     let written_too = ready.entries().to_vec();
     node.advance_issued(ready).unwrap();
     assert_eq!(node.raft.log().committed(), 0);
     node.store_mut().append(&written);
-    node.store_mut().hard_state.term = 1;
-    node.on_persist(1).unwrap();
+    node.on_persist(2).unwrap();
     assert_eq!(node.raft.log().committed(), 1);
     node.store_mut().append(&written_too);
-    node.on_persist(2).unwrap();
+    node.on_persist(3).unwrap();
     assert_eq!(node.raft.log().committed(), 2);
-    let mut acked = answer(MessageType::MsgAppendResponse, 2, 1, 1);
-    acked.index = 2;
-    node.step(acked).unwrap();
-    node.propose(vec![], b"y".to_vec()).unwrap();
-    let ready = node.ready().unwrap();
-    assert_eq!(sent(ready.messages(), 2), vec![3]);
 }
 
 /// The answers to `leader`'s heartbeats among `messages`.

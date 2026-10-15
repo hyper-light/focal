@@ -28,8 +28,10 @@ use crate::machine::wake::WakeLatency;
 
 /// Format: the record's magic.
 const MAGIC: [u8; 8] = *b"HRTCAL\0\x01";
-/// Format: the layout's version; a record of another is measured again.
-const VERSION: u16 = 1;
+/// Format: the layout's version and what its fields mean; a record of another is measured again. 2: the
+/// wake's mean is the median of the probe's rounds' means and its spread the rounds' median coefficient of
+/// variation (docs/runtime.md §10.4), where 1 held the pooled sample's.
+const VERSION: u16 = 2;
 /// Format: the longest key a record carries (the identity line is well under it; a longer one is refused,
 /// so a record never grows with a hostile CPU string).
 pub const MAX_KEY: usize = 1_024;
@@ -325,7 +327,7 @@ mod tests {
             Err(Stale::Key)
         );
         let mut versioned = record.clone();
-        versioned[8] = 2;
+        versioned[8..10].copy_from_slice(&(VERSION + 1).to_le_bytes());
         let body = versioned.len() - 4;
         let crc = crc32c::crc32c(&versioned[..body]);
         versioned[body..].copy_from_slice(&crc.to_le_bytes());

@@ -90,17 +90,23 @@ pub struct RuntimeConfig {
     /// `None` is a hand-written configuration with no measured prior to track (a test harness's fixed
     /// quanta, an internal helper runtime), which keeps its fixed values.
     pub wake_tracking: Option<WakeTracking>,
+    /// The consumer's latency objective for one loop step, nanoseconds, where it is tighter than the wake
+    /// ([`Constants::latency_objective_ns`]): a step's batch reads its inputs again by the smaller of it and
+    /// the step quantum (docs/runtime.md §3.3). `None`: the quantum alone.
+    pub latency_objective_ns: Option<u64>,
 }
 
 /// What a shard needs to refine its wake estimate after boot (§4.1: the boot probe's mean converges
 /// slowly under a heavy tail — a virtual machine's needs 38,000–75,000 wakes where the probe's budget buys
-/// a few thousand — so the estimate a shard sizes its spin and its quantum by keeps learning from the
-/// wakes it actually pays).
+/// a few thousand — and is one sample of a few tens of milliseconds of a host whose load moves, so the
+/// estimate a shard sizes its quantum by keeps learning from the wakes it actually pays,
+/// [`crate::machine::wake::WakeTrack`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WakeTracking {
-    /// The boot probe's mean wake, nanoseconds: the estimate's seed.
+    /// The boot probe's mean wake (the median of its rounds' means), nanoseconds: the estimate's seed.
     pub prior_ns: u64,
-    /// The estimate's weighting shift, about `2^shift` wakes ([`crate::machine::wake::WakeLatency::estimate_shift`]).
+    /// The estimate's window, `2^shift` wakes: what its blocks hold between them once grown
+    /// ([`crate::machine::wake::WakeLatency::estimate_shift`]).
     pub shift: u32,
     /// The idle spin window as a multiple of the estimate (1 for the runtime's own spin-then-park; the
     /// daemon's idle window sets its ratio).
@@ -189,6 +195,7 @@ impl RuntimeConfig {
                 shift: calibration.wake.estimate_shift(),
                 idle_ratio: 1,
             }),
+            latency_objective_ns: constants.latency_objective_ns,
         };
         config.batch = config
             .calibrate_batch(constants.batch_budget_ns.get())

@@ -270,6 +270,13 @@ pub struct PairReport {
     /// delay the peer is trusted, the election law's base (`docs/timing.md` §2.3); `None` while no
     /// margin judges.
     pub freshness: Option<Duration>,
+    /// The interval this node's own heartbeats to the peer are due at, once the first is
+    /// scheduled: how long the peer's evidence of this node goes without moving while the stream
+    /// keeps its schedule, which an owner waiting on that evidence must wait past.
+    pub sending: Option<Duration>,
+    /// When this node's next heartbeat to the peer is due, on the clock the stream is polled by;
+    /// `None` before the first is scheduled.
+    pub sending_due_ns: Option<u64>,
     /// Configurations made.
     pub configurations: u64,
     /// Suspicions of the peer.

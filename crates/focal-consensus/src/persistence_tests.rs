@@ -586,8 +586,16 @@ fn a_change_of_membership_is_applied_only_once_the_log_holds_its_commit() {
     let mut alone = DurableNode::open(config(1), dirs[0].path()).unwrap();
     assert_eq!(alone.status().voters, vec![1]);
     alone.campaign().unwrap();
-    drop(alone.drain().unwrap());
-    assert_eq!(alone.status().role, StateRole::Leader);
+    // The one voter leads once the hard state naming its vote is durable (hyper-raft's I9): the
+    // drain that writes it follows the one that gives what its log replayed as it opened.
+    while alone.status().role != StateRole::Leader {
+        assert!(
+            alone.has_ready(),
+            "the one voter stopped short of leading: {:?}",
+            alone.status()
+        );
+        drop(alone.drain().unwrap());
+    }
     alone.propose(b"alone".to_vec()).unwrap();
     assert_eq!(alone.drain().unwrap().committed[0].data, b"alone");
 }
