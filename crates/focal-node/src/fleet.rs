@@ -1045,24 +1045,6 @@ impl Pending {
 }
 /// What a native read holds while it waits: its place among the requests, beside its own bytes.
 pub(crate) const NATIVE_READ_PLACE_BYTES: usize = 4096;
-/// What a native page may take as the owner builds it: its objects as they are read, at most
-/// as many as the client's frame holds once encoded, 32 times that resident, and the place
-/// the reply keeps. A read's own charge grows to it as its page is built and shrinks to what
-/// its reply holds as it is answered (`finish_response`); a page that cannot be funded is
-/// refused, without effect.
-pub(crate) fn fund_page(
-    charge: &mut Allocation,
-    client_frame_bytes: u32,
-) -> Result<(), AccessError> {
-    let room = usize::try_from(client_frame_bytes)
-        .ok()
-        .and_then(|frame| frame.checked_mul(32))
-        .and_then(|room| room.checked_add(4096))
-        .ok_or(AccessError::Capacity)?;
-    charge
-        .grow(room.saturating_sub(charge.bytes()))
-        .map_err(|_| AccessError::Capacity)
-}
 /// What decides when a grouped owner runs a session next ([`Owner::group_deadline`]).
 #[derive(Clone, Copy, Debug)]
 struct GroupDue {
@@ -2131,11 +2113,12 @@ impl ReplicaHost {
             .ok()
             .and_then(|n| {
                 if native_read {
-                    // A native read waits as its request and a place: the room its page may take
-                    // is funded as the owner builds it, one page at a time (`fund_page`), and
+                    // A native read waits as its request and a place: each object its page
+                    // takes is charged as the owner builds it (`native_reads::PageObjects`), and
                     // given back to what the reply holds as it is answered. Reserved for every
                     // read as it waited, 32 times the client's frame, a session's memory took a
-                    // few dozen reads at once and refused the rest.
+                    // few dozen reads at once and refused the rest; reserved for every page as it
+                    // was built, one read refused every other request beside it.
                     n.checked_mul(2)?.checked_add(NATIVE_READ_PLACE_BYTES)
                 } else if native_write {
                     // A native write waits as the bytes it came in (`Operation::Native` is its
@@ -4484,7 +4467,6 @@ impl Owner {
                     // its custody for a family retired before (doc 31 M2, A2): immutable once
                     // retired, so any applied prefix holding the continuation serves it.
                     if let NativeReadQuery::Cold(query) = &read.query {
-                        fund_page(&mut charge, self.client_limits.max_frame_bytes)?;
                         return crate::archive_reads::cold_page(
                             &mut self.session,
                             &self.budget,
@@ -4493,6 +4475,7 @@ impl Owner {
                             read,
                             query,
                             &self.client_limits,
+                            &mut charge,
                         )
                         .map(Response::NativeRead);
                     }
@@ -4532,7 +4515,6 @@ impl Owner {
                             self.session.ledger(),
                             &read.consistency,
                         )?;
-                        fund_page(&mut charge, self.client_limits.max_frame_bytes)?;
                         crate::native_reads::page(
                             &crate::native_reads::Reader {
                                 core,
@@ -4543,6 +4525,7 @@ impl Owner {
                                 route: request.route_epoch,
                             },
                             read,
+                            &mut charge,
                         )
                         .map(Response::NativeRead)
                     }
@@ -4556,7 +4539,6 @@ impl Owner {
                     }
                     let key = *self.views.list_key()?;
                     let core = self.session.native_core().map_err(access)?;
-                    fund_page(&mut charge, self.client_limits.max_frame_bytes)?;
                     crate::native_lists::serve(
                         &crate::native_reads::Reader {
                             core,
@@ -4568,6 +4550,7 @@ impl Owner {
                         },
                         &key,
                         list,
+                        &mut charge,
                     )
                     .map(Response::NativeListed)
                 }
@@ -5110,24 +5093,20 @@ impl Owner {
                     .find(|boundary| boundary.correlation == *correlation)
                     .map(
                         |boundary| match self.session.native_read_at_least(*boundary) {
-                            Ok(core) => {
-                                fund_page(&mut pending._charge, self.client_limits.max_frame_bytes)
-                                    .and_then(|()| {
-                                        crate::native_reads::page(
-                                            &crate::native_reads::Reader {
-                                                core,
-                                                ledger: self.session.ledger(),
-                                                profile: *profile,
-                                                principal: *principal,
-                                                role: *role,
-                                                route: pending.header.route_epoch,
-                                            },
-                                            read,
-                                        )
-                                    })
-                                    .map(Response::NativeRead)
-                                    .unwrap_or_else(Response::Error)
-                            }
+                            Ok(core) => crate::native_reads::page(
+                                &crate::native_reads::Reader {
+                                    core,
+                                    ledger: self.session.ledger(),
+                                    profile: *profile,
+                                    principal: *principal,
+                                    role: *role,
+                                    route: pending.header.route_epoch,
+                                },
+                                read,
+                                &mut pending._charge,
+                            )
+                            .map(Response::NativeRead)
+                            .unwrap_or_else(Response::Error),
                             Err(error) => Response::Error(access(error)),
                         },
                     ),

@@ -36,13 +36,23 @@ fn response(
     let limits = WireLimits::default();
     let verified = verify_request(principal.clone(), request.clone(), &limits)
         .unwrap_or_else(|error| panic!("{error:?}: {request:?}"));
+    let budget = focal_memory::MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+    let mut charge = budget
+        .reserve(
+            focal_memory::BudgetKind::Query,
+            focal_memory::BudgetLane::Ordinary,
+            0,
+        )
+        .unwrap()
+        .commit();
     let response = super::dispatch(
         node,
         &mut ReadViews::new(),
         &mut Streams::new().unwrap(),
         verified,
         &limits,
-        &focal_memory::MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
+        &budget,
+        &mut charge,
     )
     .answered();
     validate_response(&request, &response, Some(principal.principal()), &limits)

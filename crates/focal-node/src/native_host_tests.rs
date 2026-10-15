@@ -740,6 +740,14 @@ fn proposals_taken_before_one_poll_share_its_flush() {
             },
         );
         let verified = verify_request(actor.clone(), envelope, &limits).unwrap();
+        let mut charge = budget
+            .reserve(
+                focal_memory::BudgetKind::Query,
+                focal_memory::BudgetLane::Ordinary,
+                0,
+            )
+            .unwrap()
+            .commit();
         let dispatched = dispatch(
             &mut node,
             &mut views,
@@ -747,6 +755,7 @@ fn proposals_taken_before_one_poll_share_its_flush() {
             verified,
             &limits,
             &budget,
+            &mut charge,
         );
         let proposal = dispatched
             .proposal

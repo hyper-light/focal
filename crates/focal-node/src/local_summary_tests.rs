@@ -18,13 +18,23 @@ fn read(node: &mut EmbeddedNode, id: u128, operation: Operation) -> ResponseEnve
     .unwrap();
     let limits = WireLimits::default();
     let verified = verify_request(principal, request.clone(), &limits).unwrap();
+    let budget = focal_memory::MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
+    let mut charge = budget
+        .reserve(
+            focal_memory::BudgetKind::Query,
+            focal_memory::BudgetLane::Ordinary,
+            0,
+        )
+        .unwrap()
+        .commit();
     let reply = super::dispatch(
         node,
         &mut ReadViews::new(),
         &mut Streams::new().unwrap(),
         verified,
         &limits,
-        &focal_memory::MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
+        &budget,
+        &mut charge,
     )
     .answered();
     validate_response(&request, &reply, None, &limits).unwrap();

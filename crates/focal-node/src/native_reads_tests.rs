@@ -8,7 +8,7 @@
 //! against the same page: `validation.get` follows the pages to the end and
 //! `validation.begin` binds the evaluation the owner selected.
 use crate::native_lists;
-use crate::native_reads::{Reader, check_consistency, page};
+use crate::native_reads::{Reader, check_consistency, object_bytes, page};
 use focal_client::ClientError;
 use focal_client::input::{BuildContext, InputError};
 use focal_client::operations::{
@@ -94,6 +94,53 @@ struct Harness {
     time: u64,
     requests: u128,
 }
+/// A read's charge from nothing, in a request budget as a node holds (64 MiB, an eighth of it
+/// reserved): what its page takes is charged to it object by object.
+fn read_charge() -> focal_memory::Allocation {
+    focal_memory::MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024)
+        .unwrap()
+        .reserve(
+            focal_memory::BudgetKind::Query,
+            focal_memory::BudgetLane::Ordinary,
+            0,
+        )
+        .unwrap()
+        .commit()
+}
+/// A read's charge from nothing in `budget`.
+fn charge_in(budget: &MemoryBudget) -> focal_memory::Allocation {
+    budget
+        .reserve(
+            focal_memory::BudgetKind::Query,
+            focal_memory::BudgetLane::Ordinary,
+            0,
+        )
+        .unwrap()
+        .commit()
+}
+/// What a page's objects hold as their read charges them: the list's slots and each object.
+fn held(objects: &[NativeObject], slots: usize) -> usize {
+    slots * size_of::<NativeObject>()
+        + objects
+            .iter()
+            .map(|object| object_bytes(object).unwrap())
+            .sum::<usize>()
+}
+/// What taking `object` after `objects` (in a list of `slots`) charges: its bytes and, where
+/// the list is full, its growth.
+fn cost_after(objects: &[NativeObject], slots: usize, object: &NativeObject) -> usize {
+    let grow = if objects.len() == slots {
+        slots.max(4)
+    } else {
+        0
+    };
+    grow * size_of::<NativeObject>() + object_bytes(object).unwrap()
+}
+/// A budget with room for `fits` objects of at most `largest` bytes and their list's slots.
+fn room_for(fits: usize, largest: usize) -> usize {
+    fits * largest + fits.next_power_of_two().max(4) * size_of::<NativeObject>()
+}
+
 impl Harness {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -143,16 +190,32 @@ impl Harness {
             route_epoch: RouteEpoch(1),
         }
     }
-    /// The node's read page, exactly as the host serves it.
+    /// The node's read page, exactly as the host serves it, each object charged to the read.
     fn page(&self, request: &NativeReadRequest) -> Result<NativeReadPage, AccessError> {
+        self.page_in(request, &mut read_charge())
+    }
+    /// The node's read page charged to `charge`, as a read beside others in its budget is.
+    fn page_in(
+        &self,
+        request: &NativeReadRequest,
+        charge: &mut focal_memory::Allocation,
+    ) -> Result<NativeReadPage, AccessError> {
         request.validate(&WireLimits::default())?;
         check_consistency(self.core(), ledger(), &request.consistency)?;
-        page(&self.reader(), request)
+        page(&self.reader(), request, charge)
     }
     /// The node's list page, exactly as the host serves it.
     fn list(&self, request: &NativeListRequest) -> Result<NativeListPage, AccessError> {
+        self.list_in(request, &mut read_charge())
+    }
+    /// The node's list page charged to `charge`.
+    fn list_in(
+        &self,
+        request: &NativeListRequest,
+        charge: &mut focal_memory::Allocation,
+    ) -> Result<NativeListPage, AccessError> {
         request.validate(&WireLimits::default())?;
-        native_lists::serve(&self.reader(), &LIST_KEY, request)
+        native_lists::serve(&self.reader(), &LIST_KEY, request, charge)
     }
     /// The client's driver over this owner's pages.
     fn read(&self, operation: &NativeReadOperation) -> Result<NativeReadPage, DriveError> {
@@ -978,4 +1041,270 @@ fn the_responses_list_reaches_the_end_of_a_long_chain_one_row_per_page() {
         );
     }
     assert_eq!(cycles, (1..=CYCLES).rev().collect::<Vec<u32>>());
+}
+
+/// The claim's whole expansion at `token`: the claim, its responses from the latest cycle back,
+/// its evaluations in key order.
+fn expansion(
+    p: &Populated,
+    token: ReadToken,
+    after: Option<NativeContinuation>,
+) -> NativeReadRequest {
+    NativeReadRequest {
+        consistency: if after.is_none() {
+            ReadConsistency::AtLeast(token)
+        } else {
+            ReadConsistency::Exact(token)
+        },
+        query: NativeReadQuery::Claim {
+            id: p.claim,
+            expand: NativeClaimExpand {
+                content: false,
+                scopes: false,
+                responses: true,
+                evaluations: true,
+                history: false,
+            },
+            after,
+        },
+        max_items: WireLimits::default().max_items,
+    }
+}
+
+#[test]
+fn a_page_its_read_cannot_fund_whole_ends_before_the_first_object_it_cannot_and_resumes_there() {
+    let p = populated();
+    let h = &p.h;
+    let token = h.token();
+    let whole = h.page(&expansion(&p, token, None)).unwrap();
+    assert!(whole.next.is_none());
+    let reference = whole.objects;
+    assert!(reference.len() > (SLOTS * CYCLES) as usize);
+    let largest = reference
+        .iter()
+        .map(|object| object_bytes(object).unwrap())
+        .max()
+        .unwrap();
+    // In budgets with room for a few of its objects, each page takes what its budget funds and
+    // ends before the first object it cannot, with that object's continuation: the claim, the
+    // responses and the evaluations are each cut somewhere, the pages concatenate to the whole
+    // expansion, and every page holds exactly what its objects were charged.
+    for fits in [1usize, 2, 3, 5, 8, 13, 21] {
+        let room = room_for(fits, largest);
+        let budget = MemoryBudget::new(room, 0).unwrap();
+        let mut objects: Vec<NativeObject> = Vec::new();
+        let mut after = None;
+        let mut pages = 0usize;
+        loop {
+            let mut charge = charge_in(&budget);
+            let page = h
+                .page_in(&expansion(&p, token, after), &mut charge)
+                .unwrap();
+            pages += 1;
+            let slots = page.objects.capacity();
+            assert_eq!(
+                charge.bytes(),
+                held(&page.objects, slots),
+                "fits {fits}: a page holds what its objects were charged"
+            );
+            assert!(charge.bytes() <= room, "fits {fits}");
+            let Some(next) = page.next else {
+                objects.extend(page.objects);
+                break;
+            };
+            assert!(
+                page.objects.len() >= fits,
+                "fits {fits}: a page takes what its budget funds"
+            );
+            let following = &reference[objects.len() + page.objects.len()];
+            assert!(
+                charge.bytes() + cost_after(&page.objects, slots, following) > room,
+                "fits {fits}: a page ends only where its budget does"
+            );
+            objects.extend(page.objects);
+            after = Some(next);
+            assert!(pages <= reference.len(), "fits {fits}: the pages must end");
+        }
+        assert!(pages > 1, "fits {fits}");
+        assert_eq!(objects, reference, "fits {fits}");
+    }
+}
+
+#[test]
+fn a_read_that_cannot_fund_its_first_object_is_refused_and_holds_nothing() {
+    let p = populated();
+    let h = &p.h;
+    let token = h.token();
+    // The claim alone, in a budget a byte short of it and in one of exactly its size: what a
+    // read is charged is its object and its list's first slots, and nothing beside them.
+    let alone = NativeReadRequest {
+        consistency: ReadConsistency::AtLeast(token),
+        query: NativeReadQuery::Objects(vec![NativeObjectRef::Claim(p.claim)]),
+        max_items: 1,
+    };
+    let claim = h.page(&alone).unwrap().objects;
+    let first = cost_after(&[], 0, &claim[0]);
+    let short = MemoryBudget::new(first - 1, 0).unwrap();
+    let mut charge = charge_in(&short);
+    assert!(matches!(
+        h.page_in(&alone, &mut charge),
+        Err(AccessError::Capacity)
+    ));
+    assert_eq!(charge.bytes(), 0);
+    let exact = MemoryBudget::new(first, 0).unwrap();
+    let mut charge = charge_in(&exact);
+    assert_eq!(h.page_in(&alone, &mut charge).unwrap().objects, claim);
+    assert_eq!(charge.bytes(), first);
+    // A paged read that cannot fund its first object could only send its reader back where it
+    // started: refused, fresh or resumed, whichever object it starts at, holding nothing.
+    let first_evaluation = h
+        .core()
+        .native_claim_evaluations_from(p.claim, None)
+        .next()
+        .unwrap();
+    let none = MemoryBudget::new(4 * size_of::<NativeObject>(), 0).unwrap();
+    for request in [
+        expansion(&p, token, None),
+        expansion(
+            &p,
+            token,
+            Some(NativeContinuation::Responses { cycle: CYCLES + 1 }),
+        ),
+        expansion(
+            &p,
+            token,
+            Some(NativeContinuation::Evaluations(
+                focal_core::native::event_record::evaluation_key(first_evaluation),
+            )),
+        ),
+        NativeReadRequest {
+            consistency: ReadConsistency::AtLeast(token),
+            query: NativeReadQuery::Responses {
+                claim: p.claim,
+                after: None,
+            },
+            max_items: 4,
+        },
+        NativeReadRequest {
+            consistency: ReadConsistency::AtLeast(token),
+            query: NativeReadQuery::Evaluations {
+                claim: p.claim,
+                validation: p.increment,
+                after: None,
+            },
+            max_items: 4,
+        },
+    ] {
+        let mut charge = charge_in(&none);
+        assert!(
+            matches!(h.page_in(&request, &mut charge), Err(AccessError::Capacity)),
+            "{request:?}"
+        );
+        assert_eq!(charge.bytes(), 0, "{request:?}");
+    }
+    let mut charge = charge_in(&none);
+    assert!(matches!(
+        h.list_in(
+            &NativeListRequest {
+                filter: NativeListFilter::Responses { claim: p.claim },
+                cursor: None,
+                max_items: 4,
+                max_visits: 4,
+            },
+            &mut charge
+        ),
+        Err(AccessError::Capacity)
+    ));
+    assert_eq!(charge.bytes(), 0);
+}
+
+#[test]
+fn a_read_beside_other_requests_is_answered_from_what_they_leave() {
+    let p = populated();
+    let h = &p.h;
+    let token = h.token();
+    // The fleet's request level (64 MiB, 24 MiB of it the completion reserve) with 8.5 MiB held
+    // by the requests beside the read.
+    let level = MemoryBudget::new(64 << 20, 24 << 20).unwrap();
+    let _beside = level
+        .reserve(
+            focal_memory::BudgetKind::Query,
+            focal_memory::BudgetLane::Ordinary,
+            17 << 19,
+        )
+        .unwrap()
+        .commit();
+    // Precharged for the page it might fill (thirty-two client frames and a page's slack), a
+    // read beside them was refused before it took anything (a deliver load at 10k/s: 1,484
+    // lifecycles abandoned on reads refused so).
+    let precharge = 32 * WireLimits::default().max_frame_bytes as usize + 4096;
+    assert!(precharge > level.headroom(focal_memory::BudgetLane::Ordinary));
+    // Charged object by object, it is answered: the claim's whole expansion in one page,
+    // holding what its objects hold.
+    let mut charge = charge_in(&level);
+    let page = h.page_in(&expansion(&p, token, None), &mut charge).unwrap();
+    assert!(page.next.is_none());
+    let evaluations = h
+        .core()
+        .native_claim_evaluations_from(p.claim, None)
+        .count();
+    assert_eq!(page.objects.len(), 1 + CYCLES as usize + evaluations);
+    assert_eq!(charge.bytes(), held(&page.objects, page.objects.capacity()));
+}
+
+#[test]
+fn a_list_page_its_read_cannot_fund_whole_resumes_at_the_first_row_it_could_not() {
+    let p = populated();
+    let h = &p.h;
+    let request = |cursor| NativeListRequest {
+        filter: NativeListFilter::Responses { claim: p.claim },
+        cursor,
+        max_items: WireLimits::default().max_items,
+        max_visits: WireLimits::default().max_items,
+    };
+    let whole = h.list(&request(None)).unwrap();
+    assert!(whole.next.is_none());
+    let reference = whole.objects;
+    assert_eq!(reference.len(), CYCLES as usize);
+    let largest = reference
+        .iter()
+        .map(|object| object_bytes(object).unwrap())
+        .max()
+        .unwrap();
+    for fits in [1usize, 2, 3, 5] {
+        let room = room_for(fits, largest);
+        let budget = MemoryBudget::new(room, 0).unwrap();
+        let mut rows: Vec<NativeObject> = Vec::new();
+        let mut cursor = None;
+        let mut pages = 0usize;
+        loop {
+            let mut charge = charge_in(&budget);
+            let page = h.list_in(&request(cursor), &mut charge).unwrap();
+            pages += 1;
+            let slots = page.objects.capacity();
+            assert_eq!(
+                charge.bytes(),
+                held(&page.objects, slots),
+                "fits {fits}: a page holds what its rows were charged"
+            );
+            let Some(next) = page.next else {
+                rows.extend(page.objects);
+                break;
+            };
+            assert!(
+                page.objects.len() >= fits,
+                "fits {fits}: a page takes what its budget funds"
+            );
+            let following = &reference[rows.len() + page.objects.len()];
+            assert!(
+                charge.bytes() + cost_after(&page.objects, slots, following) > room,
+                "fits {fits}: a page ends only where its budget does"
+            );
+            rows.extend(page.objects);
+            cursor = Some(next);
+            assert!(pages <= reference.len(), "fits {fits}: the pages must end");
+        }
+        assert!(pages > 1, "fits {fits}");
+        assert_eq!(rows, reference, "fits {fits}");
+    }
 }

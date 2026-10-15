@@ -43,6 +43,7 @@ pub(crate) fn seal_reference(ledger: LedgerId, query: &NativeSealQuery) -> Conte
 /// held it (the audit's F12). A participant reads its own principal's
 /// outcomes only; a runtime any. A fold's bundle names the member holding
 /// the generation, read in turn; custody this node lacks is `Unavailable`.
+#[allow(clippy::too_many_arguments)] // The read's inputs, each its own owner's.
 pub(crate) fn sealed_page(
     store: &ContentStore,
     ledger: LedgerId,
@@ -51,6 +52,7 @@ pub(crate) fn sealed_page(
     read: &NativeReadRequest,
     query: &NativeSealQuery,
     limits: &WireLimits,
+    charge: &mut focal_memory::Allocation,
 ) -> Result<NativeReadPage, AccessError> {
     read.validate(limits)?;
     let role = native_reads::role(peer)?;
@@ -110,7 +112,7 @@ pub(crate) fn sealed_page(
         },
         native_sequence: through,
         logical_time: 0,
-        objects: vec![object],
+        objects: native_reads::PageObjects::new(charge).only(object)?,
         next: None,
         visited: 1,
     })
@@ -148,6 +150,7 @@ pub(crate) fn page(
     read: &NativeReadRequest,
     query: &NativeArchiveQuery,
     limits: &WireLimits,
+    charge: &mut focal_memory::Allocation,
 ) -> Result<NativeReadPage, AccessError> {
     read.validate(limits)?;
     let reference = reference(ledger, query);
@@ -169,6 +172,7 @@ pub(crate) fn page(
         route,
         read,
         query.object,
+        charge,
     )
 }
 /// The family a bundle or a cold frame holds: its ledger, and its name and length.
@@ -190,6 +194,7 @@ pub(crate) fn cold_page(
     read: &NativeReadRequest,
     query: &NativeColdQuery,
     limits: &WireLimits,
+    charge: &mut focal_memory::Allocation,
 ) -> Result<NativeReadPage, AccessError> {
     read.validate(limits)?;
     let ledger = session.ledger();
@@ -251,6 +256,7 @@ pub(crate) fn cold_page(
         route,
         read,
         query.object,
+        charge,
     )
 }
 /// One page holding `object` of the family `bytes` hold (a bundle or a cold frame), hydrated
@@ -265,6 +271,7 @@ fn page_of<R: focal_evidence::NativeCustodyReader>(
     route: RouteEpoch,
     read: &NativeReadRequest,
     object: NativeObjectRef,
+    charge: &mut focal_memory::Allocation,
 ) -> Result<NativeReadPage, AccessError> {
     let ledger = bundle.ledger;
     let role = native_reads::role(peer)?;
@@ -312,8 +319,11 @@ fn page_of<R: focal_evidence::NativeCustodyReader>(
         })
     };
     let first = native_reads::object(&reader, object)?;
-    let mut objects = Vec::new();
-    objects.try_reserve(1).map_err(|_| AccessError::Capacity)?;
+    // Each object charged to the read as the page takes it (`native_reads::PageObjects`); the
+    // pages built inside this one take the read's charge as they build, given back before
+    // their objects are taken here, archived.
+    let mut objects = native_reads::PageObjects::new(charge);
+    let max_items = read.max_items as usize;
     let mut visited = 1u32;
     // A validation is read with what was recorded under it: its evaluations
     // in key order and each one's accepted results, the pages a live
@@ -324,8 +334,11 @@ fn page_of<R: focal_evidence::NativeCustodyReader>(
         }
         _ => None,
     };
-    objects.push(archived(first)?);
+    if !objects.take(archived(first)?)? {
+        return Err(AccessError::Capacity);
+    }
     if let Some((claim, validation)) = expansion {
+        let before = objects.charge().bytes();
         let evaluations = native_reads::page(
             &reader,
             &NativeReadRequest {
@@ -337,7 +350,9 @@ fn page_of<R: focal_evidence::NativeCustodyReader>(
                 },
                 max_items: read.max_items,
             },
+            objects.charge(),
         )?;
+        let _ = objects.charge().shrink_to(before);
         visited = visited.saturating_add(evaluations.visited);
         let keys: Vec<NativeEvaluationKey> = evaluations
             .objects
@@ -347,16 +362,20 @@ fn page_of<R: focal_evidence::NativeCustodyReader>(
                 _ => None,
             })
             .collect();
-        objects
-            .try_reserve(evaluations.objects.len())
-            .map_err(|_| AccessError::Capacity)?;
+        // The page holds what fits in its items and the read's budget: an archived page has no
+        // continuation, so the rest is left for a narrower read, as the items' bound left it.
+        let mut room = true;
         for object in evaluations.objects {
-            objects.push(archived(object)?);
-        }
-        for key in keys {
-            if objects.len() >= read.max_items as usize {
+            if objects.len() >= max_items || !objects.take(archived(object)?)? {
+                room = false;
                 break;
             }
+        }
+        for key in keys {
+            if !room || objects.len() >= max_items {
+                break;
+            }
+            let before = objects.charge().bytes();
             let results = native_reads::page(
                 &reader,
                 &NativeReadRequest {
@@ -367,16 +386,17 @@ fn page_of<R: focal_evidence::NativeCustodyReader>(
                     },
                     max_items: read.max_items,
                 },
+                objects.charge(),
             )?;
+            let _ = objects.charge().shrink_to(before);
             visited = visited.saturating_add(results.visited);
-            objects
-                .try_reserve(results.objects.len())
-                .map_err(|_| AccessError::Capacity)?;
             for object in results.objects {
-                objects.push(archived(object)?);
+                if objects.len() >= max_items || !objects.take(archived(object)?)? {
+                    room = false;
+                    break;
+                }
             }
         }
-        objects.truncate(read.max_items as usize);
     }
     Ok(NativeReadPage {
         token: ReadToken {
@@ -388,7 +408,7 @@ fn page_of<R: focal_evidence::NativeCustodyReader>(
         // A bundle carries no clock: its objects are at or below the prefix
         // it claims, and say their own times.
         logical_time: 0,
-        objects,
+        objects: objects.into_vec(),
         next: None,
         visited,
     })

@@ -131,27 +131,24 @@ fn decode(
 }
 
 /// The bounded walk of one page: items are consumed until the visit allowance
-/// or the page is full; the resume position is the last visited item.
-struct Walk {
-    objects: Vec<NativeObject>,
+/// or the page is full, or the read cannot fund the next object
+/// (`native_reads::PageObjects`); the resume position is the last item consumed.
+struct Walk<'c> {
+    objects: crate::native_reads::PageObjects<'c>,
     visited: u32,
     max_items: u32,
     max_visits: u32,
     next: Option<Position>,
 }
-impl Walk {
-    fn new(request: &NativeListRequest) -> Result<Self, AccessError> {
-        let mut objects = Vec::new();
-        objects
-            .try_reserve_exact(request.max_items as usize)
-            .map_err(|_| AccessError::Capacity)?;
-        Ok(Self {
-            objects,
+impl<'c> Walk<'c> {
+    fn new(request: &NativeListRequest, charge: &'c mut focal_memory::Allocation) -> Self {
+        Self {
+            objects: crate::native_reads::PageObjects::new(charge),
             visited: 0,
             max_items: request.max_items,
             max_visits: request.max_visits,
             next: None,
-        })
+        }
     }
     /// Consume `items` in order. `accept` returns the object an item yields
     /// once every residual predicate holds, or nothing for a visited miss.
@@ -168,13 +165,24 @@ impl Walk {
                 return Ok(());
             }
             self.visited = self.visited.saturating_add(1);
-            last = Some(position(&item));
+            let at = position(&item);
             if let Some(object) = accept(item)? {
-                self.objects.push(object);
+                if !self.objects.take(object)? {
+                    // Not funded: the page ends before it, resumed at it. A page that consumed
+                    // nothing could only send its reader back where it started.
+                    if last.is_none() {
+                        return Err(AccessError::Capacity);
+                    }
+                    self.next = last;
+                    return Ok(());
+                }
+                last = Some(at);
                 if self.objects.len() >= self.max_items as usize {
                     self.next = last;
                     return Ok(());
                 }
+            } else {
+                last = Some(at);
             }
         }
         self.next = None;
@@ -313,7 +321,7 @@ impl ClaimPredicates<'_> {
 
 fn claims(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     predicates: &ClaimPredicates<'_>,
 ) -> Result<(), AccessError> {
@@ -395,7 +403,7 @@ fn claims(
 
 fn artifacts(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     producer: Option<ParticipantId>,
     kind: Option<&str>,
@@ -455,7 +463,7 @@ fn artifacts(
 
 fn definitions(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     claim: Option<ClaimId>,
     evaluator: Option<ParticipantId>,
@@ -522,7 +530,7 @@ fn definitions(
 
 fn evaluations(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     claim: Option<ClaimId>,
     validation: Option<ValidationId>,
@@ -608,7 +616,7 @@ fn evaluations(
 
 fn responses(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     claim: ClaimId,
 ) -> Result<(), AccessError> {
@@ -649,7 +657,7 @@ fn responses(
 
 fn receipts(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     holder: Option<ParticipantId>,
     claim: Option<ClaimId>,
@@ -675,7 +683,7 @@ fn receipts(
 
 fn monitors(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     claim: ClaimId,
 ) -> Result<(), AccessError> {
@@ -706,7 +714,7 @@ fn monitors(
 
 fn events(
     reader: &Reader<'_>,
-    walk: &mut Walk,
+    walk: &mut Walk<'_>,
     after: Option<Position>,
     from: Option<(SessionSeq, u32)>,
 ) -> Result<(), AccessError> {
@@ -760,6 +768,7 @@ pub(crate) fn serve(
     reader: &Reader<'_>,
     key: &[u8; 32],
     request: &NativeListRequest,
+    charge: &mut focal_memory::Allocation,
 ) -> Result<NativeListPage, AccessError> {
     let filter = filter_bytes(&request.filter)?;
     let after = request
@@ -767,7 +776,7 @@ pub(crate) fn serve(
         .as_ref()
         .map(|cursor| decode(reader, key, &filter, cursor))
         .transpose()?;
-    let mut walk = Walk::new(request)?;
+    let mut walk = Walk::new(request, charge);
     match &request.filter {
         NativeListFilter::Claims {
             issuer,
@@ -840,7 +849,7 @@ pub(crate) fn serve(
             route_epoch: reader.route,
         },
         native_sequence: reader.core.native_sequence(),
-        objects: walk.objects,
+        objects: walk.objects.into_vec(),
         next,
         visited: walk.visited,
     })
@@ -854,6 +863,7 @@ pub(crate) fn local(
     request: &NativeListRequest,
     route: RouteEpoch,
     limits: &WireLimits,
+    charge: &mut focal_memory::Allocation,
 ) -> Result<NativeListPage, AccessError> {
     request.validate(limits)?;
     let profile = crate::native_reads::profile(session)?;
@@ -871,5 +881,6 @@ pub(crate) fn local(
         },
         &key,
         request,
+        charge,
     )
 }

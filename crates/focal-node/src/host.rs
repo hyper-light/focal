@@ -201,22 +201,8 @@ impl LocalHost {
                     };
                     match work {
                         Work::Request(request, response, mut charge) => {
-                            // A native read's page is funded as the owner builds it, one at a
-                            // time: one that cannot be is refused, without effect.
-                            let native_read = matches!(
-                                request.request().operation,
-                                Operation::NativeRead(_) | Operation::NativeList(_)
-                            );
-                            if native_read
-                                && crate::fleet::fund_page(&mut charge, limits.max_frame_bytes)
-                                    .is_err()
-                            {
-                                let refused = request
-                                    .request()
-                                    .reply(Response::Error(AccessError::Capacity));
-                                let _ = response.send(finish_response(refused, charge));
-                                continue;
-                            }
+                            // A native read's page is charged to the read as the owner builds
+                            // it, object by object (`native_reads::PageObjects`).
                             // A vanished caller cannot cancel an already admitted mutation.
                             let dispatched = dispatch(
                                 &mut node,
@@ -225,6 +211,7 @@ impl LocalHost {
                                 *request,
                                 &limits,
                                 &host_budget,
+                                &mut charge,
                             );
                             match dispatched.proposal {
                                 None => {
@@ -423,13 +410,13 @@ impl RequestHandler for LocalHost {
                 .ok()
                 .and_then(|n| {
                     if native_read {
-                        // A native read waits as its request and a place: the room its page may
-                        // take is funded as the owner builds it, one page at a time
-                        // (`fleet::fund_page`), and given back to what the reply holds as it is
-                        // answered. Reserved for every read as it waited, 32 times the client's
-                        // frame, the host's budget took two reads at once and refused the rest
-                        // (a deliver load on one embedded node: 177 of 200 lifecycles abandoned,
-                        // every event tail's page refused).
+                        // A native read waits as its request and a place: each object its page
+                        // takes is charged as the owner builds it (`native_reads::PageObjects`),
+                        // and given back to what the reply holds as it is answered. Reserved for
+                        // every read as it waited, 32 times the client's frame, the host's budget
+                        // took two reads at once and refused the rest (a deliver load on one
+                        // embedded node: 177 of 200 lifecycles abandoned, every event tail's page
+                        // refused).
                         n.checked_mul(2)?
                             .checked_add(crate::fleet::NATIVE_READ_PLACE_BYTES)
                     } else {
@@ -496,16 +483,24 @@ pub(crate) fn finish_response(
     mut header: ResponseEnvelope,
     mut charge: Allocation,
 ) -> OwnedResponse {
-    // Admission covers the maximum page before constructing it. Once staging
-    // is gone retain only this reply's conservative resident/encoding allowance,
-    // so a small response does not pin the entire possible page budget.
-    let retained = postcard::experimental::serialized_size(&header)
-        .ok()
+    // A reply admitted with room to spare keeps only its conservative resident/encoding
+    // allowance, so a small response does not pin what its request was admitted with. A native
+    // page charged object by object as the owner built it (`native_reads::PageObjects`) holds
+    // what its objects were charged, which is what its reply holds: kept, and grown to the
+    // reply's encoding where that is more.
+    let encoded = postcard::experimental::serialized_size(&header).ok();
+    let retained = encoded
         .and_then(|n| n.checked_mul(32))
         .and_then(|n| n.checked_add(512));
-    match retained {
-        Some(bytes) if bytes <= charge.bytes() => {
+    match (retained, encoded.and_then(|n| n.checked_add(512))) {
+        (Some(bytes), _) if bytes <= charge.bytes() => {
             if charge.shrink_to(bytes).is_err() {
+                header.result = Response::Error(AccessError::OutcomeUnknown);
+            }
+        }
+        (_, Some(floor)) if floor <= charge.bytes() => {}
+        (_, Some(floor)) => {
+            if charge.grow(floor.saturating_sub(charge.bytes())).is_err() {
                 header.result = Response::Error(AccessError::OutcomeUnknown);
             }
         }
@@ -614,6 +609,7 @@ pub(crate) fn dispatch(
     verified: VerifiedRequest,
     limits: &WireLimits,
     budget: &MemoryBudget,
+    charge: &mut focal_memory::Allocation,
 ) -> Dispatched {
     let principal = verified.peer().principal();
     let peer = verified.peer();
@@ -712,6 +708,7 @@ pub(crate) fn dispatch(
                     read,
                     query,
                     limits,
+                    charge,
                 ),
                 NativeReadQuery::Sealed(query) => crate::archive_reads::sealed_page(
                     &node.content,
@@ -721,6 +718,7 @@ pub(crate) fn dispatch(
                     read,
                     query,
                     limits,
+                    charge,
                 ),
                 NativeReadQuery::Cold(query) => crate::archive_reads::cold_page(
                     &mut node.session,
@@ -730,6 +728,7 @@ pub(crate) fn dispatch(
                     read,
                     query,
                     limits,
+                    charge,
                 ),
                 _ => crate::native_reads::local(
                     &mut node.session,
@@ -738,6 +737,7 @@ pub(crate) fn dispatch(
                     request.request_id,
                     request.route_epoch,
                     limits,
+                    charge,
                 ),
             }
             .map(Response::NativeRead),
@@ -748,6 +748,7 @@ pub(crate) fn dispatch(
                 list,
                 request.route_epoch,
                 limits,
+                charge,
             )
             .map(Response::NativeListed),
             Operation::Monitor { id } => crate::monitor_reads::local(

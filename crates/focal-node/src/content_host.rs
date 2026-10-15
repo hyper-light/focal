@@ -937,6 +937,27 @@ fn custody_request(
         })),
     })
 }
+/// A read's page answered: a reply its client's frame holds, charged what its objects were as
+/// the page took them and grown to its encoding and its place where that is more.
+fn answer_page(
+    owner: &CustodyStore,
+    reply: ResponseEnvelope,
+    mut allocation: focal_memory::Allocation,
+    limits: &WireLimits,
+) -> Result<Accounted<ResponseEnvelope>, AccessError> {
+    let bytes =
+        postcard::experimental::serialized_size(&reply).map_err(|_| AccessError::InvalidRequest)?;
+    if bytes > limits.max_frame_bytes as usize {
+        return Err(AccessError::Capacity);
+    }
+    let held = bytes.saturating_add(4096);
+    if held > allocation.bytes() {
+        allocation
+            .grow(held.saturating_sub(allocation.bytes()))
+            .map_err(|_| AccessError::Capacity)?;
+    }
+    Ok(owner.accounted(reply, allocation))
+}
 fn handle_request(
     owner: &mut CustodyStore,
     verified: &VerifiedRequest,
@@ -961,6 +982,11 @@ fn handle_request(
             scope,
             &crate::archive_reads::seal_reference(request.ledger, query),
         )?;
+        // The page's objects charged as it takes them; the reply holds them, and its encoding.
+        let mut allocation = budget
+            .reserve(BudgetKind::Query, BudgetLane::Ordinary, 0)
+            .map_err(|_| AccessError::Capacity)?
+            .commit();
         let page = crate::archive_reads::sealed_page(
             owner.content(),
             request.ledger,
@@ -969,22 +995,10 @@ fn handle_request(
             read,
             query,
             limits,
+            &mut allocation,
         )?;
         let reply = request.reply(Response::NativeRead(page));
-        let bytes = postcard::experimental::serialized_size(&reply)
-            .map_err(|_| AccessError::InvalidRequest)?;
-        if bytes > limits.max_frame_bytes as usize {
-            return Err(AccessError::Capacity);
-        }
-        let allocation = budget
-            .reserve(
-                BudgetKind::Query,
-                BudgetLane::Ordinary,
-                bytes.saturating_add(4096),
-            )
-            .map_err(|_| AccessError::Capacity)?
-            .commit();
-        return Ok(owner.accounted(reply, allocation));
+        return answer_page(owner, reply, allocation, limits);
     }
     if let Operation::NativeRead(read) = &request.operation
         && let NativeReadQuery::Archived(query) = &read.query
@@ -993,6 +1007,10 @@ fn handle_request(
             scope,
             &crate::archive_reads::reference(request.ledger, query),
         )?;
+        let mut allocation = budget
+            .reserve(BudgetKind::Query, BudgetLane::Ordinary, 0)
+            .map_err(|_| AccessError::Capacity)?
+            .commit();
         let page = crate::archive_reads::page(
             owner.content(),
             budget,
@@ -1002,22 +1020,10 @@ fn handle_request(
             read,
             query,
             limits,
+            &mut allocation,
         )?;
         let reply = request.reply(Response::NativeRead(page));
-        let bytes = postcard::experimental::serialized_size(&reply)
-            .map_err(|_| AccessError::InvalidRequest)?;
-        if bytes > limits.max_frame_bytes as usize {
-            return Err(AccessError::Capacity);
-        }
-        let allocation = budget
-            .reserve(
-                BudgetKind::Query,
-                BudgetLane::Ordinary,
-                bytes.saturating_add(4096),
-            )
-            .map_err(|_| AccessError::Capacity)?
-            .commit();
-        return Ok(owner.accounted(reply, allocation));
+        return answer_page(owner, reply, allocation, limits);
     }
     let output = match &request.operation {
         Operation::Download { max_bytes, .. } => {
