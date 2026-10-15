@@ -1785,10 +1785,17 @@ fn a_pass_that_cannot_be_charged_for_its_notes_sweeps_nothing() {
     assert_eq!(core.payload_sweep().let_go, 0);
     assert_eq!(core.payload_log().unwrap().held_segments(), held);
     drop(squeeze);
-    assert_eq!(budget.stats().used, used, "a pass that fell short kept a charge");
+    assert_eq!(
+        budget.stats().used,
+        used,
+        "a pass that fell short kept a charge"
+    );
     assert_eq!(checkpoint(&core), reference);
     assert!(core.sweep_payloads().is_some_and(|swept| swept > 0));
     assert!(core.payload_log().unwrap().held_segments() < held);
     assert_eq!(checkpoint(&core), reference);
-    assert!(budget.stats().used > used, "the room it noted in is charged");
+    assert!(
+        budget.stats().used > used,
+        "the room it noted in is charged"
+    );
 }

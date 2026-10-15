@@ -1807,6 +1807,10 @@ impl<'a> Fresh<'a> {
             view.state.ledger,
             view.payloads(),
         )?;
+        // What the rows it puts reserve for their finishing; what those it replaces reserved is
+        // counted with their bytes.
+        let finishing_added =
+            super::finishing::added(fragments.changes().map(|(_, _, change)| change))?;
         // What the rows this mutation replaces or deletes take in a checkpoint, as the state it
         // is prepared on holds them, which is the root it publishes onto: published, it takes
         // them away without looking each up again.
@@ -1846,6 +1850,8 @@ impl<'a> Fresh<'a> {
                 encoded_added,
                 encoded_removed,
                 rows_removed,
+                finishing_added,
+                finishing_taken: removed.finishing(),
                 _index: Some(index),
                 events,
                 retire: None,

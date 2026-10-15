@@ -1543,11 +1543,12 @@ fn a_candidate_refused_at_admission_leaves_nothing_in_the_payload_log() {
     );
 }
 
-/// A ledger at its checkpoint's bound still finishes what it took and retires what finished: a
-/// cancel finishes work already taken and a retirement takes rows away, so neither is refused
-/// where fresh work is. Before, the bound refused both as it refused a creation: a ledger that
-/// reached it could neither finish its claims nor retire its families, and refused all work for
-/// good.
+/// A ledger at its checkpoint's bound still finishes what it took and retires what finished:
+/// every claim taken before the bound is cancelled at it, each having reserved its finishing as
+/// it was admitted (`focal_core::native::Finishing`), and a retirement takes rows away, so neither
+/// is refused where fresh work is; the retirement leaves the root with its reservations smaller.
+/// Before, the bound refused both as it refused a creation: a ledger that reached it could
+/// neither finish its claims nor retire its families, and refused all work for good.
 #[test]
 fn a_ledger_at_its_checkpoint_bound_still_finishes_and_retires() {
     let dir = tempfile::tempdir().unwrap();
@@ -1560,40 +1561,19 @@ fn a_ledger_at_its_checkpoint_bound_still_finishes_and_retires() {
     finished_family(&mut session, 1, 100);
     let (request, refused) = fill_to_the_bound(&mut session, 10);
     assert!(refused_at_checkpoint(&refused), "{refused:?}");
-    // Claims created before the bound are finished at it, until finishing takes what is left.
+    // Every claim created before the bound is finished at it.
     let mut next = request;
-    let mut cancelled = 0u128;
-    let mut stopped = None;
     for claim in 10..request {
         let (_, expected) = claim_status(&session, 1_000 + claim);
         next += 1;
-        match session.propose(context(), cancel(next, expected)) {
-            Ok(NativeSubmission::Pending { outcome, .. }) => {
-                let committed = (0..16).any(|_| {
-                    session
-                        .poll()
-                        .unwrap()
-                        .committed
-                        .iter()
-                        .any(|commit| commit.outcome == outcome)
-                });
-                assert!(committed, "cancel of claim {claim} never committed");
-                cancelled += 1;
-            }
-            Ok(other) => panic!("a fresh cancel was {other:?}"),
-            Err(error) => {
-                stopped = Some(error);
-                break;
-            }
-        }
+        commit(
+            &mut session,
+            cancel(next, expected),
+            "a cancel at the bound",
+        );
     }
-    assert!(cancelled > 0, "no claim was finished at the bound");
-    eprintln!(
-        "cancelled {cancelled} of {} at the bound: {stopped:?}",
-        request - 10
-    );
-    // A family finished before the bound retires at it, whatever finishing took, as the
-    // archive's walk offers it: a candidate among the writes.
+    // A family finished before the bound retires at it, as the archive's walk offers it: a
+    // candidate among the writes.
     let family = session
         .committed_core()
         .unwrap()
@@ -1605,6 +1585,7 @@ fn a_ledger_at_its_checkpoint_bound_still_finishes_and_retires() {
         bundle: ContentHash([9; 32]),
         bytes: 4096,
     };
+    let before = projection_reserved(&session);
     let (batch, submission) = session.retire(&[offer]).unwrap();
     let Some(NativeSubmission::Pending { outcome, .. }) = submission else {
         panic!("the bound refused a retirement: {batch:?}, {submission:?}");
@@ -1625,16 +1606,12 @@ fn a_ledger_at_its_checkpoint_bound_still_finishes_and_retires() {
             .native_claim(ClaimId::from_u128(100))
             .is_none()
     );
-    // What it took away is room again: the claim whose cancel the bound refused is finished.
-    if stopped.is_some() {
-        let claim = 10 + cancelled;
-        let (_, expected) = claim_status(&session, 1_000 + claim);
-        commit(
-            &mut session,
-            cancel(next + 1, expected),
-            "a cancel after the retirement",
-        );
-    }
+    // What it took away is room again: the root with its reservations is smaller by it.
+    let after = projection_reserved(&session);
+    assert!(
+        after.1.0 < before.1.0 && after.1.1 < before.1.1,
+        "the retirement took nothing away: {before:?} -> {after:?}"
+    );
 }
 
 #[test]
@@ -1913,4 +1890,138 @@ fn a_native_engine_admits_within_its_share_and_holds_its_sessions_allowance() {
     );
     assert_eq!(budget.reservation_limit(BudgetLane::Completion), 700 << 20);
     assert_eq!(budget.reservation_limit(BudgetLane::Committed), 800 << 20);
+}
+
+/// The projection of the active owner's checkpoint, rows and bytes, alone and with what its claims
+/// reserve for their finishing.
+fn projection_reserved(
+    session: &NativeSession<BuiltinNativeSchemas>,
+) -> ((usize, usize), (usize, usize)) {
+    let Some(super::engine::Domain::Active(owner, _)) = session.engine.domain.as_ref() else {
+        panic!("no active owner");
+    };
+    let projection = owner.checkpoint_projection().unwrap();
+    ((projection.rows, projection.bytes), projection.reserved())
+}
+/// The projection of the active owner's checkpoint: rows and bytes.
+fn projection(session: &NativeSession<BuiltinNativeSchemas>) -> (usize, usize) {
+    let Some(super::engine::Domain::Active(owner, _)) = session.engine.domain.as_ref() else {
+        panic!("no active owner");
+    };
+    let projection = owner.checkpoint_projection().unwrap();
+    (projection.rows, projection.bytes)
+}
+
+/// A ledger at its checkpoint's bound finishes every claim it holds, whatever order its clients
+/// finish them in: here every claim is cancelled first, then every one released, then every
+/// family retired, and fresh work is admitted again. No claim was finished before the bound.
+/// Before, fresh work stopped an eighth short of the bound and the cancels took that eighth
+/// before any release came: every release was refused, no family could retire, and the ledger
+/// could finish nothing more (a review's repro: 14 claims, 10 cancels, every release refused).
+/// Each claim now reserves its finishing where it is admitted (`focal_core::native::Finishing`),
+/// so the root with its reservations never passes the bound and no finishing is refused by it.
+#[test]
+fn a_ledger_at_its_checkpoint_bound_finishes_every_claim_in_any_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let mut bounded = limits();
+    bounded.checkpoint.rows = 200;
+    let mut session = open_with(dir.path(), &parent, bounded).unwrap();
+    lead(&mut session);
+    let (request, refused) = fill_to_the_bound(&mut session, 10);
+    assert!(refused_at_checkpoint(&refused), "{refused:?}");
+    let claims: Vec<u128> = (10..request).map(|at| 1_000 + at).collect();
+    assert!(claims.len() >= 8, "only {} claims fit", claims.len());
+    let mut next = request;
+    for claim in &claims {
+        let (_, expected) = claim_status(&session, *claim);
+        next += 1;
+        commit(
+            &mut session,
+            cancel(next, expected),
+            "a cancel at the bound",
+        );
+    }
+    for claim in &claims {
+        let (_, expected) = claim_status(&session, *claim);
+        next += 1;
+        commit(
+            &mut session,
+            release(next, expected),
+            "a release at the bound",
+        );
+    }
+    for (at, claim) in claims.iter().enumerate() {
+        let root = ClaimId::from_u128(*claim);
+        let family = session
+            .committed_core()
+            .unwrap()
+            .retirement_family(root)
+            .unwrap();
+        let offer = focal_core::native::retirement_batch::RetireOffer {
+            root,
+            family: focal_core::native::retirement_batch::family_digest(ledger(), &family).unwrap(),
+            bundle: ContentHash([u8::try_from(at + 1).unwrap(); 32]),
+            bytes: 4096,
+        };
+        let (batch, submission) = session.retire(&[offer]).unwrap();
+        let Some(NativeSubmission::Pending { outcome, .. }) = submission else {
+            panic!("the bound refused the retirement of {claim}: {batch:?}, {submission:?}");
+        };
+        let committed = (0..16).any(|_| {
+            session
+                .poll()
+                .unwrap()
+                .committed
+                .iter()
+                .any(|commit| commit.outcome == outcome)
+        });
+        assert!(committed, "the retirement of {claim} never committed");
+    }
+    let core = session.committed_core().unwrap();
+    assert!(
+        claims
+            .iter()
+            .all(|claim| core.native_claim(ClaimId::from_u128(*claim)).is_none())
+    );
+    assert_eq!(
+        core.finishing_reserved(),
+        focal_core::native::Finishing::default()
+    );
+    // What they took away is room again.
+    commit(
+        &mut session,
+        create(next + 1, 9_000),
+        "a creation once the ledger emptied",
+    );
+}
+
+#[test]
+#[ignore = "measurement"]
+fn measure_the_checkpoint_growth_of_each_step_of_a_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let mut session = open_with(dir.path(), &parent, limits()).unwrap();
+    lead(&mut session);
+    for claim in 0..3u128 {
+        let base = 100 * (claim + 1);
+        let at = projection(&session);
+        commit(&mut session, create(base, 1_000 + base), "create");
+        let created = projection(&session);
+        let (_, expected) = claim_status(&session, 1_000 + base);
+        commit(&mut session, cancel(base + 1, expected), "cancel");
+        let cancelled = projection(&session);
+        let (_, expected) = claim_status(&session, 1_000 + base);
+        commit(&mut session, release(base + 2, expected), "release");
+        let released = projection(&session);
+        eprintln!(
+            "claim {claim}: create +{} rows +{} B, cancel +{} rows +{} B, release +{} rows +{} B",
+            created.0 - at.0,
+            created.1 - at.1,
+            cancelled.0 - created.0,
+            cancelled.1 - created.1,
+            released.0 - cancelled.0,
+            released.1 - cancelled.1
+        );
+    }
 }

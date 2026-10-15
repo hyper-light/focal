@@ -258,6 +258,7 @@ impl<'a> StructuralArchive<'a> {
                     profile: self.header.profile,
                     // An archive's rows hold their bytes.
                     encoded_rows: crate::native::encoded_rows_of(&rows, self.header.ledger, None)?,
+                    finishing: crate::native::finishing::of_rows(&rows)?,
                     rows,
                     budget,
                     events: crate::native::event_index::EventIndex::unbuilt(),

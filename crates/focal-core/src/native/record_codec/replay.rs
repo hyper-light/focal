@@ -647,6 +647,7 @@ pub(super) fn install(
     // member beyond the one the record funded (25 §4).
     let encoded_added =
         crate::native::encoded_added(changes.iter(), core.state.ledger, core.state.payloads())?;
+    let finishing_added = crate::native::finishing::added(changes.iter())?;
     let extra = core.state.rows.input_extra_bytes(changes.len())?;
     if extra != 0 {
         let mut extra_allocation = core
@@ -728,6 +729,8 @@ pub(super) fn install(
         encoded_added,
         encoded_removed: removed.bytes(),
         rows_removed: removed.rows(),
+        finishing_added,
+        finishing_taken: removed.finishing(),
         // A replay is published at once, never held in a chain.
         _index: None,
         events,

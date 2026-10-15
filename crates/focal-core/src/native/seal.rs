@@ -1251,6 +1251,7 @@ impl Core<NativeState> {
         let encoded = self.encoded_after_changes(&changes)?;
         // The rows it writes: those it replaces or deletes may leave spilled copies unnamed.
         let written = changes.len();
+        let reserved = self.finishing_after_changes(&changes)?;
         // One publication of what the seal's bound allows: a bundle's rows,
         // every window at most once, the fold's rows, the seal's row, the
         // meta and the outcome.
@@ -1266,6 +1267,7 @@ impl Core<NativeState> {
         )?;
         self.state.encoded_rows = encoded;
         self.state.marks.churned(written);
+        self.state.finishing = reserved;
         Ok(left)
     }
 }

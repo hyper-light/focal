@@ -785,9 +785,10 @@ fn measure_refusal_at_the_memory_bound() {
 }
 
 /// A bound on `owner`'s checkpoint that leaves fresh work no room past the root as it stands,
-/// pending candidates published: the least whose ordinary share reaches the projection.
+/// pending candidates published: the least whose ordinary share reaches the projection with what
+/// its claims reserve for their finishing, which is what admission holds to the bound.
 fn bound_at_projection(owner: &mut NativeOwner) {
-    let projection = owner.checkpoint_projection().unwrap();
+    let (rows, bytes) = owner.checkpoint_projection().unwrap().reserved();
     let least = |at: usize| {
         let mut whole = at;
         while whole - whole / 8 < at {
@@ -798,8 +799,8 @@ fn bound_at_projection(owner: &mut NativeOwner) {
     owner
         .core
         .bound_checkpoint(Some(crate::native::CheckpointBound {
-            rows: least(projection.rows),
-            bytes: least(projection.bytes),
+            rows: least(rows),
+            bytes: least(bytes),
         }));
 }
 

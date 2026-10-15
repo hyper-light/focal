@@ -395,6 +395,7 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
             ledger: header.ledger,
             profile: header.profile,
             encoded_rows: crate::native::encoded_rows_of(&rows, header.ledger, payloads)?,
+            finishing: crate::native::finishing::of_rows(&rows)?,
             rows,
             budget,
             events: crate::native::event_index::EventIndex::unbuilt(),

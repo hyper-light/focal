@@ -887,6 +887,11 @@ fn a_publication_takes_away_what_its_build_replaced() {
             state.encoded_rows,
             crate::native::encoded_rows_of(&state.rows, state.ledger, state.payloads()).unwrap()
         );
+        // What the rows reserve for their finishing is kept the same way, exactly.
+        assert_eq!(
+            state.finishing,
+            crate::native::finishing::of_rows(&state.rows).unwrap()
+        );
     }
     assert_eq!(owner.pending_len(), 0);
 }

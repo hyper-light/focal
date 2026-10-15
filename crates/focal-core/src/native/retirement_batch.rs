@@ -540,6 +540,8 @@ impl Core<NativeState> {
             view.state.ledger,
             view.payloads(),
         )?;
+        let finishing_added =
+            super::finishing::added(fragments.changes().map(|(_, _, change)| change))?;
         let mut removed = super::EncodedRemoved::new(view.state.ledger, view.payloads());
         for (_, _, change) in fragments.changes() {
             let key = change.key();
@@ -568,6 +570,8 @@ impl Core<NativeState> {
             encoded_added,
             encoded_removed: removed.bytes(),
             rows_removed: removed.rows(),
+            finishing_added,
+            finishing_taken: removed.finishing(),
             _index: Some(index),
             events: None,
             retire: Some(RetireBody {

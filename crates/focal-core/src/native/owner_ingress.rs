@@ -87,8 +87,8 @@ pub(super) enum Need {
     /// headroom lacked.
     Memory { lane: BudgetLane, bytes: usize },
     /// Room for what its candidate grew the root by, in rows and in encoded
-    /// bytes, below what work on its lane may bring the root to
-    /// ([`super::super::CheckpointBound`]).
+    /// bytes with what they reserve for finishing, below what work on its lane
+    /// may bring the root to ([`super::super::CheckpointBound`]).
     Checkpoint {
         lane: BudgetLane,
         rows: usize,
@@ -173,8 +173,9 @@ impl NativeOwner {
                 let room = self.core.checkpoint_bound().is_none_or(|bound| {
                     let (row_room, byte_room) = bound.on(lane);
                     self.checkpoint_projection().is_ok_and(|projection| {
-                        projection.rows.saturating_add(rows) <= row_room
-                            && projection.bytes.saturating_add(bytes) <= byte_room
+                        let (now_rows, now_bytes) = projection.reserved();
+                        now_rows.saturating_add(rows) <= row_room
+                            && now_bytes.saturating_add(bytes) <= byte_room
                     })
                 });
                 (!room).then_some(NativeError::Capacity(CHECKPOINT_REFUSAL))

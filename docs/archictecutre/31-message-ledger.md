@@ -962,6 +962,39 @@ Each stage lands on its own, measured:
        - Measured (`measure_refusal_at_the_checkpoint_bound`, release): 45.8 µs a prepared
          creation, then 5,000 of 5,000 refused at 0.21 µs each. At the memory's bound the
          refusal costs 0.25 µs.
+     - **A fixed reserve could not hold every claim's finishing.** The bound's lanes left an
+       eighth of it to finishing work, and a review found the order that wedged it: at the
+       bound, cancel every claim first, then release them. A cancel adds 3 rows and 680 bytes
+       (its outcome, the claim's event and its status event, and the cut the claim ends at), a
+       release 2 rows and 503 bytes, and only a released family retires. The cancels took the
+       eighth before any release came: every release was refused, no family could retire, and the
+       ledger could finish nothing more (14 claims, 10 cancels, every release refused).
+       - Now each claim reserves its finishing where it is admitted (`Finishing`), by the shape
+         it has: an open claim what its terminal transition adds and its release, a terminal one
+         its release, each monitor it has active the cancel that must come before the release,
+         and each live evaluation its fence. A claim with dependencies reserves for the larger
+         cut a dependency's failure ends it at, one with a monitor for the monitor's deadline.
+         The root with its reservations never passes the bound, and fresh work stops an eighth
+         short of it as before. A transition that ends a claim or releases one takes no more
+         than the reservation it gives back, so the bound never refuses it, in any order. This is
+         how XFS and ext4's jbd2 reserve a transaction's log space before it changes anything,
+         and how doc 22's completion promises reserve a report's rows before it arrives.
+       - The reservations are kept as the encoded bytes are: counted for each candidate as its
+         build counts what it replaces, kept as each publication, seal and replay applies, and
+         summed once where a root is built whole. A spilled claim waits to be delivered, on
+         nothing and in nothing, so it reserves what an open claim of no dependency and no
+         monitor does, unread. Nothing a transition deletes (a timer it consumes) is counted on.
+       - What it costs: an open claim of no dependency and no monitor reserves 5 rows and 1,187
+         bytes beside the 12 to 14 rows and 1.7 to 1.9 KB its creation takes. With the rows
+         deciding (a 200-row bound), 9 claims fit where 13 did; the other 4 were claims the
+         ledger could not have finished.
+       - Tested: every finishing path takes no more than it reserved, rows and bytes, and the
+         running reservation is after every step what a walk of the rows gives
+         (`finishing_a_claim_takes_no_more_than_it_reserved`: cancels of a posted claim, of one
+         with an evaluation begun or not, of one others depend on (one on two claims), of an owned
+         tree's root; a claim's deadline and a monitor's; a monitor's cancel; every release). A
+         ledger at its bound cancels every claim, then releases every one, then retires every
+         family, then admits fresh work. Both fail with the reservations set to nothing.
      - **Not fixed, recorded.**
        - An installing replica still assembles the encoded root whole, so the bound stays where
          its memory puts it. Streaming the install chunk by chunk, as TiKV and CockroachDB
