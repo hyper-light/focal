@@ -168,14 +168,16 @@ impl FleetWait {
 /// every datagram between them crosses a relay that delays it `delay` and
 /// up to `jitter` more, and where `loss` is given loses one datagram in so
 /// many, so the streams of frames sent together complete in any order; and
-/// the connectors of the nodes in `old` offer what a binary before the
-/// ordered profile offered, so their frames go plain.
+/// the connectors of the nodes in `limited` offer `offering` alone, as a binary
+/// that knew no later profile did (`OLDER_PROFILES`: their frames go plain;
+/// `ORDERED_PROFILES`: ordered, each on a stream of its own).
 #[derive(Clone, Copy)]
 struct Shaped<'a> {
     delay: Duration,
     jitter: Duration,
     loss: Option<u64>,
-    old: &'a [u64],
+    limited: &'a [u64],
+    offering: &'static [u16],
 }
 /// The fleet's tick: its owners' period.
 const TICK: Duration = Duration::from_millis(20);
@@ -184,6 +186,15 @@ const TICK: Duration = Duration::from_millis(20);
 const FROZEN: Duration = Duration::from_secs(60);
 /// What a binary before the ordered profile offered in its Hello.
 const OLDER_PROFILES: [u16; 4] = [
+    NATIVE_PROTOCOL_VERSION,
+    PEER_PROTOCOL_VERSION,
+    MANAGED_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+];
+/// What a binary of the ordered profile and before the laned one offered: each frame on a
+/// stream of its own, in its order by the follower's resequencer.
+const ORDERED_PROFILES: [u16; 5] = [
+    ORDERED_PROTOCOL_VERSION,
     NATIVE_PROTOCOL_VERSION,
     PEER_PROTOCOL_VERSION,
     MANAGED_PROTOCOL_VERSION,
@@ -495,9 +506,9 @@ impl Fleet {
             let handler = host.clone();
             let server_task = focal_rt::spawn(async move { serving.serve(handler).await }).unwrap();
             let connector = match shaped {
-                Some(shaped) if shaped.old.contains(&id) => pki
+                Some(shaped) if shaped.limited.contains(&id) => pki
                     .connector(identity, focal_wire::net::Sender::Node)
-                    .offering(&OLDER_PROFILES)
+                    .offering(shaped.offering)
                     .unwrap(),
                 _ => pki.connector(identity, focal_wire::net::Sender::Node),
             };
@@ -901,7 +912,12 @@ mod relay;
 /// (`ReplicaProgress::appends_rejected_in_order`): there are none, while
 /// the path made the followers hold frames for the ones they overtook.
 /// With every connector offering what a binary before the ordered profile
-/// offered, the frames go plain and the burst commits as well.
+/// offered, the frames go plain and the burst commits as well. With the
+/// laned profile, the product's, a peer's frames share one stream (27 §12):
+/// the path cannot reorder them, nothing is held, and every write of the
+/// burst commits across the loss with no refusal the order should have
+/// spared; the ordered profile is run apart, so the resequencer meets the
+/// overtaking it is for.
 ///
 /// What the test may not claim is how many appends a run refuses: how
 /// many of the frames a loss overtakes name entries their follower lacks
@@ -916,11 +932,19 @@ mod relay;
 #[test]
 fn a_peers_appends_are_stepped_in_their_order_across_a_lossy_path() {
     focal_rt::block_on(async move {
-        let plain = appends_refused_across_a_lossy_path(&[1, 2, 3]).await;
-        let ordered = appends_refused_across_a_lossy_path(&[]).await;
+        let plain = appends_refused_across_a_lossy_path(&[1, 2, 3], &OLDER_PROFILES).await;
+        let ordered = appends_refused_across_a_lossy_path(&[1, 2, 3], &ORDERED_PROFILES).await;
+        let laned = appends_refused_across_a_lossy_path(&[], &[]).await;
         println!(
-            "lossy path: {} appends refused with plain frames; {} with ordered ones ({} in order), {} held, {} let go past their patience",
-            plain.refused, ordered.refused, ordered.in_order, ordered.held, ordered.let_go
+            "lossy path: {} appends refused with plain frames; {} with ordered ones ({} in order), {} held, {} let go past their patience; {} with laned ones ({} in order), {} held",
+            plain.refused,
+            ordered.refused,
+            ordered.in_order,
+            ordered.held,
+            ordered.let_go,
+            laned.refused,
+            laned.in_order,
+            laned.held
         );
         assert!(
             ordered.held > 0,
@@ -930,6 +954,11 @@ fn a_peers_appends_are_stepped_in_their_order_across_a_lossy_path() {
             ordered.in_order, 0,
             "an ordered frame was refused for overtaking within its patience: {} of {} refused, {} let go",
             ordered.in_order, ordered.refused, ordered.let_go
+        );
+        assert_eq!(
+            laned.in_order, 0,
+            "a laned frame was refused for its order: {} of {} refused",
+            laned.in_order, laned.refused
         );
     }).unwrap()
 }
@@ -1019,7 +1048,7 @@ impl ActorConnections {
 }
 /// The appends the followers refused while a burst of entries crossed a
 /// path of 5 ms each way that loses one datagram in fifty, the connectors
-/// of the nodes in `old` offering the older profiles. A frame whose
+/// of the nodes in `limited` offering `offering` alone. A frame whose
 /// datagram the path lost arrives a loss detection later — the
 /// acknowledgement of what was sent behind it, a round trip and the delay
 /// the peer may hold it — after the frame sent behind it, which is how one
@@ -1029,7 +1058,10 @@ impl ActorConnections {
 /// leaves; the burst is long enough for a thousand appends — the entries
 /// and the commits after them — to cross to the followers, a fiftieth of
 /// them overtaken.
-async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
+async fn appends_refused_across_a_lossy_path(
+    limited: &[u64],
+    offering: &'static [u16],
+) -> Refusals {
     const BURST: u128 = 512;
     let directory = tempfile::tempdir().unwrap();
     let fleet = Fleet::open_shaped(
@@ -1041,7 +1073,8 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
             delay: Duration::from_millis(5),
             jitter: Duration::from_millis(2),
             loss: Some(50),
-            old,
+            limited,
+            offering,
         }),
     )
     .await;
@@ -1241,7 +1274,7 @@ async fn appends_refused_across_a_lossy_path(old: &[u64]) -> Refusals {
         refusals.let_go += progress.frames_let_go;
     }
     println!(
-        "lossy path, older offers {old:?}: {} appends refused, {} frames held, {} let go, {lost} exchanges lost",
+        "lossy path, {limited:?} offering {offering:?}: {} appends refused, {} frames held, {} let go, {lost} exchanges lost",
         refusals.refused, refusals.held, refusals.let_go
     );
     fleet.stop().await;
