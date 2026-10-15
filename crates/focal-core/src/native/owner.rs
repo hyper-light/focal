@@ -486,21 +486,18 @@ impl std::fmt::Debug for NativeOwner {
 }
 // Whole-owner destruction needs no journal rollback: pending records/pages
 // drop before Core and book, and every pool permit keeps its actual backing.
-/// The segments of the payload log the pending candidates' rows name, added to `live`: what a
-/// sweep keeps beside the committed rows' (doc 31 M3).
-fn pending_segments(pending: &VecDeque<Pending>, live: &mut std::collections::BTreeSet<u32>) {
-    for row in pending {
-        super::payloads::segments_of(
-            row.prepared
-                .fragments
-                .changes()
-                .filter_map(|(_, _, change)| match change {
-                    super::ranges::RowChange::Put(entry) => Some(entry.value),
-                    super::ranges::RowChange::Delete(_) => None,
-                }),
-            live,
-        );
-    }
+/// The rows the pending candidates put: what a sweep keeps the segments of beside the committed
+/// rows' (doc 31 M3).
+fn pending_rows(pending: &VecDeque<Pending>) -> impl Iterator<Item = &Row> {
+    pending.iter().flat_map(|row| {
+        row.prepared
+            .fragments
+            .changes()
+            .filter_map(|(_, _, change)| match change {
+                super::ranges::RowChange::Put(entry) => Some(entry.value),
+                super::ranges::RowChange::Delete(_) => None,
+            })
+    })
 }
 
 // Explicit suffix discard still rolls back journals before further admission.
@@ -1364,11 +1361,7 @@ impl NativeOwner {
         if !self.core.mark_payloads(due) {
             return None;
         }
-        let pending = &self.pending;
-        Some(
-            self.core
-                .sweep_marked(|live| pending_segments(pending, live)),
-        )
+        Some(self.core.sweep_marked(pending_rows(&self.pending)))
     }
     /// A whole pass of the payload log's sweep, now ([`Core::sweep_payloads`]), the pending
     /// candidates' segments kept. How many segments it let go of.
@@ -1376,10 +1369,7 @@ impl NativeOwner {
         let steps = super::payloads::pass_steps(self.core.state.rows.len());
         for _ in 0..steps {
             if self.core.mark_payloads(true) {
-                let pending = &self.pending;
-                return self
-                    .core
-                    .sweep_marked(|live| pending_segments(pending, live));
+                return self.core.sweep_marked(pending_rows(&self.pending));
             }
         }
         0

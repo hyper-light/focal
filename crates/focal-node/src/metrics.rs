@@ -2321,6 +2321,7 @@ mod tests {
             payload_open_refusals: 0,
             payload_passes: 0,
             payload_let_go: 0,
+            payload_short: 0,
             payload_named: 0,
             native_by_kind: {
                 let mut kinds = [0; focal_client::admin::NATIVE_MEMORY_KINDS];

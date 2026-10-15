@@ -143,10 +143,10 @@ pub trait PayloadLog: PayloadRead + Send + Sync {
     /// A reader of what the log holds now, for another thread (a frozen image's encoder).
     fn reader(&self) -> Result<Box<dyn PayloadRead + Send>, PayloadError>;
     /// Let go of every sealed part of the log before segment `before` that no row references,
-    /// `live` naming the segments that some row does (every committed and pending row's, as a
-    /// sweep's pass found them, [`Marks`]). How many parts it let go.
-    fn sweep(&self, live: &std::collections::BTreeSet<u32>, before: u32) -> usize {
-        let _ = (live, before);
+    /// `named` saying whether some row does (every committed and pending row's, as a sweep's pass
+    /// found them, [`Marks`]). How many parts it let go.
+    fn sweep(&self, named: &dyn Fn(u32) -> bool, before: u32) -> usize {
+        let _ = (named, before);
         0
     }
     /// The segment appends go to now: what a sweep's pass that begins now may let go of is before
@@ -180,17 +180,6 @@ pub(super) fn logged(row: &super::Row) -> Option<PayloadRef> {
     }
 }
 
-/// The segment of every spilled row among `rows`, added to `live`. Bounded by the segments a log
-/// holds: a set of `u32`.
-pub(super) fn segments_of<'a>(
-    rows: impl Iterator<Item = &'a super::Row>,
-    live: &mut std::collections::BTreeSet<u32>,
-) {
-    for at in rows.filter_map(logged) {
-        live.insert(at.segment());
-    }
-}
-
 /// The committed rows a sweep's pass visits a step: a few tens of microseconds of a replica's
 /// thread, so no step walks the whole root.
 #[cfg(not(test))]
@@ -217,6 +206,11 @@ pub(super) fn pass_steps(rows: usize) -> usize {
 ///   to, from where it began, never one it may let go of; a row a publication puts while it goes on
 ///   may stand where it has already been, so a publication names its rows' segments to it
 ///   ([`Marks::published`]).
+///
+/// What it notes is charged as it grows, a doubling at a time, its charge admitted before the
+/// growth, and kept with the room between passes. A pass that cannot be charged for a segment it
+/// meets notes the shortfall and sweeps nothing: its notes are incomplete, and a segment one of its
+/// rows names would read as named by none. The next pass begins afresh.
 #[derive(Debug, Default)]
 pub(crate) struct Marks {
     /// Where appends went when the pass began: what it may let go of is before it. None between
@@ -224,20 +218,29 @@ pub(crate) struct Marks {
     from: Option<u32>,
     /// The last row the pass visited: the next step begins after it.
     after: Option<super::Key>,
-    /// The bytes of each segment the rows it visited, and the rows published since it began, name.
-    /// Bounded by the segments the log holds.
-    live: std::collections::BTreeMap<u32, u64>,
+    /// The segments the rows it visited, the rows published since it began and a leader's pending
+    /// candidates name, sorted, each with the bytes seen naming it. Bounded by the segments the log
+    /// holds.
+    named: Vec<(u32, u64)>,
+    /// What `named`'s room is charged, held while it holds the room.
+    charge: Option<focal_memory::Allocation>,
+    /// A segment it met and could not note for want of memory: its sweep lets go of nothing.
+    short: bool,
     /// What the passes have done, since the core was made ([`PayloadSweep`]).
     done: PayloadSweep,
 }
 
 /// What a core's payload log sweep has done since the core was made (doc 31 M3): the passes that
-/// ended, the segments their sweeps let go, and the bytes the last pass found its rows naming:
-/// beside the log's own size, how much of it is live.
+/// ended, the segments their sweeps let go, the passes that could not be charged for what they met
+/// and so swept nothing, and the bytes the last pass saw its rows name. That last is an upper bound
+/// of what is live beside the log's own size, not an exact count: a row published while a pass
+/// goes on is counted where it is published and again where the pass reaches it, and a row that
+/// is replaced or deleted after its count still counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PayloadSweep {
     pub passes: u64,
     pub let_go: u64,
+    pub short: u64,
     pub named: u64,
 }
 
@@ -250,19 +253,96 @@ impl Marks {
     pub(super) fn begin(&mut self, from: u32) {
         self.from = Some(from);
         self.after = None;
-        self.live.clear();
+        self.named.clear();
+        self.short = false;
     }
-    fn name(&mut self, at: PayloadRef) {
+    /// `at`'s segment noted as named, its bytes added to what names it; the room for a segment
+    /// not yet noted grown first where there is none, and the pass short where it cannot be.
+    fn name(&mut self, at: PayloadRef, budget: &focal_memory::MemoryBudget) {
         let bytes = u64::try_from(at.len()).unwrap_or(u64::MAX);
-        let named = self.live.entry(at.segment()).or_insert(0);
-        *named = named.saturating_add(bytes);
+        match self
+            .named
+            .binary_search_by_key(&at.segment(), |(segment, _)| *segment)
+        {
+            Ok(found) => {
+                if let Some((_, named)) = self.named.get_mut(found) {
+                    *named = named.saturating_add(bytes);
+                }
+            }
+            Err(place) => {
+                if self.named.len() == self.named.capacity() && !self.grow(budget) {
+                    self.short = true;
+                    return;
+                }
+                // Within the room just made: no reallocation.
+                self.named.insert(place, (at.segment(), bytes));
+            }
+        }
+    }
+    /// `named`'s room doubled (sixteen segments at least), its charge admitted first, on the
+    /// completion lane: a sweep gives back what it lets go of, and runs while fresh work's lane is
+    /// spent.
+    fn grow(&mut self, budget: &focal_memory::MemoryBudget) -> bool {
+        if self.charge.is_none() {
+            match budget.reserve(
+                focal_memory::BudgetKind::Payload,
+                focal_memory::BudgetLane::Completion,
+                0,
+            ) {
+                Ok(permit) => self.charge = Some(permit.commit()),
+                Err(_) => return false,
+            }
+        }
+        let Some(charge) = self.charge.as_mut() else {
+            return false;
+        };
+        let have = self.named.capacity();
+        let want = have.saturating_mul(2).max(16);
+        let Some(more) = want
+            .checked_sub(have)
+            .and_then(|more| more.checked_mul(size_of::<(u32, u64)>()))
+        else {
+            return false;
+        };
+        if charge.grow(more).is_err() {
+            return false;
+        }
+        if self
+            .named
+            .try_reserve_exact(want.saturating_sub(self.named.len()))
+            .is_err()
+        {
+            let held = charge.bytes().saturating_sub(more);
+            // Given back exactly what was admitted for it.
+            let _ = charge.shrink_to(held);
+            return false;
+        }
+        true
+    }
+    /// Whether some row the pass met names `segment`.
+    pub(super) fn names(&self, segment: u32) -> bool {
+        self.named
+            .binary_search_by_key(&segment, |(at, _)| *at)
+            .is_ok()
     }
     /// The rows a publication puts while a pass goes on name their segments to it.
-    pub(super) fn published<'a>(&mut self, rows: impl Iterator<Item = &'a super::Row>) {
+    pub(super) fn published<'a>(
+        &mut self,
+        rows: impl Iterator<Item = &'a super::Row>,
+        budget: &focal_memory::MemoryBudget,
+    ) {
         if self.running() {
-            for at in rows.filter_map(logged) {
-                self.name(at);
-            }
+            self.pending(rows, budget);
+        }
+    }
+    /// The rows of a leader's pending candidates name their segments to the pass at its end.
+    pub(super) fn pending<'a>(
+        &mut self,
+        rows: impl Iterator<Item = &'a super::Row>,
+        budget: &focal_memory::MemoryBudget,
+    ) {
+        for at in rows.filter_map(logged) {
+            self.name(at, budget);
         }
     }
     /// What the passes have done.
@@ -278,27 +358,39 @@ impl Marks {
     pub(super) fn visited<'a>(
         &mut self,
         rows: impl Iterator<Item = super::ranges::RowEntry<'a>>,
+        budget: &focal_memory::MemoryBudget,
     ) -> bool {
         let mut visited = 0usize;
         for entry in rows {
             if let Some(at) = logged(entry.value) {
-                self.name(at);
+                self.name(at, budget);
             }
             self.after = Some(entry.key);
             visited = visited.saturating_add(1);
         }
         visited < MARK_ROWS
     }
-    /// The pass ended: where it began, the segments it named and their bytes, the pass over.
-    pub(super) fn end(&mut self) -> Option<(u32, std::collections::BTreeMap<u32, u64>)> {
+    /// The pass ended: where it began, where it noted every segment it met; none where it fell
+    /// short, and its sweep lets go of nothing. Its notes stay for the sweep to read until
+    /// [`Self::clear`].
+    pub(super) fn end(&mut self) -> Option<u32> {
         let from = self.from.take()?;
         self.after = None;
-        let live = std::mem::take(&mut self.live);
         self.done.passes = self.done.passes.saturating_add(1);
-        self.done.named = live
-            .values()
-            .fold(0u64, |sum, bytes| sum.saturating_add(*bytes));
-        Some((from, live))
+        self.done.named = self
+            .named
+            .iter()
+            .fold(0u64, |sum, (_, bytes)| sum.saturating_add(*bytes));
+        if self.short {
+            self.done.short = self.done.short.saturating_add(1);
+            return None;
+        }
+        Some(from)
+    }
+    /// The notes of a pass whose sweep is made let go: the room and its charge are kept.
+    pub(super) fn clear(&mut self) {
+        self.named.clear();
+        self.short = false;
     }
     /// The segments a pass's sweep let go.
     pub(super) fn let_go(&mut self, segments: usize) {
@@ -531,13 +623,13 @@ impl PayloadLog for SegmentedPayloads {
             segments: std::sync::Mutex::new(segments),
         }))
     }
-    fn sweep(&self, live: &std::collections::BTreeSet<u32>, before: u32) -> usize {
+    fn sweep(&self, named: &dyn Fn(u32) -> bool, before: u32) -> usize {
         let mut segments = self.segments.lock().unwrap();
         let current = Self::current(&segments);
         let mut removed = 0;
         for (id, segment) in segments.iter_mut().enumerate() {
             let id = u32::try_from(id).unwrap();
-            if id < before && id != current && segment.is_some() && !live.contains(&id) {
+            if id < before && id != current && segment.is_some() && !named(id) {
                 *segment = None;
                 removed += 1;
             }

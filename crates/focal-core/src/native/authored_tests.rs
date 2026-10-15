@@ -1726,7 +1726,7 @@ fn a_publication_while_a_sweep_goes_on_keeps_its_segments() {
     assert!(steps > 1, "the pass took one step: nothing is measured");
     let held = core.payload_log().unwrap().held_segments();
     core.publish_native(late).unwrap();
-    core.sweep_marked(|_| {});
+    core.sweep_marked(std::iter::empty());
     assert!(core.payload_log().unwrap().held_segments() > held);
     let reference = checkpoint(&core);
     // A candidate let go unpublished: its plan's spills are named by nothing, and go.
@@ -1735,4 +1735,67 @@ fn a_publication_while_a_sweep_goes_on_keeps_its_segments() {
     assert!(core.sweep_payloads() > 0);
     assert!(core.payload_log().unwrap().held_segments() < held);
     assert_eq!(checkpoint(&core), reference);
+}
+
+/// A pass that cannot be charged for what it meets sweeps nothing: with the core's memory spent its
+/// notes fall short, so every segment stays (one that only a candidate let go unpublished named
+/// included) and every committed row reads back as before, and it holds no charge it took for them.
+/// With memory back, the next pass lets the unnamed segment go; the room it was charged for stays
+/// with it, charged, for the passes after.
+#[test]
+fn a_pass_that_cannot_be_charged_for_its_notes_sweeps_nothing() {
+    use focal_memory::{BudgetKind, BudgetLane};
+    let checkpoint = |core: &Core<NativeState>| {
+        let limits = record_codec::EncodingLimits {
+            bytes: 1 << 24,
+            visits: usize::MAX,
+            rows: 1 << 16,
+        };
+        let plan = record_codec::checkpoint::EncodingPlan::prepare(core, limits).unwrap();
+        let mut bytes = vec![0; plan.quote().bytes];
+        plan.write_into(&mut bytes).unwrap();
+        bytes
+    };
+    let mut core = core();
+    core.attach_payload_log_with_young(
+        Box::new(crate::native::payloads::SegmentedPayloads::default()),
+        0,
+    );
+    for id in 1..=6u128 {
+        publish(&mut core, create(id, vec![proposal(id, 10_000 + id)]));
+    }
+    drop(prepare(&core, create(8, vec![proposal(8, 10_008)]), &[]));
+    let reference = checkpoint(&core);
+    let held = core.payload_log().unwrap().held_segments();
+    let budget = core.state.budget.clone();
+    let used = budget.stats().used;
+    // Every byte either lane can still lend, held elsewhere.
+    let mut squeeze = Vec::new();
+    for lane in [BudgetLane::Ordinary, BudgetLane::Completion] {
+        let mut size = 1usize << 26;
+        while size > 0 {
+            match budget.reserve(BudgetKind::Query, lane, size) {
+                Ok(held) => squeeze.push(held),
+                Err(_) => size /= 2,
+            }
+        }
+    }
+    assert_eq!(core.sweep_payloads(), 0);
+    assert_eq!(core.payload_sweep().short, 1);
+    assert_eq!(core.payload_sweep().let_go, 0);
+    assert_eq!(core.payload_log().unwrap().held_segments(), held);
+    drop(squeeze);
+    assert_eq!(
+        budget.stats().used,
+        used,
+        "a pass that fell short kept a charge"
+    );
+    assert_eq!(checkpoint(&core), reference);
+    assert!(core.sweep_payloads() > 0);
+    assert!(core.payload_log().unwrap().held_segments() < held);
+    assert_eq!(checkpoint(&core), reference);
+    assert!(
+        budget.stats().used > used,
+        "the room it noted in is charged"
+    );
 }

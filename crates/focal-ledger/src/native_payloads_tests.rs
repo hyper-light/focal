@@ -1,5 +1,6 @@
 use super::*;
 use focal_memory::DiskBudgetConfig;
+use std::collections::BTreeSet;
 
 fn source(root: &Path, disk: DiskBudget) -> PayloadSource {
     PayloadSource {
@@ -46,7 +47,7 @@ fn payloads_read_back_across_segments_and_a_reader_keeps_what_a_sweep_removes() 
     // Only the last payload's segment is live: every sealed one before it goes.
     let (last, _) = written.last().unwrap();
     let live = BTreeSet::from([last.segment()]);
-    assert!(log.sweep(&live, u32::MAX) > 0);
+    assert!(log.sweep(&|id| live.contains(&id), u32::MAX) > 0);
     assert_eq!(log.segments(), 1);
     for (at, bytes) in &written {
         if at.segment() == last.segment() {
@@ -550,7 +551,7 @@ fn a_hold_given_back_across_new_segments_seals_where_it_began() {
     assert_eq!(read(&log, next).unwrap(), payload(9, 300));
     // Only the first payload's segment and the newest are live: the sealed empty ones go.
     let live = BTreeSet::from([first.segment(), next.segment()]);
-    log.sweep(&live, u32::MAX);
+    log.sweep(&|id| live.contains(&id), u32::MAX);
     assert_eq!(log.segments(), 2);
     let reader = log.reader().unwrap();
     assert_eq!(read(reader.as_ref(), first).unwrap(), payload(1, 700));

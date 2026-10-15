@@ -36,7 +36,7 @@ use focal_core::native::payloads::{
 use focal_memory::{
     Allocation, BudgetKind, BudgetLane, DiskBudget, DiskKind, DiskReservation, MemoryBudget,
 };
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -871,26 +871,24 @@ impl FilePayloads {
     /// a sweep's pass found them. The current segment stays, and so does every segment from
     /// `before` on (rows spilled while the pass went on are there). What the window held of a
     /// removed segment is let go with it. How many it removed.
-    pub fn sweep(&self, live: &BTreeSet<u32>, before: u32) -> usize {
+    pub fn sweep(&self, named: &dyn Fn(u32) -> bool, before: u32) -> usize {
         let Ok(mut writer) = self.writer.lock() else {
             return 0;
         };
         let current = writer.current;
-        let dead: Vec<u32> = writer
-            .segments
-            .range(..before)
-            .map(|(id, _)| *id)
-            .filter(|id| *id != current && !live.contains(id))
-            .collect();
+        let root = &self.root;
         let mut removed = 0usize;
-        for id in dead {
-            // A removal that fails keeps the segment, and the next sweep tries again.
-            if std::fs::remove_file(segment_path(&self.root, id)).is_ok()
-                && writer.segments.remove(&id).is_some()
-            {
-                removed = removed.saturating_add(1);
+        writer.segments.retain(|id, _| {
+            if *id >= before || *id == current || named(*id) {
+                return true;
             }
-        }
+            // A removal that fails keeps the segment, and the next sweep tries again.
+            if std::fs::remove_file(segment_path(root, *id)).is_err() {
+                return true;
+            }
+            removed = removed.saturating_add(1);
+            false
+        });
         // A chunk of a removed segment goes back to the spares; the writer's copy of it, if it
         // still holds one, comes back to the I/O buffers.
         let Writer {
@@ -1050,8 +1048,8 @@ impl PayloadLog for FilePayloads {
         writer.rewind(held);
         gave
     }
-    fn sweep(&self, live: &BTreeSet<u32>, before: u32) -> usize {
-        FilePayloads::sweep(self, live, before)
+    fn sweep(&self, named: &dyn Fn(u32) -> bool, before: u32) -> usize {
+        FilePayloads::sweep(self, named, before)
     }
     fn segment(&self) -> u32 {
         self.writer.lock().map_or(0, |writer| writer.current)

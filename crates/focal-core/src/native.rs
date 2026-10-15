@@ -2325,6 +2325,7 @@ impl Core<NativeState> {
             rows,
             payloads,
             marks,
+            budget,
             ..
         } = &mut self.state;
         let Some(log) = payloads.as_deref() else {
@@ -2337,30 +2338,37 @@ impl Core<NativeState> {
             marks.begin(log.segment());
         }
         match marks.after().copied() {
-            Some(after) => marks.visited(rows.entries_from(&after, true).take(payloads::MARK_ROWS)),
-            None => marks.visited(rows.entries().take(payloads::MARK_ROWS)),
+            Some(after) => marks.visited(
+                rows.entries_from(&after, true).take(payloads::MARK_ROWS),
+                budget,
+            ),
+            None => marks.visited(rows.entries().take(payloads::MARK_ROWS), budget),
         }
     }
     /// The sweep a pass that has visited every row allows (doc 31 M3): the segments sealed before
-    /// it began that no row it visited, no row published since it began and nothing `also` names
-    /// (a leader's pending candidates' rows) let go. How many.
-    pub(crate) fn sweep_marked(
+    /// it began that no row it visited, no row published since it began and none of `pending` (a
+    /// leader's pending candidates' rows) names let go; none where the pass could not be charged for
+    /// what it met. How many.
+    pub(in crate::native) fn sweep_marked<'a>(
         &mut self,
-        also: impl FnOnce(&mut std::collections::BTreeSet<u32>),
+        pending: impl Iterator<Item = &'a Row>,
     ) -> usize {
         let NativeState {
-            payloads, marks, ..
+            payloads,
+            marks,
+            budget,
+            ..
         } = &mut self.state;
-        let Some((from, named)) = marks.end() else {
+        if !marks.running() {
             return 0;
+        }
+        marks.pending(pending, budget);
+        let swept = match (marks.end(), payloads.as_deref()) {
+            (Some(from), Some(log)) => log.sweep(&|segment| marks.names(segment), from),
+            _ => 0,
         };
-        let Some(log) = payloads.as_deref() else {
-            return 0;
-        };
-        let mut live: std::collections::BTreeSet<u32> = named.keys().copied().collect();
-        also(&mut live);
-        let swept = log.sweep(&live, from);
         marks.let_go(swept);
+        marks.clear();
         swept
     }
     /// What the payload log's sweep has done since this core was made ([`payloads::PayloadSweep`]).
@@ -2371,7 +2379,7 @@ impl Core<NativeState> {
     /// let go of when its pass ended, none while one goes on or none is due.
     pub fn sweep_payloads_step(&mut self, due: bool) -> Option<usize> {
         if self.mark_payloads(due) {
-            Some(self.sweep_marked(|_| {}))
+            Some(self.sweep_marked(std::iter::empty()))
         } else {
             None
         }
@@ -2382,7 +2390,7 @@ impl Core<NativeState> {
         let steps = payloads::pass_steps(self.state.rows.len());
         for _ in 0..steps {
             if self.mark_payloads(true) {
-                return self.sweep_marked(|_| {});
+                return self.sweep_marked(std::iter::empty());
             }
         }
         0
@@ -2683,6 +2691,7 @@ impl Core<NativeState> {
                     ranges::RowChange::Put(entry) => Some(entry.value),
                     ranges::RowChange::Delete(_) => None,
                 }),
+            &self.state.budget,
         );
         if let Err((error, fragments)) = self.state.rows.publish_recoverable(fragments) {
             if retire.is_some() {

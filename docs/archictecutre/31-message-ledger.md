@@ -944,9 +944,16 @@ Each stage lands on its own, measured:
        - A publication while it goes on names its rows' segments to it. A candidate prepared
          before the pass and published after the pass had been past its keys would otherwise
          lose its bytes. A leader's pending candidates are named at the end.
-       - The replica's diagnostics report the passes, the segments let go and the bytes the last
-         pass found named (`payload_passes`, `payload_let_go`, `payload_named` beside
-         `payload_bytes`).
+       - What a pass notes (each segment met, with the bytes seen naming it) is charged as it
+         grows, a doubling at a time on the completion lane, its charge admitted first and kept
+         with the room between passes. A pass that cannot be charged for a segment it meets sweeps
+         nothing (its notes are incomplete) and the next begins afresh; the log's sweep reads the
+         notes in place, with no copy.
+       - The replica's diagnostics report the passes, the segments let go, the passes that fell
+         short, and the bytes the last pass saw its rows name (`payload_passes`,
+         `payload_let_go`, `payload_short`, `payload_named` beside `payload_bytes`). The last is
+         an upper bound of the live bytes, not an exact count: a row published while a pass goes
+         on may be counted twice, and one replaced after its count still counts.
      - **A cleaner, built and measured, not kept.** A pass that moved the rows of segments named
        half or less to where appends go (LFS's cleaner, WiscKey's value-log collection) freed
        nothing in the deliver run (env-9). 43% of its moves were refused: a frozen checkpoint
