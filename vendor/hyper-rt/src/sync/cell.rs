@@ -55,6 +55,24 @@ pub(crate) struct Cell {
 }
 
 impl Cell {
+    /// Records the task `word` as this cell's waiter, then fences, so the caller's check of the state that
+    /// follows is ordered after the registration (`crate::handoff::register_task`).
+    pub(crate) fn register(&self, word: Encoded) {
+        crate::handoff::register_task(&self.waiter, word.word());
+    }
+
+    /// Wakes the waiter, if one waits: a task through the registry, a blocked thread by its handle. Of several
+    /// publishers, one wakes each registration (`crate::handoff`).
+    pub(crate) fn wake(&self) {
+        crate::handoff::wake_waiter(&self.waiter);
+    }
+
+    /// [`Cell::wake`] for a publisher that fenced (`SeqCst`) after its change and wrote nothing since, on the
+    /// shard `here` when it knows it (`crate::handoff::wake_waiter_fenced`).
+    pub(crate) fn wake_fenced(&self, here: Option<&crate::shard::ShardContext>) {
+        crate::handoff::wake_waiter_fenced(&self.waiter, here);
+    }
+
     const fn new() -> Self {
         Self {
             generation: AtomicU32::new(0),
@@ -252,7 +270,7 @@ impl CellRef {
     /// (`crate::handoff`; mantle's final review, second pass, finding 2).
     pub(crate) fn register(self, word: Encoded) {
         if let Some(cell) = self.cell() {
-            crate::handoff::register_task(&cell.waiter, word.word());
+            cell.register(word);
         }
     }
 
@@ -260,7 +278,7 @@ impl CellRef {
     /// publishers, one wakes each registration (`crate::handoff`).
     pub(crate) fn wake(self) {
         if let Some(cell) = self.cell() {
-            crate::handoff::wake_waiter(&cell.waiter);
+            cell.wake();
         }
     }
 

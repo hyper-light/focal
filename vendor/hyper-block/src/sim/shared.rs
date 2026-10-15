@@ -83,17 +83,14 @@ enum Op {
     Read {
         buf: Vec<u8>,
         offset: u64,
-        end: u64,
     },
     Write {
         buf: Vec<u8>,
         offset: u64,
-        end: u64,
     },
     WriteDurable {
         buf: Vec<u8>,
         offset: u64,
-        end: u64,
     },
     Sync,
     Len,
@@ -272,20 +269,16 @@ fn serve(mut disk: Disk, requests: &Receiver<Request>, mut answer: Vec<Option<Sy
                 continue;
             }
             Op::Open(reply) => Reply::Opened(open(&mut answer, reply)),
-            Op::Read {
-                mut buf,
-                offset,
-                end,
-            } => {
-                let outcome = disk.read(&mut buf, offset, end);
+            Op::Read { mut buf, offset } => {
+                let outcome = disk.read(&mut buf, offset);
                 Reply::Transfer(outcome, buf)
             }
-            Op::Write { buf, offset, end } => {
-                let outcome = disk.write(&buf, offset, end);
+            Op::Write { buf, offset } => {
+                let outcome = disk.write(&buf, offset);
                 Reply::Transfer(outcome, buf)
             }
-            Op::WriteDurable { buf, offset, end } => {
-                let outcome = disk.write_durable(&buf, offset, end);
+            Op::WriteDurable { buf, offset } => {
+                let outcome = disk.write_durable(&buf, offset);
                 Reply::Durable(outcome, buf)
             }
             Op::Sync => Reply::Done(disk.sync()),
@@ -342,13 +335,13 @@ impl SimHandle {
         &self,
         buf: &[u8],
         offset: u64,
-        make: fn(Vec<u8>, u64, u64) -> Op,
+        make: fn(Vec<u8>, u64) -> Op,
     ) -> Result<Reply, DiskError> {
-        let end = check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
+        check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
         let mut scratch = self.link.scratch.take();
         scratch.clear();
         scratch.extend_from_slice(buf);
-        self.link.call(make(scratch, offset, end))
+        self.link.call(make(scratch, offset))
     }
 
     /// Puts the transfer buffer back for the next transfer.
@@ -370,14 +363,13 @@ impl BlockFile for SimHandle {
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), DiskError> {
-        let end = check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
+        check(self.align, buf.as_ptr().addr(), offset, buf.len())?;
         let mut scratch = self.link.scratch.take();
         scratch.clear();
         scratch.resize(buf.len(), 0);
         let Reply::Transfer(outcome, scratch) = self.link.call(Op::Read {
             buf: scratch,
             offset,
-            end,
         })?
         else {
             return Err(mismatched());
@@ -392,11 +384,7 @@ impl BlockFile for SimHandle {
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), DiskError> {
         let Reply::Transfer(outcome, scratch) =
-            self.write_with(buf, offset, |buf, offset, end| Op::Write {
-                buf,
-                offset,
-                end,
-            })?
+            self.write_with(buf, offset, |buf, offset| Op::Write { buf, offset })?
         else {
             return Err(mismatched());
         };
@@ -412,11 +400,7 @@ impl BlockFile for SimHandle {
     /// The write, durable on its own as a FUA write is, as [`SimFile`]'s.
     fn write_durable_at(&self, buf: &[u8], offset: u64) -> Result<Durable, DiskError> {
         let Reply::Durable(outcome, scratch) =
-            self.write_with(buf, offset, |buf, offset, end| Op::WriteDurable {
-                buf,
-                offset,
-                end,
-            })?
+            self.write_with(buf, offset, |buf, offset| Op::WriteDurable { buf, offset })?
         else {
             return Err(mismatched());
         };

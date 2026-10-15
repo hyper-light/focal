@@ -181,6 +181,13 @@ caller hands in the alignment, queue and measured depth it found.
     `DeviceFile::read_resident_at` states what a true answer means on Linux: read without waiting,
     not in memory before.
 
+16. **The simulated file's model in hyper-sim** (`sim.rs`, `sim/shared.rs`; `docs/sim.md` §16, step
+    S-3): the device itself, its images, faults, generator and counts, is `hyper_sim::storage::Device`,
+    and `SimFile` and `SimDevice` are adapters over it that add a direct-I/O file's refusals and map
+    its refusals onto `DiskError`. `Fault`, `Crash` and `SimStats` are hyper-sim's (`Stats`), with
+    its new faults: a lost write, a misdirected write, a block read as zeros or junk. Every seed's bytes
+    are unchanged (hyper-log's equivalence hashes, identical); the `sim` feature takes hyper-sim.
+
 ## Planned
 
 - The log's frame writes and flushes through the device's issuer, and the issuer's own reads (mantle

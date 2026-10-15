@@ -623,7 +623,9 @@ impl Connection {
     /// original; the copy timer wakes the connection for the earliest still waiting
     fn queue_copies(&mut self, now: Instant) {
         self.timers.stop(Timer::Copies);
-        if !self.config.handshake_copies {
+        if !self.config.handshake_copies
+            || SpaceId::iter().all(|space| !self.spaces.get(space).holds_flights())
+        {
             return;
         }
         // What losing both costs: the probe timer's interval, as `pto_time_and_space` arms it
@@ -666,7 +668,9 @@ impl Connection {
     fn after_fill(&mut self, nothing_sent: bool, congestion_blocked: bool) {
         for space in SpaceId::iter() {
             let space = self.spaces.get_mut(space);
-            if space.pending.is_empty(&self.streams) {
+            // Only a space sending copies has anything to leave: its pending frames are read only
+            // then, not on every transmission
+            if space.sending_copies && space.pending.is_empty(&self.streams) {
                 space.sending_copies = false;
             }
         }
@@ -2945,10 +2949,15 @@ impl Connection {
         if max > self.config.crypto_buffer_size as u64 {
             return Err(TransportError::CRYPTO_BUFFER_EXCEEDED(""));
         }
+        // What the peer may send: the buffer's size past what TLS has read
+        let limit = space
+            .crypto_stream
+            .bytes_read()
+            .saturating_add(u64::try_from(self.config.crypto_buffer_size).unwrap_or(u64::MAX));
 
         space
             .crypto_stream
-            .insert(crypto.offset, crypto.data.clone(), payload_len)
+            .insert(crypto.offset, crypto.data.clone(), payload_len, limit)
             .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in crypto stream buffer"))?;
 
         while let Some(chunk) = space.crypto_stream.read(usize::MAX, true) {
@@ -4965,6 +4974,14 @@ impl Connection {
         .ok()?;
 
         Some(packet.payload.to_vec())
+    }
+
+    /// The Data space's packets in flight, and whether one of the handshake's flights may still be
+    /// among them: what a test of the copies' scan reads
+    #[cfg(test)]
+    pub(crate) fn data_flights(&self) -> (usize, bool) {
+        let data = self.spaces.get(SpaceId::Data);
+        (data.sent_packets.len(), data.holds_flights())
     }
 
     /// The number of bytes of packets containing retransmittable frames that have not been

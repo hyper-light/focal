@@ -20,7 +20,7 @@ pub(super) struct Send {
     /// The reason the peer wants us to stop, if `STOP_SENDING` was received
     pub(super) stop_reason: Option<VarInt>,
     /// Whether a peer-initiated stream's credit went back to its peer before the stream was
-    /// freed: its request read whole and its response finished (`VENDORED.md` §27). Freeing it
+    /// freed: its request read whole and its response finished (`VENDORED.md` §29). Freeing it
     /// then gives none back again.
     pub(super) credit_returned: bool,
 }

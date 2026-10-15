@@ -644,6 +644,9 @@ pub(crate) struct SimSockets {
     interface_mtu: Cell<Option<usize>>,
     /// Links this shard's tasks added, counted so each gets the id the fabric will give it.
     links_added: Cell<u32>,
+    /// Whether a send or a scenario change waits for the runtime's drain: the pump passes a shard whose
+    /// tasks queued neither, where it took and put back both empty queues at every pass.
+    queued: Cell<bool>,
 }
 
 impl SimSockets {
@@ -667,6 +670,7 @@ impl SimSockets {
             scenario: Cell::new(Vec::new()),
             interface_mtu: Cell::new(None),
             links_added: Cell::new(0),
+            queued: Cell::new(false),
         }
     }
 
@@ -701,6 +705,7 @@ impl SimSockets {
             queue.push(change);
         }
         self.scenario.set(queue);
+        self.queued.set(true);
     }
 }
 
@@ -802,6 +807,7 @@ pub(crate) fn sim_send(index: u16, dest: u16, bytes: &[u8]) -> Result<Option<usi
         sockets
             .outbound_bytes
             .set(queued.saturating_add(bytes.len()));
+        sockets.queued.set(true);
         Ok(Some(bytes.len()))
     })
     .unwrap_or(Err(RtError::NotOnShardThread))
@@ -1267,7 +1273,13 @@ impl SimRuntime {
         let now = self.now_ns;
         let mut arrivals = std::mem::take(&mut self.arrivals);
         for sim_shard in &self.shards {
-            let Some(sockets) = sim_shard.shard.context().sim.as_ref() else {
+            let Some(sockets) = sim_shard
+                .shard
+                .context()
+                .sim
+                .as_ref()
+                .filter(|sockets| sockets.queued.replace(false))
+            else {
                 continue;
             };
             let mut changes = sockets.scenario.take();
@@ -1284,7 +1296,9 @@ impl SimRuntime {
             }
             sockets.outbound.set(sends);
         }
-        self.fabric.deliver_due(now, &mut arrivals);
+        if !self.fabric.in_flight.is_empty() {
+            self.fabric.deliver_due(now, &mut arrivals);
+        }
         let mut woke = false;
         for arrival in arrivals.drain(..) {
             woke |= self.deliver(arrival);

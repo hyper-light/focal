@@ -57,6 +57,7 @@ pub mod control;
 pub mod dns;
 pub mod driver;
 pub mod error;
+mod frames;
 pub mod futures;
 mod handoff;
 pub mod interests;

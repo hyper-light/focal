@@ -84,7 +84,12 @@ impl Recv {
         // already stopped
         if !self.stopped {
             self.assembler
-                .insert(frame.offset, frame.data, payload_len)
+                .insert(
+                    frame.offset,
+                    frame.data,
+                    payload_len,
+                    self.sent_max_stream_data,
+                )
                 .map_err(|_| TransportError::INTERNAL_ERROR("too many gaps in stream buffer"))?;
         }
 

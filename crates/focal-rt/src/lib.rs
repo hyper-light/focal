@@ -87,6 +87,9 @@ pub fn local_config() -> RuntimeConfig {
         page_bytes: LOCAL_PAGE_BYTES,
         spin_ns: 0,
         wake_tracking: None,
+        // No objective tighter than the fixed step quantum: a local shard's batch reads its inputs
+        // again by the quantum alone, as it did before hyper-rt took an objective.
+        latency_objective_ns: None,
     }
 }
 

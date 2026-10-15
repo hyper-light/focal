@@ -8,14 +8,16 @@ license = "MIT"
 repository = "https://github.com/hyper-light/hyper-raft"
 
 [features]
-# Test support for other crates: the simulated power-loss file and, on macOS, a disk image
-# attached as a device node.
-sim = []
+# Test support for other crates: the simulated power-loss file, over hyper-sim's block device, and,
+# on macOS, a disk image attached as a device node.
+sim = ["dep:hyper-sim"]
 
 [dependencies]
 crc32c = "0.6"
 getrandom = "0.4"
 hyper-rt = { version = "0.1.0", path = "../hyper-rt" }
+# The simulated device's model (`sim`, test support only): hyper-sim's block device.
+hyper-sim = { version = "0.1.0", path = "../hyper-sim", optional = true }
 thiserror = "2.0"
 
 [target.'cfg(unix)'.dependencies]

@@ -29,12 +29,34 @@ use std::sync::atomic::AtomicUsize;
 /// Format: slots per word.
 const BITS: usize = 64;
 
+/// Derived: the words that share the head's line with the pending flag and the first summary word: what is
+/// left of a 128-byte line (Apple silicon's, the largest the runtime targets) after those two, `(128 - 16) / 8`;
+/// slots `0..896`. A task's slot is the lowest free one when it is spawned (the free stack is last in, first
+/// out), so a shard's tasks sit there unless it holds more than that many at once.
+const HEAD_WORDS: usize = 14;
+
+/// The bitmap's first line: the flag every wake sets and every drain takes, the summary word of the first 64
+/// words, and the first [`HEAD_WORDS`] words. A wake of a slot in it, and the drain that takes it, move one
+/// line between the waker's core and the shard's, where the flag, the summary and the word on lines of their
+/// own moved three (the two-shard request and reply's wake, counted by line).
+#[repr(C, align(128))]
+#[derive(Debug)]
+struct Head {
+    pending: AtomicBool,
+    summary: AtomicU64,
+    words: [AtomicU64; HEAD_WORDS],
+}
+
 /// A shard's wake bitmap.
 #[derive(Debug)]
 pub struct WakeBitmap {
+    head: Head,
+    /// Words past the head's.
     words: Box<[AtomicU64]>,
+    /// Summary words past the head's first.
     summary: Box<[AtomicU64]>,
-    pending: AtomicBool,
+    /// The words in all, the head's included: a slot past them is refused.
+    word_count: usize,
     /// The word the next drain starts at.
     cursor: AtomicUsize,
 }
@@ -42,15 +64,46 @@ pub struct WakeBitmap {
 impl WakeBitmap {
     /// A bitmap for slots `0..slots`.
     pub fn new(slots: usize) -> Self {
-        let words = slots.div_ceil(BITS);
+        let word_count = slots.div_ceil(BITS);
         Self {
-            words: (0..words).map(|_| AtomicU64::new(0)).collect(),
-            summary: (0..words.div_ceil(BITS))
+            head: Head {
+                pending: AtomicBool::new(false),
+                summary: AtomicU64::new(0),
+                words: std::array::from_fn(|_| AtomicU64::new(0)),
+            },
+            words: (0..word_count.saturating_sub(HEAD_WORDS))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
-            pending: AtomicBool::new(false),
+            summary: (0..word_count.div_ceil(BITS).saturating_sub(1))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            word_count,
             cursor: AtomicUsize::new(0),
         }
+    }
+
+    /// Word `word` of the bitmap, the head's or the rest's; `None` past the bitmap.
+    fn word(&self, word: usize) -> Option<&AtomicU64> {
+        if word >= self.word_count {
+            return None;
+        }
+        match word.checked_sub(HEAD_WORDS) {
+            None => self.head.words.get(word),
+            Some(rest) => self.words.get(rest),
+        }
+    }
+
+    /// Summary word `group` (of words `64 × group ..`), the head's for the first.
+    fn summary(&self, group: usize) -> Option<&AtomicU64> {
+        match group.checked_sub(1) {
+            None => Some(&self.head.summary),
+            Some(rest) => self.summary.get(rest),
+        }
+    }
+
+    /// The summary words in all.
+    fn groups(&self) -> usize {
+        self.word_count.div_ceil(BITS)
     }
 
     /// Marks `slot` woken; false for a slot past the bitmap (a stale or foreign word, ignored).
@@ -59,8 +112,7 @@ impl WakeBitmap {
             return false;
         };
         let (word, bit) = (slot / BITS, slot % BITS);
-        let (Some(target), Some(summary)) = (self.words.get(word), self.summary.get(word / BITS))
-        else {
+        let (Some(target), Some(summary)) = (self.word(word), self.summary(word / BITS)) else {
             return false;
         };
         // The waker that took the word from empty marks the summary. A later one marks it too unless it reads it
@@ -80,25 +132,30 @@ impl WakeBitmap {
         // which coherence forbids, and the parking model lost the wake (2026-10-06). With the swap the three
         // parking models pass (37, 44 and 1,993 interleavings). Reducing that execution to a loom report is
         // open (docs/runtime.md §15).
-        self.pending.swap(true, Ordering::AcqRel);
+        self.head.pending.swap(true, Ordering::AcqRel);
         true
     }
 
     /// Whether a wake may be waiting (one atomic load: the parking protocol's re-check).
     pub fn is_pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire)
+        self.head.pending.load(Ordering::Acquire)
     }
 
     /// Hands every woken slot to `woken`, clearing it; returns how many. Starts at the word after the last
     /// one the previous drain handed over, and wraps.
     pub fn drain(&self, mut woken: impl FnMut(u32)) -> usize {
-        if !self.pending.swap(false, Ordering::AcqRel) {
+        // A load first: a drain that finds nothing pending writes nothing to the line every waker writes. A
+        // flag set after the load is the next drain's, as one set after the swap would be; a parking shard
+        // looks again after it announces (`crate::parking`), so nothing waits on this drain.
+        if !self.head.pending.load(Ordering::Acquire)
+            || !self.head.pending.swap(false, Ordering::AcqRel)
+        {
             return 0;
         }
-        let words = self.words.len();
+        let words = self.word_count;
         let start = self.cursor.load(Ordering::Relaxed).min(words);
         let (start_high, start_low) = (start / BITS, start % BITS);
-        let groups = self.summary.len();
+        let groups = self.groups();
         let mut count: usize = 0;
         let mut last = None;
         // The start group's words below the cursor come last, after the wrap.
@@ -108,7 +165,7 @@ impl WakeBitmap {
                 .saturating_add(step)
                 .checked_rem(groups)
                 .unwrap_or(0);
-            let Some(summary) = self.summary.get(high) else {
+            let Some(summary) = self.summary(high) else {
                 continue;
             };
             let mut marked = summary.swap(0, Ordering::AcqRel);
@@ -144,7 +201,7 @@ impl WakeBitmap {
             let low = usize::try_from(marked.trailing_zeros()).unwrap_or(0);
             marked &= marked.wrapping_sub(1);
             let word = high.saturating_mul(BITS).saturating_add(low);
-            let Some(target) = self.words.get(word) else {
+            let Some(target) = self.word(word) else {
                 continue;
             };
             let mut bits = target.swap(0, Ordering::AcqRel);

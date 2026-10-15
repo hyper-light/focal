@@ -1258,6 +1258,10 @@ impl<S: Storage> RawNode<S> {
         // What storage holds now may hold what the member lost.
         self.raft.settle_lost()?;
         self.raft.settle_priority();
+        // A candidate's vote for itself counts once it is durable, after what
+        // the writes held is: the entries a leader it makes appends are not.
+        let (term, vote) = self.durable_vote;
+        self.raft.on_vote_durable(term, vote)?;
         self.after_persist(in_place)
     }
     /// What a write made durable is acted on: its snapshot, its entries (I3:
@@ -1376,6 +1380,10 @@ impl<S: Storage> RawNode<S> {
         )?;
         self.raft.settle_lost()?;
         self.raft.settle_priority();
+        // A candidate's vote for itself counts once it is durable, after what
+        // the write held is: the entries a leader it makes appends are not.
+        let (term, vote) = self.durable_vote;
+        self.raft.on_vote_durable(term, vote)?;
         // Nothing is out and nothing is left to write: what follows leaves
         // now (`RawNode::releases_now`).
         let mut light = self.light(taken.in_place, true)?;

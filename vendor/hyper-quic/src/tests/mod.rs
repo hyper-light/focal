@@ -639,6 +639,26 @@ fn reject_missing_client_cert() {
                     if error.code == TransportErrorCode::crypto(AlertDescription::CertificateRequired.into()));
 }
 
+/// The copies of the handshake's flights look at those flights alone. A bulk transfer's packets
+/// in flight are none of them, so once the flights are acknowledged the scan has nothing to visit
+/// however many packets the window holds. It once visited every packet in flight at every
+/// transmission, and a mebibyte took 1.58 times upstream's instructions (VENDORED.md §27).
+#[test]
+fn the_copies_look_at_the_handshakes_flights_alone() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect();
+    pair.drive();
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s)
+        .write(&[42; 64 * 1024])
+        .unwrap();
+    pair.drive_client();
+    let (in_flight, flights) = pair.client_conn_mut(client_ch).data_flights();
+    assert!(in_flight > 1, "{in_flight} packets in flight");
+    assert!(!flights);
+}
+
 #[test]
 fn congestion() {
     let _guard = subscribe();

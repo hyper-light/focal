@@ -25,14 +25,14 @@ mod room;
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 use std::task::{Context, Poll};
 
 use crate::error::RtError;
 use crate::waker::polling_task;
 
 use cell::{CellRef, claim};
-use ring::{Refused, Ring, Shared};
+use ring::{Padded, Refused, Ring, Shared};
 use room::Room;
 
 /// Why a primitive's call ended without a value.
@@ -58,8 +58,13 @@ const SENDERS_GONE: u64 = 1 << 6;
 
 /// Whether `bit` is set in the state of `cell`; a cell that is gone reads as every bit set.
 fn state_has(cell: CellRef, bit: u64) -> bool {
-    cell.cell()
-        .is_none_or(|words| words.state.load(Ordering::Acquire) & bit != 0)
+    words_have(cell.cell(), bit)
+}
+
+/// Whether `bit` is set in the state of a cell's `words`, as a live end holds them ([`Shared::words`]); words
+/// that are gone read as every bit set.
+fn words_have(words: Option<&cell::Cell>, bit: u64) -> bool {
+    words.is_none_or(|words| words.state.load(Ordering::Acquire) & bit != 0)
 }
 
 /// Sets `bit` in the state of `cell` (a release: what the setter did before is seen by a reader of the bit).
@@ -231,14 +236,15 @@ impl<T> OneshotReceiver<T> {
 
     /// The value if it came, without waiting.
     pub fn try_recv(&mut self) -> Result<Option<T>, SyncError<()>> {
-        if let Some(value) = self.shared.get().value.pop() {
+        // The receiver is the ring's one taker until its drop closes it (`Ring::pop_owned`).
+        if let Some(value) = self.shared.get().value.pop_owned() {
             return Ok(Some(value));
         }
         if !state_has(self.shared.cell(), SENDERS_GONE) {
             return Ok(None);
         }
         // The sender is gone; what it sent before going is visible now (its state bit was set after).
-        match self.shared.get().value.pop() {
+        match self.shared.get().value.pop_owned() {
             Some(value) => Ok(Some(value)),
             None => Err(SyncError::Closed(())),
         }
@@ -285,13 +291,20 @@ fn poll_value<T>(tried: &mut Result<Option<T>, SyncError<()>>) -> Option<Result<
 
 // ------------------------------------------------------------------------------------------ channel
 
-/// What a channel's ends share: its values, the senders waiting for room, and how many senders live.
+/// What a channel's ends share: its values, the senders waiting for room, how many senders live, and
+/// whether every one is gone.
 #[derive(Debug)]
 struct ChannelState<T> {
     values: Ring<T>,
     room: Room,
     /// The live senders; the last to go closes the channel for the receiver.
     senders: AtomicUsize,
+    /// Whether every sender is gone, on a line of its own that only the last sender's drop writes. The
+    /// receiver reads it each time it finds the ring empty, and it used to read the cell's state word for
+    /// it, in the process-wide table where a cell is 32 bytes, four to an Apple silicon line, beside other
+    /// primitives' words that their own ends write: an empty `try_recv` cost 1.8 ns alone and 2.1–2.7 ns
+    /// while two threads churned one-shots (`benchmark-results/hyper-rt-recv-20261013`).
+    senders_gone: Padded<AtomicBool>,
 }
 
 /// The sending half of a bounded channel; clone it for more senders.
@@ -334,6 +347,7 @@ pub fn channel_with<T>(
             values,
             room,
             senders: AtomicUsize::new(1),
+            senders_gone: Padded(AtomicBool::new(false)),
         },
         cell,
     );
@@ -357,8 +371,9 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         // The last sender closes the channel for the receiver, then wakes it to see so: its values, and every
         // earlier sender's (each released by its own count above), are visible to a receiver that reads the bit.
-        if self.shared.get().senders.fetch_sub(1, Ordering::AcqRel) == 1 {
-            set_state(self.shared.cell(), SENDERS_GONE);
+        let state = self.shared.get();
+        if state.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            state.senders_gone.0.store(true, Ordering::Release);
             self.shared.cell().wake();
         }
     }
@@ -367,24 +382,40 @@ impl<T> Drop for Sender<T> {
 impl<T> Sender<T> {
     /// Sends without waiting: `Full` when the channel is at its capacity, `Closed` when the receiver is gone.
     pub fn try_send(&self, value: T) -> Result<(), SyncError<T>> {
-        let cell = self.shared.cell();
-        if state_has(cell, RECEIVER_GONE) {
+        self.try_send_on(value, None)
+    }
+
+    /// [`Sender::try_send`] by a task polling on the shard `here`, which its wake of a waiting task of that
+    /// shard uses rather than look the thread's shard up again.
+    fn try_send_on(
+        &self,
+        value: T,
+        here: Option<&crate::shard::ShardContext>,
+    ) -> Result<(), SyncError<T>> {
+        let words = self.shared.words();
+        if words_have(words, RECEIVER_GONE) {
             return Err(SyncError::Closed(value));
         }
         let values = &self.shared.get().values;
         match values.push(value) {
             Ok(()) => {
                 // A receiver that closed after this push claimed its place may have drained before it
-                // landed: what is left is dropped here, as the receiver's drop drops what was sent.
+                // landed: what is left is dropped here, as the receiver's drop drops what was sent. The fence
+                // also orders the push before the read of the waiter word, the wake's own fence's work, while
+                // no drain has written since.
                 fence(Ordering::SeqCst);
                 if values.is_closed() {
                     values.drain();
+                    if let Some(words) = words {
+                        words.wake();
+                    }
+                } else if let Some(words) = words {
+                    words.wake_fenced(here);
                 }
-                cell.wake();
                 Ok(())
             }
             Err(Refused::Closed(value)) => Err(SyncError::Closed(value)),
-            Err(Refused::Full(value)) if state_has(cell, RECEIVER_GONE) => {
+            Err(Refused::Full(value)) if words_have(words, RECEIVER_GONE) => {
                 Err(SyncError::Closed(value))
             }
             Err(Refused::Full(value)) => Err(SyncError::Full(value)),
@@ -475,7 +506,28 @@ impl<T> Future for Send<'_, T> {
         let Some(value) = self.value.take() else {
             return Poll::Ready(Ok(()));
         };
-        let Some(word) = polling_task(cx.waker()) else {
+        // One lookup of the thread's shard serves the task's word and the wake of a waiting task there.
+        let this = &mut *self;
+        crate::registry::with_here(|here| match here {
+            Some(here) => this.poll_on(here, value, cx),
+            None => {
+                this.leave(false);
+                Poll::Ready(Err(SyncError::NotOnShardThread(value)))
+            }
+        })
+    }
+}
+
+impl<T> Send<'_, T> {
+    /// [`Send::poll`] on the shard `here`, the task's word taken from it; a waker that is not the polling
+    /// task's is refused `NotOnShardThread`, the value handed back.
+    fn poll_on(
+        &mut self,
+        here: &crate::shard::ShardContext,
+        value: T,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), SyncError<T>>> {
+        let Some(word) = crate::waker::polling_task_in(here, cx.waker()) else {
             self.leave(false);
             return Poll::Ready(Err(SyncError::NotOnShardThread(value)));
         };
@@ -483,7 +535,7 @@ impl<T> Future for Send<'_, T> {
         let room = &sender.shared.get().room;
         // A grant seen before the try is used by a send that follows it.
         let granted = self.place.is_some_and(|place| room.granted(place));
-        let value = match sender.try_send(value) {
+        let value = match sender.try_send_on(value, Some(here)) {
             Err(SyncError::Full(value)) => value,
             sent => {
                 self.leave(granted);
@@ -508,7 +560,7 @@ impl<T> Future for Send<'_, T> {
         };
         room.register_task(place, word.word());
         // Room made before the place showed waiting is seen here; room made after it is granted to the place.
-        match sender.try_send(value) {
+        match sender.try_send_on(value, Some(here)) {
             Err(SyncError::Full(value)) => {
                 self.value = Some(value);
                 if room.granted(place) {
@@ -529,15 +581,16 @@ impl<T> ChannelReceiver<T> {
     /// Takes a value without waiting: `None` when the channel is empty, `Closed` when every sender is gone.
     pub fn try_recv(&mut self) -> Result<Option<T>, SyncError<()>> {
         let state = self.shared.get();
-        if let Some(value) = state.values.pop() {
+        // The receiver is the ring's one taker until its drop closes it (`Ring::pop_owned`).
+        if let Some(value) = state.values.pop_owned() {
             state.room.grant_one();
             return Ok(Some(value));
         }
-        if !state_has(self.shared.cell(), SENDERS_GONE) {
+        if !state.senders_gone.0.load(Ordering::Acquire) {
             return Ok(None);
         }
-        // Every sender is gone; what they sent before going is visible now (the last set the bit after).
-        match state.values.pop() {
+        // Every sender is gone; what they sent before going is visible now (the last set the flag after).
+        match state.values.pop_owned() {
             Some(value) => {
                 state.room.grant_one();
                 Ok(Some(value))
@@ -591,7 +644,9 @@ impl<T> Future for Recv<'_, T> {
         if let Some(ready) = poll_value(&mut self.receiver.try_recv()) {
             return Poll::Ready(ready);
         }
-        self.receiver.shared.cell().register(word);
+        if let Some(words) = self.receiver.shared.words() {
+            words.register(word);
+        }
         match poll_value(&mut self.receiver.try_recv()) {
             Some(ready) => Poll::Ready(ready),
             None => Poll::Pending,

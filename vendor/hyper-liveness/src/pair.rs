@@ -307,6 +307,9 @@ impl Pair {
                         .saturating_add(link.estimator.margin()?),
                 )
             }),
+            sending: (self.stream.interval_ns != 0)
+                .then(|| Duration::from_nanos(self.stream.interval_ns)),
+            sending_due_ns: self.next_due(),
             configurations: counts.configurations,
             suspicions: counts.suspicions,
             allowance: counts.allowance,

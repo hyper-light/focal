@@ -7,11 +7,13 @@ exclude = [
     "vendor/hyper-durable",
     "vendor/hyper-liveness",
     "vendor/hyper-log",
+    "vendor/hyper-measure",
     "vendor/hyper-quic",
     "vendor/hyper-raft",
     "vendor/hyper-rt",
     "vendor/hyper-rt-transport",
     "vendor/hyper-seal",
+    "vendor/hyper-sim",
     "vendor/hyper-timing",
     "vendor/hyper-tls",
     "vendor/hyper-transport",
@@ -62,6 +64,11 @@ hyper-rt = { version = "0.1.0", path = "vendor/hyper-rt" }
 hyper-rt-transport = { version = "0.1.0", path = "vendor/hyper-rt-transport" }
 hyper-tls = { version = "0.1.0", path = "vendor/hyper-tls" }
 hyper-transport = { version = "0.1.0", path = "vendor/hyper-transport" }
+# Measurement only, vendored from hyper-raft (vendor/hyper-measure/SNAPSHOT): the
+# counting allocator, the OS's page-fault and CPU accounts, the open-loop schedule
+# and quantile intervals every benchmark of the event bus reports through. A
+# dev-dependency; no shipped crate takes it.
+hyper-measure = { version = "0.1.0", path = "vendor/hyper-measure" }
 # raft-rs 0.7's message and log types, for focal-consensus's tests alone: the
 # oracle its envelope codec is held to byte for byte, since focal's WAL and
 # wire keep raft-rs's protobuf encoding (focal-consensus/src/envelope.rs).
@@ -72,6 +79,9 @@ serde_json = "1.0"
 serde_saphyr = { package = "serde-saphyr", version = "1.2", default-features = false, features = ["deserialize"] }
 tempfile = "3.20"
 thiserror = "2.0"
+# The edge codec of the event bus: Zstandard (RFC 8878), dictionary-trained per stream, which
+# claimants and respondents run and the bus never does (docs/archictecutre/32-event-bus.md).
+zstd = { version = "0.13", default-features = false, features = ["zdict_builder"] }
 # tools/compare alone: the competitors' canonical clients it drives (async-nats, redis) run on
 # tokio. No focal crate uses it; focal runs on hyper-rt (vendor/hyper-rt).
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "fs"] }

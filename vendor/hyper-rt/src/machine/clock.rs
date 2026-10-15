@@ -93,11 +93,14 @@ pub fn shard_clock_ns() -> u64 {
 /// Format: the fractional bits of the timebase's fixed-point scale, so a tick converts with one 64×64-bit
 /// multiply and a shift rather than a 128-bit division: `scale = round((numer << 32) / denom)`, off by at
 /// most half of `2⁻³²` of a tick's nanoseconds, a relative error under 10⁻¹¹ for Apple silicon's 125/3.
-#[cfg(any(target_os = "macos", test))]
 const SCALE_BITS: u32 = 32;
 
 /// The fixed-point scale of a `numer / denom` timebase, rounded to nearest; `None` for a zero ratio.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_arch = "aarch64"),
+    test
+))]
 fn scale_of(numer: u32, denom: u32) -> Option<u64> {
     let denom = u64::from(denom);
     u64::from(numer)
@@ -108,13 +111,122 @@ fn scale_of(numer: u32, denom: u32) -> Option<u64> {
 }
 
 /// Ticks of a timebase whose fixed-point scale is `scale`, as nanoseconds.
-#[cfg(any(target_os = "macos", test))]
 fn ticks_to_ns(ticks: u64, scale: u64) -> u64 {
     u128::from(ticks)
         .saturating_mul(u128::from(scale))
         .checked_shr(SCALE_BITS)
         .and_then(|ns| u64::try_from(ns).ok())
         .unwrap_or(u64::MAX)
+}
+
+/// The counter the shard carries its clock forward by between the loop's own readings of it (docs/runtime.md
+/// §3.9, "a poll's end from the counter"): the generic timer's virtual count, read without synchronization.
+/// The OS clocks read it ordered behind the instructions before them: macOS's `mach_continuous_time` reads
+/// an Apple register on this machine (`S3_4_C15_C10_6`, where the sampled time sat), CNTVCTSS_EL0 or an `isb`
+/// and CNTVCT_EL0 on others (libsystem_kernel, disassembled 2026-10-13), and Linux's vDSO puts an `isb`
+/// before its read. An ordered read waits for the poll's outstanding work to complete; unordered, the CPU
+/// may take the reading ahead of the instructions before it, by no more than its reorder window, a few
+/// hundred cycles, where the loop times polls of microseconds. `None` where this crate reads no counter: the
+/// shard clock then takes every reading.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux"),
+    not(miri)
+))]
+pub fn counter_ticks() -> Option<u64> {
+    let ticks: u64;
+    // SAFETY: CNTVCT_EL0, the generic timer's virtual count, is readable at EL0 under macOS, whose commpage
+    // clock reads it, and Linux, whose vDSO reads it (where an erratum keeps EL0 out, the kernel emulates the
+    // read); `mrs` writes its one output register and touches no memory, stack or flags.
+    unsafe {
+        core::arch::asm!(
+            "mrs {ticks}, cntvct_el0",
+            ticks = out(reg) ticks,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    Some(ticks)
+}
+
+/// No counter read here (see the aarch64 form): the shard clock takes every reading.
+#[cfg(not(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux"),
+    not(miri)
+)))]
+pub fn counter_ticks() -> Option<u64> {
+    None
+}
+
+/// The counter's nanoseconds a tick as a fixed-point scale, as the architecture states it: its frequency
+/// register, CNTFRQ_EL0, which firmware sets and Linux's own clocksource reads (the kernel's binding for the
+/// timer, `Documentation/devicetree/bindings/timer/arm,arch_timer.yaml`, keeps a device-tree frequency only
+/// for firmware that set it wrong). Not the timebase macOS's clocks count in: on this machine (Apple M5 Max,
+/// 2026-10-13) CNTVCT_EL0 counts at CNTFRQ_EL0's 1 GHz, while `mach_continuous_time` and its register
+/// `S3_4_C15_C10_6` count the 24 MHz of the 125/3 timebase. Read once.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux"),
+    not(miri)
+))]
+pub fn counter_scale() -> Option<u64> {
+    static SCALE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        let hz: u64;
+        // SAFETY: CNTFRQ_EL0 is readable at EL0 wherever the counter is (the same access control gates both);
+        // `mrs` writes its one output register and touches no memory, stack or flags.
+        unsafe {
+            core::arch::asm!(
+                "mrs {hz}, cntfrq_el0",
+                hz = out(reg) hz,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        /// Format: nanoseconds per second.
+        const NS_PER_SECOND: u32 = 1_000_000_000;
+        scale_of(NS_PER_SECOND, u32::try_from(hz).ok()?)
+    })
+}
+
+/// No counter here: no scale.
+#[cfg(not(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux"),
+    not(miri)
+)))]
+pub fn counter_scale() -> Option<u64> {
+    None
+}
+
+/// The shard clock carried forward by the counter: a reading of the shard clock, the counter's ticks then,
+/// and the counter's scale. Where the loop reads the shard clock once a step, a reading within the step is
+/// that one plus the counter's ticks since, so a scale off by a fraction moves a reading by that fraction of
+/// the time since the step's own, never more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Carried {
+    base_ns: u64,
+    base_ticks: u64,
+    scale: u64,
+}
+
+impl Carried {
+    /// The shard clock read at `base_ns` beside the counter at `base_ticks`, ticks of `scale` nanoseconds.
+    pub const fn new(base_ns: u64, base_ticks: u64, scale: u64) -> Carried {
+        Carried {
+            base_ns,
+            base_ticks,
+            scale,
+        }
+    }
+
+    /// The shard clock at the counter's `ticks`: never before the base, as a counter read ahead of the
+    /// base's own can make the ticks since look negative.
+    pub fn now_ns(&self, ticks: u64) -> u64 {
+        self.base_ns.saturating_add(ticks_to_ns(
+            ticks.saturating_sub(self.base_ticks),
+            self.scale,
+        ))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -162,6 +274,98 @@ mod tests {
         assert_eq!(ticks_to_ns(123_456_789, intel), 123_456_789);
         assert_eq!(scale_of(0, 1), None);
         assert_eq!(scale_of(1, 0), None);
+    }
+
+    /// The carried clock by use: a reading is the base plus the ticks since at the scale, exactly, and a
+    /// counter read ahead of the base's own (ticks before it) reads the base, never earlier.
+    #[test]
+    fn a_carried_reading_is_the_base_plus_the_ticks_since() {
+        let apple = scale_of(125, 3).unwrap();
+        let carried = Carried::new(1_000_000, 24_000, apple);
+        assert_eq!(carried.now_ns(24_000), 1_000_000);
+        assert_eq!(carried.now_ns(24_003), 1_000_125);
+        assert_eq!(carried.now_ns(48_000), 2_000_000);
+        assert_eq!(carried.now_ns(23_999), 1_000_000);
+    }
+
+    /// A counter read ordered behind everything before it (an `isb` first), so a pairing brackets the shard
+    /// clock's reading between two of them.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux"),
+        not(miri)
+    ))]
+    fn ordered_ticks() -> u64 {
+        let ticks: u64;
+        // SAFETY: as `counter_ticks`, with an `isb` before the read; neither touches memory or the stack.
+        unsafe {
+            core::arch::asm!(
+                "isb",
+                "mrs {ticks}, cntvct_el0",
+                ticks = out(reg) ticks,
+                options(nostack, preserves_flags)
+            );
+        }
+        ticks
+    }
+
+    /// The shard clock's least step here, nanoseconds: macOS's continuous time counts the timebase's ticks;
+    /// elsewhere the monotonic clock's reported resolution.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux"),
+        not(miri)
+    ))]
+    fn shard_clock_step_ns() -> u64 {
+        #[cfg(target_os = "macos")]
+        let step =
+            continuous_scale().map_or_else(resolution_ns, |scale| ticks_to_ns(1, scale).max(1));
+        #[cfg(not(target_os = "macos"))]
+        let step = resolution_ns();
+        step
+    }
+
+    /// §3.9 by use on this machine: where the shard reads a counter, it runs at the scale the OS or the
+    /// architecture states. Two pairings each read the counter, the shard clock and the counter, so the
+    /// clock's reading lies within its bracket; between them the counter's ticks at the stated scale and the
+    /// clock's own elapsed time differ by no more than the brackets' halves, a counter tick and a clock step
+    /// each. The test waits until the span is twenty times that (so a scale off by the crate's precision,
+    /// five percent, would show past it), reading the live host however busy, and holds the bound exactly.
+    #[test]
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux"),
+        not(miri)
+    ))]
+    fn the_counter_runs_at_its_stated_scale() {
+        let scale = counter_scale().expect("a counter's scale where the shard reads a counter");
+        let tick_ns = ticks_to_ns(1, scale).max(1);
+        let clock_step_ns = shard_clock_step_ns();
+        let pairing = || {
+            let before = ordered_ticks();
+            let clock = shard_clock_ns();
+            let after = ordered_ticks();
+            (before, clock, after)
+        };
+        let (a_before, a_clock, a_after) = pairing();
+        let open_a = ticks_to_ns(a_after.saturating_sub(a_before), scale) / 2;
+        loop {
+            let (b_before, b_clock, b_after) = pairing();
+            let open_b = ticks_to_ns(b_after.saturating_sub(b_before), scale) / 2;
+            let bound = open_a + open_b + 2 * tick_ns + 2 * clock_step_ns;
+            let clock_span = b_clock.saturating_sub(a_clock);
+            if clock_span < 20 * bound {
+                continue;
+            }
+            let mid_a = a_before + (a_after - a_before) / 2;
+            let mid_b = b_before + (b_after - b_before) / 2;
+            let counter_span = ticks_to_ns(mid_b - mid_a, scale);
+            assert!(
+                counter_span.abs_diff(clock_span) <= bound,
+                "counter {counter_span} ns against the clock's {clock_span} ns, bound {bound} ns"
+            );
+            break;
+        }
     }
 
     /// The shard's clock never runs backwards between two readings on one thread.

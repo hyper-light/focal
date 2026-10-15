@@ -65,6 +65,10 @@ pub(super) struct PacketSpace {
     /// Whether the packets sent now carry copies ([`PacketSpace::queue_copies`]), which are not
     /// copied again
     pub(super) sending_copies: bool,
+    /// One past the largest packet number sent as one of the handshake's flights
+    /// ([`SentPacket::handshake_flight`]): every packet [`Self::queue_copies`] may copy is below
+    /// it, so it looks at those alone rather than at every packet in flight
+    pub(super) flights_end: u64,
     pub(super) ping_pending: bool,
     pub(super) immediate_ack_pending: bool,
     /// Number of packets sent in the current key phase
@@ -97,6 +101,7 @@ impl PacketSpace {
             loss_time: None,
             loss_probes: 0,
             sending_copies: false,
+            flights_end: 0,
             ping_pending: false,
             immediate_ack_pending: false,
             sent_with_keys: 0,
@@ -191,7 +196,7 @@ impl PacketSpace {
         let mut ready = !sending && self.loss_probes == 0 && self.pending.is_empty(streams);
         let mut queued = false;
         let mut waiting: Option<Instant> = None;
-        for packet in self.sent_packets.values_mut() {
+        for (_, packet) in self.sent_packets.range_mut(..self.flights_end) {
             if packet.copied
                 || !packet.handshake_flight
                 || !packet.ack_eliciting
@@ -230,6 +235,12 @@ impl PacketSpace {
         }
         self.sending_copies |= queued;
         waiting
+    }
+
+    /// Whether a packet of the handshake's flights may still be in flight here: one numbered below
+    /// [`Self::flights_end`], the only packets [`Self::queue_copies`] copies
+    pub(super) fn holds_flights(&self) -> bool {
+        self.sent_packets.range(..self.flights_end).next().is_some()
     }
 
     /// Get the next outgoing packet number in this space
@@ -352,6 +363,9 @@ impl PacketSpace {
                 self.unacked_non_ack_eliciting_tail.saturating_add(1);
         }
 
+        if packet.handshake_flight {
+            self.flights_end = self.flights_end.max(number.saturating_add(1));
+        }
         self.sent_packets.insert(number, packet);
         forgotten
     }

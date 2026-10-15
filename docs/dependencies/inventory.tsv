@@ -90,19 +90,20 @@ heck	0.5.0	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-ind
 home	0.5.12	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 http	1.5.0	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 httparse	1.10.1	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
-hyper-block	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-datagram	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-durable	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-liveness	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-log	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-quic	0.1.0	MIT OR Apache-2.0	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-raft	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-rt	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-rt-transport	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-seal	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-timing	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-tls	0.1.0	Apache-2.0 OR ISC OR MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
-hyper-transport	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=5007f44a47220c2674d19ecf933f547567f58d77#5007f44a47220c2674d19ecf933f547567f58d77
+hyper-block	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-datagram	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-durable	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-liveness	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-log	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-measure	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-quic	0.1.0	MIT OR Apache-2.0	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-raft	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-rt	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-rt-transport	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-seal	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-timing	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-tls	0.1.0	Apache-2.0 OR ISC OR MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
+hyper-transport	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=3d86b42c162c61339d17457c34c315efd4ae27f9#3d86b42c162c61339d17457c34c315efd4ae27f9
 icu_collections	2.3.0	Unicode-3.0	registry+https://github.com/rust-lang/crates.io-index
 icu_locale_core	2.3.0	Unicode-3.0	registry+https://github.com/rust-lang/crates.io-index
 icu_normalizer	2.3.0	Unicode-3.0	registry+https://github.com/rust-lang/crates.io-index
@@ -120,6 +121,7 @@ jobserver	0.1.35	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.
 lazy_static	1.5.0	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 libc	0.2.189	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 libm	0.2.16	MIT	registry+https://github.com/rust-lang/crates.io-index
+libmimalloc-sys	0.1.49	MIT	registry+https://github.com/rust-lang/crates.io-index
 linux-raw-sys	0.12.1	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index
 linux-raw-sys	0.4.15	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index
 litemap	0.8.3	Unicode-3.0	registry+https://github.com/rust-lang/crates.io-index
@@ -127,6 +129,7 @@ lock_api	0.4.14	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.i
 log	0.4.34	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 lru-slab	0.1.2	MIT OR Apache-2.0 OR Zlib	registry+https://github.com/rust-lang/crates.io-index
 memchr	2.8.3	Unlicense OR MIT	registry+https://github.com/rust-lang/crates.io-index
+mimalloc	0.1.52	MIT	registry+https://github.com/rust-lang/crates.io-index
 minimal-lexical	0.2.1	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 mio	1.2.3	MIT	registry+https://github.com/rust-lang/crates.io-index
 multimap	0.8.3	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
@@ -191,7 +194,7 @@ rustc_version	0.4.1	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crat
 rusticata-macros	4.1.0	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 rustix	0.38.44	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index
 rustix	1.1.4	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index
-rustls	0.23.45	Apache-2.0 OR ISC OR MIT	registry+https://github.com/rust-lang/crates.io-index
+rustls	0.23.46	Apache-2.0 OR ISC OR MIT	registry+https://github.com/rust-lang/crates.io-index
 rustls-native-certs	0.8.4	Apache-2.0 OR ISC OR MIT	registry+https://github.com/rust-lang/crates.io-index
 rustls-pki-types	1.15.1	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 rustls-webpki	0.103.15	ISC	registry+https://github.com/rust-lang/crates.io-index
@@ -290,3 +293,6 @@ zerovec	0.11.8	Unicode-3.0	registry+https://github.com/rust-lang/crates.io-index
 zerovec-derive	0.11.6	Unicode-3.0	registry+https://github.com/rust-lang/crates.io-index
 zlib-rs	0.6.8	Zlib	registry+https://github.com/rust-lang/crates.io-index
 zmij	1.0.23	MIT	registry+https://github.com/rust-lang/crates.io-index
+zstd	0.13.3	MIT	registry+https://github.com/rust-lang/crates.io-index
+zstd-safe	7.3.0	BSD-3-Clause	registry+https://github.com/rust-lang/crates.io-index
+zstd-sys	2.1.1+zstd.1.5.7	BSD-3-Clause	registry+https://github.com/rust-lang/crates.io-index

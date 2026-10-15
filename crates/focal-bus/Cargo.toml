@@ -1,0 +1,27 @@
+[package]
+name = "focal-bus"
+description = "focal's event bus: claims to their respondents and testaments to their recipients, held in memory, durability off the delivery path"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+# What a benchmark costs, counted where it happens (vendor/hyper-measure): allocations, page
+# faults, CPU, and the noise band two sets of runs must clear before they differ.
+hyper-measure.workspace = true
+serde_json.workspace = true
+# The edge codec under study (docs/archictecutre/32-event-bus.md §codec): claimants and respondents
+# compress, the bus never does, so it is a dev-dependency of the bus itself.
+zstd.workspace = true
+
+[lints]
+workspace = true
+
+# Step 0 of the event bus: what the dense JSON a claim or a testament carries costs to send, per
+# message and per batch, raw and compressed at the edges; a table, not a criterion run.
+[[bench]]
+name = "codec"
+harness = false

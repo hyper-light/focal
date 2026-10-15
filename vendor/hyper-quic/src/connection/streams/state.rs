@@ -1194,7 +1194,7 @@ impl StreamsState {
 
     /// Gives a peer-initiated bidirectional stream's credit back to its peer once its request is
     /// read whole (its receive half freed) and its response finished, without waiting for the
-    /// acknowledgement of the response's last frames, which frees it (`VENDORED.md` §27): the
+    /// acknowledgement of the response's last frames, which frees it (`VENDORED.md` §29): the
     /// raised limit then goes out with those frames, where it went alone a round trip later.
     /// Once for each stream; whether it gave the credit back now.
     pub(super) fn return_credit_early(&mut self, id: StreamId) -> bool {
@@ -2312,7 +2312,7 @@ mod tests {
     }
 
     /// A peer's request read whole and its response finished gives the stream's credit back at
-    /// once, so the raised limit goes out with the response (`VENDORED.md` §27): before, it went
+    /// once, so the raised limit goes out with the response (`VENDORED.md` §29): before, it went
     /// once the response's last frames were acknowledged, alone, a round trip later. The
     /// acknowledgement that frees the stream gives none back again. In the other order, the
     /// response finished before the request is read, the credit goes back as the request is, and
