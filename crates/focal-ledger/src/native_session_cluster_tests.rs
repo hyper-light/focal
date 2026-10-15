@@ -3063,6 +3063,8 @@ fn an_anchored_seal_outlives_its_custody_and_pressure_closes_in_band() {
     else {
         panic!("a fresh proposal is pending until the log commits it");
     };
+    let owner = cluster.node(1).owner_incarnation();
+    assert!(owner.is_some());
     cluster
         .node(1)
         .propose_seal(&plan, bundle, length, None)
@@ -3093,6 +3095,8 @@ fn an_anchored_seal_outlives_its_custody_and_pressure_closes_in_band() {
     );
     assert_eq!(cluster.node(1).seals_applied(), 1);
     assert!(!cluster.node(1).seal_wanted());
+    // The leader's owner took the seal in place and goes on: no rebuild, a walk of every row.
+    assert_eq!(cluster.node(1).owner_incarnation(), owner);
     let seventh = cluster.creation(7);
     cluster.commit(1, PARTIES.issuer, seventh, &[]);
     cluster.settle(&[]);

@@ -541,7 +541,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// (`Core::apply_anchored`). The authority proposed it with nothing
     /// pending, and admission held behind it, so the state it applies to is
     /// the state it was proposed against: a plan or an ordinal that does
-    /// not hold is a divergence. A closing seal is counted apart.
+    /// not hold is a divergence. An owner with nothing pending takes it in
+    /// place and goes on (`NativeOwner::apply_anchored`); any other replica
+    /// applies it to its committed rows and rebuilds its owner at the next
+    /// readiness barrier. A closing seal is counted apart.
     fn apply_anchored_seal(&mut self, data: &[u8]) -> Result<(), NativeSessionError> {
         let record = seal::AnchoredSealRecord::decode(data)?;
         if record.ledger != self.ledger {
@@ -564,17 +567,11 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         if !self.pending.is_empty() {
             self.resolve_suffix(SuffixEvidence::Retired)?;
-        } else if matches!(self.domain, Some(Domain::Active(..))) {
-            self.passive_for_replay()?;
         }
-        self.readiness_requested = None;
-        self.reconstruction_needed = true;
         self.close_check_at = 0;
         let local = u64::try_from(self.limits.recovery.native.outcomes).unwrap_or(u64::MAX);
-        let Some(Domain::Passive(core)) = self.domain.as_mut() else {
-            return Err(NativeSessionError::Failed);
-        };
-        let floors = core
+        let floors = self
+            .committed_core()?
             .close_floors(record.floors.len())
             .map_err(NativeSessionError::Native)?;
         if floors != record.floors {
@@ -586,7 +583,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             }
             return Err(NativeSessionError::Corrupt);
         }
-        let applied = core.apply_anchored(focal_core::native::seal::AnchoredRecord {
+        let anchored = || focal_core::native::seal::AnchoredRecord {
             floors: &record.floors,
             ordinal: record.ordinal,
             through: record.through,
@@ -595,13 +592,29 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             bundle: record.bundle,
             bytes: record.bytes,
             fold: record.fold,
-        });
-        match applied {
-            Ok(_) => {}
-            Err(error @ (NativeError::Memory(_) | NativeError::Capacity(_))) => {
-                return Err(error.into());
+        };
+        let refused = |error: NativeError| -> NativeSessionError {
+            match error {
+                error @ (NativeError::Memory(_) | NativeError::Capacity(_)) => error.into(),
+                _ => NativeSessionError::Corrupt,
             }
-            Err(_) => return Err(NativeSessionError::Corrupt),
+        };
+        let in_place = match self.domain.as_mut() {
+            Some(Domain::Active(owner, _)) => {
+                owner.apply_anchored(anchored()).map_err(refused)?.is_some()
+            }
+            _ => false,
+        };
+        if !in_place {
+            if matches!(self.domain, Some(Domain::Active(..))) {
+                self.passive_for_replay()?;
+            }
+            self.readiness_requested = None;
+            self.reconstruction_needed = true;
+            let Some(Domain::Passive(core)) = self.domain.as_mut() else {
+                return Err(NativeSessionError::Failed);
+            };
+            core.apply_anchored(anchored()).map_err(refused)?;
         }
         if record.is_closing() {
             self.closes_applied = self.closes_applied.saturating_add(1);

@@ -517,6 +517,14 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// The owner must be reconstructed before this engine is authoritative
     /// again: a record it did not author through its owner applied through
     /// its committed core (a retirement, 26 §4).
+    /// The active owner's incarnation, if there is one.
+    #[cfg(test)]
+    pub(crate) fn owner_incarnation(&self) -> Option<focal_memory::OwnerId> {
+        match self.domain.as_ref() {
+            Some(Domain::Active(owner, _)) => Some(owner.incarnation()),
+            _ => None,
+        }
+    }
     pub(crate) fn reconstruction_needed(&self) -> bool {
         self.reconstruction_needed
     }

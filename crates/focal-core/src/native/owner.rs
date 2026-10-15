@@ -1354,6 +1354,28 @@ impl NativeOwner {
         Ok(self.core.rename_native_member(index, id)?)
     }
 
+    /// Which owner this is: a rebuilt one is another.
+    pub fn incarnation(&self) -> OwnerId {
+        self.incarnation
+    }
+
+    /// Apply a committed anchored seal (F12) to the committed rows ([`Core::apply_anchored`]),
+    /// the owner going on over them: what it keeps beside the rows (its completion book, whose
+    /// promises name evaluations and claims and whose counts it reads from the rows as it checks
+    /// them, and its queue, empty here) names nothing a seal takes, so it is the owner a rebuild
+    /// over the sealed rows would make, without the rebuild's two walks of every row. `None`
+    /// where it may not go on (something pending, or the owner unsound): the caller applies the
+    /// seal to the committed rows and rebuilds the owner.
+    pub fn apply_anchored(
+        &mut self,
+        record: super::seal::AnchoredRecord<'_>,
+    ) -> Result<Option<usize>, NativeError> {
+        if !self.pending.is_empty() || self.faulted {
+            return Ok(None);
+        }
+        self.core.apply_anchored(record).map(Some)
+    }
+
     fn check_layout_change(&self) -> Result<(), NativeOwnerError> {
         if !self.pending.is_empty() {
             return Err(NativeOwnerError::PendingCandidates);

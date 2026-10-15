@@ -1013,6 +1013,11 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     pub fn seals_applied(&self) -> u64 {
         self.engine.seals_applied()
     }
+    /// The active owner's incarnation, if there is one: a rebuilt owner is another.
+    #[cfg(test)]
+    pub(crate) fn owner_incarnation(&self) -> Option<focal_memory::OwnerId> {
+        self.engine.owner_incarnation()
+    }
     /// Closing seals applied through this replica's applied prefix.
     pub fn closes_applied(&self) -> u64 {
         self.engine.closes_applied()
