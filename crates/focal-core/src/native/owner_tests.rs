@@ -890,3 +890,71 @@ fn a_publication_takes_away_what_its_build_replaced() {
     }
     assert_eq!(owner.pending_len(), 0);
 }
+
+/// What a candidate's plan spills to the payload log is held until its admission is decided: one
+/// its session discards leaves nothing in the log, one admitted keeps what it spilled through its
+/// publication, and an exact retry appends nothing.
+#[test]
+fn a_discarded_candidate_leaves_nothing_in_the_payload_log() {
+    let mut core = core();
+    core.attach_payload_log(Box::new(super::super::payloads::MemoryPayloads::default()));
+    let mut owner = NativeOwner::new(core).unwrap();
+    let logged = |owner: &NativeOwner| {
+        owner
+            .committed_core()
+            .payload_log()
+            .map_or(0, |log| log.held_bytes())
+    };
+    let required = [(ValidationMode::Required, false)];
+    let (first, _) = stage(&mut owner, 1, creation(1, 1, &required, None));
+    assert!(
+        logged(&owner) > 0,
+        "a creation spilled nothing: nothing is measured"
+    );
+    owner.keep_appends();
+    let outcome = owner.publish_after_durable(first).unwrap();
+    let published = logged(&owner);
+    let (second, _) = stage(&mut owner, 2, creation(2, 2, &required, None));
+    assert!(logged(&owner) > published);
+    owner.discard_from(second).unwrap();
+    assert_eq!(logged(&owner), published);
+    let retry = creation(1, 1, &required, None);
+    assert!(matches!(
+        owner.prepare(context(retry.request.principal, 4), retry, None),
+        Ok(NativeStaging::Existing { outcome: answered, .. }) if answered == outcome
+    ));
+    assert_eq!(logged(&owner), published);
+}
+
+/// A rejected publication must not keep another candidate's held appends: its session may
+/// still discard that suffix, which gives back everything it spilled before admission.
+#[test]
+fn a_rejected_publication_leaves_the_discarded_candidates_appends_reclaimable() {
+    let mut core = core();
+    core.attach_payload_log(Box::new(super::super::payloads::MemoryPayloads::default()));
+    let mut owner = NativeOwner::new(core).unwrap();
+    let logged = |owner: &NativeOwner| {
+        owner
+            .committed_core()
+            .payload_log()
+            .map_or(0, |log| log.held_bytes())
+    };
+    let required = [(ValidationMode::Required, false)];
+    let (first, expected) = stage(&mut owner, 1, creation(1, 1, &required, None));
+    owner.keep_appends();
+    let kept = logged(&owner);
+    let (second, _) = stage(&mut owner, 2, creation(2, 2, &required, None));
+    assert!(logged(&owner) > kept);
+
+    assert!(matches!(
+        owner.publish_after_durable(second),
+        Err(NativeOwnerError::OutOfOrder)
+    ));
+    owner.discard_from(second).unwrap();
+    assert_eq!(
+        logged(&owner),
+        kept,
+        "rejection committed the suffix's appends"
+    );
+    assert_eq!(owner.publish_after_durable(first).unwrap(), expected);
+}

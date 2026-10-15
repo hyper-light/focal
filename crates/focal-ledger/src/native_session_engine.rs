@@ -1572,7 +1572,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 return Err(NativeSessionError::Capacity(bound));
             }
         }
-        let submission = self.submit_staged(consensus, staged, status.term)?;
+        let submission = self.submit_staged(consensus, staged, status.term);
+        // Admitted, what its preparation appended to the payload log is the log's; a candidate
+        // a deterministic refusal discarded gave it back.
+        if let Some(Domain::Active(owner, _)) = self.domain.as_mut() {
+            owner.keep_appends();
+        }
+        let submission = submission?;
         if matches!(submission, NativeSubmission::Pending { .. }) {
             self.note_pressure()?;
         }

@@ -904,6 +904,24 @@ Each stage lands on its own, measured:
        - What the session held beside its native engine peaked at 0.27 MB at both rates,
          sampled every 5 s, against the eighth of the allowance (100 MB) the wide share leaves
          it.
+   - **Refused work leaves nothing in the payload log (2026-10-15).** A candidate's plan spills
+     its events and outcome to the log as it builds them, before its session has weighed it. A
+     candidate refused after that (the checkpoint's bound, the pending room, the disk headroom, a
+     moving range, the owner's own post-plan checks) left its payloads in a segment the open claims
+     kept live: a million open claims offered to one node in a 2 GiB envelope grew the log from
+     787 MB to 1.39 GB while nothing committed.
+     - Now the log holds what a fresh preparation appends (`PayloadLog::hold`): none of it is
+       handed to the writer until the candidate is admitted (`keep`). Refused or discarded, it is
+       given back (`give_back`): the window cut where the hold began, segments opened since sealed
+       empty, the next append where the first held one went. This is what a broker does when it
+       validates a batch before appending it.
+     - The owner keeps a hold before anything else appends: another preparation, a staged
+       retirement, a publication once its ticket is the head's, the log detached. So a hold only
+       ever covers its own candidate's bytes, and no published row names a byte the files lack.
+     - Tested: refused creations leave the log's bytes as they were, a discarded candidate gives
+       its bytes back, a rejected publication leaves the next candidate's held bytes to its
+       discard, and held bytes never reach a file, even when a reader's barrier asks for every
+       byte or a hold crosses chunks and segments.
 4. **M4, durability classes.**
    - Memory-quorum acknowledgement with a bounded background flush; the disk class kept.
    - Measure: p99 at 1k, 4k and 12k/s against Kafka, NATS and Redis.

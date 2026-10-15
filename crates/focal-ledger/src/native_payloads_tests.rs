@@ -444,3 +444,115 @@ fn measure_payload_append_and_read_cost() {
         );
     }
 }
+
+/// The bytes of segment `segment` in its file now.
+fn on_disk(log: &FilePayloads, segment: u32) -> u64 {
+    std::fs::metadata(segment_path(&log.root, segment)).map_or(0, |metadata| metadata.len())
+}
+
+/// What a hold holds back is never handed to the writer, even as its chunk fills and a reader's
+/// barrier asks for every byte, and giving it back takes the log back to where it began: the
+/// next append goes where the first held one went, and what was appended before reads as it did.
+/// A hold that no longer stands changes nothing.
+#[test]
+fn a_held_append_is_never_written_and_giving_it_back_takes_the_log_back_to_where_it_began() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = FilePayloads::open_with(&source(directory.path(), unbounded()), &memory(), 1 << 20)
+        .unwrap();
+    let before: Vec<_> = (0..3u8)
+        .map(|seed| {
+            let bytes = payload(seed, 10_000);
+            (log.append(&bytes).unwrap(), bytes)
+        })
+        .collect();
+    let kept = log.bytes();
+    let hold = log.hold().unwrap();
+    // Past the window's chunk (64 KiB here): the filled chunk is handed only up to the hold.
+    let held: Vec<_> = (10..18u8)
+        .map(|seed| log.append(&payload(seed, 10_000)).unwrap())
+        .collect();
+    assert_eq!(log.bytes(), kept + 80_000);
+    drop(log.reader().unwrap());
+    drained(&log);
+    assert_eq!(on_disk(&log, 0), kept, "a held byte reached the file");
+    for at in &held {
+        assert!(
+            read(&log, *at).is_ok(),
+            "the window serves what it holds back"
+        );
+    }
+    assert!(log.give_back(hold));
+    assert_eq!(log.bytes(), kept);
+    assert!(!log.give_back(hold), "a hold given back no longer stands");
+    let next = log.append(&payload(99, 500)).unwrap();
+    assert_eq!(u64::from(next.offset()), kept);
+    assert_eq!(read(&log, next).unwrap(), payload(99, 500));
+    let reader = log.reader().unwrap();
+    for (at, bytes) in &before {
+        assert_eq!(read(&log, *at).unwrap(), *bytes);
+        assert_eq!(read(reader.as_ref(), *at).unwrap(), *bytes);
+    }
+    assert_eq!(read(reader.as_ref(), next).unwrap(), payload(99, 500));
+}
+
+/// A hold kept is the log's: what it held back is written as any append is, and a hold that no
+/// longer stands gives nothing back.
+#[test]
+fn a_kept_hold_is_written_as_any_append() {
+    let directory = tempfile::tempdir().unwrap();
+    let log = FilePayloads::open_with(&source(directory.path(), unbounded()), &memory(), 1 << 20)
+        .unwrap();
+    let hold = log.hold().unwrap();
+    let held: Vec<_> = (0..8u8)
+        .map(|seed| {
+            let bytes = payload(seed, 10_000);
+            (log.append(&bytes).unwrap(), bytes)
+        })
+        .collect();
+    log.keep(hold);
+    assert!(!log.give_back(hold));
+    let reader = log.reader().unwrap();
+    for (at, bytes) in &held {
+        assert_eq!(read(reader.as_ref(), *at).unwrap(), *bytes);
+    }
+    assert_eq!(on_disk(&log, 0), 80_000);
+}
+
+/// A hold whose appends opened new segments gives them back as well: the segment it began in is
+/// sealed where it began, those opened since hold nothing (a sweep removes them, no row naming
+/// them), appends go on from the newest's first byte, and nothing held was written anywhere.
+#[test]
+fn a_hold_given_back_across_new_segments_seals_where_it_began() {
+    let directory = tempfile::tempdir().unwrap();
+    let log =
+        FilePayloads::open_with(&source(directory.path(), unbounded()), &memory(), 1_000).unwrap();
+    let first = log.append(&payload(1, 700)).unwrap();
+    let hold = log.hold().unwrap();
+    for seed in 2..6u8 {
+        log.append(&payload(seed, 700)).unwrap();
+    }
+    assert!(log.segments() >= 4, "{}", log.segments());
+    drop(log.reader().unwrap());
+    drained(&log);
+    for segment in 1..u32::try_from(log.segments()).unwrap() {
+        assert_eq!(
+            on_disk(&log, segment),
+            0,
+            "segment {segment} holds held bytes"
+        );
+    }
+    assert!(log.give_back(hold));
+    assert_eq!(log.bytes(), 700);
+    let next = log.append(&payload(9, 300)).unwrap();
+    assert_eq!(next.offset(), 0);
+    assert!(next.segment() > first.segment());
+    assert_eq!(read(&log, first).unwrap(), payload(1, 700));
+    assert_eq!(read(&log, next).unwrap(), payload(9, 300));
+    // Only the first payload's segment and the newest are live: the sealed empty ones go.
+    let live = BTreeSet::from([first.segment(), next.segment()]);
+    log.sweep(&live);
+    assert_eq!(log.segments(), 2);
+    let reader = log.reader().unwrap();
+    assert_eq!(read(reader.as_ref(), first).unwrap(), payload(1, 700));
+    assert_eq!(read(reader.as_ref(), next).unwrap(), payload(9, 300));
+}

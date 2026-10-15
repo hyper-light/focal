@@ -1278,6 +1278,15 @@ impl crate::native::payloads::PayloadLog for Switched {
         }
         self.log.append(bytes)
     }
+    fn hold(&self) -> Option<crate::native::payloads::PayloadHold> {
+        self.log.hold()
+    }
+    fn keep(&self, hold: crate::native::payloads::PayloadHold) {
+        self.log.keep(hold);
+    }
+    fn give_back(&self, hold: crate::native::payloads::PayloadHold) -> bool {
+        self.log.give_back(hold)
+    }
     fn reader(
         &self,
     ) -> Result<

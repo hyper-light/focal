@@ -466,6 +466,9 @@ pub struct NativeOwner {
     /// rather than wrap, which could only overstate it and refuse admission.
     pending_rows: usize,
     pending_bytes: usize,
+    /// The payload log's hold over what the newest candidate's preparation appended, while its
+    /// admission is weighed, and the candidate's serial ([`NativeOwner::keep_appends`]).
+    held: Option<(u64, super::payloads::PayloadHold)>,
     /// The last fresh request of each of a few commands that this owner's
     /// memory refused, while the headroom stays short of what it needed:
     /// another like it is refused from its header
@@ -616,6 +619,7 @@ impl NativeOwner {
                 next_serial: 0,
                 pending_rows: 0,
                 pending_bytes: 0,
+                held: None,
                 shortfalls: [None; ingress::SHORTFALLS],
             }),
             Err(error) => Err(NativeOwnerInitError {
@@ -718,6 +722,31 @@ impl NativeOwner {
     fn uncount_pending(&mut self, prepared: &NativePrepared) {
         self.pending_rows = self.pending_rows.saturating_sub(prepared.mutation_count());
         self.pending_bytes = self.pending_bytes.saturating_sub(prepared.encoded_added);
+    }
+
+    /// The newest candidate is admitted: what its preparation appended to the payload log is the
+    /// log's ([`super::payloads::PayloadLog::hold`]). Its session says so once it has weighed it;
+    /// another preparation, a retirement staged, a publication and the log detached each keep it
+    /// first, so the log holds back only what a candidate still being weighed appended.
+    pub fn keep_appends(&mut self) {
+        if let Some((_, hold)) = self.held.take()
+            && let Some(log) = self.core.state.payloads.as_deref()
+        {
+            log.keep(hold);
+        }
+    }
+
+    /// What the newest candidate appended to the payload log, given back where it is among the
+    /// candidates from serial `from` on that are discarded: the log as if it was never prepared.
+    fn give_back_appends(&mut self, from: u64) {
+        if let Some((serial, hold)) = self.held
+            && serial >= from
+        {
+            self.held = None;
+            if let Some(log) = self.core.state.payloads.as_deref() {
+                log.give_back(hold);
+            }
+        }
     }
 
     pub fn oldest(&self) -> Option<NativeCandidate> {
@@ -850,6 +879,7 @@ impl NativeOwner {
         batch: &retirement_batch::RetireBatch,
         index: usize,
     ) -> Result<Option<NativeStaging>, NativeOwnerError> {
+        self.keep_appends();
         let Some(families) = batch
             .candidate(index)
             .filter(|families| !families.is_empty())
@@ -1000,6 +1030,39 @@ impl NativeOwner {
         custody: Option<(&mut ContentStore, ContentDomainId)>,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
+        // A candidate before it that was not discarded was admitted. What this one's plan spills
+        // is held until its session admits it: a refusal, here or there, gives it back.
+        self.keep_appends();
+        let hold = self
+            .core
+            .state
+            .payloads
+            .as_deref()
+            .and_then(|log| log.hold());
+        let staged = self.prepare_held(input, evidence, custody, schemas);
+        if let Some(hold) = hold {
+            match &staged {
+                Ok(NativeStaging::Prepared { candidate, .. }) => {
+                    self.held = Some((candidate.serial, hold));
+                }
+                // An exact retry appended nothing; a refused candidate leaves nothing.
+                Ok(NativeStaging::Existing { .. }) | Err(_) => {
+                    if let Some(log) = self.core.state.payloads.as_deref() {
+                        log.give_back(hold);
+                    }
+                }
+            }
+        }
+        staged
+    }
+
+    fn prepare_held(
+        &mut self,
+        input: OwnerInput,
+        evidence: Option<&VerifiedNativeArtifact>,
+        custody: Option<(&mut ContentStore, ContentDomainId)>,
+        schemas: &impl NativeSchemaVerifier,
+    ) -> Result<NativeStaging, NativeOwnerError> {
         // What earlier operations read back is theirs alone (doc 31 M3).
         self.core.state.reads.release();
         // Room for the candidate, made before its chain is borrowed: a retry is answered whatever
@@ -1142,6 +1205,9 @@ impl NativeOwner {
         if self.position(candidate)? != 0 {
             return Err(NativeOwnerError::OutOfOrder);
         }
+        // Published, a row's bytes must be in the log, and the publication may append.
+        // A rejected ticket leaves the latest candidate's appends available to discard.
+        self.keep_appends();
         let head = self
             .pending
             .pop_front()
@@ -1190,6 +1256,7 @@ impl NativeOwner {
     /// Stale/foreign tickets leave the complete chain intact.
     pub fn discard_from(&mut self, candidate: NativeCandidate) -> Result<usize, NativeOwnerError> {
         let position = self.position(candidate)?;
+        self.give_back_appends(candidate.serial);
         let count = self
             .pending
             .len()
@@ -1217,6 +1284,7 @@ impl NativeOwner {
     /// Drop all pending candidates tail first. As with `discard_from`, the
     /// caller must resolve durability before using this to continue admission.
     pub fn discard_all(&mut self) -> usize {
+        self.give_back_appends(0);
         let count = self.pending.len();
         while let Some(row) = self.pending.pop_back() {
             let pending = &self.pending;
@@ -1264,6 +1332,8 @@ impl NativeOwner {
 
     /// The payload log the committed core spills to, given back (for a restored core).
     pub fn detach_payload_log(&mut self) -> Option<Box<dyn super::payloads::PayloadLog>> {
+        // A candidate pending still names what it appended: the log keeps it.
+        self.keep_appends();
         self.core.detach_payload_log()
     }
     /// Spill to `log` again, given back by a refused restore.
@@ -1432,7 +1502,8 @@ impl NativeOwner {
     /// Transfer a fully reconciled committed Core without allocating or copying
     /// rows. A pending or faulted owner is returned unchanged for reconciliation.
     #[allow(clippy::result_large_err)] // Return the identical owner without allocation on refusal.
-    pub fn into_committed_core(self) -> Result<Core<NativeState>, NativeOwnerIntoCoreError> {
+    pub fn into_committed_core(mut self) -> Result<Core<NativeState>, NativeOwnerIntoCoreError> {
+        self.keep_appends();
         let error = if !self.pending.is_empty() {
             Some(NativeOwnerError::PendingCandidates)
         } else if self.faulted {

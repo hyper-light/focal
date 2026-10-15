@@ -1322,6 +1322,78 @@ fn a_ledger_at_its_checkpoint_bound_refuses_fresh_rows_and_still_checkpoints() {
     );
 }
 
+/// Creations from request `first` on, each committed as it is admitted, until one is refused:
+/// the refused request and its refusal.
+fn fill_to_the_bound(
+    session: &mut NativeSession<BuiltinNativeSchemas>,
+    first: u128,
+) -> (u128, NativeSessionError) {
+    let mut request = first;
+    loop {
+        assert!(
+            request < first + 1_000,
+            "the bound never refused a creation"
+        );
+        match session.propose(context(), create(request, 1_000 + request)) {
+            Ok(NativeSubmission::Pending { outcome, .. }) => {
+                let committed = (0..16).any(|_| {
+                    session
+                        .poll()
+                        .unwrap()
+                        .committed
+                        .iter()
+                        .any(|commit| commit.outcome == outcome)
+                });
+                assert!(committed, "creation {request} never committed");
+            }
+            Ok(other) => panic!("a fresh creation was {other:?}"),
+            Err(error) => return (request, error),
+        }
+        request += 1;
+    }
+}
+
+/// A candidate refused at admission leaves nothing in the payload log. Its plan spilled its rows
+/// as it built them, before the session weighed it; the log held them back and gives them back.
+/// Before, each refusal at the checkpoint's bound left its payloads in a segment the ledger's
+/// open claims kept live: a node refusing two thousand creations a second grew its log by 2.2 MB
+/// a second, past 1.3 GB, committing nothing.
+#[test]
+fn a_candidate_refused_at_admission_leaves_nothing_in_the_payload_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let mut bounded = limits();
+    bounded.checkpoint.rows = 200;
+    let mut session = open_with(dir.path(), &parent, bounded).unwrap();
+    lead(&mut session);
+    let (mut request, refused) = fill_to_the_bound(&mut session, 1);
+    assert!(
+        matches!(refused, NativeSessionError::Capacity(_)),
+        "{refused:?}"
+    );
+    let held = session.engine.payload_bytes();
+    assert!(
+        held > 0,
+        "the creations spilled nothing: nothing is measured"
+    );
+    for _ in 0..64 {
+        request += 1;
+        let refused = session
+            .propose(context(), create(request, 1_000 + request))
+            .unwrap_err();
+        assert!(
+            matches!(refused, NativeSessionError::Capacity(_)),
+            "{refused:?}"
+        );
+    }
+    let _ = session.poll().unwrap();
+    assert_eq!(
+        session.engine.payload_bytes(),
+        held,
+        "refused candidates left their payloads in the log"
+    );
+}
+
 #[test]
 #[ignore = "measurement"]
 fn measure_the_checkpoint_of_a_ledger_of_thousands_of_claims() {

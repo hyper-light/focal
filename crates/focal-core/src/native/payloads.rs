@@ -100,13 +100,46 @@ pub trait PayloadRead: std::fmt::Debug {
     fn read(&self, at: PayloadRef, into: &mut [u8]) -> Result<(), PayloadError>;
 }
 
+/// The appends a log holds back while the candidate that made them is weighed
+/// ([`PayloadLog::hold`]): what keeps them or gives them back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadHold(u64);
+
+impl PayloadHold {
+    /// The hold a log numbered `serial`.
+    pub fn new(serial: u64) -> Self {
+        Self(serial)
+    }
+    pub fn serial(self) -> u64 {
+        self.0
+    }
+}
+
 /// A replica's payload log as its core holds it. Rows are spilled where they are built, while a
 /// candidate is prepared on a read-only view of the core, so an append takes `&self`: the log
 /// serializes its own writes (a single writer, the owner, in practice).
+///
+/// A leader's candidate spills its rows as its plan builds them, before the session has weighed
+/// it, so its appends are held ([`Self::hold`]) until it is admitted ([`Self::keep`]) or refused
+/// ([`Self::give_back`]): a refused candidate leaves nothing in the log, as a broker validates a
+/// batch before it appends it. Its owner keeps a hold before anything else appends, so what a
+/// hold holds back is its candidate's alone.
 pub trait PayloadLog: PayloadRead + Send + Sync {
     /// `bytes` appended: where they are, or `None` when the log refuses them (its bound, an I/O
     /// error), and the row keeps its bytes.
     fn append(&self, bytes: &[u8]) -> Option<PayloadRef>;
+    /// Hold back every byte appended from now on until [`Self::keep`] or [`Self::give_back`] is
+    /// handed what this returns: none of it is the log's, or written, before. A hold begun while
+    /// another stands keeps that one. None where the log cannot hold (it is failing), and what is
+    /// appended is the log's at once.
+    fn hold(&self) -> Option<PayloadHold>;
+    /// What `hold` held back is the log's, written as anything else is. A hold that no longer
+    /// stands changes nothing.
+    fn keep(&self, hold: PayloadHold);
+    /// What `hold` held back is let go: the log's next append goes where its first did, as if it
+    /// had never been made. A hold that no longer stands changes nothing. Whether it let go of
+    /// anything.
+    fn give_back(&self, hold: PayloadHold) -> bool;
     /// A reader of what the log holds now, for another thread (a frozen image's encoder).
     fn reader(&self) -> Result<Box<dyn PayloadRead + Send>, PayloadError>;
     /// Let go of every sealed part of the log no row references, `live` naming the segments
@@ -231,6 +264,8 @@ pub(crate) struct MemoryPayloads {
     bytes: std::sync::Mutex<Vec<u8>>,
     /// Refuse appends past this many bytes, to exercise a full log.
     pub(crate) bound: Option<usize>,
+    /// The holds it has numbered, and the one standing: its number and where it began.
+    holds: std::sync::Mutex<(u64, Option<(u64, usize)>)>,
 }
 
 #[cfg(test)]
@@ -238,8 +273,8 @@ impl MemoryPayloads {
     /// A log that refuses appends past `bound` bytes, where there is one.
     pub(crate) fn bounded(bound: Option<usize>) -> Self {
         Self {
-            bytes: std::sync::Mutex::new(Vec::new()),
             bound,
+            ..Self::default()
         }
     }
 }
@@ -271,11 +306,45 @@ impl PayloadLog for MemoryPayloads {
         held.extend_from_slice(bytes);
         Some(at)
     }
+    fn hold(&self) -> Option<PayloadHold> {
+        let mut holds = self.holds.lock().ok()?;
+        let serial = holds.0.checked_add(1)?;
+        let from = self.bytes.lock().ok()?.len();
+        *holds = (serial, Some((serial, from)));
+        Some(PayloadHold::new(serial))
+    }
+    fn keep(&self, hold: PayloadHold) {
+        if let Ok(mut holds) = self.holds.lock()
+            && holds.1.is_some_and(|(serial, _)| serial == hold.serial())
+        {
+            holds.1 = None;
+        }
+    }
+    fn give_back(&self, hold: PayloadHold) -> bool {
+        let Ok(mut holds) = self.holds.lock() else {
+            return false;
+        };
+        let Some((_, from)) = holds.1.filter(|(serial, _)| *serial == hold.serial()) else {
+            return false;
+        };
+        holds.1 = None;
+        let Ok(mut bytes) = self.bytes.lock() else {
+            return false;
+        };
+        let gave = bytes.len() > from;
+        bytes.truncate(from);
+        gave
+    }
     fn reader(&self) -> Result<Box<dyn PayloadRead + Send>, PayloadError> {
         let bytes = self.bytes.lock().map_err(|_| PayloadError::Unavailable)?;
         Ok(Box::new(Self {
             bytes: std::sync::Mutex::new(bytes.clone()),
-            bound: None,
+            ..Self::default()
         }))
+    }
+    fn held_bytes(&self) -> u64 {
+        self.bytes
+            .lock()
+            .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
     }
 }

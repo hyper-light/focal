@@ -23,8 +23,16 @@
 //! rather than wait. A reader for another thread reads the files, behind a barrier the writer
 //! answers once every byte appended before it is written: the reader waits on its own thread, never
 //! the appender.
+//!
+//! What a leader's candidate appends while it is weighed is held ([`PayloadLog::hold`]): nothing
+//! from where the hold began is handed to the writer, a reader's barrier included (no published row
+//! names it), until the hold is kept. Given back, the log is as it was where the hold began: the
+//! window cut there, any segment opened since sealed empty, the next append where the first held
+//! one went. A refused candidate so leaves nothing in the files.
 
-use focal_core::native::payloads::{PayloadError, PayloadLog, PayloadRead, PayloadRef};
+use focal_core::native::payloads::{
+    PayloadError, PayloadHold, PayloadLog, PayloadRead, PayloadRef,
+};
 use focal_memory::{
     Allocation, BudgetKind, BudgetLane, DiskBudget, DiskKind, DiskReservation, MemoryBudget,
 };
@@ -235,6 +243,36 @@ struct Writer {
     /// The window's first chunk that may hold bytes the writer was not handed, never past the
     /// chunk appends go to: where a hand begins, so an append does not walk the window.
     unsent_from: usize,
+    /// The hold standing over the newest appends, if one does: nothing from where it began is
+    /// handed to the writer until it is kept, and giving it back takes the log back there. And
+    /// how many holds were numbered.
+    hold: Option<Held>,
+    holds: u64,
+}
+
+/// A hold over the log's newest appends: its number and where it began.
+#[derive(Debug, Clone, Copy)]
+struct Held {
+    serial: u64,
+    segment: u32,
+    offset: u64,
+}
+
+impl Held {
+    /// How much of `chunk` may be handed under this hold: all of it before the hold began, none
+    /// from there.
+    fn handable(self, chunk: &Chunk) -> usize {
+        if chunk.segment < self.segment {
+            return chunk.bytes.len();
+        }
+        if chunk.segment > self.segment {
+            return 0;
+        }
+        self.offset
+            .checked_sub(chunk.start)
+            .and_then(|before| usize::try_from(before).ok())
+            .map_or(0, |before| before.min(chunk.bytes.len()))
+    }
 }
 
 impl Writer {
@@ -305,6 +343,7 @@ impl Writer {
             jobs,
             charge,
             unsent_from,
+            hold,
             ..
         } = self;
         let Some(jobs) = jobs.as_ref() else {
@@ -317,11 +356,17 @@ impl Writer {
             if !all && index.saturating_add(1) == count {
                 break;
             }
-            let Some(rest) = chunk.bytes.get(chunk.sent..) else {
+            // What a hold keeps back is not handed: a chunk only up to where the hold began, and
+            // no chunk after it.
+            let end = hold.map_or(chunk.bytes.len(), |held| held.handable(chunk));
+            let Some(rest) = chunk.bytes.get(chunk.sent..end) else {
                 handed = false;
                 break;
             };
             if rest.is_empty() {
+                if end < chunk.bytes.len() {
+                    break;
+                }
                 index = index.saturating_add(1);
                 continue;
             }
@@ -382,7 +427,10 @@ impl Writer {
                 extra: made,
             }) {
                 Ok(()) => {
-                    chunk.sent = chunk.bytes.len();
+                    chunk.sent = end;
+                    if end < chunk.bytes.len() {
+                        break;
+                    }
                     index = index.saturating_add(1);
                 }
                 Err(TrySendError::Full(Job::Write { buffer, .. }))
@@ -434,6 +482,49 @@ impl Writer {
             written: 0,
         });
         Some(())
+    }
+
+    /// The log as it stood where `held` began, none of what was appended since handed to the
+    /// writer (the hold kept it back): every chunk from there back to the spares, the one it
+    /// began in cut there. Where a segment was opened since, the one it began in stays sealed and
+    /// ends where it began, each opened after it but the newest is sealed empty (a sweep removes
+    /// it, as no row names it), and appends go on from the newest's first byte.
+    fn rewind(&mut self, held: Held) {
+        let Self {
+            window,
+            spare,
+            segments,
+            current,
+            tail,
+            unsent_from,
+            ..
+        } = self;
+        window.retain_mut(|chunk| {
+            let kept = held.handable(chunk);
+            if kept == 0 && (chunk.segment, chunk.start) >= (held.segment, held.offset) {
+                // Within the spares' capacity: the window and the spares hold its chunks.
+                let mut bytes = std::mem::take(&mut chunk.bytes);
+                bytes.clear();
+                spare.push(bytes);
+                return false;
+            }
+            chunk.bytes.truncate(kept);
+            chunk.sent = chunk.sent.min(kept);
+            chunk.written = chunk.written.min(kept);
+            true
+        });
+        if *current == held.segment {
+            *tail = held.offset;
+        } else {
+            if let Some(sealed) = segments.get_mut(&held.segment) {
+                sealed.len = held.offset;
+            }
+            for (_, opened) in segments.range_mut(held.segment.saturating_add(1)..*current) {
+                opened.len = 0;
+            }
+            *tail = 0;
+        }
+        *unsent_from = (*unsent_from).min(window.len().saturating_sub(1));
     }
 }
 
@@ -740,6 +831,8 @@ impl FilePayloads {
                 charge,
                 failures_seen: 0,
                 unsent_from: 0,
+                hold: None,
+                holds: 0,
             }),
             thread: Some(thread),
             close_wait: CLOSE_WAIT,
@@ -923,6 +1016,38 @@ impl PayloadLog for FilePayloads {
         Some(at)
     }
 
+    fn hold(&self) -> Option<PayloadHold> {
+        let mut writer = self.writer.lock().ok()?;
+        let serial = writer.holds.checked_add(1)?;
+        writer.holds = serial;
+        writer.hold = Some(Held {
+            serial,
+            segment: writer.current,
+            offset: writer.tail,
+        });
+        Some(PayloadHold::new(serial))
+    }
+    fn keep(&self, hold: PayloadHold) {
+        let Ok(mut writer) = self.writer.lock() else {
+            return;
+        };
+        if writer.hold.is_some_and(|held| held.serial == hold.serial()) {
+            writer.hold = None;
+        }
+    }
+    fn give_back(&self, hold: PayloadHold) -> bool {
+        let Ok(mut writer) = self.writer.lock() else {
+            return false;
+        };
+        let Some(held) = writer.hold.filter(|held| held.serial == hold.serial()) else {
+            return false;
+        };
+        writer.hold = None;
+        writer.settle();
+        let gave = (writer.current, writer.tail) != (held.segment, held.offset);
+        writer.rewind(held);
+        gave
+    }
     fn sweep(&self, live: &BTreeSet<u32>) -> usize {
         FilePayloads::sweep(self, live)
     }
