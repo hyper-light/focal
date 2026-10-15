@@ -224,7 +224,7 @@ impl Streams {
         // proves the consumer decodes them, so older profiles are refused at
         // the door rather than handed facts they cannot read.
         let native = session.activation().is_native();
-        if native && request.protocol != NATIVE_PROTOCOL_VERSION {
+        if native && !native_protocol(request.protocol) {
             return Err(AccessError::UnsupportedProtocol);
         }
         let scope = stream_scope(peer, request.ledger, stream.filter())?;

@@ -486,6 +486,7 @@ fn native_ledgers_stream_only_under_the_native_profile() {
         };
         let legacy = open(PROTOCOL_VERSION, 1);
         let native = open(NATIVE_PROTOCOL_VERSION, 2);
+        let written = open(NATIVE_WRITTEN_PROTOCOL_VERSION, 3);
         let (host, owner) = LocalHost::spawn(node, WireLimits::default()).unwrap();
         // A legacy-profile consumer cannot decode schema-2 deltas: refused at the
         // door, before any cursor is registered.
@@ -497,7 +498,11 @@ fn native_ledgers_stream_only_under_the_native_profile() {
         // admitted request epoch on a native ledger, so this cursor is refused as
         // an invalid request; durable watches use the managed cursor stream.
         assert_eq!(
-            call(&host, actor, native).await,
+            call(&host, actor.clone(), native).await,
+            Response::Error(AccessError::InvalidRequest)
+        );
+        assert_eq!(
+            call(&host, actor, written).await,
             Response::Error(AccessError::InvalidRequest)
         );
         host.stop().await.unwrap();

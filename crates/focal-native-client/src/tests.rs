@@ -25,6 +25,72 @@ use focal_model::*;
 use focal_wire::inspect_native_frame;
 use serde_json::{Value, json};
 
+#[test]
+fn own_write_bindings_use_fixed_slots_without_allocating_read_vectors() {
+    let sequence = SessionSeq(9);
+    let state = focal_wire::NativeWrittenState {
+        sequence,
+        claim: Some(focal_wire::NativeWrittenClaim {
+            binding: focal_wire::NativeBinding {
+                object: ObjectId::from_u128(100),
+                content: ContentHash([4; 32]),
+                revision: ObjectRevision(1),
+            },
+            issuer: ISSUER,
+            subject: SUBJECT,
+            status: ClaimStatus::Generated,
+            receipt: None,
+            response_count: 0,
+            latest_response: None,
+        }),
+        response: Some(focal_wire::NativeWrittenResponse {
+            binding: focal_wire::NativeBinding {
+                object: ObjectId::from_u128(200),
+                content: ContentHash([5; 32]),
+                revision: ObjectRevision(2),
+            },
+            claim: ClaimId::from_u128(100),
+            cycle: 1,
+        }),
+    };
+    let resolved = Resolved::from_written(ledger(), sequence, &state).unwrap();
+    assert_eq!(resolved.claims.capacity(), 0);
+    assert_eq!(resolved.responses.capacity(), 0);
+    assert_eq!(
+        resolved
+            .claim(ClaimId::from_u128(100))
+            .unwrap()
+            .binding
+            .ledger,
+        ledger()
+    );
+    assert_eq!(
+        resolved
+            .response(TestamentId::from_u128(200))
+            .unwrap()
+            .cycle,
+        1
+    );
+    let operation =
+        NativeAuthoredOperation::ClaimPost(focal_client::operations::NativeClaimTargetDocument {
+            claim: format!("{:032x}", 100),
+        });
+    assert!(resolved.covers(&operation).unwrap());
+    let missing =
+        NativeAuthoredOperation::ClaimPost(focal_client::operations::NativeClaimTargetDocument {
+            claim: format!("{:032x}", 101),
+        });
+    assert!(!resolved.covers(&missing).unwrap());
+    let response = NativeAuthoredOperation::TestamentPost(
+        focal_client::operations::NativeResponseTargetDocument {
+            claim: format!("{:032x}", 100),
+            testament: format!("{:032x}", 200),
+        },
+    );
+    assert!(resolved.covers(&response).unwrap());
+    assert!(Resolved::from_written(ledger(), SessionSeq(10), &state).is_err());
+}
+
 const ISSUER: ParticipantId = ParticipantId::from_u128(1);
 const SUBJECT: ParticipantId = ParticipantId::from_u128(2);
 const EVALUATOR: ParticipantId = ParticipantId::from_u128(3);

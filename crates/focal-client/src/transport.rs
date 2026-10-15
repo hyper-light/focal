@@ -44,7 +44,7 @@ impl<H: RequestHandler> ClientTransport for EmbeddedTransport<H> {
             {
                 return Err(WireError::Access(AccessError::UnsupportedProtocol));
             }
-            if request.protocol == NATIVE_PROTOCOL_VERSION
+            if native_protocol(request.protocol)
                 && (!self.handler.supports_managed_requests()
                     || !self.handler.supports_participant_requests()
                     || !self.handler.supports_native_requests())

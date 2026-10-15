@@ -274,6 +274,9 @@ pub struct Resolved {
     pub diagnostics: Vec<ResolvedDiagnostic>,
     pub artifacts: Vec<ResolvedArtifact>,
     pub result_testaments: Vec<ResolvedResultTestament>,
+    /// Own-write bindings never allocate the read path's vectors.
+    written_claim: Option<ResolvedClaim>,
+    written_response: Option<ResolvedResponse>,
 }
 impl Resolved {
     /// The exact small state returned beside an own-write receipt, checked against that
@@ -286,53 +289,45 @@ impl Resolved {
         written
             .validate(sequence)
             .map_err(|_| CompileError::Unsupported("invalid written state"))?;
-        let mut resolved = Self::default();
-        if let Some(claim) = written.claim {
-            push(
-                &mut resolved.claims,
-                ResolvedClaim {
-                    binding: binding(ledger, claim.binding),
-                    issuer: claim.issuer,
-                    subject: claim.subject,
-                    status: claim.status,
-                    receipt: claim.receipt.map(|receipt| (receipt.holder, receipt.fence)),
-                    response_count: claim.response_count,
-                    latest_response: claim.latest_response,
-                },
-            )?;
-        }
-        if let Some(response) = written.response {
-            push(
-                &mut resolved.responses,
-                ResolvedResponse {
-                    binding: binding(ledger, response.binding),
-                    claim: response.claim,
-                    cycle: response.cycle,
-                },
-            )?;
-        }
-        Ok(resolved)
+        Ok(Self {
+            written_claim: written.claim.map(|claim| ResolvedClaim {
+                binding: binding(ledger, claim.binding),
+                issuer: claim.issuer,
+                subject: claim.subject,
+                status: claim.status,
+                receipt: claim.receipt.map(|receipt| (receipt.holder, receipt.fence)),
+                response_count: claim.response_count,
+                latest_response: claim.latest_response,
+            }),
+            written_response: written.response.map(|response| ResolvedResponse {
+                binding: binding(ledger, response.binding),
+                claim: response.claim,
+                cycle: response.cycle,
+            }),
+            ..Self::default()
+        })
     }
 
-    /// Whether every explicit object this operation binds to is in this resolution.
-    /// Selection queries still require their normal read.
+    /// Whether a lifecycle step's fixed claim/response requirements are covered.
+    /// Other operations conservatively keep their normal read. This check never
+    /// allocates a requirement list; the canonical compiler still judges the step.
     pub fn covers(&self, operation: &NativeAuthoredOperation) -> Result<bool, CompileError> {
-        Ok(requirements(operation)?
-            .into_iter()
-            .all(|requirement| match requirement {
-                Requirement::Objects(objects) => objects.into_iter().all(|object| match object {
-                    NativeObjectRef::Claim(id) => self
-                        .claims
-                        .iter()
-                        .any(|claim| claim.binding.object.0 == id.0),
-                    NativeObjectRef::Response(id) => self
-                        .responses
-                        .iter()
-                        .any(|response| response.binding.object.0 == id.0),
-                    _ => false,
-                }),
-                Requirement::Evaluation { .. } => false,
-            }))
+        use NativeAuthoredOperation as Op;
+        let (claim, response) = match operation {
+            Op::ClaimPost(document)
+            | Op::ClaimCancel(document)
+            | Op::ClaimReleaseScope(document) => (document.claim.as_str(), None),
+            Op::TestamentSubmit(document) => (document.claim.as_str(), None),
+            Op::TestamentPost(document)
+            | Op::TestamentReceive(document)
+            | Op::ValidationEnterWholeWork(document) => {
+                (document.claim.as_str(), Some(document.testament.as_str()))
+            }
+            _ => return Ok(false),
+        };
+        let claim = ClaimId(parse_id(claim)?);
+        let response = response.map(parse_id).transpose()?.map(TestamentId);
+        Ok(self.claim(claim).is_ok() && response.is_none_or(|id| self.response(id).is_ok()))
     }
 
     /// Missing objects are skipped here and reported by the verb that needs
@@ -458,12 +453,14 @@ impl Resolved {
     pub fn claim(&self, id: ClaimId) -> Result<&ResolvedClaim, CompileError> {
         self.claims
             .iter()
+            .chain(self.written_claim.iter())
             .find(|claim| claim.binding.object.0 == id.0)
             .ok_or(CompileError::Missing("claim"))
     }
     pub fn response(&self, id: TestamentId) -> Result<&ResolvedResponse, CompileError> {
         self.responses
             .iter()
+            .chain(self.written_response.iter())
             .find(|response| response.binding.object.0 == id.0)
             .ok_or(CompileError::Missing("response"))
     }
