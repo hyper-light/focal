@@ -208,13 +208,12 @@ impl EventIndex {
             self.drop_all();
             return;
         }
-        if let Some(recipient) = recipient {
-            if !self
+        if let Some(recipient) = recipient
+            && !self
                 .filed
                 .insert((DELIVERY, recipient.0, position.sequence.0, position.ordinal))
-            {
-                self.drop_all();
-            }
+        {
+            self.drop_all();
         }
     }
     /// Unfile `position` from `home`, giving back its charge. One not filed is not an index of
