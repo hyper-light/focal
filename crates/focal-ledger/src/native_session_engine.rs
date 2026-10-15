@@ -688,6 +688,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             None => Ok(None),
         }
     }
+    /// The cold data stream as it stands, to be read away from the owner
+    /// (`cold::ColdSlot::data`): none where this replica keeps no cold streams.
+    pub(crate) fn cold_data(&self) -> Result<Option<super::cold::ColdData>, NativeSessionError> {
+        self.cold
+            .data(self.cold_source.as_ref(), &self.budget)
+            .map_err(super::cold::cold_error)
+    }
     /// The cold chunks the checkpoint `streams` names are durable: its encoding made them so
     /// before its bytes existed (doc 31 M2, A2), so they are pending no more.
     fn note_cold(

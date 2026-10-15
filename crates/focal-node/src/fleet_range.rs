@@ -164,11 +164,9 @@ pub(super) enum RangeCall {
         digest: ContentHash,
         reply: OneshotSender<Result<Option<focal_ledger::ColdFrame>, LedgerError>>,
     },
-    /// What a cold family's frame names of the ledger's content (doc 31 M2, A2).
-    ColdContent {
-        retired_at: focal_model::SessionSeq,
-        digest: ContentHash,
-        reply: OneshotSender<Result<Option<focal_ledger::ColdContent>, LedgerError>>,
+    /// The session's cold data stream as it stands, to be scanned away from the owner (26 §5).
+    ColdData {
+        reply: OneshotSender<Result<Option<ColdData>, LedgerError>>,
     },
     /// One walk of the status index for a cold retirement, its offers retired (doc 31 M2, A2).
     ColdWalk {
@@ -230,7 +228,7 @@ impl RangeCall {
             Self::RetireBatch { .. } => "range: retire batch",
             Self::RetireRule { .. } => "range: retire rule",
             Self::ColdWalk { .. } => "range: cold walk",
-            Self::ColdContent { .. } => "range: cold content",
+            Self::ColdData { .. } => "range: cold data",
             Self::ColdFrame { .. } => "range: cold frame",
             Self::Retired { .. } => "range: retired claim",
             Self::SealBundle { .. } => "range: seal bundle",
@@ -244,6 +242,13 @@ impl RangeCall {
 /// plan it was derived from, its bundle, and a fold of older seal rows with
 /// its directory bundle when the index reached its bound. The bytes stay
 /// charged to the replica's budget until the agent is done with them.
+/// A replica's cold data stream as it stands and the limits its frames are inspected under
+/// (`Session::native_cold_data`).
+pub type ColdData = (
+    focal_ledger::ColdData,
+    focal_core::native::record_codec::InspectionLimits,
+);
+
 pub struct SealedOutcomes {
     pub plan: SealPlan,
     pub bundle: Vec<u8>,
@@ -436,19 +441,11 @@ impl ReplicaHost {
         })
         .await
     }
-    /// What a cold family's frame names of the ledger's content (doc 31 M2, A2): `None` when no
-    /// cold record applied at `retired_at`.
-    pub async fn cold_content(
-        &self,
-        retired_at: focal_model::SessionSeq,
-        digest: ContentHash,
-    ) -> Result<Option<focal_ledger::ColdContent>, LedgerError> {
-        self.range_call(|reply| RangeCall::ColdContent {
-            retired_at,
-            digest,
-            reply,
-        })
-        .await
+    /// The session's cold data stream as it stands, and the limits its frames are inspected
+    /// under: what the collector reads the content its retired families keep from, away from the
+    /// owner (26 §5; doc 31 M2, A2). `None` where this replica keeps no cold streams.
+    pub async fn cold_data(&self) -> Result<Option<ColdData>, LedgerError> {
+        self.range_call(|reply| RangeCall::ColdData { reply }).await
     }
     /// One walk of the status index from `cursor` for a cold retirement (doc 31 M2, A2), on the
     /// replica's own thread: every family that may retire now offered and retired, nothing
@@ -647,12 +644,8 @@ impl Owner {
                 drop(charge);
                 let _ = reply.send(result);
             }
-            RangeCall::ColdContent {
-                retired_at,
-                digest,
-                reply,
-            } => {
-                let result = self.session.native_cold_content(retired_at, digest);
+            RangeCall::ColdData { reply } => {
+                let result = self.session.native_cold_data();
                 drop(charge);
                 let _ = reply.send(result);
             }

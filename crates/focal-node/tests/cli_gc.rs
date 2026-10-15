@@ -406,6 +406,14 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     );
     let retired = manifests(root, &tenant);
     assert_eq!(retired, bound, "the payload alone: {retired:?}");
+    // Its frame was read once: a pass with nothing newly retired reads none of the stream, and
+    // the payload stays.
+    let read = gc_status(root)["passes"].as_u64().unwrap();
+    let status = pass_where(root, |_| {
+        gc_status(root)["passes"].as_u64().unwrap() > read + 1
+    });
+    assert_eq!(status["last"]["cold_bytes_scanned"], 0, "{status}");
+    assert_eq!(manifests(root, &tenant), bound);
     let archive = admin(root, &["inspect", "archive", "--claim", &claim]);
     assert_eq!(archive["result"]["archive"]["verified"], true, "{archive}");
     let bundle = archive["result"]["archive"]["bundle"].as_str().unwrap();

@@ -15202,3 +15202,41 @@ virtual machine holding 16 of the 18 cores, load average 42 to 47), exit 0: `car
 `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked --no-fail-fast -- --test-threads=4`: 167 test binaries,
 3462 passed, 0 failed, 31 ignored.
+
+### 2026-10-15 — The custody collector reads the cold stream once, away from the owner
+
+The collector learned what retired families' frames name by reading every frame at every pass,
+one owner call each. Each call read and hashed a whole chunk or two, and the frames were
+gathered into a list deduplicated one by one. In the 2 GiB envelope at 4,000 writes a second
+(doc 09, the landing above), the owner spent 12.5% of its time on those reads and 9.2% on
+retirement walks. Write latency rose to a p50 of 176 ms and a p99 of 2.04 s.
+
+A pass now takes the stream's state from the owner once (`Session::native_cold_data`: its
+whole chunks' names and its open chunk's bytes, charged while held). On the blocking pool's
+file share it reads what was appended since the last pass, a window of whole batches at a time
+(`ColdData::scan_content`), each chunk checked against its name once. The roots found join a
+sorted set kept between passes, charged to the collector's own 128 MiB; a set past it keeps
+the domain opaque. The pass reports what it read (`cold_bytes_scanned`); the quadratic
+gathering is gone.
+
+The same run (`4d65e808`, harness `wq-env-run3.sh`, binaries' hashes kept with the run), under
+another workload's load (load average 24 to 34 at its start): 1,162,571 writes committed, 6,463
+refused for memory (0.55%), none unknown, none abandoned, 93,797 families retired. Write
+latency was p50 26.3 ms (from 176 ms) and p99 0.89 s (from 2.04 s).
+
+A ten-second profile at 200 s shows no cold reads on the owner, which now has idle time (16% of
+its samples waiting). What still holds requests is the owner's long steps:
+- drains of a poll's committed entries whole: 230 slow steps, up to 332 ms;
+- retirement walks: 296, up to 255 ms. Each family is derived twice (on the committed core, then
+  on the pending view), its spilled events are read back to derive it, and its frame is encoded
+  twice (to quote, then to append).
+
+Those are the next batch.
+
+The gate on head `4d65e808` (macOS 26.4.1 arm64, load average 8 to 11), exit 0: `cargo fmt
+--all --check`, `python3 scripts/check-contracts.py` (1564 links, 37 source hashes, 15
+vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D
+warnings`, `bash scripts/check-production.sh` (1184 production sources, no policy allowance,
+no runtime recursion), `cargo deny check advisories bans licenses sources`, and `bash
+scripts/cargo.sh test --workspace --locked --no-fail-fast -- --test-threads=4`: 167 test
+binaries, 3463 passed, 0 failed, 31 ignored.

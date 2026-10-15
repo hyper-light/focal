@@ -185,6 +185,156 @@ pub fn frame_in(
     read_frame(geometry, charge, &in_data, at, length).map(Some)
 }
 
+/// The bytes a scan of a cold data stream reads at a time: the batches within them, and a batch
+/// longer than them read whole.
+const SCAN_WINDOW: usize = 4 << 20;
+
+/// A session's cold data stream as it stands, to be read away from its writer (26 §5, doc 31 M2,
+/// A2): its state as a checkpoint names it (the open chunk's bytes read back from their file),
+/// the directory its whole chunks are read from, durable or pending, and how it is cut. What its
+/// state holds is charged while it is held.
+pub struct ColdData {
+    geometry: ColdGeometry,
+    state: ColdState,
+    reader: ColdReader,
+    _charge: Allocation,
+}
+
+/// The part of a cold data stream a scan holds: `bytes` from `start`.
+struct ScanWindow {
+    start: u64,
+    bytes: Vec<u8>,
+}
+
+impl ColdData {
+    /// The stream's length.
+    pub fn length(&self) -> u64 {
+        self.state.length
+    }
+    /// Every content root the frames of this stream name, from `from`, the start of a batch, to
+    /// the stream's end, each given to `found` (26 §5; doc 31 M2, A2): its frames' headers name the
+    /// content their families keep. The stream is read front to back, a window of whole batches
+    /// at a time, so each chunk is read and checked against its name once, and each frame's
+    /// header is inspected under `inspection`. Returns where it stopped: the stream's end. What it
+    /// reads is charged to `budget` while it is held. Read a frame at a time through its marks,
+    /// every frame took a whole chunk or two, read and hashed, and the custody collector read every
+    /// retired family's that way at every pass, on the session's owner.
+    pub fn scan_content(
+        &self,
+        from: u64,
+        inspection: focal_core::native::record_codec::InspectionLimits,
+        budget: &MemoryBudget,
+        found: &mut dyn FnMut(ContentHash) -> Result<(), ContentError>,
+    ) -> Result<u64, ContentError> {
+        let length = self.state.length;
+        if from > length {
+            return Err(ContentError::Invalid);
+        }
+        let mut charge = budget
+            .reserve(BudgetKind::Query, BudgetLane::Ordinary, 0)
+            .map_err(|_| ContentError::Capacity)?
+            .commit();
+        let mut window = ScanWindow {
+            start: from,
+            bytes: Vec::new(),
+        };
+        let mut at = from;
+        // Every batch takes its count at least: the batches are fewer than the stream's bytes.
+        let batches = length
+            .saturating_sub(from)
+            .checked_div(u64::try_from(COLD_COUNT_BYTES).map_err(|_| ContentError::Capacity)?)
+            .ok_or(ContentError::Capacity)?;
+        for _ in 0..=batches {
+            if at >= length {
+                return Ok(at);
+            }
+            let count = self.within(&mut window, &mut charge, at, COLD_COUNT_BYTES)?;
+            let entries = usize::from(u16::from_le_bytes(
+                count.try_into().map_err(|_| ContentError::Corrupt)?,
+            ));
+            let header = entries
+                .checked_mul(COLD_ENTRY_BYTES)
+                .and_then(|n| n.checked_add(COLD_COUNT_BYTES))
+                .ok_or(ContentError::Capacity)?;
+            if header > MAX_HEADER {
+                return Err(ContentError::Corrupt);
+            }
+            let (entries, frames) =
+                cold_header(self.within(&mut window, &mut charge, at, header)?)
+                    .map_err(|_| ContentError::Corrupt)?;
+            let mut batch = frames;
+            for entry in &entries {
+                let frame = usize::try_from(entry.length).map_err(|_| ContentError::Capacity)?;
+                if frame > inspection.bytes {
+                    return Err(ContentError::Corrupt);
+                }
+                batch = batch.checked_add(frame).ok_or(ContentError::Capacity)?;
+            }
+            let end = u64::try_from(batch)
+                .ok()
+                .and_then(|batch| at.checked_add(batch))
+                .ok_or(ContentError::Capacity)?;
+            if end > length {
+                return Err(ContentError::Corrupt);
+            }
+            let bytes = self.within(&mut window, &mut charge, at, batch)?;
+            let mut offset = frames;
+            for entry in &entries {
+                let stop = usize::try_from(entry.length)
+                    .ok()
+                    .and_then(|frame| offset.checked_add(frame))
+                    .ok_or(ContentError::Capacity)?;
+                let frame = bytes.get(offset..stop).ok_or(ContentError::Corrupt)?;
+                let archive =
+                    focal_core::native::record_codec::archive::StructuralArchive::inspect(
+                        frame, inspection,
+                    )
+                    .map_err(|_| ContentError::Corrupt)?;
+                let header = archive.header();
+                for root in header.content.iter().chain(&header.inline) {
+                    found(*root)?;
+                }
+                offset = stop;
+            }
+            at = end;
+        }
+        Err(ContentError::Corrupt)
+    }
+    /// The stream's `length` bytes from `at`, from `window` when it holds them, else read into it
+    /// from `at`: a window's worth, or the range whole where it is longer, charged before it is
+    /// read.
+    fn within<'w>(
+        &self,
+        window: &'w mut ScanWindow,
+        charge: &mut Allocation,
+        at: u64,
+        length: usize,
+    ) -> Result<&'w [u8], ContentError> {
+        let held = at
+            .checked_sub(window.start)
+            .and_then(|from| usize::try_from(from).ok())
+            .and_then(|from| Some((from, from.checked_add(length)?)))
+            .filter(|(_, to)| *to <= window.bytes.len());
+        if let Some((from, to)) = held {
+            return window.bytes.get(from..to).ok_or(ContentError::Corrupt);
+        }
+        let rest = usize::try_from(self.state.length.saturating_sub(at)).unwrap_or(usize::MAX);
+        let take = length.max(SCAN_WINDOW).min(rest);
+        if take < length {
+            return Err(ContentError::Corrupt);
+        }
+        window.bytes = Vec::new();
+        charge.shrink_to(0).map_err(|_| ContentError::Capacity)?;
+        charge
+            .grow(self.geometry.read_bytes(take)?)
+            .map_err(|_| ContentError::Capacity)?;
+        let chunk = |hash: ContentHash, size: usize| self.reader.read(hash, size);
+        window.bytes = self.state.read(self.geometry, at, take, &chunk)?;
+        window.start = at;
+        window.bytes.get(..length).ok_or(ContentError::Corrupt)
+    }
+}
+
 /// A session's cold streams as its engine holds them: kept or not, and open once used.
 pub(crate) enum ColdSlot {
     /// This replica keeps no cold streams.
@@ -252,6 +402,53 @@ impl ColdSlot {
         match self {
             Self::Open(cold) => cold.made_durable(streams),
             _ => Ok(()),
+        }
+    }
+    /// The data stream as it stands, to be read away from its writer ([`ColdData`]), its state
+    /// charged to `budget` before it is taken: from the writer when it is open, else as the
+    /// checkpoint the streams were restored from named them. None where this replica keeps no
+    /// cold streams or none was ever appended to.
+    pub(crate) fn data(
+        &self,
+        source: Option<&ColdSource>,
+        budget: &MemoryBudget,
+    ) -> Result<Option<ColdData>, ContentError> {
+        let reserve = |bytes: usize| {
+            budget
+                .reserve(BudgetKind::Query, BudgetLane::Ordinary, bytes)
+                .map(focal_memory::Reservation::commit)
+                .map_err(|_| ContentError::Capacity)
+        };
+        match self {
+            Self::Open(cold) if !cold.is_empty() => {
+                let charge = reserve(cold.data.captured_bytes()?)?;
+                let (state, _) = cold.data.capture()?;
+                Ok(Some(ColdData {
+                    geometry: cold.geometry,
+                    state,
+                    reader: cold.data.reader(),
+                    _charge: charge,
+                }))
+            }
+            Self::Closed(Some(streams)) if streams.data.length > 0 => {
+                let source = source.ok_or(ContentError::Invalid)?;
+                let names = streams
+                    .data
+                    .manifests
+                    .len()
+                    .checked_add(streams.data.names.len())
+                    .and_then(|names| names.checked_mul(size_of::<ContentHash>()))
+                    .and_then(|names| names.checked_add(streams.data.open.len()))
+                    .ok_or(ContentError::Capacity)?;
+                let charge = reserve(names)?;
+                Ok(Some(ColdData {
+                    geometry: streams.geometry,
+                    state: streams.data.clone(),
+                    reader: ColdReader::open(source.root.join("data"))?,
+                    _charge: charge,
+                }))
+            }
+            _ => Ok(None),
         }
     }
 }

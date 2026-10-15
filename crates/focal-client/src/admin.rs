@@ -438,6 +438,9 @@ pub struct AdminGcPass {
     /// Bundles named by a continuation that this node could not read or
     /// verify; their proof is protected by name only.
     pub bundles_unreadable: u64,
+    /// Bytes of the hosted replicas' cold data streams read this pass: only what was appended
+    /// since the last, the rest's content already known.
+    pub cold_bytes_scanned: u64,
     pub content: AdminCollectorReport,
     pub seeds: AdminSeedReport,
 }

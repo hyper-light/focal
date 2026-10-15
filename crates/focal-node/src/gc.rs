@@ -45,6 +45,117 @@ const BUNDLE_INSPECTION: InspectionLimits = InspectionLimits {
     row_bytes: 6 << 20,
 };
 
+/// What the collector's own memory may hold (26 §5): what it read of the hosted replicas' cold
+/// data streams, kept between passes, and the windows it reads them through.
+pub const GC_MEMORY_BYTES: usize = 128 * 1024 * 1024;
+
+/// What the collector read of one replica's cold data stream (26 §5; doc 31 M2, A2): its bytes
+/// from the start, and every content root their frames name, sorted, each once, charged as their
+/// buffer grows. A frame never changes once appended, so a pass reads only what was appended
+/// since the last. Read whole at every pass, a frame at a time through the session's owner (a
+/// whole chunk or two read and hashed for each), the frames dedup'd against a list one by one,
+/// the stream held the owner for most of a pass once a few minutes of retirements were behind
+/// it.
+struct ColdScanned {
+    through: u64,
+    roots: Vec<ContentHash>,
+    charge: focal_memory::Allocation,
+    /// Its roots outgrew the collector's memory: its domain stays opaque, read no more.
+    overflowed: bool,
+}
+impl ColdScanned {
+    fn new(budget: &focal_memory::MemoryBudget) -> Option<Self> {
+        Some(Self {
+            through: 0,
+            roots: Vec::new(),
+            charge: budget
+                .reserve(
+                    focal_memory::BudgetKind::Index,
+                    focal_memory::BudgetLane::Ordinary,
+                    0,
+                )
+                .ok()?
+                .commit(),
+            overflowed: false,
+        })
+    }
+    /// What `data` appended since `self.through` names, read and joined to the roots, `through`
+    /// moved to its end. Refused or failed, it stands where it stood; roots that outgrow the
+    /// collector's memory are let go and it is kept opaque from here on (`overflowed`).
+    fn read(
+        &mut self,
+        data: &focal_ledger::ColdData,
+        inspection: InspectionLimits,
+        budget: &focal_memory::MemoryBudget,
+    ) -> Result<(), focal_evidence::ContentError> {
+        use focal_evidence::ContentError;
+        let mut found = Vec::new();
+        let mut charge = budget
+            .reserve(
+                focal_memory::BudgetKind::Query,
+                focal_memory::BudgetLane::Ordinary,
+                0,
+            )
+            .map_err(|_| ContentError::Capacity)?
+            .commit();
+        let through = data.scan_content(self.through, inspection, budget, &mut |root| {
+            if found.len() == found.capacity() {
+                let more = found.capacity().max(64);
+                charge
+                    .grow(more.saturating_mul(size_of::<ContentHash>()))
+                    .map_err(|_| ContentError::Capacity)?;
+                found
+                    .try_reserve_exact(more)
+                    .map_err(|_| ContentError::Capacity)?;
+            }
+            found.push(root);
+            Ok(())
+        })?;
+        if let Err(error) = self.join(found) {
+            self.roots = Vec::new();
+            let _ = self.charge.shrink_to(0);
+            self.overflowed = true;
+            return Err(error);
+        }
+        self.through = through;
+        Ok(())
+    }
+    /// `found` joined to the roots, sorted and each once, the growth charged first: refused
+    /// (`Capacity`), the roots are as they were.
+    fn join(&mut self, mut found: Vec<ContentHash>) -> Result<(), focal_evidence::ContentError> {
+        use focal_evidence::ContentError;
+        if found.is_empty() {
+            return Ok(());
+        }
+        let wanted = self
+            .roots
+            .len()
+            .checked_add(found.len())
+            .ok_or(ContentError::Capacity)?;
+        if wanted > self.roots.capacity() {
+            let room = wanted.max(self.roots.capacity().saturating_mul(2));
+            let more = room
+                .saturating_sub(self.roots.capacity())
+                .checked_mul(size_of::<ContentHash>())
+                .ok_or(ContentError::Capacity)?;
+            self.charge.grow(more).map_err(|_| ContentError::Capacity)?;
+            if self
+                .roots
+                .try_reserve_exact(room.saturating_sub(self.roots.len()))
+                .is_err()
+            {
+                let held = self.charge.bytes().saturating_sub(more);
+                let _ = self.charge.shrink_to(held);
+                return Err(ContentError::Capacity);
+            }
+        }
+        self.roots.append(&mut found);
+        self.roots.sort_unstable();
+        self.roots.dedup();
+        Ok(())
+    }
+}
+
 /// The operator's view of the collector on this node.
 #[derive(Clone)]
 pub struct GcHandle(watch::Receiver<AdminGc>);
@@ -66,6 +177,11 @@ pub struct GcAgent {
     /// What each bundle's header names — the roots of content objects and
     /// of the sealed inline objects — by bundle root.
     bundles: BTreeMap<ContentHash, (Vec<ContentHash>, Vec<ContentHash>)>,
+    /// What each hosted replica's cold data stream names, as far as it was read; a replica no
+    /// longer hosted is let go at the next pass.
+    colds: BTreeMap<LedgerId, ColdScanned>,
+    /// The collector's own memory ([`GC_MEMORY_BYTES`]).
+    budget: focal_memory::MemoryBudget,
     status: watch::Sender<AdminGc>,
 }
 
@@ -111,6 +227,7 @@ impl GcAgent {
         node: u64,
         interval: Duration,
         config: CollectorConfig,
+        budget: focal_memory::MemoryBudget,
     ) -> Result<(Self, GcHandle), focal_rt::RtError> {
         let interval = interval.max(Duration::from_millis(10));
         let (status, receiver) = watch::channel(AdminGc {
@@ -129,6 +246,8 @@ impl GcAgent {
                 passes: 0,
                 last: None,
                 bundles: BTreeMap::new(),
+                colds: BTreeMap::new(),
+                budget,
                 status,
             },
             GcHandle(receiver),
@@ -136,7 +255,10 @@ impl GcAgent {
     }
     /// The interval and the collector's settings from the environment, else
     /// the defaults.
-    pub fn from_env(node: u64) -> Result<(Self, GcHandle), focal_rt::RtError> {
+    pub fn from_env(
+        node: u64,
+        budget: focal_memory::MemoryBudget,
+    ) -> Result<(Self, GcHandle), focal_rt::RtError> {
         let millis = |name: &str| {
             std::env::var_os(name).and_then(|value| {
                 value
@@ -157,7 +279,7 @@ impl GcAgent {
         if let Some(terminal) = millis(TERMINAL_ENV) {
             config.terminal_grace_ms = terminal;
         }
-        Self::new(node, interval, config)
+        Self::new(node, interval, config, budget)
     }
     pub async fn run(mut self, handles: &NetworkHandles) -> Result<(), AccessError> {
         if hyper_rt::futures::shard_id().is_none() {
@@ -192,6 +314,7 @@ impl GcAgent {
             protected_objects: 0,
             opaque_domains: 0,
             bundles_unreadable: 0,
+            cold_bytes_scanned: 0,
             content: AdminCollectorReport::default(),
             seeds: AdminSeedReport::default(),
         };
@@ -247,7 +370,9 @@ impl GcAgent {
     ) -> Result<ProtectionSet, AccessError> {
         let mut protection = ProtectionSet::new();
         let policies = handles.content.policies().await?;
-        for ledger in Self::ledgers(handles, policies) {
+        let ledgers = Self::ledgers(handles, policies);
+        self.colds.retain(|ledger, _| ledgers.contains(ledger));
+        for ledger in ledgers {
             let domain = ContentDomainId(ledger.tenant.0);
             let Ok(host) = handles.fleet.current_host(ledger) else {
                 protection.opaque_domain(domain).map_err(content)?;
@@ -257,7 +382,7 @@ impl GcAgent {
             let mut cursor = None;
             let mut complete = false;
             let mut bundles = Vec::new();
-            let mut colds = Vec::new();
+            let mut cold = false;
             loop {
                 let page = match host.content_roots(cursor, PAGE).await {
                     Ok(page) => page,
@@ -284,17 +409,8 @@ impl GcAgent {
                         }
                         // A cold family's frame is no content object; what it names of the
                         // ledger's content is read from the replica's cold stream (doc 31 M2,
-                        // A2). Its members share one frame.
-                        ContentRoot::Cold {
-                            digest, retired_at, ..
-                        } => {
-                            if !colds.contains(&(retired_at, digest)) {
-                                colds
-                                    .try_reserve_exact(1)
-                                    .map_err(|_| AccessError::Capacity)?;
-                                colds.push((retired_at, digest));
-                            }
-                        }
+                        // A2), every frame's at once below.
+                        ContentRoot::Cold { .. } => cold = true,
                     }
                 }
                 cursor = page.next;
@@ -343,27 +459,78 @@ impl GcAgent {
                 }
                 hyper_rt::futures::yield_now().await;
             }
-            for (retired_at, digest) in colds {
-                match host.cold_content(retired_at, digest).await {
-                    Ok(Some(cold)) => {
-                        for inner in cold.content.into_iter().chain(cold.inline) {
-                            protection.protect_object(domain, inner).map_err(content)?;
+            if cold {
+                if self.cold_roots(ledger, &host, pass).await {
+                    if let Some(scanned) = self.colds.get(&ledger) {
+                        for inner in &scanned.roots {
+                            protection.protect_object(domain, *inner).map_err(content)?;
                         }
                     }
-                    // A frame not readable here leaves this domain's protection provably
-                    // incomplete: it is opaque this pass, as an unreadable bundle makes it.
-                    _ => {
-                        pass.bundles_unreadable = pass.bundles_unreadable.saturating_add(1);
-                        protection.opaque_domain(domain).map_err(content)?;
-                        pass.opaque_domains = pass.opaque_domains.saturating_add(1);
-                        break;
-                    }
+                } else {
+                    // A stream not readable here, or one whose content outgrew the collector's
+                    // memory, leaves this domain's protection provably incomplete: it is opaque
+                    // this pass, as an unreadable bundle makes it.
+                    pass.bundles_unreadable = pass.bundles_unreadable.saturating_add(1);
+                    protection.opaque_domain(domain).map_err(content)?;
+                    pass.opaque_domains = pass.opaque_domains.saturating_add(1);
                 }
-                hyper_rt::futures::yield_now().await;
             }
         }
         protection.finish();
         Ok(protection)
+    }
+    /// Whether every content root `ledger`'s cold data stream names is known
+    /// (`self.colds`): what was appended since the last pass read now, front to back, on the
+    /// blocking pool's file share, away from the session's owner. False where the stream cannot
+    /// be read here, its read failed (read again from where it stood at the next pass), or its
+    /// roots outgrew the collector's memory.
+    async fn cold_roots(
+        &mut self,
+        ledger: LedgerId,
+        host: &crate::fleet::ReplicaHost,
+        pass: &mut AdminGcPass,
+    ) -> bool {
+        let Ok(Some((data, inspection))) = host.cold_data().await else {
+            return false;
+        };
+        let mut scanned = match self.colds.remove(&ledger) {
+            Some(scanned) => scanned,
+            None => match ColdScanned::new(&self.budget) {
+                Some(scanned) => scanned,
+                None => return false,
+            },
+        };
+        if scanned.overflowed {
+            self.colds.insert(ledger, scanned);
+            return false;
+        }
+        if scanned.through > data.length() {
+            // Not the stream it read (a replica restored anew): read from its start.
+            scanned.through = 0;
+            scanned.roots.clear();
+        }
+        let from = scanned.through;
+        let budget = self.budget.clone();
+        let read = focal_rt::on_pool(&focal_rt::FILES, move || {
+            let read = scanned.read(&data, inspection, &budget);
+            (scanned, read)
+        })
+        .await;
+        match read {
+            Ok((scanned, read)) => {
+                let known = read.is_ok();
+                if known {
+                    pass.cold_bytes_scanned = pass
+                        .cold_bytes_scanned
+                        .saturating_add(scanned.through.saturating_sub(from));
+                }
+                // Refused or failed, it stands where it stood and is read again at the next pass.
+                self.colds.insert(ledger, scanned);
+                known
+            }
+            // The job unwound on its worker, what it held with it: read from the start next.
+            Err(_) => false,
+        }
     }
     /// The content roots one bundle's header names, read once from this
     /// node's store and remembered; `None` when the bundle is not local or

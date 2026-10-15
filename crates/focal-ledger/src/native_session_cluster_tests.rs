@@ -3513,6 +3513,79 @@ fn a_cold_retirement_writes_the_same_streams_on_every_replica() {
     assert_cold_frames(&mut cluster, 2, &claims);
 }
 
+/// A collector reads a cold data stream away from its writer (26 §5): front to back from its
+/// start, every batch whole, it names what reading each family's frame names and stops at the
+/// stream's end; resumed there it reads nothing more, and resumed past it is refused. A replica
+/// restarted from its log, its writer not yet open, reads the same.
+#[test]
+fn a_cold_data_stream_read_away_from_its_writer_names_what_its_frames_do() {
+    use focal_core::native::record_codec::{InspectionLimits, archive::StructuralArchive};
+    let inspection = InspectionLimits {
+        bytes: 6 << 20,
+        visits: 1 << 30,
+        rows: 100_000,
+        row_bytes: 6 << 20,
+    };
+    let budget = focal_memory::MemoryBudget::new(256 << 20, 0).unwrap();
+    let mut cluster = Cluster::with_limits(|_| cold_limits());
+    cluster.elect(1, &[]);
+    let claims: Vec<u128> = (1..=12).collect();
+    let offers = finished_offers(&mut cluster, 1, &claims);
+    for batch in offers.chunks(5) {
+        cluster.node(1).retire(batch).unwrap();
+        cluster.pump(&[]);
+        cluster.settle(&[]);
+    }
+    let named = |cluster: &mut Cluster, id: u64| {
+        let mut named = std::collections::BTreeSet::new();
+        for claim in &claims {
+            let retired = *cluster
+                .node(id)
+                .committed_core()
+                .unwrap()
+                .native_retired(ClaimId::from_u128(*claim))
+                .unwrap();
+            let frame = cluster
+                .node(id)
+                .cold_frame(retired.retired_at, retired.bundle)
+                .unwrap()
+                .unwrap();
+            let archive = StructuralArchive::inspect(frame.bytes(), inspection).unwrap();
+            named.extend(archive.header().content.iter().copied());
+            named.extend(archive.header().inline.iter().copied());
+        }
+        named
+    };
+    let scan = |cluster: &mut Cluster, id: u64, from: u64| {
+        let data = cluster.node(id).engine.cold_data().unwrap().unwrap();
+        let mut found = std::collections::BTreeSet::new();
+        let through = data
+            .scan_content(from, inspection, &budget, &mut |root| {
+                found.insert(root);
+                Ok(())
+            })
+            .map(|through| (through, data.length()));
+        (through, found)
+    };
+    let expected = named(&mut cluster, 1);
+    let (read, found) = scan(&mut cluster, 1, 0);
+    let (through, length) = read.unwrap();
+    assert!(length > 0);
+    assert_eq!(through, length, "read to the stream's end");
+    assert_eq!(found, expected);
+    let (again, found) = scan(&mut cluster, 1, through);
+    assert_eq!(again.unwrap().0, through);
+    assert!(found.is_empty(), "nothing appended since");
+    let (past, _) = scan(&mut cluster, 1, through + 1);
+    assert!(matches!(past, Err(focal_evidence::ContentError::Invalid)));
+    cluster.stop(3);
+    cluster.reopen(3).unwrap();
+    cluster.settle(&[]);
+    let (read, found) = scan(&mut cluster, 3, 0);
+    assert_eq!(read.unwrap().0, through);
+    assert_eq!(found, named(&mut cluster, 3));
+}
+
 /// A lagging replica installs a checkpoint naming cold streams only once every chunk they name
 /// is local: it names them, a peer serves them, each verified on the way in, and the streams it
 /// then keeps are the peer's, every family readable.

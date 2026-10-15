@@ -1162,7 +1162,10 @@ impl NetworkService {
             budget.child(128 * 1024 * 1024, 32 * 1024 * 1024)?,
             4,
         )?;
-        let (gc_agent, gc_handle) = crate::gc::GcAgent::from_env(identity.node)?;
+        let (gc_agent, gc_handle) = crate::gc::GcAgent::from_env(
+            identity.node,
+            budget.child(crate::gc::GC_MEMORY_BYTES, 0)?,
+        )?;
         let (archive_agent, archive_handle) = crate::archive_agent::ArchiveAgent::from_env()?;
         let (metrics, metrics_view) =
             focal_rt::watch::channel::<Option<crate::metrics::MetricsPage>>(None)?;
