@@ -190,6 +190,7 @@ pub(crate) fn failure(error: LedgerError) -> Result<NativeMutationReply, AccessE
 pub(crate) struct Proposal {
     pub(crate) key: RequestKey,
     pub(crate) outcome: focal_core::native::NativeOutcome,
+    pub(crate) written: Option<focal_core::native::NativeWrittenState>,
 }
 /// Admit one frame on the embedded owner. Artifact payloads are verified and
 /// sealed by the exclusive content writer before the owner records them. A
@@ -208,11 +209,14 @@ pub(crate) fn admit_local(
         node.session
             .propose_native_frame(context, frame, NativeCustody::Store(&mut node.content));
     match result {
-        Ok(NativeSubmission::Committed(outcome)) => Ok(committed_reply(outcome)),
-        Ok(NativeSubmission::Pending { outcome, .. }) => {
+        Ok(NativeSubmission::Committed(outcome)) => Ok(committed_reply(outcome, None)),
+        Ok(NativeSubmission::Pending { candidate, outcome }) => {
             *proposed = Some(Proposal {
                 key: header.key,
                 outcome,
+                written: (envelope.protocol == NATIVE_WRITTEN_PROTOCOL_VERSION)
+                    .then(|| node.session.native_written_state(candidate))
+                    .flatten(),
             });
             // Never sent: the parked proposal is answered by its commit.
             Err(AccessError::OutcomeUnknown)
@@ -227,7 +231,9 @@ pub(crate) fn settled(
     proposal: Proposal,
 ) -> Result<Option<Response>, AccessError> {
     match session.native_outcome(proposal.key).map_err(access)? {
-        Some(committed) if committed == proposal.outcome => Ok(Some(committed_reply(committed))),
+        Some(committed) if committed == proposal.outcome => {
+            Ok(Some(committed_reply(committed, proposal.written)))
+        }
         _ => Ok(None),
     }
 }
@@ -239,9 +245,10 @@ pub(crate) fn ticket(proposal: Proposal) -> Response {
         intent: proposal.outcome.intent,
     }))
 }
-fn committed_reply(outcome: focal_core::native::NativeOutcome) -> Response {
+fn committed_reply(
+    outcome: focal_core::native::NativeOutcome,
+    written: Option<focal_core::native::NativeWrittenState>,
+) -> Response {
     crate::fault::hit(crate::fault::FaultSite::AfterCommitBeforeReply);
-    Response::Native(NativeMutationReply::Committed(
-        crate::native_documents::outcome(outcome),
-    ))
+    Response::Native(crate::native_documents::committed(outcome, written))
 }

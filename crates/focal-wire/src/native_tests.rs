@@ -1,6 +1,9 @@
 use super::*;
 use std::collections::BTreeSet;
 
+#[path = "native_written_tests.rs"]
+mod written;
+
 fn ledger() -> LedgerId {
     LedgerId {
         tenant: TenantId::from_u128(7),

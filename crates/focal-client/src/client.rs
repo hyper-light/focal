@@ -259,7 +259,10 @@ fn trace_outcome(result: &Result<ResponseEnvelope, ClientError>) -> crate::Trace
                 sequence: receipt.sequence,
                 command_hash: receipt.command_hash,
             },
-            Response::Native(NativeMutationReply::Committed(receipt)) => TraceOutcome::Committed {
+            Response::Native(
+                NativeMutationReply::Committed(receipt)
+                | NativeMutationReply::CommittedWithWritten { receipt, .. },
+            ) => TraceOutcome::Committed {
                 sequence: receipt.sequence,
                 command_hash: receipt.intent,
             },

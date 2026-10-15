@@ -61,6 +61,20 @@ at exactly this run's retained size.
 Each run uses a distinct identity space per `seed` (and per worker under it),
 so two runs never collide and a run is reproducible.
 
+In `deliver` mode both recipient tails first establish their starting committed
+prefix. The offered schedule and write-phase clock start only after both tails
+have joined, so neither can skip a post from this run while joining at the end
+of the existing history. Startup uses the existing delivery-wait bound; a tail
+that cannot join fails the run before writes begin.
+
+The explicit native written-state profile returns the bounded bindings from a
+write's own candidate beside its committed receipt. The next step reuses them
+when they cover its requirements; the two cross-participant handoffs still
+read the committed state. `lifecycle_binding_reads` counts actual binding-read
+requests, and `written_reuse_fallbacks` counts own-write continuations that
+required a read instead, including an omitted continuation on retry. The
+eight-write delivery lifecycle is unchanged.
+
 ## Report
 
 ```json

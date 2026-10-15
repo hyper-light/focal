@@ -30,6 +30,40 @@ fn cancel(id: u128, expected: Binding) -> NativeInput {
     }
 }
 
+#[test]
+fn written_state_is_taken_from_the_exact_newest_candidate_without_following_later_writes() {
+    let mut owner = NativeOwner::new(core()).unwrap();
+    let first_input = creation(1, 100, &[], None);
+    let retry = creation(1, 100, &[], None);
+    let (first, original) = stage(&mut owner, 1, first_input);
+    let written = owner.newest_written_state(first).unwrap();
+    let generated = written.claim.unwrap();
+    assert_eq!(written.sequence, original.sequence);
+    assert_eq!(generated.status, ClaimStatus::Generated);
+    let (second, _) = stage(
+        &mut owner,
+        2,
+        NativeInput {
+            request: request(ISSUER, 2),
+            command: NativeCommand::Post {
+                expected: generated.binding,
+            },
+        },
+    );
+    assert!(owner.newest_written_state(first).is_none());
+    let posted = owner.newest_written_state(second).unwrap();
+    assert_eq!(posted.claim.unwrap().status, ClaimStatus::Posted);
+    assert_ne!(posted.claim.unwrap().binding, generated.binding);
+    assert_eq!(written.claim.unwrap(), generated);
+    owner.publish_after_durable(first).unwrap();
+    owner.publish_after_durable(second).unwrap();
+    assert!(owner.newest_written_state(second).is_none());
+    assert!(matches!(
+        owner.prepare(context(ISSUER, 3), retry, None).unwrap(),
+        NativeStaging::Existing { outcome, candidate: None } if outcome == original
+    ));
+}
+
 fn child(id: u128, claim: u128, parent: Binding) -> NativeInput {
     let mut input = creation(id, claim, &[], None);
     let NativeCommand::Create { claims, .. } = &mut input.command else {

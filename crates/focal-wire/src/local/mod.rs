@@ -316,6 +316,7 @@ where
             | MANAGED_PROTOCOL_VERSION
             | PEER_PROTOCOL_VERSION
             | crate::NATIVE_PROTOCOL_VERSION
+            | crate::NATIVE_WRITTEN_PROTOCOL_VERSION
     ) || !negotiated.accepts_protocol(request.protocol)
         || negotiated.max_frame_bytes > limits.max_frame_bytes
         || negotiated.max_items > limits.max_items

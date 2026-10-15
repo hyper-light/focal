@@ -902,11 +902,19 @@ impl Negotiated {
                         | crate::NATIVE_PROTOCOL_VERSION
                         | crate::ORDERED_PROTOCOL_VERSION
                 )
+                | (
+                    crate::NATIVE_WRITTEN_PROTOCOL_VERSION,
+                    PROTOCOL_VERSION
+                        | MANAGED_PROTOCOL_VERSION
+                        | PEER_PROTOCOL_VERSION
+                        | crate::NATIVE_PROTOCOL_VERSION
+                        | crate::NATIVE_WRITTEN_PROTOCOL_VERSION
+                )
         )
     }
     /// Whether a connection that negotiated this profile carries replication frames on lanes.
     pub fn laned(self) -> bool {
-        self.protocol >= crate::LANED_PROTOCOL_VERSION
+        self.protocol == crate::LANED_PROTOCOL_VERSION
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1048,6 +1056,14 @@ impl WireLimits {
             && hello.versions.contains(&crate::ORDERED_PROTOCOL_VERSION)
         {
             crate::ORDERED_PROTOCOL_VERSION
+        } else if managed
+            && participant
+            && native
+            && hello
+                .versions
+                .contains(&crate::NATIVE_WRITTEN_PROTOCOL_VERSION)
+        {
+            crate::NATIVE_WRITTEN_PROTOCOL_VERSION
         } else if managed
             && participant
             && native

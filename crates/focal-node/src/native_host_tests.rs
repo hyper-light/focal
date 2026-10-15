@@ -14,6 +14,9 @@ use focal_model::lifecycle::{
 use focal_model::*;
 use focal_wire::*;
 
+#[path = "native_written_tests.rs"]
+mod written_tests;
+
 fn settings(root: &std::path::Path) -> Settings {
     let mut settings = Settings::default();
     settings.node.data_dir = Some(root.to_owned());

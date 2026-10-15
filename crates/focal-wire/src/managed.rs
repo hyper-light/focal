@@ -43,7 +43,7 @@ pub fn managed_request_identity(
     // Managed operations ride the managed profile or, on a native ledger,
     // the native profile that admits them (`native_profile_operation`).
     if (request.protocol != MANAGED_PROTOCOL_VERSION
-        && request.protocol != NATIVE_PROTOCOL_VERSION
+        && !native_protocol(request.protocol)
         && !is_peer_request(request))
         || request.request_epoch != RequestEpoch(1)
         || request.route_epoch.0 == 0

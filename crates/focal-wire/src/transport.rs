@@ -811,8 +811,9 @@ pub struct QuicConnector {
     /// binary speaks, unless [`Self::offering`] made it an older one.
     offers: Vec<u16>,
 }
-/// Every profile this binary speaks, the newest first: what a connector
-/// offers in its Hello.
+/// Default profiles offered by a connector, newest first. Native written-state
+/// replies are explicitly requested with NATIVE_WRITTEN_PROTOCOLS so peer
+/// connections keep their existing lane negotiation.
 pub const OFFERED_PROTOCOLS: [u16; 6] = [
     crate::LANED_PROTOCOL_VERSION,
     crate::ORDERED_PROTOCOL_VERSION,
@@ -868,16 +869,17 @@ impl QuicConnector {
         let budget = endpoint_budget(&limits, None)?;
         Self::bind(address, tls, limits, budget)
     }
-    /// A connector that offers only `versions` in its Hello: what a
-    /// connector of an older binary offers, for a fleet's tests of a mixed
-    /// window (27 §12). The base profile is always among them.
+    /// A connector that explicitly offers only `versions` in its Hello: an
+    /// older peer profile for a mixed window (27 §12), or the optional native
+    /// written-state profile. The base profile is always among them.
     pub fn offering(mut self, versions: &[u16]) -> Result<Self, WireError> {
         if versions.is_empty()
-            || versions.len() > OFFERED_PROTOCOLS.len()
+            || versions.len() > OFFERED_PROTOCOLS.len().saturating_add(1)
             || !versions.contains(&PROTOCOL_VERSION)
-            || versions
-                .iter()
-                .any(|version| !OFFERED_PROTOCOLS.contains(version))
+            || versions.iter().any(|version| {
+                !OFFERED_PROTOCOLS.contains(version)
+                    && *version != crate::NATIVE_WRITTEN_PROTOCOL_VERSION
+            })
         {
             return Err(WireError::Limit);
         }
@@ -1108,6 +1110,7 @@ async fn open_remote(
             | MANAGED_PROTOCOL_VERSION
             | PEER_PROTOCOL_VERSION
             | crate::NATIVE_PROTOCOL_VERSION
+            | crate::NATIVE_WRITTEN_PROTOCOL_VERSION
             | crate::ORDERED_PROTOCOL_VERSION
             | crate::LANED_PROTOCOL_VERSION
     ) {

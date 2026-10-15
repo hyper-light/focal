@@ -569,7 +569,10 @@ async fn drive(
         .submit_native(operation.request.clone())
         .await
     {
-        Ok(reply @ NativeMutationReply::Committed(receipt)) => {
+        Ok(
+            reply @ (NativeMutationReply::Committed(receipt)
+            | NativeMutationReply::CommittedWithWritten { receipt, .. }),
+        ) => {
             store.record_reply(operation.id, &context.operation, &reply)?;
             deliver(&receipt)
         }

@@ -25,8 +25,8 @@ use crate::{
 };
 use focal_model::*;
 use focal_wire::{
-    NATIVE_PROTOCOL_VERSION, NativeInvocationRef, NativeMutationReply, NativeReceipt,
-    NativeRefusal, Operation, RequestEnvelope, inspect_native_frame,
+    NativeInvocationRef, NativeMutationReply, NativeReceipt, NativeRefusal, Operation,
+    RequestEnvelope, inspect_native_frame, native_protocol,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -532,7 +532,7 @@ fn validate_request(
     let Operation::Native { frame } = &request.operation else {
         return Err(NativeStoreError::InvalidRequest);
     };
-    if request.protocol != NATIVE_PROTOCOL_VERSION
+    if !native_protocol(request.protocol)
         || request.ledger != context.ledger
         || request.request_epoch != epoch
         || epoch.0 == 0
@@ -1060,7 +1060,7 @@ impl NativeOperationStore {
         context: &OperationContext,
         reply: &NativeMutationReply,
     ) -> Result<NativeStage, NativeStoreError> {
-        let NativeMutationReply::Committed(receipt) = reply else {
+        let Some(receipt) = reply.committed_receipt() else {
             return Err(NativeStoreError::NotCommitted);
         };
         let directory = files::Directory::open_native(&self.root)?;

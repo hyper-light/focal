@@ -24,6 +24,10 @@ pub struct Report {
     pub lifecycles: u64,
     /// Lifecycle steps never sent: the read of the claim they bind to failed.
     pub abandoned: u64,
+    /// Scoped object reads issued to bind lifecycle operations, including fallback reads.
+    pub lifecycle_binding_reads: u64,
+    /// Own-write continuations unavailable or stale, requiring a scoped object read.
+    pub written_reuse_fallbacks: u64,
     /// Generation floors this run advanced, as the journal does once the
     /// generation below drained.
     pub floors_advanced: u64,

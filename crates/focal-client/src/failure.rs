@@ -101,7 +101,9 @@ pub fn native(refusal: &NativeRefusal) -> Failure {
 /// unknown; refusals classify by category.
 pub fn native_reply(reply: &NativeMutationReply) -> Option<Failure> {
     match reply {
-        NativeMutationReply::Committed(_) => None,
+        NativeMutationReply::Committed(_) | NativeMutationReply::CommittedWithWritten { .. } => {
+            None
+        }
         NativeMutationReply::Pending(_) => Some(Failure::outcome_unknown()),
         NativeMutationReply::Refused(refusal) => Some(native(refusal)),
     }

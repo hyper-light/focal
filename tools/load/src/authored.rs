@@ -129,7 +129,7 @@ pub fn step_envelope(
     root: RootCommandId,
     request: RequestKey,
     operation: &NativeAuthoredOperation,
-    objects: &[focal_wire::NativeObject],
+    resolved: &Resolved,
     ids: std::ops::Range<u128>,
 ) -> Result<(RequestEnvelope, Vec<NativeIdentity>), LoadError> {
     let context = BuildContext {
@@ -138,7 +138,6 @@ pub fn step_envelope(
         root,
         policy_revision: 1,
     };
-    let resolved = Resolved::from_objects(ledger, objects).map_err(fixture("resolved objects"))?;
     let mut next = ids.start;
     let mut ids = move || -> Result<[u8; 16], InputError> {
         if next >= ids.end {
@@ -153,7 +152,7 @@ pub fn step_envelope(
         &context,
         request,
         &mut ids,
-        &resolved,
+        resolved,
         &CompileLimits::default(),
     )
     .map_err(fixture("compile"))?;

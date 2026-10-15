@@ -45,6 +45,12 @@ fn every_message_is_delivered_through_the_events_and_measured_end_to_end() {
     assert_eq!(report["unknown"], 0);
     assert_eq!(report["lifecycles"], 12);
     assert_eq!(report["abandoned"], 0);
+    assert_eq!(
+        report["lifecycle_binding_reads"],
+        12 * 2,
+        "only the two cross-participant observations need a binding read"
+    );
+    assert_eq!(report["written_reuse_fallbacks"], 0);
     let deliver = &report["deliver"];
     assert_eq!(deliver["delivered"], 12);
     assert_eq!(deliver["undelivered"], 0);

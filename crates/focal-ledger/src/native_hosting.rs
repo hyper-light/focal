@@ -1103,6 +1103,14 @@ impl Session {
     ) -> Result<Option<NativeOutcome>, LedgerError> {
         Ok(self.native_engine()?.outcome(request)?)
     }
+    /// Provisional continuation of the candidate just admitted. The host may expose it
+    /// only alongside that candidate's identical committed outcome; it is not a receipt.
+    pub fn native_written_state(
+        &self,
+        candidate: focal_core::native::NativeCandidate,
+    ) -> Option<focal_core::native::NativeWrittenState> {
+        self.native.as_deref()?.written_state(candidate)
+    }
     /// The committed native prefix; pending candidates are never visible.
     pub fn native_core(&self) -> Result<&Core<NativeState>, LedgerError> {
         Ok(self.native_engine()?.committed_core()?)

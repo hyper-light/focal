@@ -115,6 +115,8 @@ mod transactions;
 #[cfg(test)]
 mod validation_tests;
 mod whole_work;
+mod written;
+pub use written::{NativeWrittenClaim, NativeWrittenResponse, NativeWrittenState};
 mod work_artifacts;
 mod work_authority;
 mod work_checks;

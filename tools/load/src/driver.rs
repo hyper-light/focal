@@ -156,7 +156,8 @@ impl Conn {
                 .map_err(|_| LoadError::Shape("local address".into()))?;
                 // The connection's endpoint is its own owner.
                 let connector =
-                    QuicConnector::bind_standalone(address, client.tls, limits.clone())?;
+                    QuicConnector::bind_standalone(address, client.tls, limits.clone())?
+                        .offering(&focal_wire::NATIVE_WRITTEN_PROTOCOLS)?;
                 // One route, one connection: the transport's bound is the
                 // routes a client may hold, as the CLI's enrolled context.
                 let transport = QuicTransport::new(connector, initial, 16)?;
@@ -228,6 +229,8 @@ struct Outcome {
     /// Lifecycle steps never sent: the read of the claim they bind to
     /// failed.
     abandoned: u64,
+    lifecycle_binding_reads: u64,
+    written_reuse_fallbacks: u64,
     /// `deliver`: the messages delivered end to end.
     deliveries: Deliveries,
     /// `deliver`: messages whose other side never showed its step in the
@@ -309,13 +312,42 @@ fn read_hit(result: &Result<ResponseEnvelope, ClientError>, claim: u128) -> bool
 }
 
 /// How the owner answered a write.
+#[derive(Clone, Copy)]
+struct Written {
+    sequence: SessionSeq,
+    state: Option<focal_wire::NativeWrittenState>,
+    own: bool,
+}
+impl Written {
+    fn observed(sequence: SessionSeq) -> Self {
+        Self {
+            sequence,
+            state: None,
+            own: false,
+        }
+    }
+}
+
+struct BoundStep<'a> {
+    operation: &'a NativeAuthoredOperation,
+    bindings: &'a focal_native_client::Resolved,
+    ids: std::ops::Range<u128>,
+    observed: SessionSeq,
+    reused: bool,
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "bounded own-write bindings stay inline, avoiding a heap allocation for every successful step"
+)]
 enum Reply {
     /// Committed at this native sequence.
-    Committed(SessionSeq),
+    Committed(Written),
     /// Refused by name: the request's generation is closed, or not admitted
     /// yet (the audit's F12); never executed.
     Expired,
     Refused(String, RefusalCause),
+    StaleRevision(String),
     Unknown(String),
 }
 
@@ -332,7 +364,18 @@ fn classify(result: Result<ResponseEnvelope, ClientError>) -> Reply {
     match result {
         Ok(envelope) => match envelope.result {
             Response::Native(NativeMutationReply::Committed(receipt)) => {
-                Reply::Committed(receipt.sequence)
+                Reply::Committed(Written {
+                    sequence: receipt.sequence,
+                    state: None,
+                    own: true,
+                })
+            }
+            Response::Native(NativeMutationReply::CommittedWithWritten { receipt, written }) => {
+                Reply::Committed(Written {
+                    sequence: receipt.sequence,
+                    state: Some(written),
+                    own: true,
+                })
             }
             Response::Native(NativeMutationReply::Refused(refusal))
                 if matches!(
@@ -343,6 +386,15 @@ fn classify(result: Result<ResponseEnvelope, ClientError>) -> Reply {
                 ) =>
             {
                 Reply::Expired
+            }
+            Response::Native(NativeMutationReply::Refused(refusal))
+                if matches!(
+                    refusal.kind,
+                    NativeRefusalKind::Stale { .. }
+                        | NativeRefusalKind::Refused(NativeErrorCode::StaleRevision)
+                ) =>
+            {
+                Reply::StaleRevision(format!("refused: {refusal:?}"))
             }
             Response::Native(NativeMutationReply::Refused(refusal)) => {
                 // The owner names the bound that refused (its memory, its pending
@@ -533,7 +585,7 @@ impl Shared<'_> {
                 actor.generations.advance_failed()?;
                 self.learn(actor).await.map(|_| ())
             }
-            Reply::Refused(reason, _) | Reply::Unknown(reason) => {
+            Reply::Refused(reason, _) | Reply::StaleRevision(reason) | Reply::Unknown(reason) => {
                 actor.generations.advance_failed()?;
                 self.note(format!("floor advance: {reason}"));
                 Ok(())
@@ -560,7 +612,7 @@ impl Shared<'_> {
         &self,
         i: u64,
         claim: u128,
-        mut written: SessionSeq,
+        mut written: Written,
     ) -> Result<(), LoadError> {
         let later = [
             NativeAuthoredOperation::ClaimCancel(authored::claim_target(claim)),
@@ -591,7 +643,7 @@ impl Shared<'_> {
         &self,
         i: u64,
         claim: u128,
-        created: SessionSeq,
+        created: Written,
         started: Instant,
     ) -> Result<(), LoadError> {
         let Some((consumer, watch)) = &self.consumer else {
@@ -628,7 +680,14 @@ impl Shared<'_> {
         };
         let acquire = NativeAuthoredOperation::ReceiptAcquire(authored::receipt(claim));
         let Some((written, _)) = self
-            .later(consumer, i, 2, &acquire, seen, receipt_ids)
+            .later(
+                consumer,
+                i,
+                2,
+                &acquire,
+                Written::observed(seen),
+                receipt_ids,
+            )
             .await?
         else {
             return Ok(());
@@ -667,7 +726,10 @@ impl Shared<'_> {
         }
         let target = authored::testament_target(claim, testament);
         let receive = NativeAuthoredOperation::TestamentReceive(target.clone());
-        let Some((written, _)) = self.later(&self.issuer, i, 5, &receive, seen, 0..0).await? else {
+        let Some((written, _)) = self
+            .later(&self.issuer, i, 5, &receive, Written::observed(seen), 0..0)
+            .await?
+        else {
             return Ok(());
         };
         let enter = NativeAuthoredOperation::ValidationEnterWholeWork(target);
@@ -729,13 +791,39 @@ impl Shared<'_> {
         i: u64,
         step: u8,
         operation: &NativeAuthoredOperation,
-        written: SessionSeq,
+        written: Written,
         ids: std::ops::Range<u128>,
-    ) -> Result<Option<(SessionSeq, Vec<NativeIdentity>)>, LoadError> {
-        let Some(objects) = self.read_for(actor, operation, written).await? else {
-            let mut outcome = self.outcome.borrow_mut();
-            outcome.abandoned = outcome.abandoned.saturating_add(1);
-            return Ok(None);
+    ) -> Result<Option<(Written, Vec<NativeIdentity>)>, LoadError> {
+        let cached = match written.state {
+            Some(state) => {
+                let bindings = focal_native_client::Resolved::from_written(
+                    self.job.names.ledger,
+                    written.sequence,
+                    &state,
+                )
+                .map_err(|error| LoadError::Fixture(format!("written bindings: {error}")))?;
+                bindings
+                    .covers(operation)
+                    .map_err(|error| LoadError::Fixture(format!("requirements: {error}")))?
+                    .then_some(bindings)
+            }
+            None => None,
+        };
+        let reused = cached.is_some();
+        let bindings = match cached {
+            Some(bindings) => bindings,
+            None => {
+                if written.own {
+                    self.note_reuse_fallback();
+                }
+                let Some(objects) = self.read_for(actor, operation, written.sequence).await? else {
+                    let mut outcome = self.outcome.borrow_mut();
+                    outcome.abandoned = outcome.abandoned.saturating_add(1);
+                    return Ok(None);
+                };
+                focal_native_client::Resolved::from_objects(self.job.names.ledger, &objects)
+                    .map_err(|error| LoadError::Fixture(format!("resolved objects: {error}")))?
+            }
         };
         Ok(self
             .step(
@@ -743,10 +831,20 @@ impl Shared<'_> {
                 i,
                 step,
                 Instant::now(),
-                Some((operation, &objects, ids)),
+                Some(BoundStep {
+                    operation,
+                    bindings: &bindings,
+                    ids,
+                    observed: written.sequence,
+                    reused,
+                }),
             )
             .await?
             .map(|(_, sequence, minted)| (sequence, minted)))
+    }
+    fn note_reuse_fallback(&self) {
+        let mut outcome = self.outcome.borrow_mut();
+        outcome.written_reuse_fallbacks = outcome.written_reuse_fallbacks.saturating_add(1);
     }
     /// The objects `operation` binds to (`requirements`), as `actor` reads them at least at
     /// `written`, in one page; `None`, with the reason noted, when they could not be read.
@@ -793,6 +891,10 @@ impl Shared<'_> {
                 max_items: wanted,
             }),
         };
+        {
+            let mut outcome = self.outcome.borrow_mut();
+            outcome.lifecycle_binding_reads = outcome.lifecycle_binding_reads.saturating_add(1);
+        }
         match actor.conn.request(envelope).await {
             Ok(envelope) => match envelope.result {
                 Response::NativeRead(page) if !page.objects.is_empty() => Ok(Some(page.objects)),
@@ -819,15 +921,12 @@ impl Shared<'_> {
         i: u64,
         step: u8,
         started: Instant,
-        later: Option<(
-            &NativeAuthoredOperation,
-            &[NativeObject],
-            std::ops::Range<u128>,
-        )>,
-    ) -> Result<Option<(u128, SessionSeq, Vec<NativeIdentity>)>, LoadError> {
+        later: Option<BoundStep<'_>>,
+    ) -> Result<Option<(u128, Written, Vec<NativeIdentity>)>, LoadError> {
         let offset = u128::from(i);
         let steps = u128::from(self.job.lifecycle.steps());
         let mut attempt = 0u128;
+        let mut refreshed = None;
         loop {
             let request = offset
                 .checked_mul(steps)
@@ -844,12 +943,12 @@ impl Shared<'_> {
                 epoch: minted.epoch,
                 id: RequestId::from_u128(request),
             };
-            let (envelope, claim, identities) = match &later {
+            let (mut envelope, claim, identities) = match &later {
                 None => {
                     let (envelope, claim) = build(self.job, offset, key)?;
                     (envelope, claim, Vec::new())
                 }
-                Some((operation, objects, ids)) => {
+                Some(later) => {
                     let names = &self.job.names;
                     let (envelope, identities) = authored::step_envelope(
                         names.ledger,
@@ -857,13 +956,14 @@ impl Shared<'_> {
                         actor.principal,
                         names.root,
                         key,
-                        operation,
-                        objects,
-                        ids.clone(),
+                        later.operation,
+                        refreshed.as_ref().unwrap_or(later.bindings),
+                        later.ids.clone(),
                     )?;
                     (envelope, 0, identities)
                 }
             };
+            envelope.protocol = focal_wire::NATIVE_WRITTEN_PROTOCOL_VERSION;
             let sent = Instant::now();
             let response = actor.conn.request(envelope).await;
             let finished = Instant::now();
@@ -882,11 +982,12 @@ impl Shared<'_> {
                 outcome: match &reply {
                     Reply::Committed(_) => WriteOutcome::Committed,
                     Reply::Expired => WriteOutcome::Expired,
-                    Reply::Refused(..) => WriteOutcome::Refused,
+                    Reply::Refused(..) | Reply::StaleRevision(_) => WriteOutcome::Refused,
                     Reply::Unknown(_) => WriteOutcome::Unknown,
                 },
                 refusal: match &reply {
                     Reply::Refused(_, cause) => *cause,
+                    Reply::StaleRevision(_) => RefusalCause::Other,
                     _ => RefusalCause::None,
                 },
                 step,
@@ -914,6 +1015,39 @@ impl Shared<'_> {
                         &mut outcome.refusals,
                         "refused by name in the generation the owner named".into(),
                     );
+                }
+                Reply::StaleRevision(reason) => {
+                    {
+                        let mut outcome = self.outcome.borrow_mut();
+                        outcome.refused = outcome.refused.saturating_add(1);
+                        note(&mut outcome.refusals, reason);
+                    }
+                    if let Some(later) = &later
+                        && later.reused
+                        && refreshed.is_none()
+                        && attempt.saturating_add(1) < ATTEMPTS
+                    {
+                        self.note_reuse_fallback();
+                        let Some(objects) = self
+                            .read_for(actor, later.operation, later.observed)
+                            .await?
+                        else {
+                            let mut outcome = self.outcome.borrow_mut();
+                            outcome.abandoned = outcome.abandoned.saturating_add(1);
+                            return Ok(None);
+                        };
+                        refreshed = Some(
+                            focal_native_client::Resolved::from_objects(
+                                self.job.names.ledger,
+                                &objects,
+                            )
+                            .map_err(|error| {
+                                LoadError::Fixture(format!("refreshed bindings: {error}"))
+                            })?,
+                        );
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
                 }
                 Reply::Refused(reason, _) => {
                     let mut outcome = self.outcome.borrow_mut();
@@ -1180,42 +1314,40 @@ async fn run_phase(
         )),
         None => None,
     };
-    let run_start_epoch_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| LoadError::Clock)?
-        .as_nanos();
-    let run_start = Instant::now();
-    let mut callers =
-        focal_rt::Concurrent::new(jobs.len()).map_err(|_| LoadError::Bound("callers"))?;
-    for job in jobs {
-        let slot = usize::from(job.index)
-            .checked_rem(conns.len())
-            .ok_or(LoadError::Bound("connections"))?;
-        let conn = conns.get(slot).ok_or(LoadError::Bound("connections"))?;
-        let side = match consumer {
-            Some(side) => Some(ConsumerSide {
-                principal: side.principal,
-                conn: consumer_conns
-                    .get(slot)
-                    .ok_or(LoadError::Bound("consumer connections"))?,
-                generations: side.generations,
-                watch: side.watch,
-            }),
-            None => None,
-        };
-        let index = job.index;
-        callers
-            .push(async move {
-                (
-                    index,
-                    worker(job, phase, run_start, generations, conn, side).await,
-                )
-            })
-            .map_err(|_| LoadError::Bound("callers"))?;
-    }
-    // Every caller to its end, the first failure kept; the tails stopped either way, so none
-    // outlives the callers it serves.
-    let collect = async {
+    let work = async {
+        let run_start_epoch_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| LoadError::Clock)?
+            .as_nanos();
+        let run_start = Instant::now();
+        let mut callers =
+            focal_rt::Concurrent::new(jobs.len()).map_err(|_| LoadError::Bound("callers"))?;
+        for job in jobs {
+            let slot = usize::from(job.index)
+                .checked_rem(conns.len())
+                .ok_or(LoadError::Bound("connections"))?;
+            let conn = conns.get(slot).ok_or(LoadError::Bound("connections"))?;
+            let side = match consumer {
+                Some(side) => Some(ConsumerSide {
+                    principal: side.principal,
+                    conn: consumer_conns
+                        .get(slot)
+                        .ok_or(LoadError::Bound("consumer connections"))?,
+                    generations: side.generations,
+                    watch: side.watch,
+                }),
+                None => None,
+            };
+            let index = job.index;
+            callers
+                .push(async move {
+                    (
+                        index,
+                        worker(job, phase, run_start, generations, conn, side).await,
+                    )
+                })
+                .map_err(|_| LoadError::Bound("callers"))?;
+        }
         let mut outcomes = Vec::with_capacity(callers.len());
         let mut failed = None;
         while let Some((index, outcome)) = callers.join_next().await {
@@ -1226,15 +1358,24 @@ async fn run_phase(
                 }
             }
         }
-        if let Some(side) = consumer {
-            side.watch.stop();
-        }
         match failed {
             Some(error) => Err(error),
-            None => Ok(outcomes),
+            None => Ok((outcomes, run_start.elapsed().as_nanos(), run_start_epoch_ns)),
         }
     };
-    let mut outcomes = match (consumer, &tail_conns) {
+    // Both tails establish their starting prefix before the schedule or any write starts.
+    // Stop them on startup failure as well as on a caller failure.
+    let collect = async {
+        match consumer {
+            Some(side) => {
+                let result = side.watch.after_joined(work).await;
+                side.watch.stop();
+                result
+            }
+            None => work.await,
+        }
+    };
+    let (mut outcomes, elapsed, epoch_ns) = match (consumer, &tail_conns) {
         (Some(side), Some((consumer_tail, issuer_tail))) => {
             let (outcomes, consumer_tailed, issuer_tailed) = hyper_rt::combine::join3(
                 collect,
@@ -1268,8 +1409,8 @@ async fn run_phase(
     outcomes.sort_unstable_by_key(|(index, _)| *index);
     Ok((
         outcomes.into_iter().map(|(_, outcome)| outcome).collect(),
-        run_start.elapsed().as_nanos(),
-        run_start_epoch_ns,
+        elapsed,
+        epoch_ns,
     ))
 }
 
@@ -1596,6 +1737,12 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     let abandoned = write_outcomes.iter().fold(0u64, |total, outcome| {
         total.saturating_add(outcome.abandoned)
     });
+    let lifecycle_binding_reads = write_outcomes.iter().fold(0u64, |total, outcome| {
+        total.saturating_add(outcome.lifecycle_binding_reads)
+    });
+    let written_reuse_fallbacks = write_outcomes.iter().fold(0u64, |total, outcome| {
+        total.saturating_add(outcome.written_reuse_fallbacks)
+    });
     // Requests whose intended start falls in the warm-up are sent, never measured.
     let warmup = u128::from(shape.warmup_ms).saturating_mul(1_000_000);
     writes.samples.retain(|(start, _)| *start >= warmup);
@@ -1732,6 +1879,8 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         expired,
         lifecycles,
         abandoned,
+        lifecycle_binding_reads,
+        written_reuse_fallbacks,
         floors_advanced,
         wall_ms: write_nanos.checked_div(1_000_000).unwrap_or(0),
         throughput_ops_per_s: report::per_second(committed, write_nanos),

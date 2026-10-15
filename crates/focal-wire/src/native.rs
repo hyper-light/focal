@@ -13,6 +13,21 @@ use serde::{Deserialize, Serialize};
 mod tests;
 
 pub const NATIVE_PROTOCOL_VERSION: u16 = 4;
+/// Explicitly offered native profile with optional own-write continuation replies. The
+/// protocol-4 receipt and persisted request envelopes retain their original layout.
+pub const NATIVE_WRITTEN_PROTOCOL_VERSION: u16 = 7;
+pub const NATIVE_WRITTEN_PROTOCOLS: [u16; 3] = [
+    NATIVE_WRITTEN_PROTOCOL_VERSION,
+    NATIVE_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+];
+
+pub const fn native_protocol(protocol: u16) -> bool {
+    matches!(
+        protocol,
+        NATIVE_PROTOCOL_VERSION | NATIVE_WRITTEN_PROTOCOL_VERSION
+    )
+}
 /// The frame magic and format version fixed by the native input format (21 §3).
 pub const NATIVE_FRAME_MAGIC: [u8; 8] = *b"FCNINPUT";
 pub const NATIVE_FRAME_VERSION: u16 = 1;
@@ -337,6 +352,49 @@ pub struct NativeReceipt {
     pub intent: ContentHash,
     pub counts: NativeOutcomeCounts,
 }
+/// A bounded continuation taken from a fresh candidate's own rows at its committed
+/// sequence. It carries no immutable content or histories. Exact retries may omit it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWrittenState {
+    pub sequence: SessionSeq,
+    pub claim: Option<NativeWrittenClaim>,
+    pub response: Option<NativeWrittenResponse>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWrittenClaim {
+    pub binding: NativeBinding,
+    pub issuer: ParticipantId,
+    pub subject: ParticipantId,
+    pub status: ClaimStatus,
+    pub receipt: Option<NativeEntitlement>,
+    pub response_count: u32,
+    pub latest_response: Option<TestamentId>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWrittenResponse {
+    pub binding: NativeBinding,
+    pub claim: ClaimId,
+    pub cycle: u32,
+}
+impl NativeWrittenState {
+    pub fn validate(&self, sequence: SessionSeq) -> Result<(), AccessError> {
+        let binding = |value: NativeBinding| !value.object.is_zero();
+        if sequence.0 == 0
+            || self.sequence != sequence
+            || (self.claim.is_none() && self.response.is_none())
+            || self.claim.is_some_and(|claim| !binding(claim.binding))
+            || self
+                .response
+                .is_some_and(|response| !binding(response.binding) || response.claim.is_zero())
+        {
+            return Err(AccessError::InvalidRequest);
+        }
+        Ok(())
+    }
+}
 /// Accepted but not known committed. Resending the exact frame resolves it;
 /// this is never reported as success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,10 +451,28 @@ pub struct NativeRefusal {
     pub detail: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "fixed continuation stays inline in precharged reply storage, avoiding an allocation per committed write"
+)]
 pub enum NativeMutationReply {
     Committed(NativeReceipt),
     Pending(NativeTicket),
     Refused(NativeRefusal),
+    /// Only returned to a protocol-7 request. The receipt remains the stable outcome;
+    /// the continuation is optional, local reply data and never persisted as that outcome.
+    CommittedWithWritten {
+        receipt: NativeReceipt,
+        written: NativeWrittenState,
+    },
+}
+impl NativeMutationReply {
+    pub fn committed_receipt(&self) -> Option<&NativeReceipt> {
+        match self {
+            Self::Committed(receipt) | Self::CommittedWithWritten { receipt, .. } => Some(receipt),
+            Self::Pending(_) | Self::Refused(_) => None,
+        }
+    }
 }
 
 /// Addresses of committed native rows. Legacy families carry frozen V1 bytes.

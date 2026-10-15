@@ -225,7 +225,7 @@ pub async fn dispatch_accounted_by(
     };
     if (verified.request().protocol == PEER_PROTOCOL_VERSION
         && (!handler.supports_managed_requests() || !handler.supports_participant_requests()))
-        || (verified.request().protocol == crate::NATIVE_PROTOCOL_VERSION
+        || (crate::native_protocol(verified.request().protocol)
             && (!handler.supports_managed_requests()
                 || !handler.supports_participant_requests()
                 || !handler.supports_native_requests()))
@@ -524,11 +524,18 @@ pub fn validate_response(
                     && principal.is_none_or(|p| key.principal == p)
             };
             match reply {
-                NativeMutationReply::Committed(receipt) => {
+                NativeMutationReply::Committed(receipt)
+                | NativeMutationReply::CommittedWithWritten { receipt, .. } => {
                     let NativeInvocationRef::Request(key) = &receipt.invocation else {
                         return Err(WireError::InvalidFrame);
                     };
                     if !key_valid(key) || receipt.sequence.0 == 0 {
+                        return Err(WireError::InvalidFrame);
+                    }
+                    if let NativeMutationReply::CommittedWithWritten { written, .. } = reply
+                        && (request.protocol != crate::NATIVE_WRITTEN_PROTOCOL_VERSION
+                            || written.validate(receipt.sequence).is_err())
+                    {
                         return Err(WireError::InvalidFrame);
                     }
                 }

@@ -616,7 +616,7 @@ pub fn verify_request(
             | Operation::ManagedSupport { .. }
     );
     let participant = is_peer_request(&request);
-    let native = request.protocol == crate::NATIVE_PROTOCOL_VERSION;
+    let native = crate::native_protocol(request.protocol);
     // An ordered frame, or an ask of what a copy holds, is of the ordered
     // profile and nothing else is (27 §12): a sender names the profile its
     // request needs, and a receiver holds it to it.

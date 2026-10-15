@@ -1532,6 +1532,17 @@ impl NativeOwner {
             .ok_or(NativeOwnerError::UnknownCandidate)
     }
 
+    /// The newest candidate's own small continuation, before any publication. A host takes
+    /// it immediately after admission and may return it only once the matching outcome
+    /// commits. Older pending tickets and committed retries need no chain scan or snapshot.
+    pub fn newest_written_state(&self, candidate: NativeCandidate) -> Option<NativeWrittenState> {
+        self.pending
+            .back()
+            .filter(|pending| pending.candidate == candidate)?
+            .prepared
+            .written_state()
+    }
+
     pub fn budget_stats(&self) -> BudgetStats {
         self.core.native_budget()
     }

@@ -543,6 +543,29 @@ or filling the read-back cache. An index that cannot be funded or kept exact
 refuses with capacity; it never silently substitutes a global scan. The existing
 global `Events` variant and canonical record/checkpoint encodings are unchanged.
 
+A native client may explicitly offer protocol 7 (`NATIVE_WRITTEN_PROTOCOLS`) for
+own-write continuations. A fresh mutation can return `CommittedWithWritten`:
+the unchanged receipt and a fixed-size projection of at most one claim and one
+response, taken only from that candidate's own puts. The host retains this
+provisional value with its bounded pending reply and exposes it only after the
+identical outcome commits. Larger writes, unavailable projections and exact
+outcome retries return the ordinary receipt. A later root is never used to
+reconstruct an original projection, including after restart.
+
+The client can compile the next operation from `Resolved::from_written` only
+when every explicit object requirement is covered. Missing state falls back to
+an ordinary scoped read at least at the receipt's sequence. A stale own-write
+binding is refreshed under a new request identity within the existing attempt
+bound. Cross-participant observations and evaluation selections retain their
+reads. The delivery load keeps all eight authored writes and both event waits,
+reusing five own-write observations and measuring its binding reads and fallbacks.
+
+Protocol-4 requests and replies, persisted request journals, receipts, canonical
+input frames, records and checkpoints keep their layouts. Protocol 7 extends the
+native request profile; ordered and laned replication keep profiles 5 and 6.
+It is explicitly selected for a native connection and is absent from the
+default peer offers, so existing lane negotiation is unchanged.
+
 ## 6. Durable Session contract
 
 [NativeSession](../../crates/focal-ledger/src/native_session.rs) binds this

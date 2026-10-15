@@ -841,6 +841,7 @@ enum WaitingFor {
     NativeMutation {
         key: RequestKey,
         outcome: focal_core::native::NativeOutcome,
+        written: Option<focal_core::native::NativeWrittenState>,
     },
     NativeRead {
         correlation: focal_ledger::ReadCorrelation,
@@ -4442,11 +4443,14 @@ impl Owner {
                                 crate::native_documents::outcome(outcome),
                             )))
                         }
-                        Ok(focal_ledger::NativeSubmission::Pending { outcome, .. }) => {
+                        Ok(focal_ledger::NativeSubmission::Pending { candidate, outcome }) => {
                             waiting = Some((
                                 WaitingFor::NativeMutation {
                                     key: header.key,
                                     outcome,
+                                    written: (request.protocol == NATIVE_WRITTEN_PROTOCOL_VERSION)
+                                        .then(|| self.session.native_written_state(candidate))
+                                        .flatten(),
                                 },
                                 deadline,
                             ));
@@ -5067,24 +5071,26 @@ impl Owner {
                     .receipt(key)
                     .cloned()
                     .map(|receipt| Response::Submitted(MutationReply::Committed(receipt))),
-                WaitingFor::NativeMutation { key, outcome } => {
-                    match self.session.native_outcome(*key) {
-                        Ok(Some(committed)) if committed == *outcome => {
-                            crate::fault::hit(crate::fault::FaultSite::AfterCommitBeforeReply);
-                            Some(Response::Native(NativeMutationReply::Committed(
-                                crate::native_documents::outcome(committed),
-                            )))
-                        }
-                        Ok(Some(_)) => Some(Response::Native(NativeMutationReply::Refused(
-                            NativeRefusal {
-                                kind: NativeRefusalKind::Conflict,
-                                detail: "request key committed another native intent".into(),
-                            },
-                        ))),
-                        Ok(None) => None,
-                        Err(error) => Some(Response::Error(access(error))),
+                WaitingFor::NativeMutation {
+                    key,
+                    outcome,
+                    written,
+                } => match self.session.native_outcome(*key) {
+                    Ok(Some(committed)) if committed == *outcome => {
+                        crate::fault::hit(crate::fault::FaultSite::AfterCommitBeforeReply);
+                        Some(Response::Native(crate::native_documents::committed(
+                            committed, *written,
+                        )))
                     }
-                }
+                    Ok(Some(_)) => Some(Response::Native(NativeMutationReply::Refused(
+                        NativeRefusal {
+                            kind: NativeRefusalKind::Conflict,
+                            detail: "request key committed another native intent".into(),
+                        },
+                    ))),
+                    Ok(None) => None,
+                    Err(error) => Some(Response::Error(access(error))),
+                },
                 WaitingFor::NativeRead {
                     correlation,
                     principal,

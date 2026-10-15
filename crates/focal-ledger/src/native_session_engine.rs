@@ -207,6 +207,15 @@ pub(crate) struct NativeSources {
 }
 
 impl<S: NativeSchemaVerifier> NativeEngine<S> {
+    pub(crate) fn written_state(
+        &self,
+        candidate: NativeCandidate,
+    ) -> Option<focal_core::native::NativeWrittenState> {
+        match self.domain.as_ref()? {
+            Domain::Active(owner, _) => owner.newest_written_state(candidate),
+            Domain::Passive(_) => None,
+        }
+    }
     /// An empty native domain at the group's origin. Startup delivery restores
     /// the committed prefix from consensus; nothing here reads the log.
     pub(crate) fn new(

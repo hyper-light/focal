@@ -1,6 +1,6 @@
 use super::*;
 use crate::operation_store::OperationIntent;
-use focal_wire::{NativeOperationKind, NativeOutcomeCounts};
+use focal_wire::{NATIVE_PROTOCOL_VERSION, NativeOperationKind, NativeOutcomeCounts};
 
 fn context() -> OperationContext {
     OperationContext {

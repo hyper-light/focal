@@ -116,6 +116,39 @@ pub(crate) fn outcome(value: core_native::NativeOutcome) -> NativeReceipt {
         },
     }
 }
+pub(crate) fn written(value: core_native::NativeWrittenState) -> NativeWrittenState {
+    NativeWrittenState {
+        sequence: value.sequence,
+        claim: value.claim.map(|claim| NativeWrittenClaim {
+            binding: binding(claim.binding),
+            issuer: claim.issuer,
+            subject: claim.subject,
+            status: claim.status,
+            receipt: claim.receipt.map(entitlement),
+            response_count: claim.response_count,
+            latest_response: claim.latest_response,
+        }),
+        response: value.response.map(|response| NativeWrittenResponse {
+            binding: binding(response.binding),
+            claim: response.claim,
+            cycle: response.cycle,
+        }),
+    }
+}
+
+pub(crate) fn committed(
+    value: core_native::NativeOutcome,
+    written: Option<core_native::NativeWrittenState>,
+) -> NativeMutationReply {
+    let receipt = outcome(value);
+    match written.filter(|written| written.sequence == value.sequence) {
+        Some(written) => NativeMutationReply::CommittedWithWritten {
+            receipt,
+            written: self::written(written),
+        },
+        None => NativeMutationReply::Committed(receipt),
+    }
+}
 pub(crate) fn target(value: validation::Target) -> NativeTarget {
     match value {
         validation::Target::Artifact {

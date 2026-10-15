@@ -6109,7 +6109,12 @@ fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it() {
                 .offering(&[PROTOCOL_VERSION, LANED_PROTOCOL_VERSION])
                 .is_ok()
         );
-        assert!(connector().offering(&[PROTOCOL_VERSION, 7]).is_err());
+        assert!(
+            connector()
+                .offering(&[PROTOCOL_VERSION, NATIVE_WRITTEN_PROTOCOL_VERSION])
+                .is_ok()
+        );
+        assert!(connector().offering(&[PROTOCOL_VERSION, u16::MAX]).is_err());
         // A receiver holds an ordered frame to the ordered profile, and a
         // plain frame to the base one; a node sends either.
         let node = || {

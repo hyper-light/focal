@@ -276,6 +276,65 @@ pub struct Resolved {
     pub result_testaments: Vec<ResolvedResultTestament>,
 }
 impl Resolved {
+    /// The exact small state returned beside an own-write receipt, checked against that
+    /// receipt's committed sequence. The server may omit this state on retry.
+    pub fn from_written(
+        ledger: LedgerId,
+        sequence: SessionSeq,
+        written: &focal_wire::NativeWrittenState,
+    ) -> Result<Self, CompileError> {
+        written
+            .validate(sequence)
+            .map_err(|_| CompileError::Unsupported("invalid written state"))?;
+        let mut resolved = Self::default();
+        if let Some(claim) = written.claim {
+            push(
+                &mut resolved.claims,
+                ResolvedClaim {
+                    binding: binding(ledger, claim.binding),
+                    issuer: claim.issuer,
+                    subject: claim.subject,
+                    status: claim.status,
+                    receipt: claim.receipt.map(|receipt| (receipt.holder, receipt.fence)),
+                    response_count: claim.response_count,
+                    latest_response: claim.latest_response,
+                },
+            )?;
+        }
+        if let Some(response) = written.response {
+            push(
+                &mut resolved.responses,
+                ResolvedResponse {
+                    binding: binding(ledger, response.binding),
+                    claim: response.claim,
+                    cycle: response.cycle,
+                },
+            )?;
+        }
+        Ok(resolved)
+    }
+
+    /// Whether every explicit object this operation binds to is in this resolution.
+    /// Selection queries still require their normal read.
+    pub fn covers(&self, operation: &NativeAuthoredOperation) -> Result<bool, CompileError> {
+        Ok(requirements(operation)?
+            .into_iter()
+            .all(|requirement| match requirement {
+                Requirement::Objects(objects) => objects.into_iter().all(|object| match object {
+                    NativeObjectRef::Claim(id) => self
+                        .claims
+                        .iter()
+                        .any(|claim| claim.binding.object.0 == id.0),
+                    NativeObjectRef::Response(id) => self
+                        .responses
+                        .iter()
+                        .any(|response| response.binding.object.0 == id.0),
+                    _ => false,
+                }),
+                Requirement::Evaluation { .. } => false,
+            }))
+    }
+
     /// Missing objects are skipped here and reported by the verb that needs
     /// them, so a page containing unrelated objects is still usable.
     pub fn from_objects(ledger: LedgerId, objects: &[NativeObject]) -> Result<Self, CompileError> {

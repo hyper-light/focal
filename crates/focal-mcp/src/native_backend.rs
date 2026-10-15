@@ -454,7 +454,8 @@ impl<T: ClientTransport> Backend<T> {
         })
         .await?;
         match reply {
-            NativeMutationReply::Committed(receipt) => {
+            NativeMutationReply::Committed(receipt)
+            | NativeMutationReply::CommittedWithWritten { receipt, .. } => {
                 native
                     .store
                     .record_reply(operation.id, &self.context, &reply)?;

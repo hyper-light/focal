@@ -18,6 +18,8 @@ use hyper_rt::combine::{Either, race2};
 use hyper_rt::sync::{OneshotReceiver, OneshotSender, oneshot};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
 /// How long a side waits for the other's step to show in the events before it counts the
@@ -59,6 +61,8 @@ pub struct Watch {
     stopped: Cell<bool>,
     consumer: Cell<TailCounts>,
     issuer: Cell<TailCounts>,
+    joined: Cell<u8>,
+    join_waiter: RefCell<Option<Waker>>,
 }
 
 impl Watch {
@@ -71,6 +75,48 @@ impl Watch {
             stopped: Cell::new(false),
             consumer: Cell::new(TailCounts::default()),
             issuer: Cell::new(TailCounts::default()),
+            joined: Cell::new(0),
+            join_waiter: RefCell::new(None),
+        }
+    }
+    /// Starts the offered schedule and its work only after both tails have joined their prefix.
+    pub async fn after_joined<T>(
+        &self,
+        work: impl Future<Output = Result<T, LoadError>>,
+    ) -> Result<T, LoadError> {
+        let joined = std::future::poll_fn(|cx| {
+            if self.stopped.get() {
+                Poll::Ready(Err(LoadError::Bound(
+                    "delivery tails stopped before joining",
+                )))
+            } else if self.joined.get() == 3 {
+                Poll::Ready(Ok(()))
+            } else {
+                *self.join_waiter.borrow_mut() = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        });
+        let ready = race2(joined, focal_rt::time::sleep(WAIT)).await;
+        self.join_waiter.borrow_mut().take();
+        match ready {
+            Either::First(result) => result?,
+            Either::Second(slept) => {
+                slept.map_err(LoadError::Runtime)?;
+                return Err(LoadError::Bound("delivery tails did not join"));
+            }
+        }
+        work.await
+    }
+    fn joined(&self, side: Side) {
+        self.joined.set(
+            self.joined.get()
+                | match side {
+                    Side::Consumer => 1,
+                    Side::Issuer => 2,
+                },
+        );
+        if let Some(waiter) = self.join_waiter.borrow_mut().take() {
+            waiter.wake();
         }
     }
     /// Waits for `claim`'s post to show: registered before the post is sent.
@@ -104,6 +150,9 @@ impl Watch {
     /// Ends the tails at their next page, and every wait with them.
     pub fn stop(&self) {
         self.stopped.set(true);
+        if let Some(waiter) = self.join_waiter.borrow_mut().take() {
+            waiter.wake();
+        }
         self.posted.borrow_mut().clear();
         self.answered.borrow_mut().clear();
     }
@@ -223,6 +272,7 @@ pub async fn tail(
             // prefix's last record.
             after = Some((page.native_sequence, u32::MAX));
             started = true;
+            watch.joined(side);
             continue;
         }
         let mut read = 0u64;
@@ -247,4 +297,36 @@ pub async fn tail(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_write_waits_for_both_prefixes_even_when_one_tail_is_delayed() {
+        focal_rt::block_on(async {
+            let watch = Watch::new(1);
+            let writes = Cell::new(0);
+            let mut work = std::pin::pin!(watch.after_joined(async {
+                writes.set(writes.get() + 1);
+                Ok(())
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(work.as_mut().poll(cx).is_pending());
+                assert_eq!(writes.get(), 0);
+                watch.joined(Side::Consumer);
+                assert!(work.as_mut().poll(cx).is_pending());
+                assert_eq!(writes.get(), 0);
+                watch.joined(Side::Consumer);
+                assert!(work.as_mut().poll(cx).is_pending());
+                watch.joined(Side::Issuer);
+                assert!(matches!(work.as_mut().poll(cx), Poll::Ready(Ok(()))));
+                assert_eq!(writes.get(), 1);
+                Poll::Ready(())
+            })
+            .await;
+        })
+        .unwrap();
+    }
 }

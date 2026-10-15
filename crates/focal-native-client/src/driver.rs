@@ -561,7 +561,8 @@ pub async fn maintain(
         return Ok(Some(receipt));
     }
     match submit.submit(prepared.request.clone()).await? {
-        reply @ NativeMutationReply::Committed(receipt) => {
+        reply @ (NativeMutationReply::Committed(receipt)
+        | NativeMutationReply::CommittedWithWritten { receipt, .. }) => {
             preparation
                 .store
                 .record_reply(prepared.id, &preparation.context, &reply)?;
