@@ -746,28 +746,60 @@ fn a_held_log_is_asked_nothing_and_its_answer_wakes_every_session_that_waits() {
             // answered write, which gave the room back (`waits_handed`; uncounted,
             // it read as a session never woken: CI run 38079021596, macOS, one of
             // a hundred).
-            let mut swept = 0;
-            let mut handed = 0;
-            let unwoken: Vec<(u128, Woken, Woken)> = (1..=sessions)
-                .filter_map(|index| {
-                    let progress = fixture.hosts[&ledger(index)].progress();
-                    let before = answered_before[usize::try_from(index - 1).unwrap()];
-                    let after = (
-                        progress.waits_answered,
-                        progress.waits_swept,
-                        progress.waits_handed,
-                    );
-                    if after.1 > before.1 {
-                        swept += 1;
-                    }
-                    if after.2 > before.2 {
-                        handed += 1;
-                    }
-                    (after.0 <= before.0 && after.1 <= before.1 && after.2 <= before.2)
-                        .then_some((index, before, after))
-                })
-                .collect();
-            println!("{sessions} sessions: {swept} looked at by a sweep, {handed} handed a wake");
+            //
+            // A wake is counted as its owner takes it and published at the session's next step,
+            // after the step that answered its write: the answer reaches the client first, and a
+            // tick that drained the write as the log answered leaves the count to the signal's
+            // step, later still. Each session's published count is waited for, the wait charged
+            // to the sessions found woken as they come: a wake never counted stops them coming,
+            // and fails as it did. Read once, the second-to-last of a thousand sessions read as
+            // never woken (CI run 38723835957, Ubuntu).
+            let unwoken_now = || -> (Vec<(u128, Woken, Woken)>, usize, usize) {
+                let mut swept = 0;
+                let mut handed = 0;
+                let unwoken = (1..=sessions)
+                    .filter_map(|index| {
+                        let progress = fixture.hosts[&ledger(index)].progress();
+                        let before = answered_before[usize::try_from(index - 1).unwrap()];
+                        let after = (
+                            progress.waits_answered,
+                            progress.waits_swept,
+                            progress.waits_handed,
+                        );
+                        if after.1 > before.1 {
+                            swept += 1;
+                        }
+                        if after.2 > before.2 {
+                            handed += 1;
+                        }
+                        (after.0 <= before.0 && after.1 <= before.1 && after.2 <= before.2)
+                            .then_some((index, before, after))
+                    })
+                    .collect::<Vec<_>>();
+                (unwoken, swept, handed)
+            };
+            let mut published = focal_timing::ProgressDeadline::begin(
+                &[0],
+                u64::try_from(sessions).unwrap().saturating_add(1),
+                crate::network_service::tests::FROZEN,
+            );
+            let mut late = None;
+            let (unwoken, swept, handed) = loop {
+                let (unwoken, swept, handed) = unwoken_now();
+                late.get_or_insert(unwoken.len());
+                let woken = u64::try_from(sessions).unwrap() - unwoken.len() as u64;
+                if unwoken.is_empty() || published.check(&[woken]).is_err() {
+                    break (unwoken, swept, handed);
+                }
+                focal_rt::time::sleep(Duration::from_millis(10))
+                    .await
+                    .unwrap();
+            };
+            println!(
+                "{sessions} sessions: {swept} looked at by a sweep, {handed} handed a wake, {} \
+                 published after their writes were answered",
+                late.unwrap_or(0)
+            );
             shutdown(fixture).await;
             assert!(
                 unwoken.is_empty(),
