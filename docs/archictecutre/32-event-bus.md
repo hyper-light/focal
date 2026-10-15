@@ -1,0 +1,133 @@
+# 32 — The event bus: in memory, durable off the delivery path
+
+Status: 2026-10-15. The owner ordered the rewrite ("We're re-writing this… a proper in-memory event
+bus with disk durability… bench it at each step and ensure it hits our 10x requirement… dense
+JSON"). Steps 0 and 1 are built and measured here; steps 2 and 3 are next. This supersedes
+[31](31-message-ledger.md) as the implementation plan; its decisions that carry over are named
+below.
+
+## 1. What the ledger is for
+
+The owner's statement of scope (2026-10-15): the ledger's only concerns are that a **claim reaches
+its correct respondent**, a **testament reaches its correct recipient**, and a **testament's
+artifacts can be retrieved correctly and quickly**. Artifacts are arbitrary bytes of any size
+(audio, video, text), kept by an independent system built for them; a testament carries references.
+
+So the bus carries small messages and a lifecycle is two publishes and two acknowledgements (a
+claim to a respondent's stream, acknowledged; a testament to the recipient's stream, acknowledged),
+where the old design took eight writes and seven reads.
+
+### 1.1 Artifacts are references
+
+A testament carries `{BLAKE3 root, length, media type, key if encrypted, location hints}`:
+
+- The root says what the bytes are, so the recipient checks them whatever served them (a replica,
+  another region, a cache, object storage); BLAKE3's tree lets a stream or a range read be checked
+  chunk by chunk (Bao verified streaming). The bus vouches for the reference, the reference for the
+  bytes.
+- Hints say where to look first and change without the testament changing.
+- **Data before pointer**: a testament commits only after the artifact store confirms the artifact
+  durable.
+- The bus bounds a message's size; anything larger is an artifact.
+
+Precedents: the Claim Check pattern (Hohpe and Woolf); Kafka's and NATS's 1 MB default message
+bounds; NATS's object store, which stores every 128 KiB chunk of an object as a stream message (what
+this avoids); GFS's separation of the data flow from the control flow (SOSP 2003); Haystack and f4
+(OSDI 2010, 2014); Ambry (SIGMOD 2016).
+
+## 2. Decisions
+
+| # | Decision | Grounds |
+|---|---|---|
+| D1 | Durability is off the delivery path; replication across failure domains is on it only as far as a stream's class promises | Kafka writes to the page cache and relies on replication with recovery (Vanlightly 2023) and still needed KIP-966; JetStream's two-minute fsync lost 131,418 of 930,005 acknowledged writes in Jepsen's power cut (2.12.1, 2025) and bit flips on a minority lost 679,153 of 1,367,069; Redpanda's argument that plain Raft turns one node's unsynced loss into global loss |
+| D2 | Three classes a stream: **ephemeral** (at most once; memory, a bounded replay ring, explicit gap notices), **replicated** (at least once; a memory quorum while healthy, a disk quorum once a failure is suspected), **persisted** (at least once; acknowledged after a quorum's fsync) | SAUCR (OSDI 2018: 0–9% over memory-only), doc 31's situation-aware decision; VR Revisited's recovery (a restarted member does not vote or serve until it recovers from a quorum); protocol-aware recovery (FAST 2018: a corrupt record is repaired from peers, never truncated) |
+| D3 | At least once plus idempotence: producer sequences, receivers' ids | Kafka KIP-98; exactly-once delivery is impossible on a lossy network, an exactly-once effect is not |
+| D4 | The replicated log is the store: a batch's bytes are written once and the same bytes are replicated, flushed and delivered; only small state is checkpointed | Kafka (NetDB 2011); the old focal's profile spent 56% of its owner thread decoding and inspecting frames, the message re-encoded into rows, checkpoints, a payload log and a cold stream |
+| D5 | One log a part, the part's streams interleaved in it; segments from a demand-sized warm pool; a segment goes back once none of its batches is held, out of order | RAMCloud's log-structured memory (FAST 2014: 80–90% utilization; its per-segment live counts); BookKeeper's interleaved entry log |
+| D6 | A stream keeps no index: its batches chain through the log (`next`, stamped by the owner) | Measured in step 1 (§4.2): a block index cost 1 to 5.3 times an event's payload with sparse streams |
+| D7 | A work queue's state is a bounded window: an ack floor and a byte and a lease a claim in flight | KIP-932's share-partition window; Redis's per-message PEL entries and JetStream's map entries as the cost avoided |
+| D8 | Thread per core, one writer per part; idle: run to completion, no handoff; contended: drain what arrived, one append each, one flush | Seastar/Redpanda; the Disruptor's single-writer principle; Aether (VLDB 2010) and flat combining; ZygOS (SOSP 2017) for the tail risk of per-core queues under skew |
+| D9 | Binary frames; payloads compressed and decompressed by claimants and respondents, never by the bus; zstd with a per-stream trained dictionary by default, a schema-driven encoding where a stream declares a schema | Measured in step 0 (§4.1); Viotti and Kinderkhedia (2022): compressed JSON beats CBOR and MessagePack, compressed schema-driven encodings beat compressed JSON in every case; QPACK's interning for subjects |
+| D10 | Built on the shared crates at their latest (hyper-rt, hyper-transport over hyper-quic, hyper-durable, hyper-log, hyper-seal, hyper-liveness, hyper-measure) | The owner's direction, 2026-10-15; all re-vendored at hyper-raft `3d86b42` |
+
+## 3. The batch
+
+One producer's burst of records to one stream: the unit appended, replicated, flushed and
+delivered (`crates/focal-bus/src/batch.rs`). A 56-byte header: length, a CRC-32C over everything the
+producer wrote, the base offset and `next` the owner stamps outside the CRC (as Kafka keeps
+`baseOffset` and `partitionLeaderEpoch` outside its batch CRC), stream, producer, sequence, count,
+flags and a timestamp; then each record's payload length and time delta as LEB128 and its payload,
+opaque. The receiver of a delivered batch checks the producer's own CRC, so a fault anywhere between
+is caught end to end.
+
+## 4. Measured
+
+Both benches print tables: `cargo bench -p focal-bus --bench codec` and `--bench inmemory`. Apple
+silicon laptop, shared with other work (load in each row's run), release build.
+
+### 4.1 Step 0: the edge codec on dense JSON
+
+`focal_bus::corpus` writes progress events, claims, testaments and an incompressible blob shape, a
+function of its seed. A dictionary is trained on one seed and every codec measured on another
+seed's 4,000 messages, each round-tripped; 7 passes, load 6.8; ns are a message's medians.
+
+| shape | raw B | zstd 3 B (ratio) | zstd 3 + 64 KiB dict B (ratio) | compress / decompress ns | receiver's JSON parse ns |
+|---|---|---|---|---|---|
+| event | 495 | 361 (1.37) | 151 (3.29) | 1,392 / 595 | 1,391 |
+| claim | 3,499 | 1,873 (1.87) | 1,149 (3.04) | 11,714 / 3,327 | 8,361 (218 allocations) |
+| testament | 5,201 | 2,291 (2.27) | 1,486 (3.50) | 14,069 / 5,820 | 9,353 (239 allocations) |
+| entropy | 4,086 | 3,128 (1.31) | 3,077 (1.33) | 6,953 / 3,212 | 1,159 |
+
+- A dictionary is worth 1.5 to 2.4 times plain zstd; 64 KiB beats 16 KiB and 112 KiB adds nothing.
+- Level 9 buys under 4% for four to seven times the CPU.
+- Sixteen messages to a frame add little beyond a dictionary (claims 3.04 → 3.14), so a message is
+  its own frame and any subscriber takes it alone.
+- Compressing and decompressing allocate nothing a message once contexts are kept.
+- Parsing JSON costs a receiver more than decompressing it: the bus must never parse a payload, and
+  what it reads belongs in its binary header.
+
+### 4.2 Step 1: the in-memory core
+
+Each shape's messages compressed as above, one record a batch. **Quiet**: one thread appends,
+delivers (reads the stored batch where the chain leads) and acknowledges once 10,000 later batches
+have followed; per message after a warm-up pass, 5 passes, 100,000 messages a pass, load 17.3:
+
+| shape | streams | segment | ns | allocations | page faults | payload B | held B a message in flight |
+|---|---|---|---|---|---|---|---|
+| event | 1 | 1 MiB | 57 | 0 | 0 | 210 | 419 |
+| event | 10,000 | 64 KiB | 82 | 0 | 0 | 210 | 342 |
+| event | 1,000,000 | 1 MiB | 109 | 0 | 0 | 210 | 898 |
+| claim | 10,000 | 1 MiB | 204 | 0 | 0 | 1,209 | 1,483 |
+| claim | 1,000,000 | 1 MiB | 215 | 0 | 0 | 1,209 | 1,842 |
+| testament | 10,000 | 1 MiB | 235 | 0 | 0 | 1,545 | 1,797 |
+| entropy | 1,000,000 | 1 MiB | 493 | 0 | 0 | 3,137 | 3,729 |
+
+"Held" counts the segments in use and warm and the stream table, divided by the batches in flight;
+at a million streams it is mostly the streams' own forty bytes and map entries amortized over
+10,000 batches. The first version kept a 2 KiB index block a stream: 906 and 1,420 bytes held for
+an event at 10,000 and a million streams, and the chain (D6) replaced it.
+
+**Contended**, one owner thread fed by producer threads over hyper-rt's bounded ring (claims, 10,000
+streams, closed loop): 2.7 M messages a second from one producer, 2.3 M from two, 1.85 M from four,
+the owner's time a message rising from 342 to 540 ns as producers share the ring and the cache lines
+it hands over. **Open loop** (one producer, Poisson arrivals, hand to append): p50 4.8 µs at 400,000 a
+second to 10.6 µs at 1,000 a second, the difference a parked owner's wake; at load 7.8 the p99 was 40
+to 48 µs at every rate, at load 17 it reached milliseconds where the host descheduled the owner.
+
+What these say for step 2: the core's own work is 57 to 493 ns a message with no allocation and no
+fault, so a node's cost is its transport and its handoffs. A connection served on the shard that owns
+its stream's part hands nothing over; one that is not hands batches over in runs, never one at a
+time.
+
+## 5. Steps
+
+| Step | What | Bar |
+|---|---|---|
+| 0 | Dense JSON corpus and edge codec | done (§4.1) |
+| 1 | In-memory core: batch format, part log, segment pool, streams, ack window | done (§4.2); 0 allocations and faults a message |
+| 2 | One node over QUIC (hyper-rt-transport), ephemeral class, in a 1-CPU, 2 GB container, against NATS core and Redis Pub/Sub | p99 and p99.9 delivery latency at most a tenth of the best competitor's at the same offered load; no collapse as load rises |
+| 3 | Three nodes, replicated class on hyper-durable against Kafka acks=all and JetStream R3, then persisted against their synchronous settings | the same bar, class against class |
+
+Open after step 1: a header smaller than 56 bytes for one-record batches (27% of a 210-byte event);
+the stream table's keyed hash (SipHash) against an id the directory assigns; a compacting cleaner
+should long-held batches fragment segments (RAMCloud's two-level cleaning), measured before built.

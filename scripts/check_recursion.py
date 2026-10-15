@@ -2,7 +2,10 @@
 """No runtime recursion (CLAUDE.md §1a), checked on the compiled code and on the source.
 
 The call graph: every library and binary target of the workspace, and every vendored
-`hyper-*` crate, is compiled to LLVM IR at opt-level 0 (`--profile recursion-ir`), where no
+`hyper-*` crate the workspace ships (one a member reaches through its normal or build
+dependencies; a crate only tests and benchmarks take, as hyper-measure, ships in no binary, and
+cargo cannot build it alone: its feature resolver has no features for a package reached only
+through dev-dependencies), is compiled to LLVM IR at opt-level 0 (`--profile recursion-ir`), where no
 call is inlined and every direct call, drop glue's included, is an explicit `call` or `invoke`.
 The direct-call graph's strongly connected components are found with Tarjan's algorithm, run
 iteratively. A component of more than one function, or a function that calls itself, is a
@@ -683,6 +686,25 @@ def production_sources() -> list[Path]:
     return files
 
 
+def shipped_packages(metadata: dict, members: set[str]) -> set[str]:
+    """The packages the workspace's members reach through normal or build dependencies: what its
+    binaries can contain. An edge that is a dev-dependency alone (a test's or a benchmark's) is
+    not followed."""
+    nodes = {node["id"]: node for node in (metadata.get("resolve") or {}).get("nodes", [])}
+    reached: set[str] = set()
+    stack = list(members)
+    while stack:
+        package = stack.pop()
+        if package in reached:
+            continue
+        reached.add(package)
+        for dep in nodes.get(package, {}).get("deps", []):
+            kinds = [kind.get("kind") for kind in dep.get("dep_kinds", [])]
+            if any(kind != "dev" for kind in kinds):
+                stack.append(dep["pkg"])
+    return reached
+
+
 def targets() -> tuple[list[tuple[str, str, str]], set[str], Path]:
     """Each library and binary target to compile, as (package, kind, name), the crate names the
     workspace's code lives under (its members' and the vendored `hyper-*` crates'), and cargo's
@@ -697,19 +719,24 @@ def targets() -> tuple[list[tuple[str, str, str]], set[str], Path]:
         ).stdout
     )
     members = set(metadata["workspace_members"])
+    shipped = shipped_packages(metadata, members)
     wanted: list[tuple[str, str, str]] = []
     crates: set[str] = set()
     for package in metadata["packages"]:
         manifest = Path(package["manifest_path"]).resolve()
         vendored = manifest.parent.parent == ROOT / "vendor" and package["name"].startswith("hyper-")
-        if package["id"] not in members and not vendored:
+        if package["id"] not in members and not (vendored and package["id"] in shipped):
             continue
         for target in package["targets"]:
             kinds = set(target["kind"])
-            crates.add(target["name"].replace("-", "_"))
+            # Only the targets read here name the workspace's code: a test's or a benchmark's name
+            # is no crate of the IR, and one that matches a dependency's (a bench named `core`)
+            # would claim that dependency's functions as the workspace's.
             if kinds & {"lib", "rlib"}:
+                crates.add(target["name"].replace("-", "_"))
                 wanted.append((package["name"], "lib", target["name"]))
             elif "bin" in kinds and package["id"] in members:
+                crates.add(target["name"].replace("-", "_"))
                 wanted.append((package["name"], "bin", target["name"]))
     return wanted, crates, Path(metadata["target_directory"])
 
