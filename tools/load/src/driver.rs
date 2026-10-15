@@ -200,9 +200,9 @@ struct Job {
     lifecycle: Lifecycle,
     /// Write phase: the most of this worker's lifecycle reads under way at once.
     lifecycle_reads: u16,
-    /// Write phase, paced (the shape's `rate`): the interval between this
-    /// worker's intended starts.
-    pace: Option<Duration>,
+    /// Write phase: the aggregate offered rate. Every caller takes its interleaved places on
+    /// that one schedule, including a rate's remainder across callers.
+    pace: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -296,8 +296,16 @@ fn read_envelope(names: &Names, request: u128, claim: u128) -> RequestEnvelope {
     }
 }
 
-fn read_hit(result: &Result<ResponseEnvelope, ClientError>) -> bool {
-    matches!(result, Ok(envelope) if matches!(&envelope.result, Response::NativeRead(page) if !page.objects.is_empty()))
+/// The point query asks for one exact claim. Missing/retired markers and unrelated objects
+/// must not inflate successful-read throughput, including the probe after reopening.
+fn read_hit(result: &Result<ResponseEnvelope, ClientError>, claim: u128) -> bool {
+    let Ok(envelope) = result else {
+        return false;
+    };
+    let Response::NativeRead(page) = &envelope.result else {
+        return false;
+    };
+    matches!(page.objects.as_slice(), [NativeObject::Claim(object)] if object.binding.object.0 == claim.to_be_bytes())
 }
 
 /// How the owner answered a write.
@@ -928,7 +936,7 @@ async fn write_open_loop(shared: &Shared<'_>, inflight: u16) -> Result<(), LoadE
         // The next write's place, while one is left: on the schedule, or now.
         let due = if i < job.count {
             Some(match job.pace {
-                Some(interval) => place(shared.run_start, interval, job, i)?,
+                Some(rate) => place(shared.run_start, rate, job, i)?,
                 None => Instant::now(),
             })
         } else {
@@ -974,20 +982,21 @@ async fn write_open_loop(shared: &Shared<'_>, inflight: u16) -> Result<(), LoadE
     }
 }
 
-/// Write `i`'s place on a paced worker's schedule: the callers' schedules
-/// spread over the interval, caller `index` of `callers` at its share of it,
-/// so the offered rate arrives evenly, never as every caller's request at one
-/// instant.
-fn place(run_start: Instant, interval: Duration, job: &Job, i: u64) -> Result<Instant, LoadError> {
-    let phase = interval
-        .checked_mul(u32::from(job.index))
-        .and_then(|spread| spread.checked_div(u32::from(job.callers)))
+/// Write `i`'s place in the aggregate schedule: caller `index` takes every `callers`th
+/// position. Divide only after scaling its global ordinal, so neither a remainder across
+/// callers nor rounding a recurring interval changes the aggregate offered rate.
+fn place(run_start: Instant, rate: u64, job: &Job, i: u64) -> Result<Instant, LoadError> {
+    let ordinal = i
+        .checked_mul(u64::from(job.callers))
+        .and_then(|ordinal| ordinal.checked_add(u64::from(job.index)))
         .ok_or(LoadError::Bound("schedule"))?;
-    u32::try_from(i)
-        .ok()
-        .and_then(|i| interval.checked_mul(i))
-        .and_then(|offset| offset.checked_add(phase))
-        .and_then(|offset| run_start.checked_add(offset))
+    let nanos = u128::from(ordinal)
+        .checked_mul(1_000_000_000)
+        .and_then(|scaled| scaled.checked_div(u128::from(rate)))
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .ok_or(LoadError::Bound("schedule"))?;
+    run_start
+        .checked_add(Duration::from_nanos(nanos))
         .ok_or(LoadError::Bound("schedule"))
 }
 
@@ -1084,7 +1093,7 @@ async fn worker(
                     started.saturating_duration_since(run_start).as_nanos(),
                     started.elapsed().as_nanos(),
                 ));
-                if read_hit(&result) {
+                if read_hit(&result, claim) {
                     outcome.hits = outcome.hits.saturating_add(1);
                 }
             }
@@ -1532,22 +1541,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         }),
         None => None,
     };
-    // Paced writes: each worker's share of the offered rate, as a fixed
-    // interval between its intended starts.
-    let pace = match shape.rate {
-        Some(rate) => {
-            let per_worker = rate
-                .checked_div(u64::from(shape.concurrency))
-                .filter(|share| *share > 0)
-                .ok_or(LoadError::Bound("rate below one a second per worker"))?;
-            Some(
-                Duration::from_secs(1)
-                    .checked_div(u32::try_from(per_worker).map_err(|_| LoadError::Bound("rate"))?)
-                    .ok_or(LoadError::Bound("rate"))?,
-            )
-        }
-        None => None,
-    };
+    let pace = shape.rate;
 
     let connections = shape.connections.unwrap_or(shape.concurrency);
     // Writes: every worker its share of the claims, in its own id space.
@@ -1708,7 +1702,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 let started = Instant::now();
                 let result = conn.request(envelope).await;
                 first_read_after_reopen_ns = Some(started.elapsed().as_nanos());
-                reopen_read_hit = Some(read_hit(&result));
+                reopen_read_hit = Some(read_hit(&result, claim));
                 drop(conn);
                 drop(probe);
             }

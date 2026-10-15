@@ -54,3 +54,80 @@ fn reasons_past_the_kept_ones_are_counted_never_dropped() {
     assert_eq!(run.len(), MAX_REFUSALS);
     assert_eq!(run.iter().map(|(_, count)| count).sum::<u64>(), 2 * noted);
 }
+
+fn claim_read(id: u128) -> ResponseEnvelope {
+    let ledger = LedgerId {
+        tenant: focal_model::TenantId::from_u128(1),
+        session: focal_model::SessionId::from_u128(1),
+    };
+    let claim = focal_wire::NativeClaim {
+        binding: focal_model::native_event::NativeBinding {
+            object: focal_model::ObjectId::from_u128(id),
+            content: focal_model::ContentHash([1; 32]),
+            revision: focal_model::ObjectRevision(1),
+        },
+        issuer: ParticipantId::from_u128(1),
+        subject: ParticipantId::from_u128(2),
+        created: SessionSeq(1),
+        deadline: None,
+        status: focal_model::ClaimStatus::Generated,
+        origin: focal_wire::NativeClaimOrigin::Native,
+        released: false,
+        receipt: None,
+        local_complete: false,
+        local_sealed_at: None,
+        terminal: None,
+        latest_response: None,
+        response_count: 0,
+        max_responses: 1,
+        obligations: Vec::new(),
+        cause: focal_model::Cause::Root(RootCommandId::from_u128(1)),
+        corrections: Vec::new(),
+        acceptance: Vec::new(),
+        scopes: None,
+        content: None,
+    };
+    ResponseEnvelope {
+        protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
+        ledger,
+        route_epoch: RouteEpoch(1),
+        request_epoch: RequestEpoch(1),
+        request_id: RequestId::from_u128(1),
+        result: Response::NativeRead(focal_wire::NativeReadPage {
+            token: ReadToken {
+                ledger,
+                sequence: SessionSeq(1),
+                route_epoch: RouteEpoch(1),
+            },
+            native_sequence: SessionSeq(1),
+            logical_time: 0,
+            objects: vec![NativeObject::Claim(Box::new(claim))],
+            next: None,
+            visited: 1,
+        }),
+    }
+}
+
+/// A nonempty page can contain an explicit Missing marker or the wrong object. Neither proves
+/// that a committed claim was read, even though the old presence-only hit counter accepted it.
+#[test]
+fn only_the_requested_claim_counts_as_a_read_hit() {
+    assert!(read_hit(&Ok(claim_read(10)), 10));
+    assert!(
+        !read_hit(&Ok(claim_read(20)), 10),
+        "a different claim is not a hit"
+    );
+    let mut envelope = claim_read(10);
+    let Response::NativeRead(page) = &mut envelope.result else {
+        panic!("fixture")
+    };
+    page.objects = vec![NativeObject::Missing(focal_wire::NativeObjectRef::Claim(
+        ClaimId::from_u128(10),
+    ))];
+    assert!(!read_hit(&Ok(envelope.clone()), 10), "Missing is not a hit");
+    let Response::NativeRead(page) = &mut envelope.result else {
+        panic!("fixture")
+    };
+    page.objects.clear();
+    assert!(!read_hit(&Ok(envelope), 10));
+}
