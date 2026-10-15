@@ -15125,3 +15125,80 @@ recursion), `cargo deny check advisories bans licenses sources`, and
 `bash scripts/cargo.sh test --workspace --locked -- --test-threads=4`: 167 test binaries, 3307
 passed, 0 failed, 22 ignored. CI on the same head passed on Linux and macOS (run 38204821696) and
 Windows (run 38204821646).
+
+### 2026-10-15 — Replication on lanes; memory charged as it is held; a session past a million writes in a 2 GiB envelope keeps retiring, sealing and committing
+
+The landing of `native-memory-kinds` onto `f26-metrics` (`ad3ddb16..e559544a`, 34 commits), measured with
+the work queue's real workload (`focal-load` `lifecycle: deliver`: eight writes a message, two principals,
+the issuer releasing the claim's scope at the end) at 4,000 writes a second, past a million writes, on one
+node whose envelope is 2 GiB (`node.memory_bytes`; its session takes half, 1,074 MB, its native share
+939.5 MB).
+
+**Replication on lanes.** A group's replication goes on hyper-transport lanes, answered by Raft alone
+(`8f3ec4a8`, `7a12c99b`, `af37bbab`, `2c68b583`). The ack clock first counted an unanswered message's age as
+its peer's lateness and renewed check-quorum's patience every tick up to its cap (about 20 s), so a deafened
+or isolated leader never stood down within the fleet tests' budgets; patience is now taken from answers
+alone (`c8bd0ee3`). The lossy-path test runs its burst under every replication profile, so the ordered one
+keeps its teeth (`a35a3dbb`).
+
+**Memory charged as it is held.** Completion, a write's preparation and a count's bound are charged what
+they hold as they hold it, with no prepaid pool and no promised bytes (`ce1576d9`, `ed15bac3`, `b0a1bcb8`).
+A payload log's window grows to what its session can spare, its writer keeps and stays charged for what it
+failed to write, and a written range is found by a search of the window (`fb89a23f`, `25bb266e`,
+`779f9830`, `fc02b5ab`). The young generation sizes itself to a quarter of a session's memory, keeps every
+spill it puts off, finds a lost row again, and tracks a key in 17 bytes (`095e056d`, `a779216d`,
+`67eef3ec`). A native read is charged its page object by object: a precharge of 32 client frames per read
+(about 33.5 MB) refused every read beside 8.5 MB of other requests, and 1,484 lifecycles were abandoned on
+it (`364804f1`, `545fda69`).
+
+**Sealing and retirement that keep pace.**
+- An archive bundle is sealed under the content store's bound. Sealed as an inline import, every bundle
+  past 1 MiB was refused, and writes stopped at the outcome bound (`f742bf59`).
+- A committed anchored seal is applied in place on an owner with nothing pending (`23d535fb`).
+- The deliver lifecycle releases its scope, so a delivered message's family may retire (`34937d55`).
+- A family is dated by when its session's records settled, from a sparse sample of committed sequences and
+  logical times on the authority (`archive_derive::Settled`). It was dated by its last outcome, which an
+  anchored seal takes out of the core within seconds; every walk past a sealed one failed (`Corrupt`), went
+  back to its first family and rested the interval, and no family retired (`97978af9`, `aee9863a`).
+- A retirement is staged on the completion lane (`eed270a3`).
+- A session retires once its ordinary headroom is under a quarter of its allowance, before its young
+  generation spills at an eighth, keeping room for what a checkpoint's frozen image pins (`e559544a`).
+- A collector passes over a file gone since its walk listed it. A checkpoint's commit renames its seed
+  batch off the owner, and the seed sweep took a renamed file for an I/O failure; it failed the store, and
+  the next checkpoint stopped the session (`104c3033`).
+- A failed retirement walk keeps its cursor and is asked again after 20 ms, doubling up to the interval, and
+  walks and seal rounds that fail are counted (`walks_failed`, `seals_failed`).
+
+**Workload and measurement.** `focal-load` delivers messages end to end and the comparison measures a work
+queue's message (`6efdc08a`, `896e9d07`, `916d9572`, `2e0627a2`); offered load is paced exactly (`e1c83aa4`);
+the offered-rate measurement prints its whole report where a write did not commit (`cff69568`). A session's
+native memory is reported kind by kind in its replica diagnostics (`e7a38a65`); the metrics page lists the
+node's charge by kind and no session's, so a node of a three-host fleet lists all its sessions again
+(`7b30621f`).
+
+The 2 GiB runs, each 4 × 125 lifecycles a second for up to 600 s (harness `wq-env-run3.sh`; binaries' hashes
+kept with each run):
+
+| Run | Code | Committed | Refused | Unknown | Retired | Note |
+|---|---|---|---|---|---|---|
+| env-1 | before dating | 696,401 | 64,218 | 0 | 0 | memory full at 939 MB; 4 writes/s at the end |
+| env-2 | `aee9863a` | 1,024,813 | 26,822 | 0 | 63,787 | no collapse; 641 walks failed for memory |
+| env-3 | `eed270a3` | 1,036,535 | 24,637 | 0 | 61,968 | each memory peak within a checkpoint's encode |
+| env-5 | water at a quarter | 1,182,466 | 3,704 | 0 | 97,919 | every scheduled lifecycle done in 307 s |
+| env-6 | `e559544a` | 1,198,506 | 329 | 0 | 101,678 | no stop; another workload held 16 of 18 cores |
+
+env-4, the water mark before `104c3033`, stopped at 1,063,183 writes on the seed sweep's failure.
+Retirement on the owner now takes about a fifth of its time. A walk derives each family, reading its spilled
+events back, and the custody collector reads every retired family's frame through the owner at every pass,
+a whole chunk read and hashed for each, against a list deduplicated one by one. Write latency rose with it
+(env-5: p50 176 ms, p99 2.04 s; the same load with no envelope, nothing retiring: 24 ms and 123 ms). Moving the collector's read
+off the owner and making it incremental is the next batch.
+
+The gate on the landing tree (head `e559544a`, macOS 26.4.1 arm64, under another workload's load: a
+virtual machine holding 16 of the 18 cores, load average 42 to 47), exit 0: `cargo fmt --all --check`,
+`python3 scripts/check-contracts.py` (1564 links, 37 source hashes, 15 vocabularies),
+`bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`,
+`bash scripts/check-production.sh` (1184 production sources, no policy allowance, no runtime recursion),
+`cargo deny check advisories bans licenses sources`, and
+`bash scripts/cargo.sh test --workspace --locked --no-fail-fast -- --test-threads=4`: 167 test binaries,
+3462 passed, 0 failed, 31 ignored.
