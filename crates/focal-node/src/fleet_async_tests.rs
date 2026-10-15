@@ -386,7 +386,19 @@ fn host_stop_reaches_retained_ready_and_expires_unknown_under_pinned_wal_budget(
     focal_rt::block_on(async move {
         let path = tempfile::tempdir().unwrap();
         let fixture = fixture(path.path(), 2);
+        let host = fixture.hosts[&ledger(1)].clone();
+        let mut observation = host.progress.clone();
+        observation.borrow_and_update();
+        let mut unrelated = observation.clone();
+        let observed: Vec<&ReplicaHost> = fixture.hosts.values().collect();
+        let step = TICK * crate::test_waits::STEP;
         settle(&fixture).await;
+        // The reads published progress before this write existed. A notification by itself
+        // cannot establish that the write reached a retained Ready.
+        crate::test_waits::within(&observed, step, TICK, unrelated.changed())
+            .await
+            .unwrap()
+            .unwrap();
         let pressure = fixture
             .wal_budget
             .reserve(
@@ -395,34 +407,39 @@ fn host_stop_reaches_retained_ready_and_expires_unknown_under_pinned_wal_budget(
                 fixture.wal_budget.stats().limit - fixture.wal_budget.stats().used,
             )
             .unwrap();
-        let host = fixture.hosts[&ledger(1)].clone();
-        let mut observation = host.progress.clone();
-        observation.borrow_and_update();
-        let write = focal_rt::spawn(async move {
-            dispatch(
-                &host,
-                peer(),
-                envelope(
-                    1,
-                    Operation::OpenEpoch {
-                        epoch: RequestEpoch(1),
-                    },
-                ),
-                &ReplicaHost::wire_limits(),
-            )
-            .await
+        let waits = host.progress().waits_asked;
+        let wire = ReplicaHost::wire_limits();
+        let mut write = Box::pin(dispatch(
+            &host,
+            peer(),
+            envelope(
+                1,
+                Operation::OpenEpoch {
+                    epoch: RequestEpoch(1),
+                },
+            ),
+            &wire,
+        ));
+        // Queue the actual request before waiting for its owner, independently of when a
+        // spawned caller would first run. The WAL stays pinned, so it cannot be answered.
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(write.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
         })
-        .unwrap();
-        let observed: Vec<&ReplicaHost> = fixture.hosts.values().collect();
-        let step = TICK * crate::test_waits::STEP;
-        crate::test_waits::within(&observed, step, TICK, observation.changed())
-            .await
-            .expect("the session's progress changed")
-            .unwrap();
+        .await;
+        crate::test_waits::within(&observed, step, TICK, async {
+            while host.progress().waits_asked <= waits {
+                observation.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the owner observed its retained Ready waiting on the pinned WAL");
         let stopped =
             crate::test_waits::within(&observed, step, TICK, fixture.hosts[&ledger(1)].stop())
                 .await;
-        let result = write.await.unwrap();
+        let result = write.as_mut().await;
+        drop(write);
+        drop(host);
         drop(pressure);
         let other = dispatch(
             &fixture.hosts[&ledger(2)],
