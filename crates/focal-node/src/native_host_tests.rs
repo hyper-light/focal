@@ -17,6 +17,67 @@ use focal_wire::*;
 #[path = "native_written_tests.rs"]
 mod written_tests;
 
+#[test]
+fn terminal_disposal_frames_can_enter_when_fresh_work_has_filled_its_lane() {
+    use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
+    let ledger = LedgerId {
+        tenant: TenantId::from_u128(1),
+        session: SessionId::from_u128(2),
+    };
+    let expected = binding(ledger, 100);
+    let budget = MemoryBudget::new(16 * 1024, 4 * 1024).unwrap();
+    let ordinary = budget
+        .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 12 * 1024)
+        .unwrap()
+        .commit();
+    assert!(
+        budget
+            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 1)
+            .is_err()
+    );
+    for command in [
+        NativeCommand::Cancel { expected },
+        NativeCommand::ReleaseScope { expected },
+        NativeCommand::CancelMonitor {
+            expected,
+            receipt: None,
+            id: MonitorId::from_u128(200),
+        },
+    ] {
+        let input = NativeInput {
+            request: RequestKey {
+                principal: ParticipantId::from_u128(3),
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(4),
+            },
+            command,
+        };
+        let encoded = frame(ledger, &input);
+        let admission = budget
+            .reserve(
+                BudgetKind::Pending,
+                crate::native_ingress::lane(&encoded),
+                512,
+            )
+            .unwrap();
+        drop(admission);
+    }
+    let post = NativeInput {
+        request: RequestKey {
+            principal: ParticipantId::from_u128(3),
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(5),
+        },
+        command: NativeCommand::Post { expected },
+    };
+    assert_eq!(
+        crate::native_ingress::lane(&frame(ledger, &post)),
+        BudgetLane::Ordinary
+    );
+    drop(ordinary);
+    assert_eq!(budget.stats().used, 0);
+}
+
 fn settings(root: &std::path::Path) -> Settings {
     let mut settings = Settings::default();
     settings.node.data_dir = Some(root.to_owned());

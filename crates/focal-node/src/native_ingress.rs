@@ -43,10 +43,10 @@ pub(crate) fn evaluation_artifact_of_frame(
         .map_err(|_| AccessError::InvalidRequest)
 }
 /// Completion-class commands ride the completion lane like their legacy
-/// counterparts; creation, posting and monitors stay ordinary.
+/// counterparts; creation, posting, monitor registration and rebinding stay ordinary.
 pub(crate) fn lane(frame: &[u8]) -> BudgetLane {
     match inspect_native_frame(frame) {
-        Ok(header) if matches!(header.command, 0..=2 | 23..=27) => BudgetLane::Ordinary,
+        Ok(header) if matches!(header.command, 0 | 2 | 24 | 25 | 27) => BudgetLane::Ordinary,
         Ok(_) => BudgetLane::Completion,
         Err(_) => BudgetLane::Ordinary,
     }
