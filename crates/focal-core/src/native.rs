@@ -294,6 +294,13 @@ impl NativeState {
     /// Directed delivery facts: a posted claim to its subject, a posted response to its
     /// claimant. The claim's participants are immutable and replay verifies that invariant.
     fn delivery_recipient(&self, event: NativeEvent) -> Result<Option<ParticipantId>, NativeError> {
+        self.delivery_recipient_from(event, self.payloads())
+    }
+    fn delivery_recipient_from(
+        &self,
+        event: NativeEvent,
+        payloads: Option<&dyn payloads::PayloadRead>,
+    ) -> Result<Option<ParticipantId>, NativeError> {
         let (id, to_subject) = match event.fact {
             NativeFact::Claim(claim) if claim.kind == NativeEventKind::Posted => {
                 (ClaimId(claim.after.object.0), true)
@@ -310,7 +317,7 @@ impl NativeState {
                 Some(claim) => (claim.issuer(), claim.subject()),
                 None => {
                     let at = stored.logged().ok_or(ContractError::InvalidManifest)?;
-                    self.with_spilled(at, |bytes| {
+                    with_spilled(payloads, at, |bytes| {
                         record_codec::claim_participants(id, bytes, self.ledger)
                     })?
                 }
@@ -2838,7 +2845,7 @@ impl Core<NativeState> {
     /// or one whose memory was refused): a walk of every event, once.
     pub fn build_event_index(&mut self) {
         if !self.state.events.complete() {
-            self.state.events = event_index::EventIndex::build(&self.state);
+            self.state.events = event_index::EventIndex::build(&self.state, self.state.payloads());
         }
     }
     /// What the rows take in a checkpoint once `prepared` publishes, each replaced or deleted row

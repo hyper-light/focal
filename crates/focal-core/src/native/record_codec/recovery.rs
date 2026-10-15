@@ -404,9 +404,10 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
         },
         limits: limits.native,
     };
-    // Its event index, built from the restored rows (doc 31 M2); where its charge is refused it
-    // waits, unbuilt, for the next retirement to build it.
-    core.build_event_index();
+    // Hydration may already have spilled events and claims through this borrowed log. The
+    // caller attaches its owned handle after return; index construction must use it now too.
+    // Where its charge is refused it waits, unbuilt, for the next retirement to build it.
+    core.state.events = crate::native::event_index::EventIndex::build(&core.state, payloads);
     Ok((core, envelope))
 }
 /// Rows hydrated from a frame and validated as a whole, not yet laid out:

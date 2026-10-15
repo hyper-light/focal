@@ -12,6 +12,50 @@ fn id(value: u128) -> ClaimId {
 }
 
 #[test]
+fn delivery_index_survives_a_spilling_checkpoint_install() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ckpt::store(directory.path());
+    let mut source = f::core();
+    f::publish(&mut source, 10, f::creation(1, 1, &[], None));
+    let binding = binding_of(&source, 1);
+    f::publish(&mut source, 20, f::post(2, binding));
+    let subject = source.native_claim(id(1)).unwrap().subject();
+    let expected = source
+        .native_deliveries_from(subject, None)
+        .unwrap()
+        .collect::<Vec<_>>();
+    let bytes = ckpt::encode(&source);
+    let log = super::payloads::MemoryPayloads::default();
+    let mut restored = recovery::restore_spilling(
+        &ckpt::inspect(&bytes),
+        RangeId(91),
+        ckpt::limits(source.limits),
+        ckpt::budget(),
+        &store,
+        &BuiltinNativeSchemas,
+        Some(&log),
+    )
+    .unwrap();
+    let (sequence, ordinal) = expected[0];
+    assert!(matches!(
+        restored.state.rows.get(&Key::Event(sequence, ordinal)),
+        Some(Row::Event(OwnedEvent::Logged(_)))
+    ));
+    restored.attach_payload_log(Box::new(log));
+    let got = restored
+        .native_deliveries_from(subject, None)
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        got, expected,
+        "the same log used during install must build the delivery index"
+    );
+    for (sequence, ordinal) in got {
+        assert!(restored.native_event(sequence, ordinal).is_some());
+    }
+}
+
+#[test]
 fn delivery_index_rebuilds_from_spilled_claim_headers_and_retires_with_the_family() {
     let mut core = f::core();
     core.attach_payload_log_with_young(Box::new(super::payloads::MemoryPayloads::default()), 0);

@@ -264,7 +264,7 @@ impl EventIndex {
     }
     /// The index of every event `rows` hold under `ledger`, charged to `budget` before it is
     /// built; where the charge is refused, or a row is not an event, it stays unbuilt.
-    pub(super) fn build(state: &NativeState) -> Self {
+    pub(super) fn build(state: &NativeState, payloads: Option<&dyn payloads::PayloadRead>) -> Self {
         let rows = &state.rows;
         let budget = &state.budget;
         let mut count = 0u32;
@@ -294,13 +294,13 @@ impl EventIndex {
                 break;
             };
             let event = match &entry.value {
-                Row::Event(stored) => stored.get(state.ledger, state.payloads()),
+                Row::Event(stored) => stored.get(state.ledger, payloads),
                 _ => None,
             };
             let Some(event) = event else {
                 return Self::unbuilt();
             };
-            let Ok(recipient) = state.delivery_recipient(event) else {
+            let Ok(recipient) = state.delivery_recipient_from(event, payloads) else {
                 return Self::unbuilt();
             };
             index.file(home(event), recipient, Position { sequence, ordinal });
