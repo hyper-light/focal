@@ -1732,7 +1732,7 @@ fn a_publication_while_a_sweep_goes_on_keeps_its_segments() {
     // A candidate let go unpublished: its plan's spills are named by nothing, and go.
     drop(prepare(&core, create(8, vec![proposal(8, 10_008)]), &[]));
     let held = core.payload_log().unwrap().held_segments();
-    assert!(core.sweep_payloads() > 0);
+    assert!(core.sweep_payloads().is_some_and(|swept| swept > 0));
     assert!(core.payload_log().unwrap().held_segments() < held);
     assert_eq!(checkpoint(&core), reference);
 }
@@ -1780,7 +1780,7 @@ fn a_pass_that_cannot_be_charged_for_its_notes_sweeps_nothing() {
             }
         }
     }
-    assert_eq!(core.sweep_payloads(), 0);
+    assert_eq!(core.sweep_payloads(), None, "a pass that fell short swept");
     assert_eq!(core.payload_sweep().short, 1);
     assert_eq!(core.payload_sweep().let_go, 0);
     assert_eq!(core.payload_log().unwrap().held_segments(), held);
@@ -1791,7 +1791,7 @@ fn a_pass_that_cannot_be_charged_for_its_notes_sweeps_nothing() {
         "a pass that fell short kept a charge"
     );
     assert_eq!(checkpoint(&core), reference);
-    assert!(core.sweep_payloads() > 0);
+    assert!(core.sweep_payloads().is_some_and(|swept| swept > 0));
     assert!(core.payload_log().unwrap().held_segments() < held);
     assert_eq!(checkpoint(&core), reference);
     assert!(

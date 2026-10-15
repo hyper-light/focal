@@ -2347,12 +2347,12 @@ impl Core<NativeState> {
     }
     /// The sweep a pass that has visited every row allows (doc 31 M3): the segments sealed before
     /// it began that no row it visited, no row published since it began and none of `pending` (a
-    /// leader's pending candidates' rows) names let go; none where the pass could not be charged for
-    /// what it met. How many.
+    /// leader's pending candidates' rows) names let go. How many; none where the pass could not be
+    /// charged for what it met, which swept nothing (`payloads::SweepStep::Short`).
     pub(in crate::native) fn sweep_marked<'a>(
         &mut self,
         pending: impl Iterator<Item = &'a Row>,
-    ) -> usize {
+    ) -> Option<usize> {
         let NativeState {
             payloads,
             marks,
@@ -2360,14 +2360,17 @@ impl Core<NativeState> {
             ..
         } = &mut self.state;
         if !marks.running() {
-            return 0;
+            return Some(0);
         }
         marks.pending(pending, budget);
-        let swept = match (marks.end(), payloads.as_deref()) {
-            (Some(from), Some(log)) => log.sweep(&|segment| marks.names(segment), from),
-            _ => 0,
-        };
-        marks.let_go(swept);
+        let swept = marks.end().map(|from| {
+            payloads
+                .as_deref()
+                .map_or(0, |log| log.sweep(&|segment| marks.names(segment), from))
+        });
+        if let Some(segments) = swept {
+            marks.swept(segments);
+        }
         marks.clear();
         swept
     }
@@ -2375,25 +2378,41 @@ impl Core<NativeState> {
     pub fn payload_sweep(&self) -> payloads::PayloadSweep {
         self.state.marks.done()
     }
-    /// One step of the payload log's sweep for a core without candidates: how many segments it
-    /// let go of when its pass ended, none while one goes on or none is due.
-    pub fn sweep_payloads_step(&mut self, due: bool) -> Option<usize> {
+    /// One step of the payload log's sweep for a core without candidates ([`payloads::SweepStep`]).
+    pub fn sweep_payloads_step(&mut self, due: bool) -> payloads::SweepStep {
         if self.mark_payloads(due) {
-            Some(self.sweep_marked(std::iter::empty()))
+            match self.sweep_marked(std::iter::empty()) {
+                Some(segments) => payloads::SweepStep::Swept(segments),
+                None => payloads::SweepStep::Short,
+            }
+        } else if self.state.marks.running() {
+            payloads::SweepStep::Going
         } else {
-            None
+            payloads::SweepStep::Idle
         }
     }
     /// A whole pass of the payload log's sweep and its sweep, now: for a core no session steps (a
-    /// restore's, a test's). A pass under way goes on to its end. How many segments it let go of.
-    pub fn sweep_payloads(&mut self) -> usize {
+    /// restore's, a test's). A pass under way goes on to its end. How many segments it let go of;
+    /// none where the pass fell short.
+    pub fn sweep_payloads(&mut self) -> Option<usize> {
         let steps = payloads::pass_steps(self.state.rows.len());
         for _ in 0..steps {
             if self.mark_payloads(true) {
                 return self.sweep_marked(std::iter::empty());
             }
         }
-        0
+        Some(0)
+    }
+    /// Whether enough rows were written since the last pass that swept began to make another due
+    /// though the log has not grown ([`payloads::CHURN_SHARE`]).
+    pub fn payload_churned(&self) -> bool {
+        self.state.marks.churned_enough(self.state.rows.len())
+    }
+    /// Refuse, or allow again, the growth of the payload sweep's notes, as a budget out of memory
+    /// does: every pass that must grow them falls short (a session's tests).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refuse_payload_marks(&mut self, refuse: bool) {
+        self.state.marks.refuse_growth(refuse);
     }
     pub fn native_sequence(&self) -> SessionSeq {
         SessionSeq(self.state.rows.prefix())
@@ -2712,6 +2731,8 @@ impl Core<NativeState> {
             });
         }
         self.state.encoded_rows = encoded;
+        // What it replaced or deleted may have left spilled copies no row names (doc 31 M3).
+        self.state.marks.churned(writes.len());
         self.file_events(outcome, events);
         self.spill_published(&writes);
         Ok(outcome)

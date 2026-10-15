@@ -10,6 +10,10 @@ const DISK_SAMPLE_INTERVAL: u32 = 32;
 /// The most of a stopped session's cause it keeps: an error's text runs to a
 /// line, its detail named once.
 const FAILURE_TEXT: usize = 512;
+/// The most steps a payload sweep whose pass fell short waits before the next may begin (doc 31
+/// M3): the wait doubles from one step with each pass that falls short, so a sweep short of memory
+/// tries again at a bounded cadence whatever the log does, and never walks the root back to back.
+pub(crate) const SWEEP_RETRY_STEPS: u32 = 1024;
 
 pub(super) struct Pending {
     pub(super) candidate: NativeCandidate,
@@ -95,9 +99,17 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// Committed retirement records this replica applied nothing for since
     /// it opened; a diagnostic, never an input to state.
     pub(super) retirements_inert: u64,
-    /// The segments the payload log held after its last sweep (doc 31 M3): a retirement sweeps
-    /// again once the log has sealed another past them.
+    /// The segments the payload log held after its last sweep (doc 31 M3): another pass is due
+    /// once the log has sealed two past them. A pass that fell short swept nothing and leaves it.
     pub(super) payload_segments_swept: usize,
+    /// The steps the payload sweep waits before a pass may begin, after one fell short, and what
+    /// it waited the last time ([`SWEEP_RETRY_STEPS`]).
+    pub(super) payload_sweep_wait: u32,
+    pub(super) payload_sweep_backoff: u32,
+    /// Segments of this many bytes in the payload log the session opens, for the tests of a log
+    /// at its segment cap.
+    #[cfg(test)]
+    pub(crate) payload_segment_bytes: Option<u64>,
     /// Where the replica keeps its payload log, and how many times it could not be opened
     /// there: a replica without one holds every row's bytes until it opens.
     pub(super) payload_source: Option<super::payloads::PayloadSource>,
@@ -307,6 +319,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             retired_families: 0,
             retirements_inert: 0,
             payload_segments_swept: 0,
+            payload_sweep_wait: 0,
+            payload_sweep_backoff: 0,
+            #[cfg(test)]
+            payload_segment_bytes: None,
             payload_source: payloads,
             payload_open_refusals,
             seal: None,
@@ -577,7 +593,14 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if has_log {
             return;
         }
-        let log = match super::payloads::FilePayloads::open(source, &self.budget) {
+        #[cfg(test)]
+        let opened = match self.payload_segment_bytes {
+            Some(bytes) => super::payloads::FilePayloads::open_with(source, &self.budget, bytes),
+            None => super::payloads::FilePayloads::open(source, &self.budget),
+        };
+        #[cfg(not(test))]
+        let opened = super::payloads::FilePayloads::open(source, &self.budget);
+        let log = match opened {
             Ok(log) => log,
             Err(_) => {
                 self.payload_open_refusals = self.payload_open_refusals.saturating_add(1);
@@ -632,51 +655,73 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.step_payload_sweep();
     }
     /// One step of the payload log's sweep ([`Self::sweep_payloads_if_due`]), the log as it is:
-    /// what each applied batch of entries takes, never opening a log that could not open.
+    /// what each delivery takes, never opening a log that could not open. A pass is due once the
+    /// log has sealed two segments past the last sweep, or once rows an eighth of the root were
+    /// written since the last pass that swept began
+    /// (`focal_core::native::payloads::CHURN_SHARE`): a retirement or a deletion leaves spilled
+    /// copies no row names without sealing a segment, and a log at its segment cap seals none. A
+    /// pass that fell short for want of memory swept nothing and is not taken for a sweep: the next
+    /// is as due, after a wait that doubles with each that falls short ([`SWEEP_RETRY_STEPS`]).
+    /// Taken for one, a passing memory refusal left a log at its cap unswept for good, its
+    /// segments counted swept and no two more ever to be sealed.
     pub(super) fn step_payload_sweep(&mut self) {
+        use focal_core::native::payloads::SweepStep;
         let held = |core: &Core<NativeState>| {
             core.payload_log()
                 .map_or(0, focal_core::native::payloads::PayloadLog::held_segments)
         };
-        let due = |core: &Core<NativeState>, swept: usize| held(core) > swept.saturating_add(1);
+        let waiting = self.payload_sweep_wait != 0;
+        self.payload_sweep_wait = self.payload_sweep_wait.saturating_sub(1);
         let swept = self.payload_segments_swept;
-        let after = match self.domain.as_mut() {
+        let due = |core: &Core<NativeState>| {
+            !waiting && (held(core) > swept.saturating_add(1) || core.payload_churned())
+        };
+        let (step, after) = match self.domain.as_mut() {
             Some(Domain::Passive(core)) => {
-                let due = due(core, swept);
-                core.sweep_payloads_step(due).map(|_| held(core))
+                let due = due(core);
+                (core.sweep_payloads_step(due), held(core))
             }
             Some(Domain::Active(owner, _)) => {
-                let due = due(owner.committed_core(), swept);
-                owner
-                    .sweep_payloads_step(due)
-                    .map(|_| held(owner.committed_core()))
+                let due = due(owner.committed_core());
+                let step = owner.sweep_payloads_step(due);
+                (step, held(owner.committed_core()))
             }
-            None => None,
+            None => return,
         };
-        if let Some(after) = after {
-            self.payload_segments_swept = after;
+        match step {
+            SweepStep::Swept(_) => {
+                self.payload_segments_swept = after;
+                self.payload_sweep_backoff = 0;
+            }
+            SweepStep::Short => {
+                self.payload_sweep_backoff = self
+                    .payload_sweep_backoff
+                    .saturating_mul(2)
+                    .clamp(1, SWEEP_RETRY_STEPS);
+                self.payload_sweep_wait = self.payload_sweep_backoff;
+            }
+            SweepStep::Idle | SweepStep::Going => {}
         }
     }
     /// A whole pass of the payload log's sweep, now: after a restore, whose rows spilled afresh
     /// to segments of their own, so what the core it replaced spilled is named by nothing.
     pub(super) fn sweep_payloads_now(&mut self) {
         self.open_payload_log();
-        let held = match self.domain.as_mut() {
-            Some(Domain::Passive(core)) => {
-                core.sweep_payloads();
-                core.payload_log()
-                    .map_or(0, focal_core::native::payloads::PayloadLog::held_segments)
-            }
+        let held = |core: &Core<NativeState>| {
+            core.payload_log()
+                .map_or(0, focal_core::native::payloads::PayloadLog::held_segments)
+        };
+        let swept = match self.domain.as_mut() {
+            Some(Domain::Passive(core)) => core.sweep_payloads().map(|_| held(core)),
             Some(Domain::Active(owner, _)) => {
-                owner.sweep_payloads();
-                owner
-                    .committed_core()
-                    .payload_log()
-                    .map_or(0, focal_core::native::payloads::PayloadLog::held_segments)
+                owner.sweep_payloads().map(|_| held(owner.committed_core()))
             }
             None => return,
         };
-        self.payload_segments_swept = held;
+        // A pass that fell short swept nothing: the steps that follow try again.
+        if let Some(held) = swept {
+            self.payload_segments_swept = held;
+        }
     }
     /// The chunks of the latest checkpoint seed, sorted.
     pub(crate) fn seed_chunks(&self) -> &[ContentHash] {

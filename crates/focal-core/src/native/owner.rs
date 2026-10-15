@@ -1355,24 +1355,35 @@ impl NativeOwner {
         self.core.attach_payload_log(log);
     }
     /// One step of the payload log's sweep (doc 31 M3, [`Core::sweep_payloads_step`]): the
-    /// segments the pending candidates' rows name kept as the committed rows' are. How many
-    /// segments it let go of when its pass ended, none while one goes on or none is due.
-    pub fn sweep_payloads_step(&mut self, due: bool) -> Option<usize> {
-        if !self.core.mark_payloads(due) {
-            return None;
+    /// segments the pending candidates' rows name kept as the committed rows' are.
+    pub fn sweep_payloads_step(&mut self, due: bool) -> super::payloads::SweepStep {
+        if self.core.mark_payloads(due) {
+            match self.core.sweep_marked(pending_rows(&self.pending)) {
+                Some(segments) => super::payloads::SweepStep::Swept(segments),
+                None => super::payloads::SweepStep::Short,
+            }
+        } else if self.core.state.marks.running() {
+            super::payloads::SweepStep::Going
+        } else {
+            super::payloads::SweepStep::Idle
         }
-        Some(self.core.sweep_marked(pending_rows(&self.pending)))
+    }
+    /// Refuse, or allow again, the growth of the payload sweep's notes
+    /// ([`Core::refuse_payload_marks`], a session's tests).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refuse_payload_marks(&mut self, refuse: bool) {
+        self.core.refuse_payload_marks(refuse);
     }
     /// A whole pass of the payload log's sweep, now ([`Core::sweep_payloads`]), the pending
-    /// candidates' segments kept. How many segments it let go of.
-    pub fn sweep_payloads(&mut self) -> usize {
+    /// candidates' segments kept. How many segments it let go of; none where it fell short.
+    pub fn sweep_payloads(&mut self) -> Option<usize> {
         let steps = super::payloads::pass_steps(self.core.state.rows.len());
         for _ in 0..steps {
             if self.core.mark_payloads(true) {
                 return self.core.sweep_marked(pending_rows(&self.pending));
             }
         }
-        0
+        Some(0)
     }
 
     /// The most a checkpoint of the committed root, with every pending

@@ -943,7 +943,9 @@ Each stage lands on its own, measured:
      - **Now (`payloads::Marks`).**
        - A pass over every committed row, of every kind, a bounded step at each applied batch:
          4,096 rows a step, a few tens of microseconds. A pass begins once the log has sealed
-         two segments since the last.
+         two segments since the last pass that swept, or once rows an eighth of the root were
+         written since that pass began (`CHURN_SHARE`): retirements and deletions leave copies
+         no row names without sealing a segment, and a log at its segment cap seals none.
        - Rows spilled while it goes on land where appends go, from where it began, so its sweep
          lets go only of segments sealed before it began.
        - A publication while it goes on names its rows' segments to it. A candidate prepared
@@ -953,7 +955,9 @@ Each stage lands on its own, measured:
          grows, a doubling at a time on the completion lane, its charge admitted first and kept
          with the room between passes. A pass that cannot be charged for a segment it meets sweeps
          nothing (its notes are incomplete) and the next begins afresh; the log's sweep reads the
-         notes in place, with no copy.
+         notes in place, with no copy. A pass that fell short is not taken for a sweep
+         (`SweepStep::Short`): the next is as due, after a wait that doubles from one step with
+         each that falls short, to 1,024 at most (`SWEEP_RETRY_STEPS`).
        - The replica's diagnostics report the passes, the segments let go, the passes that fell
          short, and the bytes the last pass saw its rows name (`payload_passes`,
          `payload_let_go`, `payload_short`, `payload_named` beside `payload_bytes`). The last is
@@ -970,10 +974,22 @@ Each stage lands on its own, measured:
        pass of env-9 still found 321 MB named and no segment empty: something in every old
        segment outlives retirement. That decides the fix: retire or seal what pins them, or a
        cleaner that waits for the store's pages and keeps what it moves apart from new writes.
+     - **A pass that fell short was taken for a sweep (review).** The replica counted the log's
+       segments as swept when a pass ended, short or not, and the next pass waited for two more
+       to be sealed. A log at its segment cap seals none, so a passing memory refusal stopped its
+       reclamation for good. Now the pass says it fell short, the replica tries again at the
+       bounded cadence above, and rows written make a pass due without the log growing.
+     - **What a retirement leaves.** In a session at its cap, a finished family's retirement left
+       its oldest segments named by its requests' outcomes and creation results. A seal takes
+       those once their generation closes, as the archive's seals do in a running node.
      - **Tested.** A sweep keeps the segment of every committed row of any kind (a log whose
        every append is a segment of its own; it fails with events alone named). A candidate
        published after a pass's last step keeps its segments (it fails without the
-       publication's word), and what an unpublished one spilled goes.
+       publication's word), and what an unpublished one spilled goes. A session's log at its cap
+       of 256 segments, every pass short while finished families and then open claims fill it,
+       the families retired and their generation sealed: once memory is back, 12 dead segments
+       are let go within the longest wait and one pass, no segment sealed (10 passes fell short;
+       it fails with the short pass taken for a sweep).
 4. **M4, durability classes.**
    - Memory-quorum acknowledgement with a bounded background flush; the disk class kept.
    - Measure: p99 at 1k, 4k and 12k/s against Kafka, NATS and Redis.

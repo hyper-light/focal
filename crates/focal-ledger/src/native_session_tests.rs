@@ -1353,6 +1353,155 @@ fn fill_to_the_bound(
     }
 }
 
+/// Refuse, or allow again, the growth of the payload sweep's notes in `session`'s core, as a
+/// budget out of memory does.
+fn refuse_marks(session: &mut NativeSession<BuiltinNativeSchemas>, refuse: bool) {
+    match session.engine.domain.as_mut() {
+        Some(super::engine::Domain::Active(owner, _)) => owner.refuse_payload_marks(refuse),
+        Some(super::engine::Domain::Passive(core)) => core.refuse_payload_marks(refuse),
+        None => panic!("no domain"),
+    }
+}
+
+/// A payload log at its segment cap whose sweep fell short for want of memory lets go of its dead
+/// segments once memory is back, sealing no segment to get there. A pass that fell short was
+/// taken for a sweep: the log's segments were counted as swept, the next pass waited for two more
+/// to be sealed, and a log at its cap seals none, so a passing memory refusal stopped its
+/// reclamation for good. Here every pass falls short while finished families and then open
+/// claims fill the log to its cap, the families retire, and memory comes back.
+#[test]
+fn a_payload_log_at_its_cap_lets_go_of_dead_segments_after_a_sweep_fell_short() {
+    const SEGMENT: u64 = 1024;
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(1 << 30, 64 << 20).unwrap();
+    let mut session = open_with(dir.path(), &parent, limits()).unwrap();
+    // The log the session opened, empty yet, opened again with segments a test can fill.
+    assert_eq!(session.engine.payload_bytes(), 0);
+    drop(session.engine.take_payload_log());
+    session.engine.payload_segment_bytes = Some(SEGMENT);
+    session.engine.open_payload_log();
+    lead(&mut session);
+    refuse_marks(&mut session, true);
+    // Families finished first: the oldest segments hold what they spilled.
+    let families: Vec<u128> = (0..8).map(|n| 100_000 + n).collect();
+    let mut request = 1u128;
+    for claim in &families {
+        finished_family(&mut session, request, *claim);
+        request += 3;
+    }
+    // The principal closes their generation from its next, as a client moves on: what the
+    // families' requests left is the closed generation's, to be sealed.
+    let mut advance = NativeInput {
+        request: key(request),
+        command: NativeCommand::AdvanceEpochFloor {
+            minimum: RequestEpoch(2),
+        },
+    };
+    advance.request.epoch = RequestEpoch(2);
+    commit(&mut session, advance, "the generation's close");
+    request += 1;
+    // Open claims until the log holds its most segments.
+    let mut claim = 200_000u128;
+    while session.engine.payload_segments() < super::payloads::MAX_SEGMENTS {
+        assert!(
+            claim < 204_000,
+            "the log never reached its cap: {} segments, {} bytes",
+            session.engine.payload_segments(),
+            session.engine.payload_bytes()
+        );
+        let mut input = create(request, claim);
+        input.request.epoch = RequestEpoch(2);
+        commit(&mut session, input, "a creation toward the cap");
+        request += 1;
+        claim += 1;
+    }
+    // The finished families retire: nothing names what they spilled now.
+    for (at, root) in families.iter().enumerate() {
+        let root = ClaimId::from_u128(*root);
+        let family = session
+            .committed_core()
+            .unwrap()
+            .retirement_family(root)
+            .unwrap();
+        let offer = focal_core::native::retirement_batch::RetireOffer {
+            root,
+            family: focal_core::native::retirement_batch::family_digest(ledger(), &family).unwrap(),
+            bundle: ContentHash([u8::try_from(at + 1).unwrap(); 32]),
+            bytes: 4096,
+        };
+        let (batch, submission) = session.retire(&[offer]).unwrap();
+        let Some(NativeSubmission::Pending { outcome, .. }) = submission else {
+            panic!("the retirement of {root:?} was refused: {batch:?}, {submission:?}");
+        };
+        let committed = (0..16).any(|_| {
+            session
+                .poll()
+                .unwrap()
+                .committed
+                .iter()
+                .any(|commit| commit.outcome == outcome)
+        });
+        assert!(committed, "the retirement of {root:?} never committed");
+    }
+    // What retirement leaves of the families, the outcomes and creation results of their closed
+    // generation, a seal takes, as the archive's seals take them in a running node.
+    {
+        let (plan, bundle, length) = {
+            let core = session.committed_core().unwrap();
+            let floors = core.pressure_floors(super::seal::MAX_FLOORS).unwrap();
+            let plan = core
+                .seal_plan(
+                    &floors,
+                    focal_core::native::seal::SealBound {
+                        principals: core.native_limits().principals,
+                        rows: focal_core::native::seal::DEFAULT_SEAL_ROWS_PER_BUNDLE,
+                    },
+                )
+                .unwrap();
+            let quote = core.seal_quote(&plan, limits().encoding).unwrap();
+            let mut bytes = vec![0; quote.bytes];
+            let hash = core.seal_into(&plan, &mut bytes, quote.visits).unwrap();
+            (plan, hash, u64::try_from(bytes.len()).unwrap())
+        };
+        assert!(
+            plan.outcomes() > families.len(),
+            "the seal takes the closed generation's outcomes: {}",
+            plan.outcomes()
+        );
+        let applied = session.seals_applied();
+        session.propose_seal(&plan, bundle, length, None).unwrap();
+        assert!(
+            (0..16).any(|_| {
+                let _ = session.poll().unwrap();
+                session.seals_applied() > applied
+            }),
+            "the seal never applied"
+        );
+    }
+    let swept = session.engine.payload_sweep();
+    assert!(swept.short > 0, "no pass fell short: nothing is measured");
+    assert_eq!(swept.let_go, 0);
+    let held = session.engine.payload_segments();
+    assert_eq!(held, super::payloads::MAX_SEGMENTS);
+    // Memory back: within the longest wait and one pass's steps, the dead segments go.
+    refuse_marks(&mut session, false);
+    let rows = session.committed_core().unwrap().native_stats().entries;
+    let bound = usize::try_from(super::engine::SWEEP_RETRY_STEPS).unwrap() + rows / 4096 + 4;
+    let mut polls = 0usize;
+    while session.engine.payload_sweep().let_go == 0 {
+        assert!(polls < bound, "the sweep never let go within {bound} polls");
+        let _ = session.poll().unwrap();
+        polls += 1;
+    }
+    let after = session.engine.payload_segments();
+    assert!(after < held, "{after} segments of {held}");
+    eprintln!(
+        "{} passes fell short; after {polls} polls {} segments let go, {after} of {held} held",
+        swept.short,
+        session.engine.payload_sweep().let_go
+    );
+}
+
 /// A candidate refused at admission leaves nothing in the payload log. Its plan spilled its rows
 /// as it built them, before the session weighed it; the log held them back and gives them back.
 /// Before, each refusal at the checkpoint's bound left its payloads in a segment the ledger's

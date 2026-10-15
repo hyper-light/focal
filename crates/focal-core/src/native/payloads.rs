@@ -196,6 +196,28 @@ pub(super) fn pass_steps(rows: usize) -> usize {
         .saturating_add(2)
 }
 
+/// What a step of the payload log's sweep did (doc 31 M3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepStep {
+    /// No pass under way, and none due.
+    Idle,
+    /// A pass goes on.
+    Going,
+    /// A pass ended, and its sweep let go of this many segments.
+    Swept(usize),
+    /// A pass ended short: it could not be charged for a segment it met, so its notes are
+    /// incomplete and it let go of nothing. Nothing was swept: the next pass is as due as this was.
+    Short,
+}
+
+/// The share of the committed rows that, written since the last pass that swept began, makes
+/// another due though the log has not grown (doc 31 M3): an eighth. A retirement or a deletion
+/// leaves spilled copies no row names without sealing a segment, and a log at its segment cap
+/// seals none at all. Every row written counts (put, replaced or deleted; a new row leaves no
+/// copy, so a pass may come early, never late), and a pass's walk of every row costs at most
+/// eight visits for each.
+pub const CHURN_SHARE: u64 = 8;
+
 /// A pass over a core's committed rows that learns which segments of its payload log they name, and
 /// how many of each segment's bytes (doc 31 M3), [`MARK_ROWS`] rows a step from where the last step
 /// stopped, and the sweep it allows: the segments sealed before it began that no row named.
@@ -226,6 +248,14 @@ pub(crate) struct Marks {
     charge: Option<focal_memory::Allocation>,
     /// A segment it met and could not note for want of memory: its sweep lets go of nothing.
     short: bool,
+    /// The rows publications and seals wrote since the last pass that swept began: each it
+    /// replaced or deleted may have left a spilled copy no row names.
+    churn: u64,
+    /// `churn` when the pass under way began: what its sweep accounts for once it sweeps.
+    churn_at_begin: u64,
+    /// Refuse to grow the notes' room, as a budget out of memory does (a session's tests).
+    #[cfg(any(test, feature = "test-support"))]
+    refuse_growth: bool,
     /// What the passes have done, since the core was made ([`PayloadSweep`]).
     done: PayloadSweep,
 }
@@ -255,6 +285,24 @@ impl Marks {
         self.after = None;
         self.named.clear();
         self.short = false;
+        self.churn_at_begin = self.churn;
+    }
+    /// `rows` rows written: put, replaced or deleted.
+    pub(super) fn churned(&mut self, rows: usize) {
+        self.churn = self
+            .churn
+            .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
+    }
+    /// Whether the rows written since the last pass that swept began reach a [`CHURN_SHARE`]th of
+    /// `rows`, the committed rows: another pass is due though the log has not grown.
+    pub(super) fn churned_enough(&self, rows: usize) -> bool {
+        self.churn != 0
+            && self.churn.saturating_mul(CHURN_SHARE) >= u64::try_from(rows).unwrap_or(u64::MAX)
+    }
+    /// Refuse, or allow again, the growth of the notes' room (a session's tests).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn refuse_growth(&mut self, refuse: bool) {
+        self.refuse_growth = refuse;
     }
     /// `at`'s segment noted as named, its bytes added to what names it; the room for a segment
     /// not yet noted grown first where there is none, and the pass short where it cannot be.
@@ -283,6 +331,10 @@ impl Marks {
     /// completion lane: a sweep gives back what it lets go of, and runs while fresh work's lane is
     /// spent.
     fn grow(&mut self, budget: &focal_memory::MemoryBudget) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.refuse_growth {
+            return false;
+        }
         if self.charge.is_none() {
             match budget.reserve(
                 focal_memory::BudgetKind::Payload,
@@ -392,10 +444,13 @@ impl Marks {
         self.named.clear();
         self.short = false;
     }
-    /// The segments a pass's sweep let go.
-    pub(super) fn let_go(&mut self, segments: usize) {
+    /// A pass's sweep was made and let go of `segments`: what the rows written before the pass
+    /// began could have left unnamed is accounted for.
+    pub(super) fn swept(&mut self, segments: usize) {
         let segments = u64::try_from(segments).unwrap_or(u64::MAX);
         self.done.let_go = self.done.let_go.saturating_add(segments);
+        self.churn = self.churn.saturating_sub(self.churn_at_begin);
+        self.churn_at_begin = 0;
     }
 }
 
