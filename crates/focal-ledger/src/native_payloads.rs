@@ -265,11 +265,8 @@ impl Writer {
             if !done.ok {
                 self.failures_seen = self.failures_seen.saturating_add(1);
             }
-            let found = self.window.iter_mut().enumerate().find(|(_, chunk)| {
-                chunk.segment == done.segment
-                    && done.offset >= chunk.start
-                    && chunk.end().is_some_and(|end| done.offset < end)
-            });
+            let found = chunk_at(&self.window, done.segment, done.offset)
+                .and_then(|index| self.window.get_mut(index).map(|chunk| (index, chunk)));
             if let Some((index, chunk)) = found
                 && let Some(from) = done
                     .offset
@@ -498,6 +495,16 @@ impl Drop for FilePayloads {
             }
         }
     }
+}
+
+/// Where in `window` the chunk holding `offset` in `segment` stands, if one does: its chunks stand
+/// in log order (each opened after the last, removals keeping the order), so a search finds it,
+/// never a walk of the window.
+fn chunk_at(window: &VecDeque<Chunk>, segment: u32, offset: u64) -> Option<usize> {
+    let after = window.partition_point(|chunk| (chunk.segment, chunk.start) <= (segment, offset));
+    let index = after.checked_sub(1)?;
+    let chunk = window.get(index)?;
+    (chunk.segment == segment && chunk.end().is_some_and(|end| offset < end)).then_some(index)
 }
 
 /// A buffer for `len` bytes made beyond the pool, with a charge of its own from `charge`'s budget,
@@ -837,11 +844,13 @@ impl PayloadRead for FilePayloads {
         let mut writer = self.writer.lock().map_err(|_| PayloadError::Unavailable)?;
         writer.settle();
         let offset = u64::from(at.offset());
-        let held = writer.window.iter().rev().find_map(|chunk| {
-            chunk
-                .holds(at.segment(), offset, into.len())
-                .and_then(|range| chunk.bytes.get(range))
-        });
+        let held = chunk_at(&writer.window, at.segment(), offset)
+            .and_then(|index| writer.window.get(index))
+            .and_then(|chunk| {
+                chunk
+                    .holds(at.segment(), offset, into.len())
+                    .and_then(|range| chunk.bytes.get(range))
+            });
         match held {
             // The window holds it: a copy.
             Some(bytes) => into.copy_from_slice(bytes),
