@@ -1294,10 +1294,7 @@ fn a_ledger_at_its_checkpoint_bound_refuses_fresh_rows_and_still_checkpoints() {
             Err(error) => break error,
         }
     };
-    assert!(
-        matches!(refused, NativeSessionError::Capacity(_)),
-        "{refused:?}"
-    );
+    assert!(refused_at_checkpoint(&refused), "{refused:?}");
     assert_eq!(refused.class(), FailureClass::Retryable);
     assert!(request > 2, "the bound refused before any claim fit");
     // What it admitted, it checkpoints.
@@ -1320,6 +1317,15 @@ fn a_ledger_at_its_checkpoint_bound_refuses_fresh_rows_and_still_checkpoints() {
             .unwrap(),
         NativeSubmission::Committed(outcome)
     );
+}
+
+/// Whether `error` is the checkpoint's bound refusing a candidate.
+fn refused_at_checkpoint(error: &NativeSessionError) -> bool {
+    matches!(
+        error,
+        NativeSessionError::Owner(NativeOwnerError::Native(NativeError::Capacity(text)))
+            if *text == focal_core::native::CHECKPOINT_REFUSAL
+    )
 }
 
 /// Creations from request `first` on, each committed as it is admitted, until one is refused:
@@ -1516,10 +1522,7 @@ fn a_candidate_refused_at_admission_leaves_nothing_in_the_payload_log() {
     let mut session = open_with(dir.path(), &parent, bounded).unwrap();
     lead(&mut session);
     let (mut request, refused) = fill_to_the_bound(&mut session, 1);
-    assert!(
-        matches!(refused, NativeSessionError::Capacity(_)),
-        "{refused:?}"
-    );
+    assert!(refused_at_checkpoint(&refused), "{refused:?}");
     let held = session.engine.payload_bytes();
     assert!(
         held > 0,
@@ -1530,10 +1533,7 @@ fn a_candidate_refused_at_admission_leaves_nothing_in_the_payload_log() {
         let refused = session
             .propose(context(), create(request, 1_000 + request))
             .unwrap_err();
-        assert!(
-            matches!(refused, NativeSessionError::Capacity(_)),
-            "{refused:?}"
-        );
+        assert!(refused_at_checkpoint(&refused), "{refused:?}");
     }
     let _ = session.poll().unwrap();
     assert_eq!(
@@ -1541,6 +1541,100 @@ fn a_candidate_refused_at_admission_leaves_nothing_in_the_payload_log() {
         held,
         "refused candidates left their payloads in the log"
     );
+}
+
+/// A ledger at its checkpoint's bound still finishes what it took and retires what finished: a
+/// cancel finishes work already taken and a retirement takes rows away, so neither is refused
+/// where fresh work is. Before, the bound refused both as it refused a creation: a ledger that
+/// reached it could neither finish its claims nor retire its families, and refused all work for
+/// good.
+#[test]
+fn a_ledger_at_its_checkpoint_bound_still_finishes_and_retires() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let mut bounded = limits();
+    bounded.checkpoint.rows = 200;
+    let mut session = open_with(dir.path(), &parent, bounded).unwrap();
+    lead(&mut session);
+    // A family finished before the bound, to retire at it.
+    finished_family(&mut session, 1, 100);
+    let (request, refused) = fill_to_the_bound(&mut session, 10);
+    assert!(refused_at_checkpoint(&refused), "{refused:?}");
+    // Claims created before the bound are finished at it, until finishing takes what is left.
+    let mut next = request;
+    let mut cancelled = 0u128;
+    let mut stopped = None;
+    for claim in 10..request {
+        let (_, expected) = claim_status(&session, 1_000 + claim);
+        next += 1;
+        match session.propose(context(), cancel(next, expected)) {
+            Ok(NativeSubmission::Pending { outcome, .. }) => {
+                let committed = (0..16).any(|_| {
+                    session
+                        .poll()
+                        .unwrap()
+                        .committed
+                        .iter()
+                        .any(|commit| commit.outcome == outcome)
+                });
+                assert!(committed, "cancel of claim {claim} never committed");
+                cancelled += 1;
+            }
+            Ok(other) => panic!("a fresh cancel was {other:?}"),
+            Err(error) => {
+                stopped = Some(error);
+                break;
+            }
+        }
+    }
+    assert!(cancelled > 0, "no claim was finished at the bound");
+    eprintln!(
+        "cancelled {cancelled} of {} at the bound: {stopped:?}",
+        request - 10
+    );
+    // A family finished before the bound retires at it, whatever finishing took, as the
+    // archive's walk offers it: a candidate among the writes.
+    let family = session
+        .committed_core()
+        .unwrap()
+        .retirement_family(ClaimId::from_u128(100))
+        .unwrap();
+    let offer = focal_core::native::retirement_batch::RetireOffer {
+        root: ClaimId::from_u128(100),
+        family: focal_core::native::retirement_batch::family_digest(ledger(), &family).unwrap(),
+        bundle: ContentHash([9; 32]),
+        bytes: 4096,
+    };
+    let (batch, submission) = session.retire(&[offer]).unwrap();
+    let Some(NativeSubmission::Pending { outcome, .. }) = submission else {
+        panic!("the bound refused a retirement: {batch:?}, {submission:?}");
+    };
+    let committed = (0..16).any(|_| {
+        session
+            .poll()
+            .unwrap()
+            .committed
+            .iter()
+            .any(|commit| commit.outcome == outcome)
+    });
+    assert!(committed, "the retirement never committed");
+    assert!(
+        session
+            .committed_core()
+            .unwrap()
+            .native_claim(ClaimId::from_u128(100))
+            .is_none()
+    );
+    // What it took away is room again: the claim whose cancel the bound refused is finished.
+    if stopped.is_some() {
+        let claim = 10 + cancelled;
+        let (_, expected) = claim_status(&session, 1_000 + claim);
+        commit(
+            &mut session,
+            cancel(next + 1, expected),
+            "a cancel after the retirement",
+        );
+    }
 }
 
 #[test]

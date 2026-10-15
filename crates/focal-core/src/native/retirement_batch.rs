@@ -567,6 +567,7 @@ impl Core<NativeState> {
             writes,
             encoded_added,
             encoded_removed: removed.bytes(),
+            rows_removed: removed.rows(),
             _index: Some(index),
             events: None,
             retire: Some(RetireBody {

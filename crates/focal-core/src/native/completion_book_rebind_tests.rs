@@ -268,6 +268,7 @@ fn with_seals(
             writes: crate::native::mutation::WriteSet::unrecorded(),
             encoded_added,
             encoded_removed: removed.bytes(),
+            rows_removed: removed.rows(),
             _index: None,
             events: None,
             retire: None,

@@ -727,6 +727,7 @@ pub(super) fn install(
         writes,
         encoded_added,
         encoded_removed: removed.bytes(),
+        rows_removed: removed.rows(),
         // A replay is published at once, never held in a chain.
         _index: None,
         events,

@@ -1642,12 +1642,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     return Err(error);
                 }
             };
+            // The checkpoint's bound the owner checked as it prepared the candidate, on the lane
+            // of the work it is (`NativeOwner::checkpoint_projection`).
             let refused = if full {
                 Some("pending candidates")
             } else if !headroom {
                 Some("disk headroom")
-            } else if !self.checkpointable()? {
-                Some("checkpoint: the root with its candidates past what a checkpoint holds")
             } else {
                 None
             };
@@ -1741,20 +1741,6 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if let Ok(bytes) = array::<Pending>(self.pending.capacity()) {
             let _ = self._pending_allocation.shrink_to(bytes);
         }
-    }
-    /// Whether the committed root, with every pending candidate published,
-    /// still fits a checkpoint (rule 2): what this session admits it must be
-    /// able to checkpoint. A fresh candidate past the checkpoint's rows or
-    /// assembled bytes is refused typed at admission, and the session keeps
-    /// serving; never admitted and then a checkpoint failed and the session
-    /// stopped (a ledger did, at 4,200 claims, before this check).
-    fn checkpointable(&self) -> Result<bool, NativeSessionError> {
-        let Some(Domain::Active(owner, _)) = self.domain.as_ref() else {
-            return Err(NativeSessionError::Failed);
-        };
-        let projection = owner.checkpoint_projection()?;
-        let (rows, bytes) = self.limits.admission_checkpoint();
-        Ok(projection.rows <= rows && projection.bytes <= bytes)
     }
     /// Discard a prepared candidate, re-borrowing the active owner. Used when a
     /// refusal is decided after a `&mut self` call has ended the owner borrow.

@@ -437,6 +437,10 @@ impl Pending {
 /// still require the enclosing log/custody owner.
 /// A durable owner must retain it while append/commit status is unresolved.
 /// [`NativeOwner::checkpoint_projection`].
+/// What a candidate the checkpoint's bound refuses is refused with.
+pub const CHECKPOINT_REFUSAL: &str =
+    "checkpoint: the root with its candidates past what a checkpoint holds";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointProjection {
     pub rows: usize,
@@ -458,14 +462,15 @@ pub struct NativeOwner {
     _queue_allocation: Allocation,
     incarnation: OwnerId,
     next_serial: u64,
-    /// What the pending candidates add to a checkpoint, kept as the chain changes: their writes
-    /// and their encoded bytes ([`NativeOwner::checkpoint_projection`]). Summed over the chain at
+    /// What the pending candidates change a checkpoint by, kept as the chain changes: the rows
+    /// they put and the rows of the root they replace or delete, the encoded bytes they add and
+    /// those they take away ([`NativeOwner::checkpoint_projection`]). Summed over the chain at
     /// each admission, it was a walk of the whole pipeline for every write, quadratic in its depth
     /// once the depth was the memory's to bound ([`NativeOwner::reserve_pending`]). Bounded by
     /// what the pending candidates are charged, so a sum never nears `usize::MAX`; it saturates
-    /// rather than wrap, which could only overstate it and refuse admission.
-    pending_rows: usize,
-    pending_bytes: usize,
+    /// rather than wrap, and a projection that cannot be told refuses admission.
+    pending_rows: (usize, usize),
+    pending_bytes: (usize, usize),
     /// The payload log's hold over what the newest candidate's preparation appended, while its
     /// admission is weighed, and the candidate's serial ([`NativeOwner::keep_appends`]).
     held: Option<(u64, super::payloads::PayloadHold)>,
@@ -474,6 +479,9 @@ pub struct NativeOwner {
     /// another like it is refused from its header
     /// ([`NativeOwner::refuse_when_full`]).
     shortfalls: [Option<ingress::Shortfall>; ingress::SHORTFALLS],
+    /// What the last candidate the checkpoint's bound refused grew the root by, rows and bytes,
+    /// and its lane: what a request like it needs ([`ingress::Need::Checkpoint`]).
+    checkpoint_refused: Option<(BudgetLane, usize, usize)>,
 }
 impl std::fmt::Debug for NativeOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -631,10 +639,11 @@ impl NativeOwner {
                 _queue_allocation: allocation,
                 incarnation,
                 next_serial: 0,
-                pending_rows: 0,
-                pending_bytes: 0,
+                pending_rows: (0, 0),
+                pending_bytes: (0, 0),
                 held: None,
                 shortfalls: [None; ingress::SHORTFALLS],
+                checkpoint_refused: None,
             }),
             Err(error) => Err(NativeOwnerInitError {
                 error: error.into(),
@@ -726,16 +735,55 @@ impl NativeOwner {
         }
     }
 
-    /// Adds `prepared` to what the pending candidates add to a checkpoint.
+    /// Adds `prepared` to what the pending candidates change a checkpoint by.
     fn count_pending(&mut self, prepared: &NativePrepared) {
-        self.pending_rows = self.pending_rows.saturating_add(prepared.mutation_count());
-        self.pending_bytes = self.pending_bytes.saturating_add(prepared.encoded_added);
+        let (added, taken) = prepared.encoded_change();
+        self.pending_rows = (
+            self.pending_rows.0.saturating_add(prepared.rows_put()),
+            self.pending_rows.1.saturating_add(prepared.rows_removed()),
+        );
+        self.pending_bytes = (
+            self.pending_bytes.0.saturating_add(added),
+            self.pending_bytes.1.saturating_add(taken),
+        );
     }
 
-    /// Takes `prepared` from what the pending candidates add to a checkpoint.
+    /// Takes `prepared` from what the pending candidates change a checkpoint by.
     fn uncount_pending(&mut self, prepared: &NativePrepared) {
-        self.pending_rows = self.pending_rows.saturating_sub(prepared.mutation_count());
-        self.pending_bytes = self.pending_bytes.saturating_sub(prepared.encoded_added);
+        let (added, taken) = prepared.encoded_change();
+        self.pending_rows = (
+            self.pending_rows.0.saturating_sub(prepared.rows_put()),
+            self.pending_rows.1.saturating_sub(prepared.rows_removed()),
+        );
+        self.pending_bytes = (
+            self.pending_bytes.0.saturating_sub(added),
+            self.pending_bytes.1.saturating_sub(taken),
+        );
+    }
+
+    /// Whether the chain, `prepared` published after it, stays within the root's checkpoint
+    /// bound for work on `lane` ([`super::CheckpointBound`]): in rows and in bytes alike, what it
+    /// does not grow, or grows to within what `lane` may bring the root to. A candidate that
+    /// takes away at least what it adds (a retirement) is never refused by it, so a root at its
+    /// bound always empties.
+    fn checkpoint_admits(
+        &self,
+        prepared: &NativePrepared,
+        lane: BudgetLane,
+    ) -> Result<bool, NativeOwnerError> {
+        let Some(bound) = self.core.checkpoint_bound() else {
+            return Ok(true);
+        };
+        let (rows, bytes) = bound.on(lane);
+        let projection = self.checkpoint_projection()?;
+        let (put, removed) = (prepared.rows_put(), prepared.rows_removed());
+        let (added, taken) = prepared.encoded_change();
+        // Saturating, the projection is only overstated, and refused.
+        let rows_within =
+            put <= removed || projection.rows.saturating_add(put).saturating_sub(removed) <= rows;
+        let bytes_within =
+            added <= taken || projection.bytes.saturating_add(added).saturating_sub(taken) <= bytes;
+        Ok(rows_within && bytes_within)
     }
 
     /// The newest candidate is admitted: what its preparation appended to the payload log is the
@@ -968,13 +1016,19 @@ impl NativeOwner {
                 .and_then(|()| self.book.check_graph_growth(&view, &prepared))
         });
         let record = match checked {
-            Ok(()) => record_codec::PendingRecord::reserve(
-                &prepared,
-                &self.core.state.budget,
-                lane,
-                self.record_buffers,
-                self.core.state.payloads(),
-            ),
+            // A retirement takes away what it adds and more: the bound refuses it only where it
+            // grows the root.
+            Ok(()) => match self.checkpoint_admits(&prepared, lane) {
+                Ok(true) => record_codec::PendingRecord::reserve(
+                    &prepared,
+                    &self.core.state.budget,
+                    lane,
+                    self.record_buffers,
+                    self.core.state.payloads(),
+                ),
+                Ok(false) => Err(NativeError::Capacity(CHECKPOINT_REFUSAL).into()),
+                Err(error) => Err(error),
+            },
             Err(error) => Err(error.into()),
         };
         let record = match record {
@@ -1163,6 +1217,27 @@ impl NativeOwner {
                         return Err(rollback.into());
                     }
                     return Err(error.into());
+                }
+                // What it admits it can checkpoint (rule 2), on the lane of the work it is.
+                let admitted = self.checkpoint_admits(&prepared, lane);
+                if matches!(admitted, Ok(false)) {
+                    let (added, taken) = prepared.encoded_change();
+                    self.checkpoint_refused = Some((
+                        lane,
+                        prepared.rows_put().saturating_sub(prepared.rows_removed()),
+                        added.saturating_sub(taken),
+                    ));
+                }
+                if !matches!(admitted, Ok(true)) {
+                    drop(prepared);
+                    if let Err(rollback) = self.book.rollback_candidate(journal) {
+                        self.faulted = true;
+                        return Err(rollback.into());
+                    }
+                    return Err(match admitted {
+                        Err(error) => error,
+                        Ok(_) => NativeError::Capacity(CHECKPOINT_REFUSAL).into(),
+                    });
                 }
                 // Completion work's record is charged on the completion lane, every record to the
                 // state's budget: nothing was set aside for it.
@@ -1386,14 +1461,17 @@ impl NativeOwner {
         Some(0)
     }
 
-    /// The most a checkpoint of the committed root, with every pending
-    /// candidate published, could take: its rows (the committed rows and
-    /// every pending candidate's writes, each at most one new row) and an
-    /// upper bound of its encoded bytes (a frame header, every row at its
-    /// widest inline encoding, and the rows' heap at the codec's expansion). A session refuses fresh work whose
-    /// projection its checkpoint could not hold, typed at admission, so that
-    /// what it admitted it can always checkpoint (rule 2) instead of failing
-    /// that checkpoint and stopping.
+    /// What a checkpoint of the committed root takes with every pending candidate published,
+    /// exactly: its rows, the committed rows with what each candidate puts less the rows it
+    /// replaces or deletes, and its encoded bytes, the committed root's
+    /// ([`Core::checkpoint_bytes`]) with what each adds less what it takes away. Each candidate's
+    /// change is measured on the root its predecessors leave, which is the root it publishes
+    /// onto, and a discard takes a suffix of the chain, so the sum is what publishing the chain
+    /// leaves. A session refuses fresh work whose projection its checkpoint could not hold
+    /// ([`NativeOwner::checkpoint_admits`]), typed at admission, so that what it admitted it can
+    /// always checkpoint (rule 2) instead of failing that checkpoint and stopping. It counted every
+    /// write as a row and took nothing away: a retirement, which takes rows away, projected
+    /// growth, and a ledger at its bound refused the retirements that would have emptied it.
     pub fn checkpoint_projection(&self) -> Result<CheckpointProjection, NativeOwnerError> {
         let capacity =
             |_: ()| NativeOwnerError::Native(NativeError::Capacity("checkpoint projection"));
@@ -1402,19 +1480,14 @@ impl NativeOwner {
             .state
             .rows
             .len()
-            .checked_add(self.pending_rows)
+            .checked_add(self.pending_rows.0)
+            .and_then(|rows| rows.checked_sub(self.pending_rows.1))
             .ok_or_else(|| capacity(()))?;
-        // What the committed root encodes to, exactly (its frame and the rows' running total,
-        // `Core::checkpoint_bytes`), and every row a pending candidate puts, whole: what a
-        // candidate replaces or deletes is not taken away, so with every candidate published
-        // the checkpoint is at most this. The bound it replaced inferred the rows' bodies from
-        // the memory their pages are charged and quadrupled it: twenty-two times what a
-        // checkpoint of authored claims encodes to, and admission refused at a twentieth of
-        // what a checkpoint holds.
         let bytes = self
             .core
             .checkpoint_bytes()?
-            .checked_add(self.pending_bytes)
+            .checked_add(self.pending_bytes.0)
+            .and_then(|bytes| bytes.checked_sub(self.pending_bytes.1))
             .ok_or_else(|| capacity(()))?;
         Ok(CheckpointProjection { rows, bytes })
     }

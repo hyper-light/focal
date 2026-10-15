@@ -58,27 +58,42 @@ const SHORTFALL_PROBE_MAX: u32 = 1024;
 /// or the one its tag picks.
 pub(super) const SHORTFALLS: usize = 8;
 
-/// A fresh request the owner's budget refused once its frame was decoded and
-/// its candidate built: its command, its frame's size, the lane its
-/// reservations took, and the least it needed, the headroom it found and the
-/// part of a reservation that headroom lacked. It retained nothing, so while
-/// the lane's headroom stays below that, another fresh request of its
-/// command, its frame at least as large, needs more than there is and is
-/// refused from its header, as a zero window refuses data. At the memory's
-/// bound each refusal had cost a preparation, 19 µs of a 23 µs claim creation
-/// in the isolated harness: a creation's construction and publication take
-/// 2.3 MB of headroom for the 7 KB its claim retains, and only its last
-/// reservation was refused.
+/// A fresh request the owner refused once its frame was decoded and its
+/// candidate built, for want of what it still lacks: its command, its frame's
+/// size and what it needed ([`Need`]). It retained nothing, so while the owner
+/// lacks that, another fresh request of its command, its frame at least as
+/// large, needs more than there is and is refused from its header, as a zero
+/// window refuses data. At the memory's bound each refusal had cost a
+/// preparation, 19 µs of a 23 µs claim creation in the isolated harness: a
+/// creation's construction and publication take 2.3 MB of headroom for the
+/// 7 KB its claim retains, and only its last reservation was refused. At the
+/// checkpoint's bound each had cost one as well.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Shortfall {
     command: u8,
     frame_bytes: usize,
-    lane: BudgetLane,
-    need: usize,
+    need: Need,
     /// Refused from their headers since the last probe, and how many make
     /// the next.
     refused: u32,
     probe: u32,
+}
+
+/// What a refused request needed that the owner lacked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Need {
+    /// The headroom of the lane its reservations took, at least this many
+    /// bytes: the headroom it found and the part of a reservation that
+    /// headroom lacked.
+    Memory { lane: BudgetLane, bytes: usize },
+    /// Room for what its candidate grew the root by, in rows and in encoded
+    /// bytes, below what work on its lane may bring the root to
+    /// ([`super::super::CheckpointBound`]).
+    Checkpoint {
+        lane: BudgetLane,
+        rows: usize,
+        bytes: usize,
+    },
 }
 
 /// What the owner's budget showed before a frame was prepared: the refusals
@@ -137,30 +152,55 @@ impl NativeOwner {
         if queue_full {
             return Err(NativeError::Capacity("pending candidates").into());
         }
-        match self.short_of_memory(header.kind, bytes.len()) {
+        match self.short_of(header.kind, bytes.len()) {
             Some(error) => Err(error.into()),
             None => Ok(()),
         }
     }
 
+    /// What a request needing `need` is refused with while the owner lacks it,
+    /// none once it has it.
+    fn lacks(&self, need: Need) -> Option<NativeError> {
+        match need {
+            Need::Memory { lane, bytes } => {
+                let headroom = self.core.state.budget.headroom(lane);
+                (headroom < bytes).then_some(NativeError::Memory(MemoryError::Capacity {
+                    requested: bytes,
+                    available: headroom,
+                }))
+            }
+            Need::Checkpoint { lane, rows, bytes } => {
+                let room = self.core.checkpoint_bound().is_none_or(|bound| {
+                    let (row_room, byte_room) = bound.on(lane);
+                    self.checkpoint_projection().is_ok_and(|projection| {
+                        projection.rows.saturating_add(rows) <= row_room
+                            && projection.bytes.saturating_add(bytes) <= byte_room
+                    })
+                });
+                (!room).then_some(NativeError::Capacity(CHECKPOINT_REFUSAL))
+            }
+        }
+    }
+
     /// The refusal a fresh request of `kind`, its frame `frame_bytes` long,
-    /// meets while the owner's memory stays short of the last request of its
-    /// command it refused, if any. Memory come back since ends that
+    /// meets while the owner still lacks what the last request of its command
+    /// it refused needed, if any. What it needed come since ends that
     /// shortfall.
-    fn short_of_memory(&mut self, kind: FrameKind, frame_bytes: usize) -> Option<MemoryError> {
+    fn short_of(&mut self, kind: FrameKind, frame_bytes: usize) -> Option<NativeError> {
         let FrameKind::Request { command } = kind else {
             return None;
         };
-        let slot = self
+        let at = self
             .shortfalls
-            .iter_mut()
-            .find(|slot| slot.is_some_and(|shortfall| shortfall.command == command))?;
-        let shortfall = (*slot)?;
-        let headroom = self.core.state.budget.headroom(shortfall.lane);
-        if headroom >= shortfall.need {
+            .iter()
+            .position(|slot| slot.is_some_and(|shortfall| shortfall.command == command))?;
+        let shortfall = (*self.shortfalls.get(at)?)?;
+        let lacking = self.lacks(shortfall.need);
+        let slot = self.shortfalls.get_mut(at)?;
+        let Some(error) = lacking else {
             *slot = None;
             return None;
-        }
+        };
         if frame_bytes < shortfall.frame_bytes {
             return None;
         }
@@ -176,10 +216,7 @@ impl NativeOwner {
             refused,
             ..shortfall
         });
-        Some(MemoryError::Capacity {
-            requested: shortfall.need,
-            available: headroom,
-        })
+        Some(error)
     }
 
     /// The slot for `command`'s shortfall: its own, an empty one, or the one
@@ -204,6 +241,7 @@ impl NativeOwner {
         prepare: impl FnOnce(&mut Self) -> Result<NativeStaging, NativeOwnerError>,
     ) -> Result<NativeStaging, NativeOwnerError> {
         self.refuse_when_full(context, bytes)?;
+        self.checkpoint_refused = None;
         let budget = &self.core.state.budget;
         let before = Before {
             refusals: budget.refusals().count,
@@ -230,31 +268,46 @@ impl NativeOwner {
     }
 
     /// Leaves the [`Shortfall`] of a fresh request whose preparation the
-    /// owner's own budget refused: the refusal its error reports is the one
-    /// the budget has counted since `before`, not another bound that reports
-    /// capacity, and the headroom it found is its lane's.
+    /// owner refused for want of memory or of room under the checkpoint's
+    /// bound. A memory refusal is the one the budget has counted since
+    /// `before`, not another bound that reports capacity, and the headroom it
+    /// found is its lane's; a checkpoint refusal is the one its preparation
+    /// recorded, with what its candidate grew the root by.
     fn note_shortfall(&mut self, bytes: &[u8], before: Before, error: &NativeOwnerError) {
-        let NativeOwnerError::Native(NativeError::Memory(MemoryError::Capacity {
-            requested,
-            available,
-        })) = error
-        else {
-            return;
+        let checkpoint = self.checkpoint_refused.take();
+        let need = match error {
+            NativeOwnerError::Native(NativeError::Memory(MemoryError::Capacity {
+                requested,
+                available,
+            })) => {
+                let refused = self.core.state.budget.refusals();
+                if refused.count == before.refusals
+                    || refused.requested != *requested
+                    || refused.available != *available
+                {
+                    return;
+                }
+                // A fresh request is admitted in the ordinary or completion lane, never the
+                // committed.
+                let headroom = match refused.lane {
+                    BudgetLane::Ordinary => before.ordinary,
+                    BudgetLane::Completion | BudgetLane::Committed => before.completion,
+                };
+                Need::Memory {
+                    lane: refused.lane,
+                    bytes: headroom.saturating_add(requested.saturating_sub(*available)),
+                }
+            }
+            NativeOwnerError::Native(NativeError::Capacity(CHECKPOINT_REFUSAL)) => {
+                let Some((lane, rows, bytes)) = checkpoint else {
+                    return;
+                };
+                Need::Checkpoint { lane, rows, bytes }
+            }
+            _ => return,
         };
-        let refused = self.core.state.budget.refusals();
-        if refused.count == before.refusals
-            || refused.requested != *requested
-            || refused.available != *available
-        {
-            return;
-        }
         let Some(command) = command(bytes) else {
             return;
-        };
-        // A fresh request is admitted in the ordinary or completion lane, never the committed.
-        let headroom = match refused.lane {
-            BudgetLane::Ordinary => before.ordinary,
-            BudgetLane::Completion | BudgetLane::Committed => before.completion,
         };
         let Some(slot) = self.shortfall_slot(command) else {
             return;
@@ -269,8 +322,7 @@ impl NativeOwner {
         *slot = Some(Shortfall {
             command,
             frame_bytes: bytes.len(),
-            lane: refused.lane,
-            need: headroom.saturating_add(requested.saturating_sub(*available)),
+            need,
             refused: 0,
             probe,
         });

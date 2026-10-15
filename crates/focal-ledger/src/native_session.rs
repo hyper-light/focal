@@ -197,7 +197,7 @@ impl NativeSessionLimits {
         // A session's root is charged to its memory budget, so it never holds
         // more rows than that budget can keep resident; its checkpoint carries
         // that many, and admission refuses what would outgrow either bound
-        // (`checkpointable`). The fixed 100,000 rows was stricter than memory:
+        // (`CheckpointBound`). The fixed 100,000 rows was stricter than memory:
         // a ledger was admitted past it, its checkpoint failed, and it stopped.
         let memory_bytes: usize = 128 << 20;
         let checkpoint = crate::native_checkpoint::Limits {
@@ -323,7 +323,7 @@ impl NativeSessionLimits {
     /// the standard 16 of 128 MiB, and its checkpoint's bounds following what it holds. A root is
     /// charged to the engine's budget, so it holds at most as many rows as that budget keeps
     /// resident, and admission refuses a mutation whose projected checkpoint would pass what the
-    /// share allows (`checkpointable`): both follow the allowance, down as well as up, so an
+    /// share allows (`CheckpointBound`): both follow the allowance, down as well as up, so an
     /// engine on a small node refuses at what it can hold rather than holding what it cannot.
     pub fn standard_within(
         content_domain: focal_model::ContentDomainId,

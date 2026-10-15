@@ -70,18 +70,18 @@ fn the_chain_keeps_its_projection_finds_by_serial_and_gives_back_a_bursts_memory
     let core = core();
     let floor = core.limits.pending;
     let mut owner = NativeOwner::new(core).unwrap();
-    let walk = |owner: &NativeOwner| -> (usize, usize) {
-        let rows = owner
-            .pending
-            .iter()
-            .map(|row| row.prepared.mutation_count())
-            .sum::<usize>();
-        let bytes = owner
-            .pending
-            .iter()
-            .map(|row| row.prepared.encoded_added)
-            .sum::<usize>();
-        (rows, bytes)
+    let walk = |owner: &NativeOwner| -> ((usize, usize), (usize, usize)) {
+        let sum = |of: &dyn Fn(&NativePrepared) -> usize| {
+            owner
+                .pending
+                .iter()
+                .map(|row| of(&row.prepared))
+                .sum::<usize>()
+        };
+        (
+            (sum(&|p| p.rows_put()), sum(&|p| p.rows_removed())),
+            (sum(&|p| p.encoded_added), sum(&|p| p.encoded_removed)),
+        )
     };
     let kept = |owner: &NativeOwner| (owner.pending_rows, owner.pending_bytes);
     let required = [(ValidationMode::Required, false)];
@@ -124,7 +124,7 @@ fn the_chain_keeps_its_projection_finds_by_serial_and_gives_back_a_bursts_memory
         owner.publish_after_durable(candidate).unwrap();
         assert_eq!(kept(&owner), walk(&owner));
     }
-    assert_eq!(kept(&owner), (0, 0));
+    assert_eq!(kept(&owner), ((0, 0), (0, 0)));
     assert!(
         owner.pending.capacity() < grown,
         "the drained chain gave back its buffer"
@@ -892,10 +892,11 @@ fn a_publication_takes_away_what_its_build_replaced() {
 }
 
 /// What a candidate's plan spills to the payload log is held until its admission is decided: one
-/// its session discards leaves nothing in the log, one admitted keeps what it spilled through its
-/// publication, and an exact retry appends nothing.
+/// the owner refuses as it prepares it (here at the checkpoint's bound) or one its session
+/// discards leaves nothing in the log, and one admitted keeps what it spilled through its
+/// publication. Before, each refusal left its payloads in the log for good.
 #[test]
-fn a_discarded_candidate_leaves_nothing_in_the_payload_log() {
+fn a_candidate_refused_or_discarded_leaves_nothing_in_the_payload_log() {
     let mut core = core();
     core.attach_payload_log(Box::new(super::super::payloads::MemoryPayloads::default()));
     let mut owner = NativeOwner::new(core).unwrap();
@@ -914,10 +915,32 @@ fn a_discarded_candidate_leaves_nothing_in_the_payload_log() {
     owner.keep_appends();
     let outcome = owner.publish_after_durable(first).unwrap();
     let published = logged(&owner);
+    // Discarded by its session: what it spilled is given back.
     let (second, _) = stage(&mut owner, 2, creation(2, 2, &required, None));
     assert!(logged(&owner) > published);
     owner.discard_from(second).unwrap();
     assert_eq!(logged(&owner), published);
+    // Refused by the checkpoint's bound as it is prepared: nothing stays.
+    let projection = owner.checkpoint_projection().unwrap();
+    owner
+        .core
+        .bound_checkpoint(Some(super::super::CheckpointBound {
+            rows: projection.rows + 1,
+            bytes: projection.bytes + 1,
+        }));
+    let third = creation(3, 3, &required, None);
+    let refused = owner
+        .prepare(context(third.request.principal, 3), third, None)
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            NativeOwnerError::Native(NativeError::Capacity(CHECKPOINT_REFUSAL))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(logged(&owner), published);
+    // An exact retry of what was published is answered, and appends nothing.
     let retry = creation(1, 1, &required, None);
     assert!(matches!(
         owner.prepare(context(retry.request.principal, 4), retry, None),

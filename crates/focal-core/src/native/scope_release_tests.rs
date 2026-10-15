@@ -352,7 +352,18 @@ fn release_pressure_and_range_failure_preserve_tree_and_suffix_discard_restores_
         )
         .unwrap()
         .commit();
+    // A release finishes work already taken: the memory refuses it only once the completion lane
+    // is spent as well.
+    let finishing = source
+        .reserve(
+            BudgetKind::Payload,
+            BudgetLane::Completion,
+            source.headroom(BudgetLane::Completion),
+        )
+        .unwrap()
+        .commit();
     refused(&mut owner, release(originals[2].binding(), f::ISSUER, 30));
+    drop(finishing);
     drop(pressure);
     let failed = crate::native::prepare::fail_range_after(0, || {
         owner.prepare(
@@ -383,6 +394,27 @@ fn release_pressure_and_range_failure_preserve_tree_and_suffix_discard_restores_
     commit(&mut owner, release(originals[1].binding(), f::ISSUER, 31));
     commit(&mut owner, release(originals[0].binding(), f::ISSUER, 32));
     assert!(owner.committed().claim(ROOT).unwrap().released());
+}
+
+/// A release finishes work already taken (its claim terminal, every owned child released) and is
+/// what lets the claim's family retire: under fresh work's pressure alone it is admitted, on the
+/// completion lane, as a cancel is. On the ordinary lane a session whose writes filled it could
+/// no longer release the claims it had finished, and their families never retired.
+#[test]
+fn a_release_under_fresh_works_pressure_is_admitted_on_the_completion_lane() {
+    let mut owner = cancelled_tree();
+    let leaf = copy(&owner, 3);
+    let source = owner.budget_for_test();
+    let pressure = source
+        .reserve(
+            BudgetKind::Payload,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
+        )
+        .unwrap()
+        .commit();
+    commit(&mut owner, release(leaf.binding(), f::ISSUER, 30));
+    drop(pressure);
 }
 
 #[test]

@@ -512,6 +512,7 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         writes: mutation::WriteSet::unrecorded(),
         encoded_added,
         encoded_removed: removed.bytes(),
+        rows_removed: removed.rows(),
         _index: None,
         events: None,
         retire: None,

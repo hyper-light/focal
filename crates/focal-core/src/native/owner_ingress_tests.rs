@@ -587,7 +587,9 @@ fn a_request_the_memory_refused_refuses_its_like_from_its_header() {
         "{first:?}"
     );
     assert_eq!(budget.refusals().count, refusals + 1);
-    let need = owner.shortfalls[0].unwrap().need;
+    let Need::Memory { bytes: need, .. } = owner.shortfalls[0].unwrap().need else {
+        panic!("a memory refusal left another shortfall");
+    };
     assert!(need > left, "{need}");
     for n in 1..SHORTFALL_PROBE {
         let refused = owner.prepare_frame(
@@ -779,5 +781,167 @@ fn measure_refusal_at_the_memory_bound() {
         prepared_ns as f64 / prepared as f64 / 1000.0,
         each as f64 / 1000.0,
         budget.refusals().count - before
+    );
+}
+
+/// A bound on `owner`'s checkpoint that leaves fresh work no room past the root as it stands,
+/// pending candidates published: the least whose ordinary share reaches the projection.
+fn bound_at_projection(owner: &mut NativeOwner) {
+    let projection = owner.checkpoint_projection().unwrap();
+    let least = |at: usize| {
+        let mut whole = at;
+        while whole - whole / 8 < at {
+            whole += 1;
+        }
+        whole
+    };
+    owner
+        .core
+        .bound_checkpoint(Some(crate::native::CheckpointBound {
+            rows: least(projection.rows),
+            bytes: least(projection.bytes),
+        }));
+}
+
+/// A request the checkpoint's bound refused leaves its shortfall as one the memory refused does:
+/// another of its command, its frame as large, is refused from its header while the root has no
+/// room for what the first grew it by, every `SHORTFALL_PROBE`th prepared after all and, refused
+/// again, the next probe twice as far; an exact retry is answered; and room made (the pending
+/// candidate discarded) ends it.
+#[test]
+fn a_request_the_checkpoint_refused_refuses_its_like_from_its_header() {
+    let mut owner = NativeOwner::new(core()).unwrap();
+    let limits = NativeDecodeLimits::for_native(
+        owner.core.limits,
+        1 << 20,
+        DecodeWork {
+            parse: 1 << 24,
+            source: 1 << 24,
+            model: 1 << 24,
+            acceptance: 1 << 24,
+            native: 1 << 24,
+        },
+    )
+    .unwrap();
+    let frame = |id: u128| {
+        encoded(
+            &creation(id, id, &[(ValidationMode::Required, false)], None),
+            NativeContentProfile::ProjectionOnly,
+        )
+    };
+    let retried = frame(700);
+    let pending = ticket(
+        owner
+            .prepare_frame(context(ISSUER, 10), &retried, limits, None)
+            .unwrap(),
+    );
+    bound_at_projection(&mut owner);
+    let refused = |result: &Result<NativeStaging, NativeOwnerError>| {
+        matches!(
+            result,
+            Err(NativeOwnerError::Native(NativeError::Capacity(
+                CHECKPOINT_REFUSAL
+            )))
+        )
+    };
+    let first = owner.prepare_frame(context(ISSUER, 10), &frame(701), limits, None);
+    assert!(refused(&first), "{first:?}");
+    let shortfall = owner.shortfalls.iter().flatten().next().copied().unwrap();
+    let Need::Checkpoint { lane, rows, bytes } = shortfall.need else {
+        panic!("{shortfall:?}");
+    };
+    assert_eq!(lane, BudgetLane::Ordinary);
+    assert!(rows > 0 && bytes > 0, "{shortfall:?}");
+    for n in 1..SHORTFALL_PROBE {
+        let header = owner.prepare_frame(
+            context(ISSUER, 10),
+            &frame(701 + u128::from(n)),
+            limits,
+            None,
+        );
+        assert!(refused(&header), "{n}: {header:?}");
+        let now = owner.shortfalls.iter().flatten().next().copied().unwrap();
+        assert_eq!(now.refused, n, "{n}: refused from its header");
+    }
+    // The probe is prepared, refused on its merits, and the next waits twice as long.
+    let probe = owner.prepare_frame(context(ISSUER, 10), &frame(800), limits, None);
+    assert!(refused(&probe), "{probe:?}");
+    let now = owner.shortfalls.iter().flatten().next().copied().unwrap();
+    assert_eq!((now.refused, now.probe), (0, 2 * SHORTFALL_PROBE));
+    assert!(matches!(
+        owner.prepare_frame(context(ISSUER, 10), &retried, limits, None),
+        Ok(NativeStaging::Existing { candidate: Some(again), .. }) if again == pending
+    ));
+    // Room made ends it: the next like request is prepared and admitted.
+    owner.discard_from(pending).unwrap();
+    assert!(matches!(
+        owner.prepare_frame(context(ISSUER, 10), &frame(900), limits, None),
+        Ok(NativeStaging::Prepared { .. })
+    ));
+    assert!(owner.shortfalls.iter().all(Option::is_none));
+}
+
+/// The owner's preparation of fresh claim creations to the checkpoint's bound, then of 5,000
+/// more it refuses there: what each refusal costs and how many are prepared (the shortfall's
+/// probes). Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "measurement"]
+fn measure_refusal_at_the_checkpoint_bound() {
+    let mut owner = NativeOwner::new(core()).unwrap();
+    let limits = NativeDecodeLimits::for_native(
+        owner.core.limits,
+        1 << 20,
+        DecodeWork {
+            parse: 1 << 24,
+            source: 1 << 24,
+            model: 1 << 24,
+            acceptance: 1 << 24,
+            native: 1 << 24,
+        },
+    )
+    .unwrap();
+    let frame = |id: u128| {
+        encoded(
+            &creation(id, id, &[], None),
+            NativeContentProfile::ProjectionOnly,
+        )
+    };
+    let mut id = 10_000u128;
+    let mut prepared_ns = 0u128;
+    for _ in 0..200 {
+        id += 1;
+        let bytes = frame(id);
+        let started = std::time::Instant::now();
+        let staged = owner.prepare_frame(context(ISSUER, 10), &bytes, limits, None);
+        prepared_ns += started.elapsed().as_nanos();
+        let Ok(NativeStaging::Prepared { candidate, .. }) = staged else {
+            panic!("{staged:?}");
+        };
+        owner.publish_after_durable(candidate).unwrap();
+    }
+    bound_at_projection(&mut owner);
+    let frames: Vec<_> = (0..5000u128).map(|n| frame(id + 1 + n)).collect();
+    let started = std::time::Instant::now();
+    let mut refused = 0usize;
+    for bytes in &frames {
+        if owner
+            .prepare_frame(context(ISSUER, 10), bytes, limits, None)
+            .is_err()
+        {
+            refused += 1;
+        }
+    }
+    let each = started.elapsed().as_nanos() / 5000;
+    let probes = owner
+        .shortfalls
+        .iter()
+        .flatten()
+        .map(|shortfall| shortfall.probe)
+        .max()
+        .unwrap_or(0);
+    println!(
+        "prepared {:.1} µs each; then {refused} of 5000 refused at {:.2} µs each (probe every {probes})",
+        prepared_ns as f64 / 200.0 / 1000.0,
+        each as f64 / 1000.0,
     );
 }

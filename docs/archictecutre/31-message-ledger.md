@@ -927,6 +927,48 @@ Each stage lands on its own, measured:
        it returned an owner whose discard could give nothing back. It keeps only once the
        transfer goes ahead. Tested: a transfer refused with a candidate pending, then the
        candidate's discard, leaves nothing in the log (698 bytes stayed before).
+   - **At the checkpoint's bound (2026-10-15).** A million open claims offered to one node in
+     a 2 GiB envelope (2,000 creations a second, none consumed) committed 434,661. Every write
+     after that was refused at the checkpoint's bound, while the native share was at 577 of
+     939.5 MB. The bound is real while an installing replica assembles the encoded root whole
+     (`SeedManifest::assemble`). Besides the payloads refused work left behind (above), the run
+     showed two defects at the bound, each fixed at its cause:
+     - **A ledger at its bound could not empty.** The projection counted every write as a row
+       and took nothing away, so a retirement projected growth. One limit stood for all work,
+       so a cancel and a release were refused as a creation was. A ledger that reached the
+       bound could neither finish its claims nor retire its families. The test that found it:
+       2 of 14 claims could be cancelled at the bound, and the retirement was refused.
+       - The projection is now exact (`NativeOwner::checkpoint_projection`): committed rows
+         and bytes, plus what each pending candidate puts or adds, less what it replaces,
+         deletes or takes away. Each candidate is measured on the root its predecessors leave,
+         and a discard takes a suffix.
+       - The bound has the memory's lanes (`CheckpointBound`): fresh work stops an eighth
+         short of it, and work that finishes what was taken goes on to the bound.
+         `ReleaseScope` joins the completion lane: it requires a terminal claim, and it is what
+         lets the family retire. A candidate that takes away at least what it adds is never
+         refused by the bound.
+       - A root within a quarter of the bound of where fresh work stops retires finished
+         families without waiting out their grace, as a session pressed for memory does
+         (`Core::checkpoint_pressed`). The bound lives on the core and is set where the session
+         makes the core its owner's, so admission and the archive's due rule read one value.
+       - Tested: at the bound, 8 of 13 claims are cancelled where fresh work stops. Then the
+         retirement is admitted, and a cancel the bound had refused is admitted after it.
+     - **Each refusal there cost a preparation.** The check ran after the candidate was built,
+       about 46 µs of owner time per refused request. The owner now checks the bound as it
+       stages the candidate. A refused one leaves a shortfall, as a memory refusal does
+       (`ingress::Need::Checkpoint`: its lane, and the rows and bytes it grew the root by).
+       While the root has no room for that, a like request is refused from its header. Every
+       32nd is prepared as a probe, the interval doubling to 1,024 while it is refused.
+       - Measured (`measure_refusal_at_the_checkpoint_bound`, release): 45.8 µs a prepared
+         creation, then 5,000 of 5,000 refused at 0.21 µs each. At the memory's bound the
+         refusal costs 0.25 µs.
+     - **Not fixed, recorded.**
+       - An installing replica still assembles the encoded root whole, so the bound stays where
+         its memory puts it. Streaming the install chunk by chunk, as TiKV and CockroachDB
+         ingest snapshots and Redis loads an RDB, would leave memory the only bound.
+       - `NATIVE_ENTRY_BYTES` (96, `size_of::<(Key, Row)>()`) bounds the checkpoint's rows. A
+         resident row measured 74 bytes in the run, so the row bound refuses before memory
+         would.
    - **The payload log's sweep (2026-10-15).** The 2 GiB deliver run (env-7) held native
      memory near 690 MB, with retirement keeping pace. Its payload log grew by about 755 bytes a
      write all the same: 883 MB in 14 segments after 1.17 million writes, none ever let go.

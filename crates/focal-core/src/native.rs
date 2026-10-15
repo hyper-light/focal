@@ -161,8 +161,8 @@ use owned::{
     OwnedClaim, OwnedClaimContent, OwnedDeclaration, OwnedEvaluation, OwnedEvent, OwnedLegacy,
 };
 pub use owner::{
-    CheckpointProjection, NativeCandidate, NativeOwner, NativeOwnerError, NativeOwnerInitError,
-    NativeOwnerIntoCoreError, NativeStaging, NativeView,
+    CHECKPOINT_REFUSAL, CheckpointProjection, NativeCandidate, NativeOwner, NativeOwnerError,
+    NativeOwnerInitError, NativeOwnerIntoCoreError, NativeStaging, NativeView,
 };
 pub use projection_quote::NativeProjectionQuote;
 /// The least memory one row of a native root holds resident: its key and its
@@ -170,6 +170,50 @@ pub use projection_quote::NativeProjectionQuote;
 /// `n / NATIVE_ENTRY_BYTES` rows, which is the most a session's checkpoint
 /// must be able to carry.
 pub const NATIVE_ENTRY_BYTES: usize = size_of::<(Key, Row)>();
+
+/// The share of a checkpoint's bound fresh work leaves to work that finishes what was taken and
+/// to retirement: an eighth, as memory keeps its completion lane.
+const CHECKPOINT_RESERVE: usize = 8;
+/// How far short of where fresh work stops a root presses on its checkpoint's bound: a quarter of
+/// the bound, as memory's retirement water mark is a quarter of its allowance.
+const CHECKPOINT_PRESS: usize = 4;
+
+/// The most a checkpoint of a session's root may take (rule 2), its rows and its encoded bytes,
+/// as its session derives it from what its replicas hold. What a session admits it can always
+/// checkpoint, and a bound reached never wedges it: fresh work stops an eighth short of it
+/// ([`CHECKPOINT_RESERVE`]), work that finishes what was taken goes on to the bound itself, and
+/// work that takes rows away (a retirement) is never refused by it. A root pressed on it retires
+/// its finished families without waiting out their grace ([`Core::retirement_due`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointBound {
+    pub rows: usize,
+    pub bytes: usize,
+}
+
+impl CheckpointBound {
+    /// What work on `lane` may bring the root to, rows and bytes: the whole bound for finishing
+    /// work, all but its reserve for fresh work.
+    pub fn on(self, lane: focal_memory::BudgetLane) -> (usize, usize) {
+        let less_reserve =
+            |whole: usize| whole.saturating_sub(whole.checked_div(CHECKPOINT_RESERVE).unwrap_or(0));
+        match lane {
+            focal_memory::BudgetLane::Ordinary => {
+                (less_reserve(self.rows), less_reserve(self.bytes))
+            }
+            focal_memory::BudgetLane::Completion | focal_memory::BudgetLane::Committed => {
+                (self.rows, self.bytes)
+            }
+        }
+    }
+    /// Whether a root of `rows` and `bytes` presses on the bound: within a quarter of the bound
+    /// of where fresh work stops, in either.
+    pub fn pressed(self, rows: usize, bytes: usize) -> bool {
+        let (fresh_rows, fresh_bytes) = self.on(focal_memory::BudgetLane::Ordinary);
+        let press = |whole: usize| whole.checked_div(CHECKPOINT_PRESS).unwrap_or(0);
+        fresh_rows.saturating_sub(rows) < press(self.rows)
+            || fresh_bytes.saturating_sub(bytes) < press(self.bytes)
+    }
+}
 pub use index_rows::ContentSource as NativeClaimContentRead;
 pub use owned::HeldClaimBody;
 pub use response_input::{
@@ -289,6 +333,9 @@ pub struct NativeState {
     /// The newest spillable claims and definitions, held until newer ones push them out
     /// (doc 31 M3, [`young`]).
     young: young::Young,
+    /// What a checkpoint of the root may take, as its session bounds it (rule 2): none on a core
+    /// no session bounds ([`Core::bound_checkpoint`]).
+    checkpoint: Option<CheckpointBound>,
     /// The payload log's sweep under way (doc 31 M3, [`payloads::Marks`]).
     marks: payloads::Marks,
 }
@@ -1825,6 +1872,9 @@ pub struct NativePrepared {
     /// build took them out of their pages: what its publication takes away. Built on the root
     /// its predecessors leave, which is the root it publishes onto.
     encoded_removed: usize,
+    /// How many of those rows it took out: with the rows it puts, what its publication changes
+    /// the root's rows by ([`Self::rows_put`]).
+    rows_removed: usize,
     /// What its changes may take in an owner's pending index
     /// ([`pending_index::entry_charge`]), funded with the rest of it.
     _index: Option<focal_memory::Allocation>,
@@ -1848,6 +1898,22 @@ impl NativePrepared {
     /// Number of actual storage writes, including metadata, indices and history.
     pub fn mutation_count(&self) -> usize {
         self.writes.len()
+    }
+    /// The rows it puts, new or in place of one: with [`Self::rows_removed`], what its
+    /// publication changes the root's rows by.
+    pub fn rows_put(&self) -> usize {
+        self.writes
+            .entries()
+            .filter(|(_, deleted)| !deleted)
+            .count()
+    }
+    /// The rows of the root it replaces or deletes.
+    pub fn rows_removed(&self) -> usize {
+        self.rows_removed
+    }
+    /// What it adds to a checkpoint's encoded bytes, and what it takes away.
+    pub fn encoded_change(&self) -> (usize, usize) {
+        (self.encoded_added, self.encoded_removed)
     }
     /// The positions, in layout order, of the group members this mutation
     /// writes (25 §6): what a movement fence checks before admission.
@@ -2234,6 +2300,7 @@ impl Core<NativeState> {
                 payloads,
                 reads,
                 young: young::Young::none(),
+                checkpoint: None,
                 marks: payloads::Marks::default(),
             },
             limits,
@@ -2295,7 +2362,28 @@ impl Core<NativeState> {
     /// core within seconds of its close, long before a grace ends. The grace is the offering
     /// authority's alone: a replica checks what a family holds, never its age.
     pub fn retirement_due(&self, settled: Option<u64>, now: u64, grace_ms: u64) -> bool {
-        self.native_memory_pressed() || settled.is_some_and(|at| now.saturating_sub(at) >= grace_ms)
+        self.native_memory_pressed()
+            || self.checkpoint_pressed()
+            || settled.is_some_and(|at| now.saturating_sub(at) >= grace_ms)
+    }
+    /// Bound what a checkpoint of this root may take (rule 2): what its owner admits a candidate
+    /// within, and what presses its finished families to retire ([`CheckpointBound`]).
+    pub fn bound_checkpoint(&mut self, bound: Option<CheckpointBound>) {
+        self.state.checkpoint = bound;
+    }
+    pub fn checkpoint_bound(&self) -> Option<CheckpointBound> {
+        self.state.checkpoint
+    }
+    /// Whether the committed root presses on its checkpoint's bound ([`CheckpointBound::pressed`]),
+    /// where its finished families retire without waiting out their grace, as a session pressed
+    /// for memory does: a ledger at its bound otherwise refused fresh work until the grace
+    /// ended. A root whose size cannot be told presses.
+    pub fn checkpoint_pressed(&self) -> bool {
+        let Some(bound) = self.state.checkpoint else {
+            return false;
+        };
+        self.checkpoint_bytes()
+            .map_or(true, |bytes| bound.pressed(self.state.rows.len(), bytes))
     }
     /// The young generation (doc 31 M3): the keys it tracks, the spills it put off and kept to
     /// try again, and the keys it could not keep, since it was made.
@@ -2692,6 +2780,7 @@ impl Core<NativeState> {
             writes,
             encoded_added,
             encoded_removed,
+            rows_removed,
             _index,
             events,
             retire,
@@ -2724,6 +2813,7 @@ impl Core<NativeState> {
                     writes,
                     encoded_added,
                     encoded_removed,
+                    rows_removed,
                     _index,
                     events,
                     retire,
@@ -3478,6 +3568,9 @@ pub(in crate::native) struct EncodedRemoved<'a> {
     /// Where a committed row's spilled bytes are read from.
     payloads: Option<&'a dyn payloads::PayloadRead>,
     bytes: usize,
+    /// How many rows it took out: each the root holds no more, unless the build puts its key
+    /// again.
+    rows: usize,
 }
 
 impl<'a> EncodedRemoved<'a> {
@@ -3489,6 +3582,7 @@ impl<'a> EncodedRemoved<'a> {
             ledger,
             payloads,
             bytes: 0,
+            rows: 0,
         }
     }
     pub(in crate::native) fn count(&mut self, key: &Key, row: &Row) -> Result<(), MemoryError> {
@@ -3498,10 +3592,17 @@ impl<'a> EncodedRemoved<'a> {
             .bytes
             .checked_add(bytes)
             .ok_or(MemoryError::CounterExhausted("checkpoint bytes"))?;
+        self.rows = self
+            .rows
+            .checked_add(1)
+            .ok_or(MemoryError::CounterExhausted("checkpoint rows"))?;
         Ok(())
     }
     pub(in crate::native) fn bytes(&self) -> usize {
         self.bytes
+    }
+    pub(in crate::native) fn rows(&self) -> usize {
+        self.rows
     }
 }
 

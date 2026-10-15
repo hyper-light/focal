@@ -696,10 +696,12 @@ impl Core<NativeState> {
             NativeCommand::ReportAdmission { .. } => NativeOperation::ReportAdmission,
         };
         // Finishing work already taken (a cancel, a report, a respondent's diagnostic, close or
-        // post) is on the completion lane, which fresh work cannot take.
+        // post, the release of a finished claim's scope that lets its family retire) is on the
+        // completion lane, which fresh work cannot take.
         let lane = if matches!(
             operation,
             NativeOperation::Cancel
+                | NativeOperation::ReleaseScope
                 | NativeOperation::ReportAdmission
                 | NativeOperation::ReportIncrement
                 | NativeOperation::ReportWork
@@ -1816,6 +1818,7 @@ impl<'a> Fresh<'a> {
             }
         }
         let encoded_removed = removed.bytes();
+        let rows_removed = removed.rows();
         writes.check(&fragments)?;
         // Its changes' place in an owner's pending index, funded as the rest of it is.
         let index = super::pending_index::entry_charge()
@@ -1842,6 +1845,7 @@ impl<'a> Fresh<'a> {
                 writes,
                 encoded_added,
                 encoded_removed,
+                rows_removed,
                 _index: Some(index),
                 events,
                 retire: None,

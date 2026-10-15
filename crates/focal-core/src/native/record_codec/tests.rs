@@ -436,6 +436,7 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
         writes,
         encoded_added,
         encoded_removed: taken.bytes(),
+        rows_removed: taken.rows(),
         _index: None,
         events: None,
         retire: None,

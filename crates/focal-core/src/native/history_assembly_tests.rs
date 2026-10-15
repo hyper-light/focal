@@ -157,6 +157,7 @@ fn publish(core: &mut Core<NativeState>, staged: Staged) -> (NativeOutcome, Vec<
         writes: mutation::WriteSet::unrecorded(),
         encoded_added,
         encoded_removed: removed.bytes(),
+        rows_removed: removed.rows(),
         _index: None,
         events: None,
         retire: None,
