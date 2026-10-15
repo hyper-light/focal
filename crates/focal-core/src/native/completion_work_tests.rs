@@ -1,16 +1,7 @@
 use super::*;
-use crate::native::completion_envelope::{
-    CompletionEnvelope, CompletionSlots, CompletionUse, EvidenceBounds,
-};
+use crate::native::completion_envelope::{CompletionEnvelope, CompletionSlots, CompletionUse};
 use crate::native::prepare::Scratch;
 use focal_model::lifecycle::artifact_descriptor::Limits as ArtifactLimits;
-
-fn evidence_bounds() -> EvidenceBounds {
-    EvidenceBounds {
-        workspace_bytes: 4096,
-        retained_bytes: 512,
-    }
-}
 
 fn quote_with(
     fixture: &Fixture,
@@ -38,7 +29,6 @@ fn quote_with(
             visibility_label_bytes: 128,
             construction_bytes: 128 * 1024,
         },
-        evidence_bounds(),
     )
 }
 
@@ -57,10 +47,7 @@ fn check(fixture: &Fixture, envelope: CompletionEnvelope) -> Result<(), NativeEr
     let result = envelope.check_work(
         &fixture.view(),
         fixture.core.limits,
-        &mut Scratch {
-            used: 0,
-            max: envelope.work_check_bytes(),
-        },
+        &mut Scratch::bound(envelope.work_check_bytes()),
     );
     drop(reservation);
     result
@@ -117,27 +104,12 @@ fn received_target_prices_all_retry_versions_and_graph_consequences_before_entry
     let changed =
         17 + cohort.changed_keys() + report_index + status * (1 + cohort.claims()) + timers;
     assert_eq!(storage.limits().changed_keys, changed);
-    let journal = crate::native::completion_book::journal_bytes(1 + cohort.evaluations()).unwrap();
-    let writes = crate::native::mutation::bytes(changed).unwrap();
-    assert!(journal > 0);
-    assert_eq!(
-        envelope
-            .per_report_retained_bytes(CompletionUse::Regular)
-            .unwrap(),
-        storage.additional_retained_bytes() + writes + journal,
-        "each pending Work report owns its possible mixed journal"
-    );
-    assert_eq!(
-        envelope.total_retained_bytes(),
-        2 * (storage.additional_retained_bytes() + writes + journal)
-    );
     assert!(
         envelope
             .report_storage(CompletionUse::AdmissionFailure)
             .is_err()
     );
     assert!(envelope.work_check_bytes() > 0);
-    assert!(envelope.workspace_bytes() > envelope.work_check_bytes());
     assert!(
         envelope.descriptor_limits().construction_bytes < fixture.core.limits.preparation_bytes
     );

@@ -542,7 +542,9 @@ impl NativeOwner {
                             self.core.limits,
                         )?,
                     };
-                    let loan = self.book.report_contract_view(
+                    // The report is checked against its evaluation's contract, and charged
+                    // to the state's budget on the completion lane.
+                    self.book.report_contract_view(
                         key,
                         registered.state.binding(),
                         registered.parent,
@@ -551,14 +553,14 @@ impl NativeOwner {
                         authorization.schema(),
                         schemas,
                     )?;
-                    return Ok(loan.source().reserve(
+                    return Ok(self.core.state.budget.reserve(
                         BudgetKind::Pending,
                         BudgetLane::Completion,
                         bytes,
                     )?);
                 }
                 ArtifactCommand::SubmitDiagnostic { claim, reason } => {
-                    if let Some((key, spend)) = respondent::select_diagnostic(
+                    if respondent::select_diagnostic(
                         view,
                         context,
                         claim,
@@ -567,9 +569,10 @@ impl NativeOwner {
                         &self.book,
                         schemas,
                         self.core.limits,
-                    )? {
-                        let loan = self.book.respondent_contract(key, spend, view, schemas)?;
-                        return Ok(loan.source().reserve(
+                    )?
+                    .is_some()
+                    {
+                        return Ok(self.core.state.budget.reserve(
                             BudgetKind::Pending,
                             BudgetLane::Completion,
                             bytes,
@@ -579,7 +582,7 @@ impl NativeOwner {
                 ArtifactCommand::SubmitWork { .. } | ArtifactCommand::RejectWork { .. } => {}
             },
             DecodedPlan::Response(plan) => {
-                if let Some((key, spend)) = respondent::select_response(
+                if respondent::select_response(
                     view,
                     context,
                     plan.claim(),
@@ -588,9 +591,10 @@ impl NativeOwner {
                     &self.book,
                     schemas,
                     self.core.limits,
-                )? {
-                    let loan = self.book.respondent_contract(key, spend, view, schemas)?;
-                    return Ok(loan.source().reserve(
+                )?
+                .is_some()
+                {
+                    return Ok(self.core.state.budget.reserve(
                         BudgetKind::Pending,
                         BudgetLane::Completion,
                         bytes,
@@ -599,7 +603,7 @@ impl NativeOwner {
             }
             DecodedPlan::Fixed { input, .. } => {
                 if let NativeCommand::PostResponse { claim, expected } = input.command
-                    && let Some((key, spend)) = respondent::select_post(
+                    && respondent::select_post(
                         view,
                         context,
                         claim,
@@ -608,9 +612,9 @@ impl NativeOwner {
                         schemas,
                         self.core.limits,
                     )?
+                    .is_some()
                 {
-                    let loan = self.book.respondent_contract(key, spend, view, schemas)?;
-                    return Ok(loan.source().reserve(
+                    return Ok(self.core.state.budget.reserve(
                         BudgetKind::Pending,
                         BudgetLane::Completion,
                         bytes,

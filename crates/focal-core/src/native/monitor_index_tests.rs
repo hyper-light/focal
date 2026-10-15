@@ -20,10 +20,7 @@ fn view(core: &Core<NativeState>) -> View<'_> {
     View::committed(&core.state)
 }
 fn scratch() -> Scratch {
-    Scratch {
-        used: 0,
-        max: 16 * 1024 * 1024,
-    }
+    Scratch::bound(16 * 1024 * 1024)
 }
 fn cut(core: &Core<NativeState>) -> ClaimCut {
     ClaimCut {

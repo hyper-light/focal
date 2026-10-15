@@ -204,10 +204,7 @@ fn held_original_union_survives_disposition_shrink_and_quote_refusal_is_read_onl
             root,
             core.limits,
             None,
-            &mut Scratch {
-                used: 0,
-                max: core.limits.preparation_bytes,
-            },
+            &mut Scratch::bound(core.limits.preparation_bytes),
         )
         .unwrap();
         assert_eq!(plan.budget().charges().monitor_events, 1);
@@ -224,10 +221,7 @@ fn held_original_union_survives_disposition_shrink_and_quote_refusal_is_read_onl
                 root,
                 limits,
                 None,
-                &mut Scratch {
-                    used: 0,
-                    max: limits.preparation_bytes
-                }
+                &mut Scratch::bound(limits.preparation_bytes)
             )
             .is_err()
         );
@@ -249,10 +243,7 @@ fn held_original_union_survives_disposition_shrink_and_quote_refusal_is_read_onl
             root,
             core.limits,
             Some(budget),
-            &mut Scratch {
-                used: 0,
-                max: core.limits.preparation_bytes
-            }
+            &mut Scratch::bound(core.limits.preparation_bytes)
         )
         .is_err()
     );
@@ -262,10 +253,7 @@ fn held_original_union_survives_disposition_shrink_and_quote_refusal_is_read_onl
         core.limits,
         Some(budget),
         &ids,
-        &mut Scratch {
-            used: 0,
-            max: core.limits.preparation_bytes,
-        },
+        &mut Scratch::bound(core.limits.preparation_bytes),
     )
     .unwrap();
     assert_eq!(plan.members().len(), 2);

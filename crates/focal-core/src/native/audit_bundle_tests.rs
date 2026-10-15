@@ -479,8 +479,8 @@ fn discard_restores_bundle_index_and_ordinary_pressure_refuses_fresh_operations_
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
@@ -502,8 +502,8 @@ fn discard_restores_bundle_index_and_ordinary_pressure_refuses_fresh_operations_
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
@@ -520,8 +520,8 @@ fn discard_restores_bundle_index_and_ordinary_pressure_refuses_fresh_operations_
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();

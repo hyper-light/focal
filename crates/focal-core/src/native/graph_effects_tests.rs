@@ -79,10 +79,7 @@ fn future_heap_ceiling_prices_peer_history_and_registry_copies_without_repricing
         root,
         core.limits,
         None,
-        &mut Scratch {
-            used: 0,
-            max: core.limits.preparation_bytes,
-        },
+        &mut Scratch::bound(core.limits.preparation_bytes),
     )
     .unwrap();
     let original = plan.budget();
@@ -126,10 +123,7 @@ fn terminal_peer_keeps_its_source_identity_without_a_future_copy_obligation() {
         root,
         core.limits,
         None,
-        &mut Scratch {
-            used: 0,
-            max: core.limits.preparation_bytes,
-        },
+        &mut Scratch::bound(core.limits.preparation_bytes),
     )
     .unwrap();
     let mut copied = Vec::new();
@@ -168,10 +162,7 @@ fn reverse_transitive_dependencies_fail_from_original_root_without_repainting_te
     let root_binding = root.binding();
     let root_created = root.created();
     let view = View::committed(&core.state);
-    let mut scratch = Scratch {
-        used: 0,
-        max: core.limits.preparation_bytes,
-    };
+    let mut scratch = Scratch::bound(core.limits.preparation_bytes);
     let mut extras = extras(&mut scratch);
     let before = core.state.budget.stats();
     let rows = prepare(
@@ -312,10 +303,7 @@ fn incomplete_reverse_links_and_closure_limits_refuse_without_partial_publicatio
             2 => limits.plan_edges = 1,
             _ => {}
         }
-        let mut scratch = Scratch {
-            used: 0,
-            max: limits.preparation_bytes,
-        };
+        let mut scratch = Scratch::bound(limits.preparation_bytes);
         let mut extras = extras(&mut scratch);
         assert!(prepare(&view, root, cut(&view), limits, &mut extras, &mut scratch).is_err());
         assert!(extras.journal.unwrap().is_empty());
@@ -338,10 +326,7 @@ fn construction_budget_and_publication_cut_are_checked_before_graph_mutation() {
     let candidate = cancel(&core, 1);
     let view = View::committed(&core.state);
     for bad in 0..3 {
-        let mut scratch = Scratch {
-            used: 0,
-            max: core.limits.preparation_bytes,
-        };
+        let mut scratch = Scratch::bound(core.limits.preparation_bytes);
         let mut extras = extras(&mut scratch);
         let mut at = cut(&view);
         match bad {
@@ -378,10 +363,7 @@ fn already_terminal_connected_rows_keep_their_exact_original_cuts() {
     let old = old.try_copy(old.copy_charge().unwrap()).unwrap();
     let candidate = cancel(&core, 1);
     let view = View::committed(&core.state);
-    let mut scratch = Scratch {
-        used: 0,
-        max: core.limits.preparation_bytes,
-    };
+    let mut scratch = Scratch::bound(core.limits.preparation_bytes);
     let mut extras = extras(&mut scratch);
     let rows = prepare(
         &view,
@@ -398,10 +380,7 @@ fn already_terminal_connected_rows_keep_their_exact_original_cuts() {
 }
 
 fn scratch(core: &Core<NativeState>) -> Scratch {
-    Scratch {
-        used: 0,
-        max: core.limits.preparation_bytes,
-    }
+    Scratch::bound(core.limits.preparation_bytes)
 }
 
 #[test]
@@ -577,10 +556,7 @@ fn graph_quote_checks_remaining_stage_bytes_before_copying_or_mutating_sources()
         root,
         core.limits,
         None,
-        &mut Scratch {
-            used: 0,
-            max: remaining,
-        },
+        &mut Scratch::bound(remaining),
     )
     .unwrap();
     assert!(matches!(
@@ -589,10 +565,7 @@ fn graph_quote_checks_remaining_stage_bytes_before_copying_or_mutating_sources()
             root,
             core.limits,
             None,
-            &mut Scratch {
-                used: 0,
-                max: remaining - 1
-            }
+            &mut Scratch::bound(remaining - 1)
         ),
         Err(NativeError::Capacity(_))
     ));

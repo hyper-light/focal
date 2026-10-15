@@ -23,7 +23,6 @@ fn quote(
         limits,
         &registered,
         descriptor_limits(limits, registered.parent, registered.registry)?,
-        evidence(),
     )
 }
 fn peer(core: &mut Core<NativeState>, id: u128, target: u128) {
@@ -73,26 +72,13 @@ fn isolated_required_parent_is_protected_and_failure_credit_is_still_one_time() 
         envelope.slots().events,
         3 * envelope.reports() as usize + 1 + envelope.cohort().events()
     );
-    assert_eq!(
-        envelope.total_retained_bytes(),
-        (envelope.reports() as usize - 1)
-            * envelope
-                .per_report_retained_bytes(CompletionUse::Regular)
-                .unwrap()
-            + envelope
-                .per_report_retained_bytes(CompletionUse::AdmissionFailure)
-                .unwrap()
-    );
     let view = View::committed(&core.state);
     envelope
         .check_graph_with_members(
             &view,
             core.limits,
             members.ids(),
-            &mut prepare::Scratch {
-                used: 0,
-                max: envelope.graph_check_bytes(),
-            },
+            &mut prepare::Scratch::bound(envelope.graph_check_bytes()),
         )
         .unwrap();
     drop(members);
@@ -197,10 +183,7 @@ fn new_incoming_member_and_insufficient_failure_shape_refuse_without_changing_bu
                 &view,
                 core.limits,
                 members.as_ref().unwrap().ids(),
-                &mut prepare::Scratch {
-                    used: 0,
-                    max: envelope.graph_check_bytes()
-                }
+                &mut prepare::Scratch::bound(envelope.graph_check_bytes())
             )
             .is_err()
     );

@@ -63,10 +63,7 @@ fn owned(ids: &[u128]) -> Vec<(ClaimState, RegistrationSet)> {
 }
 
 fn scratch() -> Scratch {
-    Scratch {
-        used: 17,
-        max: usize::MAX,
-    }
+    Scratch::with_used(17, usize::MAX)
 }
 
 #[test]
@@ -80,7 +77,7 @@ fn empty_and_one_move_complete_native_membership_without_collection_allocation()
     let original = registry.rows().to_vec();
     let pointer = registry.rows().as_ptr();
     let retained = registry.retained_bytes().unwrap();
-    let mut scratch = Scratch { used: 17, max: 17 };
+    let mut scratch = Scratch::with_used(17, 17);
     overrides.insert(&claim, registry, 1, &mut scratch).unwrap();
     assert_eq!(scratch.used, 17);
     assert_eq!(overrides.len(), 1);
@@ -235,10 +232,7 @@ fn refused_spill_precharge_does_not_move_one_or_consume_any_scratch() {
     let rows = registry.rows().to_vec();
     let pointer = registry.rows().as_ptr();
     let mut overrides = RegistryOverrides::new();
-    let mut limited = Scratch {
-        used: 17,
-        max: exact - 1,
-    };
+    let mut limited = Scratch::with_used(17, exact - 1);
     overrides.insert(&first, registry, 2, &mut limited).unwrap();
     assert!(
         overrides
@@ -423,10 +417,7 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         &[],
     ));
     let view = View::committed(&core.state).with_own(&receipt).unwrap();
-    let mut allowance = Scratch {
-        used: 0,
-        max: core.limits.preparation_bytes,
-    };
+    let mut allowance = Scratch::bound(core.limits.preparation_bytes);
     let mut rows = allowance.reserve::<ClaimState>(2).unwrap();
     let mut registry = RegistryOverrides::new();
     for id in [2u128, 1] {

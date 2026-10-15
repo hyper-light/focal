@@ -20,13 +20,7 @@ fn staged() -> (NativeOwner, NativeOutcome, Vec<ClaimState>, Extras) {
     let mut rows = Vec::new();
     let mut extras = Extras::new(128, usize::MAX).unwrap();
     extras
-        .begin_journal(
-            128,
-            &mut Scratch {
-                used: 0,
-                max: usize::MAX,
-            },
-        )
+        .begin_journal(128, &mut Scratch::bound(usize::MAX))
         .unwrap();
     let mut suffix = false;
     let mut seals = Vec::new();

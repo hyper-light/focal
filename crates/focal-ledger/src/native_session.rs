@@ -727,13 +727,13 @@ impl<'a> RecordingReader<'a> {
         }
     }
 }
-impl focal_evidence::NativeCustodyReader for RecordingReader<'_> {
-    fn read_content(
+impl RecordingReader<'_> {
+    /// An object found missing is recorded once, up to the pending bound.
+    fn note<T>(
         &self,
         reference: &focal_model::ContentRef,
-        budget: usize,
-    ) -> Result<Vec<u8>, focal_evidence::ContentError> {
-        let result = self.inner.read_content(reference, budget);
+        result: Result<T, focal_evidence::ContentError>,
+    ) -> Result<T, focal_evidence::ContentError> {
         if let Err(focal_evidence::ContentError::Io(error)) = &result
             && error.kind() == std::io::ErrorKind::NotFound
             && let Ok(mut missing) = self.missing.lock()
@@ -744,6 +744,21 @@ impl focal_evidence::NativeCustodyReader for RecordingReader<'_> {
             missing.push(reference.clone());
         }
         result
+    }
+}
+impl focal_evidence::NativeCustodyReader for RecordingReader<'_> {
+    fn read_content(
+        &self,
+        reference: &focal_model::ContentRef,
+        budget: usize,
+    ) -> Result<Vec<u8>, focal_evidence::ContentError> {
+        self.note(reference, self.inner.read_content(reference, budget))
+    }
+    fn manifest_chunks(
+        &self,
+        reference: &focal_model::ContentRef,
+    ) -> Result<usize, focal_evidence::ContentError> {
+        self.note(reference, self.inner.manifest_chunks(reference))
     }
 }
 

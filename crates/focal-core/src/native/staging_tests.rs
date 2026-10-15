@@ -123,10 +123,7 @@ fn conflicting_descriptor_cannot_replace_fact_or_trigger_growth() {
 fn scratch_refuses_missing_bytes_and_charges_actual_coexisting_capacities() {
     let original = 37;
     let requested = array::<Binding>(7).unwrap();
-    let mut scratch = Scratch {
-        used: original,
-        max: original + requested - 1,
-    };
+    let mut scratch = Scratch::with_used(original, original + requested - 1);
     assert!(matches!(
         scratch.reserve::<Binding>(7),
         Err(NativeError::Capacity(_))
@@ -219,10 +216,7 @@ fn evaluation_requires_entire_singleton_charge_before_staging_any_fact() {
     .unwrap()
     .into_state();
     let mut extras = Extras::new(1, array::<Extra>(1).unwrap() * 2).unwrap();
-    let mut scratch = Scratch {
-        used: 19,
-        max: 19 + OwnedEvaluation::container_charge() - 1,
-    };
+    let mut scratch = Scratch::with_used(19, 19 + OwnedEvaluation::container_charge() - 1);
     for _ in 0..2 {
         assert!(matches!(
             extras.evaluation(
@@ -270,10 +264,7 @@ fn evaluation_requires_entire_singleton_charge_before_staging_any_fact() {
 
 #[test]
 fn impossible_capacities_fail_before_changing_scratch_or_allocating_rows() {
-    let mut scratch = Scratch {
-        used: 1,
-        max: usize::MAX,
-    };
+    let mut scratch = Scratch::with_used(1, usize::MAX);
     assert!(matches!(
         scratch.charge(usize::MAX),
         Err(NativeError::Capacity(_))
@@ -367,4 +358,44 @@ fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
     ));
     assert_eq!(budget.stats(), initial);
     assert!(core.native_outcome(request).unwrap().is_none());
+}
+
+#[test]
+fn a_metered_scratch_holds_what_it_charged_never_its_bound() {
+    let budget = MemoryBudget::new(64 * 1024 * 1024, 0).unwrap();
+    let bound = 32 * 1024 * 1024;
+    let mut scratch = Scratch::metered(&budget, BudgetLane::Ordinary, bound).unwrap();
+    // A preparation's bound is no reservation: nothing is held before use.
+    assert_eq!(scratch.held(), 0);
+    assert_eq!(budget.stats().used, 0);
+    scratch.charge(100).unwrap();
+    let step = scratch.held();
+    assert!((100..=64 * 1024).contains(&step), "held {step}");
+    assert_eq!(budget.stats().used, step);
+    // Charges within the held step take nothing more from the budget.
+    scratch.charge(step - 100).unwrap();
+    assert_eq!(budget.stats().used, step);
+    // Past it, the charge grows in steps, never past the bound.
+    scratch.charge(step * 3).unwrap();
+    assert!(scratch.held() >= scratch.used && scratch.held() <= bound);
+    assert_eq!(budget.stats().used, scratch.held());
+    // The bound refuses without charging more.
+    let held = scratch.held();
+    assert!(scratch.charge(bound).is_err());
+    assert_eq!(scratch.held(), held);
+    // A refusal by the budget leaves the scratch as it was.
+    let pressure = budget
+        .reserve(
+            BudgetKind::Payload,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
+        )
+        .unwrap()
+        .commit();
+    let used = scratch.used;
+    assert!(scratch.charge(held + 1).is_err());
+    assert_eq!((scratch.used, scratch.held()), (used, held));
+    drop(pressure);
+    drop(scratch);
+    assert_eq!(budget.stats().used, 0);
 }

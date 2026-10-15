@@ -108,10 +108,7 @@ fn retained_proof_detects_changed_original_owner_and_result_positions() {
     let supplied = proposal(1, 1);
     let mut meta = view.meta();
     let mut extras = Extras::new(128, 1024 * 1024).unwrap();
-    let mut scratch = Scratch {
-        used: 0,
-        max: 1024 * 1024,
-    };
+    let mut scratch = Scratch::bound(1024 * 1024);
     let plan = super::super::prepare(
         vec![supplied],
         key(1),

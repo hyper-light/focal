@@ -463,8 +463,8 @@ fn valid_local_report_and_exact_pending_and_committed_retries_need_no_new_custod
     let pressure = parent
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            parent.limit() - parent.stats().used,
+            BudgetLane::Ordinary,
+            parent.headroom(BudgetLane::Ordinary),
         )
         .unwrap();
     let budget = parent.stats();

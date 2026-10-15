@@ -85,8 +85,8 @@ fn exhaust(budget: &MemoryBudget) -> Allocation {
     budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit()
@@ -106,10 +106,10 @@ fn decoded_admission_uses_held_input_capacity_with_all_parent_memory_exhausted()
     let proof = verified(&mut custody, &input);
     drop(input);
     let _pressure = exhaust(&budget);
-    let pool_before = owner.book.source().stats();
+    let pool_before = owner.core.state.budget.stats();
     let candidate =
         ticket(stage_report(&mut owner, &bytes, EVALUATOR, Some(&proof), 1 << 24).unwrap());
-    let pool_pending = owner.book.source().stats();
+    let pool_pending = owner.core.state.budget.stats();
     assert!(pool_pending.used > pool_before.used);
     // No second construction allowance, current-state report authority or
     // queue admission is needed for the exact retained request.
@@ -117,7 +117,7 @@ fn decoded_admission_uses_held_input_capacity_with_all_parent_memory_exhausted()
         matches!(stage_report(&mut owner, &bytes, EVALUATOR, None, 0).unwrap(),
         NativeStaging::Existing { candidate: Some(found), .. } if found == candidate)
     );
-    assert_eq!(owner.book.source().stats(), pool_pending);
+    assert_eq!(owner.core.state.budget.stats(), pool_pending);
     owner.publish_after_durable(candidate).unwrap();
     assert!(matches!(
         stage_report(&mut owner, &bytes, EVALUATOR, None, 0).unwrap(),
@@ -147,7 +147,7 @@ fn decoded_report_refusals_release_ingress_capacity_and_preserve_the_promise() {
     let mut custody = Custody::new();
     let proof = verified(&mut custody, &input);
     let _pressure = exhaust(&budget);
-    let before = owner.book.source().stats();
+    let before = owner.core.state.budget.stats();
     for (actor, evidence, work) in [
         (ISSUER, Some(&proof), 1 << 24),
         (EVALUATOR, None, 1 << 24),
@@ -155,12 +155,12 @@ fn decoded_report_refusals_release_ingress_capacity_and_preserve_the_promise() {
     ] {
         assert!(stage_report(&mut owner, &bytes, actor, evidence, work).is_err());
         assert_eq!(owner.pending_len(), 0);
-        assert_eq!(owner.book.source().stats(), before);
+        assert_eq!(owner.core.state.budget.stats(), before);
     }
     let candidate =
         ticket(stage_report(&mut owner, &bytes, EVALUATOR, Some(&proof), 1 << 24).unwrap());
     owner.discard_from(candidate).unwrap();
-    assert_eq!(owner.book.source().stats(), before);
+    assert_eq!(owner.core.state.budget.stats(), before);
     ticket(stage_report(&mut owner, &bytes, EVALUATOR, Some(&proof), 1 << 24).unwrap());
 }
 
@@ -353,13 +353,13 @@ fn borrowed_authority_cannot_consume_the_final_artifact_construction_pass() {
             1 << 22,
         )
         .unwrap();
-    let before = owner.book.source().stats();
+    let before = owner.core.state.budget.stats();
     assert!(
         owner
             .prepare_decoded(context(EVALUATOR, 100), plan.into(), 1 << 24, Some(&proof))
             .is_err()
     );
-    assert_eq!(owner.book.source().stats(), before);
+    assert_eq!(owner.core.state.budget.stats(), before);
     assert_eq!(owner.pending_len(), 0);
     ticket(stage_report(&mut owner, &bytes, EVALUATOR, Some(&proof), 1 << 24).unwrap());
 }
@@ -391,13 +391,13 @@ fn raw_owner_ingress_preserves_held_reporting_and_exact_retry_without_build_head
         ..limits
     };
     let _pressure = exhaust(&budget);
-    let before = owner.book.source().stats();
+    let before = owner.core.state.budget.stats();
     assert!(
         owner
             .prepare_frame(context(EVALUATOR, 100), &bytes, inspect_only, Some(&proof))
             .is_err()
     );
-    assert_eq!(owner.book.source().stats(), before);
+    assert_eq!(owner.core.state.budget.stats(), before);
     let candidate = ticket(
         owner
             .prepare_frame(context(EVALUATOR, 100), &bytes, limits, Some(&proof))
@@ -492,8 +492,8 @@ fn a_full_owner_refuses_a_fresh_request_from_its_header() {
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap();
     let fresh = encoded(

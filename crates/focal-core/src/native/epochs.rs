@@ -449,10 +449,7 @@ pub(super) fn staged(
     let NativeInvocation::Request(request) = outcome.invocation else {
         return None;
     };
-    let mut scratch = Scratch {
-        used: 0,
-        max: limits.preparation_bytes,
-    };
+    let mut scratch = Scratch::bound(limits.preparation_bytes);
     let window = admit(
         view,
         meta,
@@ -569,10 +566,10 @@ mod tests {
         assert_eq!(window.seal_of(RequestEpoch(1)), Some(2));
         assert_eq!(window.seal_of(RequestEpoch(3)), Some(2));
         assert!(window.valid());
-        let mut scratch = Scratch { used: 0, max: 1024 };
+        let mut scratch = Scratch::bound(1024);
         let copy = window.try_copy(&mut scratch).unwrap();
         assert_eq!(copy, window);
         assert_eq!(scratch.used, copy.heap_charge().unwrap());
-        assert!(window.try_copy(&mut Scratch { used: 0, max: 1 }).is_err());
+        assert!(window.try_copy(&mut Scratch::bound(1)).is_err());
     }
 }

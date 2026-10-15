@@ -349,8 +349,8 @@ fn complete_retry_fallback_and_quality_chain_uses_funded_capacity_under_full_par
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
@@ -1470,8 +1470,8 @@ fn reconstruction_refunds_refusal_then_funds_live_increment_after_received_respo
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
@@ -1489,8 +1489,8 @@ fn reconstruction_refunds_refusal_then_funds_live_increment_after_received_respo
     let pressure = budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();

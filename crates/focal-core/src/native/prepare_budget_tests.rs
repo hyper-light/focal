@@ -55,10 +55,7 @@ fn begin_preserves_a_tighter_scratch_limit_instead_of_widening_it() {
             limits(4, 1, scratch_bytes),
         )
         .unwrap();
-        let mut scratch = Scratch {
-            used: 0,
-            max: budget.scratch_bytes,
-        };
+        let mut scratch = Scratch::bound(budget.scratch_bytes);
         assert_eq!(scratch.charge(required).is_ok(), scratch_bytes >= required);
         assert_eq!(
             scratch.used,

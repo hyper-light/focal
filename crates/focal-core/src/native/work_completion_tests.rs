@@ -146,8 +146,8 @@ fn exhaust(f: &Fixture) -> Allocation {
     source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit()

@@ -534,10 +534,7 @@ impl Core<NativeState> {
             .ok()
             .and_then(|seals| seals.checked_add(1))
             .ok_or(SealRefusal::Capacity)?;
-        let mut scratch = Scratch {
-            used: 0,
-            max: self.limits.preparation_bytes,
-        };
+        let mut scratch = Scratch::bound(self.limits.preparation_bytes);
         let mut keys: Vec<Key> = Vec::new();
         keys.try_reserve_exact(bound.rows.min(self.resident_outcomes().saturating_mul(2)))
             .map_err(|_| SealRefusal::Capacity)?;
@@ -1093,10 +1090,7 @@ impl Core<NativeState> {
                 .checked_add(1)
                 .ok_or(NativeError::Capacity("sequence"))?,
         );
-        let mut scratch = Scratch {
-            used: 0,
-            max: self.limits.preparation_bytes,
-        };
+        let mut scratch = Scratch::bound(self.limits.preparation_bytes);
         // Every window that changes: the floors forced, the seal recorded,
         // the fold followed; each at most once.
         let mut windows: Vec<(ParticipantId, EpochWindow)> = Vec::new();

@@ -294,11 +294,7 @@ impl CohortSeals {
             add(add(final_events, additional_evaluations)?, 2)?,
         )?;
         within(changes, limits.range.max_batch_entries)?;
-        let mut charged = Scratch {
-            used: scratch.used,
-            max: scratch.max,
-        };
-        charged.charge(bytes)?;
+        scratch.fits(bytes)?;
         let mut suffix = Self {
             tokens: reserve(changed)?,
             updates: reserve(changed)?,
@@ -351,7 +347,7 @@ impl CohortSeals {
             return Err(ContractError::InvalidManifest.into());
         }
         suffix.canonicalize()?;
-        *scratch = charged;
+        scratch.charge(bytes)?;
         Ok(suffix)
     }
 

@@ -141,14 +141,11 @@ impl CompletionBook {
             if grant.growth_checked.replace(true) {
                 return Ok(());
             }
-            let bytes = grant.envelope.graph_check_bytes();
-            let reservation =
-                self.source()
-                    .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?;
-            let mut scratch = prepare::Scratch {
-                used: 0,
-                max: bytes,
-            };
+            let mut scratch = prepare::Scratch::metered(
+                &view.state.budget,
+                BudgetLane::Completion,
+                grant.envelope.graph_check_bytes(),
+            )?;
             let members = grant
                 .members
                 .as_ref()
@@ -159,7 +156,6 @@ impl CompletionBook {
                 members.ids(),
                 &mut scratch,
             )?;
-            drop(reservation);
             Ok(())
         })?;
         self.check_health()

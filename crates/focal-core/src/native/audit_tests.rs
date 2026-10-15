@@ -419,8 +419,8 @@ fn audit_refuses_open_claim_or_ordinary_pressure_before_callback_and_releases_qu
     let pressure = parent
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            parent.limit() - parent.stats().used,
+            BudgetLane::Ordinary,
+            parent.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();

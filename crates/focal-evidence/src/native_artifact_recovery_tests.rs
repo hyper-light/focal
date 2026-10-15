@@ -15,7 +15,13 @@ fn recovery_reads_existing_inline_and_pointer_trees_without_resealing() {
     let current = store(root.path());
     let quote = NativeVerificationBudget::for_schema(artifact.schema_hash(), &BuiltinNativeSchemas)
         .unwrap();
-    let exact = MemoryBudget::new(quote.peak_bytes(), quote.peak_bytes()).unwrap();
+    let peak = quote
+        .peak_for(
+            expected.length as usize,
+            current.manifest_chunks(&reference(expected)).unwrap(),
+        )
+        .unwrap();
+    let exact = MemoryBudget::new(peak, peak).unwrap();
     let recovered = current
         .recover_native_artifact(
             request(),
@@ -80,7 +86,13 @@ fn recovery_refuses_wrong_bytes_revision_request_schema_and_unfunded_reads() {
     drop(sealed);
     let quote = NativeVerificationBudget::for_schema(artifact.schema_hash(), &BuiltinNativeSchemas)
         .unwrap();
-    let short = MemoryBudget::new(quote.peak_bytes() - 1, quote.peak_bytes() - 1).unwrap();
+    let peak = quote
+        .peak_for(
+            expected.length as usize,
+            current.manifest_chunks(&reference(expected)).unwrap(),
+        )
+        .unwrap();
+    let short = MemoryBudget::new(peak - 1, peak - 1).unwrap();
     assert!(matches!(
         current.recover_native_artifact(
             request(),

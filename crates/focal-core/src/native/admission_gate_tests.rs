@@ -20,8 +20,8 @@ fn checked_pending_input_builds_from_selected_funding_after_parent_exhaustion() 
     let pressure = parent
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            parent.limit() - parent.stats().used,
+            BudgetLane::Ordinary,
+            parent.headroom(BudgetLane::Ordinary),
         )
         .unwrap();
     let before = parent.stats();
@@ -99,8 +99,8 @@ fn checked_retries_resolve_before_full_queue_memory_and_new_logical_time() {
     let pressure = parent
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            parent.limit() - parent.stats().used,
+            BudgetLane::Ordinary,
+            parent.headroom(BudgetLane::Ordinary),
         )
         .unwrap();
     let before = parent.stats();

@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 #[derive(Debug, PartialEq, Eq)]
 struct Row {
     value: u64,
-    workspace: usize,
 }
 
 fn source() -> MemoryBudget {
@@ -25,24 +24,14 @@ fn key(value: u64) -> EvaluationKey {
     }
 }
 
-fn put(index: &mut CompletionIndex<Row>, source: &MemoryBudget, value: u64, workspace: usize) {
+fn put(index: &mut CompletionIndex<Row>, source: &MemoryBudget, value: u64) {
     drop(index.grow(source, 8192).unwrap());
-    index
-        .insert(key(value), Row { value, workspace }, workspace)
-        .unwrap();
+    index.insert(key(value), Row { value }).unwrap();
 }
 
-fn check(index: &CompletionIndex<Row>, oracle: &BTreeMap<EvaluationKey, (u64, usize)>) {
+fn check(index: &CompletionIndex<Row>, oracle: &BTreeMap<EvaluationKey, u64>) {
     index.validate().unwrap();
     assert_eq!(index.len(), oracle.len());
-    assert_eq!(
-        index.maximum(),
-        oracle
-            .values()
-            .map(|(_, weight)| *weight)
-            .max()
-            .unwrap_or(0)
-    );
     let lower = EvaluationKey {
         claim: ClaimId::from_u128(0),
         validation: ValidationId::from_u128(0),
@@ -51,12 +40,12 @@ fn check(index: &CompletionIndex<Row>, oracle: &BTreeMap<EvaluationKey, (u64, us
     };
     let actual: Vec<_> = index
         .iter_from(lower)
-        .map(|(key, row)| (key, (row.value, row.workspace)))
+        .map(|(key, row)| (key, row.value))
         .collect();
     let expected: Vec<_> = oracle.iter().map(|(key, row)| (*key, *row)).collect();
     assert_eq!(actual, expected);
-    for (key, &(value, workspace)) in oracle {
-        assert_eq!(index.get(*key), Some(&Row { value, workspace }));
+    for (key, &value) in oracle {
+        assert_eq!(index.get(*key), Some(&Row { value }));
     }
 }
 
@@ -75,32 +64,24 @@ fn random(state: &mut u64) -> u64 {
 }
 
 #[test]
-fn all_avl_rotation_shapes_preserve_physical_grant_slots_and_exact_maximum() {
+fn all_avl_rotation_shapes_preserve_physical_grant_slots() {
     for order in [[30, 20, 10], [10, 20, 30], [30, 10, 20], [10, 30, 20]] {
         let source = source();
         let mut index = CompletionIndex::new();
         let mut oracle = BTreeMap::new();
         let mut original_slots = BTreeMap::new();
         for value in order {
-            put(&mut index, &source, value, value as usize);
+            put(&mut index, &source, value);
             original_slots.insert(value, index.slot(key(value)).unwrap());
-            oracle.insert(key(value), (value, value as usize));
+            oracle.insert(key(value), value);
             check(&index, &oracle);
             for (&old, &slot) in &original_slots {
                 assert_eq!(index.slot(key(old)), Some(slot));
             }
         }
-        index
-            .replace_weight(key(10), 99, |row| row.workspace = 99)
-            .unwrap();
-        oracle.get_mut(&key(10)).unwrap().1 = 99;
+        index.update(key(10), |row| row.value = 99).unwrap();
+        *oracle.get_mut(&key(10)).unwrap() = 99;
         check(&index, &oracle);
-        index
-            .replace_weight(key(10), 0, |row| row.workspace = 0)
-            .unwrap();
-        oracle.get_mut(&key(10)).unwrap().1 = 0;
-        check(&index, &oracle);
-        assert_eq!(index.maximum(), 30);
         for value in order {
             assert_eq!(index.slot(key(value)), Some(original_slots[&value]));
         }
@@ -120,8 +101,8 @@ fn deleting_two_child_nodes_transplants_successor_without_relocating_other_grant
         let mut index = CompletionIndex::new();
         let mut oracle = BTreeMap::new();
         for &value in &order {
-            put(&mut index, &source, value, (value * 3) as usize);
-            oracle.insert(key(value), (value, (value * 3) as usize));
+            put(&mut index, &source, value);
+            oracle.insert(key(value), value);
         }
         let before = slots(&index, &order);
         let removed_row = index.remove(key(removed)).unwrap();
@@ -135,23 +116,14 @@ fn deleting_two_child_nodes_transplants_successor_without_relocating_other_grant
         // Existing vacant capacity remains usable after an interior deletion;
         // no surviving grant needs to move or obtain a new allocation.
         assert!(index.grow(&source, index.capacity()).unwrap().is_none());
-        index
-            .insert(
-                key(99),
-                Row {
-                    value: 99,
-                    workspace: 999,
-                },
-                999,
-            )
-            .unwrap();
+        index.insert(key(99), Row { value: 99 }).unwrap();
         let new_slot = index.slot(key(99)).unwrap();
         for &value in order.iter().filter(|&&value| value != removed) {
             assert_ne!(new_slot, before[&value]);
             assert_eq!(index.slot(key(value)), Some(before[&value]));
         }
         assert_eq!(source.stats(), budget);
-        oracle.insert(key(99), (99, 999));
+        oracle.insert(key(99), 99);
         check(&index, &oracle);
         drop(index);
         assert_eq!(source.stats().used, 0);
@@ -159,43 +131,33 @@ fn deleting_two_child_nodes_transplants_successor_without_relocating_other_grant
 }
 
 #[test]
-fn randomized_insert_remove_weight_updates_and_lower_bounds_match_ordered_oracle() {
+fn randomized_insert_remove_updates_and_lower_bounds_match_ordered_oracle() {
     let source = source();
     let mut index = CompletionIndex::new();
     let mut oracle = BTreeMap::new();
     let mut seed = 0x1cb2_30dc_761e_4a8d;
     for step in 0..6000_u64 {
         let value = random(&mut seed) % 256;
-        let weight = (random(&mut seed) % 16384) as usize;
         match random(&mut seed) % 4 {
             0 if !oracle.contains_key(&key(value)) => {
-                put(&mut index, &source, value, weight);
-                oracle.insert(key(value), (value, weight));
+                put(&mut index, &source, value);
+                oracle.insert(key(value), value);
             }
             1 => {
                 let before = oracle.remove(&key(value));
                 match before {
-                    Some((stored, workspace)) => {
-                        assert_eq!(
-                            index.remove(key(value)).unwrap(),
-                            Row {
-                                value: stored,
-                                workspace
-                            }
-                        )
+                    Some(stored) => {
+                        assert_eq!(index.remove(key(value)).unwrap(), Row { value: stored })
                     }
                     None => assert!(index.remove(key(value)).is_err()),
                 }
             }
             2 => {
-                let result = index.replace_weight(key(value), weight, |row| {
-                    row.value = step;
-                    row.workspace = weight;
-                });
+                let result = index.update(key(value), |row| row.value = step);
                 match oracle.get_mut(&key(value)) {
                     Some(row) => {
                         result.unwrap();
-                        *row = (step, weight);
+                        *row = step;
                     }
                     None => assert!(result.is_err()),
                 }
@@ -204,7 +166,7 @@ fn randomized_insert_remove_weight_updates_and_lower_bounds_match_ordered_oracle
                 let actual = index
                     .iter_from(key(value))
                     .next()
-                    .map(|(key, row)| (key, (row.value, row.workspace)));
+                    .map(|(key, row)| (key, row.value));
                 let expected = oracle
                     .range(key(value)..)
                     .next()
@@ -214,12 +176,11 @@ fn randomized_insert_remove_weight_updates_and_lower_bounds_match_ordered_oracle
         }
         check(&index, &oracle);
     }
-    for (key, (value, workspace)) in oracle {
-        assert_eq!(index.remove(key).unwrap(), Row { value, workspace });
+    for (key, value) in oracle {
+        assert_eq!(index.remove(key).unwrap(), Row { value });
         index.validate().unwrap();
     }
     assert_eq!(index.len(), 0);
-    assert_eq!(index.maximum(), 0);
     drop(index);
     assert_eq!(source.stats().used, 0);
 }
@@ -230,8 +191,8 @@ fn lower_bound_and_claim_cohort_traversal_skip_unrelated_grants() {
     let mut index = CompletionIndex::new();
     let mut oracle = BTreeMap::new();
     for value in (0..2048).rev() {
-        put(&mut index, &source, value, (value % 31) as usize);
-        oracle.insert(key(value), (value, (value % 31) as usize));
+        put(&mut index, &source, value);
+        oracle.insert(key(value), value);
     }
     for claim in [1, 2, 31, 32, 63, 64, 65] {
         let lower = EvaluationKey {
@@ -244,7 +205,7 @@ fn lower_bound_and_claim_cohort_traversal_skip_unrelated_grants() {
         let actual: Vec<_> = index
             .iter_from(lower)
             .take_while(|(key, _)| key.claim == lower.claim)
-            .map(|(key, row)| (key, (row.value, row.workspace)))
+            .map(|(key, row)| (key, row.value))
             .collect();
         let visits = index.visits();
         let expected: Vec<_> = oracle
@@ -268,59 +229,22 @@ fn lower_bound_and_claim_cohort_traversal_skip_unrelated_grants() {
 fn max_capacity_and_parent_pressure_refuse_growth_without_mutating_the_live_index() {
     let source = source();
     let mut index = CompletionIndex::new();
-    assert!(
-        index
-            .insert(
-                key(1),
-                Row {
-                    value: 1,
-                    workspace: 1
-                },
-                1
-            )
-            .is_err()
-    );
+    assert!(index.insert(key(1), Row { value: 1 }).is_err());
     assert_eq!(source.stats().used, 0);
     assert!(index.grow(&source, 0).is_err());
     drop(index.grow(&source, 1).unwrap());
-    index
-        .insert(
-            key(1),
-            Row {
-                value: 1,
-                workspace: 1,
-            },
-            1,
-        )
-        .unwrap();
+    index.insert(key(1), Row { value: 1 }).unwrap();
     let original_slot = index.slot(key(1));
     let budget = source.stats();
     assert!(index.grow(&source, 1).is_err());
     assert_eq!(source.stats(), budget);
-    assert!(
-        index
-            .insert(
-                key(1),
-                Row {
-                    value: 999,
-                    workspace: 999
-                },
-                999
-            )
-            .is_err()
-    );
-    assert_eq!(
-        index.get(key(1)),
-        Some(&Row {
-            value: 1,
-            workspace: 1
-        })
-    );
+    assert!(index.insert(key(1), Row { value: 999 }).is_err());
+    assert_eq!(index.get(key(1)), Some(&Row { value: 1 }));
     let pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
@@ -328,21 +252,11 @@ fn max_capacity_and_parent_pressure_refuse_growth_without_mutating_the_live_inde
     assert!(index.grow(&source, 2).is_err());
     assert_eq!(source.stats(), full);
     assert_eq!(index.slot(key(1)), original_slot);
-    assert_eq!(index.maximum(), 1);
     assert_eq!(index.capacity(), 1);
     index.validate().unwrap();
     index.remove(key(1)).unwrap();
     assert!(index.grow(&source, 1).unwrap().is_none());
-    index
-        .insert(
-            key(2),
-            Row {
-                value: 2,
-                workspace: 2,
-            },
-            2,
-        )
-        .unwrap();
+    index.insert(key(2), Row { value: 2 }).unwrap();
     assert_eq!(index.slot(key(2)), original_slot);
     assert_eq!(source.stats(), full);
     drop(pressure);
@@ -355,27 +269,17 @@ fn growth_rollback_preserves_committed_older_deletion_and_refuses_live_trailing_
     let source = source();
     let mut index = CompletionIndex::new();
     for value in 1..=4 {
-        put(&mut index, &source, value, value as usize);
+        put(&mut index, &source, value);
     }
     assert_eq!(index.capacity(), 4);
     let original = slots(&index, &[1, 2, 3, 4]);
     let budget = source.stats();
     let growth = index.grow(&source, 8).unwrap().unwrap();
-    index
-        .insert(
-            key(5),
-            Row {
-                value: 5,
-                workspace: 50,
-            },
-            50,
-        )
-        .unwrap();
+    index.insert(key(5), Row { value: 5 }).unwrap();
     assert!(index.slot(key(5)).unwrap() >= 4);
     let expanded = source.stats();
     assert!(index.check_restore_growth(&growth).is_err());
     assert_eq!(source.stats(), expanded);
-    assert_eq!(index.maximum(), 50);
     // An older terminal head can publish while this Begin remains pending.
     // Rolling back the later growth must not resurrect that removed grant.
     index.remove(key(2)).unwrap();
@@ -390,18 +294,8 @@ fn growth_rollback_preserves_committed_older_deletion_and_refuses_live_trailing_
         assert_eq!(index.slot(key(value)), Some(original[&value]));
     }
     index.validate().unwrap();
-    assert_eq!(index.maximum(), 4);
     assert!(index.grow(&source, 4).unwrap().is_none());
-    index
-        .insert(
-            key(6),
-            Row {
-                value: 6,
-                workspace: 60,
-            },
-            60,
-        )
-        .unwrap();
+    index.insert(key(6), Row { value: 6 }).unwrap();
     assert_eq!(index.slot(key(6)), Some(original[&2]));
     assert_eq!(source.stats(), budget);
     drop(index);
@@ -412,31 +306,13 @@ fn growth_rollback_preserves_committed_older_deletion_and_refuses_live_trailing_
 fn nested_growth_rollback_keeps_removed_old_slots_vacant_and_refunds_each_buffer_once() {
     let source = source();
     let mut index = CompletionIndex::new();
-    put(&mut index, &source, 1, 10);
+    put(&mut index, &source, 1);
     let one = source.stats();
     let first = index.grow(&source, 8).unwrap().unwrap();
-    index
-        .insert(
-            key(2),
-            Row {
-                value: 2,
-                workspace: 20,
-            },
-            20,
-        )
-        .unwrap();
+    index.insert(key(2), Row { value: 2 }).unwrap();
     let two = source.stats();
     let second = index.grow(&source, 8).unwrap().unwrap();
-    index
-        .insert(
-            key(3),
-            Row {
-                value: 3,
-                workspace: 30,
-            },
-            30,
-        )
-        .unwrap();
+    index.insert(key(3), Row { value: 3 }).unwrap();
     let slot_two = index.slot(key(2));
     index.remove(key(1)).unwrap();
     index.remove(key(3)).unwrap();
@@ -450,9 +326,8 @@ fn nested_growth_rollback_keeps_removed_old_slots_vacant_and_refunds_each_buffer
     assert_eq!(source.stats(), one);
     assert_eq!(index.capacity(), 1);
     assert_eq!(index.len(), 0);
-    assert_eq!(index.maximum(), 0);
     index.validate().unwrap();
-    put(&mut index, &source, 9, 90);
+    put(&mut index, &source, 9);
     assert_eq!(index.slot(key(9)), Some(0));
     assert_eq!(source.stats(), one);
     drop(index);
@@ -466,8 +341,8 @@ fn sustained_large_index_churn_has_logarithmic_structural_work_and_no_growth_all
         let mut index = CompletionIndex::new();
         let mut oracle = BTreeMap::new();
         for value in 0..population {
-            put(&mut index, &source, value, value as usize);
-            oracle.insert(key(value), (value, value as usize));
+            put(&mut index, &source, value);
+            oracle.insert(key(value), value);
         }
         let budget = source.stats();
         // A per-operation logarithmic bound across three population sizes allows
@@ -486,45 +361,26 @@ fn sustained_large_index_churn_has_logarithmic_structural_work_and_no_growth_all
             oracle.remove(&key(old));
             let next = population + step;
             index.reset_visits();
-            index
-                .insert(
-                    key(next),
-                    Row {
-                        value: next,
-                        workspace: next as usize,
-                    },
-                    next as usize,
-                )
-                .unwrap();
+            index.insert(key(next), Row { value: next }).unwrap();
             assert!(
                 index.visits() < max_touches,
                 "insert visits {}",
                 index.visits()
             );
-            oracle.insert(key(next), (next, next as usize));
+            oracle.insert(key(next), next);
             let changed = step + population / 2;
-            let weight = if step % 2 == 0 {
-                100_000 + step as usize
-            } else {
-                0
-            };
+            let value = 100_000 + step;
             index.reset_visits();
-            index
-                .replace_weight(key(changed), weight, |row| row.workspace = weight)
-                .unwrap();
+            index.update(key(changed), |row| row.value = value).unwrap();
             assert!(
                 index.visits() < max_touches,
                 "update visits {}",
                 index.visits()
             );
-            oracle.get_mut(&key(changed)).unwrap().1 = weight;
+            *oracle.get_mut(&key(changed)).unwrap() = value;
             index.reset_visits();
-            assert_eq!(index.get(key(changed)).unwrap().workspace, weight);
+            assert_eq!(index.get(key(changed)).unwrap().value, value);
             assert!(index.visits() < 8 * log, "lookup visits {}", index.visits());
-            assert_eq!(
-                index.maximum(),
-                oracle.values().map(|row| row.1).max().unwrap()
-            );
             assert_eq!(source.stats(), budget);
             if step % 128 == 0 {
                 check(&index, &oracle);
@@ -542,24 +398,9 @@ fn refuses_all_mutations_after_poison(index: &mut CompletionIndex<Row>, source: 
     let len = index.len();
     let capacity = index.capacity();
     let invoked = std::cell::Cell::new(false);
-    assert!(
-        index
-            .replace_weight(key(20), 999, |_| invoked.set(true))
-            .is_err()
-    );
+    assert!(index.update(key(20), |_| invoked.set(true)).is_err());
     assert!(!invoked.get());
-    assert!(
-        index
-            .insert(
-                key(999),
-                Row {
-                    value: 999,
-                    workspace: 999
-                },
-                999
-            )
-            .is_err()
-    );
+    assert!(index.insert(key(999), Row { value: 999 }).is_err());
     assert!(index.remove(key(20)).is_err());
     assert!(index.grow(source, 8192).is_err());
     assert_eq!(index.len(), len);
@@ -573,11 +414,10 @@ fn missing_root_or_referenced_child_poison_reads_and_refuse_later_mutations() {
         let source = source();
         let mut index = CompletionIndex::new();
         for value in [20, 10, 30] {
-            put(&mut index, &source, value, value as usize);
+            put(&mut index, &source, value);
         }
         if missing_root {
             index.root = None;
-            assert_eq!(index.maximum(), 0);
             assert!(index.iter_from(key(10)).next().is_none());
         } else {
             let child = index.slot(key(10)).unwrap();
@@ -596,7 +436,7 @@ fn broken_parent_cursor_repair_and_vacancy_cycles_refuse_with_bounded_work() {
         let source = source();
         let mut index = CompletionIndex::new();
         for value in [40, 20, 60, 10, 30, 50, 70] {
-            put(&mut index, &source, value, value as usize);
+            put(&mut index, &source, value);
         }
         let low = index.slot(key(10)).unwrap();
         let high = index.slot(key(70)).unwrap();
@@ -614,29 +454,16 @@ fn broken_parent_cursor_repair_and_vacancy_cycles_refuse_with_bounded_work() {
                 assert!(index.iter_from(key(70)).take(16).count() <= 1);
             }
             2 => {
+                // An insert below the self-parented node repairs heights upward
+                // and must stop at the walk limit instead of cycling.
                 index.slots[high].node.as_mut().unwrap().parent = Some(high);
-                assert!(
-                    index
-                        .replace_weight(key(70), 999, |row| row.workspace = 999)
-                        .is_err()
-                );
+                assert!(index.insert(key(75), Row { value: 75 }).is_err());
             }
             _ => {
                 index.remove(key(70)).unwrap();
                 let free = index.free.unwrap();
                 index.slots[free].free_previous = Some(free);
-                assert!(
-                    index
-                        .insert(
-                            key(80),
-                            Row {
-                                value: 80,
-                                workspace: 80
-                            },
-                            80
-                        )
-                        .is_err()
-                );
+                assert!(index.insert(key(80), Row { value: 80 }).is_err());
                 assert!(
                     !index
                         .slots

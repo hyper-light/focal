@@ -1,6 +1,6 @@
 use super::*;
 use crate::native::completion_book::{CandidateJournal, CompletionBook, JournalFunding};
-use crate::native::completion_envelope::{CompletionEnvelope, EvidenceBounds, descriptor_limits};
+use crate::native::completion_envelope::{CompletionEnvelope, descriptor_limits};
 use crate::native::completion_schemas::SchemaSet;
 use crate::native::report_tests as fixture;
 use focal_evidence::BuiltinNativeSchemas;
@@ -275,10 +275,6 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
         core.limits.plan_edges,
     )
     .unwrap();
-    let evidence = EvidenceBounds {
-        workspace_bytes: schemas.workspace_bytes() - schemas.custody_bytes(),
-        retained_bytes: schemas.custody_bytes(),
-    };
     let envelope = CompletionEnvelope::derive(
         &core.state.rows,
         core.limits,
@@ -286,7 +282,6 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
         registered.registry,
         registered.definition,
         descriptor_limits(core.limits, registered.parent, registered.registry).unwrap(),
-        evidence,
     )
     .unwrap();
     let mut book = CompletionBook::new(&core.state.budget, core.limits).unwrap();
@@ -301,7 +296,6 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
         )
         .unwrap();
     let expected_reports = book.remaining_reports(proof.key());
-    let capacity = book.funded_capacity();
     let Some(Row::Event(event)) = original
         .fragments
         .get(&Key::Event(original.outcome().sequence, 0))
@@ -367,7 +361,6 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
         );
         assert_eq!(core.native_budget(), baseline);
         assert_eq!(book.remaining_reports(proof.key()), expected_reports);
-        assert_eq!(book.funded_capacity(), capacity);
     }
     let update = book
         .apply_prepared(
@@ -422,7 +415,6 @@ fn a_fake_handler_free_begun_fact_cannot_hide_behind_an_unbegun_final_row() {
     proof.check(&malformed).unwrap();
     let mut book = CompletionBook::new(&core.state.budget, core.limits).unwrap();
     let budget = core.native_budget();
-    let capacity = book.funded_capacity();
     assert!(matches!(
         book.apply_prepared(
             &view,
@@ -438,7 +430,6 @@ fn a_fake_handler_free_begun_fact_cannot_hide_behind_an_unbegun_final_row() {
         Err(NativeError::Contract(ContractError::InvalidTransition))
     ));
     assert_eq!(core.native_budget(), budget);
-    assert_eq!(book.funded_capacity(), capacity);
     assert_eq!(book.remaining_reports(proof.key()), None);
     assert_eq!(
         core.native_chain(&[&created, &posted])

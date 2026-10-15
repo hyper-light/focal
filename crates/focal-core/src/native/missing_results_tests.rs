@@ -228,10 +228,7 @@ impl Fixture {
         }
     }
     fn extras(&self) -> (Extras, Scratch) {
-        let mut scratch = Scratch {
-            used: 0,
-            max: 1024 * 1024,
-        };
+        let mut scratch = Scratch::bound(1024 * 1024);
         let mut extras = Extras::new(16, 128 * 1024).unwrap();
         extras.begin_journal(16, &mut scratch).unwrap();
         for _ in 0..3 {

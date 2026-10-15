@@ -122,12 +122,12 @@ fn exhaust(f: &Fixture) -> Allocation {
     let pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
-    assert_eq!(source.stats().used, source.limit());
+    assert_eq!(source.headroom(BudgetLane::Ordinary), 0);
     pressure
 }
 

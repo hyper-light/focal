@@ -70,10 +70,6 @@ fn envelope(core: &Core<NativeState>) -> RespondentEnvelope {
         view.claim(ClaimId::from_u128(1)).unwrap(),
         core.limits,
         descriptor_limits(),
-        EvidenceBounds {
-            workspace_bytes: 4096,
-            retained_bytes: 256,
-        },
     )
     .unwrap()
 }
@@ -154,17 +150,7 @@ fn independent_action_credits_retain_every_version_and_release_only_consumed_sha
     ] {
         let before = envelope.demand(remainder).unwrap();
         let after = envelope.demand(next).unwrap();
-        assert_eq!(
-            before.retained_bytes - after.retained_bytes,
-            envelope
-                .storage(operation)
-                .unwrap()
-                .additional_retained_bytes()
-                + crate::native::mutation::bytes(
-                    envelope.storage(operation).unwrap().limits().changed_keys
-                )
-                .unwrap()
-        );
+        envelope.storage(operation).unwrap();
         assert_eq!(before.actions - after.actions, 1);
         remainder = next;
     }
@@ -172,7 +158,7 @@ fn independent_action_credits_retain_every_version_and_release_only_consumed_sha
         envelope
             .demand(RespondentCredit::default())
             .unwrap()
-            .retained_bytes,
+            .actions,
         0
     );
     assert!(
@@ -219,10 +205,9 @@ fn reconstruction_keeps_both_generated_posts_after_later_cycles_close() {
         }
     );
     assert_eq!(
-        before.demand(before.maximum).unwrap().retained_bytes
-            - after.demand(after.maximum).unwrap().retained_bytes,
-        before.post.storage.additional_retained_bytes()
-            + crate::native::mutation::bytes(7 + crate::native::index_rows::STATUS_ROWS).unwrap()
+        before.demand(before.maximum).unwrap().actions
+            - after.demand(after.maximum).unwrap().actions,
+        1
     );
 }
 
@@ -245,12 +230,7 @@ fn authored_buffer_capacity_cannot_spend_unreserved_construction_space() {
         NativeOperation::CloseResponse,
         NativeOperation::PostResponse,
     ] {
-        let construction = envelope.construction(operation, core.limits).unwrap();
-        assert!(
-            construction.temporary_bytes().unwrap()
-                + transient(envelope.storage(operation).unwrap()).unwrap()
-                <= envelope.workspace_bytes()
-        );
+        envelope.construction(operation, core.limits).unwrap();
     }
 }
 
@@ -277,19 +257,7 @@ fn impossible_diagnostic_or_complete_close_capacity_refuses_before_reservation()
         },
     ] {
         let before = core.state.budget.stats();
-        assert!(
-            RespondentEnvelope::derive(
-                &view,
-                claim,
-                limits,
-                descriptor_limits(),
-                EvidenceBounds {
-                    workspace_bytes: 0,
-                    retained_bytes: 0
-                }
-            )
-            .is_err()
-        );
+        assert!(RespondentEnvelope::derive(&view, claim, limits, descriptor_limits(),).is_err());
         assert_eq!(core.state.budget.stats(), before);
     }
     assert!(multiply(usize::MAX, 2).is_err());

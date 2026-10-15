@@ -164,8 +164,8 @@ fn verified_required_failure_counts_history_and_registry_seal_and_retry_needs_no
     let pressure = budget
         .reserve(
             BudgetKind::Query,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap();
     let occupied = budget.stats();

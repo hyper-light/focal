@@ -87,8 +87,8 @@ fn exhaust(owner: &NativeOwner) -> Allocation {
     source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit()
@@ -164,7 +164,9 @@ fn separate_pending_seal_journals_retain_and_refund_their_own_credit_under_press
         .unwrap()
         .held_pending_bytes();
     let after_first = owner.budget_stats();
-    assert_eq!(after_first.used, before.used);
+    // Fresh work holds every ordinary byte; the report holds its own bytes on
+    // the completion lane.
+    assert_eq!(after_first.ordinary_used, before.ordinary_used);
     assert_eq!(
         after_first.by_kind[BudgetKind::Pending as usize],
         before.by_kind[BudgetKind::Pending as usize] + journal + first_writes + first_held
@@ -180,7 +182,7 @@ fn separate_pending_seal_journals_retain_and_refund_their_own_credit_under_press
         .unwrap()
         .held_pending_bytes();
     let after_second = owner.budget_stats();
-    assert_eq!(after_second.used, before.used);
+    assert_eq!(after_second.ordinary_used, before.ordinary_used);
     assert_eq!(
         after_second.by_kind[BudgetKind::Pending as usize],
         before.by_kind[BudgetKind::Pending as usize]

@@ -347,8 +347,8 @@ fn release_pressure_and_range_failure_preserve_tree_and_suffix_discard_restores_
     let pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
@@ -535,8 +535,8 @@ fn scope_release_preserves_begun_late_observe_authority_and_its_reserved_report_
     let pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();

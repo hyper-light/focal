@@ -17,8 +17,8 @@ fn pressure(budget: &MemoryBudget) -> Allocation {
     budget
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            budget.limit() - budget.stats().used,
+            BudgetLane::Ordinary,
+            budget.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit()
@@ -133,7 +133,7 @@ fn checkpoint_owner_restores_begun_retry_and_quality_reports_under_exhausted_par
         let retry = f::copy_report(&input);
         let committed_retry = f::copy_report(&input);
         held.push(pressure(&budget));
-        assert_eq!(budget.stats().used, budget.limit());
+        assert_eq!(budget.headroom(BudgetLane::Ordinary), 0);
         let (candidate, outcome) = stage(&mut owner, input, &mut store);
         assert!(
             owner

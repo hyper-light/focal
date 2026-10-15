@@ -1524,6 +1524,16 @@ pub struct ContentReader {
     root: PathBuf,
 }
 impl ContentReader {
+    /// The length of an installed object's manifest, from its file's
+    /// metadata, nothing read.
+    pub fn manifest_length(&self, reference: &ContentRef) -> Result<usize, ContentError> {
+        let length = usize::try_from(fs::metadata(manifest_path(&self.root, reference))?.len())
+            .map_err(|_| ContentError::Capacity)?;
+        if length > MAX_TRANSFER_MANIFEST_BYTES {
+            return Err(ContentError::Capacity);
+        }
+        Ok(length)
+    }
     pub fn open(root: impl AsRef<Path>) -> Result<Self, ContentError> {
         let root = root.as_ref().to_path_buf();
         if !root.join("objects").is_dir() || !root.join("custody").is_dir() {

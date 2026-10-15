@@ -186,7 +186,7 @@ fn funded_admission_failure_publishes_complete_graph_and_monitor_effects_and_dis
     let failed = report_claim(&owner, 1, 1, 90_011, VerdictValue::Fail);
     let retry = copy_report(&failed);
     let pressure = exhaust(&parent);
-    assert_eq!(parent.stats().used, parent.limit());
+    assert_eq!(parent.headroom(BudgetLane::Ordinary), 0);
     let failure_candidate = report_at(&mut owner, &mut store, failed, 41);
     let outcome = owner
         .candidate(failure_candidate)

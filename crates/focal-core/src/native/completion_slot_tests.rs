@@ -90,7 +90,6 @@ fn each_metadata_ceiling_protects_held_slots_and_restores_them_on_rollback() {
         book.commit(begin).unwrap();
         let before = book.totals;
         let budget = source.stats();
-        let pool = book.source().stats();
         let sequence = core.native_sequence();
         let rows = core.state.rows.len();
         book.check_slots(meta, sequence, rows).unwrap();
@@ -114,7 +113,6 @@ fn each_metadata_ceiling_protects_held_slots_and_restores_them_on_rollback() {
         );
         assert_eq!(book.totals, before);
         assert_eq!(source.stats(), budget);
-        assert_eq!(book.source().stats(), pool);
 
         // The shared journal retires all future slots after a terminal result.
         // Its rollback must restore every dimension, not just report/event counts.
@@ -132,7 +130,6 @@ fn each_metadata_ceiling_protects_held_slots_and_restores_them_on_rollback() {
         book.rollback(retired).unwrap();
         assert_eq!(book.totals, before);
         assert_eq!(source.stats(), budget);
-        assert_eq!(book.source().stats(), pool);
         assert!(
             book.check_slots(stolen, sequence, rows).is_err(),
             "{} rollback protection",

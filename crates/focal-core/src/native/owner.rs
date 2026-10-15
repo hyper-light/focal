@@ -4,9 +4,7 @@
 use super::completion_book::{
     CandidateJournal, CompletionBook, GraphMembers, JournalFunding, ReportAdvance,
 };
-use super::completion_envelope::{
-    CompletionEnvelope, EvidenceBounds, ReportParent, descriptor_limits,
-};
+use super::completion_envelope::{CompletionEnvelope, ReportParent, descriptor_limits};
 use super::completion_schemas::SchemaSet;
 use super::pending_index::{self, Chain, PendingIndex};
 use super::*;
@@ -60,26 +58,19 @@ fn completion_contract(
         limits.plan_edges,
     )?;
     let descriptor = descriptor_limits(limits, registered.parent, registered.registry)?;
-    let evidence = EvidenceBounds {
-        workspace_bytes: pins
-            .workspace_bytes()
-            .checked_sub(pins.custody_bytes())
-            .ok_or(NativeError::Capacity("completion verification workspace"))?,
-        retained_bytes: pins.custody_bytes(),
-    };
     let (envelope, members) = if matches!(
         registered.state.target(),
         validation::Target::Artifact { .. }
     ) {
         let (envelope, members) =
-            CompletionEnvelope::derive_work(view, limits, registered, descriptor, evidence)?;
+            CompletionEnvelope::derive_work(view, limits, registered, descriptor)?;
         super::work_authority::check_completion_target(view, registered, &envelope, limits)?;
         (envelope, Some(members))
     } else if matches!(
         registered.state.target(),
         validation::Target::Admission { .. }
     ) {
-        CompletionEnvelope::derive_admission(view, limits, registered, descriptor, evidence)?
+        CompletionEnvelope::derive_admission(view, limits, registered, descriptor)?
     } else {
         (
             CompletionEnvelope::derive(
@@ -89,7 +80,6 @@ fn completion_contract(
                 registered.registry,
                 registered.definition,
                 descriptor,
-                evidence,
             )?,
             None,
         )
@@ -119,14 +109,19 @@ fn build_funded(
             .map(|(prepared, journal)| (prepared, journal, true));
     }
     if let Some(deadline) = fresh.authorize_deadline()? {
+        // A begun evaluation's due timer finishes work already taken: charged as it is written, on
+        // the completion lane.
         let funding = if deadline.begun {
-            JournalFunding::HeldCompletion
+            JournalFunding::External {
+                source,
+                lane: BudgetLane::Completion,
+            }
         } else {
             JournalFunding::External { source, lane }
         };
         let built = if deadline.begun {
             let loan = book.deadline_contract(deadline.key, deadline.binding)?;
-            fresh.build_recorded(loan.source(), None, None, Some(loan.storage()))?
+            fresh.build_recorded(source, None, None, Some(loan.storage()))?
         } else {
             fresh.build_recorded(source, None, None, None)?
         };
@@ -229,7 +224,7 @@ fn build_funded(
                     fresh.input()?.request,
                     artifact.get().ok_or(ContractError::MissingEvidence)?,
                     domain,
-                    loan.source(),
+                    source,
                     schemas,
                     loan.verification(),
                 )?)
@@ -237,7 +232,7 @@ fn build_funded(
                 None
             };
             let built = fresh.build_recorded(
-                loan.source(),
+                source,
                 verified.as_ref().or(evidence),
                 Some(loan.envelope()),
                 None,
@@ -255,7 +250,10 @@ fn build_funded(
                 }),
                 None,
                 built.seals(),
-                JournalFunding::HeldCompletion,
+                JournalFunding::External {
+                    source,
+                    lane: BudgetLane::Completion,
+                },
             )?;
             Ok((
                 built.into_prepared(),
@@ -1074,14 +1072,11 @@ impl NativeOwner {
                     }
                     return Err(error.into());
                 }
-                let record_source = if held_record {
-                    self.book.source()
-                } else {
-                    &self.core.state.budget
-                };
+                // Completion work's record is charged on the completion lane, every record to the
+                // state's budget: nothing was set aside for it.
                 let record = match record_codec::PendingRecord::reserve(
                     &prepared,
-                    record_source,
+                    &self.core.state.budget,
                     if held_record {
                         BudgetLane::Completion
                     } else {
@@ -1148,12 +1143,6 @@ impl NativeOwner {
                     self.faulted = true;
                     return Err(error.into());
                 }
-                if self.pending.is_empty()
-                    && let Err(error) = self.book.trim_idle()
-                {
-                    self.faulted = true;
-                    return Err(error.into());
-                }
                 Ok(outcome)
             }
             Err(refused) => {
@@ -1207,12 +1196,6 @@ impl NativeOwner {
                 }
             }
         }
-        if self.pending.is_empty()
-            && let Err(error) = self.book.trim_idle()
-        {
-            self.faulted = true;
-            return Err(error.into());
-        }
         Ok(count)
     }
 
@@ -1232,9 +1215,6 @@ impl NativeOwner {
             if self.book.rollback_candidate(row.journal).is_err() {
                 self.faulted = true;
             }
-        }
-        if !self.faulted && self.book.trim_idle().is_err() {
-            self.faulted = true;
         }
         count
     }

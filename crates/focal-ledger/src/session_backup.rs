@@ -526,6 +526,9 @@ pub mod backup {
             }
             Ok(bytes)
         }
+        fn manifest_chunks(&self, reference: &ContentRef) -> Result<usize, ContentError> {
+            Ok(self.describe(reference.domain, reference.root)?.chunks())
+        }
     }
     impl<M: BackupMedium> ObjectSource for BackupContent<'_, M> {
         fn describe(

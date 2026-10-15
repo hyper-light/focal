@@ -44,7 +44,6 @@ fn begin_and_mixed_update_rollback_restore_the_exact_pre_begin_pool_and_index() 
     }
     let baseline = source.stats();
     let capacity = book.entries.capacity();
-    let funding = book.funded_capacity();
     let totals = book.totals;
     let revision = book.revision;
     let old = [1, 3].map(|index| book.grant(fixture::key(index)).unwrap().credit);
@@ -83,7 +82,6 @@ fn begin_and_mixed_update_rollback_restore_the_exact_pre_begin_pool_and_index() 
     assert_eq!(book.revision, revision);
     assert_eq!(book.totals, totals);
     assert_eq!(book.entries.capacity(), capacity);
-    assert_eq!(book.funded_capacity(), funding);
     assert_eq!(source.stats(), baseline);
     assert!(book.grant(fixture::key(2)).is_err());
     assert_eq!(
@@ -142,7 +140,10 @@ fn composed_head_commit_preserves_the_new_grants_younger_pending_report() {
             }),
             None,
             &[],
-            JournalFunding::HeldCompletion,
+            JournalFunding::External {
+                source: &source,
+                lane: BudgetLane::Completion,
+            },
         )
         .unwrap();
     let advanced = book.grant(fixture::key(2)).unwrap().credit;

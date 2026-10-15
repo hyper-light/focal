@@ -27,15 +27,6 @@ use graph::CompletionGraph;
 #[path = "completion_envelope_tests.rs"]
 pub(super) mod tests;
 
-/// Supplied by the owner's pinned verifier contract for every reachable schema.
-/// Workspace excludes the separately retained verification capability. Both may
-/// coexist with ingress and Core construction, so the envelope sums them.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct EvidenceBounds {
-    pub(super) workspace_bytes: usize,
-    pub(super) retained_bytes: usize,
-}
-
 /// The one additional allowance belongs only to a checked Admission failure.
 /// Other changed parent rows do not consume that target-specific credit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,13 +302,6 @@ pub(super) struct CompletionEnvelope {
     reports: u32,
     ordinary_report: RangeWriteEnvelope,
     failed_report: Option<RangeWriteEnvelope>,
-    // Mixed completion journals survive construction until their pending
-    // candidate commits or rolls back, just like the candidate's range rows.
-    ordinary_journal_bytes: usize,
-    failed_journal_bytes: usize,
-    retained: usize,
-    workspace: usize,
-    required: usize,
     slot_demand: SlotDemand,
     slots: CompletionSlots,
     cohort: CohortBudget,
@@ -722,7 +706,6 @@ impl CompletionEnvelope {
         registrations: &RegistrationSet,
         declaration: &validation::Declaration,
         mut descriptor: ArtifactLimits,
-        evidence: EvidenceBounds,
     ) -> Result<Self, NativeError> {
         let target = CompletionTarget::of(declaration)?;
         // WholeWork needs the actual response, complete graph and future
@@ -905,47 +888,6 @@ impl CompletionEnvelope {
             None
         };
         let reports = declaration.attempt_bound();
-        let count = usize::try_from(reports).map_err(|_| NativeError::Capacity("report count"))?;
-        let failed_journal_bytes = if cohort.claims() == 0 {
-            0
-        } else {
-            super::completion_book::journal_bytes(add(1, cohort.evaluations())?)?
-        };
-        let regular_retained = crate::native::mutation::retained(ordinary_report)?;
-        let retained = if let Some(failed) = failed_report {
-            add(
-                multiply(
-                    count
-                        .checked_sub(1)
-                        .ok_or(NativeError::Capacity("report count"))?,
-                    regular_retained,
-                )?,
-                add(
-                    crate::native::mutation::retained(failed)?,
-                    failed_journal_bytes,
-                )?,
-            )?
-        } else {
-            multiply(count, regular_retained)?
-        };
-        let transient = |envelope: RangeWriteEnvelope| {
-            envelope
-                .additional_peak_bytes()
-                .checked_sub(envelope.additional_retained_bytes())
-                .ok_or(NativeError::Capacity("range temporary charge"))
-        };
-        let range_workspace =
-            transient(ordinary_report)?.max(failed_report.map(transient).transpose()?.unwrap_or(0));
-        // The owner serializes verification/construction. Charge one workspace,
-        // never one peak for every possible attempt. Ingress may have its own
-        // permit while Core's conservative input precharges coexist with it.
-        let workspace = add(
-            add(
-                input_heap,
-                add(evidence.workspace_bytes, evidence.retained_bytes)?,
-            )?,
-            add(construction.temporary_bytes()?, range_workspace)?,
-        )?;
         let failure_events = add(1, cohort.events())?;
         // A report's new rows: artifact, identity, accepted result, outcome,
         // three events, and the artifact's and verdict's index rows (22 §7).
@@ -985,11 +927,6 @@ impl CompletionEnvelope {
             reports,
             ordinary_report,
             failed_report,
-            ordinary_journal_bytes: 0,
-            failed_journal_bytes,
-            retained,
-            workspace,
-            required: add(retained, workspace)?,
             slot_demand,
             slots,
             cohort,
@@ -1052,15 +989,6 @@ impl CompletionEnvelope {
         self.slots = self.remaining_slots(self.reports, failure.is_some())?;
         Ok(self)
     }
-    pub(super) fn total_retained_bytes(self) -> usize {
-        self.retained
-    }
-    pub(super) fn workspace_bytes(self) -> usize {
-        self.workspace
-    }
-    pub(super) fn required_bytes(self) -> usize {
-        self.required
-    }
     pub(super) fn report_storage(
         self,
         usage: CompletionUse,
@@ -1072,25 +1000,6 @@ impl CompletionEnvelope {
             CompletionUse::Regular => Ok(self.ordinary_report),
         }
     }
-    pub(super) fn per_report_retained_bytes(
-        self,
-        usage: CompletionUse,
-    ) -> Result<usize, NativeError> {
-        let storage = self.report_storage(usage)?;
-        let records = self
-            .record_buffers
-            .map(|limits| record_codec::future_record_bytes(storage, limits))
-            .transpose()?
-            .unwrap_or(0);
-        add(
-            add(crate::native::mutation::retained(storage)?, records)?,
-            match usage {
-                CompletionUse::Regular => self.ordinary_journal_bytes,
-                CompletionUse::AdmissionFailure => self.failed_journal_bytes,
-            },
-        )
-    }
-
     pub(super) fn with_record_buffers(
         mut self,
         limits: record_codec::EncodingLimits,
@@ -1098,24 +1007,11 @@ impl CompletionEnvelope {
         if self.record_buffers.is_some() {
             return Err(ContractError::InvalidTransition.into());
         }
-        let regular = record_codec::future_record_bytes(self.ordinary_report, limits)?;
-        let records = if let Some(failed) = self.failed_report {
-            add(
-                multiply(
-                    usize::try_from(self.reports.checked_sub(1).ok_or(ContractError::Capacity)?)
-                        .map_err(|_| ContractError::Capacity)?,
-                    regular,
-                )?,
-                record_codec::future_record_bytes(failed, limits)?,
-            )?
-        } else {
-            multiply(
-                usize::try_from(self.reports).map_err(|_| ContractError::Capacity)?,
-                regular,
-            )?
-        };
-        self.retained = add(self.retained, records)?;
-        self.required = add(self.required, records)?;
+        // Every report's record must encode within the record limits.
+        record_codec::future_record_bytes(self.ordinary_report, limits)?;
+        if let Some(failed) = self.failed_report {
+            record_codec::future_record_bytes(failed, limits)?;
+        }
         self.record_buffers = Some(limits);
         Ok(self)
     }
@@ -1146,14 +1042,6 @@ impl CompletionEnvelope {
                 event_containers(construction.max_events)?,
             )?,
             dimensions.incoming_heap,
-        )?;
-        let transient = storage
-            .additional_peak_bytes()
-            .checked_sub(storage.additional_retained_bytes())
-            .ok_or(NativeError::Capacity("deadline range temporary charge"))?;
-        within(
-            add(construction.temporary_bytes()?, transient)?,
-            self.workspace_bytes(),
         )?;
         self.remaining_slots(1, false)?
             .checked_sub(CompletionSlots {

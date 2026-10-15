@@ -26,10 +26,7 @@ fn stage(
     let mut meta = view.meta();
     meta.logical_time += 1;
     meta.outcomes += 1;
-    let mut scratch = Scratch {
-        used: 0,
-        max: core.limits.preparation_bytes,
-    };
+    let mut scratch = Scratch::bound(core.limits.preparation_bytes);
     let mut extras = Extras::new(
         core.limits.range.max_batch_entries,
         core.limits.preparation_bytes,

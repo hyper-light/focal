@@ -2,7 +2,7 @@
 //! The checked owner separately grants authority and holds the quoted backing.
 use super::*;
 use crate::native::{admission_authority::Registered, completion_book::GraphMembers};
-use focal_memory::{BudgetKind, BudgetLane};
+use focal_memory::BudgetLane;
 use focal_model::ReceiptFence;
 use focal_model::lifecycle::aggregation::ProjectionShape;
 
@@ -140,7 +140,6 @@ impl CompletionEnvelope {
         limits: NativeLimits,
         registered: &Registered<'_>,
         descriptor: ArtifactLimits,
-        evidence: EvidenceBounds,
     ) -> Result<(Self, GraphMembers), NativeError> {
         let parent = registered.parent;
         let registry = registered.registry;
@@ -167,15 +166,11 @@ impl CompletionEnvelope {
         // fixed complete row shape also covers target Work/Response overrides.
         let projection =
             NativeProjectionQuote::derive_with_retired(limits, parent, shape, 6, retired.count)?;
-        let reservation = view.state.budget.reserve(
-            BudgetKind::Pending,
+        let mut scratch = prepare::Scratch::metered(
+            &view.state.budget,
             BudgetLane::Ordinary,
             limits.preparation_bytes,
         )?;
-        let mut scratch = prepare::Scratch {
-            used: 0,
-            max: limits.preparation_bytes,
-        };
         let plan = graph_effects::preflight(view, parent, limits, None, &mut scratch)?;
         let (graph, cohort) = CompletionGraph::from_plan(view, &plan, limits)?;
         let graph_charges = graph.budget.charges();
@@ -318,41 +313,6 @@ impl CompletionEnvelope {
             limits.max_ranges,
         )?;
         let reports = definition.attempt_bound();
-        // A report may seal any newly terminal graph cohort. Its mixed credit
-        // journal remains owned by the pending candidate, so each attempt must
-        // retain its own allowance rather than reuse the serial workspace.
-        let respondent_journal =
-            super::super::completion_book::respondent_journal_bytes(graph_charges.changed_rows)?;
-        let ordinary_journal_bytes = add(
-            super::super::completion_book::journal_bytes(add(1, cohort.evaluations())?)?,
-            respondent_journal,
-        )?;
-        let retained = multiply(
-            usize::try_from(reports).map_err(|_| ContractError::Capacity)?,
-            add(
-                crate::native::mutation::retained(ordinary_report)?,
-                ordinary_journal_bytes,
-            )?,
-        )?;
-        let transient = ordinary_report
-            .additional_peak_bytes()
-            .checked_sub(ordinary_report.additional_retained_bytes())
-            .ok_or(ContractError::Capacity)?;
-        // Serial protection checks use a complete graph preflight, but no
-        // projection/copy of the entire acceptance state. Keeping the full graph
-        // preparation allowance safely covers its capture and bounded cursors.
-        let check_bytes = graph.check_bytes;
-        let workspace = [
-            input_heap,
-            evidence.workspace_bytes,
-            evidence.retained_bytes,
-            construction.temporary_bytes()?,
-            transient,
-            check_bytes,
-            respondent_journal,
-        ]
-        .into_iter()
-        .try_fold(0, add)?;
         let slot_demand = SlotDemand {
             per_report: CompletionSlots {
                 artifacts: 1,
@@ -389,11 +349,6 @@ impl CompletionEnvelope {
             reports,
             ordinary_report,
             failed_report: None,
-            ordinary_journal_bytes,
-            failed_journal_bytes: 0,
-            retained,
-            workspace,
-            required: add(retained, workspace)?,
             slot_demand,
             slots: slot_demand.remaining(reports, false)?,
             cohort,
@@ -412,7 +367,7 @@ impl CompletionEnvelope {
         crate::native::work_authority::check_completion_target(view, registered, &result, limits)?;
         let members = GraphMembers::copy_from(&view.state.budget, plan.members())?;
         drop(plan);
-        drop(reservation);
+        drop(scratch);
         Ok((result, members))
     }
 

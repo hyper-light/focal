@@ -113,10 +113,27 @@ impl NativeVerificationBudget {
     pub fn maximum_bytes(self) -> usize {
         self.maximum
     }
-    /// Additional store/read/schema workspace plus the retained custody token.
-    /// Caller-owned descriptors and their construction are accounted separately.
+    /// The most any verification under this budget can hold: the schema's
+    /// maximum payload, the store's workspace bound and the custody token. A
+    /// bound, never a charge: a verification is charged [`Self::peak_for`]
+    /// its actual payload.
     pub fn peak_bytes(self) -> usize {
         self.peak
+    }
+    /// What verifying a payload of `length` bytes in at most `chunks` chunks
+    /// holds at its peak: the custody token, the payload's read copy and the
+    /// chunk scratch beside it (inline, the schema's unescape scratch: the
+    /// payload itself is borrowed), and its manifest as a seal holds it.
+    /// Never the schema's maximum or the store's whole workspace: a short
+    /// text payload costs about its own size, so many verified at once cost
+    /// bytes each (doc 27).
+    pub fn peak_for(self, length: usize, chunks: usize) -> Result<usize, NativeEvidenceError> {
+        if length > self.maximum {
+            return Err(ContentError::Capacity.into());
+        }
+        let manifest = crate::store::UploadSealing::resident_for(chunks)?;
+        let held = add(self.retained, add(add(length, length)?, manifest)?)?;
+        Ok(held.min(self.peak))
     }
     pub fn retained_bytes(self) -> usize {
         self.retained
@@ -223,6 +240,10 @@ fn reference(pointer: ContentPointer) -> ContentRef {
 /// provide it; neither reading path seals inline bytes or creates a witness.
 pub trait NativeCustodyReader {
     fn read_content(&self, reference: &ContentRef, budget: usize) -> Result<Vec<u8>, ContentError>;
+    /// The most chunks an installed object's manifest names, read no further
+    /// than its length where the source allows: what a recovery charges for
+    /// the chunks it will read.
+    fn manifest_chunks(&self, reference: &ContentRef) -> Result<usize, ContentError>;
 
     /// Restore custody only from an already present, fully verified local tree.
     /// Unlike submission, this path never seals inline bytes or creates missing
@@ -260,11 +281,13 @@ pub trait NativeCustodyReader {
             }
             PayloadSpec::Content(_) => {}
         }
+        let length = usize::try_from(expected.length).map_err(|_| ContentError::Capacity)?;
+        let chunks = self.manifest_chunks(&reference(expected))?;
         let mut allocation = budget
             .reserve(
                 BudgetKind::Payload,
                 BudgetLane::Completion,
-                verification.peak_bytes(),
+                verification.peak_for(length, chunks)?,
             )?
             .commit();
         {
@@ -295,11 +318,25 @@ impl NativeCustodyReader for ContentStore {
     fn read_content(&self, reference: &ContentRef, budget: usize) -> Result<Vec<u8>, ContentError> {
         self.read_bytes(reference, budget)
     }
+    fn manifest_chunks(&self, reference: &ContentRef) -> Result<usize, ContentError> {
+        chunks_within(ContentStore::manifest_length(self, reference)?)
+    }
 }
 impl NativeCustodyReader for ContentReader {
     fn read_content(&self, reference: &ContentRef, budget: usize) -> Result<Vec<u8>, ContentError> {
         self.read_bytes(reference, budget)
     }
+    fn manifest_chunks(&self, reference: &ContentRef) -> Result<usize, ContentError> {
+        chunks_within(ContentReader::manifest_length(self, reference)?)
+    }
+}
+/// The most chunks a manifest of `encoded` bytes can name: each entry is at
+/// least a 32-byte hash and a one-byte length.
+pub fn chunks_within(encoded: usize) -> Result<usize, ContentError> {
+    encoded
+        .checked_div(33)
+        .and_then(|chunks| chunks.checked_add(1))
+        .ok_or(ContentError::Capacity)
 }
 fn check_verification_request(
     request: RequestKey,
@@ -387,13 +424,24 @@ impl ContentStore {
         verification: &NativeVerificationBudget,
     ) -> Result<VerifiedNativeArtifact, NativeEvidenceError> {
         let maximum = verification.maximum_bytes();
-        // Includes complete read/manifest/chunk and bounded schema scratch. The
-        // descriptor stays owned by ingress; this capability borrows no payload.
+        // What this payload's read, manifest, chunk and schema scratch hold,
+        // charged before any is taken. The descriptor stays owned by ingress;
+        // this capability borrows no payload.
+        let (length, chunks) = match descriptor.payload() {
+            PayloadSpec::Inline(bytes) => (
+                bytes.len(),
+                bytes.len().div_ceil(self.limits.chunk_bytes.max(1)),
+            ),
+            PayloadSpec::Content(content) => (
+                usize::try_from(content.length).map_err(|_| ContentError::Capacity)?,
+                chunks_within(self.manifest_length(&reference(content))?)?,
+            ),
+        };
         let mut allocation = budget
             .reserve(
                 BudgetKind::Payload,
                 BudgetLane::Completion,
-                verification.peak_bytes(),
+                verification.peak_for(length, chunks)?,
             )?
             .commit();
         let payload = match descriptor.payload() {

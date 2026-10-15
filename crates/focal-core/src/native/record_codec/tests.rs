@@ -307,8 +307,8 @@ fn held_report_records_include_original_result_artifact_and_event_without_new_ow
     let _pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();

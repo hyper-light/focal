@@ -263,8 +263,8 @@ fn held_reports_retain_write_sets_through_pending_and_release_them_on_rollback()
     let _pressure = source
         .reserve(
             BudgetKind::Payload,
-            BudgetLane::Completion,
-            source.limit() - source.stats().used,
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();

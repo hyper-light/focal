@@ -3,8 +3,7 @@
 //! credits are independent: several Generated responses can await posting.
 
 use super::completion_envelope::{
-    CompletionSlots, EvidenceBounds, entry_heap, parent_bound, pinned_descriptor_charge,
-    registry_bound,
+    CompletionSlots, entry_heap, parent_bound, pinned_descriptor_charge, registry_bound,
 };
 use super::prepare::{add, array, containers, event_containers, heap, within};
 use super::prepare_budget::ConstructionBudget;
@@ -26,7 +25,6 @@ mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RespondentDemand {
-    pub(super) retained_bytes: usize,
     pub(super) slots: CompletionSlots,
     pub(super) actions: u64,
 }
@@ -62,20 +60,12 @@ pub(super) struct RespondentEnvelope {
     diagnostic: Action,
     close: Action,
     post: Action,
-    workspace: usize,
 }
 
 fn multiply(left: usize, right: usize) -> Result<usize, NativeError> {
     left.checked_mul(right).ok_or(NativeError::Capacity(
         "respondent completion multiplication",
     ))
-}
-
-fn transient(storage: RangeWriteEnvelope) -> Result<usize, NativeError> {
-    storage
-        .additional_peak_bytes()
-        .checked_sub(storage.additional_retained_bytes())
-        .ok_or(NativeError::Capacity("respondent range workspace"))
 }
 
 fn count(value: u32) -> Result<usize, NativeError> {
@@ -165,7 +155,6 @@ impl RespondentEnvelope {
         claim: &ClaimState,
         limits: NativeLimits,
         mut descriptor: ArtifactLimits,
-        evidence: EvidenceBounds,
     ) -> Result<Self, NativeError> {
         let (key, maximum) = super::respondent_state::read(view, claim, limits)?
             .ok_or(ContractError::InvalidTransition)?;
@@ -364,30 +353,6 @@ impl RespondentEnvelope {
                 ..CompletionSlots::default()
             },
         )?;
-        // Ingress and verification coexist with Core's conservative input
-        // precharge. Only one action executes at once; its range transient is
-        // additional to the independently retained sum of every future action.
-        let diagnostic_workspace = add(
-            add(
-                input_heap,
-                add(evidence.workspace_bytes, evidence.retained_bytes)?,
-            )?,
-            add(
-                diagnostic_construction.temporary_bytes()?,
-                transient(diagnostic.storage)?,
-            )?,
-        )?;
-        let close_workspace = add(
-            response_input_heap,
-            add(
-                close_construction.temporary_bytes()?,
-                transient(close.storage)?,
-            )?,
-        )?;
-        let post_workspace = add(
-            post_construction.temporary_bytes()?,
-            transient(post.storage)?,
-        )?;
         let envelope = Self {
             record_buffers: None,
             key,
@@ -412,9 +377,6 @@ impl RespondentEnvelope {
             diagnostic,
             close,
             post,
-            workspace: diagnostic_workspace
-                .max(close_workspace)
-                .max(post_workspace),
         };
         envelope.demand(maximum)?;
         envelope.check_parent(view, claim, limits)?;
@@ -428,41 +390,19 @@ impl RespondentEnvelope {
         {
             return Err(NativeError::Capacity("respondent credit exceeds contract"));
         }
-        let mut retained_bytes = 0;
         let mut slots = CompletionSlots::default();
         for (action, count) in [
             (self.diagnostic, credit.diagnostics),
             (self.close, credit.closes),
             (self.post, credit.posts),
         ] {
-            retained_bytes = add(
-                retained_bytes,
-                multiply(
-                    add(
-                        crate::native::mutation::retained(action.storage)?,
-                        self.record_buffers
-                            .map(|limits| record_codec::future_record_bytes(action.storage, limits))
-                            .transpose()?
-                            .unwrap_or(0),
-                    )?,
-                    self::count(count)?,
-                )?,
-            )?;
             slots = slots.checked_add(action.slots.checked_scale(count)?)?;
         }
         let actions = u64::from(credit.diagnostics)
             .checked_add(u64::from(credit.closes))
             .and_then(|n| n.checked_add(u64::from(credit.posts)))
             .ok_or(NativeError::Capacity("respondent action serials"))?;
-        Ok(RespondentDemand {
-            retained_bytes,
-            slots,
-            actions,
-        })
-    }
-
-    pub(super) fn workspace_bytes(&self) -> usize {
-        self.workspace
+        Ok(RespondentDemand { slots, actions })
     }
 
     pub(super) fn with_record_buffers(
@@ -485,15 +425,7 @@ impl RespondentEnvelope {
         limits: NativeLimits,
     ) -> Result<ConstructionBudget, NativeError> {
         self.storage(operation)?;
-        let construction = ConstructionBudget::for_operation(operation, limits)?;
-        within(
-            add(
-                construction.temporary_bytes()?,
-                transient(self.storage(operation)?)?,
-            )?,
-            self.workspace,
-        )?;
-        Ok(construction)
+        ConstructionBudget::for_operation(operation, limits)
     }
 
     pub(super) fn storage(

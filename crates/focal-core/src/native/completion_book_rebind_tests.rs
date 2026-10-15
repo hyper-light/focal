@@ -80,10 +80,7 @@ fn with_seals(
     let mut meta = view.meta();
     meta.logical_time = base_outcome.logical_time;
     meta.outcomes += 1;
-    let mut scratch = Scratch {
-        used: 0,
-        max: core.limits.preparation_bytes,
-    };
+    let mut scratch = Scratch::bound(core.limits.preparation_bytes);
     let mut extras = Extras::new(32, core.limits.preparation_bytes).unwrap();
     let plan = transactions::prepare(
         input.command,
@@ -300,7 +297,6 @@ fn mixed_retirement_and_live_seals_commit_after_a_younger_report_and_rollback_ex
     let mut book = installed(&core, &source, 3);
     let original_totals = book.totals;
     let original_credit = book.grant(fixture::key(2)).unwrap().credit;
-    let original_weight = book.entries.maximum();
     let original_stats = source.stats();
     let mut custody = fixture::Custody::new();
     let request = input(&core, None, 901, 1, VerdictValue::Fail);
@@ -371,7 +367,6 @@ fn mixed_retirement_and_live_seals_commit_after_a_younger_report_and_rollback_ex
     book.rollback(journal).unwrap();
     assert_eq!(book.totals, original_totals);
     assert_eq!(book.grant(fixture::key(2)).unwrap().credit, original_credit);
-    assert_eq!(book.entries.maximum(), original_weight);
     assert_eq!(source.stats(), original_stats);
 
     let request = input(&core, None, 903, 1, VerdictValue::Fail);

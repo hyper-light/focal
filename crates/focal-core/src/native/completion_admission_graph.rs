@@ -2,7 +2,7 @@
 //! allowance includes that complete failure and every later audit-only report.
 use super::*;
 use crate::native::{admission_authority::Registered, completion_book::GraphMembers};
-use focal_memory::{BudgetKind, BudgetLane};
+use focal_memory::BudgetLane;
 
 impl CompletionEnvelope {
     pub(in crate::native) fn derive_admission(
@@ -10,7 +10,6 @@ impl CompletionEnvelope {
         limits: NativeLimits,
         registered: &Registered<'_>,
         descriptor: ArtifactLimits,
-        evidence: EvidenceBounds,
     ) -> Result<(Self, Option<GraphMembers>), NativeError> {
         let parent = registered.parent;
         let registry = registered.registry;
@@ -33,7 +32,6 @@ impl CompletionEnvelope {
                     registry,
                     definition,
                     descriptor,
-                    evidence,
                 )?,
                 None,
             ));
@@ -41,15 +39,11 @@ impl CompletionEnvelope {
 
         // Even an isolated parent is protected: a later incoming dependency or
         // subscription must not enlarge this already accepted responsibility.
-        let reservation = view.state.budget.reserve(
-            BudgetKind::Pending,
+        let mut scratch = prepare::Scratch::metered(
+            &view.state.budget,
             BudgetLane::Ordinary,
             limits.preparation_bytes,
         )?;
-        let mut scratch = prepare::Scratch {
-            used: 0,
-            max: limits.preparation_bytes,
-        };
         let plan = graph_effects::preflight(view, parent, limits, None, &mut scratch)?;
         let (graph, cohort) = CompletionGraph::from_plan(view, &plan, limits)?;
         let charges = graph.budget.charges();
@@ -134,7 +128,6 @@ impl CompletionEnvelope {
             registry,
             definition,
             descriptor,
-            evidence,
         )?;
         let descriptor_heap = result
             .input_heap
@@ -191,11 +184,6 @@ impl CompletionEnvelope {
         result.graph = Some(graph);
         result.cohort = cohort;
         result.failed_report = Some(failed);
-        let respondent_journal = crate::native::completion_book::respondent_journal_bytes(claims)?;
-        result.failed_journal_bytes = add(
-            crate::native::completion_book::journal_bytes(add(1, cohort.evaluations())?)?,
-            respondent_journal,
-        )?;
         let construction = result.report_construction(limits)?;
         construction.check_counts(
             claims,
@@ -209,35 +197,6 @@ impl CompletionEnvelope {
             )?
             .min(limits.range.max_batch_entries),
         )?;
-        let count = usize::try_from(result.reports).map_err(|_| ContractError::Capacity)?;
-        result.retained = add(
-            multiply(
-                count.checked_sub(1).ok_or(ContractError::Capacity)?,
-                crate::native::mutation::retained(result.ordinary_report)?,
-            )?,
-            add(
-                crate::native::mutation::retained(failed)?,
-                result.failed_journal_bytes,
-            )?,
-        )?;
-        let transient = |range: RangeWriteEnvelope| {
-            range
-                .additional_peak_bytes()
-                .checked_sub(range.additional_retained_bytes())
-                .ok_or(NativeError::Capacity("range temporary charge"))
-        };
-        result.workspace = [
-            result.input_heap,
-            evidence.workspace_bytes,
-            evidence.retained_bytes,
-            construction.temporary_bytes()?,
-            transient(result.ordinary_report)?.max(transient(failed)?),
-            graph.check_bytes,
-            respondent_journal,
-        ]
-        .into_iter()
-        .try_fold(0, add)?;
-        result.required = add(result.retained, result.workspace)?;
         let extra_events = add(charges.graph_events, cohort.events())?;
         result.slot_demand.failure = Some(CompletionSlots {
             events: extra_events,
@@ -248,7 +207,7 @@ impl CompletionEnvelope {
         result.check_parent(parent, registry)?;
         let members = GraphMembers::copy_from(&view.state.budget, plan.members())?;
         drop(plan);
-        drop(reservation);
+        drop(scratch);
         Ok((result, Some(members)))
     }
 }

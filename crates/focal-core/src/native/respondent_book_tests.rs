@@ -1,7 +1,7 @@
 //! Actual Core receipt/response history drives the shared accounting journal.
 //! These tests inspect private credit only after checked native preparation.
 use super::*;
-use crate::native::completion_envelope::{EvidenceBounds, descriptor_limits};
+use crate::native::completion_envelope::descriptor_limits;
 use crate::native::report_tests::{self as fixture, ISSUER, SUBJECT};
 use focal_evidence::BuiltinNativeSchemas;
 use focal_model::{Confidence, OutcomeKind};
@@ -85,10 +85,6 @@ fn quote(
         claim,
         limits,
         descriptor_limits(limits, claim, registry).unwrap(),
-        EvidenceBounds {
-            workspace_bytes: verification.peak_bytes() - verification.retained_bytes(),
-            retained_bytes: verification.retained_bytes(),
-        },
     )
     .unwrap();
     (envelope, verification)
@@ -159,22 +155,27 @@ fn receipt_install_rollback_and_parent_refusal_restore_exact_index_and_backing()
     assert_eq!(book.totals, Totals::default());
     assert_eq!(source.stats(), baseline);
 
+    // A receipt's install sets nothing aside for its future actions: on a session of 1 MiB and
+    // no completion reserve it holds its index slot alone, where it once asked for the worst
+    // each of its twelve actions could hold (29 MB a receipt).
     let limited = MemoryBudget::new(1024 * 1024, 0).unwrap();
-    let mut refused = CompletionBook::new(&limited, core.limits).unwrap();
+    let mut small = CompletionBook::new(&limited, core.limits).unwrap();
     let before = limited.stats();
     let (envelope, verification) = quote(&view, 1, core.limits);
-    assert!(
-        refused
-            .install_respondent(
-                &view,
-                view.claim(ClaimId::from_u128(1)).unwrap(),
-                &envelope,
-                verification
-            )
-            .is_err()
-    );
-    assert_eq!(refused.respondents.capacity(), 0);
-    assert_eq!(refused.totals, Totals::default());
+    let journal = small
+        .install_respondent(
+            &view,
+            view.claim(ClaimId::from_u128(1)).unwrap(),
+            &envelope,
+            verification,
+        )
+        .unwrap();
+    assert_eq!(small.totals.reports, 12);
+    let held = limited.stats().used - before.used;
+    assert!(held < 64 * 1024, "a receipt's install held {held} bytes");
+    small.rollback(journal).unwrap();
+    assert_eq!(small.respondents.capacity(), 0);
+    assert_eq!(small.totals, Totals::default());
     assert_eq!(limited.stats(), before);
     book.install_recovered_respondent(
         &view,
@@ -204,7 +205,14 @@ fn generated_post_credit_survives_older_close_commit_and_younger_tail_rollback()
         close(core.native_claim(key.claim).unwrap().binding(), 900),
     );
     let first = book
-        .apply_respondents(&view(&core), &close, JournalFunding::HeldCompletion)
+        .apply_respondents(
+            &view(&core),
+            &close,
+            JournalFunding::External {
+                source: &source,
+                lane: BudgetLane::Completion,
+            },
+        )
         .unwrap();
     let after_close = credit(&book, key);
     assert_eq!(
@@ -231,7 +239,14 @@ fn generated_post_credit_survives_older_close_commit_and_younger_tail_rollback()
         },
     );
     let second = book
-        .apply_respondents(&tail, &post, JournalFunding::HeldCompletion)
+        .apply_respondents(
+            &tail,
+            &post,
+            JournalFunding::External {
+                source: &source,
+                lane: BudgetLane::Completion,
+            },
+        )
         .unwrap();
     let advanced = credit(&book, key);
     assert_eq!(advanced.posts, 3);
@@ -265,12 +280,7 @@ fn adoption_composes_retirement_with_exact_new_receipt_install_and_refunds_tail(
     book.commit(installed).unwrap();
     let claim = core.native_claim(ClaimId::from_u128(1)).unwrap();
     let old = key(claim).unwrap();
-    let before = (
-        book.totals,
-        source.stats(),
-        book.respondents.capacity(),
-        book.funded_capacity(),
-    );
+    let before = (book.totals, source.stats(), book.respondents.capacity());
     let adopted = prepared(
         &core,
         &[],
@@ -307,20 +317,22 @@ fn adoption_composes_retirement_with_exact_new_receipt_install_and_refunds_tail(
     let budget = source.stats();
     // An already-applied successor cannot masquerade as this candidate's base.
     assert!(
-        book.apply_respondents(&candidate, &adopted, JournalFunding::HeldCompletion)
-            .is_err()
+        book.apply_respondents(
+            &candidate,
+            &adopted,
+            JournalFunding::External {
+                source: &source,
+                lane: BudgetLane::Completion,
+            }
+        )
+        .is_err()
     );
     assert_eq!(book.totals, totals);
     assert_eq!(source.stats(), budget);
     drop(adopted);
     book.rollback_candidate(combined).unwrap();
     assert_eq!(
-        (
-            book.totals,
-            source.stats(),
-            book.respondents.capacity(),
-            book.funded_capacity()
-        ),
+        (book.totals, source.stats(), book.respondents.capacity()),
         before
     );
     assert_eq!(credit(&book, old).actions().unwrap(), 12);
@@ -384,46 +396,45 @@ fn actual_batch_supersession_retires_multiple_receipts_with_a_refundable_held_jo
             ClaimStatus::Superseded
         );
     }
-    let baseline = (book.totals, source.stats(), book.source().stats());
+    // The superseding write's journal is charged to the session as it is made, as every write's
+    // is: nothing of the receipts it retires was set aside for it.
+    let funding = || JournalFunding::External {
+        source: &source,
+        lane: BudgetLane::Ordinary,
+    };
+    let baseline = (book.totals, source.stats());
     let configured = book.limits.plan_edges;
     book.limits.plan_edges = 0;
     assert!(matches!(
-        book.apply_respondents(&view(&core), &candidate, JournalFunding::HeldCompletion),
+        book.apply_respondents(&view(&core), &candidate, funding()),
         Err(NativeError::Capacity("respondent journal visits"))
     ));
     book.limits.plan_edges = configured;
-    assert_eq!(
-        (book.totals, source.stats(), book.source().stats()),
-        baseline
-    );
-    let blocked = book
-        .source()
+    assert_eq!((book.totals, source.stats()), baseline);
+    let blocked = source
         .reserve(
             BudgetKind::Pending,
-            BudgetLane::Completion,
-            book.pool.available(),
+            BudgetLane::Ordinary,
+            source.headroom(BudgetLane::Ordinary),
         )
         .unwrap()
         .commit();
     let pressured = source.stats();
     assert!(
-        book.apply_respondents(&view(&core), &candidate, JournalFunding::HeldCompletion)
+        book.apply_respondents(&view(&core), &candidate, funding())
             .is_err()
     );
     assert_eq!(book.totals, baseline.0);
     assert_eq!(source.stats(), pressured);
     drop(blocked);
     let journal = book
-        .apply_respondents(&view(&core), &candidate, JournalFunding::HeldCompletion)
+        .apply_respondents(&view(&core), &candidate, funding())
         .unwrap();
     assert!(matches!(journal.change, Change::RespondentMany { .. }));
     assert_eq!(book.totals, Totals::default());
     assert_eq!(book.respondents.len(), 2);
-    assert!(book.source().stats().used > baseline.2.used);
+    assert!(source.stats().used > baseline.1.used);
     drop(candidate);
     book.rollback(journal).unwrap();
-    assert_eq!(
-        (book.totals, source.stats(), book.source().stats()),
-        baseline
-    );
+    assert_eq!((book.totals, source.stats()), baseline);
 }

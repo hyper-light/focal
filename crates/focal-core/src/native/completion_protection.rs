@@ -132,7 +132,7 @@ impl Protections {
                     return Err(ContractError::Capacity.into());
                 }
                 let growth = self.index.grow(source, limit)?;
-                if let Err(error) = self.index.insert(key, (), 0) {
+                if let Err(error) = self.index.insert(key, ()) {
                     if let Some(growth) = growth {
                         self.index.restore_growth(growth)?;
                     }

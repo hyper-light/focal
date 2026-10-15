@@ -23,7 +23,7 @@ fn context(view: &View<'_>, max: usize) -> (ClaimCut, Scratch) {
             position: SessionSeq(view.prefix().0 + 1),
             cause: ContentHash([37; 32]),
         },
-        Scratch { used: 0, max },
+        Scratch::bound(max),
     )
 }
 

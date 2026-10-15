@@ -12,10 +12,7 @@ fn prepared_plan(
     limits.plan_edges = 65_536;
     let source = owner.committed();
     let mut extras = Extras::new(limits.range.max_batch_entries, limits.preparation_bytes).unwrap();
-    let mut scratch = Scratch {
-        used: 0,
-        max: limits.preparation_bytes,
-    };
+    let mut scratch = Scratch::bound(limits.preparation_bytes);
     let plan = crate::native::scope_release::prepare(
         expected,
         f::context(f::ISSUER, outcome.logical_time),

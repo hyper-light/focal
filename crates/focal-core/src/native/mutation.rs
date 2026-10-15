@@ -2,8 +2,8 @@
 //! storage plan supplies keys; final values remain in its one candidate root.
 //! This is not a WAL encoding, an imported root or an activation promise.
 use super::*;
-use focal_memory::{Allocation, RangeWriteEnvelope};
-use prepare::{add, array, within};
+use focal_memory::Allocation;
+use prepare::{array, within};
 
 #[cfg(test)]
 #[path = "mutation_tests.rs"]
@@ -25,15 +25,6 @@ pub(super) struct WriteSet {
 
 pub(super) fn bytes(count: usize) -> Result<usize, NativeError> {
     array::<MutationKey>(count)
-}
-
-/// Pending write-set storage is retained independently for each promised action.
-/// The range's own retained charge covers only pages and the persistent root.
-pub(super) fn retained(range: RangeWriteEnvelope) -> Result<usize, NativeError> {
-    add(
-        range.additional_retained_bytes(),
-        bytes(range.limits().changed_keys)?,
-    )
 }
 
 impl WriteSet {

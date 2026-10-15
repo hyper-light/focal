@@ -19,7 +19,6 @@ pub(in crate::native) struct ReportAdvance {
 /// loan. Held loans always borrow this book's one completion pool; external
 /// controls retain their original source and lane without cloning a budget.
 pub(in crate::native) enum JournalFunding<'a> {
-    HeldCompletion,
     External {
         source: &'a MemoryBudget,
         lane: BudgetLane,
@@ -926,15 +925,11 @@ impl CompletionBook {
             };
         }
         let bytes = journal_bytes(count)?;
-        let reservation = match funding {
-            JournalFunding::HeldCompletion => {
-                self.source()
-                    .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?
-            }
-            JournalFunding::External { source, lane } => {
-                source.reserve(BudgetKind::Pending, lane, bytes)?
-            }
-        };
+        let JournalFunding::External {
+            source: budget,
+            lane,
+        } = funding;
+        let reservation = budget.reserve(BudgetKind::Pending, lane, bytes)?;
         let mut updates = Vec::new();
         updates
             .try_reserve_exact(count)
@@ -1022,16 +1017,10 @@ impl CompletionBook {
         // No allocations or ordinary refusal remain after this point. Structural
         // index failure poisons the book and the exclusive owner fails closed.
         for update in &updates {
-            let workspace = if update.after.remaining_reports == 0 {
-                0
-            } else {
-                self.grant(update.key)?.envelope.workspace_bytes()
-            };
             self.entries
-                .replace_weight(update.key, workspace, |grant| grant.credit = update.after)?;
+                .update(update.key, |grant| grant.credit = update.after)?;
         }
         self.totals = totals;
-        self.totals.workspace = self.maximum_workspace();
         self.check_health()?;
         self.journals = journals;
         let before_revision = self.revision;

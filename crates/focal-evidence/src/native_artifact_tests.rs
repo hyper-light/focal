@@ -744,7 +744,14 @@ fn memory_pressure_refuses_before_writes_and_completion_permit_releases_after_cu
     let verification =
         NativeVerificationBudget::for_schema(artifact.schema_hash(), &BuiltinNativeSchemas)
             .unwrap();
-    let workspace = verification.peak_bytes();
+    // Charged what this payload holds, never the schema's maximum.
+    let workspace = verification
+        .peak_for(
+            REPORT.len(),
+            REPORT.len().div_ceil(store.limits.chunk_bytes),
+        )
+        .unwrap();
+    assert!(workspace < verification.peak_bytes() / 100, "{workspace}");
     let short = MemoryBudget::new(workspace - 1, workspace - 1).unwrap();
     assert!(matches!(
         store.verify_native_artifact_with_budget(

@@ -265,18 +265,76 @@ pub(super) fn fail_range_after<T>(count: usize, action: impl FnOnce() -> T) -> T
     action()
 }
 
-/// Temporary native heaps share one pre-reserved allowance. Every allocation is
-/// preflighted; allocator-reported capacities are reconciled before retention.
+/// Temporary native heaps are bounded by `max`, and every allocation is
+/// preflighted against it; allocator-reported capacities are reconciled before
+/// retention. A metered scratch is charged to its budget as it is used, never
+/// its bound up front: what a preparation holds is what it allocated (doc 27).
+/// Its charge ends with it, after the temporaries it counted.
 pub(super) struct Scratch {
     pub used: usize,
     pub max: usize,
+    meter: Option<Allocation>,
 }
+
+/// A metered scratch grows its charge at least this much at a time, so many
+/// small temporaries walk the budget a few times, never past the bound.
+const METER_STEP: usize = 16 * 1024;
+
 impl Scratch {
+    /// A bound alone: what it counts is charged where its allowance was.
+    pub const fn bound(max: usize) -> Self {
+        Self {
+            used: 0,
+            max,
+            meter: None,
+        }
+    }
+    /// A bound charged to `budget` on `lane` as it is used.
+    pub fn metered(
+        budget: &focal_memory::MemoryBudget,
+        lane: BudgetLane,
+        max: usize,
+    ) -> Result<Self, NativeError> {
+        Ok(Self {
+            used: 0,
+            max,
+            meter: Some(budget.reserve(BudgetKind::Pending, lane, 0)?.commit()),
+        })
+    }
+    /// Whether `bytes` more stay within the bound, changing nothing: for a
+    /// step that charges only once its allocation has passed its checks.
+    pub fn fits(&self, bytes: usize) -> Result<(), NativeError> {
+        within(add(self.used, bytes)?, self.max)
+    }
     pub fn charge(&mut self, bytes: usize) -> Result<(), NativeError> {
         let next = add(self.used, bytes)?;
         within(next, self.max)?;
+        if let Some(meter) = self.meter.as_mut() {
+            let held = meter.bytes();
+            if next > held {
+                let step = next
+                    .saturating_sub(held)
+                    .max(METER_STEP)
+                    .min(self.max.saturating_sub(held));
+                meter.grow(step)?;
+            }
+        }
         self.used = next;
         Ok(())
+    }
+    /// A bound already partly used, for a test of what follows.
+    #[cfg(test)]
+    pub const fn with_used(used: usize, max: usize) -> Self {
+        Self {
+            used,
+            max,
+            meter: None,
+        }
+    }
+    /// The charge this scratch holds now, for a test of its accounting.
+    #[cfg(test)]
+    pub fn held(&self) -> usize {
+        self.meter.as_ref().map_or(0, Allocation::bytes)
     }
     pub fn remaining(&self) -> Result<usize, NativeError> {
         self.max
@@ -1177,6 +1235,12 @@ impl<'a> Fresh<'a> {
     pub(super) fn lane(&self) -> BudgetLane {
         self.lane
     }
+    /// The candidate finishes work already taken (a respondent's diagnostic, close or post):
+    /// it is built on the completion lane, which fresh work cannot take.
+    pub(super) fn on_completion_lane(mut self) -> Self {
+        self.lane = BudgetLane::Completion;
+        self
+    }
     pub(super) fn limits(&self) -> NativeLimits {
         self.limits
     }
@@ -1410,10 +1474,7 @@ impl<'a> Fresh<'a> {
         let allocation = source
             .reserve(BudgetKind::Pending, lane, construction.temporary_bytes()?)?
             .commit();
-        let mut scratch = Scratch {
-            used: 0,
-            max: construction.scratch_bytes,
-        };
+        let mut scratch = Scratch::bound(construction.scratch_bytes);
         let mut extras = Extras::new(construction.extras_count, construction.extras_bytes)?;
         let report_parent = match &dispatch {
             Dispatch::Request {
@@ -1437,10 +1498,7 @@ impl<'a> Fresh<'a> {
                 // The principal's window as this request leaves it (F12):
                 // admitted here again on the same facts the fence saw, and
                 // written beside the meta and the outcome.
-                let mut window_scratch = Scratch {
-                    used: 0,
-                    max: construction.window_bytes,
-                };
+                let mut window_scratch = Scratch::bound(construction.window_bytes);
                 let mut admitted = super::epochs::admit(
                     &view,
                     &mut meta,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::native::completion_envelope::{EvidenceBounds, descriptor_limits};
+use crate::native::completion_envelope::descriptor_limits;
 use crate::native::report_tests as fixture;
 use focal_evidence::{BuiltinNativeSchemas, test_report_schema};
 use focal_model::lifecycle::{creation::Owner, succession::Lineage};
@@ -21,7 +21,6 @@ fn install(
     core: &Core<NativeState>,
     source: &MemoryBudget,
     index: u32,
-    extra_workspace: usize,
 ) -> Journal {
     let key = fixture::key(index);
     let (parent, registry) = parent(core);
@@ -34,10 +33,6 @@ fn install(
         registry,
         declaration,
         descriptor_limits(core.limits, parent, registry).unwrap(),
-        EvidenceBounds {
-            workspace_bytes: schemas.workspace_bytes() - schemas.custody_bytes() + extra_workspace,
-            retained_bytes: schemas.custody_bytes(),
-        },
     )
     .unwrap();
     let ordinal = registry
@@ -104,63 +99,29 @@ fn children(core: &Core<NativeState>, count: u128) -> NativeInput {
 }
 
 #[test]
-fn retiring_largest_workspace_tracks_exact_remaining_max_and_rollback_preserves_older_commit() {
+fn retiring_a_grant_and_rolling_back_later_reports_preserves_the_older_commit() {
     let core = fixture::running(&[(ValidationMode::Observe, false); 3]);
     let source = source();
     let mut book = CompletionBook::new(&source, core.limits).unwrap();
-    for (index, extra) in [(1, 1000), (2, 3000), (3, 2000)] {
-        let journal = install(&mut book, &core, &source, index, extra);
+    for index in [1, 2, 3] {
+        let journal = install(&mut book, &core, &source, index);
         book.commit(journal).unwrap();
     }
-    let largest = book
-        .grant(fixture::key(2))
-        .unwrap()
-        .envelope
-        .workspace_bytes();
-    let medium = book
-        .grant(fixture::key(3))
-        .unwrap()
-        .envelope
-        .workspace_bytes();
-    assert!(largest > medium);
-    assert_eq!(book.totals.workspace, largest);
-    let issued = book
-        .source()
-        .reserve(BudgetKind::Pages, BudgetLane::Completion, 4096)
-        .unwrap()
-        .commit();
-    let backing = book.funded_capacity();
     let older = advance(&mut book, 1, true);
     let retiring = advance(&mut book, 2, true);
-    assert_eq!(book.totals.workspace, medium);
-    assert_eq!(book.entries.maximum(), medium);
     let younger = advance(&mut book, 3, false);
     book.commit(older).unwrap();
     assert!(book.entries.get(fixture::key(1)).is_none());
-    assert_eq!(book.totals.workspace, medium);
-    assert!(book.trim_idle().is_err());
-    assert_eq!(book.funded_capacity(), backing);
-    assert_eq!(issued.bytes(), 4096);
     book.rollback(younger).unwrap();
     book.rollback(retiring).unwrap();
     assert!(book.entries.get(fixture::key(1)).is_none());
-    assert_eq!(book.totals.workspace, largest);
-    assert_eq!(book.entries.maximum(), largest);
     assert_eq!(book.remaining_reports(fixture::key(2)), Some(2));
     assert_eq!(book.remaining_reports(fixture::key(3)), Some(2));
-    assert_eq!(book.funded_capacity(), backing);
-    book.trim_idle().unwrap();
     for index in [2, 3] {
         let journal = advance(&mut book, index, true);
         book.commit(journal).unwrap();
     }
-    assert_eq!(book.totals.workspace, 0);
-    assert_eq!(book.entries.maximum(), 0);
-    book.trim_idle().unwrap();
-    assert_eq!(book.funded_capacity(), issued.bytes());
     drop(book);
-    assert!(source.stats().used >= issued.bytes());
-    drop(issued);
     assert_eq!(source.stats().used, 0);
 }
 
@@ -170,7 +131,7 @@ fn wrong_pinned_registration_ordinal_refuses_report_and_changed_parent_without_s
     let source = source();
     let mut book = CompletionBook::new(&source, core.limits).unwrap();
     for index in 1..=2 {
-        let journal = install(&mut book, &core, &source, index, 0);
+        let journal = install(&mut book, &core, &source, index);
         book.commit(journal).unwrap();
     }
     let changed = fixture::prepared(core.prepare_native(
@@ -201,7 +162,6 @@ fn wrong_pinned_registration_ordinal_refuses_report_and_changed_parent_without_s
     let original = book.grant(key).unwrap().registration_index;
     let other = book.grant(fixture::key(2)).unwrap().registration_index;
     assert_ne!(original, other);
-    let weight = book.grant(key).unwrap().envelope.workspace_bytes();
     book.report_contract(
         key,
         *expected,
@@ -215,10 +175,9 @@ fn wrong_pinned_registration_ordinal_refuses_report_and_changed_parent_without_s
     let changed_view = View::committed(&core.state).with_own(&changed).unwrap();
     book.check_parents(&changed_view, &changed).unwrap();
     book.entries
-        .replace_weight(key, weight, |grant| grant.registration_index = other)
+        .update(key, |grant| grant.registration_index = other)
         .unwrap();
     let budget = source.stats();
-    let backing = book.funded_capacity();
     assert!(matches!(
         book.report_contract(
             key,
@@ -237,9 +196,8 @@ fn wrong_pinned_registration_ordinal_refuses_report_and_changed_parent_without_s
     ));
     assert_eq!(book.remaining_reports(key), Some(2));
     assert_eq!(source.stats(), budget);
-    assert_eq!(book.funded_capacity(), backing);
     book.entries
-        .replace_weight(key, weight, |grant| grant.registration_index = original)
+        .update(key, |grant| grant.registration_index = original)
         .unwrap();
     book.report_contract(
         key,
@@ -286,7 +244,7 @@ fn child_registration_batch_checks_the_final_parent_cohort_once() {
     let source = source();
     let mut book = CompletionBook::new(&source, core.limits).unwrap();
     for index in 1..=8 {
-        let journal = install(&mut book, &core, &source, index, 0);
+        let journal = install(&mut book, &core, &source, index);
         book.commit(journal).unwrap();
     }
     let one = fixture::prepared(core.prepare_native(
