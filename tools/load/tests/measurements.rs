@@ -118,9 +118,10 @@ fn assert_offered_schedule(rate: u64, callers: u16) {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
-    assert_eq!(report["committed"], rate);
-    assert_eq!(report["refused"], 0);
-    assert_eq!(report["unknown"], 0);
+    // What became of every write, shown whole where one did not commit.
+    assert_eq!(report["committed"], rate, "{report}");
+    assert_eq!(report["refused"], 0, "{report}");
+    assert_eq!(report["unknown"], 0, "{report}");
     let text = std::fs::read_to_string(csv).unwrap();
     let mut lines = text.lines();
     let header: Vec<_> = lines.next().unwrap().split(',').collect();
