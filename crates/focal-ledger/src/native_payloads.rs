@@ -10,17 +10,19 @@
 //! to another thread holds its own handles, so removing a segment never breaks a read it began.
 //!
 //! The newest payloads are held in memory, the log's file written behind them by a thread of its
-//! own, as Kafka serves a log's tail from memory and writes it behind: the thread that appends
-//! and reads (a session's owner) never waits on the volume. Appends are copied into a window of
-//! chunks, each allocated, charged to the session's memory budget and touched once, when the
-//! window first needs it, and reused after; the window grows so to an eighth of the session's
-//! memory. A chunk is copied into one of a few I/O buffers and handed to the log's writer as it
-//! fills, and is let go (to hold the next payloads) once its bytes are in the file, the oldest
-//! first once the window can grow no more. A read of a payload the window holds is a copy; only an older one reads the file. A
-//! window whose every chunk still waits for the writer refuses the next payload (the row keeps
-//! its bytes) rather than wait. A reader for another thread reads the files, behind a barrier the
-//! writer answers once every byte appended before it is written: the reader waits on its own
-//! thread, never the appender.
+//! own, as Kafka serves a log's tail from memory and writes it behind: the thread that appends (a
+//! session's owner) never waits for a write. It still waits on the volume twice: a read older than
+//! the window reads the file on the reading thread, under the log's lock, and the append that needs
+//! a new segment makes its file. Appends are copied into a window of chunks, each allocated,
+//! charged to the session's memory budget and touched once, when the window first needs it, and
+//! reused after; the window grows so to an eighth of the session's memory. A chunk is copied into
+//! one of a few I/O buffers and handed to the log's writer as it fills, and is let go (to hold the
+//! next payloads) once its bytes are in the file, the oldest first once the window can grow no
+//! more. A read of a payload the window holds is a copy; only an older one reads the file. A window
+//! whose every chunk still waits for the writer refuses the next payload (the row keeps its bytes)
+//! rather than wait. A reader for another thread reads the files, behind a barrier the writer
+//! answers once every byte appended before it is written: the reader waits on its own thread, never
+//! the appender.
 
 use focal_core::native::payloads::{PayloadError, PayloadLog, PayloadRead, PayloadRef};
 use focal_memory::{
@@ -30,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::time::Duration;
 
 /// One segment's bytes at most: what a payload's offset addresses.
@@ -53,6 +55,8 @@ const IO_BUFFERS: usize = 2;
 const BARRIERS: usize = 4;
 /// How long a reader waits for its barrier before it refuses to read.
 const BARRIER_WAIT: Duration = Duration::from_secs(30);
+/// How long a log let go waits for its writer to finish what it holds before letting it go.
+const CLOSE_WAIT: Duration = Duration::from_secs(30);
 
 /// Where a session keeps its payload log, and the volume it is charged to.
 #[derive(Clone)]
@@ -107,17 +111,28 @@ impl Chunk {
     }
 }
 
+/// An I/O buffer and its charge: they go together, to the writer and back, so a buffer is charged
+/// for as long as anything holds it, the writer included after the log has let go of it.
+struct Funded {
+    bytes: Vec<u8>,
+    _charge: Allocation,
+}
+
 /// What the log's writer is handed, in order.
 enum Job {
-    /// `bytes` written at `offset` in segment `segment`, through a handle of its own.
+    /// `buffer`'s bytes written at `offset` in segment `segment`, through a handle of its own.
     Write {
         segment: u32,
         offset: u64,
         file: File,
-        bytes: Vec<u8>,
+        buffer: Funded,
+        /// A buffer made for this write beyond the pool (a reader's barrier must follow every
+        /// byte): let go, with its charge, when it comes back.
+        extra: bool,
     },
-    /// Answered once every job before it is done.
-    Barrier(SyncSender<()>),
+    /// Answered once every job before it is done, with how many writes have failed since the
+    /// log opened: a reader whose writes were not all in the files refuses to read.
+    Barrier(SyncSender<u64>),
 }
 
 /// What the writer gives back: the I/O buffer it was handed, and whether its bytes are in the
@@ -126,29 +141,64 @@ struct Written {
     segment: u32,
     offset: u64,
     len: usize,
-    bytes: Vec<u8>,
+    buffer: Funded,
     ok: bool,
+    extra: bool,
 }
 
+/// Where a test holds a log's writer before each write; nothing outside tests.
+#[cfg(test)]
+type WriteGate = Option<Receiver<()>>;
+#[cfg(not(test))]
+struct WriteGate;
+
+/// A gate that holds no write.
+#[cfg(test)]
+fn no_gate() -> WriteGate {
+    None
+}
+#[cfg(not(test))]
+fn no_gate() -> WriteGate {
+    WriteGate
+}
+
+/// The writer waits at `gate` until a test lets it on (or lets go of the gate).
+#[cfg(test)]
+fn pass(gate: &WriteGate) {
+    if let Some(gate) = gate {
+        let _ = gate.recv();
+    }
+}
+#[cfg(not(test))]
+fn pass(_: &WriteGate) {}
+
 /// The writer's loop: each write done in order, its buffer given back; each barrier answered once
-/// every write before it is done. It ends when the log lets go of its queue.
-fn write_behind(jobs: &Receiver<Job>, returned: &SyncSender<Written>) {
+/// every write before it is done. It ends when the log lets go of its queue, or of what the writer
+/// gives back.
+fn write_behind(jobs: &Receiver<Job>, returned: &SyncSender<Written>, gate: &WriteGate) {
+    let mut failures = 0u64;
     while let Ok(job) = jobs.recv() {
         match job {
             Job::Write {
                 segment,
                 offset,
                 file,
-                bytes,
+                buffer,
+                extra,
             } => {
-                let ok = write_at(&file, &bytes, offset).is_ok();
-                let len = bytes.len();
+                pass(gate);
+                let ok = write_at(&file, &buffer.bytes, offset).is_ok();
+                if !ok {
+                    failures = failures.saturating_add(1);
+                }
+                let len = buffer.bytes.len();
                 let written = Written {
                     segment,
                     offset,
                     len,
-                    bytes,
+                    buffer,
                     ok,
+                    extra,
                 };
                 if returned.send(written).is_err() {
                     return;
@@ -156,7 +206,7 @@ fn write_behind(jobs: &Receiver<Job>, returned: &SyncSender<Written>) {
             }
             Job::Barrier(reply) => {
                 // A reader that stopped waiting has nothing to hear.
-                let _ = reply.try_send(());
+                let _ = reply.try_send(failures);
             }
         }
     }
@@ -169,17 +219,22 @@ struct Writer {
     tail: u64,
     /// The newest payloads, oldest first; appends go to the last.
     window: VecDeque<Chunk>,
-    /// Chunk buffers no chunk holds, and I/O buffers the writer does not.
+    /// Chunk buffers no chunk holds, and I/O buffers the writer does not, each with its charge.
     spare: Vec<Vec<u8>>,
-    buffers: Vec<Vec<u8>>,
-    /// The writer's queue (none once the log closes), and what it gives back.
+    buffers: Vec<Funded>,
+    /// The writer's queue and what it gives back (none of either once the log closes).
     jobs: Option<SyncSender<Job>>,
-    returned: Receiver<Written>,
-    /// The chunks the window may grow to, the size of each, and the charge for every chunk and
-    /// I/O buffer it allocated.
+    returned: Option<Receiver<Written>>,
+    /// The chunks the window may grow to, the size of each, and the charge for every chunk it
+    /// allocated (each I/O buffer carries its own, the writer's queue slots are its thread's).
     max_chunks: usize,
     chunk_bytes: usize,
     charge: Allocation,
+    /// The writes the writer has reported failed: what a reader's barrier is checked against.
+    failures_seen: u64,
+    /// The window's first chunk that may hold bytes the writer was not handed, never past the
+    /// chunk appends go to: where a hand begins, so an append does not walk the window.
+    unsent_from: usize,
 }
 
 impl Writer {
@@ -197,106 +252,145 @@ impl Writer {
             }
         }
     }
-    /// What the writer has given back, taken in: each chunk's bytes it wrote, or handed again
-    /// where it failed to, and its buffers.
+    /// What the writer has given back, taken in: each chunk's bytes it wrote, as far as they are
+    /// written without a hole (a write after a failed one does not count, as the failed range is
+    /// handed again whole), or handed again where it failed; its buffers back to the pool, or an
+    /// extra one let go with its charge.
     fn settle(&mut self) {
-        while let Ok(done) = self.returned.try_recv() {
-            let chunk = self.window.iter_mut().find(|chunk| {
+        while let Some(done) = self
+            .returned
+            .as_ref()
+            .and_then(|returned| returned.try_recv().ok())
+        {
+            if !done.ok {
+                self.failures_seen = self.failures_seen.saturating_add(1);
+            }
+            let found = self.window.iter_mut().enumerate().find(|(_, chunk)| {
                 chunk.segment == done.segment
                     && done.offset >= chunk.start
                     && chunk.end().is_some_and(|end| done.offset < end)
             });
-            if let Some(chunk) = chunk
+            if let Some((index, chunk)) = found
                 && let Some(from) = done
                     .offset
                     .checked_sub(chunk.start)
                     .and_then(|from| usize::try_from(from).ok())
             {
                 if done.ok {
-                    chunk.written = chunk.written.max(from.saturating_add(done.len));
+                    if from == chunk.written {
+                        chunk.written = from.saturating_add(done.len);
+                    }
                 } else {
-                    // Not in the file: those bytes are handed again.
+                    // Not in the file: those bytes, and every one after them, are handed again.
                     chunk.sent = chunk.sent.min(from);
+                    self.unsent_from = self.unsent_from.min(index);
                 }
             }
-            let mut bytes = done.bytes;
-            bytes.clear();
-            if self.buffers.len() < IO_BUFFERS {
-                self.buffers.push(bytes);
+            // A buffer made beyond the pool goes, its charge with it; a pooled one comes back.
+            let mut buffer = done.buffer;
+            if !done.extra && self.buffers.len() < IO_BUFFERS {
+                buffer.bytes.clear();
+                self.buffers.push(buffer);
             }
         }
     }
 
-    /// Hand the writer what of each chunk it has not been handed, oldest first, while it has a
-    /// buffer and room in its queue; the chunk appends go to only when `all`. With `extra`, a
-    /// buffer is made for what the pooled ones cannot take (a reader's barrier must follow every
-    /// byte). Whether every byte of the chunks it was to hand is handed.
+    /// Hand the writer what of each chunk it has not been handed, oldest first from the first
+    /// chunk that may hold any, while it has a buffer and room in its queue; the chunk appends go
+    /// to only when `all`. With `extra`, a buffer is made, its charge admitted first, for what
+    /// the pooled ones cannot take (a reader's barrier must follow every byte). Whether every
+    /// byte of the chunks it was to hand is handed.
     fn hand(&mut self, all: bool, extra: bool) -> bool {
         let Self {
             segments,
             window,
             buffers,
             jobs,
+            charge,
+            unsent_from,
             ..
         } = self;
         let Some(jobs) = jobs.as_ref() else {
             return false;
         };
         let count = window.len();
+        let mut index = (*unsent_from).min(count);
         let mut handed = true;
-        for (index, chunk) in window.iter_mut().enumerate() {
+        while let Some(chunk) = window.get_mut(index) {
             if !all && index.saturating_add(1) == count {
                 break;
             }
             let Some(rest) = chunk.bytes.get(chunk.sent..) else {
                 handed = false;
-                continue;
+                break;
             };
             if rest.is_empty() {
+                index = index.saturating_add(1);
                 continue;
             }
-            let Some(mut buffer) = buffers.pop().or_else(|| {
-                extra
-                    .then(|| {
-                        let mut buffer = Vec::new();
-                        buffer.try_reserve_exact(rest.len()).ok().map(|()| buffer)
-                    })
-                    .flatten()
-            }) else {
-                handed = false;
-                break;
+            // A pooled buffer holds a chunk; one made beyond the pool, what it is made for, its
+            // charge admitted before it is allocated.
+            let (mut buffer, made) = match buffers.pop() {
+                Some(buffer) => (buffer, false),
+                None if extra => match funded(charge, rest.len()) {
+                    Some(buffer) => (buffer, true),
+                    None => {
+                        handed = false;
+                        break;
+                    }
+                },
+                None => {
+                    handed = false;
+                    break;
+                }
+            };
+            // A buffer not handed: a pooled one back to the pool, a made one let go with its
+            // charge.
+            let give_back = |mut buffer: Funded, buffers: &mut Vec<Funded>| {
+                if !made {
+                    buffer.bytes.clear();
+                    buffers.push(buffer);
+                }
             };
             let Some(file) = segments
                 .get(&chunk.segment)
                 .and_then(|segment| segment.file.try_clone().ok())
             else {
-                buffer.clear();
-                buffers.push(buffer);
+                give_back(buffer, buffers);
                 handed = false;
-                continue;
+                break;
             };
-            buffer.clear();
-            buffer.extend_from_slice(rest);
             let Some(offset) = u64::try_from(chunk.sent)
                 .ok()
                 .and_then(|sent| chunk.start.checked_add(sent))
             else {
+                give_back(buffer, buffers);
                 handed = false;
-                continue;
+                break;
             };
+            // Copied within its capacity, never grown: a pooled buffer holds a chunk, a made one
+            // exactly this.
+            if rest.len() > buffer.bytes.capacity() {
+                give_back(buffer, buffers);
+                handed = false;
+                break;
+            }
+            buffer.bytes.clear();
+            buffer.bytes.extend_from_slice(rest);
             match jobs.try_send(Job::Write {
                 segment: chunk.segment,
                 offset,
                 file,
-                bytes: buffer,
+                buffer,
+                extra: made,
             }) {
-                Ok(()) => chunk.sent = chunk.bytes.len(),
-                Err(TrySendError::Full(Job::Write { mut bytes, .. }))
-                | Err(TrySendError::Disconnected(Job::Write { mut bytes, .. })) => {
-                    bytes.clear();
-                    if buffers.len() < IO_BUFFERS {
-                        buffers.push(bytes);
-                    }
+                Ok(()) => {
+                    chunk.sent = chunk.bytes.len();
+                    index = index.saturating_add(1);
+                }
+                Err(TrySendError::Full(Job::Write { buffer, .. }))
+                | Err(TrySendError::Disconnected(Job::Write { buffer, .. })) => {
+                    give_back(buffer, buffers);
                     handed = false;
                     break;
                 }
@@ -306,6 +400,9 @@ impl Writer {
                 }
             }
         }
+        // The chunk appends go to takes more bytes after any hand: the next hand looks at it
+        // again.
+        *unsent_from = index.min(count.saturating_sub(1));
         handed
     }
 
@@ -327,6 +424,7 @@ impl Writer {
                     return None;
                 }
                 let mut bytes = self.window.pop_front()?.bytes;
+                self.unsent_from = self.unsent_from.saturating_sub(1);
                 bytes.clear();
                 bytes
             }
@@ -350,8 +448,9 @@ pub struct FilePayloads {
     segment_bytes: u64,
     chunk_bytes: usize,
     writer: Mutex<Writer>,
-    /// The writer's thread, joined when the log closes.
+    /// The writer's thread, joined when the log closes, and how long the close waits for it.
     thread: Option<std::thread::JoinHandle<()>>,
+    close_wait: Duration,
 }
 
 impl std::fmt::Debug for FilePayloads {
@@ -364,14 +463,59 @@ impl std::fmt::Debug for FilePayloads {
 
 impl Drop for FilePayloads {
     fn drop(&mut self) {
-        // The queue let go, the writer ends once it has done what it holds.
-        if let Ok(mut writer) = self.writer.lock() {
-            writer.jobs = None;
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        // The queue let go, even past a panic that poisoned the lock, and the writer ends once it
+        // has done what it holds. What it gives back meanwhile is taken, so it never waits on a
+        // send no one takes; the taking ends when it ends, as its end of the channel closes.
+        let writer = match self.writer.get_mut() {
+            Ok(writer) => writer,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        writer.jobs = None;
+        let thread = self.thread.take();
+        let Some(returned) = writer.returned.as_ref() else {
+            return;
+        };
+        let Some(deadline) = std::time::Instant::now().checked_add(self.close_wait) else {
+            return;
+        };
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match returned.recv_timeout(left) {
+                Ok(_) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    // Both queues let go before the thread that is charged for them ends.
+                    writer.returned = None;
+                    if let Some(thread) = thread {
+                        let _ = thread.join();
+                    }
+                    return;
+                }
+                // A write the volume has not returned from by the deadline: the writer is let
+                // go, and ends when it does, its next send finding no one to take it. What it
+                // still holds (the buffers handed to it, its queues) stays charged until then:
+                // each buffer carries its charge, and the queues' is its thread's.
+                Err(RecvTimeoutError::Timeout) => return,
+            }
         }
     }
+}
+
+/// A buffer for `len` bytes made beyond the pool, with a charge of its own from `charge`'s budget,
+/// admitted before it is allocated (and for whatever more the allocator gave): none where either
+/// is refused, nothing held.
+fn funded(charge: &mut Allocation, len: usize) -> Option<Funded> {
+    let mut own = charge.split_off(0).ok()?;
+    own.grow(len).ok()?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).ok()?;
+    let more = bytes.capacity().saturating_sub(len);
+    if more > 0 {
+        own.grow(more).ok()?;
+    }
+    Some(Funded {
+        bytes,
+        _charge: own,
+    })
 }
 
 /// A buffer of `bytes` capacity, every page of it touched once: what the window and the writer
@@ -464,6 +608,15 @@ impl FilePayloads {
         memory: &MemoryBudget,
         segment_bytes: u64,
     ) -> std::io::Result<Self> {
+        Self::open_gated(source, memory, segment_bytes, no_gate())
+    }
+    /// As [`Self::open_with`], its writer held at `gate` before each write (in tests).
+    fn open_gated(
+        source: &PayloadSource,
+        memory: &MemoryBudget,
+        segment_bytes: u64,
+        gate: WriteGate,
+    ) -> std::io::Result<Self> {
         if segment_bytes == 0 || segment_bytes > SEGMENT_BYTES {
             return Err(std::io::ErrorKind::InvalidInput.into());
         }
@@ -484,14 +637,29 @@ impl FilePayloads {
             .saturating_sub(IO_BUFFERS)
             .clamp(2, WINDOW_CHUNKS);
         const FIRST: usize = 2;
+        // The queue holds each chunk's bytes at most twice (a part handed early for a reader or
+        // a seal, then the rest) and the readers' barriers; what comes back, as much. Each slot
+        // of each is charged with the buffers.
+        let depth = chunks
+            .checked_mul(2)
+            .and_then(|jobs| jobs.checked_add(BARRIERS))
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        let slots = depth
+            .checked_mul(size_of::<Job>().saturating_add(size_of::<Written>()))
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
         let held = FIRST
             .checked_add(IO_BUFFERS)
             .and_then(|buffers| buffers.checked_mul(chunk_bytes))
+            .and_then(|buffers| buffers.checked_add(slots))
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
-        let charge = memory
+        let out_of_memory = |_| std::io::Error::from(std::io::ErrorKind::OutOfMemory);
+        let mut charge = memory
             .reserve(BudgetKind::Payload, BudgetLane::Ordinary, held)
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?
+            .map_err(out_of_memory)?
             .commit();
+        // The queues' slots are charged to the writer's thread, each I/O buffer carries its own:
+        // what the log charges is the window's chunks.
+        let slots = charge.split_off(slots).map_err(out_of_memory)?;
         let mut spare = Vec::new();
         spare
             .try_reserve_exact(chunks)
@@ -504,7 +672,10 @@ impl FilePayloads {
             .try_reserve_exact(IO_BUFFERS)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
         for _ in 0..IO_BUFFERS {
-            buffers.push(touched(chunk_bytes)?);
+            buffers.push(Funded {
+                bytes: touched(chunk_bytes)?,
+                _charge: charge.split_off(chunk_bytes).map_err(out_of_memory)?,
+            });
         }
         let mut window = VecDeque::new();
         window
@@ -530,17 +701,19 @@ impl FilePayloads {
             }
             Err(error) => return Err(error),
         }
-        // The queue holds each chunk's bytes at most twice (a part handed early for a reader or
-        // a seal, then the rest) and the readers' barriers; what comes back, as much.
-        let depth = chunks
-            .checked_mul(2)
-            .and_then(|jobs| jobs.checked_add(BARRIERS))
-            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
         let (jobs, queue) = sync_channel(depth);
         let (back, returned) = sync_channel(depth);
         let thread = std::thread::Builder::new()
             .name("focal-payloads".into())
-            .spawn(move || write_behind(&queue, &back))?;
+            .spawn(move || {
+                // The queues' slots are this thread's charge: let go once it has let go of its
+                // ends, after the log let go of its own.
+                let slots = slots;
+                write_behind(&queue, &back, &gate);
+                drop(queue);
+                drop(back);
+                drop(slots);
+            })?;
         let log = Self {
             root: source.root.clone(),
             disk: source.disk.clone(),
@@ -554,12 +727,15 @@ impl FilePayloads {
                 spare,
                 buffers,
                 jobs: Some(jobs),
-                returned,
+                returned: Some(returned),
                 max_chunks: chunks,
                 chunk_bytes,
                 charge,
+                failures_seen: 0,
+                unsent_from: 0,
             }),
             thread: Some(thread),
+            close_wait: CLOSE_WAIT,
         };
         {
             let mut writer = log
@@ -630,6 +806,8 @@ impl FilePayloads {
             spare.push(bytes);
             false
         });
+        // Chunks left from anywhere: the next hand looks from the start, once.
+        writer.unsent_from = 0;
         removed
     }
 
@@ -753,6 +931,9 @@ impl PayloadLog for FilePayloads {
         if !writer.hand(true, true) {
             return Err(PayloadError::Unavailable);
         }
+        // Every failure the writer reported is behind a range handed again above; one it reports
+        // past this count failed after, and its bytes may not be in the files.
+        let failures = writer.failures_seen;
         let (reply, barrier) = sync_channel(1);
         writer
             .jobs
@@ -770,7 +951,7 @@ impl PayloadLog for FilePayloads {
         }
         Ok(Box::new(FileReader {
             segments,
-            barrier: Mutex::new(Some(barrier)),
+            gate: Mutex::new(Gate::Waiting(barrier, failures)),
         }))
     }
 }
@@ -780,8 +961,16 @@ impl PayloadLog for FilePayloads {
 #[derive(Debug)]
 struct FileReader {
     segments: BTreeMap<u32, File>,
-    /// The writer's answer that every byte before the reader is written; none once heard.
-    barrier: Mutex<Option<Receiver<()>>>,
+    gate: Mutex<Gate>,
+}
+
+/// Whether a reader's bytes are in the files: waiting on the writer's barrier (and the failures
+/// it may report), open once it reports none past those the log had handed again, shut else.
+#[derive(Debug)]
+enum Gate {
+    Waiting(Receiver<u64>, u64),
+    Open,
+    Shut,
 }
 
 impl PayloadRead for FileReader {
@@ -790,12 +979,22 @@ impl PayloadRead for FileReader {
             return Err(PayloadError::Corrupt);
         }
         {
-            let mut barrier = self.barrier.lock().map_err(|_| PayloadError::Unavailable)?;
-            if let Some(waiting) = barrier.as_ref() {
-                match waiting.recv_timeout(BARRIER_WAIT) {
-                    Ok(()) => *barrier = None,
-                    Err(_) => return Err(PayloadError::Unavailable),
-                }
+            let mut gate = self.gate.lock().map_err(|_| PayloadError::Unavailable)?;
+            let next = match &*gate {
+                Gate::Open => None,
+                Gate::Shut => return Err(PayloadError::Unavailable),
+                Gate::Waiting(barrier, failures) => match barrier.recv_timeout(BARRIER_WAIT) {
+                    Ok(reported) if reported == *failures => Some(Gate::Open),
+                    // A write before the barrier failed after the log handed the reader's
+                    // bytes, or the writer is gone: the files may hold a hole.
+                    Ok(_) | Err(_) => Some(Gate::Shut),
+                },
+            };
+            if let Some(next) = next {
+                *gate = next;
+            }
+            if matches!(*gate, Gate::Shut) {
+                return Err(PayloadError::Unavailable);
             }
         }
         let file = self
