@@ -2888,6 +2888,12 @@ fn a_follower_past_its_share_applies_what_committed_within_its_hold() {
         .unwrap();
     cluster.pump(&[]);
     assert_same_layout(&mut cluster, 1);
+    // The lifecycle and the split took it past its share. (Installing the leader's checkpoint
+    // later lets go of what its old state held, so its end use says nothing of this.)
+    assert!(
+        budget.stats().used > budget.limit(),
+        "what it applied took it past its share"
+    );
     let second = cluster.creation(2);
     cluster.commit(1, PARTIES.issuer, second, &[3]);
     cluster.node(1).begin_checkpoint().unwrap();
@@ -2905,10 +2911,6 @@ fn a_follower_past_its_share_applies_what_committed_within_its_hold() {
     cluster.pump(&[]);
     assert!(!cluster.node(3).checkpoint_pending());
     assert!(!cluster.node(3).engine.failed());
-    assert!(
-        budget.stats().used > budget.limit(),
-        "what it applied took it past its share"
-    );
     cluster.assert_same_state(&[1, 2, 3]);
     drop(filled);
 

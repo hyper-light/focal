@@ -275,6 +275,22 @@ impl OwnedClaim {
             ClaimStorage::Held(_) => None,
         }
     }
+    /// Whether the row may spill ([`Self::spill`]): held, waiting to be delivered, on nothing and
+    /// in nothing.
+    pub(super) fn spillable(&self) -> bool {
+        let Some(row) = self.held() else {
+            return false;
+        };
+        matches!(
+            row.state.status(),
+            focal_model::ClaimStatus::Generated | focal_model::ClaimStatus::Posted
+        ) && row.state.receipt().is_none()
+            && row.registrations.rows().is_empty()
+            && row.state.graph().obligations().is_empty()
+            && matches!(row.state.lineage().cause(), focal_model::Cause::Root(_))
+            && row.state.scopes().iter().next().is_none()
+            && row.state.scopes().children().is_empty()
+    }
     /// This row spilled to `log` as its record encoding, where it is held, it waits to be
     /// delivered, the encoding fits a spilled row and the log takes it: what a candidate's rows
     /// become once every check has read them (`payloads::spill_changes`).
@@ -291,19 +307,7 @@ impl OwnedClaim {
         &self,
         log: &dyn super::payloads::PayloadLog,
     ) -> Result<Option<Self>, NativeError> {
-        let Some(row) = self.held() else {
-            return Ok(None);
-        };
-        if !matches!(
-            row.state.status(),
-            focal_model::ClaimStatus::Generated | focal_model::ClaimStatus::Posted
-        ) || row.state.receipt().is_some()
-            || !row.registrations.rows().is_empty()
-            || !row.state.graph().obligations().is_empty()
-            || !matches!(row.state.lineage().cause(), focal_model::Cause::Root(_))
-            || row.state.scopes().iter().next().is_some()
-            || !row.state.scopes().children().is_empty()
-        {
+        if !self.spillable() {
             return Ok(None);
         }
         let mut buffer = [0u8; super::payloads::SPILLED_BYTES];
@@ -421,11 +425,15 @@ impl OwnedDeclaration {
     /// This row spilled to `log` as its record encoding, where it is an authored one held, the
     /// encoding fits a spilled row and the log takes it (`payloads::spill_changes`). A legacy
     /// definition keeps its bytes.
+    /// Whether the row may spill ([`Self::spill`]): an authored definition held.
+    pub(super) fn spillable(&self) -> bool {
+        matches!(self.0, DeclarationStorage::Authored(_))
+    }
     pub(super) fn spill(
         &self,
         log: &dyn super::payloads::PayloadLog,
     ) -> Result<Option<Self>, NativeError> {
-        if !matches!(self.0, DeclarationStorage::Authored(_)) {
+        if !self.spillable() {
             return Ok(None);
         }
         let mut buffer = [0u8; super::payloads::SPILLED_BYTES];

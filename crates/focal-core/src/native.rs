@@ -93,6 +93,7 @@ mod result_owned;
 mod retired_cycles;
 pub mod retirement;
 pub mod retirement_batch;
+mod young;
 pub use epochs::{EpochWindow, OPEN_EPOCHS, OpenEpoch, SealedRange};
 pub mod seal;
 pub use seal::SealRow;
@@ -285,6 +286,9 @@ pub struct NativeState {
     /// The spilled claims and definitions reads have taken back since the state last changed
     /// (doc 31 M3).
     reads: read_back::ReadBack,
+    /// The newest spillable claims and definitions, held until newer ones push them out
+    /// (doc 31 M3, [`young`]).
+    young: young::Young,
 }
 impl NativeState {
     /// Where a spilled row's bytes are read from.
@@ -2227,15 +2231,30 @@ impl Core<NativeState> {
                 events,
                 payloads,
                 reads,
+                young: young::Young::none(),
             },
             limits,
         })
     }
     /// Spill the rows this core builds from now on to `log` (doc 31 M3), where the replica keeps
     /// its payloads. Rows already held keep their bytes.
+    /// As [`Self::attach_payload_log`], the young generation `bound` rows (none at zero: each
+    /// spillable row spills where it is published).
+    #[cfg(test)]
+    pub(crate) fn attach_payload_log_with_young(
+        &mut self,
+        log: Box<dyn payloads::PayloadLog>,
+        bound: usize,
+    ) {
+        self.attach_payload_log(log);
+        self.state.young = young::Young::bounded(&self.state.budget, bound).unwrap();
+    }
     pub fn attach_payload_log(&mut self, log: Box<dyn payloads::PayloadLog>) {
         self.state.reads.release();
         self.state.reads.hold_floor(&self.state.budget);
+        // A generation the budget refuses leaves none: each row spills where it is published.
+        self.state.young =
+            young::Young::for_budget(&self.state.budget).unwrap_or_else(|_| young::Young::none());
         self.state.payloads = Some(log);
     }
     /// The payload log this core spills to, given back (for the core that replaces this one).
@@ -2611,7 +2630,12 @@ impl Core<NativeState> {
         if std::env::var_os("FOCAL_MEASURE_HELD_CLAIMS").is_some() {
             return 0;
         }
-        let NativeState { rows, payloads, .. } = &mut self.state;
+        let NativeState {
+            rows,
+            payloads,
+            young,
+            ..
+        } = &mut self.state;
         let Some(log) = payloads.as_deref() else {
             return 0;
         };
@@ -2620,9 +2644,22 @@ impl Core<NativeState> {
             if deleted || !matches!(key, Key::Claim(_) | Key::Definition(_)) {
                 continue;
             }
-            let row = match rows.get(&key) {
+            // Only a row that may spill joins the generation; the oldest it pushes out spills
+            // if its row still may (its claim taken or tied into work since, it stays held).
+            let spillable = match rows.get(&key) {
+                Some(Row::Claim(claim)) => claim.spillable(),
+                Some(Row::Definition(definition)) => definition.spillable(),
+                _ => false,
+            };
+            if !spillable {
+                continue;
+            }
+            let Some(oldest) = young.admit(key) else {
+                continue;
+            };
+            let row = match rows.get(&oldest) {
                 // A claim another depends on is reached by work on that one: it stays held.
-                Some(Row::Claim(_)) if matches!(key, Key::Claim(id) if rows.get(&Key::IncomingHead(id)).is_some()) => {
+                Some(Row::Claim(_)) if matches!(oldest, Key::Claim(id) if rows.get(&Key::IncomingHead(id)).is_some()) => {
                     None
                 }
                 Some(Row::Claim(claim)) => claim.spill(log).ok().flatten().map(Row::Claim),
@@ -2635,7 +2672,7 @@ impl Core<NativeState> {
                 continue;
             };
             if matches!(
-                rows.rewrite(&key, move |_| Ok(Some((row, 0)))),
+                rows.rewrite(&oldest, move |_| Ok(Some((row, 0)))),
                 Ok(focal_memory::Rewrite::Rewritten)
             ) {
                 spilled = spilled.saturating_add(1);

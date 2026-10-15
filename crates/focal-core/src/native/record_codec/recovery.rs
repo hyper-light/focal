@@ -400,6 +400,7 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
             events: crate::native::event_index::EventIndex::unbuilt(),
             payloads: None,
             reads: crate::native::read_back::ReadBack::new(limits.native),
+            young: crate::native::young::Young::none(),
         },
         limits: limits.native,
     };

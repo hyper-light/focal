@@ -1169,6 +1169,41 @@ fn spilled_rows_encode_replay_and_checkpoint_as_held_ones() {
 /// As above, with each spilling replica's log refusing appends once it holds a few events:
 /// the events past its bound stay held, and every encoding is unchanged.
 #[test]
+fn the_newest_waiting_claims_stay_held_and_only_those_pushed_out_spill() {
+    use crate::native::payloads::MemoryPayloads;
+    let mut plain = core();
+    let mut young = core();
+    // A generation of four rows: each claim and its definition take one place apiece.
+    young.attach_payload_log_with_young(Box::new(MemoryPayloads::default()), 4);
+    assert_eq!(young.state.young.bound(), 4);
+    for id in 1..=6 {
+        let held = prepare(&plain, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        plain.publish_native(held).unwrap();
+        let prepared = prepare(&young, create(id, vec![proposal(id, 10_000 + id)]), &[]);
+        young.publish_native(prepared).unwrap();
+        assert!(young.state.young.len() <= 4);
+    }
+    // The four newest rows (claims 5 and 6 and their definitions) are held; the older ones
+    // were pushed out and spilled, and every one reads as the held core's.
+    for id in 1..=6u128 {
+        let claim = ClaimId::from_u128(id);
+        let Some(Row::Claim(row)) = young.state.rows.get(&Key::Claim(claim)) else {
+            panic!("claim {id} is held or spilled");
+        };
+        assert_eq!(row.logged().is_some(), id <= 4, "claim {id}");
+        let Some(Row::Definition(definition)) = young
+            .state
+            .rows
+            .get(&Key::Definition(ValidationId::from_u128(10_000 + id)))
+        else {
+            panic!("definition {id} is held or spilled");
+        };
+        assert_eq!(definition.logged().is_some(), id <= 4, "definition {id}");
+        assert_eq!(young.native_claim(claim), plain.native_claim(claim));
+    }
+}
+
+#[test]
 fn a_full_payload_log_leaves_rows_held_and_every_encoding_unchanged() {
     spilled_rows_match_held_ones(Some(2_000));
 }
@@ -1180,10 +1215,11 @@ fn spilled_rows_match_held_ones(bound: Option<usize>) {
     use crate::native::payloads::MemoryPayloads;
     let log = || Box::new(MemoryPayloads::bounded(bound));
     let mut plain = core();
+    // No young generation: each spillable row spills where it is published.
     let mut spilled = core();
-    spilled.attach_payload_log(log());
+    spilled.attach_payload_log_with_young(log(), 0);
     let mut follower = core();
-    follower.attach_payload_log(log());
+    follower.attach_payload_log_with_young(log(), 0);
     let replay_dir = tempfile::tempdir().unwrap();
     let store = crate::native::record_codec::recovery::tests::store(replay_dir.path());
     let limits = record_codec::EncodingLimits {
