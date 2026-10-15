@@ -520,7 +520,15 @@ how a reader tells a cold family from one under custody. A retired claim is
 read through the stream's marks (31 M2); the collector protects what a cold
 frame names, never the frame, which lives in its own directory
 (`cold/<session>`), never swept; a stub whose sequence has no mark is read
-from custody as before.
+from custody as before. The collector learns what the frames name by reading
+the data stream front to back from where its last pass stopped, a window of
+whole batches at a time, away from the session's owner (the stream's state,
+its open chunk included, taken from the owner once a pass, its whole chunks
+read from their files, each checked against its name once): a frame never
+changes once appended, so what earlier passes found is kept (sorted, charged
+to the collector's own memory) and a pass reads only what was appended since
+(`cold_bytes_scanned` in its report). Roots past what that memory holds keep
+the domain opaque, never collected.
 
 ## 4a. Seals: the outcome history leaves the live core (F12, 2026-09-30)
 

@@ -808,6 +808,29 @@ impl Session {
             inline: header.inline.clone(),
         }))
     }
+    /// This replica's cold data stream as it stands, to be scanned away from its owner (26 §5),
+    /// and the limits its frames are inspected under: none where it keeps no cold streams or none
+    /// was ever appended to.
+    pub fn native_cold_data(
+        &self,
+    ) -> Result<
+        Option<(
+            crate::ColdData,
+            focal_core::native::record_codec::InspectionLimits,
+        )>,
+        LedgerError,
+    > {
+        let inspection = self
+            .hosting
+            .as_ref()
+            .ok_or(LedgerError::NativeUnsupported)?
+            .limits
+            .inspection;
+        Ok(self
+            .native_engine()?
+            .cold_data()?
+            .map(|data| (data, inspection)))
+    }
     /// A lock-free reader of this node's content: what an archived family is hydrated against.
     pub fn native_content_reader(&self) -> Result<ContentReader, LedgerError> {
         Ok(self
