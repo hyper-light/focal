@@ -922,6 +922,11 @@ Each stage lands on its own, measured:
        its bytes back, a rejected publication leaves the next candidate's held bytes to its
        discard, and held bytes never reach a file, even when a reader's barrier asks for every
        byte or a hold crosses chunks and segments.
+     - **A refused transfer kept the hold (review).** Handing the committed core back from the
+       owner kept the newest candidate's hold before it checked that nothing was pending; refused,
+       it returned an owner whose discard could give nothing back. It keeps only once the
+       transfer goes ahead. Tested: a transfer refused with a candidate pending, then the
+       candidate's discard, leaves nothing in the log (698 bytes stayed before).
    - **The payload log's sweep (2026-10-15).** The 2 GiB deliver run (env-7) held native
      memory near 690 MB, with retirement keeping pace. Its payload log grew by about 755 bytes a
      write all the same: 883 MB in 14 segments after 1.17 million writes, none ever let go.

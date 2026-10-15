@@ -1514,7 +1514,6 @@ impl NativeOwner {
     /// rows. A pending or faulted owner is returned unchanged for reconciliation.
     #[allow(clippy::result_large_err)] // Return the identical owner without allocation on refusal.
     pub fn into_committed_core(mut self) -> Result<Core<NativeState>, NativeOwnerIntoCoreError> {
-        self.keep_appends();
         let error = if !self.pending.is_empty() {
             Some(NativeOwnerError::PendingCandidates)
         } else if self.faulted {
@@ -1522,9 +1521,13 @@ impl NativeOwner {
         } else {
             None
         };
+        // A refused transfer returns the owner as it was, its hold included, so a discard after
+        // it still gives back what the newest candidate appended; only the core that leaves it
+        // keeps what it still holds.
         if let Some(error) = error {
             return Err(NativeOwnerIntoCoreError { error, owner: self });
         }
+        self.keep_appends();
         let Self {
             pending,
             core,

@@ -926,6 +926,33 @@ fn a_discarded_candidate_leaves_nothing_in_the_payload_log() {
     assert_eq!(logged(&owner), published);
 }
 
+/// A transfer of the committed core refused while a candidate is pending returns the owner with
+/// its hold: the candidate's discard after it still gives back everything it spilled. The
+/// transfer kept the hold before it checked, so the refused owner's discard gave nothing back.
+#[test]
+fn a_refused_transfer_leaves_the_pending_candidates_appends_to_its_discard() {
+    let mut core = core();
+    core.attach_payload_log(Box::new(super::super::payloads::MemoryPayloads::default()));
+    let mut owner = NativeOwner::new(core).unwrap();
+    let logged = |owner: &NativeOwner| {
+        owner
+            .committed_core()
+            .payload_log()
+            .map_or(0, |log| log.held_bytes())
+    };
+    let required = [(ValidationMode::Required, false)];
+    let (candidate, _) = stage(&mut owner, 1, creation(1, 1, &required, None));
+    assert!(
+        logged(&owner) > 0,
+        "a creation spilled nothing: nothing is measured"
+    );
+    let refused = owner.into_committed_core().unwrap_err();
+    assert!(matches!(refused.error, NativeOwnerError::PendingCandidates));
+    let mut owner = refused.owner;
+    owner.discard_from(candidate).unwrap();
+    assert_eq!(logged(&owner), 0);
+}
+
 /// A rejected publication must not keep another candidate's held appends: its session may
 /// still discard that suffix, which gives back everything it spilled before admission.
 #[test]
