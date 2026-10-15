@@ -74,12 +74,42 @@ fn a_payload_that_reads_back_wrong_is_refused_and_a_full_volume_refuses_the_next
     let first = log.append(&payload(1, 600)).unwrap();
     assert_eq!(log.append(&payload(2, 600)), None, "no second segment");
     assert_eq!(read(&log, first).unwrap(), payload(1, 600));
-    // A segment's bytes changed under the log are caught by the reference's check.
+    // A reader reads the file once the writer has written it; a segment's bytes changed under
+    // the log are caught by the reference's check. The log's own window still holds them.
+    drop(log.reader().unwrap());
+    let reader = log.reader().unwrap();
+    assert_eq!(read(reader.as_ref(), first).unwrap(), payload(1, 600));
     let path = segment_path(&directory.path().join("payloads"), first.segment());
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[0] ^= 0xff;
     std::fs::write(&path, &bytes).unwrap();
-    assert_eq!(read(&log, first), Err(PayloadError::Corrupt));
+    assert_eq!(read(reader.as_ref(), first), Err(PayloadError::Corrupt));
+    assert_eq!(read(&log, first).unwrap(), payload(1, 600));
+}
+
+#[test]
+fn the_window_serves_the_newest_payloads_and_a_full_window_refuses_rather_than_waits() {
+    let directory = tempfile::tempdir().unwrap();
+    let log =
+        FilePayloads::open_with(&source(directory.path(), unbounded()), &memory(), 1_000).unwrap();
+    let mut written = Vec::new();
+    for seed in 0..200u8 {
+        let bytes = payload(seed, 300);
+        let Some(at) = log.append(&bytes) else {
+            // Every chunk the writer still holds: refused, the row keeps its bytes.
+            continue;
+        };
+        written.push((at, bytes));
+    }
+    assert!(written.len() > 100, "{}", written.len());
+    for (at, bytes) in &written {
+        assert_eq!(read(&log, *at).unwrap(), *bytes);
+    }
+    // Every byte reaches the files: a reader behind the barrier reads them all.
+    let reader = log.reader().unwrap();
+    for (at, bytes) in &written {
+        assert_eq!(read(reader.as_ref(), *at).unwrap(), *bytes);
+    }
 }
 
 #[test]
@@ -111,14 +141,20 @@ fn opening_a_log_lets_go_of_what_an_earlier_run_left() {
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn measure_payload_append_and_read_cost() {
     let directory = tempfile::tempdir().unwrap();
-    let log = FilePayloads::open(&source(directory.path(), unbounded()), &memory()).unwrap();
+    // A session's share as a node gives it: the window is its eighth.
+    let memory = MemoryBudget::new(512 << 20, 0).unwrap();
+    let log = FilePayloads::open(&source(directory.path(), unbounded()), &memory).unwrap();
     const ROWS: usize = 20_000;
     for size in [96usize, 300, 600] {
         let bytes = payload(7, size);
         let started = std::time::Instant::now();
         let mut refs = Vec::with_capacity(ROWS);
+        let mut refused = 0usize;
         for _ in 0..ROWS {
-            refs.push(log.append(&bytes).unwrap());
+            match log.append(&bytes) {
+                Some(at) => refs.push(at),
+                None => refused += 1,
+            }
         }
         let append = started.elapsed().as_nanos() as f64 / ROWS as f64;
         let mut into = vec![0u8; size];
@@ -126,21 +162,14 @@ fn measure_payload_append_and_read_cost() {
         for at in &refs {
             log.read(*at, &mut into).unwrap();
         }
-        let read = started.elapsed().as_nanos() as f64 / ROWS as f64;
+        let read = started.elapsed().as_nanos() as f64 / refs.len().max(1) as f64;
         let started = std::time::Instant::now();
         for _ in 0..ROWS {
             std::hint::black_box(PayloadRef::at(0, 0, &bytes).unwrap());
         }
         let check = started.elapsed().as_nanos() as f64 / ROWS as f64;
-        // Five rows a candidate in one run: the append a candidate would make.
-        let run = payload(9, size * 5);
-        let started = std::time::Instant::now();
-        for _ in 0..ROWS / 5 {
-            std::hint::black_box(log.append(&run).unwrap());
-        }
-        let batched = started.elapsed().as_nanos() as f64 / (ROWS / 5) as f64;
         println!(
-            "{size:>4} B: append {append:.0} ns, read {read:.0} ns (check alone {check:.0} ns); a run of five {batched:.0} ns"
+            "{size:>4} B: append {append:.0} ns ({refused} refused), read {read:.0} ns (check alone {check:.0} ns)"
         );
     }
 }
