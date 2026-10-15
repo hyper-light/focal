@@ -9,12 +9,12 @@ fn position(sequence: u64, ordinal: u32) -> Position {
 fn budget() -> MemoryBudget {
     MemoryBudget::new(1 << 20, 0).unwrap()
 }
-fn funding(budget: &MemoryBudget, events: u32) -> Allocation {
+fn funding(budget: &MemoryBudget, entries: u32) -> Allocation {
     budget
         .reserve(
             BudgetKind::Index,
             BudgetLane::Ordinary,
-            charge_for(events).unwrap(),
+            entry_charge() * entries as usize,
         )
         .unwrap()
         .commit()
@@ -95,7 +95,7 @@ fn inbox_ranges_seek_exclusively_and_retirement_returns_both_charges() {
     let root = index.charged();
     let first = ParticipantId([1; 16]);
     let other = ParticipantId([2; 16]);
-    index.fund(funding(&budget, 4));
+    index.fund(funding(&budget, 7));
     index.file([1; 16], Some(first), position(1, 0));
     index.file([2; 16], Some(other), position(1, 1));
     index.file([3; 16], Some(first), position(2, 0));

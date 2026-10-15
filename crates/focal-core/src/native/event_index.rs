@@ -64,6 +64,11 @@ pub(super) fn charge_for(events: u32) -> Result<usize, NativeError> {
         .ok_or(NativeError::Capacity("event index charge"))
 }
 
+/// The entries this particular event needs, split from its publication's own funding.
+pub(super) fn event_charge(delivery: bool) -> usize {
+    entry_charge().saturating_mul(if delivery { 2 } else { 1 })
+}
+
 /// The home an event is filed under.
 pub(super) fn home(event: NativeEvent) -> [u8; 16] {
     match event.fact {
@@ -210,10 +215,6 @@ impl EventIndex {
             {
                 self.drop_all();
             }
-        } else {
-            // Preparation promises two entries per event; only posted claims and responses
-            // need the second. Give its unused promise back as soon as the event is filed.
-            self.release(entry_charge());
         }
     }
     /// Unfile `position` from `home`, giving back its charge. One not filed is not an index of
@@ -288,7 +289,7 @@ impl EventIndex {
         let Some(funding) = funding else {
             return Self::unbuilt();
         };
-        index.fund(funding.commit());
+        let mut funding = funding.commit();
         for entry in rows.entries_from(&Key::Event(SessionSeq(0), 0), false) {
             let Key::Event(sequence, ordinal) = entry.key else {
                 break;
@@ -303,6 +304,10 @@ impl EventIndex {
             let Ok(recipient) = state.delivery_recipient_from(event, payloads) else {
                 return Self::unbuilt();
             };
+            let Ok(charge) = funding.split_off(event_charge(recipient.is_some())) else {
+                return Self::unbuilt();
+            };
+            index.fund(charge);
             index.file(home(event), recipient, Position { sequence, ordinal });
             if !index.complete {
                 return index;

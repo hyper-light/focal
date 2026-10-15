@@ -2815,13 +2815,13 @@ impl Core<NativeState> {
                     .as_ref()
                     .is_some_and(|funding| funding.bytes() == wanted)
             });
-        match funding {
-            Some(funding) if funded => self.state.events.fund(funding),
+        let mut funding = match funding {
+            Some(funding) if funded => funding,
             _ => {
                 self.state.events.drop_all();
                 return;
             }
-        }
+        };
         for ordinal in 0..outcome.events {
             let Some(event) = self.native_event(outcome.sequence, ordinal) else {
                 self.state.events.drop_all();
@@ -2831,6 +2831,15 @@ impl Core<NativeState> {
                 self.state.events.drop_all();
                 return;
             };
+            let Ok(charge) = funding.split_off(event_index::event_charge(recipient.is_some()))
+            else {
+                self.state.events.drop_all();
+                return;
+            };
+            self.state.events.fund(charge);
+            if !self.state.events.complete() {
+                return;
+            }
             self.state.events.file(
                 event_index::home(event),
                 recipient,
@@ -2840,6 +2849,9 @@ impl Core<NativeState> {
                 },
             );
         }
+        // Unused delivery promises return to this publication's exact source. Releasing an
+        // arbitrary existing index permit could free ordinary parent credit while its funded
+        // completion pool still retained the unused charge.
     }
     /// Build the event index from the committed rows where it is not built (a restored core's,
     /// or one whose memory was refused): a walk of every event, once.
