@@ -299,6 +299,11 @@ impl Marks {
         self.churn != 0
             && self.churn.saturating_mul(CHURN_SHARE) >= u64::try_from(rows).unwrap_or(u64::MAX)
     }
+    /// The rows written since the last pass that swept began.
+    #[cfg(test)]
+    pub(super) fn churn(&self) -> u64 {
+        self.churn
+    }
     /// Refuse, or allow again, the growth of the notes' room (a session's tests).
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn refuse_growth(&mut self, refuse: bool) {

@@ -979,6 +979,16 @@ Each stage lands on its own, measured:
        to be sealed. A log at its segment cap seals none, so a passing memory refusal stopped its
        reclamation for good. Now the pass says it fell short, the replica tries again at the
        bounded cadence above, and rows written make a pass due without the log growing.
+     - **Retirements applied directly kept stale totals (review).** A follower applies a
+       committed retirement record (and a legacy retirement applies a family) by publishing its
+       changes straight to the root, as a seal does, but neither moved the root's running totals:
+       the encoded bytes kept the retired families' (11,086 against the 7,081 the rows give in the
+       follower test), so a follower promoted to leader projected its checkpoint too large and
+       refused fresh work it had room for, and the rows it wrote were no churn, so a follower's
+       log at its cap never swept for its retirements. Both now count their changes before
+       anything changes and move the totals with the publication. Tested: a follower's totals
+       equal a walk of its rows and the leader's after a derived retirement; a legacy
+       retirement's checkpoint is what its total says; both fail without the counts.
      - **What a retirement leaves.** In a session at its cap, a finished family's retirement left
        its oldest segments named by its requests' outcomes and creation results. A seal takes
        those once their generation closes, as the archive's seals do in a running node.

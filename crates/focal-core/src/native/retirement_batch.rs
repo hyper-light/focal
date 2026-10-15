@@ -622,6 +622,11 @@ impl Core<NativeState> {
         if outcome != header.outcome {
             return Err(ContractError::InvalidManifest.into());
         }
+        // What the rows take in a checkpoint once the record publishes, and the rows it writes
+        // (doc 31 M3), counted before anything changes, as a leader's publication counts them: a
+        // replica that applied a retirement here kept the bytes of the families it took away.
+        let encoded = self.encoded_after_changes(&changes)?;
+        let written = changes.len();
         for retiring in &families {
             self.unfile_family_events(&retiring.family);
         }
@@ -634,6 +639,8 @@ impl Core<NativeState> {
             self.state.events.drop_all();
             return Err(error);
         }
+        self.state.encoded_rows = encoded;
+        self.state.marks.churned(written);
         Ok(outcome)
     }
 }

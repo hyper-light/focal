@@ -243,9 +243,11 @@ fn a_family_leaves_the_core_only_when_terminal_released_and_unreferenced() {
     );
     let issuer_request = f::request(f::ISSUER, 1);
     let outcomes_before = core.native_stats().entries;
+    let churn = core.state.marks.churn();
     let rows = core
         .retire_native_family(&family, hash, bytes.len() as u64, through)
         .unwrap();
+    assert!(core.state.marks.churn() > churn, "it wrote no rows");
     assert_eq!(rows, family.rows());
     assert_eq!(core.native_sequence(), SessionSeq(through.0 + 1));
     assert!(core.native_claim(id(1)).is_none());
@@ -277,8 +279,10 @@ fn a_family_leaves_the_core_only_when_terminal_released_and_unreferenced() {
         core.retirement_family(id(1)).unwrap_err(),
         RetirementRefusal::Unknown(id(1))
     );
-    // The checkpoint restores and validates with the continuation in place.
+    // The checkpoint restores and validates with the continuation in place, and is what the
+    // root's running total says: the retirement took its families' bytes away.
     let encoded = ckpt::encode(&core);
+    assert_eq!(core.checkpoint_bytes().unwrap(), encoded.len());
     let restored = recovery::restore(
         &ckpt::inspect(&encoded),
         RangeId(777),
