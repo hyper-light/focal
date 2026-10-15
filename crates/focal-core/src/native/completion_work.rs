@@ -313,24 +313,6 @@ impl CompletionEnvelope {
             limits.max_ranges,
         )?;
         let reports = definition.attempt_bound();
-        let slot_demand = SlotDemand {
-            per_report: CompletionSlots {
-                artifacts: 1,
-                identities: 1,
-                results: 1,
-                outcomes: 1,
-                events,
-                sequences: 1,
-                new_rows: add(
-                    add(add(graph_charges.graph_events, 10)?, cohort.events())?,
-                    crate::native::index_rows::report_rows(
-                        super::completion_envelope::input_bound(descriptor),
-                    )?,
-                )?,
-                ..CompletionSlots::default()
-            },
-            failure: None,
-        };
         let (parent_heap, registry_heap) = parent_bound(limits, parent, registry)?;
         let result = Self {
             record_buffers: None,
@@ -349,8 +331,6 @@ impl CompletionEnvelope {
             reports,
             ordinary_report,
             failed_report: None,
-            slot_demand,
-            slots: slot_demand.remaining(reports, false)?,
             cohort,
             work: Some(WorkCompletion {
                 key,

@@ -68,10 +68,6 @@ fn isolated_required_parent_is_protected_and_failure_credit_is_still_one_time() 
             + crate::native::index_rows::STATUS_ROWS * (1 + cohort.claims())
             + timers
     );
-    assert_eq!(
-        envelope.slots().events,
-        3 * envelope.reports() as usize + 1 + envelope.cohort().events()
-    );
     let view = View::committed(&core.state);
     envelope
         .check_graph_with_members(
@@ -167,7 +163,6 @@ fn actual_dependency_failure_and_automatic_seals_fit_held_range_and_construction
             )
             .is_err()
     );
-    assert!(candidate.outcome().events as usize <= envelope.slots().events);
 }
 
 #[test]

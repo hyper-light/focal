@@ -1,5 +1,5 @@
 use super::*;
-use crate::native::completion_envelope::{CompletionEnvelope, CompletionSlots, CompletionUse};
+use crate::native::completion_envelope::{CompletionEnvelope, CompletionUse};
 use crate::native::prepare::Scratch;
 use focal_model::lifecycle::artifact_descriptor::Limits as ArtifactLimits;
 
@@ -79,21 +79,6 @@ fn received_target_prices_all_retry_versions_and_graph_consequences_before_entry
     assert_eq!(reports, 2);
     let report_index = crate::native::index_rows::report_rows(16).unwrap();
     let status = crate::native::index_rows::STATUS_ROWS;
-    assert_eq!(
-        envelope.slots(),
-        CompletionSlots {
-            artifacts: 2,
-            identities: 2,
-            results: 2,
-            outcomes: 2,
-            events: 14 + 2 * cohort.events(),
-            sequences: 2,
-            // Eleven primary rows and the artifact's twenty index rows per
-            // report (doc 22 §7).
-            new_rows: 2 * (11 + report_index) + 2 * cohort.events(),
-            ..CompletionSlots::default()
-        }
-    );
     let storage = envelope.report_storage(CompletionUse::Regular).unwrap();
     // Seventeen primary changes (the principal's window among them, F12),
     // the cohort's rows, the report's index rows, a status move for the
@@ -327,11 +312,6 @@ fn incoming_topology_growth_is_detected_even_when_original_parent_row_did_not_ch
             + crate::native::index_rows::report_rows(16).unwrap()
             + crate::native::index_rows::STATUS_ROWS * (2 + cohort.claims())
             + timers
-    );
-    assert_eq!(larger.slots().events, 16 + 2 * larger.cohort().events());
-    assert_eq!(
-        larger.slots().new_rows,
-        2 * (12 + crate::native::index_rows::report_rows(16).unwrap()) + 2 * cohort.events()
     );
     check(&fixture, larger).unwrap();
 }

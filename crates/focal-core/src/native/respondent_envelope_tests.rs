@@ -116,12 +116,6 @@ fn independent_action_credits_retain_every_version_and_release_only_consumed_sha
     };
     let demand = envelope.demand(all).unwrap();
     assert_eq!(demand.actions, 12);
-    assert_eq!(demand.slots.artifacts, 4);
-    assert_eq!(demand.slots.identities, 4);
-    assert_eq!(demand.slots.responses, 4);
-    assert_eq!(demand.slots.outcomes, 12);
-    assert_eq!(demand.slots.events, 24);
-    assert_eq!(demand.slots.new_rows, 60);
     let mut remainder = all;
     for (operation, next) in [
         (

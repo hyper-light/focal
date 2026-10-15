@@ -148,7 +148,6 @@ fn receipt_install_rollback_and_parent_refusal_restore_exact_index_and_backing()
     let journal = install(&mut book, &view, 1);
     assert_eq!(book.respondents.len(), 1);
     assert_eq!(book.totals.reports, 12);
-    assert_eq!(book.totals.slots.responses, 4);
     assert!(source.stats().used > baseline.used);
     book.rollback(journal).unwrap();
     assert_eq!(book.respondents.capacity(), 0);

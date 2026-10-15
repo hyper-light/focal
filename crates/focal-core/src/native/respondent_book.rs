@@ -78,7 +78,6 @@ fn demand(envelope: RespondentEnvelope, credit: RespondentCredit) -> Result<Tota
         // This counter reserves candidate identities for all remaining funded
         // actions. Its original name is retained for evaluator-only callers.
         reports: actions,
-        slots: demand.slots,
         live: 1,
         graphs: 0,
     })

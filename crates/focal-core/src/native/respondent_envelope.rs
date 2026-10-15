@@ -3,7 +3,7 @@
 //! credits are independent: several Generated responses can await posting.
 
 use super::completion_envelope::{
-    CompletionSlots, entry_heap, parent_bound, pinned_descriptor_charge, registry_bound,
+    entry_heap, parent_bound, pinned_descriptor_charge, registry_bound,
 };
 use super::prepare::{add, array, containers, event_containers, heap, within};
 use super::prepare_budget::ConstructionBudget;
@@ -25,14 +25,12 @@ mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RespondentDemand {
-    pub(super) slots: CompletionSlots,
     pub(super) actions: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Action {
     storage: RangeWriteEnvelope,
-    slots: CompletionSlots,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,7 +76,6 @@ fn action(
     changes: usize,
     deleted: usize,
     incoming_heap: usize,
-    slots: CompletionSlots,
 ) -> Result<Action, NativeError> {
     Ok(Action {
         storage: view.state.rows.future_write_envelope(
@@ -91,7 +88,6 @@ fn action(
             },
             max_ranges,
         )?,
-        slots,
     })
 }
 
@@ -310,15 +306,6 @@ impl RespondentEnvelope {
                 )?,
                 event_containers(2)?,
             )?,
-            CompletionSlots {
-                artifacts: 1,
-                identities: 1,
-                outcomes: 1,
-                events: 2,
-                sequences: 1,
-                new_rows: 7,
-                ..CompletionSlots::default()
-            },
         )?;
         let close_events = add(work_limit, 2)?;
         let close = action(
@@ -330,14 +317,6 @@ impl RespondentEnvelope {
                 add(claim_row, response_row)?,
                 add(work_rows, event_containers(close_events)?)?,
             )?,
-            CompletionSlots {
-                responses: 1,
-                outcomes: 1,
-                events: close_events,
-                sequences: 1,
-                new_rows: add(work_limit, 5)?,
-                ..CompletionSlots::default()
-            },
         )?;
         let post = action(
             view,
@@ -345,13 +324,6 @@ impl RespondentEnvelope {
             add(7, post_index)?,
             1,
             add(add(claim_row, response_row)?, event_containers(2)?)?,
-            CompletionSlots {
-                outcomes: 1,
-                events: 2,
-                sequences: 1,
-                new_rows: 3,
-                ..CompletionSlots::default()
-            },
         )?;
         let envelope = Self {
             record_buffers: None,
@@ -390,19 +362,11 @@ impl RespondentEnvelope {
         {
             return Err(NativeError::Capacity("respondent credit exceeds contract"));
         }
-        let mut slots = CompletionSlots::default();
-        for (action, count) in [
-            (self.diagnostic, credit.diagnostics),
-            (self.close, credit.closes),
-            (self.post, credit.posts),
-        ] {
-            slots = slots.checked_add(action.slots.checked_scale(count)?)?;
-        }
         let actions = u64::from(credit.diagnostics)
             .checked_add(u64::from(credit.closes))
             .and_then(|n| n.checked_add(u64::from(credit.posts)))
             .ok_or(NativeError::Capacity("respondent action serials"))?;
-        Ok(RespondentDemand { slots, actions })
+        Ok(RespondentDemand { actions })
     }
 
     pub(super) fn with_record_buffers(

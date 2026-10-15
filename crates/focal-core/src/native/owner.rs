@@ -593,7 +593,13 @@ impl NativeOwner {
                     book.install_recovered_respondent(&view, claim, &envelope, verification)?;
                 }
             }
-            book.check_slots(view.meta(), view.prefix(), core.state.rows.len())?;
+            // What is committed may stand anywhere within the bounds.
+            book.check_slots(
+                view.meta(),
+                view.prefix(),
+                core.state.rows.len(),
+                BudgetLane::Completion,
+            )?;
             Ok::<_, NativeError>((incarnation, pending, allocation, index_root, book))
         })();
         match resources {
@@ -903,7 +909,7 @@ impl NativeOwner {
         let journal = CandidateJournal::single(journal);
         let checked = source.with_own(&prepared).and_then(|view| {
             self.book
-                .check_slots(view.meta(), view.prefix(), prepared.fragments.len())
+                .check_slots(view.meta(), view.prefix(), prepared.fragments.len(), lane)
                 .and_then(|()| self.book.check_serial(serial))
                 .and_then(|()| self.book.check_parents(&view, &prepared))
                 .and_then(|()| self.book.check_graph_growth(&view, &prepared))
@@ -1058,7 +1064,7 @@ impl NativeOwner {
                 )?;
                 let checked = source.with_own(&prepared).and_then(|view| {
                     self.book
-                        .check_slots(view.meta(), view.prefix(), prepared.fragments.len())
+                        .check_slots(view.meta(), view.prefix(), prepared.fragments.len(), lane)
                         .and_then(|()| self.book.check_serial(serial))
                         .and_then(|()| self.book.check_parents(&view, &prepared))
                         .and_then(|()| self.book.check_graph_growth(&view, &prepared))
@@ -1382,8 +1388,13 @@ impl NativeOwner {
                 .checked_add(1)
                 .ok_or(NativeError::Capacity("sequence"))?,
         );
-        self.book
-            .check_slots(meta, sequence, self.core.state.rows.len())?;
+        // A retirement makes room: it is not fresh work.
+        self.book.check_slots(
+            meta,
+            sequence,
+            self.core.state.rows.len(),
+            BudgetLane::Completion,
+        )?;
         Ok(())
     }
 

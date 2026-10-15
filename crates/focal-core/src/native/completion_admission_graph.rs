@@ -197,13 +197,6 @@ impl CompletionEnvelope {
             )?
             .min(limits.range.max_batch_entries),
         )?;
-        let extra_events = add(charges.graph_events, cohort.events())?;
-        result.slot_demand.failure = Some(CompletionSlots {
-            events: extra_events,
-            new_rows: extra_events,
-            ..CompletionSlots::default()
-        });
-        result.slots = result.slot_demand.remaining(result.reports, true)?;
         result.check_parent(parent, registry)?;
         let members = GraphMembers::copy_from(&view.state.budget, plan.members())?;
         drop(plan);

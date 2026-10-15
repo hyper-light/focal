@@ -1,5 +1,6 @@
 //! Exclusive native-owner completion accounting. A grant counts an evaluation's
-//! outstanding reports and record slots; it sets no bytes aside for them. Each
+//! outstanding reports; it sets no bytes or record slots aside for them: each
+//! count's bound keeps a completion share instead ([`CompletionBook::check_slots`]). Each
 //! report is charged what it holds as it is written, on the completion lane that
 //! fresh work cannot take (doc 27): nothing is prepaid for a report that may
 //! never come, so an in-flight message costs the bytes it holds.
@@ -11,7 +12,7 @@
 //! removals touch logarithmic paths; charged buffer growth is geometric and
 //! journaled for exact rollback.
 
-use super::completion_envelope::{CompletionEnvelope, CompletionSlots, CompletionUse, ParentFacts};
+use super::completion_envelope::{CompletionEnvelope, CompletionUse, ParentFacts};
 use super::completion_index::{CompletionIndex, IndexGrowth};
 use super::completion_schemas::SchemaSet;
 use super::prepare::{add, array, within};
@@ -66,7 +67,6 @@ struct Grant {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Totals {
     reports: usize,
-    slots: CompletionSlots,
     live: usize,
     graphs: usize,
 }
@@ -181,6 +181,10 @@ pub(super) struct CompletionBook {
     revision: u64,
 }
 
+/// Each count's bound keeps this share of itself (a sixteenth) for completing work already
+/// admitted: fresh work admits within the rest ([`CompletionBook::check_slots`]).
+const COMPLETION_SHARE: usize = 16;
+
 fn sub(left: usize, right: usize) -> Result<usize, NativeError> {
     left.checked_sub(right)
         .ok_or(NativeError::Capacity("completion credit accounting"))
@@ -190,9 +194,9 @@ fn mul(left: usize, right: usize) -> Result<usize, NativeError> {
         .ok_or(NativeError::Capacity("completion credit accounting"))
 }
 
-/// What an evaluation's outstanding reports count against the book: their identities and slots.
-/// Nothing is set aside for the bytes they may hold: each report is charged what it holds as it
-/// is written, on the completion lane, as every write is.
+/// What an evaluation's outstanding reports count against the book: their identities. Nothing is
+/// set aside for the bytes or the records they may take: each report is charged what it holds as
+/// it is written, and counted within the bounds' completion share, on the completion lane.
 fn demand(envelope: CompletionEnvelope, credit: Credit) -> Result<Totals, NativeError> {
     if credit.remaining_reports == 0 {
         return Ok(Totals::default());
@@ -201,7 +205,6 @@ fn demand(envelope: CompletionEnvelope, credit: Credit) -> Result<Totals, Native
         .map_err(|_| NativeError::Capacity("completion report count"))?;
     Ok(Totals {
         reports,
-        slots: envelope.remaining_slots(credit.remaining_reports, credit.failure_available)?,
         live: 1,
         graphs: usize::from(envelope.has_graph()),
     })
@@ -211,7 +214,6 @@ impl Totals {
     fn replace(self, old: Self, new: Self) -> Result<Self, NativeError> {
         Ok(Self {
             reports: add(sub(self.reports, old.reports)?, new.reports)?,
-            slots: self.slots.checked_sub(old.slots)?.checked_add(new.slots)?,
             live: add(sub(self.live, old.live)?, new.live)?,
             graphs: add(sub(self.graphs, old.graphs)?, new.graphs)?,
         })
@@ -386,16 +388,6 @@ impl CompletionBook {
                 .report_storage(CompletionUse::AdmissionFailure)
                 .is_ok(),
         };
-        let full = demand(
-            envelope,
-            Credit {
-                remaining_reports: envelope.reports(),
-                ..credit
-            },
-        )?;
-        if full.slots != envelope.slots() {
-            return Err(NativeError::Capacity("completion envelope accounting"));
-        }
         let before = self.totals;
         let totals = before.replace(Totals::default(), demand(envelope, credit)?)?;
         let journals = add(self.journals, 1)?;
@@ -765,60 +757,52 @@ impl CompletionBook {
         self.check_health()
     }
 
-    /// Check the candidate's actual effective counts AFTER its credit journal is
-    /// applied. Ordinary admission cannot consume promised reports' slots. One
-    /// additional outcome/sequence remains available for an authority control.
+    /// Check the candidate's actual effective counts after its credit journal is
+    /// applied, on its lane: each count's bound keeps a completion share (doc 27),
+    /// so fresh work admits within the bound less its share and work already
+    /// admitted completes within the rest. Nothing is set aside for a grant's
+    /// future reports. Resident outcomes have no share: a seal under pressure is
+    /// what makes room for them, for fresh work and completion alike. One more
+    /// outcome and sequence stay for an authority control.
     pub(super) fn check_slots(
         &self,
         meta: Meta,
         sequence: SessionSeq,
         rows: usize,
+        lane: BudgetLane,
     ) -> Result<(), NativeError> {
         self.check_health()?;
-        let slots = self.totals.slots;
-        within(add(meta.claims, slots.claims)?, self.limits.claims)?;
-        within(
-            add(meta.definitions, slots.definitions)?,
-            self.limits.definitions,
-        )?;
-        within(
-            add(meta.evaluations, slots.evaluations)?,
-            self.limits.evaluations,
-        )?;
-        within(add(meta.artifacts, slots.artifacts)?, self.limits.artifacts)?;
-        within(add(meta.results, slots.results)?, self.limits.results)?;
-        within(add(meta.responses, slots.responses)?, self.limits.responses)?;
-        within(add(meta.receipts, slots.receipts)?, self.limits.receipts)?;
+        let ceiling = |limit: usize| match lane {
+            BudgetLane::Ordinary => {
+                limit.saturating_sub(limit.checked_div(COMPLETION_SHARE).unwrap_or(0))
+            }
+            BudgetLane::Completion | BudgetLane::Committed => limit,
+        };
+        within(meta.claims, ceiling(self.limits.claims))?;
+        within(meta.definitions, ceiling(self.limits.definitions))?;
+        within(meta.evaluations, ceiling(self.limits.evaluations))?;
+        within(meta.artifacts, ceiling(self.limits.artifacts))?;
+        within(meta.results, ceiling(self.limits.results))?;
+        within(meta.responses, ceiling(self.limits.responses))?;
+        within(meta.receipts, ceiling(self.limits.receipts))?;
         // Exactly one claimant result testament may be generated per claim.
         // Its native admission path shares the configured claim-count ceiling.
-        within(
-            add(meta.result_testaments, slots.result_testaments)?,
-            self.limits.claims,
-        )?;
-        within(add(meta.monitors, slots.monitors)?, self.limits.monitors)?;
-        within(
-            add(meta.monitor_links, slots.monitor_links)?,
-            self.limits.monitor_links,
-        )?;
-        within(add(meta.events, slots.events)?, self.limits.events)?;
+        within(meta.result_testaments, ceiling(self.limits.claims))?;
+        within(meta.monitors, ceiling(self.limits.monitors))?;
+        within(meta.monitor_links, ceiling(self.limits.monitor_links))?;
+        within(meta.events, ceiling(self.limits.events))?;
         let control = usize::from(self.totals.live != 0);
         // Resident outcomes (F12): the lifetime count less what left into
         // seals and retirement bundles.
         within(
-            add(
-                add(meta.outcomes.saturating_sub(meta.sealed), slots.outcomes)?,
-                control,
-            )?,
+            add(meta.outcomes.saturating_sub(meta.sealed), control)?,
             self.limits.outcomes,
         )?;
         sequence
             .0
-            .checked_add(slots.sequences)
-            .and_then(|value| value.checked_add(u64::from(control != 0)))
+            .checked_add(u64::from(control != 0))
             .ok_or(NativeError::Capacity("completion sequence margin"))?;
-        // Identities have one matching artifact; their count is priced in new
-        // rows. There is no separate configurable total-row ceiling today.
-        add(add(rows, slots.new_rows)?, control)?;
+        add(rows, control)?;
         Ok(())
     }
 

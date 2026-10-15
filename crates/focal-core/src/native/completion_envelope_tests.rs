@@ -76,20 +76,6 @@ fn full_chain_prices_all_retained_versions_and_only_one_parent_failure() {
             assert_eq!(cohort.claims(), failure);
             assert_eq!(cohort.evaluations(), failure * 5);
             assert_eq!(envelope.reports(), reports);
-            assert_eq!(
-                envelope.slots(),
-                CompletionSlots {
-                    artifacts: reports as usize,
-                    identities: reports as usize,
-                    results: reports as usize,
-                    outcomes: reports as usize,
-                    sequences: u64::from(reports),
-                    events: 3 * reports as usize + failure + cohort.events(),
-                    // Seven primary rows and twenty-one index rows per report.
-                    new_rows: 28 * reports as usize + failure + cohort.events(),
-                    ..CompletionSlots::default()
-                }
-            );
             // Ten primary writes (the principal's window among them, F12),
             // the report's twenty-one index rows and the due timers of the
             // reported and every sealed cohort evaluation.
@@ -1310,7 +1296,6 @@ fn required_increment_prices_ten_writes_per_attempt_without_a_claim_failure_allo
         descriptor_limits(limits, claim, &registry).unwrap(),
     )
     .unwrap();
-    let reports = declaration.attempt_bound() as usize;
     assert_eq!(declaration.mode(), ValidationMode::Required);
     assert!(quote.supports_target(EvaluationTarget::of(state.target())));
     assert!(!quote.supports_target(EvaluationTarget::Admission));
@@ -1329,8 +1314,6 @@ fn required_increment_prices_ten_writes_per_attempt_without_a_claim_failure_allo
             .changed_keys,
         10 + 21 + 1
     );
-    assert_eq!(quote.slots().events, reports * 3);
-    assert_eq!(quote.slots().new_rows, reports * 28);
     assert_eq!(core.state.budget.stats(), before);
     limits.range.max_batch_entries = 8;
     assert!(
@@ -1377,163 +1360,6 @@ fn increment_envelope_requires_actual_registered_family_and_keeps_full_parent_bo
     assert!(quote.max_registrations > quote.registrations);
     assert!(quote.parent_heap >= heap(claim).unwrap());
     assert!(quote.registry_heap >= transactions::registry_heap(&registry).unwrap());
-}
-
-#[test]
-fn remaining_slots_keep_admission_surcharge_until_used_and_zero_it_after_terminal() {
-    let core = running(&[(ValidationMode::Required, false)]);
-    let quote = envelope(&core);
-    assert_eq!(quote.remaining_slots(2, true).unwrap(), quote.slots());
-    assert_eq!(
-        quote.remaining_slots(1, true).unwrap(),
-        CompletionSlots {
-            artifacts: 1,
-            identities: 1,
-            results: 1,
-            outcomes: 1,
-            events: 4 + quote.cohort().events(),
-            sequences: 1,
-            new_rows: 29 + quote.cohort().events(),
-            ..CompletionSlots::default()
-        }
-    );
-    assert_eq!(
-        quote.remaining_slots(1, false).unwrap(),
-        CompletionSlots {
-            artifacts: 1,
-            identities: 1,
-            results: 1,
-            outcomes: 1,
-            events: 3,
-            sequences: 1,
-            // Seven primary rows and the report's twenty-one index rows.
-            new_rows: 28,
-            ..CompletionSlots::default()
-        }
-    );
-    assert_eq!(
-        quote.remaining_slots(0, true).unwrap(),
-        CompletionSlots::default()
-    );
-    assert!(quote.remaining_slots(3, false).is_err());
-    let observe = running(&[(ValidationMode::Observe, false)]);
-    assert!(envelope(&observe).remaining_slots(1, true).is_err());
-}
-
-#[test]
-fn finite_slot_arithmetic_checks_every_dimension_and_sequence_counter() {
-    let one = CompletionSlots {
-        claims: 1,
-        definitions: 1,
-        evaluations: 1,
-        artifacts: 1,
-        identities: 1,
-        results: 1,
-        responses: 1,
-        receipts: 1,
-        result_testaments: 1,
-        monitors: 1,
-        monitor_links: 1,
-        outcomes: 1,
-        events: 1,
-        sequences: 1,
-        new_rows: 1,
-    };
-    let zero = CompletionSlots::default();
-    for dimension in 0..15 {
-        let mut maximum = zero;
-        let mut unit = zero;
-        match dimension {
-            0 => {
-                maximum.artifacts = usize::MAX;
-                unit.artifacts = 1;
-            }
-            1 => {
-                maximum.identities = usize::MAX;
-                unit.identities = 1;
-            }
-            2 => {
-                maximum.results = usize::MAX;
-                unit.results = 1;
-            }
-            3 => {
-                maximum.outcomes = usize::MAX;
-                unit.outcomes = 1;
-            }
-            4 => {
-                maximum.events = usize::MAX;
-                unit.events = 1;
-            }
-            5 => {
-                maximum.sequences = u64::MAX;
-                unit.sequences = 1;
-            }
-            6 => {
-                maximum.new_rows = usize::MAX;
-                unit.new_rows = 1;
-            }
-            7 => {
-                maximum.claims = usize::MAX;
-                unit.claims = 1;
-            }
-            8 => {
-                maximum.definitions = usize::MAX;
-                unit.definitions = 1;
-            }
-            9 => {
-                maximum.evaluations = usize::MAX;
-                unit.evaluations = 1;
-            }
-            10 => {
-                maximum.responses = usize::MAX;
-                unit.responses = 1;
-            }
-            11 => {
-                maximum.receipts = usize::MAX;
-                unit.receipts = 1;
-            }
-            12 => {
-                maximum.result_testaments = usize::MAX;
-                unit.result_testaments = 1;
-            }
-            13 => {
-                maximum.monitors = usize::MAX;
-                unit.monitors = 1;
-            }
-            14 => {
-                maximum.monitor_links = usize::MAX;
-                unit.monitor_links = 1;
-            }
-            _ => unreachable!(),
-        }
-        assert_eq!(maximum.checked_add(zero).unwrap(), maximum);
-        assert_eq!(maximum.checked_scale(1).unwrap(), maximum);
-        assert_eq!(maximum.checked_scale(0).unwrap(), zero);
-        assert!(
-            maximum.checked_add(unit).is_err(),
-            "addition dimension {dimension}"
-        );
-        assert!(
-            maximum.checked_scale(2).is_err(),
-            "scaling dimension {dimension}"
-        );
-        assert!(
-            zero.checked_sub(unit).is_err(),
-            "subtraction dimension {dimension}"
-        );
-        assert_eq!(
-            maximum
-                .checked_sub(unit)
-                .unwrap()
-                .checked_add(unit)
-                .unwrap(),
-            maximum
-        );
-    }
-    assert_eq!(
-        one.checked_scale(3).unwrap().checked_sub(one).unwrap(),
-        one.checked_scale(2).unwrap()
-    );
 }
 
 #[test]

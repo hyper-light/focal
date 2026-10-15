@@ -214,20 +214,26 @@ fn failed_index_growth_restores_existing_metadata_and_parent_exactly() {
 }
 
 #[test]
-fn serial_and_outcome_margins_include_reports_and_one_control() {
+fn serial_margin_includes_reports_and_outcomes_one_control() {
     let core = fixture::running(&[(ValidationMode::Observe, false)]);
     let source = source();
     let mut book = CompletionBook::new(&source, core.limits).unwrap();
     let begin = install(&mut book, &core, &source, 1);
     assert!(book.check_serial(u64::MAX - 2).is_err());
     book.check_serial(u64::MAX - 3).unwrap();
+    // Resident outcomes keep one for an authority control while a grant lives,
+    // nothing for the reports it may yet make.
     let mut meta = Meta {
-        outcomes: book.limits.outcomes - 3,
+        outcomes: book.limits.outcomes - 1,
         ..Meta::default()
     };
-    book.check_slots(meta, SessionSeq(u64::MAX - 3), 0).unwrap();
+    book.check_slots(meta, SessionSeq(u64::MAX - 1), 0, BudgetLane::Ordinary)
+        .unwrap();
     meta.outcomes += 1;
-    assert!(book.check_slots(meta, SessionSeq(0), 0).is_err());
+    assert!(
+        book.check_slots(meta, SessionSeq(0), 0, BudgetLane::Completion)
+            .is_err()
+    );
     book.rollback(begin).unwrap();
     book.check_serial(u64::MAX).unwrap();
 }
@@ -281,7 +287,6 @@ fn increment_grant_funds_exact_target_family_and_journals_terminal_report_withou
         Some(declaration.attempt_bound())
     );
     assert!(!book.grant(key).unwrap().credit.failure_available);
-    assert_eq!(book.totals.slots.events, 3);
     let before_report = source.stats();
     assert!(
         book.advance(
@@ -351,186 +356,11 @@ fn admission_envelope_cannot_fund_an_increment_identity_even_with_the_same_defin
 }
 
 #[test]
-fn unequal_envelope_demands_survive_partial_reports_head_commits_and_tail_rollback() {
-    // Synthetic finite-record profiles exercise the accounting seam; no new
-    // WholeWork target or mismatched physical report is admitted by this test.
-    let core = fixture::running(&[
-        (ValidationMode::Required, false),
-        (ValidationMode::Observe, true),
-    ]);
-    let source = source();
-    let mut book = CompletionBook::new(&source, core.limits).unwrap();
-    let (a_binding, a, a_schemas) = parts(&core, &source, 1);
-    let a = a
-        .with_slot_demand_for_test(
-            CompletionSlots {
-                artifacts: 2,
-                identities: 2,
-                results: 2,
-                outcomes: 1,
-                events: 11,
-                sequences: 1,
-                new_rows: 20,
-                ..CompletionSlots::default()
-            },
-            Some(CompletionSlots {
-                events: 3,
-                new_rows: 4,
-                ..CompletionSlots::default()
-            }),
-        )
-        .unwrap();
-    let (b_binding, b, b_schemas) = parts(&core, &source, 2);
-    let b = b
-        .with_slot_demand_for_test(
-            CompletionSlots {
-                artifacts: 1,
-                identities: 1,
-                results: 1,
-                outcomes: 1,
-                events: 6,
-                sequences: 1,
-                new_rows: 10,
-                ..CompletionSlots::default()
-            },
-            None,
-        )
-        .unwrap();
-    let a_begin = book
-        .install_begin(
-            fixture::key(1),
-            a_binding,
-            a,
-            a_schemas,
-            registration(&core, 1),
-        )
-        .unwrap();
-    let b_begin = book
-        .install_begin(
-            fixture::key(2),
-            b_binding,
-            b,
-            b_schemas,
-            registration(&core, 2),
-        )
-        .unwrap();
-    let full = book.totals;
-    assert_eq!(
-        full.slots,
-        CompletionSlots {
-            artifacts: 7,
-            identities: 7,
-            results: 7,
-            outcomes: 5,
-            events: 43,
-            sequences: 5,
-            new_rows: 74,
-            ..CompletionSlots::default()
-        }
-    );
-    assert_eq!(full.reports, 5);
-    let first = book
-        .advance(
-            fixture::key(1),
-            a_binding,
-            a_binding.next().unwrap(),
-            false,
-            CompletionUse::Regular,
-        )
-        .unwrap();
-    let after_first = book.totals;
-    assert_eq!(
-        after_first.slots,
-        CompletionSlots {
-            artifacts: 5,
-            identities: 5,
-            results: 5,
-            outcomes: 4,
-            events: 32,
-            sequences: 4,
-            new_rows: 54,
-            ..CompletionSlots::default()
-        }
-    );
-    let second = book
-        .advance(
-            fixture::key(2),
-            b_binding,
-            b_binding.next().unwrap(),
-            false,
-            CompletionUse::Regular,
-        )
-        .unwrap();
-    assert_eq!(
-        book.totals.slots,
-        CompletionSlots {
-            artifacts: 4,
-            identities: 4,
-            results: 4,
-            outcomes: 3,
-            events: 26,
-            sequences: 3,
-            new_rows: 44,
-            ..CompletionSlots::default()
-        }
-    );
-    book.commit(a_begin).unwrap();
-    book.commit(b_begin).unwrap();
-    book.rollback(second).unwrap();
-    assert_eq!(book.totals, after_first);
-    book.rollback(first).unwrap();
-    assert_eq!(book.totals, full);
-    let failed = book
-        .advance(
-            fixture::key(1),
-            a_binding,
-            a_binding.next().unwrap(),
-            true,
-            CompletionUse::AdmissionFailure,
-        )
-        .unwrap();
-    assert_eq!(book.totals.slots, b.slots());
-    book.commit(failed).unwrap();
-    book.check_slots(Meta::default(), SessionSeq(0), 0).unwrap();
-    let done = book
-        .advance(
-            fixture::key(2),
-            b_binding,
-            b_binding.next().unwrap(),
-            true,
-            CompletionUse::Regular,
-        )
-        .unwrap();
-    book.commit(done).unwrap();
-    assert_eq!(book.totals.slots, CompletionSlots::default());
-    assert_eq!(book.totals.reports, 0);
-}
-
-#[test]
-fn recovered_partial_credit_uses_its_envelope_profile_instead_of_full_original_count() {
+fn recovered_partial_credit_counts_only_its_remaining_reports() {
     let core = fixture::running(&[(ValidationMode::Required, true)]);
     let source = source();
     let mut book = CompletionBook::new(&source, core.limits).unwrap();
     let (binding, envelope, schemas) = parts(&core, &source, 1);
-    let envelope = envelope
-        .with_slot_demand_for_test(
-            CompletionSlots {
-                artifacts: 1,
-                identities: 1,
-                results: 2,
-                outcomes: 1,
-                events: 9,
-                sequences: 1,
-                new_rows: 15,
-                ..CompletionSlots::default()
-            },
-            Some(CompletionSlots {
-                events: 2,
-                new_rows: 3,
-                ..CompletionSlots::default()
-            }),
-        )
-        .unwrap();
     assert_eq!(envelope.reports(), 3);
     book.install_recovered(
         fixture::key(1),
@@ -541,86 +371,5 @@ fn recovered_partial_credit_uses_its_envelope_profile_instead_of_full_original_c
         registration(&core, 1),
     )
     .unwrap();
-    assert_eq!(
-        book.totals.slots,
-        CompletionSlots {
-            artifacts: 1,
-            identities: 1,
-            results: 2,
-            outcomes: 1,
-            events: 11,
-            sequences: 1,
-            new_rows: 18,
-            ..CompletionSlots::default()
-        }
-    );
     assert_eq!(book.totals.reports, 1);
-    let mut meta = Meta {
-        events: book.limits.events - 11,
-        ..Meta::default()
-    };
-    book.check_slots(meta, SessionSeq(0), 0).unwrap();
-    meta.events += 1;
-    assert!(book.check_slots(meta, SessionSeq(0), 0).is_err());
-}
-
-#[test]
-fn summed_slot_overflow_refuses_before_metadata_growth() {
-    let core = fixture::running(&[
-        (ValidationMode::Required, false),
-        (ValidationMode::Observe, false),
-    ]);
-    let source = source();
-    let mut book = CompletionBook::new(&source, core.limits).unwrap();
-    let (binding, envelope, schemas) = parts(&core, &source, 1);
-    let envelope = envelope
-        .with_slot_demand_for_test(
-            CompletionSlots {
-                artifacts: 1,
-                identities: 1,
-                results: 1,
-                outcomes: 1,
-                events: usize::MAX / 2,
-                sequences: 1,
-                new_rows: 7,
-                ..CompletionSlots::default()
-            },
-            Some(CompletionSlots {
-                events: 1,
-                new_rows: 1,
-                ..CompletionSlots::default()
-            }),
-        )
-        .unwrap();
-    let first = book
-        .install_begin(
-            fixture::key(1),
-            binding,
-            envelope,
-            schemas,
-            registration(&core, 1),
-        )
-        .unwrap();
-    assert_eq!(book.totals.slots.events, usize::MAX);
-    let before = source.stats();
-    let totals = book.totals;
-    let capacity = book.entries.capacity();
-    let (binding, envelope, schemas) = parts(&core, &source, 2);
-    assert!(
-        book.install_begin(
-            fixture::key(2),
-            binding,
-            envelope,
-            schemas,
-            registration(&core, 2)
-        )
-        .is_err()
-    );
-    assert_eq!(source.stats(), before);
-    assert_eq!(book.totals, totals);
-    assert_eq!(book.entries.capacity(), capacity);
-    assert_eq!(book.len(), 1);
-    assert_eq!(book.journals, 1);
-    book.rollback(first).unwrap();
-    assert_eq!(book.totals.slots, CompletionSlots::default());
 }

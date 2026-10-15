@@ -670,19 +670,21 @@ fn reserved_core() -> Core<NativeState> {
     core
 }
 
-/// The owner holds the outcomes it promised to live reports and one
-/// control back from a retirement, as it holds them back from every fresh
-/// candidate: at the smallest bound the owner rebuilds under, the core's
-/// own check passes (the bound has room for one more outcome) and the owner
-/// refuses (`OutcomesReserved` at the session); retiring through the core
-/// regardless leaves a state no owner rebuilds over — the deadlock the
-/// unchecked retirement used to make. One above that bound the retirement
-/// is allowed, the owner rebuilds, and the promised report and a deadline
-/// control are admitted after it.
+/// The owner holds one outcome for an authority control back from a
+/// retirement, as it does from every candidate while a grant lives: at the
+/// smallest bound the owner rebuilds under, the core's own check passes (the
+/// bound has room for one more outcome) and the owner refuses
+/// (`OutcomesReserved` at the session); retiring through the core regardless
+/// leaves a state no owner rebuilds over — the deadlock the unchecked
+/// retirement used to make. One above that bound the retirement is allowed,
+/// the owner rebuilds, and the live report and a deadline control are
+/// admitted after it.
 #[test]
 fn a_retirement_never_takes_an_outcome_promised_to_a_live_report() {
     let (bound, mut core) = smallest_owner_bound(reserved_core());
-    assert!(bound > outcomes_of(&core) + 1, "reports are promised");
+    // Nothing is promised to the live report: beside the resident outcomes the
+    // owner keeps one for an authority control alone.
+    assert_eq!(bound, outcomes_of(&core) + 1);
     core.limits.outcomes = bound;
     assert!(core.retirement_family(id(2)).is_ok());
     let owner = NativeOwner::new(core).unwrap();
