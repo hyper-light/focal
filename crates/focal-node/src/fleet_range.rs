@@ -662,8 +662,14 @@ impl Owner {
                 visits,
                 reply,
             } => {
-                let result =
-                    crate::archive_derive::cold_walk(&mut self.session, cursor, min_age_ms, visits);
+                let result = crate::archive_derive::cold_walk(
+                    &mut self.session,
+                    &self.budget,
+                    &mut self.settled,
+                    cursor,
+                    min_age_ms,
+                    visits,
+                );
                 drop(charge);
                 let _ = reply.send(result);
             }
@@ -722,11 +728,17 @@ impl Owner {
     /// One family's bundle from the committed core (26 §4), derived as
     /// `archive_derive::archived_family` says.
     fn archive_family(
-        &self,
+        &mut self,
         root: ClaimId,
         min_age_ms: u64,
     ) -> Result<Option<ArchivedFamily>, LedgerError> {
-        crate::archive_derive::archived_family(&self.session, &self.budget, root, min_age_ms)
+        crate::archive_derive::archived_family(
+            &self.session,
+            &self.budget,
+            &mut self.settled,
+            root,
+            min_age_ms,
+        )
     }
     /// The seal the committed state yields now (F12), derived as
     /// `archive_derive::sealed_outcomes` says.

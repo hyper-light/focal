@@ -102,6 +102,19 @@ pub(crate) fn retire_pace(walked: Walked, since: Duration, interval: Duration) -
         .clamp(BACKLOG_INTERVAL, interval)
 }
 
+/// When to walk a replica's families again after `failures` walks in a row it refused or that
+/// failed: [`BACKLOG_INTERVAL`] after the first, each next twice as long, never later than the
+/// interval. A refusal is most often the session busy a moment (a seal draining, a retirement in
+/// flight); a fault that stays is asked after once an interval.
+pub(crate) fn failed_pace(failures: u32, interval: Duration) -> Duration {
+    let doubled = 1u32
+        .checked_shl(failures.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    BACKLOG_INTERVAL
+        .saturating_mul(doubled)
+        .clamp(BACKLOG_INTERVAL, interval.max(BACKLOG_INTERVAL))
+}
+
 /// A replica's walk: where it resumes, when it last ran and when it runs next.
 #[derive(Debug, Clone, Copy)]
 struct Walk {
@@ -113,6 +126,8 @@ struct Walk {
     rule: Option<(focal_ledger::RetireRule, std::time::Instant)>,
     /// The tick that last saw the replica hosted here: a walk not seen by a tick is let go.
     seen: u64,
+    /// Walks refused or failed since its last that was not: how long the next waits.
+    failures: u32,
 }
 
 /// The operator's view of the archive agent on this node.
@@ -133,6 +148,8 @@ pub struct ArchiveAgent {
     waiting: u64,
     seals_proposed: u64,
     seals_waiting: u64,
+    walks_failed: u64,
+    seals_failed: u64,
     status: watch::Sender<AdminArchiveAgent>,
 }
 
@@ -159,6 +176,8 @@ impl ArchiveAgent {
             waiting: 0,
             seals_proposed: 0,
             seals_waiting: 0,
+            walks_failed: 0,
+            seals_failed: 0,
             last_tick_ms: 0,
         })?;
         Ok((
@@ -171,6 +190,8 @@ impl ArchiveAgent {
                 waiting: 0,
                 seals_proposed: 0,
                 seals_waiting: 0,
+                walks_failed: 0,
+                seals_failed: 0,
                 status,
             },
             ArchiveHandle(receiver),
@@ -185,6 +206,8 @@ impl ArchiveAgent {
             waiting: self.waiting,
             seals_proposed: self.seals_proposed,
             seals_waiting: self.seals_waiting,
+            walks_failed: self.walks_failed,
+            seals_failed: self.seals_failed,
             last_tick_ms: now_ms(),
         };
         self.status.send(status);
@@ -250,19 +273,35 @@ impl ArchiveAgent {
             let now = std::time::Instant::now();
             let walk = self.walk(ledger, now);
             if walk.due <= now {
-                // A replica that is not native, not authoritative, or refuses
-                // the walk simply waits for its next.
-                let walked = self
-                    .step(ledger, &host, handles, walk.cursor)
-                    .await
-                    .unwrap_or_default();
-                let pace = retire_pace(
-                    walked.0,
-                    now.saturating_duration_since(walk.at),
-                    self.interval,
-                );
+                // A replica that is not native or not authoritative walks nothing. A walk the
+                // replica refuses, or that fails, resumes where it stood, sooner than the
+                // interval while its failures are few, and is counted: one sent its replica back
+                // to the first of its families and rested the interval, so a family the walk
+                // could not date stopped every retirement there, unseen.
+                let (walked, cursor, failures) =
+                    match self.step(ledger, &host, handles, walk.cursor).await {
+                        Ok((walked, cursor)) => (walked, cursor, 0),
+                        Err(_) => {
+                            self.walks_failed = self.walks_failed.saturating_add(1);
+                            (
+                                Walked::default(),
+                                walk.cursor,
+                                walk.failures.saturating_add(1),
+                            )
+                        }
+                    };
+                let pace = if failures > 0 {
+                    failed_pace(failures, self.interval)
+                } else {
+                    retire_pace(
+                        walked,
+                        now.saturating_duration_since(walk.at),
+                        self.interval,
+                    )
+                };
                 if let Some(next) = self.walks.get_mut(&ledger) {
-                    next.cursor = walked.1;
+                    next.cursor = cursor;
+                    next.failures = failures;
                     next.at = now;
                     next.due = now.checked_add(pace).unwrap_or(now);
                 }
@@ -271,10 +310,7 @@ impl ArchiveAgent {
                 backlog.retire_at = Some(backlog.retire_at.map_or(due, |soonest| soonest.min(due)));
             }
             if seals {
-                backlog.seals |= self
-                    .seal_step(ledger, &host, handles)
-                    .await
-                    .unwrap_or(false);
+                backlog.seals |= self.seal_counted(ledger, &host, handles).await;
             }
         }
         let tick = self.ticks;
@@ -295,6 +331,7 @@ impl ArchiveAgent {
             due: now,
             rule: None,
             seen: self.ticks,
+            failures: 0,
         });
         walk.seen = self.ticks;
         *walk
@@ -305,13 +342,26 @@ impl ArchiveAgent {
         let mut backlog = false;
         while let Some((ledger, host)) = handles.fleet.next_host(after) {
             after = Some(ledger);
-            backlog |= self
-                .seal_step(ledger, &host, handles)
-                .await
-                .unwrap_or(false);
+            backlog |= self.seal_counted(ledger, &host, handles).await;
         }
         self.publish();
         backlog
+    }
+    /// [`Self::seal_step`], a failure counted (`seals_failed`) and the seal asked again at the
+    /// next round, as one held is.
+    async fn seal_counted(
+        &mut self,
+        ledger: LedgerId,
+        host: &ReplicaHost,
+        handles: &NetworkHandles,
+    ) -> bool {
+        match self.seal_step(ledger, host, handles).await {
+            Ok(backlog) => backlog,
+            Err(_) => {
+                self.seals_failed = self.seals_failed.saturating_add(1);
+                false
+            }
+        }
     }
     /// One seal for the replica when the committed state yields one worth
     /// proposing (F12): the bundle (and a fold's) sealed as content under
@@ -570,6 +620,9 @@ pub(crate) struct EmbeddedArchive {
     retire_due: std::time::Instant,
     walked_at: std::time::Instant,
     cursor: Option<focal_core::native::retirement::RetirementCursor>,
+    /// When the session's committed records settled, as its walks sampled them
+    /// (`archive_derive::Settled`).
+    settled: crate::archive_derive::Settled,
     pub(crate) proposed: u64,
     pub(crate) seals_proposed: u64,
     pub(crate) deferred: u64,
@@ -586,6 +639,7 @@ impl EmbeddedArchive {
             retire_due: now,
             walked_at: now.checked_sub(interval).unwrap_or(now),
             cursor: None,
+            settled: crate::archive_derive::Settled::default(),
             proposed: 0,
             seals_proposed: 0,
             deferred: 0,
@@ -678,6 +732,8 @@ impl EmbeddedArchive {
             // nothing sealed, and polled to commitment.
             let walk = crate::archive_derive::cold_walk(
                 &mut node.session,
+                budget,
+                &mut self.settled,
                 self.cursor,
                 self.grace_ms,
                 COLD_VISITS,
@@ -705,8 +761,13 @@ impl EmbeddedArchive {
             .try_reserve_exact(MAX_RETIRE_FAMILIES)
             .map_err(|_| crate::embedded::NodeError::Domain("retirement offers".into()))?;
         for root in candidates.claims {
-            let Some(archived) =
-                crate::archive_derive::archived_family(&node.session, budget, root, self.grace_ms)?
+            let Some(archived) = crate::archive_derive::archived_family(
+                &node.session,
+                budget,
+                &mut self.settled,
+                root,
+                self.grace_ms,
+            )?
             else {
                 continue;
             };

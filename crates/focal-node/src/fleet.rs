@@ -1219,6 +1219,9 @@ struct Owner {
     #[cfg(test)]
     dropped_snapshots: u64,
     budget: MemoryBudget,
+    /// When the session's committed records settled, as the archive agent's walks sampled them:
+    /// what its families' grace is told by (`archive_derive::Settled`).
+    settled: crate::archive_derive::Settled,
     pace: crate::pace::TickPeriod,
     /// When leadership goes back to the placement's preferred leader.
     leader_return: crate::leader_return::LeaderReturn,
@@ -1452,6 +1455,7 @@ impl ReplicaHost {
             #[cfg(test)]
             dropped_snapshots: 0,
             budget: budget.clone(),
+            settled: crate::archive_derive::Settled::default(),
             nonblocking: false,
             batching: false,
             drain_owed: false,

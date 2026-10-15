@@ -50,6 +50,11 @@ const OUTCOMES: &str = "48";
 /// A node on the network when `advertise` names its endpoint, else the
 /// embedded node of the data directory alone.
 fn start(root: &Path, advertise: Option<&str>) -> Server {
+    start_with(root, advertise, "0")
+}
+/// [`start`] with a released family retiring once `grace_ms` of the node's logical time has
+/// passed since its last event settled.
+fn start_with(root: &Path, advertise: Option<&str>, grace_ms: &str) -> Server {
     deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
@@ -59,9 +64,9 @@ fn start(root: &Path, advertise: Option<&str>) -> Server {
     let mut child = command
         .env("FOCAL_NATIVE_OUTCOMES", OUTCOMES)
         // The archive agent looks every fifth of a second, and retires a
-        // released family at once.
+        // released family once its grace has passed.
         .env("FOCAL_RETIRE_INTERVAL_MS", "200")
-        .env("FOCAL_RETIRE_AFTER_MS", "0")
+        .env("FOCAL_RETIRE_AFTER_MS", grace_ms)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -178,11 +183,13 @@ fn sequence(root: &Path) -> u64 {
         .unwrap()
 }
 fn seals_proposed(root: &Path) -> u64 {
+    retire_status(root)["seals_proposed"].as_u64().unwrap()
+}
+/// The archive agent's account on this node (`inspect node --storage`).
+fn retire_status(root: &Path) -> Value {
     let shown = admin(root, None, &["inspect", "node", "--storage"]);
     assert_eq!(shown["result"]["kind"], "storage", "{shown}");
-    shown["result"]["storage"]["retire"]["seals_proposed"]
-        .as_u64()
-        .unwrap()
+    shown["result"]["storage"]["retire"].clone()
 }
 /// The founder's replica's live window and its seals (F12, 26 §4a).
 fn sealing(root: &Path) -> Value {
@@ -535,5 +542,127 @@ fn an_embedded_node_seals_its_closed_generations_and_retires_released_families()
             &claim_document(&worker, "The claim after the restart.").to_string(),
         ],
     ));
+    drop(server);
+}
+
+/// A family released before its generation closed has its outcomes sealed while its grace runs,
+/// and still retires once the grace ends (26 §4): a walk dates it by when the session's records
+/// settled, never by its outcome, which the seal took out of the core. Dated by its outcome, a walk
+/// that met it failed (`Corrupt`), went back to the first family and rested the interval, and no
+/// family retired again: a deliver load filled its session's memory and stopped. The grace is a day
+/// while the generation closes and is sealed; restarted with none, the node retires the family at
+/// its first walks, and no walk fails.
+#[test]
+fn a_family_whose_outcomes_a_seal_took_retires_once_its_grace_ends() {
+    let founder = tempfile::Builder::new()
+        .prefix("focal-epochs-graced-")
+        .tempdir()
+        .unwrap();
+    let client = tempfile::Builder::new()
+        .prefix("focal-epochs-graced-client-")
+        .tempdir()
+        .unwrap();
+    private(founder.path());
+    private(client.path());
+    let root = founder.path();
+    let activation = admin(root, None, &["activate", "native"]);
+    assert_eq!(activation["activated"], true, "{activation}");
+    let advertise = address();
+    let server = start_with(root, Some(&advertise), "86400000");
+    let invitation = client.path().join("alice.invite");
+    admin(
+        root,
+        None,
+        &[
+            "invite",
+            "client",
+            "--name",
+            "alice",
+            "--output",
+            invitation.to_str().unwrap(),
+        ],
+    );
+    let enrolled = run(
+        client.path(),
+        None,
+        &[
+            "enroll",
+            "context",
+            "alice",
+            "--invite-file",
+            invitation.to_str().unwrap(),
+        ],
+    );
+    assert!(enrolled.status.success());
+    let alice_standing = admin(client.path(), Some("alice"), &["inspect", "prefix"]);
+    let alice = hex_hash(&objects(&alice_standing)[0]["Standing"]["principal"]);
+
+    // A family released at once, in the founder's first generation.
+    let (_, result) = committed(&cli(
+        root,
+        None,
+        &[
+            "submit",
+            "claim",
+            "--json",
+            &claim_document(&alice, "A claim to release.").to_string(),
+        ],
+    ));
+    let released = hex_hash(&result["created"][0]["id"]);
+    committed(&cli(root, None, &["cancel", "claim", &released]));
+    let (release, _) = committed(&cli(root, None, &["release", "scope", &released]));
+
+    // Claims until the owner closes that generation, and the archive agent seals its outcomes,
+    // the release's among them.
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
+    let mut closed = false;
+    for round in 0..96u32 {
+        assert!(deadline.open(), "the generation never closed");
+        let document = claim_document(&alice, &format!("Claim {round} of the window."));
+        let (code, value) = attempt(
+            root,
+            None,
+            &["submit", "claim", "--json", &document.to_string()],
+        );
+        if code == 0 {
+            committed(&value);
+            continue;
+        }
+        assert_eq!(
+            value["result"]["code"], "request_history_expired",
+            "{value}"
+        );
+        closed = true;
+        break;
+    }
+    assert!(closed, "the founder's generation was closed under pressure");
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
+    loop {
+        let view = sealing(root);
+        if view["seals_applied"].as_u64().unwrap() >= 1 && view["busy"] == false {
+            break;
+        }
+        assert!(
+            deadline.open(),
+            "the closed generation was never sealed: {view}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The release's outcome is read from the seal; the family is live, within its grace, and
+    // the walks that met it did not fail.
+    assert!(!observed(root, &release).is_null());
+    assert!(
+        objects(&cli(root, None, &["get", "claim", &released]))[0]
+            .get("Claim")
+            .is_some()
+    );
+    assert_eq!(retire_status(root)["walks_failed"], 0);
+
+    // Its grace ended: the family retires behind its continuation, and no walk failed.
+    drop(server);
+    let server = start_with(root, Some(&advertise), "0");
+    let continuation = retired(root, &released);
+    assert!(continuation["bundle"].is_array(), "{continuation}");
+    assert_eq!(retire_status(root)["walks_failed"], 0);
     drop(server);
 }

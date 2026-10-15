@@ -489,6 +489,10 @@ pub struct AdminArchiveAgent {
     /// have not all answered yet.
     pub seals_proposed: u64,
     pub seals_waiting: u64,
+    /// Walks of a replica's families and seal rounds that the replica refused or that failed:
+    /// each walk resumed where it stood, each seal was asked again.
+    pub walks_failed: u64,
+    pub seals_failed: u64,
     pub last_tick_ms: u64,
 }
 /// One hosted native session's retention as the storage view lists it.

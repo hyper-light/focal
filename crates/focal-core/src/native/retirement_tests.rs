@@ -972,7 +972,8 @@ fn the_event_index_finds_what_a_walk_of_every_event_finds() {
 /// A finished family is due to retire once its grace has passed, and at once while its session is
 /// short of memory (doc 31 M3), so a session under sustained load gives its finished families
 /// back rather than fill: the waiver is the offering authority's, and the family is the one a
-/// replica derives either way.
+/// replica derives either way. Where when it settled is not known yet, it waits, unless the
+/// session is short.
 #[test]
 fn a_finished_family_is_due_after_its_grace_or_at_once_when_memory_is_short() {
     let mut core = f::core();
@@ -981,14 +982,10 @@ fn a_finished_family_is_due_after_its_grace_or_at_once_when_memory_is_short() {
     let family = core.retirement_family(id(1)).unwrap();
     let day = 24 * 60 * 60 * 1000;
     assert!(!core.native_memory_short());
-    assert_eq!(
-        core.retirement_due(&family, 30 + day - 1, day).unwrap(),
-        Some(false)
-    );
-    assert_eq!(
-        core.retirement_due(&family, 30 + day, day).unwrap(),
-        Some(true)
-    );
+    assert!(!core.retirement_due(Some(30), 30 + day - 1, day));
+    assert!(core.retirement_due(Some(30), 30 + day, day));
+    assert!(!core.retirement_due(None, u64::MAX, day));
+    assert!(core.retirement_due(Some(30), 30, 0));
     let budget = core.state.budget.clone();
     let squeezed = budget
         .reserve(
@@ -999,11 +996,12 @@ fn a_finished_family_is_due_after_its_grace_or_at_once_when_memory_is_short() {
         .unwrap()
         .commit();
     assert!(core.native_memory_short());
-    assert_eq!(core.retirement_due(&family, 30, day).unwrap(), Some(true));
+    assert!(core.retirement_due(Some(30), 30, day));
+    assert!(core.retirement_due(None, 30, day));
     assert_eq!(core.retirement_family(id(1)).unwrap(), family);
     drop(squeezed);
     assert!(!core.native_memory_short());
-    assert_eq!(core.retirement_due(&family, 30, day).unwrap(), Some(false));
+    assert!(!core.retirement_due(Some(30), 30, day));
 }
 
 #[test]

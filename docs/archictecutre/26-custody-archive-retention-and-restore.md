@@ -405,16 +405,26 @@ it (the complete sequences every registered consumer lets retire reach
 the family's last event, everything published when there is no
 consumer), and the family's last event settled at least the grace ago
 (`FOCAL_RETIRE_AFTER_MS`, one day by default, measured on the node's
-logical clock against the logical time of the outcome that published
-that event: a finished claim stays readable in the core for that long;
+logical clock against when the session's records settled as the
+authority sampled them: its committed sequence and the core's logical
+time there, at most 1,024 samples spaced by the grace, the first at or
+past the family's last event bounding from above when it settled, since
+logical time never falls along the sequence; never the outcome that
+published the event, which a seal takes out of the core within seconds
+of its close. A finished claim stays readable in the core for that long;
 a session short of memory, its ordinary headroom under an eighth of its
 allowance, waives the grace, so its finished families retire as soon as
 they may, the first memory it gets back) —
 seals the bundle under custody, and proposes the record once
 every required copy holds a receipt; one family per replica per tick, and
 a family whose copies have not all answered waits for a later tick with
-its bundle already sealed. The agent holds nothing the records do not: a
-restart resumes the walk from the index.
+its bundle already sealed. A walk the replica refuses, or that fails,
+resumes where it stood, asked again sooner than the interval while its
+failures are few (each doubling the wait from the backlog's), and is
+counted; a seal round that fails is counted and asked again. The agent
+holds nothing the records do not: a restart resumes the walk from the
+index, and dates every family it holds by its first sample, a grace after
+it.
 
 **The operator's view.** `inspect replicas --retention [--session]`
 (`diagnose.cluster.retention`) reads the floor of §3 with the families retired
@@ -935,7 +945,8 @@ content, archive, staging), the headroom that is never spent and the
 completion reserve; the uploads in progress and the bytes they have
 staged; the archive agent's settings (interval, grace) and progress
 (ticks, records proposed, bundles sealed whose required copies have not
-all answered — the repair the agent is waiting on); the collector's
+all answered — the repair the agent is waiting on — and the walks and
+seal rounds that failed); the collector's
 settings; and for every hosted native session whether this node is its
 authority, the log kept beyond its checkpoint, and its retention floor
 with the published prefix, what consumers still need, what the archive

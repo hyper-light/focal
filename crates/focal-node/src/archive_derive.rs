@@ -7,8 +7,108 @@
 use crate::fleet::{ArchivedFamily, SealedOutcomes};
 use focal_core::native::seal::{SealBound, SealRefusal};
 use focal_ledger::{LedgerError, Session};
-use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
-use focal_model::ClaimId;
+use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
+use focal_model::{ClaimId, SessionSeq};
+use std::collections::VecDeque;
+
+/// The samples a session's [`Settled`] keeps at most.
+pub(crate) const SETTLE_SAMPLES: usize = 1024;
+
+/// When a session's committed records settled (26 §4): its committed sequence and the logical time
+/// its core held there, sampled as the archive agent's walks come, oldest first. A record whose
+/// logical time is below its core's is refused, so time never falls along the sequence, and the
+/// first sample at or past a family's last event bounds from above when that event settled: a
+/// family dated by it never retires before its grace, whether the outcome that settled it is
+/// still in the core or a seal took it out (an anchored seal takes outcomes within seconds of
+/// their close; a family was dated by its outcome alone, every walk past one sealed failed, and
+/// none retired, a deliver run filling its session's 1 GiB). A sample is taken at most every
+/// `grace / (SETTLE_SAMPLES / 2)`, those older than the newest at or before `now - grace` are
+/// let go, and at most [`SETTLE_SAMPLES`] are kept, the oldest let go first, which only dates a
+/// family later; what its buffer holds is charged as it grows. Kept on the authority alone and
+/// never replicated: a replica that becomes the authority dates every family it holds by its
+/// first sample, a grace after it.
+#[derive(Default)]
+pub(crate) struct Settled {
+    samples: VecDeque<(SessionSeq, u64)>,
+    charge: Option<Allocation>,
+}
+impl Settled {
+    /// The committed core at `at` held logical time `time`, read at logical time `now` under a
+    /// grace of `grace_ms`. A sample the buffer cannot be grown for is not taken: the families
+    /// it would have dated are dated by a later one.
+    pub(crate) fn sample(
+        &mut self,
+        budget: &MemoryBudget,
+        at: SessionSeq,
+        time: u64,
+        now: u64,
+        grace_ms: u64,
+    ) {
+        let cut = now.saturating_sub(grace_ms);
+        while self.samples.get(1).is_some_and(|(_, time)| *time <= cut) {
+            self.samples.pop_front();
+        }
+        let gap = grace_ms
+            .checked_div(u64::try_from(SETTLE_SAMPLES / 2).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+            .max(1);
+        if self
+            .samples
+            .back()
+            .is_some_and(|(last, last_time)| *last >= at || time < last_time.saturating_add(gap))
+        {
+            return;
+        }
+        if self.samples.len() >= SETTLE_SAMPLES {
+            self.samples.pop_front();
+        }
+        if self.samples.len() == self.samples.capacity() && !self.grow(budget) {
+            return;
+        }
+        self.samples.push_back((at, time));
+    }
+    /// The buffer doubled (to [`SETTLE_SAMPLES`] at most, 16 at least), its charge admitted first.
+    fn grow(&mut self, budget: &MemoryBudget) -> bool {
+        if self.charge.is_none() {
+            match budget.reserve(BudgetKind::Index, BudgetLane::Ordinary, 0) {
+                Ok(permit) => self.charge = Some(permit.commit()),
+                Err(_) => return false,
+            }
+        }
+        let Some(charge) = self.charge.as_mut() else {
+            return false;
+        };
+        let have = self.samples.capacity();
+        let want = have.saturating_mul(2).clamp(16, SETTLE_SAMPLES);
+        let Some(more) = want
+            .checked_sub(have)
+            .filter(|more| *more > 0)
+            .and_then(|more| more.checked_mul(size_of::<(SessionSeq, u64)>()))
+        else {
+            return false;
+        };
+        if charge.grow(more).is_err() {
+            return false;
+        }
+        if self
+            .samples
+            .try_reserve_exact(want.saturating_sub(self.samples.len()))
+            .is_err()
+        {
+            let held = charge.bytes().saturating_sub(more);
+            // Given back exactly what was admitted for it.
+            let _ = charge.shrink_to(held);
+            return false;
+        }
+        true
+    }
+    /// The latest logical time the record at `through` can have settled at: the first sample at or
+    /// past it, none before one is taken there.
+    pub(crate) fn by(&self, through: SessionSeq) -> Option<u64> {
+        let first = self.samples.partition_point(|(at, _)| *at < through);
+        self.samples.get(first).map(|(_, time)| *time)
+    }
+}
 
 /// One family's bundle from the committed core (26 §4): only on the
 /// authority, only when the family is eligible, every registered consumer
@@ -19,10 +119,11 @@ use focal_model::ClaimId;
 pub(crate) fn archived_family(
     session: &Session,
     budget: &MemoryBudget,
+    settled: &mut Settled,
     root: ClaimId,
     min_age_ms: u64,
 ) -> Result<Option<ArchivedFamily>, LedgerError> {
-    let Some(family) = eligible_family(session, root, min_age_ms)? else {
+    let Some(family) = eligible_family(session, budget, settled, root, min_age_ms)? else {
         return Ok(None);
     };
     let limits = session.native_encoding_limits()?;
@@ -58,9 +159,12 @@ pub(crate) fn archived_family(
 }
 /// The family rooted at `root` when it may retire now (26 §4): only on the authority, only when
 /// it is eligible, every registered consumer has read past its last event, and that event settled
-/// at least `min_age_ms` of the node's logical time ago.
+/// at least `min_age_ms` of the node's logical time ago as `settled` dates it, the committed
+/// core sampled into it first.
 fn eligible_family(
     session: &Session,
+    budget: &MemoryBudget,
+    settled: &mut Settled,
     root: ClaimId,
     min_age_ms: u64,
 ) -> Result<Option<focal_core::native::retirement::RetirementFamily>, LedgerError> {
@@ -70,33 +174,33 @@ fn eligible_family(
     let now = crate::native_ingress::logical_time(session)
         .map_err(|_| LedgerError::NotReady { leader: 0 })?;
     let report = session.native_retention()?;
-    eligible_in(session.native_core()?, &report, now, root, min_age_ms)
+    let core = session.native_core()?;
+    settled.sample(
+        budget,
+        core.native_sequence(),
+        core.native_logical_time(),
+        now,
+        min_age_ms,
+    );
+    Ok(eligible_in(core, &report, now, root, min_age_ms, settled))
 }
-/// [`eligible_family`] on a core read once, under the session's retention report and logical
-/// time read once: what a walk asks of every family it visits.
+/// [`eligible_family`] on a core read once, under the session's retention report, logical time
+/// and samples read once: what a walk asks of every family it visits.
 fn eligible_in(
     core: &focal_core::Core<focal_core::native::NativeState>,
     report: &focal_ledger::RetentionReport,
     now: u64,
     root: ClaimId,
     min_age_ms: u64,
-) -> Result<Option<focal_core::native::retirement::RetirementFamily>, LedgerError> {
-    let Ok(family) = core.retirement_family(root) else {
-        return Ok(None);
-    };
+    settled: &Settled,
+) -> Option<focal_core::native::retirement::RetirementFamily> {
+    let family = core.retirement_family(root).ok()?;
     if !report.allows_family(family.through) {
-        return Ok(None);
+        return None;
     }
-    // Its last event settled the grace ago, or its session is short of memory (doc 31 M3). An
-    // outcome that cannot be read back is the payload log's failure, not an absence.
-    match core
-        .retirement_due(&family, now, min_age_ms)
-        .map_err(focal_ledger::NativeSessionError::from)?
-    {
-        Some(true) => Ok(Some(family)),
-        Some(false) => Ok(None),
-        None => Err(LedgerError::Corrupt),
-    }
+    // Its last event settled the grace ago, or its session is short of memory (doc 31 M3).
+    core.retirement_due(settled.by(family.through), now, min_age_ms)
+        .then_some(family)
 }
 /// What one cold walk did (doc 31 M2, A2): how many families it retired, deferred and refused,
 /// whether it found more than one batch of offers, whether it submitted a candidate, and where
@@ -119,6 +223,8 @@ pub(crate) struct ColdWalk {
 /// a family; the work is bounded by `visits`. Only on the authority.
 pub(crate) fn cold_walk(
     session: &mut Session,
+    budget: &MemoryBudget,
+    settled: &mut Settled,
     cursor: Option<focal_core::native::retirement::RetirementCursor>,
     min_age_ms: u64,
     visits: usize,
@@ -132,6 +238,13 @@ pub(crate) fn cold_walk(
     let report = session.native_retention()?;
     let ledger = session.ledger();
     let core = session.native_core()?;
+    settled.sample(
+        budget,
+        core.native_sequence(),
+        core.native_logical_time(),
+        now,
+        min_age_ms,
+    );
     let candidates = core
         .retirement_candidates(cursor, visits)
         .map_err(|error| LedgerError::Native(error.into()))?;
@@ -140,7 +253,7 @@ pub(crate) fn cold_walk(
         .try_reserve_exact(candidates.claims.len())
         .map_err(|_| LedgerError::Capacity)?;
     for root in &candidates.claims {
-        let Some(family) = eligible_in(core, &report, now, *root, min_age_ms)? else {
+        let Some(family) = eligible_in(core, &report, now, *root, min_age_ms, settled) else {
             continue;
         };
         offers.push(RetireOffer {
@@ -340,3 +453,7 @@ pub enum SealOffer {
     /// A seal and its bundle, to put under custody and propose.
     Ready(Box<SealedOutcomes>),
 }
+
+#[cfg(test)]
+#[path = "archive_derive_tests.rs"]
+mod tests;

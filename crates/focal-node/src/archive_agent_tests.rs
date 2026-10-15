@@ -89,3 +89,16 @@ fn a_walk_comes_again_as_soon_as_a_batch_is_likely_waiting() {
         at_once
     );
 }
+
+/// A walk refused or failed is asked again soon, each failure in a row doubling the wait, never
+/// later than the interval.
+#[test]
+fn a_failed_walk_is_asked_again_sooner_than_the_interval_while_its_failures_are_few() {
+    let interval = Duration::from_secs(5);
+    assert_eq!(failed_pace(1, interval), BACKLOG_INTERVAL);
+    assert_eq!(failed_pace(2, interval), BACKLOG_INTERVAL * 2);
+    assert_eq!(failed_pace(3, interval), BACKLOG_INTERVAL * 4);
+    assert_eq!(failed_pace(9, interval), interval);
+    assert_eq!(failed_pace(u32::MAX, interval), interval);
+    assert_eq!(failed_pace(1, Duration::from_millis(1)), BACKLOG_INTERVAL);
+}
