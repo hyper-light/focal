@@ -6,7 +6,7 @@
     clippy::arithmetic_side_effects,
     clippy::disallowed_macros
 )]
-//! The `deliver` lifecycle end to end on an embedded node: every message's seven writes commit,
+//! The `deliver` lifecycle end to end on an embedded node: every message's eight writes commit,
 //! each side finding the other's step only in the ledger's events, and each message is measured
 //! from its place on the schedule to its testament posted and to its claim satisfied.
 use serde_json::Value;
@@ -40,7 +40,7 @@ fn every_message_is_delivered_through_the_events_and_measured_end_to_end() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
-    assert_eq!(report["committed"], 12 * 7, "seven writes a message");
+    assert_eq!(report["committed"], 12 * 8, "eight writes a message");
     assert_eq!(report["refused"], 0, "{}", report["refusals"]);
     assert_eq!(report["unknown"], 0);
     assert_eq!(report["lifecycles"], 12);
@@ -79,6 +79,6 @@ fn every_message_is_delivered_through_the_events_and_measured_end_to_end() {
     for (message, mut written) in steps {
         written.sort_unstable();
         let order: Vec<u64> = written.iter().map(|(_, step)| *step).collect();
-        assert_eq!(order, (0..7).collect::<Vec<_>>(), "{message:?}");
+        assert_eq!(order, (0..8).collect::<Vec<_>>(), "{message:?}");
     }
 }

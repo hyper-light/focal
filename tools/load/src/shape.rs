@@ -49,11 +49,14 @@ pub enum Lifecycle {
     /// Delivered as a work queue delivers a message, end to end (the comparison's `deliver`
     /// mode): the issuer creates the claim for its consumer and posts it; the consumer, a
     /// principal of its own, finds it in the ledger's events, acquires its receipt, submits its
-    /// testament and posts it; the issuer finds the testament in the events, receives it and
-    /// enters its whole-work validation, which satisfies a receipt claim. Seven writes, each
-    /// compiled against the objects it binds to as read just before it (`requirements`), as an
-    /// agent's client compiles them; neither side is told of the other's step but through the
-    /// events it polls, as a consumer learns of a message only by fetching it.
+    /// testament and posts it; the issuer finds the testament in the events, receives it,
+    /// enters its whole-work validation, which satisfies a receipt claim, and releases the
+    /// claim's scope, which ends its lifecycle: a delivered message's family then retires from
+    /// memory to the cold tier (doc 31 4.7). Eight writes (seven before the release was the
+    /// last), each compiled against the objects it binds to as read just before it
+    /// (`requirements`), as an agent's client compiles them; neither side is told of the
+    /// other's step but through the events it polls, as a consumer learns of a message only by
+    /// fetching it.
     Deliver,
 }
 impl Lifecycle {
@@ -62,7 +65,7 @@ impl Lifecycle {
         match self {
             Self::Create => 1,
             Self::CancelRelease => 3,
-            Self::Deliver => 7,
+            Self::Deliver => 8,
         }
     }
 }

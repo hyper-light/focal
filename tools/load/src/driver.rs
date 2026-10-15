@@ -581,8 +581,9 @@ impl Shared<'_> {
     }
     /// The claim the issuer created at `created`, delivered: posted by the issuer, found by the
     /// consumer in the ledger's events, acquired, answered with a testament and the testament
-    /// posted; the testament found by the issuer in the events, received, and its whole-work
-    /// validation entered, which satisfies the claim. Each side waits on the events it polls
+    /// posted; the testament found by the issuer in the events, received, its whole-work
+    /// validation entered, which satisfies the claim, and the claim's scope released, which ends
+    /// its lifecycle so its family may retire. Each side waits on the events it polls
     /// for the other's step, registered before the write that makes it is sent. Recorded: when
     /// the consumer's testament was posted (the message handled) and when the claim was
     /// satisfied, each from the message's place on the schedule.
@@ -670,24 +671,35 @@ impl Shared<'_> {
             return Ok(());
         };
         let enter = NativeAuthoredOperation::ValidationEnterWholeWork(target);
-        if self
+        let Some((written, _)) = self
             .later(&self.issuer, i, 6, &enter, written, 0..0)
             .await?
-            .is_none()
-        {
+        else {
             return Ok(());
-        }
+        };
         let satisfied = Instant::now();
-        let mut outcome = self.outcome.borrow_mut();
-        outcome.lifecycles = outcome.lifecycles.saturating_add(1);
-        outcome.deliveries.push(Delivery {
+        // Delivered once satisfied, whether or not the release that ends its lifecycle commits:
+        // a message delivered and a lifecycle completed are counted apart.
+        self.outcome.borrow_mut().deliveries.push(Delivery {
             start_ns: started.saturating_duration_since(self.run_start).as_nanos(),
             handled_ns: handled.saturating_duration_since(self.run_start).as_nanos(),
             satisfied_ns: satisfied
                 .saturating_duration_since(self.run_start)
                 .as_nanos(),
-        })
+        })?;
+        let release = NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim));
+        if self
+            .later(&self.issuer, i, 7, &release, written, 0..0)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let mut outcome = self.outcome.borrow_mut();
+        outcome.lifecycles = outcome.lifecycles.saturating_add(1);
+        Ok(())
     }
+
     /// A step the other side never showed in the events within the wait's bound: counted, its
     /// waiter let go.
     fn undelivered(&self, claim: u128, watch: &Watch) -> Result<(), LoadError> {
