@@ -10,6 +10,68 @@ use focal_model::{Cause, ValidationMode, VerdictValue};
 fn id(value: u128) -> ClaimId {
     ClaimId::from_u128(value)
 }
+
+#[test]
+fn delivery_index_rebuilds_from_spilled_claim_headers_and_retires_with_the_family() {
+    let mut core = f::core();
+    core.attach_payload_log_with_young(Box::new(super::payloads::MemoryPayloads::default()), 0);
+    for claim in [1, 2] {
+        f::publish(
+            &mut core,
+            claim as u64 * 10,
+            f::creation(claim * 10, claim, &[], None),
+        );
+        let binding = binding_of(&core, claim);
+        f::publish(
+            &mut core,
+            claim as u64 * 10 + 1,
+            f::post(claim * 10 + 1, binding),
+        );
+    }
+    let subject = core.native_claim(id(1)).unwrap().subject();
+    let before = core
+        .native_deliveries_from(subject, None)
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(before.len(), 2);
+    core.state.events.drop_all();
+    assert!(matches!(
+        core.native_deliveries_from(subject, None),
+        Err(NativeError::Capacity(_))
+    ));
+    let read_backs = core.native_read_backs();
+    core.build_event_index();
+    assert_eq!(
+        core.native_read_backs(),
+        read_backs,
+        "an inbox rebuild never hydrates claims"
+    );
+    assert_eq!(
+        core.native_deliveries_from(subject, None)
+            .unwrap()
+            .collect::<Vec<_>>(),
+        before
+    );
+    cancel(&mut core, 30, 1, 30);
+    release(&mut core, 31, 1, 40);
+    let (family, hash, bytes, through) = bundle_of(&core, id(1));
+    core.retire_native_family(&family, hash, bytes, through)
+        .unwrap();
+    assert_eq!(
+        core.native_deliveries_from(subject, None)
+            .unwrap()
+            .collect::<Vec<_>>(),
+        [before[1]]
+    );
+    core.state.events.drop_all();
+    core.build_event_index();
+    assert_eq!(
+        core.native_deliveries_from(subject, None)
+            .unwrap()
+            .collect::<Vec<_>>(),
+        [before[1]]
+    );
+}
 fn binding_of(core: &Core<NativeState>, claim: u128) -> Binding {
     core.native_claim(id(claim)).unwrap().binding()
 }

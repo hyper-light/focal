@@ -1509,6 +1509,12 @@ pub enum NativeListFilter {
     Events {
         after: Option<(SessionSeq, u32)>,
     },
+    /// Posted claims to this participant and posted responses to claims it issued.
+    /// An additive variant: the existing global Events query keeps its encoding and meaning.
+    Deliveries {
+        recipient: ParticipantId,
+        after: Option<(SessionSeq, u32)>,
+    },
 }
 impl NativeListFilter {
     fn valid(&self) -> bool {
@@ -1557,6 +1563,7 @@ impl NativeListFilter {
                 !holder.is_some_and(ParticipantId::is_zero) && !claim.is_some_and(ClaimId::is_zero)
             }
             Self::Events { .. } => true,
+            Self::Deliveries { recipient, .. } => !recipient.is_zero(),
         }
     }
 }

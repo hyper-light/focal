@@ -763,6 +763,41 @@ fn events(
     )
 }
 
+/// A recipient's indexed delivery positions, sought before event materialization.
+fn deliveries(
+    reader: &Reader<'_>,
+    walk: &mut Walk<'_>,
+    after: Option<Position>,
+    recipient: ParticipantId,
+    from: Option<(SessionSeq, u32)>,
+) -> Result<(), AccessError> {
+    let start = match after {
+        None => from,
+        Some(Position::Event { sequence, ordinal }) => Some((sequence, ordinal)),
+        Some(_) => return Err(wrong_position()),
+    };
+    let positions = reader
+        .core
+        .native_deliveries_from(recipient, start)
+        .map_err(|_| AccessError::Capacity)?;
+    walk.run(
+        positions,
+        |(sequence, ordinal)| Position::Event {
+            sequence: *sequence,
+            ordinal: *ordinal,
+        },
+        |(sequence, ordinal)| {
+            let event = reader
+                .core
+                .native_event(sequence, ordinal)
+                .ok_or(AccessError::Unavailable)?;
+            Ok(Some(NativeObject::Event(Box::new(docs::event_record(
+                event,
+            )))))
+        },
+    )
+}
+
 /// Serve one page from a fixed committed prefix.
 pub(crate) fn serve(
     reader: &Reader<'_>,
@@ -837,6 +872,10 @@ pub(crate) fn serve(
         }
         NativeListFilter::Monitors { claim } => monitors(reader, &mut walk, after, *claim)?,
         NativeListFilter::Events { after: from } => events(reader, &mut walk, after, *from)?,
+        NativeListFilter::Deliveries {
+            recipient,
+            after: from,
+        } => deliveries(reader, &mut walk, after, *recipient, *from)?,
     }
     let next = walk
         .next

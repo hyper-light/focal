@@ -67,6 +67,23 @@ fn authored_creation_post_and_zero_event_reuse_replay_into_fresh_incarnations() 
     // A second independent incarnation starts at the posted checkpoint. The
     // exact same immutable reuse record must extend either validated base.
     let mut checkpoint_base = restored(&original, 13_002, &store);
+    let subject = original.native_claim(claim).unwrap().subject();
+    let deliveries = |core: &Core<NativeState>| {
+        core.native_deliveries_from(subject, None)
+            .unwrap()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(deliveries(&original).len(), 1);
+    assert_eq!(
+        deliveries(&recovered),
+        deliveries(&original),
+        "follower replay files the same delivery"
+    );
+    assert_eq!(
+        deliveries(&checkpoint_base),
+        deliveries(&original),
+        "checkpoint restore rebuilds the inbox"
+    );
     let original_event_count = match recovered.state.rows.get(&Key::Meta).unwrap() {
         Row::Meta(meta) => meta.events,
         _ => panic!("missing metadata"),

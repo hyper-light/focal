@@ -44,6 +44,9 @@ const CYCLES: u32 = 17;
 const FAR: u64 = 4_102_444_800_000;
 const LIST_KEY: [u8; 32] = [7; 32];
 
+#[path = "native_delivery_tests.rs"]
+mod delivery_tests;
+
 fn ledger() -> LedgerId {
     LedgerId {
         tenant: TenantId::from_u128(11),

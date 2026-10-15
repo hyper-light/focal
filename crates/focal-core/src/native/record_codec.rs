@@ -81,7 +81,7 @@ pub(in crate::native) use read_evidence::{
     creation_decode_bound, decode_creation, decode_definition,
 };
 pub(in crate::native) use read_history::event_object;
-pub(in crate::native) use spilled::{ClaimRows, decode_claim};
+pub(in crate::native) use spilled::{ClaimRows, claim_participants, decode_claim};
 /// Codec work an outcome's record encoding takes at most: a fixed-width row's.
 const OUTCOME_VISITS: usize = 4096;
 /// `outcome`'s record encoding written into the front of `into`: its length (a spilled outcome's

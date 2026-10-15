@@ -49,10 +49,10 @@ fn every_message_is_delivered_through_the_events_and_measured_end_to_end() {
     assert_eq!(deliver["delivered"], 12);
     assert_eq!(deliver["undelivered"], 0);
     assert_eq!(deliver["tail_failures"], 0);
-    // Each side read the other's steps from the events: at least a claim posted and a testament
-    // posted a message.
-    assert!(deliver["consumer_events"].as_u64().unwrap() >= 12);
-    assert!(deliver["issuer_events"].as_u64().unwrap() >= 12);
+    // The indexed inbox delivers only the other side's posted message, once a lifecycle:
+    // neither side materializes the rest of the ledger's events and filters them locally.
+    assert_eq!(deliver["consumer_events"].as_u64().unwrap(), 12);
+    assert_eq!(deliver["issuer_events"].as_u64().unwrap(), 12);
     let handled = deliver["handled_latency_ns"]["max"].as_u64().unwrap();
     let satisfied = deliver["satisfied_latency_ns"]["max"].as_u64().unwrap();
     assert!(handled > 0 && handled <= satisfied, "{handled} {satisfied}");

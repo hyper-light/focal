@@ -5,7 +5,24 @@ use super::{bytes::Cursor, read_claim, read_evidence as evidence, read_source::M
 use crate::native::{EvaluationKey, LedgerId, NativeError, NativeLimits, OwnedClaim, Row};
 use focal_memory::Allocation;
 use focal_model::lifecycle::{ContractError, aggregation, evidence::Response, validation};
-use focal_model::{ClaimId, TestamentId, ValidationId};
+use focal_model::{ClaimId, ParticipantId, TestamentId, ValidationId};
+
+/// Read only the immutable routing header of a claim already verified before it was spilled.
+/// Building an inbox index must not hydrate every claim and its declarations into a cache.
+pub(in crate::native) fn claim_participants(
+    id: ClaimId,
+    bytes: &[u8],
+    ledger: LedgerId,
+) -> Result<(ParticipantId, ParticipantId), NativeError> {
+    let mut cursor = Cursor::new(bytes, bytes.len(), 256).map_err(evidence::codec)?;
+    let binding = super::read_fields::binding(&mut cursor).map_err(evidence::codec)?;
+    if binding.ledger != ledger || binding.object.0 != id.0 {
+        return Err(ContractError::InvalidManifest.into());
+    }
+    let issuer = super::read_fields::participant(&mut cursor).map_err(evidence::codec)?;
+    let subject = super::read_fields::participant(&mut cursor).map_err(evidence::codec)?;
+    Ok((issuer, subject))
+}
 
 /// The rows a spilled claim's encoding names, as the view it is read in holds them. None of
 /// them is a claim, so reading one never reads a claim back.

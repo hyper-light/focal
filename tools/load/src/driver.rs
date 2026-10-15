@@ -1244,6 +1244,7 @@ async fn run_phase(
                     side.poll,
                     consumer_tail,
                     names.ledger,
+                    side.principal,
                     tail_ids(side.seed, CONSUMER_TAIL_WORKER),
                 ),
                 watch::tail(
@@ -1252,6 +1253,7 @@ async fn run_phase(
                     side.poll,
                     issuer_tail,
                     names.ledger,
+                    names.issuer,
                     tail_ids(side.seed, ISSUER_TAIL_WORKER),
                 ),
             )

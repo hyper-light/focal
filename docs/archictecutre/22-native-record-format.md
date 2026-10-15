@@ -530,6 +530,19 @@ repositioned. Because every family but `ByStatus` is written once, a cursor
 stays valid while the prefix grows: a later page sees later rows at a later
 prefix, which the page's token names.
 
+`NativeListFilter::Deliveries` reads one participant's inbox: a posted claim goes
+to its subject and a posted response goes to its claimant. The derived event
+index keeps these publication coordinates in a separate recipient namespace,
+in sequence and ordinal order. Seeking after a coordinate visits only the next
+deliveries for that participant; event bodies are read after selection. The
+index is funded before publication (at most two entries per event, with an
+unused inbox entry's charge returned immediately), maintained during follower
+replay and retirement, and rebuilt from checkpoint rows on restore. A spilled
+claim supplies its immutable routing header without hydrating its declarations
+or filling the read-back cache. An index that cannot be funded or kept exact
+refuses with capacity; it never silently substitutes a global scan. The existing
+global `Events` variant and canonical record/checkpoint encodings are unchanged.
+
 ## 6. Durable Session contract
 
 [NativeSession](../../crates/focal-ledger/src/native_session.rs) binds this
@@ -629,4 +642,3 @@ activation protocol, the `FOCALSS6`/`FOCALSS7` envelopes and the import design.
 ## 8. The backup manifest (`FCLBKUP1`)
 
 A backup directory ([26 §6](26-custody-archive-retention-and-restore.md)) is `MANIFEST`, `checkpoint` (the exact `FOCALSS7` envelope), `seeds/<hash>.seed` (the chunks of a seeded Core root, named and verified as the seed store names them) and `content/<root>.manifest` plus `content/<hash>.chunk` (each object's manifest verbatim and its chunks, named as the content store names them). `MANIFEST` is the 8-byte magic `FCLBKUP1`, a postcard body and a 32-byte BLAKE3 trailer over magic and body; the body is schema `1`, the creation time (unix ms), the evidence prefix (cluster, ledger, log group, placement genesis, node, legacy sequence, Raft index and term, route, placement and membership epochs, operation, placement digest, envelope hash and length, artifact count), the native prefix, the activation genesis, the profile byte, the content domain, the decoder pair (predecessor, successor), the membership configuration, the envelope hash and length again, the seed chunks (hash, length) in table order, the objects sorted by root (root, length, class, chunks as hash and length) and the retention section's `archived_through` and `retired_families`. A manifest is decoded only whole and validated field by field; it is written last and a directory without one is not a backup. The format is pre-release and may still change with a version of its magic.
-

@@ -291,6 +291,38 @@ pub struct NativeState {
     young: young::Young,
 }
 impl NativeState {
+    /// Directed delivery facts: a posted claim to its subject, a posted response to its
+    /// claimant. The claim's participants are immutable and replay verifies that invariant.
+    fn delivery_recipient(&self, event: NativeEvent) -> Result<Option<ParticipantId>, NativeError> {
+        let (id, to_subject) = match event.fact {
+            NativeFact::Claim(claim) if claim.kind == NativeEventKind::Posted => {
+                (ClaimId(claim.after.object.0), true)
+            }
+            NativeFact::Response {
+                claim,
+                state: ResponseState::Posted,
+                ..
+            } => (claim, false),
+            _ => return Ok(None),
+        };
+        let participants = match self.rows.get(&Key::Claim(id)) {
+            Some(Row::Claim(stored)) => match stored.claim() {
+                Some(claim) => (claim.issuer(), claim.subject()),
+                None => {
+                    let at = stored.logged().ok_or(ContractError::InvalidManifest)?;
+                    self.with_spilled(at, |bytes| {
+                        record_codec::claim_participants(id, bytes, self.ledger)
+                    })?
+                }
+            },
+            _ => return Err(ContractError::InvalidManifest.into()),
+        };
+        Ok(Some(if to_subject {
+            participants.1
+        } else {
+            participants.0
+        }))
+    }
     /// Where a spilled row's bytes are read from.
     pub(crate) fn payloads(&self) -> Option<&dyn payloads::PayloadRead> {
         self.payloads
@@ -2540,9 +2572,28 @@ impl Core<NativeState> {
     }
     pub fn native_event(&self, sequence: SessionSeq, ordinal: u32) -> Option<NativeEvent> {
         match self.state.rows.get(&Key::Event(sequence, ordinal)) {
-            Some(Row::Event(event)) => event.get(self.state.ledger, self.state.payloads()),
+            Some(Row::Event(event)) => {
+                event.get(self.state.ledger, payloads::source(&self.state.payloads))
+            }
             _ => None,
         }
+    }
+    /// Posted claims addressed to `recipient` and posted responses addressed to their
+    /// claimant, in publication order. Positions are selected before any event is read.
+    /// An unavailable derived index is a typed refusal, never a global-scan fallback.
+    pub fn native_deliveries_from(
+        &self,
+        recipient: ParticipantId,
+        after: Option<(SessionSeq, u32)>,
+    ) -> Result<impl Iterator<Item = (SessionSeq, u32)> + '_, NativeError> {
+        if !self.state.events.complete() {
+            return Err(NativeError::Capacity("delivery index unavailable"));
+        }
+        Ok(self
+            .state
+            .events
+            .deliveries(recipient, after)
+            .map(|at| (at.sequence, at.ordinal)))
     }
     pub fn native_budget(&self) -> BudgetStats {
         self.state.budget.stats()
@@ -2713,13 +2764,6 @@ impl Core<NativeState> {
     }
     /// Unfile every event `fragments` deletes from the event index (doc 31 M2).
     fn unfile_deleted_events(&mut self, fragments: &ranges::Fragments) {
-        let NativeState {
-            rows,
-            events,
-            ledger,
-            payloads: log,
-            ..
-        } = &mut self.state;
         for (_, _, change) in fragments.changes() {
             let ranges::RowChange::Delete(key) = change else {
                 continue;
@@ -2727,34 +2771,34 @@ impl Core<NativeState> {
             let Key::Event(sequence, ordinal) = key else {
                 continue;
             };
-            if !events.complete() {
+            if !self.state.events.complete() {
                 return;
             }
-            let event = match rows.get(&key) {
-                Some(Row::Event(stored)) => stored.get(*ledger, payloads::source(log)),
-                _ => None,
-            };
-            match event {
-                Some(event) => events.unfile(
-                    event_index::home(event),
-                    event_index::Position { sequence, ordinal },
-                ),
-                None => events.drop_all(),
-            }
+            self.unfile_event(sequence, ordinal);
+        }
+    }
+    /// Unfile a delivery and its object's history together while the claim still exists.
+    fn unfile_event(&mut self, sequence: SessionSeq, ordinal: u32) {
+        let filed = self.native_event(sequence, ordinal).and_then(|event| {
+            self.state
+                .delivery_recipient(event)
+                .ok()
+                .map(|recipient| (event, recipient))
+        });
+        match filed {
+            Some((event, recipient)) => self.state.events.unfile(
+                event_index::home(event),
+                recipient,
+                event_index::Position { sequence, ordinal },
+            ),
+            None => self.state.events.drop_all(),
         }
     }
     /// File the events `outcome` published, every one at its sequence, on the charge its
     /// preparation funded (doc 31 M2). A publication not funded for them, or a row that is not
     /// the event it should be, lets the index go, for the rows to build again.
     fn file_events(&mut self, outcome: NativeOutcome, funding: Option<focal_memory::Allocation>) {
-        let NativeState {
-            rows,
-            events,
-            ledger,
-            payloads: log,
-            ..
-        } = &mut self.state;
-        if outcome.events == 0 || !events.complete() {
+        if outcome.events == 0 || !self.state.events.complete() {
             return;
         }
         let funded = event_index::charge_for(outcome.events)
@@ -2765,23 +2809,24 @@ impl Core<NativeState> {
                     .is_some_and(|funding| funding.bytes() == wanted)
             });
         match funding {
-            Some(funding) if funded => events.fund(funding),
+            Some(funding) if funded => self.state.events.fund(funding),
             _ => {
-                events.drop_all();
+                self.state.events.drop_all();
                 return;
             }
         }
         for ordinal in 0..outcome.events {
-            let event = match rows.get(&Key::Event(outcome.sequence, ordinal)) {
-                Some(Row::Event(stored)) => stored.get(*ledger, payloads::source(log)),
-                _ => None,
-            };
-            let Some(event) = event else {
-                events.drop_all();
+            let Some(event) = self.native_event(outcome.sequence, ordinal) else {
+                self.state.events.drop_all();
                 return;
             };
-            events.file(
+            let Ok(recipient) = self.state.delivery_recipient(event) else {
+                self.state.events.drop_all();
+                return;
+            };
+            self.state.events.file(
                 event_index::home(event),
+                recipient,
                 event_index::Position {
                     sequence: outcome.sequence,
                     ordinal,
@@ -2793,12 +2838,7 @@ impl Core<NativeState> {
     /// or one whose memory was refused): a walk of every event, once.
     pub fn build_event_index(&mut self) {
         if !self.state.events.complete() {
-            self.state.events = event_index::EventIndex::build(
-                &self.state.rows,
-                self.state.ledger,
-                self.state.payloads(),
-                &self.state.budget,
-            );
+            self.state.events = event_index::EventIndex::build(&self.state);
         }
     }
     /// What the rows take in a checkpoint once `prepared` publishes, each replaced or deleted row

@@ -27,8 +27,11 @@ pub(super) struct Position {
     pub(super) ordinal: u32,
 }
 
-/// One filed event: its home, then its position, so a home's events are one range.
-type Filed = ([u8; 16], u64, u32);
+/// An object's history or a participant's inbox, followed by its publication position.
+/// The namespaces keep an object id equal to a participant id from mixing the two ranges.
+type Filed = (u8, [u8; 16], u64, u32);
+const HISTORY: u8 = 0;
+const DELIVERY: u8 = 1;
 
 /// What one filed event may take in the index: a B-tree node's slots for its entry with the
 /// node at its least occupancy (half of its eleven, so twice the slot), its share of a node's
@@ -55,6 +58,8 @@ const MAX_CHARGES: usize = 8;
 /// What filing `events` events costs: what a publication funds as it is prepared.
 pub(super) fn charge_for(events: u32) -> Result<usize, NativeError> {
     entry_charge()
+        .checked_mul(2)
+        .ok_or(NativeError::Capacity("event index charge"))?
         .checked_mul(usize::try_from(events).map_err(|_| NativeError::Capacity("events"))?)
         .ok_or(NativeError::Capacity("event index charge"))
 }
@@ -119,7 +124,10 @@ impl EventIndex {
     /// Events filed, a diagnostic.
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.filed.len()
+        self.filed
+            .iter()
+            .filter(|(kind, ..)| *kind == HISTORY)
+            .count()
     }
     /// What the index is charged.
     #[cfg(test)]
@@ -131,8 +139,27 @@ impl EventIndex {
     /// The events filed under `home`, in the order they were published.
     pub(super) fn positions(&self, home: [u8; 16]) -> impl Iterator<Item = Position> + '_ {
         self.filed
-            .range((home, 0, 0)..=(home, u64::MAX, u32::MAX))
-            .map(|(_, sequence, ordinal)| Position {
+            .range((HISTORY, home, 0, 0)..=(HISTORY, home, u64::MAX, u32::MAX))
+            .map(|(_, _, sequence, ordinal)| Position {
+                sequence: SessionSeq(*sequence),
+                ordinal: *ordinal,
+            })
+    }
+    /// Seek directly to a recipient's next delivery. Neither unrelated events nor the
+    /// recipient's earlier history are visited to resume a tail.
+    pub(super) fn deliveries(
+        &self,
+        recipient: ParticipantId,
+        after: Option<(SessionSeq, u32)>,
+    ) -> impl Iterator<Item = Position> + '_ {
+        use std::ops::Bound::{Excluded, Included};
+        let start = match after {
+            Some((sequence, ordinal)) => Excluded((DELIVERY, recipient.0, sequence.0, ordinal)),
+            None => Included((DELIVERY, recipient.0, 0, 0)),
+        };
+        self.filed
+            .range((start, Included((DELIVERY, recipient.0, u64::MAX, u32::MAX))))
+            .map(|(_, _, sequence, ordinal)| Position {
                 sequence: SessionSeq(*sequence),
                 ordinal: *ordinal,
             })
@@ -160,33 +187,71 @@ impl EventIndex {
     }
     /// File `position` under `home`, funded by [`Self::fund`]. One filed already is not an
     /// index of the rows: the index is let go.
-    pub(super) fn file(&mut self, home: [u8; 16], position: Position) {
-        if self.complete
-            && !self
-                .filed
-                .insert((home, position.sequence.0, position.ordinal))
-        {
-            self.drop_all();
-        }
-    }
-    /// Unfile `position` from `home`, giving back its charge. One not filed is not an index of
-    /// the rows: the index is let go.
-    pub(super) fn unfile(&mut self, home: [u8; 16], position: Position) {
+    pub(super) fn file(
+        &mut self,
+        home: [u8; 16],
+        recipient: Option<ParticipantId>,
+        position: Position,
+    ) {
         if !self.complete {
             return;
         }
         if !self
             .filed
-            .remove(&(home, position.sequence.0, position.ordinal))
+            .insert((HISTORY, home, position.sequence.0, position.ordinal))
         {
             self.drop_all();
             return;
         }
+        if let Some(recipient) = recipient {
+            if !self
+                .filed
+                .insert((DELIVERY, recipient.0, position.sequence.0, position.ordinal))
+            {
+                self.drop_all();
+            }
+        } else {
+            // Preparation promises two entries per event; only posted claims and responses
+            // need the second. Give its unused promise back as soon as the event is filed.
+            self.release(entry_charge());
+        }
+    }
+    /// Unfile `position` from `home`, giving back its charge. One not filed is not an index of
+    /// the rows: the index is let go.
+    pub(super) fn unfile(
+        &mut self,
+        home: [u8; 16],
+        recipient: Option<ParticipantId>,
+        position: Position,
+    ) {
+        if !self.complete {
+            return;
+        }
+        if !self
+            .filed
+            .remove(&(HISTORY, home, position.sequence.0, position.ordinal))
+        {
+            self.drop_all();
+            return;
+        }
+        self.release(entry_charge());
+        if let Some(recipient) = recipient {
+            if !self
+                .filed
+                .remove(&(DELIVERY, recipient.0, position.sequence.0, position.ordinal))
+            {
+                self.drop_all();
+                return;
+            }
+            self.release(entry_charge());
+        }
+    }
+    fn release(&mut self, bytes: usize) {
         let released = self
             .charges
             .iter_mut()
-            .find(|charge| charge.bytes() >= entry_charge())
-            .map(|charge| charge.split_off(entry_charge()).map(drop));
+            .find(|charge| charge.bytes() >= bytes)
+            .map(|charge| charge.split_off(bytes).map(drop));
         if !matches!(released, Some(Ok(()))) {
             self.drop_all();
         }
@@ -199,12 +264,9 @@ impl EventIndex {
     }
     /// The index of every event `rows` hold under `ledger`, charged to `budget` before it is
     /// built; where the charge is refused, or a row is not an event, it stays unbuilt.
-    pub(super) fn build(
-        rows: &ranges::NativeRanges,
-        ledger: LedgerId,
-        payloads: Option<&dyn super::payloads::PayloadRead>,
-        budget: &MemoryBudget,
-    ) -> Self {
+    pub(super) fn build(state: &NativeState) -> Self {
+        let rows = &state.rows;
+        let budget = &state.budget;
         let mut count = 0u32;
         for entry in rows.entries_from(&Key::Event(SessionSeq(0), 0), false) {
             let Key::Event(..) = entry.key else {
@@ -232,13 +294,16 @@ impl EventIndex {
                 break;
             };
             let event = match &entry.value {
-                Row::Event(stored) => stored.get(ledger, payloads),
+                Row::Event(stored) => stored.get(state.ledger, state.payloads()),
                 _ => None,
             };
             let Some(event) = event else {
                 return Self::unbuilt();
             };
-            index.file(home(event), Position { sequence, ordinal });
+            let Ok(recipient) = state.delivery_recipient(event) else {
+                return Self::unbuilt();
+            };
+            index.file(home(event), recipient, Position { sequence, ordinal });
             if !index.complete {
                 return index;
             }

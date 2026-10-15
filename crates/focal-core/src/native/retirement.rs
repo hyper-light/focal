@@ -925,32 +925,14 @@ impl Core<NativeState> {
     }
     /// Unfile every event of `family` from the event index (doc 31 M2).
     pub(super) fn unfile_family_events(&mut self, family: &RetirementFamily) {
-        let NativeState {
-            rows,
-            events,
-            ledger,
-            payloads: log,
-            ..
-        } = &mut self.state;
         for key in &family.keys {
             let Key::Event(sequence, ordinal) = *key else {
                 continue;
             };
-            if !events.complete() {
+            if !self.state.events.complete() {
                 return;
             }
-            match rows.get(key) {
-                Some(Row::Event(stored)) => {
-                    match stored.get(*ledger, crate::native::payloads::source(log)) {
-                        Some(event) => events.unfile(
-                            event_index::home(event),
-                            event_index::Position { sequence, ordinal },
-                        ),
-                        None => events.drop_all(),
-                    }
-                }
-                _ => events.drop_all(),
-            }
+            self.unfile_event(sequence, ordinal);
         }
     }
     /// Retire the family (26 §4): one publication at the next native prefix

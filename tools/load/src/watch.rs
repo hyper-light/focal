@@ -1,6 +1,6 @@
 //! What a `deliver` run's two sides wait to see in the ledger's events, and the tails that see
 //! it. The consumer learns of a claim posted for it, and the issuer of a testament posted for
-//! its claim, only by reading the ledger's events a page at a time from where it last read, as a
+//! its claim, only by reading its recipient inbox a page at a time from where it last read, as a
 //! consumer of a log learns of a message by fetching it: neither side is told by the other. A
 //! message registers what it waits for before it sends the write that makes it, so no event it
 //! waits for can come before its waiter; an event for a claim nobody waits on is not this run's
@@ -8,7 +8,9 @@
 use crate::driver::Conn;
 use crate::error::LoadError;
 use focal_model::native_event::{NativeEventRecord, NativeFactRecord, NativeResponseState};
-use focal_model::{ClaimStatus, LedgerId, RequestEpoch, RequestId, RouteEpoch, SessionSeq};
+use focal_model::{
+    ClaimStatus, LedgerId, ParticipantId, RequestEpoch, RequestId, RouteEpoch, SessionSeq,
+};
 use focal_wire::{
     NativeListFilter, NativeListRequest, NativeObject, Operation, RequestEnvelope, Response,
 };
@@ -23,7 +25,7 @@ use std::time::Duration;
 pub const WAIT: Duration = Duration::from_secs(120);
 /// Events one page of a tail holds at most: the native client's page of objects.
 const TAIL_ITEMS: u32 = 256;
-/// Event slots one page visits at most: each record's events, and one slot past them.
+/// Indexed delivery positions one page visits at most.
 const TAIL_VISITS: u32 = 4096;
 
 /// Which side a tail reads for.
@@ -166,7 +168,7 @@ fn expect<T>(
     Ok(receiver)
 }
 
-/// The events of `side`'s tail from the committed prefix on, a page at a time over `conn` in
+/// The deliveries of `side`'s recipient from the committed prefix on, a page at a time over `conn` in
 /// `ledger`, each page's request id from `ids`, waiting `poll` after a page with nothing new,
 /// until the watch stops.
 pub async fn tail(
@@ -175,6 +177,7 @@ pub async fn tail(
     poll: Duration,
     conn: &Conn,
     ledger: LedgerId,
+    recipient: ParticipantId,
     mut ids: impl FnMut() -> Result<u128, LoadError>,
 ) -> Result<(), LoadError> {
     // Where the tail starts: after every event the prefix holds now, as a consumer joins a log
@@ -195,7 +198,7 @@ pub async fn tail(
             request_epoch: RequestEpoch(1),
             request_id: RequestId::from_u128(ids()?),
             operation: Operation::NativeList(NativeListRequest {
-                filter: NativeListFilter::Events { after },
+                filter: NativeListFilter::Deliveries { recipient, after },
                 cursor: cursor.take(),
                 max_items,
                 max_visits,
@@ -234,8 +237,7 @@ pub async fn tail(
             counts.events = counts.events.saturating_add(read)
         });
         if read == 0 {
-            // A page that visited only empty slots resumes where it stopped; one that reached
-            // the prefix waits for more.
+            // A page that reached the prefix waits for more.
             cursor = page.next;
             if cursor.is_none() {
                 focal_rt::time::sleep(poll)
