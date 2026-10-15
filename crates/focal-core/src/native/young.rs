@@ -86,10 +86,25 @@ struct Lost {
 }
 
 /// Whether `budget` is short of memory: its ordinary headroom below its low water, an eighth of
-/// its allowance. There a session's young generation spills its oldest rows and its finished
-/// families retire without waiting out their grace.
+/// its allowance. There a session's young generation spills its oldest rows.
 pub(super) fn short(budget: &MemoryBudget) -> bool {
     budget.headroom(BudgetLane::Ordinary) < budget.limit().checked_div(LOW_WATER).unwrap_or(0)
+}
+
+/// The part of a session's allowance below which its ordinary headroom retires its finished
+/// families without waiting out their grace: a quarter, twice the low water, so a session
+/// retires before it spills and keeps room beside its rows for what a checkpoint's frozen image
+/// pins while later writes copy what they change. Retiring only once short, a 1 GiB session at
+/// 4,000 writes a second held its rows at the low water, each memory peak fell within a
+/// checkpoint's encode (about 120 MB of pages and 20 MB of roots copied over its four seconds)
+/// and took the rest of its share, and 24,637 writes were refused for memory in ten minutes
+/// (doc 31 §4.8; as Redis keeps `maxmemory` below what a forked save may copy).
+const RETIRE_WATER: usize = 4;
+
+/// Whether `budget` is pressed for memory: its ordinary headroom below a quarter of its
+/// allowance. There a session's finished families retire without waiting out their grace.
+pub(super) fn pressed(budget: &MemoryBudget) -> bool {
+    budget.headroom(BudgetLane::Ordinary) < budget.limit().checked_div(RETIRE_WATER).unwrap_or(0)
 }
 
 pub(super) struct Young {

@@ -412,9 +412,11 @@ past the family's last event bounding from above when it settled, since
 logical time never falls along the sequence; never the outcome that
 published the event, which a seal takes out of the core within seconds
 of its close. A finished claim stays readable in the core for that long;
-a session short of memory, its ordinary headroom under an eighth of its
+a session pressed for memory, its ordinary headroom under a quarter of its
 allowance, waives the grace, so its finished families retire as soon as
-they may, the first memory it gets back) —
+they may, the first memory it gets back, before its young generation
+spills at an eighth and with room left for what a checkpoint's frozen image
+pins) —
 seals the bundle under custody, and proposes the record once
 every required copy holds a receipt; one family per replica per tick, and
 a family whose copies have not all answered waits for a later tick with

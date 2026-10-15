@@ -970,37 +970,47 @@ fn the_event_index_finds_what_a_walk_of_every_event_finds() {
 /// that keeps them does: the same family, the same bundle, the same index, and the same root
 /// once the family has left, its spilled events with it.
 /// A finished family is due to retire once its grace has passed, and at once while its session is
-/// short of memory (doc 31 M3), so a session under sustained load gives its finished families
-/// back rather than fill: the waiver is the offering authority's, and the family is the one a
-/// replica derives either way. Where when it settled is not known yet, it waits, unless the
-/// session is short.
+/// pressed for memory (doc 31 §4.8), its ordinary headroom under a quarter of its allowance, so a
+/// session under sustained load gives its finished families back rather than fill, before its
+/// young generation spills at an eighth: the waiver is the offering authority's, and the family
+/// is the one a replica derives either way. Where when it settled is not known yet, it waits,
+/// unless the session is pressed.
 #[test]
-fn a_finished_family_is_due_after_its_grace_or_at_once_when_memory_is_short() {
+fn a_finished_family_is_due_after_its_grace_or_at_once_when_memory_is_pressed() {
     let mut core = f::core();
     // Created at 10, cancelled at 20, released at 30: its last event settled at 30.
     finished(&mut core, 1, 1, 10);
     let family = core.retirement_family(id(1)).unwrap();
     let day = 24 * 60 * 60 * 1000;
-    assert!(!core.native_memory_short());
+    assert!(!core.native_memory_pressed());
     assert!(!core.retirement_due(Some(30), 30 + day - 1, day));
     assert!(core.retirement_due(Some(30), 30 + day, day));
     assert!(!core.retirement_due(None, u64::MAX, day));
     assert!(core.retirement_due(Some(30), 30, 0));
     let budget = core.state.budget.clone();
-    let squeezed = budget
-        .reserve(
-            focal_memory::BudgetKind::Payload,
-            focal_memory::BudgetLane::Ordinary,
-            budget.headroom(focal_memory::BudgetLane::Ordinary) - budget.limit() / 16,
-        )
-        .unwrap()
-        .commit();
-    assert!(core.native_memory_short());
+    let squeeze = |left: usize| {
+        budget
+            .reserve(
+                focal_memory::BudgetKind::Payload,
+                focal_memory::BudgetLane::Ordinary,
+                budget.headroom(focal_memory::BudgetLane::Ordinary) - left,
+            )
+            .unwrap()
+            .commit()
+    };
+    // Pressed, under a quarter, before short: due, and nothing spills yet.
+    let pressed = squeeze(budget.limit() * 3 / 16);
+    assert!(core.native_memory_pressed() && !core.native_memory_short());
+    assert!(core.retirement_due(Some(30), 30, day));
+    assert!(core.retirement_due(None, 30, day));
+    drop(pressed);
+    let squeezed = squeeze(budget.limit() / 16);
+    assert!(core.native_memory_pressed() && core.native_memory_short());
     assert!(core.retirement_due(Some(30), 30, day));
     assert!(core.retirement_due(None, 30, day));
     assert_eq!(core.retirement_family(id(1)).unwrap(), family);
     drop(squeezed);
-    assert!(!core.native_memory_short());
+    assert!(!core.native_memory_pressed());
     assert!(!core.retirement_due(Some(30), 30, day));
 }
 

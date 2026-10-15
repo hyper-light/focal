@@ -2274,20 +2274,25 @@ impl Core<NativeState> {
         self.state.reads.failure()
     }
     /// Whether the session is short of memory (doc 31 M3): its ordinary headroom below an eighth
-    /// of its allowance, where its young generation spills its oldest rows and its finished
-    /// families retire without waiting out their grace ([`Self::retirement_due`]).
+    /// of its allowance, where its young generation spills its oldest rows.
     pub fn native_memory_short(&self) -> bool {
         young::short(&self.state.budget)
     }
+    /// Whether the session is pressed for memory (doc 31 §4.8): its ordinary headroom below a
+    /// quarter of its allowance, where its finished families retire without waiting out their
+    /// grace ([`Self::retirement_due`]), before its young generation spills.
+    pub fn native_memory_pressed(&self) -> bool {
+        young::pressed(&self.state.budget)
+    }
     /// Whether a family that may retire is due to at logical time `now` under a grace of
-    /// `grace_ms` (26 §4): the session is short of memory, which waives the grace, since a
+    /// `grace_ms` (26 §4): the session is pressed for memory, which waives the grace, since a
     /// finished family is the first memory a session gets back (doc 31 §4.8), or its last event
     /// settled that long ago or longer, `settled` bounding from above when it did (none where that
     /// is not known yet). The outcome that settled it is no witness: a seal takes it out of the
     /// core within seconds of its close, long before a grace ends. The grace is the offering
     /// authority's alone: a replica checks what a family holds, never its age.
     pub fn retirement_due(&self, settled: Option<u64>, now: u64, grace_ms: u64) -> bool {
-        self.native_memory_short() || settled.is_some_and(|at| now.saturating_sub(at) >= grace_ms)
+        self.native_memory_pressed() || settled.is_some_and(|at| now.saturating_sub(at) >= grace_ms)
     }
     /// The young generation (doc 31 M3): the keys it tracks, the spills it put off and kept to
     /// try again, and the keys it could not keep, since it was made.
