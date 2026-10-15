@@ -12,10 +12,11 @@
 //! The newest payloads are held in memory, the log's file written behind them by a thread of its
 //! own, as Kafka serves a log's tail from memory and writes it behind: the thread that appends
 //! and reads (a session's owner) never waits on the volume. Appends are copied into a window of
-//! chunks, allocated, charged to the session's memory budget and touched once when the log
-//! opens and reused after; a chunk is copied into one of a few I/O buffers and handed to the
-//! log's writer as it fills, and is let go (to hold the next payloads) once its bytes are in the
-//! file. A read of a payload the window holds is a copy; only an older one reads the file. A
+//! chunks, each allocated, charged to the session's memory budget and touched once, when the
+//! window first needs it, and reused after; the window grows so to an eighth of the session's
+//! memory. A chunk is copied into one of a few I/O buffers and handed to the log's writer as it
+//! fills, and is let go (to hold the next payloads) once its bytes are in the file, the oldest
+//! first once the window can grow no more. A read of a payload the window holds is a copy; only an older one reads the file. A
 //! window whose every chunk still waits for the writer refuses the next payload (the row keeps
 //! its bytes) rather than wait. A reader for another thread reads the files, behind a barrier the
 //! writer answers once every byte appended before it is written: the reader waits on its own
@@ -41,8 +42,8 @@ pub(crate) const MAX_SEGMENTS: usize = 256;
 pub(crate) const CHUNK_BYTES: usize = 1 << 20;
 /// A window chunk's bytes at least, the segment's size permitting: sixty-four spilled rows.
 const MIN_CHUNK_BYTES: usize = 64 << 10;
-/// The window's chunks at most: the newest 32 MiB of payloads read from memory.
-pub(crate) const WINDOW_CHUNKS: usize = 32;
+/// The window's chunks at most, whatever the session's memory: the newest 4 GiB of payloads.
+pub(crate) const WINDOW_CHUNKS: usize = 4096;
 /// The window takes at most this share of the session's memory: an eighth.
 const WINDOW_SHARE: usize = 8;
 /// The I/O buffers a window's chunks are copied into for the writer: what the writer has in hand
@@ -174,9 +175,28 @@ struct Writer {
     /// The writer's queue (none once the log closes), and what it gives back.
     jobs: Option<SyncSender<Job>>,
     returned: Receiver<Written>,
+    /// The chunks the window may grow to, the size of each, and the charge for every chunk and
+    /// I/O buffer it allocated.
+    max_chunks: usize,
+    chunk_bytes: usize,
+    charge: Allocation,
 }
 
 impl Writer {
+    /// One more chunk for the window, its charge admitted first, touched once: none when the
+    /// budget or the allocator refuses it.
+    fn grow(&mut self) -> Option<Vec<u8>> {
+        self.charge.grow(self.chunk_bytes).ok()?;
+        match touched(self.chunk_bytes) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => {
+                let held = self.charge.bytes().saturating_sub(self.chunk_bytes);
+                // Given back exactly what was admitted for it.
+                let _ = self.charge.shrink_to(held);
+                None
+            }
+        }
+    }
     /// What the writer has given back, taken in: each chunk's bytes it wrote, or handed again
     /// where it failed to, and its buffers.
     fn settle(&mut self) {
@@ -289,11 +309,17 @@ impl Writer {
         handed
     }
 
-    /// A chunk for the payloads from `start` in `segment` on: a spare buffer, or the oldest
-    /// chunk's once all its bytes are in the file. None while the writer still holds every
-    /// chunk's bytes: the payload is refused rather than waited for.
+    /// A chunk for the payloads from `start` in `segment` on: a spare buffer, a new one while
+    /// the window may grow and its charge is admitted, or the oldest chunk's once all its bytes
+    /// are in the file. None while the writer still holds every chunk's bytes: the payload is
+    /// refused rather than waited for.
     fn open_chunk(&mut self, segment: u32, start: u64) -> Option<()> {
-        let bytes = match self.spare.pop() {
+        let grown = if self.spare.is_empty() && self.window.len() < self.max_chunks {
+            self.grow()
+        } else {
+            None
+        };
+        let bytes = match self.spare.pop().or(grown) {
             Some(bytes) => bytes,
             None => {
                 let oldest = self.window.front()?;
@@ -326,8 +352,6 @@ pub struct FilePayloads {
     writer: Mutex<Writer>,
     /// The writer's thread, joined when the log closes.
     thread: Option<std::thread::JoinHandle<()>>,
-    /// The window's and the I/O buffers' memory, charged while the log is open.
-    _memory: Allocation,
 }
 
 impl std::fmt::Debug for FilePayloads {
@@ -446,7 +470,8 @@ impl FilePayloads {
         // The window takes an eighth of the session's memory at most: chunks as large as that
         // holds four of (two to fill and write, two I/O buffers), from MIN_CHUNK_BYTES to
         // CHUNK_BYTES and no larger than a segment, and as many of them as it holds beside the
-        // I/O buffers, two at least, WINDOW_CHUNKS at most.
+        // I/O buffers, two at least, WINDOW_CHUNKS at most. Two are made now; the rest as the
+        // window first needs them.
         let share = memory.limit().checked_div(WINDOW_SHARE).unwrap_or(0);
         let chunk_bytes = share
             .checked_div(IO_BUFFERS.saturating_add(2))
@@ -458,7 +483,8 @@ impl FilePayloads {
             .unwrap_or(0)
             .saturating_sub(IO_BUFFERS)
             .clamp(2, WINDOW_CHUNKS);
-        let held = chunks
+        const FIRST: usize = 2;
+        let held = FIRST
             .checked_add(IO_BUFFERS)
             .and_then(|buffers| buffers.checked_mul(chunk_bytes))
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
@@ -470,7 +496,7 @@ impl FilePayloads {
         spare
             .try_reserve_exact(chunks)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
-        for _ in 0..chunks {
+        for _ in 0..FIRST {
             spare.push(touched(chunk_bytes)?);
         }
         let mut buffers = Vec::new();
@@ -529,9 +555,11 @@ impl FilePayloads {
                 buffers,
                 jobs: Some(jobs),
                 returned,
+                max_chunks: chunks,
+                chunk_bytes,
+                charge,
             }),
             thread: Some(thread),
-            _memory: charge,
         };
         {
             let mut writer = log
