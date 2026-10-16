@@ -1,0 +1,200 @@
+# Interleaved A/B tail latency on kiln, from .github/workflows/compare-ab.yml: two focal builds
+# measured on one host, their runs interleaved: at every rate, A then B in the first round and
+# B then A in the second (and so on), so the host's disk, its neighbours and its warmth weigh on
+# both alike.
+#
+# A branch named ab/<anything> runs it: B is the pushed commit and A the commit named in
+# tools/compare/ab-base (a full SHA). Both sides' nodes are driven by B's generator, so only the
+# nodes differ.
+#
+# Adapted from GHA:
+# - GHA's `base` job (read tools/compare/ab-base) is the image job's first step.
+# - No GHCR mirror or login (mirror.sh needs the workflow's token): public sources, as GHA falls
+#   back to. The images stay in the bench host's docker instead of travelling as an artifact.
+# - A and B are git worktrees of the job's checkout (A first, as GHA checks them out).
+# - The step summary is written to reports/summary.md, uploaded with the reports.
+name: compare-ab
+on:
+  push: { branches: ["ab/**"] }
+  manual: true
+# compare and compare-ab tag the same `focal:bench` image in the host's docker: one run at a time.
+concurrency:
+  group: focal-bench-docker
+  cancel-in-progress: false
+jobs:
+  # Both sides on one host, one after the other: the second build reuses the first's compiled
+  # dependencies in the build's cache mount.
+  image:
+    name: focal:bench-a and focal:bench-b images
+    runs-on: [baremetal, bench]
+    timeout-minutes: 150
+    steps:
+      - name: A is the commit tools/compare/ab-base names
+        run: |
+          sha=$(tr -d '[:space:]' < tools/compare/ab-base)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "tools/compare/ab-base names no full commit" >&2; exit 1; }
+          echo "A $sha"
+          echo "B $KILN_SHA"
+      - name: Both sides checked out, A first
+        run: |
+          git worktree add --detach ab/a "$(tr -d '[:space:]' < tools/compare/ab-base)"
+          git worktree add --detach ab/b "$KILN_SHA"
+      # A side whose Dockerfile predates BASE ignores it and pulls as it did.
+      - name: A's image
+        run: |
+          docker build --progress=plain \
+            -f ab/a/tools/compare/compose/focal.Dockerfile \
+            --build-arg BASE=public.ecr.aws/docker/library \
+            -t focal:bench-a ab/a
+      # B's build reuses A's compiled crates through the build's cache mount, and cargo judges a
+      # crate fresh by its sources' times: B was checked out before A was built, so B's sources
+      # read as older than A's outputs. Each file B changes or adds is made newer than A's build,
+      # so cargo rebuilds what B changed and what depends on it; a file B removed leaves its
+      # crate's sources incomplete, which cargo rebuilds as well.
+      - name: B's changes newer than A's build
+        working-directory: ab
+        run: |
+          changed=0
+          while IFS= read -r line; do
+            case "$line" in
+              "Files a/"*" and b/"*" differ")
+                path=${line#Files a/}; path=${path%% and b/*}
+                touch "b/$path"; changed=$((changed + 1)) ;;
+              "Only in b"*)
+                dir=${line#Only in }; dir=${dir%%: *}; name=${line#*: }
+                find "$dir/$name" -exec touch {} +; changed=$((changed + 1)) ;;
+            esac
+          done < <(diff -rq --exclude=.git a b || true)
+          echo "B differs from A in $changed paths"
+          test "$changed" -gt 0
+      - name: B's image
+        run: |
+          docker build --progress=plain \
+            -f ab/b/tools/compare/compose/focal.Dockerfile \
+            --build-arg BASE=public.ecr.aws/docker/library \
+            -t focal:bench-b ab/b
+      # The two sides' nodes are different builds, or the comparison measures one build against
+      # itself.
+      - name: A's and B's nodes differ
+        run: |
+          a=$(docker run --rm focal:bench-a sha256sum /usr/local/bin/focal | cut -d' ' -f1)
+          b=$(docker run --rm focal:bench-b sha256sum /usr/local/bin/focal | cut -d' ' -f1)
+          echo "A's focal: $a"
+          echo "B's focal: $b"
+          test "$a" != "$b"
+
+  measure:
+    needs: [image]
+    runs-on: [baremetal, bench]
+    exclusive: true
+    timeout-minutes: 330
+    env:
+      NODE_CPUS: "1"
+      FOCAL_LOAD_IMAGE: focal:bench-b
+      # GHA's dispatch inputs, at their defaults.
+      RATES: "100 1000 4000"
+      ROUNDS: "2"
+      RUN_SECONDS: "60"
+      WARMUP: "15"
+    artifacts: ["tools/compare/compose/reports/**"]
+    steps:
+      - name: Both sides' images
+        run: docker image inspect focal:bench-a focal:bench-b >/dev/null && echo "focal:bench-a and focal:bench-b are here"
+      - name: The disk the runs write to
+        # /tmp is tmpfs on this host: the probe writes to the job's TMPDIR, on the agent's disk.
+        run: |
+          mkdir -p tools/compare/compose/reports
+          {
+            echo "A $(cat tools/compare/ab-base)"
+            echo "B $KILN_SHA"
+            df -h /var/lib/docker || df -h /
+            lsblk -o NAME,ROTA,SIZE,MODEL || true
+            echo "one writer:"
+            dd if=/dev/zero of="$TMPDIR/dsync" bs=4k count=500 oflag=dsync 2>&1 | tail -1
+          } | tee tools/compare/compose/reports/disk.txt
+      - name: Runs, interleaved
+        run: |
+          for round in $(seq 1 "$ROUNDS"); do
+            order="a b"
+            if [ $((round % 2)) -eq 0 ]; then order="b a"; fi
+            for rate in $RATES; do
+              for side in $order; do
+                docker tag "focal:bench-$side" focal:bench
+                # A failed run is recorded and the rest still run.
+                bash tools/compare/compose/run.sh focal "$rate" \
+                  "$RUN_SECONDS" \
+                  "$WARMUP" \
+                  128 "reports/$side/$round" || echo "$side round $round at $rate/s failed"
+              done
+            done
+          done
+      - name: A beside B, every round
+        env:
+          SUMMARY: tools/compare/compose/reports/summary.md
+        run: |
+          {
+            echo '```'
+            cat tools/compare/compose/reports/disk.txt
+            echo '```'
+          } | tee -a "$SUMMARY"
+          python3 - <<'PY' | tee -a "$SUMMARY"
+          import glob, json, os, statistics
+          def cpu(path, writes):
+              """The nodes' CPU over a run, from run.sh's cgroup counters taken
+              before and after the load: the busiest node's and all nodes'
+              microseconds per write, the busiest node's share of the wall
+              clock and the milliseconds its quota held it back. None where no
+              counters were taken."""
+              seen = {}
+              try:
+                  lines = open(path + ".cpu.txt").read().splitlines()
+              except OSError:
+                  return None
+              for line in lines:
+                  parts = line.split()
+                  if len(parts) == 4 and parts[3].isdigit():
+                      phase, container, key, value = parts
+                      seen.setdefault(container, {}).setdefault(key, {})[phase] = int(value)
+              delta = {c: {k: v["after"] - v["before"] for k, v in keys.items() if len(v) == 2}
+                       for c, keys in seen.items()}
+              wall = delta.pop("-", {}).get("wall_usec", 0)
+              nodes = [d for c, d in delta.items()
+                       if "usage_usec" in d and "focal-load" not in c and "generator" not in c]
+              if not nodes or writes <= 0 or wall <= 0:
+                  return None
+              busiest = max(nodes, key=lambda d: d["usage_usec"])
+              return (busiest["usage_usec"] / writes, sum(d["usage_usec"] for d in nodes) / writes,
+                      100 * busiest["usage_usec"] / wall, busiest.get("throttled_usec", 0) / 1000)
+          rows = {}
+          for path in glob.glob("tools/compare/compose/reports/*/*/focal-*-128.json"):
+              side, round_ = path.split(os.sep)[-3:-1]
+              r = json.load(open(path))
+              m = r["measured_writes"]
+              l = m["committed_latency_ns"]
+              rate = r["shape"]["rate"]
+              # The counters span the whole load, warm-up included, as do
+              # the run's committed writes.
+              rows.setdefault(rate, {}).setdefault(side, []).append(
+                  (int(round_), m["committed"], m["refused"] + m["unknown"] + m.get("expired", 0),
+                   l["p50"] / 1000, l["p99"] / 1000, l["p999"] / 1000, cpu(path, r["committed"])))
+          print("| offered/s | side | round | committed | refused | p50 µs | p99 µs | p99.9 µs | busiest node CPU µs/write | all nodes CPU µs/write | busiest node busy % | its quota held, ms |")
+          print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+          for rate in sorted(rows):
+              for side in ("a", "b"):
+                  for row in sorted(rows[rate].get(side, []), key=lambda x: x[0]):
+                      c = " | ".join(f"{v:,.0f}" for v in row[6]) if row[6] else "– | – | – | –"
+                      print(f"| {rate} | {side} | {row[0]} | {row[1]:,} | {row[2]:,} | {row[3]:,.0f} | {row[4]:,.0f} | {row[5]:,.0f} | {c} |")
+          print()
+          print("| offered/s | median committed A → B | median p99 µs A → B | median busiest node CPU µs/write A → B |")
+          print("|---|---|---|---|")
+          for rate in sorted(rows):
+              a = rows[rate].get("a", [])
+              b = rows[rate].get("b", [])
+              if a and b:
+                  ca, cb = statistics.median(x[1] for x in a), statistics.median(x[1] for x in b)
+                  pa, pb = statistics.median(x[4] for x in a), statistics.median(x[4] for x in b)
+                  ua = [x[6][0] for x in a if x[6]]
+                  ub = [x[6][0] for x in b if x[6]]
+                  u = f"{statistics.median(ua):,.0f} → {statistics.median(ub):,.0f}" if ua and ub else "–"
+                  print(f"| {rate} | {ca:,.0f} → {cb:,.0f} | {pa:,.0f} → {pb:,.0f} | {u} |")
+          PY

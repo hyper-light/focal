@@ -1,0 +1,62 @@
+# Nightly qualification on kiln, from .github/workflows/nightly.yml. The macOS leg is not
+# reproduced (no macOS agents). GHA's workflow_dispatch inputs become the step env below, at
+# their defaults.
+name: nightly
+on:
+  schedule: ["0 6 * * *"] # 06:00 UTC daily.
+  manual: true
+jobs:
+  qualification:
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "6", memory: 12Gi }
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "6"
+      # No CARGO_PROFILE_{DEV,TEST}_DEBUG override: Cargo.toml already builds dev and test with
+      # `debug = 0`, lighter than line-tables-only.
+    steps:
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component clippy
+      # GHA installs protobuf-compiler; its runner image already carries the rest.
+      - name: Install native protobuf compiler and build tools (Linux)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends protobuf-compiler python3 cmake clang libclang-dev pkg-config libssl-dev >/dev/null
+          protoc --version
+      # Black-box linearizability: client traces (embedded + the real binary) checked against the
+      # offline-recovered committed prefix, plus lost-reply exactly-once.
+      - name: Black-box histories
+        run: bash scripts/cargo.sh test -p focal-node --test history_black_box --test cli_history_black_box --locked -- --test-threads=4
+      # Bounded-allocation decoding of malformed / oversized inputs.
+      - name: Adversarial inputs
+        run: |
+          bash scripts/cargo.sh test -p focal-node --test adversarial_inputs --locked -- --test-threads=4
+          bash scripts/cargo.sh test -p focal-wire --test adversarial --locked
+      # Crash cuts: fault sites on the mutation and movement paths.
+      - name: Crash-cut matrix
+        run: bash scripts/cargo.sh test -p focal-node --test cli_native_a4 --test placement_binary --locked -- --test-threads=4
+      # Seeded end-to-end campaign: every workload run commits without loss.
+      - name: Workload campaign
+        env:
+          FOCAL_SEED_START: "0"
+          FOCAL_SEED_COUNT: "16"
+          FOCAL_CAMPAIGN_CLAIMS: "500"
+          FOCAL_CAMPAIGN_READS: "2000"
+        run: bash scripts/cargo.sh test -p focal-load --test campaign --locked -- --ignored --nocapture
+      # A session filled to admission's bound closes, checkpoints and reopens
+      # (tools/load/tests/full_session.rs).
+      - name: Full session
+        run: bash scripts/cargo.sh test -p focal-load --release --test full_session --locked -- --ignored
+      # What the fast track takes against the classic one, every case.
+      - name: Fast track latency
+        env:
+          FOCAL_FAST_FULL: "1"
+        run: bash scripts/cargo.sh test -p focal-consensus --release --locked sim_fast -- --nocapture
+      # The congestion laws against each other over the modelled paths: the grid the choice of
+      # focal's law is recorded from.
+      - name: Congestion laws
+        env:
+          FOCAL_CONGESTION_FULL: "1"
+        run: bash scripts/cargo.sh test -p focal-wire --release --locked --test congestion -- --nocapture

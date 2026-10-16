@@ -1,0 +1,102 @@
+# focal CI on kiln, from .github/workflows/ci.yml ("Rust contracts"): the dependency audit, the
+# fast track's TLA+ model, and the gates of CLAUDE.md §4 on Linux.
+# Not reproduced: the macOS leg of `check` and .github/workflows/windows.yml (no macOS or
+# Windows agents).
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request: {}
+  manual: true
+concurrency:
+  group: "ci-${{ branch }}"
+  cancel-in-progress: true
+jobs:
+  dependencies:
+    name: dependency audit (cargo-deny)
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "2", memory: 4Gi }
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      # Lands in the shared cargo cache ($CARGO_HOME/bin), so later runs find it installed.
+      - name: Install pinned dependency auditor
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Audit dependencies
+        run: cargo deny check advisories bans licenses sources
+
+  model:
+    # The fast track's model (docs/models/FastTrack.tla): every state of the configurations a
+    # change is checked with, each within the states it states, and the rules the core does not
+    # follow, which the checker must refuse.
+    name: TLA+ model (FastTrack)
+    runs-on: [k8s]
+    image: docker.io/library/eclipse-temurin:21-jdk
+    resources: { cpu: "4", memory: 2Gi }
+    timeout-minutes: 45
+    env:
+      # GHA says `auto` on a 4-vCPU runner that does nothing else. A pod has no CPU limit and
+      # shares its node, where `auto` would be the node's every CPU: four, the pod's request.
+      # A configuration the checker must refuse runs with one, whatever this says.
+      TLC_WORKERS: "4"
+    steps:
+      - name: Java
+        run: |
+          java -version
+          # scripts/check-model.sh fetches tla2tools.jar with curl.
+          command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null; }
+      - name: Check the model, one index
+        run: bash scripts/check-model.sh
+      - name: Check the model, two indexes
+        run: bash scripts/check-model.sh round
+      - name: The checker finds an index committed by what members hold
+        run: bash scripts/check-model.sh reached
+      - name: The checker refuses the wrong rule
+        run: bash scripts/check-model.sh wrong
+      - name: The checker refuses a fast quorum counted without its round
+        run: bash scripts/check-model.sh anyround
+      - name: Check the model, the same four voters with the round counted
+        run: bash scripts/check-model.sh four
+
+  check:
+    name: check (contracts, fmt, clippy, production policy, tests, release build)
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "6", memory: 12Gi }
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "6"
+      # No CARGO_PROFILE_{DEV,TEST}_DEBUG override: Cargo.toml already builds dev and test with
+      # `debug = 0` (lighter than line-tables-only), and an override of `dev` would also reach the
+      # `recursion-ir` profile whose LLVM IR scripts/check_recursion.py reads.
+    steps:
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy
+      # GHA installs protobuf-compiler; its runner image already carries the rest (python3, cmake,
+      # clang), which the rust image does not.
+      - name: Install native protobuf compiler and build tools (Linux)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends protobuf-compiler python3 cmake clang libclang-dev pkg-config libssl-dev >/dev/null
+          protoc --version && python3 --version
+      - name: Verify source and schema contracts
+        run: python3 scripts/check-contracts.py
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Lints
+        run: bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings
+      - name: Production panic policy
+        run: bash scripts/check-production.sh
+      - name: Tests
+        # Bound test parallelism to match the release workflow: the multi-node fleet and runbook
+        # tests each spawn several node processes, so running every test binary at once
+        # oversubscribes memory and the node correctly refuses admission at capacity, failing a
+        # test that is otherwise sound.
+        run: bash scripts/cargo.sh test --workspace --locked -- --test-threads=4
+      - name: Release build
+        run: bash scripts/cargo.sh build --release --workspace --locked
