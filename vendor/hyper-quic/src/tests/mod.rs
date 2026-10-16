@@ -4125,6 +4125,76 @@ fn ack_frequency_update_max_delay() {
     );
 }
 
+/// The ACKs a server sends while it takes what the client sent `after` from now.
+fn server_acks_by(pair: &mut Pair, server_ch: ConnectionHandle, after: Duration) -> u64 {
+    pair.time += after;
+    let before = pair.server_conn_mut(server_ch).stats().frame_tx.acks;
+    pair.drive_server();
+    pair.server_conn_mut(server_ch).stats().frame_tx.acks - before
+}
+
+/// Google QUIC's decimation (`TransportConfig::decimate_acks`): nothing is asked of the peer before
+/// the 100th packet, so slow start's packets are acknowledged as RFC 9000 asks; from then on an
+/// ACK for every 10 ack-eliciting packets, or a quarter of the smoothed round trip after the first
+/// one waiting.
+#[test]
+fn decimated_acks_come_from_the_hundredth_packet_every_tenth_or_a_quarter_round_trip_on() {
+    let _guard = subscribe();
+    let mut client_config = client_config_with_deterministic_pns();
+    client_config
+        .transport
+        .decimate_acks()
+        .mtu_discovery_config(None);
+    let mut pair = Pair::deterministic_pns(endpoint_config_without_warm_up());
+    // A 20 ms round trip, so a quarter of it, 5 ms, is past the server's 1 ms granularity
+    let latency = Duration::from_millis(10);
+    pair.latency = latency;
+    let (client_ch, server_ch) = pair.connect_with(client_config);
+    pair.drive();
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .frame_tx
+            .ack_frequency,
+        0
+    );
+    for _ in 0..100 {
+        pair.client_conn_mut(client_ch).ping();
+        pair.drive_client();
+    }
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .frame_rx
+            .ack_frequency,
+        1
+    );
+
+    // A ping alone waits a quarter of the round trip for its ACK
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    assert_eq!(server_acks_by(&mut pair, server_ch, latency), 0);
+    assert_eq!(
+        server_acks_by(&mut pair, server_ch, Duration::from_millis(4)),
+        0
+    );
+    assert_eq!(
+        server_acks_by(&mut pair, server_ch, Duration::from_millis(1)),
+        1
+    );
+
+    // Nine pings wait; the tenth is acknowledged at once, with the nine
+    for _ in 0..9 {
+        pair.client_conn_mut(client_ch).ping();
+        pair.drive_client();
+    }
+    assert_eq!(server_acks_by(&mut pair, server_ch, latency), 0);
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    assert_eq!(server_acks_by(&mut pair, server_ch, latency), 1);
+}
+
 fn stream_chunks(mut recv: RecvStream) -> Vec<u8> {
     let mut buf = Vec::new();
 

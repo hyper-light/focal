@@ -276,14 +276,7 @@ impl PartLog {
             // A tail that holds no batch and has no room for this one takes no more: it goes back
             // first, so the pool can hand it out again. Kept as the tail while it had room, it was
             // never looked at again, and a segment a rollover was held for good.
-            if let Some(tail) = self.slots.back_mut()
-                && tail.live == 0
-                && let Some(segment) = tail.segment.take()
-            {
-                pool.give(segment);
-                self.held = self.held.saturating_sub(1);
-                self.trim();
-            }
+            self.seal(pool);
             let segment = pool.take()?;
             self.slots.push_back(Slot {
                 segment: Some(segment),
@@ -353,6 +346,25 @@ impl PartLog {
             .get_mut(start..)?;
         let length = crate::batch::stated_length(bytes)?;
         bytes.get_mut(..length)
+    }
+
+    /// Gives the tail back if it holds no batch: the next batch starts a segment of its own. What
+    /// memory pressure does with a tail whose batches were all let go (`Node::relieve`), and what a
+    /// batch the tail has no room for does. Whether a segment went back.
+    pub fn seal(&mut self, pool: &mut SegmentPool) -> bool {
+        let Some(tail) = self.slots.back_mut() else {
+            return false;
+        };
+        if tail.live != 0 {
+            return false;
+        }
+        let Some(segment) = tail.segment.take() else {
+            return false;
+        };
+        pool.give(segment);
+        self.held = self.held.saturating_sub(1);
+        self.trim();
+        true
     }
 
     /// The batch at `at` is no longer held: its segment's count falls by one, and a segment that

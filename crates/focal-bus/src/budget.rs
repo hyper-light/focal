@@ -120,6 +120,9 @@ pub struct BusBudget {
     /// Buffers allocated, and returned to the system: a measurement's counts.
     allocated: u64,
     released: u64,
+    /// Reservations given back, whatever became of their bytes: what tells an owner whose frame
+    /// found no memory that some may be there now (`Node::starving`).
+    returns: u64,
 }
 
 /// What a [`BusBudget`] holds and has done.
@@ -133,6 +136,8 @@ pub struct BusBudgetStats {
     pub allocated: u64,
     /// Buffers returned to the system.
     pub released: u64,
+    /// Reservations given back, warm or returned to the system.
+    pub returns: u64,
 }
 
 impl BusBudget {
@@ -149,6 +154,7 @@ impl BusBudget {
             refused: 0,
             allocated: 0,
             released: 0,
+            returns: 0,
         }
     }
 
@@ -159,16 +165,25 @@ impl BusBudget {
             refused: self.refused,
             allocated: self.allocated,
             released: self.released,
+            returns: self.returns,
         }
     }
 
     fn charge(&mut self, bytes: usize) -> Result<(), Refusal> {
-        let Ok(reservation) = self
-            .budget
-            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, bytes)
-        else {
-            return Err(self.refuse());
-        };
+        let reservation =
+            match self
+                .budget
+                .reserve(BudgetKind::Pending, BudgetLane::Ordinary, bytes)
+            {
+                Ok(reservation) => reservation,
+                // Every class's warm buffers give their bytes back before a grant is refused: what a
+                // class keeps for its next frame goes first to a frame that needs it now.
+                Err(_) if self.shed() > 0 => self
+                    .budget
+                    .reserve(BudgetKind::Pending, BudgetLane::Ordinary, bytes)
+                    .map_err(|_| self.refuse())?,
+                Err(_) => return Err(self.refuse()),
+            };
         let mut granted = reservation.commit();
         match &mut self.held {
             Some(held) => held.absorb(&mut granted).map_err(|_| self.refuse_now()),
@@ -185,6 +200,25 @@ impl BusBudget {
             // Shrinking one's own allocation gives bytes back; it cannot be refused.
             let _ = held.shrink_to(keep);
         }
+    }
+
+    /// Returns every class's warm buffers to the system, their bytes to the budget; how many.
+    fn shed(&mut self) -> usize {
+        let sizes = self.sizes;
+        let mut shed = 0_usize;
+        let mut bytes = 0_usize;
+        for (class, shelf) in self.shelves.iter_mut().enumerate() {
+            let size = sizes.size_of(class);
+            let count = shelf.warm.len();
+            shelf.warm.clear();
+            shed = shed.saturating_add(count);
+            bytes = bytes.saturating_add(size.saturating_mul(count));
+        }
+        self.released = self
+            .released
+            .saturating_add(u64::try_from(shed).unwrap_or(u64::MAX));
+        self.discharge(bytes);
+        shed
     }
 
     fn refuse(&mut self) -> Refusal {
@@ -239,6 +273,7 @@ impl Budget<Class> for BusBudget {
     }
 
     fn release(&mut self, reservation: Reservation) {
+        self.returns = self.returns.saturating_add(1);
         let tag = reservation.tag();
         if tag == WINDOW {
             let bytes = usize::try_from(reservation.granted()).unwrap_or(usize::MAX);

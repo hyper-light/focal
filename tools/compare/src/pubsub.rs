@@ -241,6 +241,8 @@ pub struct Run {
     pub total: Duration,
     pub payloads: Vec<Vec<u8>>,
     pub inflight: usize,
+    /// NATS over TLS, trusting only this CA ([`nats`]).
+    pub tls_ca: Option<std::path::PathBuf>,
 }
 
 /// Resolves at `due` to within a few microseconds: it sleeps until [`SPIN`] before it, then yields
@@ -277,7 +279,9 @@ pub fn run(run: Run) -> Result<(Tally, Received, Lag), CompareError> {
         total,
         payloads,
         inflight,
+        tls_ca,
     } = run;
+    let tls_ca = tls_ca.as_deref();
     let interval = Duration::from_secs(1)
         .checked_div(rate)
         .ok_or(CompareError::Argument("rate"))?;
@@ -285,7 +289,7 @@ pub fn run(run: Run) -> Result<(Tally, Received, Lag), CompareError> {
         let endpoint = endpoint.as_str();
         let subscribing = scope.spawn(move || {
             runtime()?.block_on(async move {
-                let subscriber = Subscriber::connect(system, endpoint).await?;
+                let subscriber = Subscriber::connect(system, endpoint, tls_ca).await?;
                 let start = Instant::now();
                 started
                     .send(start)
@@ -298,7 +302,7 @@ pub fn run(run: Run) -> Result<(Tally, Received, Lag), CompareError> {
         let payloads = &payloads;
         let publishing = scope.spawn(move || {
             runtime()?.block_on(async move {
-                let publisher = Publisher::connect(system, endpoint).await?;
+                let publisher = Publisher::connect(system, endpoint, tls_ca).await?;
                 let schedule = Schedule {
                     interval,
                     warmup,
@@ -563,6 +567,26 @@ impl rdkafka::producer::ProducerContext for Deliveries {
     }
 }
 
+/// A NATS client of `endpoint`: in plaintext, or over TLS 1.3 trusting only `tls_ca`'s certificate
+/// (the bench's own CA, `focal-compare certs`), as a production deployment runs it.
+async fn nats(
+    endpoint: &str,
+    tls_ca: Option<&std::path::Path>,
+) -> Result<async_nats::Client, CompareError> {
+    let url = format!("nats://{endpoint}");
+    let connected = match tls_ca {
+        None => async_nats::connect(url.as_str()).await,
+        Some(ca) => {
+            async_nats::ConnectOptions::new()
+                .add_root_certificates(ca.to_path_buf())
+                .require_tls(true)
+                .connect(url.as_str())
+                .await
+        }
+    };
+    connected.map_err(|error| CompareError::Target(error.to_string()))
+}
+
 /// A publisher of one system: its client.
 pub enum Publisher {
     Nats(async_nats::Client),
@@ -572,13 +596,14 @@ pub enum Publisher {
 
 impl Publisher {
     /// Connects a publisher of `system`.
-    pub async fn connect(system: System, endpoint: &str) -> Result<Self, CompareError> {
+    pub async fn connect(
+        system: System,
+        endpoint: &str,
+        tls_ca: Option<&std::path::Path>,
+    ) -> Result<Self, CompareError> {
         let fail = |error: String| CompareError::Target(error);
         match system {
-            System::Nats => async_nats::connect(format!("nats://{endpoint}").as_str())
-                .await
-                .map(Self::Nats)
-                .map_err(|error| fail(error.to_string())),
+            System::Nats => nats(endpoint, tls_ca).await.map(Self::Nats),
             System::Redis => redis::Client::open(format!("redis://{endpoint}"))
                 .map_err(|error| fail(error.to_string()))?
                 .get_multiplexed_async_connection()
@@ -613,13 +638,15 @@ pub enum Subscriber {
 impl Subscriber {
     /// Connects a subscriber of `system`, subscribed before this returns, so it takes the first
     /// publish. Kafka's topic is made here, before anything is published to it.
-    pub async fn connect(system: System, endpoint: &str) -> Result<Self, CompareError> {
+    pub async fn connect(
+        system: System,
+        endpoint: &str,
+        tls_ca: Option<&std::path::Path>,
+    ) -> Result<Self, CompareError> {
         let fail = |error: String| CompareError::Target(error);
         match system {
             System::Nats => {
-                let listener = async_nats::connect(format!("nats://{endpoint}").as_str())
-                    .await
-                    .map_err(|error| fail(error.to_string()))?;
+                let listener = nats(endpoint, tls_ca).await?;
                 let subscription = listener
                     .subscribe(SUBJECT)
                     .await

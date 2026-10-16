@@ -15240,3 +15240,47 @@ warnings`, `bash scripts/check-production.sh` (1184 production sources, no polic
 no runtime recursion), `cargo deny check advisories bans licenses sources`, and `bash
 scripts/cargo.sh test --workspace --locked --no-fail-fast -- --test-threads=4`: 167 test
 binaries, 3463 passed, 0 failed, 31 ignored.
+
+### 2026-10-16 — The bus measured on bare metal: a delivery short of memory waits, acknowledgements decimated, NATS over TLS beside it
+
+**A delivery the node found no memory for took its subscriber as gone.** The first container
+matrix of the bus against NATS, Redis and Kafka (a busy laptop's Docker) lost 1.1 million
+messages at 100,000 a second: a frame the budget refused (`Refusal::Budget`) was mapped to the
+peer's going, so a subscriber the node could not find a delivery's bytes for was dropped in
+silence while it waited. A refusal for memory is the window's to answer now: the oldest retained
+batches give their room (`Node::relieve`, which seals an emptied tail and sheds the warm buffers
+first) and the delivery is asked again; where nothing can be given, the subscriber waits, starved,
+until the transport gives memory back, and the serve loop wakes for that (`Node::starving`,
+`BusBudget`'s `returns`). The test refuses a subscriber's deliveries for memory part way through a
+run and expects every batch delivered in order:
+`a_delivery_the_node_has_no_memory_for_waits_and_its_subscriber_stays` (it failed on the old
+mapping, the subscriber stopping at 20 of 100).
+
+**Acknowledgements decimated.** Measured on a bare-metal machine (Ryzen 9 9950X3D2), a node at
+100,000 one-packet messages a second handled 3.4 datagrams a message, a third of them QUIC
+acknowledgements. Every connection now asks its peer for Google QUIC's decimation, fixed in the
+shared repository and taken here as a new snapshot of all fifteen crates at hyper-raft
+`a8f5941` (`main`, where the bus's transport branch merged; hyper-quic patch Q22): the node's CPU
+a message fell 6 % at 100,000 a second, 27 % at 10,000, and 25 % on a core a busy loop shares,
+where its p99 went from 0.05 to 0.04 ms (doc 32 §4.3).
+
+**NATS over TLS.** `pubsub.sh nats-tls` runs the same NATS node with TLS 1.3 required and its
+clients trusting only the bench's own CA (`focal-compare certs DIR`), the like-for-like row for a
+bus that always encrypts.
+
+The comparison on bare metal, each node alone on a core, is in doc 32 §4.3: at 1,000,000 offered
+the bus delivered 766,000 a second and lost none (NATS 895,000, 67 lost; NATS over TLS 399,000 and
+Redis 390,000, millions lost; Kafka 344,000 at a p99 of 4.6 s); at 10,000 a second its p99.9 was
+95 µs against NATS's 677; at 100,000 its p99 was 297 µs against NATS's 48, its user time per
+message 2.3 µs against 0.6; the profile's open items are listed there. On a core a busy loop
+shares, the first busy matrix found the node telling one gap of two batches at 1,000,000 a second,
+batches its subscriber had not taken: open, being traced (doc 32 §4.3).
+
+The gate on the landing tree (macOS 26.4.1 arm64, under other work's load, load average 17 to 55),
+exit 0: `cargo fmt --all --check`, `python3 scripts/check-contracts.py` (1566 links, 37 source
+hashes, 15 vocabularies), `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D
+warnings`, `bash scripts/check-production.sh` (1204 production sources, no policy allowance, no
+runtime recursion), `cargo deny check advisories bans licenses sources`, and `bash scripts/cargo.sh
+test --workspace --locked --no-fail-fast -- --test-threads=4`: 171 test binaries, 3500 passed, 0
+failed, 31 ignored. The shared crates at a8f5941 passed hyper-raft's own gates on Linux (8 CPUs of
+the bare-metal machine) before its push.

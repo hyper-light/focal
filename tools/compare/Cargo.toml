@@ -26,6 +26,8 @@ hyper-quic = { workspace = true }
 hyper-rt = { workspace = true }
 hyper-rt-transport = { workspace = true }
 hyper-transport = { workspace = true }
+# The bench's own CA and NATS server certificate (`focal-compare certs`), as the bus makes its own.
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "aws_lc_rs"] }
 # The corpus's codec, as a claimant compresses (doc 32 §4.1).
 zstd = { workspace = true }
 serde = { workspace = true }

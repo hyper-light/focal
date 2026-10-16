@@ -167,6 +167,12 @@ impl Part {
         Some((state.floor, state.next))
     }
 
+    /// Gives the log's tail back if it holds no batch (`PartLog::seal`); whether a segment went
+    /// back.
+    pub fn seal(&mut self, pool: &mut SegmentPool) -> bool {
+        self.log.seal(pool)
+    }
+
     /// Lets `stream`'s batches below `floor` go: a batch goes once every record in it is below.
     pub fn release_below(
         &mut self,

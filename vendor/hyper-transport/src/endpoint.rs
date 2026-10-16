@@ -170,7 +170,9 @@ impl Limits {
     }
     /// The QUIC transport both sides of every connection run with: the stream limits above, the
     /// initial receive window and the reserve on top of it ([`crate::credit`]), a stream window
-    /// at quinn's assembler ceiling or the share, whichever is less.
+    /// at quinn's assembler ceiling or the share, whichever is less, and acknowledgements
+    /// decimated as Google QUIC's are (`TransportConfig::decimate_acks`): every peer is
+    /// hyper-quic, which takes the extension.
     fn transport(&self, ranks: u8, congestion: &Congestion) -> Result<TransportConfig, Refusal> {
         let reserve = class_reserve(ranks.saturating_sub(1));
         let window = initial_window(MIN_DATAGRAM).saturating_add(reserve);
@@ -190,7 +192,8 @@ impl Limits {
             .send_window(self.window_ceiling)
             .max_idle_timeout(Some(idle))
             .keep_alive_interval(self.keep_alive)
-            .congestion(congestion.clone());
+            .congestion(congestion.clone())
+            .decimate_acks();
         Ok(transport)
     }
 }

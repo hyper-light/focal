@@ -7,6 +7,8 @@
 services:
   nats:
     cpuset: "${NODE_CPUSET}"
+  nats-tls:
+    cpuset: "${NODE_CPUSET}"
   kafka:
     cpuset: "${NODE_CPUSET}"
   redis:
@@ -15,7 +17,7 @@ services:
     cpuset: "${NODE_CPUSET}"
   hog:
     image: ${FOCAL_IMAGE:-focal:bench}
-    profiles: [nats, kafka, redis, focal-bus]
+    profiles: [nats, nats-tls, kafka, redis, focal-bus]
     cpuset: "${NODE_CPUSET}"
     networks: [bench]
     command: ["sh", "-c", "i=0; while [ $$i -lt ${NODE_CPUS:-1} ]; do (while :; do :; done) & i=$$((i + 1)); done; wait"]

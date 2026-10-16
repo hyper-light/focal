@@ -43,8 +43,13 @@ impl AckFrequencyState {
         let min_ack_delay =
             Duration::from_micros(peer_params.min_ack_delay.map_or(0, |x| x.into()));
 
-        // Use the peer's max_ack_delay if no custom max_ack_delay was provided in the config
-        let candidate = config.max_ack_delay.unwrap_or(self.peer_max_ack_delay);
+        // A fixed delay where the config gives one; else the smoothed RTT's share where it asks
+        // for one (`AckFrequencyConfig::decimation`); else the peer's own max_ack_delay
+        let candidate = match (config.max_ack_delay, config.rtt_divisor) {
+            (Some(fixed), _) => fixed,
+            (None, Some(divisor)) => rtt.checked_div(divisor).unwrap_or(rtt),
+            (None, None) => self.peer_max_ack_delay,
+        };
 
         // Must be no smaller than the `min_ack_delay` advertised by the peer
         Ord::max(
@@ -78,16 +83,18 @@ impl AckFrequencyState {
         Some(seq)
     }
 
-    /// Returns true if we should send an ACK_FREQUENCY frame
+    /// Returns true if we should send an ACK_FREQUENCY frame, `sent` the packet numbers the
+    /// application data space has used
     pub(super) fn should_send_ack_frequency(
         &self,
         rtt: Duration,
         config: &AckFrequencyConfig,
         peer_params: &TransportParameters,
+        sent: u64,
     ) -> bool {
         if self.next_outgoing_sequence_number.0 == 0 {
-            // Always send at startup
-            return true;
+            // At startup, once the packets the config waits for have been sent (none by default)
+            return sent >= config.after_packets;
         }
         let current = self
             .in_flight_ack_frequency_frame

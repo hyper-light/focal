@@ -77,6 +77,8 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
         "blocked": stats.blocked,
         "subscribed": stats.subscribed,
         "held": stats.held,
+        "starved": stats.starved,
+        "dropped": stats.dropped,
         "rooms": {
             "least": rooms.least,
             "most": rooms.most,

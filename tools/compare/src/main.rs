@@ -8,6 +8,7 @@
 //! consumer and acknowledged durably, and timed from its intended send time
 //! to that acknowledgement (`deliver.rs`).
 mod bus;
+mod certs;
 mod deliver;
 mod pubsub;
 mod report;
@@ -104,6 +105,18 @@ pub struct Args {
     /// `focal-bus`: the node's local identity directory (`focal start bus --pki`), shared with it.
     #[arg(long)]
     pub pki: Option<std::path::PathBuf>,
+    /// `nats`: connect over TLS 1.3, trusting only this CA certificate (PEM), as a production NATS
+    /// deployment runs; without it the clients connect in plaintext.
+    #[arg(long)]
+    pub tls_ca: Option<std::path::PathBuf>,
+}
+
+/// `focal-compare certs DIR`: the bench's own certificates instead of a run.
+#[derive(Debug, Parser)]
+#[command(about = "Write the bench's own CA and the nats-tls node's certificate")]
+struct Certs {
+    /// Where `ca.pem`, `server.pem` and `server.key` (PKCS #8) are written.
+    dir: std::path::PathBuf,
 }
 
 /// The longest latency recorded: anything slower is clamped there and counted.
@@ -111,6 +124,14 @@ pub const HIGHEST_NS: u64 = 120_000_000_000;
 
 #[tokio::main]
 async fn main() -> Result<(), CompareError> {
+    // `certs` is a task of its own, its arguments none of a run's.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|first| first == "certs")
+    {
+        let task = Certs::parse_from(std::env::args_os().skip(1));
+        return certs::write(&task.dir);
+    }
     let args = Args::parse();
     if args.rate == 0 || args.payload == 0 || args.inflight == 0 || args.seconds == 0 {
         return Err(CompareError::Argument(
@@ -321,6 +342,7 @@ async fn pubsub_main(args: Args) -> Result<(), CompareError> {
         total,
         payloads,
         inflight: args.inflight,
+        tls_ca: args.tls_ca.clone(),
     };
     let (tally, received, lag) = tokio::task::spawn_blocking(move || pubsub::run(run))
         .await

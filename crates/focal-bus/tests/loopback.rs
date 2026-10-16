@@ -17,9 +17,11 @@
     clippy::cast_possible_truncation
 )]
 
+use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::pin::pin;
+use std::rc::Rc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -29,15 +31,37 @@ use focal_bus::client::{Client, Delivery};
 use focal_bus::directory::BusDirectory;
 use focal_bus::limits::IO;
 use focal_bus::node::{Node, NodeConfig};
-use focal_bus::wire::{self, Bus, Role};
+use focal_bus::wire::{self, Bus, Class, Role};
 use focal_memory::MemoryBudget;
 use focal_timing::ProgressDeadline;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt_transport::Driver;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
-use hyper_transport::{Config, Endpoint, Event, Refusal};
+use hyper_transport::{Budget, Config, Endpoint, Event, Lane, Refusal, Reservation};
 
-type Drv = Driver<Bus, BusBudget, BusDirectory>;
+type Drv = Driver<Bus, Starving, BusDirectory>;
+
+/// The bus's budget, refusing the next delivery frames it is told to: how a node whose memory is
+/// full looks to its deliveries. It refuses nothing until told.
+struct Starving {
+    inner: BusBudget,
+    /// Delivery frames still to refuse.
+    refuse: Rc<Cell<u32>>,
+}
+
+impl Budget<Class> for Starving {
+    fn reserve(&mut self, bytes: u64, lane: Lane<Class>) -> Result<Reservation, Refusal> {
+        if matches!(lane, Lane::Class(Class::Deliver)) && self.refuse.get() > 0 {
+            self.refuse.set(self.refuse.get() - 1);
+            return Err(Refusal::Budget);
+        }
+        self.inner.reserve(bytes, lane)
+    }
+
+    fn release(&mut self, reservation: Reservation) {
+        self.inner.release(reservation);
+    }
+}
 
 const NODE: u64 = 1;
 const PUBLISHER: u64 = 2;
@@ -113,7 +137,8 @@ fn endpoint(
     role: Role,
     listen: bool,
     budget: &MemoryBudget,
-) -> Endpoint<Bus, BusBudget, BusDirectory> {
+    refuse: &Rc<Cell<u32>>,
+) -> Endpoint<Bus, Starving, BusDirectory> {
     let mut directory = BusDirectory::new(8);
     for (certificate, peer, role, name) in peers {
         directory.enroll(certificate, *peer, *role, name).unwrap();
@@ -129,7 +154,10 @@ fn endpoint(
     };
     Endpoint::new(
         config,
-        BusBudget::new(budget.clone()),
+        Starving {
+            inner: BusBudget::new(budget.clone()),
+            refuse: refuse.clone(),
+        },
         directory,
         Instant::now(),
     )
@@ -223,6 +251,10 @@ struct Harness {
     events: u64,
     turn: usize,
     wait: ProgressDeadline,
+    /// The node's delivery frames still to refuse (`Starving`).
+    refuse: Rc<Cell<u32>>,
+    /// The node's transport's reservations given back as the harness last looked.
+    returns: u64,
 }
 
 impl Harness {
@@ -238,6 +270,13 @@ impl Harness {
         )
         .await
         else {
+            // No event within a tick: a delivery that found no memory is asked again once the
+            // node's transport gave memory back, as the node's own loop asks (`serve`).
+            let returns = self.node_driver.endpoint().budget().inner.stats().returns;
+            if self.node.starving() && returns != self.returns {
+                self.returns = returns;
+                self.node.relieve_transport(self.node_driver.endpoint());
+            }
             return;
         };
         self.events += 1;
@@ -246,6 +285,7 @@ impl Harness {
             while let Some(event) = self.node_driver.endpoint().poll_event() {
                 self.node.on_event(self.node_driver.endpoint(), event);
             }
+            self.returns = self.node_driver.endpoint().budget().inner.stats().returns;
             self.node.relieve_transport(self.node_driver.endpoint());
             return;
         }
@@ -315,12 +355,96 @@ impl Harness {
     }
 }
 
+impl Harness {
+    /// A node, a publisher and a subscriber of the node's budgets and config over loopback, both
+    /// clients connected and the subscriber subscribed from the stream's tail.
+    async fn connect(
+        pki: &Pki,
+        node_budget: &MemoryBudget,
+        client_budget: &MemoryBudget,
+        part_budget: &MemoryBudget,
+        config: NodeConfig,
+    ) -> Self {
+        let node_id = pki.issue("bus-node");
+        let publisher_id = pki.issue("bus-publisher");
+        let subscriber_id = pki.issue("bus-subscriber");
+        let refuse = Rc::new(Cell::new(0));
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let node_endpoint = endpoint(
+            pki,
+            &node_id,
+            &[
+                (&publisher_id.0, PUBLISHER, Role::Client, "bus-publisher"),
+                (&subscriber_id.0, SUBSCRIBER, Role::Client, "bus-subscriber"),
+            ],
+            Role::Node,
+            true,
+            node_budget,
+            &refuse,
+        );
+        let node_driver: Drv = Driver::bind(node_endpoint, loopback, IO).unwrap();
+        let node_addr = node_driver.local_addr().unwrap();
+        let directory = [(&node_id.0[..], NODE, Role::Node, "bus-node")];
+        let client = |own: &(Vec<u8>, Vec<u8>)| {
+            let endpoint = endpoint(
+                pki,
+                own,
+                &directory,
+                Role::Client,
+                false,
+                client_budget,
+                &Rc::new(Cell::new(0)),
+            );
+            let driver: Drv = Driver::bind(endpoint, loopback, IO).unwrap();
+            driver
+        };
+        let mut publisher = client(&publisher_id);
+        let mut subscriber = client(&subscriber_id);
+        let now = publisher.clock().unwrap();
+        publisher.endpoint().connect(now, NODE, node_addr).unwrap();
+        let now = subscriber.clock().unwrap();
+        subscriber.endpoint().connect(now, NODE, node_addr).unwrap();
+        let mut bus = Harness {
+            node_driver,
+            node: Node::new(config, part_budget.clone()).unwrap(),
+            publisher,
+            subscriber,
+            publishing: Client::new(NODE),
+            subscribing: Client::new(NODE),
+            builder: BatchBuilder::new(),
+            sent: 0,
+            seen: Seen::default(),
+            events: 0,
+            turn: 0,
+            wait: ProgressDeadline::begin(&[0], u64::MAX, FROZEN),
+            refuse,
+            returns: 0,
+        };
+        while bus.seen.connected < 2 {
+            bus.step(true).await;
+            bus.moved("connecting");
+        }
+        let now = bus.subscriber.clock().unwrap();
+        bus.subscribing
+            .subscribe(
+                bus.subscriber.endpoint(),
+                now,
+                STREAM,
+                wire::From::Tail,
+                focal_bus::limits::SERVE_PERIOD,
+            )
+            .unwrap();
+        while !bus.seen.subscribed {
+            bus.step(true).await;
+            bus.moved("subscribing");
+        }
+        bus
+    }
+}
+
 #[test]
 fn every_publish_reaches_the_subscriber_in_order_and_a_stalled_subscriber_holds_its_publisher() {
     let pki = Pki::new();
-    let node_id = pki.issue("bus-node");
-    let publisher_id = pki.issue("bus-publisher");
-    let subscriber_id = pki.issue("bus-subscriber");
     let node_budget = MemoryBudget::new(256 << 20, 0).unwrap();
     let client_budget = MemoryBudget::new(256 << 20, 0).unwrap();
     let segment = usize::try_from(wire::BATCH_BOUND).unwrap();
@@ -335,83 +459,9 @@ fn every_publish_reaches_the_subscriber_in_order_and_a_stalled_subscriber_holds_
         .block_on({
             let node_budget = node_budget.clone();
             async move {
-                let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
-                let node_endpoint = endpoint(
-                    &pki,
-                    &node_id,
-                    &[
-                        (&publisher_id.0, PUBLISHER, Role::Client, "bus-publisher"),
-                        (&subscriber_id.0, SUBSCRIBER, Role::Client, "bus-subscriber"),
-                    ],
-                    Role::Node,
-                    true,
-                    &node_budget,
-                );
-                let node_driver: Drv = Driver::bind(node_endpoint, loopback, IO).unwrap();
-                let node_addr = node_driver.local_addr().unwrap();
-                let directory = [(&node_id.0[..], NODE, Role::Node, "bus-node")];
-                let mut publisher: Drv = Driver::bind(
-                    endpoint(
-                        &pki,
-                        &publisher_id,
-                        &directory,
-                        Role::Client,
-                        false,
-                        &client_budget,
-                    ),
-                    loopback,
-                    IO,
-                )
-                .unwrap();
-                let mut subscriber: Drv = Driver::bind(
-                    endpoint(
-                        &pki,
-                        &subscriber_id,
-                        &directory,
-                        Role::Client,
-                        false,
-                        &client_budget,
-                    ),
-                    loopback,
-                    IO,
-                )
-                .unwrap();
-                let now = publisher.clock().unwrap();
-                publisher.endpoint().connect(now, NODE, node_addr).unwrap();
-                let now = subscriber.clock().unwrap();
-                subscriber.endpoint().connect(now, NODE, node_addr).unwrap();
-                let mut bus = Harness {
-                    node_driver,
-                    node: Node::new(config, part_budget.clone()).unwrap(),
-                    publisher,
-                    subscriber,
-                    publishing: Client::new(NODE),
-                    subscribing: Client::new(NODE),
-                    builder: BatchBuilder::new(),
-                    sent: 0,
-                    seen: Seen::default(),
-                    events: 0,
-                    turn: 0,
-                    wait: ProgressDeadline::begin(&[0], u64::MAX, FROZEN),
-                };
-                while bus.seen.connected < 2 {
-                    bus.step(true).await;
-                    bus.moved("connecting");
-                }
-                let now = bus.subscriber.clock().unwrap();
-                bus.subscribing
-                    .subscribe(
-                        bus.subscriber.endpoint(),
-                        now,
-                        STREAM,
-                        wire::From::Tail,
-                        focal_bus::limits::SERVE_PERIOD,
-                    )
-                    .unwrap();
-                while !bus.seen.subscribed {
-                    bus.step(true).await;
-                    bus.moved("subscribing");
-                }
+                let mut bus =
+                    Harness::connect(&pki, &node_budget, &client_budget, &part_budget, config)
+                        .await;
 
                 // 1,000 batches to a subscriber that keeps up: the publisher holds back while its
                 // lane is full or it is KEEPS_UP ahead of what the subscriber took.
@@ -556,4 +606,69 @@ fn every_publish_reaches_the_subscriber_in_order_and_a_stalled_subscriber_holds_
     eprintln!("{report}");
     drop(runtime);
     assert_eq!(node_budget.stats().used, 0, "the node gave every byte back");
+}
+
+/// A node with no memory for a delivery's frame keeps its subscriber. The window gives up its
+/// oldest batches for the frame, the subscriber told what it missed; with nothing left to give, the
+/// subscriber waits and is served once the transport gives memory back. Taken as the subscriber's
+/// going, the refusal let the subscription go in silence (the pubsub matrix of 2026-10-16 lost 1.1
+/// million messages so at 100,000 a second).
+#[test]
+fn a_delivery_the_node_has_no_memory_for_waits_and_its_subscriber_stays() {
+    /// Batches published, the node's memory refusing deliveries partway.
+    const PUBLISHED: u32 = 100;
+    /// Batches delivered before the node's memory refuses.
+    const BEFORE: u64 = 20;
+    /// Delivery frames refused in a row: the first met by the window's relief, the rest by waiting.
+    const REFUSED: u32 = 3;
+    let pki = Pki::new();
+    let node_budget = MemoryBudget::new(256 << 20, 0).unwrap();
+    let client_budget = MemoryBudget::new(256 << 20, 0).unwrap();
+    let segment = usize::try_from(wire::BATCH_BOUND).unwrap();
+    let part_budget = node_budget.child(PART_SEGMENTS * segment, 0).unwrap();
+    let config = NodeConfig {
+        segment_bytes: segment,
+        streams: 64,
+        subscriptions: 16,
+    };
+    let mut runtime = LocalRuntime::new(&runtime()).unwrap();
+    runtime
+        .block_on(async move {
+            let mut bus =
+                Harness::connect(&pki, &node_budget, &client_budget, &part_budget, config).await;
+            // The first batches published and delivered whole: what the node sends after this, it
+            // reserves after the refusals are set.
+            let before = u32::try_from(BEFORE).unwrap();
+            while bus.seen.reached() < BEFORE {
+                bus.publish(before);
+                bus.step(true).await;
+                bus.moved("delivering before the refusals");
+            }
+            bus.refuse.set(REFUSED);
+            while bus.seen.reached() < u64::from(PUBLISHED) {
+                bus.publish(PUBLISHED.min(u32::try_from(bus.seen.reached()).unwrap() + KEEPS_UP));
+                bus.step(true).await;
+                bus.moved("delivering through the refusals");
+            }
+            let stats = bus.node.stats();
+            assert_eq!(bus.refuse.get(), 0, "every refusal was met");
+            assert_eq!(stats.dropped, 0, "no subscription was let go");
+            assert!(stats.starved > 0, "a delivery waited for memory: {stats:?}");
+            // Each item goes on where the last ended: a batch delivered, or offsets told missed.
+            let mut at = 0;
+            for item in &bus.seen.order {
+                match *item {
+                    Item::Batch { base, end, .. } => {
+                        assert_eq!(base, at, "in order: {:?}", bus.seen.order);
+                        at = end;
+                    }
+                    Item::Gap { from, to } => {
+                        assert_eq!(from, at, "a gap told where it began: {:?}", bus.seen.order);
+                        at = to;
+                    }
+                }
+            }
+            assert_eq!(at, u64::from(PUBLISHED));
+        })
+        .unwrap();
 }

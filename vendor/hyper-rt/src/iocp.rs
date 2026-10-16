@@ -1,5 +1,13 @@
 //! The I/O completion port driver (Windows): `PostQueuedCompletionStatus` for kicks and no-ops,
 //! `GetQueuedCompletionStatusEx` with a timeout for the wait [B: Microsoft Learn].
+//!
+//! A timed wait's own timeout is in milliseconds, and the kernel ends it on its timer interrupt,
+//! 15.6 ms apart unless some process has raised the rate: a timer the wheel had due in 200 µs
+//! fired a tick of the system clock late. So a timed wait arms a high-resolution waitable timer
+//! (Windows 10 1803) whose signal ntdll's wait completion packet posts to the port, and the wait's
+//! own timeout only backs it: Go's netpoller since 1.23 (`netpoll_windows.go`, `netpollQueueTimer`).
+//! The packet functions are found at run time, as Go finds them, since some platforms (Wine) do not
+//! carry them; where they or the timer are missing, a wait is one of milliseconds alone.
 #![allow(unsafe_code)]
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
@@ -22,6 +30,192 @@ const NOP_KEY: usize = usize::MAX - 1;
 /// Format: the completion key the AFD readiness device is associated under. Its completions carry a
 /// poll block in the overlapped pointer (its head is the block), not a user word in the key.
 const AFD_KEY: usize = usize::MAX - 2;
+/// Format: the completion key a timed wait's timer posts under ([`Precise`]).
+const TIMER_KEY: usize = usize::MAX - 3;
+
+/// Format: NTSTATUS values the wait completion packets answer (ntstatus.h).
+const STATUS_SUCCESS: i32 = 0;
+/// Format: `STATUS_CANCELLED`, 0xC0000120.
+const STATUS_CANCELLED: i32 = i32::from_ne_bytes(0xC000_0120_u32.to_ne_bytes());
+/// Format: `GENERIC_ALL`, the access a wait completion packet is made with (as Go makes it).
+const GENERIC_ALL: u32 = 0x1000_0000;
+
+/// ntdll's `NtCreateWaitCompletionPacket(handle, access, attributes)`.
+type CreatePacket = unsafe extern "system" fn(*mut HANDLE, u32, *const std::ffi::c_void) -> i32;
+/// ntdll's `NtAssociateWaitCompletionPacket(packet, port, target, key, apc, status, information,
+/// already_signaled)`.
+type AssociatePacket = unsafe extern "system" fn(
+    HANDLE,
+    HANDLE,
+    HANDLE,
+    *const std::ffi::c_void,
+    *const std::ffi::c_void,
+    i32,
+    usize,
+    *mut u8,
+) -> i32;
+/// ntdll's `NtCancelWaitCompletionPacket(packet, remove_signaled)`.
+type CancelPacket = unsafe extern "system" fn(HANDLE, u8) -> i32;
+
+/// A timed wait's high-resolution timer and the wait completion packet that posts its signal to the
+/// port under [`TIMER_KEY`].
+struct Precise {
+    timer: HANDLE,
+    packet: HANDLE,
+    associate: AssociatePacket,
+    cancel: CancelPacket,
+    /// Whether the packet waits on a timer a wait armed and has not yet seen fire: an untimed wait
+    /// cancels it first, or that timer would end the wait.
+    armed: bool,
+}
+
+/// What arming the timer came to.
+enum Armed {
+    /// The timer will post its signal to the port.
+    Set,
+    /// It passed between its setting and its association: the wait need not wait.
+    Signaled,
+    /// The packet's last wait could not be cancelled yet (it fired as it was asked), or a call was
+    /// refused: this wait keeps its own timeout alone, as Go's does.
+    Coarse,
+}
+
+impl Precise {
+    /// The timer and its packet, where this Windows carries both: none before 1803 (no
+    /// high-resolution timer) or where ntdll lacks the packet functions.
+    fn make() -> Option<Precise> {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        use windows_sys::Win32::System::Threading::{
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW,
+            SYNCHRONIZATION_SYNCHRONIZE, TIMER_MODIFY_STATE, TIMER_QUERY_STATE,
+        };
+        let ntdll: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+        // SAFETY: a NUL-terminated wide name; ntdll is loaded in every Windows process.
+        let module = unsafe { GetModuleHandleW(ntdll.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        // SAFETY: NUL-terminated names looked up in the module just found; a missing one is null.
+        let (create, associate, cancel) = unsafe {
+            (
+                GetProcAddress(module, c"NtCreateWaitCompletionPacket".as_ptr().cast())?,
+                GetProcAddress(module, c"NtAssociateWaitCompletionPacket".as_ptr().cast())?,
+                GetProcAddress(module, c"NtCancelWaitCompletionPacket".as_ptr().cast())?,
+            )
+        };
+        // SAFETY: each is ntdll's export of that name, whose signature the alias states (the
+        // functions Microsoft documents, and Go's runtime calls the same way).
+        let (create, associate, cancel): (CreatePacket, AssociatePacket, CancelPacket) = unsafe {
+            (
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, CreatePacket>(create),
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, AssociatePacket>(
+                    associate,
+                ),
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, CancelPacket>(cancel),
+            )
+        };
+        // SAFETY: no name and no attributes; the result is checked.
+        let timer = unsafe {
+            CreateWaitableTimerExW(
+                std::ptr::null(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                SYNCHRONIZATION_SYNCHRONIZE | TIMER_QUERY_STATE | TIMER_MODIFY_STATE,
+            )
+        };
+        if timer.is_null() {
+            return None;
+        }
+        let mut packet: HANDLE = std::ptr::null_mut();
+        // SAFETY: `packet` is written with the new handle; no attributes.
+        let status = unsafe { create(&raw mut packet, GENERIC_ALL, std::ptr::null()) };
+        if status != STATUS_SUCCESS || packet.is_null() {
+            // SAFETY: the timer was made just above and is closed once here.
+            unsafe { CloseHandle(timer) };
+            return None;
+        }
+        Some(Precise {
+            timer,
+            packet,
+            associate,
+            cancel,
+            armed: false,
+        })
+    }
+
+    /// Arms the timer `ns` from now, its signal to post to `port`: the packet's last wait, which an
+    /// arrival may have outrun, is cancelled first (removing its signal if it was posted), since a
+    /// packet waits on one object at a time.
+    fn arm(&mut self, port: HANDLE, ns: u64) -> Armed {
+        use windows_sys::Win32::System::Threading::SetWaitableTimer;
+        // SAFETY: the packet is this value's own handle, open while it lives.
+        match unsafe { (self.cancel)(self.packet, 1) } {
+            // Nothing waited, or what did fired (which cancels the packet's wait itself).
+            STATUS_SUCCESS | STATUS_CANCELLED => self.armed = false,
+            // `STATUS_PENDING` (0x103): the wait fired as it was asked and cannot be cancelled yet,
+            // its signal to end the next wait; anything else, refused. Either way this wait keeps
+            // its own timeout alone.
+            _ => return Armed::Coarse,
+        }
+        // Relative, in 100 ns units, negative (SetWaitableTimer).
+        let due = i64::try_from(ns.div_ceil(100))
+            .unwrap_or(i64::MAX)
+            .max(1)
+            .saturating_neg();
+        // SAFETY: the timer is this value's own; `due` is live for the call; no completion routine.
+        if unsafe { SetWaitableTimer(self.timer, &raw const due, 0, None, std::ptr::null(), 0) }
+            == 0
+        {
+            return Armed::Coarse;
+        }
+        let mut signaled: u8 = 0;
+        // SAFETY: the packet, the port and the timer are open handles; the key is a tag the wait
+        // reads back, never dereferenced; `signaled` is written once.
+        let status = unsafe {
+            (self.associate)(
+                self.packet,
+                port,
+                self.timer,
+                std::ptr::without_provenance(TIMER_KEY),
+                std::ptr::null(),
+                STATUS_SUCCESS,
+                0,
+                &raw mut signaled,
+            )
+        };
+        match (status, signaled) {
+            (STATUS_SUCCESS, 0) => {
+                self.armed = true;
+                Armed::Set
+            }
+            (STATUS_SUCCESS, _) => Armed::Signaled,
+            _ => Armed::Coarse,
+        }
+    }
+
+    /// Cancels the packet's wait on a timer an earlier wait armed, its signal removed if posted.
+    /// One whose cancel cannot be done yet is firing as it is asked: its signal ends the next wait
+    /// once, to no waiter, as a kick does.
+    fn disarm(&mut self) {
+        if self.armed {
+            // SAFETY: the packet is this value's own handle, open while it lives.
+            unsafe { (self.cancel)(self.packet, 1) };
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for Precise {
+    fn drop(&mut self) {
+        // SAFETY: both handles are this value's own, closed once here, the packet's wait cancelled
+        // first (its signal removed if posted), so nothing posts to the port after the driver.
+        unsafe {
+            (self.cancel)(self.packet, 1);
+            CloseHandle(self.packet);
+            CloseHandle(self.timer);
+        }
+    }
+}
 
 /// Shape: entries drained per wait (see the kqueue driver for the reasoning).
 const EVENTS_PER_WAIT: usize = 64;
@@ -71,6 +265,8 @@ pub struct IocpDriver {
     handles_bound: usize,
     /// Polls issued and not yet reclaimed, cancelled ones included: what the drop drains.
     in_flight: usize,
+    /// A timed wait's timer, where this Windows carries one ([`Precise`]).
+    precise: Option<Precise>,
 }
 
 /// Cited: how long a dropped driver waits for completions the kernel still owes it — the I/O manager's own
@@ -131,6 +327,7 @@ impl IocpDriver {
             outstanding: HashMap::new(),
             handles_bound: 0,
             in_flight: 0,
+            precise: Precise::make(),
         })
     }
 
@@ -337,9 +534,21 @@ impl Driver for IocpDriver {
         const NANOS_PER_MILLI: u64 = 1_000_000;
         /// Format: INFINITE.
         const INFINITE: u32 = u32::MAX;
-        let timeout_ms = timeout_ns.map_or(INFINITE, |ns| {
+        let mut timeout_ms = timeout_ns.map_or(INFINITE, |ns| {
             u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1)
         });
+        match (timeout_ns, self.precise.as_mut()) {
+            // A zero timeout needs no timer.
+            (Some(0), _) | (_, None) => {}
+            // The timer ends a timed wait when due; the wait's own timeout only backs it.
+            (Some(ns), Some(precise)) => {
+                if let Armed::Signaled = precise.arm(self.port, ns) {
+                    timeout_ms = 0;
+                }
+            }
+            // An untimed wait first disarms what an earlier one left, or that timer would end it.
+            (None, Some(precise)) => precise.disarm(),
+        }
         let mut count: u32 = 0;
         let capacity = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
         // SAFETY: the entry buffer holds `capacity` records and `count` is writable.
@@ -372,6 +581,12 @@ impl Driver for IocpDriver {
         {
             match entry.lpCompletionKey {
                 KICK_KEY => {}
+                // A timed wait's timer fired: the shard's clock tells which timers are due.
+                TIMER_KEY => {
+                    if let Some(precise) = self.precise.as_mut() {
+                        precise.armed = false;
+                    }
+                }
                 NOP_KEY => out.push(Completion {
                     user_data: u64::try_from(entry.lpOverlapped.addr()).unwrap_or(0),
                     result: 0,
@@ -487,6 +702,69 @@ mod tests {
             wake_tracking: None,
             latency_objective_ns: None,
         }
+    }
+
+    /// A timed wait ends at its timeout through the high-resolution timer, not at the system clock's
+    /// next interrupt (15.625 ms apart unless some process has raised the rate): a 2 ms sleep's
+    /// median end is below half that period, which a wait of whole milliseconds on the clock's own
+    /// interrupt cannot reach.
+    #[test]
+    fn a_timed_wait_ends_at_its_timeout_not_the_clock_s_interrupt() {
+        /// Shape: each sleep, well under the default interrupt period.
+        const SLEEP_NS: u64 = 2_000_000;
+        /// Shape: Windows' default timer interrupt period, 64 a second.
+        const DEFAULT_PERIOD_NS: u64 = 15_625_000;
+        /// Shape: sleeps taken; their median stands against a busy runner's late wakes.
+        const TRIES: usize = 21;
+        let mut rt = LocalRuntime::new(&config()).unwrap();
+        let mut ended = rt
+            .block_on(async {
+                let mut ended = Vec::with_capacity(TRIES);
+                for _ in 0..TRIES {
+                    let began = crate::futures::now_ns();
+                    sleep(SLEEP_NS).await.unwrap();
+                    ended.push(crate::futures::now_ns().saturating_sub(began));
+                }
+                ended
+            })
+            .unwrap();
+        ended.sort_unstable();
+        let median = ended.get(TRIES / 2).copied().unwrap();
+        assert!(
+            median < DEFAULT_PERIOD_NS / 2,
+            "a {SLEEP_NS} ns sleep ended after {median} ns at the median: {ended:?}"
+        );
+    }
+
+    /// A timed wait a kick ends leaves its timer armed; the untimed wait after it disarms it first,
+    /// so that timer cannot end it (each wait here ends at once on a kick sent before it).
+    #[test]
+    fn an_untimed_wait_disarms_the_timer_a_timed_one_left() {
+        use crate::driver::{Driver, Kick};
+        /// Shape: a timed wait's timeout, far past the kick that ends it.
+        const WAIT_NS: u64 = 1_000_000_000;
+        let port = super::prepare().unwrap();
+        let registration =
+            crate::registry::register(2, 1, crate::runtime::register_kick(Some(port))).unwrap();
+        let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
+        let Kick::Iocp(port) = kick else {
+            panic!("the IOCP driver's kick is its port");
+        };
+        let mut driver = super::IocpDriver::from_prepared(port).unwrap();
+        let armed = |driver: &super::IocpDriver| driver.precise.as_ref().map(|timer| timer.armed);
+        if armed(&driver).is_none() {
+            eprintln!("this Windows carries no high-resolution timer or no wait completion packet");
+            return;
+        }
+        let mut out = Vec::new();
+        kick.kick();
+        driver.wait(Some(WAIT_NS), &mut out).unwrap();
+        assert_eq!(armed(&driver), Some(true));
+        kick.kick();
+        driver.wait(None, &mut out).unwrap();
+        assert_eq!(armed(&driver), Some(false));
+        drop(driver);
+        drop(registration);
     }
 
     /// Mantle's final review, second pass, finding 1. Do: a reader waits on a socket (its AFD poll in flight);

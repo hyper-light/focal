@@ -693,6 +693,7 @@ dependencies = [
  "hyper-rt",
  "hyper-rt-transport",
  "hyper-transport",
+ "rcgen 0.14.10",
  "rdkafka",
  "redis",
  "serde",

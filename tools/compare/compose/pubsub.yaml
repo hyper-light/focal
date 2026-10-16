@@ -16,6 +16,23 @@ services:
     profiles: [nats]
     # Core NATS as shipped: no configuration, no JetStream.
     command: ["--port", "4222"]
+  # NATS over TLS 1.3 (`pubsub.sh nats-tls`): the same node, its certificate the bench's own CA's,
+  # written once by the generator's image before the node starts.
+  certs:
+    image: ${FOCAL_IMAGE:-focal:bench}
+    profiles: [nats-tls]
+    command: ["focal-compare", "certs", "/certs"]
+    volumes: ["certs:/certs"]
+    networks: [bench]
+  nats-tls:
+    <<: *node
+    image: ${BENCH_LIBRARY:-public.ecr.aws/docker/library}/nats:2.12-alpine@sha256:b270f5e2428354c0335612694d7dd2fb588148e567a5757fdff325ef9c9332e6
+    profiles: [nats-tls]
+    command: ["--port", "4222", "--tls", "--tlscert", "/certs/server.pem", "--tlskey", "/certs/server.key"]
+    volumes: ["certs:/certs:ro"]
+    depends_on:
+      certs:
+        condition: service_completed_successfully
   kafka:
     <<: *node
     image: ${BENCH_KAFKA:-apache/kafka}:4.1.0@sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f
@@ -50,12 +67,12 @@ services:
   # The generator, on the bench network, its CPUs its own (GENERATOR_CPUS).
   generator:
     image: ${FOCAL_IMAGE:-focal:bench}
-    profiles: [nats, kafka, redis, focal-bus]
+    profiles: [nats, nats-tls, kafka, redis, focal-bus]
     cpus: "${GENERATOR_CPUS:-2}"
     mem_limit: 2g
     networks: [bench]
     command: ["sleep", "86400"]
-    volumes: ["reports:/reports", "pki:/pki"]
+    volumes: ["reports:/reports", "pki:/pki", "certs:/certs"]
 
 networks:
   bench: {}
@@ -63,3 +80,4 @@ networks:
 volumes:
   pki: {}
   reports: {}
+  certs: {}

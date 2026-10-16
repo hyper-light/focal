@@ -1238,3 +1238,32 @@ methods are the map's, so every use reads as it did. Test:
 `spaces::test::sent_packets_answer_as_the_map_they_replaced` runs the deque against the map over
 20,000 of a space's own operations from a seed: sends, takes from either end and the middle,
 lookups, and every range shape the uses ask.
+
+## 33. Acknowledgements decimated as Google QUIC's (2026-10-16)
+
+Patch Q22 lets a sender ask its peer, through the acknowledgement frequency extension it already
+carried (draft-ietf-quic-ack-frequency), to acknowledge as Google QUIC's receivers do (quiche,
+`quic_constants.h`): an ACK for every 10 ack-eliciting packets (`kMaxRetransmittablePacketsBeforeAck`),
+else a quarter of the round trip after the first one waiting (`kPeerAckDecimationDelay`), from the
+100th packet on (`kMinReceivedBeforeAckDecimation`, "to avoid the beginning of slow start, when
+CWNDs may be rapidly increasing"). `AckFrequencyConfig::decimation(packet_threshold)` builds the
+request and `TransportConfig::decimate_acks` asks it with the configuration's own packet threshold.
+Upstream's request is static, a fixed delay or the peer's own (25 ms on most paths), sent at once:
+- the delay asked is the smoothed round trip over four (`AckFrequencyConfig::rtt_divisor`), the
+  smoothed round trip and not the least (draft-ietf-quic-ack-frequency-14 §8.1; quiche takes the
+  least), never below the peer's `min_ack_delay`, which hyper-quic advertises as its 1 ms timer
+  granularity (RFC 9002 §6.1.2): on a path under 4 ms the delay is 1 ms;
+- the first request waits until the application data space has numbered 100 packets
+  (`AckFrequencyConfig::after_packets`), so slow start's packets are acknowledged as RFC 9000
+  §13.2.2 asks; a request is sent again as before, once the delay it would ask differs by a fifth;
+- the reordering threshold is the loss detector's packet threshold (§9), so a reordering elicits an
+  immediate ACK only where it would let the sender declare a loss.
+
+RFC 9000 §13.2.2's default, an ACK for every other ack-eliciting packet, cost each delivery of a
+one-packet message half a packet back, with its system calls and the sender's wake: at 100,000 bus
+messages a second a node handled 3.4 datagrams a message, a third of them acknowledgements
+(`docs/transport.md` §4k).
+
+Test: `tests::decimated_acks_come_from_the_hundredth_packet_every_tenth_or_a_quarter_round_trip_on`
+(no request before the 100th packet; then a lone ping is acknowledged a quarter of a 20 ms round
+trip later, 5 ms and not 4, and the tenth of ten pings at once).

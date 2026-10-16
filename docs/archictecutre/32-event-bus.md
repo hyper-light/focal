@@ -155,14 +155,73 @@ first), and a subscriber that falls below what is kept is told the offsets it mi
 reserved for a worst case: the transport's buffers, the tables, the index of retained batches and
 the segments are all charged when they are held, to one budget.
 
-Found on the way: a log's tail emptied while it took batches was never given back once the log
-moved past it, a segment held for good at each such rollover (fixed: the log gives it back as it
-takes the next).
+Found on the way:
+- a log's tail emptied while it took batches was never given back once the log moved past it, a
+  segment held for good at each such rollover (fixed: the log gives it back as it takes the next);
+- a delivery the node found no memory for took its subscriber as gone: the first container matrix
+  (a busy laptop's Docker, 2026-10-16) lost 1.1 million messages at 100,000 a second, the
+  subscriber let go in silence while it waited. A refusal for memory is the window's to answer:
+  the oldest retained batches give their room and the delivery is asked again, and where nothing
+  can be given the subscriber waits, starved, until the transport gives memory back
+  (`Node::starving`; `a_delivery_the_node_has_no_memory_for_waits_and_its_subscriber_stays`);
+- a third of a node's datagrams were QUIC acknowledgements, one for every other packet (RFC 9000
+  §13.2.2's default): every connection now asks for Google QUIC's decimation, an ACK for every 10
+  packets or a quarter of the round trip (hyper-quic patch Q22, hyper-raft `a8f5941`).
+
+**Measured** on a bare-metal machine (AMD Ryzen 9 9950X3D2, Linux 7.2), each system's node alone
+on one core in its container, the generator on four others, the claim corpus's 1,150-byte
+messages, 20 s after 5 s of warm-up; CPU is the node's container's, user and kernel, a message
+received (2026-10-16, one run each):
+
+| 10,000 a second | p50 | p99 | p99.9 | Lost | CPU a message |
+|---|---|---|---|---|---|
+| Bus | 24 µs | 36 µs | 95 µs | 0 | 10.3 µs |
+| NATS | 14 µs | 24 µs | 677 µs | 1 | 6.0 µs |
+| NATS over TLS | 21 µs | 34 µs | 714 µs | 1 | 7.9 µs |
+
+| 100,000 a second | p50 | p99 | p99.9 | Lost | CPU a message |
+|---|---|---|---|---|---|
+| Bus | 28 µs | 297 µs | 1.29 ms | 0 | 6.5 µs |
+| NATS | 15 µs | 48 µs | 0.98 ms | 1 | 4.8 µs |
+| NATS over TLS | 21 µs | 709 µs | 2.79 ms | 2 | 5.6 µs |
+| Redis | 19 µs | 504 µs | 4.14 ms | 0 | 4.2 µs |
+
+| 1,000,000 offered | Delivered a second | p99 | p99.9 | Lost |
+|---|---|---|---|---|
+| Bus | 766,000 | 6.2 ms | 6.7 ms | 0 |
+| NATS | 895,000 | 4.3 ms | 11.4 ms | 67 |
+| NATS over TLS | 399,000 | 250 ms | 266 ms | 2,463,006 |
+| Redis | 390,000 | 29 ms | 46 ms | 12,202,622 |
+| Kafka | 344,000 | 4.6 s | 4.7 s | 0 |
+
+Every system's kernel cost a message is about the same (4.2 to 4.4 µs at 100,000 a second); the
+bus's user time is what it pays above NATS (2.3 µs against 0.6). Decimated acknowledgements, three
+interleaved pairs at each rate: at 100,000 a second the node handles 2.7 datagrams a message
+instead of 3.4 and its CPU falls 6 % (6.10 µs against 6.50); at 10,000 a second it falls 27 %
+(7.27 µs against 9.98), and on a core a busy loop shares, 25 % (7.89 against 10.55), its p99 there
+0.04 ms against 0.05 and its p99.9 0.11 ms against 0.14.
+
+Where the node's time goes (perf on the same machine, hardware counters, kernel symbols placed
+from the kernel's `System.map`): at 100,000 a second, 61 % in the kernel, a fifth of that in the
+container bridge's modules every system pays, and the epoll re-arm each wait makes; at saturation
+(1.33 µs a message, 909 messages a batch), AES-GCM 22 %, QUIC's packet bookkeeping about 25 %, the
+kernel 21 % (7 % clearing pages faulted afresh), five user copies of each message 16.5 % and the
+CRC-32C pass 8.6 %.
 
 Open: a subscriber of many streams waits a round trip a stream (subscribes as lane frames would
 not); the retained batches' index costs 16 bytes a batch beside the log, which already holds what
-it says (a scan of the log from its oldest segment would replace it). The comparison against NATS
-core, Redis Pub/Sub and Kafka in the container is to be run on this tree.
+it says (a scan of the log from its oldest segment would replace it). From the profile: a segment
+freed and faulted afresh where the window could reuse it; a one-shot epoll registration re-armed
+at every wait; five user copies of each message where two would carry it; CRC-32C at about half a
+cycle a byte; receive headers rebuilt at every call; kernel receive stamps the transport does not
+read. The busy-machine matrix of every system on the bare-metal machine follows these.
+
+Open, from that matrix's first run (2026-10-16): at 1,000,000 offered on a core a busy loop shares,
+the node told its subscriber one gap of two batches (1,819 messages) in 9,487: the window gave up
+batches its subscriber had not yet taken, where memory was short for a delivery. Every bound around
+a live subscriber (a lossless lane holds one frame beyond what QUIC took; a held publisher's lane is
+not read) keeps it within megabytes of the head, so a window of 1.5 GB should not reach it; it is
+being traced with the window, the pool and the budget logged at each gap.
 
 ## 5. Steps
 

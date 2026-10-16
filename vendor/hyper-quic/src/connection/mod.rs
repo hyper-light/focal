@@ -716,9 +716,10 @@ impl Connection {
     /// Check whether we need to send an ACK_FREQUENCY frame
     fn queue_ack_frequency(&mut self) {
         if let Some(config) = &self.config.ack_frequency_config {
+            let sent = self.spaces.get(SpaceId::Data).next_packet_number;
             self.spaces.get_mut(SpaceId::Data).pending.ack_frequency = self
                 .ack_frequency
-                .should_send_ack_frequency(self.path.rtt.get(), config, &self.peer_params)
+                .should_send_ack_frequency(self.path.rtt.get(), config, &self.peer_params, sent)
                 && self.highest_space == SpaceId::Data
                 && self.peer_supports_ack_frequency();
         }

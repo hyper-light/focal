@@ -5,7 +5,9 @@
 # wait is bounded.
 #
 #   pubsub.sh SYSTEM RATE SECONDS WARMUP CORPUS OUT
-#   SYSTEM: focal-bus | nats | kafka | redis       CORPUS: claim | event | testament | entropy
+#   SYSTEM: focal-bus | nats | nats-tls | kafka | redis   CORPUS: claim | event | testament | entropy
+#   (nats-tls: NATS with its clients over TLS 1.3, the like-for-like row for a bus that always
+#   encrypts.)
 set -euo pipefail
 cd "$(dirname "$0")"
 system="$1"; rate="$2"; seconds="$3"; warmup="$4"; corpus="$5"; out="$6"
@@ -59,9 +61,11 @@ net_stat() {
 trap cleanup EXIT
 cleanup
 dc up -d
+generator_system="$system"
 case "$system" in
   focal-bus) endpoint=bus:7443; extra="--pki /pki" ;;
   nats) endpoint=nats:4222; extra="" ;;
+  nats-tls) endpoint=nats-tls:4222; extra="--tls-ca /certs/ca.pem"; generator_system=nats ;;
   kafka) endpoint=kafka:9092; extra="" ;;
   redis) endpoint=redis:6379; extra="" ;;
   *) echo "unknown system $system" >&2; exit 2 ;;
@@ -74,6 +78,7 @@ ready() {
     focal-bus) dc logs bus 2>/dev/null | grep -q '"Listening"' ;;
     redis) dc exec -T redis redis-cli ping 2>/dev/null | grep -q PONG ;;
     nats) dc logs nats 2>/dev/null | grep -q "Server is ready" ;;
+    nats-tls) dc logs nats-tls 2>/dev/null | grep -q "Server is ready" ;;
     kafka) dc logs kafka 2>/dev/null | grep -q "Kafka Server started" ;;
   esac
 }
@@ -90,7 +95,7 @@ net_stat before > "$out/$report.net.txt"
 # shellcheck disable=SC2086
 if ! timeout $(( (seconds + warmup) * 4 + 60 )) \
   docker compose -p "$project" $files --profile "$system" exec -T generator focal-compare \
-    --system "$system" --mode pubsub --endpoints "$endpoint" --rate "$rate" \
+    --system "$generator_system" --mode pubsub --endpoints "$endpoint" --rate "$rate" \
     --seconds "$seconds" --warmup "$warmup" --corpus "$corpus" $extra --out "/reports/$report"; then
   evidence
   exit 1

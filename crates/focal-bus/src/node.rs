@@ -97,6 +97,11 @@ pub struct NodeStats {
     pub subscribed: u64,
     /// Times a publisher's lane was held for a stream whose subscriber took no more.
     pub held: u64,
+    /// Deliveries the node had no memory for once the window had given what it holds: each waited
+    /// for the transport to give memory back, its subscriber held as a full lane holds it.
+    pub starved: u64,
+    /// Subscriptions let go because the transport could no longer reach their peer.
+    pub dropped: u64,
 }
 
 /// A batch the part retains, in the order appended: its stream, and the offset after it.
@@ -152,13 +157,22 @@ pub struct Node {
     holding: Vec<Holding>,
     /// The lanes one release found free, kept between releases.
     freed: Vec<(PeerId, LaneId)>,
+    /// Subscriptions whose delivery found no memory once the window had none left to give: asked
+    /// again whenever the transport gives memory back ([`Node::relieve_transport`]). The list is
+    /// swapped with `retrying` to be walked, so neither ever allocates past the subscriptions.
+    starved: Vec<usize>,
+    retrying: Vec<usize>,
     stats: NodeStats,
 }
 
 /// How a delivery attempt ended.
 enum Sent {
     Queued,
+    /// The lane holds what its path carries: the transport says `LaneRoom` when it has room.
     Full,
+    /// No memory for the frame (`Refusal::Budget`).
+    Short,
+    /// The peer cannot be reached any more.
     Gone,
 }
 
@@ -192,6 +206,8 @@ impl Node {
             scratch: Vec::new(),
             holding: Vec::new(),
             freed: Vec::new(),
+            starved: Vec::new(),
+            retrying: Vec::new(),
             stats: NodeStats::default(),
         })
     }
@@ -345,6 +361,12 @@ impl Node {
                 return true;
             }
         }
+        // The last batches let go were the tail's, which is kept while it takes batches: with
+        // nothing in it, it goes back, and the next batch starts a segment of its own.
+        if self.part.seal(&mut self.pool) {
+            self.pool.shed();
+            return true;
+        }
         false
     }
 
@@ -359,6 +381,47 @@ impl Node {
         // Bounded: `relieve` is false once the part retains nothing.
         while endpoint.stats().frames_reserving > 0 && self.relieve() {
             endpoint.retry_reserving();
+        }
+        self.retry_starved(endpoint);
+    }
+
+    /// Whether a delivery waits for the transport to give memory back: its owner asks again
+    /// ([`Node::relieve_transport`]) when the transport has returned memory, not only on its next
+    /// event, which may never come while every lane waits.
+    pub fn starving(&self) -> bool {
+        !self.starved.is_empty()
+    }
+
+    /// Asks again for the deliveries that found no memory: each subscription is let out of its
+    /// wait and pumped; one that finds none again waits again.
+    fn retry_starved<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        if self.starved.is_empty() {
+            return;
+        }
+        let mut retrying = std::mem::take(&mut self.retrying);
+        std::mem::swap(&mut retrying, &mut self.starved);
+        for slot in retrying.iter().copied() {
+            self.update(slot, |s| s.blocked = false);
+            self.pump(endpoint, slot);
+        }
+        retrying.clear();
+        self.retrying = retrying;
+        // A stream no subscriber waits on any more lets its publishers go.
+        self.release_unblocked(endpoint);
+    }
+
+    /// `slot`'s delivery found no memory: its subscriber waits, held as a full lane holds it (the
+    /// publishers feeding its stream are held too), until the transport gives memory back.
+    fn starve(&mut self, slot: usize) {
+        self.stats.starved = self.stats.starved.saturating_add(1);
+        self.update(slot, |s| s.blocked = true);
+        // Room reserved with the subscription (`reserve_subscription`): no allocation.
+        if !self.starved.contains(&slot) {
+            self.starved.push(slot);
         }
     }
 
@@ -385,6 +448,8 @@ impl Node {
             self.freed.capacity(),
             std::mem::size_of::<(PeerId, LaneId)>(),
         )?)?
+        .checked_add(of(self.starved.capacity(), std::mem::size_of::<usize>())?)?
+        .checked_add(of(self.retrying.capacity(), std::mem::size_of::<usize>())?)?
         .checked_add(of(
             buckets,
             std::mem::size_of::<(u64, Vec<usize>)>().checked_add(1)?,
@@ -409,6 +474,12 @@ impl Node {
             .map_err(short)?;
         self.scratch
             .try_reserve(slots.saturating_sub(self.scratch.len()))
+            .map_err(short)?;
+        self.starved
+            .try_reserve(slots.saturating_sub(self.starved.len()))
+            .map_err(short)?;
+        self.retrying
+            .try_reserve(slots.saturating_sub(self.retrying.len()))
             .map_err(short)?;
         self.by_stream.try_reserve(1).map_err(short)?;
         if let Some(list) = self.by_stream.get_mut(&stream) {
@@ -623,6 +694,7 @@ impl Node {
                 self.by_stream.remove(&subscription.stream);
             }
         }
+        self.starved.retain(|known| *known != slot);
         self.free.push(slot);
     }
 
@@ -661,7 +733,13 @@ impl Node {
                         continue;
                     }
                     Sent::Full => return self.block(slot),
-                    Sent::Gone => return self.drop_slot(slot),
+                    Sent::Short => {
+                        if self.short(endpoint) {
+                            continue;
+                        }
+                        return self.starve(slot);
+                    }
+                    Sent::Gone => return self.gone(slot),
                 }
             }
             let Some(word) = self.next_word(&subscription) else {
@@ -680,7 +758,15 @@ impl Node {
                     });
                 }
                 Sent::Full => return self.block(slot),
-                Sent::Gone => return self.drop_slot(slot),
+                Sent::Short => {
+                    // The batch may have been the window's to give up: the loop finds where the
+                    // subscriber stands now, a gap told if it was.
+                    if self.short(endpoint) {
+                        continue;
+                    }
+                    return self.starve(slot);
+                }
+                Sent::Gone => return self.gone(slot),
             }
         }
     }
@@ -712,6 +798,27 @@ impl Node {
     fn block(&mut self, slot: usize) {
         self.stats.blocked = self.stats.blocked.saturating_add(1);
         self.update(slot, |s| s.blocked = true);
+    }
+
+    /// A frame found no memory: the window gives up its oldest batches until a segment goes back,
+    /// and the lanes that waited for memory read on. Whether memory came back, and the frame may be
+    /// asked for again.
+    fn short<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>) -> bool
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        let relieved = self.relieve();
+        if relieved {
+            endpoint.retry_reserving();
+        }
+        relieved
+    }
+
+    /// `slot`'s peer cannot be reached any more: its subscription goes, counted.
+    fn gone(&mut self, slot: usize) {
+        self.stats.dropped = self.stats.dropped.saturating_add(1);
+        self.drop_slot(slot);
     }
 }
 
@@ -749,6 +856,10 @@ where
     match endpoint.send_frame(peer, LANE, kind, bytes) {
         Ok(()) => Sent::Queued,
         Err(Refusal::LaneFull) => Sent::Full,
+        // Memory is not the peer's going: taken as gone, a subscriber the node could not find a
+        // frame's bytes for was let go in silence while it waited (the pubsub matrix of
+        // 2026-10-16 lost 1.1 million messages so at 100,000 a second).
+        Err(Refusal::Budget) => Sent::Short,
         Err(_) => Sent::Gone,
     }
 }

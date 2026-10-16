@@ -286,6 +286,14 @@ impl TransportConfig {
         self
     }
 
+    /// Asks the peer to acknowledge as Google QUIC does ([`AckFrequencyConfig::decimation`]), its
+    /// reordering threshold this configuration's [`packet_threshold`](Self::packet_threshold), so
+    /// set that first.
+    pub fn decimate_acks(&mut self) -> &mut Self {
+        self.ack_frequency_config = Some(AckFrequencyConfig::decimation(self.packet_threshold));
+        self
+    }
+
     /// Number of consecutive PTOs after which network is considered to be experiencing persistent congestion.
     pub fn persistent_congestion_threshold(&mut self, value: u32) -> &mut Self {
         self.persistent_congestion_threshold = value;
@@ -514,9 +522,38 @@ pub struct AckFrequencyConfig {
     pub(crate) ack_eliciting_threshold: VarInt,
     pub(crate) max_ack_delay: Option<Duration>,
     pub(crate) reordering_threshold: VarInt,
+    /// The `max_ack_delay` requested as the smoothed RTT divided by this, where no fixed one is.
+    pub(crate) rtt_divisor: Option<u32>,
+    /// The packet numbers sent before the first request.
+    pub(crate) after_packets: u64,
 }
 
 impl AckFrequencyConfig {
+    /// Google QUIC's acknowledgement decimation (quiche, `quic_constants.h`), asked of the peer
+    /// through the extension: an ACK for every 10 ack-eliciting packets
+    /// (`kMaxRetransmittablePacketsBeforeAck`) or after a quarter of the round trip
+    /// (`kPeerAckDecimationDelay`, 0.25), from the 100th packet on
+    /// (`kMinReceivedBeforeAckDecimation`, "to avoid the beginning of slow start, when CWNDs may
+    /// be rapidly increasing"). The round trip is the smoothed one, not the least
+    /// (draft-ietf-quic-ack-frequency-14 §8.1), so the delay stays under the round trip the draft
+    /// bounds it by, and never below the peer's `min_ack_delay` (its timer granularity, RFC 9002
+    /// §6.1.2's 1 ms), which on a path shorter than 4 ms is the delay. A reordering elicits an
+    /// immediate ACK only where it would let the sender declare a loss: the threshold is the
+    /// loss detector's `packet_threshold` (§9).
+    ///
+    /// RFC 9000 §13.2.2's default, an ACK for every other ack-eliciting packet, made each delivery
+    /// of a one-packet message cost its receiver half a packet back, with the system calls and
+    /// the sender's wake it takes.
+    pub fn decimation(packet_threshold: u32) -> Self {
+        Self {
+            ack_eliciting_threshold: VarInt(9),
+            max_ack_delay: None,
+            reordering_threshold: VarInt::from_u32(packet_threshold),
+            rtt_divisor: Some(4),
+            after_packets: 100,
+        }
+    }
+
     /// The ack-eliciting threshold we will request the peer to use
     ///
     /// This threshold represents the number of ack-eliciting packets an endpoint may receive
@@ -572,6 +609,8 @@ impl Default for AckFrequencyConfig {
             ack_eliciting_threshold: VarInt(1),
             max_ack_delay: None,
             reordering_threshold: VarInt(2),
+            rtt_divisor: None,
+            after_packets: 0,
         }
     }
 }

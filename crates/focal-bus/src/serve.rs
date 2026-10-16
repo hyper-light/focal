@@ -123,27 +123,55 @@ pub async fn serve(
     let signals = signal::subscribe(&[Signal::Interrupt, Signal::Terminate])
         .map_err(|_| BusError::Configuration("signals could not be subscribed"))?;
     ready(address);
+    // The transport's reservations given back as the node last looked: a delivery that found no
+    // memory is asked again once some come back.
+    let mut returns = driver.endpoint().budget().stats().returns;
     loop {
         let mut stop = pin!(signals.recv());
-        let next = poll_fn(|context| {
+        let woke = poll_fn(|context| {
             if stop.as_mut().poll(context).is_ready() {
-                return Poll::Ready(None);
+                return Poll::Ready(Woke::Stop);
             }
-            driver.poll_event(context).map(Some)
+            if let Poll::Ready(event) = driver.poll_event(context) {
+                return Poll::Ready(Woke::Event(event));
+            }
+            // A frame sent and answered gives its buffer back as the driver reads the answer, and
+            // no event of the node's need follow: a starved delivery is asked again then.
+            if node.starving() && driver.endpoint().budget().stats().returns != returns {
+                return Poll::Ready(Woke::Freed);
+            }
+            Poll::Pending
         })
         .await;
-        let Some(event) = next else {
-            return Ok((
-                node.stats(),
-                driver.rooms(),
-                hyper_rt::futures::shard_counters(),
-            ));
-        };
-        let event = event.map_err(|_| BusError::Configuration("the endpoint's socket failed"))?;
-        node.on_event(driver.endpoint(), event);
-        while let Some(event) = driver.endpoint().poll_event() {
-            node.on_event(driver.endpoint(), event);
+        match woke {
+            Woke::Stop => {
+                return Ok((
+                    node.stats(),
+                    driver.rooms(),
+                    hyper_rt::futures::shard_counters(),
+                ));
+            }
+            Woke::Event(event) => {
+                let event =
+                    event.map_err(|_| BusError::Configuration("the endpoint's socket failed"))?;
+                node.on_event(driver.endpoint(), event);
+                while let Some(event) = driver.endpoint().poll_event() {
+                    node.on_event(driver.endpoint(), event);
+                }
+            }
+            Woke::Freed => {}
         }
+        returns = driver.endpoint().budget().stats().returns;
         node.relieve_transport(driver.endpoint());
     }
+}
+
+/// What woke the node's loop.
+enum Woke<E> {
+    /// An interrupt or a termination.
+    Stop,
+    /// The endpoint's event.
+    Event(E),
+    /// The transport gave memory back while a delivery waited for some.
+    Freed,
 }
