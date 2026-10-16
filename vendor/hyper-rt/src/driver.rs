@@ -171,6 +171,16 @@ pub trait Driver {
     /// bound). Completions are appended to `out`. Returns `DriverLost` when the driver died.
     fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError>;
 
+    /// The most a timed `wait` may end after its timeout, nanoseconds, handed to the OS's own
+    /// coalescing: Linux's timer slack, macOS's timer leeway. The shard gives its timer tick, since
+    /// a parked shard cannot fire a timer sooner than it wakes and its timers' lateness is already
+    /// bounded by the tick (docs/runtime.md §3.6). Called once, on the shard's thread, as the shard
+    /// is built; a driver whose OS coalesces nothing it asks ignores it.
+    fn set_timer_slack_ns(&mut self, slack_ns: u64) -> Result<(), RtError> {
+        let _ = slack_ns;
+        Ok(())
+    }
+
     /// Submits an operation that completes with `user_data` on a following `wait` (the seam's
     /// self-test; every real operation follows the same path).
     fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError>;

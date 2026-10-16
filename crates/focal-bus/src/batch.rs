@@ -54,6 +54,13 @@ const FLAGS: core::ops::Range<usize> = 46..48;
 const TIMESTAMP: core::ops::Range<usize> = 48..56;
 /// Where the CRC starts: after the fields the owner stamps.
 const COVERED_FROM: usize = 24;
+/// Where a batch's CRC is and what it covers, as the transport that carries it checks it
+/// (`hyper_transport::Classes::embedded_checksum`, `wire`): the transport's own checksum covers
+/// the rest, so each byte of a publish or a delivery is summed once on its way.
+pub const EMBEDDED: hyper_transport::Embedded = hyper_transport::Embedded {
+    covered_from: COVERED_FROM,
+    at: CRC.start,
+};
 /// `next` before the stream's next batch is appended.
 pub const NO_NEXT: u64 = u64::MAX;
 
@@ -137,6 +144,10 @@ fn varint(bytes: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
+/// The most a record's head takes: its length and its delta, each a `u64` in LEB128, ten bytes at
+/// most.
+const RECORD_HEAD_MAX: usize = 20;
+
 fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let low = u8::try_from(value & 0x7F).unwrap_or(0);
@@ -158,6 +169,17 @@ pub struct Batch<'a> {
 impl<'a> Batch<'a> {
     /// Checks `bytes` as a whole batch of at most `limit` bytes.
     pub fn parse(bytes: &'a [u8], limit: usize) -> Result<Self, BatchError> {
+        Self::check(bytes, limit, true)
+    }
+
+    /// [`Self::parse`] but for the CRC: for a batch whose CRC the transport that carried it
+    /// verified as it arrived ([`EMBEDDED`]). A node summed each publish twice, the transport's
+    /// sum and this, before the transport checked the batch's own.
+    pub fn parse_verified(bytes: &'a [u8], limit: usize) -> Result<Self, BatchError> {
+        Self::check(bytes, limit, false)
+    }
+
+    fn check(bytes: &'a [u8], limit: usize, crc: bool) -> Result<Self, BatchError> {
         if bytes.len() > limit {
             return Err(BatchError::TooLarge {
                 bytes: bytes.len(),
@@ -174,14 +196,16 @@ impl<'a> Batch<'a> {
                 offered: bytes.len(),
             });
         }
-        let stated_crc = le_u32(bytes, CRC).ok_or(BatchError::Short)?;
-        let covered = bytes.get(COVERED_FROM..).ok_or(BatchError::Short)?;
-        let computed = crc32c::crc32c(covered);
-        if computed != stated_crc {
-            return Err(BatchError::Crc {
-                stated: stated_crc,
-                computed,
-            });
+        if crc {
+            let stated_crc = le_u32(bytes, CRC).ok_or(BatchError::Short)?;
+            let covered = bytes.get(COVERED_FROM..).ok_or(BatchError::Short)?;
+            let computed = crc32c::crc32c(covered);
+            if computed != stated_crc {
+                return Err(BatchError::Crc {
+                    stated: stated_crc,
+                    computed,
+                });
+            }
         }
         let count = le_u16(bytes, COUNT).ok_or(BatchError::Short)?;
         if count == 0 {
@@ -397,6 +421,27 @@ impl BatchBuilder {
         self.timestamp = producing.timestamp;
     }
 
+    /// The batch's bytes so far, its header's included.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether no batch is begun.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// The records pushed since the batch began.
+    pub const fn count(&self) -> u16 {
+        self.count
+    }
+
+    /// The most a record of `payload` bytes adds to a batch: its length's and its delta's varints,
+    /// ten bytes each at most, and its bytes.
+    pub const fn record_bytes(payload: usize) -> usize {
+        payload.saturating_add(RECORD_HEAD_MAX)
+    }
+
     /// Adds a record of `payload` at `timestamp` (µs; not before the batch's first).
     pub fn push(&mut self, timestamp: u64, payload: &[u8]) -> Result<(), BusError> {
         self.count = self
@@ -508,6 +553,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// What the transport checks of a publish or a delivery ([`EMBEDDED`]) is the batch's own CRC:
+    /// a batch as built, and as stamped by its owner, passes it, and every flipped bit the CRC
+    /// covers fails it, so the transport's check stands for [`Batch::parse`]'s and
+    /// [`Batch::parse_verified`] skips no check that was not made.
+    #[test]
+    fn the_transport_s_check_is_the_batch_s_own_crc() {
+        let mut builder = BatchBuilder::new();
+        builder.begin(&producing());
+        builder.push(1_792_022_400_000_000, b"claim").unwrap();
+        let mut bytes = builder.finish().unwrap().to_vec();
+        assert_eq!(EMBEDDED.verify(&bytes), Ok(()));
+        stamp(&mut bytes, 12_345).unwrap();
+        stamp_next(&mut bytes, 77).unwrap();
+        assert_eq!(EMBEDDED.verify(&bytes), Ok(()));
+        for at in COVERED_FROM..bytes.len() {
+            let mut damaged = bytes.clone();
+            damaged[at] ^= 1;
+            assert!(EMBEDDED.verify(&damaged).is_err(), "byte {at} passed");
+        }
+        let verified = Batch::parse_verified(&bytes, 1 << 20).unwrap();
+        assert_eq!(
+            verified.bytes(),
+            Batch::parse(&bytes, 1 << 20).unwrap().bytes()
+        );
     }
 
     #[test]

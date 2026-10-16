@@ -36,6 +36,13 @@ pub fn scheduler_overrun_ns() -> u64 {
     registry::with_current(|ctx| ctx.scheduler_overrun_ns()).unwrap_or(0)
 }
 
+/// The current shard's counters as they stand now ([`crate::shard::ShardContext::counters`]): what a task
+/// tells of the loop it runs on (its steps, waits, spins, timers fired, the reads its learning made), as a
+/// node reports them when it stops. None off a shard thread.
+pub fn shard_counters() -> Option<crate::shard_loop::Counters> {
+    registry::with_current(|ctx| ctx.counters())
+}
+
 /// The current shard's timer tick in nanoseconds ([`crate::shard::ShardContext::timer_tick_ns`]): a sleep
 /// ends up to a tick later than due by design, and later still by [`scheduler_overrun_ns`]. A wait that must
 /// end before another's (an answer before its asker gives up) sets both aside. Zero off a shard thread.

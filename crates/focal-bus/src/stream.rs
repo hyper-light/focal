@@ -34,7 +34,7 @@ pub struct StreamState {
 }
 
 /// What one stream costs the table: its state, and its map entry with the map's control byte.
-const STREAM_BYTES: usize =
+pub const STREAM_BYTES: usize =
     std::mem::size_of::<StreamState>() + std::mem::size_of::<(u64, usize)>() + 1;
 
 /// The streams of a part, by identity, at most `limit` of them.

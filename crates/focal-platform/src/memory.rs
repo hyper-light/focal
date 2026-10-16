@@ -17,6 +17,14 @@ pub fn memory_limit() -> Option<u64> {
     }
 }
 
+/// What a process of this machine holds as its own envelope: three quarters of what it may use
+/// ([`memory_limit`]), the share .NET's GC takes of a container's limit by default
+/// (`GCHeapHardLimitPercent`), the rest left to the allocator, the runtime and the kernel's page
+/// cache and socket queues. `None` where the machine's memory cannot be read.
+pub fn memory_envelope() -> Option<u64> {
+    memory_limit().map(|limit| limit.checked_div(4).unwrap_or(0).saturating_mul(3))
+}
+
 #[cfg(target_os = "linux")]
 fn physical() -> Option<u64> {
     meminfo_total(&read_small("/proc/meminfo")?)

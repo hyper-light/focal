@@ -1,5 +1,6 @@
 mod args;
 mod authored;
+pub(crate) mod bus;
 mod claim_wait;
 pub(crate) mod cluster;
 pub(crate) mod command_tree;

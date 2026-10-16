@@ -1,0 +1,21 @@
+# A busy machine, the condition every system is judged under (pubsub.sh adds this file unless
+# BUSY=0): the system's node is held to the cores NODE_CPUSET names, and a busy loop at the same
+# priority runs on each of those cores beside it, so each of the node's threads waits for its core
+# as it does on a host whose other work wants every core it has. The loop is the hog service: one
+# shell loop per node CPU, gone with the run (`docker compose down`). The generator keeps cores of
+# its own (it is the measuring instrument, not the system measured).
+services:
+  nats:
+    cpuset: "${NODE_CPUSET}"
+  kafka:
+    cpuset: "${NODE_CPUSET}"
+  redis:
+    cpuset: "${NODE_CPUSET}"
+  bus:
+    cpuset: "${NODE_CPUSET}"
+  hog:
+    image: ${FOCAL_IMAGE:-focal:bench}
+    profiles: [nats, kafka, redis, focal-bus]
+    cpuset: "${NODE_CPUSET}"
+    networks: [bench]
+    command: ["sh", "-c", "i=0; while [ $$i -lt ${NODE_CPUS:-1} ]; do (while :; do :; done) & i=$$((i + 1)); done; wait"]

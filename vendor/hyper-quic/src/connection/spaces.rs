@@ -1,7 +1,7 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     mem,
-    ops::{Bound, Range},
+    ops::{Bound, Range, RangeBounds},
 };
 
 use rand::{Rng, RngExt};
@@ -36,9 +36,8 @@ pub(super) struct PacketSpace {
     pub(super) largest_ack_eliciting_sent: u64,
     /// Number of packets in `sent_packets` with numbers above `largest_ack_eliciting_sent`
     pub(super) unacked_non_ack_eliciting_tail: u64,
-    /// Transmitted but not acked
-    // We use a BTreeMap here so we can efficiently query by range on ACK and for loss detection
-    pub(super) sent_packets: BTreeMap<u64, SentPacket>,
+    /// Transmitted but not acked, in packet number order ([`SentPackets`])
+    pub(super) sent_packets: SentPackets,
     /// Number of explicit congestion notification codepoints seen on incoming packets
     pub(super) ecn_counters: frame::EcnCounts,
     /// Recent ECN counters sent by the peer in ACK frames
@@ -90,7 +89,7 @@ impl PacketSpace {
             largest_acked_packet_sent: now,
             largest_ack_eliciting_sent: 0,
             unacked_non_ack_eliciting_tail: 0,
-            sent_packets: BTreeMap::new(),
+            sent_packets: SentPackets::default(),
             ecn_counters: frame::EcnCounts::ZERO,
             ecn_feedback: frame::EcnCounts::ZERO,
 
@@ -348,15 +347,15 @@ impl PacketSpace {
             // non-ACK-eliciting packets must only contain PADDING, ACK, and CONNECTION_CLOSE
             // frames, which require no special handling on ACK or loss beyond removal from
             // in-flight counters if padded.
-            forgotten = self
+            let oldest = self
                 .sent_packets
                 .range((
                     Bound::Excluded(self.largest_ack_eliciting_sent),
                     Bound::Unbounded,
                 ))
                 .next()
-                .map(|(&oldest, _)| oldest)
-                .and_then(|oldest| self.sent_packets.remove(&oldest));
+                .map(|(&oldest, _)| oldest);
+            forgotten = oldest.and_then(|oldest| self.sent_packets.remove(&oldest));
         } else {
             // Bounded by the limit just above
             self.unacked_non_ack_eliciting_tail =
@@ -426,7 +425,7 @@ pub(super) struct SentPacket {
     /// Whether an acknowledgement is expected directly in response to this packet.
     pub(super) ack_eliciting: bool,
     /// The largest packet number acknowledged by this packet
-    pub(super) largest_acked: Option<u64>,
+    pub(super) largest_acked: LargestAcked,
     /// Data which needs to be retransmitted in case the packet is lost.
     /// The data is boxed to minimize `SentPacket` size for the typical case of
     /// packets only containing ACKs and STREAM frames.
@@ -445,10 +444,36 @@ pub(super) struct SentPacket {
     /// Whether the packet is the path's warm-up's (`Connection::write_warm_up`), whose samples
     /// alone judge the warm-up's queue
     pub(super) warm_up: bool,
+    /// What the path had delivered as the packet went, for the delivery-rate sample its
+    /// acknowledgement takes ([`super::Delivery`]); read of a packet in flight alone
+    pub(super) delivery: super::Snapshot,
+    /// Whether the packet went in a phase the application limited, its delivery's sample then of
+    /// the application (draft-cheng-iccrg-delivery-rate-estimation-02 §3.4)
+    pub(super) app_limited: bool,
     /// The next ack-eliciting packet this space sent after this one, if this one is ack-eliciting:
     /// its number and when it went, the neighbour whose fate says whether a loss of this one came
     /// in a burst (`losses.rs`)
     pub(super) next: Option<(u64, Instant)>,
+}
+
+/// The largest packet number an ACK frame in a packet acknowledged, held as one more than it in
+/// eight bytes, `None`'s in the niche: a packet number is below 2^62 (RFC 9000 §12.3), so one more
+/// never overflows. Sixteen bytes as an `Option<u64>`, and a sent packet's record holds 128.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct LargestAcked(Option<std::num::NonZeroU64>);
+
+impl LargestAcked {
+    pub(super) fn new(largest: Option<u64>) -> Self {
+        Self(
+            largest
+                .and_then(|pn| pn.checked_add(1))
+                .and_then(std::num::NonZeroU64::new),
+        )
+    }
+
+    pub(super) fn get(self) -> Option<u64> {
+        self.0.and_then(|held| held.get().checked_sub(1))
+    }
 }
 
 /// Retransmittable data queue
@@ -1103,9 +1128,235 @@ const MAX_PACKET_NUMBER: u64 = 1 << 62;
 /// Ensures we can always fit all our ACKs in a single minimum-MTU packet with room to spare
 const MAX_ACK_BLOCKS: usize = 64;
 
+/// A packet space's packets sent and not yet acknowledged, declared lost or forgotten, in packet
+/// number order. Packet numbers only grow (RFC 9000 §12.3), so a packet sent goes at the back, and
+/// acknowledgements come oldest first, so most packets leave from the front: a deque, where
+/// upstream's `BTreeMap` moved the rest of a leaf's packets on each take (a [`SentPacket`] is some
+/// two hundred bytes and a leaf holds eleven), the receive path's largest copy after its own data
+/// (macOS `sample`, 100,000 messages a second, 2026-10-16). Chromium keeps its unacknowledged
+/// packets so, a deque from the least unacknowledged (`QuicUnackedPacketMap`). A take from the
+/// middle (an acknowledgement past a loss, a forgotten acknowledgement-only packet) moves the
+/// shorter side; a lookup is a binary search, the newest asked first. Its methods are the map's it
+/// replaces, so its uses read as they did.
+#[derive(Debug, Default)]
+pub(super) struct SentPackets {
+    packets: VecDeque<(u64, SentPacket)>,
+}
+
+impl SentPackets {
+    /// Where `number` is, or where it would go.
+    fn search(&self, number: u64) -> Result<usize, usize> {
+        // The newest is the one most asked for: the last ack-eliciting packet, its successor's
+        // neighbour.
+        match self.packets.back() {
+            Some((last, _)) if *last == number => Ok(self.packets.len().saturating_sub(1)),
+            Some((last, _)) if *last < number => Err(self.packets.len()),
+            _ => self.packets.binary_search_by_key(&number, |(pn, _)| *pn),
+        }
+    }
+
+    /// The first place whose number is `number` or more.
+    fn lower(&self, number: u64) -> usize {
+        self.packets.partition_point(|(pn, _)| *pn < number)
+    }
+
+    /// The places `range` spans, within the deque.
+    fn span(&self, range: &impl RangeBounds<u64>) -> Range<usize> {
+        let len = self.packets.len();
+        let past = |n: u64| n.checked_add(1).map_or(len, |n| self.lower(n));
+        let from = match range.start_bound() {
+            Bound::Included(&n) => self.lower(n),
+            Bound::Excluded(&n) => past(n),
+            Bound::Unbounded => 0,
+        };
+        let to = match range.end_bound() {
+            Bound::Included(&n) => past(n),
+            Bound::Excluded(&n) => self.lower(n),
+            Bound::Unbounded => len,
+        }
+        .min(len);
+        from.min(to)..to
+    }
+
+    /// Packets held (what a test of the copies' scan reads).
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    /// Holds `packet` as `number`, replacing one held as it.
+    pub(super) fn insert(&mut self, number: u64, packet: SentPacket) {
+        match self.search(number) {
+            Ok(at) => {
+                if let Some(place) = self.packets.get_mut(at) {
+                    place.1 = packet;
+                }
+            }
+            Err(at) => self.packets.insert(at, (number, packet)),
+        }
+    }
+
+    /// Takes the packet held as `number`.
+    pub(super) fn remove(&mut self, number: &u64) -> Option<SentPacket> {
+        let at = self.search(*number).ok()?;
+        self.packets.remove(at).map(|(_, packet)| packet)
+    }
+
+    /// The packet held as `number`.
+    pub(super) fn get(&self, number: &u64) -> Option<&SentPacket> {
+        let at = self.search(*number).ok()?;
+        self.packets.get(at).map(|(_, packet)| packet)
+    }
+
+    /// The packet held as `number`, to change.
+    pub(super) fn get_mut(&mut self, number: &u64) -> Option<&mut SentPacket> {
+        let at = self.search(*number).ok()?;
+        self.packets.get_mut(at).map(|(_, packet)| packet)
+    }
+
+    /// Whether a packet is held as `number`.
+    pub(super) fn contains_key(&self, number: &u64) -> bool {
+        self.search(*number).is_ok()
+    }
+
+    /// The packets numbered within `range`, in order.
+    pub(super) fn range(
+        &self,
+        range: impl RangeBounds<u64>,
+    ) -> impl Iterator<Item = (&u64, &SentPacket)> {
+        let span = self.span(&range);
+        self.packets.range(span).map(|(pn, packet)| (pn, packet))
+    }
+
+    /// The packets numbered within `range`, in order, to change.
+    pub(super) fn range_mut(
+        &mut self,
+        range: impl RangeBounds<u64>,
+    ) -> impl Iterator<Item = (&u64, &mut SentPacket)> {
+        let span = self.span(&range);
+        self.packets
+            .range_mut(span)
+            .map(|(pn, packet)| (&*pn, packet))
+    }
+
+    /// Every packet held, in order.
+    pub(super) fn values(&self) -> impl Iterator<Item = &SentPacket> {
+        self.packets.iter().map(|(_, packet)| packet)
+    }
+
+    /// Every packet held, in order, to change.
+    pub(super) fn values_mut(&mut self) -> impl Iterator<Item = &mut SentPacket> {
+        self.packets.iter_mut().map(|(_, packet)| packet)
+    }
+
+    /// Every packet held, in order, taken.
+    pub(super) fn into_values(self) -> impl Iterator<Item = SentPacket> {
+        self.packets.into_iter().map(|(_, packet)| packet)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// A sent packet whose size names its number, so the two holders' answers can be compared.
+    fn sent_as(number: u64) -> SentPacket {
+        SentPacket {
+            path_generation: 0,
+            largest_acked: LargestAcked::new(None),
+            time_sent: Instant::now(),
+            size: (number % u64::from(u16::MAX)) as u16,
+            ack_eliciting: true,
+            retransmits: ThinRetransmits::default(),
+            stream_frames: frame::StreamMetaVec::new(),
+            copied: false,
+            handshake_flight: false,
+            warm_up: false,
+            delivery: super::super::Snapshot::default(),
+            app_limited: false,
+            next: None,
+        }
+    }
+
+    /// The deque answers as the `BTreeMap` it replaced does, over a space's own operations from a
+    /// seed: sends with a skipped number now and then, takes oldest first and from the middle (a
+    /// loss, a forgotten acknowledgement-only packet), lookups, and every range shape its uses
+    /// ask (an acknowledgement's inclusive range, loss detection's prefix, the tail past a
+    /// number).
+    #[test]
+    fn sent_packets_answer_as_the_map_they_replaced() {
+        use std::collections::BTreeMap;
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut deque = SentPackets::default();
+        let mut map = BTreeMap::new();
+        let mut number = 0u64;
+        for _ in 0..20_000 {
+            match next() % 10 {
+                0..=4 => {
+                    number += 1 + next() % 3 / 2;
+                    deque.insert(number, sent_as(number));
+                    map.insert(number, sent_as(number));
+                }
+                5..=6 => {
+                    let oldest = map.keys().next().copied();
+                    if let Some(oldest) = oldest {
+                        assert_eq!(
+                            deque.remove(&oldest).map(|p| p.size),
+                            map.remove(&oldest).map(|p| p.size)
+                        );
+                    }
+                }
+                7 => {
+                    let any = next() % (number + 2);
+                    assert_eq!(
+                        deque.remove(&any).map(|p| p.size),
+                        map.remove(&any).map(|p| p.size)
+                    );
+                }
+                _ => {
+                    let at = next() % (number + 2);
+                    assert_eq!(deque.contains_key(&at), map.contains_key(&at));
+                    assert_eq!(deque.get(&at).map(|p| p.size), map.get(&at).map(|p| p.size));
+                    let to = at + next() % 8;
+                    let numbers = |i: &mut dyn Iterator<Item = u64>| i.collect::<Vec<_>>();
+                    assert_eq!(
+                        numbers(&mut deque.range(at..=to).map(|(n, _)| *n)),
+                        numbers(&mut map.range(at..=to).map(|(n, _)| *n))
+                    );
+                    assert_eq!(
+                        numbers(&mut deque.range(0..at).map(|(n, _)| *n)),
+                        numbers(&mut map.range(0..at).map(|(n, _)| *n))
+                    );
+                    assert_eq!(
+                        deque
+                            .range((Bound::Excluded(at), Bound::Unbounded))
+                            .next()
+                            .map(|(n, _)| *n),
+                        map.range((Bound::Excluded(at), Bound::Unbounded))
+                            .next()
+                            .map(|(n, _)| *n)
+                    );
+                    assert_eq!(
+                        numbers(&mut deque.range_mut(..to).map(|(n, _)| *n)),
+                        numbers(&mut map.range_mut(..to).map(|(n, _)| *n))
+                    );
+                }
+            }
+            assert_eq!(deque.len(), map.len());
+        }
+        let held: Vec<u16> = deque.values().map(|p| p.size).collect();
+        assert_eq!(held, map.values().map(|p| p.size).collect::<Vec<_>>());
+        assert_eq!(
+            deque.into_values().map(|p| p.size).collect::<Vec<_>>(),
+            held
+        );
+    }
 
     #[test]
     fn sanity() {

@@ -99,8 +99,14 @@ fn region(expected_revision: u64, id: u128) -> ControlCommand {
 fn leader(replica: &mut ControlReplica) {
     replica.drain(&Evidence).unwrap();
     replica.campaign().unwrap();
+    // A sole voter leads once the write of its vote is durable (hyper-raft 5189926, etcd's
+    // `campaign`), and the drive that answer brings writes the blank entry its term begins with.
+    // Over the shell's log a drain waits only for the writes out when it began, so that entry
+    // commits in the next drain; over focal-log the drain that wrote the vote has committed it,
+    // and the next finds nothing to do.
     replica.drain(&Evidence).unwrap();
     assert_eq!(replica.status().role, StateRole::Leader);
+    replica.drain(&Evidence).unwrap();
 }
 fn commit(replica: &mut ControlReplica, request: ControlRequest) -> ControlReceipt {
     let id = request.id;

@@ -92,6 +92,11 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// The event bus (doc 32): run one of its nodes.
+    Bus {
+        #[command(subcommand)]
+        command: cli::bus::BusCommand,
+    },
     /// Run a program against focal's tools, as the MCP server's code mode does.
     Code {
         #[command(subcommand)]
@@ -283,6 +288,14 @@ fn execute(args: Args) -> Result<()> {
             _ => cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into),
         };
     }
+    // An event bus node runs to completion on one shard of this thread, which
+    // it owns for as long as it serves (`cli::bus::run`).
+    if let Commands::Bus {
+        command: cli::bus::BusCommand::Start(start),
+    } = args.command
+    {
+        return cli::bus::run(start);
+    }
     // The command is one root task on one shard of this thread: its
     // connections' endpoints live on that shard for as long as it runs, and
     // whatever it spawned is cancelled and joined when it returns. A runtime
@@ -379,6 +392,9 @@ async fn run(args: Args) -> Result<()> {
         Commands::Code { command } => {
             cli::code(&settings, args.client_context.as_deref(), command).map_err(Into::into)
         }
+        Commands::Bus {
+            command: cli::bus::BusCommand::Start(start),
+        } => cli::bus::start(start).await.map_err(Into::into),
         Commands::Context { command } => cli::context::run(&settings, command)
             .await
             .map_err(Into::into),

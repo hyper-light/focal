@@ -586,6 +586,12 @@ fn a_change_of_membership_is_applied_only_once_the_log_holds_its_commit() {
     let mut alone = DurableNode::open(config(1), dirs[0].path()).unwrap();
     assert_eq!(alone.status().voters, vec![1]);
     alone.campaign().unwrap();
+    // A sole voter counts its own vote once the write naming it is durable (hyper-raft 5189926,
+    // etcd's `campaign`). The first drain hands over what the log replayed at opening, a page of
+    // committed entries, and leaves the vote unwritten: the member is a candidate still.
+    drop(alone.drain().unwrap());
+    assert_eq!(alone.status().role, StateRole::Candidate);
+    // The next writes the vote, and the member leads on it.
     drop(alone.drain().unwrap());
     assert_eq!(alone.status().role, StateRole::Leader);
     alone.propose(b"alone".to_vec()).unwrap();

@@ -142,7 +142,10 @@ fn actual_help_describes_local_configuration_and_only_supported_family_filters()
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(help.contains("YAML configuration file"));
     assert!(help.contains("durable ledger and local client state"));
-    assert!(help.contains("start node"));
+    // `start` runs the durable service or one event bus node: one row of the help, its things
+    // listed.
+    assert!(help.contains("start bus | node"), "{help}");
+    assert!(help.contains("Run the durable service"), "{help}");
     assert!(help.contains("GLOBAL OPTIONS"));
     assert!(!help.contains("running founder"));
     for (family, present, absent) in [

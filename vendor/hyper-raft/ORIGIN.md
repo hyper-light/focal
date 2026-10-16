@@ -391,6 +391,28 @@ Not a port: this repository's change, the first of the core steps the durable sh
 - **Measured**: allocations identical on every workload, time within the noise
   (`docs/benchmarks.md`, "Readies in flight").
 
+## I9: a candidate's vote for itself counts once it is durable
+
+Not a port: this repository's change (`docs/durable.md` I9, `docs/raft.md` §3.3), etcd's rule
+(`raft.go`, `campaign`: the self vote is delivered after the write that holds it).
+
+- **The vote** (`src/raft.rs`, `src/node.rs`): `ask_votes` records a candidate's vote for itself as
+  owed (`Raft::self_vote`) where it counted it at once; `RawNode::on_persist` and `advance_append`
+  count it (`Raft::on_vote_durable`) once the write naming it is durable, after what that write held
+  is stabilized. A pre-candidate's vote changes nothing durable and counts at once, as a marked
+  member's refusal does. Counted at once under R-4, a sole voter led a term on a vote it could lose
+  to a crash, and the term had a second leader (hyper-durable's simulation, seed 206).
+- **A sole voter by suspicion** campaigns once a term: while its vote's write is out it waits for
+  that write with no campaign armed (`Raft::wake_follower`), for a campaign at every wake moved its
+  term past the write each time its owner woke it first (hyper-durable-e2e's one member, term
+  1,232,434).
+- **What an owner sees**: a sole voter leads after its first write, so a proposal made before the
+  owner drives that write is refused `NoLeader`, as any proposal without a leader is; a group of
+  more voters is unchanged in time, its candidate's requests leaving after the same write (I1).
+- **Tests**: `a_sole_voter_leads_only_once_its_vote_is_durable` (`src/tests.rs`),
+  `a_sole_voter_waits_for_its_own_vote_and_campaigns_once` (`tests/suspicion.rs`), and Election
+  Safety's oracle in hyper-durable's simulation at 10,000 seeds of each shape in CI.
+
 ## R-6: the durable commit, the apply pause, applying before durability
 
 Not a port: this repository's change (`docs/durable.md` §4.4, which states the design as built;

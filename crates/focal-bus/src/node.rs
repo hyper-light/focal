@@ -1,0 +1,754 @@
+//! A bus node: one part, its publishers and its subscribers, driven by hyper-transport's events.
+//!
+//! A publish is appended to its stream (checked whole, copied once) and then delivered to each of
+//! the stream's subscribers by the subscriber's own cursor: a delivery reads the stored batch where
+//! the stream's chain leads and queues it on the subscriber's lane, as long as the lane has room. A
+//! subscriber whose lane is full is left where it is, holding nothing but its cursor, and goes on
+//! when hyper-transport says the lane has room again (`Event::LaneRoom`); the node keeps no queue
+//! for it.
+//!
+//! Nothing a live subscriber is owed is dropped. Its lane is lossless and holds about a congestion
+//! window (hyper-transport `Classes::lossless`), so a full lane says its path carries no more; the
+//! node then holds the publishers feeding its stream (`Endpoint::hold_lane`), whose batches wait in
+//! QUIC behind the node's receive window, and lets them go once the stream's subscribers take
+//! again. A publisher past what the slowest live subscriber takes is held at its own lane, and no
+//! queue grows past what the path carries. A subscriber that goes, or hangs until the transport's
+//! idle timeout closes it, holds nothing. The part keeps what the node's memory holds of its
+//! batches, for subscriptions that start behind (a reconnect, a replay): a batch, or a frame the
+//! transport waits to take (`Stats::frames_reserving`), that the memory cannot hold now is given the
+//! room of the oldest batches the part retains, let go oldest first ([`Node::relieve_transport`]). A
+//! subscriber whose cursor falls below its stream's retained floor is told the offsets it missed
+//! (`Gap`) and goes on from the floor, where NATS and Redis disconnect such a subscriber without
+//! saying what it lost.
+//!
+//! Every table is bounded, and its memory charged to the node's budget before it grows: streams at
+//! the part's bound, subscriptions at `subscriptions`, both the rows the node's memory holds, and
+//! the window at what the memory holds.
+
+use std::collections::{HashMap, VecDeque};
+
+use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
+use hyper_transport::{
+    Budget, Classes, Directory, Endpoint, Epoch, Event, ExchangeId, LaneId, PeerId, Refusal,
+};
+
+use crate::BusError;
+use crate::batch::Batch;
+use crate::log::{Position, SegmentPool};
+use crate::part::{Appended, Part, PartLimits};
+use crate::stream::STREAM_BYTES;
+use crate::wire::{self, Bus, Gap, Kind, LANE, Subscribe, Subscribed};
+
+/// What a node holds at most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeConfig {
+    /// Each segment's bytes.
+    pub segment_bytes: usize,
+    /// Streams the part holds.
+    pub streams: usize,
+    /// Subscriptions at once.
+    pub subscriptions: usize,
+}
+
+/// What one subscription costs the node's tables at least: its slot, its place on the free list,
+/// and its place among its stream's subscribers.
+const SUBSCRIPTION_BYTES: usize = std::mem::size_of::<Option<Subscription>>()
+    + std::mem::size_of::<usize>()
+    + std::mem::size_of::<usize>();
+
+impl NodeConfig {
+    /// Each segment's bytes: [`wire::SEGMENT_BATCHES`] of the largest batch, so a segment's last
+    /// batch leaves at most a fifth of it unused.
+    pub const SEGMENT_BYTES: usize = {
+        let bytes = wire::BATCH_BOUND.saturating_mul(wire::SEGMENT_BATCHES);
+        if bytes > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            bytes as usize
+        }
+    };
+    /// A node's bounds for a node of `memory_bytes`: the streams and the subscriptions whose rows
+    /// its memory holds ([`STREAM_BYTES`], [`SUBSCRIPTION_BYTES`] each at least). Each row is
+    /// charged as it is taken, so the budget refuses no later than these; nothing is held before
+    /// it is used.
+    pub const fn sized(memory_bytes: usize) -> Self {
+        Self {
+            segment_bytes: Self::SEGMENT_BYTES,
+            streams: memory_bytes / STREAM_BYTES,
+            subscriptions: memory_bytes / SUBSCRIPTION_BYTES,
+        }
+    }
+}
+
+/// What a node has done.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeStats {
+    /// Batches appended.
+    pub published: u64,
+    /// Publishes refused, each for its typed reason.
+    pub refused: u64,
+    /// Batches queued to subscribers.
+    pub delivered: u64,
+    /// Gap notices sent.
+    pub gaps: u64,
+    /// Times a subscriber's lane was full.
+    pub blocked: u64,
+    /// Subscriptions made.
+    pub subscribed: u64,
+    /// Times a publisher's lane was held for a stream whose subscriber took no more.
+    pub held: u64,
+}
+
+/// A batch the part retains, in the order appended: its stream, and the offset after it.
+#[derive(Clone, Copy, Debug)]
+struct Retained {
+    stream: u64,
+    end: u64,
+}
+
+/// A publisher's lane the node holds while a stream it fed has a subscriber that takes no more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Holding {
+    peer: PeerId,
+    lane: LaneId,
+    stream: u64,
+}
+
+/// A subscriber of one stream on one connection.
+#[derive(Clone, Copy, Debug)]
+struct Subscription {
+    peer: PeerId,
+    epoch: Epoch,
+    stream: u64,
+    /// The next offset to deliver.
+    cursor: u64,
+    /// Where the batch last delivered is (a position word), to follow the chain from.
+    last: Option<u64>,
+    /// Its lane was full: it waits for room.
+    blocked: bool,
+}
+
+/// One bus node's state.
+#[derive(Debug)]
+pub struct Node {
+    pool: SegmentPool,
+    part: Part,
+    retained: VecDeque<Retained>,
+    config: NodeConfig,
+    budget: MemoryBudget,
+    /// The charge for the retained batches' index, by its capacity.
+    index: Option<Allocation>,
+    /// The charge for the subscriptions' tables and what serves them, by their capacities.
+    tables: Option<Allocation>,
+    subscriptions: Vec<Option<Subscription>>,
+    free: Vec<usize>,
+    by_stream: HashMap<u64, Vec<usize>>,
+    /// The subscriptions one event delivers to, gathered here and pumped after: kept between
+    /// events, so a publish or a lane's room allocates nothing once it has grown to the most
+    /// subscribers one stream has had.
+    scratch: Vec<usize>,
+    /// The publishers' lanes held for streams whose subscribers take no more: one for each
+    /// (publisher's lane, stream), at most a publisher's lanes for each subscription that blocks.
+    holding: Vec<Holding>,
+    /// The lanes one release found free, kept between releases.
+    freed: Vec<(PeerId, LaneId)>,
+    stats: NodeStats,
+}
+
+/// How a delivery attempt ended.
+enum Sent {
+    Queued,
+    Full,
+    Gone,
+}
+
+impl Node {
+    /// A node holding nothing, its segments and tables charged to `budget`.
+    pub fn new(config: NodeConfig, budget: MemoryBudget) -> Result<Self, BusError> {
+        let batch_bytes = usize::try_from(wire::BATCH_BOUND)
+            .map_err(|_| BusError::Configuration("the batch bound"))?;
+        if config.segment_bytes < batch_bytes {
+            return Err(BusError::Configuration(
+                "a segment holds at least one batch of the largest size",
+            ));
+        }
+        Ok(Self {
+            pool: SegmentPool::new(config.segment_bytes, budget.clone())?,
+            part: Part::new(
+                PartLimits {
+                    streams: config.streams,
+                    batch_bytes,
+                },
+                budget.clone(),
+            ),
+            retained: VecDeque::new(),
+            config,
+            budget,
+            index: None,
+            tables: None,
+            subscriptions: Vec::new(),
+            free: Vec::new(),
+            by_stream: HashMap::new(),
+            scratch: Vec::new(),
+            holding: Vec::new(),
+            freed: Vec::new(),
+            stats: NodeStats::default(),
+        })
+    }
+
+    /// What the node has done.
+    pub const fn stats(&self) -> NodeStats {
+        self.stats
+    }
+
+    /// The node's part.
+    pub const fn part(&self) -> &Part {
+        &self.part
+    }
+
+    /// The segment pool.
+    pub const fn pool(&self) -> &SegmentPool {
+        &self.pool
+    }
+
+    /// Acts on one of the endpoint's events.
+    pub fn on_event<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, event: Event<Bus>)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        match event {
+            Event::Frame {
+                kind: Kind::Publish,
+                peer,
+                lane,
+                frame,
+            } => {
+                let stream = self.publish(endpoint, frame.bytes());
+                endpoint.release(frame);
+                if let Some(stream) = stream {
+                    self.hold_if_blocked(endpoint, peer, lane, stream);
+                }
+            }
+            Event::Frame { frame, .. } => endpoint.release(frame),
+            Event::Request {
+                exchange,
+                peer,
+                epoch,
+                kind: Kind::Subscribe,
+                ..
+            } => self.subscribe(endpoint, exchange, peer, epoch),
+            Event::Request { exchange, .. } => endpoint.refuse_exchange(exchange, Refusal::Kind),
+            Event::LaneRoom { peer, epoch, .. } => {
+                self.resume(endpoint, peer, epoch);
+                self.release_unblocked(endpoint);
+            }
+            Event::Closed { peer, epoch, .. } => {
+                self.forget(peer, epoch);
+                self.holding.retain(|held| held.peer != peer);
+                self.release_unblocked(endpoint);
+            }
+            Event::Connected { .. }
+            | Event::Reply { .. }
+            | Event::BodyReady { .. }
+            | Event::Writable { .. }
+            | Event::Refused { .. }
+            | Event::Unreachable { .. } => {}
+        }
+    }
+
+    /// Appends and delivers a published batch; its stream, if it was appended. What the memory
+    /// cannot hold for it, the oldest batches retained give up ([`Node::relieve`]).
+    fn publish<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, bytes: &[u8]) -> Option<u64>
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        let mut relieved = false;
+        // Bounded: each turn but the last gives a warm segment or a retained batch back.
+        let appended = loop {
+            match self.take(bytes) {
+                Ok(appended) => break appended,
+                Err(BusError::Memory(_)) if self.relieve() => relieved = true,
+                Err(_) => {
+                    self.stats.refused = self.stats.refused.saturating_add(1);
+                    if relieved {
+                        endpoint.retry_reserving();
+                    }
+                    return None;
+                }
+            }
+        };
+        self.stats.published = self.stats.published.saturating_add(1);
+        // The budget holds more now: a lane whose frame waited for it reads on.
+        if relieved {
+            endpoint.retry_reserving();
+        }
+        let mut slots = std::mem::take(&mut self.scratch);
+        slots.clear();
+        if let Some(subscribers) = self.by_stream.get(&appended.stream) {
+            slots.extend_from_slice(subscribers);
+        }
+        for slot in slots.iter().copied() {
+            self.pump(endpoint, slot);
+        }
+        self.scratch = slots;
+        Some(appended.stream)
+    }
+
+    /// Takes a published batch into the part, its place in the window's index charged first, so
+    /// the part never holds a batch the window cannot let go.
+    fn take(&mut self, bytes: &[u8]) -> Result<Appended, BusError> {
+        if self.retained.len() == self.retained.capacity() {
+            self.retained
+                .try_reserve(1)
+                .map_err(|_| BusError::Memory(focal_memory::MemoryError::AllocationFailed))?;
+        }
+        let index = self
+            .retained
+            .capacity()
+            .checked_mul(std::mem::size_of::<Retained>())
+            .ok_or(BusError::Capacity("the window's index"))?;
+        charge(&self.budget, &mut self.index, index)?;
+        // A publish came through the transport, which checked its batch's CRC where the wire says
+        // it carries one.
+        let appended = if Bus::embedded_checksum(Kind::Publish).is_some() {
+            self.part.append_verified(&mut self.pool, bytes)?
+        } else {
+            self.part.append(&mut self.pool, bytes)?
+        };
+        // Its room was reserved above: nothing is allocated here.
+        self.retained.push_back(Retained {
+            stream: appended.stream,
+            end: appended.base.saturating_add(u64::from(appended.count)),
+        });
+        Ok(appended)
+    }
+
+    /// Gives memory back for what is live, at the window's expense: the pool's warm segments first,
+    /// then the oldest batches the part retains, until a segment is given back. Whether anything
+    /// was.
+    pub fn relieve(&mut self) -> bool {
+        if self.pool.warm() > 0 {
+            self.pool.shed();
+            return true;
+        }
+        let (_, returned) = self.pool.churn();
+        // Bounded: each turn lets one retained batch go.
+        while let Some(oldest) = self.retained.pop_front() {
+            // A stream's batches leave in order, so its floor moves past the oldest's end.
+            let _ = self
+                .part
+                .release_below(&mut self.pool, oldest.stream, oldest.end);
+            if self.pool.warm() > 0 || self.pool.churn().1 > returned {
+                self.pool.shed();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Gives the transport's frames that wait for memory (`Stats::frames_reserving`) the room of
+    /// the oldest batches retained, until none waits or the part retains nothing: live traffic goes
+    /// before what is kept for subscribers that start behind. Asked once a turn of the owner's.
+    pub fn relieve_transport<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        // Bounded: `relieve` is false once the part retains nothing.
+        while endpoint.stats().frames_reserving > 0 && self.relieve() {
+            endpoint.retry_reserving();
+        }
+    }
+
+    /// The bytes the subscriptions' tables and what serves them hold, by their capacities: the
+    /// slots, the free list, the scratch lists and the held lanes, and the map of each stream's
+    /// subscribers (its buckets kept at most seven eighths full, a power of two, and each stream's
+    /// list).
+    fn table_bytes(&self) -> Option<usize> {
+        let of = |capacity: usize, item: usize| capacity.checked_mul(item);
+        let buckets = self
+            .by_stream
+            .capacity()
+            .checked_mul(8)?
+            .checked_div(7)?
+            .checked_next_power_of_two()?;
+        let mut bytes = of(
+            self.subscriptions.capacity(),
+            std::mem::size_of::<Option<Subscription>>(),
+        )?
+        .checked_add(of(self.free.capacity(), std::mem::size_of::<usize>())?)?
+        .checked_add(of(self.scratch.capacity(), std::mem::size_of::<usize>())?)?
+        .checked_add(of(self.holding.capacity(), std::mem::size_of::<Holding>())?)?
+        .checked_add(of(
+            self.freed.capacity(),
+            std::mem::size_of::<(PeerId, LaneId)>(),
+        )?)?
+        .checked_add(of(
+            buckets,
+            std::mem::size_of::<(u64, Vec<usize>)>().checked_add(1)?,
+        )?)?;
+        for slots in self.by_stream.values() {
+            bytes = bytes.checked_add(of(slots.capacity(), std::mem::size_of::<usize>())?)?;
+        }
+        Some(bytes)
+    }
+
+    /// Room for one more subscription to `stream`, charged before it is taken: its slot, its
+    /// stream's entry and list, and the free and scratch lists it may come to occupy, so dropping it
+    /// or delivering to it allocates nothing.
+    fn reserve_subscription(&mut self, stream: u64) -> Result<(), BusError> {
+        let short = |_| BusError::Memory(focal_memory::MemoryError::AllocationFailed);
+        if self.free.is_empty() {
+            self.subscriptions.try_reserve(1).map_err(short)?;
+        }
+        let slots = self.subscriptions.capacity();
+        self.free
+            .try_reserve(slots.saturating_sub(self.free.len()))
+            .map_err(short)?;
+        self.scratch
+            .try_reserve(slots.saturating_sub(self.scratch.len()))
+            .map_err(short)?;
+        self.by_stream.try_reserve(1).map_err(short)?;
+        if let Some(list) = self.by_stream.get_mut(&stream) {
+            list.try_reserve(1).map_err(short)?;
+        }
+        let bytes = self
+            .table_bytes()
+            .ok_or(BusError::Capacity("the subscriptions' tables"))?;
+        charge(&self.budget, &mut self.tables, bytes)
+    }
+
+    /// Room for one more held lane, charged before it is taken, and for the lanes a release may
+    /// find free.
+    fn reserve_hold(&mut self) -> Result<(), BusError> {
+        let short = |_| BusError::Memory(focal_memory::MemoryError::AllocationFailed);
+        self.holding.try_reserve(1).map_err(short)?;
+        let held = self.holding.capacity();
+        self.freed
+            .try_reserve(held.saturating_sub(self.freed.len()))
+            .map_err(short)?;
+        let bytes = self
+            .table_bytes()
+            .ok_or(BusError::Capacity("the subscriptions' tables"))?;
+        charge(&self.budget, &mut self.tables, bytes)
+    }
+
+    /// Whether a subscriber of `stream` takes no more: its lane is full, its path carrying what it
+    /// can.
+    fn blocked(&self, stream: u64) -> bool {
+        self.by_stream.get(&stream).is_some_and(|slots| {
+            slots.iter().any(|slot| {
+                self.subscriptions
+                    .get(*slot)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|subscription| subscription.blocked)
+            })
+        })
+    }
+
+    /// Holds `peer`'s `lane`, which fed `stream`, while a subscriber of the stream takes no more.
+    fn hold_if_blocked<B, D>(
+        &mut self,
+        endpoint: &mut Endpoint<Bus, B, D>,
+        peer: PeerId,
+        lane: LaneId,
+        stream: u64,
+    ) where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        if !self.blocked(stream) {
+            return;
+        }
+        let held = Holding { peer, lane, stream };
+        if self.holding.contains(&held) {
+            return;
+        }
+        // A hold the node has no room to record, or the transport refuses (a lane past the peer's
+        // bound), leaves the publisher unheld: its batches are taken as they come, the window
+        // keeping what the memory holds of them.
+        if self.reserve_hold().is_err() {
+            return;
+        }
+        if endpoint.hold_lane(peer, lane).is_ok() {
+            self.holding.push(held);
+            self.stats.held = self.stats.held.saturating_add(1);
+        }
+    }
+
+    /// Lets go every publisher's lane no stream it was held for still holds.
+    fn release_unblocked<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        if self.holding.is_empty() {
+            return;
+        }
+        let mut holding = std::mem::take(&mut self.holding);
+        let mut freed = std::mem::take(&mut self.freed);
+        freed.clear();
+        holding.retain(|held| {
+            let keep = self.blocked(held.stream);
+            if !keep {
+                freed.push((held.peer, held.lane));
+            }
+            keep
+        });
+        for (peer, lane) in freed.iter().copied() {
+            // A lane another blocked stream holds stays held.
+            if !holding
+                .iter()
+                .any(|held| held.peer == peer && held.lane == lane)
+            {
+                let _ = endpoint.release_lane(peer, lane);
+            }
+        }
+        self.holding = holding;
+        self.freed = freed;
+    }
+
+    fn subscribe<B, D>(
+        &mut self,
+        endpoint: &mut Endpoint<Bus, B, D>,
+        exchange: ExchangeId,
+        peer: PeerId,
+        epoch: Epoch,
+    ) where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        let Some(head) = endpoint.head(exchange) else {
+            endpoint.refuse_exchange(exchange, Refusal::Kind);
+            return;
+        };
+        let Ok(asked) = Subscribe::decode(head) else {
+            endpoint.refuse_exchange(exchange, Refusal::Kind);
+            return;
+        };
+        let live = self.subscriptions.len().saturating_sub(self.free.len());
+        if live >= self.config.subscriptions {
+            endpoint.refuse_exchange(exchange, Refusal::Exchanges);
+            return;
+        }
+        if self.reserve_subscription(asked.stream).is_err() {
+            endpoint.refuse_exchange(exchange, Refusal::Budget);
+            return;
+        }
+        let (floor, next) = self.part.bounds(asked.stream).unwrap_or((0, 0));
+        let start = match asked.from {
+            wire::From::Tail => next,
+            wire::From::Offset(offset) => offset.max(floor),
+        };
+        let subscription = Subscription {
+            peer,
+            epoch,
+            stream: asked.stream,
+            cursor: start,
+            last: None,
+            blocked: false,
+        };
+        let slot = match self.free.pop() {
+            Some(slot) => {
+                if let Some(place) = self.subscriptions.get_mut(slot) {
+                    *place = Some(subscription);
+                }
+                slot
+            }
+            None => {
+                self.subscriptions.push(Some(subscription));
+                self.subscriptions.len().saturating_sub(1)
+            }
+        };
+        self.by_stream.entry(asked.stream).or_default().push(slot);
+        self.stats.subscribed = self.stats.subscribed.saturating_add(1);
+        let reply = Subscribed { floor, next, start };
+        if endpoint.reply(exchange, &reply.encode(), None).is_ok() {
+            endpoint.end(exchange);
+        }
+        self.pump(endpoint, slot);
+    }
+
+    fn resume<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, peer: PeerId, epoch: Epoch)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        let mut waiting = std::mem::take(&mut self.scratch);
+        waiting.clear();
+        waiting.extend(
+            self.subscriptions
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, subscription)| {
+                    subscription
+                        .filter(|s| s.peer == peer && s.epoch == epoch && s.blocked)
+                        .map(|_| slot)
+                }),
+        );
+        for slot in waiting.iter().copied() {
+            if let Some(Some(subscription)) = self.subscriptions.get_mut(slot) {
+                subscription.blocked = false;
+            }
+            self.pump(endpoint, slot);
+        }
+        self.scratch = waiting;
+    }
+
+    fn forget(&mut self, peer: PeerId, epoch: Epoch) {
+        for slot in 0..self.subscriptions.len() {
+            let gone = self
+                .subscriptions
+                .get(slot)
+                .and_then(Option::as_ref)
+                .is_some_and(|s| s.peer == peer && s.epoch == epoch);
+            if gone {
+                self.drop_slot(slot);
+            }
+        }
+    }
+
+    fn drop_slot(&mut self, slot: usize) {
+        let Some(place) = self.subscriptions.get_mut(slot) else {
+            return;
+        };
+        let Some(subscription) = place.take() else {
+            return;
+        };
+        if let Some(slots) = self.by_stream.get_mut(&subscription.stream) {
+            slots.retain(|known| *known != slot);
+            if slots.is_empty() {
+                self.by_stream.remove(&subscription.stream);
+            }
+        }
+        self.free.push(slot);
+    }
+
+    /// Delivers what `slot`'s subscriber has not taken, as long as its lane has room.
+    fn pump<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, slot: usize)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        loop {
+            let Some(Some(subscription)) = self.subscriptions.get(slot).copied() else {
+                return;
+            };
+            if subscription.blocked {
+                return;
+            }
+            let Some((floor, next)) = self.part.bounds(subscription.stream) else {
+                return;
+            };
+            if subscription.cursor >= next {
+                return;
+            }
+            if subscription.cursor < floor {
+                let gap = Gap {
+                    stream: subscription.stream,
+                    from: subscription.cursor,
+                    to: floor,
+                };
+                match send(endpoint, subscription.peer, Kind::Gap, &gap.encode()) {
+                    Sent::Queued => {
+                        self.stats.gaps = self.stats.gaps.saturating_add(1);
+                        self.update(slot, |s| {
+                            s.cursor = floor;
+                            s.last = None;
+                        });
+                        continue;
+                    }
+                    Sent::Full => return self.block(slot),
+                    Sent::Gone => return self.drop_slot(slot),
+                }
+            }
+            let Some(word) = self.next_word(&subscription) else {
+                return;
+            };
+            let Some(batch) = self.part.batch(Position::from_word(word)) else {
+                return;
+            };
+            let end = batch.end_offset();
+            match send(endpoint, subscription.peer, Kind::Deliver, batch.bytes()) {
+                Sent::Queued => {
+                    self.stats.delivered = self.stats.delivered.saturating_add(1);
+                    self.update(slot, |s| {
+                        s.cursor = end;
+                        s.last = Some(word);
+                    });
+                }
+                Sent::Full => return self.block(slot),
+                Sent::Gone => return self.drop_slot(slot),
+            }
+        }
+    }
+
+    /// Where the subscriber's next batch is: after the batch it took last while that is held,
+    /// else found from the stream's first batch held.
+    fn next_word(&self, subscription: &Subscription) -> Option<u64> {
+        if let Some(last) = subscription.last
+            && let Some(batch) = self.part.batch(Position::from_word(last))
+        {
+            return batch.next();
+        }
+        let mut word = self.part.first_word(subscription.stream)?;
+        loop {
+            let batch: Batch<'_> = self.part.batch(Position::from_word(word))?;
+            if subscription.cursor < batch.end_offset() {
+                return Some(word);
+            }
+            word = batch.next()?;
+        }
+    }
+
+    fn update(&mut self, slot: usize, change: impl FnOnce(&mut Subscription)) {
+        if let Some(Some(subscription)) = self.subscriptions.get_mut(slot) {
+            change(subscription);
+        }
+    }
+
+    fn block(&mut self, slot: usize) {
+        self.stats.blocked = self.stats.blocked.saturating_add(1);
+        self.update(slot, |s| s.blocked = true);
+    }
+}
+
+/// Charges `charge` up to `held` bytes, what a table's capacities hold now; a charge already past
+/// them stays.
+fn charge(
+    budget: &MemoryBudget,
+    charge: &mut Option<Allocation>,
+    held: usize,
+) -> Result<(), BusError> {
+    let charged = charge.as_ref().map_or(0, Allocation::bytes);
+    if held <= charged {
+        return Ok(());
+    }
+    let more = held.saturating_sub(charged);
+    match charge {
+        Some(charge) => charge.grow(more).map_err(BusError::Memory),
+        None => {
+            *charge = Some(
+                budget
+                    .reserve(BudgetKind::Index, BudgetLane::Ordinary, more)
+                    .map_err(BusError::Memory)?
+                    .commit(),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn send<B, D>(endpoint: &mut Endpoint<Bus, B, D>, peer: PeerId, kind: Kind, bytes: &[u8]) -> Sent
+where
+    B: Budget<<Bus as Classes>::Class>,
+    D: Directory<Role = <Bus as Classes>::Role>,
+{
+    match endpoint.send_frame(peer, LANE, kind, bytes) {
+        Ok(()) => Sent::Queued,
+        Err(Refusal::LaneFull) => Sent::Full,
+        Err(_) => Sent::Gone,
+    }
+}

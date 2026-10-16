@@ -51,6 +51,11 @@ impl Family {
     }
 }
 
+/// Bound: the sizes asked of the kernel for a socket buffer, each half the last, before the ask is
+/// refused: a size an OS refuses (macOS past `kern.ipc.maxsockbuf`, `ENOBUFS`) is halved and asked
+/// again, and 32 halvings reach a single byte from any `usize` a 32-bit option takes.
+const BUFFER_ASKS: usize = 32;
+
 // ============================================================================== Unix (rustix)
 
 #[cfg(unix)]
@@ -97,6 +102,43 @@ mod imp {
     pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
         rustix::net::sockopt::socket_recv_buffer_size(&socket.fd)
             .map_err(|e| refused("getsockopt", e))
+    }
+
+    /// The bytes waiting in the socket's receive queue as `FIONREAD` counts them: on XNU and the
+    /// other BSDs every queued datagram's, with their addresses and control (`soioctl`:
+    /// `so_rcv.sb_cc`); on Linux only the next datagram's (udp(7), `SIOCINQ`).
+    pub(crate) fn queued_bytes(socket: &Socket) -> Result<usize, RtError> {
+        let bytes =
+            rustix::io::ioctl_fionread(&socket.fd).map_err(|e| refused("ioctl(FIONREAD)", e))?;
+        Ok(usize::try_from(bytes).unwrap_or(usize::MAX))
+    }
+
+    /// Asks for a kernel receive buffer of `bytes`: on Linux `SO_RCVBUFFORCE` first, which passes
+    /// `net.core.rmem_max` for a process that may (`CAP_NET_ADMIN`), then `SO_RCVBUF`, which Linux
+    /// caps at `rmem_max` without a word; a size the OS refuses outright (macOS past
+    /// `kern.ipc.maxsockbuf`, `ENOBUFS`) is halved and asked again, at most [`super::BUFFER_ASKS`]
+    /// times. What was granted is read back with [`recv_buffer_bytes`].
+    pub(crate) fn set_recv_buffer(socket: &Socket, bytes: usize) -> Result<(), RtError> {
+        #[cfg(target_os = "linux")]
+        if rustix::net::sockopt::set_socket_recv_buffer_size_force(&socket.fd, bytes).is_ok() {
+            return Ok(());
+        }
+        let mut asked = bytes;
+        let mut refusal = Errno::NOBUFS;
+        for _ in 0..super::BUFFER_ASKS {
+            match rustix::net::sockopt::set_socket_recv_buffer_size(&socket.fd, asked) {
+                Ok(()) => return Ok(()),
+                Err(e @ (Errno::NOBUFS | Errno::INVAL)) => {
+                    refusal = e;
+                    asked = asked.checked_div(2).unwrap_or(0);
+                    if asked == 0 {
+                        break;
+                    }
+                }
+                Err(e) => return Err(refused("setsockopt(SO_RCVBUF)", e)),
+            }
+        }
+        Err(refused("setsockopt(SO_RCVBUF)", refusal))
     }
 
     /// A non-blocking, close-on-exec datagram socket of `family`, IPv6 only when IPv6, sending with
@@ -288,6 +330,28 @@ mod imp {
             Err(e) => classify("sendto", e),
         }
     }
+
+    /// Lets other sockets of this process bind `socket`'s port as well (`SO_REUSEPORT`), before it
+    /// is bound: a listener and the sockets it connects to its peers share one port.
+    pub(crate) fn share_port(socket: &Socket) -> Result<(), RtError> {
+        rustix::net::sockopt::set_socket_reuseport(&socket.fd, true)
+            .map_err(|e| refused("setsockopt(SO_REUSEPORT)", e))
+    }
+
+    /// Connects `socket` to `addr`: the kernel hands it `addr`'s datagrams to its port, and it
+    /// sends to `addr` alone.
+    pub(crate) fn connect(socket: &Socket, addr: SocketAddr) -> Result<(), RtError> {
+        rustix::net::connect(&socket.fd, &addr).map_err(|e| refused("connect", e))
+    }
+
+    /// Sends `buf` on a connected `socket`, naming no address (`send(2)`): BSD refuses an address
+    /// on a connected socket (`EISCONN`).
+    pub(crate) fn send(socket: &Socket, buf: &[u8]) -> Result<Io<usize>, RtError> {
+        match rustix::net::send(&socket.fd, buf, SendFlags::empty()) {
+            Ok(n) => Ok(Io::Ready(n)),
+            Err(e) => classify("send", e),
+        }
+    }
 }
 
 // ============================================================================== Windows (Winsock 2)
@@ -298,14 +362,14 @@ pub(crate) mod imp {
     use std::sync::OnceLock;
 
     use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, AF_INET6, FIONBIO, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, INVALID_SOCKET,
-        IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_UDP, IPV6_DONTFRAG, IPV6_V6ONLY,
-        SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,
-        SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSADATA, WSAECONNREFUSED,
-        WSAECONNRESET, WSAEHOSTUNREACH, WSAEINTR, WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH,
-        WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket, getsockname,
-        getsockopt, ioctlsocket, recvfrom as ws_recvfrom, sendto as ws_sendto, setsockopt,
-        socket as ws_socket,
+        AF_INET, AF_INET6, FIONBIO, FIONREAD, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0,
+        INVALID_SOCKET, IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_UDP, IPV6_DONTFRAG,
+        IPV6_V6ONLY, SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+        SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSADATA,
+        WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINTR, WSAEMSGSIZE, WSAENETRESET,
+        WSAENETUNREACH, WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket,
+        connect as ws_connect, getsockname, getsockopt, ioctlsocket, recvfrom as ws_recvfrom,
+        send as ws_send, sendto as ws_sendto, setsockopt, socket as ws_socket,
     };
 
     use core::net::{Ipv6Addr, SocketAddrV6};
@@ -506,6 +570,45 @@ pub(crate) mod imp {
             "getsockopt(SO_RCVBUF)",
         )?;
         usize::try_from(bytes).map_err(|_| last("getsockopt(SO_RCVBUF)"))
+    }
+
+    /// The bytes waiting in the socket's receive queue: for a datagram socket every queued
+    /// datagram's ("Winsock IOCTLs", `FIONREAD`: "the total number of bytes available to read, not
+    /// the size of the first datagram").
+    pub(crate) fn queued_bytes(socket: &Socket) -> Result<usize, RtError> {
+        let mut bytes: u32 = 0;
+        // SAFETY: FIONREAD writes one u32 through the pointer; a live local suffices.
+        if unsafe { ioctlsocket(socket.socket, FIONREAD, &mut bytes) } == SOCKET_ERROR {
+            return Err(last("ioctlsocket(FIONREAD)"));
+        }
+        Ok(usize::try_from(bytes).unwrap_or(usize::MAX))
+    }
+
+    /// Asks for a kernel receive buffer of `bytes` (`SO_RCVBUF`, an `int`); a size Winsock refuses
+    /// is halved and asked again, at most [`super::BUFFER_ASKS`] times. What was granted is read
+    /// back with [`recv_buffer_bytes`].
+    pub(crate) fn set_recv_buffer(socket: &Socket, bytes: usize) -> Result<(), RtError> {
+        let mut asked = i32::try_from(bytes).unwrap_or(i32::MAX);
+        let mut refusal = None;
+        for _ in 0..super::BUFFER_ASKS {
+            match set_int(
+                socket.socket,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                asked,
+                "setsockopt(SO_RCVBUF)",
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    refusal = Some(error);
+                    asked = asked.checked_div(2).unwrap_or(0);
+                    if asked == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(refusal.unwrap_or_else(|| last("setsockopt(SO_RCVBUF)")))
     }
 
     /// The length of a socket address structure, as Winsock takes it.
@@ -744,6 +847,42 @@ pub(crate) mod imp {
         }
         Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
     }
+
+    /// Sharing a port as the BSDs and Linux do is not Winsock's: `SO_REUSEADDR` there lets a second
+    /// socket take the port's datagrams, not those of one peer, so a listener keeps its peers'.
+    pub(crate) fn share_port(_socket: &Socket) -> Result<(), RtError> {
+        Err(RtError::BadConfig {
+            what: "a shared port: Winsock does not hand a connected socket its peer's datagrams",
+        })
+    }
+
+    /// Connects `socket` to `addr`.
+    pub(crate) fn connect(socket: &Socket, addr: SocketAddr) -> Result<(), RtError> {
+        let (sa, sa_len) = sockaddr(addr);
+        // SAFETY: connect reads the address from `sa`, `sa_len` bytes of it.
+        let rc = unsafe {
+            ws_connect(
+                socket.socket,
+                std::ptr::addr_of!(sa).cast::<SOCKADDR>(),
+                sa_len,
+            )
+        };
+        if rc == SOCKET_ERROR {
+            return Err(last("connect"));
+        }
+        Ok(())
+    }
+
+    /// Sends `buf` on a connected `socket`, naming no address.
+    pub(crate) fn send(socket: &Socket, buf: &[u8]) -> Result<Io<usize>, RtError> {
+        let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+        // SAFETY: send reads `len` bytes from `buf`.
+        let rc = unsafe { ws_send(socket.socket, buf.as_ptr(), len, 0) };
+        if rc == SOCKET_ERROR {
+            return classify("send");
+        }
+        Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
+    }
 }
 
 /// The Winsock helpers the stream seam (`crate::tcpsys`) shares.
@@ -753,5 +892,6 @@ pub(crate) use imp as winsock;
 pub(crate) use imp::dont_fragment;
 pub(crate) use imp::{OwnedDatagram, Socket};
 pub(crate) use imp::{
-    adopt, bind, dgram_socket, into_owned, local_addr, recv_buffer_bytes, recv_from, send_to,
+    adopt, bind, connect, dgram_socket, into_owned, local_addr, queued_bytes, recv_buffer_bytes,
+    recv_from, send, send_to, set_recv_buffer, share_port,
 };

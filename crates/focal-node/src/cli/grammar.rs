@@ -71,6 +71,13 @@ pub(crate) const USES: &[Use] = &[
     ),
     said(
         "run",
+        "start",
+        "bus",
+        &["bus", "start"],
+        "Run one event bus node, admitting the client identities of its local directory",
+    ),
+    said(
+        "run",
         "join",
         "cluster",
         &["join"],
@@ -979,6 +986,11 @@ pub(crate) const GROUP_ABOUTS: &[(&str, &str, &str)] = &[
         "run",
         "run",
         "Run the claim, testament and validator demo, or a JavaScript program against focal's tools",
+    ),
+    (
+        "run",
+        "start",
+        "Run the durable service, or one event bus node",
     ),
     (
         "claims",

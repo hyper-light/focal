@@ -2533,6 +2533,9 @@ impl<S: Storage> Raft<S> {
     fn wake_follower(&mut self, now: u64) -> Result<bool> {
         let (promotable, local, term) = (self.promotable(), self.config.seed, self.term);
         let alone = self.tracker.is_singleton() && self.tracker.configuration().votes(self.id);
+        // A sole voter's campaign in its term waits for its own vote to be durable (I9), which
+        // alone elects it.
+        let own_vote_out = alone && self.state == StateRole::Candidate && self.self_vote;
         let trusts = self
             .watch
             .as_deref()
@@ -2540,6 +2543,13 @@ impl<S: Storage> Raft<S> {
         let watch = self.watch_mut()?;
         watch.beat = Arm::Off;
         watch.transfer = Arm::Off;
+        // It waits for that write, with no campaign armed: campaigning again
+        // moved its term past the write each time its owner woke it first, as
+        // an owner does after every call.
+        if own_vote_out {
+            watch.campaign = Arm::Off;
+            return Ok(false);
+        }
         // It led this term and leads no more: until another leader or a
         // later term reaches it, its followers may trust it still.
         let led = watch.led == term && term != 0;
@@ -2597,8 +2607,10 @@ impl<S: Storage> Raft<S> {
         }
         self.watch_mut()?.campaign = Arm::Off;
         self.hup(false)?;
-        if self.state != StateRole::Leader {
-            // Unresolved within a round, it draws again.
+        // Unresolved within a round, it draws again; a sole voter's waits for
+        // its own vote's write, with nothing armed.
+        let waits = alone && self.state == StateRole::Candidate && self.self_vote;
+        if self.state != StateRole::Leader && !waits {
             let watch = self.watch_mut()?;
             watch.campaign = match (watch.round(), watch.draw(local)) {
                 (Some(tail), Some(delay)) => {

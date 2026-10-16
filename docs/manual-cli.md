@@ -18,6 +18,27 @@ Use the same `--data-dir` in another terminal. The examples below abbreviate tha
 
 The node's sockets live in its data directory (`focal.sock`, `focal-admin.sock`), and a local socket's address holds at most 103 bytes of path on macOS and 107 on Linux and Windows, so the data directory's path may be at most 86 and 90 bytes respectively. A longer one is refused (`invalid_input`, naming the socket's path) before anything is written in it or an invitation is read.
 
+## Run an event bus node
+
+The event bus ([32](archictecutre/32-event-bus.md)) carries claims to their respondents and
+testaments to their recipients as small messages held in memory. Its standalone mode runs one node
+that admits the client identities of a local directory, made at the node's first start (an
+authority, the node's certificate and `--clients` client identities, as DER files a client reads):
+
+```sh
+focal start bus --listen 127.0.0.1:7443 --pki /tmp/focal-bus-pki --clients 2
+```
+
+The node prints one JSON line when it listens and one when an interrupt or a termination stops
+it, with what it did. Nothing else is set: the node holds three quarters of the memory it finds
+(the least of the machine's and its control group's limit, the share .NET's GC takes) and refuses to
+start where it cannot read it; it keeps what that memory holds of the batches published, for
+subscribers that start behind, letting the oldest go when live traffic needs the room (a subscriber
+that falls below what is kept is told the offsets it missed); it runs on one shard of the thread
+that starts it; and it asks its socket for the receive queue its connections' windows need,
+granting them no more than the kernel gives it. `--clients` is at least one, and at most what the
+node's memory admits.
+
 ## Offline schemas, examples and completion
 
 These commands need no running service, node identity or saved configuration. They

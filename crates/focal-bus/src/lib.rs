@@ -23,11 +23,19 @@
 //! three replicated nodes (step 3).
 
 pub mod batch;
+pub mod budget;
+pub mod client;
 pub mod corpus;
+pub mod directory;
+pub mod limits;
 pub mod log;
+pub mod node;
 pub mod part;
+pub mod pki;
+pub mod serve;
 pub mod stream;
 pub mod window;
+pub mod wire;
 
 /// Why the bus refused or failed an operation. Every refusal is typed; none leaves a part changed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +50,10 @@ pub enum BusError {
     Configuration(&'static str),
     /// A stream the part does not hold.
     UnknownStream(u64),
+    /// A message a peer sent that the protocol does not allow, named.
+    Protocol(&'static str),
+    /// The transport refused.
+    Transport(hyper_transport::Refusal),
 }
 
 impl std::fmt::Display for BusError {
@@ -52,6 +64,8 @@ impl std::fmt::Display for BusError {
             Self::Capacity(bound) => write!(f, "at its bound: {bound}"),
             Self::Configuration(what) => write!(f, "configuration: {what}"),
             Self::UnknownStream(stream) => write!(f, "no stream {stream} in this part"),
+            Self::Protocol(what) => write!(f, "protocol: {what}"),
+            Self::Transport(refusal) => write!(f, "transport refused: {refusal:?}"),
         }
     }
 }

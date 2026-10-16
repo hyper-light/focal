@@ -2,7 +2,10 @@ use bytes::Bytes;
 use rand::RngExt;
 use tracing::{debug, trace, trace_span};
 
-use super::{Connection, SentFrames, spaces::SentPacket};
+use super::{
+    Connection, SentFrames,
+    spaces::{LargestAcked, SentPacket},
+};
 use crate::{
     ConnectionId, Instant, TransportError, TransportErrorCode,
     connection::ConnectionSide,
@@ -235,9 +238,14 @@ impl PacketBuilder {
             || conn.state.is_handshake()
             || (conn.handshake_datagram && !conn.zero_rtt_enabled)
             || first_round;
+        // A packet in flight carries what the path had delivered as it went, before it is counted
+        let (delivery, app_limited) = match size {
+            0 => Default::default(),
+            _ => conn.path.delivery.on_sent(now, conn.path.in_flight.bytes),
+        };
         let packet = SentPacket {
             path_generation: conn.path.generation(),
-            largest_acked: sent.largest_acked,
+            largest_acked: LargestAcked::new(sent.largest_acked),
             time_sent: now,
             size,
             ack_eliciting,
@@ -246,6 +254,8 @@ impl PacketBuilder {
             copied: conn.spaces.get(space_id).sending_copies,
             handshake_flight,
             warm_up: sent.warm_up,
+            delivery,
+            app_limited,
             next: None,
         };
 

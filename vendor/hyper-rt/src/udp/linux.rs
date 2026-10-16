@@ -82,6 +82,49 @@ pub(crate) fn enable_stamps(fd: RawFd) -> bool {
     status == 0
 }
 
+/// Format: `SK_MEMINFO_VARS` (`include/uapi/linux/sock_diag.h`), the words `SO_MEMINFO` fills on a
+/// kernel that reports drops, the last of them `SK_MEMINFO_DROPS`. An older kernel fills fewer and
+/// says so in the length it returns (`sk_getsockopt` copies the smaller).
+const MEMINFO_WORDS: usize = 9;
+
+/// What the kernel charges `fd`'s receive queue now (`SO_MEMINFO`, `sk_get_meminfo`): the bytes
+/// charged for the datagrams queued (`SK_MEMINFO_RMEM_ALLOC`, each its allocation's truesize), the
+/// buffer they count against (`SK_MEMINFO_RCVBUF`) and, where the kernel reports them, the
+/// datagrams it has dropped for want of room (`SK_MEMINFO_DROPS`).
+pub(crate) fn queue_charge(fd: RawFd) -> io::Result<(u32, u32, Option<u32>)> {
+    let mut info = [0u32; MEMINFO_WORDS];
+    let mut length = socklen(size_of::<[u32; MEMINFO_WORDS]>());
+    // SAFETY: `info` and `length` are live locals of the sizes passed; getsockopt writes at most
+    // `length` bytes into `info` and the length it wrote into `length`.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MEMINFO,
+            info.as_mut_ptr().cast(),
+            &raw mut length,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let filled = usize::try_from(length)
+        .unwrap_or(0)
+        .checked_div(size_of::<u32>())
+        .unwrap_or(0);
+    let word = |index: libc::c_int| {
+        usize::try_from(index)
+            .ok()
+            .filter(|at| *at < filled)
+            .and_then(|at| info.get(at).copied())
+    };
+    let charged = word(libc::SK_MEMINFO_RMEM_ALLOC)
+        .ok_or_else(|| io::Error::other("SO_MEMINFO without the receive queue's charge"))?;
+    let buffer = word(libc::SK_MEMINFO_RCVBUF)
+        .ok_or_else(|| io::Error::other("SO_MEMINFO without the receive buffer"))?;
+    Ok((charged, buffer, word(libc::SK_MEMINFO_DROPS)))
+}
+
 /// What the kernel offers this socket.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Offload {
@@ -162,6 +205,11 @@ pub(crate) const fn message_bytes() -> usize {
 }
 
 impl Headers {
+    /// The messages a receive offers the kernel at most, beside the buffers it is lent.
+    pub(crate) fn places(&self) -> usize {
+        self.names.len()
+    }
+
     /// Headers for up to `batch` messages.
     pub(crate) fn new(batch: usize) -> Self {
         Self {
@@ -342,6 +390,83 @@ pub(crate) fn send(
         Err(_) => Err(SendFailed {
             error: io::Error::last_os_error(),
             slots: groups.first().copied().unwrap_or(1),
+        }),
+    }
+}
+
+/// The datagrams of `size` bytes one segmented send carries at most: [`MAX_SEGMENTS`], and no more
+/// than [`SEGMENTED_BYTES`] hold; at least one.
+pub(crate) fn segments_per_message(size: usize) -> usize {
+    SEGMENTED_BYTES
+        .checked_div(size)
+        .unwrap_or(1)
+        .clamp(1, MAX_SEGMENTS)
+}
+
+/// Sends `bytes` to `to` as one message straight from the caller's buffer, segmented into datagrams
+/// of `size` bytes (the last may be shorter) where it holds more than one, with one `sendmmsg` of
+/// one message; the caller keeps the message within [`segments_per_message`].
+pub(crate) fn send_one(
+    fd: RawFd,
+    to: SocketAddr,
+    bytes: &[u8],
+    size: usize,
+    headers: &mut Headers,
+) -> Result<(), SendFailed> {
+    let Headers {
+        headers: messages,
+        iovecs,
+        names,
+        controls,
+        groups,
+    } = headers;
+    messages.clear();
+    iovecs.clear();
+    groups.clear();
+    let (Some(name), Some(control)) = (names.first_mut(), controls.first_mut()) else {
+        return Err(SendFailed {
+            error: io::Error::from_raw_os_error(libc::ENOBUFS),
+            slots: 1,
+        });
+    };
+    iovecs.push(libc::iovec {
+        iov_base: bytes.as_ptr().cast_mut().cast(),
+        iov_len: bytes.len(),
+    });
+    let name_length = write_name(to, name);
+    // SAFETY: an all-zero `mmsghdr` is valid: null pointers with zero lengths.
+    let mut message: libc::mmsghdr = unsafe { zeroed() };
+    message.msg_hdr.msg_name = ptr::from_mut(name).cast();
+    message.msg_hdr.msg_namelen = name_length;
+    message.msg_hdr.msg_iov = iovecs.as_mut_ptr();
+    message.msg_hdr.msg_iovlen = field(1);
+    if size < bytes.len() {
+        segment(&mut message.msg_hdr, control, size);
+    }
+    messages.push(message);
+    let one: libc::c_uint = 1;
+    // SAFETY: `messages` holds one initialised header whose name, iovec and control point into
+    // `names`, `iovecs`, `controls` and `bytes`, all borrowed for this call and not moved since the
+    // pointers were taken; sendmmsg reads them and writes only `msg_len`.
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_sendmmsg,
+            fd,
+            messages.as_mut_ptr(),
+            one,
+            libc::MSG_DONTWAIT,
+        )
+    };
+    match usize::try_from(sent) {
+        Ok(1) => Ok(()),
+        // Nothing taken and no error: as a full socket
+        Ok(_) => Err(SendFailed {
+            error: io::Error::from_raw_os_error(libc::EAGAIN),
+            slots: 1,
+        }),
+        Err(_) => Err(SendFailed {
+            error: io::Error::last_os_error(),
+            slots: 1,
         }),
     }
 }

@@ -1,7 +1,7 @@
 //! Logic for controlling the rate at which data is sent
 
-use crate::Instant;
 use crate::connection::RttEstimator;
+use crate::{Duration, Instant};
 use std::any::Any;
 
 mod bbr;
@@ -34,6 +34,12 @@ pub trait Controller: Send + Sync {
         rtt: &RttEstimator,
     ) {
     }
+
+    /// What the acknowledgement being processed says of the path's delivery rate, once its
+    /// packets are acknowledged (`on_ack`) and before `on_end_acks`: given when it acknowledged an
+    /// in-flight packet of the current path
+    #[allow(unused_variables)]
+    fn on_delivered(&mut self, now: Instant, sample: &RateSample) {}
 
     /// Packets are acked in batches, all with the same `now` argument. This indicates one of those batches has completed.
     #[allow(unused_variables)]
@@ -106,6 +112,28 @@ pub trait Controller: Send + Sync {
 
     /// Returns Self for use in down-casting to extract implementation details
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+/// What an acknowledgement says of how fast its path delivers: a delivery-rate sample
+/// (draft-cheng-iccrg-delivery-rate-estimation-02 §3.3, Linux's `tcp_rate.c`), taken from the
+/// newest packet it acknowledged ([`Controller::on_delivered`])
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RateSample {
+    /// The bytes the path delivered between the newest packet's send, by what had been delivered
+    /// then, and the acknowledgement
+    pub delivered: u64,
+    /// The time they took: the longer of the newest packet's flight's send phase and its
+    /// acknowledgement phase (§3.3)
+    pub interval: Duration,
+    /// `delivered` over `interval`, bytes a second; `None` when the interval is shorter than the
+    /// path's least round trip, which no flight is delivered faster than (§3.3)
+    pub rate: Option<u64>,
+    /// Whether the newest packet was sent in a phase the application limited (§3.4): its rate
+    /// measures the application, a floor of the path's
+    pub app_limited: bool,
+    /// The newest packet's round trip as measured, the peer's ACK delay in it
+    pub rtt: Duration,
 }
 
 /// Common congestion controller metrics

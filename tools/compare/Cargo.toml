@@ -16,6 +16,18 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+# The event bus's client (`pubsub` against focal-bus), its corpus and its runtime.
+focal-bus = { version = "0.1.0", path = "../../crates/focal-bus" }
+focal-rt = { version = "0.1.0", path = "../../crates/focal-rt" }
+focal-memory = { version = "0.1.0", path = "../../crates/focal-memory" }
+# The machine's envelope a client's endpoints are charged within, as a node's are.
+focal-platform = { version = "0.1.0", path = "../../crates/focal-platform" }
+hyper-quic = { workspace = true }
+hyper-rt = { workspace = true }
+hyper-rt-transport = { workspace = true }
+hyper-transport = { workspace = true }
+# The corpus's codec, as a claimant compresses (doc 32 §4.1).
+zstd = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

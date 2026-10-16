@@ -80,6 +80,9 @@ pub(crate) enum Reading {
     Frame,
     /// A frame's bytes are being skipped.
     Skipping,
+    /// A lossless frame's prefix is read and its bytes wait for the budget to hold them
+    /// ([`crate::Classes::lossless`]): the lane is not read until they can be.
+    Reserving,
 }
 
 /// A lane from a peer.
@@ -103,6 +106,8 @@ pub(crate) struct LaneIn {
     pub(crate) queued: usize,
     /// It is not read until a seat for its next frame is free.
     pub(crate) paused: bool,
+    /// Its owner holds it ([`crate::Endpoint::hold_lane`]): it is not read until let go.
+    pub(crate) held: bool,
 }
 
 impl LaneIn {
@@ -121,6 +126,7 @@ impl LaneIn {
             rank: 0,
             queued: 0,
             paused: false,
+            held: false,
         }
     }
 }

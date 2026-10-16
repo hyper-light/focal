@@ -4,15 +4,13 @@ use std::fmt::Debug;
 use rand::{RngExt, SeedableRng};
 use rand_pcg::Pcg32;
 
-use crate::congestion::ControllerMetrics;
-use crate::congestion::bbr::bw_estimation::BandwidthEstimation;
 use crate::congestion::bbr::min_max::MinMax;
+use crate::congestion::{ControllerMetrics, RateSample};
 use crate::connection::RttEstimator;
 use crate::{Duration, Instant, float};
 
 use super::{Controller, initial_window};
 
-mod bw_estimation;
 mod min_max;
 
 /// Experimental! Use at your own risk.
@@ -21,11 +19,25 @@ mod min_max;
 /// Based on google's quiche implementation <https://source.chromium.org/chromium/chromium/src/+/master:net/third_party/quiche/src/quic/core/congestion_control/bbr_sender.cc>
 /// of BBR <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control>.
 /// More discussion and links at <https://groups.google.com/g/bbr-dev>.
+///
+/// Its bandwidth is the windowed maximum of the path's delivery-rate samples
+/// (draft-cheng-iccrg-delivery-rate-estimation, [`RateSample`]), as Chromium's `BandwidthSampler`
+/// gives its BBR, and its least round trip theirs (`VENDORED.md` §30).
 #[derive(Debug, Clone)]
 pub struct Bbr {
     config: BbrConfig,
     current_mtu: u64,
-    max_bandwidth: BandwidthEstimation,
+    /// The most a delivery-rate sample measured in the last ten round trips, bytes a second
+    /// (Chromium's `max_bandwidth_`, its window `kBandwidthWindowSize`)
+    max_bandwidth: MinMax,
+    /// The bytes the acknowledgement being processed acknowledged
+    acked_in_ack: u64,
+    /// The delivery-rate sample of the acknowledgement being processed, taken into the model in
+    /// `on_end_acks`, after the round trip it may begin
+    sample: Option<RateSample>,
+    /// Whether the last sample was of a phase the application limited (Chromium's
+    /// `last_sample_is_app_limited_`)
+    last_sample_app_limited: bool,
     acked_bytes: u64,
     mode: Mode,
     loss_state: LossState,
@@ -43,7 +55,8 @@ pub struct Bbr {
     min_cwnd: u64,
     prev_in_flight_count: u64,
     exit_probe_rtt_at: Option<Instant>,
-    probe_rtt_last_started_at: Option<Instant>,
+    /// When the minimum round trip held now was sampled: it expires ten seconds after.
+    min_rtt_timestamp: Option<Instant>,
     min_rtt: Duration,
     exiting_quiescence: bool,
     pacing_rate: u64,
@@ -68,7 +81,10 @@ impl Bbr {
         Self {
             config,
             current_mtu: current_mtu as u64,
-            max_bandwidth: BandwidthEstimation::default(),
+            max_bandwidth: MinMax::default(),
+            acked_in_ack: 0,
+            sample: None,
+            last_sample_app_limited: false,
             acked_bytes: 0,
             mode: Mode::Startup,
             loss_state: Default::default(),
@@ -86,7 +102,7 @@ impl Bbr {
             min_cwnd: calculate_min_window(current_mtu as u64),
             prev_in_flight_count: 0,
             exit_probe_rtt_at: None,
-            probe_rtt_last_started_at: None,
+            min_rtt_timestamp: None,
             min_rtt: Default::default(),
             exiting_quiescence: false,
             pacing_rate: 0,
@@ -216,12 +232,43 @@ impl Bbr {
         }
     }
 
+    /// Whether the minimum round trip held now is older than ten seconds (Chromium's
+    /// `kMinRttExpiry`), timed from when it was sampled, as Chromium's `min_rtt_timestamp_` is. The
+    /// port timed it from when ProbeRtt last began and, before any had, called it expired: every
+    /// connection entered ProbeRtt, its window four datagrams, at its first acknowledgement not
+    /// app-limited, and stayed 200 ms. A sample of a phase the application limited does not
+    /// expire it: such a sender keeps no queue of its own to drain (Chromium's option
+    /// `probe_rtt_disabled_if_app_limited_`).
     fn is_min_rtt_expired(&self, now: Instant, app_limited: bool) -> bool {
+        /// How long a minimum round trip stands before it is measured again (Chromium's value)
+        const MIN_RTT_EXPIRY: Duration = Duration::from_secs(10);
         !app_limited
             && self
-                .probe_rtt_last_started_at
-                .map(|last| now.saturating_duration_since(last) > Duration::from_secs(10))
-                .unwrap_or(true)
+                .min_rtt_timestamp
+                .is_some_and(|sampled| now.saturating_duration_since(sampled) > MIN_RTT_EXPIRY)
+    }
+
+    /// The acknowledgement's delivery-rate sample, taken into the model (Chromium's
+    /// `UpdateBandwidthAndMinRtt`): its rate into the windowed maximum, unless it measured the
+    /// application and is below it, and its round trip into the minimum, which is taken anew from
+    /// the sample once it expires, so a path whose round trip grew is measured as it is now.
+    /// Returns whether the minimum had expired.
+    fn update_bandwidth_and_min_rtt(&mut self, now: Instant, sample: &RateSample) -> bool {
+        self.last_sample_app_limited = sample.app_limited;
+        if let Some(rate) = sample.rate
+            && (!sample.app_limited || self.max_bandwidth.get() < rate)
+        {
+            self.max_bandwidth.update_max(self.round_count, rate);
+        }
+        if sample.rtt.is_zero() {
+            return false;
+        }
+        let expired = self.is_min_rtt_expired(now, sample.app_limited);
+        if expired || self.min_rtt.is_zero() || sample.rtt < self.min_rtt {
+            self.min_rtt = sample.rtt;
+            self.min_rtt_timestamp = Some(now);
+        }
+        expired
     }
 
     fn maybe_enter_or_exit_probe_rtt(
@@ -229,16 +276,14 @@ impl Bbr {
         now: Instant,
         is_round_start: bool,
         bytes_in_flight: u64,
-        app_limited: bool,
+        min_rtt_expired: bool,
     ) {
-        let min_rtt_expired = self.is_min_rtt_expired(now, app_limited);
         if min_rtt_expired && !self.exiting_quiescence && self.mode != Mode::ProbeRtt {
             self.mode = Mode::ProbeRtt;
             self.pacing_gain = 1.0;
             // Do not decide on the time to exit ProbeRtt until the
             // |bytes_in_flight| is at the target small value.
             self.exit_probe_rtt_at = None;
-            self.probe_rtt_last_started_at = Some(now);
         }
 
         if self.mode == Mode::ProbeRtt {
@@ -270,7 +315,7 @@ impl Bbr {
     }
 
     fn get_target_cwnd(&self, gain: f32) -> u64 {
-        let bw = self.max_bandwidth.get_estimate();
+        let bw = self.max_bandwidth.get();
         // Byte counts: saturating holds them at a size no connection reaches
         let bdp = u64::try_from(self.min_rtt.as_micros())
             .unwrap_or(u64::MAX)
@@ -294,7 +339,7 @@ impl Bbr {
     }
 
     fn calculate_pacing_rate(&mut self) {
-        let bw = self.max_bandwidth.get_estimate();
+        let bw = self.max_bandwidth.get();
         if bw == 0 {
             return;
         }
@@ -308,7 +353,7 @@ impl Bbr {
         // available.
         // With no RTT measured yet there is no rate
         if self.pacing_rate == 0
-            && let Some(rate) = BandwidthEstimation::bw_from_delta(self.init_cwnd, self.min_rtt)
+            && let Some(rate) = bw_from_delta(self.init_cwnd, self.min_rtt)
         {
             self.pacing_rate = rate;
             return;
@@ -338,9 +383,15 @@ impl Bbr {
         // time.
         if self.is_at_full_bandwidth {
             self.cwnd = target_window.min(self.cwnd.saturating_add(bytes_acked));
-        } else if (self.cwnd_gain < target_window as f32) || (self.acked_bytes < self.init_cwnd) {
-            // If the connection is not yet out of startup phase, do not decrease
-            // the window.
+        } else if self.cwnd < target_window || self.acked_bytes < self.init_cwnd {
+            // If the connection is not yet out of startup phase, do not decrease the window; grow
+            // it towards the target and no further. Chromium's `CalculateCongestionWindow` compares
+            // the window with the target (`congestion_window_ < target_window`); the port compared
+            // the gain (about 2.89) with the target in bytes, true of any target, so a sender that
+            // stays in startup (one its peer's flow control holds is app-limited, and never sees
+            // full bandwidth) grew its window by every byte acked, without end: a bus publisher's
+            // reached 409 MB on a path of 72 µs, its lane bound to it holding seconds of bytes.
+            // RFC 9002 §7.8: a window not used to its size is not grown.
             self.cwnd = self.cwnd.saturating_add(bytes_acked);
         }
 
@@ -389,7 +440,7 @@ impl Bbr {
         }
         let target =
             float::saturating_u64(self.bw_at_last_round as f64 * K_STARTUP_GROWTH_TARGET as f64);
-        let bw = self.max_bandwidth.get_estimate();
+        let bw = self.max_bandwidth.get();
         if bw >= target {
             self.bw_at_last_round = bw;
             self.round_wo_bw_gain = 0;
@@ -407,46 +458,41 @@ impl Bbr {
 }
 
 impl Controller for Bbr {
-    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+    fn on_sent(&mut self, _now: Instant, _bytes: u64, last_packet_number: u64) {
         self.max_sent_packet_number = last_packet_number;
-        self.max_bandwidth.on_sent(now, bytes);
     }
 
     fn on_ack(
         &mut self,
-        now: Instant,
-        sent: Instant,
+        _now: Instant,
+        _sent: Instant,
         bytes: u64,
-        app_limited: bool,
-        rtt: &RttEstimator,
+        _app_limited: bool,
+        _rtt: &RttEstimator,
     ) {
-        self.max_bandwidth
-            .on_ack(now, sent, bytes, self.round_count, app_limited);
+        self.acked_in_ack = self.acked_in_ack.saturating_add(bytes);
         self.acked_bytes = self.acked_bytes.saturating_add(bytes);
-        if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
-            self.min_rtt = rtt.min();
-        }
+    }
+
+    fn on_delivered(&mut self, _now: Instant, sample: &RateSample) {
+        self.sample = Some(*sample);
     }
 
     fn on_end_acks(
         &mut self,
         now: Instant,
         in_flight: u64,
-        app_limited: bool,
+        _app_limited: bool,
         largest_packet_num_acked: Option<u64>,
     ) {
-        let bytes_acked = self.max_bandwidth.bytes_acked_this_window();
-        let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
-            bytes_acked,
-            now,
-            self.round_count,
-            self.max_bandwidth.get_estimate(),
-        );
-        self.max_bandwidth.end_acks(self.round_count, app_limited);
+        let bytes_acked = core::mem::take(&mut self.acked_in_ack);
         if let Some(largest_acked_packet) = largest_packet_num_acked {
             self.max_acked_packet_number = largest_acked_packet;
         }
 
+        // Chromium's order (`BbrSender::OnCongestionEvent`): the round trip the acknowledgement
+        // may begin, the sample taken into the model, recovery, then ack aggregation by the
+        // bandwidth just updated
         let mut is_round_start = false;
         if bytes_acked > 0 {
             is_round_start =
@@ -456,20 +502,32 @@ impl Controller for Bbr {
                 self.round_count = self.round_count.saturating_add(1);
             }
         }
+        let min_rtt_expired = self
+            .sample
+            .take()
+            .is_some_and(|sample| self.update_bandwidth_and_min_rtt(now, &sample));
 
         self.update_recovery_state(is_round_start);
+
+        let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
+            bytes_acked,
+            now,
+            self.round_count,
+            self.max_bandwidth.get(),
+        );
 
         if self.mode == Mode::ProbeBw {
             self.update_gain_cycle_phase(now, in_flight);
         }
 
+        // A sample of a phase the application limited says nothing of whether the pipe is full
         if is_round_start && !self.is_at_full_bandwidth {
-            self.check_if_full_bw_reached(app_limited);
+            self.check_if_full_bw_reached(self.last_sample_app_limited);
         }
 
         self.maybe_exit_startup_or_drain(now, in_flight);
 
-        self.maybe_enter_or_exit_probe_rtt(now, is_round_start, in_flight, app_limited);
+        self.maybe_enter_or_exit_probe_rtt(now, is_round_start, in_flight, min_rtt_expired);
 
         // After the model is updated, recalculate the pacing rate and congestion window.
         self.calculate_pacing_rate();
@@ -646,6 +704,17 @@ impl LossState {
     }
 }
 
+/// Bytes a second from `bytes` over `delta`, computed in u128 (upstream's u64 product overflowed
+/// past 18 GB) and saturating into a u64; none over an empty interval
+fn bw_from_delta(bytes: u64, delta: Duration) -> Option<u64> {
+    /// Nanoseconds in a second
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    let bytes_per_second = u128::from(bytes)
+        .saturating_mul(NANOS_PER_SEC)
+        .checked_div(delta.as_nanos())?;
+    Some(u64::try_from(bytes_per_second).unwrap_or(u64::MAX))
+}
+
 fn calculate_min_window(current_mtu: u64) -> u64 {
     4u64.saturating_mul(current_mtu)
 }
@@ -692,6 +761,193 @@ const DRAIN_TO_TARGET: bool = true;
 mod tests {
     use super::super::BASE_DATAGRAM_SIZE;
     use super::*;
+    use crate::connection::{Delivery, RttEstimator, Snapshot};
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    const PACKET: u64 = 1_200;
+
+    /// An acknowledgement due: when, the packet's send, its snapshot, whether it went app-limited,
+    /// and its number
+    type Due = (Instant, Instant, Snapshot, bool, u64);
+
+    /// A connection's side of the controller: the path's delivery and round trip, sampled as a
+    /// connection samples them, an acknowledgement a packet
+    struct Sender {
+        bbr: Bbr,
+        delivery: Delivery,
+        rtt: RttEstimator,
+        in_flight: u64,
+        sent: u64,
+    }
+
+    impl Sender {
+        fn new() -> Self {
+            Self {
+                bbr: Bbr::new(BbrConfig::default(), BASE_DATAGRAM_SIZE as u16),
+                delivery: Delivery::default(),
+                rtt: RttEstimator::new(Duration::from_millis(333)),
+                in_flight: 0,
+                sent: 0,
+            }
+        }
+
+        /// A packet goes at `now`: its snapshot, whether it went app-limited, and its number
+        fn send(&mut self, now: Instant) -> (Snapshot, bool, u64) {
+            let (snapshot, app_limited) = self.delivery.on_sent(now, self.in_flight);
+            let number = self.sent;
+            self.bbr.on_sent(now, PACKET, number);
+            self.in_flight += PACKET;
+            self.sent += 1;
+            (snapshot, app_limited, number)
+        }
+
+        /// The packet `number`, sent at `sent` with `snapshot`, is acknowledged at `now`: its
+        /// round trip
+        fn ack(&mut self, (now, sent, snapshot, app_limited, number): Due) -> Duration {
+            self.in_flight -= PACKET;
+            self.bbr.on_ack(now, sent, PACKET, false, &self.rtt);
+            let round_trip = now - sent;
+            self.rtt.update(Duration::ZERO, round_trip);
+            self.delivery
+                .on_acked(now, sent, PACKET, snapshot, app_limited);
+            if let Some(sample) = self.delivery.sample(now, self.rtt.min()) {
+                self.bbr.on_delivered(now, &sample);
+            }
+            self.bbr
+                .on_end_acks(now, self.in_flight, false, Some(number));
+            round_trip
+        }
+    }
+
+    fn start() -> Instant {
+        hyper_sim::Anchor::new().instant(0).unwrap()
+    }
+
+    /// A sender its peer's flow control holds is app-limited, and stays in startup: it never sees
+    /// full bandwidth. Paced at four packets a millisecond over a round trip of one, its window
+    /// grows towards the target, the gain times the bandwidth-delay product it measures, and no
+    /// further, however many bytes are acknowledged. The port grew it by every byte acknowledged:
+    /// it compared the gain, not the window, with the target (Chromium's
+    /// `CalculateCongestionWindow`), and its estimate, fed no app-limited sample, stayed zero, so
+    /// every byte acknowledged was ack aggregation's excess (RFC 9002 §7.8).
+    #[test]
+    fn an_app_limited_sender_in_startup_grows_its_window_to_the_target_and_no_further() {
+        let (gap, round_trip) = (Duration::from_micros(250), Duration::from_millis(1));
+        let mut sender = Sender::new();
+        let start = start();
+        let mut due: VecDeque<Due> = VecDeque::new();
+        let mut halfway = 0;
+        for number in 0..8_000_u32 {
+            let now = start + gap * number;
+            while due.front().is_some_and(|(at, ..)| *at <= now) {
+                sender.ack(due.pop_front().unwrap());
+            }
+            let (snapshot, app_limited, number) = sender.send(now);
+            due.push_back((now + round_trip, now, snapshot, app_limited, number));
+            // Nothing more to send, the window open
+            assert!(sender.in_flight < sender.bbr.window());
+            sender.delivery.on_app_limited(sender.in_flight);
+            if number == 3_999 {
+                halfway = sender.bbr.window();
+            }
+        }
+        // 8,000 packets, 9.6 MB; the path carried four a millisecond: 4.8 KB a round trip. The
+        // window is the target, the startup gain (2.89) times that and ack aggregation's excess,
+        // and the second half of the bytes acknowledged grew it not at all.
+        let bdp = 4 * PACKET;
+        let window = sender.bbr.window();
+        assert!(
+            window <= 6 * bdp,
+            "the window grew past the target: {window} B for a BDP of {bdp} B"
+        );
+        assert_eq!(
+            window, halfway,
+            "4.8 MB more acknowledged, the window unmoved"
+        );
+        assert_eq!(sender.bbr.mode, Mode::Startup);
+    }
+
+    /// What a bulk sender saw through a bottleneck of `RATE` and `PROPAGATION` each way, its
+    /// sends held by the window alone or also paced at the rate the controller states: the
+    /// controller, and the longest round trip of the second half of its packets
+    fn bulk(paced: bool) -> (Bbr, Duration) {
+        const PACKETS: u64 = 4_000;
+        let mut sender = Sender::new();
+        let mut now = start();
+        let (mut free, mut next_send) = (now, now);
+        let mut due: VecDeque<Due> = VecDeque::new();
+        let (mut acked, mut most) = (0, Duration::ZERO);
+        while acked < PACKETS {
+            let open = sender.in_flight + PACKET <= sender.bbr.window() && sender.sent < PACKETS;
+            if open && now >= next_send {
+                let (snapshot, app_limited, number) = sender.send(now);
+                free = free.max(now) + SERIALIZE;
+                due.push_back((free + 2 * PROPAGATION, now, snapshot, app_limited, number));
+                if let Some(rate) = sender.bbr.pacing_rate().filter(|_| paced) {
+                    next_send = now + Duration::from_nanos(PACKET * 1_000_000_000 / rate);
+                }
+                continue;
+            }
+            // The next event: the pacer's release, if the window is open and it comes first, or
+            // the next acknowledgement
+            if open && due.front().is_none_or(|(at, ..)| next_send < *at) {
+                now = next_send;
+                continue;
+            }
+            let next = due.pop_front().unwrap();
+            now = now.max(next.0);
+            let round_trip = sender.ack(next);
+            acked += 1;
+            if acked > PACKETS / 2 {
+                most = most.max(round_trip);
+            }
+        }
+        (sender.bbr, most)
+    }
+
+    /// A bottleneck of 12.5 MB/s (100 Mbit/s)
+    const RATE: u64 = 12_500_000;
+    /// 40 µs of propagation each way
+    const PROPAGATION: Duration = Duration::from_micros(40);
+    /// A packet's time at the bottleneck: 96 µs
+    const SERIALIZE: Duration = Duration::from_nanos(PACKET * 1_000_000_000 / RATE);
+
+    /// A packet's round trip alone, 176 µs, and the path's bandwidth-delay product, 2.2 kB
+    fn alone() -> (Duration, u64) {
+        let alone = 2 * PROPAGATION + SERIALIZE;
+        let bdp = RATE * u64::try_from(alone.as_nanos()).unwrap() / 1_000_000_000;
+        (alone, bdp)
+    }
+
+    /// A sender with all it can send, its window alone holding it, through the bottleneck: its
+    /// bandwidth is the bottleneck's, and its window a few times the product, so the queue it
+    /// keeps is a few packets. With the port's estimator, the bytes of each packet acknowledged
+    /// over the gap since the acknowledgement before and of the latest packet sent over the gap
+    /// since the one before, whichever packets those were, a pair on this path estimated 357 MB/s
+    /// and its window grew to 147 kB, 65 times the product, its queue lengthening the round trip
+    /// from 143 µs to 5 ms (`VENDORED.md` §30).
+    #[test]
+    fn a_bulk_sender_measures_its_bottleneck_and_keeps_a_window_of_a_few_bandwidth_delay_products()
+    {
+        let (bbr, most) = bulk(false);
+        let (alone, bdp) = alone();
+        let estimate = bbr.max_bandwidth.get();
+        assert!(
+            (RATE * 9 / 10..=RATE).contains(&estimate),
+            "estimated {estimate} B/s of a {RATE} B/s bottleneck"
+        );
+        assert_eq!(bbr.min_rtt, alone);
+        let window = bbr.window();
+        assert!(
+            window <= 4 * bdp,
+            "a window of {window} B for a product of {bdp} B"
+        );
+        assert!(
+            most <= alone * 4,
+            "round trips to {most:?} on a path of {alone:?}"
+        );
+    }
 
     /// RFC 9002 §7.2's initial window by the path's datagram size, as CUBIC's and NewReno's are; a
     /// window set in the configuration is kept whatever the datagram size

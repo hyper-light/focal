@@ -382,6 +382,8 @@ impl Shard {
         let config = seed.config;
         let mut driver = (seed.driver)(seed.kick)?;
         driver.reserve_handles(config.interests_per_shard)?;
+        // A timed wait may end at most a tick late: the wheel's own lateness (§3.6).
+        driver.set_timer_slack_ns(config.timer_tick_ns.max(1))?;
         registry::bind_cleanup_thread(seed.holder)?;
         let is_sim = driver.kind() == DriverKind::Simulation;
         let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);

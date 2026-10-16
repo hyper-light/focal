@@ -297,6 +297,25 @@ impl Epoch {
 }
 
 impl Resident {
+    /// A handle on `file`, with no mapping yet: it maps one on its first read, and learns there
+    /// whether it can.
+    pub(crate) fn probed(_file: &std::fs::File) -> std::io::Result<Self> {
+        Ok(Self::new())
+    }
+
+    /// A handle that shares `self`'s open file (a duplicate): its own mapping when it first reads,
+    /// the same answer to whether one can be made.
+    pub(crate) fn duplicate(&self) -> Self {
+        let mut duplicate = Self::new();
+        duplicate.refused = self.refused;
+        duplicate
+    }
+
+    /// Whether a read can be made from memory: no mapping or probe refused.
+    pub(crate) fn reads(&self) -> bool {
+        !self.refused
+    }
+
     /// A handle with no mapping yet: it maps one on its first read.
     pub(crate) fn new() -> Self {
         Self {

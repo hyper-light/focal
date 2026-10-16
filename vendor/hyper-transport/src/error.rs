@@ -83,14 +83,18 @@ pub enum Refusal {
     /// The peer refused with a code this side does not know.
     #[error("the peer refused with an unknown code")]
     Unknown,
+    /// The socket's receive queue cannot hold another connection's window: what the peers may send
+    /// unread, summed, never passes what the queue holds (`Endpoint::set_receive_capacity`).
+    #[error("the socket's receive queue holds no more windows")]
+    ReceiveBuffer,
 }
 
 /// The refusals that cross the wire, in the order of their codes; a code is its index plus one,
 /// so that zero, QUIC's conventional "no error", is never a refusal. A refusal is only ever added
 /// at the end, so a code keeps its meaning between versions. The admission bounds a connection is
-/// closed at (the last five) cross as the connection's close code, so a dialer learns that the
-/// peer was full rather than gone (`Event::Unreachable`).
-const WIRE: [Refusal; 14] = [
+/// closed at (codes 10 to 14, and the receive queue's, 15) cross as the connection's close code,
+/// so a dialer learns that the peer was full rather than gone (`Event::Unreachable`).
+const WIRE: [Refusal; 15] = [
     Refusal::Kind,
     Refusal::FrameBound,
     Refusal::Budget,
@@ -105,6 +109,7 @@ const WIRE: [Refusal; 14] = [
     Refusal::Connections,
     Refusal::Events,
     Refusal::Busy,
+    Refusal::ReceiveBuffer,
 ];
 
 impl Refusal {
@@ -146,11 +151,12 @@ mod tests {
     fn a_refusal_keeps_its_code_as_refusals_are_added() {
         // Appended, never renumbered: what an older peer sends means what it meant.
         let codes: Vec<u32> = WIRE.iter().map(|refusal| refusal.code()).collect();
-        assert_eq!(codes, (1..=14).collect::<Vec<u32>>());
+        assert_eq!(codes, (1..=15).collect::<Vec<u32>>());
         assert_eq!(Refusal::Kind.code(), 1);
         assert_eq!(Refusal::Identity.code(), 9);
         assert_eq!(Refusal::Pending.code(), 10);
         assert_eq!(Refusal::Events.code(), 13);
         assert_eq!(Refusal::Busy.code(), 14);
+        assert_eq!(Refusal::ReceiveBuffer.code(), 15);
     }
 }

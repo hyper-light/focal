@@ -131,11 +131,15 @@ pub(super) struct Context {
     events: Vec<IoEvent>,
     /// Events the last reap filled.
     reaped: usize,
-    /// Whether the kernel takes `RWF_NOWAIT`; cleared at the first `EINVAL` that says it does not.
+    /// Whether the kernel and the file's file system take `RWF_NOWAIT`; cleared at the first
+    /// `EINVAL` or `EOPNOTSUPP` that says they do not.
     nowait: bool,
     /// Whether the kernel takes `IOCB_CMD_FDSYNC`; cleared at the first `EINVAL` that says it does
     /// not.
     fdsync: bool,
+    /// Tests: the error the next submission answers with, as io_submit(2) would.
+    #[cfg(test)]
+    pub(super) fail_next: Option<i32>,
 }
 
 impl Context {
@@ -157,6 +161,8 @@ impl Context {
             reaped: 0,
             nowait: true,
             fdsync: true,
+            #[cfg(test)]
+            fail_next: None,
         })
     }
 
@@ -218,6 +224,10 @@ impl Context {
             return Ok(0);
         }
         let fd = u32::try_from(file.as_raw_fd()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        #[cfg(test)]
+        if let Some(code) = self.fail_next.take() {
+            return Err(io::Error::from_raw_os_error(code));
+        }
         loop {
             let flags = if self.nowait { RWF_NOWAIT } else { 0 };
             self.pointers.clear();
@@ -258,8 +268,13 @@ impl Context {
                     self.fdsync = false;
                     return Ok(0);
                 }
-                // A kernel before 4.14 takes no `RWF_NOWAIT`: submit again without it.
-                Some(libc::EINVAL) if first == Some(IOCB_CMD_PREAD) && self.nowait => {
+                // A kernel before 4.14 takes no `RWF_NOWAIT` (`EINVAL`), nor a file system whose
+                // files lack `FMODE_NOWAIT` (`EOPNOTSUPP`, `kiocb_set_rw_flags`: overlayfs on
+                // Linux 6.12, a container's own file system, measured 2026-10-16): submit again
+                // without it.
+                Some(libc::EINVAL | libc::EOPNOTSUPP)
+                    if first == Some(IOCB_CMD_PREAD) && self.nowait =>
+                {
                     self.nowait = false;
                 }
                 // The context is full for now: none taken; the caller reaps and submits again.

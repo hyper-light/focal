@@ -505,6 +505,7 @@ fn refused(refusal: Refusal) -> WireError {
         | Refusal::Identities
         | Refusal::Connections
         | Refusal::Busy
+        | Refusal::ReceiveBuffer
         | Refusal::Events => WireError::Access(AccessError::Capacity),
         Refusal::Closed
         | Refusal::NotConnected

@@ -50,7 +50,20 @@ impl Prefix {
         head: &[u8],
         body: Option<u64>,
     ) -> Result<[u8; PREFIX_BYTES], Refusal> {
-        let length = u32::try_from(head.len()).map_err(|_| Refusal::FrameBound)?;
+        Self::encode_covering(kind, head.len(), head, body)
+    }
+
+    /// The prefix of a message of `kind` whose head is `length` bytes, its checksum covering the
+    /// prefix and only `covered`, the head's first bytes: a lane frame that carries its own
+    /// checksum of the rest ([`Embedded`]).
+    pub(crate) fn encode_covering(
+        kind: u16,
+        length: usize,
+        covered: &[u8],
+        body: Option<u64>,
+    ) -> Result<[u8; PREFIX_BYTES], Refusal> {
+        let head = covered;
+        let length = u32::try_from(length).map_err(|_| Refusal::FrameBound)?;
         let mut bytes = [0u8; PREFIX_BYTES];
         let flags = if body.is_some() { FLAG_BODY } else { 0 };
         let fields = [VERSION, flags];
@@ -125,6 +138,49 @@ fn read<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N], Refusal> {
         .ok_or(Refusal::Corrupt)
 }
 
+/// A lane frame's own CRC-32C (Castagnoli), which the protocol above it checks end to end (a bus
+/// batch's producer checksum; Kafka's record batch CRC, KIP-98): of the frame's bytes from
+/// `covered_from` to its end, stated little-endian at `at..at + 4`, which lies before
+/// `covered_from`. The transport's prefix checksum then covers the frame only before
+/// `covered_from`, so each byte is summed once, and the receiver verifies the frame's own checksum
+/// where it would have summed the same bytes again: a bus node summed each batch three times, its
+/// prefix's on receipt, the batch's, and its prefix's again to deliver it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Embedded {
+    /// Where the bytes the frame's own checksum covers begin.
+    pub covered_from: usize,
+    /// Where the four bytes stating it are.
+    pub at: usize,
+}
+
+impl Embedded {
+    /// The part of `frame` the transport's prefix checksum covers: what the frame's own does not.
+    pub(crate) fn head<'a>(&self, frame: &'a [u8]) -> Result<&'a [u8], Refusal> {
+        let stated_end = self.at.checked_add(TRAILER_BYTES).ok_or(Refusal::Corrupt)?;
+        if stated_end > self.covered_from {
+            return Err(Refusal::Corrupt);
+        }
+        frame.get(..self.covered_from).ok_or(Refusal::Corrupt)
+    }
+
+    /// Whether `frame`'s own checksum is that of its bytes from `covered_from`: what a receiver of
+    /// the frame's kind checks, which a protocol declaring one may check its own layout against.
+    pub fn verify(&self, frame: &[u8]) -> Result<(), Refusal> {
+        let end = self.at.checked_add(TRAILER_BYTES).ok_or(Refusal::Corrupt)?;
+        let stated = frame
+            .get(self.at..end)
+            .and_then(|field| <[u8; TRAILER_BYTES]>::try_from(field).ok())
+            .map(u32::from_le_bytes)
+            .ok_or(Refusal::Corrupt)?;
+        let covered = frame.get(self.covered_from..).ok_or(Refusal::Corrupt)?;
+        if crc32c::crc32c(covered) == stated {
+            Ok(())
+        } else {
+            Err(Refusal::Corrupt)
+        }
+    }
+}
+
 /// A body's running checksum, kept as its bytes pass in either direction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BodySum(u32);
@@ -186,6 +242,52 @@ mod tests {
         flipped[3] ^= 1;
         let prefix = Prefix::decode(&flipped).unwrap();
         assert_eq!(prefix.verify(&flipped, b"head"), Err(Refusal::Corrupt));
+    }
+
+    /// A frame of its own checksum: the prefix covers what that does not, the frame's checksum
+    /// the rest, and a changed byte anywhere is found by one of them.
+    #[test]
+    fn a_frame_s_own_checksum_and_its_prefix_cover_every_byte_once() {
+        let embedded = Embedded {
+            covered_from: 8,
+            at: 0,
+        };
+        let mut frame = vec![0u8; 8];
+        frame.extend((0..100u8).map(|n| n.wrapping_mul(7)));
+        let sum = crc32c::crc32c(&frame[8..]);
+        frame[..4].copy_from_slice(&sum.to_le_bytes());
+        frame[4..8].copy_from_slice(b"head");
+        let bytes =
+            Prefix::encode_covering(5, frame.len(), embedded.head(&frame).unwrap(), None).unwrap();
+        let prefix = Prefix::decode(&bytes).unwrap();
+        assert_eq!(prefix.length(), frame.len() as u64);
+        prefix
+            .verify(&bytes, embedded.head(&frame).unwrap())
+            .unwrap();
+        embedded.verify(&frame).unwrap();
+        // A covered byte the frame's own checksum finds.
+        let mut body = frame.clone();
+        body[50] ^= 1;
+        assert_eq!(embedded.verify(&body), Err(Refusal::Corrupt));
+        prefix
+            .verify(&bytes, embedded.head(&body).unwrap())
+            .unwrap();
+        // A byte before the covered span the prefix's finds, the stated checksum among them.
+        for at in [2, 6] {
+            let mut head = frame.clone();
+            head[at] ^= 1;
+            assert_eq!(
+                prefix.verify(&bytes, embedded.head(&head).unwrap()),
+                Err(Refusal::Corrupt)
+            );
+        }
+        // A frame shorter than its covered span's start, or a stated field past it, is corrupt.
+        assert_eq!(embedded.head(&frame[..7]), Err(Refusal::Corrupt));
+        let past = Embedded {
+            covered_from: 4,
+            at: 2,
+        };
+        assert_eq!(past.head(&frame), Err(Refusal::Corrupt));
     }
 
     #[test]

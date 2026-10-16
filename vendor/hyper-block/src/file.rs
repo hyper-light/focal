@@ -95,6 +95,13 @@ impl DeviceFile {
             Caching::Direct => align,
             Caching::Buffered => layout_of(&file, path, align)?,
         };
+        // A buffered handle asks once whether its file system lets it read from memory, so it
+        // says so before its first read (`crate::resident`); a direct one never reads there.
+        let resident = match caching {
+            Caching::Direct => crate::resident::Resident::new(),
+            Caching::Buffered => crate::resident::Resident::probed(&file)
+                .map_err(wrap("ask whether reads from memory are taken"))?,
+        };
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -102,7 +109,7 @@ impl DeviceFile {
             align,
             layout,
             node,
-            resident: crate::resident::Resident::new(),
+            resident,
             epoch: crate::resident::Epoch::new(),
         })
     }
@@ -128,8 +135,9 @@ impl DeviceFile {
             align: self.align,
             layout: self.layout,
             node: self.node,
-            // A duplicate maps its own window when it first reads from memory.
-            resident: crate::resident::Resident::new(),
+            // A duplicate maps its own window when it first reads from memory, and shares the
+            // file system's answer to whether it can.
+            resident: self.resident.duplicate(),
             epoch: crate::resident::Epoch::new(),
         })
     }
@@ -299,9 +307,12 @@ impl DeviceFile {
     }
 
     /// Whether [`Self::read_resident_at`] can read anything: a buffered file, where the platform
-    /// can tell what the OS holds (`crate::resident`).
+    /// can tell what the OS holds (`crate::resident`) and the file system has not refused to
+    /// (overlayfs refuses Linux's `RWF_NOWAIT`).
     pub fn reads_resident(&self) -> bool {
-        self.caching == Caching::Buffered && cfg!(any(target_os = "linux", target_vendor = "apple"))
+        self.caching == Caching::Buffered
+            && cfg!(any(target_os = "linux", target_vendor = "apple"))
+            && self.resident.reads()
     }
 
     /// Fills `buf` from `offset`; reaching the end of the file first is an error.

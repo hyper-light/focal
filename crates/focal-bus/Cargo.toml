@@ -9,15 +9,22 @@ license.workspace = true
 [dependencies]
 # A batch's checksum, CRC-32C (Castagnoli), hardware-computed (SSE 4.2, ARMv8 CRC32).
 crc32c = "0.6"
-# What every segment and index block is charged to.
+# What every segment, table and transport byte is charged to.
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
+# The bus's wire: exchanges and lanes over QUIC (vendor/hyper-transport), driven on a hyper-rt
+# shard over its batched UDP socket (hyper-rt-transport).
+hyper-transport.workspace = true
+hyper-rt.workspace = true
+hyper-rt-transport.workspace = true
+# The standalone mode's local identities (`pki`).
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "aws_lc_rs"] }
 
 [dev-dependencies]
 # What a benchmark costs, counted where it happens (vendor/hyper-measure): allocations, page
 # faults, CPU, and the noise band two sets of runs must clear before they differ.
 hyper-measure.workspace = true
-# The bounded ring the contended benchmark hands batches over: the one hyper-rt's shards use.
-hyper-rt.workspace = true
+# Waits charged to the progress of what they wait on (the loopback test).
+focal-timing = { version = "0.1.0", path = "../focal-timing" }
 serde_json.workspace = true
 # The edge codec under study (docs/archictecutre/32-event-bus.md §codec): claimants and respondents
 # compress, the bus never does, so it is a dev-dependency of the bus itself.

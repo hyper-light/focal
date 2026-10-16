@@ -1,0 +1,559 @@
+//! A bus node, a publisher and a subscriber over real UDP sockets on loopback, their three
+//! endpoints driven by one task on one hyper-rt shard: every published batch reaches the
+//! subscriber in order with its producer's CRC intact; a subscriber that stops reading holds the
+//! publisher feeding its stream (the node holds the publisher's lane), so nothing is let go from
+//! under it, and once it reads again it takes every batch, in order, none missed; the node keeps
+//! what its part's memory holds, letting the oldest batches go once it holds no more; a
+//! subscription that starts below the window's floor is told exactly which offsets it missed; and
+//! what the node holds of the budget goes back. Every bound is the bus's own (`focal_bus::limits`).
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::disallowed_macros,
+    clippy::cast_possible_truncation
+)]
+
+use std::future::{Future, poll_fn};
+use std::net::SocketAddr;
+use std::pin::pin;
+use std::task::Poll;
+use std::time::{Duration, Instant};
+
+use focal_bus::batch::{BatchBuilder, Producing};
+use focal_bus::budget::BusBudget;
+use focal_bus::client::{Client, Delivery};
+use focal_bus::directory::BusDirectory;
+use focal_bus::limits::IO;
+use focal_bus::node::{Node, NodeConfig};
+use focal_bus::wire::{self, Bus, Role};
+use focal_memory::MemoryBudget;
+use focal_timing::ProgressDeadline;
+use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
+use hyper_rt_transport::Driver;
+use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
+use hyper_transport::{Config, Endpoint, Event, Refusal};
+
+type Drv = Driver<Bus, BusBudget, BusDirectory>;
+
+const NODE: u64 = 1;
+const PUBLISHER: u64 = 2;
+const SUBSCRIBER: u64 = 3;
+const STREAM: u64 = 77;
+/// Batches published while the subscriber reads.
+const IN_ORDER: u32 = 1_000;
+/// How far a subscriber that keeps up is behind the publisher, at most: well inside the node's
+/// window, so it is never left behind.
+const KEEPS_UP: u32 = 200;
+/// A wait fails only when nothing it waits on moved for this long: a wedge, not slowness.
+const FROZEN: Duration = Duration::from_secs(30);
+/// The segments the node's part has memory for, of the least size a segment may be (one batch of
+/// the largest): what the window holds before it lets the oldest batches go.
+const PART_SEGMENTS: usize = 3;
+
+struct Pki {
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+    root: Vec<u8>,
+}
+
+impl Pki {
+    fn new() -> Self {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let root = params.self_signed(&key).unwrap().der().to_vec();
+        Self {
+            issuer: rcgen::Issuer::new(params, key),
+            root,
+        }
+    }
+
+    fn issue(&self, name: &str) -> (Vec<u8>, Vec<u8>) {
+        let params = rcgen::CertificateParams::new(vec![name.to_owned()]).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.signed_by(&key, &self.issuer).unwrap();
+        (certificate.der().to_vec(), key.serialize_der())
+    }
+
+    fn credentials(&self, own: &(Vec<u8>, Vec<u8>)) -> Credentials {
+        Credentials {
+            chain: vec![CertificateDer::from(own.0.clone())],
+            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(own.1.clone())),
+            roots: vec![CertificateDer::from(self.root.clone())],
+        }
+    }
+}
+
+fn runtime() -> RuntimeConfig {
+    RuntimeConfig {
+        shards: 1,
+        tasks_per_shard: 64,
+        timers_per_shard: 64,
+        interests_per_shard: 64,
+        ring_entries: 64,
+        step_budget_ns: 1_000_000,
+        timer_tick_ns: 100_000,
+        batch: 64,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: 4096,
+        spin_ns: 0,
+        wake_tracking: None,
+        latency_objective_ns: None,
+    }
+}
+
+fn endpoint(
+    pki: &Pki,
+    own: &(Vec<u8>, Vec<u8>),
+    peers: &[(&[u8], u64, Role, &str)],
+    role: Role,
+    listen: bool,
+    budget: &MemoryBudget,
+) -> Endpoint<Bus, BusBudget, BusDirectory> {
+    let mut directory = BusDirectory::new(8);
+    for (certificate, peer, role, name) in peers {
+        directory.enroll(certificate, *peer, *role, name).unwrap();
+    }
+    let config = Config {
+        tls: Tls::mutual(&pki.credentials(own), listen).unwrap(),
+        role,
+        limits: match role {
+            Role::Node => focal_bus::limits::node(2).unwrap(),
+            Role::Client => focal_bus::limits::client().unwrap(),
+        },
+        congestion: Default::default(),
+    };
+    Endpoint::new(
+        config,
+        BusBudget::new(budget.clone()),
+        directory,
+        Instant::now(),
+    )
+    .unwrap()
+}
+
+/// The next event of any driver polled, as (whose, event); `None` for none within a tick. Each
+/// call starts with the next driver in turn, so none waits behind another that is always busy. A
+/// subscriber left out has stopped reading: what is sent to it waits in its socket, unacknowledged.
+async fn next(
+    turn: usize,
+    node: &mut Drv,
+    publisher: &mut Drv,
+    mut subscriber: Option<&mut Drv>,
+) -> Option<(u64, Event<Bus>)> {
+    let mut tick = pin!(hyper_rt::futures::sleep(1_000_000));
+    poll_fn(|context| {
+        for at in 0..3 {
+            let whose = [NODE, PUBLISHER, SUBSCRIBER][(turn + at) % 3];
+            let driver = match whose {
+                NODE => Some(&mut *node),
+                PUBLISHER => Some(&mut *publisher),
+                _ => subscriber.as_deref_mut(),
+            };
+            if let Some(driver) = driver
+                && let Poll::Ready(event) = driver.poll_event(context)
+            {
+                return Poll::Ready(Some((whose, event.unwrap())));
+            }
+        }
+        if tick.as_mut().poll(context).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+fn batch(builder: &mut BatchBuilder, sequence: u32) -> Vec<u8> {
+    builder.begin(&Producing {
+        stream: STREAM,
+        producer: PUBLISHER,
+        sequence,
+        flags: 0,
+        timestamp: 1_792_022_400_000_000,
+    });
+    builder
+        .push(1_792_022_400_000_000, &u64::from(sequence).to_le_bytes())
+        .unwrap();
+    builder.finish().unwrap().to_vec()
+}
+
+/// What the subscriber was handed, in the order handed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Item {
+    Batch { base: u64, end: u64, sequence: u64 },
+    Gap { from: u64, to: u64 },
+}
+
+#[derive(Default)]
+struct Seen {
+    connected: u32,
+    subscribed: bool,
+    /// Each subscription's reply: the stream's window when it was made, and where it starts.
+    replies: Vec<wire::Subscribed>,
+    order: Vec<Item>,
+    refused: u64,
+}
+
+impl Seen {
+    /// The offset the subscriber has accounted for: delivered, or told it missed.
+    fn reached(&self) -> u64 {
+        match self.order.last() {
+            Some(Item::Batch { end, .. }) => *end,
+            Some(Item::Gap { to, .. }) => *to,
+            None => 0,
+        }
+    }
+}
+
+struct Harness {
+    node_driver: Drv,
+    node: Node,
+    publisher: Drv,
+    subscriber: Drv,
+    publishing: Client,
+    subscribing: Client,
+    builder: BatchBuilder,
+    sent: u32,
+    seen: Seen,
+    events: u64,
+    turn: usize,
+    wait: ProgressDeadline,
+}
+
+impl Harness {
+    /// Handles the next event of any endpoint, the subscriber's only while it `reads`.
+    async fn step(&mut self, reads: bool) {
+        let subscriber = reads.then_some(&mut self.subscriber);
+        self.turn = self.turn.wrapping_add(1);
+        let Some((which, event)) = next(
+            self.turn,
+            &mut self.node_driver,
+            &mut self.publisher,
+            subscriber,
+        )
+        .await
+        else {
+            return;
+        };
+        self.events += 1;
+        if which == NODE {
+            self.node.on_event(self.node_driver.endpoint(), event);
+            while let Some(event) = self.node_driver.endpoint().poll_event() {
+                self.node.on_event(self.node_driver.endpoint(), event);
+            }
+            self.node.relieve_transport(self.node_driver.endpoint());
+            return;
+        }
+        let (driver, client) = if which == PUBLISHER {
+            (&mut self.publisher, &mut self.publishing)
+        } else {
+            (&mut self.subscriber, &mut self.subscribing)
+        };
+        let seen = &mut self.seen;
+        let mut handle = |event: Event<Bus>, driver: &mut Drv| {
+            if let Event::Connected { .. } = &event {
+                seen.connected += 1;
+            }
+            client.on_event(driver.endpoint(), event, |delivery| match delivery {
+                Delivery::Batch(batch) => seen.order.push(Item::Batch {
+                    base: batch.base_offset(),
+                    end: batch.end_offset(),
+                    sequence: batch.sequence().into(),
+                }),
+                Delivery::Gap(gap) => seen.order.push(Item::Gap {
+                    from: gap.from,
+                    to: gap.to,
+                }),
+                Delivery::Subscribed { subscribed, .. } => {
+                    seen.subscribed = true;
+                    seen.replies.push(subscribed);
+                }
+                Delivery::Refused(_) => seen.refused += 1,
+                Delivery::Unsubscribed { refusal, .. } => {
+                    panic!("a subscribe refused: {refusal:?}")
+                }
+                Delivery::Lost(why) => panic!("the node's connection ended: {why:?}"),
+            });
+        };
+        handle(event, driver);
+        while let Some(event) = driver.endpoint().poll_event() {
+            handle(event, driver);
+        }
+    }
+
+    /// Publishes batches up to `until` while the publisher's lane has room.
+    fn publish(&mut self, until: u32) {
+        while self.sent < until {
+            let bytes = batch(&mut self.builder, self.sent);
+            match self.publishing.publish(self.publisher.endpoint(), &bytes) {
+                Ok(()) => self.sent += 1,
+                Err(Refusal::LaneFull) => return,
+                Err(other) => panic!("publish refused: {other:?}"),
+            }
+        }
+    }
+
+    /// Fails the test once nothing moved for the frozen window.
+    fn moved(&mut self, what: &str) {
+        if let Err(spent) = self.wait.check(&[self.events]) {
+            panic!(
+                "the bus stopped while {what}: {spent}; sent {}, the subscriber reached {}",
+                self.sent,
+                self.seen.reached()
+            );
+        }
+    }
+
+    /// The stream's retained window at the node: (floor, next).
+    fn bounds(&self) -> (u64, u64) {
+        self.node.part().bounds(STREAM).unwrap_or((0, 0))
+    }
+}
+
+#[test]
+fn every_publish_reaches_the_subscriber_in_order_and_a_stalled_subscriber_holds_its_publisher() {
+    let pki = Pki::new();
+    let node_id = pki.issue("bus-node");
+    let publisher_id = pki.issue("bus-publisher");
+    let subscriber_id = pki.issue("bus-subscriber");
+    let node_budget = MemoryBudget::new(256 << 20, 0).unwrap();
+    let client_budget = MemoryBudget::new(256 << 20, 0).unwrap();
+    let segment = usize::try_from(wire::BATCH_BOUND).unwrap();
+    let part_budget = node_budget.child(PART_SEGMENTS * segment, 0).unwrap();
+    let config = NodeConfig {
+        segment_bytes: segment,
+        streams: 64,
+        subscriptions: 16,
+    };
+    let mut runtime = LocalRuntime::new(&runtime()).unwrap();
+    let report = runtime
+        .block_on({
+            let node_budget = node_budget.clone();
+            async move {
+                let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let node_endpoint = endpoint(
+                    &pki,
+                    &node_id,
+                    &[
+                        (&publisher_id.0, PUBLISHER, Role::Client, "bus-publisher"),
+                        (&subscriber_id.0, SUBSCRIBER, Role::Client, "bus-subscriber"),
+                    ],
+                    Role::Node,
+                    true,
+                    &node_budget,
+                );
+                let node_driver: Drv = Driver::bind(node_endpoint, loopback, IO).unwrap();
+                let node_addr = node_driver.local_addr().unwrap();
+                let directory = [(&node_id.0[..], NODE, Role::Node, "bus-node")];
+                let mut publisher: Drv = Driver::bind(
+                    endpoint(
+                        &pki,
+                        &publisher_id,
+                        &directory,
+                        Role::Client,
+                        false,
+                        &client_budget,
+                    ),
+                    loopback,
+                    IO,
+                )
+                .unwrap();
+                let mut subscriber: Drv = Driver::bind(
+                    endpoint(
+                        &pki,
+                        &subscriber_id,
+                        &directory,
+                        Role::Client,
+                        false,
+                        &client_budget,
+                    ),
+                    loopback,
+                    IO,
+                )
+                .unwrap();
+                let now = publisher.clock().unwrap();
+                publisher.endpoint().connect(now, NODE, node_addr).unwrap();
+                let now = subscriber.clock().unwrap();
+                subscriber.endpoint().connect(now, NODE, node_addr).unwrap();
+                let mut bus = Harness {
+                    node_driver,
+                    node: Node::new(config, part_budget.clone()).unwrap(),
+                    publisher,
+                    subscriber,
+                    publishing: Client::new(NODE),
+                    subscribing: Client::new(NODE),
+                    builder: BatchBuilder::new(),
+                    sent: 0,
+                    seen: Seen::default(),
+                    events: 0,
+                    turn: 0,
+                    wait: ProgressDeadline::begin(&[0], u64::MAX, FROZEN),
+                };
+                while bus.seen.connected < 2 {
+                    bus.step(true).await;
+                    bus.moved("connecting");
+                }
+                let now = bus.subscriber.clock().unwrap();
+                bus.subscribing
+                    .subscribe(
+                        bus.subscriber.endpoint(),
+                        now,
+                        STREAM,
+                        wire::From::Tail,
+                        focal_bus::limits::SERVE_PERIOD,
+                    )
+                    .unwrap();
+                while !bus.seen.subscribed {
+                    bus.step(true).await;
+                    bus.moved("subscribing");
+                }
+
+                // 1,000 batches to a subscriber that keeps up: the publisher holds back while its
+                // lane is full or it is KEEPS_UP ahead of what the subscriber took.
+                while bus.seen.reached() < u64::from(IN_ORDER) {
+                    let ahead = u32::try_from(bus.seen.reached()).unwrap() + KEEPS_UP;
+                    bus.publish(IN_ORDER.min(ahead));
+                    bus.step(true).await;
+                    bus.moved("delivering in order");
+                }
+                for (at, item) in bus.seen.order.iter().enumerate() {
+                    let at = at as u64;
+                    assert_eq!(
+                        *item,
+                        Item::Batch {
+                            base: at,
+                            end: at + 1,
+                            sequence: at
+                        },
+                        "in order, each once"
+                    );
+                }
+
+                // The subscriber stops reading. Its lane fills (about a congestion window, the lane
+                // being lossless), and the node holds the publisher feeding its stream: the
+                // publisher's own lane fills and stays full, the node takes nothing more, and no
+                // offset is let go from under the subscriber.
+                let published = bus.node.stats().published;
+                let mut still = 0;
+                let mut last = published;
+                for _ in 0..100_000 {
+                    bus.publish(u32::MAX);
+                    bus.step(false).await;
+                    bus.moved("the subscriber stalled");
+                    let now = bus.node.stats().published;
+                    if bus.node.stats().held > 0 && now == last {
+                        still += 1;
+                        // Held: a run of turns in which the node took nothing more.
+                        if still >= 200 {
+                            break;
+                        }
+                    } else {
+                        still = 0;
+                    }
+                    last = now;
+                }
+                assert!(bus.node.stats().held > 0, "the node held the publisher");
+                assert!(still >= 200, "the publisher was held still");
+                assert_eq!(
+                    bus.node.stats().gaps,
+                    0,
+                    "nothing let go from under the subscriber"
+                );
+                let held_at = bus.sent;
+
+                // The subscriber reads again: it takes everything published, in order, none
+                // missed, and the publisher goes on.
+                let end = u64::from(held_at) + 1_000;
+                while bus.seen.reached() < end {
+                    bus.publish(u32::try_from(end).unwrap());
+                    bus.step(true).await;
+                    bus.moved("the subscriber catches up");
+                }
+                // The node keeps what its part's memory holds. The subscriber reading along, the
+                // publisher goes on until the window lets the stream's oldest batches go: the
+                // subscriber had taken them, and misses none.
+                while bus.bounds().0 == 0 {
+                    let ahead = u32::try_from(bus.seen.reached()).unwrap() + KEEPS_UP;
+                    bus.publish(ahead);
+                    bus.step(true).await;
+                    bus.moved("filling the window");
+                }
+                let end = u64::from(bus.sent);
+                while bus.seen.reached() < end {
+                    bus.step(true).await;
+                    bus.moved("the subscriber takes the rest");
+                }
+                let (floor, next) = bus.bounds();
+                assert_eq!(next, end, "the node appended every batch published");
+                assert!(
+                    bus.node.pool().held() <= PART_SEGMENTS,
+                    "the window held no more than its memory"
+                );
+                for (at, item) in bus.seen.order.iter().enumerate() {
+                    let at = at as u64;
+                    assert_eq!(
+                        *item,
+                        Item::Batch {
+                            base: at,
+                            end: at + 1,
+                            sequence: at
+                        },
+                        "every batch, in order, none missed"
+                    );
+                }
+                assert_eq!(bus.node.stats().gaps, 0);
+                assert_eq!(
+                    bus.seen.refused, 0,
+                    "every delivery passed its producer's CRC"
+                );
+
+                // A subscription that asks from where the window has let go: its reply says where
+                // it starts, the window's floor, so it knows exactly which offsets it missed, and
+                // it takes the window from there, in order.
+                assert!(floor > 0, "the window let the stream's first batches go");
+                let taken = bus.seen.order.len();
+                let now = bus.subscriber.clock().unwrap();
+                bus.subscribing
+                    .subscribe(
+                        bus.subscriber.endpoint(),
+                        now,
+                        STREAM,
+                        wire::From::Offset(0),
+                        focal_bus::limits::SERVE_PERIOD,
+                    )
+                    .unwrap();
+                let want = usize::try_from(next - floor).unwrap();
+                while bus.seen.replies.len() < 2 || bus.seen.order.len() < taken + want {
+                    bus.step(true).await;
+                    bus.moved("the late subscription takes the window");
+                }
+                let reply = bus.seen.replies[1];
+                assert_eq!((reply.floor, reply.next, reply.start), (floor, next, floor));
+                for (at, item) in bus.seen.order[taken..].iter().enumerate() {
+                    let at = floor + at as u64;
+                    assert_eq!(
+                        *item,
+                        Item::Batch {
+                            base: at,
+                            end: at + 1,
+                            sequence: at
+                        },
+                        "the window from its floor, in order"
+                    );
+                }
+                format!(
+                    "{IN_ORDER} delivered in order; stalled, the publisher was held at {held_at} \
+                     batches, then all {end} delivered in order, none missed (window floor {floor})"
+                )
+            }
+        })
+        .unwrap();
+    eprintln!("{report}");
+    drop(runtime);
+    assert_eq!(node_budget.stats().used, 0, "the node gave every byte back");
+}

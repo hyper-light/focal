@@ -28,11 +28,7 @@ pub(crate) fn node_bytes(settings: &Settings) -> usize {
     let bytes = settings
         .node
         .memory_bytes
-        .unwrap_or_else(|| {
-            focal_platform::memory_limit().map_or(UNKNOWN_NODE_BYTES, |limit| {
-                limit.checked_div(4).unwrap_or(0).saturating_mul(3)
-            })
-        })
+        .unwrap_or_else(|| focal_platform::memory_envelope().unwrap_or(UNKNOWN_NODE_BYTES))
         .max(MIN_NODE_BYTES);
     usize::try_from(bytes).unwrap_or(usize::MAX)
 }

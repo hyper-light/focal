@@ -46,6 +46,7 @@ impl Target {
     ) -> Result<Self, CompareError> {
         let fail = |error: String| CompareError::Target(error);
         match system {
+            System::FocalBus => Err(CompareError::Argument("focal-bus runs the pubsub mode")),
             System::Nats => {
                 // Durability is the servers' `sync_interval` (always, or the
                 // shipped 2 min); the client awaits the stream's ack.

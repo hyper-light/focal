@@ -64,8 +64,14 @@ fn fixture_stretching(path: &std::path::Path, count: u128, ceiling: Duration) ->
 enum FirstTerm {
     /// Each campaigned and made its term's first entry durable: it leads, ready in its term.
     Durable,
-    /// Each campaigned, its first entry not yet written: it leads a term it is not yet ready in.
+    /// Each campaigned and no more: its owner writes the vote and carries the election.
     Campaigned,
+    /// Each campaigned and made the write of its vote durable, its term's first entry not yet
+    /// written. A candidate counts its own vote once the write naming it is durable (hyper-raft
+    /// 5189926, etcd's `campaign`), on the answer its owner's first drain takes: a sole voter then
+    /// leads a term it is not yet ready in, its first entry written behind whatever the fixture's
+    /// `before_spawn` holds of the log.
+    VoteDurable,
 }
 /// A fixture whose sessions, configured by `configure`, have done `first` of their first term,
 /// and what `before_spawn` made of its log before their owners took them.
@@ -114,9 +120,18 @@ fn fixture_with<R>(
                 Session::from_node_in(ledger(index), node, SessionLimits::default(), &tenant)
                     .unwrap();
             session.campaign().unwrap();
-            if first == FirstTerm::Durable {
-                for _ in 0..3 {
-                    session.poll().unwrap();
+            match first {
+                FirstTerm::Durable => {
+                    for _ in 0..3 {
+                        session.poll().unwrap();
+                    }
+                }
+                FirstTerm::Campaigned => {}
+                FirstTerm::VoteDurable => {
+                    // The vote's write goes out and is waited for; its answer is the owner's to
+                    // take.
+                    assert!(session.try_poll().unwrap().is_none());
+                    assert!(session.wait_persisted().unwrap());
                 }
             }
             let mut config = ReplicaConfig::new(RootCommandId::from_u128(119));
@@ -1420,16 +1435,27 @@ fn a_peers_frame_waits_in_its_own_room_while_the_participants_queue_is_full() {
 fn a_leader_serves_once_its_term_is_ready() {
     focal_rt::block_on(async move {
         let path = tempfile::tempdir().unwrap();
-        // The paused writer holds the campaign's first entry: the session leads, not ready.
+        // The paused writer holds the campaign's first entry: once its owner takes the answer to
+        // the vote's write, the session leads, not ready.
         let (fixture, (resume, disk)) = fixture_with(
             path.path(),
             1,
             Duration::from_secs(2),
-            FirstTerm::Campaigned,
+            FirstTerm::VoteDurable,
             |_| {},
             |wal| pause(blocker(wal)),
         );
         let host = fixture.hosts[&ledger(1)].clone();
+        let steps = TICK * (2 * crate::test_waits::STEP);
+        crate::test_waits::within(&[&host], steps, TICK, async {
+            while host.progress().leader != host.progress().node {
+                focal_rt::time::sleep(Duration::from_millis(1))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .unwrap();
         let progress = host.progress();
         assert_eq!(progress.leader, progress.node, "{progress:?}");
         assert!(
@@ -1452,7 +1478,6 @@ fn a_leader_serves_once_its_term_is_ready() {
             .await
         })
         .unwrap();
-        let steps = TICK * (2 * crate::test_waits::STEP);
         crate::test_waits::within(&[&host], steps, TICK, async {
             while host.pace.queued(true) < 1 {
                 focal_rt::time::sleep(Duration::from_millis(1))

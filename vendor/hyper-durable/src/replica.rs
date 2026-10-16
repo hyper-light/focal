@@ -223,6 +223,10 @@ struct Out {
     state: State,
     /// Messages to send once this write and every earlier one is durable.
     messages: Vec<Message>,
+    /// The last entry of the core's log when the write was laid out, its index and term: what its
+    /// messages acknowledge stands on it. Refused, the write's messages leave with the write made
+    /// again only while the core's log still holds that entry ([`Replica::make_again`]).
+    tip: (u64, u64),
     /// The commit its hard state stated.
     commit: Option<u64>,
     /// Whether it changed the term or the vote: its time to durable is a vote's flush.
@@ -268,7 +272,9 @@ struct Stall {
     freed: bool,
     /// The last `Ready` refused: its notice says every refused one is durable.
     ready: Option<u64>,
-    messages: Vec<Message>,
+    /// Each refused `Ready`'s messages, with the tip of the log they were made against
+    /// ([`Out::tip`]): at most one a write out.
+    messages: Vec<((u64, u64), Vec<Message>)>,
 }
 
 /// Where a walk of committed entries stopped.
@@ -714,10 +720,12 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             sum.saturating_add(messages(&out.messages))
                 .saturating_add(std::mem::size_of::<Out>())
         });
-        let stalled = self
-            .stall
-            .as_ref()
-            .map_or(0, |stall| messages(&stall.messages));
+        let stalled = self.stall.as_ref().map_or(0, |stall| {
+            stall
+                .messages
+                .iter()
+                .fold(0usize, |sum, (_, held)| sum.saturating_add(messages(held)))
+        });
         let reads = self.reads.iter().fold(0usize, |sum, (_, context)| {
             sum.saturating_add(context.capacity())
                 .saturating_add(std::mem::size_of::<(u64, Vec<u8>)>())
@@ -1327,14 +1335,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         });
         if let Kind::Ready(number) = write.kind {
             stall.ready = Some(number);
-            stall.messages.extend(write.messages);
+            stall.messages.push((write.tip, write.messages));
         }
     }
 
     /// Makes the refused writes again, once every write out has been answered and the log has
     /// room: one write of everything the core holds not yet durable, laid out from the core
-    /// (R-4 keeps it until its notice), with the latest hard state and the messages every
-    /// refused write held. Its notice is the last refused `Ready`'s, which covers all of them.
+    /// (R-4 keeps it until its notice), with the latest hard state and the messages of each
+    /// refused write whose log the core still holds (`Out::tip`). Its notice is the last refused
+    /// `Ready`'s, which covers all of them.
     fn make_again(&mut self, now: u64, waker: &Waker) -> Result<(), ReplicaError> {
         let freed = self.stall.as_ref().is_some_and(|stall| stall.freed);
         if !freed || !self.writes.is_empty() || !self.node.store().log.room() {
@@ -1398,16 +1407,55 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let submitted = self.node.store_mut().log.submit(&write, waker);
         let state = self.submitted_state(submitted)?;
         self.issued = hard;
+        // The messages each refused write held, where the core's log still holds the entry it
+        // ended at when that write was laid out: by Log Matching every entry before it is the
+        // same, and what they acknowledge is what this write makes durable. Where a later
+        // leader's append cut the log back past it since, they acknowledge entries this write
+        // does not hold, and are dropped, as the network may drop any message (I2: the shell's
+        // simulation, seed 3828 of its second shape, released an acknowledgement of 46 over a
+        // log made durable to 41).
+        let mut messages: Option<Vec<Message>> = None;
+        for (tip, mut held) in stall.messages {
+            if !self.holds(tip) {
+                continue;
+            }
+            match messages.as_mut() {
+                Some(all) => all.append(&mut held),
+                None => messages = Some(held),
+            }
+        }
+        let tip = self.tip()?;
         self.writes.push_back(Out {
             kind: Kind::Ready(number),
             state,
-            messages: stall.messages,
+            messages: messages.unwrap_or_default(),
+            tip,
             commit: Some(hard.commit),
             vote: true,
             start: start.is_some(),
             submitted: now,
         });
         Ok(())
+    }
+
+    /// The last entry of the core's log, its index and term ([`Out::tip`]).
+    fn tip(&mut self) -> Result<(u64, u64), ReplicaError> {
+        let log = self.node.raft.log();
+        let tip = log
+            .last_index()
+            .and_then(|last| log.term(last).map(|term| (last, term)));
+        self.must(tip)
+    }
+
+    /// Whether the core's log holds `tip`, an index and the term of the entry there.
+    fn holds(&self, (index, term): (u64, u64)) -> bool {
+        index == 0
+            || self
+                .node
+                .raft
+                .log()
+                .term(index)
+                .is_ok_and(|held| held == term)
     }
 
     /// What a submission's outcome makes of the write: with the log, refused as nothing, or a
@@ -1555,10 +1603,12 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         if let Some(hard) = hard {
             self.issued = hard;
         }
+        let tip = self.tip()?;
         self.writes.push_back(Out {
             kind: Kind::Ready(number),
             state,
             messages,
+            tip,
             commit: hard.map(|h| h.commit),
             vote,
             start: installs,
@@ -1697,6 +1747,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             kind: Kind::Commit,
             state,
             messages: Vec::new(),
+            tip: (0, 0),
             commit: Some(hard.commit),
             vote: false,
             start: false,
@@ -2024,6 +2075,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 kind: Kind::Start(imaged),
                 state,
                 messages: Vec::new(),
+                tip: (0, 0),
                 commit: hard.map(|h| h.commit),
                 vote: false,
                 start: true,

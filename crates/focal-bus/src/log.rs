@@ -11,15 +11,16 @@
 //! [`SegmentPool`] the moment that count reaches zero, whatever its place in the log, so one
 //! stream's long-held batch never keeps the segments around it: RAMCloud keeps the same per-segment
 //! live count for its cleaner. A segment given back leaves an empty slot in the log's order until
-//! every older slot is empty too. The pool keeps a few given back warm,
-//! already faulted in, as many as a quarter of those in use (at least [`SegmentPool::MIN_WARM`]):
-//! the next segment costs neither an allocation nor a page fault, and a burst's segments are
-//! returned to the system once it has passed. Every segment held, in use or warm, is charged to the
-//! budget; a part is refused room past it, never given more than the budget allows.
+//! every older slot is empty too. The pool keeps segments given back warm, already faulted in, as
+//! many as its own demand has recently needed ([`WorkingSet`]): the next segment costs neither an
+//! allocation nor a page fault, and a burst's segments are returned to the system once a busy
+//! period that needs fewer has ended. Every segment held, in use or warm, is charged to the budget;
+//! a part is refused room past it, never given more than the budget allows.
 //!
 //! A batch is never split across segments: one that does not fit the tail segment's room starts
-//! the next, and the room it leaves is at most one batch less a byte, so with batches bounded to an
-//! eighth of a segment at least seven eighths of every full segment hold batches.
+//! the next, and the room it leaves is at most one batch less a byte, so with batches bounded to a
+//! fifth of a segment (`wire::SEGMENT_BATCHES`) at least four fifths of every full segment hold
+//! batches.
 
 use std::collections::VecDeque;
 
@@ -84,6 +85,44 @@ impl Segment {
     }
 }
 
+/// What a pool keeps warm, learned from its own demand: the most it had out at once in its current
+/// period and in the period before. A period runs from one trough of demand to the next, a take
+/// that follows gives, so it is the demand's own unit and the rule takes no time constant and no
+/// fraction. A pool holds, out and warm, no more than that working set: a buffer given back is kept
+/// only while demand this recent reached past what is out now, and a burst's are returned once a
+/// period that needs fewer has ended. It never holds more than the pool's own peak, which its
+/// budget allowed when the peak was reached (the working set of Bonwick and Adams's magazine depot,
+/// USENIX 2001, delimited by demand's troughs rather than a reaping interval). A trough, not an
+/// empty pool: a log's tail is out for as long as the log takes batches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WorkingSet {
+    /// The most out at once in this period.
+    peak: usize,
+    /// The most out at once in the period before it.
+    last: usize,
+    /// Whether the last change was a give: the next take ends the period.
+    falling: bool,
+}
+
+impl WorkingSet {
+    /// One more is out, `out` with it.
+    pub fn took(&mut self, out: usize) {
+        if self.falling {
+            // A trough: the period ends, its peak what the next one is kept warm for.
+            self.falling = false;
+            self.last = self.peak;
+            self.peak = 0;
+        }
+        self.peak = self.peak.max(out);
+    }
+
+    /// One came back, `out` after it: how many may be kept warm.
+    pub fn gave(&mut self, out: usize) -> usize {
+        self.falling = true;
+        self.peak.max(self.last).saturating_sub(out)
+    }
+}
+
 /// The segments a shard's parts take and give back: one size, each charged while held.
 #[derive(Debug)]
 pub struct SegmentPool {
@@ -91,6 +130,8 @@ pub struct SegmentPool {
     budget: MemoryBudget,
     warm: Vec<Segment>,
     in_use: usize,
+    /// What it keeps warm.
+    working: WorkingSet,
     /// Segments allocated from the system over the pool's life; a measurement's count.
     allocated: u64,
     /// Segments returned to the system.
@@ -98,10 +139,6 @@ pub struct SegmentPool {
 }
 
 impl SegmentPool {
-    /// The least the pool keeps warm, whatever is in use: one to take the next batch at once and
-    /// one beside it, so a part writing steadily never waits on the allocator.
-    pub const MIN_WARM: usize = 2;
-
     /// A pool of segments of `size` bytes charged to `budget`.
     pub fn new(size: usize, budget: MemoryBudget) -> Result<Self, BusError> {
         if !(crate::batch::MIN_BATCH..=Position::MAX_SEGMENT).contains(&size) {
@@ -114,6 +151,7 @@ impl SegmentPool {
             budget,
             warm: Vec::new(),
             in_use: 0,
+            working: WorkingSet::default(),
             allocated: 0,
             released: 0,
         })
@@ -132,6 +170,11 @@ impl SegmentPool {
     /// Segments in use by parts.
     pub const fn in_use(&self) -> usize {
         self.in_use
+    }
+
+    /// Segments kept warm.
+    pub fn warm(&self) -> usize {
+        self.warm.len()
     }
 
     /// Segments allocated from the system and returned to it over the pool's life.
@@ -160,12 +203,13 @@ impl SegmentPool {
             }
         };
         self.in_use = self.in_use.saturating_add(1);
+        self.working.took(self.in_use);
         Ok(segment)
     }
 
     fn give(&mut self, mut segment: Segment) {
         self.in_use = self.in_use.saturating_sub(1);
-        let keep = (self.in_use / 4).max(Self::MIN_WARM);
+        let keep = self.working.gave(self.in_use);
         if self.warm.len() < keep {
             segment.bytes.clear();
             self.warm.push(segment);
@@ -229,6 +273,17 @@ impl PartLog {
             .and_then(|slot| slot.segment.as_ref())
             .is_some_and(|tail| tail.room() >= batch.len());
         if !fits {
+            // A tail that holds no batch and has no room for this one takes no more: it goes back
+            // first, so the pool can hand it out again. Kept as the tail while it had room, it was
+            // never looked at again, and a segment a rollover was held for good.
+            if let Some(tail) = self.slots.back_mut()
+                && tail.live == 0
+                && let Some(segment) = tail.segment.take()
+            {
+                pool.give(segment);
+                self.held = self.held.saturating_sub(1);
+                self.trim();
+            }
             let segment = pool.take()?;
             self.slots.push_back(Slot {
                 segment: Some(segment),
@@ -399,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn a_released_segment_is_gone_and_the_pool_keeps_a_few_warm() {
+    fn a_released_segment_is_gone_and_the_pool_keeps_what_its_demand_needed() {
         let mut pool = pool(128);
         let mut log = PartLog::new();
         let positions: Vec<_> = (0..40)
@@ -411,14 +466,65 @@ mod tests {
         }
         assert_eq!(log.read(positions[29], 100), None);
         assert_eq!(log.read(positions[30], 100), Some(&[1; 100][..]));
-        // Ten in use keep two warm; the other twenty-eight went back to the system.
-        assert_eq!((pool.in_use(), pool.held(), log.segments()), (10, 12, 10));
-        assert_eq!(pool.churn(), (40, 28));
+        // Demand reached forty in this busy period: the thirty given back are kept warm.
+        assert_eq!((pool.in_use(), pool.held(), log.segments()), (10, 40, 10));
+        assert_eq!(pool.churn(), (40, 0));
         // The next segments come from the warm ones, with no new allocation.
-        for _ in 0..2 {
-            log.append(&mut pool, &[2; 100]).unwrap();
+        let more: Vec<_> = (0..30)
+            .map(|_| log.append(&mut pool, &[2; 100]).unwrap())
+            .collect();
+        assert_eq!(pool.churn(), (40, 0));
+        // Everything is given back but the tail, which takes the next batch: the burst's forty
+        // stay while demand this recent needed them.
+        for position in positions[30..].iter().chain(&more) {
+            log.release(&mut pool, *position).unwrap();
         }
-        assert_eq!(pool.churn(), (40, 28));
+        assert_eq!((pool.in_use(), pool.held()), (1, 40));
+        // Then two periods that each need two: once one has ended, the pool keeps what they need
+        // and returns the rest of the burst's.
+        for round in 0..2 {
+            let pair: Vec<_> = (0..2)
+                .map(|_| log.append(&mut pool, &[3; 100]).unwrap())
+                .collect();
+            for position in &pair {
+                log.release(&mut pool, *position).unwrap();
+            }
+            let _ = round;
+        }
+        assert!(pool.held() <= 2, "held {}", pool.held());
+        assert_eq!(pool.churn().0, 40, "nothing allocated after the burst");
+    }
+
+    /// A tail emptied while it took batches is given back once a batch it has no room for comes,
+    /// and the next segment is it again: nothing is held for good, nothing allocated anew.
+    #[test]
+    fn an_emptied_tail_goes_back_when_the_log_moves_past_it() {
+        let mut pool = pool(128);
+        let mut log = PartLog::new();
+        for _ in 0..100 {
+            let position = log.append(&mut pool, &[5; 100]).unwrap();
+            log.release(&mut pool, position).unwrap();
+        }
+        assert_eq!((pool.in_use(), pool.held(), log.segments()), (1, 1, 1));
+        assert_eq!(pool.churn(), (1, 0));
+    }
+
+    /// One taken and given back at a time, as a part writing steadily past its window does: one is
+    /// kept warm, and none is allocated after the first.
+    #[test]
+    fn a_working_set_of_one_keeps_one() {
+        let mut working = WorkingSet::default();
+        for _ in 0..1_000 {
+            working.took(1);
+            assert_eq!(working.gave(0), 1);
+        }
+        let mut pool = pool(128);
+        let mut log = PartLog::new();
+        for _ in 0..100 {
+            let position = log.append(&mut pool, &[4; 100]).unwrap();
+            log.release(&mut pool, position).unwrap();
+        }
+        assert_eq!(pool.churn(), (1, 0));
     }
 
     #[test]

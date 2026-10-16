@@ -119,6 +119,51 @@ fault, so a node's cost is its transport and its handoffs. A connection served o
 its stream's part hands nothing over; one that is not hands batches over in runs, never one at a
 time.
 
+### 4.3 Step 2: one node over QUIC
+
+`focal start bus` runs one node in its standalone mode (`crates/focal-bus/src/serve.rs`): its part,
+its endpoint on hyper-transport over hyper-rt's batched UDP socket, on one shard of the thread that
+starts it, run to completion (D8). A publish is a lane frame carrying one batch, appended once and
+delivered to each subscriber by its own cursor; a delivery is the stored batch, its producer's CRC
+checked by the transport as the frame's own (each byte summed once, the KIP-98 batch CRC end to
+end) and again by the client. Lanes are lossless: a subscriber whose lane is full holds the
+publishers feeding its stream at their own lanes, so no queue grows past what the path carries,
+and nothing a live subscriber is owed is let go.
+
+**Nothing is configured, and no number is the bus's own choice.** Each bound is the protocol's, the
+transport's, or cited (`crates/focal-bus/src/limits.rs`, `wire.rs`):
+
+| Bound | Value | Ground |
+|---|---|---|
+| Largest batch | 1 MiB | nats-server's `MAX_PAYLOAD_SIZE`; Kafka's `message.max.bytes`, the largest record batch |
+| Segment | five of the largest batches | a segment's tail wastes at most a fifth, jemalloc's rounding bound ("approximately 20%", jemalloc(3)) |
+| Control message | 24 bytes | the largest of a subscribe's head and its reply's |
+| Datagrams a system call | 64 | Linux's `NAPI_POLL_WEIGHT`, the packets one device poll hands up |
+| Lane window | 64 datagrams of 1,200 bytes of the smallest frames | RFC 9000 §14's least datagram |
+| Receive window ceiling | the transport's stream ceiling a stream a peer sends on | hyper-transport's `stream_window_ceiling`, auto-tuned below it |
+| Idle timeout | 2 minutes | RFC 4787 REQ-5, the least a NAT keeps a UDP mapping |
+| Keep-alive | 15 seconds | RFC 8085 §3.5's shortest interval |
+| Connections a client | 2 | the one it is served on and the one replacing it after a reconnect |
+| Node memory | three quarters of the process's limit | .NET's GC share of a container's limit (focal's node envelope) |
+| Warm segments and buffers | what the last periods of demand needed | Bonwick and Adams's working set, delimited by demand's troughs |
+| Streams, subscriptions | the rows the node's memory holds | each row charged to the budget as it is taken |
+
+**Memory is charged as held, and the window is what memory holds.** A node keeps the batches its
+memory holds for subscribers that start behind; when a batch, or a frame the transport waits to
+take, needs room the memory has not, the oldest batches retained give it theirs (warm segments
+first), and a subscriber that falls below what is kept is told the offsets it missed. Nothing is
+reserved for a worst case: the transport's buffers, the tables, the index of retained batches and
+the segments are all charged when they are held, to one budget.
+
+Found on the way: a log's tail emptied while it took batches was never given back once the log
+moved past it, a segment held for good at each such rollover (fixed: the log gives it back as it
+takes the next).
+
+Open: a subscriber of many streams waits a round trip a stream (subscribes as lane frames would
+not); the retained batches' index costs 16 bytes a batch beside the log, which already holds what
+it says (a scan of the log from its oldest segment would replace it). The comparison against NATS
+core, Redis Pub/Sub and Kafka in the container is to be run on this tree.
+
 ## 5. Steps
 
 | Step | What | Bar |

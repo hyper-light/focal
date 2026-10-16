@@ -7,7 +7,9 @@
 //! report per run. In `deliver` mode each record is also taken by a
 //! consumer and acknowledged durably, and timed from its intended send time
 //! to that acknowledgement (`deliver.rs`).
+mod bus;
 mod deliver;
+mod pubsub;
 mod report;
 mod target;
 
@@ -28,12 +30,14 @@ pub enum CompareError {
     Report(String),
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum System {
     Kafka,
     Nats,
     Redis,
+    /// focal's event bus (doc 32): `pubsub` only, its ephemeral class.
+    FocalBus,
 }
 
 /// What becomes of each record.
@@ -46,6 +50,10 @@ pub enum Mode {
     /// Appended, then taken by a consumer and acknowledged by it durably: a
     /// work queue's message end to end, focal's `deliver` lifecycle.
     Deliver,
+    /// Published at most once to a subscriber placed first, timed from the
+    /// intended send to the delivery: NATS core, Redis Pub/Sub and focal's
+    /// event bus, each as shipped, on one node.
+    Pubsub,
 }
 
 #[derive(Debug, Parser)]
@@ -87,6 +95,15 @@ pub struct Args {
     /// Where the JSON report goes.
     #[arg(long)]
     pub out: std::path::PathBuf,
+    /// `pubsub`: each message one of a shape of focal's dense JSON corpus (claim, event,
+    /// testament or entropy), compressed as a claimant sends it (zstd 3 with a 64 KiB
+    /// dictionary trained on another seed), its first 16 bytes the stamp; without it, `payload`
+    /// bytes of one value.
+    #[arg(long)]
+    pub corpus: Option<String>,
+    /// `focal-bus`: the node's local identity directory (`focal start bus --pki`), shared with it.
+    #[arg(long)]
+    pub pki: Option<std::path::PathBuf>,
 }
 
 /// The longest latency recorded: anything slower is clamped there and counted.
@@ -99,6 +116,12 @@ async fn main() -> Result<(), CompareError> {
         return Err(CompareError::Argument(
             "rate, payload, inflight and seconds must be positive",
         ));
+    }
+    if args.mode == Mode::Pubsub {
+        return pubsub_main(args).await;
+    }
+    if args.system == System::FocalBus {
+        return Err(CompareError::Argument("focal-bus runs the pubsub mode"));
     }
     let deliver = args.mode == Mode::Deliver;
     if deliver && args.payload < deliver::HEADER {
@@ -120,7 +143,8 @@ async fn main() -> Result<(), CompareError> {
         Mode::Deliver => {
             Some(deliver::Consumer::connect(args.system, args.durable, &endpoints, &target).await?)
         }
-        Mode::Append => None,
+        // `pubsub` returned above, with its own subscriber.
+        Mode::Append | Mode::Pubsub => None,
     };
     let (produced, stop) = tokio::sync::watch::channel(None);
     let interval = Duration::from_secs(1)
@@ -209,9 +233,107 @@ async fn main() -> Result<(), CompareError> {
     report::Report::new(&args, &histogram, &tally, delivered.as_ref()).write(&args.out)
 }
 
+/// The `pubsub` mode's messages: a shape of focal's corpus, compressed as a claimant sends it, or
+/// `payload` bytes of one value; each at least the stamp's 16 bytes.
+fn payloads(args: &Args) -> Result<Vec<Vec<u8>>, CompareError> {
+    let Some(shape) = args.corpus.as_deref() else {
+        return Ok(vec![vec![0x5a_u8; args.payload.max(deliver::HEADER)]]);
+    };
+    let shape = focal_bus::corpus::Shape::ALL
+        .into_iter()
+        .find(|known| known.label() == shape)
+        .ok_or(CompareError::Argument(
+            "corpus: claim, event, testament or entropy",
+        ))?;
+    let fail = |error: std::io::Error| {
+        CompareError::Argument(if error.kind() == std::io::ErrorKind::Other {
+            "corpus codec"
+        } else {
+            "corpus"
+        })
+    };
+    let mut text = String::new();
+    let mut train = focal_bus::corpus::Corpus::new(0x5EED_0001);
+    let mut samples = Vec::new();
+    for _ in 0..2_000 {
+        train
+            .next(shape, &mut text)
+            .map_err(|_| CompareError::Argument("corpus"))?;
+        samples.push(text.as_bytes().to_vec());
+    }
+    let dictionary = zstd::dict::from_samples(&samples, 64 * 1024).map_err(fail)?;
+    let mut compressor = zstd::bulk::Compressor::with_dictionary(3, &dictionary).map_err(fail)?;
+    let mut test = focal_bus::corpus::Corpus::new(0x5EED_0002);
+    let mut payloads = Vec::new();
+    for _ in 0..1_024 {
+        test.next(shape, &mut text)
+            .map_err(|_| CompareError::Argument("corpus"))?;
+        let mut compressed = compressor.compress(text.as_bytes()).map_err(fail)?;
+        if compressed.len() < deliver::HEADER {
+            compressed.resize(deliver::HEADER, 0);
+        }
+        payloads.push(compressed);
+    }
+    Ok(payloads)
+}
+
+/// The `pubsub` mode: a publisher on the open-loop schedule, a subscriber placed first.
+async fn pubsub_main(args: Args) -> Result<(), CompareError> {
+    let payloads = payloads(&args)?;
+    let mean = payloads.iter().map(Vec::len).sum::<usize>() as f64 / payloads.len().max(1) as f64;
+    let warmup = Duration::from_secs(args.warmup);
+    let total = warmup
+        .checked_add(Duration::from_secs(args.seconds))
+        .ok_or(CompareError::Argument("duration"))?;
+    let endpoint = args
+        .endpoints
+        .split(',')
+        .next()
+        .ok_or(CompareError::Argument("endpoints"))?
+        .to_owned();
+    if args.system == System::FocalBus {
+        let node = tokio::net::lookup_host(endpoint.as_str())
+            .await
+            .map_err(|error| CompareError::Target(error.to_string()))?
+            .next()
+            .ok_or(CompareError::Argument("the bus node's address"))?;
+        let run = bus::Run {
+            node,
+            pki: args
+                .pki
+                .clone()
+                .ok_or(CompareError::Argument("focal-bus needs --pki"))?,
+            rate: args.rate,
+            warmup,
+            total,
+            payloads,
+        };
+        let (tally, received, lag) = tokio::task::spawn_blocking(move || bus::run(run))
+            .await
+            .map_err(|error| CompareError::Target(error.to_string()))??;
+        return report::Report::pubsub(&args, &tally, &received, &lag, mean).write(&args.out);
+    }
+    let run = pubsub::Run {
+        system: args.system,
+        endpoint,
+        rate: args.rate,
+        warmup,
+        total,
+        payloads,
+        inflight: args.inflight,
+    };
+    let (tally, received, lag) = tokio::task::spawn_blocking(move || pubsub::run(run))
+        .await
+        .map_err(|error| CompareError::Target(error.to_string()))??;
+    report::Report::pubsub(&args, &tally, &received, &lag, mean).write(&args.out)
+}
+
 /// What a run counts beside the histogram.
 #[derive(Debug, Default)]
 pub struct Tally {
+    /// Messages the schedule still held when its time was over: the generator could not offer
+    /// them (a rate past what it publishes).
+    pub behind: u64,
     pub sent: u64,
     /// Records stored, the warm-up's included: what a consumer takes.
     pub produced: u64,
@@ -221,6 +343,13 @@ pub struct Tally {
     pub first_error: Option<String>,
     /// From the schedule's close to the last answer.
     pub drain: Duration,
+    /// The times a publisher was held (its lane full), what it was held in all, and the longest
+    /// one, nanoseconds.
+    pub holds: u64,
+    pub held_ns: u64,
+    pub held_most_ns: u64,
+    /// When the hold in progress began.
+    pub held_since: Option<std::time::Instant>,
 }
 impl Tally {
     fn record(

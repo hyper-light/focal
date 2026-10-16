@@ -21,7 +21,9 @@
 //! **Reads** each ask `RWF_NOWAIT` (Linux 4.14): a read that would block inside the kernel (a lock
 //! the file system holds, a congested device) completes at once with `EAGAIN` rather than block
 //! the submitter, and is then read in place on the submitter's thread. A kernel that takes no
-//! `RWF_NOWAIT` refuses the submission with `EINVAL`; it is sent again without the flag.
+//! `RWF_NOWAIT` refuses the submission with `EINVAL`, and a file system whose files lack
+//! `FMODE_NOWAIT` (overlayfs) with `EOPNOTSUPP`; it is sent again without the flag. A submission
+//! refused otherwise fails each of its transfers, typed.
 //!
 //! **Writes** keep the issuer's rule: a batch's writes all complete before its flush is issued,
 //! and the flush only if every write succeeded, since a failed write leaves the file in a state its
@@ -426,27 +428,41 @@ impl AioFile {
                 }
             }
             let flushes = self.ctx.flushes();
-            let submitted =
-                self.ctx
-                    .submit(self.file.std_file())
-                    .map_err(|source| DiskError::Io {
+            let submitted = match self.ctx.submit(self.file.std_file()) {
+                Ok(submitted) => submitted,
+                Err(source) => {
+                    // io_submit took none: every record of the submission goes back to the
+                    // front, in order, so the caller fails each (`fail_waiting`). Until
+                    // 2026-10-16 they were dropped here, their batches never answered, and a
+                    // caller waiting on them spun for good (overlayfs refused every read).
+                    self.requeue(0, pushed);
+                    return Err(DiskError::Io {
                         op: "io_submit",
                         path: self.path.clone(),
                         source,
-                    })?;
+                    });
+                }
+            };
             self.in_flight = self.in_flight.saturating_add(submitted);
             // What the kernel did not take goes back to the front, in order.
-            let mut at = pushed;
-            while at > submitted {
-                at = at.saturating_sub(1);
-                if let Some(tag) = self.ctx.pushed(at) {
-                    self.waiting.push_front(tag);
-                }
-            }
+            self.requeue(submitted, pushed);
             // None taken because the first was a flush the kernel refused: send the rest again,
             // that flush now made in place.
             if submitted == 0 && self.ctx.flushes() == flushes {
                 return Ok(());
+            }
+        }
+    }
+
+    /// The submission's records `from..to`, which the kernel did not take, back at the front of
+    /// the queue, in their order.
+    #[cfg(target_os = "linux")]
+    fn requeue(&mut self, from: usize, to: usize) {
+        let mut at = to;
+        while at > from {
+            at = at.saturating_sub(1);
+            if let Some(tag) = self.ctx.pushed(at) {
+                self.waiting.push_front(tag);
             }
         }
     }
@@ -539,5 +555,60 @@ impl AioFile {
         if let Err(e) = outcome {
             batch.failed.get_or_insert(e);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_truncation
+    )
+)]
+mod tests {
+    use super::*;
+    use crate::buf::Alignment;
+    use crate::file::CachingRequest;
+
+    /// Shape: the page each read moves, the block of the file systems the tests run on.
+    const PAGE: usize = 4096;
+    /// Shape: answers asked for before the test calls a batch lost: one is owed at once.
+    const POLLS: usize = 4;
+
+    /// A submission io_submit refuses fails each of its transfers, typed, and its batch is
+    /// answered. Until 2026-10-16 the refused submission's transfers were dropped between the
+    /// queue and the kernel, so their batch was never answered and a caller polling for it spun
+    /// for good: overlayfs refuses `RWF_NOWAIT` with `EOPNOTSUPP`, which the context did not take
+    /// for a refusal of the flag.
+    #[test]
+    fn a_submission_the_kernel_refuses_fails_its_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let align = Alignment::new(PAGE).unwrap();
+        let file = DeviceFile::open(
+            &dir.path().join("aio"),
+            true,
+            CachingRequest::PreferDirect,
+            align,
+        )
+        .unwrap();
+        if file.caching() != Caching::Direct {
+            // tmpfs among others takes no direct I/O, and AIO is made only over it.
+            return;
+        }
+        let mut aio = AioFile::new(file, 4, 1).unwrap();
+        aio.ctx.fail_next = Some(libc::EIO);
+        let mut buf = AlignedBuf::zeroed(PAGE, align).unwrap();
+        buf.set_len(PAGE).unwrap();
+        let number = aio.submit_reads(vec![(buf, 0)]).unwrap();
+        let answer = (0..POLLS).find_map(|_| aio.try_answer().unwrap());
+        let Some((answered, outcome)) = answer else {
+            panic!("the refused batch was never answered");
+        };
+        assert_eq!(answered, number);
+        assert!(outcome.is_err(), "a refused read cannot have read");
+        assert_eq!(aio.out(), 0);
     }
 }

@@ -491,6 +491,33 @@ fn finish_stream_simple() {
     let _ = chunks.finalize();
 }
 
+/// The STREAM frame bytes a connection received count what its datagrams carried (patch Q20), not
+/// flow control's end offsets, which move by a gap's bytes when a frame lands past one. Do: lose
+/// the packet carrying a stream's first 100 bytes, deliver the one carrying its next 100, then let
+/// the first be sent again. Expect: 100 counted when the second lands past the gap, where the end
+/// offsets moved by 200; then at least 200, the first's bytes as they arrive again.
+#[test]
+fn stream_bytes_received_count_what_frames_carried() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    let before = pair.server_conn_mut(server_ch).stream_bytes_received();
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s).write(&[1u8; 100]).unwrap();
+    pair.drive_client();
+    pair.server.inbound.clear(); // Lose the packet carrying the first 100 bytes
+    pair.client_send(client_ch, s).write(&[2u8; 100]).unwrap();
+    pair.drive_client();
+    pair.drive_server();
+    assert_eq!(
+        pair.server_conn_mut(server_ch).stream_bytes_received() - before,
+        100,
+        "the second frame's bytes, landed past the gap"
+    );
+    pair.drive();
+    assert!(pair.server_conn_mut(server_ch).stream_bytes_received() - before >= 200);
+}
+
 #[test]
 fn reset_stream() {
     let _guard = subscribe();
@@ -924,12 +951,57 @@ fn a_warm_up_over_a_slow_path_ends_once_its_packets_queue_and_over_a_fast_one_me
 /// The budget stops a warm-up's sending, not its last round trip's measurement. A warm-up from two
 /// packets reaches its budget while the round trip that meets its target is in flight: the budget
 /// ended it as it sent, the round trip's acknowledgements came to an ended warm-up, and the
-/// measurement was lost (this pair, under BBR at 100 Mbit/s and 40 µs one way: 160 packets each
-/// side, ended at the budget). It now sends no more and ends once its last packet is acknowledged,
-/// here with the measurement.
+/// measurement was lost (160 packets each side, ended at the budget). It now sends no more and ends
+/// once its last packet is acknowledged, here with the measurement.
+///
+/// Under BBR at 100 Mbit/s and 5 ms one way, the path's bandwidth-delay product (125 kB) holds four
+/// initial windows. This test ran at 40 µs one way, a product of 2 kB, where it measured only
+/// because BBR's window grew without bound and the queue it kept lengthened each round trip; with
+/// BBR's window a few products (`VENDORED.md` §30) that path ends at its plateau (below). And at
+/// 5 ms the warm-up met BBR's ProbeRtt, four datagrams, at its first acknowledgement, until the
+/// minimum round trip was timed from its sample.
+///
+/// The client alone warms up. Two warm-ups at once each wait out the flight the other's packets
+/// make (a warm-up waits while it receives one), and the rounds that costs them varies with the
+/// pair's random packet numbers: with both warming, 3 runs of 40 ended at the budget, the target
+/// met only by the round the budget's last packets were in.
 #[test]
 fn a_warm_up_keeps_what_its_last_round_trip_measures() {
     let _guard = subscribe();
+    let [(_, client), (_, server)] = warm_up(Duration::from_millis(5), false);
+    assert_eq!(server.warm_up_end, None);
+    assert_eq!(server.sent_warm_up_packets, 0);
+    assert_eq!(client.warm_up_end, Some(WarmUpEnd::Measured));
+    // Within its budget, sixteen initial windows of the path's MTU
+    assert!(
+        client.sent_warm_up_bytes <= 16 * 10 * u64::from(client.current_mtu),
+        "{} bytes",
+        client.sent_warm_up_bytes
+    );
+}
+
+/// At 40 µs one way the same rate's bandwidth-delay product is about two kilobytes: four initial
+/// windows a round trip would queue some twenty-five times the path's worth. BBR's window, a few
+/// times the product it measures from the path's delivery rate, delivers no more round trip after
+/// round trip, and the warm-up ends at its plateau, short of the target, within its budget. With
+/// the port's estimator the window grew to 147 kB here and the warm-up queued its way to the target
+/// or the budget (`VENDORED.md` §30).
+#[test]
+fn a_warm_up_on_a_path_shorter_than_its_target_ends_at_a_plateau() {
+    let _guard = subscribe();
+    for (side, path) in warm_up(Duration::from_micros(40), true) {
+        assert_eq!(path.warm_up_end, Some(WarmUpEnd::Plateau), "{side}");
+        assert!(
+            path.sent_warm_up_bytes <= 16 * 10 * u64::from(path.current_mtu),
+            "{side}: {} bytes",
+            path.sent_warm_up_bytes
+        );
+    }
+}
+
+/// A connection under BBR at 100 Mbit/s and `latency` one way, driven until quiet, the server
+/// warming its path up too if `server_warms`: each side's path statistics.
+fn warm_up(latency: Duration, server_warms: bool) -> [(&'static str, crate::PathStats); 2] {
     let bbr = || {
         let mut transport = TransportConfig::default();
         transport.congestion(congestion::Congestion::Bbr(congestion::BbrConfig::default()));
@@ -939,23 +1011,22 @@ fn a_warm_up_keeps_what_its_last_round_trip_measures() {
     server.transport = bbr();
     let mut client = client_config();
     client.transport = bbr();
-    let mut pair = Pair::new(Default::default(), server);
-    pair.latency = Duration::from_micros(40);
+    let mut resume = crate::CarefulResumeConfig::default();
+    resume.warm_up(server_warms);
+    let mut server_endpoint = EndpointConfig::default();
+    server_endpoint.careful_resume(Some(resume));
+    let mut pair = Pair::new_from_endpoint(
+        Endpoint::new(EndpointConfig::default(), None, true, None).unwrap(),
+        Endpoint::new(server_endpoint, Some(server), true, None).unwrap(),
+    );
+    pair.latency = latency;
     pair.rate = Some(12_500_000);
     let (client_ch, server_ch) = pair.connect_with(client);
     pair.drive();
-    for (side, path) in [
+    [
         ("client", pair.client_conn_mut(client_ch).stats().path),
         ("server", pair.server_conn_mut(server_ch).stats().path),
-    ] {
-        assert_eq!(path.warm_up_end, Some(WarmUpEnd::Measured), "{side}");
-        // Within its budget, sixteen initial windows of the path's MTU
-        assert!(
-            path.sent_warm_up_bytes <= 16 * 10 * u64::from(path.current_mtu),
-            "{side}: {} bytes",
-            path.sent_warm_up_bytes
-        );
-    }
+    ]
 }
 
 #[test]

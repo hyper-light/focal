@@ -34,7 +34,9 @@ mod batched;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use batched::{Arrival, Batched, Io, IoStats, MAX_BATCH, RECEIVE_BYTES, Sent, Slot};
+pub use batched::{
+    Arrival, Batched, Io, IoStats, MAX_BATCH, Queued, RECEIVE_BYTES, Ring, Sent, Slot, Taken,
+};
 
 use crate::error::RtError;
 use crate::netsys::{self, Family, Socket};
@@ -49,6 +51,25 @@ pub use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 /// Windows; `std::net::UdpSocket` converts into either with `.into()`.
 pub type OwnedDatagram = netsys::OwnedDatagram;
 
+/// What the kernel charges a socket's receive queue at one moment ([`UdpSocket::queue_charge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueCharge {
+    /// Bytes charged for the datagrams the queue holds.
+    pub charged: u64,
+    /// The buffer they are charged against: what `SO_RCVBUF` reports (Linux's, doubled).
+    pub buffer: u64,
+    /// The datagrams dropped for want of room since the socket was made, where the kernel says.
+    pub drops: Option<u64>,
+    /// The most the kernel may still charge for datagrams already read: Linux releases a reader's
+    /// charge in batches, up to a quarter of the buffer while datagrams wait unread
+    /// (`udp_rmem_release`, `forward_threshold = sk_rcvbuf >> 2`); the fabric releases at once.
+    pub release_lag: u64,
+    /// The least the queue may be charged one message beyond what `charged` tells: on macOS the
+    /// mbuf limit `charged` does not read, a datagram's mbufs over `sb_efficiency`; nothing where
+    /// `charged` is the kernel's whole account.
+    pub message_floor: u64,
+}
+
 /// An async UDP socket: a real OS datagram socket, or a port on the simulation's in-memory fabric.
 /// The representation is hidden (the real/sim choice is the driver's, R8); a caller drives it through
 /// the methods below, never by matching a backend.
@@ -58,6 +79,8 @@ pub struct UdpSocket {
     /// Calls that returned an astray report instead of data (module doc). Atomic only so a task that
     /// borrows the socket across an await stays `Send`; one thread counts it.
     astray: AtomicU64,
+    /// The peer the socket is connected to ([`UdpSocket::connect`]), which it sends to alone.
+    peer: Option<SocketAddr>,
 }
 
 /// The socket's backend: a real OS datagram socket (through the platform seam), or a simulation
@@ -108,7 +131,50 @@ impl UdpSocket {
         UdpSocket {
             inner,
             astray: AtomicU64::new(0),
+            peer: None,
         }
+    }
+
+    /// Binds a non-blocking UDP socket to `addr` that other sockets of this process may bind too
+    /// (`SO_REUSEPORT`): the port a listener shares with the sockets it connects to its peers
+    /// ([`UdpSocket::connect`]), each of which then takes its peer's datagrams into a receive queue
+    /// of its own, as a TCP connection's socket does. Refused `BadConfig` on Windows, where a shared
+    /// port hands a connected socket no peer's datagrams of its own, and on the simulation fabric,
+    /// whose ports are one socket's each.
+    pub fn bind_shared(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
+        let addr = addr.into();
+        if on_sim() {
+            return Err(RtError::BadConfig {
+                what: "a shared port on the simulation fabric, whose ports are one socket's",
+            });
+        }
+        let socket = netsys::dgram_socket(Family::of(addr))?;
+        netsys::share_port(&socket)?;
+        netsys::bind(&socket, addr)?;
+        Ok(UdpSocket::of(Inner::Real { socket }))
+    }
+
+    /// Connects the socket to `remote`: the kernel hands it `remote`'s datagrams to its port in
+    /// place of an unconnected socket sharing the port (a connected socket's exact match ranks first,
+    /// on Linux and the BSDs alike, measured), and it sends to `remote` alone, naming no address
+    /// (BSD refuses one on a connected socket).
+    pub fn connect(&mut self, remote: SocketAddr) -> Result<(), RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::connect(socket, remote)?,
+            Inner::Sim { .. } => {
+                return Err(RtError::BadConfig {
+                    what: "a connected socket on the simulation fabric",
+                });
+            }
+            Inner::Moved => return Err(moved()),
+        }
+        self.peer = Some(remote);
+        Ok(())
+    }
+
+    /// The peer the socket is connected to, if it is.
+    pub fn peer(&self) -> Option<SocketAddr> {
+        self.peer
     }
 
     /// Adopts an already-bound OS datagram socket (a `std::net::UdpSocket` converts into
@@ -183,6 +249,84 @@ impl UdpSocket {
         }
     }
 
+    /// What its receive queue is charged now, as the kernel counts it, where it says: Linux's
+    /// `SO_MEMINFO` (each queued datagram its allocation, against the buffer `SO_RCVBUF` reports,
+    /// and the drops for want of room); macOS's byte count (`FIONREAD`, each datagram's payload,
+    /// address and control) with its mbuf limit as a floor a message; the simulation fabric's own
+    /// account (each datagram its payload). `None` where no such account may be read (Windows).
+    pub fn queue_charge(&self) -> Result<Option<QueueCharge>, RtError> {
+        match &self.inner {
+            #[cfg(target_os = "linux")]
+            Inner::Real { socket } => {
+                let (charged, buffer, drops) =
+                    linux::queue_charge(socket.raw_id()).map_err(|error| {
+                        RtError::DriverRefused {
+                            call: "getsockopt(SO_MEMINFO)",
+                            code: error.raw_os_error(),
+                        }
+                    })?;
+                Ok(Some(QueueCharge {
+                    charged: u64::from(charged),
+                    buffer: u64::from(buffer),
+                    drops: drops.map(u64::from),
+                    release_lag: u64::from(buffer >> 2),
+                    message_floor: 0,
+                }))
+            }
+            // XNU's byte limit counts each datagram's payload, address and control (`sbappendaddr`)
+            // against `sb_hiwat` (what `SO_RCVBUF` reports), and `FIONREAD` reads what it has
+            // counted (`soioctl`: `so_rcv.sb_cc`); it releases a datagram's count as it is read.
+            #[cfg(target_os = "macos")]
+            Inner::Real { socket } => Ok(Some(QueueCharge {
+                charged: u64::try_from(netsys::queued_bytes(socket)?).unwrap_or(u64::MAX),
+                buffer: u64::try_from(netsys::recv_buffer_bytes(socket)?).unwrap_or(u64::MAX),
+                drops: None,
+                release_lag: 0,
+                message_floor: macos::message_floor(),
+            })),
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            Inner::Real { .. } => Ok(None),
+            Inner::Sim { index, .. } => {
+                let (charged, buffer) = crate::sim::sim_queue_charge(*index);
+                Ok(Some(QueueCharge {
+                    charged: u64::try_from(charged).unwrap_or(u64::MAX),
+                    buffer: u64::try_from(buffer).unwrap_or(u64::MAX),
+                    drops: None,
+                    release_lag: 0,
+                    message_floor: 0,
+                }))
+            }
+            Inner::Moved => Err(moved()),
+        }
+    }
+
+    /// The bytes waiting in its receive queue as the platform counts them: every queued datagram's
+    /// on Windows and the BSDs (the BSDs with their addresses and control), only the next one's on
+    /// Linux (`FIONREAD`), every one's on the simulation fabric.
+    pub fn queued_bytes(&self) -> Result<usize, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::queued_bytes(socket),
+            Inner::Sim { index, .. } => Ok(crate::sim::sim_queued(*index)),
+            Inner::Moved => Err(moved()),
+        }
+    }
+
+    /// Asks the kernel for a receive buffer of `bytes` (`SO_RCVBUFFORCE` where the process may, on
+    /// Linux past `net.core.rmem_max`, else `SO_RCVBUF`; a size the OS refuses outright is halved
+    /// and asked again) and returns the buffer it reports after the ask
+    /// ([`UdpSocket::recv_buffer_bytes`]), which the OS may cap below the ask (Linux at `rmem_max`,
+    /// macOS at `kern.ipc.maxsockbuf`) and Linux reports doubled. What the buffer holds of datagram
+    /// payload is the transport's to count (hyper-transport's `socket_room`). The simulation
+    /// fabric's buffer is fixed: nothing is asked.
+    pub fn set_recv_buffer_bytes(&self, bytes: usize) -> Result<usize, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::set_recv_buffer(socket, bytes)?,
+            Inner::Sim { .. } => {}
+            Inner::Moved => return Err(moved()),
+        }
+        self.recv_buffer_bytes()
+    }
+
     /// Sends a datagram to `addr` without blocking: the bytes accepted, or `RtError::WouldBlock` when the
     /// OS has no room for it now — local pressure, typed apart from a failure of the socket, so a caller
     /// retries it once [`UdpSocket::writable`] (or sends with [`UdpSocket::send_to_writable`]) rather than
@@ -210,7 +354,13 @@ impl UdpSocket {
     /// One non-blocking send.
     fn send_once(&self, buf: &[u8], addr: SocketAddr) -> Result<Outcome<usize>, RtError> {
         match &self.inner {
-            Inner::Real { socket } => Ok(self.outcome(netsys::send_to(socket, buf, addr)?)),
+            Inner::Real { socket } => match self.peer {
+                None => Ok(self.outcome(netsys::send_to(socket, buf, addr)?)),
+                Some(peer) if peer == addr => Ok(self.outcome(netsys::send(socket, buf)?)),
+                Some(_) => Err(RtError::BadConfig {
+                    what: "a send to another address than the peer the socket is connected to",
+                }),
+            },
             Inner::Sim { index, .. } => Ok(crate::sim::sim_send(*index, addr.port(), buf)?
                 .map_or(Outcome::NotNow, Outcome::Done)),
             Inner::Moved => Err(moved()),

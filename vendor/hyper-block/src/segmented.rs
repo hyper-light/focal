@@ -424,7 +424,8 @@ impl BlockFile for SegmentedFile {
     }
 
     fn reads_resident(&self) -> bool {
-        self.first().is_ok_and(|s| s.file.reads_resident())
+        // Every segment's own handle: one that learned its file system refuses says so for all.
+        self.first().is_ok() && self.slots.iter().all(|s| s.file.reads_resident())
     }
 
     fn residency(&self) -> crate::Residency {

@@ -72,6 +72,27 @@ impl Part {
     /// Checks `bytes` as a batch and appends it to its stream.
     pub fn append(&mut self, pool: &mut SegmentPool, bytes: &[u8]) -> Result<Appended, BusError> {
         let batch = Batch::parse(bytes, self.limits.batch_bytes).map_err(BusError::Batch)?;
+        self.append_batch(pool, batch)
+    }
+
+    /// [`Self::append`] for a batch whose CRC the transport that carried it verified as it arrived
+    /// ([`crate::batch::EMBEDDED`]): every other check is made.
+    pub fn append_verified(
+        &mut self,
+        pool: &mut SegmentPool,
+        bytes: &[u8],
+    ) -> Result<Appended, BusError> {
+        let batch =
+            Batch::parse_verified(bytes, self.limits.batch_bytes).map_err(BusError::Batch)?;
+        self.append_batch(pool, batch)
+    }
+
+    fn append_batch(
+        &mut self,
+        pool: &mut SegmentPool,
+        batch: Batch<'_>,
+    ) -> Result<Appended, BusError> {
+        let bytes = batch.bytes();
         let stream_id = batch.stream();
         let count = batch.count();
         let stream = self.streams.get_or_insert(stream_id)?;
@@ -112,6 +133,11 @@ impl Part {
     /// The batch after `batch` in its stream, once it is appended.
     pub fn after(&self, batch: &Batch<'_>) -> Option<Batch<'_>> {
         self.batch(Position::from_word(batch.next()?))
+    }
+
+    /// Where the oldest batch `stream` holds is (a position word).
+    pub fn first_word(&self, stream: u64) -> Option<u64> {
+        self.streams.get(stream)?.first
     }
 
     /// The oldest batch `stream` holds.

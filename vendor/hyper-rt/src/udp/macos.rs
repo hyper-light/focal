@@ -74,6 +74,30 @@ impl Clock {
     }
 }
 
+/// `MSIZE` (`bsd/arm/param.h`, `bsd/i386/param.h`): an mbuf's own size. A received datagram is
+/// queued as its address's mbuf, its control's and its data's, each charged at least this.
+pub(crate) const MSIZE: u64 = 256;
+/// `M16KCLBYTES` (`bsd/arm/param.h`, `bsd/i386/param.h`): XNU's largest cluster, the "jumbo
+/// cluster", the most storage a receiving driver gives a datagram's data in one mbuf.
+pub(crate) const M16KCLBYTES: u64 = 16_384;
+/// `sb_efficiency` (`bsd/kern/uipc_socket2.c`): a socket buffer's mbuf storage is limited to this
+/// many times its byte limit (`sbreserve`: `sb_mbmax = cc * sb_efficiency`), the second limit
+/// `sbspace` takes.
+pub(crate) const SB_EFFICIENCY: u64 = 8;
+
+/// The least XNU may charge one queued datagram, against its byte limit: `sbspace` is the smaller
+/// of what is left of the byte limit (`sb_hiwat - sb_cc`, which `FIONREAD` reads) and of the mbuf
+/// limit (`sb_mbmax - sb_mbcnt`, which nothing reads), and a datagram's mbufs are its address's,
+/// its control's and its data's, the data's at most a jumbo cluster, so its storage over
+/// `sb_efficiency` is the most the mbuf limit can cost it in bytes of the byte limit.
+pub(crate) fn message_floor() -> u64 {
+    MSIZE
+        .saturating_mul(3)
+        .saturating_add(M16KCLBYTES)
+        .checked_div(SB_EFFICIENCY)
+        .unwrap_or(u64::MAX)
+}
+
 /// Asks the kernel to stamp each datagram `fd` receives. Whether it agreed.
 pub(crate) fn enable_stamps(fd: RawFd) -> bool {
     let on: libc::c_int = 1;

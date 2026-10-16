@@ -1,0 +1,65 @@
+# One node of each system on equal terms (doc 32 §5, step 2): NATS core (no JetStream), Kafka
+# (one KRaft broker), Redis Pub/Sub and focal's event bus (its ephemeral class), each node on one
+# CPU and 2 GiB (the owner's terms for the first one-node test), the generator apart on its own
+# CPUs, one bridge network. One system at a time:
+#   docker compose -f pubsub.yaml --profile nats up -d
+# The images are compose.yaml's, at the same digests; focal's is focal.Dockerfile's.
+x-node: &node
+  cpus: "${NODE_CPUS:-1}"
+  mem_limit: 2g
+  networks: [bench]
+
+services:
+  nats:
+    <<: *node
+    image: ${BENCH_LIBRARY:-public.ecr.aws/docker/library}/nats:2.12-alpine@sha256:b270f5e2428354c0335612694d7dd2fb588148e567a5757fdff325ef9c9332e6
+    profiles: [nats]
+    # Core NATS as shipped: no configuration, no JetStream.
+    command: ["--port", "4222"]
+  kafka:
+    <<: *node
+    image: ${BENCH_KAFKA:-apache/kafka}:4.1.0@sha256:bff074a5d0051dbc0bbbcd25b045bb1fe84833ec0d3c7c965d1797dd289ec88f
+    profiles: [kafka]
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_HEAP_OPTS: -Xms1g -Xmx1g
+  redis:
+    <<: *node
+    image: ${BENCH_LIBRARY:-public.ecr.aws/docker/library}/redis:8.2-alpine@sha256:b51665e66f00759be7c3152ad5ac3c66fb2f619c13ef62dea7cc1f9914524635
+    profiles: [redis]
+    command: ["redis-server"]
+  bus:
+    <<: *node
+    image: ${FOCAL_IMAGE:-focal:bench}
+    profiles: [focal-bus]
+    # As shipped: the node sizes itself from what it finds (its container's memory, the socket
+    # buffers the kernel grants an unprivileged process); nothing is tuned.
+    command: ["focal", "start", "bus", "--listen", "0.0.0.0:7443", "--pki", "/pki"]
+    volumes: ["pki:/pki"]
+  # The generator, on the bench network, its CPUs its own (GENERATOR_CPUS).
+  generator:
+    image: ${FOCAL_IMAGE:-focal:bench}
+    profiles: [nats, kafka, redis, focal-bus]
+    cpus: "${GENERATOR_CPUS:-2}"
+    mem_limit: 2g
+    networks: [bench]
+    command: ["sleep", "86400"]
+    volumes: ["reports:/reports", "pki:/pki"]
+
+networks:
+  bench: {}
+
+volumes:
+  pki: {}
+  reports: {}

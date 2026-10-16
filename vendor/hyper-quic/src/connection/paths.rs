@@ -33,6 +33,8 @@ pub(super) struct PathData {
     pub(super) congestion: Box<dyn congestion::Controller>,
     /// Pacing state
     pub(super) pacing: Pacer,
+    /// What the path has delivered, for its delivery-rate samples
+    pub(super) delivery: super::Delivery,
     pub(super) challenge: Option<u64>,
     pub(super) challenge_pending: bool,
     /// Whether we're certain the peer can both send and receive on this address
@@ -85,6 +87,7 @@ impl PathData {
                 config.get_initial_mtu(),
                 now,
             ),
+            delivery: super::Delivery::default(),
             congestion,
             challenge: None,
             challenge_pending: false,
@@ -127,6 +130,8 @@ impl PathData {
             remote,
             rtt: prev.rtt,
             pacing: Pacer::new(smoothed_rtt, congestion.window(), prev.current_mtu(), now),
+            // A new path's flights are its own
+            delivery: super::Delivery::default(),
             sending_ecn: true,
             congestion,
             challenge: None,
@@ -150,6 +155,7 @@ impl PathData {
     pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
         self.rtt = RttEstimator::new(config.initial_rtt);
         self.congestion = config.congestion.build(now, config.get_initial_mtu());
+        self.delivery = super::Delivery::default();
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
         self.pacing = Pacer::new(
             self.rtt.get(),

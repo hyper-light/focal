@@ -35,6 +35,7 @@
 mod admission;
 mod arena;
 mod budget;
+mod charge;
 mod credit;
 mod deadlines;
 mod endpoint;
@@ -52,12 +53,14 @@ pub mod tls;
 
 pub use admission::{AdmissionLimits, AdmissionStats};
 pub use budget::{Budget, Fixed, Lane, Reservation};
+pub use charge::{Account, Charged, Queue, ReceiveCharge, SocketCharge, Unprompted, probes_within};
 pub use credit::{
     K_GRANULARITY, MIN_DATAGRAM, STREAM_BYTES_PER_PACKET, class_reserve, initial_window,
-    stream_window_ceiling,
+    socket_buffer_ask, stream_window_ceiling,
 };
 pub use endpoint::{AskQueue, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit};
 pub use error::Refusal;
+pub use frame::Embedded;
 /// The congestion controllers a connection may run ([`Config::congestion`]).
 pub use hyper_quic::congestion;
 pub use hyper_quic::{EcnCodepoint, Transmit};
@@ -115,6 +118,34 @@ pub trait Classes {
         let _ = role;
         false
     }
+    /// Whether a lane frame of `class` is never skipped. A frame whose class bound or budget cannot
+    /// take it is skipped and counted, so one full range never stalls a lane (`lane`'s module doc):
+    /// right for a class whose frames the protocol above sends again (consensus messages). A class
+    /// whose frames are their sender's only copy (a bus's messages) is lossless: a frame of it the
+    /// budget cannot take now waits, its lane unread so QUIC's flow control holds its sender, until
+    /// the budget can ([`Endpoint::retry_reserving`]). One past its class's bound is still refused,
+    /// as it never fits. None is, unless a side says so.
+    fn lossless(class: Self::Class) -> bool {
+        let _ = class;
+        false
+    }
+    /// Where a lane frame of `kind` carries its own CRC-32C, which its receiver's protocol checks
+    /// end to end ([`Embedded`]): the transport's prefix checksum then covers the frame only before
+    /// it, and the transport verifies the frame's own on receipt, so a frame is summed once, not
+    /// twice. Each frame of such a kind must carry it; one whose own checksum fails is refused as
+    /// corrupt, as one whose prefix checksum fails is. None does, unless a side says so.
+    fn embedded_checksum(kind: Self::Kind) -> Option<Embedded> {
+        let _ = kind;
+        None
+    }
+}
+
+/// The bytes an endpoint asks its budget for to queue an outgoing lane frame of `length` bytes: the
+/// frame and the transport's prefix before it. An owner whose budget hands out buffers by size sizes
+/// its largest from this of its largest [`Classes::frame_bound`], so no frame its classes allow is
+/// refused for want of a buffer; a constant of its own would drift from the transport's.
+pub fn frame_grant(length: u64) -> u64 {
+    length.saturating_add(u64::try_from(frame::PREFIX_BYTES).unwrap_or(u64::MAX))
 }
 
 /// What a connection's handshake established, for [`Directory::identify`]: everything the

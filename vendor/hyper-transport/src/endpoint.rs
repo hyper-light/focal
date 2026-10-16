@@ -40,8 +40,9 @@ use hyper_quic::{
 
 use crate::admission::{Admission, AdmissionLimits, AdmissionStats};
 use crate::budget::{Budget, Lane, Reservation};
+use crate::charge::{Unprompted, probes_within};
 use crate::credit::{
-    K_GRANULARITY, MIN_DATAGRAM, Window, class_reserve, initial_window, stream_window_ceiling,
+    K_GRANULARITY, MIN_DATAGRAM, Room, Window, class_reserve, initial_window, stream_window_ceiling,
 };
 use crate::deadlines;
 use crate::exchange::{End, Exchange, In, Incoming, Out, Outgoing, Pushed, abandon, pull, push};
@@ -256,12 +257,26 @@ pub struct Stats {
     pub events: usize,
     /// Lane frames skipped because their class or the budget could not take them.
     pub frames_dropped: u64,
+    /// Lanes whose next frame, of a lossless class, waits for the budget to hold it.
+    pub frames_reserving: usize,
     /// Endpoint responses dropped at their bound.
     pub responses_dropped: u64,
     /// Streams a peer opened past a bound, refused.
     pub streams_refused: u64,
+    /// Lanes stopped at a frame refused: corrupt (its prefix's or its own checksum failed), or a
+    /// lane past its bounds.
+    pub lanes_refused: u64,
     /// Receive chunks held, each charged to the budget.
     pub receive_chunks: usize,
+    /// What the socket's receive queue holds of the connections' windows, payload bytes
+    /// ([`Endpoint::set_receive_capacity`]; `u64::MAX` until the owner says).
+    pub receive_capacity: u64,
+    /// The windows granted, summed: what the peers may send unread.
+    pub receive_granted: u64,
+    /// Connections refused for the queue holding no more first windows.
+    pub receive_refused: u64,
+    /// Connections that receive on a socket of their own ([`Endpoint::set_peer_room`]).
+    pub receive_rooms: usize,
     /// Datagrams copied into buffers of their own because no chunk could take them.
     pub receive_copied: u64,
     /// The stream pool ([`StreamCredit::Pooled`]).
@@ -329,6 +344,9 @@ struct Conn<R> {
     grants: Vec<Reservation>,
     /// The connection was lost and its owner told.
     lost: bool,
+    /// The room of the socket it receives on alone, once its driver connected one to its peer
+    /// ([`Endpoint::set_peer_room`]); until then its windows are the shared socket's.
+    room: Option<Room>,
     /// Its part of the stream pool ([`StreamCredit::Pooled`]).
     share: Share,
     /// The exchanges its peer opened that are open: what a pooled connection's grant serves.
@@ -373,6 +391,8 @@ struct PeerEntry<R> {
     frames: usize,
     /// Its lanes not read for want of a seat for their next frame.
     paused: u32,
+    /// The lanes of its the owner holds ([`Endpoint::hold_lane`]): at most its lanes' bound.
+    holds: Vec<crate::LaneId>,
 }
 
 impl<R> PeerEntry<R> {
@@ -385,6 +405,7 @@ impl<R> PeerEntry<R> {
             role: None,
             used,
             held: 0,
+            holds: Vec::new(),
             dialing: false,
             unreachable: None,
             closed: None,
@@ -508,6 +529,12 @@ struct Core<C: Classes, B, D> {
     /// The streams pooled connections share ([`StreamCredit::Pooled`]); until the owner sizes it,
     /// one connection's streams.
     pool: Pool,
+    /// What the socket's receive queue holds of the windows granted ([`Room`]).
+    room: Room,
+    /// Moves whenever a connection is identified or goes ([`Endpoint::connection_generation`]).
+    generation: u64,
+    /// Lanes whose next frame waits for the budget ([`Reading::Reserving`]).
+    reserving: usize,
 }
 
 /// What `conn` has moved, as the wait of an exchange of `rank` reads it.
@@ -629,6 +656,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 ids: Vec::new(),
                 stats: Stats::default(),
                 pool: Pool::new(u64::from(limits.streams_per_connection)),
+                room: Room::unbounded(),
+                generation: 0,
+                reserving: 0,
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
@@ -678,6 +708,19 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
 
     /// The next datagram to send, written into `out` (cleared first).
     pub fn poll_transmit(&mut self, now: Instant, out: &mut Vec<u8>) -> Option<Transmit> {
+        self.poll_transmit_batch(now, 1, out)
+    }
+
+    /// The next datagrams to send, written into `out` (cleared first): up to `max_datagrams` of one
+    /// connection's, to one destination, each but the last [`Transmit::segment_size`] bytes, for a
+    /// socket that sends them in one segmented call (`UDP_SEGMENT`) or splits them. A driver that
+    /// asked for one at a time made a call, and a slot of its outbox, a datagram.
+    pub fn poll_transmit_batch(
+        &mut self,
+        now: Instant,
+        max_datagrams: usize,
+        out: &mut Vec<u8>,
+    ) -> Option<Transmit> {
         self.core.now = now;
         out.clear();
         if let Some((transmit, bytes)) = self.responses.pop_front() {
@@ -695,7 +738,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             let Some(Some(conn)) = self.conns.get_mut(key) else {
                 continue;
             };
-            let sent = conn.quic.poll_transmit(now, 1, out, self.quic.configs());
+            let sent = conn
+                .quic
+                .poll_transmit(now, max_datagrams.max(1), out, self.quic.configs());
             // Sending, or finding nothing to send, moves the connection's timers.
             self.rearm_later(key);
             if let Some(transmit) = sent {
@@ -719,6 +764,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// Time has reached `now`: fire every timer due.
     pub fn handle_timeout(&mut self, now: Instant) {
         self.core.now = now;
+        self.retry_reserving();
         self.read_touched();
         let mut due = std::mem::take(&mut self.due);
         due.clear();
@@ -978,14 +1024,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     fn dial(&mut self, now: Instant, peer: PeerId, address: SocketAddr) -> Result<(), Refusal> {
         let grant = self.core.window_grant()?;
         let Some(name) = self.core.directory.server_name(peer) else {
-            self.core.budget.release(grant);
+            self.core.release_window(grant);
             return Err(Refusal::Identity);
         };
         let dialed = self.quic.connect(now, self.client, address, name, None);
         let (handle, quic) = match dialed {
             Ok(dialed) => dialed,
             Err(_) => {
-                self.core.budget.release(grant);
+                self.core.release_window(grant);
                 return Err(Refusal::Quic);
             }
         };
@@ -1162,9 +1208,39 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         self.core.budget.reserve(bytes, Lane::Class(class))
     }
 
-    /// Give a reservation back to the budget: a frame's, or one the owner reserved.
+    /// Give a reservation back to the budget: a frame's, or one the owner reserved. A lossless frame
+    /// that waited for the budget is reserved again now.
     pub fn release(&mut self, reservation: Reservation) {
         self.core.budget.release(reservation);
+        self.retry_reserving();
+    }
+
+    /// The budget may hold more than it did (the owner gave bytes back to it elsewhere): each lane
+    /// whose lossless frame waits for it ([`Classes::lossless`]) asks again, and is read on if its
+    /// frame is reserved. Nothing waits, nothing is done.
+    pub fn retry_reserving(&mut self) {
+        if self.core.reserving == 0 {
+            return;
+        }
+        for key in 0..self.conns.len() {
+            let Some(mut conn) = self.take(key) else {
+                continue;
+            };
+            // From the last: reading a lane removes at most that lane.
+            for at in (0..conn.lanes_in.len()).rev() {
+                let waiting = conn
+                    .lanes_in
+                    .get(at)
+                    .is_some_and(|lane| lane.state == Reading::Reserving);
+                if waiting {
+                    self.core.read_lane(&mut conn, at);
+                }
+            }
+            self.put(key, conn);
+            if self.core.reserving == 0 {
+                break;
+            }
+        }
     }
 
     /// Queue `frame` of `kind` on `peer`'s lane `lane`, in order after the lane's earlier frames.
@@ -1181,9 +1257,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         }
         let key = self.core.connection_of(peer).ok_or(Refusal::NotConnected)?;
         let mut conn = self.take(key).ok_or(Refusal::NotConnected)?;
-        let queued = self
-            .core
-            .send_frame(&mut conn, lane, (C::kind_code(kind), class), frame);
+        let queued = self.core.send_frame(
+            &mut conn,
+            lane,
+            (C::kind_code(kind), class, C::embedded_checksum(kind)),
+            frame,
+        );
         self.put(key, conn);
         queued
     }
@@ -1314,8 +1393,240 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             receive_chunks: self.receive.chunks(),
             receive_copied: self.receive.copied(),
             pool: self.core.pool.stats(),
+            receive_capacity: self.core.room.capacity(),
+            receive_granted: self.core.room.granted(),
+            receive_refused: self.core.room.refused(),
+            frames_reserving: self.core.reserving,
+            receive_rooms: self
+                .conns
+                .iter()
+                .flatten()
+                .filter(|conn| conn.room.is_some())
+                .count(),
             ..self.core.stats
         }
+    }
+
+    /// What the endpoint's windows may grant at most, summed, payload bytes: for every connection
+    /// admission holds and every handshake it lets wait beside them, a window at its ceiling and the
+    /// reserve on top. What its socket's receive queue should hold for no window to be held below
+    /// its ceiling by the queue ([`Endpoint::set_receive_capacity`]).
+    pub fn receive_demand(&self) -> u64 {
+        let admission = self.core.limits.admission;
+        let held = admission.connections.saturating_add(admission.pending);
+        u64::try_from(held)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(self.peer_demand())
+    }
+
+    /// What one connection's windows may grant at most: its window at the ceiling and the reserve
+    /// on top. What a socket it receives on alone should hold ([`Endpoint::set_peer_room`]).
+    pub fn peer_demand(&self) -> u64 {
+        let reserve = class_reserve(C::RANKS.saturating_sub(1));
+        self.core
+            .limits
+            .window_ceiling
+            .max(initial_window(MIN_DATAGRAM))
+            .saturating_add(reserve)
+    }
+
+    /// The socket's receive queue holds `bytes` of its peers' stream data: what its driver's
+    /// [`crate::ReceiveCharge`] tells of the buffer the socket reports, or before anything is
+    /// measured [`Endpoint::unmeasured_room`]. From now the windows granted, summed, never pass
+    /// it, a window grows only while what is left holds the first windows of the
+    /// handshakes that may come, and a connection whose first window it cannot hold is refused
+    /// [`Refusal::ReceiveBuffer`] (`credit`'s socket room). Windows granted already stand until they
+    /// are given back.
+    pub fn set_receive_capacity(&mut self, bytes: u64) {
+        self.core.room.set_capacity(bytes);
+    }
+
+    /// The owner holds `peer`'s lane `lane`: nothing more of it is read until the owner lets it go
+    /// ([`Endpoint::release_lane`]), so what the peer sends on it waits in QUIC, and QUIC's flow
+    /// control holds the peer at the window this side granted (the socket's room). A consumer's
+    /// backpressure: a node whose subscribers cannot take more holds the publishers that feed them,
+    /// rather than queueing what they send. A lane the peer has not yet opened is held from its
+    /// opening, on this connection or a later one. Refused `Lanes` past the lanes a peer may open.
+    pub fn hold_lane(&mut self, peer: PeerId, lane: crate::LaneId) -> Result<(), Refusal> {
+        let bound = usize::try_from(self.core.limits.lanes_per_peer).unwrap_or(usize::MAX);
+        let entry = self
+            .core
+            .peer_entry_mut(peer)
+            .ok_or(Refusal::NotConnected)?;
+        if !entry.holds.contains(&lane) {
+            if entry.holds.len() >= bound {
+                return Err(Refusal::Lanes);
+            }
+            entry.holds.push(lane);
+        }
+        self.mark_lanes(peer, lane, true);
+        Ok(())
+    }
+
+    /// The owner lets `peer`'s lane `lane` go: it is read again from where it stopped.
+    pub fn release_lane(&mut self, peer: PeerId, lane: crate::LaneId) -> Result<(), Refusal> {
+        let entry = self
+            .core
+            .peer_entry_mut(peer)
+            .ok_or(Refusal::NotConnected)?;
+        entry.holds.retain(|held| *held != lane);
+        self.mark_lanes(peer, lane, false);
+        Ok(())
+    }
+
+    /// Marks `peer`'s open lanes named `lane` held or not, reading on those let go.
+    fn mark_lanes(&mut self, peer: PeerId, lane: crate::LaneId, held: bool) {
+        let mut keys = std::mem::take(&mut self.keys);
+        keys.clear();
+        keys.extend(self.core.admission.connections_of(peer));
+        for &key in &keys {
+            let Some(mut conn) = self.take(key) else {
+                continue;
+            };
+            // From the last: reading a lane removes at most that lane.
+            for at in (0..conn.lanes_in.len()).rev() {
+                let matches = conn
+                    .lanes_in
+                    .get(at)
+                    .is_some_and(|open| open.state != Reading::Opener && open.lane == lane);
+                if !matches {
+                    continue;
+                }
+                if let Some(open) = conn.lanes_in.get_mut(at) {
+                    open.held = held;
+                }
+                if !held {
+                    self.core.read_lane(&mut conn, at);
+                }
+            }
+            self.put(key, conn);
+        }
+        self.keys = keys;
+    }
+
+    /// A count that moves whenever a connection is identified or goes: an owner that keeps
+    /// something for each connection (a driver's socket for each peer) looks again
+    /// ([`Endpoint::established`]) only when it moved.
+    pub fn connection_generation(&self) -> u64 {
+        self.core.generation
+    }
+
+    /// Every identified connection's peer and the address it is reached at now, into `out`
+    /// (cleared first; at most the admission's bound on connections).
+    pub fn established(&self, out: &mut Vec<(PeerId, SocketAddr)>) {
+        out.clear();
+        for conn in self.conns.iter().flatten() {
+            if let Some((peer, _)) = conn.peer
+                && !conn.lost
+            {
+                out.push((peer, conn.quic.remote_address()));
+            }
+        }
+    }
+
+    /// The connection window `peer` has consumed, summed over its streams as flow control counts
+    /// it: what a message read from its socket carried, as the difference across the read
+    /// (hyper-quic patch Q20). `None` for a peer with no connection.
+    pub fn stream_bytes_received(&self, peer: PeerId) -> Option<u64> {
+        let key = self.core.connection_of(peer)?;
+        let conn = self.conns.get(key).and_then(Option::as_ref)?;
+        Some(conn.quic.stream_bytes_received())
+    }
+
+    /// The connection window consumed, summed over the connections that receive on the shared
+    /// socket (those without a socket of their own, [`Endpoint::set_peer_room`]).
+    pub fn stream_bytes_received_shared(&self) -> u64 {
+        self.conns
+            .iter()
+            .flatten()
+            .filter(|conn| conn.room.is_none())
+            .fold(0u64, |sum, conn| {
+                sum.saturating_add(conn.quic.stream_bytes_received())
+            })
+    }
+
+    /// What `peer` may send its socket unprompted by any window while this side does not read: an
+    /// acknowledgement for each of this side's ack-eliciting packets in flight to it, and the loss
+    /// probes it may send within the idle timeout ([`crate::probes_within`]). `None` for a peer with
+    /// no connection.
+    pub fn unprompted(&self, peer: PeerId) -> Option<Unprompted> {
+        let key = self.core.connection_of(peer)?;
+        let conn = self.conns.get(key).and_then(Option::as_ref)?;
+        Some(Unprompted {
+            acknowledgements: conn.quic.ack_eliciting_in_flight(),
+            probes: probes_within(self.core.limits.idle_timeout),
+        })
+    }
+
+    /// What the shared socket's peers may send it unprompted: each connection without a socket of
+    /// its own, as [`Endpoint::unprompted`], and the probes of each handshake admission lets wait.
+    pub fn unprompted_shared(&self) -> Unprompted {
+        let probes = probes_within(self.core.limits.idle_timeout);
+        let pending = u64::try_from(self.core.limits.admission.pending).unwrap_or(u64::MAX);
+        self.conns
+            .iter()
+            .flatten()
+            .filter(|conn| conn.room.is_none())
+            .fold(
+                Unprompted {
+                    acknowledgements: 0,
+                    probes: pending.saturating_mul(probes),
+                },
+                |sum, conn| Unprompted {
+                    acknowledgements: sum
+                        .acknowledgements
+                        .saturating_add(conn.quic.ack_eliciting_in_flight()),
+                    probes: sum.probes.saturating_add(probes),
+                },
+            )
+    }
+
+    /// The room the shared socket must hold before anything is measured: the first window of every
+    /// connection and handshake admission lets in at once. What each sends before this side first
+    /// acknowledges it is bounded by the protocol (RFC 9000 §8.1's three times what it was sent
+    /// before its address is validated, RFC 9002 §7.2's initial window), and the first datagram the
+    /// socket reads is the first sample.
+    pub fn unmeasured_room(&self) -> u64 {
+        let admission = self.core.limits.admission;
+        let held = admission.connections.saturating_add(admission.pending);
+        u64::try_from(held)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(Core::<C, B, D>::first_window())
+    }
+
+    /// One connection's first window, the room a socket of its own must hold before anything is
+    /// measured ([`Endpoint::unmeasured_room`]).
+    pub fn unmeasured_peer_room(&self) -> u64 {
+        Core::<C, B, D>::first_window()
+    }
+
+    /// `peer`'s connection receives on a socket of its own from now, whose queue holds `bytes` of
+    /// datagram payload (its driver connected a socket to the peer): its windows leave the shared
+    /// socket's room for a room of their own, in which they grow alone, so each connection a node
+    /// holds brings the queue its windows need, as a TCP connection's socket does. Said again, the
+    /// room is resized. Refused `NotConnected` for a peer with no connection.
+    pub fn set_peer_room(&mut self, peer: PeerId, bytes: u64) -> Result<(), Refusal> {
+        let key = self.core.connection_of(peer).ok_or(Refusal::NotConnected)?;
+        let conn = self
+            .conns
+            .get_mut(key)
+            .and_then(Option::as_mut)
+            .ok_or(Refusal::NotConnected)?;
+        if let Some(room) = conn.room.as_mut() {
+            room.set_capacity(bytes);
+            return Ok(());
+        }
+        let held = conn
+            .grants
+            .iter()
+            .map(Reservation::granted)
+            .fold(0, u64::saturating_add);
+        self.core.room.release(held);
+        let mut room = Room::unbounded();
+        room.set_capacity(bytes);
+        room.hold(held);
+        conn.room = Some(room);
+        Ok(())
     }
 
     /// Sizes the stream pool ([`StreamCredit::Pooled`]): the exchanges pooled peers may have open
@@ -1441,6 +1752,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             delivered: Delivered::new(C::RANKS),
             grants,
             lost: false,
+            room: None,
             share: Share::default(),
             served: 0,
         };
@@ -1488,7 +1800,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             }
             Err(error) => {
                 self.core.admission.end_pending();
-                self.core.budget.release(grant);
+                self.core.release_window(grant);
                 if let Some(transmit) = error.response {
                     self.respond(transmit, buffer);
                 }
@@ -1562,10 +1874,39 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D> {
+    /// A connection's first window, with the reserve on top of it: room in the socket's queue
+    /// first, then the budget's bytes.
     fn window_grant(&mut self) -> Result<Reservation, Refusal> {
+        let bytes = Self::first_window();
+        self.room.first(bytes)?;
+        match self.budget.reserve(bytes, Lane::Window) {
+            Ok(grant) => Ok(grant),
+            Err(refusal) => {
+                self.room.release(bytes);
+                Err(refusal)
+            }
+        }
+    }
+
+    /// The bytes of a connection's first window and the reserve on top of it.
+    fn first_window() -> u64 {
         let reserve = class_reserve(C::RANKS.saturating_sub(1));
-        let bytes = initial_window(MIN_DATAGRAM).saturating_add(reserve);
-        self.budget.reserve(bytes, Lane::Window)
+        initial_window(MIN_DATAGRAM).saturating_add(reserve)
+    }
+
+    /// The room a window's growth leaves: the first windows of the handshakes admission may still
+    /// let wait at once.
+    fn kept_for_handshakes(&self) -> u64 {
+        let limit = self.limits.admission.pending;
+        let waiting = self.admission.stats().pending;
+        let more = u64::try_from(limit.saturating_sub(waiting)).unwrap_or(u64::MAX);
+        more.saturating_mul(Self::first_window())
+    }
+
+    /// A window grant given back: its room in the socket's queue and its bytes.
+    fn release_window(&mut self, grant: Reservation) {
+        self.room.release(grant.granted());
+        self.budget.release(grant);
     }
 
     fn connection_of(&self, peer: PeerId) -> Option<usize> {
@@ -1845,6 +2186,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             entry.epoch
         });
         conn.epoch = epoch;
+        self.generation = self.generation.wrapping_add(1);
         self.report_lifecycle(peer);
         self.accept_streams(now, key, conn, Dir::Bi);
         self.accept_streams(now, key, conn, Dir::Uni);
@@ -1926,9 +2268,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// The connection drained: what it held goes back.
     fn gone(&mut self, key: usize, mut conn: Box<Conn<C::Role>>) {
         self.lost(key, &mut conn);
+        // A connection's windows go back to the room that held them: the shared socket's, or the
+        // room of its own, which goes with it.
+        let shared = conn.room.is_none();
         for grant in conn.grants.drain(..) {
+            if shared {
+                self.room.release(grant.granted());
+            }
             self.budget.release(grant);
         }
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn release_lanes(&mut self, conn: &mut Conn<C::Role>) {
@@ -3112,7 +3461,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return;
         };
         let more = grown.saturating_sub(conn.window.window());
+        // A connection on a socket of its own grows in its own room, which no handshake shares;
+        // one on the shared socket leaves the first windows of the handshakes that may come.
+        let grew = match conn.room.as_mut() {
+            Some(room) => room.grow(more, 0),
+            None => {
+                let kept = self.kept_for_handshakes();
+                self.room.grow(more, kept)
+            }
+        };
+        if !grew {
+            return;
+        }
         let Ok(grant) = self.budget.reserve(more, Lane::Window) else {
+            match conn.room.as_mut() {
+                Some(room) => room.release(more),
+                None => self.room.release(more),
+            }
             return;
         };
         conn.grants.push(grant);
@@ -3127,7 +3492,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         &mut self,
         conn: &mut Conn<C::Role>,
         lane: crate::LaneId,
-        (kind, class): (u16, C::Class),
+        (kind, class, embedded): (u16, C::Class, Option<crate::Embedded>),
         frame: &[u8],
     ) -> Result<(), Refusal> {
         if conn.peer.is_none() || conn.lost {
@@ -3145,10 +3510,19 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 conn.lanes_out.len().saturating_sub(1)
             }
         };
-        let full = conn
-            .lanes_out
-            .get(at)
-            .is_none_or(|out| out.queue.len() >= self.limits.lane_window);
+        // A lossless class's lane holds one frame beyond what QUIC took. QUIC's stream holds what
+        // the peer's credit lets it, as a socket's send buffer does, whose writer waits once it is
+        // full: a frame left waiting says the peer, the connection's credit or the class's share
+        // takes no more, and the sender is held, not its queue grown. The lane held a congestion
+        // window of bytes, as Linux's TCP Small Queues bound what waits below a socket (Dumazet,
+        // 2012), but a loss-based law's window on a path that loses nothing grows without end:
+        // CUBIC's on loopback reached 1.55 GB, and a bus publisher the node held queued 470 ms of
+        // messages in its own lane. A window of frames of the class's bound (the core's, T37) is
+        // otherwise megabytes deep.
+        let full = conn.lanes_out.get(at).is_none_or(|out| {
+            out.queue.len() >= self.limits.lane_window
+                || (C::lossless(class) && !out.queue.is_empty())
+        });
         if full {
             // Said once the lane has room again (`flush_frames`).
             if let Some(out) = conn.lanes_out.get_mut(at) {
@@ -3156,7 +3530,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             }
             return Err(Refusal::LaneFull);
         }
-        let prefix = Prefix::encode(kind, frame, None)?;
+        // A frame of its own checksum is covered by the prefix only before it: its owner summed
+        // the rest, and its receiver verifies that sum.
+        let prefix = match embedded {
+            Some(embedded) => {
+                Prefix::encode_covering(kind, frame.len(), embedded.head(frame)?, None)?
+            }
+            None => Prefix::encode(kind, frame, None)?,
+        };
         let mut bytes = self.budget.reserve(
             length(PREFIX_BYTES).saturating_add(length(frame.len())),
             Lane::Class(class),
@@ -3299,6 +3680,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 Ok(true) => {}
                 Ok(false) => return,
                 Err(refusal) => {
+                    self.stats.lanes_refused = self.stats.lanes_refused.saturating_add(1);
                     if at < conn.lanes_in.len() {
                         let lane = conn.lanes_in.remove(at);
                         let _ = conn
@@ -3320,8 +3702,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             .get(at)
             .map(|lane| lane.state)
             .ok_or(Refusal::Lanes)?;
+        // A lane its owner holds is not read past its opening: what its peer sends waits in QUIC.
+        if state != Reading::Opener && conn.lanes_in.get(at).is_some_and(|lane| lane.held) {
+            return Ok(false);
+        }
         match state {
-            Reading::Opener => lane_opener(conn, at),
+            Reading::Opener => {
+                let advanced = lane_opener(conn, at)?;
+                // The lane named itself: held from now if its owner holds its peer's lane of that name.
+                let opened = conn
+                    .lanes_in
+                    .get(at)
+                    .filter(|lane| lane.state != Reading::Opener)
+                    .map(|lane| lane.lane);
+                if let (Some(id), Some((peer, _))) = (opened, conn.peer) {
+                    let held = self
+                        .peer_entry_mut(peer)
+                        .is_some_and(|entry| entry.holds.contains(&id));
+                    if let Some(lane) = conn.lanes_in.get_mut(at) {
+                        lane.held = held;
+                    }
+                }
+                Ok(advanced)
+            }
             Reading::Prefix if self.frame_room(conn, at) => self.lane_prefix(conn, at),
             Reading::Prefix => {
                 self.pause_lane(conn, at);
@@ -3329,6 +3732,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             }
             Reading::Frame => self.lane_frame(conn, at),
             Reading::Skipping => self.lane_skip(conn, at),
+            Reading::Reserving => self.lane_reserve(conn, at),
         }
     }
 
@@ -3386,6 +3790,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if let Some(frame) = lane.frame {
             self.budget.release(frame);
         }
+        if lane.state == Reading::Reserving {
+            self.reserving = self.reserving.saturating_sub(1);
+        }
         if lane.paused
             && let Some(entry) = peer.and_then(|peer| self.peer_entry_mut(peer))
         {
@@ -3427,12 +3834,35 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         });
         let lane = conn.lanes_in.get_mut(at).ok_or(Refusal::Lanes)?;
         lane.rank = fits.map_or(0, C::rank);
-        lane.state = if frame.is_some() {
-            Reading::Frame
-        } else {
-            Reading::Skipping
+        lane.state = match (&frame, fits) {
+            (Some(_), _) => Reading::Frame,
+            // A lossless frame the budget cannot hold now waits for it, its lane unread.
+            (None, Some(class)) if C::lossless(class) => Reading::Reserving,
+            (None, _) => Reading::Skipping,
         };
         lane.frame = frame;
+        if lane.state == Reading::Reserving {
+            self.reserving = self.reserving.saturating_add(1);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// A lossless frame's bytes ask the budget again: read on once it holds them, else the lane
+    /// stays unread.
+    fn lane_reserve(&mut self, conn: &mut Conn<C::Role>, at: usize) -> Result<bool, Refusal> {
+        let role = conn.peer.map(|(_, role)| role).ok_or(Refusal::Identity)?;
+        let lane = conn.lanes_in.get_mut(at).ok_or(Refusal::Lanes)?;
+        let prefix = lane.decoded.ok_or(Refusal::Order)?;
+        let class = C::kind_of(lane.kind)
+            .and_then(|kind| C::class_of(kind, role))
+            .ok_or(Refusal::Kind)?;
+        let Ok(frame) = self.budget.reserve(prefix.length(), Lane::Class(class)) else {
+            return Ok(false);
+        };
+        lane.frame = Some(frame);
+        lane.state = Reading::Frame;
+        self.reserving = self.reserving.saturating_sub(1);
         Ok(true)
     }
 
@@ -3450,11 +3880,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         }
         let frame = lane.frame.take().ok_or(Refusal::Order)?;
         lane.state = Reading::Prefix;
-        let verified = lane
-            .decoded
-            .ok_or(Refusal::Order)?
-            .verify(&lane.prefix, frame.bytes());
+        let decoded = lane.decoded.ok_or(Refusal::Order)?;
         let (peer, kind) = (conn.peer.map(|(peer, _)| peer), C::kind_of(lane.kind));
+        // A frame of its own checksum: the prefix's covers what that does not, and that the rest.
+        let verified = match kind.and_then(C::embedded_checksum) {
+            Some(embedded) => embedded
+                .head(frame.bytes())
+                .and_then(|head| decoded.verify(&lane.prefix, head))
+                .and_then(|()| embedded.verify(frame.bytes())),
+            None => decoded.verify(&lane.prefix, frame.bytes()),
+        };
         let (lane_id, stream) = (lane.lane, lane.stream);
         match (verified, peer, kind) {
             (Ok(()), Some(peer), Some(kind)) => {

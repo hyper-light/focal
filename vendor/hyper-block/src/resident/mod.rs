@@ -93,9 +93,54 @@ pub(crate) struct Resident {
 
 #[cfg(target_os = "linux")]
 impl Resident {
-    /// A handle that has not asked yet.
+    /// A handle that has not asked: a direct one, which reads nothing from memory.
     pub(crate) fn new() -> Self {
         Self { refused: false }
+    }
+
+    /// A handle on `file` that asked the kernel, as it was opened, whether its file system takes
+    /// `RWF_NOWAIT`: a read of one byte at the file's end, which reads nothing and starts no
+    /// read-ahead, but which the kernel refuses (`EOPNOTSUPP`) for a file without `FMODE_NOWAIT`
+    /// before it looks at the length (`kiocb_set_rw_flags`). overlayfs is one (Linux 6.12,
+    /// measured 2026-10-16, where the ext4 beneath it takes the flag), so a handle on a
+    /// container's own file system knew it could not read from memory only once a read had
+    /// tried, and said it could until then.
+    pub(crate) fn probed(file: &File) -> io::Result<Self> {
+        use rustix::io::{Errno, ReadWriteFlags, preadv2};
+        let end = file.metadata()?.len();
+        let mut byte = [0u8; 1];
+        match preadv2(
+            file,
+            &mut [io::IoSliceMut::new(&mut byte)],
+            end,
+            ReadWriteFlags::NOWAIT,
+        ) {
+            // Nothing past the end, or a byte another writer put there since: taken. A byte not
+            // in memory would wait, which also says the flag is taken.
+            Ok(_) => Ok(Self { refused: false }),
+            Err(e) if e == Errno::AGAIN || e == Errno::INTR => Ok(Self { refused: false }),
+            Err(e) if Self::refusal(e) => Ok(Self { refused: true }),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// A handle that shares `self`'s open file (a duplicate): the same file system's answer.
+    pub(crate) fn duplicate(&self) -> Self {
+        Self {
+            refused: self.refused,
+        }
+    }
+
+    /// preadv2(2): EOPNOTSUPP for a flag the kernel or file system does not take, ENOSYS before
+    /// 4.6, EINVAL where an old kernel reads an unknown flag as invalid.
+    fn refusal(e: rustix::io::Errno) -> bool {
+        use rustix::io::Errno;
+        e == Errno::OPNOTSUPP || e == Errno::NOSYS || e == Errno::INVAL
+    }
+
+    /// Whether a read can be made from memory: the kernel has not refused the flag.
+    pub(crate) fn reads(&self) -> bool {
+        !self.refused
     }
 
     /// Fills `buf` from `offset` if every byte of it is in memory now: true when it did; false
@@ -123,9 +168,7 @@ impl Resident {
             // wait (preadv2(2), BUGS), which is short too.
             Ok(read) => Ok(read == want),
             Err(e) if e == Errno::AGAIN || e == Errno::INTR => Ok(false),
-            // preadv2(2): EOPNOTSUPP for a flag the kernel or file system does not take, ENOSYS
-            // before 4.6, EINVAL where an old kernel reads an unknown flag as invalid.
-            Err(e) if e == Errno::OPNOTSUPP || e == Errno::NOSYS || e == Errno::INVAL => {
+            Err(e) if Self::refusal(e) => {
                 self.refused = true;
                 Ok(false)
             }
@@ -157,6 +200,21 @@ pub(crate) struct Resident;
 impl Resident {
     pub(crate) fn new() -> Self {
         Self
+    }
+
+    /// A handle on `file`: nothing to ask, nothing read here.
+    pub(crate) fn probed(_file: &File) -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    /// A duplicate's state.
+    pub(crate) fn duplicate(&self) -> Self {
+        Self
+    }
+
+    /// No read is made from memory here.
+    pub(crate) fn reads(&self) -> bool {
+        false
     }
 
     /// Never reads: every read goes to the thread that may wait.
