@@ -520,6 +520,12 @@ mod imp {
             .map_err(|e| refused("setsockopt(SO_REUSEPORT)", e))
     }
 
+    /// Whether other sockets of this process may bind `socket`'s port as well (`SO_REUSEPORT`).
+    pub(crate) fn shares_port(socket: &Socket) -> Result<bool, RtError> {
+        rustix::net::sockopt::socket_reuseport(&socket.fd)
+            .map_err(|e| refused("getsockopt(SO_REUSEPORT)", e))
+    }
+
     /// Connects `socket` to `addr`: the kernel hands it `addr`'s datagrams to its port, and it
     /// sends to `addr` alone.
     pub(crate) fn connect(socket: &Socket, addr: SocketAddr) -> Result<(), RtError> {
@@ -1070,6 +1076,11 @@ pub(crate) mod imp {
         })
     }
 
+    /// Never: no Winsock socket shares its port as [`share_port`] means it.
+    pub(crate) fn shares_port(_socket: &Socket) -> Result<bool, RtError> {
+        Ok(false)
+    }
+
     /// Connects `socket` to `addr`.
     pub(crate) fn connect(socket: &Socket, addr: SocketAddr) -> Result<(), RtError> {
         let (sa, sa_len) = sockaddr(addr);
@@ -1107,5 +1118,5 @@ pub(crate) use imp::dont_fragment;
 pub(crate) use imp::{OwnedDatagram, Socket};
 pub(crate) use imp::{
     adopt, bind, connect, dgram_socket, into_owned, local_addr, path_payload, queued_bytes,
-    recv_buffer_bytes, recv_from, send, send_to, set_recv_buffer, share_port,
+    recv_buffer_bytes, recv_from, send, send_to, set_recv_buffer, share_port, shares_port,
 };

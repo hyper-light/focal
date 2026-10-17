@@ -176,12 +176,21 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     }
 
     /// A driver for `endpoint` on `socket`, whose sockets receive into a ring of `socket`'s batch.
-    /// Called on a shard thread.
+    /// A socket bound with its port shared ([`UdpSocket::bind_shared`]) shares it with a socket for
+    /// each peer, as [`Driver::bind`] does: a caller that holds its port from the moment it learns it
+    /// (an adopted socket, a supervisor's) loses no peer's queue of its own by handing the socket
+    /// over. Called on a shard thread.
     pub fn new(endpoint: Endpoint<C, B, D>, socket: Batched) -> Result<Self, RtError> {
         let ring = Ring::new(Io {
             batch: socket.batch(),
         })?;
-        Self::with_ring(endpoint, socket, ring)
+        let shared = match socket.socket().shares_port()? {
+            true => Some(socket.local_addr()?),
+            false => None,
+        };
+        let mut driver = Self::with_ring(endpoint, socket, ring)?;
+        driver.shared = shared;
+        Ok(driver)
     }
 
     #[allow(

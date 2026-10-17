@@ -169,6 +169,17 @@ impl UdpSocket {
         Ok(UdpSocket::of(Inner::Real { socket }))
     }
 
+    /// Whether other sockets of this process may bind this socket's port too, as
+    /// [`UdpSocket::bind_shared`] binds one (`SO_REUSEPORT`): what lets a driver given a socket
+    /// already bound share its port with a socket for each peer. Never on Windows, where no socket
+    /// shares a port so, nor on the simulation fabric, whose ports are one socket's.
+    pub fn shares_port(&self) -> Result<bool, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::shares_port(socket),
+            _ => Ok(false),
+        }
+    }
+
     /// Connects the socket to `remote`: the kernel hands it `remote`'s datagrams to its port in
     /// place of an unconnected socket sharing the port (a connected socket's exact match ranks first,
     /// on Linux and the BSDs alike, measured), and it sends to `remote` alone, naming no address

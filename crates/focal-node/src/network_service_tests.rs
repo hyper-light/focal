@@ -245,8 +245,25 @@ impl TestSettings {
         NetworkService::open_with_socket(&self.value, Some(self.socket.try_clone().unwrap()))
     }
 }
+/// A loopback port held from the moment it is chosen, by a socket bound with its port shared
+/// where the platform shares ports: the listener adopts it and gives each peer a socket of its own
+/// on the port (hyper-rt-transport's `Driver::new`), so a node runs here as one started on its own
+/// address does. A reservation bound plainly kept every peer on the listener's one queue, a path
+/// no node takes once started. Windows shares no port so, and binds it plainly.
+pub(crate) fn reserve_listener() -> std::net::UdpSocket {
+    let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    if cfg!(windows) {
+        return std::net::UdpSocket::bind(loopback).unwrap();
+    }
+    std::net::UdpSocket::from(
+        hyper_rt::udp::UdpSocket::bind_shared(loopback)
+            .unwrap()
+            .into_owned()
+            .unwrap(),
+    )
+}
 pub(crate) fn settings(root: &Path) -> TestSettings {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let socket = reserve_listener();
     let address = socket.local_addr().unwrap();
     let mut settings = Settings::default();
     settings.node.data_dir = Some(root.to_path_buf());
@@ -890,7 +907,7 @@ fn a_founder_restarted_on_a_new_listen_address_behind_its_advertised_endpoint_re
         let peer_dir = tempfile::tempdir().unwrap();
         // The advertised endpoint stays fixed across both starts; only the
         // listen address behind it changes.
-        let first_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let first_socket = reserve_listener();
         let first_listen = first_socket.local_addr().unwrap();
         let port = first_listen.port();
         let name = first_listen.to_string();
@@ -998,7 +1015,7 @@ fn a_host_restarted_on_a_new_address_reannounces_and_regains_its_leader() {
         drop(first);
         // The host returns on a different address; the root still holds the
         // old one, so nothing reaches the host until it announces the move.
-        let second_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let second_socket = reserve_listener();
         let second_advertise = second_socket.local_addr().unwrap();
         assert_ne!(second_advertise, first_advertise);
         let mut value = Settings::default();
