@@ -787,12 +787,25 @@ impl NetworkService {
         let (credential_handle, credential_requests) =
             crate::credential_renewal::CredentialHandle::channel(4)?;
         let limits = ControlHost::wire_limits();
-        let socket = match socket {
-            Some(socket) => socket,
-            None => std::net::UdpSocket::bind(state.listen).map_err(WireError::from)?,
+        // A socket the caller holds is adopted whole. Without one the listener binds its address
+        // with the port shared, so each peer gets a socket of its own where the platform lets it
+        // (hyper-rt-transport's `Driver::bind`): every connection brings the receive queue its
+        // windows need, as a TCP connection's socket does. The listener bound its socket here
+        // first and handed it over, so every connection the node accepted shared that one queue:
+        // on Linux's default buffer (319 KB usable) four connections' unprompted messages filled
+        // it, and every first window after was refused.
+        let bind: focal_wire::Bind = match socket {
+            Some(socket) => socket.into(),
+            None => {
+                // A port another socket holds is refused here, as it was: the shared bind lets
+                // any socket of this user share the port, so it would take a second node on the
+                // same address and split its peers between the two.
+                drop(std::net::UdpSocket::bind(state.listen).map_err(WireError::from)?);
+                state.listen.into()
+            }
         };
         let listener = NetworkListener::bind(
-            socket,
+            bind,
             &credentials,
             signing_identity.as_ref(),
             &state.sponsor.root_certificates(),

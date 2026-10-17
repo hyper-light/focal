@@ -473,6 +473,65 @@ fn node_connector(pki: &Pki, cert: Vec<u8>, key: Vec<u8>) -> QuicConnector {
     .unwrap()
 }
 
+/// A listener bound to its address gives each peer a socket of its own where the platform shares
+/// a port (Linux's and macOS's `SO_REUSEPORT`), so each connection brings the receive queue its
+/// windows need; one adopted whole holds every peer on its one queue. Do: a client connects to and
+/// asks each of two servers, one bound to an address and one to a socket bound first, and the
+/// servers' rooms are read. Expect: the first holds the peer's room apart where the platform
+/// shares ports, the second never.
+#[test]
+fn a_listener_bound_to_its_address_gives_each_peer_a_socket_of_its_own() {
+    focal_rt::block_on(async move {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
+            .unwrap();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(move |verified: VerifiedRequest| async move { response(verified.request()) });
+        let adopted = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let shares = cfg!(any(target_os = "linux", target_os = "macos"));
+        for (bind, apart) in [
+            (
+                Bind::from("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap()),
+                shares,
+            ),
+            (Bind::from(adopted), false),
+        ] {
+            let (server_certificate, server_key) = pki.issue(true);
+            let tls = server_tls(
+                TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+                vec![pki.ca.der().to_vec()],
+                &limits(),
+            )
+            .unwrap();
+            let server = Arc::new(
+                QuicServer::bind(bind, tls, registry.clone(), limits(), budget()).unwrap(),
+            );
+            let running = server.clone();
+            let handler = handler.clone();
+            let task = spawn(async move { running.serve(handler).await });
+            let connector = connector(&pki, certificate.clone(), key.clone());
+            let remote = connector
+                .connect(server.local_addr().unwrap(), "localhost")
+                .await
+                .unwrap();
+            assert_eq!(
+                remote.request(&request(1)).await.unwrap(),
+                response(&request(1))
+            );
+            let rooms = server.stats().await.endpoint.receive_rooms;
+            assert_eq!(rooms, usize::from(apart), "bound to an address: {apart}");
+            drop(remote);
+            connector.close().unwrap();
+            server.close().unwrap();
+            task.join().await.unwrap();
+        }
+    })
+    .unwrap()
+}
+
 #[test]
 fn mutual_tls_tenant_isolation_live_revocation_and_independent_streams() {
     focal_rt::block_on(async move {
