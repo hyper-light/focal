@@ -241,7 +241,24 @@ batches only while that budget could not hold the largest frame the transport re
 `loopback::a_frame_that_waits_for_anything_but_memory_takes_nothing_from_the_window` (a frame
 refused with the memory free, then held: the window keeps every batch, and the frame, let go, is
 delivered in order). Thirty more busy runs at 1,000,000 a second told no gap, the node delivering
-405,700 a second at the median against 359,400 before (1.22 µs a message against 1.37).
+405,700 a second at the median against 359,400 before (1.22 µs a message against 1.37). The
+transport no longer counts a held lane's frame as waiting for memory (hyper-raft 76eaa33,
+`Endpoint::frames_reserving`), and the relief reads that count where it visited every connection
+for it each turn.
+
+Two of the node's system calls a message went at the same re-vendor, measured on the bare-metal
+machine (interleaved pairs, CPU a message at the median): the socket's account (`SO_MEMINFO`)
+read at an epoch's doublings where it was read before every drain, a drop told by the traffic
+(`SO_RXQ_OVFL`), and an idle turn's ask of the driver left to the park that follows.
+
+| Change | 100,000/s | 10,000/s | 10,000/s, busy core |
+|---|---|---|---|
+| Sparse account reads | 6,207 → 6,082 ns | 7,434 → 7,135 ns | 7,920 → 7,767 ns |
+| The idle turn's ask left to the park | 6,016 → 6,080 ns | 7,326 → 7,209 ns | 7,801 → 7,955 ns |
+
+The idle ask's p99.9 at 10,000 a second fell from 0.61 ms to 0.29 ms; at 100,000 a second half of
+its asks had found work and handled it in the same step, and each became a park and a step of its
+own, so that row is level within the machine's noise.
 
 ## 5. Steps
 

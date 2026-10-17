@@ -590,7 +590,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         measure: &mut SocketCharge,
         stream: impl Fn(&Endpoint<C, B, D>) -> Option<u64>,
     ) -> Result<Queued, RtError> {
-        let before = socket.socket().queue_charge()?.map(account);
+        // The account is read only where the drain may sample what the measure still needs
+        // (`SocketCharge::wants_before`): each read is a system call.
+        let before = if measure.wants_before() {
+            socket.socket().queue_charge()?.map(account)
+        } else {
+            None
+        };
         if let Some(before) = before {
             measure.before(before);
         }
@@ -610,6 +616,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             _ => 0,
         };
         let emptied = ended == Queued::Emptied;
+        // A drop is told by the datagrams themselves, read or not.
+        measure.drops(socket.stats().drops);
         let after = match before {
             Some(before) if measure.wants_after(&before, taken.messages, emptied) => {
                 socket.socket().queue_charge()?.map(account)

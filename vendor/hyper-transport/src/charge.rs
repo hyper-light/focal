@@ -188,8 +188,8 @@ impl ReceiveCharge {
     }
 
     /// The peers consumed `stream` bytes more of their windows; `room` is the room in force. An
-    /// epoch ends once the room it began with is consumed.
-    pub fn consumed(&mut self, stream: u64, room: u64) {
+    /// epoch ends once the room it began with is consumed: whether this ended one.
+    pub fn consumed(&mut self, stream: u64, room: u64) -> bool {
         if self.epoch == 0 {
             self.epoch = room.max(1);
         }
@@ -201,7 +201,9 @@ impl ReceiveCharge {
             self.share.next_epoch();
             self.consumed = 0;
             self.epoch = room.max(1);
+            return true;
         }
+        false
     }
 
     /// The kernel dropped what the queue could not hold: the samples no longer describe the
@@ -275,6 +277,10 @@ pub struct SocketCharge {
     drops: Option<u64>,
     room: u64,
     backlog: bool,
+    /// Drains in the current epoch.
+    drains: u64,
+    /// The drain of the current epoch at which the account is read next.
+    next_read: u64,
 }
 
 impl SocketCharge {
@@ -292,6 +298,8 @@ impl SocketCharge {
             drops: None,
             room,
             backlog: false,
+            drains: 0,
+            next_read: 0,
         }
     }
 
@@ -308,6 +316,28 @@ impl SocketCharge {
     /// Whether its room is told from what it measured, not the first windows before anything was.
     pub fn measured(&self) -> bool {
         self.queue.is_some() && self.charge.measured()
+    }
+
+    /// Whether the drain about to begin reads the queue's account first. Every drain does until a
+    /// message carrying stream data has been sampled; then an epoch's drains 0, 2, 6, 14, …, each
+    /// read at twice the drains before it, so an epoch brings a sample if any of its reads is a
+    /// singleton, the worst of the two epochs stays current, and a change of traffic within the
+    /// epoch is read in a doubling of its drains, while the reads grow with the logarithm of the
+    /// drains. Each read is a system call, and reading before every drain made two a drain (the
+    /// account after a singleton too): 2.4 a message of a bus node's 8.3 at 10,000 a second
+    /// (`docs/transport.md` §4l). A drop is told by the traffic, not by these reads
+    /// ([`SocketCharge::drops`]).
+    pub fn wants_before(&self) -> bool {
+        self.queue.is_none() || !self.charge.measured() || self.drains >= self.next_read
+    }
+
+    /// The socket says it has dropped `drops` datagrams for want of room since it was made (as its
+    /// receives tell, `SO_RXQ_OVFL`): a drop since the last count forgets the samples.
+    pub fn drops(&mut self, drops: Option<u64>) {
+        if drops.zip(self.drops).is_some_and(|(now, seen)| now > seen) {
+            self.charge.forget();
+        }
+        self.drops = drops.or(self.drops);
     }
 
     /// A drain begins with the queue's account `before`: the queue's buffer and lag are taken, and
@@ -359,7 +389,14 @@ impl SocketCharge {
                 datagrams,
             });
         }
-        self.charge.consumed(consumed, self.room);
+        self.drains = self.drains.saturating_add(1);
+        if before.is_some() {
+            self.next_read = self.drains.saturating_mul(2);
+        }
+        if self.charge.consumed(consumed, self.room) {
+            self.drains = 0;
+            self.next_read = 0;
+        }
         self.backlog = !emptied;
     }
 
@@ -579,5 +616,80 @@ mod tests {
             socket.room(Unprompted::default()),
             Some(usable * 1_150 / 2_304)
         );
+    }
+
+    /// The account is read at an epoch's drains 0, 2, 6, 14, …, once a message carrying stream
+    /// data is measured, and at every drain before. Do: drains of one 1,200-byte singleton each
+    /// carrying 1,150 stream bytes, with a room of 100 of them, an account read where the socket
+    /// asks for one. Expect: every drain reads until the first sample; then the reads come at the
+    /// doublings; the epoch's end (100 messages' stream bytes consumed) starts the count again.
+    #[test]
+    fn the_account_is_read_at_doublings_of_an_epochs_drains() {
+        let before = Account {
+            charged: 2_304,
+            buffer: QUEUE.buffer,
+            drops: Some(0),
+            release_lag: QUEUE.release_lag,
+            message_floor: 0,
+        };
+        let after = Account {
+            charged: 0,
+            ..before
+        };
+        let mut socket = SocketCharge::new(100 * 1_150);
+        let mut reads = Vec::new();
+        for drain in 0..230u64 {
+            let read = socket.wants_before().then_some(before);
+            if let Some(before) = read {
+                reads.push(drain);
+                socket.before(before);
+            }
+            let after = read.map(|_| after);
+            socket.after(read, after, 1_150, (1, 1_200), true);
+        }
+        // The first drain reads and samples; the epoch began at the room in force, 100 messages'
+        // worth, so it ends at drain 99 and the next begins at 100.
+        assert_eq!(
+            reads,
+            vec![
+                0, 2, 6, 14, 30, 62, 100, 102, 106, 114, 130, 162, 200, 202, 206, 214
+            ],
+            "an epoch's doublings"
+        );
+    }
+
+    /// A drop the traffic tells (the socket's count, `SO_RXQ_OVFL`) forgets the samples, and the
+    /// account is read at every drain until stream data is measured again.
+    #[test]
+    fn a_drop_the_traffic_tells_forgets_the_samples() {
+        let before = Account {
+            charged: 2_304,
+            buffer: QUEUE.buffer,
+            drops: Some(0),
+            release_lag: QUEUE.release_lag,
+            message_floor: 0,
+        };
+        let after = Account {
+            charged: 0,
+            ..before
+        };
+        let mut socket = SocketCharge::new(100 * 1_150);
+        socket.drops(Some(0));
+        socket.before(before);
+        socket.after(Some(before), Some(after), 1_150, (1, 1_200), true);
+        assert!(socket.room(Unprompted::default()).is_some());
+        assert!(
+            !socket.wants_before(),
+            "measured: the next read waits for a doubling"
+        );
+        socket.drops(Some(0));
+        assert!(socket.room(Unprompted::default()).is_some(), "no new drop");
+        socket.drops(Some(3));
+        assert_eq!(
+            socket.room(Unprompted::default()),
+            None,
+            "the samples forgotten"
+        );
+        assert!(socket.wants_before(), "every drain reads again");
     }
 }

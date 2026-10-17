@@ -256,6 +256,11 @@ struct Core {
     latency_objective_ns: Option<u64>,
     /// The published time of the last driver retrieval: busy native turns share one quantum.
     last_driver_ns: u64,
+    /// The last step found the shard idle and left its driver to what follows: a park's wait, which
+    /// returns at once with what is ready, or the ask a spin or [`Shard::run_until_idle`] makes first
+    /// where it does not park. A loop that does neither finds the driver asked once a quantum, as a
+    /// busy turn does.
+    harvest_owed: bool,
     /// The counter's scale where the shard reads a counter on real time (`machine::clock::counter_scale`):
     /// each step's reading of the driver's clock is carried forward by it (`ShardContext::carried`).
     counter_scale: Option<u64>,
@@ -438,6 +443,7 @@ impl Shard {
                 crate::driver::Clock::Sim(_) | crate::driver::Clock::Published => None,
             },
             last_driver_ns: now_ns,
+            harvest_owed: false,
             real_time: !is_sim,
             attribution: Tracker::default(),
             deferred: Vec::with_capacity(config.batch.max(1)),
@@ -877,6 +883,10 @@ impl Shard {
             if self.has_inbound() || self.wake_ready_pollers() {
                 continue;
             }
+            // The idle step left the driver to a park: the final nonblocking turn asks it here.
+            if self.core.harvest_owed && self.harvest_io(self.desk.now_ns.get()) {
+                continue;
+            }
             match outcome.next_deadline_ns {
                 Some(deadline) => {
                     self.park(Some(deadline));
@@ -887,8 +897,10 @@ impl Shard {
     }
 
     /// Every nonblocking turn services registered driver work. Native busy turns share the measured
-    /// quantum; idle turns retrieve immediately. Simulation has no elapsed CPU time to cross a quantum,
-    /// so a registered deterministic event is retrieved on its next turn without advancing virtual time.
+    /// quantum; an idle turn leaves the driver to the park that follows, whose wait returns at once with
+    /// what is ready (`harvest_owed`): asked here as well, an idle turn made two system calls where the
+    /// park's one does. Simulation has no elapsed CPU time to cross a quantum, so a registered
+    /// deterministic event is retrieved on its next turn without advancing virtual time.
     fn harvest_turn(&mut self) -> bool {
         if self.core.driver_lost || self.core.exited {
             return false;
@@ -901,14 +913,15 @@ impl Shard {
         }
         let now = self.desk.now_ns.get();
         if !self.core.real_time
-            || self.desk.local.is_empty()
             || pending
             || now.saturating_sub(self.core.last_driver_ns) >= self.quantum_ns()
         {
-            self.harvest_io(now)
-        } else {
-            false
+            return self.harvest_io(now);
         }
+        if self.desk.local.is_empty() {
+            self.core.harvest_owed = true;
+        }
+        false
     }
 
     /// Adds a task's readiness wait to the table and arms the handle for every direction now waited for, or
@@ -1012,6 +1025,7 @@ impl Shard {
             return false;
         }
         self.core.last_driver_ns = now_ns;
+        self.core.harvest_owed = false;
         count(&self.desk.live.harvests, 1);
         self.receive_completions(Some(0))
     }
@@ -1071,7 +1085,12 @@ impl Shard {
     /// readiness waits no longer than a wake would have while the spin makes no system call a turn. The
     /// preceding step's retrieval and the spin share their quantum, so idle entry does not ask twice.
     fn spin_for_work(&mut self, spin_end: u64, deadline_ns: Option<u64>) -> bool {
-        let mut next_harvest_ns = self.core.last_driver_ns.saturating_add(self.quantum_ns());
+        // The idle step left the driver to what follows: the spin asks it at its start.
+        let mut next_harvest_ns = if self.core.harvest_owed {
+            0
+        } else {
+            self.core.last_driver_ns.saturating_add(self.quantum_ns())
+        };
         // A turn's time is the step's reading carried by the counter, as a poll's end is (§3.9): a turn that
         // read the OS's clock spent most of itself there, and a wake waited for the turn to notice it. A deadline
         // it finds a little early costs a step, which reads the clock afresh.
@@ -1513,6 +1532,7 @@ impl Shard {
         let now = self.now_ns();
         if retrieved {
             self.core.last_driver_ns = now;
+            self.core.harvest_owed = false;
         }
         if self.core.real_time && self.core.attribution.armed() {
             let read = account_now(now);

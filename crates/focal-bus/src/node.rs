@@ -15,7 +15,7 @@
 //! queue grows past what the path carries. A subscriber that goes, or hangs until the transport's
 //! idle timeout closes it, holds nothing. The part keeps what the node's memory holds of its
 //! batches, for subscriptions that start behind (a reconnect, a replay): a batch, or a frame the
-//! transport waits to take (`Stats::frames_reserving`), that the memory cannot hold now is given the
+//! transport waits to take (`Endpoint::frames_reserving`), that the memory cannot hold now is given the
 //! room of the oldest batches the part retains, let go oldest first ([`Node::relieve_transport`]). A
 //! subscriber whose cursor falls below its stream's retained floor is told the offsets it missed
 //! (`Gap`) and goes on from the floor, where NATS and Redis disconnect such a subscriber without
@@ -414,27 +414,26 @@ impl Node {
         false
     }
 
-    /// Gives the transport's frames that wait for memory (`Stats::frames_reserving`) what the
-    /// budget holds now, then the room of the oldest batches retained while memory is what they
-    /// lack: while the transport's budget could not hold the largest frame it reserves
-    /// ([`crate::budget::largest_grant`]). Live traffic goes before what is kept for subscribers
-    /// that start behind, but a frame that waits for anything else (its lane held by the node, its
-    /// stream's subscribers taking no more) is given nothing: the window would let every batch go,
-    /// those its subscribers are owed among them, and the frame would wait on. Asked once a turn of
-    /// the owner's.
+    /// Gives the transport's frames that wait for memory (`Endpoint::frames_reserving`, which
+    /// counts none whose lane the node holds) what the budget holds now, then the room of the
+    /// oldest batches retained while memory is what they lack: while the transport's budget could
+    /// not hold the largest frame it reserves ([`crate::budget::largest_grant`]). Live traffic goes
+    /// before what is kept for subscribers that start behind, but a frame that waits for anything
+    /// else is given nothing: the window would let every batch go, those its subscribers are owed
+    /// among them, and the frame would wait on. Asked once a turn of the owner's.
     pub fn relieve_transport<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>)
     where
         B: Budget<<Bus as Classes>::Class> + Headroom,
         D: Directory<Role = <Bus as Classes>::Role>,
     {
-        if endpoint.stats().frames_reserving > 0 {
+        if endpoint.frames_reserving() > 0 {
             // What the budget holds now goes first: a frame given back since the waiting frame was
             // refused, or a warm buffer, which the budget gives back before it refuses.
             endpoint.retry_reserving();
             let largest = crate::budget::largest_grant();
             // Bounded: each turn gives a segment back, and `relieve` is false once the part
             // retains nothing.
-            while endpoint.stats().frames_reserving > 0
+            while endpoint.frames_reserving() > 0
                 && endpoint.budget().headroom() < largest
                 && self.relieve()
             {

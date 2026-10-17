@@ -151,6 +151,12 @@ pub struct Path {
     pub rtt_us: f64,
     pub min_rtt_us: f64,
     pub cwnd: u64,
+    /// The largest UDP payload the path carried as the run ended: the MTU its discovery reached
+    /// (it starts at QUIC's 1,200 bytes), which decides how many datagrams a message takes.
+    pub mtu: u16,
+    /// MTU probes sent (PING frames) and black holes declared: whether the discovery ran.
+    pub pings_tx: u64,
+    pub black_holes: u64,
     pub congestion_events: u64,
     pub lost_packets: u64,
     pub sent_packets: u64,
@@ -187,6 +193,9 @@ impl Path {
             rtt_us: micros(stats.path.rtt),
             min_rtt_us: micros(stats.path.min_rtt),
             cwnd: stats.path.cwnd,
+            mtu: stats.path.current_mtu,
+            pings_tx: stats.frame_tx.ping,
+            black_holes: stats.path.black_holes_detected,
             congestion_events: stats.path.congestion_events,
             lost_packets: stats.path.lost_packets,
             sent_packets: stats.path.sent_packets,

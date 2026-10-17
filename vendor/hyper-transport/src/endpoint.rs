@@ -260,7 +260,8 @@ pub struct Stats {
     pub events: usize,
     /// Lane frames skipped because their class or the budget could not take them.
     pub frames_dropped: u64,
-    /// Lanes whose next frame, of a lossless class, waits for the budget to hold it.
+    /// Lanes whose next frame, of a lossless class, waits for the budget to hold it, and that
+    /// their owner does not hold: a held lane's frame waits for its owner, and no memory moves it.
     pub frames_reserving: usize,
     /// Endpoint responses dropped at their bound.
     pub responses_dropped: u64,
@@ -536,8 +537,12 @@ struct Core<C: Classes, B, D> {
     room: Room,
     /// Moves whenever a connection is identified or goes ([`Endpoint::connection_generation`]).
     generation: u64,
-    /// Lanes whose next frame waits for the budget ([`Reading::Reserving`]).
+    /// Lanes whose next frame waits for the budget ([`Reading::Reserving`]) and that their owner
+    /// does not hold: a held lane's frame waits for its owner, and no memory moves it.
     reserving: usize,
+    /// By connection key, its lanes counted in `reserving`: what a retry visits, so a budget that
+    /// holds more asks again of the connections with a frame waiting, never every connection.
+    reserving_at: Vec<u32>,
 }
 
 /// What `conn` has moved, as the wait of an exchange of `rank` reads it.
@@ -662,6 +667,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 room: Room::unbounded(),
                 generation: 0,
                 reserving: 0,
+                reserving_at: Vec::new(),
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
@@ -1220,12 +1226,22 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
 
     /// The budget may hold more than it did (the owner gave bytes back to it elsewhere): each lane
     /// whose lossless frame waits for it ([`Classes::lossless`]) asks again, and is read on if its
-    /// frame is reserved. Nothing waits, nothing is done.
+    /// frame is reserved. Only the connections with such a lane are visited, and a lane its owner
+    /// holds waits for its owner. Nothing waits, nothing is done.
     pub fn retry_reserving(&mut self) {
         if self.core.reserving == 0 {
             return;
         }
-        for key in 0..self.conns.len() {
+        // Bounded: one turn for each connection key the count has seen.
+        for key in 0..self.core.reserving_at.len() {
+            let waits = self
+                .core
+                .reserving_at
+                .get(key)
+                .is_some_and(|count| *count > 0);
+            if !waits {
+                continue;
+            }
             let Some(mut conn) = self.take(key) else {
                 continue;
             };
@@ -1234,7 +1250,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 let waiting = conn
                     .lanes_in
                     .get(at)
-                    .is_some_and(|lane| lane.state == Reading::Reserving);
+                    .is_some_and(|lane| lane.state == Reading::Reserving && !lane.held);
                 if waiting {
                     self.core.read_lane(&mut conn, at);
                 }
@@ -1244,6 +1260,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 break;
             }
         }
+    }
+
+    /// Lanes whose next frame, of a lossless class, waits for the budget to hold it, their owner
+    /// not holding them: what [`Endpoint::retry_reserving`] moves once the budget holds more.
+    /// [`Stats::frames_reserving`] without the visit of every connection [`Endpoint::stats`] makes.
+    pub fn frames_reserving(&self) -> usize {
+        self.core.reserving
     }
 
     /// Queue `frame` of `kind` on `peer`'s lane `lane`, in order after the lane's earlier frames.
@@ -1495,8 +1518,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 if !matches {
                     continue;
                 }
-                if let Some(open) = conn.lanes_in.get_mut(at) {
-                    open.held = held;
+                let Some(open) = conn.lanes_in.get_mut(at) else {
+                    continue;
+                };
+                let was = std::mem::replace(&mut open.held, held);
+                // A frame waiting for the budget waits for its owner while held, and for the
+                // budget again once let go.
+                if open.state == Reading::Reserving && was != held {
+                    if held {
+                        self.core.waited_for_budget(key);
+                    } else {
+                        self.core.waits_for_budget(key);
+                    }
                 }
                 if !held {
                     self.core.read_lane(&mut conn, at);
@@ -2290,8 +2323,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             }
         }
         let peer = conn.peer.map(|(peer, _)| peer);
+        let key = conn.key;
         for lane in conn.lanes_in.drain(..) {
-            self.drop_lane_in(peer, lane);
+            self.drop_lane_in(key, peer, lane);
         }
     }
 
@@ -3690,7 +3724,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                             .quic
                             .recv_stream(lane.stream)
                             .stop(VarInt::from_u32(refusal.code()));
-                        self.drop_lane_in(conn.peer.map(|(peer, _)| peer), lane);
+                        self.drop_lane_in(conn.key, conn.peer.map(|(peer, _)| peer), lane);
                     }
                     return;
                 }
@@ -3788,13 +3822,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         self.read_lane(conn, at);
     }
 
-    /// A lane from `peer` is gone: its frame in progress goes back, and its pause with it.
-    fn drop_lane_in(&mut self, peer: Option<PeerId>, lane: LaneIn) {
+    /// A lane from `peer` on the connection `key` is gone: its frame in progress goes back, and its
+    /// pause and its wait for the budget with it.
+    fn drop_lane_in(&mut self, key: usize, peer: Option<PeerId>, lane: LaneIn) {
         if let Some(frame) = lane.frame {
             self.budget.release(frame);
         }
-        if lane.state == Reading::Reserving {
-            self.reserving = self.reserving.saturating_sub(1);
+        if lane.state == Reading::Reserving && !lane.held {
+            self.waited_for_budget(key);
         }
         if lane.paused
             && let Some(entry) = peer.and_then(|peer| self.peer_entry_mut(peer))
@@ -3844,11 +3879,33 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             (None, _) => Reading::Skipping,
         };
         lane.frame = frame;
+        // Read, so not held: it waits for the budget alone.
         if lane.state == Reading::Reserving {
-            self.reserving = self.reserving.saturating_add(1);
+            self.waits_for_budget(conn.key);
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// A lane of the connection `key` waits for the budget, its owner not holding it.
+    fn waits_for_budget(&mut self, key: usize) {
+        self.reserving = self.reserving.saturating_add(1);
+        if self.reserving_at.len() <= key {
+            // Keys are the QUIC endpoint's connection handles, bounded by the connections it holds.
+            self.reserving_at.resize(key.saturating_add(1), 0);
+        }
+        if let Some(count) = self.reserving_at.get_mut(key) {
+            *count = count.saturating_add(1);
+        }
+    }
+
+    /// A lane of the connection `key` counted in `reserving` waits for the budget no more: its
+    /// frame reserved, its owner holding it, or the lane gone.
+    fn waited_for_budget(&mut self, key: usize) {
+        self.reserving = self.reserving.saturating_sub(1);
+        if let Some(count) = self.reserving_at.get_mut(key) {
+            *count = count.saturating_sub(1);
+        }
     }
 
     /// A lossless frame's bytes ask the budget again: read on once it holds them, else the lane
@@ -3865,7 +3922,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         };
         lane.frame = Some(frame);
         lane.state = Reading::Frame;
-        self.reserving = self.reserving.saturating_sub(1);
+        self.waited_for_budget(conn.key);
         Ok(true)
     }
 

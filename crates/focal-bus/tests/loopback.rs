@@ -743,7 +743,7 @@ fn a_frame_that_waits_for_anything_but_memory_takes_nothing_from_the_window() {
             // every turn.
             bus.refusing.publish.set(true);
             bus.publish(BEFORE + 1);
-            while bus.node_driver.endpoint().stats().frames_reserving == 0 {
+            while bus.node_driver.endpoint().frames_reserving() == 0 {
                 bus.step(true).await;
                 bus.moved("the publish frame comes to wait");
             }
@@ -761,6 +761,11 @@ fn a_frame_that_waits_for_anything_but_memory_takes_nothing_from_the_window() {
                 .hold_lane(PUBLISHER, wire::LANE)
                 .unwrap();
             bus.refusing.publish.set(false);
+            assert_eq!(
+                bus.node_driver.endpoint().frames_reserving(),
+                0,
+                "a held lane's frame waits for its lane, not for memory"
+            );
             bus.node.relieve_transport(bus.node_driver.endpoint());
             assert_eq!(bus.bounds(), window, "a held frame took the window");
             assert_eq!(

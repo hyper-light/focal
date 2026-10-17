@@ -15346,3 +15346,28 @@ hyper-raft and comes with the next re-vendor.
 Gates on this tree (macOS 26.4.1 arm64): cargo fmt, check-contracts, clippy -D warnings,
 check-production, cargo deny, and the workspace's tests (171 binaries, 3,502 passed, 0 failed, 31
 ignored).
+
+### 2026-10-16 — Every shared crate at hyper-raft 8b36a88: sparse account reads, a held lane's frame waits for its owner, the idle ask left to the park
+
+Every shared crate is re-vendored at hyper-raft 8b36a88, main's merge of the bus's next three
+changes (76eaa33) and its formatting fix:
+
+- hyper-rt, hyper-transport, hyper-rt-transport: a socket's account (`SO_MEMINFO`) is read at an
+  epoch's drains 0, 2, 6, 14, …, where it was read before every drain, and a drop is told by the
+  traffic (`SO_RXQ_OVFL` on Linux).
+- hyper-transport: a held lane's waiting frame waits for its owner and leaves
+  `Endpoint::frames_reserving`, and a retry visits only the connections with a frame waiting.
+- hyper-rt: an idle turn leaves its ask of the driver to the park that follows.
+
+The bus's relief reads `Endpoint::frames_reserving` (the count, which holds no held lane's frame)
+where it called `stats()`, which visits every connection, at every turn. The loopback test now
+also asserts that a held lane's frame leaves that count. focal-compare reports each path's MTU, its
+MTU probes and black holes: paths reach 1,452 bytes on loopback, and a compressed claim larger than
+one packet carries takes two, about one message in five.
+
+Measured on the bare-metal machine (interleaved pairs, CPU a message at the median):
+
+| Change | 100,000/s | 10,000/s | 10,000/s, busy core |
+|---|---|---|---|
+| Sparse account reads (3 pairs; busy 3 + 6) | 6,207 → 6,082 ns | 7,434 → 7,135 ns | 7,920 → 7,767 ns; 8,609 → 8,057 ns |
+| The idle ask left to the park (3 pairs) | 6,016 → 6,080 ns | 7,326 → 7,209 ns | 7,801 → 7,955 ns |

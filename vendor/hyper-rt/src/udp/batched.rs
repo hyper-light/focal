@@ -106,6 +106,10 @@ pub struct IoStats {
     /// Whether the kernel stamps each datagram received (Linux's `SO_TIMESTAMPNS`, macOS's
     /// `SO_TIMESTAMP_MONOTONIC`); otherwise a datagram is stamped when it is read.
     pub kernel_stamps: bool,
+    /// The datagrams the kernel dropped for want of room since the socket was made, as the
+    /// datagrams received say (Linux's `SO_RXQ_OVFL`): `Some(0)` until one says more, `None` where
+    /// the kernel does not tell. A drop after the last datagram received is told by the next.
+    pub drops: Option<u64>,
     /// Datagrams dropped because they were larger than a slot holds ([`RECEIVE_BYTES`]): no UDP payload
     /// or segmented send is, so one is a caller's fault, and the slot never grows past its bound for it.
     pub oversize: u64,
@@ -127,6 +131,10 @@ impl IoStats {
             gso: self.gso || other.gso,
             gro: self.gro || other.gro,
             kernel_stamps: self.kernel_stamps || other.kernel_stamps,
+            drops: match (self.drops, other.drops) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                (a, b) => a.or(b),
+            },
             oversize: self.oversize.saturating_add(other.oversize),
         }
     }
@@ -459,6 +467,7 @@ impl Batched {
                 stats.gso = offload.gso;
                 stats.gro = offload.gro;
                 stats.kernel_stamps = stamps && linux::enable_stamps(fd);
+                stats.drops = linux::enable_drop_counts(fd).then_some(0);
             }
             let linux = Linux {
                 send: linux::Headers::new(io.batch),
@@ -1000,6 +1009,9 @@ impl Batched {
         let now_ns = shard_now()?;
         let mut delivered = 0usize;
         for taken in &linux.received {
+            if let (Some(told), Some(held)) = (taken.drops, stats.drops.as_mut()) {
+                *held = (*held).max(u64::from(told));
+            }
             let Some(bytes) = buffers
                 .get_mut(taken.index)
                 .and_then(|buffer| buffer.get_mut(..taken.length))

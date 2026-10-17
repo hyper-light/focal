@@ -29,9 +29,10 @@ pub(crate) const MAX_SEGMENTS: usize = 64;
 pub(crate) const SEGMENTED_BYTES: usize = 65_507;
 /// The control buffer of one message, in 8-byte words for `cmsghdr`'s alignment: room for one
 /// `UDP_SEGMENT` (a `u16`) or one `UDP_GRO` (an `int`) beside one `SCM_TIMESTAMPNS` (a
-/// `struct timespec`): `CMSG_SPACE(4) + CMSG_SPACE(16)`, 24 + 32 = 56 bytes on a 64-bit target
-/// (a 16-byte header) and less on a 32-bit one, seven words (`the_control_buffer_holds_both`).
-const CONTROL_WORDS: usize = 7;
+/// `struct timespec`) and one `SO_RXQ_OVFL` (a `u32`): `CMSG_SPACE(4) + CMSG_SPACE(16) +
+/// CMSG_SPACE(4)`, 24 + 32 + 24 = 80 bytes on a 64-bit target (a 16-byte header) and less on a
+/// 32-bit one, ten words (`the_control_buffer_holds_every_message`).
+const CONTROL_WORDS: usize = 10;
 
 type Control = [u64; CONTROL_WORDS];
 
@@ -64,6 +65,25 @@ fn clock_ns(clock: libc::clockid_t) -> io::Result<u64> {
 /// `CLOCK_REALTIME`, nanoseconds: the clock `SO_TIMESTAMPNS` stamps on.
 pub(crate) fn realtime_ns() -> io::Result<u64> {
     clock_ns(libc::CLOCK_REALTIME)
+}
+
+/// Asks the kernel to tell, with each datagram `fd` receives, how many it dropped for want of
+/// room since the socket was made (`SO_RXQ_OVFL`, socket(7)): an `SO_RXQ_OVFL` control message of
+/// a `u32`, attached once the count is past zero. A drop is then known from the traffic itself,
+/// without asking the socket's account. Whether it agreed.
+pub(crate) fn enable_drop_counts(fd: RawFd) -> bool {
+    let on: libc::c_int = 1;
+    // SAFETY: `on` is a live `c_int` and the length passed is its size; setsockopt only reads it.
+    let status = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RXQ_OVFL,
+            ptr::addr_of!(on).cast(),
+            socklen(size_of::<libc::c_int>()),
+        )
+    };
+    status == 0
 }
 
 /// Asks the kernel to stamp each datagram `fd` receives (`SO_TIMESTAMPNS`). Whether it agreed.
@@ -520,6 +540,9 @@ pub(crate) struct Received {
     pub(crate) segment: Option<usize>,
     /// The kernel's receive stamp, nanoseconds of `CLOCK_REALTIME`, when it attached one.
     pub(crate) stamp: Option<u64>,
+    /// The datagrams the socket had dropped for want of room when this one was queued
+    /// (`SO_RXQ_OVFL`), when the kernel attached the count: none until it is past zero.
+    pub(crate) drops: Option<u32>,
 }
 
 /// Receives up to one message into each of `buffers` with one `recvmmsg`, appending what arrived
@@ -596,13 +619,14 @@ pub(crate) fn receive(
         let Ok(length) = usize::try_from(message.msg_len) else {
             continue;
         };
-        let (segment, stamp) = controls_of(&message.msg_hdr);
+        let (segment, stamp, drops) = controls_of(&message.msg_hdr);
         out.push(Received {
             index,
             from,
             length,
             segment,
             stamp,
+            drops,
         });
     }
     Ok(received)
@@ -624,12 +648,12 @@ fn whole(bytes: usize) -> usize {
 /// The `UDP_GRO` segment size of a received message, if the kernel coalesced it, and its
 /// `SCM_TIMESTAMPNS` stamp in nanoseconds, if the kernel stamped it. A message whose `cmsg_len`
 /// does not cover its data (a truncated control buffer) is not read.
-fn controls_of(header: &libc::msghdr) -> (Option<usize>, Option<u64>) {
-    let (mut segment, mut stamp) = (None, None);
+fn controls_of(header: &libc::msghdr) -> (Option<usize>, Option<u64>, Option<u32>) {
+    let (mut segment, mut stamp, mut drops) = (None, None, None);
     // SAFETY: `header` was filled by recvmmsg, whose control buffer and length are its own;
     // CMSG_FIRSTHDR and CMSG_NXTHDR stay within `msg_controllen`; a `UDP_GRO` message's data is
-    // an `int` and an `SCM_TIMESTAMPNS` message's a `timespec`, each read unaligned once its
-    // `cmsg_len` is checked to cover it.
+    // an `int`, an `SCM_TIMESTAMPNS` message's a `timespec` and an `SO_RXQ_OVFL` message's a
+    // `u32`, each read unaligned once its `cmsg_len` is checked to cover it.
     unsafe {
         let mut at = libc::CMSG_FIRSTHDR(header);
         while let Some(control) = at.as_ref() {
@@ -646,25 +670,32 @@ fn controls_of(header: &libc::msghdr) -> (Option<usize>, Option<u64>) {
             {
                 let time = ptr::read_unaligned(libc::CMSG_DATA(at).cast::<libc::timespec>());
                 stamp = timespec_ns(&time);
+            } else if control.cmsg_level == libc::SOL_SOCKET
+                && control.cmsg_type == libc::SO_RXQ_OVFL
+                && length >= whole(size_of::<u32>())
+            {
+                drops = Some(ptr::read_unaligned(libc::CMSG_DATA(at).cast::<u32>()));
             }
             at = libc::CMSG_NXTHDR(header, at);
         }
     }
-    (segment, stamp)
+    (segment, stamp, drops)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The control buffer holds a `UDP_GRO` message beside an `SCM_TIMESTAMPNS` one.
+    /// The control buffer holds a `UDP_GRO` message beside an `SCM_TIMESTAMPNS` one and an
+    /// `SO_RXQ_OVFL` one.
     #[test]
-    fn the_control_buffer_holds_both() {
+    fn the_control_buffer_holds_every_message() {
         // SAFETY: CMSG_SPACE only computes a length.
-        let both = unsafe {
+        let every = unsafe {
             libc::CMSG_SPACE(socklen_u32(size_of::<libc::c_int>()))
                 + libc::CMSG_SPACE(socklen_u32(size_of::<libc::timespec>()))
+                + libc::CMSG_SPACE(socklen_u32(size_of::<u32>()))
         };
-        assert!(usize::try_from(both).unwrap() <= size_of::<Control>());
+        assert!(usize::try_from(every).unwrap() <= size_of::<Control>());
     }
 }
