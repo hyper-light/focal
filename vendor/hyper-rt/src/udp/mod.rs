@@ -47,6 +47,21 @@ use crate::registry;
 // a caller names an address without depending on the socket backend.
 pub use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
+/// The most datagrams of `size` bytes one segmented send carries where the kernel segments (Linux,
+/// `UDP_SEGMENT`): `UDP_MAX_SEGMENTS`, and no more than one IP datagram's length holds, so one at a
+/// loopback path's 65,507 bytes; one where the kernel does not segment.
+pub fn segments_per_send(size: usize) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        linux::segments_per_message(size)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = size;
+        1
+    }
+}
+
 /// The owned OS handle [`UdpSocket::adopt`] takes — a file descriptor on Unix, a Winsock socket on
 /// Windows; `std::net::UdpSocket` converts into either with `.into()`.
 pub type OwnedDatagram = netsys::OwnedDatagram;
@@ -234,6 +249,37 @@ impl UdpSocket {
         match &self.inner {
             Inner::Real { socket } => netsys::dont_fragment(socket),
             Inner::Sim { .. } => Ok(true),
+            Inner::Moved => Err(moved()),
+        }
+    }
+
+    /// The largest UDP payload the kernel would send to the connected peer in one unfragmented
+    /// datagram: the path's MTU as the kernel holds it (the route's, or less where an ICMP "packet
+    /// too big" taught it less) less the IP and UDP headers. It is RFC 8899's MAX_PLPMTU for the
+    /// path (§5.1.2, "the largest size of PLPMTU", bounded by the local interface), so a search
+    /// for the path's MTU need not probe past it. `None` where the platform does not say (macOS),
+    /// the socket has no peer, or on the simulation fabric.
+    pub fn path_payload(&self) -> Result<Option<u16>, RtError> {
+        match &self.inner {
+            Inner::Real { socket } => netsys::path_payload(socket),
+            Inner::Sim { .. } => Ok(None),
+            Inner::Moved => Err(moved()),
+        }
+    }
+
+    /// The largest UDP payload the kernel would carry from this socket's host to `remote` in one
+    /// unfragmented datagram, as [`UdpSocket::path_payload`] reads it on a socket connected there:
+    /// a socket of `remote`'s family is connected to it (connecting a datagram socket sends
+    /// nothing), asked, and closed. For a socket that serves many peers and so cannot be connected
+    /// to one, a listener. `None` where the platform does not say, or on the simulation fabric.
+    pub fn path_payload_to(&self, remote: SocketAddr) -> Result<Option<u16>, RtError> {
+        match &self.inner {
+            Inner::Real { .. } => {
+                let asked = netsys::dgram_socket(Family::of(remote))?;
+                netsys::connect(&asked, remote)?;
+                netsys::path_payload(&asked)
+            }
+            Inner::Sim { .. } => Ok(None),
             Inner::Moved => Err(moved()),
         }
     }

@@ -58,6 +58,35 @@ const BUFFER_ASKS: usize = 32;
 
 // ============================================================================== Unix (rustix)
 
+/// Format: what an IPv4 datagram's headers take before its UDP payload: the IPv4 header's 20 bytes
+/// without options (RFC 791 §3.1; none are set here) and UDP's 8 (RFC 768).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const IPV4_UDP_HEADERS: u32 = 28;
+/// Format: IPv6's fixed header, 40 bytes (RFC 8200 §3; no extension header is sent here).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const IPV6_HEADER: u32 = 40;
+/// Format: UDP's header, 8 bytes (RFC 768).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const UDP_HEADER: u32 = 8;
+/// Format: the largest IPv4 datagram, Total Length's 16 bits (RFC 791 §3.1), and the largest IPv6
+/// payload, Payload Length's 16 bits (RFC 8200 §3; jumbograms are not sent here).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const LENGTH_FIELD_MAX: u32 = 65_535;
+
+/// The largest UDP payload a path of `mtu` bytes carries in one unfragmented datagram of `family`:
+/// the MTU less the headers, and never past what the length fields can say.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn payload_of(mtu: u32, family: Family) -> u16 {
+    let payload = match family {
+        Family::V4 => mtu.min(LENGTH_FIELD_MAX).saturating_sub(IPV4_UDP_HEADERS),
+        Family::V6 => mtu
+            .saturating_sub(IPV6_HEADER)
+            .min(LENGTH_FIELD_MAX)
+            .saturating_sub(UDP_HEADER),
+    };
+    u16::try_from(payload).unwrap_or(u16::MAX)
+}
+
 #[cfg(unix)]
 mod imp {
     use std::os::fd::{AsRawFd, OwnedFd};
@@ -102,6 +131,159 @@ mod imp {
     pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
         rustix::net::sockopt::socket_recv_buffer_size(&socket.fd)
             .map_err(|e| refused("getsockopt", e))
+    }
+
+    /// The largest UDP payload the connected path carries unfragmented, from its MTU as the kernel
+    /// holds it (`IP_MTU`, `IPV6_MTU`; ip(7), ipv6(7)): the route's, or less where an ICMP "packet
+    /// too big" taught it less. `None` for a socket with no peer (`ENOTCONN`).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn path_payload(socket: &Socket) -> Result<Option<u16>, RtError> {
+        let mtu = match socket.family {
+            Family::V4 => rustix::net::sockopt::ip_mtu(&socket.fd),
+            Family::V6 => rustix::net::sockopt::ipv6_mtu(&socket.fd),
+        };
+        match mtu {
+            Ok(mtu) => Ok(Some(super::payload_of(mtu, socket.family))),
+            Err(Errno::NOTCONN) => Ok(None),
+            Err(e) => Err(refused("getsockopt(IP_MTU)", e)),
+        }
+    }
+
+    /// The largest UDP payload the interface carrying the connected path takes, found by the
+    /// socket's local address. XNU keeps no path MTU a socket can read (it has no `IP_MTU`), but
+    /// `getifaddrs` gives each interface's MTU (`if_data.ifi_mtu`, on its link-level entry), which
+    /// bounds any path through it (RFC 8899 §5.1.2's MAX_PLPMTU). `None` for a socket with no peer
+    /// (its local address unspecified until it connects) or an address no interface holds.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn path_payload(socket: &Socket) -> Result<Option<u16>, RtError> {
+        let local = local_addr(socket)?;
+        if local.ip().is_unspecified() {
+            return Ok(None);
+        }
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        // SAFETY: getifaddrs writes the list it allocates through a pointer to a live local; the
+        // list is freed below, once, whatever was found in it.
+        if unsafe { libc::getifaddrs(&raw mut head) } != 0 {
+            return Err(RtError::os("getifaddrs"));
+        }
+        let mtu = interface_mtu(head, local.ip());
+        // SAFETY: `head` is the list getifaddrs returned, freed here only.
+        unsafe { libc::freeifaddrs(head) };
+        // XNU also refuses any datagram past its UDP cap (`net.inet.udp.maxdgram`, 9,216 bytes by
+        // default), below loopback's MTU: what passes both is what the path carries.
+        let payload = mtu.map(|mtu| super::payload_of(mtu, socket.family));
+        Ok(match (payload, udp_datagram_cap()) {
+            (Some(payload), Some(cap)) => Some(payload.min(cap)),
+            (payload, _) => payload,
+        })
+    }
+
+    /// The host's cap on a UDP datagram's payload (`net.inet.udp.maxdgram`), if it says.
+    #[cfg(target_os = "macos")]
+    fn udp_datagram_cap() -> Option<u16> {
+        let mut cap: libc::c_uint = 0;
+        let mut len = std::mem::size_of::<libc::c_uint>();
+        // SAFETY: the name is NUL-terminated; the out pointer and its length name one live local
+        // `c_uint`, the sysctl's type; no new value is written.
+        let outcome = unsafe {
+            libc::sysctlbyname(
+                c"net.inet.udp.maxdgram".as_ptr(),
+                (&raw mut cap).cast::<libc::c_void>(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (outcome == 0).then(|| u16::try_from(cap).unwrap_or(u16::MAX))
+    }
+
+    /// Bound: the entries `getifaddrs` lists, an interface's addresses of each family (link, IPv4,
+    /// IPv6) for at most 65,535 interfaces (XNU's interface index, `sdl_index`, is 16 bits); a list
+    /// longer than that is read no further.
+    #[cfg(target_os = "macos")]
+    const INTERFACE_ENTRIES: usize = 3 * 65_535;
+
+    /// The MTU of the interface holding `ip`, from the list at `head`: the name of the entry whose
+    /// address is `ip`, then that name's link-level entry, whose data is its `if_data`.
+    #[cfg(target_os = "macos")]
+    fn interface_mtu(head: *const libc::ifaddrs, ip: std::net::IpAddr) -> Option<u32> {
+        let name = entry_name(entries(head).find(|entry| entry_ip(entry) == Some(ip))?)?;
+        let link = entries(head).find(|entry| {
+            entry_name(entry) == Some(name)
+                && family(entry) == Some(libc::AF_LINK)
+                && !entry.ifa_data.is_null()
+        })?;
+        // SAFETY: a link-level entry's data is the interface's `if_data` (getifaddrs(3)), not
+        // null (checked above); read unaligned, as nothing promises its alignment.
+        let data = unsafe { std::ptr::read_unaligned(link.ifa_data.cast::<libc::if_data>()) };
+        Some(data.ifi_mtu)
+    }
+
+    /// An entry's interface name, if it has one.
+    #[cfg(target_os = "macos")]
+    fn entry_name(entry: &libc::ifaddrs) -> Option<&std::ffi::CStr> {
+        if entry.ifa_name.is_null() {
+            return None;
+        }
+        // SAFETY: a name that is not null is a NUL-terminated string the list owns, alive while
+        // the entry it is borrowed with is.
+        Some(unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) })
+    }
+
+    /// The entries of the list at `head`, in order, at most [`INTERFACE_ENTRIES`].
+    #[cfg(target_os = "macos")]
+    fn entries<'a>(head: *const libc::ifaddrs) -> impl Iterator<Item = &'a libc::ifaddrs> {
+        // SAFETY: `head` is null or the first entry of the list getifaddrs returned, alive until
+        // it is freed, which its caller does only after the iterator is gone.
+        let first = unsafe { head.as_ref() };
+        std::iter::successors(first, |entry| next_entry(entry)).take(INTERFACE_ENTRIES)
+    }
+
+    /// The entry after `entry` in its list, if any.
+    #[cfg(target_os = "macos")]
+    fn next_entry<'a>(entry: &libc::ifaddrs) -> Option<&'a libc::ifaddrs> {
+        // SAFETY: an entry's `ifa_next` is null or the next entry of the same list, alive as long
+        // as the list, which outlives every iterator over it.
+        unsafe { entry.ifa_next.cast_const().as_ref() }
+    }
+
+    /// The address family of an entry's address, if it has one.
+    #[cfg(target_os = "macos")]
+    fn family(entry: &libc::ifaddrs) -> Option<libc::c_int> {
+        // SAFETY: an entry's address is null or a `sockaddr` the list owns.
+        unsafe { entry.ifa_addr.cast_const().as_ref() }
+            .map(|address| libc::c_int::from(address.sa_family))
+    }
+
+    /// An entry's IP address, if it has an IPv4 or IPv6 one.
+    #[cfg(target_os = "macos")]
+    fn entry_ip(entry: &libc::ifaddrs) -> Option<std::net::IpAddr> {
+        match family(entry)? {
+            libc::AF_INET => {
+                // SAFETY: an address of family AF_INET is a `sockaddr_in`; read unaligned.
+                let address =
+                    unsafe { std::ptr::read_unaligned(entry.ifa_addr.cast::<libc::sockaddr_in>()) };
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                    u32::from_be(address.sin_addr.s_addr),
+                )))
+            }
+            libc::AF_INET6 => {
+                // SAFETY: an address of family AF_INET6 is a `sockaddr_in6`; read unaligned.
+                let address = unsafe {
+                    std::ptr::read_unaligned(entry.ifa_addr.cast::<libc::sockaddr_in6>())
+                };
+                Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                    address.sin6_addr.s6_addr,
+                )))
+            }
+            _ => None,
+        }
+    }
+
+    /// No other platform here keeps a path MTU a socket can read: `None`.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn path_payload(_socket: &Socket) -> Result<Option<u16>, RtError> {
+        Ok(None)
     }
 
     /// The bytes waiting in the socket's receive queue as `FIONREAD` counts them: on XNU and the
@@ -363,13 +545,14 @@ pub(crate) mod imp {
 
     use windows_sys::Win32::Networking::WinSock::{
         AF_INET, AF_INET6, FIONBIO, FIONREAD, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0,
-        INVALID_SOCKET, IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_UDP, IPV6_DONTFRAG,
-        IPV6_V6ONLY, SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
-        SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSADATA,
-        WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINTR, WSAEMSGSIZE, WSAENETRESET,
-        WSAENETUNREACH, WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket,
-        connect as ws_connect, getsockname, getsockopt, ioctlsocket, recvfrom as ws_recvfrom,
-        send as ws_send, sendto as ws_sendto, setsockopt, socket as ws_socket,
+        INVALID_SOCKET, IP_DONTFRAGMENT, IP_MTU, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_UDP,
+        IPV6_DONTFRAG, IPV6_MTU, IPV6_V6ONLY, SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR,
+        SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_STORAGE, SOCKET, SOCKET_ERROR,
+        SOL_SOCKET, WSADATA, WSAECONNREFUSED, WSAECONNRESET, WSAEHOSTUNREACH, WSAEINTR,
+        WSAEMSGSIZE, WSAENETRESET, WSAENETUNREACH, WSAENOPROTOOPT, WSAENOTCONN, WSAEWOULDBLOCK,
+        WSAGetLastError, WSAStartup, bind as ws_bind, closesocket, connect as ws_connect,
+        getsockname, getsockopt, ioctlsocket, recvfrom as ws_recvfrom, send as ws_send,
+        sendto as ws_sendto, setsockopt, socket as ws_socket,
     };
 
     use core::net::{Ipv6Addr, SocketAddrV6};
@@ -570,6 +753,37 @@ pub(crate) mod imp {
             "getsockopt(SO_RCVBUF)",
         )?;
         usize::try_from(bytes).map_err(|_| last("getsockopt(SO_RCVBUF)"))
+    }
+
+    /// The largest UDP payload the connected path carries unfragmented, from its MTU as Windows
+    /// holds it (`IP_MTU`, `IPV6_MTU`, "IPPROTO_IP socket options", Windows 10 1703 on). `None` for
+    /// a socket with no peer (`WSAENOTCONN`) or a Windows without the option (`WSAENOPROTOOPT`).
+    pub(crate) fn path_payload(socket: &Socket) -> Result<Option<u16>, RtError> {
+        let (level, option) = match socket.family {
+            Family::V4 => (IPPROTO_IP, IP_MTU),
+            Family::V6 => (IPPROTO_IPV6, IPV6_MTU),
+        };
+        let mut mtu: u32 = 0;
+        // The option is a `DWORD`: its length is that type's size, which always fits an `i32`.
+        let mut len: i32 = i32::try_from(std::mem::size_of::<u32>()).unwrap_or(i32::MAX);
+        // SAFETY: the option is a `DWORD`; the out pointer and its length name one live local `u32`.
+        let outcome = unsafe {
+            getsockopt(
+                socket.socket,
+                level,
+                option,
+                (&raw mut mtu).cast::<u8>(),
+                &raw mut len,
+            )
+        };
+        if outcome != SOCKET_ERROR {
+            return Ok(Some(super::payload_of(mtu, socket.family)));
+        }
+        // SAFETY: reads the calling thread's last Winsock error, set by the call above.
+        match unsafe { WSAGetLastError() } {
+            WSAENOTCONN | WSAENOPROTOOPT => Ok(None),
+            _ => Err(last("getsockopt(IP_MTU)")),
+        }
     }
 
     /// The bytes waiting in the socket's receive queue: for a datagram socket every queued
@@ -892,6 +1106,6 @@ pub(crate) use imp as winsock;
 pub(crate) use imp::dont_fragment;
 pub(crate) use imp::{OwnedDatagram, Socket};
 pub(crate) use imp::{
-    adopt, bind, connect, dgram_socket, into_owned, local_addr, queued_bytes, recv_buffer_bytes,
-    recv_from, send, send_to, set_recv_buffer, share_port,
+    adopt, bind, connect, dgram_socket, into_owned, local_addr, path_payload, queued_bytes,
+    recv_buffer_bytes, recv_from, send, send_to, set_recv_buffer, share_port,
 };

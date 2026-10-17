@@ -110,15 +110,20 @@ pub fn socket_buffer_ask(bytes: u64) -> u64 {
 /// no flow control of its own, where TCP's kernel advertises its own queue's room. So the windows
 /// granted, summed, never pass what the queue holds (hyper-rt's `recv_capacity_bytes`), and an
 /// owner the machine stops for any while loses nothing, as TCP's reader does not. A connection's
-/// first window is taken whole or the connection refused; a window grows only while what is left
-/// still holds the first windows of the handshakes admission lets wait, so a peer that grew first
-/// never shuts out one that comes next.
+/// first window is taken whole, with room for what its peer may send unprompted, or the
+/// connection refused; a window grows only while what is left still holds the first windows of
+/// the handshakes admission may still let wait, and their peers' unprompted messages, so a peer
+/// that grew first never shuts out one that comes next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Room {
     /// What the queue holds, payload bytes: unbounded until the owner says what its socket holds.
     capacity: u64,
     /// The windows granted, summed, each with the reserve on top of it.
     granted: u64,
+    /// What the peers of the connections taken since the capacity was last said may send
+    /// unprompted, in the room's bytes: held until a capacity said after them counts them in its
+    /// own reckoning, so connections taken between two sayings never pass what the queue holds.
+    unprompted: u64,
     /// First windows refused for want of room.
     refused: u64,
 }
@@ -129,13 +134,16 @@ impl Room {
         Self {
             capacity: u64::MAX,
             granted: 0,
+            unprompted: 0,
             refused: 0,
         }
     }
-    /// The queue holds `capacity` bytes: windows past it are no longer granted; those granted
-    /// stand until they are given back.
+    /// The queue holds `capacity` bytes, the unprompted messages of every connection it serves
+    /// counted already: windows past it are no longer granted; those granted stand until they are
+    /// given back.
     pub(crate) fn set_capacity(&mut self, capacity: u64) {
         self.capacity = capacity;
+        self.unprompted = 0;
     }
     /// What the queue holds.
     pub(crate) fn capacity(&self) -> u64 {
@@ -149,12 +157,16 @@ impl Room {
     pub(crate) fn refused(&self) -> u64 {
         self.refused
     }
-    /// A connection's first window of `bytes`, taken whole, or refused
+    /// A connection's first window of `bytes`, taken whole with `unprompted`, the room its peer's
+    /// unprompted messages take until the capacity counts them, or refused
     /// [`Refusal::ReceiveBuffer`].
-    pub(crate) fn first(&mut self, bytes: u64) -> Result<(), Refusal> {
-        match self.granted.checked_add(bytes) {
-            Some(granted) if granted <= self.capacity => {
-                self.granted = granted;
+    pub(crate) fn first(&mut self, bytes: u64, unprompted: u64) -> Result<(), Refusal> {
+        let held = self.unprompted.checked_add(unprompted);
+        let needed = held.and_then(|held| self.granted.checked_add(bytes)?.checked_add(held));
+        match needed {
+            Some(needed) if needed <= self.capacity => {
+                self.granted = self.granted.saturating_add(bytes);
+                self.unprompted = held.unwrap_or(u64::MAX);
                 Ok(())
             }
             _ => {
@@ -163,13 +175,13 @@ impl Room {
             }
         }
     }
-    /// A window grows by `bytes` if what is left after it still holds `kept`, the first windows of
-    /// the handshakes that may come; whether it grew.
+    /// A window grows by `bytes` if what is left after it still holds `kept`, what the
+    /// handshakes that may come need; whether it grew.
     pub(crate) fn grow(&mut self, bytes: u64, kept: u64) -> bool {
         let Some(granted) = self.granted.checked_add(bytes) else {
             return false;
         };
-        if granted.saturating_add(kept) > self.capacity {
+        if granted.saturating_add(self.unprompted).saturating_add(kept) > self.capacity {
             return false;
         }
         self.granted = granted;
@@ -252,6 +264,27 @@ mod tests {
     /// granularity: on Windows' 15.6 ms timer a window consumed in 20 ms, past two round trips of
     /// a 400 µs path and past RFC 9002's 1 ms, is still within two of the owner's granularity, the
     /// finest time in which it sees the window consumed.
+    /// A first window is taken with the room its peer's unprompted messages take, which is held
+    /// until a capacity said after it counts them, and a window grows only past both. Do: a room
+    /// of 100 bytes; two first windows of 30, each taken with 20; a third of 1 with none; the
+    /// capacity said again at 100; a window grown by 30, then by 1 keeping 9. Expect: the first two
+    /// taken, the third refused (61 + 40 > 100), and once the capacity is said again a growth that
+    /// leaves the 9 kept.
+    #[test]
+    fn a_first_window_is_taken_with_its_peers_unprompted_room() {
+        let mut room = Room::unbounded();
+        room.set_capacity(100);
+        assert_eq!(room.first(30, 20), Ok(()));
+        assert_eq!(room.first(30, 20), Ok(()));
+        assert_eq!(room.first(1, 0), Err(Refusal::ReceiveBuffer));
+        assert_eq!((room.granted(), room.refused()), (60, 1));
+        assert!(!room.grow(1, 0), "the unprompted room is held");
+        room.set_capacity(100);
+        assert!(room.grow(30, 0));
+        assert!(!room.grow(1, 10), "91 granted and 10 kept pass 100");
+        assert!(room.grow(1, 9));
+    }
+
     #[test]
     fn a_round_trip_under_the_granularity_counts_as_the_granularity() {
         let start = hyper_sim::Anchor::new().instant(0).unwrap();

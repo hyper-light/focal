@@ -36,6 +36,22 @@ impl Pacer {
         }
     }
 
+    /// The path's MTU rose to `mtu` (a probe of it was acknowledged): the bucket holds at least one
+    /// datagram of it, within its capacity, as a controller's window is raised to its minimum on the
+    /// same news. A send waits for a whole datagram of tokens, so a bucket filled for the smaller
+    /// MTU released nothing at all until it refilled past the larger one: from 1,452 to the 8,954 of
+    /// a jumbo-frame path, several round trips with even a 50-byte packet held.
+    fn credit_mtu_rise(&mut self, mtu: u16) {
+        if mtu > self.last_mtu {
+            self.tokens = self.tokens.max(u64::from(mtu)).min(self.capacity);
+        }
+    }
+
+    /// Bytes the bucket holds, as its last `delay` refilled it.
+    pub(super) fn tokens(&self) -> u64 {
+        self.tokens
+    }
+
     /// Record that a packet has been transmitted.
     pub(super) fn on_transmit(&mut self, packet_length: u16) {
         self.tokens = self.tokens.saturating_sub(packet_length.into())
@@ -67,6 +83,7 @@ impl Pacer {
 
             // Clamp the tokens
             self.tokens = self.capacity.min(self.tokens);
+            self.credit_mtu_rise(mtu);
             self.last_window = window;
             self.last_mtu = mtu;
             self.last_rate = None;
@@ -141,6 +158,7 @@ impl Pacer {
         if self.last_rate != Some(rate) || mtu != self.last_mtu {
             self.capacity = rate_capacity(rate, mtu);
             self.tokens = self.capacity.min(self.tokens);
+            self.credit_mtu_rise(mtu);
             self.last_rate = Some(rate);
             self.last_mtu = mtu;
         }
@@ -319,6 +337,28 @@ mod tests {
         let mut idle = Pacer::new(rtt, 2_000_000, mtu, start);
         idle.tokens = 0;
         assert_eq!(idle.delay(rtt, Some(0), 1_000, mtu, 2_000_000, start), None);
+    }
+
+    /// The path's MTU rising (a probe of it acknowledged) leaves a datagram of the new size free to
+    /// go: a bucket filled for 1,452-byte datagrams and holding less than one of 8,954 held every
+    /// send until it refilled, under the window's rule and a stated rate alike. A bucket already
+    /// holding more is left as it is.
+    #[test]
+    fn an_mtu_rise_leaves_a_datagram_of_the_new_size_free_to_go() {
+        let rtt = Duration::from_millis(50);
+        let now = Instant::now();
+        for rate in [None, Some(1_000_000)] {
+            let mut pacer = Pacer::new(rtt, 2_000_000, 1_452, now);
+            pacer.tokens = 2_000;
+            assert_eq!(pacer.delay(rtt, rate, 1_452, 1_452, 2_000_000, now), None);
+            pacer.tokens = 2_000;
+            assert_eq!(pacer.delay(rtt, rate, 8_954, 8_954, 2_000_000, now), None);
+            assert_eq!(pacer.tokens, 8_954);
+        }
+        let mut full = Pacer::new(rtt, 2_000_000, 1_452, now);
+        assert_eq!(full.tokens, 80_000);
+        assert_eq!(full.delay(rtt, None, 8_954, 8_954, 2_000_000, now), None);
+        assert_eq!(full.tokens, 80_000);
     }
 
     #[test]

@@ -22,7 +22,7 @@ pub(crate) const OPENER_BYTES: usize = 8;
 /// The opening of lane `lane`.
 pub(crate) fn opener(lane: LaneId) -> [u8; OPENER_BYTES] {
     let id = lane.to_be_bytes();
-    let sum = crc32c::crc32c(&id).to_be_bytes();
+    let sum = crate::crc::crc32c(&id).to_be_bytes();
     let [a, b, c, d] = id;
     let [e, f, g, h] = sum;
     [a, b, c, d, e, f, g, h]
@@ -32,7 +32,7 @@ pub(crate) fn opener(lane: LaneId) -> [u8; OPENER_BYTES] {
 pub(crate) fn opened(bytes: [u8; OPENER_BYTES]) -> Result<LaneId, Refusal> {
     let [a, b, c, d, e, f, g, h] = bytes;
     let id = [a, b, c, d];
-    if crc32c::crc32c(&id).to_be_bytes() != [e, f, g, h] {
+    if crate::crc::crc32c(&id).to_be_bytes() != [e, f, g, h] {
         return Err(Refusal::Corrupt);
     }
     Ok(LaneId::from_be_bytes(id))

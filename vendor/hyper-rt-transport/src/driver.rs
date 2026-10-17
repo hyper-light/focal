@@ -136,6 +136,8 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     seen: u64,
     /// The endpoint's connections as last listed ([`Endpoint::established`]).
     listed: Vec<(PeerId, SocketAddr)>,
+    /// The listed connections told their path's ceiling (`tell_ceilings`): at most those listed.
+    told: Vec<(PeerId, SocketAddr)>,
     /// A transmit its socket took only part of, waiting for it to write: at most one.
     held: Option<Held>,
     /// The buffer the endpoint makes each transmit in, kept between transmits.
@@ -202,7 +204,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             .socket()
             .set_recv_buffer_bytes(usize::try_from(ask).unwrap_or(usize::MAX))?;
         let unmeasured = endpoint.unmeasured_room();
-        endpoint.set_receive_capacity(unmeasured);
+        endpoint.set_receive_capacity(unmeasured, 0);
         let anchor = (shard_now()?, Instant::now());
         let resolution = Duration::from_nanos(hyper_rt::machine::clock::resolution_ns());
         Ok(Self {
@@ -217,6 +219,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             peers: Vec::new(),
             seen: 0,
             listed: Vec::new(),
+            told: Vec::new(),
             held: None,
             outgoing: Vec::new(),
             ring,
@@ -334,6 +337,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             if self.endpoint.poll_timeout().is_some_and(|due| due <= now) {
                 self.endpoint.handle_timeout(now);
             }
+            // A connection established in this turn's receives has its socket, and its path's
+            // ceiling, before its first transmission: its first MTU probe is never past the path.
+            if let Err(error) = self.reconcile() {
+                return Poll::Ready(Err(error));
+            }
             let more = self.send(now);
             if let Some(event) = self.endpoint.poll_event() {
                 return Poll::Ready(Ok(event));
@@ -420,15 +428,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// moved to that queue's room), and none for a connection that went. A socket the platform
     /// refuses leaves its peer on the listener. At most the admission's bound on connections.
     fn reconcile(&mut self) -> Result<(), RtError> {
-        let Some(local) = self.shared else {
-            return Ok(());
-        };
         let generation = self.endpoint.connection_generation();
         if generation == self.seen {
             return Ok(());
         }
         self.seen = generation;
         self.endpoint.established(&mut self.listed);
+        self.tell_ceilings();
+        let Some(local) = self.shared else {
+            return Ok(());
+        };
         let listed = &self.listed;
         self.peers.retain(|socket| {
             listed
@@ -483,6 +492,30 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             );
         }
         Ok(())
+    }
+
+    /// Tells each connection established since it was last called its path's ceiling, as the
+    /// kernel holds the path's MTU (`UdpSocket::path_payload_to`, a socket connected to the peer
+    /// asked and closed), before the connection's first MTU probe: whether or not the peer gets a
+    /// socket of its own, and on every platform that can say. A path the kernel cannot say is
+    /// searched up to the peer's limit, a datagram past it refused at its send and taken as a
+    /// lost probe.
+    fn tell_ceilings(&mut self) {
+        let listed = &self.listed;
+        self.told.retain(|told| listed.contains(told));
+        for &(peer, remote) in &self.listed {
+            if self.told.contains(&(peer, remote)) {
+                continue;
+            }
+            // At most the connections listed, which the admission bounds.
+            if self.told.try_reserve(1).is_err() {
+                return;
+            }
+            if let Ok(Some(payload)) = self.socket.socket().path_payload_to(remote) {
+                let _ = self.endpoint.set_path_ceiling(peer, payload);
+            }
+            self.told.push((peer, remote));
+        }
     }
 
     /// Polls the timer for `due`, arming it anew when the deadline moved; whether it fired.
@@ -540,12 +573,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                 |endpoint| Some(endpoint.stream_bytes_received_shared()),
             )?;
             self.listener_ready = ended == Queued::More;
-            let unprompted = self.endpoint.unprompted_shared();
-            let room = self
+            let (room, handshake) = self
                 .measure
-                .room(unprompted)
-                .unwrap_or_else(|| self.endpoint.unmeasured_room());
-            self.endpoint.set_receive_capacity(room);
+                .rooms(
+                    self.endpoint.unprompted_shared(),
+                    self.endpoint.unprompted_handshake(),
+                )
+                .unwrap_or_else(|| (self.endpoint.unmeasured_room(), 0));
+            self.endpoint.set_receive_capacity(room, handshake);
             self.measure.set_room(room);
         }
         for peer in &mut self.peers {

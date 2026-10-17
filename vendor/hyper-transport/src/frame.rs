@@ -72,7 +72,7 @@ impl Prefix {
         write(&mut bytes, 4, &length.to_be_bytes())?;
         write(&mut bytes, 8, &body.unwrap_or(0).to_be_bytes())?;
         let covered = bytes.get(..COVERED_BYTES).ok_or(Refusal::Corrupt)?;
-        let checksum = crc32c::crc32c_append(crc32c::crc32c(covered), head);
+        let checksum = crate::crc::crc32c_append(crate::crc::crc32c(covered), head);
         write(&mut bytes, COVERED_BYTES, &checksum.to_be_bytes())?;
         Ok(bytes)
     }
@@ -107,7 +107,7 @@ impl Prefix {
     /// prefix as received, and the head.
     pub(crate) fn verify(&self, bytes: &[u8; PREFIX_BYTES], head: &[u8]) -> Result<(), Refusal> {
         let covered = bytes.get(..COVERED_BYTES).ok_or(Refusal::Corrupt)?;
-        let checksum = crc32c::crc32c_append(crc32c::crc32c(covered), head);
+        let checksum = crate::crc::crc32c_append(crate::crc::crc32c(covered), head);
         if checksum == self.checksum {
             Ok(())
         } else {
@@ -173,7 +173,7 @@ impl Embedded {
             .map(u32::from_le_bytes)
             .ok_or(Refusal::Corrupt)?;
         let covered = frame.get(self.covered_from..).ok_or(Refusal::Corrupt)?;
-        if crc32c::crc32c(covered) == stated {
+        if crate::crc::crc32c(covered) == stated {
             Ok(())
         } else {
             Err(Refusal::Corrupt)
@@ -188,7 +188,7 @@ pub(crate) struct BodySum(u32);
 impl BodySum {
     /// The checksum with `bytes` folded in.
     pub(crate) fn fold(&mut self, bytes: &[u8]) {
-        self.0 = crc32c::crc32c_append(self.0, bytes);
+        self.0 = crate::crc::crc32c_append(self.0, bytes);
     }
     /// The trailer that ends a body with this checksum.
     pub(crate) fn trailer(self) -> [u8; TRAILER_BYTES] {
@@ -254,7 +254,7 @@ mod tests {
         };
         let mut frame = vec![0u8; 8];
         frame.extend((0..100u8).map(|n| n.wrapping_mul(7)));
-        let sum = crc32c::crc32c(&frame[8..]);
+        let sum = crate::crc::crc32c(&frame[8..]);
         frame[..4].copy_from_slice(&sum.to_le_bytes());
         frame[4..8].copy_from_slice(b"head");
         let bytes =

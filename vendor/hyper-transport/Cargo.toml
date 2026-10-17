@@ -15,7 +15,7 @@ hyper-quic = { version = "0.1.0", path = "../hyper-quic" }
 hyper-timing = { version = "0.1.0", path = "../hyper-timing" }
 # The QUIC layer takes a received datagram as BytesMut (hyper-quic's own dependency).
 bytes = "1"
-crc32c = "0.6"
+crc-fast = { version = "1.10", default-features = false, features = ["std", "vpclmulqdq"] }
 thiserror = "2.0"
 
 # A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside focal's workspace. Its

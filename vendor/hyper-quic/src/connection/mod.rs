@@ -559,13 +559,24 @@ impl Connection {
             return Some(challenge);
         }
 
-        // If we need to send a probe, make sure we have something to send.
+        // If we need to send a probe, make sure we have something to send. The first timeout
+        // after an acknowledgement repeats the oldest packet whole, so a lost reply goes again
+        // with its probe. One that follows an unanswered timeout says the peer is not
+        // acknowledging: it has stopped reading, and what it was sent waits in its socket's
+        // queue, or the path drops it, and the probe's acknowledgement will declare it lost. Its
+        // probes repeat no stream data in the Data space, only control frames, as upstream's did,
+        // so a peer that has stopped reading is sent at most one packet's stream data again
+        // whatever its MTU, however many timeouts pass (hyper-transport's receive charge counts
+        // on it). A handshake space's packets fit the smallest datagram and repeat whole.
         for space in SpaceId::iter() {
             let request_immediate_ack =
                 space == SpaceId::Data && self.peer_supports_ack_frequency();
-            self.spaces
-                .get_mut(space)
-                .maybe_queue_probe(request_immediate_ack, &mut self.streams);
+            let streams_too = space != SpaceId::Data || self.pto_count <= 1;
+            self.spaces.get_mut(space).maybe_queue_probe(
+                request_immediate_ack,
+                streams_too,
+                &mut self.streams,
+            );
         }
         self.queue_copies(now);
 
@@ -956,11 +967,12 @@ impl Connection {
         // waited behind its upload while the peer's validation of the new path ran out.
         let responding =
             space_id == SpaceId::Data && self.path_responses.has_on_path(self.path.remote);
-        if ack_eliciting
-            && self.spaces.get(space_id).loss_probes == 0
-            && let Some(fill) = self.congestion_blocks(now, tx, responding)
-        {
-            return Some(fill);
+        let mut room = room;
+        if ack_eliciting && self.spaces.get(space_id).loss_probes == 0 {
+            match self.congestion_room(now, tx, responding, room) {
+                Ok(afforded) => room = afforded,
+                Err(fill) => return Some(fill),
+            }
         }
 
         // Finish current packet
@@ -974,22 +986,33 @@ impl Connection {
         None
     }
 
-    /// `Some` when congestion control or pacing holds back the next datagram; `unpaced` exempts it
-    /// from the pacer
-    fn congestion_blocks(
+    /// The most bytes the next datagram may take under congestion control and pacing, at most
+    /// `room`, or the `Fill` when they hold it back; `unpaced` exempts it from the pacer.
+    ///
+    /// A window or a bucket that cannot take a whole segment but can take a datagram every QUIC
+    /// path carries (RFC 9000 §14, 1,200 bytes) takes the datagram cut to what it can, as TCP sends
+    /// what its window allows, and the batch ends with it. Held back for a whole segment, a packet
+    /// of a few hundred bytes waited for an acknowledgement whenever one large datagram was in
+    /// flight under a window of two (RFC 9002 §7.2's minimum at an MTU of 65,527, the most a
+    /// loopback path carries), and with nothing more to send the peer's acknowledgement waited
+    /// for its delay to run out.
+    fn congestion_room(
         &mut self,
         now: Instant,
         tx: &mut TransmitState,
         unpaced: bool,
-    ) -> Option<Fill> {
+        room: usize,
+    ) -> Result<usize, Fill> {
         // Assume the current packet will get padded to fill the segment
         let untracked_bytes = match &tx.builder {
             Some(builder) => tx.buf_capacity.saturating_sub(builder.partial_encode.start),
             None => 0,
         } as u64;
+        let floor = u64::from(INITIAL_MTU);
+        let mut wanted = u64::try_from(room.min(tx.segment_size)).unwrap_or(u64::MAX);
 
         // Byte counts: saturating can only over-state them, which blocks rather than over-sends
-        let bytes_to_send = (tx.segment_size as u64).saturating_add(untracked_bytes);
+        let bytes_to_send = wanted.saturating_add(untracked_bytes);
         let mut window_blocked = self.path.in_flight.bytes.saturating_add(bytes_to_send)
             >= self.path.congestion.window();
         if window_blocked
@@ -1005,6 +1028,24 @@ impl Connection {
             window_blocked = self.path.in_flight.bytes.saturating_add(bytes_to_send)
                 >= self.path.congestion.window();
         }
+        if window_blocked {
+            // What the window takes short of reaching it, as the check above counts
+            let afforded = self
+                .path
+                .congestion
+                .window()
+                .saturating_sub(self.path.in_flight.bytes)
+                .saturating_sub(untracked_bytes)
+                .saturating_sub(1);
+            if afforded >= floor {
+                // The window is still what limits the transmit: marked so, it grows by what this
+                // round trip acknowledges (RFC 9002 §7.8), where a cut unmarked read as an idle
+                // window and held it (busy core, 100,000 a second: p99 2.0 -> 8.4 ms)
+                wanted = afforded;
+                window_blocked = false;
+                tx.congestion_blocked = true;
+            }
+        }
         // RFC 9002 §7: a packet may exceed the window "when entering recovery", one packet
         // (§7.3.2), which speeds loss recovery as RFC 6675 §5 does for TCP. Without it a lost
         // Initial whose peer cannot acknowledge the in-flight Handshake packets (it has no keys
@@ -1014,53 +1055,60 @@ impl Connection {
             // We continue instead of breaking here in order to avoid
             // blocking loss probes queued for higher spaces.
             trace!("blocked by congestion control");
-            return Some(Fill::NextSpace);
+            return Err(Fill::NextSpace);
         }
 
         // Loss probes should be subject to pacing, even though they are not congestion controlled
-        if !unpaced && self.paced(now, bytes_to_send) {
-            tx.congestion_blocked = true;
-            trace!("blocked by pacing");
-            return Some(Fill::Stop);
+        if !unpaced
+            && let Some(due) = self.pacing_delay(now, wanted.saturating_add(untracked_bytes))
+        {
+            let held = self.path.pacing.tokens().saturating_sub(untracked_bytes);
+            if held >= floor {
+                // Limited by the pacer, as a datagram held back is
+                wanted = held;
+                tx.congestion_blocked = true;
+            } else {
+                self.timers.set(Timer::Pacing, due);
+                tx.congestion_blocked = true;
+                trace!("blocked by pacing");
+                return Err(Fill::Stop);
+            }
         }
         if window_blocked {
             trace!("one packet past the window on entering recovery");
             self.recovery_packet = false;
         }
-        None
+        Ok(usize::try_from(wanted).unwrap_or(usize::MAX).min(room))
     }
 
-    /// Whether the pacer holds back a datagram of `bytes`, its timer then set for when it may go
-    ///
-    /// Nothing is paced until the handshake is confirmed (RFC 9001 §4.1.2; the Handshake keys
-    /// discarded): its flights are bounded by the initial window and the anti-amplification limit,
-    /// all RFC 9002 §7.7 asks ("Senders SHOULD limit bursts to the initial congestion window"),
-    /// and a rate before then rests on one RTT sample at most, or on the initial RTT's guess. Paced
-    /// then, the handshake's flights went two datagrams at a time, and a client's Finished waited
-    /// behind a copy while its first 1-RTT packets reached a server that dropped them.
     fn paced(&mut self, now: Instant, bytes: u64) -> bool {
-        if self.spaces.get(SpaceId::Handshake).crypto.is_some() || !self.state.is_established() {
-            return false;
-        }
-        let smoothed_rtt = self.path.rtt.get();
-        let pacing_rate = self.path.congestion.pacing_rate().or_else(|| {
-            self.resume
-                .pacing_rate(self.path.congestion.window(), smoothed_rtt)
-        });
-        match self.path.pacing.delay(
-            smoothed_rtt,
-            pacing_rate,
-            bytes,
-            self.path.current_mtu(),
-            self.path.congestion.window(),
-            now,
-        ) {
+        match self.pacing_delay(now, bytes) {
             Some(delay) => {
                 self.timers.set(Timer::Pacing, delay);
                 true
             }
             None => false,
         }
+    }
+
+    /// When the pacer lets `bytes` go, if not now
+    fn pacing_delay(&mut self, now: Instant, bytes: u64) -> Option<Instant> {
+        if self.spaces.get(SpaceId::Handshake).crypto.is_some() || !self.state.is_established() {
+            return None;
+        }
+        let smoothed_rtt = self.path.rtt.get();
+        let pacing_rate = self.path.congestion.pacing_rate().or_else(|| {
+            self.resume
+                .pacing_rate(self.path.congestion.window(), smoothed_rtt)
+        });
+        self.path.pacing.delay(
+            smoothed_rtt,
+            pacing_rate,
+            bytes,
+            self.path.current_mtu(),
+            self.path.congestion.window(),
+            now,
+        )
     }
 
     /// Finishes the current packet so another datagram can follow it; `Some` when the GSO
@@ -5143,6 +5191,20 @@ impl Connection {
     /// Buffers passed to [`Connection::poll_transmit`] should be at least this large.
     pub fn current_mtu(&self) -> u16 {
         self.path.current_mtu()
+    }
+
+    /// The largest UDP payload the local stack carries on the current path, as its kernel knows the
+    /// path's MTU (hyper-rt's `UdpSocket::path_payload`): MTU discovery searches no further (RFC
+    /// 8899 §5.1.2's MAX_PLPMTU) and no datagram sent is larger. One raised past what a finished
+    /// search found starts the next search now; one below the current MTU brings it down, never
+    /// below the minimum every QUIC path carries.
+    pub fn set_path_ceiling(&mut self, now: Instant, payload: u16) {
+        let before = self.path.mtud.current_mtu();
+        self.path.mtud.on_path_ceiling(now, payload);
+        let after = self.path.mtud.current_mtu();
+        if after != before {
+            self.path.congestion.on_mtu_update(after);
+        }
     }
 
     /// Size of non-frame data for a 1-RTT packet

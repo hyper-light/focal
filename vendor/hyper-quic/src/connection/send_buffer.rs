@@ -8,7 +8,12 @@ use crate::{VarInt, range_set::RangeSet};
 #[derive(Default, Debug)]
 pub(super) struct SendBuffer {
     /// Data queued by the application but not yet acknowledged. May or may not have been sent.
-    unacked_segments: VecDeque<Bytes>,
+    /// Each piece carries the stream offset of its first byte, so a read finds the piece holding
+    /// its offset by binary search: walked from the front, every read of new data passed every
+    /// piece in flight before it, about two a frame (its prefix and its body), and decimated
+    /// acknowledgements keep a millisecond of them in flight (at 100,000 frames a second on a busy
+    /// core the walk was 5.5% of the node's time, `populate_packet`'s most of it).
+    unacked_segments: VecDeque<Piece>,
     /// Total size of `unacked_segments`
     unacked_len: usize,
     /// Acknowledged bytes removed from the first segment's view but still held by its allocation
@@ -37,9 +42,14 @@ impl SendBuffer {
     pub(super) fn write(&mut self, data: Bytes) {
         // Bytes held in memory, and a stream offset the send window bounds below 2^62: neither
         // sum saturates.
+        if data.is_empty() {
+            return;
+        }
+        let start = self.offset;
         self.unacked_len = self.unacked_len.saturating_add(data.len());
         self.offset = self.offset.saturating_add(len_u64(data.len()));
-        self.unacked_segments.push_back(data);
+        self.unacked_segments
+            .push_back(Piece { start, bytes: data });
     }
 
     /// The offset of the first byte still held: `unacked_len` is at most `offset`.
@@ -55,40 +65,52 @@ impl SendBuffer {
         range.end = base_offset.max(range.end);
 
         // A range acknowledged through one copy of a packet is not sent again for another's loss
-        self.retransmits.remove(range.clone());
+        if !self.retransmits.is_empty() {
+            self.retransmits.remove(range.clone());
+        }
+        // Acknowledged in order with nothing acknowledged past it, as a stream's data almost always
+        // is: the front moves on without the set, where each acknowledged frame cost an insertion
+        // into it and its removal again (two searches of a B-tree a frame).
+        if range.start == base_offset && self.acks.is_empty() {
+            self.advance(range.end.saturating_sub(range.start));
+            return;
+        }
         self.acks.insert(range);
 
         while self.acks.min() == Some(self.base_offset()) {
             let Some(prefix) = self.acks.pop_min() else {
                 break;
             };
-            // Acknowledged data is data still held: at most `unacked_len`.
-            let mut to_advance = usize::try_from(prefix.end.saturating_sub(prefix.start))
-                .map_or(self.unacked_len, |n| n.min(self.unacked_len));
+            self.advance(prefix.end.saturating_sub(prefix.start));
+        }
+    }
 
-            self.unacked_len = self.unacked_len.saturating_sub(to_advance);
-            while to_advance > 0 {
-                // `unacked_len` counts the bytes of these segments.
-                let Some(front) = self.unacked_segments.front_mut() else {
-                    break;
-                };
+    /// Lets go of the first `acked` bytes held, acknowledged: at most what is held.
+    fn advance(&mut self, acked: u64) {
+        let mut to_advance =
+            usize::try_from(acked).map_or(self.unacked_len, |n| n.min(self.unacked_len));
+        self.unacked_len = self.unacked_len.saturating_sub(to_advance);
+        while to_advance > 0 {
+            // `unacked_len` counts the bytes of these segments.
+            let Some(front) = self.unacked_segments.front_mut() else {
+                break;
+            };
 
-                if let Some(rest) = to_advance.checked_sub(front.len()) {
-                    to_advance = rest;
-                    self.unacked_segments.pop_front();
-                    self.front_trimmed = 0;
+            if let Some(rest) = to_advance.checked_sub(front.bytes.len()) {
+                to_advance = rest;
+                self.unacked_segments.pop_front();
+                self.front_trimmed = 0;
 
-                    if self.unacked_segments.len().saturating_mul(4)
-                        < self.unacked_segments.capacity()
-                    {
-                        self.unacked_segments.shrink_to_fit();
-                    }
-                } else {
-                    front.advance(to_advance);
-                    // Within the front segment's length.
-                    self.front_trimmed = self.front_trimmed.saturating_add(to_advance);
-                    to_advance = 0;
+                if self.unacked_segments.len().saturating_mul(4) < self.unacked_segments.capacity()
+                {
+                    self.unacked_segments.shrink_to_fit();
                 }
+            } else {
+                front.bytes.advance(to_advance);
+                front.start = front.start.saturating_add(len_u64(to_advance));
+                // Within the front segment's length.
+                self.front_trimmed = self.front_trimmed.saturating_add(to_advance);
+                to_advance = 0;
             }
         }
     }
@@ -159,26 +181,24 @@ impl SendBuffer {
     /// should call the function again with an incremented start offset to
     /// retrieve more data.
     pub(super) fn get(&self, offsets: Range<u64>) -> &[u8] {
-        let mut segment_offset = self.base_offset();
-        for segment in self.unacked_segments.iter() {
-            // Offsets of data held in memory: the sums do not saturate.
-            let segment_end = segment_offset.saturating_add(len_u64(segment.len()));
-            if offsets.start >= segment_offset && offsets.start < segment_end {
-                // Both within this segment's length, which is a usize.
-                let start = usize::try_from(offsets.start.saturating_sub(segment_offset))
-                    .unwrap_or(usize::MAX)
-                    .min(segment.len());
-                let end = usize::try_from(offsets.end.saturating_sub(segment_offset))
-                    .unwrap_or(usize::MAX)
-                    .min(segment.len());
-
-                let tail = segment.split_at(start).1;
-                return tail.split_at(end.saturating_sub(start).min(tail.len())).0;
-            }
-            segment_offset = segment_end;
-        }
-
-        &[]
+        // The pieces are in offset order and none is empty: the one holding `offsets.start` is
+        // the last that starts at or before it.
+        let after = self
+            .unacked_segments
+            .partition_point(|piece| piece.start <= offsets.start);
+        let Some(piece) = after
+            .checked_sub(1)
+            .and_then(|at| self.unacked_segments.get(at))
+        else {
+            return &[];
+        };
+        // Both are offsets into the piece, a usize long.
+        let start =
+            usize::try_from(offsets.start.saturating_sub(piece.start)).unwrap_or(usize::MAX);
+        let end = usize::try_from(offsets.end.saturating_sub(piece.start))
+            .unwrap_or(usize::MAX)
+            .min(piece.bytes.len());
+        piece.bytes.get(start..end.max(start)).unwrap_or(&[])
     }
 
     /// Release abandoned data while preserving the final offset for RESET_STREAM
@@ -248,6 +268,13 @@ impl SendBuffer {
     pub(super) fn buffered(&self) -> u64 {
         len_u64(self.unacked_len.saturating_add(self.front_trimmed))
     }
+}
+
+/// A write still held: its bytes not yet acknowledged, and the stream offset of the first.
+#[derive(Debug)]
+struct Piece {
+    start: u64,
+    bytes: Bytes,
 }
 
 /// A length in memory as a stream offset: a usize fits a u64 on every supported target.
@@ -473,9 +500,75 @@ mod tests {
         assert!(buf.acks.is_empty());
     }
 
+    /// A read finds its bytes wherever they are held: across hundreds of uneven writes, with
+    /// partial and whole acknowledgements trimming the front, every read returns the bytes written
+    /// at its offsets, from the piece holding its start (a read crossing a piece's end returns that
+    /// piece's rest, and its caller reads on), and nothing before the acknowledged front.
+    #[test]
+    fn reads_find_their_piece_among_many() {
+        let mut buf = SendBuffer::new();
+        let mut written = Vec::new();
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 16
+        };
+        for i in 0..400usize {
+            let len = (next() % 97 + 1) as usize;
+            let piece: Vec<u8> = (0..len).map(|j| (i + j) as u8).collect();
+            written.extend_from_slice(&piece);
+            buf.write(piece.into());
+        }
+        let total = written.len() as u64;
+        while buf.poll_transmit(1200).0.end < total {}
+        let mut acked = 0u64;
+        while acked < total {
+            for _ in 0..8 {
+                let start = acked + u64::from(next()) % (total - acked);
+                let end = (start + u64::from(next() % 300)).min(total);
+                let got = buf.get(start..end);
+                assert!(!got.is_empty() || start == end);
+                assert!(start + got.len() as u64 <= end);
+                let from = start as usize;
+                assert_eq!(got, &written[from..from + got.len()]);
+            }
+            let step = u64::from(next() % 150 + 1).min(total - acked);
+            buf.ack(acked..acked + step);
+            acked += step;
+            assert!(buf.get(0..acked).is_empty());
+            assert_eq!(buf.base_offset(), acked);
+        }
+        assert!(buf.is_fully_acked());
+    }
+
+    /// Acknowledgements in order move the front without the set of ranges acknowledged ahead,
+    /// and one ahead of the front waits in it until the gap before it is acknowledged, after which
+    /// the front has moved past both and the set is empty again.
+    #[test]
+    fn in_order_acknowledgements_leave_the_set_alone() {
+        let mut buf = SendBuffer::new();
+        for _ in 0..8 {
+            buf.write(Bytes::from_static(&[1; 100]));
+        }
+        while buf.poll_transmit(64).0.end < 800 {}
+        buf.ack(0..150);
+        assert!(buf.acks.is_empty());
+        assert_eq!(buf.base_offset(), 150);
+        buf.ack(300..400);
+        assert!(!buf.acks.is_empty());
+        assert_eq!(buf.base_offset(), 150);
+        buf.ack(150..300);
+        assert!(buf.acks.is_empty());
+        assert_eq!(buf.base_offset(), 400);
+        buf.ack(350..450);
+        assert!(buf.acks.is_empty());
+        assert_eq!(buf.base_offset(), 450);
+        assert_eq!(buf.get(450..460), &[1; 10]);
+    }
+
     fn aggregate_unacked(buf: &SendBuffer) -> Vec<u8> {
         let mut result = Vec::new();
-        for segment in buf.unacked_segments.iter() {
+        for segment in buf.unacked_segments.iter().map(|piece| &piece.bytes) {
             result.extend_from_slice(&segment[..]);
         }
         result

@@ -1267,3 +1267,32 @@ messages a second a node handled 3.4 datagrams a message, a third of them acknow
 Test: `tests::decimated_acks_come_from_the_hundredth_packet_every_tenth_or_a_quarter_round_trip_on`
 (no request before the 100th packet; then a lone ping is acknowledged a quarter of a 20 ms round
 trip later, 5 ms and not 4, and the tenth of ten pings at once).
+
+## 34. A probe timeout that follows an unanswered one repeats no stream data (2026-10-17)
+
+Patch Q23 narrows §11's first departure. A probe with no new data to send repeats its oldest
+packet's frames, STREAM frames included, as Chromium's does. That stays so for the first probe
+timeout after an acknowledgement, where a lost reply goes again with its probe. A timeout that
+follows an unanswered one (`pto_count` past one) repeats only the oldest packet's control frames in
+the application data space, as upstream's probes did, and no stream data
+(`Connection::poll_transmit`, `PacketSpace::maybe_queue_probe`'s `streams_too`). RFC 9002 §6.2.4
+lets a sender choose: previously sent data "MAY" be sent when no new data can be.
+
+The reason is the peer's socket. Every probe datagram is clamped to the smallest datagram
+(upstream's rule, `allocate_datagram`), but the frames a probe moves are its oldest packet's, and
+what its two datagrams cannot hold went beside them as the congestion window allowed. So each probe
+timeout could send up to a packet of the path's MTU again. A peer that has stopped reading holds
+all of it in its socket's queue, and may time out fifteen times before its idle timeout (ten
+seconds). hyper-transport reserves room in that queue for what a peer sends unprompted, and at the
+path's MTU (65,507 bytes on loopback, §4q of `docs/transport.md`) that took 262 KB to 2 MB of the
+319 KB Linux grants by default. A timeout that follows an unanswered one says the peer is not
+acknowledging: it has stopped reading, and the data waits in its queue, or the path drops it, and
+the probe's acknowledgement will declare it lost. So a peer that has stopped reading is now sent at
+most one packet of stream data again (`docs/transport.md` §4s). The handshake spaces repeat whole:
+their packets fit the smallest datagram, and the handshake cannot go on without them.
+
+Test: `tests::a_probe_timeout_after_an_unanswered_one_repeats_no_stream_data` (every datagram
+dropped through three timeouts: the first's two probes repeat stream data, the next two timeouts'
+probes carry none, only their IMMEDIATE_ACKs, and every probe is within the smallest datagram). §11's
+`geo::a_lost_reply_goes_again_in_the_first_probe_within_two_round_trips` and
+`tests::blackhole_after_mtu_change_repairs_itself` pass unchanged.

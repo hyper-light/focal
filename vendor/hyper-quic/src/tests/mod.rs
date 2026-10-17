@@ -894,12 +894,13 @@ fn a_window_used_up_grows_by_all_the_round_trip_after_acknowledges() {
         pair.drive_server();
         pair.time += Duration::from_millis(1);
     }
-    // The run is exact: from the 14,520-byte initial window (1,452-byte datagrams), the round trip
-    // after the window filled acknowledges 13,102 bytes; judged by the last transmission, the window
-    // grew by 4,002 of them, to 18,522.
+    // The run is exact: from the 14,520-byte initial window (1,452-byte datagrams), filled to
+    // within a datagram every path carries (1,200 bytes; a whole segment short, before datagrams
+    // were cut to what the window takes), the round trip after the window filled acknowledges 13,466
+    // bytes; judged by the last transmission, the window grew by 4,002 of 13,102, to 18,522.
     let cwnd = pair.client_conn_mut(client_ch).stats().path.cwnd;
     assert_eq!(initial, 14_520);
-    assert_eq!(cwnd, 27_622);
+    assert_eq!(cwnd, 27_986);
 }
 
 /// A warm-up measures a path to four initial windows a round trip. Over a path that carries far
@@ -3373,6 +3374,64 @@ fn loss_probe_requests_immediate_ack() {
         stats_after_recovery.frame_tx.immediate_ack - stats_after_connect.frame_tx.immediate_ack,
         2
     );
+}
+
+/// A probe timeout that follows an unanswered one repeats no stream data. Do: the client writes
+/// 20,000 bytes on a stream with every datagram it sends dropped, through its first probe timeout
+/// and the two after. Expect: the first timeout's two probes repeat stream data (one asking an
+/// immediate acknowledgement); the later ones carry none, each only its IMMEDIATE_ACK; every probe
+/// fits the smallest datagram.
+#[test]
+fn a_probe_timeout_after_an_unanswered_one_repeats_no_stream_data() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect();
+    pair.drive();
+
+    let default_mtu = mem::replace(&mut pair.mtu, 0);
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s)
+        .write(&[0xab; 20_000])
+        .unwrap();
+    pair.drive_client();
+    let sent = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(pair.client_conn_mut(client_ch).pto_state().0, 0);
+
+    let mut rounds = Vec::new();
+    for timeout in 1..=3 {
+        let before = pair.client_conn_mut(client_ch).stats();
+        // Through the client's timers until this timeout has fired and its probes have gone.
+        for _ in 0..64 {
+            if pair.client_conn_mut(client_ch).pto_state().0 >= timeout {
+                break;
+            }
+            let wakeup = pair.client.next_wakeup().unwrap();
+            pair.time = pair.time.max(wakeup);
+            pair.drive_client();
+        }
+        assert_eq!(pair.client_conn_mut(client_ch).pto_state().0, timeout);
+        let after = pair.client_conn_mut(client_ch).stats();
+        rounds.push((
+            after.frame_tx.stream - before.frame_tx.stream,
+            after.frame_tx.immediate_ack - before.frame_tx.immediate_ack,
+            after.udp_tx.datagrams - before.udp_tx.datagrams,
+            after.udp_tx.bytes - before.udp_tx.bytes,
+        ));
+    }
+    pair.mtu = default_mtu;
+
+    let (streams, immediate, datagrams, bytes) = rounds[0];
+    assert!(
+        streams > 0,
+        "the first timeout repeats stream data: {rounds:?}"
+    );
+    assert_eq!((immediate, datagrams), (1, 2), "{rounds:?}");
+    assert!(bytes <= 2 * 1_200, "{rounds:?}");
+    for &(streams, immediate, datagrams, bytes) in &rounds[1..] {
+        assert_eq!((streams, immediate, datagrams), (0, 2, 2), "{rounds:?}");
+        assert!(bytes <= 2 * 1_200, "{rounds:?}");
+    }
+    assert!(sent.frame_tx.stream > 0);
 }
 
 #[test]

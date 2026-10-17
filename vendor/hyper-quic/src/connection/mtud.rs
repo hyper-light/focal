@@ -86,6 +86,21 @@ impl MtuDiscovery {
         }
     }
 
+    /// Notifies the [`MtuDiscovery`] of the largest UDP payload the local stack carries on the
+    /// path, as its kernel knows the path's MTU: RFC 8899's MAX_PLPMTU (§5.1.2, "the largest size
+    /// of PLPMTU", bounded by the local interface). The search probes no further than it, the
+    /// current MTU is never above it, and one raised past what a finished search found starts the
+    /// next search now. A search with no ceiling probed up to the peer's limit, losing each size
+    /// past the path three times before it gave that size up.
+    pub(crate) fn on_path_ceiling(&mut self, now: Instant, ceiling: u16) {
+        // The guaranteed MTU is carried whatever the kernel says.
+        let ceiling = ceiling.max(self.black_hole_detector.min_mtu);
+        self.current_mtu = self.current_mtu.min(ceiling);
+        if let Some(state) = self.state.as_mut() {
+            state.on_path_ceiling(now, ceiling, self.current_mtu);
+        }
+    }
+
     /// Notifies the [`MtuDiscovery`] that a packet has been ACKed
     ///
     /// Returns true if the packet was an MTU probe
@@ -163,6 +178,9 @@ impl MtuDiscovery {
 struct EnabledMtuDiscovery {
     phase: Phase,
     peer_max_udp_payload_size: u16,
+    /// The largest UDP payload the local stack carries on the path (`on_path_ceiling`); the most
+    /// QUIC allows until it is known.
+    path_ceiling: u16,
     config: MtuDiscoveryConfig,
 }
 
@@ -171,7 +189,43 @@ impl EnabledMtuDiscovery {
         Self {
             phase: Phase::Initial,
             peer_max_udp_payload_size: MAX_UDP_PAYLOAD,
+            path_ceiling: MAX_UDP_PAYLOAD,
             config,
+        }
+    }
+
+    /// The most a search may find: what the peer takes and the path carries.
+    fn limit(&self) -> u16 {
+        self.peer_max_udp_payload_size.min(self.path_ceiling)
+    }
+
+    /// The path's ceiling moved to `ceiling`: a search under way probes no further, and a search
+    /// finished below a ceiling raised past it by the minimum change is due now.
+    fn on_path_ceiling(&mut self, now: Instant, ceiling: u16, current_mtu: u16) {
+        let raised = ceiling > self.path_ceiling;
+        self.path_ceiling = ceiling;
+        match &mut self.phase {
+            Phase::Searching(search) => {
+                search.lower_bound = search.lower_bound.min(ceiling);
+                search.upper_bound = search.upper_bound.min(ceiling).max(search.lower_bound);
+                // A size past the ceiling is not probed again. A probe of one still in flight
+                // stays the search's, so its loss is still a probe's (no congestion response, no
+                // black hole evidence), but its fate no longer moves the search.
+                if search.last_probed_mtu > search.upper_bound {
+                    search.lost_probe_count = 0;
+                    if search.in_flight_probe.is_some() {
+                        search.abandoned = true;
+                    } else {
+                        search.last_probed_mtu = search.lower_bound;
+                    }
+                }
+            }
+            Phase::Complete(_)
+                if raised && ceiling.saturating_sub(current_mtu) >= self.config.minimum_change =>
+            {
+                self.phase = Phase::Complete(Some(now));
+            }
+            Phase::Initial | Phase::Complete(_) => {}
         }
     }
 
@@ -179,22 +233,16 @@ impl EnabledMtuDiscovery {
     fn poll_transmit(&mut self, now: Instant, current_mtu: u16, next_pn: u64) -> Option<u16> {
         if let Phase::Initial = &self.phase {
             // Start the first search
-            self.phase = Phase::Searching(SearchState::new(
-                current_mtu,
-                self.peer_max_udp_payload_size,
-                &self.config,
-            ));
+            self.phase =
+                Phase::Searching(SearchState::new(current_mtu, self.limit(), &self.config));
         } else if let Phase::Complete(next_mtud_activation) = &self.phase {
             if next_mtud_activation.is_none_or(|activation| now < activation) {
                 return None;
             }
 
             // Start a new search (we have reached the next activation time)
-            self.phase = Phase::Searching(SearchState::new(
-                current_mtu,
-                self.peer_max_udp_payload_size,
-                &self.config,
-            ));
+            self.phase =
+                Phase::Searching(SearchState::new(current_mtu, self.limit(), &self.config));
         }
 
         if let Phase::Searching(state) = &mut self.phase {
@@ -239,6 +287,10 @@ impl EnabledMtuDiscovery {
             Phase::Searching(state) if state.in_flight_probe == Some(pn) => {
                 state.in_flight_probe = None;
                 state.lost_probe_count = 0;
+                if std::mem::take(&mut state.abandoned) {
+                    state.last_probed_mtu = state.lower_bound;
+                    return None;
+                }
                 Some(state.last_probed_mtu)
             }
             _ => None,
@@ -250,7 +302,12 @@ impl EnabledMtuDiscovery {
         // We might no longer be searching, e.g. if a black hole was detected
         if let Phase::Searching(state) = &mut self.phase {
             state.in_flight_probe = None;
-            state.lost_probe_count = state.lost_probe_count.saturating_add(1);
+            if std::mem::take(&mut state.abandoned) {
+                state.last_probed_mtu = state.lower_bound;
+                state.lost_probe_count = 0;
+            } else {
+                state.lost_probe_count = state.lost_probe_count.saturating_add(1);
+            }
         }
     }
 
@@ -287,6 +344,8 @@ struct SearchState {
     in_flight_probe: Option<u64>,
     /// Lost probes at the current probe size
     lost_probe_count: usize,
+    /// Whether the probe in flight is of a size past the path's ceiling, learned after it was sent
+    abandoned: bool,
 }
 
 impl SearchState {
@@ -305,6 +364,7 @@ impl SearchState {
         Self {
             in_flight_probe: None,
             lost_probe_count: 0,
+            abandoned: false,
             lower_bound,
             upper_bound,
             minimum_change: config.minimum_change,
@@ -319,8 +379,9 @@ impl SearchState {
         if last_probe_succeeded {
             self.lower_bound = self.last_probed_mtu;
         } else {
-            // A probed size is at least the lower bound, itself at least the minimum MTU
-            self.upper_bound = self.last_probed_mtu.saturating_sub(1);
+            // A probed size is at least the lower bound, itself at least the minimum MTU; a
+            // bound the path's ceiling lowered stays lowered
+            self.upper_bound = self.upper_bound.min(self.last_probed_mtu.saturating_sub(1));
         }
 
         let next_mtu = self.lower_bound.midpoint(self.upper_bound);
@@ -747,6 +808,118 @@ mod tests {
         ));
         mtud.on_peer_max_udp_payload_size_received(1300);
         assert_eq!(mtud.state.as_ref().unwrap().peer_max_udp_payload_size, 1300);
+    }
+
+    /// A path whose kernel says it carries 8,954-byte payloads (a 9,000-byte MTU less the IPv6 and
+    /// UDP headers, measured on a jumbo-frame bridge) is searched no further: no probe is larger
+    /// and none is lost, where the search up to the peer's limit lost each size past the path
+    /// three times.
+    #[test]
+    fn a_search_probes_no_further_than_the_paths_ceiling() {
+        let mut config = MtuDiscoveryConfig::default();
+        config.upper_bound(MAX_UDP_PAYLOAD);
+        let mut mtud = MtuDiscovery::new(1_200, 1_200, None, config);
+        mtud.on_path_ceiling(Instant::now(), 8_954);
+
+        let probed_sizes = drive_to_completion(&mut mtud, Instant::now(), 8_954);
+
+        assert!(
+            probed_sizes.iter().all(|&size| size <= 8_954),
+            "{probed_sizes:?}"
+        );
+        assert_eq!(mtud.current_mtu, 8_954);
+        assert!(probed_sizes.len() <= 9, "{probed_sizes:?}");
+        assert!(completed(&mtud));
+    }
+
+    /// A ceiling learned mid-search (the path's socket is made once the connection is established,
+    /// after the first probe) bounds the rest of the search, and a ceiling below the current MTU
+    /// brings it down at once, never below the guaranteed minimum.
+    #[test]
+    fn a_ceiling_learned_mid_search_bounds_it_and_lowers_the_current_mtu() {
+        let mut config = MtuDiscoveryConfig::default();
+        config.upper_bound(MAX_UDP_PAYLOAD);
+        let mut mtud = MtuDiscovery::new(1_200, 1_200, None, config);
+        let now = Instant::now();
+        let first = mtud.poll_transmit(now, 1).unwrap();
+        assert!(first > 1_472);
+        mtud.on_probe_lost();
+        mtud.on_path_ceiling(now, 1_472);
+        let rest = drive_to_completion(&mut mtud, now, 1_472);
+        assert!(rest.iter().all(|&size| size <= 1_472), "{rest:?}");
+        assert_eq!(mtud.current_mtu, 1_472);
+
+        mtud.on_path_ceiling(now, 1_300);
+        assert_eq!(mtud.current_mtu, 1_300);
+        mtud.on_path_ceiling(now, 900);
+        assert_eq!(mtud.current_mtu, 1_200);
+    }
+
+    /// A probe in flight when the ceiling comes down past its size stays the search's (its loss is
+    /// a probe's, `in_flight_mtu_probe` still names it) but no longer moves the search: lost, the
+    /// search resumes under the ceiling without retrying the size; acknowledged after all, the MTU
+    /// does not rise past the ceiling.
+    #[test]
+    fn a_probe_in_flight_past_a_lowered_ceiling_is_abandoned() {
+        let mut config = MtuDiscoveryConfig::default();
+        config.upper_bound(MAX_UDP_PAYLOAD);
+        let now = Instant::now();
+
+        let mut lost = MtuDiscovery::new(1_200, 1_200, None, config.clone());
+        let first = lost.poll_transmit(now, 1).unwrap();
+        lost.on_path_ceiling(now, 1_472);
+        assert_eq!(lost.in_flight_mtu_probe(), Some(1));
+        assert_eq!(
+            lost.poll_transmit(now, 2),
+            None,
+            "one probe in flight at a time"
+        );
+        lost.on_probe_lost();
+        let rest = drive_to_completion(&mut lost, now, 1_472);
+        assert!(
+            rest.iter().all(|&size| size <= 1_472 && size != first),
+            "{rest:?}"
+        );
+        assert_eq!(lost.current_mtu, 1_472);
+
+        let mut acked = MtuDiscovery::new(1_200, 1_200, None, config);
+        let first = acked.poll_transmit(now, 1).unwrap();
+        acked.on_path_ceiling(now, 1_472);
+        assert!(!acked.on_acked(SpaceId::Data, 1, first));
+        assert_eq!(acked.current_mtu, 1_200);
+        let rest = drive_to_completion(&mut acked, now, 1_472);
+        assert!(rest.iter().all(|&size| size <= 1_472), "{rest:?}");
+        assert_eq!(acked.current_mtu, 1_472);
+    }
+
+    /// A ceiling raised past what a finished search found (the route's MTU grew) starts the next
+    /// search now, not at the interval's end; one raised by less than the minimum change does not.
+    #[test]
+    fn a_raised_ceiling_starts_the_next_search_now() {
+        let mut config = MtuDiscoveryConfig::default();
+        config.upper_bound(MAX_UDP_PAYLOAD);
+        let mut mtud = MtuDiscovery::new(1_200, 1_200, None, config);
+        let now = Instant::now();
+        mtud.on_path_ceiling(now, 1_472);
+        drive_to_completion(&mut mtud, now, 1_472);
+        assert_eq!(mtud.current_mtu, 1_472);
+        assert_eq!(mtud.poll_transmit(now, 50), None);
+
+        mtud.on_path_ceiling(now, 1_480);
+        assert_eq!(
+            mtud.poll_transmit(now, 51),
+            None,
+            "less than the minimum change"
+        );
+
+        mtud.on_path_ceiling(now, 8_954);
+        let probed_sizes = drive_to_completion(&mut mtud, now, 8_954);
+        assert!(!probed_sizes.is_empty());
+        assert!(
+            probed_sizes.iter().all(|&size| size <= 8_954),
+            "{probed_sizes:?}"
+        );
+        assert_eq!(mtud.current_mtu, 8_954);
     }
 
     #[test]
