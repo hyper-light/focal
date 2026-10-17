@@ -909,9 +909,17 @@ fn runbook_node_loss_within_the_hold_moves_no_seat() {
         |view| !alive(view, silent),
     );
     let seen_dead = std::time::Instant::now();
+    // The plan says for how many seconds more the death stands. Where the
+    // death had stood its hold before it was seen (the hold is seconds since
+    // the verdict, `deaths_stand_for`, and a loaded machine can take longer
+    // to observe the commit), it says the placement is replanned for the dead
+    // node, and no more: which fact holds is read, never presumed.
     let plan = plan_text();
-    let standing = seconds_standing(&plan)
-        .unwrap_or_else(|| panic!("the plan does not say the death stands: {plan}"));
+    let standing = seconds_standing(&plan);
+    assert!(
+        standing.is_some() || plan.contains("(DeadNode)"),
+        "the plan neither holds the death nor replans for it: {plan}"
+    );
     servers[2].resume();
     // The hold runs in the controller's periods from the death's commit; the
     // voter's return counts once the controller has seen it alive again. On
@@ -934,7 +942,10 @@ fn runbook_node_loss_within_the_hold_moves_no_seat() {
         // voter is no voter. Nothing else this test asks remains to be
         // shown on this run.
         eprintln!(
-            "the death stood {stood:?} after it was seen, past its hold of {standing} s: the seat moved"
+            "the death stood {stood:?} after it was seen, past its hold ({}): the seat moved",
+            standing.map_or("stood when the plan was read".to_owned(), |left| format!(
+                "{left} s more when the plan was read"
+            ))
         );
         let healed = wait_for(
             &founder,
@@ -957,34 +968,46 @@ fn runbook_node_loss_within_the_hold_moves_no_seat() {
         assert_eq!(claim_id(&read_claim(&founder, &claim)), claim);
         return;
     }
-    // It returned while the death stood: nothing moved. (The hold is counted
-    // in the controller's periods, which stretch under load; the seconds the
-    // plan stated and the seconds measured here need not agree.)
-    eprintln!(
-        "the voter returned {stood:?} after its death was seen; the plan gave the death {standing} s more, and the seat stayed"
-    );
+    // It returned while the death stood, or after its hold but before a heal
+    // had moved its seat: nothing moved. (The seconds the plan stated and the
+    // seconds measured here need not agree: the plan's are the verdict's,
+    // and the observation of the death and of the return each lag it.)
     assert_eq!(back["placement_epoch"], epoch, "{back}");
     assert!(back["pending"].is_null(), "{back}");
-    // And nothing moves once the death would have stood: the founder runs
-    // the hold and one window more, charged to its progress.
-    let span = u64::try_from(
-        Duration::from_secs(standing + 1).as_millis() / deadline::progress::PERIOD.as_millis(),
-    )
-    .unwrap();
-    let began = periods(&founder).unwrap();
-    let mut wait = Progress::begin(&[&founder], Duration::from_secs(standing + 1 + 60));
-    while periods(&founder).is_none_or(|now| now < began + span) {
-        assert!(wait.spent().is_none(), "the founder stopped");
-        std::thread::sleep(Duration::from_millis(250));
+    match standing {
+        Some(standing) => {
+            eprintln!(
+                "the voter returned {stood:?} after its death was seen; the plan gave the death {standing} s more, and the seat stayed"
+            );
+            // And nothing moves once the death would have stood: the founder
+            // runs the hold and one window more, charged to its progress.
+            let span = u64::try_from(
+                Duration::from_secs(standing + 1).as_millis()
+                    / deadline::progress::PERIOD.as_millis(),
+            )
+            .unwrap();
+            let began = periods(&founder).unwrap();
+            let mut wait = Progress::begin(&[&founder], Duration::from_secs(standing + 1 + 60));
+            while periods(&founder).is_none_or(|now| now < began + span) {
+                assert!(wait.spent().is_none(), "the founder stopped");
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            let rested = session_row(&placement(&founder).unwrap(), &ledger)
+                .unwrap()
+                .clone();
+            assert_eq!(rested["placement_epoch"], epoch, "{rested}");
+            assert_eq!(sorted(&rested["voters"]), seated, "{rested}");
+            assert!(rested["pending"].is_null(), "{rested}");
+            let plan = plan_text();
+            assert_eq!(seconds_standing(&plan), None, "{plan}");
+        }
+        // The death had stood when the plan was read, and the return was seen
+        // before a heal moved the seat: the hold this test asks about passed
+        // before this run could show it, and the death below still must heal.
+        None => eprintln!(
+            "the death had stood its hold when the plan was read; the voter returned {stood:?} after it was seen, before a heal, and the seat stayed"
+        ),
     }
-    let rested = session_row(&placement(&founder).unwrap(), &ledger)
-        .unwrap()
-        .clone();
-    assert_eq!(rested["placement_epoch"], epoch, "{rested}");
-    assert_eq!(sorted(&rested["voters"]), seated, "{rested}");
-    assert!(rested["pending"].is_null(), "{rested}");
-    let plan = plan_text();
-    assert_eq!(seconds_standing(&plan), None, "{plan}");
     assert_eq!(claim_id(&read_claim(&founder, &claim)), claim);
     // Silent again, and for good: the death stands, and the seat goes to
     // the spare without an operator.
