@@ -10,7 +10,7 @@ use std::{
     io::Cursor,
     rc::Rc,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 /// A task on the test's shard, its output awaited later (what tokio's `spawn` gave).
@@ -661,6 +661,97 @@ fn prepared_publication_checks_lineage_revision_and_metadata_budget() {
     assert!(bounded.charged_bytes() <= limits.max_checkpoint_bytes);
     let bytes = bounded.checkpoint().unwrap();
     EnrollmentRegistry::restore(&bytes, [1; 16], limits).unwrap();
+}
+
+/// A dial's pause doubles from the time the refused dial took, at least the timer's granularity,
+/// its first half waited and its second drawn. Do: pauses for dials of 3 ms and of nothing, at
+/// each of the first four refusals, with the least and the largest draws. Expect: 1.5–3, 3–6,
+/// 6–12 and 12–24 ms for the 3 ms dial; from 0.5–1 ms for the instant one; a saturated doubling
+/// stays a `Duration`.
+#[test]
+fn a_refused_dial_waits_its_own_time_doubled_half_drawn_at_random() {
+    let ms = Duration::from_millis;
+    for (refusals, least, most) in [
+        (0, 1_500, 3_000),
+        (1, 3_000, 6_000),
+        (2, 6_000, 12_000),
+        (3, 12_000, 24_000),
+    ] {
+        assert_eq!(
+            transport::dial_pause(ms(3), refusals, 0),
+            Duration::from_micros(least)
+        );
+        assert_eq!(
+            transport::dial_pause(ms(3), refusals, u64::MAX),
+            Duration::from_micros(most)
+        );
+    }
+    assert_eq!(
+        transport::dial_pause(Duration::ZERO, 0, 0),
+        Duration::from_micros(500)
+    );
+    assert_eq!(transport::dial_pause(Duration::ZERO, 0, u64::MAX), ms(1));
+    assert!(transport::dial_pause(ms(3), u32::MAX, u64::MAX) >= Duration::from_secs(1 << 20));
+}
+
+/// Joiners the sponsor's bounds refuse dial again within their timeout, where each gave up at
+/// its first refusal and failed its join. Do: eight joiners redeem at once against a sponsor
+/// that lets one handshake wait (a quarter of 4 connections) and answers each request with a
+/// refusal. Expect: every request reaches the handler, none ends `Unavailable`.
+#[test]
+fn joiners_refused_a_handshake_place_dial_again_within_their_timeout() {
+    focal_rt::block_on(refused_joiners_dial_again()).unwrap();
+}
+async fn refused_joiners_dial_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let authority = Arc::new(authority(&dir, [1; 16]));
+    let mut registry = registry(&authority);
+    let invitation = invite(&mut registry, &authority, EnrollmentRole::Node);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let handler: Arc<dyn JoinHandler> = Arc::new(move |_: JoinRequest| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { JoinResponse::Rejected(JoinFailure::Unauthorized) }
+    });
+    let server = Rc::new(
+        EnrollmentServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            &authority.server_identity(),
+            TransportLimits {
+                max_connections: 4,
+                timeout: Duration::from_secs(15),
+            },
+        )
+        .unwrap(),
+    );
+    let running = server.clone();
+    let task = spawn(async move { running.serve(handler).await });
+    let client = Rc::new(
+        EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default()).unwrap(),
+    );
+    let address = server.local_addr().unwrap();
+    let key = Rc::new(JoinKey::open_or_create(dir.path().join("join"), [1; 16]).unwrap());
+    let invitation = Rc::new(invitation);
+    let joiners: Vec<_> = (0..8)
+        .map(|_| {
+            let (client, key, invitation) = (client.clone(), key.clone(), invitation.clone());
+            spawn(async move { client.redeem(address, &invitation, &key, now()).await })
+        })
+        .collect();
+    let mut answers = Vec::new();
+    for joiner in joiners {
+        answers.push(joiner.await.unwrap());
+    }
+    assert!(
+        answers
+            .iter()
+            .all(|answer| !matches!(answer, Err(JoinTransportError::Unavailable))),
+        "{answers:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 8);
+    server.close().unwrap();
+    task.await.unwrap().unwrap();
 }
 
 #[test]

@@ -484,15 +484,7 @@ impl EnrollmentClient {
         .map_err(|_| JoinTransportError::Unavailable)?;
         let timeout = self.limits.timeout;
         let exchanged = hyper_rt::futures::within(nanos(timeout), async {
-            let link = connector
-                .enrollment(address, &trust.server_name, trust.pins())
-                .await
-                .map_err(|error| match error {
-                    WireError::Unpinned => {
-                        JoinTransportError::Enrollment(EnrollmentError::Unpinned)
-                    }
-                    _ => JoinTransportError::Unavailable,
-                })?;
+            let link = connect(&connector, address, trust).await?;
             // The link wipes the message however its exchange ends: it holds an invitation's
             // secret.
             let answer = link
@@ -537,6 +529,75 @@ impl Drop for Permit<'_> {
 
 fn nanos(period: Duration) -> u64 {
     u64::try_from(period.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The connection to the sponsor at `address`, its leaf pinned. A dial the sponsor's bounds refused
+/// (its handshake places or its socket's room taken: `AccessError::Capacity`) or that reached no
+/// sponsor sent nothing, so it is made again after [`dial_pause`]; the caller's timeout ends the
+/// dials. A leaf not pinned and a failed TLS authentication are the sponsor's answer and end them
+/// at once. Each joiner gave up at its first refusal: in a burst of joiners the sponsor's places
+/// were taken, and every joiner past them failed its whole join (on Linux's default receive buffer
+/// a sponsor's socket holds two first windows at once, hyper-raft's `docs/transport.md` §4s).
+async fn connect(
+    connector: &QuicConnector,
+    address: SocketAddr,
+    trust: &ServerTrust,
+) -> Result<focal_wire::EnrollmentLink, JoinTransportError> {
+    let mut refusals = 0u32;
+    // Bound: each pause is at least half of the last dial's time doubled once for each refusal
+    // before, and never under the timer's granularity, so 128 of them pass any `Duration`, and the
+    // caller's timeout ends the dials long before.
+    for _ in 0..u128::BITS {
+        let began = hyper_rt::futures::now_ns();
+        match connector
+            .enrollment(address, &trust.server_name, trust.pins())
+            .await
+        {
+            Ok(link) => return Ok(link),
+            Err(WireError::Unpinned) => {
+                return Err(JoinTransportError::Enrollment(EnrollmentError::Unpinned));
+            }
+            Err(WireError::Authentication) => return Err(JoinTransportError::Unavailable),
+            Err(_) => {
+                let took = Duration::from_nanos(hyper_rt::futures::now_ns().saturating_sub(began));
+                let pause = dial_pause(took, refusals, entropy());
+                refusals = refusals.saturating_add(1);
+                let _ = hyper_rt::futures::sleep(nanos(pause)).await;
+            }
+        }
+    }
+    Err(JoinTransportError::Unavailable)
+}
+
+/// The pause before the dial that follows `refusals` refused ones, the last of which took `took`:
+/// that time, at least the timer's granularity (RFC 9002 §6.1.2), doubled for each refusal as TCP
+/// doubles its retransmission timer (RFC 6298 §5.5); its first half is waited and its second drawn
+/// uniformly from `random`, so joiners refused together come back apart and the pauses still grow
+/// (equal jitter: Brooker, "Exponential Backoff And Jitter", AWS Architecture Blog, 2015). The
+/// time a dial took to be refused is a round trip and the sponsor's work on it, about the time
+/// its handshakes hold a place.
+pub(crate) fn dial_pause(took: Duration, refusals: u32, random: u64) -> Duration {
+    let base = took.max(focal_wire::TIMER_GRANULARITY);
+    let doubled = base.saturating_mul(2u32.saturating_pow(refusals));
+    let half = doubled.checked_div(2).unwrap_or(Duration::ZERO);
+    let drawn = half
+        .as_nanos()
+        .saturating_mul(u128::from(random))
+        .checked_div(u128::from(u64::MAX))
+        .unwrap_or(0);
+    half.saturating_add(Duration::from_nanos(
+        u64::try_from(drawn).unwrap_or(u64::MAX),
+    ))
+}
+
+/// Sixty-four random bits from the operating system; when it has none to give, the largest draw,
+/// the whole pause and never a shorter one.
+fn entropy() -> u64 {
+    let mut bytes = [0; 8];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => u64::from_le_bytes(bytes),
+        Err(_) => u64::MAX,
+    }
 }
 
 /// A network adapter runs on a hyper-rt shard: off one it is refused, typed, before any socket
