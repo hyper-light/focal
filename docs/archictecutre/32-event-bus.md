@@ -186,6 +186,13 @@ Found on the way:
   At 1,000,000 a second on a busy core: 10 to 11 buffers allocated in a run, none returned,
   against 1,479 to 2,820; 374,437 messages a second against 341,678 and 1.32 µs a message against
   1.42 (medians of three pairs), the node holding 3 MB more of transport buffers.
+- a full window let its oldest segment go in one append: once memory holds the window, the
+  append that rolled the tail over let every batch of the oldest segment go before it went on
+  (990 in the test, about 4,100 of the claim corpus's every 5 MiB at 100,000 a second). The oldest
+  segment is now let go in the share the tail has filled, at most two batches an append in the
+  test, and is empty and warm when the tail rolls over. At 100,000 a second on a busy core (three
+  pairs, medians) the p99 was 2.12 ms against 2.53 and the worst run's p99.9 3.67 ms against
+  9.93, CPU level.
 
 **Measured** on a bare-metal machine (AMD Ryzen 9 9950X3D2, Linux 7.2), each system's node alone
 on one core in its container, the generator on four others, the claim corpus's 1,150-byte

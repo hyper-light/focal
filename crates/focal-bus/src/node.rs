@@ -362,7 +362,32 @@ impl Node {
             stream: appended.stream,
             end: appended.base.saturating_add(u64::from(appended.count)),
         });
+        self.recycle_ahead();
         Ok(appended)
+    }
+
+    /// Once the window holds what the memory holds, lets the oldest batches go as the tail fills:
+    /// the oldest segment is let go in the share the tail has filled, so it is empty and warm when
+    /// the tail takes the next. Let go all at once as the tail rolled over, a segment's batches held
+    /// the node for as long as it took to give each back (about 4,100 of the claim corpus's every
+    /// 5 MiB at 100,000 a second). The same batches go, oldest first, spread over the appends.
+    fn recycle_ahead(&mut self) {
+        if self.pool.warm() > 0
+            || self.budget.headroom(BudgetLane::Ordinary) >= self.config.segment_bytes
+        {
+            return;
+        }
+        let need = self.part.log().recycle_need(self.config.segment_bytes);
+        // Bounded: at most the oldest segment's batches, each popped once.
+        for _ in 0..need {
+            let Some(oldest) = self.retained.pop_front() else {
+                break;
+            };
+            // A stream's batches leave in order, so its floor moves past the oldest's end.
+            let _ = self
+                .part
+                .release_below(&mut self.pool, oldest.stream, oldest.end);
+        }
     }
 
     /// Lets the oldest batches retained go until a segment comes back to the pool, where it stays
@@ -919,5 +944,83 @@ where
         // 2026-10-16 lost 1.1 million messages so at 100,000 a second).
         Err(Refusal::Budget) => Sent::Short,
         Err(_) => Sent::Gone,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::batch::{BatchBuilder, Producing};
+
+    /// A batch of one record of `payload` bytes on stream 1.
+    fn batch(builder: &mut BatchBuilder, sequence: u32, payload: usize) -> Vec<u8> {
+        builder.begin(&Producing {
+            stream: 1,
+            producer: 2,
+            sequence,
+            flags: 0,
+            timestamp: 1_792_022_400_000_000,
+        });
+        builder
+            .push(1_792_022_400_000_000, &vec![7u8; payload])
+            .unwrap();
+        builder.finish().unwrap().to_vec()
+    }
+
+    /// Appends `bytes` as a publish does, the memory's relief included; how many retained batches
+    /// the append let go.
+    fn append(node: &mut Node, bytes: &[u8]) -> usize {
+        let before = node.retained.len();
+        for _ in 0..1_000 {
+            match node.take(bytes) {
+                Ok(_) => return (before + 1).saturating_sub(node.retained.len()),
+                Err(BusError::Memory(_)) if node.pool.warm() == 0 && node.free_segment() => {}
+                Err(BusError::Memory(_)) if node.relieve() => {}
+                Err(other) => panic!("append refused: {other:?}"),
+            }
+        }
+        panic!("the append found no room");
+    }
+
+    /// Once the window holds what the memory holds, an append lets go no more than its share of the
+    /// oldest segment: the oldest segment is let go as the tail fills, and is empty when the tail
+    /// rolls over. Let go at the rollover, a segment's batches left in one append, the node held for
+    /// as long as it took to give each back.
+    #[test]
+    fn a_full_window_lets_its_oldest_segment_go_as_the_tail_fills() {
+        let segment = usize::try_from(wire::BATCH_BOUND).unwrap();
+        // Three segments and room for the window's index beside them.
+        let budget = MemoryBudget::new(3 * segment + (1 << 20), 0).unwrap();
+        let config = NodeConfig {
+            segment_bytes: segment,
+            streams: 4,
+            subscriptions: 4,
+        };
+        let mut node = Node::new(config, budget).unwrap();
+        let mut builder = BatchBuilder::new();
+        let one = batch(&mut builder, 0, 1_000).len();
+        let per_segment = segment / one;
+        let mut most = 0;
+        let mut filled = false;
+        for sequence in 0..u32::try_from(per_segment * 8).unwrap() {
+            let released = append(&mut node, &batch(&mut builder, sequence, 1_000));
+            if released > 0 {
+                filled = true;
+            }
+            if filled {
+                most = most.max(released);
+            }
+        }
+        assert!(filled, "the window never reached the memory's bound");
+        assert!(
+            most <= 2,
+            "an append let {most} batches go at once ({per_segment} a segment)"
+        );
+        // The window still holds what the memory does: about three segments of batches.
+        assert!(
+            node.retained.len() >= 2 * per_segment,
+            "{}",
+            node.retained.len()
+        );
     }
 }

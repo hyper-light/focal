@@ -240,6 +240,8 @@ impl SegmentPool {
 struct Slot {
     segment: Option<Segment>,
     live: u32,
+    /// Batches appended to it: what it held when it was the tail, `live` of them still held.
+    appended: u32,
 }
 
 /// A part's log: its segments in order, the oldest first.
@@ -281,6 +283,7 @@ impl PartLog {
             self.slots.push_back(Slot {
                 segment: Some(segment),
                 live: 0,
+                appended: 0,
             });
             self.held = self.held.saturating_add(1);
         }
@@ -297,6 +300,7 @@ impl PartLog {
             .live
             .checked_add(1)
             .ok_or(BusError::Capacity("batches in a segment"))?;
+        slot.appended = slot.appended.saturating_add(1);
         let tail = slot
             .segment
             .as_mut()
@@ -308,6 +312,29 @@ impl PartLog {
             segment: number,
             offset,
         })
+    }
+
+    /// The oldest batches to let go now so that the oldest segment is let go in the share the tail
+    /// has filled: `segment_size`'s bytes appended to the tail, the oldest segment's batches given
+    /// back by the same share, so it is empty when the tail is full. None while the oldest segment is
+    /// the tail.
+    pub fn recycle_need(&self, segment_size: usize) -> usize {
+        if self.slots.len() < 2 {
+            return 0;
+        }
+        let (Some(oldest), Some(tail)) = (self.slots.front(), self.slots.back()) else {
+            return 0;
+        };
+        let Some(tail_segment) = tail.segment.as_ref() else {
+            return 0;
+        };
+        let filled = segment_size.saturating_sub(tail_segment.room());
+        let appended = usize::try_from(oldest.appended).unwrap_or(usize::MAX);
+        let released = appended.saturating_sub(usize::try_from(oldest.live).unwrap_or(0));
+        appended
+            .saturating_mul(filled)
+            .div_ceil(segment_size.max(1))
+            .saturating_sub(released)
     }
 
     fn slot_index(&self, number: u64) -> Option<usize> {

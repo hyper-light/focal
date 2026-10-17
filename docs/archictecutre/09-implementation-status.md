@@ -15397,3 +15397,26 @@ grant needs, alone, moved nothing measurable (379,482 a second against 386,989, 
 Tests: `budget::tests::a_bursts_buffers_stay_warm_for_the_next_burst` (bursts of three frames
 with stretches of one between: three buffers serve every frame and none is returned) and
 `a_refused_grant_sheds_only_what_it_needs_the_smallest_first`.
+
+### 2026-10-16 — A full window lets its oldest segment go as the tail fills
+
+Once a node's memory holds its window, the append that rolled the tail over let every batch of
+the oldest segment go before it went on: 990 in the test, about 4,100 of the claim corpus's every
+5 MiB at 100,000 a second, each given back in turn while the node did nothing else. The oldest
+segment is now let go in the share the tail has filled (`PartLog::recycle_need`,
+`Node::recycle_ahead`), so it is empty and warm when the tail rolls over, and the release that
+remains at a rollover (`free_segment`) finds it done.
+
+At 100,000 a second on a busy core (three interleaved pairs, medians):
+
+| Arm | CPU/msg | p50 | p99 | p99.9 (worst run) |
+|---|---|---|---|---|
+| At the rollover | 3,969 ns | 0.47 ms | 2.53 ms | 3.59 ms (9.93) |
+| As the tail fills | 3,985 ns | 0.42 ms | 2.12 ms | 3.40 ms (3.67) |
+
+Quiet, at 100,000 a second, the runs were too noisy to tell apart on a machine other work loaded.
+A test of the tail's runs alone (6 s against 20 s) showed the window's filling was not what holds
+the quiet runs' tail (p99 0.70 to 2.60 ms either way, the machine shared).
+
+Test: `node::tests::a_full_window_lets_its_oldest_segment_go_as_the_tail_fills` (once the window
+fills three segments, no append lets more than two batches go; at the rollover one let 990).
