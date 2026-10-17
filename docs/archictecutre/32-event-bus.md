@@ -177,6 +177,15 @@ Found on the way:
   also counts the transport's buffers allocated and returned (about one 1 MiB frame buffer for
   every six publishes at saturation) and the memory held as the node stopped, by kind: segments,
   transport, tables.
+- those buffers were the pages a saturated node cleared: the transport's buffer classes kept warm
+  what the segment pool's working set kept, which hands a burst's buffers back once a period peaks
+  lower, and bursty traffic alternates its peaks, so each 1 MiB buffer went back to the allocator
+  and was allocated and faulted in again (86 % of the node's page faults, perf: a delivery copied
+  into a fresh buffer). A class now keeps every buffer it has used, no more than its own peak, and
+  a grant refused for want of budget takes back only what it needs, the smallest classes first.
+  At 1,000,000 a second on a busy core: 10 to 11 buffers allocated in a run, none returned,
+  against 1,479 to 2,820; 374,437 messages a second against 341,678 and 1.32 µs a message against
+  1.42 (medians of three pairs), the node holding 3 MB more of transport buffers.
 
 **Measured** on a bare-metal machine (AMD Ryzen 9 9950X3D2, Linux 7.2), each system's node alone
 on one core in its container, the generator on four others, the claim corpus's 1,150-byte
@@ -220,10 +229,8 @@ CRC-32C pass 8.6 %.
 
 Open: a subscriber of many streams waits a round trip a stream (subscribes as lane frames would
 not); the retained batches' index costs 16 bytes a batch beside the log, which already holds what
-it says (a scan of the log from its oldest segment would replace it). From the profile: pages
-cleared as they are faulted afresh (7 % at saturation), though the window no longer returns a
-segment (above), the transport's frame buffers the next to measure; a one-shot epoll registration
-re-armed at every wait; five user copies of each message where two would carry it; CRC-32C at about half a
+it says (a scan of the log from its oldest segment would replace it). From the profile: a
+one-shot epoll registration re-armed at every wait; five user copies of each message where two would carry it; CRC-32C at about half a
 cycle a byte; receive headers rebuilt at every call; kernel receive stamps the transport does not
 read. The busy-machine matrix of every system on the bare-metal machine follows these.
 

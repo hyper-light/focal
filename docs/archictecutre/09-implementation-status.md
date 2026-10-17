@@ -15371,3 +15371,29 @@ Measured on the bare-metal machine (interleaved pairs, CPU a message at the medi
 |---|---|---|---|
 | Sparse account reads (3 pairs; busy 3 + 6) | 6,207 → 6,082 ns | 7,434 → 7,135 ns | 7,920 → 7,767 ns; 8,609 → 8,057 ns |
 | The idle ask left to the park (3 pairs) | 6,016 → 6,080 ns | 7,326 → 7,209 ns | 7,801 → 7,955 ns |
+
+### 2026-10-16 — The transport's frame buffers stay warm; a refused grant sheds only what it needs
+
+**The pages a saturated node cleared were its frame buffers.** Every page fault of a node at
+1,000,000 a second came from copying (99.4 %), and 86 % from a delivery copied into a transport
+frame buffer allocated afresh (perf, sampling every fault with its frame-pointer chain). The
+buffer classes kept warm what the segment pool's working set keeps, which hands a burst's buffers
+back once a period peaks lower. Bursty traffic alternates its peaks, so each 1 MiB buffer went
+back to the allocator and was allocated, faulted in and cleared again, one for every three to six
+publishes. A class now keeps every buffer it has used: no more than its own peak, which the budget
+allowed when it was reached. A grant refused for want of budget takes back only what it needs, the
+smallest classes first (`shed_for`), where every class shed at any refusal.
+
+At 1,000,000 a second on a busy core (three interleaved pairs, medians):
+
+| Arm | Delivered/s | CPU/msg | p99 | Buffers allocated in a run |
+|---|---|---|---|---|
+| The working set | 341,678 | 1.42 µs | 24.92 ms | 1,479 to 2,820 |
+| Kept warm | 374,437 | 1.32 µs | 20.94 ms | 10 to 11 |
+
+The node held 21 MB of transport buffers as it stopped, against 18 MB. Shedding only what a refused
+grant needs, alone, moved nothing measurable (379,482 a second against 386,989, three pairs).
+
+Tests: `budget::tests::a_bursts_buffers_stay_warm_for_the_next_burst` (bursts of three frames
+with stretches of one between: three buffers serve every frame and none is returned) and
+`a_refused_grant_sheds_only_what_it_needs_the_smallest_first`.
