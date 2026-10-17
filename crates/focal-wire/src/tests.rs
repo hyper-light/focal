@@ -1455,9 +1455,11 @@ fn a_peers_refusals_are_counted_by_what_it_answered() {
     .unwrap()
 }
 
-/// Each side's socket says what it moved: after an exchange, the server's
+/// Each side's sockets say what they moved: after an exchange, the server's
 /// and the pool's both sent and received datagrams, in no more system calls
-/// than datagrams (the batching the kernel saw).
+/// than datagrams (the batching the kernel saw). Once connected, the client's
+/// datagrams reach the server by a socket of their own where the port is
+/// shared, and the server's counts take them in all the same.
 #[test]
 fn a_sockets_datagrams_and_calls_are_counted() {
     focal_rt::block_on(async move {
@@ -1501,7 +1503,18 @@ fn a_sockets_datagrams_and_calls_are_counted() {
             message: vec![3],
         };
         pool.send(2, &packet).await.unwrap();
-        for io in [server.io().await, pool.io().await] {
+        let connected = server.io().await;
+        for id in 94..110 {
+            let mut more = request(id);
+            more.operation = packet.operation.clone();
+            pool.send(2, &more).await.unwrap();
+        }
+        let server_io = server.io().await;
+        assert!(
+            server_io.received > connected.received,
+            "the server's sockets counted nothing more: {connected:?} then {server_io:?}"
+        );
+        for io in [server_io, pool.io().await] {
             assert!(io.sent > 0 && io.received > 0, "{io:?}");
             assert!(io.send_calls > 0 && io.send_calls <= io.sent, "{io:?}");
             assert!(

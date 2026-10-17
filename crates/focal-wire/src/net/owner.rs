@@ -184,9 +184,11 @@ pub struct NetStats {
     /// Dials started: a route's first, and each after its connection went. A caller that joins a
     /// dial in flight, or finds the route's connection up, starts none.
     pub dials: u64,
-    /// What the endpoint's socket did: datagrams and the system calls that moved them, and
+    /// What the endpoint's sockets did: datagrams and the system calls that moved them, and
     /// whether the kernel segments its sends and coalesces its receives (`UDP_SEGMENT`,
-    /// `UDP_GRO`).
+    /// `UDP_GRO`). The bound socket's and its peers' summed: where the port is shared each
+    /// connection has a socket of its own, which takes its peer's datagrams (those of peers
+    /// gone included, so no count goes back).
     pub io: hyper_rt::udp::IoStats,
 }
 
@@ -787,7 +789,7 @@ impl Owner {
         NetStats {
             endpoint: endpoint.stats(),
             budget: endpoint.budget().stats(),
-            io: self.driver.stats(),
+            io: self.driver.stats().plus(&self.driver.peer_stats()),
             ..self.stats
         }
     }
