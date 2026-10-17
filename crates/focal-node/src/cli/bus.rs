@@ -60,7 +60,7 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
         node: focal_bus::node::NodeConfig::sized(memory_bytes),
         memory_bytes,
     };
-    let (stats, rooms, counters) = focal_bus::serve::serve(config, |address| {
+    let (stats, memory, buffers, rooms, counters) = focal_bus::serve::serve(config, |address| {
         let line = serde_json::json!({ "condition": "Listening", "listen": address.to_string() });
         let _ = std::io::Write::write_all(
             &mut std::io::stdout().lock(),
@@ -79,6 +79,26 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
         "held": stats.held,
         "starved": stats.starved,
         "dropped": stats.dropped,
+        // Memory taken from and returned to the system: a segment or a buffer allocated anew is
+        // faulted in page by page, one kept warm is not.
+        "segments": {
+            "allocated": stats.segments_allocated,
+            "released": stats.segments_released,
+        },
+        // What the node's memory held as it stopped: the window's segments, the transport's
+        // buffers and socket, the tables.
+        "memory": {
+            "limit": memory.limit,
+            "used": memory.used,
+            "segments": memory.used_by(focal_memory::BudgetKind::Payload),
+            "transport": memory.used_by(focal_memory::BudgetKind::Pending),
+            "tables": memory.used_by(focal_memory::BudgetKind::Index),
+        },
+        "buffers": {
+            "allocated": buffers.allocated,
+            "released": buffers.released,
+            "refused": buffers.refused,
+        },
         "rooms": {
             "least": rooms.least,
             "most": rooms.most,

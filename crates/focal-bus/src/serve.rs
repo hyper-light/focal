@@ -63,10 +63,12 @@ fn credentials(local: &Local) -> Credentials {
     }
 }
 
-/// What a node did, as it stops: its own account, the rooms its sockets told, and its shard's
-/// loop (none off a shard).
+/// What a node did, as it stops: its own account, its memory, its transport's buffers, the rooms
+/// its sockets told, and its shard's loop (none off a shard).
 pub type Served = (
     NodeStats,
+    focal_memory::BudgetStats,
+    crate::budget::BusBudgetStats,
     hyper_rt_transport::Rooms,
     Option<hyper_rt::shard_loop::Counters>,
 );
@@ -147,6 +149,8 @@ pub async fn serve(
             Woke::Stop => {
                 return Ok((
                     node.stats(),
+                    node.memory(),
+                    driver.endpoint().budget().stats(),
                     driver.rooms(),
                     hyper_rt::futures::shard_counters(),
                 ));

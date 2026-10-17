@@ -102,6 +102,10 @@ pub struct NodeStats {
     pub starved: u64,
     /// Subscriptions let go because the transport could no longer reach their peer.
     pub dropped: u64,
+    /// Segments allocated from the system, each faulted in as it fills.
+    pub segments_allocated: u64,
+    /// Segments returned to the system.
+    pub segments_released: u64,
 }
 
 /// A batch the part retains, in the order appended: its stream, and the offset after it.
@@ -214,7 +218,18 @@ impl Node {
 
     /// What the node has done.
     pub const fn stats(&self) -> NodeStats {
-        self.stats
+        let (segments_allocated, segments_released) = self.pool.churn();
+        NodeStats {
+            segments_allocated,
+            segments_released,
+            ..self.stats
+        }
+    }
+
+    /// The node's memory as its budget holds it now: the segments (`Payload`), the transport's
+    /// buffers and socket (`Pending`) and the tables (`Index`).
+    pub fn memory(&self) -> focal_memory::BudgetStats {
+        self.budget.stats()
     }
 
     /// The node's part.
@@ -281,10 +296,18 @@ impl Node {
         D: Directory<Role = <Bus as Classes>::Role>,
     {
         let mut relieved = false;
-        // Bounded: each turn but the last gives a warm segment or a retained batch back.
+        // Bounded: each turn but the last frees a segment for the append, or gives a warm segment
+        // or a retained batch back.
         let appended = loop {
             match self.take(bytes) {
                 Ok(appended) => break appended,
+                // A segment the window empties is the append's own: kept warm, it is taken again as
+                // it is charged, with nothing allocated and no page faulted afresh. Given back, the
+                // next segment was allocated anew and every page of it faulted and cleared, a trip
+                // to the allocator for each segment the log took once the window was full. Only
+                // where a warm segment is not the answer (the window's index wanted the room) is
+                // memory given back.
+                Err(BusError::Memory(_)) if self.pool.warm() == 0 && self.free_segment() => {}
                 Err(BusError::Memory(_)) if self.relieve() => relieved = true,
                 Err(_) => {
                     self.stats.refused = self.stats.refused.saturating_add(1);
@@ -339,6 +362,26 @@ impl Node {
             end: appended.base.saturating_add(u64::from(appended.count)),
         });
         Ok(appended)
+    }
+
+    /// Lets the oldest batches retained go until a segment comes back to the pool, where it stays
+    /// warm for the append that wanted one (the pool keeps what its demand needed, and every
+    /// segment was out), or the pool returns it and the budget has its room. Whether either did.
+    fn free_segment(&mut self) -> bool {
+        let (_, released) = self.pool.churn();
+        let freed = |pool: &SegmentPool| pool.warm() > 0 || pool.churn().1 > released;
+        // Bounded: each turn lets one retained batch go.
+        while let Some(oldest) = self.retained.pop_front() {
+            // A stream's batches leave in order, so its floor moves past the oldest's end.
+            let _ = self
+                .part
+                .release_below(&mut self.pool, oldest.stream, oldest.end);
+            if freed(&self.pool) {
+                return true;
+            }
+        }
+        // The last batches let go were the tail's: with nothing in it, it comes back.
+        self.part.seal(&mut self.pool) && freed(&self.pool)
     }
 
     /// Gives memory back for what is live, at the window's expense: the pool's warm segments first,

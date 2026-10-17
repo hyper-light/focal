@@ -167,6 +167,16 @@ Found on the way:
 - a third of a node's datagrams were QUIC acknowledgements, one for every other packet (RFC 9000
   §13.2.2's default): every connection now asks for Google QUIC's decimation, an ACK for every 10
   packets or a quarter of the round trip (hyper-quic patch Q22, hyper-raft `a8f5941`).
+- a segment the window let go for an append went back to the system, and the append's next segment
+  was allocated anew: with the window full, as it is once memory holds it, every segment the log
+  took was a round trip to the allocator. The segment emptied is now the append's own, kept warm
+  and taken again as it is charged (`Node::free_segment`; memory goes back to the budget only where
+  a warm segment is not the answer). A node's stop line counts it: in three runs at 1,000,000 a
+  second each allocated 303 segments and returned none (the A/B against the giving back was
+  within its noise: the page faults a saturated node clears are not the segments'). The stop line
+  also counts the transport's buffers allocated and returned (about one 1 MiB frame buffer for
+  every six publishes at saturation) and the memory held as the node stopped, by kind: segments,
+  transport, tables.
 
 **Measured** on a bare-metal machine (AMD Ryzen 9 9950X3D2, Linux 7.2), each system's node alone
 on one core in its container, the generator on four others, the claim corpus's 1,150-byte
@@ -210,9 +220,10 @@ CRC-32C pass 8.6 %.
 
 Open: a subscriber of many streams waits a round trip a stream (subscribes as lane frames would
 not); the retained batches' index costs 16 bytes a batch beside the log, which already holds what
-it says (a scan of the log from its oldest segment would replace it). From the profile: a segment
-freed and faulted afresh where the window could reuse it; a one-shot epoll registration re-armed
-at every wait; five user copies of each message where two would carry it; CRC-32C at about half a
+it says (a scan of the log from its oldest segment would replace it). From the profile: pages
+cleared as they are faulted afresh (7 % at saturation), though the window no longer returns a
+segment (above), the transport's frame buffers the next to measure; a one-shot epoll registration
+re-armed at every wait; five user copies of each message where two would carry it; CRC-32C at about half a
 cycle a byte; receive headers rebuilt at every call; kernel receive stamps the transport does not
 read. The busy-machine matrix of every system on the bare-metal machine follows these.
 

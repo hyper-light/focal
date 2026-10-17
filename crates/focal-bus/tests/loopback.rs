@@ -544,6 +544,18 @@ fn every_publish_reaches_the_subscriber_in_order_and_a_stalled_subscriber_holds_
                     bus.node.pool().held() <= PART_SEGMENTS,
                     "the window held no more than its memory"
                 );
+                // The segment the window let go was the next one's: taken again warm, nothing
+                // allocated past what the memory holds and nothing returned to the system, where a
+                // segment given back was allocated anew and faulted in page by page.
+                let stats = bus.node.stats();
+                assert!(
+                    stats.segments_allocated <= u64::try_from(PART_SEGMENTS).unwrap(),
+                    "segments allocated past the memory: {stats:?}"
+                );
+                assert_eq!(
+                    stats.segments_released, 0,
+                    "a segment went back to the system and was allocated anew: {stats:?}"
+                );
                 for (at, item) in bus.seen.order.iter().enumerate() {
                     let at = at as u64;
                     assert_eq!(

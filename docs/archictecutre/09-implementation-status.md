@@ -15284,3 +15284,25 @@ runtime recursion), `cargo deny check advisories bans licenses sources`, and `ba
 test --workspace --locked --no-fail-fast -- --test-threads=4`: 171 test binaries, 3500 passed, 0
 failed, 31 ignored. The shared crates at a8f5941 passed hyper-raft's own gates on Linux (8 CPUs of
 the bare-metal machine) before its push.
+
+### 2026-10-16 — The bus keeps the segment its window lets go
+
+**A segment the window let go went back to the system, and the next was allocated anew.** Once
+a node's memory is full of its window, as it is in steady state, every append that needed a
+segment let the oldest batches go until one emptied, returned that segment to the system, and
+allocated the next one fresh, faulting its pages in again. The emptied segment is now the
+append's own: it is kept warm and taken again as it is charged (`Node::free_segment`). Memory
+goes back to the budget only where a warm segment is not the answer, when the window's index
+wanted the room. A node's stop line now counts what it allocated and returned: its segments, its
+transport's buffers (allocated, released and refused), and the memory it held as it stopped, by
+kind (segments, transport, tables).
+
+Measured on the bare-metal machine at 1,000,000 a second: each of three runs allocated 303
+segments and returned none. The interleaved A/B against the old giving-back was within its noise,
+so the 7 % of a saturated node's time spent clearing pages faulted afresh is not the segments'.
+The transport's frame buffers are the next to measure: about one 1 MiB buffer is allocated for
+every six publishes at saturation.
+
+The loopback test's window lets its oldest batches go, and the test now also checks that the node
+allocates no segment beyond what its memory holds and returns none:
+`every_publish_reaches_the_subscriber_in_order_and_a_stalled_subscriber_holds_its_publisher`.
