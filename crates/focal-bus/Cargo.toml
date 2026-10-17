@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 # A batch's checksum, CRC-32C (Castagnoli), hardware-computed (SSE 4.2, ARMv8 CRC32).
-crc32c = "0.6"
+crc-fast = { version = "1.10", default-features = false, features = ["std", "vpclmulqdq"] }
 # What every segment, table and transport byte is charged to.
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
 # The bus's wire: exchanges and lanes over QUIC (vendor/hyper-transport), driven on a hyper-rt

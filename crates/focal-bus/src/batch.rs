@@ -199,7 +199,7 @@ impl<'a> Batch<'a> {
         if crc {
             let stated_crc = le_u32(bytes, CRC).ok_or(BatchError::Short)?;
             let covered = bytes.get(COVERED_FROM..).ok_or(BatchError::Short)?;
-            let computed = crc32c::crc32c(covered);
+            let computed = crc32c(covered);
             if computed != stated_crc {
                 return Err(BatchError::Crc {
                     stated: stated_crc,
@@ -475,7 +475,7 @@ impl BatchBuilder {
             .get_mut(LENGTH)
             .ok_or_else(short)?
             .copy_from_slice(&length.to_le_bytes());
-        let crc = crc32c::crc32c(self.bytes.get(COVERED_FROM..).ok_or_else(short)?);
+        let crc = crc32c(self.bytes.get(COVERED_FROM..).ok_or_else(short)?);
         self.bytes
             .get_mut(CRC)
             .ok_or_else(short)?
@@ -484,9 +484,26 @@ impl BatchBuilder {
     }
 }
 
+/// The CRC-32C (`CRC-32/ISCSI`) of `bytes`, crc-fast's, which chooses its widest carry-less multiply
+/// when it runs: the crc32c crate took its slow path in every build for the generic target (135.5
+/// ns a 1,230-byte batch against 18.1 on the bare-metal bench; hyper-transport's `docs/transport.md`
+/// §4n). The same function: the same value for the same bytes.
+fn crc32c(bytes: &[u8]) -> u32 {
+    let sum = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, bytes);
+    u32::try_from(sum & u64::from(u32::MAX)).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The batch sum is CRC-32C (`CRC-32/ISCSI`): the catalogue's check value for "123456789", and
+    /// zero for nothing.
+    #[test]
+    fn the_batch_sum_is_crc32c() {
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+        assert_eq!(crc32c(b""), 0);
+    }
 
     fn producing() -> Producing {
         Producing {
@@ -601,7 +618,7 @@ mod tests {
         // A count of two over one record, its CRC made to match: the count is what is refused.
         let mut lying = bytes.clone();
         lying[COUNT].copy_from_slice(&2_u16.to_le_bytes());
-        let crc = crc32c::crc32c(&lying[COVERED_FROM..]);
+        let crc = crc32c(&lying[COVERED_FROM..]);
         lying[CRC].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(Batch::parse(&lying, 1 << 20).err(), Some(BatchError::Count));
         // Bytes after the last record, the length and CRC made to match: a stray byte is no
@@ -611,7 +628,7 @@ mod tests {
             trailing.extend_from_slice(extra);
             let length = u32::try_from(trailing.len()).unwrap();
             trailing[LENGTH].copy_from_slice(&length.to_le_bytes());
-            let crc = crc32c::crc32c(&trailing[COVERED_FROM..]);
+            let crc = crc32c(&trailing[COVERED_FROM..]);
             trailing[CRC].copy_from_slice(&crc.to_le_bytes());
             trailing
         };
