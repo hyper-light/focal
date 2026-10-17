@@ -171,9 +171,18 @@ warmup_ms: $(( warmup * 1000 ))
 EOF
     # Bounded at four times the run's intended length and two minutes more: a
     # run that cannot keep the offered rate still ends, its evidence printed.
+    # A deliver run's last message may then wait on each side's step twice, for
+    # its post and its testament, each up to focal-load's WAIT (two minutes,
+    # tools/load/src/watch.rs) before it counts the message undelivered: the
+    # bound holds both, so a message the events never show ends the run with
+    # its report saying so, never killed without one.
+    bound=$(( (seconds + warmup) * 4 + 120 ))
+    if [ "$mode" = deliver ]; then
+      bound=$(( bound + 2 * 120 ))
+    fi
     cpu_stat before > "$out/$report.cpu.txt"
     net_stat before > "$out/$report.net.txt"
-    if ! timeout $(( (seconds + warmup) * 4 + 120 )) docker compose -f compose.yaml --profile focal \
+    if ! timeout "$bound" docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
       focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
       evidence
