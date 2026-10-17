@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use focal_platform::fs::{
-    FileMedium, Medium as _, create_dir_private, create_private_new, install,
+    FileMedium, Medium as _, create_private_new, ensure_dir_private, install,
 };
 use hyper_seal::keys::{KeyId, KeySource as _, RECORD, Wrapped, WrappingKey};
 use hyper_seal::{FileSource, SealError, Secret32};
@@ -211,7 +211,10 @@ pub fn create_root_key(path: &Path) -> Result<(), SealSetupError> {
             }
         }
         for dir in ancestors.iter().rev() {
-            create_dir_private(dir).map_err(fail)?;
+            // Another process may make it after the look above: two nodes of one user starting
+            // at once make the same keys' directory, and the one made second failed its start
+            // ("File exists").
+            ensure_dir_private(dir).map_err(fail)?;
             if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
                 focal_platform::sync_dir(parent).map_err(fail)?;
             }

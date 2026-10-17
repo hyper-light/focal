@@ -253,6 +253,25 @@ pub fn create_dir_private(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Create a directory owner-only ([create_dir_private]), or take the one that is there. A caller
+/// that looked and found no directory may race another process making the same one, as two nodes
+/// of one user starting at once make their keys' directory: each then finds it made. std's
+/// `create_dir_all` takes a directory made under it so too. A path that is there and is not a
+/// directory is refused, `AlreadyExists`. What the directory then holds is the caller's to check,
+/// as for one that was there before it looked.
+pub fn ensure_dir_private(path: &Path) -> io::Result<()> {
+    match create_dir_private(path) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if std::fs::metadata(path)?.is_dir() {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        made => made,
+    }
+}
+
 /// Atomically replace `to` with `from` (both on the same volume).
 pub fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(windows)]
@@ -412,6 +431,24 @@ mod tests {
         assert!(check_private_file(&path, &owner, 1).unwrap());
         assert_eq!(path_identity(&path).unwrap(), file_identity(&file).unwrap());
         assert_eq!(path_hard_link_count(&path).unwrap(), 1);
+    }
+
+    /// A private directory made where one is already there is taken, as one another process made
+    /// after the caller looked; a file there is refused. Do: ensure a new directory, then the same
+    /// directory again, then a path holding a file. Expect: made, taken, refused `AlreadyExists`.
+    #[test]
+    fn ensure_dir_private_takes_a_directory_made_first_and_refuses_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        ensure_dir_private(&path).unwrap();
+        assert!(path.is_dir());
+        ensure_dir_private(&path).unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(
+            ensure_dir_private(&file).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
     }
 
     #[test]

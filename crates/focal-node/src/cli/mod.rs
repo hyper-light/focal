@@ -373,7 +373,8 @@ fn private_parent(path: &std::path::Path) -> Result<()> {
             {
                 std::fs::create_dir_all(parent)?;
             }
-            focal_platform::fs::create_dir_private(path)?;
+            // Another process may make it after the look; its owner is checked below.
+            focal_platform::fs::ensure_dir_private(path)?;
         }
         let owner = focal_platform::fs::current_owner()?;
         match focal_platform::fs::private_dir_owner(path)? {

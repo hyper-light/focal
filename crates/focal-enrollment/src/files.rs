@@ -33,8 +33,10 @@ impl PrivateDirectory {
         if !path.exists() {
             // Require an existing deployment-owned parent; do not create a
             // chain of private directories with ambiguous owner permissions.
+            // Another process may make it after the look; its owner is
+            // checked below as one there before.
             let parent = path.parent().ok_or(EnrollmentError::Invalid)?;
-            focal_platform::fs::create_dir_private(path)?;
+            focal_platform::fs::ensure_dir_private(path)?;
             sync_dir(parent)?;
         }
         let owner =

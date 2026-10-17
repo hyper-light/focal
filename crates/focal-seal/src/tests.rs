@@ -180,3 +180,30 @@ fn one_store_key_opens_as_the_node_made_it() {
     ));
     assert!(!empty.join(SEAL_FILE).exists());
 }
+
+/// Nodes of one user starting at once make their root keys in one directory not yet there: each
+/// start makes it or finds it made. Do: sixteen threads, released together, each make a root key of
+/// its own under one missing directory, over twenty rounds. Expect: every key made; before, a
+/// thread that found the directory missing and made it second failed "File exists".
+#[test]
+fn root_keys_made_at_once_share_the_directory_they_make() {
+    for _ in 0..20 {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("config").join("focal").join("keys");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let makers: Vec<_> = (0..16)
+            .map(|node| {
+                let path = dir.join(format!("{node:016x}.key"));
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    create_root_key(&path)
+                })
+            })
+            .collect();
+        for maker in makers {
+            maker.join().unwrap().unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 16);
+    }
+}
