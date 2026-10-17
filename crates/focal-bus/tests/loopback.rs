@@ -26,7 +26,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use focal_bus::batch::{BatchBuilder, Producing};
-use focal_bus::budget::BusBudget;
+use focal_bus::budget::{BusBudget, Headroom};
 use focal_bus::client::{Client, Delivery};
 use focal_bus::directory::BusDirectory;
 use focal_bus::limits::IO;
@@ -42,17 +42,31 @@ use hyper_transport::{Budget, Config, Endpoint, Event, Lane, Refusal, Reservatio
 type Drv = Driver<Bus, Starving, BusDirectory>;
 
 /// The bus's budget, refusing the next delivery frames it is told to: how a node whose memory is
-/// full looks to its deliveries. It refuses nothing until told.
+/// full looks to its deliveries. It refuses publish frames while told to, its memory as free as
+/// ever: how a frame that waits for anything but memory looks to the node. It refuses nothing
+/// until told.
 struct Starving {
     inner: BusBudget,
+    refusing: Refusing,
+}
+
+/// What a [`Starving`] budget refuses, set from outside it.
+#[derive(Clone, Default)]
+struct Refusing {
     /// Delivery frames still to refuse.
-    refuse: Rc<Cell<u32>>,
+    deliver: Rc<Cell<u32>>,
+    /// Whether publish frames are refused.
+    publish: Rc<Cell<bool>>,
 }
 
 impl Budget<Class> for Starving {
     fn reserve(&mut self, bytes: u64, lane: Lane<Class>) -> Result<Reservation, Refusal> {
-        if matches!(lane, Lane::Class(Class::Deliver)) && self.refuse.get() > 0 {
-            self.refuse.set(self.refuse.get() - 1);
+        let deliver = &self.refusing.deliver;
+        if matches!(lane, Lane::Class(Class::Deliver)) && deliver.get() > 0 {
+            deliver.set(deliver.get() - 1);
+            return Err(Refusal::Budget);
+        }
+        if matches!(lane, Lane::Class(Class::Publish)) && self.refusing.publish.get() {
             return Err(Refusal::Budget);
         }
         self.inner.reserve(bytes, lane)
@@ -60,6 +74,12 @@ impl Budget<Class> for Starving {
 
     fn release(&mut self, reservation: Reservation) {
         self.inner.release(reservation);
+    }
+}
+
+impl Headroom for Starving {
+    fn headroom(&self) -> u64 {
+        self.inner.headroom()
     }
 }
 
@@ -137,7 +157,7 @@ fn endpoint(
     role: Role,
     listen: bool,
     budget: &MemoryBudget,
-    refuse: &Rc<Cell<u32>>,
+    refusing: &Refusing,
 ) -> Endpoint<Bus, Starving, BusDirectory> {
     let mut directory = BusDirectory::new(8);
     for (certificate, peer, role, name) in peers {
@@ -156,7 +176,7 @@ fn endpoint(
         config,
         Starving {
             inner: BusBudget::new(budget.clone()),
-            refuse: refuse.clone(),
+            refusing: refusing.clone(),
         },
         directory,
         Instant::now(),
@@ -251,8 +271,8 @@ struct Harness {
     events: u64,
     turn: usize,
     wait: ProgressDeadline,
-    /// The node's delivery frames still to refuse (`Starving`).
-    refuse: Rc<Cell<u32>>,
+    /// What the node's budget refuses (`Starving`).
+    refusing: Refusing,
     /// The node's transport's reservations given back as the harness last looked.
     returns: u64,
 }
@@ -368,7 +388,7 @@ impl Harness {
         let node_id = pki.issue("bus-node");
         let publisher_id = pki.issue("bus-publisher");
         let subscriber_id = pki.issue("bus-subscriber");
-        let refuse = Rc::new(Cell::new(0));
+        let refusing = Refusing::default();
         let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let node_endpoint = endpoint(
             pki,
@@ -380,7 +400,7 @@ impl Harness {
             Role::Node,
             true,
             node_budget,
-            &refuse,
+            &refusing,
         );
         let node_driver: Drv = Driver::bind(node_endpoint, loopback, IO).unwrap();
         let node_addr = node_driver.local_addr().unwrap();
@@ -393,7 +413,7 @@ impl Harness {
                 Role::Client,
                 false,
                 client_budget,
-                &Rc::new(Cell::new(0)),
+                &Refusing::default(),
             );
             let driver: Drv = Driver::bind(endpoint, loopback, IO).unwrap();
             driver
@@ -417,7 +437,7 @@ impl Harness {
             events: 0,
             turn: 0,
             wait: ProgressDeadline::begin(&[0], u64::MAX, FROZEN),
-            refuse,
+            refusing,
             returns: 0,
         };
         while bus.seen.connected < 2 {
@@ -656,14 +676,14 @@ fn a_delivery_the_node_has_no_memory_for_waits_and_its_subscriber_stays() {
                 bus.step(true).await;
                 bus.moved("delivering before the refusals");
             }
-            bus.refuse.set(REFUSED);
+            bus.refusing.deliver.set(REFUSED);
             while bus.seen.reached() < u64::from(PUBLISHED) {
                 bus.publish(PUBLISHED.min(u32::try_from(bus.seen.reached()).unwrap() + KEEPS_UP));
                 bus.step(true).await;
                 bus.moved("delivering through the refusals");
             }
             let stats = bus.node.stats();
-            assert_eq!(bus.refuse.get(), 0, "every refusal was met");
+            assert_eq!(bus.refusing.deliver.get(), 0, "every refusal was met");
             assert_eq!(stats.dropped, 0, "no subscription was let go");
             assert!(stats.starved > 0, "a delivery waited for memory: {stats:?}");
             // Each item goes on where the last ended: a batch delivered, or offsets told missed.
@@ -681,6 +701,98 @@ fn a_delivery_the_node_has_no_memory_for_waits_and_its_subscriber_stays() {
                 }
             }
             assert_eq!(at, u64::from(PUBLISHED));
+        })
+        .unwrap();
+}
+
+/// A frame the transport waits to take while the node's memory could hold it is given nothing
+/// from the window: refused for something memory cannot meet, or its lane held by the node (its
+/// stream's subscribers taking no more), it would take every batch the window retains, those its
+/// subscribers are owed among them, and wait on all the same. Given the window whatever it waited
+/// for, a held publisher's frame let the whole window go while the node held 16 MB of its 1.5 GiB,
+/// and the subscriber it was held for was told a gap (the bare-metal pubsub run of 2026-10-16).
+#[test]
+fn a_frame_that_waits_for_anything_but_memory_takes_nothing_from_the_window() {
+    /// Batches published and delivered before the frame waits: the window retains them all.
+    const BEFORE: u32 = 50;
+    let pki = Pki::new();
+    let node_budget = MemoryBudget::new(256 << 20, 0).unwrap();
+    let client_budget = MemoryBudget::new(256 << 20, 0).unwrap();
+    let segment = usize::try_from(wire::BATCH_BOUND).unwrap();
+    let part_budget = node_budget.child(PART_SEGMENTS * segment, 0).unwrap();
+    let config = NodeConfig {
+        segment_bytes: segment,
+        streams: 64,
+        subscriptions: 16,
+    };
+    let mut runtime = LocalRuntime::new(&runtime()).unwrap();
+    runtime
+        .block_on(async move {
+            let mut bus =
+                Harness::connect(&pki, &node_budget, &client_budget, &part_budget, config).await;
+            while bus.seen.reached() < u64::from(BEFORE) {
+                bus.publish(BEFORE);
+                bus.step(true).await;
+                bus.moved("delivering before the frame waits");
+            }
+            let window = (0, u64::from(BEFORE));
+            assert_eq!(bus.bounds(), window, "the window retains every batch");
+
+            // The node's transport is refused the next publish frame's bytes, its memory as free
+            // as ever: the frame waits, its lane unread, and the node is asked to relieve it at
+            // every turn.
+            bus.refusing.publish.set(true);
+            bus.publish(BEFORE + 1);
+            while bus.node_driver.endpoint().stats().frames_reserving == 0 {
+                bus.step(true).await;
+                bus.moved("the publish frame comes to wait");
+            }
+            bus.node.relieve_transport(bus.node_driver.endpoint());
+            assert_eq!(
+                bus.bounds(),
+                window,
+                "a refusal memory cannot meet took the window"
+            );
+
+            // The node holds the publisher's lane, as it does once its stream's subscribers take no
+            // more, and the refusal ends: the frame waits for its lane now.
+            bus.node_driver
+                .endpoint()
+                .hold_lane(PUBLISHER, wire::LANE)
+                .unwrap();
+            bus.refusing.publish.set(false);
+            bus.node.relieve_transport(bus.node_driver.endpoint());
+            assert_eq!(bus.bounds(), window, "a held frame took the window");
+            assert_eq!(
+                bus.node.stats().published,
+                u64::from(BEFORE),
+                "a held lane is not read"
+            );
+
+            // Let go, the lane is read on: its frame is taken, appended and delivered, and the
+            // subscriber has every batch, in order, none missed.
+            bus.node_driver
+                .endpoint()
+                .release_lane(PUBLISHER, wire::LANE)
+                .unwrap();
+            while bus.seen.reached() < u64::from(BEFORE + 1) {
+                bus.step(true).await;
+                bus.moved("the held frame delivered");
+            }
+            for (at, item) in bus.seen.order.iter().enumerate() {
+                let at = at as u64;
+                assert_eq!(
+                    *item,
+                    Item::Batch {
+                        base: at,
+                        end: at + 1,
+                        sequence: at
+                    },
+                    "every batch, in order, none missed"
+                );
+            }
+            assert_eq!(bus.bounds(), (0, u64::from(BEFORE + 1)));
+            assert_eq!(bus.node.stats().gaps, 0);
         })
         .unwrap();
 }

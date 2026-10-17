@@ -34,6 +34,7 @@ use hyper_transport::{
 
 use crate::BusError;
 use crate::batch::Batch;
+use crate::budget::Headroom;
 use crate::log::{Position, SegmentPool};
 use crate::part::{Appended, Part, PartLimits};
 use crate::stream::STREAM_BYTES;
@@ -413,17 +414,32 @@ impl Node {
         false
     }
 
-    /// Gives the transport's frames that wait for memory (`Stats::frames_reserving`) the room of
-    /// the oldest batches retained, until none waits or the part retains nothing: live traffic goes
-    /// before what is kept for subscribers that start behind. Asked once a turn of the owner's.
+    /// Gives the transport's frames that wait for memory (`Stats::frames_reserving`) what the
+    /// budget holds now, then the room of the oldest batches retained while memory is what they
+    /// lack: while the transport's budget could not hold the largest frame it reserves
+    /// ([`crate::budget::largest_grant`]). Live traffic goes before what is kept for subscribers
+    /// that start behind, but a frame that waits for anything else (its lane held by the node, its
+    /// stream's subscribers taking no more) is given nothing: the window would let every batch go,
+    /// those its subscribers are owed among them, and the frame would wait on. Asked once a turn of
+    /// the owner's.
     pub fn relieve_transport<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>)
     where
-        B: Budget<<Bus as Classes>::Class>,
+        B: Budget<<Bus as Classes>::Class> + Headroom,
         D: Directory<Role = <Bus as Classes>::Role>,
     {
-        // Bounded: `relieve` is false once the part retains nothing.
-        while endpoint.stats().frames_reserving > 0 && self.relieve() {
+        if endpoint.stats().frames_reserving > 0 {
+            // What the budget holds now goes first: a frame given back since the waiting frame was
+            // refused, or a warm buffer, which the budget gives back before it refuses.
             endpoint.retry_reserving();
+            let largest = crate::budget::largest_grant();
+            // Bounded: each turn gives a segment back, and `relieve` is false once the part
+            // retains nothing.
+            while endpoint.stats().frames_reserving > 0
+                && endpoint.budget().headroom() < largest
+                && self.relieve()
+            {
+                endpoint.retry_reserving();
+            }
         }
         self.retry_starved(endpoint);
     }

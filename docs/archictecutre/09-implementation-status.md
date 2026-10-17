@@ -15306,3 +15306,43 @@ every six publishes at saturation.
 The loopback test's window lets its oldest batches go, and the test now also checks that the node
 allocates no segment beyond what its memory holds and returns none:
 `every_publish_reaches_the_subscriber_in_order_and_a_stalled_subscriber_holds_its_publisher`.
+
+### 2026-10-16 — A frame that waits for anything but memory takes nothing from the window
+
+**The told gap was the window given to a frame no memory could move.** On the bare-metal machine,
+at 1,000,000 messages a second offered on a core a busy loop shares, the first busy matrix's node
+told its subscriber a gap of two batches it had not taken, and fifteen more runs told one more.
+Each gap was logged with the window, the pool and the budget. The window retained nothing, the
+node held 16 MB of its 1.5 GiB, and the relief that had let the batches go was the transport's.
+
+The node gives a frame that the transport waits to take for want of memory (`frames_reserving`)
+the room of its window's oldest batches. In these runs the frame was refused while the window
+filled the memory, as a full window does, and its publisher's lane was then held by the node. A
+held lane is not read, so no memory moves its frame, but it stayed counted: the node gave it the
+window at every turn until none was left.
+
+The window now gives a waiting frame what the transport's budget holds first: a retry, which takes
+a frame given back or a warm buffer. It gives the room of its batches only while that budget could
+not hold the largest frame the transport reserves (`Headroom`, `budget::largest_grant`). A frame
+that waits for anything else is given nothing.
+
+Tests:
+- `a_frame_that_waits_for_anything_but_memory_takes_nothing_from_the_window`: a publish frame is
+  refused with the memory free, then held with its lane. The window keeps every batch, and the
+  frame, once let go, is delivered in order. On the old relief the window's floor went from 0 to
+  50 at the refusal.
+- `budget::tests::the_headroom_is_what_one_grant_can_take`.
+
+On the bare-metal machine, at 1,000,000 a second offered on a busy core:
+
+| Build | Runs | Runs with a gap | Delivered/s (median) | CPU/msg (median) |
+|---|---|---|---|---|
+| Before | 15 | 1 | 359,400 | 1.37 µs |
+| This fix | 30 | 0 | 405,700 | 1.22 µs |
+
+The transport's side, where a held lane's frame no longer counts as waiting for memory, is made in
+hyper-raft and comes with the next re-vendor.
+
+Gates on this tree (macOS 26.4.1 arm64): cargo fmt, check-contracts, clippy -D warnings,
+check-production, cargo deny, and the workspace's tests (171 binaries, 3,502 passed, 0 failed, 31
+ignored).

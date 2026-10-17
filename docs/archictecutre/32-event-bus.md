@@ -227,12 +227,21 @@ re-armed at every wait; five user copies of each message where two would carry i
 cycle a byte; receive headers rebuilt at every call; kernel receive stamps the transport does not
 read. The busy-machine matrix of every system on the bare-metal machine follows these.
 
-Open, from that matrix's first run (2026-10-16): at 1,000,000 offered on a core a busy loop shares,
-the node told its subscriber one gap of two batches (1,819 messages) in 9,487: the window gave up
-batches its subscriber had not yet taken, where memory was short for a delivery. Every bound around
-a live subscriber (a lossless lane holds one frame beyond what QUIC took; a held publisher's lane is
-not read) keeps it within megabytes of the head, so a window of 1.5 GB should not reach it; it is
-being traced with the window, the pool and the budget logged at each gap.
+Found from that matrix's first run (2026-10-16): at 1,000,000 offered on a core a busy loop shares,
+the node told its subscriber one gap of two batches (1,819 messages) in 9,487, and fifteen more
+runs told one more (1,817), with the window, the pool and the budget logged at each gap: the window
+retained nothing, and 16 MB of the node's 1.5 GiB was in use. The window had been given to a frame
+the transport counted as waiting for memory (`frames_reserving`), on a publisher's lane the node
+held. The frame was refused while the window filled the memory, as a full window does, and was then
+held with its lane, where no memory could move it. So the node gave it the window's oldest batches
+at every turn until none was left, those the held publisher's subscriber had not taken among them. The window now gives a waiting frame
+what the transport's budget holds first (a frame given back, a warm buffer), and the room of its
+batches only while that budget could not hold the largest frame the transport reserves
+(`Headroom`, `largest_grant`): a frame that waits for anything but memory is given nothing. Test:
+`loopback::a_frame_that_waits_for_anything_but_memory_takes_nothing_from_the_window` (a frame
+refused with the memory free, then held: the window keeps every batch, and the frame, let go, is
+delivered in order). Thirty more busy runs at 1,000,000 a second told no gap, the node delivering
+405,700 a second at the median against 359,400 before (1.22 µs a message against 1.37).
 
 ## 5. Steps
 

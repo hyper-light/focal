@@ -231,6 +231,41 @@ impl BusBudget {
     }
 }
 
+/// The most one of the transport's frames asks of its budget: the largest grant the bus's classes
+/// make (`frame_grant` of the largest frame bound), the last buffer class's size.
+pub fn largest_grant() -> u64 {
+    Sizes::of_bus().top
+}
+
+/// What a transport's budget could grant one reservation now. A frame that waits for memory is
+/// given the room of the node's window only while this is less than the frame may ask
+/// ([`crate::node::Node::relieve_transport`]): past it, the frame waits for something no memory
+/// gives.
+pub trait Headroom {
+    /// The bytes one reservation could take now.
+    fn headroom(&self) -> u64;
+}
+
+impl Headroom for BusBudget {
+    /// The budget's headroom, and the warm buffers every class gives back before a grant is
+    /// refused.
+    fn headroom(&self) -> u64 {
+        let sizes = self.sizes;
+        let warm = self
+            .shelves
+            .iter()
+            .enumerate()
+            .fold(0_usize, |sum, (class, shelf)| {
+                sum.saturating_add(sizes.size_of(class).saturating_mul(shelf.warm.len()))
+            });
+        let room = self
+            .budget
+            .headroom(BudgetLane::Ordinary)
+            .saturating_add(warm);
+        u64::try_from(room).unwrap_or(u64::MAX)
+    }
+}
+
 impl Budget<Class> for BusBudget {
     fn reserve(&mut self, bytes: u64, lane: Lane<Class>) -> Result<Reservation, Refusal> {
         match lane {
@@ -392,5 +427,30 @@ mod tests {
         );
         assert_eq!(bus.stats().refused, 2);
         bus.release(held);
+    }
+
+    /// The headroom is what one grant can take: the budget's room and the warm buffers given back
+    /// before a grant is refused, so a frame is never told memory is short while a warm buffer
+    /// would hold it.
+    #[test]
+    fn the_headroom_is_what_one_grant_can_take() {
+        let budget = MemoryBudget::new(8_192, 0).unwrap();
+        let mut bus = BusBudget::new(budget.clone());
+        assert_eq!(bus.headroom(), 8_192);
+        let frame = bus.reserve(4_000, Lane::Class(Class::Publish)).unwrap();
+        assert_eq!(bus.headroom(), 4_096);
+        bus.release(frame);
+        // Kept warm, the buffer is still charged, and still given to a grant that needs it.
+        assert_eq!(budget.stats().used, 4_096);
+        assert_eq!(bus.headroom(), 8_192);
+        let whole = bus.reserve(8_192, Lane::Class(Class::Deliver)).unwrap();
+        assert_eq!(bus.headroom(), 0);
+        assert_eq!(
+            bus.reserve(1, Lane::Class(Class::Control)).err(),
+            Some(Refusal::Budget)
+        );
+        bus.release(whole);
+        drop(bus);
+        assert_eq!(budget.stats().used, 0);
     }
 }
