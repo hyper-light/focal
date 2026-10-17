@@ -1096,6 +1096,12 @@ impl StreamsState {
         self.send_window = send_window;
     }
 
+    /// What a shrunk receive window has yet to take out of the credit already given: the reads
+    /// still to be absorbed before `local_max_data` moves again (patch Q24).
+    pub(crate) fn receive_window_shrink_debt(&self) -> u64 {
+        self.receive_window_shrink_debt
+    }
+
     /// Set the receive_window and returns whether the receive_window has been
     /// expanded or shrunk: true if expanded, false if shrunk.
     pub(crate) fn set_receive_window(&mut self, receive_window: VarInt) -> bool {

@@ -311,6 +311,23 @@ impl Admission {
             .iter_mut()
             .find(|held| held.key == connection)
     }
+    /// Since when `connection` of `peer` has moved nothing: none of its exchanges under way, and
+    /// nothing begun, ended or carried on it since the instant returned. `None` while an exchange
+    /// is under way, or for a connection not charged here. It is idle once that is the quiet
+    /// period ago, the rule replacement keeps.
+    pub(crate) fn quiet_since(&self, peer: PeerId, connection: ConnectionKey) -> Option<Instant> {
+        self.identities
+            .binary_search_by_key(&peer, |identity| identity.peer)
+            .ok()
+            .and_then(|at| self.identities.get(at))
+            .and_then(|identity| identity.held.iter().find(|held| held.key == connection))
+            .filter(|held| held.serving == 0)
+            .map(|held| held.moved)
+    }
+    /// The quiet period after which a connection that moved nothing is idle.
+    pub(crate) fn quiet(&self) -> Duration {
+        self.quiet
+    }
     /// `connection` of `peer` began an exchange at `tick` and `now`: it is the identity's most
     /// recently used, and the exchange keeps it from being replaced until it ends.
     pub(crate) fn begun(

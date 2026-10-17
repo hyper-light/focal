@@ -56,6 +56,16 @@ pub(crate) enum Target {
     Sim(u16),
 }
 
+impl Target {
+    /// The OS handle the shard's driver arms, if any.
+    fn raw(self) -> Option<i32> {
+        match self {
+            Self::Os(raw) => Some(raw),
+            Self::Sim(_) => None,
+        }
+    }
+}
+
 impl Future for Ready {
     type Output = Result<(), RtError>;
 
@@ -115,35 +125,156 @@ pub fn abandons_lost() -> u64 {
 }
 
 impl Ready {
-    /// Ends the armed wait, if any: its own shard withdraws it from its table and gives its slot back. On
-    /// another shard, or off any, the wait is marked abandoned on its shard's registry entry, which its
-    /// next control drain sweeps: a mark per slot, never refused for room (mantle's final review, second
-    /// pass, finding 4, and third pass, A: a control message could meet a full channel and leak the slot).
+    /// Ends the armed wait, if any ([`abandon`]).
     fn abandon(&mut self) {
-        let Some((ticket, word)) = self.armed.take() else {
-            return;
-        };
         let writable = matches!(self.interest, Interest::Writable);
-        let raw = match self.target {
-            Target::Os(raw) => Some(raw),
-            Target::Sim(_) => None,
+        abandon(self.target.raw(), writable, self.armed.take());
+    }
+}
+
+/// Ends an armed wait, if any: its own shard withdraws it from its table and gives its slot back. On
+/// another shard, or off any, the wait is marked abandoned on its shard's registry entry, which its next
+/// control drain sweeps: a mark per slot, never refused for room (mantle's final review, second pass,
+/// finding 4, and third pass, A: a control message could meet a full channel and leak the slot). A
+/// group's own slot ends the same way, its listed members with it.
+fn abandon(raw: Option<i32>, writable: bool, armed: Option<(Ticket, Encoded)>) {
+    let Some((ticket, word)) = armed else {
+        return;
+    };
+    let here = registry::with_current(|ctx| {
+        ctx.owns(ticket)
+            .then(|| ctx.abandon_interest(raw, writable, word, ticket))
+            .is_some()
+    })
+    .unwrap_or(false);
+    if here {
+        return;
+    }
+    let marked = registry::with_holder(ticket.owner(), |entry| {
+        entry.mark_abandoned(ticket.slot(), ticket.generation())
+    });
+    // `None`: the owner is gone, and its slots with it.
+    if marked == Some(false) {
+        ABANDONS_LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Readiness waits on many handles for one task, told in the order they fired (docs/runtime.md §3.7). A
+/// task that awaits each of n handles with a [`Ready`] of its own asks every one whether it fired at
+/// each poll: n asks a wake, however few fired. hyper-rt-transport's driver, with a socket for each of
+/// its connections, spent 5.5 µs more an exchange holding 512 than holding one (its `connections`
+/// bench, Linux). A group's members are armed as a `Ready` is, one-shot on the shard's driver for the
+/// polling task, each with a key its owner chooses. When a member fires, or its registration is
+/// refused, the shard puts it last on the group's list, and [`ReadyGroup::next_fired`] takes the list
+/// in that order: a wake costs what fired. The group holds one wait slot of its own (a share of
+/// `interests_per_shard`) from its first member on, on the shard that member was armed on; armed on
+/// another shard, it opens there afresh. Dropped, it lets go of its slot and of the members on its list.
+#[derive(Debug, Default)]
+pub struct ReadyGroup {
+    /// The group's slot and the task word it was opened for, while it holds one.
+    open: Option<(Ticket, Encoded)>,
+}
+
+/// A member a [`ReadyGroup`] told fired: its key, and `Ok` when its handle fired or the refusal when
+/// its registration was refused.
+pub type Fired = (u64, Result<(), RtError>);
+
+/// One armed member of a [`ReadyGroup`]. Its wait ends when its group says it fired, or when the
+/// member is dropped while armed, which withdraws the wait as a dropped [`Ready`] does. Dropped after
+/// its group told it fired, it does nothing.
+#[derive(Debug)]
+pub struct Member {
+    target: Target,
+    writable: bool,
+    armed: Option<(Ticket, Encoded)>,
+}
+
+impl Drop for Member {
+    fn drop(&mut self) {
+        abandon(self.target.raw(), self.writable, self.armed.take());
+    }
+}
+
+impl ReadyGroup {
+    /// A group holding no slot yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { open: None }
+    }
+
+    /// Arms a one-shot wait on `target`'s readability (or writability) for the task polling with `cx`, a
+    /// member keyed `key`. Refused `Capacity` when every wait slot is taken, `NotOnShardThread` off a
+    /// shard's task.
+    pub(crate) fn arm(
+        &mut self,
+        cx: &Context<'_>,
+        target: Target,
+        writable: bool,
+        key: u64,
+    ) -> Result<Member, RtError> {
+        let Some(word) = polling_task(cx.waker()) else {
+            return Err(RtError::NotOnShardThread);
         };
-        let here = registry::with_current(|ctx| {
-            ctx.owns(ticket)
-                .then(|| ctx.abandon_interest(raw, writable, word, ticket))
-                .is_some()
-        })
-        .unwrap_or(false);
-        if here {
-            return;
-        }
-        let marked = registry::with_holder(ticket.owner(), |entry| {
-            entry.mark_abandoned(ticket.slot(), ticket.generation())
+        let group = self.open_here(word)?;
+        let registered = registry::with_current(|ctx| match target {
+            Target::Os(raw) => ctx.group_member(group, Some(raw), writable, word, key),
+            Target::Sim(index) => {
+                ctx.group_member(group, None, writable, word, key)
+                    .and_then(|ticket| {
+                        crate::sim::sim_register(index, writable, word, ticket)
+                            .map(|()| ticket)
+                            .inspect_err(|_| {
+                                ctx.abandon_interest(None, writable, word, ticket);
+                            })
+                    })
+            }
         });
-        // `None`: the owner is gone, and its slots with it.
-        if marked == Some(false) {
-            ABANDONS_LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match registered {
+            Some(Ok(ticket)) => Ok(Member {
+                target,
+                writable,
+                armed: Some((ticket, word)),
+            }),
+            Some(Err(e)) => Err(e),
+            None => Err(RtError::NotOnShardThread),
         }
+    }
+
+    /// The group's slot on the current shard: the one it holds, or one opened for the task `word` names
+    /// where it holds none here (none yet, another shard's, or one that ended).
+    fn open_here(&mut self, word: Encoded) -> Result<Ticket, RtError> {
+        if let Some((ticket, _)) = self.open
+            && registry::with_current(|ctx| ctx.group_live(ticket)).unwrap_or(false)
+        {
+            return Ok(ticket);
+        }
+        self.close();
+        let ticket = registry::with_current(|ctx| ctx.group_open(word))
+            .unwrap_or(Err(RtError::NotOnShardThread))?;
+        self.open = Some((ticket, word));
+        Ok(ticket)
+    }
+
+    /// The next member that fired since the last call, in the order they fired: its key, and `Ok` when its
+    /// handle fired or the refusal when its registration was refused. That member's wait has ended: its
+    /// owner arms it again to wait again. `None` when none fired since. Refused `DriverLost` once the
+    /// shard's driver is gone.
+    pub fn next_fired(&mut self) -> Result<Option<Fired>, RtError> {
+        let Some((ticket, _)) = self.open else {
+            return Ok(None);
+        };
+        registry::with_current(|ctx| ctx.group_next(ticket)).unwrap_or(Ok(None))
+    }
+
+    /// Lets go of the group's slot and the members on its list, as a dropped wait is let go.
+    fn close(&mut self) {
+        abandon(None, false, self.open.take());
+    }
+}
+
+impl Drop for ReadyGroup {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 

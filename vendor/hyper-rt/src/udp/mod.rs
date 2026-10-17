@@ -31,6 +31,8 @@ mod linux;
 mod macos;
 
 mod batched;
+#[cfg(any(target_os = "linux", test))]
+mod carry;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -528,6 +530,28 @@ impl UdpSocket {
     /// through a handle (a kept demultiplexer, AUD-29-08) can await it outside the handle's borrow.
     pub fn readable(&self) -> crate::readiness::Ready {
         ready(self.target(), false)
+    }
+
+    /// Arms a one-shot wait on the socket's read readiness in `group` for the task polling with `cx`, a
+    /// member keyed `key` ([`crate::readiness::ReadyGroup`]): the group tells when it fired, among its
+    /// other members, in what fired alone. As with [`UdpSocket::readable`], a fire may be spurious.
+    pub fn readable_in(
+        &self,
+        group: &mut crate::readiness::ReadyGroup,
+        cx: &std::task::Context<'_>,
+        key: u64,
+    ) -> Result<crate::readiness::Member, RtError> {
+        group.arm(cx, self.target(), false, key)
+    }
+
+    /// [`UdpSocket::readable_in`] for the socket's write readiness (send-buffer space).
+    pub fn writable_in(
+        &self,
+        group: &mut crate::readiness::ReadyGroup,
+        cx: &std::task::Context<'_>,
+        key: u64,
+    ) -> Result<crate::readiness::Member, RtError> {
+        group.arm(cx, self.target(), true, key)
     }
 
     /// Takes one waiting datagram into `buf` without blocking: the byte count and the sender, or `None`

@@ -13,8 +13,10 @@
 //! **In flight.** The network holds what is in flight in an arena of [`NetLimits::messages`] slots
 //! and [`NetLimits::bytes`] bytes, the capacity `C` of §7; the world holds an event naming the slot
 //! ([`Ticket`]). Past the capacity the oldest message in flight is lost and counted, as slates' and
-//! hyper-raft's harnesses lose it: a loss the protocol must tolerate (Raft thesis §3.3). A test
-//! whose overflow losses pass its drawn losses has stated `C` too small for its schedule.
+//! hyper-raft's harnesses lose it: a loss the protocol must tolerate (Raft thesis §3.3). Its arrival
+//! leaves the world with it ([`World::cancel`]), so the world holds at most `C` arrivals however much
+//! the capacity loses. A test whose overflow losses pass its drawn losses has stated `C` too small for
+//! its schedule.
 //!
 //! A message is **duplicated** by being delivered and kept: it stays in its slot and arrives again
 //! after a fresh propagation delay (hyper-raft's `keep`), so a duplicate adds nothing to the bound.
@@ -27,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::clock::PPM;
 use crate::error::SimError;
-use crate::world::{NodeId, StreamId, World};
+use crate::world::{EventId, NodeId, StreamId, World};
 
 /// Nanoseconds in a second.
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
@@ -719,6 +721,8 @@ struct Held<P> {
     to: NodeId,
     bytes: usize,
     payload: P,
+    /// The world's event that carries it to its next arrival, once scheduled.
+    arrival: Option<EventId>,
 }
 
 /// The messages in flight: slots reused once delivered, at most `messages` of them and `bytes`.
@@ -746,6 +750,15 @@ impl<P> Flight<P> {
         self.slots
             .get(slot)?
             .as_ref()
+            .filter(|held| held.send == ticket.send)
+    }
+
+    /// The message `ticket` names, to change, if it is still held.
+    fn get_mut(&mut self, ticket: Ticket) -> Option<&mut Held<P>> {
+        let slot = usize::try_from(ticket.slot).ok()?;
+        self.slots
+            .get_mut(slot)?
+            .as_mut()
             .filter(|held| held.send == ticket.send)
     }
 
@@ -1238,8 +1251,9 @@ impl<P: Clone> Net<P> {
     }
 
     /// Makes room in flight for `bytes` more: the oldest messages are lost and counted until it
-    /// fits. A message larger than the network holds in all does not fit.
-    fn make_room(&mut self, bytes: usize) -> bool {
+    /// fits, each taking its arrival out of the world. A message larger than the network holds in
+    /// all does not fit.
+    fn make_room<E>(&mut self, world: &mut World<E>, bytes: usize) -> bool {
         if bytes > self.limits.bytes {
             return false;
         }
@@ -1249,7 +1263,9 @@ impl<P: Clone> Net<P> {
             let Some(oldest) = self.flight.oldest() else {
                 return false;
             };
-            self.flight.take(oldest);
+            if let Some(arrival) = self.flight.take(oldest).and_then(|held| held.arrival) {
+                world.cancel(arrival);
+            }
             bump(&mut self.stats.dropped_capacity);
         }
         true
@@ -1344,7 +1360,7 @@ impl<P: Clone> Net<P> {
         {
             at = at.max(previous);
         }
-        if !self.make_room(bytes) {
+        if !self.make_room(world, bytes) {
             return Ok(self.dropped(Dropped::Capacity));
         }
         let send = self.sends;
@@ -1355,14 +1371,22 @@ impl<P: Clone> Net<P> {
             to: pair.1,
             bytes,
             payload,
+            arrival: None,
         };
         let Some(ticket) = self.flight.hold(held) else {
             return Ok(self.dropped(Dropped::Capacity));
         };
-        if let Err(error) = world.schedule(at, pair.1, arrival(ticket)) {
-            // Nothing will carry it: it is not in flight.
-            self.flight.take(ticket);
-            return Err(error);
+        match world.schedule(at, pair.1, arrival(ticket)) {
+            Ok(event) => {
+                if let Some(held) = self.flight.get_mut(ticket) {
+                    held.arrival = Some(event);
+                }
+            }
+            Err(error) => {
+                // Nothing will carry it: it is not in flight.
+                self.flight.take(ticket);
+                return Err(error);
+            }
         }
         flow.last_arrival = Some(at);
         Ok(Fate::Arrives { at })
@@ -1445,11 +1469,17 @@ impl<P: Clone> Net<P> {
         if self.flows.contains_key(&pair) || self.flows.len() < self.limits.flows {
             self.flows.insert(pair, flow);
         }
-        if let Err(error) = world.schedule(world.now().saturating_add(delay), pair.1, again(ticket))
-        {
-            // Nothing will carry it again: it leaves flight with this delivery.
-            self.flight.take(ticket);
-            return Err(error);
+        match world.schedule(world.now().saturating_add(delay), pair.1, again(ticket)) {
+            Ok(event) => {
+                if let Some(held) = self.flight.get_mut(ticket) {
+                    held.arrival = Some(event);
+                }
+            }
+            Err(error) => {
+                // Nothing will carry it again: it leaves flight with this delivery.
+                self.flight.take(ticket);
+                return Err(error);
+            }
         }
         bump(&mut self.stats.delivered);
         bump(&mut self.stats.duplicated);

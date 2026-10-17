@@ -289,6 +289,13 @@ pub struct Stats {
     pub receive_granted: u64,
     /// Connections refused for the queue holding no more first windows.
     pub receive_refused: u64,
+    /// Windows set back to their first because their connections were idle when another window's
+    /// growth, or a connection's first window, was refused for what they held (`credit`'s window
+    /// set back).
+    pub windows_set_back: u64,
+    /// Connections closed because they stayed idle for a quiet period after their windows were
+    /// set back, owing what was wanted again ([`Refusal::ReceiveBuffer`]).
+    pub windows_closed: u64,
     /// Connections that receive on a socket of their own ([`Endpoint::set_peer_room`]).
     pub receive_rooms: usize,
     /// Datagrams copied into buffers of their own because no chunk could take them.
@@ -356,6 +363,11 @@ struct Conn<R> {
     delivered: Delivered,
     /// The budget's grants for the receive window: the initial one and one per growth.
     grants: Vec<Reservation>,
+    /// When its window was set back, while its growth's grants go back as its peer's reads pay
+    /// what QUIC still owes of the credit given (`Core::repay`).
+    set_back: Option<Instant>,
+    /// It waits in `Core::grown`, once.
+    listed: bool,
     /// The connection was lost and its owner told.
     lost: bool,
     /// The room of the socket it receives on alone, once its driver connected one to its peer
@@ -503,6 +515,14 @@ pub struct Endpoint<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role
     keys: Vec<usize>,
 }
 
+/// What a window's growth or a connection's first window was refused for since the endpoint last
+/// set back idle windows: room in the shared socket's queue, or the budget's bytes.
+#[derive(Clone, Copy, Debug, Default)]
+struct Wanted {
+    room: bool,
+    budget: bool,
+}
+
 /// Where a connection waits to be read again (`Endpoint::touched`, `rearm`, `sending`).
 #[derive(Clone, Copy, Debug, Default)]
 struct Marks {
@@ -550,6 +570,12 @@ struct Core<C: Classes, B, D> {
     /// The room a handshake's peer's unprompted messages take, as last said
     /// ([`Endpoint::set_receive_capacity`]): what a first window is taken with.
     handshake_room: u64,
+    /// The connections whose windows grew, each by its key and serial, once: what an idle one's
+    /// window is set back from when another wants what it holds. Bounded by the connections held;
+    /// one that goes leaves it.
+    grown: VecDeque<(usize, u64)>,
+    /// What a refused growth or first window wanted since the last pass over `grown`.
+    wanted: Wanted,
     /// Moves whenever a connection is identified or goes ([`Endpoint::connection_generation`]).
     generation: u64,
     /// Lanes whose next frame waits for the budget ([`Reading::Reserving`]) and that their owner
@@ -653,6 +679,32 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         directory: D,
         now: Instant,
     ) -> Result<Self, Refusal> {
+        Self::build(config, budget, directory, now, None)
+    }
+
+    /// [`Endpoint::new`], with the QUIC layer's own randomness drawn from `seed` where the
+    /// system's would be: its connection identifiers, reset tokens and the reserved transport
+    /// parameter whose random length moves a handshake's sizes (hyper-quic
+    /// `ReservedTransportParameter::random`). For a simulation whose run must be the same from
+    /// one seed (`docs/sim.md` §3.9); TLS draws its own, which move no size where its signatures
+    /// are of fixed length.
+    pub fn new_seeded(
+        config: Config<C::Role>,
+        budget: B,
+        directory: D,
+        now: Instant,
+        seed: [u8; 32],
+    ) -> Result<Self, Refusal> {
+        Self::build(config, budget, directory, now, Some(seed))
+    }
+
+    fn build(
+        config: Config<C::Role>,
+        budget: B,
+        directory: D,
+        now: Instant,
+        seed: Option<[u8; 32]>,
+    ) -> Result<Self, Refusal> {
         config.limits.validate()?;
         let transport = config.limits.transport(C::RANKS, &config.congestion)?;
         let (server, client) = config.tls.prepare(&transport)?;
@@ -664,7 +716,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .map_err(|_| Refusal::Configuration)?;
         endpoint.config_slots(config_slots(&config.limits.admission)?);
         let mut quic =
-            hyper_quic::Endpoint::new(endpoint, server, true, None).map_err(|_| Refusal::Quic)?;
+            hyper_quic::Endpoint::new(endpoint, server, true, seed).map_err(|_| Refusal::Quic)?;
         let client = quic
             .insert_client_config(client)
             .map_err(|_| Refusal::Quic)?;
@@ -702,6 +754,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 pool: Pool::new(u64::from(limits.streams_per_connection)),
                 room: Room::unbounded(),
                 handshake_room: 0,
+                grown: VecDeque::with_capacity(limits.admission.connections),
+                wanted: Wanted::default(),
                 generation: 0,
                 reserving: 0,
                 reserving_at: Vec::new(),
@@ -898,6 +952,62 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         }
     }
 
+    /// Takes back what idle connections' grown windows hold, once a window's growth or a
+    /// connection's first window was refused for it (`credit`'s window set back): the shared
+    /// socket's room, which only connections receiving on it hold, or the budget, which every one
+    /// does. An idle connection whose window grew is set back to its first. One set back that has
+    /// moved nothing since, for a quiet period, still owing what is wanted, is closed
+    /// ([`Refusal::ReceiveBuffer`]): its peer sent nothing that would pay it, and QUIC takes back no
+    /// credit it gave (RFC 9000 §4.1). Idle is admission's rule: no exchange under way and nothing
+    /// moved for its quiet period, the endpoint's serve period. A connection not idle, or holding
+    /// none of what was wanted, keeps its place; one whose growth all went back leaves the list,
+    /// and one gone, or whose key is another's now, is passed.
+    fn take_back_windows(&mut self) {
+        let wanted = std::mem::take(&mut self.core.wanted);
+        if !(wanted.room || wanted.budget) {
+            return;
+        }
+        let now = self.core.now;
+        let quiet = self.core.admission.quiet();
+        for _ in 0..self.core.grown.len() {
+            let Some((key, serial)) = self.core.grown.pop_front() else {
+                break;
+            };
+            let close = match self.conns.get_mut(key) {
+                Some(Some(conn)) if conn.serial == serial => {
+                    if !conn.window.grown() && conn.set_back.is_none() {
+                        conn.listed = false;
+                        continue;
+                    }
+                    let since = conn
+                        .peer
+                        .and_then(|(peer, _)| self.core.admission.quiet_since(peer, key));
+                    let idle =
+                        since.is_some_and(|since| now.saturating_duration_since(since) >= quiet);
+                    let holds = wanted.budget || (wanted.room && conn.room.is_none());
+                    match (conn.set_back, since) {
+                        _ if !(idle && holds) || conn.lost => false,
+                        // Moved strictly before it was set back: a move at the instant of the
+                        // set back may have come after it, and earns a quiet period afresh.
+                        (Some(at), Some(since)) if since < at => {
+                            now.saturating_duration_since(at) >= quiet
+                        }
+                        _ => {
+                            self.core.set_back(conn, now);
+                            false
+                        }
+                    }
+                }
+                _ => continue,
+            };
+            self.core.grown.push_back((key, serial));
+            if close {
+                self.core.stats.windows_closed = self.core.stats.windows_closed.saturating_add(1);
+                self.close(now, key, Refusal::ReceiveBuffer.code());
+            }
+        }
+    }
+
     /// Connection `key` waits for its turn to transmit, once.
     fn queue_sending(&mut self, key: usize) {
         if let Some(marks) = self.marks.get_mut(key)
@@ -923,6 +1033,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// transmit and placed again by its deadline, and those only to be re-armed are placed again.
     fn read_touched(&mut self) {
         self.grant_pool();
+        self.take_back_windows();
         let mut touched = std::mem::take(&mut self.touched);
         for &key in &touched {
             if let Some(marks) = self.marks.get_mut(key) {
@@ -1877,6 +1988,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             window: Window::new(initial, limits.window_ceiling),
             delivered: Delivered::new(C::RANKS),
             grants,
+            set_back: None,
+            listed: false,
             lost: false,
             room: None,
             share: Share::default(),
@@ -2004,11 +2117,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// first, then the budget's bytes.
     fn window_grant(&mut self) -> Result<Reservation, Refusal> {
         let bytes = Self::first_window();
-        self.room.first(bytes, self.handshake_room)?;
+        if let Err(refusal) = self.room.first(bytes, self.handshake_room) {
+            self.wanted.room = true;
+            return Err(refusal);
+        }
         match self.budget.reserve(bytes, Lane::Window) {
             Ok(grant) => Ok(grant),
             Err(refusal) => {
                 self.room.release(bytes);
+                self.wanted.budget = true;
                 Err(refusal)
             }
         }
@@ -2394,6 +2511,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// The connection drained: what it held goes back.
     fn gone(&mut self, key: usize, mut conn: Box<Conn<C::Role>>) {
         self.lost(key, &mut conn);
+        if conn.listed {
+            let serial = conn.serial;
+            self.grown
+                .retain(|&(listed, of)| !(listed == key && of == serial));
+        }
         // A connection's windows go back to the room that held them: the shared socket's, or the
         // room of its own, which goes with it.
         let shared = conn.room.is_none();
@@ -3584,6 +3706,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// Grow the receive window if the owner consumed a whole one within two round trips and the
     /// budget funds the growth: the window is `min(BDP, share)` (node.md §3.3).
     fn tune(&mut self, now: Instant, conn: &mut Conn<C::Role>) {
+        if conn.set_back.is_some() {
+            self.repay(conn);
+        }
         let Some(grown) = conn.window.tune(now, conn.quic.rtt(), self.granularity) else {
             return;
         };
@@ -3598,6 +3723,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             }
         };
         if !grew {
+            // What idle connections hold of the shared room is set back for it; a room of its
+            // own no other connection holds.
+            self.wanted.room |= conn.room.is_none();
             return;
         }
         let Ok(grant) = self.budget.reserve(more, Lane::Window) else {
@@ -3605,13 +3733,76 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 Some(room) => room.release(more),
                 None => self.room.release(more),
             }
+            self.wanted.budget = true;
             return;
         };
         conn.grants.push(grant);
         conn.window.grew(grown);
+        if !conn.listed {
+            conn.listed = true;
+            self.grown.push_back((conn.key, conn.serial));
+        }
         let reserve = class_reserve(C::RANKS.saturating_sub(1));
         if let Ok(window) = VarInt::from_u64(grown.saturating_add(reserve)) {
             conn.quic.set_receive_window(window);
+        }
+    }
+
+    /// Sets `conn`'s window back to its first (`credit`'s window set back). QUIC keeps the credit
+    /// its peer was given (RFC 9000 §4.1), so the window shrinks as the peer's reads pay it
+    /// (hyper-quic's debt, `Connection::receive_window_debt`), and what the growth holds goes back
+    /// as they do ([`Core::repay`]).
+    fn set_back(&mut self, conn: &mut Conn<C::Role>, now: Instant) {
+        conn.set_back = Some(now);
+        if !conn.window.grown() {
+            return;
+        }
+        conn.window.set_back();
+        let reserve = class_reserve(C::RANKS.saturating_sub(1));
+        if let Ok(window) = VarInt::from_u64(conn.window.window().saturating_add(reserve)) {
+            conn.quic.set_receive_window(window);
+        }
+        self.stats.windows_set_back = self.stats.windows_set_back.saturating_add(1);
+        self.repay(conn);
+    }
+
+    /// The grants of a window set back, the latest first, go back to its room and the budget
+    /// while what stays still holds what its peer may send: the window and the reserve on top of
+    /// it, and what QUIC still owes of the credit given before the window was set back. A grant
+    /// goes back whole, so what is held never falls below that.
+    fn repay(&mut self, conn: &mut Conn<C::Role>) {
+        let reserve = class_reserve(C::RANKS.saturating_sub(1));
+        let debt = conn.quic.receive_window_debt();
+        let owed = conn
+            .window
+            .window()
+            .saturating_add(reserve)
+            .saturating_add(debt);
+        let mut held = conn
+            .grants
+            .iter()
+            .map(Reservation::granted)
+            .fold(0u64, u64::saturating_add);
+        while conn.grants.len() > 1 {
+            let Some(last) = conn.grants.last().map(Reservation::granted) else {
+                break;
+            };
+            let rest = held.saturating_sub(last);
+            if rest < owed {
+                break;
+            }
+            let Some(grant) = conn.grants.pop() else {
+                break;
+            };
+            held = rest;
+            match conn.room.as_mut() {
+                Some(room) => room.release(grant.granted()),
+                None => self.room.release(grant.granted()),
+            }
+            self.budget.release(grant);
+        }
+        if debt == 0 {
+            conn.set_back = None;
         }
     }
 

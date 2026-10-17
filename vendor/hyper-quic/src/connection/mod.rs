@@ -2061,6 +2061,15 @@ impl Connection {
         self.streams.set_send_window(send_window);
     }
 
+    /// What a receive window shrunk by [`set_receive_window`](Self::set_receive_window) has yet
+    /// to take back (patch Q24). The credit a peer was given stands (RFC 9000 §4.1: "it is not an
+    /// error to advertise a smaller limit, but the smaller limit has no effect"), so a shrink is
+    /// held as this debt, and the application's reads pay it before the connection's limit moves
+    /// again: the peer may still send at most the window and the debt beyond what was read.
+    pub fn receive_window_debt(&self) -> u64 {
+        self.streams.receive_window_shrink_debt()
+    }
+
     /// See [`TransportConfig::receive_window()`]
     pub fn set_receive_window(&mut self, receive_window: VarInt) {
         if self.streams.set_receive_window(receive_window) {

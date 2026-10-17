@@ -11,6 +11,7 @@ use std::time::Instant;
 use crate::clock::{Anchor, Clock, PPM};
 use crate::error::SimError;
 use crate::queue::{Discipline, Key, Queue};
+use crate::tape::{Bounds, Tape};
 use crate::trace::{Chooser, Digest, Trace};
 use crate::wakes::{Armed, DISARMED, Wakes};
 
@@ -29,6 +30,20 @@ pub enum Source {
     Seed(u64),
     /// Read from a recorded trace: the run it records, reproduced without its seed.
     Trace(Trace),
+    /// Read from a decision tape, step by step (`crate::tape`): each decision reduced to its bound
+    /// from the next word of the step the harness is in ([`World::end_step`] closes one), and from
+    /// SplitMix64 seeded with `filler` past a step's own words, so any tape is a feasible run. The
+    /// tape the run took comes back in its [`Record`], and replays it exactly; an empty tape is a
+    /// fresh run of the filler's. A strategy mutates and shrinks a world's runs through it, as
+    /// hyper-check does a harness's own (`docs/sim.md` §18).
+    Tape {
+        /// The tape played.
+        tape: Tape,
+        /// The seed of the words past a step's own.
+        filler: u64,
+        /// What the tape the run takes may hold.
+        bounds: Bounds,
+    },
 }
 
 /// The bounds a run states (`docs/sim.md` §7): each is the harness's, derived from its schedule,
@@ -213,6 +228,9 @@ pub struct Record {
     pub digest: Digest,
     /// Every decision, replayable.
     pub trace: Trace,
+    /// The tape the run took, step by step, when it played one ([`Source::Tape`]): it replays the
+    /// run exactly.
+    pub tape: Option<Tape>,
     /// Steps taken.
     pub steps: u64,
     /// Virtual time at the end.
@@ -235,6 +253,11 @@ const EVENT: u64 = 1;
 const WAKE: u64 = 2;
 /// The tag of an observation folded into the digest.
 const OBSERVED: u64 = 3;
+
+/// An event scheduled and not yet stepped, by its place among the pending: no later event shares
+/// it, since its scheduling ordinal is unique.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventId(Key);
 
 /// The world. `E` is what the harness schedules: its messages, ticks, completions.
 #[derive(Clone, Debug)]
@@ -262,6 +285,11 @@ impl<E> World<E> {
         let mut chooser = match source {
             Source::Seed(seed) => Chooser::recording(seed, limits.streams, limits.trace_words)?,
             Source::Trace(trace) => Chooser::replaying(trace, limits.streams),
+            Source::Tape {
+                tape,
+                filler,
+                bounds,
+            } => Chooser::playing(tape, filler, bounds, limits.streams, limits.trace_words)?,
         };
         let schedule = chooser.stream("schedule", &[])?;
         Ok(Self {
@@ -329,6 +357,13 @@ impl<E> World<E> {
     /// True with probability `ppm` parts per million, from `stream`.
     pub fn chance(&mut self, stream: StreamId, ppm: u32) -> Result<bool, SimError> {
         Ok(self.below(stream, u64::from(PPM))? < u64::from(ppm))
+    }
+
+    /// The harness's step is over, of `kind`: a played tape's step closes there ([`Source::Tape`]),
+    /// and nothing happens otherwise. A step is the harness's own (a schedule's operation, the
+    /// events it took), so a tape's mutations respect the steps it names.
+    pub fn end_step(&mut self, kind: u8) -> Result<(), SimError> {
+        self.chooser.end_step(kind)
     }
 
     /// An observation folded into the digest: what the harness will judge, so a run that
@@ -434,17 +469,26 @@ impl<E> World<E> {
         Ok(())
     }
 
-    /// `event` for `node`, due at virtual time `at`.
-    pub fn schedule(&mut self, at: u64, node: NodeId, event: E) -> Result<(), SimError> {
+    /// `event` for `node`, due at virtual time `at`: its name, which [`cancel`](Self::cancel)
+    /// takes.
+    pub fn schedule(&mut self, at: u64, node: NodeId, event: E) -> Result<EventId, SimError> {
         self.held(node)?;
         if at < self.now {
             return Err(SimError::InThePast { at, now: self.now });
         }
-        self.queue.push(at, node.0, event)
+        self.queue.push(at, node.0, event).map(EventId)
+    }
+
+    /// Takes back event `id` before a step takes it: its payload, or `None` if a step took it, or
+    /// it was taken back, already. What no step took enters no digest and no trace, so a harness
+    /// takes back an event that has come to name nothing (a message the network lost to its
+    /// capacity), and it no longer holds a place among the world's events.
+    pub fn cancel(&mut self, id: EventId) -> Option<E> {
+        self.queue.cancel(id.0)
     }
 
     /// `event` for `node`, due `delay_ns` from now.
-    pub fn after(&mut self, delay_ns: u64, node: NodeId, event: E) -> Result<(), SimError> {
+    pub fn after(&mut self, delay_ns: u64, node: NodeId, event: E) -> Result<EventId, SimError> {
         let at = self
             .now
             .checked_add(delay_ns)
@@ -604,12 +648,13 @@ impl<E> World<E> {
 
     /// The run's record: its digest, its trace, its steps and its clock.
     pub fn finish(self) -> Record {
-        let (trace, digest) = self.chooser.finish();
+        let (trace, digest, tape) = self.chooser.finish();
         Record {
             digest,
             steps: self.steps,
             now: self.now,
             trace,
+            tape,
         }
     }
 }

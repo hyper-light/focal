@@ -59,7 +59,7 @@ impl<E> Queue<E> {
         self.live
     }
 
-    pub(crate) fn push(&mut self, at: u64, node: u32, event: E) -> Result<(), SimError> {
+    pub(crate) fn push(&mut self, at: u64, node: u32, event: E) -> Result<Key, SimError> {
         let full = SimError::Full {
             what: "events",
             bound: self.bound,
@@ -91,7 +91,25 @@ impl<E> Queue<E> {
         self.next_seq = self.next_seq.saturating_add(1);
         self.live = self.live.saturating_add(1);
         self.insert(key);
-        Ok(())
+        Ok(key)
+    }
+
+    /// The payload of `key`, taken back from the pending before any step took it; `None` if a step
+    /// took it, or it was taken back, already. Its place goes: the heap is rebuilt without it, or
+    /// the dense vector's last key takes its index.
+    pub(crate) fn cancel(&mut self, key: Key) -> Option<E> {
+        let pending = match self.discipline {
+            Discipline::Ordered => {
+                let before = self.heap.len();
+                self.heap.retain(|Reverse(held)| *held != key);
+                self.heap.len() != before
+            }
+            Discipline::Free => {
+                let at = self.dense.iter().position(|held| *held == key);
+                at.and_then(|at| self.remove_dense(at)).is_some()
+            }
+        };
+        if pending { self.take(key) } else { None }
     }
 
     /// A key put back among the pending: a tie the strategy did not take.

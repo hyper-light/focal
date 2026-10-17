@@ -1,9 +1,10 @@
-//! The wakes another thread sends a shard (docs/runtime.md §3.2): one bit per task slot, in 64-bit words,
-//! with a summary bit per word and one pending flag above them, the two-level shape of the Linux block
-//! layer's scalable bitmap of tags (`lib/sbitmap.c`).
+//! The wakes another thread sends a shard (docs/runtime.md §3.2): one bit per task slot, in 64-bit words, as
+//! the Linux block layer keeps its tags (`lib/sbitmap.c`, read at `v6.12`), with a summary bit per word and
+//! one pending flag above them, which are this crate's own: `sbitmap` keeps no summary, and spreads its words
+//! one to a cache line where these are packed (`docs/research/runtime-sources.md` §2).
 //!
 //! A wake is a `fetch_or` on the slot's bit, then a `fetch_or` on its word's summary bit when that word went
-//! from empty to non-empty (as `sbitmap` does) or the summary bit reads clear, then a swap of the pending flag;
+//! from empty to non-empty or the summary bit reads clear, then a swap of the pending flag;
 //! so most wakes write one cache line, not the summary word every waker of 4,096 slots shares (slates-dc's
 //! review, 2026-10-06), and no wake waits on another waker to mark the summary for it. The shard
 //! drains by swapping the flag, then each marked summary word, then each marked word, to zero: summary
@@ -127,11 +128,10 @@ impl WakeBitmap {
         {
             summary.fetch_or(mark, Ordering::AcqRel);
         }
-        // A read-modify-write, not a plain store: every wake already pays two, and with a plain `Release` store
-        // loom 0.7.2 explored an execution in which this thread's own later load read the flag's earlier value,
-        // which coherence forbids, and the parking model lost the wake (2026-10-06). With the swap the three
-        // parking models pass (37, 44 and 1,993 interleavings). Reducing that execution to a loom report is
-        // open (docs/runtime.md §15).
+        // A read-modify-write, where a plain `Release` store would do: the parking protocol's `SeqCst` fences
+        // order the store before the shard's re-check ([atomics.fences]), and the parking models pass with it.
+        // The swap was taken for a loom 0.7.2 false alarm, reduced in docs/research/runtime-sources.md §4; it
+        // stays until a measurement shows the store cheaper on this path.
         self.head.pending.swap(true, Ordering::AcqRel);
         true
     }

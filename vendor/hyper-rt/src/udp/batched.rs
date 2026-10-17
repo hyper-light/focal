@@ -325,6 +325,9 @@ struct Linux {
     send: linux::Headers,
     receive: linux::Headers,
     received: Vec<linux::Received>,
+    /// The kernel's stamps carried to the shard's clock, from the first stamped receive (the shard's
+    /// clock is read on the shard, which a socket may be made off).
+    carry: Option<super::carry::Carry>,
 }
 
 impl std::fmt::Debug for Batched {
@@ -473,6 +476,7 @@ impl Batched {
                 send: linux::Headers::new(io.batch),
                 receive: linux::Headers::new(io.batch),
                 received: Vec::with_capacity(io.batch),
+                carry: None,
             };
             (linux, if raw.is_some() { io.batch } else { 1 })
         };
@@ -996,8 +1000,9 @@ impl Batched {
             Err(error) => return receive_failed("recvmmsg", &error),
         };
         stats.receive_calls = stats.receive_calls.saturating_add(1);
-        // The stamps' clock first, then the shard's: a thread preempted between the two reads then makes
-        // the age's end later, so a stamp comes out late, never early.
+        // The stamps' clock first, then the shard's: a stamp is carried by the offset between them
+        // (`super::carry::Carry`), and a thread preempted between the two reads makes it late, never
+        // early.
         let realtime_ns = if stats.kernel_stamps {
             linux::realtime_ns().map_err(|error| RtError::DriverRefused {
                 call: "clock_gettime(CLOCK_REALTIME)",
@@ -1007,6 +1012,22 @@ impl Batched {
             0
         };
         let now_ns = shard_now()?;
+        let drained = filled < offered.min(linux.receive.places());
+        let carry = if stats.kernel_stamps {
+            let carry = linux
+                .carry
+                .get_or_insert_with(|| super::carry::Carry::new(realtime_ns, now_ns));
+            carry.read(realtime_ns, now_ns);
+            let read = *carry;
+            // A batch that took less than it asked for emptied the socket, once its own stamps
+            // are carried.
+            if drained {
+                carry.emptied();
+            }
+            Some(read)
+        } else {
+            None
+        };
         let mut delivered = 0usize;
         for taken in &linux.received {
             if let (Some(told), Some(held)) = (taken.drops, stats.drops.as_mut()) {
@@ -1020,7 +1041,8 @@ impl Batched {
             };
             let stamp = taken
                 .stamp
-                .map(|stamp| now_ns.saturating_sub(realtime_ns.saturating_sub(stamp)));
+                .zip(carry)
+                .and_then(|(stamp, carry)| carry.carry(stamp));
             let arrived = arrival(latest_ns, taken.from, stamp, now_ns);
             match taken.segment {
                 Some(size) => {
@@ -1038,7 +1060,7 @@ impl Batched {
         Ok(ReceiveStep::Delivered {
             datagrams: delivered,
             messages: linux.received.len(),
-            drained: filled < offered.min(linux.receive.places()),
+            drained,
         })
     }
 

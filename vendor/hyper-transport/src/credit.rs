@@ -2,7 +2,7 @@
 //!
 //! QUIC's flow control is limit-based and quinn keeps one window per connection, so what a node
 //! buffers for a peer is bounded by that connection's receive window, and the classes share it.
-//! Four rules are kept here, each derived:
+//! Five rules are kept here, each derived:
 //!
 //! - **The class reserve** (slates `connection.rs`, `class_credit_reserve`): a class leaves unspent
 //!   one packet's stream bytes of the peer's connection credit for every class above it, so the
@@ -22,6 +22,12 @@
 //!   queue; a UDP socket has no window of its own). Measured before the rule: a focal bus node on a
 //!   Linux socket of 208 KiB granted windows to 8 MiB and dropped 1,202 datagrams in a 25-second
 //!   run of 50,000 messages a second on a busy host, each a retransmission and a congestion event.
+//! - **A window set back** (`docs/transport.md` §4t): QUIC takes back no credit it gave (RFC 9000
+//!   §4.1), so a grown window stays granted while its peer is idle. When another window's growth,
+//!   or a connection's first window, is refused for the room or the budget such windows hold, an
+//!   idle connection's grown window goes back to its first (`Window::set_back`); what the growth
+//!   held goes back as the peer's reads pay off the credit already given, never sooner. One that
+//!   stays idle a quiet period after, still owing what is wanted again, is closed.
 //! - **The stream window's ceiling** is `2 · 1,024 · d`, from the floor of hyper-quic's span bound
 //!   (patch Q5): a window `W` of frames of at least `d` bytes is left with at most `W / (2d)` spans
 //!   when every other frame is lost, so this window never reaches the 1,024 past which upstream
@@ -202,6 +208,8 @@ impl Room {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Window {
     window: u64,
+    /// The window it started at, which a window set back returns to.
+    initial: u64,
     ceiling: u64,
     consumed: u64,
     /// The tuning epoch: when it began and what had been consumed then.
@@ -213,6 +221,7 @@ impl Window {
     pub(crate) fn new(initial: u64, ceiling: u64) -> Self {
         Self {
             window: initial,
+            initial,
             ceiling: ceiling.max(initial),
             consumed: 0,
             epoch: None,
@@ -253,6 +262,16 @@ impl Window {
     /// The window grew to `window`, its growth funded.
     pub(crate) fn grew(&mut self, window: u64) {
         self.window = window.min(self.ceiling);
+    }
+    /// Whether the window grew past the one it started at.
+    pub(crate) fn grown(&self) -> bool {
+        self.window > self.initial
+    }
+    /// The window goes back to the one it started at, and a new epoch begins at the next tune:
+    /// it grows again only as a window consumed quickly shows the path needs it.
+    pub(crate) fn set_back(&mut self) {
+        self.window = self.initial;
+        self.epoch = None;
     }
 }
 

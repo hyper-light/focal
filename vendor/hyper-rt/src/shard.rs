@@ -205,9 +205,16 @@ enum WaitPhase {
     Fired,
     /// The loop could not register it; the refusal is in the cell.
     Refused,
-    /// Its future dropped while armed: the loop withdraws it from the table and frees the slot.
+    /// Its future dropped while armed: the loop withdraws it from the table and frees the slot. A member
+    /// dropped while on its group's list stays there, abandoned, until the group takes it off.
     Abandoned,
+    /// The slot holds a group's list of the members that fired (`crate::readiness::ReadyGroup`), and
+    /// registers nothing itself.
+    Group,
 }
+
+/// No wait: the end of a group's list.
+const NO_WAIT: u32 = u32::MAX;
 
 /// One slot of the desk's wait table.
 struct WaitCell {
@@ -219,6 +226,17 @@ struct WaitCell {
     raw: Cell<Option<i32>>,
     writable: Cell<bool>,
     word: Cell<Option<Encoded>>,
+    /// The group a member joins when it fires or is refused: the group's slot and that slot's
+    /// generation when the member was armed; `None` for a lone wait.
+    group: Cell<Option<(u32, u32)>>,
+    /// The key the member's owner gave it, which its group hands back when it fired.
+    key: Cell<u64>,
+    /// Whether the member is on its group's list, which only the group takes it off.
+    listed: Cell<bool>,
+    /// The next wait on the list (`NO_WAIT`: none): a member's successor, or a group's first.
+    next: Cell<u32>,
+    /// A group's last member listed (`NO_WAIT`: none).
+    last: Cell<u32>,
 }
 
 /// The values a shard keeps for its life, filled before its first step and immutable afterwards (slates'
@@ -476,6 +494,11 @@ impl ShardContext {
                     raw: Cell::new(None),
                     writable: Cell::new(false),
                     word: Cell::new(None),
+                    group: Cell::new(None),
+                    key: Cell::new(0),
+                    listed: Cell::new(false),
+                    next: Cell::new(NO_WAIT),
+                    last: Cell::new(NO_WAIT),
                 })
                 .collect(),
             free_waits: CellStack::full_of(wait_ids.into_iter()),
@@ -1067,6 +1090,11 @@ impl ShardContext {
             cell.generation.set(cell.generation.get().wrapping_add(1));
             cell.phase.set(WaitPhase::Free);
             cell.refusal.set(None);
+            cell.group.set(None);
+            cell.key.set(0);
+            cell.listed.set(false);
+            cell.next.set(NO_WAIT);
+            cell.last.set(NO_WAIT);
             // The slot came off this stack, which holds every slot: room for it.
             let _ = self.free_waits.push(ticket.slot);
         }
@@ -1085,6 +1113,18 @@ impl ShardContext {
             return Err(RtError::DriverLost);
         }
         let ticket = self.take_wait(Some(raw), writable, word)?;
+        self.push_interest(raw, writable, word, ticket)
+    }
+
+    /// Queues the wait `ticket` names for the loop to arm on `raw`: its ticket, or `Capacity` (its slot
+    /// given back) were the registrations' ring full.
+    fn push_interest(
+        &self,
+        raw: i32,
+        writable: bool,
+        word: Encoded,
+        ticket: Ticket,
+    ) -> Result<Ticket, RtError> {
         let pushed = self.interests.push(Interest {
             raw,
             writable,
@@ -1122,6 +1162,8 @@ impl ShardContext {
                 bound: self.waits.len(),
             })),
             WaitPhase::Fired | WaitPhase::Free | WaitPhase::Abandoned => Ok(()),
+            // A group's slot is no lone wait's: it reads as fired, and only its group frees it.
+            WaitPhase::Group => return Some(Ok(())),
         };
         self.free_wait(ticket);
         Some(outcome)
@@ -1141,6 +1183,12 @@ impl ShardContext {
             return;
         };
         match (cell.phase.get(), raw) {
+            (WaitPhase::Group, _) => self.group_close(ticket),
+            // On its group's list, whose links run through it: left there, abandoned, for the group to
+            // free as it takes it off (`group_next`, `group_close`).
+            (WaitPhase::Fired | WaitPhase::Refused, _) if cell.listed.get() => {
+                cell.phase.set(WaitPhase::Abandoned);
+            }
             (WaitPhase::Armed, Some(raw)) => {
                 cell.phase.set(WaitPhase::Abandoned);
                 let pushed = self.interests.push(Interest {
@@ -1169,6 +1217,7 @@ impl ShardContext {
         match cell.phase.get() {
             WaitPhase::Armed => {
                 cell.phase.set(WaitPhase::Fired);
+                self.list(ticket.slot, cell);
                 self.wake_local(word.slot());
                 true
             }
@@ -1190,11 +1239,166 @@ impl ShardContext {
             WaitPhase::Armed => {
                 cell.phase.set(WaitPhase::Refused);
                 cell.refusal.set(Some(refusal));
+                self.list(ticket.slot, cell);
                 self.wake_local(word.slot());
             }
             WaitPhase::Abandoned => self.free_wait(ticket),
             _ => {}
         }
+    }
+
+    /// Puts the member in `slot`, which just fired or was refused, last on its group's list, while the
+    /// group it was armed in lives; a lone wait, or a member whose group ended, joins none.
+    fn list(&self, slot: u32, cell: &WaitCell) {
+        let Some((group, generation)) = cell.group.get() else {
+            return;
+        };
+        let Some(head) = self.wait_cell(group).filter(|head| {
+            head.phase.get() == WaitPhase::Group && head.generation.get() == generation
+        }) else {
+            return;
+        };
+        cell.next.set(NO_WAIT);
+        cell.listed.set(true);
+        match self.wait_cell(head.last.get()) {
+            Some(last) => last.next.set(slot),
+            None => head.next.set(slot),
+        }
+        head.last.set(slot);
+    }
+
+    /// Opens a group of readiness waits for the task `word` names (`crate::readiness::ReadyGroup`): a
+    /// wait slot of its own holding the list of its members that fired. Refused `Capacity` when every
+    /// slot is taken.
+    pub(crate) fn group_open(&self, word: Encoded) -> Result<Ticket, RtError> {
+        let ticket = self.take_wait(None, false, word)?;
+        if let Some(cell) = self.wait_of(ticket) {
+            cell.phase.set(WaitPhase::Group);
+        }
+        Ok(ticket)
+    }
+
+    /// Whether `group` names a group open on this desk.
+    pub(crate) fn group_live(&self, group: Ticket) -> bool {
+        self.wait_of(group)
+            .is_some_and(|cell| cell.phase.get() == WaitPhase::Group)
+    }
+
+    /// Arms a member of `group`: a one-shot wait on `raw` (`None`: a simulated socket, which its caller
+    /// registers) for the task `word` names, keyed `key`, which joins the group's list when it fires or
+    /// is refused. Its ticket; `Capacity` when every slot is taken, `NotOnShardThread` for a group that
+    /// is not open here.
+    pub(crate) fn group_member(
+        &self,
+        group: Ticket,
+        raw: Option<i32>,
+        writable: bool,
+        word: Encoded,
+        key: u64,
+    ) -> Result<Ticket, RtError> {
+        if self.driver_lost() {
+            return Err(RtError::DriverLost);
+        }
+        if !self.group_live(group) {
+            return Err(RtError::NotOnShardThread);
+        }
+        let ticket = self.take_wait(raw, writable, word)?;
+        if let Some(cell) = self.wait_of(ticket) {
+            cell.group.set(Some((group.slot, group.generation)));
+            cell.key.set(key);
+        }
+        match raw {
+            Some(raw) => self.push_interest(raw, writable, word, ticket),
+            None => Ok(ticket),
+        }
+    }
+
+    /// Takes the first member off `group`'s list: its key and outcome (`Ok` once its handle fired, the
+    /// refusal once its registration was refused), its wait ended and its slot given back. `None` when
+    /// the list is empty or the group is not open here; members abandoned while listed are freed on
+    /// the way. `DriverLost` once the shard's driver is gone.
+    pub(crate) fn group_next(
+        &self,
+        group: Ticket,
+    ) -> Result<Option<crate::readiness::Fired>, RtError> {
+        if self.driver_lost() {
+            return Err(RtError::DriverLost);
+        }
+        let Some(head) = self
+            .wait_of(group)
+            .filter(|cell| cell.phase.get() == WaitPhase::Group)
+        else {
+            return Ok(None);
+        };
+        // Bounded: each turn takes one member off the list, which holds at most the table's slots.
+        for _ in 0..self.waits.len() {
+            let Some((slot, cell)) = self.unlist_first(head) else {
+                return Ok(None);
+            };
+            let ticket = Ticket {
+                owner: group.owner,
+                slot,
+                generation: cell.generation.get(),
+            };
+            let outcome = match cell.phase.get() {
+                WaitPhase::Fired => Ok(()),
+                WaitPhase::Refused => Err(cell.refusal.take().unwrap_or(RtError::Capacity {
+                    what: "readiness registrations",
+                    bound: self.waits.len(),
+                })),
+                // Abandoned while listed: its owner is gone.
+                _ => {
+                    self.free_wait(ticket);
+                    continue;
+                }
+            };
+            let key = cell.key.get();
+            self.free_wait(ticket);
+            return Ok(Some((key, outcome)));
+        }
+        Ok(None)
+    }
+
+    /// Takes the first member off the list `head` holds: its slot and cell.
+    fn unlist_first(&self, head: &WaitCell) -> Option<(u32, &WaitCell)> {
+        let slot = head.next.get();
+        let Some(cell) = self.wait_cell(slot) else {
+            head.next.set(NO_WAIT);
+            head.last.set(NO_WAIT);
+            return None;
+        };
+        let after = cell.next.get();
+        head.next.set(after);
+        if after == NO_WAIT {
+            head.last.set(NO_WAIT);
+        }
+        cell.listed.set(false);
+        cell.next.set(NO_WAIT);
+        Some((slot, cell))
+    }
+
+    /// Closes `group`: the members on its list are let go, their slots given back, and its own slot
+    /// with them. A member still armed stays armed until its owner drops it; firing, it joins no list.
+    pub(crate) fn group_close(&self, group: Ticket) {
+        let Some(head) = self
+            .wait_of(group)
+            .filter(|cell| cell.phase.get() == WaitPhase::Group)
+        else {
+            return;
+        };
+        // Bounded: each turn lets one listed member go, of at most the table's slots. Each is fired,
+        // refused or abandoned: none is in the loop's table any more.
+        for _ in 0..self.waits.len() {
+            let Some((slot, cell)) = self.unlist_first(head) else {
+                break;
+            };
+            self.free_wait(Ticket {
+                owner: group.owner,
+                slot,
+                generation: cell.generation.get(),
+            });
+        }
+        self.free_wait(group);
     }
 
     /// Whether the wait `ticket` names was abandoned before the loop registered it (the loop then frees it

@@ -1296,3 +1296,14 @@ dropped through three timeouts: the first's two probes repeat stream data, the n
 probes carry none, only their IMMEDIATE_ACKs, and every probe is within the smallest datagram). §11's
 `geo::a_lost_reply_goes_again_in_the_first_probe_within_two_round_trips` and
 `tests::blackhole_after_mtu_change_repairs_itself` pass unchanged.
+
+## 35. What a shrunk receive window still owes, read (2026-10-17)
+
+Patch Q24 adds a getter and changes no behaviour. `Connection::set_receive_window` shrinks a window
+as upstream does: the credit already given stands (RFC 9000 §4.1: "it is not an error to advertise
+a smaller limit, but the smaller limit has no effect"), so the difference is held as
+`receive_window_shrink_debt`, which the application's reads pay before `local_max_data` moves
+again. `Connection::receive_window_debt` returns that debt. hyper-transport sets an idle
+connection's grown window back to its first and gives back what the growth held as the debt is
+paid (`docs/transport.md` §4t): the peer may still send at most the window and the debt beyond what
+was read, so what is held never falls below that.

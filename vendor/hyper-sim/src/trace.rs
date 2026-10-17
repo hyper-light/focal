@@ -7,6 +7,7 @@
 
 use crate::error::SimError;
 use crate::rng::{GOLDEN_GAMMA, Seeded, mix64, stream_seed};
+use crate::tape::{Bounds, Player, Tape, TapeError};
 
 /// The words of a run's decisions, in the order the run made them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -63,11 +64,13 @@ impl Digest {
     }
 }
 
-/// Whether draws come from the streams, recorded, or from a trace.
+/// Whether draws come from the streams, recorded, from a trace, or from a tape played and
+/// recorded.
 #[derive(Clone, Debug)]
 enum Mode {
     Record,
     Replay { at: usize },
+    Play(Box<Player>),
 }
 
 /// Where a world's decisions come from, and where they go: its streams, its trace and its digest.
@@ -120,6 +123,30 @@ impl Chooser {
         })
     }
 
+    /// Draws from `tape`, step by step, each word reduced to the bound its decision asks, and from
+    /// SplitMix64 seeded with `filler` past a step's own words (`crate::tape`); every value is
+    /// recorded in at most `max_words` words, as a recording chooser's are, so the run also replays
+    /// from its trace, and the tape the run took is given back at its end.
+    pub(crate) fn playing(
+        tape: Tape,
+        filler: u64,
+        bounds: Bounds,
+        max_streams: usize,
+        max_words: usize,
+    ) -> Result<Self, SimError> {
+        let mut chooser = Self::recording(filler, max_streams, max_words)?;
+        chooser.mode = Mode::Play(Box::new(Player::replay(&tape, filler, bounds)));
+        Ok(chooser)
+    }
+
+    /// The step being played is over (`Player::end_step`); nothing when no tape is played.
+    pub(crate) fn end_step(&mut self, kind: u8) -> Result<(), SimError> {
+        match &mut self.mode {
+            Mode::Play(player) => player.end_step(kind).map_err(refused),
+            Mode::Record | Mode::Replay { .. } => Ok(()),
+        }
+    }
+
     /// Draws from `trace`.
     pub(crate) fn replaying(trace: Trace, max_streams: usize) -> Self {
         let max_words = trace.len();
@@ -159,7 +186,7 @@ impl Chooser {
     /// The words of trace recorded, or replayed, so far.
     pub(crate) fn words(&self) -> usize {
         match self.mode {
-            Mode::Record => self.trace.words.len(),
+            Mode::Record | Mode::Play(_) => self.trace.words.len(),
             Mode::Replay { at } => at,
         }
     }
@@ -190,6 +217,15 @@ impl Chooser {
                 }
                 value
             }
+            Mode::Play(player) => {
+                // A decision of one option reads no word, so a tape holds only real choices.
+                if bound <= 1 {
+                    return Ok(0);
+                }
+                let value = player.below(bound).map_err(refused)?;
+                record(&mut self.trace.words, self.max_words, bound, value)?;
+                value
+            }
         };
         Ok(value)
     }
@@ -197,10 +233,11 @@ impl Chooser {
     /// The trace recorded, or as much of the one replayed as the run used, and the digest with
     /// every word of it folded in. The decisions are folded here, once, rather than as they are
     /// made: a fold is a third of a decision's cost, and the trace holds every one in order.
-    pub(crate) fn finish(self) -> (Trace, Digest) {
-        let used = match self.mode {
-            Mode::Record => self.trace.words.len(),
-            Mode::Replay { at } => at,
+    pub(crate) fn finish(self) -> (Trace, Digest, Option<Tape>) {
+        let (used, tape) = match self.mode {
+            Mode::Record => (self.trace.words.len(), None),
+            Mode::Replay { at } => (at, None),
+            Mode::Play(player) => (self.trace.words.len(), Some(player.finish())),
         };
         let mut digest = self.digest;
         let words = self.trace.words.get(..used).unwrap_or(&[]);
@@ -208,7 +245,18 @@ impl Chooser {
         for word in words {
             digest.fold(u64::from(*word));
         }
-        (self.trace, digest)
+        (self.trace, digest, tape)
+    }
+}
+
+/// A tape's refusal as the world's: the bound it reached, or a tape the host would not hold.
+fn refused(error: TapeError) -> SimError {
+    match error {
+        TapeError::Full { what, bound } => SimError::Full { what, bound },
+        TapeError::Memory => SimError::Full {
+            what: "tape memory",
+            bound: 0,
+        },
     }
 }
 

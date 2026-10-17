@@ -40,6 +40,7 @@ pub mod net;
 mod queue;
 pub mod rng;
 pub mod storage;
+pub mod tape;
 mod trace;
 mod twice;
 mod wakes;
@@ -52,6 +53,6 @@ pub use rng::Seeded;
 pub use trace::{Digest, Trace};
 pub use twice::{Twice, twice};
 pub use world::{
-    Candidate, Choice, Draw, Fifo, Limits, NodeId, Random, Record, Source, Step, Strategy,
+    Candidate, Choice, Draw, EventId, Fifo, Limits, NodeId, Random, Record, Source, Step, Strategy,
     StreamId, World,
 };

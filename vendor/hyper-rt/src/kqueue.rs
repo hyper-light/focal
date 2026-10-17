@@ -366,20 +366,38 @@ impl Driver for KqueueDriver {
 mod tests {
     use super::*;
 
-    /// Shape: a timed wait's timeout, one XNU's own coalescing of a `kevent` timeout ended 1.27 ms
-    /// late at the median (6.27 ms, measured 2026-10-16 on a loaded host).
+    /// Shape: a timed wait's timeout.
     const WAIT_NS: u64 = 5_000_000;
-    /// Shape: the median's bound, halfway between the coalesced median and the deadline: a wait
-    /// the OS coalesced ends past it, a critical timer's well before (5.03 ms, measured).
-    const MEDIAN_BOUND_NS: u64 = 5_600_000;
-    /// Shape: timed waits taken; their median stands against a busy machine's late wakes.
-    const TRIES: usize = 41;
 
-    /// A timed wait ends at its timeout, not where XNU's coalescing of a `kevent` timeout put it
-    /// (a 5 ms wait at 6.3 ms at the median), and an untimed wait after a timed one is not ended
-    /// by the timer that one left.
+    /// A timed wait is XNU's critical timer, not a `kevent` timeout XNU may coalesce (a 5 ms wait
+    /// ended at 6.3 ms at the median that way, the critical timer within 0.05 ms of its deadline:
+    /// measured 2026-10-16, docs/runtime.md §3.6): the change a timed wait arms is a one-shot
+    /// `EVFILT_TIMER` in nanoseconds with `NOTE_CRITICAL`, for the wait's own timeout, and a wait with
+    /// nothing else to end it is ended by that timer, which fires. The check is the armed record's,
+    /// exact; how late a
+    /// loaded host then runs the woken thread is the host's, which a median over its wakes judged
+    /// (it failed at a load average of 29, its wakes 8.5 to 9.4 ms late, 2026-10-17). And an untimed
+    /// wait after a timed one is not ended by the timer that one left.
     #[test]
-    fn a_timed_wait_ends_at_its_timeout_not_where_xnu_coalesces_it() {
+    fn a_timed_wait_is_a_critical_timer_for_its_own_timeout() {
+        let change = timer_change(libc::EV_ADD | libc::EV_ONESHOT, WAIT_NS);
+        // Copied out: `kevent` is packed on some targets, so its fields are not borrowed.
+        let (ident, filter, flags, fflags, data) = (
+            change.ident,
+            change.filter,
+            change.flags,
+            change.fflags,
+            change.data,
+        );
+        assert_eq!(filter, libc::EVFILT_TIMER);
+        assert_eq!(ident, TIMER_IDENT);
+        assert_eq!(flags, libc::EV_ADD | libc::EV_ONESHOT);
+        assert_eq!(
+            fflags & (libc::NOTE_NSECONDS | libc::NOTE_CRITICAL),
+            libc::NOTE_NSECONDS | libc::NOTE_CRITICAL,
+            "nanoseconds, critical: no coalescing"
+        );
+        assert_eq!(data, WAIT_NS as isize);
         let kq = prepare().unwrap();
         let registration =
             crate::registry::register(2, 1, crate::runtime::register_kick(Some(kq))).unwrap();
@@ -389,19 +407,9 @@ mod tests {
         };
         let mut driver = KqueueDriver::from_prepared(fd);
         let mut out = Vec::new();
-        let mut ended = Vec::with_capacity(TRIES);
-        for _ in 0..TRIES {
-            let began = driver.now_ns();
-            driver.wait(Some(WAIT_NS), &mut out).unwrap();
-            ended.push(driver.now_ns() - began);
-        }
-        let mut sorted = ended.clone();
-        sorted.sort_unstable();
-        let median = sorted[TRIES / 2];
-        assert!(
-            median < MEDIAN_BOUND_NS,
-            "a {WAIT_NS} ns wait ended after {median} ns at the median: {ended:?}"
-        );
+        driver.wait(Some(WAIT_NS), &mut out).unwrap();
+        assert!(out.is_empty(), "nothing but the timer ended the wait");
+        assert!(!driver.timer.armed, "the timer that ended the wait fired");
         // A timed wait a kick ends leaves its timer armed; the untimed wait after it removes it.
         kick.kick();
         driver.wait(Some(1_000_000_000), &mut out).unwrap();
