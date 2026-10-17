@@ -65,11 +65,29 @@ impl MtuDiscovery {
         self.current_mtu
     }
 
-    /// Returns the amount of bytes that should be sent as an MTU probe, if any
-    pub(crate) fn poll_transmit(&mut self, now: Instant, next_pn: u64) -> Option<u16> {
+    /// The size of the MTU probe due now, if one is: the search's next step, planned once and the
+    /// same until it is sent ([`MtuDiscovery::probe_sent`]), so a probe the connection holds back
+    /// for its congestion window or its pacer (RFC 8899 §3, item 7) waits whole.
+    pub(crate) fn probe_due(&mut self, now: Instant) -> Option<u16> {
         self.state
             .as_mut()
-            .and_then(|state| state.poll_transmit(now, self.current_mtu, next_pn))
+            .and_then(|state| state.probe_due(now, self.current_mtu))
+    }
+
+    /// The probe [`MtuDiscovery::probe_due`] said is sent as packet `pn`.
+    pub(crate) fn probe_sent(&mut self, pn: u64) {
+        if let Some(state) = self.state.as_mut() {
+            state.probe_sent(pn);
+        }
+    }
+
+    /// Returns the amount of bytes that should be sent as an MTU probe, if any, and takes it as
+    /// sent as packet `next_pn` (the search alone, as its tests drive it).
+    #[cfg(test)]
+    pub(crate) fn poll_transmit(&mut self, now: Instant, next_pn: u64) -> Option<u16> {
+        let size = self.probe_due(now)?;
+        self.probe_sent(next_pn);
+        Some(size)
     }
 
     /// Notifies the [`MtuDiscovery`] that the peer's `max_udp_payload_size` transport parameter has
@@ -219,6 +237,15 @@ impl EnabledMtuDiscovery {
                         search.last_probed_mtu = search.lower_bound;
                     }
                 }
+                // A step planned past it is planned again from the bounds as they now stand.
+                if search
+                    .planned
+                    .is_some_and(|planned| planned > search.upper_bound)
+                {
+                    search.planned = None;
+                    search.lost_probe_count = 0;
+                    search.last_probed_mtu = search.lower_bound;
+                }
             }
             Phase::Complete(_)
                 if raised && ceiling.saturating_sub(current_mtu) >= self.config.minimum_change =>
@@ -229,8 +256,9 @@ impl EnabledMtuDiscovery {
         }
     }
 
-    /// Returns the amount of bytes that should be sent as an MTU probe, if any
-    fn poll_transmit(&mut self, now: Instant, current_mtu: u16, next_pn: u64) -> Option<u16> {
+    /// The size of the MTU probe due now, if any: a lost probe's again, or the search's next step,
+    /// planned once (`SearchState::planned`) and the same until [`EnabledMtuDiscovery::probe_sent`].
+    fn probe_due(&mut self, now: Instant, current_mtu: u16) -> Option<u16> {
         if let Phase::Initial = &self.phase {
             // Start the first search
             self.phase =
@@ -253,8 +281,12 @@ impl EnabledMtuDiscovery {
 
             // Retransmit lost probes, if any
             if 0 < state.lost_probe_count && state.lost_probe_count < MAX_PROBE_RETRANSMITS {
-                state.in_flight_probe = Some(next_pn);
                 return Some(state.last_probed_mtu);
+            }
+
+            // The next step, planned before and not yet sent
+            if let Some(planned) = state.planned {
+                return Some(planned);
             }
 
             let last_probe_succeeded = state.lost_probe_count == 0;
@@ -266,8 +298,7 @@ impl EnabledMtuDiscovery {
             }
 
             if let Some(probe_udp_payload_size) = state.next_mtu_to_probe(last_probe_succeeded) {
-                state.in_flight_probe = Some(next_pn);
-                state.last_probed_mtu = probe_udp_payload_size;
+                state.planned = Some(probe_udp_payload_size);
                 return Some(probe_udp_payload_size);
             } else {
                 let next_mtud_activation = now.checked_add(self.config.interval);
@@ -277,6 +308,20 @@ impl EnabledMtuDiscovery {
         }
 
         None
+    }
+
+    /// The probe [`EnabledMtuDiscovery::probe_due`] said is sent as packet `pn`: a lost probe's
+    /// size again, or the step it planned.
+    fn probe_sent(&mut self, pn: u64) {
+        if let Phase::Searching(state) = &mut self.phase {
+            if state.in_flight_probe.is_some() {
+                return;
+            }
+            if let Some(planned) = state.planned.take() {
+                state.last_probed_mtu = planned;
+            }
+            state.in_flight_probe = Some(pn);
+        }
     }
 
     /// Called when a packet is acknowledged in [`SpaceId::Data`]
@@ -346,6 +391,10 @@ struct SearchState {
     lost_probe_count: usize,
     /// Whether the probe in flight is of a size past the path's ceiling, learned after it was sent
     abandoned: bool,
+    /// The next size the search chose (`next_mtu_to_probe`), not yet sent: the connection sends a
+    /// probe only as its congestion window and pacer afford it (RFC 8899 §3, item 7), and the
+    /// step is taken once, since choosing it reads the last probe's fate
+    planned: Option<u16>,
 }
 
 impl SearchState {
@@ -365,6 +414,7 @@ impl SearchState {
             in_flight_probe: None,
             lost_probe_count: 0,
             abandoned: false,
+            planned: None,
             lower_bound,
             upper_bound,
             minimum_change: config.minimum_change,

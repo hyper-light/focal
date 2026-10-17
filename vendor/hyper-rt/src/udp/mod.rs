@@ -152,13 +152,38 @@ impl UdpSocket {
         }
     }
 
-    /// Binds a non-blocking UDP socket to `addr` that other sockets of this process may bind too
-    /// (`SO_REUSEPORT`): the port a listener shares with the sockets it connects to its peers
-    /// ([`UdpSocket::connect`]), each of which then takes its peer's datagrams into a receive queue
-    /// of its own, as a TCP connection's socket does. Refused `BadConfig` on Windows, where a shared
-    /// port hands a connected socket no peer's datagrams of its own, and on the simulation fabric,
-    /// whose ports are one socket's each.
+    /// Binds a non-blocking UDP socket to `addr` whose port the sockets it connects to its peers may
+    /// then bind too ([`UdpSocket::join_shared`], `SO_REUSEPORT`), each of which takes its peer's
+    /// datagrams into a receive queue of its own, as a TCP connection's socket does. The socket is
+    /// bound before its port is shared, so the port is one no other socket holds: refused
+    /// `AddrInUse` where one does, and port 0 is given a port of its own. Shared at its bind, a
+    /// socket asking for port 0 on Linux could be given a port another of the user's shared sockets
+    /// held, whatever process held it (the kernel's choice of a free port passes over a port held by
+    /// a socket it may share with), and the two then split one port's datagrams: of 256 clients
+    /// bound so, one to three never heard their server in four runs of five, each sharing its port
+    /// with another client. Refused `BadConfig` on Windows, where a shared port hands a connected
+    /// socket no peer's datagrams of its own, and on the simulation fabric, whose ports are one
+    /// socket's each.
     pub fn bind_shared(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
+        let addr = addr.into();
+        if on_sim() {
+            return Err(RtError::BadConfig {
+                what: "a shared port on the simulation fabric, whose ports are one socket's",
+            });
+        }
+        netsys::port_sharing()?;
+        let socket = netsys::dgram_socket(Family::of(addr))?;
+        netsys::bind(&socket, addr)?;
+        netsys::share_port(&socket)?;
+        Ok(UdpSocket::of(Inner::Real { socket }))
+    }
+
+    /// Binds a non-blocking UDP socket to `addr`, a port a socket of this process bound with
+    /// [`UdpSocket::bind_shared`] holds, to share it: what a listener's socket for one of its peers
+    /// binds before it connects to that peer ([`UdpSocket::connect`]). Refused as
+    /// [`UdpSocket::bind_shared`] is where ports are not shared, and `AddrInUse` where the port's
+    /// holder does not share it.
+    pub fn join_shared(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
         let addr = addr.into();
         if on_sim() {
             return Err(RtError::BadConfig {
@@ -171,8 +196,8 @@ impl UdpSocket {
         Ok(UdpSocket::of(Inner::Real { socket }))
     }
 
-    /// Whether other sockets of this process may bind this socket's port too, as
-    /// [`UdpSocket::bind_shared`] binds one (`SO_REUSEPORT`): what lets a driver given a socket
+    /// Whether other sockets may bind this socket's port too, as [`UdpSocket::bind_shared`] binds
+    /// one (`SO_REUSEPORT`): what lets a driver given a socket
     /// already bound share its port with a socket for each peer. Never on Windows, where no socket
     /// shares a port so, nor on the simulation fabric, whose ports are one socket's.
     pub fn shares_port(&self) -> Result<bool, RtError> {

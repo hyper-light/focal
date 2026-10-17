@@ -3622,6 +3622,53 @@ fn blackhole_after_mtu_change_repairs_itself() {
     assert_eq!(client_stats.path.black_holes_detected, 1);
 }
 
+/// RFC 8899 §3, item 7: a probe is a packet to the congestion controller and the pacer. On a path
+/// of 128 kbit/s whose MTU is a loopback's (65,527), the search's first step (about 33 KB) holds the
+/// link two seconds; sent whenever the connection was idle, a probe held every packet behind it that
+/// long, and three focal nodes behind such relays never heard each other's votes. Do: connect over
+/// that path with the search allowed up to 65,527 and leave the connection idle. Expect: no probe is
+/// sent, since none the search plans fits the window, and the path's MTU stays where it began.
+#[test]
+fn an_mtu_probe_waits_for_the_window_on_a_slow_path() {
+    let _guard = subscribe();
+    let wide = || {
+        let mut transport = TransportConfig::default();
+        let mut search = MtuDiscoveryConfig::default();
+        search.upper_bound(65_527);
+        transport.mtu_discovery_config(Some(search));
+        transport
+    };
+    let mut endpoint_config = EndpointConfig::default();
+    endpoint_config.max_udp_payload_size(65_527).unwrap();
+    let mut server = server_config();
+    server.transport = wide();
+    let mut pair = Pair::new(endpoint_config, server);
+    pair.mtu = 65_527;
+    pair.latency = Duration::from_millis(10);
+    pair.rate = Some(16_000);
+    let mut client = client_config();
+    client.transport = wide();
+    let (client_ch, server_ch) = pair.connect_with(client);
+    pair.drive();
+
+    let client = pair.client_conn_mut(client_ch);
+    assert_eq!(
+        client.stats().path.sent_plpmtud_probes,
+        0,
+        "client: {:?}",
+        client.stats().path
+    );
+    assert_eq!(client.path_mtu(), INITIAL_MTU, "client");
+    let server = pair.server_conn_mut(server_ch);
+    assert_eq!(
+        server.stats().path.sent_plpmtud_probes,
+        0,
+        "server: {:?}",
+        server.stats().path
+    );
+    assert_eq!(server.path_mtu(), INITIAL_MTU, "server");
+}
+
 #[test]
 fn mtud_probes_include_immediate_ack() {
     let _guard = subscribe();

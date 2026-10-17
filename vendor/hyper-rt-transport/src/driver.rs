@@ -635,7 +635,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             if !self.reserve_peer() {
                 continue;
             }
-            let Ok(mut socket) = Batched::bind_shared_lent(local, true) else {
+            let Ok(mut socket) = Batched::join_shared_lent(local, true) else {
                 continue;
             };
             if socket.connect(remote).is_err() {

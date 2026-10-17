@@ -513,14 +513,21 @@ mod imp {
         }
     }
 
-    /// Lets other sockets of this process bind `socket`'s port as well (`SO_REUSEPORT`), before it
-    /// is bound: a listener and the sockets it connects to its peers share one port.
+    /// Ports are shared here: Linux and the BSDs hand a connected socket its peer's datagrams.
+    pub(crate) fn port_sharing() -> Result<(), RtError> {
+        Ok(())
+    }
+
+    /// Lets other sockets bind `socket`'s port as well (`SO_REUSEPORT`): set on a socket before it
+    /// joins a shared port, and on a listener once it is bound to a port of its own (Linux makes the
+    /// port's group when the first joiner binds, and the BSDs judge each bind by both sockets' flags
+    /// at that bind; measured on both).
     pub(crate) fn share_port(socket: &Socket) -> Result<(), RtError> {
         rustix::net::sockopt::set_socket_reuseport(&socket.fd, true)
             .map_err(|e| refused("setsockopt(SO_REUSEPORT)", e))
     }
 
-    /// Whether other sockets of this process may bind `socket`'s port as well (`SO_REUSEPORT`).
+    /// Whether other sockets may bind `socket`'s port as well (`SO_REUSEPORT`).
     pub(crate) fn shares_port(socket: &Socket) -> Result<bool, RtError> {
         rustix::net::sockopt::socket_reuseport(&socket.fd)
             .map_err(|e| refused("getsockopt(SO_REUSEPORT)", e))
@@ -1070,10 +1077,15 @@ pub(crate) mod imp {
 
     /// Sharing a port as the BSDs and Linux do is not Winsock's: `SO_REUSEADDR` there lets a second
     /// socket take the port's datagrams, not those of one peer, so a listener keeps its peers'.
-    pub(crate) fn share_port(_socket: &Socket) -> Result<(), RtError> {
+    pub(crate) fn port_sharing() -> Result<(), RtError> {
         Err(RtError::BadConfig {
             what: "a shared port: Winsock does not hand a connected socket its peer's datagrams",
         })
+    }
+
+    /// Never ([`port_sharing`]).
+    pub(crate) fn share_port(_socket: &Socket) -> Result<(), RtError> {
+        port_sharing()
     }
 
     /// Never: no Winsock socket shares its port as [`share_port`] means it.
@@ -1117,6 +1129,7 @@ pub(crate) use imp as winsock;
 pub(crate) use imp::dont_fragment;
 pub(crate) use imp::{OwnedDatagram, Socket};
 pub(crate) use imp::{
-    adopt, bind, connect, dgram_socket, into_owned, local_addr, path_payload, queued_bytes,
-    recv_buffer_bytes, recv_from, send, send_to, set_recv_buffer, share_port, shares_port,
+    adopt, bind, connect, dgram_socket, into_owned, local_addr, path_payload, port_sharing,
+    queued_bytes, recv_buffer_bytes, recv_from, send, send_to, set_recv_buffer, share_port,
+    shares_port,
 };

@@ -1307,3 +1307,33 @@ again. `Connection::receive_window_debt` returns that debt. hyper-transport sets
 connection's grown window back to its first and gives back what the growth held as the debt is
 paid (`docs/transport.md` §4t): the peer may still send at most the window and the debt beyond what
 was read, so what is held never falls below that.
+
+## 36. A probe of the path's MTU waits for the window and the pacer (2026-10-17)
+
+Patch Q25 departs from upstream's MTU discovery, which sent a probe whenever the connection had
+nothing else to send, past the congestion window and the pacer. Upstream's search stops at 1,452
+bytes by default, where a probe costs a path little. hyper-transport searches up to the path's MTU
+as its kernel holds it (`docs/transport.md` §4q): 65,527 bytes on a loopback. Behind a relay of 128
+kbit/s in front of such a loopback, the search's first step, about 33 KB, held the link two seconds
+and every packet behind it waited: three focal nodes never heard each other's votes and elected no
+leader (`evidence_quic::a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second`, every run on
+Linux once focal took the search to the path's MTU; a clamp of the ceiling to 1,452 bytes brought the
+leader back). RFC 8899
+§3, item 7 lets a probe be regulated so: "A PL MAY use a congestion controller to decide when to send
+a probe packet", its probes then "delayed or suspended during congestion", and a PL "could need
+transmission of probe packets to be regulated by" its pacing.
+
+A probe is now sent only when it fits the congestion window and the pacer lets it go
+(`write_mtu_probe`), the pacing timer set for when it may. A window of one round trip of the path
+never affords a probe that would take the path longer, so a slow path keeps its MTU and a fast one
+probes as before. The search plans its next size once (`MtuDiscovery::probe_due`, `SearchState::
+planned`) and takes it as sent when its packet exists, under its own number (`probe_sent`): choosing
+a size reads the last probe's fate, so a step held back is not chosen again, and a builder that
+refused no longer left the search waiting on a number the next packet took. A step planned past a
+ceiling lowered meanwhile is planned again from the bounds as they stand.
+
+Test: `tests::an_mtu_probe_waits_for_the_window_on_a_slow_path` (a 128 kbit/s path whose MTU is
+65,527, the search allowed to it: no probe sent, the MTU where it began; without the rule the client
+sent 12 probes, reached 65,527, and its smoothed round trip grew to 4.8 s against 48.5 ms, the
+warm-up's packets of the new MTU growing its window to 393 KB). `tests::mtud_probes_include_immediate_ack`
+and every MTU test pass unchanged.

@@ -1399,11 +1399,22 @@ impl Connection {
             return None;
         }
         let space_id = SpaceId::Data;
-        let probe_size = self.path.mtud.poll_transmit(
-            now,
-            self.packet_number_filter.peek(self.spaces.get(space_id)),
-        )?;
-
+        let probe_size = self.path.mtud.probe_due(now)?;
+        // A probe is a packet to the congestion controller and the pacer: RFC 8899 §3, item 7, "a
+        // PL MAY use a congestion controller to decide when to send a probe packet" (its probes
+        // then "delayed or suspended during congestion"), and "could need transmission of probe
+        // packets to be regulated by" its pacing. Sent whenever the connection was idle, a probe
+        // of a path's MTU took a slow path whole: behind a relay of 128 kbit/s in front of a
+        // loopback whose MTU is 65,536, each probe held the link for up to four seconds and no
+        // node of three ever heard another's vote (focal's `evidence_quic`). Held back, it waits
+        // as planned: a window of one round trip of the path never affords a probe that would
+        // take the path longer.
+        let bytes = u64::from(probe_size);
+        if self.path.in_flight.bytes.saturating_add(bytes) > self.path.congestion.window()
+            || self.paced(now, bytes)
+        {
+            return None;
+        }
         let buf_capacity = usize::from(probe_size);
         buf.reserve(buf_capacity);
 
@@ -1417,6 +1428,9 @@ impl Connection {
             true,
             self,
         )?;
+        // Taken as sent once its packet exists, under its own number: a builder refused left the
+        // search waiting on a number the next packet took (upstream committed the probe first).
+        self.path.mtud.probe_sent(builder.exact_number);
 
         // We implement MTU probes as ping packets padded up to the probe size
         buf.write(frame::FrameType::PING);
