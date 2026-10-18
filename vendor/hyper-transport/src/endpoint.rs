@@ -3611,18 +3611,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         // Out of the peer's credit — its stream's own, or the connection's with this side's bytes
         // to send — with at least a datagram of its own sent and all of that acknowledged: the
         // peer holds its bytes and gives back no credit for them. An exchange that wrote less is
-        // one waiting behind such a one, not one.
-        let unread_now = self.exchanges.get(id).is_some_and(|exchange| {
+        // one waiting behind such a one, not one. What its stream has written goes with it: written
+        // past what it had when it was found unread, the peer gave credit back.
+        let unread_now = self.exchanges.get(id).and_then(|exchange| {
             let blocked =
                 exchange.stream_blocked || (peer_takes == 0 && exchange.out.pending() > 0);
-            blocked
-                && exchange.stream.is_some_and(|stream| {
-                    let stream = conn.quic.send_stream(stream);
-                    stream
-                        .written()
-                        .is_ok_and(|written| written >= LEAST_PROGRESS)
-                        && stream.sent_acknowledged().unwrap_or(false)
-                })
+            if !blocked {
+                return None;
+            }
+            let stream = conn.quic.send_stream(exchange.stream?);
+            let written = stream.written().ok()?;
+            (written >= LEAST_PROGRESS && stream.sent_acknowledged().unwrap_or(false))
+                .then_some(written)
         });
         let held_unread = conn.unread;
         let unread_ended = conn.unread_ended;
@@ -3644,16 +3644,25 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             // carries (focal's audit F38): found unread, it is given a window more to be read, and
             // its reset gives back the connection's credit it holds.
             match (unread_now, exchange.unread_since) {
-                (true, None) => {
-                    exchange.unread_since = Some(now);
+                (Some(written), None) => {
+                    exchange.unread_since = Some((now, written));
                     unread_change = 1;
                 }
-                (true, Some(since))
+                // Written past what it had when it was found unread: the peer gave credit back,
+                // reading, however often a judgement finds the stream out of credit (a sender held
+                // to the peer's pace is out of credit at nearly every instant, its bytes taken as
+                // they go). The wait starts again from here; judged on the state alone, a transfer
+                // the peer read steadily was refused once it outlasted a window (8 MiB on a loaded
+                // host, in 12 of 14 runs under two dozen busy loops).
+                (Some(written), Some((_, mark))) if written > mark => {
+                    exchange.unread_since = Some((now, written));
+                }
+                (Some(_), Some((since, _)))
                     if now.saturating_duration_since(since) >= exchange.carry.window(floor) =>
                 {
                     return Err(Refusal::Stalled);
                 }
-                (false, Some(_)) => {
+                (None, Some(_)) => {
                     exchange.unread_since = None;
                     unread_change = -1;
                 }

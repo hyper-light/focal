@@ -26,8 +26,10 @@
 //!   charged. A stream its peer does not read ends by its own bytes, whatever else the connection
 //!   carries (focal's audit F38): out of the peer's credit (its own, or the connection's with bytes
 //!   to send), at least a datagram of it sent and all of that acknowledged, it is unread, and a
-//!   window more ends it, its reset giving back the credit it holds (hyper-quic patch Q8,
-//!   `SendStream::sent_acknowledged`, `written`). An exchange waiting only for credit that an unread
+//!   window more with nothing written ends it, its reset giving back the credit it holds (hyper-quic
+//!   patch Q8, `SendStream::sent_acknowledged`, `written`). Written past what it had when found
+//!   unread, its peer gave credit back, and the window starts again: a stream held to its peer's
+//!   pace is out of credit and acknowledged at nearly every judgement while its bytes are taken. An exchange waiting only for credit that an unread
 //!   one holds, or held in its window, is not judged: the credit comes back as the unread one
 //!   ends. What was sent is progress only while the peer is
 //!   heard: a live peer acknowledges what it receives within its `max_ack_delay` (RFC 9000 §13.2.1,

@@ -287,9 +287,10 @@ pub(crate) struct Exchange<K> {
     /// QUIC refused a write the connection's credit allowed: the stream's own window is spent,
     /// and only QUIC's `Writable` for the stream says it can take more.
     pub(crate) stream_blocked: bool,
-    /// Since when a judgement found it unread: its stream out of the peer's credit, everything it
-    /// sent acknowledged — the peer holds its bytes and reads none of them (focal's audit F38).
-    pub(crate) unread_since: Option<Instant>,
+    /// Since when a judgement found it unread, and what its stream had written then: its stream
+    /// out of the peer's credit, everything it sent acknowledged, and nothing written since — the
+    /// peer holds its bytes and gives back no credit for them (focal's audit F38).
+    pub(crate) unread_since: Option<(Instant, u64)>,
     /// The owner's last read of the body wanted more than had arrived: only then is a period that
     /// brought nothing evidence against the sender.
     pub(crate) starved: bool,
