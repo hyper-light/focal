@@ -311,12 +311,15 @@ pub async fn dispatch_accounted_by(
 
 /// How long a handler is given before its request is answered "not yet", nanoseconds: the asker's
 /// period (the request time, which a node and its askers share) less what this answer's arrival
-/// within it takes. The asker's period began when it sent, before this side had the request, and is
-/// judged by progress (hyper-transport's `Progress`): an answer begun at the period's end came
-/// after the asker had refused the exchange as stalled, every time. So the answer sets aside the
-/// path's round trip, as this connection measures it (the request's way here and the answer's way
-/// back), and how late this shard's timer ends it: a tick by design, and the shard's measured
-/// scheduler overrun. A shard so starved that nothing is left answers at once.
+/// within it takes. The asker, judging by progress (hyper-transport's `Progress`), gives this side
+/// its period once it sees the request acknowledged whole, and refuses the exchange at the end of a
+/// judgement period that began so: a period after the acknowledgement at the least, where one of its
+/// judgements falls just after it (until hyper-raft 4da10dd a request smaller than a datagram was
+/// refused at the end of the period it was sent in, and an answer begun at this side's period's end
+/// came after the refusal on a loaded host). So the answer sets aside the path's round trip, as this
+/// connection measures it (the request's way here and the acknowledgement's way back), and how late
+/// this shard's timer ends it: a tick by design, and the shard's measured scheduler overrun. A shard
+/// so starved that nothing is left answers at once.
 pub(crate) fn answer_within(period: std::time::Duration, path: std::time::Duration) -> u64 {
     let nanos = |span: std::time::Duration| u64::try_from(span.as_nanos()).unwrap_or(u64::MAX);
     nanos(period)

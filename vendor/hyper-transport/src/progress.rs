@@ -18,12 +18,14 @@
 //!   is sent it is in the network, which may hold it longer than a
 //!   period — a bottleneck's queue on a slow path holds a window for seconds — and a period is
 //!   charged what the peer acknowledged of what was sent (hyper-quic's `acked_bytes`, patch Q6), and
-//!   ends the exchange if that is less than a datagram. The peer's time to answer begins when it has
-//!   the request: when QUIC reports the exchange's stream acknowledged whole (`StreamEvent::Finished`),
-//!   and the exchange ends at the end of a period that began with it so (focal's audit F38: counted
-//!   from the send, the period began while the last of a request was still on its way, and ended
-//!   before the peer had it). A period in which the peer sent nothing at all ends it whatever was
-//!   charged. A stream its peer does not read ends by its own bytes, whatever else the connection
+//!   ends the exchange if that is less than a datagram, unless the peer acknowledged the request
+//!   whole in it: a request smaller than a datagram moves no more. The peer's time to answer begins
+//!   when it has the request: when QUIC reports the exchange's stream acknowledged whole
+//!   (`StreamEvent::Finished`), and the exchange ends at the end of a period that began with it so
+//!   (focal's audit F38: counted from the send, the period began while the last of a request was
+//!   still on its way, and ended before the peer had it; charged a datagram, a smaller request was
+//!   refused at the end of the period it was sent in). A period in which the peer sent nothing at
+//!   all ends it whatever was charged. A stream its peer does not read ends by its own bytes, whatever else the connection
 //!   carries (focal's audit F38): out of the peer's credit (its own, or the connection's with bytes
 //!   to send), at least a datagram of it sent and all of that acknowledged, it is unread, and a
 //!   window more with nothing written ends it, its reset giving back the credit it holds (hyper-quic
@@ -315,7 +317,14 @@ impl Carry {
                 } else {
                     acked
                 };
-                if *had || carried < LEAST_PROGRESS || heard == 0 {
+                // A message the peer acknowledged whole in the window moved all it had, however
+                // little: one smaller than a datagram can move no more, and the peer, which has it,
+                // is given the next window to answer. Charged a datagram all the same, it was refused
+                // at the window's end, one period from the send rather than from when the peer had
+                // it, and the peer's "not yet" for it, sent as its own period ended, lost the race
+                // whenever it was late (focal's 128 kbit/s seal: 24 ms late on a loaded host).
+                let whole = acknowledged && !*had;
+                if *had || (carried < LEAST_PROGRESS && !whole) || heard == 0 {
                     return Err(Refusal::Stalled);
                 }
                 *charged = charged.saturating_add(sent);
@@ -388,6 +397,47 @@ mod tests {
                 now,
                 moved(1_000_000 + 1_200, 8_200),
                 0,
+                0,
+                false,
+                Duration::ZERO
+            ),
+            Err(Refusal::Stalled)
+        );
+    }
+
+    /// A request smaller than a datagram, acknowledged whole in the window it was sent in, has
+    /// moved all it had: the peer, which has it, is given the next window to answer, and is given
+    /// up at that window's end. Charged a datagram, it was refused at the end of the window it was
+    /// sent in (focal's 128 kbit/s seal: 93 bytes owed, 475 sent and 310 acknowledged in the
+    /// window, refused before the peer's "not yet" arrived). One the peer has not acknowledged by
+    /// then is refused there, as before.
+    #[test]
+    fn a_request_smaller_than_a_datagram_is_given_a_window_once_the_peer_has_it() {
+        let start = hyper_sim::Anchor::new().instant(0).unwrap();
+        let mut carry = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
+        carry.asking(start, moved(0, 0), 93);
+        assert_eq!(
+            carry.judge(start + PERIOD, moved(475, 378), 0, 0, true, Duration::ZERO),
+            Ok(())
+        );
+        assert_eq!(
+            carry.judge(
+                start + PERIOD * 2,
+                moved(475 + 120, 378 + 60),
+                0,
+                0,
+                true,
+                Duration::ZERO
+            ),
+            Err(Refusal::Stalled)
+        );
+        let mut unacknowledged = Carry::idle(Progress::new(PERIOD).unwrap(), start, moved(0, 0));
+        unacknowledged.asking(start, moved(0, 0), 93);
+        assert_eq!(
+            unacknowledged.judge(
+                start + PERIOD,
+                moved(475, 378),
+                93,
                 0,
                 false,
                 Duration::ZERO

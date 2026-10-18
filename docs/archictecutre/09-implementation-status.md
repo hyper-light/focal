@@ -15482,3 +15482,18 @@ committed in 16 runs of 16, at p99 up to 621 ms. Test:
 40 native reads: without the places, the 8 past the queue were answered `Capacity`). A read of the
 older path still reserves 32 times the frame bound as it waits, so the host's 64 MiB holds two at
 once (open; native reads were fixed so).
+
+### 2026-10-17 — Every shared crate at hyper-raft 4da10dd: a request smaller than a datagram is given its peer's period to answer
+
+`evidence_quic::a_megabyte_chunk_reaches_its_copy_across_128_kbit_per_second` failed on the macOS
+gate, and under twelve busy loops in 3 runs of 13 at this batch's vendor and the one before it: the
+actor's seal request ended `Timeout` where the leader owed it a "not yet". Traced with temporary
+instrumentation: the request, 93 bytes owed, was acknowledged whole in its first period and refused
+at that period's end for moving less than a datagram (475 bytes sent and 310 acknowledged in it).
+The leader's "not yet", due at its own period from the request less the round trip and its timer's
+lateness, had reached the asker by under a millisecond in the passing runs (18 µs in one) and was
+24 ms late in the failing one. hyper-transport now counts a request acknowledged whole as its
+period's progress, so the peer's period to answer begins when it has the request, as the transport's
+rule says (hyper-raft 4da10dd; two tests there fail under the old rule). Under the same twelve busy
+loops the test passed in 10 runs of 10. `answer_within`'s doc in focal-wire says why its margin still
+serves: one of the asker's judgements may fall just after the acknowledgement.
