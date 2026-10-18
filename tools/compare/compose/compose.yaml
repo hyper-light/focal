@@ -118,19 +118,54 @@ services:
     command: ["sleep", "86400"]
     volumes: ["./focal-target.yaml:/etc/focal/target.yaml:ro", "invites:/invite", "focal-client:/client", "reports:/reports"]
 
+  # focal's event bus (doc 34): three nodes replicating one part, each acknowledging a
+  # publish once a majority's disks hold it. Node 1 makes the identity directory all
+  # three and the generator share; nodes 2 and 3 wait for it (a bounded wait). Each
+  # node's address is fixed on the bench network, as its peers name it; its log's root
+  # key is kept in a volume apart from its data.
+  focal-bus1: &bus
+    <<: *limits
+    image: ${FOCAL_IMAGE:-focal:bench}
+    profiles: [focal-bus]
+    networks: { bench: { ipv4_address: 10.231.0.11 } }
+    command: ["focal", "start", "bus", "--listen", "0.0.0.0:7443", "--pki", "/pki", "--clients", "2",
+              "--node", "1", "--peer", "2=10.231.0.12:7443", "--peer", "3=10.231.0.13:7443",
+              "--data", "/data", "--key-file", "/keys/node.key"]
+    volumes: ["bus-pki:/pki", "bus1:/data", "bus1-keys:/keys"]
+  focal-bus2:
+    <<: *bus
+    networks: { bench: { ipv4_address: 10.231.0.12 } }
+    command: ["sh", "-c", "n=0; until [ -s /pki/root.der ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal start bus --listen 0.0.0.0:7443 --pki /pki --clients 2 --node 2 --peer 1=10.231.0.11:7443 --peer 3=10.231.0.13:7443 --data /data --key-file /keys/node.key"]
+    volumes: ["bus-pki:/pki", "bus2:/data", "bus2-keys:/keys"]
+  focal-bus3:
+    <<: *bus
+    networks: { bench: { ipv4_address: 10.231.0.13 } }
+    command: ["sh", "-c", "n=0; until [ -s /pki/root.der ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal start bus --listen 0.0.0.0:7443 --pki /pki --clients 2 --node 3 --peer 1=10.231.0.11:7443 --peer 2=10.231.0.12:7443 --data /data --key-file /keys/node.key"]
+    volumes: ["bus-pki:/pki", "bus3:/data", "bus3-keys:/keys"]
+
   # The competitors' generator (focal-compare), on the bench network as
   # focal's own is, in the image focal.Dockerfile builds.
   generator:
     <<: *limits
-    image: focal:bench
-    profiles: [nats, kafka, redis]
+    image: ${FOCAL_IMAGE:-focal:bench}
+    profiles: [nats, kafka, redis, focal-bus]
     command: ["sleep", "86400"]
-    volumes: ["reports:/reports"]
+    volumes: ["reports:/reports", "bus-pki:/pki"]
 
 networks:
-  bench: {}
+  # A fixed subnet, so the bus's nodes name each other by address.
+  bench:
+    ipam:
+      config: [{ subnet: 10.231.0.0/24 }]
 
 volumes:
+  bus-pki: {}
+  bus1: {}
+  bus2: {}
+  bus3: {}
+  bus1-keys: {}
+  bus2-keys: {}
+  bus3-keys: {}
   focal1: {}
   focal2: {}
   focal3: {}

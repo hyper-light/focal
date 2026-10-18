@@ -6,7 +6,7 @@
 # OUT, and everything taken down with its volumes. Every wait is bounded.
 #
 #   run.sh SYSTEM RATE SECONDS WARMUP PAYLOAD OUT
-#   SYSTEM: focal | kafka | nats | redis
+#   SYSTEM: focal | focal-bus | kafka | nats | redis
 #   MODE (environment): append (default), each record stored; or deliver,
 #   each record also taken by a consumer and acknowledged by it durably, a
 #   work queue's message end to end (focal: its seven-write lifecycle, the
@@ -204,6 +204,7 @@ EOF
         > "$out/$report.$n.metrics.txt" 2>/dev/null || true
     done
     ;;
+  focal-bus) endpoints=focal-bus1:7443,focal-bus2:7443,focal-bus3:7443 ;;
   kafka) endpoints=kafka1:9092,kafka2:9092,kafka3:9092 ;;
   nats) endpoints=nats1:4222,nats2:4222,nats3:4222 ;;
   redis) endpoints=redis1:6379,redis2:6379,redis3:6379 ;;
@@ -213,10 +214,13 @@ esac
 if [ "$system" != focal ]; then
   # The cluster forms its quorum on its own clock: the generator's first
   # connection is asked again until it succeeds, as an operator's client would.
+  # focal's bus reads the identity directory its nodes share.
+  pki=()
+  if [ "$system" = focal-bus ]; then pki=(--pki /pki); fi
   generate() {
     dc exec -T generator focal-compare --system "$system" --durable --mode "$mode" \
       --endpoints "$endpoints" --rate "$rate" --payload "$payload" \
-      --seconds "$seconds" --warmup "$warmup" --out "/reports/$report"
+      --seconds "$seconds" --warmup "$warmup" "${pki[@]}" --out "/reports/$report"
   }
   cpu_stat before > "$out/$report.cpu.txt"
   net_stat before > "$out/$report.net.txt"
