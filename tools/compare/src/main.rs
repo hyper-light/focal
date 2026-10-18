@@ -8,6 +8,7 @@
 //! consumer and acknowledged durably, and timed from its intended send time
 //! to that acknowledgement (`deliver.rs`).
 mod bus;
+mod bus_append;
 mod certs;
 mod deliver;
 mod pubsub;
@@ -142,7 +143,12 @@ async fn main() -> Result<(), CompareError> {
         return pubsub_main(args).await;
     }
     if args.system == System::FocalBus {
-        return Err(CompareError::Argument("focal-bus runs the pubsub mode"));
+        if args.mode != Mode::Append {
+            return Err(CompareError::Argument(
+                "focal-bus runs the pubsub and append modes",
+            ));
+        }
+        return bus_append_main(args).await;
     }
     let deliver = args.mode == Mode::Deliver;
     if deliver && args.payload < deliver::HEADER {
@@ -252,6 +258,39 @@ async fn main() -> Result<(), CompareError> {
         None => None,
     };
     report::Report::new(&args, &histogram, &tally, delivered.as_ref()).write(&args.out)
+}
+
+/// The `append` mode against focal's event bus: a part replicated by the nodes `--endpoints` names,
+/// node 1 first, each record timed from its intended send to its persisted acknowledgement
+/// (`bus_append`).
+async fn bus_append_main(args: Args) -> Result<(), CompareError> {
+    let mut nodes = Vec::new();
+    for endpoint in args.endpoints.split(',') {
+        let address = tokio::net::lookup_host(endpoint)
+            .await
+            .map_err(|error| CompareError::Target(error.to_string()))?
+            .next()
+            .ok_or(CompareError::Argument("a bus node's address"))?;
+        nodes.push(address);
+    }
+    let run = bus_append::Run {
+        nodes,
+        pki: args
+            .pki
+            .clone()
+            .ok_or(CompareError::Argument("focal-bus needs --pki"))?,
+        rate: args.rate,
+        warmup: Duration::from_secs(args.warmup),
+        total: Duration::from_secs(args.warmup)
+            .checked_add(Duration::from_secs(args.seconds))
+            .ok_or(CompareError::Argument("duration"))?,
+        payload: args.payload,
+        inflight: args.inflight,
+    };
+    let (histogram, tally) = tokio::task::spawn_blocking(move || bus_append::run(run))
+        .await
+        .map_err(|error| CompareError::Target(error.to_string()))??;
+    report::Report::new(&args, &histogram, &tally, None).write(&args.out)
 }
 
 /// The `pubsub` mode's messages: a shape of focal's corpus, compressed as a claimant sends it, or

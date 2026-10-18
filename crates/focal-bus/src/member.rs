@@ -381,6 +381,12 @@ impl Member {
         budget: MemoryBudget,
         now: Instant,
     ) -> Result<Self, BusError> {
+        // The data directory, owner-only, each directory made durable in its parent.
+        focal_platform::fs::create_dir_all_durable(
+            &settings.data,
+            focal_platform::fs::create_dir_private,
+        )
+        .map_err(|_| BusError::Configuration("the node's data directory could not be made"))?;
         let run = raise_run(&settings.data.join(RUN_FILE))?;
         let log = open_log(&settings.data, &settings.key_file, settings.memory_bytes)?;
         let store = GroupStore::claim(&log, PART_GROUP)

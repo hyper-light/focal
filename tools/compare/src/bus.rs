@@ -81,7 +81,15 @@ fn endpoint(
         .ok_or_else(|| fail("no such client identity"))?;
     let mut directory = BusDirectory::new(1);
     directory
-        .enroll(&local.node.certificate, NODE, Role::Node, pki::NODE_NAME)
+        .enroll(
+            &local
+                .node(NODE)
+                .ok_or_else(|| fail("no node identity"))?
+                .certificate,
+            NODE,
+            Role::Node,
+            &pki::node_name(NODE),
+        )
         .map_err(fail)?;
     let credentials = Credentials {
         chain: vec![CertificateDer::from(identity.certificate.clone())],
@@ -193,7 +201,7 @@ pub fn run(run: Run) -> Result<(Tally, Received, Lag), CompareError> {
         total,
         payloads,
     } = run;
-    let local = pki::load_or_make(&directory, CLIENTS).map_err(fail)?;
+    let local = pki::load_or_make(&directory, 1, CLIENTS).map_err(fail)?;
     // Both clients' endpoints are charged within this process's envelope, as a node's are; a machine
     // whose memory cannot be read is refused rather than guessed at.
     let envelope = focal_platform::memory_envelope()
@@ -494,7 +502,7 @@ fn publisher(
         close,
         mut finished,
     } = tells;
-    let producer = pki::Local::client_peer(PUBLISHER).ok_or_else(|| fail("the producer"))?;
+    let producer = pki::Local::client_peer_of(1, PUBLISHER).ok_or_else(|| fail("the producer"))?;
     let mut runtime = LocalRuntime::new(&runtime).map_err(fail)?;
     runtime
         .block_on(async move {

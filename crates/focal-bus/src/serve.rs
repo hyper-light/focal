@@ -22,6 +22,7 @@ use hyper_transport::{Config, Endpoint};
 use crate::BusError;
 use crate::budget::BusBudget;
 use crate::directory::BusDirectory;
+use crate::member::{Member, MemberSettings};
 use crate::node::{Node, NodeConfig, NodeStats};
 use crate::pki::{self, Local};
 use crate::wire::{Bus, Role};
@@ -39,6 +40,21 @@ pub struct ServeConfig {
     pub node: NodeConfig,
     /// The bytes the node may hold: its segments, tables and transport.
     pub memory_bytes: usize,
+    /// The group the node's part is replicated by (doc 34), none for a lone node.
+    pub group: Option<GroupServe>,
+}
+
+/// A node of a part's group: which node it is, the others, and where it keeps its log.
+#[derive(Clone, Debug)]
+pub struct GroupServe {
+    /// This node (from 1), as the local directory names it.
+    pub node: u64,
+    /// Every other node of the group, and where it listens.
+    pub peers: Vec<(u64, SocketAddr)>,
+    /// The directory the node keeps its log, its part's image and its run in.
+    pub data: PathBuf,
+    /// The root key file the node's log's keys are kept under, outside `data`.
+    pub key_file: PathBuf,
 }
 
 /// The most client identities a node of `memory_bytes` admits: each holds its connections
@@ -55,12 +71,15 @@ pub fn most_clients(memory_bytes: usize) -> usize {
     memory_bytes.checked_div(per_client).unwrap_or(0)
 }
 
-fn credentials(local: &Local) -> Credentials {
-    Credentials {
-        chain: vec![CertificateDer::from(local.node.certificate.clone())],
-        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(local.node.key.clone())),
+fn credentials(local: &Local, node: u64) -> Result<Credentials, BusError> {
+    let identity = local
+        .node(node)
+        .ok_or(BusError::Configuration("no identity for this node"))?;
+    Ok(Credentials {
+        chain: vec![CertificateDer::from(identity.certificate.clone())],
+        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key.clone())),
         roots: vec![CertificateDer::from(local.root.clone())],
-    }
+    })
 }
 
 /// What a node did, as it stops: its own account, its memory, its transport's buffers, the rooms
@@ -84,19 +103,40 @@ pub async fn serve(
             "more client identities than the node's memory admits",
         ));
     }
-    let local = pki::load_or_make(&config.pki, config.clients)?;
+    let (this, peers) = match &config.group {
+        Some(group) => (group.node, group.peers.len()),
+        None => (1, 0),
+    };
+    let local = pki::load_or_make(&config.pki, peers.saturating_add(1), config.clients)?;
     let budget = MemoryBudget::new(config.memory_bytes, 0).map_err(BusError::Memory)?;
-    let mut directory = BusDirectory::new(config.clients);
+    let mut directory = BusDirectory::new(config.clients.saturating_add(peers));
     for (index, client) in local.clients.iter().enumerate() {
-        let peer = Local::client_peer(index).ok_or(BusError::Configuration("clients"))?;
+        let peer = local
+            .client_peer(index)
+            .ok_or(BusError::Configuration("clients"))?;
         let name = format!("focal-bus-client-{}", index.saturating_add(1));
         directory.enroll(&client.certificate, peer, Role::Client, &name)?;
     }
-    let tls = Tls::mutual(&credentials(&local), true).map_err(BusError::Transport)?;
+    if let Some(group) = &config.group {
+        for (peer, _) in &group.peers {
+            let identity = local.node(*peer).ok_or(BusError::Configuration(
+                "no identity for a node of the group",
+            ))?;
+            directory.enroll(
+                &identity.certificate,
+                *peer,
+                Role::Node,
+                &pki::node_name(*peer),
+            )?;
+        }
+    }
+    let tls = Tls::mutual(&credentials(&local, this)?, true).map_err(BusError::Transport)?;
+    let limits = crate::limits::node(config.clients, peers)?;
+    let lane_window = limits.lane_window;
     let endpoint_config = Config {
         tls,
         role: Role::Node,
-        limits: crate::limits::node(config.clients, 0)?,
+        limits,
         congestion: Default::default(),
     };
     let endpoint: Endpoint<Bus, BusBudget, BusDirectory> = Endpoint::new(
@@ -121,9 +161,36 @@ pub async fn serve(
     let address = driver
         .local_addr()
         .map_err(|_| BusError::Configuration("the listen address"))?;
-    let mut node = Node::new(config.node, budget)?;
+    let mut node = Node::new(config.node, budget.clone())?;
     let signals = signal::subscribe(&[Signal::Interrupt, Signal::Terminate])
         .map_err(|_| BusError::Configuration("signals could not be subscribed"))?;
+    if let Some(group) = config.group {
+        let memory_bytes = u64::try_from(config.memory_bytes)
+            .map_err(|_| BusError::Configuration("the node's memory"))?;
+        let mut members: Vec<u64> = group.peers.iter().map(|(peer, _)| *peer).collect();
+        members.push(group.node);
+        members.sort_unstable();
+        let now = driver
+            .clock()
+            .map_err(|_| BusError::Configuration("the shard's clock"))?;
+        let member = Member::open(
+            MemberSettings {
+                id: group.node,
+                peers: group.peers,
+                data: group.data,
+                key_file: group.key_file,
+                memory_bytes,
+            },
+            node,
+            members,
+            config.clients,
+            lane_window,
+            budget,
+            now,
+        )?;
+        ready(address);
+        return serve_member(driver, member, signals).await;
+    }
     ready(address);
     // The transport's reservations given back as the node last looked: a delivery that found no
     // memory is asked again once some come back.
@@ -163,10 +230,87 @@ pub async fn serve(
                     node.on_event(driver.endpoint(), event);
                 }
             }
-            Woke::Freed => {}
+            Woke::Freed | Woke::Due => {}
         }
         returns = driver.endpoint().budget().stats().returns;
         node.relieve_transport(driver.endpoint());
+    }
+}
+
+/// The loop of a node of a part's group (doc 34): the member's events, its turns and its waits, until
+/// an interrupt or a termination. A wake that brings no event of the endpoint's, no signal and no
+/// timer is the log's: a write the replica gave it is durable, and the turn's drive takes it.
+async fn serve_member(
+    mut driver: Driver<Bus, BusBudget, BusDirectory>,
+    mut member: Member,
+    signals: signal::SignalStream,
+) -> Result<Served, BusError> {
+    let clock = |driver: &Driver<Bus, BusBudget, BusDirectory>| {
+        driver
+            .clock()
+            .map_err(|_| BusError::Configuration("the shard's clock"))
+    };
+    let waker = poll_fn(|context| Poll::Ready(context.waker().clone())).await;
+    let now = clock(&driver)?;
+    member.connect(driver.endpoint(), now);
+    let mut returns = driver.endpoint().budget().stats().returns;
+    loop {
+        let began = clock(&driver)?;
+        let sleep_ns = member.deadline().map(|at| {
+            u64::try_from(at.saturating_duration_since(began).as_nanos())
+                .unwrap_or(u64::MAX)
+                .max(1)
+        });
+        let mut sleep = pin!(sleep_ns.map(hyper_rt::futures::sleep));
+        let mut stop = pin!(signals.recv());
+        let mut first = true;
+        let woke = poll_fn(|context| {
+            if stop.as_mut().poll(context).is_ready() {
+                return Poll::Ready(Woke::Stop);
+            }
+            if let Poll::Ready(event) = driver.poll_event(context) {
+                return Poll::Ready(Woke::Event(event));
+            }
+            if let Some(sleep) = sleep.as_mut().as_pin_mut()
+                && sleep.poll(context).is_ready()
+            {
+                return Poll::Ready(Woke::Due);
+            }
+            if member.node().starving() && driver.endpoint().budget().stats().returns != returns {
+                return Poll::Ready(Woke::Freed);
+            }
+            // Polled again with nothing else ready: the log woke the task.
+            if !std::mem::take(&mut first) {
+                return Poll::Ready(Woke::Due);
+            }
+            Poll::Pending
+        })
+        .await;
+        let now = clock(&driver)?;
+        member.waited(began, now);
+        match woke {
+            Woke::Stop => {
+                return Ok((
+                    member.node().stats(),
+                    member.node().memory(),
+                    driver.endpoint().budget().stats(),
+                    driver.rooms(),
+                    hyper_rt::futures::shard_counters(),
+                ));
+            }
+            Woke::Event(event) => {
+                let event =
+                    event.map_err(|_| BusError::Configuration("the endpoint's socket failed"))?;
+                member.on_event(driver.endpoint(), event, now);
+                while let Some(event) = driver.endpoint().poll_event() {
+                    member.on_event(driver.endpoint(), event, now);
+                }
+            }
+            Woke::Freed | Woke::Due => {}
+        }
+        member.turn(driver.endpoint(), &waker, now);
+        returns = driver.endpoint().budget().stats().returns;
+        member.node_mut().relieve_transport(driver.endpoint());
     }
 }
 
@@ -178,4 +322,6 @@ enum Woke<E> {
     Event(E),
     /// The transport gave memory back while a delivery waited for some.
     Freed,
+    /// A node of a group has work: its deadline came, or its log answered a write.
+    Due,
 }
