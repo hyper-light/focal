@@ -42,6 +42,10 @@ type Drv = Driver<Bus, BusBudget, BusDirectory>;
 const STREAM: u64 = 1;
 /// Format: the publisher's client identity.
 const PUBLISHER: usize = 0;
+/// Cited: Kafka's client's first backoff after a retriable error, `retry.backoff.ms` (100 ms).
+const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+/// Cited: the most it backs off, `retry.backoff.max.ms` (1,000 ms, KIP-580).
+const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(1_000);
 
 /// One `append` run's terms on the bus.
 pub struct Run {
@@ -151,6 +155,11 @@ async fn publish(
     // again, to the leader the client now knows.
     let mut flying: BTreeMap<u32, Flying> = BTreeMap::new();
     let mut again: Vec<u32> = Vec::new();
+    // A redirect that names no leader (an election under way) holds what goes again until a node
+    // names one or the backoff passes, as Kafka's client backs off a retriable error: from
+    // `retry.backoff.ms`, 100 ms, doubling to `retry.backoff.max.ms`, 1,000 ms (KIP-580's defaults).
+    let mut held_until: Option<Instant> = None;
+    let mut backoff = RETRY_BACKOFF;
     let mut in_flight = 0_usize;
     let mut sequence = 0_u32;
     let began = Instant::now();
@@ -180,9 +189,14 @@ async fn publish(
             }
             break;
         }
-        // Batches redirected or orphaned by a closed connection go to the leader known now.
+        // Batches redirected or orphaned by a closed connection go to the leader known now, once no
+        // backoff holds them.
         let client = Client::new(leader);
+        let backing_off = held_until.is_some_and(|until| Instant::now() < until);
         again.retain(|first| {
+            if backing_off {
+                return true;
+            }
             let Some(batch) = flying.get(first) else {
                 return false;
             };
@@ -325,12 +339,22 @@ async fn publish(
                 }
             }
             for redirect in redirected {
-                if let Some(node) = redirect.leader.node
-                    && redirect.leader.term > term
-                {
-                    leader = node;
-                    term = redirect.leader.term;
-                    let _ = driver.endpoint().connect(now, leader, address(leader)?);
+                match redirect.leader.node {
+                    Some(node) if redirect.leader.term > term => {
+                        leader = node;
+                        term = redirect.leader.term;
+                        let _ = driver.endpoint().connect(now, leader, address(leader)?);
+                        // A leader named: what waits goes at once.
+                        held_until = None;
+                        backoff = RETRY_BACKOFF;
+                    }
+                    Some(_) => {}
+                    None => {
+                        if held_until.is_none_or(|until| now >= until) {
+                            held_until = now.checked_add(backoff);
+                            backoff = backoff.saturating_mul(2).min(RETRY_BACKOFF_MAX);
+                        }
+                    }
                 }
                 if flying.contains_key(&redirect.sequence) && !again.contains(&redirect.sequence) {
                     again.push(redirect.sequence);
