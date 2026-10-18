@@ -1,7 +1,9 @@
 # 34 — Three nodes: a part replicated over hyper-durable
 
-Status: 2026-10-18, the design of doc 32's step 3 as doc 33 refines it (its steps 3b and 3g), before
-code. Doc 33 says what each class commits on; this says how a part becomes a group of three
+Status: 2026-10-18. The design of doc 32's step 3 as doc 33 refines it (its steps 3b, 3c and 3g),
+and what was built of it: steps 3b.1 to 3b.4 and 3c are in (§8); the comparison (3b.5) ran once
+and found records left unacknowledged at 10,000 a second and a tail of 1.4 s at 1,000, both open.
+Doc 33 says what each class commits on; this says how a part becomes a group of three
 replicas, and what every publish, acknowledgement and delivery does on the way.
 
 ## 1. What it builds
@@ -97,3 +99,48 @@ offered load, and no collapse as the load rises, each system held to the class i
 | 3b.3 | The replicated node: replica, log and endpoint on one shard; elections by the liveness stream | three nodes in one process over loopback: publish, acknowledge, deliver; a leader killed, publishes resent, nothing acknowledged lost |
 | 3b.4 | `focal start bus` for a node of a group; the client following the leader | three processes, kill -9 at every persistence point |
 | 3b.5 | The comparison of §6 on the bare-metal machine | the bar |
+
+## 8. What was built, and found
+
+| Step | Built | Shown |
+|---|---|---|
+| 3b.1 | `wire.rs`: a group's messages (hyper-raft's own records, their own class ranked ahead of deliveries, held rather than skipped), heartbeats on a liveness lane of their own, acknowledgements (stream, producer, sequence, offsets, class), redirects naming the leader and its term, a subscribe's reply tagged to name the leader; `RAFT_BOUND` derived from the record layout and the largest batch | round trips; every kind's roles |
+| 3b.2 | `group.rs`: the part as the group's state machine; resends recognised by the stream's newest producer's sequence; the image (each stream's floor and its newest batch's producer there, the configuration) as of the newest entry the window let go, CRC-sealed and installed durably; the log compacted to it and no further | apply, resend, image, reopen-and-replay and install tests |
+| 3b.3 | `member.rs`: the replica over the node's sealed hyper-log log (facts by `Config::derive`), the liveness stream, publishes proposed at the leader and redirected elsewhere, a parked publish holding its publisher's lane, acknowledgements at apply, a node that stops leading redirecting what it owed, Raft frames authenticated by the transport's peer | `tests/group.rs`: three nodes and a client on one shard; a leader elected; 100 acknowledged in order; delivered in order; the leader killed; 100 more; nothing acknowledged lost; a resend not appended twice |
+| 3b.4 | `focal start bus --node --peer --data --key-file`; `focal-compare --system focal-bus --mode append` | three processes: 5,000 acknowledged, none failed |
+| 3c | `--fate ID=FATE` (each node, the same at every node), `--spanning` (by default every distinct fate); hyper-raft's `Fates` where the members' fates reach the span; acknowledgements `Replicated`, or `Persisted` where replicas share their fates | `tests/group.rs` for both classes; three processes with fates: 7,000 acknowledged replicated |
+| 3b.5 | the comparison on the bare-metal machine (9950X3D2): each system's three nodes in Docker, open loop, 128-byte records, 30 s after 10 s of warm-up; Kafka, NATS and Redis durable per write (`flush=1`; `sync always`; `appendfsync always` with `WAITAOF 1 2`) | below |
+
+The comparison's first run (2026-10-18), p50 / p99 / p99.9 in milliseconds:
+
+| System | 1,000/s | 10,000/s | Unacknowledged at 10,000/s |
+|---|---|---|---|
+| focal, persisted | 33.2 / 1,404 / 1,674 | 35.4 / 70.2 / 275 | 2,441 |
+| focal, replicated (held) | 0.3 / 34.5 / 103 | 2.2 / 143 / 2,322 (7,983/s) | 1,022 |
+| Kafka | 35.4 / 172 / 252 | 38.5 / 343 / 538 | 0 |
+| Redis | 43.5 / 969 / 1,145 | 1,323 / 3,290 / 3,406 (2,600/s) | 0 |
+| NATS | 24,562 / 25,048 / 25,065 (93/s) | 23,236 / 24,059 / 24,075 (98/s) | 0 |
+
+The unacknowledged records and the persisted class's 1.4-second tail at 1,000 a second are defects,
+open until root-caused; the replicated class is a held commit, not a write on every replica's disk,
+and the rows durable per write are not its comparison.
+
+Found on the way, each root-caused:
+- **No leader was ever elected.** Every heartbeat was refused `Unmeasured` and every pair stayed
+  `Unconfigured`: the owner never told the liveness stream its waits, the timer granularity hyper-
+  liveness builds every estimator from (`Liveness::on_wait`). `Member::waited` tells it, for a wait
+  begun before the stream's wake and ended at or past it, before anything the wait brought is fed.
+  Found by a state dump of the three nodes, not by reading.
+- **The comparison never ended.** A batch whose publish found the leader not yet connected left
+  the resend list (only a full lane kept it) and stayed in flight unacknowledged; and while no
+  leader was named the client resent every batch each turn. Both fixed in the client; it backs off
+  a leaderless redirect as Kafka's client backs off a retriable error (KIP-580).
+- **A held commit of three members waits for both followers.** The leader counts its own disk and
+  never its memory (doc 33 §4.4a), so a held quorum without the leader's disk is both followers'
+  held answers; whenever either follower's durable promise falls behind the stream, the commit
+  waits a flush, the leader's or that follower's. Traced on three processes (macOS, debug):
+  propose to commit p50 1.2–4 ms, p90 23–46 ms, commit to apply 0. Open: what of it a group of
+  five changes (a held quorum is then three of four followers), and the promise's reach under bursts.
+- **Resends are recognised by the stream's newest producer only.** A producer's batch sent again
+  after another producer's batch on the same stream is appended again: at least once, the class's
+  promise. Open: a bounded producer table, as Kafka keeps per partition.

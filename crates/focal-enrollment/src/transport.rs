@@ -536,9 +536,12 @@ fn nanos(period: Duration) -> u64 {
 /// caller's, on `now_ns`'s clock). A dial the sponsor's bounds refused (its handshake places or its
 /// socket's room taken: `AccessError::Capacity`) or that reached no sponsor sent nothing, so it is
 /// made again after the pause [`Backoff`] gives; the caller's timeout ends the dials. A leaf not
-/// pinned and a failed TLS authentication are the sponsor's answer and end them at once. Each joiner gave up at its first refusal: in a burst of joiners the sponsor's places
-/// were taken, and every joiner past them failed its whole join (on Linux's default receive buffer
-/// a sponsor's socket holds two first windows at once, hyper-raft's `docs/transport.md` §4s).
+/// pinned and a failed TLS authentication are the sponsor's answer and end them at once, and a
+/// refusal after which no dial could be answered before the deadline ends them `Unavailable`:
+/// nothing was sent, where the caller's timeout could only say the outcome is unknown. Each joiner
+/// gave up at its first refusal: in a burst of joiners the sponsor's places were taken, and every
+/// joiner past them failed its whole join (on Linux's default receive buffer a sponsor's socket
+/// holds two first windows at once, hyper-raft's `docs/transport.md` §4s).
 async fn connect(
     connector: &QuicConnector,
     address: SocketAddr,
@@ -546,38 +549,27 @@ async fn connect(
     deadline: u64,
 ) -> Result<focal_wire::EnrollmentLink, JoinTransportError> {
     let mut backoff = Backoff::default();
-    let mut refusals = 0u32; // DIAG
-    let first = hyper_rt::futures::now_ns(); // DIAG
-    // Bound: each pause is at least half of the last dial's time doubled once for each refusal
-    // before, and never under the timer's granularity, so 128 of them pass any `Duration`, and the
-    // caller's timeout ends the dials long before.
+    // Bound: 128 dials. Each pause is at least half the base doubled once for each refusal before,
+    // the base never under the timer's granularity, up to what the deadline leaves less a dial,
+    // and a refusal that leaves no more than a dial ends the dials: the deadline ends them first.
     for _ in 0..u128::BITS {
         let began = hyper_rt::futures::now_ns();
         match connector
             .enrollment(address, &trust.server_name, trust.pins())
             .await
         {
-            Ok(link) => {
-                eprintln!(
-                    "DIAG dial ok after {refusals} refusals, {} ms since the first dial",
-                    hyper_rt::futures::now_ns().saturating_sub(first) / 1_000_000
-                ); // DIAG
-                return Ok(link);
-            }
+            Ok(link) => return Ok(link),
             Err(WireError::Unpinned) => {
                 return Err(JoinTransportError::Enrollment(EnrollmentError::Unpinned));
             }
             Err(WireError::Authentication) => return Err(JoinTransportError::Unavailable),
-            Err(error) => {
+            Err(_) => {
                 let now = hyper_rt::futures::now_ns();
                 let took = Duration::from_nanos(now.saturating_sub(began));
                 let left = Duration::from_nanos(deadline.saturating_sub(now));
-                let pause = backoff.pause(took, left, entropy());
-                eprintln!(
-                    "DIAG dial refused {error:?}: took {took:?}, pause {pause:?}, refusal {refusals}, {} ms since the first dial",
-                    hyper_rt::futures::now_ns().saturating_sub(first) / 1_000_000
-                ); // DIAG
-                refusals = refusals.saturating_add(1);
+                let Some(pause) = backoff.pause(took, left, entropy()) else {
+                    return Err(JoinTransportError::Unavailable);
+                };
                 let _ = hyper_rt::futures::sleep(nanos(pause)).await;
             }
         }
@@ -596,7 +588,8 @@ async fn connect(
 ///   the eighth gave a 25-second pause, past the joiner's whole 15-second budget, and three joiners
 ///   of eight failed their join in each of six runs.
 /// - **The cap** is what the caller's deadline leaves less one more dial at the base, so a pause
-///   never outlasts the time in which the dial after it could still be answered.
+///   never outlasts the time in which the dial after it could still be answered; where the
+///   deadline leaves no more than that dial, none could be, and there is no pause.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Backoff {
     /// The least a refused dial took so far.
@@ -607,14 +600,21 @@ pub(crate) struct Backoff {
 
 impl Backoff {
     /// The pause after a dial refused in `took`, the caller's deadline `left` away, drawn from
-    /// `random`.
-    pub(crate) fn pause(&mut self, took: Duration, left: Duration, random: u64) -> Duration {
+    /// `random`; none when the deadline leaves no more than a dial at the base.
+    pub(crate) fn pause(
+        &mut self,
+        took: Duration,
+        left: Duration,
+        random: u64,
+    ) -> Option<Duration> {
         let base = self.floor.map_or(took, |least| least.min(took));
         self.floor = Some(base);
-        let cap = left.saturating_sub(base);
-        let pause = dial_pause(base, self.refusals, cap, random);
+        if left <= base {
+            return None;
+        }
+        let pause = dial_pause(base, self.refusals, left.saturating_sub(base), random);
         self.refusals = self.refusals.saturating_add(1);
-        pause
+        Some(pause)
     }
 }
 

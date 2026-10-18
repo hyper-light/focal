@@ -720,13 +720,30 @@ fn a_dial_held_behind_the_sponsors_handshakes_does_not_multiply_the_pauses_after
     let mut last = Duration::ZERO;
     for took in tooks {
         spent += took;
-        let pause = backoff.pause(took, budget.saturating_sub(spent), u64::MAX);
-        assert!(spent + pause + Duration::from_micros(10_500) <= budget || pause.is_zero());
+        let pause = backoff
+            .pause(took, budget.saturating_sub(spent), u64::MAX)
+            .unwrap();
+        assert!(spent + pause + Duration::from_micros(10_500) <= budget);
         spent += pause;
         last = pause;
     }
     // Eight refusals before the 138 ms one: its pause is the floor doubled eight times.
     assert_eq!(last, Duration::from_micros(10_500) * 256);
+}
+
+/// A refusal after which the deadline leaves no more than a dial at the base ends the dials: no
+/// dial after it could be answered in time, and redialled without a pause, as a cap of nothing
+/// gave, the joiner spent its last dial's time on as many refusals as its count allowed. Do: a
+/// backoff whose base is 10 ms, refused with 25 ms, 10 ms and 5 ms left. Expect: a pause no longer
+/// than the 15 ms that leaves a dial, then none, and none.
+#[test]
+fn a_refusal_that_leaves_the_deadline_no_dial_ends_the_dials() {
+    let ms = Duration::from_millis;
+    let mut backoff = transport::Backoff::default();
+    let pause = backoff.pause(ms(10), ms(25), u64::MAX).unwrap();
+    assert!(pause <= ms(15), "{pause:?}");
+    assert_eq!(backoff.pause(ms(10), ms(10), u64::MAX), None);
+    assert_eq!(backoff.pause(ms(12), ms(5), u64::MAX), None);
 }
 
 /// Joiners the sponsor's bounds refuse dial again within their timeout, where each gave up at
@@ -778,10 +795,6 @@ async fn refused_joiners_dial_again() {
     for joiner in joiners {
         answers.push(joiner.await.unwrap());
     }
-    eprintln!(
-        "DIAG answers {answers:?} calls {}",
-        calls.load(Ordering::SeqCst)
-    ); // DIAG
     assert!(
         answers
             .iter()
