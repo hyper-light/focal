@@ -291,6 +291,12 @@ impl Unstable {
         let from = position(self.issued, self.offset).unwrap_or(0);
         self.entries.get(from..).unwrap_or(&[])
     }
+    /// The entries a write was issued for and storage does not hold yet, in order of index: with
+    /// [`Unstable::unissued`], every entry held.
+    pub fn issued_entries(&self) -> &[Entry] {
+        let to = position(self.issued, self.offset).unwrap_or(0);
+        self.entries.get(..to).unwrap_or(&self.entries)
+    }
     /// Whether an entry is held that no write was issued for.
     pub fn has_unissued(&self) -> bool {
         self.issued < self.end()

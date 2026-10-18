@@ -1393,10 +1393,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// Makes the refused writes again, once every write out has been answered and the log has
-    /// room: one write of everything the core holds not yet durable, laid out from the core
-    /// (R-4 keeps it until its notice), with the latest hard state and the messages of each
-    /// refused write whose log the core still holds (`Out::tip`). Its notice is the last refused
-    /// `Ready`'s, which covers all of them.
+    /// room: one write of everything they held, laid out from the core (R-4 keeps it until its
+    /// notice), with the latest hard state and the messages of each refused write whose log the
+    /// core still holds (`Out::tip`). Its notice is the last refused `Ready`'s, which covers all
+    /// of them, and nothing past them: an entry no write was issued for waits for the `Ready`
+    /// that issues it. Written here as well, the core would issue it again, and a compaction
+    /// bounded by what the store holds could pass it before that write, which the store then
+    /// refuses below its start (the shell's simulation, seed 9785 of its fourth shape: a leader
+    /// applying ahead of its write applied what its followers took from that `Ready`, and
+    /// compacted while the `Ready`'s write stalled).
     fn make_again(&mut self, now: u64, waker: &Waker) -> Result<(), ReplicaError> {
         let freed = self.stall.as_ref().is_some_and(|stall| stall.freed);
         if !freed || !self.writes.is_empty() || !self.node.store().log.room() {
@@ -1426,7 +1431,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             commit: if unissued {
                 self.issued.commit
             } else {
-                stated.max(self.issued.commit)
+                // I7: the core may have committed entries no write was issued for yet.
+                stated.min(self.written_through()).max(self.issued.commit)
             },
             ..self.issued
         };
@@ -1440,7 +1446,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let held: Vec<Entry> = if unissued {
             Vec::new()
         } else {
-            unstable.entries().to_vec()
+            unstable.issued_entries().to_vec()
         };
         // The fast track's proposals the refused writes held: the core keeps those of every
         // write issued until its notice, and every write out has been answered, so those it

@@ -15513,3 +15513,17 @@ write of the member's own frees a place for the next `Ready` (hyper-raft's simul
 classic commit at sixty-four clients from 12,990 to 8,660 µs, 4,907 to 7,352 entries a second).
 Doc 33 now states the design as built: a plain majority with durable promises, where its first draft
 kept SAUCR's ⌈n/2⌉+1 for SAUCR's recovery, and why each of the first build's dead ends was left.
+
+### 2026-10-18 — Every shared crate at hyper-raft c595ad1: a write made again holds what the refused writes held
+
+hyper-durable made a write the log refused for room again with every entry the core held not yet
+durable, those no `Ready` had issued among them, under the last refused `Ready`'s notice, which
+covers only the refused writes' entries: the core issued the rest again, and a leader applying ahead
+of its write could compact past them while that second write stalled, then fence on the write made
+again below the log's start (hyper-raft's shell simulation at seed 9785 of its fourth shape, the
+explore job's failure on R-8; the defect was in the shell before R-8, whose schedules reached it). A
+fenced replica in focal's event bus ended no node and answered nothing: a part's group would have
+lost a member to it in silence (the bus now ends a node whose replica fences). The write made again
+now holds what the refused writes held and states no commit past it. The snapshot also carries the
+shared-port driver test expecting Winsock's refusal of a shared bind. vendor/README.md;
+docs/dependencies/inventory.tsv.
