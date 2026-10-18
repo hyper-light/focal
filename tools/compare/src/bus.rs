@@ -371,6 +371,16 @@ fn subscriber(
                         Delivery::Lost(why) => {
                             outcome = Err(fail(format!("the node's connection ended: {why:?}")));
                         }
+                        // The lone node this mode runs leads every stream and acknowledges
+                        // nothing; a redirect or an acknowledgement here is a node of a group.
+                        Delivery::SubscribeRedirected { leader, .. } => {
+                            outcome =
+                                Err(fail(format!("the subscribe was redirected to {leader:?}")));
+                        }
+                        Delivery::Redirected(redirect) => {
+                            outcome = Err(fail(format!("a publish was redirected: {redirect:?}")));
+                        }
+                        Delivery::Acked(_) => {}
                     });
                 };
                 take(event, &mut driver);

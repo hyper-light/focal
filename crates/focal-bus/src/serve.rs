@@ -96,7 +96,7 @@ pub async fn serve(
     let endpoint_config = Config {
         tls,
         role: Role::Node,
-        limits: crate::limits::node(config.clients)?,
+        limits: crate::limits::node(config.clients, 0)?,
         congestion: Default::default(),
     };
     let endpoint: Endpoint<Bus, BusBudget, BusDirectory> = Endpoint::new(

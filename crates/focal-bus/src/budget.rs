@@ -30,7 +30,12 @@ const SMALLEST_SHIFT: u32 = (wire::Subscribe::BYTES as u64)
     .next_power_of_two()
     .trailing_zeros();
 /// Every class of the bus's messages, whose bounds the buffers are sized from.
-const BUS_CLASSES: [Class; 3] = [Class::Control, Class::Deliver, Class::Publish];
+const BUS_CLASSES: [Class; 4] = [
+    Class::Control,
+    Class::Replicate,
+    Class::Deliver,
+    Class::Publish,
+];
 /// The tag of a reservation that holds no buffer (a connection's window).
 const WINDOW: u8 = 0;
 
@@ -347,12 +352,13 @@ impl Budget<Class> for BusBudget {
 mod tests {
     use super::*;
 
-    use crate::wire::BATCH_BOUND;
+    use crate::wire::{BATCH_BOUND, RAFT_BOUND};
 
     #[test]
     fn classes_cover_every_grant_the_transport_makes_for_the_bus() {
         let sizes = Sizes::of_bus();
-        let largest = hyper_transport::frame_grant(BATCH_BOUND);
+        // The largest frame is a group's append of the largest batch.
+        let largest = hyper_transport::frame_grant(RAFT_BOUND);
         assert_eq!(sizes.top, largest, "the largest frame and its prefix");
         // The smallest class holds a subscribe's head, 17 bytes, rounded up.
         assert_eq!(sizes.class_of(1), Some((0, 32)));

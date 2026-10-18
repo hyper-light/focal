@@ -13,7 +13,9 @@ use hyper_transport::{
 
 use crate::BusError;
 use crate::batch::{Batch, BatchError};
-use crate::wire::{self, Bus, Gap, Kind, LANE, Subscribe, Subscribed};
+use crate::wire::{
+    self, Ack, Bus, Gap, Kind, LANE, Leader, Redirect, Reply, Subscribe, Subscribed,
+};
 
 /// What a client is handed.
 #[derive(Debug)]
@@ -29,6 +31,19 @@ pub enum Delivery<'a> {
         /// The reply.
         subscribed: Subscribed,
     },
+    /// A subscribe the node did not take, for it does not lead the stream's part: the leader it
+    /// knows (doc 34 P7).
+    SubscribeRedirected {
+        /// The exchange that asked.
+        exchange: ExchangeId,
+        /// The leader the node knows.
+        leader: Leader,
+    },
+    /// A publish its part's group committed (doc 34 P5).
+    Acked(Ack),
+    /// A publish the node did not take, for it does not lead the batch's part, and the leader it
+    /// knows (doc 34 P2).
+    Redirected(Redirect),
     /// A delivery that did not pass its producer's CRC, or a frame that was no delivery.
     Refused(BatchError),
     /// A subscribe the node or the transport refused, and why.
@@ -133,14 +148,39 @@ impl Client {
                 }
                 endpoint.release(frame);
             }
+            Event::Frame {
+                kind: Kind::Ack,
+                frame,
+                ..
+            } => {
+                match Ack::decode(frame.bytes()) {
+                    Ok(ack) => take(Delivery::Acked(ack)),
+                    Err(_) => take(Delivery::Refused(BatchError::Short)),
+                }
+                endpoint.release(frame);
+            }
+            Event::Frame {
+                kind: Kind::Redirect,
+                frame,
+                ..
+            } => {
+                match Redirect::decode(frame.bytes()) {
+                    Ok(redirect) => take(Delivery::Redirected(redirect)),
+                    Err(_) => take(Delivery::Refused(BatchError::Short)),
+                }
+                endpoint.release(frame);
+            }
             Event::Frame { frame, .. } => endpoint.release(frame),
             Event::Reply { exchange, .. } => {
-                let reply = endpoint.head(exchange).map(Subscribed::decode);
-                if let Some(Ok(subscribed)) = reply {
-                    take(Delivery::Subscribed {
+                match endpoint.head(exchange).map(Reply::decode) {
+                    Some(Ok(Reply::Subscribed(subscribed))) => take(Delivery::Subscribed {
                         exchange,
                         subscribed,
-                    });
+                    }),
+                    Some(Ok(Reply::Redirected(leader))) => {
+                        take(Delivery::SubscribeRedirected { exchange, leader });
+                    }
+                    _ => {}
                 }
                 endpoint.end(exchange);
             }

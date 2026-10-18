@@ -38,7 +38,7 @@ use crate::budget::Headroom;
 use crate::log::{Position, SegmentPool};
 use crate::part::{Appended, Part, PartLimits};
 use crate::stream::STREAM_BYTES;
-use crate::wire::{self, Bus, Gap, Kind, LANE, Subscribe, Subscribed};
+use crate::wire::{self, Bus, Gap, Kind, LANE, Reply, Subscribe, Subscribed};
 
 /// What a node holds at most.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -718,7 +718,7 @@ impl Node {
         };
         self.by_stream.entry(asked.stream).or_default().push(slot);
         self.stats.subscribed = self.stats.subscribed.saturating_add(1);
-        let reply = Subscribed { floor, next, start };
+        let reply = Reply::Subscribed(Subscribed { floor, next, start });
         if endpoint.reply(exchange, &reply.encode(), None).is_ok() {
             endpoint.end(exchange);
         }

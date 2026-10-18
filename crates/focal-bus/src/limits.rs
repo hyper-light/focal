@@ -10,7 +10,7 @@ use hyper_transport::{AdmissionLimits, AskQueue, Limits, StreamCredit};
 
 use crate::BusError;
 use crate::batch::MIN_BATCH;
-use crate::wire::{CONTROL_BOUND, Gap};
+use crate::wire::{Gap, HEAD_BOUND};
 
 /// Cited: the datagrams one system call carries each way: the packets one NAPI poll hands the
 /// kernel's network stack at most, the default poll weight drivers "are strongly advised to not
@@ -24,8 +24,11 @@ pub const IO: Io = Io { batch: 64 };
 /// for the serve period (hyper-transport's admission replaces only a quiet connection).
 pub const CONNECTIONS_PER_CLIENT: usize = 2;
 
-/// Format: the lanes a peer opens, the protocol's one each way ([`crate::wire::LANE`]).
-const LANES_PER_PEER: u32 = 1;
+/// Format: the lanes a client opens, the protocol's one each way ([`crate::wire::LANE`]).
+const LANES_PER_CLIENT: u32 = 1;
+/// Format: the lanes a node of a group opens to another: its groups' messages' and its heartbeats'
+/// ([`crate::wire::LANE`], [`crate::wire::LIVENESS_LANE`]), so a heartbeat waits behind no append.
+const LANES_PER_NODE: u32 = 2;
 
 /// Derived: the subscribes a connection has open at once. A node answers each in the event its
 /// request arrives (`node::Node::on_event`), so a connection's next one waits at most the round trip
@@ -73,15 +76,14 @@ fn lane_window() -> Result<usize, BusError> {
 /// transport keeps (`stream_window_ceiling`, about 2.3 MB) for each stream a peer sends on at once,
 /// its lane and its subscribe. Windows grow only as they are used (the transport's auto-tuning,
 /// Chromium QUIC's) and are charged as they grow; this bounds what one peer may pin.
-fn window_ceiling() -> u64 {
-    hyper_transport::stream_window_ceiling().saturating_mul(u64::from(
-        LANES_PER_PEER.saturating_add(STREAMS_PER_CONNECTION),
-    ))
+fn window_ceiling(lanes: u32) -> u64 {
+    hyper_transport::stream_window_ceiling()
+        .saturating_mul(u64::from(lanes.saturating_add(STREAMS_PER_CONNECTION)))
 }
 
 /// The bounds for an endpoint admitting `identities` peers' identities, of
-/// [`CONNECTIONS_PER_CLIENT`] connections each.
-fn limits(identities: usize) -> Result<Limits, BusError> {
+/// [`CONNECTIONS_PER_CLIENT`] connections each, each opening `lanes` lanes.
+fn limits(identities: usize, lanes: u32) -> Result<Limits, BusError> {
     let identities = identities.max(1);
     let connections = identities
         .checked_mul(CONNECTIONS_PER_CLIENT)
@@ -90,7 +92,7 @@ fn limits(identities: usize) -> Result<Limits, BusError> {
         .ok()
         .and_then(|streams| connections.checked_mul(streams))
         .ok_or(BusError::Configuration("exchanges"))?;
-    let window_ceiling = window_ceiling();
+    let window_ceiling = window_ceiling(lanes);
     // A full receive window of unread data, packed, and the chunk being cut (focal-wire's rule).
     let receive_chunks = usize::try_from(window_ceiling)
         .ok()
@@ -109,10 +111,10 @@ fn limits(identities: usize) -> Result<Limits, BusError> {
         stream_credit: StreamCredit::Fixed,
         ask_queue: AskQueue::Table,
         exchanges,
-        lanes_per_peer: LANES_PER_PEER,
+        lanes_per_peer: lanes,
         lane_window: lane_window()?,
-        max_head: u32::try_from(CONTROL_BOUND)
-            .map_err(|_| BusError::Configuration("the control bound"))?,
+        max_head: u32::try_from(HEAD_BOUND)
+            .map_err(|_| BusError::Configuration("the head bound"))?,
         window_ceiling,
         serve_period: SERVE_PERIOD,
         idle_timeout: IDLE_TIMEOUT,
@@ -123,14 +125,23 @@ fn limits(identities: usize) -> Result<Limits, BusError> {
     })
 }
 
-/// A node's bounds: the client identities its directory holds.
-pub fn node(clients: usize) -> Result<Limits, BusError> {
-    limits(clients)
+/// A node's bounds: the client identities its directory holds, and the other nodes of its group,
+/// none for a lone node. A node of a group opens a second lane to each other node, for heartbeats.
+pub fn node(clients: usize, peers: usize) -> Result<Limits, BusError> {
+    let identities = clients
+        .checked_add(peers)
+        .ok_or(BusError::Configuration("identities"))?;
+    let lanes = if peers == 0 {
+        LANES_PER_CLIENT
+    } else {
+        LANES_PER_NODE
+    };
+    limits(identities, lanes)
 }
 
 /// A client's bounds: the one node it dials.
 pub fn client() -> Result<Limits, BusError> {
-    limits(1)
+    limits(1, LANES_PER_CLIENT)
 }
 
 #[cfg(test)]
@@ -139,14 +150,19 @@ mod tests {
 
     #[test]
     fn the_bounds_are_the_transport_s_to_take() {
-        let node = node(2).unwrap();
-        assert_eq!(node.admission.connections, 4);
-        assert_eq!(node.lanes_per_peer, 1);
-        assert_eq!(node.max_head, 24);
+        let lone = node(2, 0).unwrap();
+        assert_eq!(lone.admission.connections, 4);
+        assert_eq!(lone.lanes_per_peer, 1);
+        // A subscribe's reply, its tag and the retained window, is the largest head.
+        assert_eq!(lone.max_head, 25);
+        // A node of a group of three admits its two peers beside its clients, on two lanes each.
+        let grouped = node(2, 2).unwrap();
+        assert_eq!(grouped.admission.identities, 4);
+        assert_eq!(grouped.lanes_per_peer, 2);
         // 1,200-byte datagrams of 44-byte frames (a 24-byte gap notice and its 20-byte prefix).
-        assert_eq!(node.lane_window, 64 * (1_200 / 44));
-        assert!(node.window_ceiling >= hyper_transport::initial_window(1_200));
-        assert!(node.keep_alive.unwrap() < node.idle_timeout);
+        assert_eq!(lone.lane_window, 64 * (1_200 / 44));
+        assert!(lone.window_ceiling >= hyper_transport::initial_window(1_200));
+        assert!(lone.keep_alive.unwrap() < lone.idle_timeout);
         let client = client().unwrap();
         assert_eq!(client.admission.identities, 1);
     }

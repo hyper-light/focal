@@ -167,7 +167,7 @@ fn endpoint(
         tls: Tls::mutual(&pki.credentials(own), listen).unwrap(),
         role,
         limits: match role {
-            Role::Node => focal_bus::limits::node(2).unwrap(),
+            Role::Node => focal_bus::limits::node(2, 0).unwrap(),
             Role::Client => focal_bus::limits::client().unwrap(),
         },
         congestion: Default::default(),
@@ -338,6 +338,15 @@ impl Harness {
                     panic!("a subscribe refused: {refusal:?}")
                 }
                 Delivery::Lost(why) => panic!("the node's connection ended: {why:?}"),
+                // A node that runs no group leads every stream it holds, and acknowledges nothing:
+                // its class is at most once.
+                Delivery::SubscribeRedirected { leader, .. } => {
+                    panic!("a lone node redirected a subscribe to {leader:?}")
+                }
+                Delivery::Acked(ack) => panic!("a lone node acknowledged {ack:?}"),
+                Delivery::Redirected(redirect) => {
+                    panic!("a lone node redirected a publish: {redirect:?}")
+                }
             });
         };
         handle(event, driver);

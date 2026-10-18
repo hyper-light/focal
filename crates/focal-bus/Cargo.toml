@@ -16,6 +16,11 @@ focal-memory = { version = "0.1.0", path = "../focal-memory" }
 hyper-transport.workspace = true
 hyper-rt.workspace = true
 hyper-rt-transport.workspace = true
+# A part replicated across nodes (doc 34): hyper-raft's core, its records the group's messages on
+# the wire, hyper-durable's shell over hyper-log's log, and the node-pair liveness stream that
+# judges each peer node for every group (doc 33 §4.1).
+hyper-raft.workspace = true
+hyper-liveness.workspace = true
 # The standalone mode's local identities (`pki`).
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "aws_lc_rs"] }
 
