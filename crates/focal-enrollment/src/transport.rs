@@ -544,6 +544,7 @@ async fn connect(
     trust: &ServerTrust,
 ) -> Result<focal_wire::EnrollmentLink, JoinTransportError> {
     let mut refusals = 0u32;
+    let first = hyper_rt::futures::now_ns(); // DIAG
     // Bound: each pause is at least half of the last dial's time doubled once for each refusal
     // before, and never under the timer's granularity, so 128 of them pass any `Duration`, and the
     // caller's timeout ends the dials long before.
@@ -553,14 +554,18 @@ async fn connect(
             .enrollment(address, &trust.server_name, trust.pins())
             .await
         {
-            Ok(link) => return Ok(link),
+            Ok(link) => {
+                eprintln!("DIAG dial ok after {refusals} refusals, {} ms since the first dial", hyper_rt::futures::now_ns().saturating_sub(first) / 1_000_000); // DIAG
+                return Ok(link);
+            }
             Err(WireError::Unpinned) => {
                 return Err(JoinTransportError::Enrollment(EnrollmentError::Unpinned));
             }
             Err(WireError::Authentication) => return Err(JoinTransportError::Unavailable),
-            Err(_) => {
+            Err(error) => {
                 let took = Duration::from_nanos(hyper_rt::futures::now_ns().saturating_sub(began));
                 let pause = dial_pause(took, refusals, entropy());
+                eprintln!("DIAG dial refused {error:?}: took {took:?}, pause {pause:?}, refusal {refusals}, {} ms since the first dial", hyper_rt::futures::now_ns().saturating_sub(first) / 1_000_000); // DIAG
                 refusals = refusals.saturating_add(1);
                 let _ = hyper_rt::futures::sleep(nanos(pause)).await;
             }

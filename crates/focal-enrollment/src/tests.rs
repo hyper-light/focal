@@ -743,6 +743,7 @@ async fn refused_joiners_dial_again() {
     for joiner in joiners {
         answers.push(joiner.await.unwrap());
     }
+    eprintln!("DIAG answers {answers:?} calls {}", calls.load(Ordering::SeqCst)); // DIAG
     assert!(
         answers
             .iter()
