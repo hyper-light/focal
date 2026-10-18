@@ -23,11 +23,18 @@ enum Work {
         Allocation,
     ),
     Stop(OneshotSender<Result<(), NodeError>>),
+    /// Holds the owner until its gate opens or closes: a test's way to fill the ingress queue.
+    #[cfg(test)]
+    Hold(mpsc::Receiver<()>),
 }
 /// Requests the ingress queue holds, and native proposals the owner holds
 /// unanswered: holding that many, it waits for the log before it takes
 /// another request, so a slow disk slows callers rather than growing a queue.
 const INGRESS: usize = 32;
+/// What a request other than a native read reserves of the host's budget past its frames as it
+/// waits for its reply (`handle`); a native read reserves `fleet::NATIVE_READ_PLACE_BYTES` past
+/// its own.
+const REQUEST_FLOOR: usize = 4096;
 /// What the owner made of one request: its reply, and for a native frame
 /// it proposed, the proposal whose commit the reply waits for.
 pub(crate) struct Dispatched {
@@ -113,6 +120,9 @@ pub(crate) fn settle_all(
 #[derive(Clone)]
 pub struct LocalHost {
     sender: mpsc::SyncSender<Work>,
+    /// Room in the ingress queue: each request takes a place before it is queued, and the owner
+    /// gives it back as it takes the request (`INGRESS`).
+    credit: hyper_rt::sync::Sender<()>,
     ended: watch::Receiver<()>,
     budget: MemoryBudget,
     limits: WireLimits,
@@ -137,7 +147,16 @@ impl LocalHost {
         let host_limits = limits.clone();
         let host_budget = budget.clone();
         let native = node.session.activation().is_native();
-        let (sender, receiver) = mpsc::sync_channel(INGRESS);
+        // A caller that finds the queue full waits its turn for room, as the queue's bound says (a
+        // slow owner slows its callers): refused at once, 13 of 250 writes from 64 callers of an
+        // embedded node were refused `Capacity` on a loaded host. Places for every caller the
+        // budget lets wait at once, each holding at least the least a request reserves; one place
+        // in the queue past the requests for the owner's stop.
+        let least = REQUEST_FLOOR.min(crate::fleet::NATIVE_READ_PLACE_BYTES);
+        let waiters = budget.limit().checked_div(least).unwrap_or(0).max(1);
+        let (credit, mut credits) = hyper_rt::sync::channel_with(INGRESS, waiters)
+            .map_err(|_| NodeError::Ledger(LedgerError::Capacity))?;
+        let (sender, receiver) = mpsc::sync_channel(INGRESS.saturating_add(1));
         let mut waiting = VecDeque::new();
         waiting
             .try_reserve_exact(INGRESS)
@@ -201,6 +220,8 @@ impl LocalHost {
                     };
                     match work {
                         Work::Request(request, response, mut charge) => {
+                            // Its place in the queue goes to the next caller waiting for one.
+                            let _ = credits.try_recv();
                             // A native read's page is charged to the read as the owner builds
                             // it, object by object (`native_reads::PageObjects`).
                             // A vanished caller cannot cancel an already admitted mutation.
@@ -232,12 +253,18 @@ impl LocalHost {
                             let _ = response.send(node.checkpoint());
                             break;
                         }
+                        #[cfg(test)]
+                        Work::Hold(gate) => {
+                            let _ = credits.try_recv();
+                            let _ = gate.recv();
+                        }
                     }
                 }
             })?;
         Ok((
             Self {
                 sender,
+                credit,
                 ended,
                 budget,
                 limits: host_limits,
@@ -245,6 +272,15 @@ impl LocalHost {
             },
             HostOwner { thread },
         ))
+    }
+    /// Holds the owner until the returned sender sends or drops: a test's way to fill the ingress
+    /// queue. Queued as a request is, its place taken first.
+    #[cfg(test)]
+    async fn hold_owner(&self) -> Option<mpsc::SyncSender<()>> {
+        let (release, gate) = mpsc::sync_channel(1);
+        self.credit.send(()).await.ok()?;
+        self.sender.try_send(Work::Hold(gate)).ok()?;
+        Some(release)
     }
     /// Completes on owner exit, including panic or fail-stop persistence errors.
     pub async fn closed(&self) {
@@ -427,7 +463,7 @@ impl RequestHandler for LocalHost {
                                     .and_then(|reply| n.checked_add(reply))
                             })
                             .and_then(|n| n.checked_add(if content { 8 * 1024 * 1024 } else { 0 }))
-                            .and_then(|n| n.checked_add(4096))
+                            .and_then(|n| n.checked_add(REQUEST_FLOOR))
                     }
                 });
             let Some(bytes) = bytes else {
@@ -458,6 +494,19 @@ impl RequestHandler for LocalHost {
             let Ok((send, receive)) = hyper_rt::sync::oneshot() else {
                 return OwnedResponse::new(full);
             };
+            // Its place in the queue, waited for in turn while the queue is full.
+            match self.credit.send(()).await {
+                Ok(()) => {}
+                // No place left to wait in: every caller the budget lets wait already waits.
+                Err(hyper_rt::sync::SyncError::Full(())) => return OwnedResponse::new(full),
+                Err(_) => {
+                    return OwnedResponse::new(
+                        request
+                            .request()
+                            .reply(Response::Error(AccessError::Unavailable)),
+                    );
+                }
+            }
             match self
                 .sender
                 .try_send(Work::Request(Box::new(request), send, charge.commit()))
@@ -1126,12 +1175,91 @@ mod tests {
         .unwrap()
     }
 
+    /// The requests answered in `requests_that_find_the_ingress_full_wait_for_room_and_are_served`.
+    static ANSWERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Requests that find the ingress queue full wait their turn for room and are served, as the
+    /// queue's bound says: a slow owner slows its callers. Do: hold the owner, send the queue's
+    /// worth of reads and eight more, let each run to its wait, then let the owner go. Expect:
+    /// none answered while the owner is held, every one served after. Refused at once, the eight
+    /// past the queue were answered `Capacity` (13 of 250 writes from 64 callers on a loaded host).
+    #[test]
+    fn requests_that_find_the_ingress_full_wait_for_room_and_are_served() {
+        focal_rt::block_on(async move {
+            let root = tempfile::tempdir().unwrap();
+            let mut settings = crate::config::Settings::default();
+            settings.node.data_dir = Some(root.path().to_owned());
+            crate::native_activation::activate_local(
+                &settings,
+                focal_ledger::NativeContentProfile::AuthoredV1,
+            )
+            .unwrap();
+            let node = EmbeddedNode::open(&settings).unwrap();
+            let identity = node.identity.clone();
+            let limits = WireLimits::default();
+            let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
+            let peer = AuthenticatedPeer::local(PeerGrant {
+                principal: identity.issuer,
+                tenants: std::collections::BTreeSet::from([identity.ledger.tenant]),
+                role: PeerRole::Runtime,
+            })
+            .unwrap();
+            // Native reads, which the owner builds: each waits as its request and a place.
+            let read = |id: u128| RequestEnvelope {
+                protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
+                ledger: identity.ledger,
+                route_epoch: RouteEpoch(1),
+                request_epoch: RequestEpoch(1),
+                request_id: RequestId::from_u128(id),
+                operation: Operation::NativeRead(focal_wire::NativeReadRequest {
+                    consistency: ReadConsistency::Linearizable,
+                    query: focal_wire::NativeReadQuery::Epochs(identity.issuer),
+                    max_items: 1,
+                }),
+            };
+            let release = host.hold_owner().await.unwrap();
+            let mut tasks = Vec::new();
+            for id in 1..=u128::try_from(INGRESS + 8).unwrap() {
+                let (host, peer, limits, request) =
+                    (host.clone(), peer.clone(), limits.clone(), read(id));
+                tasks.push(
+                    focal_rt::spawn(async move {
+                        let reply =
+                            focal_wire::dispatch_accounted(&host, peer, request, &limits).await;
+                        ANSWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        matches!(reply.envelope().result, Response::NativeRead(_))
+                    })
+                    .unwrap(),
+                );
+            }
+            // Each runs to its wait, a place in the queue or the reply the held owner owes: a
+            // yield comes back after the shard's other tasks.
+            for _ in 0..4 {
+                hyper_rt::futures::yield_now().await;
+            }
+            assert_eq!(
+                ANSWERED.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "a request was answered while the owner was held"
+            );
+            release.send(()).unwrap();
+            for task in tasks {
+                assert!(task.await.unwrap(), "a request was not served");
+            }
+            host.stop().await.unwrap();
+            owner.join().unwrap();
+        })
+        .unwrap()
+    }
+
     #[test]
     fn shutdown_backpressure_and_closed_owner_need_no_runtime_or_worker() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let (_liveness, ended) = watch::channel(()).unwrap();
+        let (credit, _credits) = hyper_rt::sync::channel(1).unwrap();
         let host = LocalHost {
             sender,
+            credit,
             ended,
             budget: MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
             limits: WireLimits::default(),

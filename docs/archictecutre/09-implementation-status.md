@@ -15468,3 +15468,17 @@ bound now passes what its generator waits for a deliver lifecycle.
   no leader in every run on Linux. A probe waits for the window and the pacer (RFC 8899 §3, item 7).
 - A stream its peer read in steps was refused as unread while it moved (8 MiB, 12 runs of 14 under
   two dozen busy loops); an unread wait now starts again whenever the stream has written more.
+
+### 2026-10-17 — The single-node host holds a caller its queue cannot take, as its bound says
+
+`LocalHost` refused a request that found its ingress queue full (`try_send`), where the queue's
+bound says a slow owner slows its callers: 13 of 250 writes from 64 callers of an embedded node
+were refused `Capacity` on a loaded host, and under two busy cores 1 run in 8. A request now takes a
+place in the queue first, waiting its turn while the queue is full, and the owner gives the place
+back as it takes the request (a hyper-rt bounded channel of places, FIFO, its waiting callers bounded
+by the host's budget, each holding at least the least a request reserves). Under the same load all 250
+committed in 16 runs of 16, at p99 up to 621 ms. Test:
+`host::tests::requests_that_find_the_ingress_full_wait_for_room_and_are_served` (the owner held,
+40 native reads: without the places, the 8 past the queue were answered `Capacity`). A read of the
+older path still reserves 32 times the frame bound as it waits, so the host's 64 MiB holds two at
+once (open; native reads were fixed so).
