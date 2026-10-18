@@ -11,7 +11,7 @@
 use crate::BusError;
 use crate::batch::{self, Batch};
 use crate::log::{PartLog, Position, SegmentPool};
-use crate::stream::StreamTable;
+use crate::stream::{Produced, StreamTable};
 use focal_memory::MemoryBudget;
 
 /// What a part holds at most, and the batches it takes.
@@ -36,6 +36,24 @@ pub struct Appended {
     pub position: Position,
 }
 
+/// What a committed batch came to in its part (`Part::append_committed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Taken {
+    /// It was appended.
+    Appended(Appended),
+    /// Its producer's sequence shows the part took it already: its producer sent it again, after
+    /// an acknowledgement that never reached it (doc 34 P6). Not appended.
+    Again {
+        /// Its stream.
+        stream: u64,
+        /// Its records.
+        count: u16,
+        /// The offset its first record took, where the part still holds it: it was the stream's
+        /// newest batch. None where the part no longer says.
+        base: Option<u64>,
+    },
+}
+
 /// A part's streams and log.
 #[derive(Debug)]
 pub struct Part {
@@ -57,6 +75,11 @@ impl Part {
     /// Streams held.
     pub fn streams(&self) -> usize {
         self.streams.len()
+    }
+
+    /// The part's bounds.
+    pub const fn limits(&self) -> PartLimits {
+        self.limits
     }
 
     /// The part's stream table.
@@ -85,6 +108,39 @@ impl Part {
         let batch =
             Batch::parse_verified(bytes, self.limits.batch_bytes).map_err(BusError::Batch)?;
         self.append_batch(pool, batch)
+    }
+
+    /// Appends a batch its part's group committed, whose CRC the transport and the log checked
+    /// on its way here, unless its producer's sequence shows the part took it already: a batch of
+    /// the stream's newest batch's producer whose records all come before the sequence that
+    /// producer's next batch takes (Kafka's idempotent producer keeps the same per partition,
+    /// KIP-98). A stream's newest batch is the only one whose producer it keeps, so a producer's
+    /// batch sent again after another producer's is appended again: at least once, the class's
+    /// promise (doc 32 D2).
+    pub fn append_committed(
+        &mut self,
+        pool: &mut SegmentPool,
+        bytes: &[u8],
+    ) -> Result<Taken, BusError> {
+        let batch =
+            Batch::parse_verified(bytes, self.limits.batch_bytes).map_err(BusError::Batch)?;
+        if let Some(state) = self.streams.get(batch.stream()) {
+            let end = u64::from(batch.sequence()).saturating_add(u64::from(batch.count()));
+            if state.tail.producer == batch.producer() && end <= state.tail.next_sequence {
+                let base = state
+                    .last
+                    .and_then(|last| self.log.batch(Position::from_word(last)))
+                    .map(Batch::trusted)
+                    .filter(|newest| newest.sequence() == batch.sequence())
+                    .map(|newest| newest.base_offset());
+                return Ok(Taken::Again {
+                    stream: batch.stream(),
+                    count: batch.count(),
+                    base,
+                });
+            }
+        }
+        self.append_batch(pool, batch).map(Taken::Appended)
     }
 
     fn append_batch(
@@ -117,6 +173,10 @@ impl Part {
         }
         stream.last = Some(word);
         stream.next = next;
+        stream.tail = Produced {
+            producer: batch.producer(),
+            next_sequence: u64::from(batch.sequence()).saturating_add(u64::from(count)),
+        };
         Ok(Appended {
             stream: stream_id,
             base,
@@ -167,6 +227,34 @@ impl Part {
         Some((state.floor, state.next))
     }
 
+    /// Every stream's floor and what its newest batch at the floor stated: a part's image
+    /// (`group`), the state as of the oldest batch the part still holds.
+    pub fn floors(&self) -> impl Iterator<Item = (u64, u64, Produced)> + '_ {
+        self.streams
+            .iter()
+            .map(|state| (state.id, state.floor, state.floor_tail))
+    }
+
+    /// Replaces everything the part holds with `floors`' streams, each holding nothing from its
+    /// floor on: a part opened from an image, or given one by its group's leader. Every segment
+    /// goes back to `pool` first.
+    pub fn restore(
+        &mut self,
+        pool: &mut SegmentPool,
+        floors: impl IntoIterator<Item = (u64, u64, Produced)>,
+    ) -> Result<(), BusError> {
+        self.log.release_all(pool);
+        self.streams.clear();
+        for (id, floor, tail) in floors {
+            let state = self.streams.get_or_insert(id)?;
+            state.next = floor;
+            state.floor = floor;
+            state.tail = tail;
+            state.floor_tail = tail;
+        }
+        Ok(())
+    }
+
     /// Gives the log's tail back if it holds no batch (`PartLog::seal`); whether a segment went
     /// back.
     pub fn seal(&mut self, pool: &mut SegmentPool) -> bool {
@@ -197,6 +285,11 @@ impl Part {
             if first.end_offset() > floor {
                 break;
             }
+            // What the stream's newest batch at its floor stated, which its image keeps.
+            state.floor_tail = Produced {
+                producer: first.producer(),
+                next_sequence: u64::from(first.sequence()).saturating_add(u64::from(first.count())),
+            };
             state.first = first.next();
             if state.first.is_none() {
                 state.last = None;

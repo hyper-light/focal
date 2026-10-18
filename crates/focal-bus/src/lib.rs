@@ -27,6 +27,7 @@ pub mod budget;
 pub mod client;
 pub mod corpus;
 pub mod directory;
+pub mod group;
 pub mod limits;
 pub mod log;
 pub mod node;

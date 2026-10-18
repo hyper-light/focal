@@ -20,11 +20,17 @@ hyper-rt-transport.workspace = true
 # the wire, hyper-durable's shell over hyper-log's log, and the node-pair liveness stream that
 # judges each peer node for every group (doc 33 §4.1).
 hyper-raft.workspace = true
+hyper-durable.workspace = true
 hyper-liveness.workspace = true
+# A part's image made durable as focal makes every file it installs: a temporary, its sync, the
+# rename and the directory's sync, write-through on Windows.
+focal-platform = { version = "0.1.0", path = "../focal-platform" }
 # The standalone mode's local identities (`pki`).
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "aws_lc_rs"] }
 
 [dev-dependencies]
+# A part's image written where each test's own directory is (`group`).
+tempfile.workspace = true
 # What a benchmark costs, counted where it happens (vendor/hyper-measure): allocations, page
 # faults, CPU, and the noise band two sets of runs must clear before they differ.
 hyper-measure.workspace = true

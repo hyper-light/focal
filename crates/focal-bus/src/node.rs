@@ -36,8 +36,8 @@ use crate::BusError;
 use crate::batch::Batch;
 use crate::budget::Headroom;
 use crate::log::{Position, SegmentPool};
-use crate::part::{Appended, Part, PartLimits};
-use crate::stream::STREAM_BYTES;
+use crate::part::{Appended, Part, PartLimits, Taken};
+use crate::stream::{Produced, STREAM_BYTES};
 use crate::wire::{self, Bus, Gap, Kind, LANE, Reply, Subscribe, Subscribed};
 
 /// What a node holds at most.
@@ -109,11 +109,15 @@ pub struct NodeStats {
     pub segments_released: u64,
 }
 
-/// A batch the part retains, in the order appended: its stream, and the offset after it.
+/// A batch the part retains, in the order appended: its stream, the offset after it, and, in a
+/// part its group replicates, the group's entry it was. The window lets batches go oldest first,
+/// so the part's floors are its state as of the newest entry it let go (`group`'s image).
 #[derive(Clone, Copy, Debug)]
 struct Retained {
     stream: u64,
     end: u64,
+    /// The group's entry, its index and term; `(0, 0)` for a lone node's batch.
+    entry: (u64, u64),
 }
 
 /// A publisher's lane the node holds while a stream it fed has a subscriber that takes no more.
@@ -167,6 +171,9 @@ pub struct Node {
     /// swapped with `retrying` to be walked, so neither ever allocates past the subscriptions.
     starved: Vec<usize>,
     retrying: Vec<usize>,
+    /// The newest group entry the window let go, its index and term: the part's floors are its
+    /// state as of it. `(0, 0)` for none, and for a lone node.
+    released: (u64, u64),
     stats: NodeStats,
 }
 
@@ -213,6 +220,7 @@ impl Node {
             freed: Vec::new(),
             starved: Vec::new(),
             retrying: Vec::new(),
+            released: (0, 0),
             stats: NodeStats::default(),
         })
     }
@@ -236,6 +244,11 @@ impl Node {
     /// The node's part.
     pub const fn part(&self) -> &Part {
         &self.part
+    }
+
+    /// The node's part's bounds.
+    pub const fn part_limits(&self) -> PartLimits {
+        self.part.limits()
     }
 
     /// The segment pool.
@@ -339,6 +352,83 @@ impl Node {
     /// Takes a published batch into the part, its place in the window's index charged first, so
     /// the part never holds a batch the window cannot let go.
     fn take(&mut self, bytes: &[u8]) -> Result<Appended, BusError> {
+        self.reserve_retained()?;
+        // A publish came through the transport, which checked its batch's CRC where the wire says
+        // it carries one.
+        let appended = if Bus::embedded_checksum(Kind::Publish).is_some() {
+            self.part.append_verified(&mut self.pool, bytes)?
+        } else {
+            self.part.append(&mut self.pool, bytes)?
+        };
+        self.retain(appended, (0, 0));
+        Ok(appended)
+    }
+
+    /// Takes a batch the part's group committed at `index` (`group`), unless its producer sent it
+    /// again (`Part::append_committed`). What the memory cannot hold for it, the window gives up,
+    /// oldest first, as a publish's does; whether the window let any go is the second value, for
+    /// the owner to ask the transport's waiting frames again. A committed batch is refused only
+    /// where the window has nothing left to give.
+    pub fn apply_committed(
+        &mut self,
+        bytes: &[u8],
+        entry: (u64, u64),
+    ) -> Result<(Taken, bool), BusError> {
+        let mut relieved = false;
+        // Bounded: each turn but the last frees a segment, or gives a warm segment or a retained
+        // batch back.
+        loop {
+            let taken = self
+                .reserve_retained()
+                .and_then(|()| self.part.append_committed(&mut self.pool, bytes));
+            match taken {
+                Ok(taken) => {
+                    if let Taken::Appended(appended) = taken {
+                        self.retain(appended, entry);
+                        self.stats.published = self.stats.published.saturating_add(1);
+                    }
+                    return Ok((taken, relieved));
+                }
+                Err(BusError::Memory(_)) if self.pool.warm() == 0 && self.free_segment() => {}
+                Err(BusError::Memory(_)) if self.relieve() => relieved = true,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Lets every batch the part holds go, and holds `floors`' streams, each from its floor on: a
+    /// part opened from its image, or given one by its group's leader. Subscribers below a floor
+    /// are told what they missed as they read on.
+    pub fn restore(
+        &mut self,
+        floors: impl IntoIterator<Item = (u64, u64, Produced)>,
+        at: (u64, u64),
+    ) -> Result<(), BusError> {
+        self.retained.clear();
+        self.released = at;
+        self.part.restore(&mut self.pool, floors)
+    }
+
+    /// Delivers what `stream` holds past each of its subscribers' cursors: after a batch of it
+    /// was appended.
+    pub fn deliver<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, stream: u64)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        let mut slots = std::mem::take(&mut self.scratch);
+        slots.clear();
+        if let Some(subscribers) = self.by_stream.get(&stream) {
+            slots.extend_from_slice(subscribers);
+        }
+        for slot in slots.iter().copied() {
+            self.pump(endpoint, slot);
+        }
+        self.scratch = slots;
+    }
+
+    /// Room for one more batch in the window's index, charged before the batch is taken.
+    fn reserve_retained(&mut self) -> Result<(), BusError> {
         if self.retained.len() == self.retained.capacity() {
             self.retained
                 .try_reserve(1)
@@ -349,21 +439,34 @@ impl Node {
             .capacity()
             .checked_mul(std::mem::size_of::<Retained>())
             .ok_or(BusError::Capacity("the window's index"))?;
-        charge(&self.budget, &mut self.index, index)?;
-        // A publish came through the transport, which checked its batch's CRC where the wire says
-        // it carries one.
-        let appended = if Bus::embedded_checksum(Kind::Publish).is_some() {
-            self.part.append_verified(&mut self.pool, bytes)?
-        } else {
-            self.part.append(&mut self.pool, bytes)?
-        };
-        // Its room was reserved above: nothing is allocated here.
+        charge(&self.budget, &mut self.index, index)
+    }
+
+    /// Keeps `appended` in the window, its room reserved before it was taken
+    /// ([`Node::reserve_retained`]): nothing is allocated here.
+    fn retain(&mut self, appended: Appended, entry: (u64, u64)) {
         self.retained.push_back(Retained {
             stream: appended.stream,
             end: appended.base.saturating_add(u64::from(appended.count)),
+            entry,
         });
         self.recycle_ahead();
-        Ok(appended)
+    }
+
+    /// The window's oldest batch, taken out of it, its entry recorded as the newest let go: the
+    /// caller lets its stream's floor move past it.
+    fn let_go_oldest(&mut self) -> Option<Retained> {
+        let oldest = self.retained.pop_front()?;
+        if oldest.entry != (0, 0) {
+            self.released = oldest.entry;
+        }
+        Some(oldest)
+    }
+
+    /// The newest group entry the window let go, its index and term, `(0, 0)` for none: the part's
+    /// floors are its state as of it (`group`'s image).
+    pub const fn released(&self) -> (u64, u64) {
+        self.released
     }
 
     /// Once the window holds what the memory holds, lets the oldest batches go as the tail fills:
@@ -380,7 +483,7 @@ impl Node {
         let need = self.part.log().recycle_need(self.config.segment_bytes);
         // Bounded: at most the oldest segment's batches, each popped once.
         for _ in 0..need {
-            let Some(oldest) = self.retained.pop_front() else {
+            let Some(oldest) = self.let_go_oldest() else {
                 break;
             };
             // A stream's batches leave in order, so its floor moves past the oldest's end.
@@ -397,7 +500,7 @@ impl Node {
         let (_, released) = self.pool.churn();
         let freed = |pool: &SegmentPool| pool.warm() > 0 || pool.churn().1 > released;
         // Bounded: each turn lets one retained batch go.
-        while let Some(oldest) = self.retained.pop_front() {
+        while let Some(oldest) = self.let_go_oldest() {
             // A stream's batches leave in order, so its floor moves past the oldest's end.
             let _ = self
                 .part
@@ -420,7 +523,7 @@ impl Node {
         }
         let (_, returned) = self.pool.churn();
         // Bounded: each turn lets one retained batch go.
-        while let Some(oldest) = self.retained.pop_front() {
+        while let Some(oldest) = self.let_go_oldest() {
             // A stream's batches leave in order, so its floor moves past the oldest's end.
             let _ = self
                 .part

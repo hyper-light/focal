@@ -675,7 +675,9 @@ version = "0.1.0"
 dependencies = [
  "crc-fast",
  "focal-memory",
+ "focal-platform",
  "focal-timing",
+ "hyper-durable",
  "hyper-liveness",
  "hyper-measure",
  "hyper-raft",
@@ -684,6 +686,7 @@ dependencies = [
  "hyper-transport",
  "rcgen 0.14.10",
  "serde_json",
+ "tempfile",
  "zstd",
 ]
 

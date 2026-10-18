@@ -488,7 +488,7 @@ impl BatchBuilder {
 /// when it runs: the crc32c crate took its slow path in every build for the generic target (135.5
 /// ns a 1,230-byte batch against 18.1 on the bare-metal bench; hyper-transport's `docs/transport.md`
 /// §4n). The same function: the same value for the same bytes.
-fn crc32c(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
     let sum = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, bytes);
     u32::try_from(sum & u64::from(u32::MAX)).unwrap_or(u32::MAX)
 }
