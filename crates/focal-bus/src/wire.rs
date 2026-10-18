@@ -500,6 +500,9 @@ pub struct Ack {
 impl Ack {
     /// The acknowledgement's bytes.
     pub const BYTES: usize = 8 + 8 + 4 + 8 + 2 + 1;
+    /// The class of a batch the part refused alike at every node (no batch the part takes, a
+    /// stream past its bound): its producer must not send it again.
+    pub const REFUSED: u8 = u8::MAX;
 
     /// The acknowledgement as sent.
     pub fn encode(&self) -> [u8; Self::BYTES] {

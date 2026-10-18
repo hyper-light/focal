@@ -141,7 +141,14 @@ pub fn node(clients: usize, peers: usize) -> Result<Limits, BusError> {
 
 /// A client's bounds: the one node it dials.
 pub fn client() -> Result<Limits, BusError> {
-    limits(1, LANES_PER_CLIENT)
+    client_of(1)
+}
+
+/// A client's bounds where the stream's part is replicated by a group of `nodes` nodes: it dials
+/// whichever leads, and the one it is redirected to while the one it left is still held (doc 34
+/// P2).
+pub fn client_of(nodes: usize) -> Result<Limits, BusError> {
+    limits(nodes, LANES_PER_CLIENT)
 }
 
 #[cfg(test)]

@@ -21,7 +21,12 @@ hyper-rt-transport.workspace = true
 # judges each peer node for every group (doc 33 §4.1).
 hyper-raft.workspace = true
 hyper-durable.workspace = true
+hyper-log.workspace = true
+hyper-block.workspace = true
 hyper-liveness.workspace = true
+hyper-timing.workspace = true
+# The node log's keys, kept under the node's root key file (doc 29).
+focal-seal = { version = "0.1.0", path = "../focal-seal" }
 # A part's image made durable as focal makes every file it installs: a temporary, its sync, the
 # rename and the directory's sync, write-through on Windows.
 focal-platform = { version = "0.1.0", path = "../focal-platform" }

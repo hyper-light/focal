@@ -48,6 +48,7 @@ hyper-block = { version = "0.1.0", path = "vendor/hyper-block" }
 hyper-durable = { version = "0.1.0", path = "vendor/hyper-durable" }
 hyper-log = { version = "0.1.0", path = "vendor/hyper-log" }
 hyper-liveness = { version = "0.1.0", path = "vendor/hyper-liveness" }
+hyper-timing = { version = "0.1.0", path = "vendor/hyper-timing" }
 # Sealing at rest, vendored from hyper-raft (vendor/hyper-seal/SNAPSHOT;
 # docs/archictecutre/29-sealing-at-rest.md).
 hyper-seal = { version = "0.1.0", path = "vendor/hyper-seal" }

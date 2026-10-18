@@ -30,6 +30,7 @@ pub mod directory;
 pub mod group;
 pub mod limits;
 pub mod log;
+pub mod member;
 pub mod node;
 pub mod part;
 pub mod pki;
