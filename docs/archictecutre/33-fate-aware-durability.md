@@ -140,9 +140,14 @@ absence is a claim to keep testing, not a proof.
     at start and refreshed from the log's own `focal_log_flush` and commit-wait histograms.
   - Safety comes only from the claim, cost only from the measurement. A "write through" device counts
     as stable at the write's completion. A "write back" device counts as stable only after a flush.
-- **Liveness.** Each peer's state from hyper-liveness (NFD-E detectors, Lifeguard-adjusted). The
-  reaction window ρ is the measured time from a peer's failure to the survivors' flush of what they
-  hold unflushed: detection, plus the flush of the dirty bytes.
+- **Liveness, per node, not per group.** Each peer node's state comes from hyper-liveness: one
+  heartbeat stream for each node pair, shared by every group the pair shares, each pair an NFD-E
+  detector, Lifeguard-adjusted. A suspicion applies at once to every group with a replica on that
+  node. No group's own heartbeats decide it: at Meta scale a node hosts many thousands of groups, and
+  an idle group goes quiet, as CockroachDB quiesces idle ranges. A count of heartbeats per group would
+  then be a storm of messages, or a suspicion that lags.
+- **The reaction window.** ρ is the measured time from a peer's failure to the survivors' writes of
+  what they hold completing: detection plus the writes already under way.
 
 ### 4.2 The classes
 
@@ -153,10 +158,27 @@ Doc 32's three classes stay. What changes is what "replicated" and "persisted" c
 | ephemeral | the owner has it | nothing past the owner's crash; gaps are announced |
 | replicated | ⌈n/2⌉+1 voters hold it in memory (SAUCR's fast quorum), none suspected, and the holders span enough independent fates to meet the stream's loss bound with the measured ρ (§4.3); otherwise as persisted | any failure the bound covers; beyond it, unavailable rather than lossy (§4.5) |
 | persisted | a majority holds it on stable media: a flushed write-back device, or a write-through device at completion | any crash of any number of nodes |
+| windowed | the owner has written it to its log, ordered, and a full flush follows within the stream's window W | any crash, keeping a consistent prefix: writes acknowledged within W of a power cut may be lost, never torn or reordered |
 
 A replicated stream with every replica in one fate (a laptop, a single box) commits as persisted, and
 its acknowledgement says so. The bus never acknowledges a memory quorum that a single power cut would
 erase.
+
+**The windowed class is the single machine's honest fast path.** It is SQLite's WAL at
+`synchronous=NORMAL`, which its documentation states "is always consistent" but "might roll back"
+transactions committed before a power loss or system crash, made explicit by the window and typed in
+the acknowledgement.
+
+- **Consistency.** The log is append-only and checksummed, and recovery stops at the first record
+  that does not verify. What survives is always a prefix, whatever order the device persisted it in.
+- **Loss bound.** A full flush at most every W (`F_FULLFSYNC`, `fdatasync`, `FlushFileBuffers`)
+  bounds what a power cut can take back.
+- **macOS ordering.** `F_BARRIERFSYNC` orders each commit at the cost of a barrier, not a drain. The
+  local `fcntl(2)` page: what was flushed before the barrier "is guaranteed to be persisted before
+  any other I/O that would follow the barrier", with no claim on what is persisted when it returns.
+  So less of the window is lost.
+- **Use.** Agent work on a laptop, where seconds of loss after a power cut cost a retry. The ledger's
+  records of value stay persisted.
 
 ### 4.3 The loss bound
 
@@ -175,16 +197,23 @@ in fates *F* = {f₁…f_k}:
   meet it, the write commits as persisted.
 - The estimate is for the failure model of §4.5 only; Byzantine faults, firmware that lies about
   flushes and operator error are outside it, as for every class.
+- **First to arrive.** A write commits on whichever comes first: the durable majority or the held
+  quorum. Within a region the held quorum wins, at a round trip without a flush. Across regions, a
+  flush is shorter than the extra replica's round trip, so the durable majority wins and the rule is
+  never slower than today's.
 
 ### 4.4 Reaction and background flushing
 
 - Every replica flushes its log in the background, so the dirty set stays small enough to flush
   within the reaction budget the stream's bound needs. It is SAUCR's background flush, sized by the
   bound instead of left to chance.
-- On suspicion of any peer, every replica holding unflushed entries flushes them at once, and the
-  leader commits subsequent writes under the rule the remaining fates allow. This is SAUCR's switch,
-  triggered per fate rather than per node count. Suspicion comes from hyper-liveness, which already
-  separates suspicion from declaration (Lifeguard).
+- On suspicion of a peer node, every leader with a replica there stops counting that replica's held
+  answers, and commits subsequent writes under the rule the remaining fates allow. This is SAUCR's
+  switch, triggered per fate rather than per node count.
+- **No flush storm.** Persistence never stops, so the switch needs no burst of flushes. Every
+  replica's writes are already under way, and the switch only changes which answers count. This
+  matters at scale: one node's failure touches thousands of groups at once, exactly when capacity has
+  just fallen.
 - A fate that recovers and responds promptly for a measured number of rounds restores the faster
   rule, as SAUCR restores fast mode.
 
@@ -216,6 +245,10 @@ not. With three voters that means all three hold the write in memory, one round 
   - each replica's last logged entry, replicated in the leader's appends;
   - a replica recovering from a memory-mode crash takes the maximum among a bare minority's maps
     before it may vote, as VR Revisited's recovering replica does.
+- **Batched per node pair.** A restarted node that hosts thousands of groups sends each peer one
+  query naming them all. The peer answers from the maps of every group it shares, in one message, as
+  hyper-multilog batches its groups' traffic per node pair. The node's groups recover in one round
+  trip, not one per group.
 - If more fates fail together than the bound covers, the stream becomes unavailable and says so. It
   never silently loses data. An operator may accept a loss explicitly, as Kafka's unclean election
   and KIP-1275's tool let one do.
@@ -229,7 +262,16 @@ not. With three voters that means all three hold the write in memory, one round 
   verification at recovery is resolved from peers, as AGL+18's CTRL resolves faulty entries: a
   simultaneous tear of every replica's tail would need every fate to fail together, which §4.5
   already treats as unavailability. That halves the persisted class's disk cost per commit.
-- This changes hyper-log's §6.2 and needs its audit S01 scenario re-run under the new rule before
+- **A node with no peers** (a laptop's single replica) has no election to lose to a correlated tear.
+  The second flush buys only a diagnosis: whether a last frame that fails verification was torn
+  before its answer, or damaged at rest after it, a media fault a single replica cannot survive in
+  either case.
+  - So a frame is answered at its own flush, and a confirmation is written periodically, every W or
+    every N frames.
+  - It bounds the frames whose at-rest damage would be taken for a tear, and reported as such, to
+    those since the last confirmation.
+  - That halves the laptop's flushes per commit.
+- This changes hyper-log's §6.2 and needs its audit S01 scenario re-run under the new rules before
   it lands.
 
 ### 4.7 Delivery waits for the bound
@@ -246,6 +288,33 @@ The producer's acknowledgement carries the class achieved and how: fates held an
 may ask to wait for a stronger one, as MongoDB's write concern and Kafka's `acks` let a client
 choose, but per write and with the measured cost known. A benchmark reports which class each system
 was held to.
+
+### 4.9 Energy is a cost
+
+A laptop is battery-bound, and a flush costs the device its power for its duration and the host a
+wakeup.
+
+- **Measured, not assumed.** The calibration (§4.1) records a flush's device time, and hyper-measure
+  the process's energy where the platform reports it (macOS's per-process energy, Linux's RAPL where
+  readable). A cost is then milliseconds and joules per committed byte.
+- **Coalesced.** Background flushes are coalesced to the largest interval the streams' bounds allow:
+  the windowed class's W, the replicated class's τ budget.
+- **Scheduled with the machine.** Writes not owed to an acknowledgement go when the device is
+  otherwise awake, and stretch on battery (macOS's power source state,
+  `/sys/class/power_supply` on Linux).
+- **The floor.** No acknowledgement a class promises is ever delayed for energy. Only the work behind
+  it moves.
+
+### 4.10 Locality
+
+At global scale a stream also chooses where its quorum lives, as CockroachDB's survival goals do:
+zone survival is its default, and region survival costs writes "at least as much as the round-trip
+time to the nearest region".
+
+- A **region-local** stream commits within one region's replicas, under the classes above.
+- It replicates to other regions asynchronously, its acknowledgement typed as such.
+- A **multi-region** stream's quorum spans regions, and §4.3's first-to-arrive rule then picks the
+  durable majority.
 
 ## 5. What every class needs on the path
 
@@ -300,4 +369,7 @@ classifies each run as correct, unavailable (allowed past the bound), or lost (n
 | 3b | A part replicated over hyper-durable across three nodes; persisted class | against Kafka `flush.messages=1`, JetStream `sync: always` and Redis `WAITAOF`, class for class; the battery's crash rows |
 | 3c | Fate model from topology and detection; replicated class with the commit rule, reaction and recovery of §4.3–4.5 | against Kafka `acks=all` (rack-aware), Redpanda-style write caching and JetStream R3 at their defaults; the battery's full rows |
 | 3d | Delivery gated on the bound (§4.7); typed acknowledgements (§4.8) | no consumer sees a write later lost, under the battery |
-| 3e | hyper-log's confirmation chosen by fate (§4.6), with the S01 scenario re-run | persisted-class commit at one flush across fates |
+| 3e | hyper-log's confirmation chosen by fate and by peers (§4.6), with the S01 scenario re-run | persisted-class commit at one flush across fates and on a single node |
+| 3f | The windowed class (§4.2), energy-coalesced flushes (§4.9) | loss after a power cut within W and a consistent prefix, under the battery; joules per committed byte against persisted |
+| 3g | Node-level suspicion for every group, recovery batched per node pair (§4.1, §4.5) | one query per peer on a restart of a node hosting many groups; no per-group heartbeats while idle |
+| 3h | Region-local and multi-region streams (§4.10) | commit latency against CockroachDB's zone and region goals' published costs, class against class |
