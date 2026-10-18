@@ -6,7 +6,7 @@
 # OUT, and everything taken down with its volumes. Every wait is bounded.
 #
 #   run.sh SYSTEM RATE SECONDS WARMUP PAYLOAD OUT
-#   SYSTEM: focal | focal-bus | kafka | nats | redis
+#   SYSTEM: focal | focal-bus | focal-bus-fates | kafka | nats | redis
 #   MODE (environment): append (default), each record stored; or deliver,
 #   each record also taken by a consumer and acknowledged by it durably, a
 #   work queue's message end to end (focal: its seven-write lifecycle, the
@@ -22,7 +22,15 @@ case "$mode" in
 esac
 mkdir -p "$out"
 export NATS_SYNC=always KAFKA_FLUSH=1 REDIS_AOF=yes REDIS_FSYNC=always
-dc() { docker compose -f compose.yaml --profile "$system" "$@"; }
+# focal-bus-fates: the bus's nodes each stating its own fate (the replicated class, core step
+# R-8). On one host the fates are declared, not independent: the run measures the mechanism, and
+# its report says which class each acknowledgement achieved.
+profile="$system"
+if [ "$system" = focal-bus-fates ]; then
+  profile=focal-bus
+  export BUS_FATES="--fate 1=1 --fate 2=2 --fate 3=3"
+fi
+dc() { docker compose -f compose.yaml --profile "$profile" "$@"; }
 # A command retried until it succeeds, at most $1 times two seconds apart.
 retry() {
   local tries=$1 n=0; shift
@@ -204,7 +212,7 @@ EOF
         > "$out/$report.$n.metrics.txt" 2>/dev/null || true
     done
     ;;
-  focal-bus) endpoints=focal-bus1:7443,focal-bus2:7443,focal-bus3:7443 ;;
+  focal-bus | focal-bus-fates) endpoints=focal-bus1:7443,focal-bus2:7443,focal-bus3:7443 ;;
   kafka) endpoints=kafka1:9092,kafka2:9092,kafka3:9092 ;;
   nats) endpoints=nats1:4222,nats2:4222,nats3:4222 ;;
   redis) endpoints=redis1:6379,redis2:6379,redis3:6379 ;;
@@ -216,9 +224,10 @@ if [ "$system" != focal ]; then
   # connection is asked again until it succeeds, as an operator's client would.
   # focal's bus reads the identity directory its nodes share.
   pki=()
-  if [ "$system" = focal-bus ]; then pki=(--pki /pki); fi
+  generator_system="$system"
+  if [ "$profile" = focal-bus ]; then pki=(--pki /pki); generator_system=focal-bus; fi
   generate() {
-    dc exec -T generator focal-compare --system "$system" --durable --mode "$mode" \
+    dc exec -T generator focal-compare --system "$generator_system" --durable --mode "$mode" \
       --endpoints "$endpoints" --rate "$rate" --payload "$payload" \
       --seconds "$seconds" --warmup "$warmup" "${pki[@]}" --out "/reports/$report"
   }

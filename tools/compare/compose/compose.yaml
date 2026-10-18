@@ -128,19 +128,18 @@ services:
     image: ${FOCAL_IMAGE:-focal:bench}
     profiles: [focal-bus]
     networks: { bench: { ipv4_address: 10.231.0.11 } }
-    command: ["focal", "start", "bus", "--listen", "0.0.0.0:7443", "--pki", "/pki", "--clients", "2",
-              "--node", "1", "--peer", "2=10.231.0.12:7443", "--peer", "3=10.231.0.13:7443",
-              "--data", "/data", "--key-file", "/keys/node.key"]
+    # BUS_FATES (run.sh's focal-bus-fates): every node's fate, for the replicated class.
+    command: ["sh", "-c", "exec focal start bus --listen 0.0.0.0:7443 --pki /pki --clients 2 --node 1 --peer 2=10.231.0.12:7443 --peer 3=10.231.0.13:7443 --data /data --key-file /keys/node.key ${BUS_FATES:-}"]
     volumes: ["bus-pki:/pki", "bus1:/data", "bus1-keys:/keys"]
   focal-bus2:
     <<: *bus
     networks: { bench: { ipv4_address: 10.231.0.12 } }
-    command: ["sh", "-c", "n=0; until [ -s /pki/root.der ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal start bus --listen 0.0.0.0:7443 --pki /pki --clients 2 --node 2 --peer 1=10.231.0.11:7443 --peer 3=10.231.0.13:7443 --data /data --key-file /keys/node.key"]
+    command: ["sh", "-c", "n=0; until [ -s /pki/root.der ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal start bus --listen 0.0.0.0:7443 --pki /pki --clients 2 --node 2 --peer 1=10.231.0.11:7443 --peer 3=10.231.0.13:7443 --data /data --key-file /keys/node.key ${BUS_FATES:-}"]
     volumes: ["bus-pki:/pki", "bus2:/data", "bus2-keys:/keys"]
   focal-bus3:
     <<: *bus
     networks: { bench: { ipv4_address: 10.231.0.13 } }
-    command: ["sh", "-c", "n=0; until [ -s /pki/root.der ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal start bus --listen 0.0.0.0:7443 --pki /pki --clients 2 --node 3 --peer 1=10.231.0.11:7443 --peer 2=10.231.0.12:7443 --data /data --key-file /keys/node.key"]
+    command: ["sh", "-c", "n=0; until [ -s /pki/root.der ]; do n=$$((n+1)); [ $$n -gt 600 ] && exit 1; sleep 1; done; exec focal start bus --listen 0.0.0.0:7443 --pki /pki --clients 2 --node 3 --peer 1=10.231.0.11:7443 --peer 2=10.231.0.12:7443 --data /data --key-file /keys/node.key ${BUS_FATES:-}"]
     volumes: ["bus-pki:/pki", "bus3:/data", "bus3-keys:/keys"]
 
   # The competitors' generator (focal-compare), on the bench network as
