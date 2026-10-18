@@ -6,9 +6,13 @@
 //! Redis `appendfsync always` with `WAITAOF`).
 //!
 //! The publisher dials the first node and follows each redirect to the leader a node names, taking
-//! a leader only where its term is past what it knew (KIP-951's rule); a batch redirected, or not
-//! acknowledged when the leader's connection ends, is sent again to the leader it then knows, and the
-//! part recognises a batch it took. It gathers the records due each turn into one batch, as the
+//! a leader only where its term is past what it knew (KIP-951's rule); a batch redirected, refused
+//! out of its session's order, not acknowledged when the leader's connection ends, or unanswered for a
+//! serve period, is sent again to the leader it then knows, and the part recognises a batch it took.
+//! It publishes on a session of its own, begun at sequence zero (Kafka's producer takes a fresh
+//! producer id), and sends in its session's order: a batch waiting to go again holds every batch
+//! after it, which the part would refuse past the gap (doc 34 P6). It gathers the records due each
+//! turn into one batch, as the
 //! other systems' clients gather what is published between two of their writes: at a low rate a
 //! batch of one, more as more fall due at once. A record due while the records in flight are at
 //! `inflight` is counted refused by the generator, never queued in it, as the other systems' are.
@@ -28,7 +32,7 @@ use hyper_rt::runtime::LocalRuntime;
 use hyper_rt_transport::Driver;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
 use hyper_transport::{Config, Endpoint, Event, Refusal};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -68,6 +72,14 @@ fn fail(what: impl std::fmt::Display) -> CompareError {
 struct Flying {
     bytes: Vec<u8>,
     records: Vec<(Instant, bool)>,
+}
+
+/// A session of the publisher's own: sixty-four random bits from the operating system, so no other
+/// run of it names the same one (doc 34 P6); never zero.
+fn session() -> Result<u64, CompareError> {
+    let mut bytes = [0; 8];
+    getrandom::fill(&mut bytes).map_err(|error| fail(format!("the session's bits: {error}")))?;
+    Ok(u64::from_le_bytes(bytes).max(1))
 }
 
 /// Runs the schedule; each acknowledged record's latency in the histogram.
@@ -111,9 +123,7 @@ pub fn run(run: Run) -> Result<(Histogram<u64>, Tally), CompareError> {
         Instant::now(),
     )
     .map_err(|error| fail(format!("{error:?}")))?;
-    let producer = local
-        .client_peer(PUBLISHER)
-        .ok_or_else(|| fail("the producer"))?;
+    let producer = session()?;
     let mut runtime = LocalRuntime::new(&focal_rt::local_config()).map_err(fail)?;
     runtime
         .block_on(async move { publish(run, endpoint, producer).await })
@@ -151,10 +161,10 @@ async fn publish(
     let payload = vec![0x5a_u8; run.payload];
     let batch_bound = usize::try_from(wire::BATCH_BOUND).map_err(fail)?;
     let mut builder = BatchBuilder::new();
-    // Every batch sent and not acknowledged, by its first record's sequence; and those to send
-    // again, to the leader the client now knows.
+    // Every batch made and not acknowledged, by its first record's sequence; and those to send, again
+    // or for the first time, to the leader the client now knows, in their session's order.
     let mut flying: BTreeMap<u32, Flying> = BTreeMap::new();
-    let mut again: Vec<u32> = Vec::new();
+    let mut pending: BTreeSet<u32> = BTreeSet::new();
     // A redirect that names no leader (an election under way) holds what goes again until a node
     // names one or the backoff passes, as Kafka's client backs off a retriable error: from
     // `retry.backoff.ms`, 100 ms, doubling to `retry.backoff.max.ms`, 1,000 ms (KIP-580's defaults).
@@ -175,7 +185,12 @@ async fn publish(
             break;
         }
         // A run that heard no acknowledgement for a whole serve period, the transport's own
-        // judgement of a silent peer, ends: what is still in flight failed.
+        // judgement of a silent peer, ends: what is still in flight failed. Before its end, all of
+        // it goes again, once a period.
+        if last_answer.elapsed() > SERVE_PERIOD && closed.is_none() {
+            pending.extend(flying.keys().copied());
+            last_answer = Instant::now();
+        }
         if last_answer.elapsed() > SERVE_PERIOD && closed.is_some() {
             for batch in std::mem::take(&mut flying).into_values() {
                 for (_, measured) in batch.records {
@@ -189,23 +204,6 @@ async fn publish(
             }
             break;
         }
-        // Batches redirected or orphaned by a closed connection go to the leader known now, once no
-        // backoff holds them.
-        let client = Client::new(leader);
-        let backing_off = held_until.is_some_and(|until| Instant::now() < until);
-        again.retain(|first| {
-            if backing_off {
-                return true;
-            }
-            let Some(batch) = flying.get(first) else {
-                return false;
-            };
-            // A lane with no room, or a connection not made yet, keeps the batch for the next turn.
-            matches!(
-                client.publish(driver.endpoint(), &batch.bytes),
-                Err(Refusal::LaneFull | Refusal::NotConnected)
-            )
-        });
         // The records due, gathered into one batch.
         let mut records: Vec<(Instant, bool)> = Vec::new();
         let first = sequence;
@@ -258,12 +256,31 @@ async fn publish(
                 .ok_or_else(|| fail("sequences"))?;
             tally.sent = tally.sent.saturating_add(u64::from(count));
             in_flight = in_flight.saturating_add(records.len());
-            match client.publish(driver.endpoint(), &bytes) {
-                Ok(()) => {}
-                Err(Refusal::LaneFull | Refusal::NotConnected) => again.push(first),
-                Err(error) => return Err(fail(format!("publish refused: {error:?}"))),
-            }
             flying.insert(first, Flying { bytes, records });
+            pending.insert(first);
+        }
+        // What waits goes to the leader known now, in order, once no backoff holds it: a lane with
+        // no room, or a connection not made yet, keeps it and everything after it for the next turn.
+        let client = Client::new(leader);
+        let backing_off = held_until.is_some_and(|until| Instant::now() < until);
+        if !backing_off {
+            // Bounded: each turn takes one batch out of `pending`, or stops.
+            for _ in 0..pending.len() {
+                let Some(&first) = pending.first() else {
+                    break;
+                };
+                let Some(batch) = flying.get(&first) else {
+                    pending.remove(&first);
+                    continue;
+                };
+                match client.publish(driver.endpoint(), &batch.bytes) {
+                    Ok(()) => {
+                        pending.remove(&first);
+                    }
+                    Err(Refusal::LaneFull | Refusal::NotConnected) => break,
+                    Err(error) => return Err(fail(format!("publish refused: {error:?}"))),
+                }
+            }
         }
         // The connection's events until the next record is due, a tick at most.
         let wait_ns = began
@@ -304,6 +321,22 @@ async fn publish(
             });
             let now = Instant::now();
             for ack in acked {
+                if ack.class == Ack::OUT_OF_ORDER {
+                    // Past a gap in the session: everything from the sequence the part waits for
+                    // goes again, in order. A sequence below every batch in flight was acknowledged:
+                    // the part no longer holds the session as it was.
+                    let lowest = flying.keys().next().map(|first| u64::from(*first));
+                    if lowest.is_some_and(|lowest| ack.base < lowest) {
+                        return Err(fail(format!(
+                            "the part waits for sequence {} of a session acknowledged past it",
+                            ack.base
+                        )));
+                    }
+                    let from = u32::try_from(ack.base).map_err(fail)?;
+                    pending.extend(flying.range(from..).map(|(first, _)| *first));
+                    continue;
+                }
+                pending.remove(&ack.sequence);
                 let Some(batch) = flying.remove(&ack.sequence) else {
                     continue;
                 };
@@ -356,8 +389,8 @@ async fn publish(
                         }
                     }
                 }
-                if flying.contains_key(&redirect.sequence) && !again.contains(&redirect.sequence) {
-                    again.push(redirect.sequence);
+                if flying.contains_key(&redirect.sequence) {
+                    pending.insert(redirect.sequence);
                 }
             }
             if lost {
@@ -366,8 +399,7 @@ async fn publish(
                 let count = u64::try_from(run.nodes.len()).unwrap_or(1).max(1);
                 leader = leader.checked_rem(count).unwrap_or(0).saturating_add(1);
                 let _ = driver.endpoint().connect(now, leader, address(leader)?);
-                again.clear();
-                again.extend(flying.keys().copied());
+                pending.extend(flying.keys().copied());
             }
         }
     }

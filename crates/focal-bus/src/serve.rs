@@ -315,6 +315,9 @@ async fn serve_member(
             Woke::Freed | Woke::Due => {}
         }
         member.turn(driver.endpoint(), &waker, now);
+        if member.fenced() {
+            return Err(BusError::Fenced);
+        }
         returns = driver.endpoint().budget().stats().returns;
         member.node_mut().relieve_transport(driver.endpoint());
     }

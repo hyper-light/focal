@@ -14,7 +14,17 @@
 //! or may not have committed: the publisher sends them again, and the part recognises those it took
 //! (P6). A publish the replica cannot take now (the leader's uncommitted bytes at their bound) is
 //! parked with its publisher's lane held, so the publisher waits, as a full lane holds it, until the
-//! group commits enough to take it.
+//! group commits enough to take it. Each entry states the identity that published it (its context),
+//! whose sessions every replica judges the batch by.
+//!
+//! **Every publish is answered.** An acknowledgement or a redirect that finds its publisher's lane
+//! full waits, in order, for the lane to make room, and the publisher's publishes are held until it
+//! goes (Kafka's network layer mutes a connection while its response waits): a node that stopped
+//! leading under load redirected some 2,300 publishes at once and dropped 1,657 of them on the full
+//! lane, so their publisher never heard of them (the comparison's 10,000 a second, traced
+//! 2026-10-18). Only a publisher whose connection is gone takes nothing: it sends again, on its next
+//! connection, what it did not hear. A replica that fences ends the node, which holds nothing it
+//! cannot answer while its owner reopens it from what is durable.
 //!
 //! **Raft frames** (P8) carry hyper-raft's own records, each from the node the transport
 //! authenticated: a record whose sender is not the frame's peer is dropped. A frame that finds its
@@ -29,7 +39,7 @@
 //! due: where the group wrote none, the node writes an empty update of the stream's own group, so a
 //! disk that stops stops the heartbeats with it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::task::Waker;
@@ -38,7 +48,9 @@ use std::time::{Duration, Instant};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
-use hyper_durable::{Budget as ReplicaBudget, GroupStore, Output, Replica, Settings as Shell};
+use hyper_durable::{
+    Budget as ReplicaBudget, GroupStore, Output, Replica, ReplicaError, Settings as Shell,
+};
 use hyper_liveness::{Change, Liveness, Settings as LiveSettings, Write as LiveWrite};
 use hyper_log::{Class as LogClass, Facts, Log, Pending, Update};
 use hyper_raft::proto::{ConfState, Message};
@@ -117,8 +129,12 @@ pub struct MemberStats {
     pub parked: u64,
     /// Publishes redirected to the leader.
     pub redirected: u64,
-    /// Acknowledgements sent.
+    /// Acknowledgements made, sent or waiting for their publisher's lane.
     pub acked: u64,
+    /// Answers that waited for their publisher's lane to make room.
+    pub answers_waited: u64,
+    /// Answers a publisher's connection went before: it sends again what it did not hear.
+    pub unanswered: u64,
     /// Raft records dropped: one that did not decode, or whose sender was not the frame's peer.
     pub dropped_records: u64,
     /// Raft messages dropped for a full outbox: Raft sends them again.
@@ -127,6 +143,8 @@ pub struct MemberStats {
     pub refused_heartbeats: u64,
     /// Drives of the replica.
     pub drives: u64,
+    /// Drives the replica refused, changing nothing (stalled for room, refused by the core).
+    pub refused_drives: u64,
 }
 
 /// hyper-durable's budget over the node's memory: what the replica reserves before an input, from
@@ -237,6 +255,29 @@ struct Parked {
     batch: Vec<u8>,
 }
 
+/// An answer to a publish: its acknowledgement or its redirect, as sent.
+#[derive(Clone, Copy, Debug)]
+enum Answer {
+    Ack([u8; Ack::BYTES]),
+    Redirect([u8; Redirect::BYTES]),
+}
+
+impl Answer {
+    const fn kind(&self) -> Kind {
+        match self {
+            Self::Ack(_) => Kind::Ack,
+            Self::Redirect(_) => Kind::Redirect,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Ack(bytes) => bytes,
+            Self::Redirect(bytes) => bytes,
+        }
+    }
+}
+
 /// The key an acknowledgement is owed under: a batch's stream, producer and sequence.
 type Owed = (u64, u64, u32);
 
@@ -255,12 +296,23 @@ pub struct Member {
     /// Raft frames waiting for their peer's lane, oldest first, each peer's at most `outbox_bound`.
     outbox: HashMap<u64, VecDeque<Vec<u8>>>,
     outbox_bound: usize,
-    /// Acknowledgements owed to publishers, while the node leads: each batch's publisher.
-    owed: HashMap<Owed, PeerId>,
+    /// Acknowledgements owed to publishers, while the node leads: each batch with the identity
+    /// that published it, whose sessions it is judged by (a session is its identity's own, so two
+    /// identities naming one session owe apart).
+    owed: HashSet<(PeerId, Owed)>,
     /// The most acknowledgements owed at once: a publisher's lane window for each client the node
     /// admits, what the publishers can have unacknowledged.
     owed_bound: usize,
     parked: VecDeque<Parked>,
+    /// Answers to publishes whose publisher's lane had no room, each publisher's in the order they
+    /// were made: sent as its lane makes room (`Event::LaneRoom`), never dropped, the publisher's
+    /// publishes held meanwhile so it sends nothing more to be answered (Kafka's network layer
+    /// mutes a connection while its response waits). What waits is what the publisher had in
+    /// flight when its lane filled: its acknowledgements owed and the publishes read in the turn
+    /// its lane was held, no more.
+    answers: HashMap<PeerId, VecDeque<Answer>>,
+    /// Whether the replica fenced: the node ends, to be reopened from what is durable.
+    fenced: bool,
     /// Whether the node led at its last turn: a node that stops leading redirects what it owed.
     leading: bool,
     /// The drives one turn makes at most: the store's depth and one.
@@ -492,9 +544,11 @@ impl Member {
             out: Output::default(),
             outbox: HashMap::new(),
             outbox_bound,
-            owed: HashMap::new(),
+            owed: HashSet::new(),
             owed_bound: clients.saturating_mul(lane_window),
             parked: VecDeque::new(),
+            answers: HashMap::new(),
+            fenced: false,
             leading: false,
             drives,
             due: false,
@@ -503,6 +557,12 @@ impl Member {
             stats: MemberStats::default(),
             class,
         })
+    }
+
+    /// Whether the replica fenced: the node takes nothing more until it is reopened from what is
+    /// durable, and its owner ends it.
+    pub const fn fenced(&self) -> bool {
+        self.fenced
     }
 
     /// The node's id.
@@ -632,11 +692,24 @@ impl Member {
                 }
             }
             Event::LaneRoom { peer, .. } if self.is_node(peer) => self.flush_outbox(endpoint, peer),
+            // A client's lane with room takes its waiting answers, then the node's deliveries to it.
+            room @ Event::LaneRoom { peer, .. } => {
+                self.flush_answers(endpoint, peer);
+                self.node_mut().on_event(endpoint, room);
+            }
             Event::Closed { peer, .. } if self.is_node(peer) => {
                 // What waited for the lane goes with the connection; Raft sends it again.
                 if let Some(waiting) = self.outbox.get_mut(&peer) {
                     waiting.clear();
                 }
+            }
+            closed @ Event::Closed { peer, .. } => {
+                // A publisher whose connection went sends again what it did not hear, on the next.
+                if let Some(waiting) = self.answers.remove(&peer) {
+                    let gone = u64::try_from(waiting.len()).unwrap_or(u64::MAX);
+                    self.stats.unanswered = self.stats.unanswered.saturating_add(gone);
+                }
+                self.node_mut().on_event(endpoint, closed);
             }
             other => self.node_mut().on_event(endpoint, other),
         }
@@ -693,10 +766,16 @@ impl Member {
     /// Proposes `batch`, owing `peer` its acknowledgement; whether the core took it. A core that
     /// holds as many uncommitted bytes as it may refuses it, and its publisher waits.
     fn propose(&mut self, peer: PeerId, batch: &[u8], key: Owed) -> bool {
-        if self.replica.propose(Vec::new(), batch.to_vec()).is_err() {
+        // The entry states the identity that published it: every replica judges the batch by that
+        // identity's sessions (`group`, doc 34 P6).
+        if self
+            .replica
+            .propose(peer.to_le_bytes().to_vec(), batch.to_vec())
+            .is_err()
+        {
             return false;
         }
-        self.owed.insert(key, peer);
+        self.owed.insert((peer, key));
         self.stats.proposed = self.stats.proposed.saturating_add(1);
         true
     }
@@ -712,19 +791,24 @@ impl Member {
         B: Budget<<Bus as Classes>::Class>,
         D: Directory<Role = <Bus as Classes>::Role>,
     {
-        // One parked publish a held lane: the transport delivers nothing more from a held lane, so
-        // a publisher parks at most one batch a lane.
-        if self.parked.iter().any(|p| p.peer == peer && p.lane == lane) {
+        // The transport reads nothing more from a held lane, but what it read before the hold
+        // still comes: it parks behind, in order, never dropped. A publish the node cannot keep
+        // (no memory, or a lane it cannot hold) is answered with the leader, sent again by its
+        // publisher.
+        let mut batch = Vec::new();
+        if batch.try_reserve_exact(bytes.len()).is_err()
+            || self.parked.try_reserve(1).is_err()
+            || endpoint.hold_lane(peer, lane).is_err()
+        {
+            if let Ok(parsed) = Batch::parse_verified(bytes, bytes.len()) {
+                let key = (parsed.stream(), parsed.producer(), parsed.sequence());
+                self.redirect(endpoint, peer, key);
+            }
             return;
         }
-        if endpoint.hold_lane(peer, lane).is_ok() {
-            self.parked.push_back(Parked {
-                peer,
-                lane,
-                batch: bytes.to_vec(),
-            });
-            self.stats.parked = self.stats.parked.saturating_add(1);
-        }
+        batch.extend_from_slice(bytes);
+        self.parked.push_back(Parked { peer, lane, batch });
+        self.stats.parked = self.stats.parked.saturating_add(1);
     }
 
     /// Proposes the parked publishes the replica can take now, letting their lanes go.
@@ -760,7 +844,11 @@ impl Member {
             };
             if taken {
                 self.parked.pop_front();
-                let _ = endpoint.release_lane(peer, lane);
+                let answered = self.answers.get(&peer).is_none_or(VecDeque::is_empty);
+                let parked = self.parked.iter().any(|p| p.peer == peer && p.lane == lane);
+                if answered && !parked {
+                    let _ = endpoint.release_lane(peer, lane);
+                }
             }
         }
     }
@@ -778,13 +866,72 @@ impl Member {
             sequence,
             leader: self.leader(),
         };
-        // A redirect that finds its publisher's lane full or gone is lost with it: the publisher
-        // that hears nothing sends again, to whichever node it then knows leads.
-        if endpoint
-            .send_frame(peer, LANE, Kind::Redirect, &redirect.encode())
-            .is_ok()
-        {
-            self.stats.redirected = self.stats.redirected.saturating_add(1);
+        self.answer(endpoint, peer, Answer::Redirect(redirect.encode()));
+        self.stats.redirected = self.stats.redirected.saturating_add(1);
+    }
+
+    /// Sends `answer` to the publisher `peer`, or keeps it, in order, while the publisher's lane has
+    /// no room or answers wait before it, holding the publisher's publishes meanwhile. A publisher
+    /// whose connection is gone takes nothing: it sends again what it did not hear, on the next
+    /// connection, and the part knows each batch it took (doc 34 P6).
+    fn answer<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, peer: PeerId, answer: Answer)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        let waiting = self
+            .answers
+            .get(&peer)
+            .is_some_and(|queue| !queue.is_empty());
+        if !waiting {
+            match endpoint.send_frame(peer, LANE, answer.kind(), answer.bytes()) {
+                Ok(()) => return,
+                Err(Refusal::LaneFull) => {}
+                Err(_) => {
+                    self.stats.unanswered = self.stats.unanswered.saturating_add(1);
+                    return;
+                }
+            }
+        }
+        let queue = self.answers.entry(peer).or_default();
+        if queue.try_reserve(1).is_err() {
+            // No memory for it: the publisher sends again what it did not hear within its period.
+            self.stats.unanswered = self.stats.unanswered.saturating_add(1);
+            return;
+        }
+        queue.push_back(answer);
+        self.stats.answers_waited = self.stats.answers_waited.saturating_add(1);
+        // Nothing more of the publisher's is read until its answers have gone.
+        let _ = endpoint.hold_lane(peer, LANE);
+    }
+
+    /// Sends the answers waiting for `peer`'s lane while it has room; once none waits, and no
+    /// publish of its is parked, its publishes are read again.
+    fn flush_answers<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, peer: PeerId)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        let Some(queue) = self.answers.get_mut(&peer) else {
+            return;
+        };
+        // Bounded: each turn sends one waiting answer or stops.
+        while let Some(front) = queue.front() {
+            match endpoint.send_frame(peer, LANE, front.kind(), front.bytes()) {
+                Ok(()) => {
+                    queue.pop_front();
+                }
+                Err(Refusal::LaneFull) => return,
+                Err(_) => {
+                    let gone = u64::try_from(queue.len()).unwrap_or(u64::MAX);
+                    self.stats.unanswered = self.stats.unanswered.saturating_add(gone);
+                    queue.clear();
+                }
+            }
+        }
+        self.answers.remove(&peer);
+        if !self.parked.iter().any(|parked| parked.peer == peer) {
+            let _ = endpoint.release_lane(peer, LANE);
         }
     }
 
@@ -966,8 +1113,17 @@ impl Member {
             self.out.clear();
             let driven = match self.replica.drive(clock, waker, &mut self.out) {
                 Ok(driven) => driven,
-                // A fenced replica takes no call until it is reopened from what is durable.
-                Err(_) => break,
+                // A fenced replica takes no call until it is reopened from what is durable: the
+                // node ends (`Member::fenced`) rather than hold, unanswered, what it owes.
+                Err(ReplicaError::Fenced(_)) => {
+                    self.fenced = true;
+                    break;
+                }
+                // Refused or stalled, nothing changed: the next turn drives again.
+                Err(_) => {
+                    self.stats.refused_drives = self.stats.refused_drives.saturating_add(1);
+                    break;
+                }
             };
             self.stats.drives = self.stats.drives.saturating_add(1);
             if let Some((submitted, answered)) = driven.flushed {
@@ -1013,14 +1169,16 @@ impl Member {
         D: Directory<Role = <Bus as Classes>::Role>,
     {
         let key = (applied.stream, applied.producer, applied.sequence);
-        let Some(peer) = self.owed.remove(&key) else {
+        let peer = applied.owner;
+        if !self.owed.remove(&(peer, key)) {
             return;
-        };
+        }
         let (base, count, class) = match applied.outcome {
             Outcome::Appended { base } => (base, applied.count, self.class.code()),
             Outcome::Again { base: Some(base) } => (base, applied.count, self.class.code()),
             // Taken before, its offsets no longer said: an acknowledgement of no records.
             Outcome::Again { base: None } => (0, 0, self.class.code()),
+            Outcome::OutOfOrder { expected } => (expected, 0, Ack::OUT_OF_ORDER),
             Outcome::Refused(_) => (0, 0, Ack::REFUSED),
         };
         let ack = Ack {
@@ -1031,12 +1189,8 @@ impl Member {
             count,
             class,
         };
-        if endpoint
-            .send_frame(peer, LANE, Kind::Ack, &ack.encode())
-            .is_ok()
-        {
-            self.stats.acked = self.stats.acked.saturating_add(1);
-        }
+        self.answer(endpoint, peer, Answer::Ack(ack.encode()));
+        self.stats.acked = self.stats.acked.saturating_add(1);
     }
 
     /// A node that stopped leading redirects every publisher it owed: the group may or may not have
@@ -1048,8 +1202,8 @@ impl Member {
     {
         let leading = self.replica.is_leader();
         if self.leading && !leading {
-            let owed: Vec<(Owed, PeerId)> = self.owed.drain().collect();
-            for (key, peer) in owed {
+            let owed: Vec<(PeerId, Owed)> = self.owed.drain().collect();
+            for (peer, key) in owed {
                 self.redirect(endpoint, peer, key);
             }
         }

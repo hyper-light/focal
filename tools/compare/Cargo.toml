@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+getrandom = { workspace = true }
 # The event bus's client (`pubsub` against focal-bus), its corpus and its runtime.
 focal-bus = { version = "0.1.0", path = "../../crates/focal-bus" }
 focal-rt = { version = "0.1.0", path = "../../crates/focal-rt" }

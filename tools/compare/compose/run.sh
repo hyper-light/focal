@@ -49,6 +49,12 @@ evidence() {
   for c in $(dc ps -a --format '{{.Name}}'); do
     docker inspect "$c" --format "$c oom={{.State.OOMKilled}} exit={{.State.ExitCode}} status={{.State.Status}}" || true
   done
+  if [ "$profile" = focal-bus ]; then
+    for n in focal-bus1 focal-bus2 focal-bus3; do
+      echo "--- $n log"
+      dc logs --no-color --tail 120 "$n" || true
+    done
+  fi
   if [ "$system" = focal ]; then
     for n in focal1 focal2 focal3; do
       echo "--- $n replicas"
@@ -237,5 +243,12 @@ if [ "$system" != focal ]; then
   cpu_stat after >> "$out/$report.cpu.txt"
   net_stat after >> "$out/$report.net.txt"
   dc exec -T generator cat "/reports/$report" > "$out/$report"
+  # Each bus node's log, whatever the run's outcome: its leadership, refusals and what it reported
+  # as it stopped, for where a tail or an unanswered record came from.
+  if [ "$profile" = focal-bus ]; then
+    for n in focal-bus1 focal-bus2 focal-bus3; do
+      dc logs --no-color "$n" > "$out/$report.$n.log" 2>&1 || true
+    done
+  fi
 fi
 echo "wrote $out/$report"

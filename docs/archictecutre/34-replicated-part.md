@@ -2,7 +2,8 @@
 
 Status: 2026-10-18. The design of doc 32's step 3 as doc 33 refines it (its steps 3b, 3c and 3g),
 and what was built of it: steps 3b.1 to 3b.4 and 3c are in (§8); the comparison (3b.5) ran once
-and found records left unacknowledged at 10,000 a second and a tail of 1.4 s at 1,000, both open.
+and found records left unacknowledged at 10,000 a second and a tail of 1.4 s at 1,000: the first is
+fixed (every publish answered, P6 as designed), the second is a shared disk's stall electing, open.
 Doc 33 says what each class commits on; this says how a part becomes a group of three
 replicas, and what every publish, acknowledgement and delivery does on the way.
 
@@ -46,7 +47,7 @@ replicas, and what every publish, acknowledgement and delivery does on the way.
 | P3 | The group's entries are the batches: the same bytes proposed, replicated, written and applied | doc 32 D4 |
 | P4 | The state machine is the part: applying an entry appends its batch to the part's log and streams, which the node delivers from | doc 32 §3; one copy into the segment the delivery reads |
 | P5 | A publish is acknowledged by a frame of its own when its leader applies it: stream, base offset, records, and the class achieved | Kafka's produce response (base offset), JetStream's PubAck (stream, sequence); doc 33 §4.8's typed acknowledgement |
-| P6 | Idempotent publishes: a batch whose producer and sequence the part already applied is acknowledged with its first offsets and not appended again; each producer's last sequence is kept a part, bounded, and evicted by the oldest use | Kafka's idempotent producer (KIP-98) and its producer-state expiry; doc 32 D3. A client resends what a failover left unacknowledged |
+| P6 | Idempotent publishes in each session's order: the part keeps, for each stream and each identity that publishes to it, the identity's sessions (the one it publishes on and the one it replaced), each with the sequence its next batch must begin with; a batch its session took already is acknowledged with its first offsets where it was the session's newest and is not appended again, one past a gap or across the next sequence is refused `OUT_OF_ORDER` naming the sequence the session waits for, a new session begins at zero, and a session is judged by the identity the leader states with the entry, so no publisher takes another's by naming it | Kafka's idempotent producer (KIP-98: `DUPLICATE_SEQUENCE_NUMBER`, `OUT_OF_ORDER_SEQUENCE_NUMBER`, a fresh producer id for a new producer) and its producer state kept per partition and snapshotted; doc 32 D3. A client resends what a failover left unacknowledged |
 | P7 | Deliveries are made by the leader from its applied part; a follower refuses a subscriber, naming the leader | Kafka's fetch from the leader; reading from a follower (KIP-392) waits for doc 33 §4.7's gate |
 | P8 | Raft messages travel between nodes as lane frames on the bus's endpoint, in hyper-raft's own wire records | one endpoint and one congestion state a peer, sealed by QUIC's TLS; the records carry every R-8 field, where focal-consensus's envelope refuses them (doc 33, step 3c) |
 | P9 | A node's groups write to one hyper-log log on its data directory | hyper-durable's `GroupStore`: one flush commits every group's writes |
@@ -141,6 +142,27 @@ Found on the way, each root-caused:
   waits a flush, the leader's or that follower's. Traced on three processes (macOS, debug):
   propose to commit p50 1.2–4 ms, p90 23–46 ms, commit to apply 0. Open: what of it a group of
   five changes (a held quorum is then three of four followers), and the promise's reach under bursts.
-- **Resends are recognised by the stream's newest producer only.** A producer's batch sent again
-  after another producer's batch on the same stream is appended again: at least once, the class's
-  promise. Open: a bounded producer table, as Kafka keeps per partition.
+- **A batch overtaken by the next of its producer's was acknowledged and lost.** 3b.2 kept only each
+  stream's newest batch's producer and its next sequence, and took any batch of that producer below
+  it for a resend: a batch redirected, or sent to a leader that stopped leading, while the next went
+  straight through came after it, was acknowledged as taken and was never appended; and a replica
+  that reopened on its image appended again a batch its floor held, where another producer's came
+  between, so its offsets could part from its group's. P6 as now built replaces it (`producer`): each
+  identity's sessions in each stream, in order, gaps refused; the image keeps the sessions as of the
+  newest batch the window let go, fed each batch as it goes in the order it was appended, so a
+  replica that reopens replays to the same sessions (version 2).
+- **Answers were dropped on a full lane.** At 10,000 a second the leader stepped down for a moment
+  (below), redirected the 2,300 publishes it owed at once, and dropped 1,657 of the redirects and 75
+  acknowledgements on the publisher's full lane: those 1,732 batches were never answered, the run's
+  3,386 failed records, sent once each and neither redirected nor acknowledged (traced on the
+  bare-metal machine, every count matching). Every publish is now answered: an answer that finds its
+  publisher's lane full waits, in order, its publisher's publishes held until it goes; the client
+  sends in its session's order, and sends again what goes unanswered for a serve period.
+- **A shared disk's stall elects.** The same run's step-down: each node's log flush took 584 to
+  587 ms in the same second, the bare-metal machine's one disk stalling under all three nodes, so
+  no node's heartbeat was proved for 0.6 s and each node suspected both others; the leader, left no
+  trusted quorum, stepped down, and won the next term. Each detector stood at 165 to 216 ms of
+  detection with a mistake expected every 29 to 36 s, charging an election the ballot law's span
+  (a round trip and a vote's flush, about 0.1 s) where the step-down cost a second. Open, in the
+  shared repository's liveness stream: the cost of an election as measured, and a stall that every
+  member shares.

@@ -31,22 +31,6 @@ pub struct StreamState {
     /// Where its newest batch is, if it holds one: the batch whose `next` the stream's next append
     /// stamps.
     pub last: Option<u64>,
-    /// The producer of its newest batch, and the producer's sequence after it: a batch of that
-    /// producer below it was taken already (doc 34 P6, Kafka's idempotent producer, KIP-98).
-    pub tail: Produced,
-    /// The same as of its floor: what its newest batch let go stated, which a part's image keeps
-    /// with the floor (`group`).
-    pub floor_tail: Produced,
-}
-
-/// A stream's newest batch's producer and the producer's sequence after that batch; none before
-/// the stream's first batch.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Produced {
-    /// The producer.
-    pub producer: u64,
-    /// The sequence the producer's next batch takes: the batch's first record's and its records.
-    pub next_sequence: u64,
 }
 
 /// What one stream costs the table: its state, and its map entry with the map's control byte.
@@ -153,8 +137,6 @@ impl StreamTable {
                     floor: 0,
                     first: None,
                     last: None,
-                    tail: Produced::default(),
-                    floor_tail: Produced::default(),
                 });
                 self.slots.insert(id, slot);
                 slot

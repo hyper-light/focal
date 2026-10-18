@@ -479,8 +479,9 @@ impl Reply {
 /// A publish's acknowledgement: its batch, named by its stream, producer and sequence, was
 /// committed by its part's group and applied by the leader at `base`, its `count` records taking
 /// `[base, base + count)`, in the class `class` states (doc 34 P5; doc 33 §4.8). A batch the part
-/// had already applied (its producer sent it again) is acknowledged with the offsets it took then
-/// (doc 34 P6).
+/// had already applied (its producer sent it again) is acknowledged with the offsets it took then,
+/// or with none where the part no longer says (`count` zero); one past a gap in its session's order
+/// is refused [`Ack::OUT_OF_ORDER`], `base` the sequence its session waits for (doc 34 P6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ack {
     /// The batch's stream.
@@ -503,6 +504,9 @@ impl Ack {
     /// The class of a batch the part refused alike at every node (no batch the part takes, a
     /// stream past its bound): its producer must not send it again.
     pub const REFUSED: u8 = u8::MAX;
+    /// The class of a batch past a gap in its session's order, not appended: its producer sends
+    /// again, in order, from the sequence `base` states (Kafka's `OUT_OF_ORDER_SEQUENCE_NUMBER`).
+    pub const OUT_OF_ORDER: u8 = u8::MAX - 1;
 
     /// The acknowledgement as sent.
     pub fn encode(&self) -> [u8; Self::BYTES] {

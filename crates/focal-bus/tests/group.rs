@@ -410,6 +410,7 @@ fn open_node(
             segment_bytes: NodeConfig::SEGMENT_BYTES,
             streams: 64,
             subscriptions: 4,
+            producers: 64,
         },
         budget.clone(),
     )

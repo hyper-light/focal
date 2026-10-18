@@ -34,6 +34,7 @@ pub mod member;
 pub mod node;
 pub mod part;
 pub mod pki;
+pub mod producer;
 pub mod serve;
 pub mod stream;
 pub mod window;
@@ -56,6 +57,9 @@ pub enum BusError {
     Protocol(&'static str),
     /// The transport refused.
     Transport(hyper_transport::Refusal),
+    /// A replica fenced on a failure it cannot go past (a write that failed, a state machine that
+    /// could not apply): it takes nothing until its node reopens it from what is durable.
+    Fenced,
 }
 
 impl std::fmt::Display for BusError {
@@ -68,6 +72,7 @@ impl std::fmt::Display for BusError {
             Self::UnknownStream(stream) => write!(f, "no stream {stream} in this part"),
             Self::Protocol(what) => write!(f, "protocol: {what}"),
             Self::Transport(refusal) => write!(f, "transport refused: {refusal:?}"),
+            Self::Fenced => write!(f, "the part's replica fenced; reopen the node from its log"),
         }
     }
 }

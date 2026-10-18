@@ -37,7 +37,8 @@ use crate::batch::Batch;
 use crate::budget::Headroom;
 use crate::log::{Position, SegmentPool};
 use crate::part::{Appended, Part, PartLimits, Taken};
-use crate::stream::{Produced, STREAM_BYTES};
+use crate::producer::{self, Entry};
+use crate::stream::STREAM_BYTES;
 use crate::wire::{self, Bus, Gap, Kind, LANE, Reply, Subscribe, Subscribed};
 
 /// What a node holds at most.
@@ -49,6 +50,8 @@ pub struct NodeConfig {
     pub streams: usize,
     /// Subscriptions at once.
     pub subscriptions: usize,
+    /// Publishing identities' sessions the part keeps (`PartLimits::producers`).
+    pub producers: usize,
 }
 
 /// What one subscription costs the node's tables at least: its slot, its place on the free list,
@@ -77,6 +80,7 @@ impl NodeConfig {
             segment_bytes: Self::SEGMENT_BYTES,
             streams: memory_bytes / STREAM_BYTES,
             subscriptions: memory_bytes / SUBSCRIPTION_BYTES,
+            producers: memory_bytes / producer::ENTRY_BYTES,
         }
     }
 }
@@ -118,6 +122,9 @@ struct Retained {
     end: u64,
     /// The group's entry, its index and term; `(0, 0)` for a lone node's batch.
     entry: (u64, u64),
+    /// The identity that published it, in a part its group replicates: the floor's sessions take
+    /// it as it goes (`Part::release_below`).
+    owner: Option<u64>,
 }
 
 /// A publisher's lane the node holds while a stream it fed has a subscriber that takes no more.
@@ -204,6 +211,7 @@ impl Node {
                 PartLimits {
                     streams: config.streams,
                     batch_bytes,
+                    producers: config.producers,
                 },
                 budget.clone(),
             ),
@@ -360,12 +368,12 @@ impl Node {
         } else {
             self.part.append(&mut self.pool, bytes)?
         };
-        self.retain(appended, (0, 0));
+        self.retain(appended, (0, 0), None);
         Ok(appended)
     }
 
-    /// Takes a batch the part's group committed at `index` (`group`), unless its producer sent it
-    /// again (`Part::append_committed`). What the memory cannot hold for it, the window gives up,
+    /// Takes a batch the part's group committed at `entry` (`group`), published by `owner`, unless
+    /// its session took it already or it comes out of its session's order (`Part::append_committed`). What the memory cannot hold for it, the window gives up,
     /// oldest first, as a publish's does; whether the window let any go is the second value, for
     /// the owner to ask the transport's waiting frames again. A committed batch is refused only
     /// where the window has nothing left to give.
@@ -373,6 +381,7 @@ impl Node {
         &mut self,
         bytes: &[u8],
         entry: (u64, u64),
+        owner: u64,
     ) -> Result<(Taken, bool), BusError> {
         let mut relieved = false;
         // Bounded: each turn but the last frees a segment, or gives a warm segment or a retained
@@ -380,11 +389,11 @@ impl Node {
         loop {
             let taken = self
                 .reserve_retained()
-                .and_then(|()| self.part.append_committed(&mut self.pool, bytes));
+                .and_then(|()| self.part.append_committed(&mut self.pool, bytes, owner));
             match taken {
                 Ok(taken) => {
                     if let Taken::Appended(appended) = taken {
-                        self.retain(appended, entry);
+                        self.retain(appended, entry, Some(owner));
                         self.stats.published = self.stats.published.saturating_add(1);
                     }
                     return Ok((taken, relieved));
@@ -396,17 +405,18 @@ impl Node {
         }
     }
 
-    /// Lets every batch the part holds go, and holds `floors`' streams, each from its floor on: a
-    /// part opened from its image, or given one by its group's leader. Subscribers below a floor
-    /// are told what they missed as they read on.
+    /// Lets every batch the part holds go, and holds `floors`' streams, each from its floor on, and
+    /// `producers`' sessions: a part opened from its image, or given one by its group's leader.
+    /// Subscribers below a floor are told what they missed as they read on.
     pub fn restore(
         &mut self,
-        floors: impl IntoIterator<Item = (u64, u64, Produced)>,
+        floors: impl IntoIterator<Item = (u64, u64)>,
+        producers: &[Entry],
         at: (u64, u64),
     ) -> Result<(), BusError> {
         self.retained.clear();
         self.released = at;
-        self.part.restore(&mut self.pool, floors)
+        self.part.restore(&mut self.pool, floors, producers)
     }
 
     /// Delivers what `stream` holds past each of its subscribers' cursors: after a batch of it
@@ -444,11 +454,12 @@ impl Node {
 
     /// Keeps `appended` in the window, its room reserved before it was taken
     /// ([`Node::reserve_retained`]): nothing is allocated here.
-    fn retain(&mut self, appended: Appended, entry: (u64, u64)) {
+    fn retain(&mut self, appended: Appended, entry: (u64, u64), owner: Option<u64>) {
         self.retained.push_back(Retained {
             stream: appended.stream,
             end: appended.base.saturating_add(u64::from(appended.count)),
             entry,
+            owner,
         });
         self.recycle_ahead();
     }
@@ -487,9 +498,9 @@ impl Node {
                 break;
             };
             // A stream's batches leave in order, so its floor moves past the oldest's end.
-            let _ = self
-                .part
-                .release_below(&mut self.pool, oldest.stream, oldest.end);
+            let _ =
+                self.part
+                    .release_below(&mut self.pool, oldest.stream, oldest.end, oldest.owner);
         }
     }
 
@@ -502,9 +513,9 @@ impl Node {
         // Bounded: each turn lets one retained batch go.
         while let Some(oldest) = self.let_go_oldest() {
             // A stream's batches leave in order, so its floor moves past the oldest's end.
-            let _ = self
-                .part
-                .release_below(&mut self.pool, oldest.stream, oldest.end);
+            let _ =
+                self.part
+                    .release_below(&mut self.pool, oldest.stream, oldest.end, oldest.owner);
             if freed(&self.pool) {
                 return true;
             }
@@ -525,9 +536,9 @@ impl Node {
         // Bounded: each turn lets one retained batch go.
         while let Some(oldest) = self.let_go_oldest() {
             // A stream's batches leave in order, so its floor moves past the oldest's end.
-            let _ = self
-                .part
-                .release_below(&mut self.pool, oldest.stream, oldest.end);
+            let _ =
+                self.part
+                    .release_below(&mut self.pool, oldest.stream, oldest.end, oldest.owner);
             if self.pool.warm() > 0 || self.pool.churn().1 > returned {
                 self.pool.shed();
                 return true;
@@ -1098,6 +1109,7 @@ mod tests {
             segment_bytes: segment,
             streams: 4,
             subscriptions: 4,
+            producers: 4,
         };
         let mut node = Node::new(config, budget).unwrap();
         let mut builder = BatchBuilder::new();

@@ -1,17 +1,18 @@
 //! A part its group replicates (doc 34): the part as the state machine of a hyper-durable replica,
 //! its batches the group's entries (doc 32 D4).
 //!
-//! Applying a committed entry appends its batch to the part, or recognises a batch its producer sent
-//! again (doc 34 P6), and answers which, for the leader to acknowledge it and every node to deliver
-//! it (P4, P5). Everything an apply decides from is the same at every node of the group: the
+//! Applying a committed entry appends its batch to the part in its session's order, or recognises a
+//! batch its producer sent again, or refuses one past a gap in its session (doc 34 P6), and answers
+//! which, for the leader to acknowledge it and every node to deliver it (P4, P5). The leader states
+//! with each entry the identity that published it (the entry's context), whose sessions judge it. Everything an apply decides from is the same at every node of the group: the
 //! entries, in their order, and the part's bounds, which the group states. What one node alone
 //! decides, which batches its memory retains for subscribers that start behind, never changes what
 //! an entry does: the window lets batches go oldest first, so the part's floors are its state as of
 //! the newest entry let go, at every node that let it go.
 //!
-//! **The image.** The part keeps nothing of its own on disk but its image: each stream's floor and
-//! what its newest batch there stated, and the configuration, as of the newest entry the window let
-//! go (`Node::released`). The group's log is compacted to that point and no further
+//! **The image.** The part keeps nothing of its own on disk but its image: each stream's floor, the
+//! producing sessions as of it, and the configuration, as of the newest entry the window let go
+//! (`Node::released`). The group's log is compacted to that point and no further
 //! (`StateMachine::durable`), so the log holds what the window holds: a node that restarts opens
 //! on its image and the log replays the window into it, offsets and batches alike (doc 34 P10). A
 //! member that lacks entries its leader's log no longer holds is given the leader's image, and the
@@ -29,12 +30,14 @@ use crate::BusError;
 use crate::batch::{self, Batch};
 use crate::node::Node;
 use crate::part::Taken;
-use crate::stream::Produced;
+use crate::producer::{Entry, SESSIONS_PER_IDENTITY, Session};
 
 /// What applying an entry answered: the batch, by its stream, producer and sequence, and what the
 /// part did with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Applied {
+    /// The identity that published it, as its entry states; zero where none is stated.
+    pub owner: u64,
     /// The batch's stream.
     pub stream: u64,
     /// Its producer.
@@ -61,6 +64,12 @@ pub enum Outcome {
         /// The offset its first record took, where the part still says.
         base: Option<u64>,
     },
+    /// Past a gap in its session's order: not appended, its publisher to send again from the
+    /// sequence its session waits for.
+    OutOfOrder {
+        /// The sequence its session's next batch must begin with.
+        expected: u64,
+    },
     /// Refused alike at every node: the entry is no batch the part takes, or its stream is past
     /// the part's bound.
     Refused(&'static str),
@@ -69,15 +78,22 @@ pub enum Outcome {
 /// Format: the image's first bytes.
 const MAGIC: [u8; 4] = *b"FBPI";
 /// Format: the image's layout.
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 /// Format: an image's bytes before its configuration: the magic, the version, the point's index
 /// and term, and the configuration's length.
 const HEAD_BYTES: usize = 4 + 1 + 8 + 8 + 4;
-/// Format: a stream's bytes in an image: its identity, its floor, and what its newest batch at the
-/// floor stated (the producer and its next sequence).
-const STREAM_IMAGE_BYTES: usize = 8 + 8 + 8 + 8;
-/// Format: the count of streams, and the CRC-32C over everything before it at the end.
-const TAIL_BYTES: usize = 8 + 4;
+/// Format: a stream's bytes in an image: its identity and its floor.
+const STREAM_IMAGE_BYTES: usize = 8 + 8;
+/// Format: a session's bytes in an image: its producer, the sequence its next batch takes, its
+/// newest batch's first sequence and first offset. A place no session holds is all zeros: a
+/// session's next sequence is past its first batch, never zero.
+const SESSION_IMAGE_BYTES: usize = 8 + 8 + 8 + 8;
+/// Format: an identity's sessions in a stream, in an image: the stream, the identity, and each of
+/// its places, most recently used first.
+const PRODUCER_IMAGE_BYTES: usize = 8 + 8 + SESSIONS_PER_IDENTITY * SESSION_IMAGE_BYTES;
+/// Format: the counts of streams and of producer entries, and the CRC-32C over everything before
+/// it at the end.
+const TAIL_BYTES: usize = 8 + 8 + 4;
 
 /// The largest configuration of a group of at most `members` members, as an image holds it: every
 /// list of members full, which no configuration reaches (its voters and learners together are at
@@ -99,11 +115,13 @@ fn largest_configuration(members: usize) -> Result<ConfState, BusError> {
     })
 }
 
-/// The bytes an image of `streams` streams under `configuration` takes.
-fn image_len(streams: usize, configuration: &ConfState) -> Option<usize> {
+/// The bytes an image of `streams` streams and `producers` producer entries under `configuration`
+/// takes.
+fn image_len(streams: usize, producers: usize, configuration: &ConfState) -> Option<usize> {
     HEAD_BYTES
         .checked_add(configuration.encoded_len())?
         .checked_add(streams.checked_mul(STREAM_IMAGE_BYTES)?)?
+        .checked_add(producers.checked_mul(PRODUCER_IMAGE_BYTES)?)?
         .checked_add(TAIL_BYTES)
 }
 
@@ -125,7 +143,7 @@ pub struct PartMachine {
     durable: Point,
     /// Where the image is kept.
     path: PathBuf,
-    /// The most bytes an image of this part takes: its stream bound's.
+    /// The most bytes an image of this part takes: its stream and producer bounds'.
     image_bound: usize,
     /// Whether an apply let the window give memory back since the owner last asked
     /// ([`PartMachine::take_relieved`]).
@@ -144,9 +162,13 @@ impl PartMachine {
         founding: ConfState,
         members: usize,
     ) -> Result<Self, BusError> {
-        let streams = node.part_limits().streams;
-        let image_bound = image_len(streams, &largest_configuration(members)?)
-            .ok_or(BusError::Configuration("an image of the part's streams"))?;
+        let limits = node.part_limits();
+        let image_bound = image_len(
+            limits.streams,
+            limits.producers,
+            &largest_configuration(members)?,
+        )
+        .ok_or(BusError::Configuration("an image of the part's streams"))?;
         let medium = FileMedium;
         let exists = medium
             .exists(&path)
@@ -156,7 +178,11 @@ impl PartMachine {
                 .read(&path, image_bound)
                 .map_err(|_| BusError::Configuration("the part's image could not be read"))?;
             let image = Image::decode(&bytes)?;
-            node.restore(image.floors(), (image.point.index, image.point.term))?;
+            node.restore(
+                image.floors(),
+                &image.producers,
+                (image.point.index, image.point.term),
+            )?;
             (image.point, image.configuration)
         } else {
             (Point::default(), founding)
@@ -221,6 +247,7 @@ impl PartMachine {
             point,
             configuration: self.floor_configuration.clone(),
             streams: self.node.part().floors().collect(),
+            producers: self.node.part().floor_producers().copied().collect(),
         };
         image
             .encode(into)
@@ -241,8 +268,21 @@ impl StateMachine for PartMachine {
         if entry.data.is_empty() {
             return Ok(());
         }
+        // The identity the leader stated published it: the sessions its batch is judged by.
+        let Ok(owner) = <[u8; 8]>::try_from(entry.context).map(u64::from_le_bytes) else {
+            answers.push(Applied {
+                owner: 0,
+                stream: 0,
+                producer: 0,
+                sequence: 0,
+                count: 0,
+                outcome: Outcome::Refused("an entry that names no publisher"),
+            });
+            return Ok(());
+        };
         let Ok(header) = Batch::parse_verified(entry.data, entry.data.len()) else {
             answers.push(Applied {
+                owner,
                 stream: 0,
                 producer: 0,
                 sequence: 0,
@@ -259,7 +299,7 @@ impl StateMachine for PartMachine {
         );
         let outcome = match self
             .node
-            .apply_committed(entry.data, (entry.index, entry.term))
+            .apply_committed(entry.data, (entry.index, entry.term), owner)
         {
             Ok((taken, relieved)) => {
                 self.relieved |= relieved;
@@ -268,6 +308,7 @@ impl StateMachine for PartMachine {
                         base: appended.base,
                     },
                     Taken::Again { base, .. } => Outcome::Again { base },
+                    Taken::OutOfOrder { expected, .. } => Outcome::OutOfOrder { expected },
                 }
             }
             // What the entries and the part's bounds decide, alike at every node.
@@ -281,6 +322,7 @@ impl StateMachine for PartMachine {
             Err(_) => return Err(Fatal("a committed batch could not be applied")),
         };
         answers.push(Applied {
+            owner,
             stream,
             producer,
             sequence,
@@ -326,7 +368,12 @@ impl StateMachine for PartMachine {
     }
 
     fn image_bytes(&self) -> Option<u64> {
-        let len = image_len(self.node.part().streams(), &self.floor_configuration)?;
+        let part = self.node.part();
+        let len = image_len(
+            part.streams(),
+            part.floor_producers().count(),
+            &self.floor_configuration,
+        )?;
         u64::try_from(len).ok()
     }
 
@@ -342,7 +389,7 @@ impl StateMachine for PartMachine {
         focal_platform::fs::install(&mut medium, &self.path, image)
             .map_err(|_| Fatal("the part's image could not be made durable"))?;
         self.node
-            .restore(decoded.floors(), (at.index, at.term))
+            .restore(decoded.floors(), &decoded.producers, (at.index, at.term))
             .map_err(|_| Fatal("the part could not hold the image's streams"))?;
         self.applied = at;
         self.durable = at;
@@ -372,12 +419,14 @@ impl StateMachine for PartMachine {
 struct Image {
     point: Point,
     configuration: ConfState,
-    /// Each stream's identity, floor, and what its newest batch at the floor stated.
-    streams: Vec<(u64, u64, Produced)>,
+    /// Each stream's identity and floor.
+    streams: Vec<(u64, u64)>,
+    /// Each identity's sessions in each stream, as of the floors.
+    producers: Vec<Entry>,
 }
 
 impl Image {
-    fn floors(&self) -> impl Iterator<Item = (u64, u64, Produced)> + '_ {
+    fn floors(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.streams.iter().copied()
     }
 
@@ -387,6 +436,8 @@ impl Image {
             .map_err(|_| BusError::Capacity("an image's configuration"))?;
         let count = u64::try_from(self.streams.len())
             .map_err(|_| BusError::Capacity("an image's streams"))?;
+        let producers = u64::try_from(self.producers.len())
+            .map_err(|_| BusError::Capacity("an image's producers"))?;
         let start = out.len();
         out.extend_from_slice(&MAGIC);
         out.push(VERSION);
@@ -394,13 +445,23 @@ impl Image {
         out.extend_from_slice(&self.point.term.to_le_bytes());
         out.extend_from_slice(&length.to_le_bytes());
         out.extend_from_slice(&configuration);
-        for (id, floor, tail) in &self.streams {
+        for (id, floor) in &self.streams {
             out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&floor.to_le_bytes());
-            out.extend_from_slice(&tail.producer.to_le_bytes());
-            out.extend_from_slice(&tail.next_sequence.to_le_bytes());
+        }
+        for entry in &self.producers {
+            out.extend_from_slice(&entry.stream.to_le_bytes());
+            out.extend_from_slice(&entry.owner.to_le_bytes());
+            for place in &entry.sessions {
+                let session = place.unwrap_or_default();
+                out.extend_from_slice(&session.producer.to_le_bytes());
+                out.extend_from_slice(&session.next.to_le_bytes());
+                out.extend_from_slice(&session.newest.to_le_bytes());
+                out.extend_from_slice(&session.base.to_le_bytes());
+            }
         }
         out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&producers.to_le_bytes());
         let crc = batch::crc32c(out.get(start..).unwrap_or(&[]));
         out.extend_from_slice(&crc.to_le_bytes());
         Ok(())
@@ -425,33 +486,63 @@ impl Image {
         };
         let length = usize::try_from(reader.u32()?).map_err(|_| refused())?;
         let configuration = ConfState::decode(reader.take(length)?).map_err(|_| refused())?;
-        let (body, count) = reader.bytes.split_last_chunk::<8>().ok_or_else(refused)?;
-        let count = usize::try_from(u64::from_le_bytes(*count)).map_err(|_| refused())?;
-        if body.len() != count.checked_mul(STREAM_IMAGE_BYTES).ok_or_else(refused)? {
+        let (body, counts) = reader.bytes.split_last_chunk::<16>().ok_or_else(refused)?;
+        let (count, producers) = counts.split_at(8);
+        let count = <[u8; 8]>::try_from(count)
+            .map(u64::from_le_bytes)
+            .ok()
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(refused)?;
+        let producers = <[u8; 8]>::try_from(producers)
+            .map(u64::from_le_bytes)
+            .ok()
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(refused)?;
+        let length = count
+            .checked_mul(STREAM_IMAGE_BYTES)
+            .zip(producers.checked_mul(PRODUCER_IMAGE_BYTES))
+            .and_then(|(streams, producers)| streams.checked_add(producers))
+            .ok_or_else(refused)?;
+        if body.len() != length {
             return Err(refused());
         }
         let mut streams = Vec::new();
         streams.try_reserve_exact(count).map_err(|_| refused())?;
         let mut rows = Reader { bytes: body };
-        // Bounded: the count the length checked above.
+        // Bounded: the counts the length checked above.
         for _ in 0..count {
             let id = rows.u64()?;
             let floor = rows.u64()?;
-            let producer = rows.u64()?;
-            let next_sequence = rows.u64()?;
-            streams.push((
-                id,
-                floor,
-                Produced {
-                    producer,
-                    next_sequence,
-                },
-            ));
+            streams.push((id, floor));
+        }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(producers)
+            .map_err(|_| refused())?;
+        for _ in 0..producers {
+            let stream = rows.u64()?;
+            let owner = rows.u64()?;
+            let mut sessions = [None; SESSIONS_PER_IDENTITY];
+            for place in &mut sessions {
+                let session = Session {
+                    producer: rows.u64()?,
+                    next: rows.u64()?,
+                    newest: rows.u64()?,
+                    base: rows.u64()?,
+                };
+                *place = (session.next != 0).then_some(session);
+            }
+            entries.push(Entry {
+                stream,
+                owner,
+                sessions,
+            });
         }
         Ok(Self {
             point,
             configuration,
             streams,
+            producers: entries,
         })
     }
 }
@@ -504,6 +595,7 @@ mod tests {
                 segment_bytes: NodeConfig::SEGMENT_BYTES,
                 streams: 64,
                 subscriptions: 4,
+                producers: 64,
             },
             MemoryBudget::new(memory, 0).unwrap(),
         )
@@ -539,12 +631,15 @@ mod tests {
         builder.finish().unwrap().to_vec()
     }
 
+    /// The identity every test batch is published by, as the leader states it with the entry.
+    const OWNER: [u8; 8] = 5_u64.to_le_bytes();
+
     fn entry(index: u64, term: u64, data: &[u8]) -> EntryRef<'_> {
         EntryRef {
             index,
             term,
             kind: EntryType::EntryNormal,
-            context: &[],
+            context: &OWNER,
             data,
         }
     }
@@ -585,8 +680,8 @@ mod tests {
             Outcome::Again { base: None }
         );
         assert_eq!(machine.node().part().bounds(7), Some((0, 5)));
-        // Another producer's batch is appended; the first producer's after it is too (at least
-        // once: the stream keeps only its newest batch's producer).
+        // Another session's batch is appended; the first session's sent again after it is still
+        // known taken, with its offsets: each session is kept.
         assert_eq!(
             apply(&mut machine, 6, &batch(7, 4, 0, 1, 16))
                 .unwrap()
@@ -595,19 +690,45 @@ mod tests {
         );
         assert_eq!(
             apply(&mut machine, 7, &second).unwrap().outcome,
+            Outcome::Again { base: Some(2) }
+        );
+        // A batch past a gap in its session is refused, naming the sequence the session waits for,
+        // and changes nothing; the batch it waits for is then taken.
+        assert_eq!(
+            apply(&mut machine, 8, &batch(7, 3, 6, 1, 16))
+                .unwrap()
+                .outcome,
+            Outcome::OutOfOrder { expected: 5 }
+        );
+        assert_eq!(
+            apply(&mut machine, 9, &batch(7, 3, 5, 1, 16))
+                .unwrap()
+                .outcome,
             Outcome::Appended { base: 6 }
         );
+        // An entry that names no publisher is refused alike at every node.
+        let mut answers = Vec::new();
+        let nameless = batch(7, 3, 6, 1, 16);
+        let unnamed = EntryRef {
+            context: &[],
+            ..entry(10, 1, &nameless)
+        };
+        machine.apply(&unnamed, &mut answers).unwrap();
+        assert!(matches!(
+            answers.pop().map(|applied| applied.outcome),
+            Some(Outcome::Refused(_))
+        ));
         // An entry that is no batch is refused alike at every node, and changes nothing. (Its
         // producer's CRC is not what decides: the transport checked it at the leader, the group's
         // records and the log carry their own, and every subscriber checks it end to end.)
         let mut short = batch(7, 3, 9, 1, 16);
         short.pop();
         assert!(matches!(
-            apply(&mut machine, 8, &short).unwrap().outcome,
+            apply(&mut machine, 11, &short).unwrap().outcome,
             Outcome::Refused(_)
         ));
-        assert_eq!(machine.node().part().bounds(7), Some((0, 9)));
-        assert_eq!(machine.applied.index, 8);
+        assert_eq!(machine.node().part().bounds(7), Some((0, 7)));
+        assert_eq!(machine.applied.index, 11);
     }
 
     #[test]
@@ -619,7 +740,9 @@ mod tests {
         for at in 0..40u32 {
             index += 1;
             let stream = u64::from(at % 3);
-            let applied = apply(&mut machine, index, &batch(stream, 1, at, 1, 400 << 10)).unwrap();
+            // Each stream's session takes one record a batch, in order.
+            let applied =
+                apply(&mut machine, index, &batch(stream, 1, at / 3, 1, 400 << 10)).unwrap();
             assert!(matches!(applied.outcome, Outcome::Appended { .. }));
         }
         let (released, _) = machine.node().released();
@@ -630,13 +753,22 @@ mod tests {
         assert_eq!(point.index, released);
         assert_eq!(configuration, founding());
         assert_eq!(machine.image_bytes(), u64::try_from(image.len()).ok());
-        // Each stream's floor is its next offset as of the image's point: every batch of it at or
-        // before the point.
+        // Each stream's floor is its next offset as of the image's point, every batch of it at or
+        // before the point, and its session's next sequence is the same.
         let decoded = Image::decode(&image).unwrap();
-        for (stream, floor, tail) in decoded.floors() {
+        for (stream, floor) in decoded.floors() {
             let taken_by_then = (1..=released).filter(|i| (*i - 1) % 3 == stream).count();
             assert_eq!(floor, taken_by_then as u64, "stream {stream}");
-            assert_eq!(tail.producer, 1);
+            let session = decoded
+                .producers
+                .iter()
+                .find(|entry| entry.stream == stream && entry.owner == 5)
+                .and_then(|entry| entry.sessions[0]);
+            assert_eq!(
+                session.map(|session| (session.producer, session.next)),
+                (floor > 0).then_some((1, floor)),
+                "stream {stream}"
+            );
         }
         // A damaged image is refused.
         let mut bad = image.clone();
@@ -651,7 +783,8 @@ mod tests {
         let mut entries = Vec::new();
         for at in 0..30u32 {
             let stream = u64::from(at % 4);
-            entries.push(batch(stream, 2, at, 2, 300 << 10));
+            // Each stream's session takes two records a batch, in order.
+            entries.push(batch(stream, 2, at / 4 * 2, 2, 300 << 10));
         }
         for (i, data) in entries.iter().enumerate() {
             apply(&mut machine, i as u64 + 1, data).unwrap();
@@ -712,7 +845,7 @@ mod tests {
             apply(
                 &mut leader,
                 u64::from(at) + 1,
-                &batch(u64::from(at % 2), 5, at, 1, 400 << 10),
+                &batch(u64::from(at % 2), 5, at / 2, 1, 400 << 10),
             )
             .unwrap();
         }

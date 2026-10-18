@@ -726,6 +726,7 @@ dependencies = [
  "focal-platform",
  "focal-rt",
  "futures-util",
+ "getrandom 0.3.4",
  "hdrhistogram",
  "hyper-quic",
  "hyper-rt",

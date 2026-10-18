@@ -11,7 +11,8 @@
 use crate::BusError;
 use crate::batch::{self, Batch};
 use crate::log::{PartLog, Position, SegmentPool};
-use crate::stream::{Produced, StreamTable};
+use crate::producer::{Entry, ProducerTable, Verdict};
+use crate::stream::StreamTable;
 use focal_memory::MemoryBudget;
 
 /// What a part holds at most, and the batches it takes.
@@ -21,6 +22,9 @@ pub struct PartLimits {
     pub streams: usize,
     /// A batch's bytes at most.
     pub batch_bytes: usize,
+    /// Publishing identities' sessions the part keeps, an entry for each identity in each stream
+    /// it publishes to (`producer`).
+    pub producers: usize,
 }
 
 /// A batch appended: where it went and the offsets it took.
@@ -41,16 +45,26 @@ pub struct Appended {
 pub enum Taken {
     /// It was appended.
     Appended(Appended),
-    /// Its producer's sequence shows the part took it already: its producer sent it again, after
-    /// an acknowledgement that never reached it (doc 34 P6). Not appended.
+    /// Its session shows the part took it already: its producer sent it again, after an
+    /// acknowledgement that never reached it (doc 34 P6). Not appended.
     Again {
         /// Its stream.
         stream: u64,
         /// Its records.
         count: u16,
-        /// The offset its first record took, where the part still holds it: it was the stream's
-        /// newest batch. None where the part no longer says.
+        /// The offset its first record took, where it was its session's newest batch. None where
+        /// the part no longer says.
         base: Option<u64>,
+    },
+    /// Past a gap in its session's order, or across the sequence its session takes next: not
+    /// appended, its producer to send again from `expected` (Kafka's
+    /// `OUT_OF_ORDER_SEQUENCE_NUMBER`). A batch the part took in a session's order is so known
+    /// again whatever came between.
+    OutOfOrder {
+        /// Its stream.
+        stream: u64,
+        /// The sequence its session's next batch must begin with.
+        expected: u64,
     },
 }
 
@@ -60,6 +74,11 @@ pub struct Part {
     log: PartLog,
     streams: StreamTable,
     limits: PartLimits,
+    /// Each stream's producing sessions, as of the newest batch appended.
+    producers: ProducerTable,
+    /// The same as of the newest batch the part let go: the batches let go, fed to it in the order
+    /// they were appended, which a part's image keeps (`group`).
+    floor_producers: ProducerTable,
 }
 
 impl Part {
@@ -67,7 +86,9 @@ impl Part {
     pub fn new(limits: PartLimits, budget: MemoryBudget) -> Self {
         Self {
             log: PartLog::new(),
-            streams: StreamTable::new(limits.streams, budget),
+            streams: StreamTable::new(limits.streams, budget.clone()),
+            producers: ProducerTable::new(limits.producers, budget.clone()),
+            floor_producers: ProducerTable::new(limits.producers, budget),
             limits,
         }
     }
@@ -111,36 +132,41 @@ impl Part {
     }
 
     /// Appends a batch its part's group committed, whose CRC the transport and the log checked
-    /// on its way here, unless its producer's sequence shows the part took it already: a batch of
-    /// the stream's newest batch's producer whose records all come before the sequence that
-    /// producer's next batch takes (Kafka's idempotent producer keeps the same per partition,
-    /// KIP-98). A stream's newest batch is the only one whose producer it keeps, so a producer's
-    /// batch sent again after another producer's is appended again: at least once, the class's
-    /// promise (doc 32 D2).
+    /// on its way here, published by `owner`, in its session's order (`producer`, doc 34 P6,
+    /// Kafka's idempotent producer, KIP-98): a batch its session took already is known again and
+    /// not appended twice, and one past a gap is refused until the batches before it come.
     pub fn append_committed(
         &mut self,
         pool: &mut SegmentPool,
         bytes: &[u8],
+        owner: u64,
     ) -> Result<Taken, BusError> {
         let batch =
             Batch::parse_verified(bytes, self.limits.batch_bytes).map_err(BusError::Batch)?;
-        if let Some(state) = self.streams.get(batch.stream()) {
-            let end = u64::from(batch.sequence()).saturating_add(u64::from(batch.count()));
-            if state.tail.producer == batch.producer() && end <= state.tail.next_sequence {
-                let base = state
-                    .last
-                    .and_then(|last| self.log.batch(Position::from_word(last)))
-                    .map(Batch::trusted)
-                    .filter(|newest| newest.sequence() == batch.sequence())
-                    .map(|newest| newest.base_offset());
-                return Ok(Taken::Again {
-                    stream: batch.stream(),
-                    count: batch.count(),
-                    base,
-                });
+        let (stream, producer) = (batch.stream(), batch.producer());
+        let (first, count) = (u64::from(batch.sequence()), u64::from(batch.count()));
+        match self.producers.judge(stream, owner, producer, first, count) {
+            Verdict::Again { base } => Ok(Taken::Again {
+                stream,
+                count: batch.count(),
+                base,
+            }),
+            Verdict::OutOfOrder { expected } => Ok(Taken::OutOfOrder { stream, expected }),
+            Verdict::Append => {
+                // Alike at every replica, before anything changes: a session the table could not
+                // record is refused whole.
+                if !self.producers.admits(stream, owner) {
+                    return Err(BusError::Capacity("producing identities in a part"));
+                }
+                let appended = self.append_batch(pool, batch)?;
+                self.producers
+                    .record(stream, owner, producer, (first, count, appended.base))?;
+                // The floor's sessions are fed what these recorded as the batch is let go, from
+                // room held now: a release never refuses.
+                self.floor_producers.reserve(self.producers.len())?;
+                Ok(Taken::Appended(appended))
             }
         }
-        self.append_batch(pool, batch).map(Taken::Appended)
     }
 
     fn append_batch(
@@ -173,10 +199,6 @@ impl Part {
         }
         stream.last = Some(word);
         stream.next = next;
-        stream.tail = Produced {
-            producer: batch.producer(),
-            next_sequence: u64::from(batch.sequence()).saturating_add(u64::from(count)),
-        };
         Ok(Appended {
             stream: stream_id,
             base,
@@ -227,32 +249,35 @@ impl Part {
         Some((state.floor, state.next))
     }
 
-    /// Every stream's floor and what its newest batch at the floor stated: a part's image
-    /// (`group`), the state as of the oldest batch the part still holds.
-    pub fn floors(&self) -> impl Iterator<Item = (u64, u64, Produced)> + '_ {
-        self.streams
-            .iter()
-            .map(|state| (state.id, state.floor, state.floor_tail))
+    /// Every stream's floor: with [`Part::floor_producers`], a part's image (`group`), the state as
+    /// of the newest batch the part let go.
+    pub fn floors(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.streams.iter().map(|state| (state.id, state.floor))
+    }
+
+    /// Each stream's producing sessions as of the newest batch the part let go.
+    pub fn floor_producers(&self) -> impl Iterator<Item = &Entry> + '_ {
+        self.floor_producers.iter()
     }
 
     /// Replaces everything the part holds with `floors`' streams, each holding nothing from its
-    /// floor on: a part opened from an image, or given one by its group's leader. Every segment
-    /// goes back to `pool` first.
+    /// floor on, and `producers`' sessions: a part opened from an image, or given one by its
+    /// group's leader. Every segment goes back to `pool` first.
     pub fn restore(
         &mut self,
         pool: &mut SegmentPool,
-        floors: impl IntoIterator<Item = (u64, u64, Produced)>,
+        floors: impl IntoIterator<Item = (u64, u64)>,
+        producers: &[Entry],
     ) -> Result<(), BusError> {
         self.log.release_all(pool);
         self.streams.clear();
-        for (id, floor, tail) in floors {
+        for (id, floor) in floors {
             let state = self.streams.get_or_insert(id)?;
             state.next = floor;
             state.floor = floor;
-            state.tail = tail;
-            state.floor_tail = tail;
         }
-        Ok(())
+        self.producers.restore(producers.iter().copied())?;
+        self.floor_producers.restore(producers.iter().copied())
     }
 
     /// Gives the log's tail back if it holds no batch (`PartLog::seal`); whether a segment went
@@ -262,11 +287,14 @@ impl Part {
     }
 
     /// Lets `stream`'s batches below `floor` go: a batch goes once every record in it is below.
+    /// `owner` is the identity that published the batches its group committed, which the floor's
+    /// sessions take as they go; none for a lone node's.
     pub fn release_below(
         &mut self,
         pool: &mut SegmentPool,
         stream: u64,
         floor: u64,
+        owner: Option<u64>,
     ) -> Result<(), BusError> {
         let Some(state) = self.streams.get_mut(stream) else {
             return Err(BusError::UnknownStream(stream));
@@ -285,11 +313,19 @@ impl Part {
             if first.end_offset() > floor {
                 break;
             }
-            // What the stream's newest batch at its floor stated, which its image keeps.
-            state.floor_tail = Produced {
-                producer: first.producer(),
-                next_sequence: u64::from(first.sequence()).saturating_add(u64::from(first.count())),
-            };
+            // The floor's sessions take each batch let go, in the order they were appended.
+            if let Some(owner) = owner {
+                self.floor_producers.record(
+                    stream,
+                    owner,
+                    first.producer(),
+                    (
+                        u64::from(first.sequence()),
+                        u64::from(first.count()),
+                        first.base_offset(),
+                    ),
+                )?;
+            }
             state.first = first.next();
             if state.first.is_none() {
                 state.last = None;
@@ -319,6 +355,7 @@ mod tests {
                 PartLimits {
                     streams: 1_000,
                     batch_bytes: segment / 8,
+                    producers: 1_000,
                 },
                 budget,
             ),
@@ -386,7 +423,7 @@ mod tests {
         for stream in 0..50 {
             shard
                 .part
-                .release_below(&mut shard.pool, stream, 20)
+                .release_below(&mut shard.pool, stream, 20, None)
                 .unwrap();
         }
         // Half of each stream went: the first offset held is 20 and a seek below it finds nothing.
@@ -395,7 +432,7 @@ mod tests {
         for stream in 0..50 {
             shard
                 .part
-                .release_below(&mut shard.pool, stream, 40)
+                .release_below(&mut shard.pool, stream, 40, None)
                 .unwrap();
         }
         // Only the tail segment stays, taking batches.
@@ -428,5 +465,131 @@ mod tests {
         ));
         assert_eq!(shard.part.bounds(5), Some((0, 1)));
         assert_eq!(shard.part.first(5).unwrap().next(), None);
+    }
+
+    /// A batch of `count` one-byte records on `stream` from `producer`'s sequence `sequence`.
+    fn session_batch(
+        builder: &mut BatchBuilder,
+        stream: u64,
+        producer: u64,
+        sequence: u32,
+        count: u16,
+    ) -> Vec<u8> {
+        builder.begin(&Producing {
+            stream,
+            producer,
+            sequence,
+            flags: 0,
+            timestamp: 1,
+        });
+        for _ in 0..count {
+            builder.push(1, b"r").unwrap();
+        }
+        builder.finish().unwrap().to_vec()
+    }
+
+    /// A session's batch that comes before the one ahead of it in its order (redirected, or sent to
+    /// a leader that stopped leading, while the next went straight through) is refused naming the
+    /// sequence the session waits for, and appended once it comes in order; then each is known
+    /// again. The part recognised a resend by the stream's newest producer's next sequence alone, so
+    /// the earlier batch, coming after the later one, was acknowledged as taken and never appended:
+    /// acknowledged and lost (the bus's comparison, 2026-10-18).
+    #[test]
+    fn a_batch_overtaken_by_the_next_of_its_session_is_refused_until_it_comes_in_order() {
+        let mut shard = shard(64 * 1024);
+        let owner = 7;
+        let earlier = session_batch(&mut shard.builder, 5, 42, 0, 2);
+        let later = session_batch(&mut shard.builder, 5, 42, 2, 3);
+        let committed = |shard: &mut Shard, bytes: &[u8]| {
+            shard
+                .part
+                .append_committed(&mut shard.pool, bytes, owner)
+                .unwrap()
+        };
+        assert_eq!(
+            committed(&mut shard, &later),
+            Taken::OutOfOrder {
+                stream: 5,
+                expected: 0
+            }
+        );
+        assert_eq!(shard.part.bounds(5), None, "nothing appended");
+        assert!(matches!(
+            committed(&mut shard, &earlier),
+            Taken::Appended(Appended { base: 0, .. })
+        ));
+        assert!(matches!(
+            committed(&mut shard, &later),
+            Taken::Appended(Appended { base: 2, .. })
+        ));
+        assert_eq!(
+            committed(&mut shard, &earlier),
+            Taken::Again {
+                stream: 5,
+                count: 2,
+                base: None
+            }
+        );
+        assert_eq!(
+            committed(&mut shard, &later),
+            Taken::Again {
+                stream: 5,
+                count: 3,
+                base: Some(2)
+            }
+        );
+        assert_eq!(shard.part.bounds(5), Some((0, 5)));
+        // Another identity naming the same session holds its own, from zero.
+        assert_eq!(
+            shard
+                .part
+                .append_committed(&mut shard.pool, &later, 8)
+                .unwrap(),
+            Taken::OutOfOrder {
+                stream: 5,
+                expected: 0
+            }
+        );
+    }
+
+    /// The floor's sessions, fed each batch as it is let go, are the sessions as of the newest batch
+    /// let go: once every batch is let go, the live ones, whatever the order of streams, sessions
+    /// and identities, and the replacements among them.
+    #[test]
+    fn the_floors_sessions_follow_the_batches_let_go() {
+        let mut shard = shard(64 * 1024);
+        let mut appended = Vec::new();
+        let mut next = std::collections::HashMap::new();
+        for at in 0..200_u64 {
+            let (stream, owner) = (at % 3, 10 + at % 2);
+            // Three sessions an identity in turn, so each stream replaces sessions as it goes.
+            let producer = 100 + (at / 7) % 3;
+            let sequence = next.entry((stream, owner, producer)).or_insert(0_u32);
+            let bytes = session_batch(&mut shard.builder, stream, producer, *sequence, 2);
+            let taken = shard
+                .part
+                .append_committed(&mut shard.pool, &bytes, owner)
+                .unwrap();
+            match taken {
+                Taken::Appended(batch) => {
+                    *sequence += 2;
+                    appended.push((batch.stream, batch.base + 2, owner));
+                }
+                // A replaced session begins again at zero, under a new session of its own.
+                Taken::OutOfOrder { expected: 0, .. } => {
+                    next.insert((stream, owner, producer), 0);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        for (stream, end, owner) in appended {
+            shard
+                .part
+                .release_below(&mut shard.pool, stream, end, Some(owner))
+                .unwrap();
+        }
+        let live: Vec<Entry> = shard.part.producers.iter().copied().collect();
+        let floor: Vec<Entry> = shard.part.floor_producers().copied().collect();
+        assert_eq!(floor, live);
     }
 }

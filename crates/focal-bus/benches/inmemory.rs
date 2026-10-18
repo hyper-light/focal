@@ -143,6 +143,7 @@ impl Owner {
                 PartLimits {
                     streams,
                     batch_bytes: segment / 8,
+                    producers: streams,
                 },
                 budget,
             ),
@@ -164,7 +165,7 @@ impl Owner {
         if self.in_flight.len() > self.window {
             let (stream, end) = self.in_flight.pop_front().unwrap();
             self.part
-                .release_below(&mut self.pool, stream, end)
+                .release_below(&mut self.pool, stream, end, None)
                 .unwrap();
         }
     }

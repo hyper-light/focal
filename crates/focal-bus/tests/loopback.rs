@@ -482,6 +482,7 @@ fn every_publish_reaches_the_subscriber_in_order_and_a_stalled_subscriber_holds_
         segment_bytes: segment,
         streams: 64,
         subscriptions: 16,
+        producers: 64,
     };
     let mut runtime = LocalRuntime::new(&runtime()).unwrap();
     let report = runtime
@@ -671,6 +672,7 @@ fn a_delivery_the_node_has_no_memory_for_waits_and_its_subscriber_stays() {
         segment_bytes: segment,
         streams: 64,
         subscriptions: 16,
+        producers: 64,
     };
     let mut runtime = LocalRuntime::new(&runtime()).unwrap();
     runtime
@@ -733,6 +735,7 @@ fn a_frame_that_waits_for_anything_but_memory_takes_nothing_from_the_window() {
         segment_bytes: segment,
         streams: 64,
         subscriptions: 16,
+        producers: 64,
     };
     let mut runtime = LocalRuntime::new(&runtime()).unwrap();
     runtime
