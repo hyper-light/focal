@@ -255,6 +255,13 @@ impl Inflights {
 pub struct Progress {
     /// The highest index known to be held by the member.
     pub matched: u64,
+    /// The highest index the member said it holds in memory (core step R-8): never below what it
+    /// holds durably, and counted only toward a held quorum, never toward `matched`.
+    pub held: u64,
+    /// The incarnation of the member asking where this leader's log ends, as its last answer
+    /// stated it; zero for none (core step R-8's narrowing of a mark). This leader's heartbeats
+    /// to it answer with its log's end while it asks.
+    pub asking: u64,
     /// The index of the next entry to send.
     pub next_index: u64,
     /// How the leader sends to the member.
@@ -294,6 +301,8 @@ impl Progress {
     pub fn new(next_index: u64, window: usize, window_bytes: u64) -> Self {
         Self {
             matched: 0,
+            held: 0,
+            asking: 0,
             next_index,
             state: ProgressState::Probe,
             paused: false,
@@ -316,6 +325,8 @@ impl Progress {
     }
     pub(crate) fn reset(&mut self, next_index: u64) {
         self.matched = 0;
+        self.held = 0;
+        self.asking = 0;
         self.next_index = next_index;
         self.state = ProgressState::Probe;
         self.paused = false;
@@ -564,6 +575,10 @@ pub struct Tracker {
     /// What a whole append costs ([`whole_append`]).
     page: u64,
     scratch: Vec<u64>,
+    /// The voters' held and durable indexes and fates while a held quorum is ordered, and the fates
+    /// it spans (core step R-8); each bounded by the configuration's members.
+    held_scratch: Vec<(u64, u64, u64)>,
+    fate_scratch: Vec<u64>,
 }
 impl Tracker {
     /// Every member of `configuration`, probed from `next_index` with a
@@ -585,6 +600,8 @@ impl Tracker {
             members,
             page: u64::MAX,
             scratch: Vec::new(),
+            held_scratch: Vec::new(),
+            fate_scratch: Vec::new(),
         };
         tracker.apply(configuration, &[], next_index)?;
         Ok(tracker)
@@ -671,6 +688,95 @@ impl Tracker {
             matched,
         );
         incoming.min(outgoing)
+    }
+    /// The highest index a held quorum holds (core step R-8, `docs/raft.md` §3.7): in each half
+    /// of a joint configuration on its own, a majority of its voters whose fates are stated, none
+    /// `suspected`, each counted by what it said it holds in memory or holds durably, the leader
+    /// `leader` by `leader_durable`, what its own disk holds. Their fates and the leader's span
+    /// `fates.spanning` distinct fates: the leader holds every entry it sent in memory, so an entry
+    /// is lost only if it fails too. Zero where no held quorum holds anything; `u64::MAX` for a half
+    /// that is not there.
+    pub fn held_quorum_index(
+        &mut self,
+        fates: &crate::Fates,
+        leader: NodeId,
+        leader_durable: u64,
+        suspected: &[NodeId],
+    ) -> u64 {
+        let incoming = self.held_half(true, fates, leader, leader_durable, suspected);
+        let outgoing = self.held_half(false, fates, leader, leader_durable, suspected);
+        incoming.min(outgoing)
+    }
+    fn held_half(
+        &mut self,
+        incoming: bool,
+        fates: &crate::Fates,
+        leader: NodeId,
+        leader_durable: u64,
+        suspected: &[NodeId],
+    ) -> u64 {
+        let voters = if incoming {
+            self.configuration.voters()
+        } else {
+            self.configuration.outgoing()
+        };
+        if voters.is_empty() {
+            return u64::MAX;
+        }
+        let needed = Quorum::Classic.of(voters.len());
+        self.held_scratch.clear();
+        self.fate_scratch.clear();
+        if self.held_scratch.try_reserve(voters.len()).is_err()
+            || self
+                .fate_scratch
+                .try_reserve(voters.len().saturating_add(1))
+                .is_err()
+        {
+            return 0;
+        }
+        // The leader's memory holds every entry it sent, whether or not its disk counts it here.
+        if let Some(fate) = fates.fate(leader) {
+            self.fate_scratch.push(fate);
+        }
+        for voter in voters {
+            let Some(fate) = fates.fate(*voter) else {
+                continue;
+            };
+            if suspected.binary_search(voter).is_ok() {
+                continue;
+            }
+            let (held, durable) = if *voter == leader {
+                (leader_durable, leader_durable)
+            } else {
+                self.progress
+                    .binary_search_by_key(voter, |(member, _)| *member)
+                    .ok()
+                    .and_then(|position| self.progress.get(position))
+                    .map_or((0, 0), |(_, progress)| {
+                        (progress.held.max(progress.matched), progress.matched)
+                    })
+            };
+            self.held_scratch.push((held, durable, fate));
+        }
+        // Descending by what each holds: walking it, the first point where the holders so far are
+        // enough and span enough fates is the highest index such a set holds. The span bounds the
+        // chance of losing what memory alone holds; where a holder's disk holds the entry no
+        // failure of memory loses it, and the span is waived.
+        self.held_scratch
+            .sort_unstable_by_key(|(held, _, _)| std::cmp::Reverse(*held));
+        let mut count = 0usize;
+        let mut on_disk = 0u64;
+        for (held, durable, fate) in &self.held_scratch {
+            count = count.saturating_add(1);
+            on_disk = on_disk.max(*durable);
+            if !self.fate_scratch.contains(fate) {
+                self.fate_scratch.push(*fate);
+            }
+            if count >= needed && (on_disk >= *held || self.fate_scratch.len() >= fates.spanning) {
+                return *held;
+            }
+        }
+        0
     }
     /// Forgets the votes of the last election.
     pub fn reset_votes(&mut self) {

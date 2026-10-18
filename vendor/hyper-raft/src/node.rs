@@ -195,6 +195,9 @@ pub struct Ready {
     snapshot: Option<Snapshot>,
     after_persisting: bool,
     light: LightReady,
+    /// Held answers (core step R-8): sent at once whatever the write, since they promise memory
+    /// alone.
+    held: Vec<Message>,
     must_sync: bool,
     /// Its messages were taken: a commit can no longer be deferred, since
     /// the answers among them already left stating it
@@ -327,6 +330,16 @@ impl Ready {
         } else {
             Vec::new()
         }
+    }
+    /// Held answers (core step R-8, `docs/raft.md` §3.7): to send at once, before this `Ready`'s
+    /// write and whatever it holds, since each promises only that the entries it names are in
+    /// memory. None in a group whose owner states no fates.
+    pub fn held_messages(&self) -> &[Message] {
+        &self.held
+    }
+    /// Takes the held answers, leaving none.
+    pub fn take_held_messages(&mut self) -> Vec<Message> {
+        std::mem::take(&mut self.held)
     }
     /// False when nothing but the commit is to persist: that write need
     /// not be waited for.
@@ -639,6 +652,26 @@ impl<S: Storage> RawNode<S> {
     pub fn restarted(&mut self, member: NodeId) -> Result<()> {
         self.operate(|raft| raft.restarted(member))
     }
+    /// The owner's node-level detector suspects `member` (core step R-8): its held answers are not
+    /// counted toward a commit until [`RawNode::trust_held`]. On ticks or by suspicion alike; one
+    /// stream per node pair decides it for every group, never a group's own heartbeats.
+    pub fn suspect_held(&mut self, member: NodeId) -> Result<()> {
+        self.operate(|raft| raft.suspect_held(member))
+    }
+    /// The owner's detector trusts `member` again: its held answers count from now on.
+    pub fn trust_held(&mut self, member: NodeId) -> Result<()> {
+        self.operate(|raft| raft.trust_held(member))
+    }
+    /// Stops this member's held answers ahead of a planned stop (core step R-8); its promise drops
+    /// in a later hard state once its disk holds what it answered for ([`RawNode::held_settled`]).
+    pub fn quiet_held(&mut self) -> Result<()> {
+        self.operate(Raft::quiet_held)
+    }
+    /// Whether it states no promise, durable or out, so that it may stop with nothing to mark it
+    /// when it opens.
+    pub fn held_settled(&self) -> bool {
+        self.raft.held_settled()
+    }
     /// What the owner's measurements give this group's elections
     /// ([`crate::Timing`]).
     pub fn set_timing(&mut self, timing: crate::Timing) -> Result<()> {
@@ -909,11 +942,56 @@ impl<S: Storage> RawNode<S> {
             && unstable.unissued_snapshot().is_none()
             && !raft.held.has_unissued()
     }
+    /// What may leave now without a write, whatever the writes out: held answers (core step R-8),
+    /// which promise memory alone under a durable promise, and the queued messages where they may
+    /// leave at once (I1, I2: a leader's while its term and vote are durable, any member's with
+    /// nothing written or to write; [`RawNode::releases_now`]). A leader's appends then leave when
+    /// it proposes, not when a write of its own frees a place for the next `Ready`, and a
+    /// follower's held answer when it takes the entries. What is left leaves with the next
+    /// `Ready`, as before.
+    pub fn messages_now(&mut self) -> Vec<Message> {
+        let mut messages = self.raft.take_held_answers();
+        if self.releases_now() && !self.raft.msgs.is_empty() {
+            let queued = self.raft.msgs.take();
+            if messages.is_empty() {
+                return queued;
+            }
+            messages.extend(queued);
+        }
+        messages
+    }
+    /// What there is to apply and to send now, without a write and whatever the writes out: what a
+    /// `Ready` would give to apply (committed and durable here, or a leader's own entries committed
+    /// before its write is durable: `Config::apply_unpersisted`, or a held quorum's, R-8), and
+    /// [`RawNode::messages_now`]. A leader whose writes fill its pipeline then applies what it
+    /// commits when it commits, not when a write of its own frees a place for the next `Ready`.
+    /// `in_place` as [`RawNode::ready_in_place`]. Refused while a `Ready` is taken and not issued.
+    pub fn light_now(&mut self, in_place: bool) -> Result<LightReady> {
+        if self.taken.is_some() {
+            return Err(Error::Invariant(
+                "a light ready asked for while a ready is taken and not issued",
+            ));
+        }
+        let release = self.releases_now();
+        let mut light = self.light(in_place, release)?;
+        let held = self.raft.take_held_answers();
+        if !held.is_empty() {
+            light.messages.extend(held);
+        }
+        self.hold_released(&mut light);
+        let hard = self.raft.hard_state();
+        if hard.commit > self.previous_hard.commit {
+            light.commit_index = Some(hard.commit);
+            self.previous_hard.commit = hard.commit;
+        }
+        Ok(light)
+    }
     /// Whether [`RawNode::ready`] has anything to give.
     pub fn has_ready(&self) -> bool {
         let raft = &self.raft;
         let unstable = raft.log().unstable();
         !raft.msgs.is_empty()
+            || raft.has_held_answers()
             || raft.reads_unasked()
             || raft.soft_state() != self.previous_soft
             || raft.hard_state() != self.previous_hard
@@ -1021,6 +1099,8 @@ impl<S: Storage> RawNode<S> {
             self.commit_since = index;
         }
         ready.light = self.light(in_place, true)?;
+        // The promise in force once this write is durable waits for it (R-8).
+        self.raft.held_taken(number)?;
         self.number = number;
         let soft = self.raft.soft_state();
         if soft != self.previous_soft {
@@ -1028,7 +1108,14 @@ impl<S: Storage> RawNode<S> {
         }
         let hard = self.raft.hard_state();
         if hard != self.previous_hard {
-            if hard.vote != self.previous_hard.vote || hard.term != self.previous_hard.term {
+            // A promise moved is written and waited for: a held answer leaves only for what a
+            // durable one covers, and a lower one must be durable before it is taken for one
+            // (R-8).
+            if hard.vote != self.previous_hard.vote
+                || hard.term != self.previous_hard.term
+                || (hard.held_index, hard.held_term)
+                    != (self.previous_hard.held_index, self.previous_hard.held_term)
+            {
                 ready.must_sync = true;
             }
             ready.hard_state = Some(hard);
@@ -1046,6 +1133,7 @@ impl<S: Storage> RawNode<S> {
         // Taken, and not emptied: what the member holds when it rests is
         // what it held before.
         ready.read_states = std::mem::take(&mut self.raft.read_states);
+        ready.held = self.raft.take_held_answers();
         ready.displaced = self.raft.take_displaced();
         if !ready.proposals.is_empty() || new_entries {
             ready.must_sync = true;
@@ -1262,6 +1350,8 @@ impl<S: Storage> RawNode<S> {
         // the writes held is: the entries a leader it makes appends are not.
         let (term, vote) = self.durable_vote;
         self.raft.on_vote_durable(term, vote)?;
+        // The promise those writes stated is durable (R-8).
+        self.raft.held_durable(number)?;
         self.after_persist(in_place)
     }
     /// What a write made durable is acted on: its snapshot, its entries (I3:
@@ -1384,6 +1474,7 @@ impl<S: Storage> RawNode<S> {
         // the write held is: the entries a leader it makes appends are not.
         let (term, vote) = self.durable_vote;
         self.raft.on_vote_durable(term, vote)?;
+        self.raft.held_durable(taken.number)?;
         // Nothing is out and nothing is left to write: what follows leaves
         // now (`RawNode::releases_now`).
         let mut light = self.light(taken.in_place, true)?;
@@ -1393,8 +1484,16 @@ impl<S: Storage> RawNode<S> {
             light.commit_index = Some(hard.commit);
             self.previous_hard.commit = hard.commit;
         }
-        // Nothing was asked of the member between the two.
-        if self.raft.hard_state() != self.previous_hard {
+        // Nothing was asked of the member between the two. Its promise moves as the write that
+        // stated it is durable (R-8), and the next `Ready` writes it.
+        let hard = self.raft.hard_state();
+        if (hard.term, hard.vote, hard.commit)
+            != (
+                self.previous_hard.term,
+                self.previous_hard.vote,
+                self.previous_hard.commit,
+            )
+        {
             return Err(Error::Invariant(
                 "a term or a vote moved while a ready was out",
             ));

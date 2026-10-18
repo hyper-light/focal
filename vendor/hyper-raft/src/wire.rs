@@ -49,6 +49,19 @@ const KEPT: u8 = 1 << 3;
 /// Flag bit of a message: its classic commit follows its body's other parts. A decoder that does
 /// not know it refuses the record, so an owner sends it only to members that do.
 const CLASSIC: u8 = 1 << 4;
+/// Flag bit of a message: an append's answer said at once, for entries held in memory (core step
+/// R-8). A decoder that does not know it refuses the record; only members of a group whose owner
+/// states fates send it, and an owner states fates only where every member reads it.
+const HELD: u8 = 1 << 5;
+/// Flag bit of a message: an incarnation and an end follow, after the classic commit (core step
+/// R-8's narrowing of a mark). Only an append's answer, a heartbeat and a heartbeat's answer carry
+/// them, so a leader's append costs what its window is charged ([`MESSAGE_RECORD_FIXED_BYTES`]).
+const TOLD: u8 = 1 << 6;
+/// Bytes of a message's incarnation and end ([`TOLD`]).
+pub const MESSAGE_TOLD_BYTES: usize = 2 * 8;
+/// Bytes of a hard state's promise, its index and term after its commit, written only when it
+/// states one, so that a group stating no fates writes the record it always did (core step R-8).
+pub const HARD_STATE_HELD_BYTES: usize = 2 * 8;
 /// Presence bit of a snapshot: its metadata follows.
 const HAS_METADATA: u8 = 1;
 /// Presence bit of a snapshot: the metadata's configuration follows its index and term.
@@ -343,18 +356,47 @@ impl Record for HardState {
     /// The kind byte `docs/raft.md` §3.1 gives this record. Format.
     const KIND: u8 = 3;
     fn body_len(&self) -> usize {
-        3 * 8
+        if self.held_term == 0 {
+            3 * 8
+        } else {
+            3 * 8 + HARD_STATE_HELD_BYTES
+        }
     }
     fn put_body(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.term.to_le_bytes());
         out.extend_from_slice(&self.vote.to_le_bytes());
         out.extend_from_slice(&self.commit.to_le_bytes());
+        if self.held_term != 0 {
+            out.extend_from_slice(&self.held_index.to_le_bytes());
+            out.extend_from_slice(&self.held_term.to_le_bytes());
+        }
     }
     fn take_body(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let term = reader.u64()?;
+        let vote = reader.u64()?;
+        let commit = reader.u64()?;
+        // The promise is there only when it states one (core step R-8): an index of an entry of a
+        // term no later than the hard state's. One stating none, or a later term, is one no
+        // encoder writes, and is refused as bytes left over would be.
+        let (held_index, held_term) = if reader.bytes.len() == HARD_STATE_HELD_BYTES {
+            let index = reader.u64()?;
+            let held = reader.u64()?;
+            if held == 0 || index == 0 || held > term {
+                return Err(DecodeError::Unknown {
+                    what: "hard state promise",
+                    value: 0,
+                });
+            }
+            (index, held)
+        } else {
+            (0, 0)
+        };
         Ok(Self {
-            term: reader.u64()?,
-            vote: reader.u64()?,
-            commit: reader.u64()?,
+            term,
+            vote,
+            commit,
+            held_index,
+            held_term,
         })
     }
 }
@@ -484,6 +526,22 @@ impl Record for Snapshot {
     }
 }
 
+/// The flag byte of `message`: one bit for each part it carries or each word it states.
+fn message_flags(message: &Message) -> u8 {
+    [
+        (message.reject, REJECT),
+        (message.snapshot.is_some(), HAS_SNAPSHOT),
+        (message.lost, LOST),
+        (message.kept, KEPT),
+        (message.classic.is_some(), CLASSIC),
+        (message.held, HELD),
+        (message.incarnation != 0, TOLD),
+    ]
+    .into_iter()
+    .filter(|(set, _)| *set)
+    .fold(0, |flags, (_, flag)| flags | flag)
+}
+
 impl Record for Message {
     /// The kind byte `docs/raft.md` §3.1 gives this record. Format.
     const KIND: u8 = 1;
@@ -496,26 +554,15 @@ impl Record for Message {
             .saturating_add(entries)
             .saturating_add(self.snapshot.as_deref().map_or(0, Record::body_len))
             .saturating_add(self.classic.map_or(0, |_| MESSAGE_CLASSIC_BYTES))
+            .saturating_add(if self.incarnation == 0 {
+                0
+            } else {
+                MESSAGE_TOLD_BYTES
+            })
     }
     fn put_body(&self, out: &mut Vec<u8>) {
         out.push(message_kind(self.msg_type));
-        let mut flags = 0;
-        if self.reject {
-            flags |= REJECT;
-        }
-        if self.snapshot.is_some() {
-            flags |= HAS_SNAPSHOT;
-        }
-        if self.lost {
-            flags |= LOST;
-        }
-        if self.kept {
-            flags |= KEPT;
-        }
-        if self.classic.is_some() {
-            flags |= CLASSIC;
-        }
-        out.push(flags);
+        out.push(message_flags(self));
         for field in [
             self.to,
             self.from,
@@ -542,11 +589,15 @@ impl Record for Message {
         if let Some(classic) = self.classic {
             out.extend_from_slice(&classic.to_le_bytes());
         }
+        if self.incarnation != 0 {
+            out.extend_from_slice(&self.incarnation.to_le_bytes());
+            out.extend_from_slice(&self.end.to_le_bytes());
+        }
     }
     fn take_body(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let msg_type = take_message_kind(reader.byte()?)?;
         let flags = reader.byte()?;
-        if flags & !(REJECT | HAS_SNAPSHOT | LOST | KEPT | CLASSIC) != 0 {
+        if flags & !(REJECT | HAS_SNAPSHOT | LOST | KEPT | CLASSIC | HELD | TOLD) != 0 {
             return Err(DecodeError::Unknown {
                 what: "message flags",
                 value: flags,
@@ -591,6 +642,31 @@ impl Record for Message {
         } else {
             None
         };
+        let (incarnation, end) = if flags & TOLD != 0 {
+            // Only the kinds that carry them, and never an incarnation of zero, which states none:
+            // what no encoder writes is refused.
+            if !matches!(
+                msg_type,
+                MessageType::MsgHeartbeat
+                    | MessageType::MsgHeartbeatResponse
+                    | MessageType::MsgAppendResponse
+            ) {
+                return Err(DecodeError::Unknown {
+                    what: "message flags",
+                    value: flags,
+                });
+            }
+            let incarnation = reader.u64()?;
+            if incarnation == 0 {
+                return Err(DecodeError::Unknown {
+                    what: "message incarnation",
+                    value: 0,
+                });
+            }
+            (incarnation, reader.u64()?)
+        } else {
+            (0, 0)
+        };
         Ok(Self {
             msg_type,
             to,
@@ -606,6 +682,9 @@ impl Record for Message {
             reject: flags & REJECT != 0,
             lost: flags & LOST != 0,
             kept: flags & KEPT != 0,
+            held: flags & HELD != 0,
+            incarnation,
+            end,
             reject_hint,
             context,
             priority,
@@ -816,6 +895,9 @@ mod tests {
             context: b"read".to_vec(),
             priority: -5,
             classic: None,
+            held: false,
+            incarnation: 0,
+            end: 0,
         }
     }
 
@@ -869,6 +951,56 @@ mod tests {
         }
     }
 
+    /// A member's held answer (core step R-8): its entries through `index` are in memory.
+    fn held_answer() -> Message {
+        Message {
+            msg_type: MessageType::MsgAppendResponse,
+            to: 1,
+            from: 2,
+            term: 7,
+            index: 45,
+            commit: 38,
+            held: true,
+            ..Message::default()
+        }
+    }
+
+    /// A marked member's lost refusal asking where its leader's log ends (R-8): its incarnation,
+    /// and no end.
+    fn asking() -> Message {
+        Message {
+            incarnation: 0x0102_0304_0506_0708,
+            ..lost()
+        }
+    }
+
+    /// A leader's heartbeat answering that incarnation (R-8): the incarnation and its log's end,
+    /// after the classic commit.
+    fn told() -> Message {
+        Message {
+            msg_type: MessageType::MsgHeartbeat,
+            to: 3,
+            from: 1,
+            term: 7,
+            commit: 40,
+            classic: Some(40),
+            incarnation: 0x0102_0304_0506_0708,
+            end: 45,
+            ..Message::default()
+        }
+    }
+
+    /// A hard state with a promise (R-8): the last entry its member may answer for in memory.
+    fn promised() -> HardState {
+        HardState {
+            term: 7,
+            vote: 9,
+            commit: 40,
+            held_index: 52,
+            held_term: 6,
+        }
+    }
+
     fn change() -> ConfChangeV2 {
         ConfChangeV2 {
             transition: ConfChangeTransition::Explicit,
@@ -897,6 +1029,8 @@ mod tests {
             term: 7,
             vote: 9,
             commit: 40,
+            held_index: 0,
+            held_term: 0,
         };
         assert_eq!(hard.encode_to_vec(), sealed(3, &body));
 
@@ -973,6 +1107,90 @@ mod tests {
             MESSAGE_RECORD_FIXED_BYTES + entry().body_len(),
             "an append's fixed bytes are what its window is charged"
         );
+
+        // A held answer (R-8): the held flag, nothing after the body.
+        let mut body = vec![4, HELD];
+        for field in [1u64, 2, 7, 0, 45, 38, 0, 0, 0] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        body.extend_from_slice(&0i64.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(held_answer().encode_to_vec(), sealed(1, &body));
+
+        // A marked member's question (R-8): the told flag, its incarnation and an end of zero
+        // after the words.
+        let mut body = vec![4, REJECT | LOST | TOLD];
+        for field in [1u64, 3, 7, 6, 44, 38, 0, 0, 40] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        body.extend_from_slice(&0i64.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        body.extend_from_slice(&0u64.to_le_bytes());
+        let encoded = asking().encode_to_vec();
+        assert_eq!(encoded, sealed(1, &body));
+        assert_eq!(encoded.len(), asking().encoded_len());
+
+        // Its leader's heartbeat answering it (R-8): the incarnation and the end after the
+        // classic commit.
+        let mut body = vec![8, CLASSIC | TOLD];
+        for field in [3u64, 1, 7, 0, 0, 40, 0, 0, 0] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        body.extend_from_slice(&0i64.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&40u64.to_le_bytes());
+        body.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        body.extend_from_slice(&45u64.to_le_bytes());
+        let encoded = told().encode_to_vec();
+        assert_eq!(encoded, sealed(1, &body));
+        assert_eq!(encoded.len(), told().encoded_len());
+
+        // A hard state with a promise (R-8): its index and term after the commit.
+        let mut body = Vec::new();
+        for field in [7u64, 9, 40, 52, 6] {
+            body.extend_from_slice(&field.to_le_bytes());
+        }
+        assert_eq!(promised().encode_to_vec(), sealed(3, &body));
+        assert_eq!(HardState::decode(&sealed(3, &body)), Ok(promised()));
+    }
+
+    /// What R-8 adds refuses what no encoder writes: a promise stating no index or no term, or
+    /// one of a term past the hard state's; an incarnation of zero; and the told flag on a kind
+    /// that does not carry it, such as a leader's append, whose window is charged without it.
+    #[test]
+    fn the_held_forms_refuse_what_no_encoder_writes() {
+        for (index, term) in [(0u64, 6u64), (52, 0), (52, 8)] {
+            let mut body = Vec::new();
+            for field in [7u64, 9, 40, index, term] {
+                body.extend_from_slice(&field.to_le_bytes());
+            }
+            assert!(
+                matches!(
+                    HardState::decode(&sealed(3, &body)),
+                    Err(DecodeError::Unknown { .. })
+                ),
+                "a promise through {index} of term {term} under term 7"
+            );
+        }
+        let mut body = vec![4, REJECT | LOST | TOLD];
+        body.extend_from_slice(&[0; 9 * 8 + 8 + 8]);
+        body.extend_from_slice(&[0; 16]);
+        assert!(matches!(
+            Message::decode(&sealed(1, &body)),
+            Err(DecodeError::Unknown { .. })
+        ));
+        let mut body = vec![3, TOLD];
+        body.extend_from_slice(&[0; 9 * 8 + 8 + 8]);
+        body.extend_from_slice(&1u64.to_le_bytes());
+        body.extend_from_slice(&45u64.to_le_bytes());
+        assert!(matches!(
+            Message::decode(&sealed(1, &body)),
+            Err(DecodeError::Unknown { .. })
+        ));
     }
 
     /// A record and whether bytes read back to its value.
@@ -987,6 +1205,10 @@ mod tests {
             (lost().encode_to_vec(), |b| round(b, &lost())),
             (kept().encode_to_vec(), |b| round(b, &kept())),
             (classic().encode_to_vec(), |b| round(b, &classic())),
+            (held_answer().encode_to_vec(), |b| round(b, &held_answer())),
+            (asking().encode_to_vec(), |b| round(b, &asking())),
+            (told().encode_to_vec(), |b| round(b, &told())),
+            (promised().encode_to_vec(), |b| round(b, &promised())),
             (entry().encode_to_vec(), |b| round(b, &entry())),
             (snapshot().encode_to_vec(), |b| round(b, &snapshot())),
             (change().encode_to_vec(), |b| round(b, &change())),
@@ -1092,7 +1314,8 @@ mod tests {
             Message::decode(&sealed(1, &body)),
             Err(DecodeError::Unknown { .. })
         ));
-        let mut body = vec![3, 1 << 5];
+        // Bits 5 and 6 are R-8's held answer and told incarnation; bit 7 names nothing.
+        let mut body = vec![3, 1 << 7];
         body.extend_from_slice(&[0; 9 * 8 + 8 + 8]);
         assert!(matches!(
             Message::decode(&sealed(1, &body)),

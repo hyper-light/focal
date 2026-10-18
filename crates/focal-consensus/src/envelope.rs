@@ -470,8 +470,15 @@ pub fn encode_entry(entry: &Entry) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// `state` as a WAL record's payload.
+/// `state` as a WAL record's payload. A promise of what is held in memory (hyper-raft's core
+/// step R-8) is refused, never dropped: no group of focal's states fates, and a promise lost on
+/// a crash would leave a member unmarked that may have answered for entries its disk lacks.
 pub fn encode_hard_state(state: &HardState) -> Result<Vec<u8>> {
+    if state.held_term != 0 || state.held_index != 0 {
+        return Err(EnvelopeError::Unstated(
+            "a promise of what is held in memory",
+        ));
+    }
     let length = add(
         add(
             varint_field_len(1, state.term),
@@ -550,6 +557,17 @@ fn classic_on(message: &Message, wire: Wire) -> u64 {
 }
 
 fn layout(message: &Message, wire: Wire) -> Result<Layout<'_>> {
+    // hyper-raft's core step R-8: no wire of focal's carries a held answer or a narrowing's
+    // incarnation and end, and no group of focal's states fates. Refused, never dropped: a held
+    // answer stripped of its flag would be taken for a durable one.
+    if message.held {
+        return Err(EnvelopeError::Unstated("a held answer"));
+    }
+    if message.incarnation != 0 {
+        return Err(EnvelopeError::Unstated(
+            "an incarnation and its leader's end",
+        ));
+    }
     if wire == Wire::Frozen {
         if message.lost {
             return Err(EnvelopeError::Unstated("a member's mark"));

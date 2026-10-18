@@ -348,6 +348,17 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     flushed: Option<(u64, u64)>,
 }
 
+/// A value no other opening of a member states, with overwhelming likelihood: the keys std's
+/// hasher draws from the operating system once a thread and advances at every draw, so that two
+/// draws in one process differ and draws in two processes are independent
+/// (`hyper_raft::Config::incarnation`). Never zero, which states none.
+fn fresh_incarnation() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u8(0);
+    hasher.finish().max(1)
+}
+
 /// The term of an entry the state machine applied, as a point.
 fn point_of(entry: &EntryRef<'_>) -> Point {
     Point {
@@ -397,6 +408,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let depth = log.depth();
         let mut config = settings.core.clone();
         config.applied = durable.index;
+        // An incarnation no other opening of this member states (core step R-8), unless the
+        // owner gave one.
+        if config.incarnation == 0 {
+            config.incarnation = fresh_incarnation();
+        }
         config.limits.readies_in_flight = depth;
         config.elections = settings.elections;
         // The core keeps what the log may lack and acts on it (`docs/durable.md` §5): it judges
@@ -751,6 +767,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// the reopened one what its detectors believe.
     pub fn suspect(&mut self, member: u64) -> Result<(), ReplicaError> {
         self.guarded(|r| {
+            // The same detector decides whose held answers a leader counts (core step R-8).
+            let held = r.node.suspect_held(member);
+            r.heard(held)?;
             let told = r.node.suspect(member);
             r.heard(told)
         })
@@ -759,6 +778,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// The owner's detectors trust `member`'s node again.
     pub fn trust(&mut self, member: u64) -> Result<(), ReplicaError> {
         self.guarded(|r| {
+            let held = r.node.trust_held(member);
+            r.heard(held)?;
             let told = r.node.trust(member);
             r.heard(told)
         })
@@ -768,9 +789,26 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// leading nothing it led before it stopped.
     pub fn restarted(&mut self, member: u64) -> Result<(), ReplicaError> {
         self.guarded(|r| {
+            let held = r.node.trust_held(member);
+            r.heard(held)?;
             let told = r.node.restarted(member);
             r.heard(told)
         })
+    }
+
+    /// Stops this member's held answers ahead of a planned stop (core step R-8): its promise drops
+    /// in a later write once its disk holds what it answered for, and the owner stops it once
+    /// [`Replica::held_settled`], so that it opens unmarked.
+    pub fn quiet_held(&mut self) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let told = r.node.quiet_held();
+            r.heard(told)
+        })
+    }
+
+    /// Whether this member states no promise, durable or out: a quieted member may stop.
+    pub fn held_settled(&self) -> bool {
+        self.node.held_settled()
     }
 
     /// What the path to `member` carries in a round trip, as the node's transport measures it: its
@@ -1163,6 +1201,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 r.take_reports()?;
                 r.release_fence(out)?;
                 r.take_ready(now, waker, out)?;
+                r.take_light(out)?;
                 r.quiet_commit(now, waker)?;
             }
             r.release_reads(out);
@@ -1296,6 +1335,20 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let mut light = self.must(persisted)?;
         self.emit(light.take_messages(), out);
         self.tell_durable_commit()?;
+        if let Some((first, last)) = light.committed_range() {
+            self.apply_range(first, last, out)?;
+        }
+        self.tell_applied()
+    }
+
+    /// What the core may apply and send without a write, whatever the writes out
+    /// (`RawNode::light_now`): a leader's appends when it proposes and what it commits when it
+    /// commits, a follower's held answers when it takes the entries (core step R-8). Without it
+    /// they wait for a write of the member's own to free a place for the next `Ready`.
+    fn take_light(&mut self, out: &mut Output<M::Answer>) -> Result<(), ReplicaError> {
+        let light = self.node.light_now(true);
+        let mut light = self.must(light)?;
+        self.emit(light.take_messages(), out);
         if let Some((first, last)) = light.committed_range() {
             self.apply_range(first, last, out)?;
         }
@@ -1570,6 +1623,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             self.must(deferred)?;
         }
         self.emit(ready.take_messages(), out);
+        // Held answers (core step R-8) promise memory alone: they leave at once, before this
+        // `Ready`'s write and whatever it holds.
+        self.emit(ready.take_held_messages(), out);
         for read in ready.take_read_states() {
             self.reads.push_back((read.index, read.request_ctx));
         }
@@ -1660,11 +1716,34 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         given: Option<&HardState>,
         carries: bool,
     ) -> Result<(Option<HardState>, bool), ReplicaError> {
-        let (term, vote) = given.map_or((self.issued.term, self.issued.vote), |h| (h.term, h.vote));
+        let (term, vote, held_index, held_term) = given.map_or(
+            (
+                self.issued.term,
+                self.issued.vote,
+                self.issued.held_index,
+                self.issued.held_term,
+            ),
+            |h| (h.term, h.vote, h.held_index, h.held_term),
+        );
         let commit = self.stated_commit()?.max(self.issued.commit);
-        let moved = (term, vote) != (self.issued.term, self.issued.vote);
+        // The promise (core step R-8) is written as a term or a vote is: a member answers for
+        // memory only under one whose write is durable, and lowers it only once its disk holds
+        // what it answered for.
+        let moved = (term, vote, held_index, held_term)
+            != (
+                self.issued.term,
+                self.issued.vote,
+                self.issued.held_index,
+                self.issued.held_term,
+            );
         let states_commit = commit > self.issued.commit && (carries || self.fence_needs_commit());
-        let hard = (moved || states_commit).then_some(HardState { term, vote, commit });
+        let hard = (moved || states_commit).then_some(HardState {
+            term,
+            vote,
+            commit,
+            held_index,
+            held_term,
+        });
         Ok((hard, moved))
     }
 

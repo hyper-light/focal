@@ -321,6 +321,10 @@ fn message(rng: &mut Seeded) -> Message {
         kept: false,
         // Below the fence, which these round trips read under, a classic commit is not carried.
         classic: None,
+        // No wire of focal's carries R-8's fields.
+        held: false,
+        incarnation: 0,
+        end: 0,
         reject_hint: number(rng),
         context: bytes(rng),
         priority,
@@ -384,6 +388,8 @@ fn every_value_is_written_as_raft_rs_writes_it_and_read_back_to_itself() {
             term: number(&mut rng),
             vote: number(&mut rng),
             commit: number(&mut rng),
+            held_index: 0,
+            held_term: 0,
         };
         let written = encode_hard_state(&state).unwrap();
         let pb = eraftpb::HardState {
@@ -537,4 +543,38 @@ fn what_no_raft_rs_message_holds_is_refused() {
         encode_message(&kept),
         Err(EnvelopeError::Unstated("an append kept ahead of a hole"))
     );
+}
+
+/// hyper-raft's core step R-8: what no wire of focal's carries is refused, never dropped: a held
+/// answer, a narrowing's incarnation, and a hard state's promise.
+#[test]
+fn what_the_envelope_does_not_carry_is_refused() {
+    let held = Message {
+        msg_type: MessageType::MsgAppendResponse,
+        held: true,
+        ..Message::default()
+    };
+    assert!(matches!(
+        encode_message_in(&held, Wire::Kept),
+        Err(EnvelopeError::Unstated(_))
+    ));
+    let asking = Message {
+        msg_type: MessageType::MsgHeartbeatResponse,
+        incarnation: 7,
+        ..Message::default()
+    };
+    assert!(matches!(
+        encode_message(&asking),
+        Err(EnvelopeError::Unstated(_))
+    ));
+    let promised = HardState {
+        term: 2,
+        held_index: 9,
+        held_term: 2,
+        ..HardState::default()
+    };
+    assert!(matches!(
+        encode_hard_state(&promised),
+        Err(EnvelopeError::Unstated(_))
+    ));
 }

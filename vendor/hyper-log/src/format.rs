@@ -74,6 +74,9 @@ const DAMAGED: u8 = 8;
 const KEY: u8 = 9;
 /// The group's proposals through an index end.
 const RELEASED: u8 = 10;
+/// A group's hard state with its member's promise, the last entry it may answer for in memory
+/// (hyper-raft's core step R-8): the hard state record's fields, then the promise's index and term.
+const HARD_STATE_HELD: u8 = 11;
 
 /// Bytes of a persist record before its groups: magic, format, padding, the log's ID, the
 /// frame's sequence, the last sequence known flushed, and the count of groups.
@@ -353,6 +356,12 @@ pub struct HardState {
     pub vote: u64,
     /// The highest entry known committed.
     pub commit: u64,
+    /// The member's promise (hyper-raft's core step R-8): the last entry it may answer for in
+    /// memory, which this log may lack; a member that opens with one its log does not reach is
+    /// marked through it. Written as a record of its own kind, so a log of a group with no such
+    /// answers is the one it always was. Restored from a persist row, which carries only that there
+    /// was one, it is the last index there is, of the row's term.
+    pub held: Option<Start>,
 }
 
 /// Where a group's log starts: after `index`, whose term is `term`.
@@ -505,11 +514,19 @@ pub fn put(payload: &mut Writer, record: &Record<'_>, tag: usize) -> Option<Plac
             Some(Placed::Entries(placed))
         }
         Record::HardState { group, state } => {
-            payload.u8(HARD_STATE);
+            payload.u8(if state.held.is_some() {
+                HARD_STATE_HELD
+            } else {
+                HARD_STATE
+            });
             payload.u128(group);
             payload.u64(state.term);
             payload.u64(state.vote);
             payload.u64(state.commit);
+            if let Some(held) = state.held {
+                payload.u64(held.index);
+                payload.u64(held.term);
+            }
             Some(Placed::Record(at))
         }
         Record::Start { group, start } => {
@@ -639,7 +656,13 @@ pub fn encoded_len(record: &Record<'_>, tag: usize) -> Option<usize> {
                     .checked_add(tag)
             })?
         }
-        Record::HardState { .. } => 24,
+        Record::HardState { state, .. } => {
+            if state.held.is_some() {
+                40
+            } else {
+                24
+            }
+        }
         Record::Start { .. } | Record::Uncertain { .. } => 16,
         Record::Proposal { bytes, .. } => 24usize.checked_add(bytes.len())?.checked_add(tag)?,
         Record::Released { .. } => 8,
@@ -786,14 +809,10 @@ fn record(r: &mut Reader<'_>, kind: u8, group: u128, at: usize) -> Option<Owned>
                 }
             }
         }
-        HARD_STATE => Owned::HardState {
+        kind @ (HARD_STATE | HARD_STATE_HELD) => Owned::HardState {
             at,
             group,
-            state: HardState {
-                term: r.u64()?,
-                vote: r.u64()?,
-                commit: r.u64()?,
-            },
+            state: hard_state(r, kind == HARD_STATE_HELD)?,
         },
         START => Owned::Start {
             at,
@@ -821,6 +840,16 @@ fn record(r: &mut Reader<'_>, kind: u8, group: u128, at: usize) -> Option<Owned>
             through: r.u64()?,
         },
         _ => return None,
+    })
+}
+
+/// A hard state record's fields, and its promise where its kind carries one.
+fn hard_state(r: &mut Reader<'_>, held: bool) -> Option<HardState> {
+    Some(HardState {
+        term: r.u64()?,
+        vote: r.u64()?,
+        commit: r.u64()?,
+        held: if held { Some(start(r)?) } else { None },
     })
 }
 
@@ -964,6 +993,9 @@ const IS_REMOVED: u8 = 16;
 const HAS_PROPOSALS: u8 = 32;
 /// The frame fenced the group as damaged.
 const IS_DAMAGED: u8 = 64;
+/// The hard state it carries states a promise (hyper-raft's core step R-8). The row has no room for
+/// the promise itself: a restore from it states the last index there is, of the row's term.
+const HARD_STATE_HELD_FLAG: u8 = 128;
 
 fn when<T>(set: bool, value: T) -> Option<T> {
     if set { Some(value) } else { None }
@@ -993,10 +1025,15 @@ fn persist_header(bytes: &[u8]) -> Option<(u128, u64, u64, usize, bool)> {
 fn persisted(r: &mut Reader<'_>) -> Option<Persisted> {
     let group = r.u128()?;
     let flags = r.u8()?;
+    let term = r.u64()?;
     let hard = HardState {
-        term: r.u64()?,
+        term,
         vote: r.u64()?,
         commit: r.u64()?,
+        held: (flags & HARD_STATE_HELD_FLAG != 0).then_some(Start {
+            index: u64::MAX,
+            term,
+        }),
     };
     let start = start(r)?;
     let entries = Written {
@@ -1054,6 +1091,10 @@ impl Persist {
                 (g.removed, IS_REMOVED),
                 (g.proposals, HAS_PROPOSALS),
                 (g.damaged, IS_DAMAGED),
+                (
+                    g.hard_state.is_some_and(|hard| hard.held.is_some()),
+                    HARD_STATE_HELD_FLAG,
+                ),
             ] {
                 if set {
                     flags |= flag;
@@ -1166,6 +1207,7 @@ fn sealables_of(
             visit(sealable(r, group, index, term)?)?;
         }
         HARD_STATE => drop(r.take(24)?),
+        HARD_STATE_HELD => drop(r.take(40)?),
         START | UNCERTAIN => drop(r.take(16)?),
         REMOVED | DAMAGED => {}
         KEY => drop(r.take(KEY_FRAME_LEN)?),
@@ -1249,6 +1291,7 @@ mod tests {
                     term: 2,
                     vote: 1,
                     commit: 9,
+                    held: None,
                 },
             },
             Record::Start { group: 5, start },
@@ -1344,6 +1387,7 @@ mod tests {
                     term: 2,
                     vote: 1,
                     commit: 9,
+                    held: None,
                 },
             },
             Record::Proposal {
@@ -1435,6 +1479,7 @@ mod tests {
                         term: 5,
                         vote: 2,
                         commit: 9,
+                        held: None,
                     }),
                     start: None,
                     entries: Some(Written {
@@ -1496,7 +1541,7 @@ mod tests {
                 let record = match kind {
                     0 => Record::Entries { group, first, entries: refs },
                     1 => Record::Relocated { group, first, entries: refs },
-                    2 => Record::HardState { group, state: HardState { term: first, vote: 1, commit: 2 } },
+                    2 => Record::HardState { group, state: HardState { term: first, vote: 1, commit: 2, held: None, } },
                     3 => Record::Start { group, start: Start { index: first, term: 4 } },
                     4 => Record::Proposal { group, index: first, term: 5, bytes },
                     5 => Record::Uncertain { group, mark: Start { index: first, term: 6 } },

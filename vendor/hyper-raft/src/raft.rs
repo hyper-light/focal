@@ -31,6 +31,7 @@ use crate::{
     watch::{Arm, TRANSFER_ROUNDS, Timing, Watch, nanos},
     wire::{ENTRY_FIXED_BYTES, MESSAGE_RECORD_FIXED_BYTES},
 };
+use std::collections::VecDeque;
 
 /// What grows only to a bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,6 +313,15 @@ pub struct Config {
     /// What storage found the log to lack when the member opened ([`Lost`]); none for a whole
     /// log. The member keeps it until its durable log holds what it marks.
     pub lost: Option<Lost>,
+    /// Each member's fate and how many distinct fates a commit on entries held in memory must
+    /// span (core step R-8, `docs/raft.md` §3.7). None: no held answers, no promise, the classic
+    /// commit alone, as before.
+    pub fates: Option<Fates>,
+    /// This opening's incarnation, unique among the member's openings; its owner draws it (core
+    /// step R-8). A member that opens marked through a promise of its term states it to its
+    /// leader, whose heartbeat answers with where its log ends, and the mark narrows to that.
+    /// Zero for none: such a mark then ends only as the log reaches it.
+    pub incarnation: u64,
     /// What the election timeouts are drawn from.
     pub seed: u64,
     /// The bounds of what grows.
@@ -346,6 +356,8 @@ impl Config {
             apply_unpersisted: false,
             elections: Elections::Ticks,
             lost: None,
+            fates: None,
+            incarnation: 0,
             seed: id,
             limits,
         }
@@ -410,8 +422,108 @@ impl Config {
                 "a message of more entries than a member may hold not yet durable",
             ));
         }
+        if let Some(fates) = &self.fates {
+            if self.fast {
+                // A fast commit counts what a voter holds beside its log, which no promise covers
+                // (`docs/durable.md` §5.2).
+                return Err(Error::Settings("fates stated for a fast group"));
+            }
+            fates.validate(self.limits.members)?;
+        }
         Ok(())
     }
+}
+
+/// What a commit on entries held in memory needs of its holders (core step R-8, `docs/raft.md`
+/// §3.7): each member's fate as its owner states it, and how many distinct fates a held quorum's
+/// holders must span. Members of one fate fail as one (one host, one power feed), so their memory
+/// counts once toward the span; a member whose fate is not stated is never counted as a holder.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fates {
+    /// Each member's fate, in order of member, one each.
+    pub of: Vec<(NodeId, u64)>,
+    /// The distinct fates a held commit's holders must span; at least one.
+    pub spanning: usize,
+}
+impl Fates {
+    /// The fate of `member`, where its owner stated one.
+    pub fn fate(&self, member: NodeId) -> Option<u64> {
+        self.of
+            .binary_search_by_key(&member, |(member, _)| *member)
+            .ok()
+            .and_then(|position| self.of.get(position))
+            .map(|(_, fate)| *fate)
+    }
+    fn validate(&self, members: usize) -> Result<()> {
+        if self.spanning == 0 {
+            return Err(Error::Settings("a held commit that spans no fate"));
+        }
+        if self.of.len() > members {
+            return Err(Error::Settings(
+                "fates stated for more members than a group holds",
+            ));
+        }
+        if self
+            .of
+            .windows(2)
+            .any(|pair| pair.first().map(|(a, _)| *a) >= pair.get(1).map(|(b, _)| *b))
+        {
+            return Err(Error::Settings("fates not in order of member, one each"));
+        }
+        if self.of.iter().any(|(member, _)| *member == 0) {
+            return Err(Error::Settings("a fate stated for member zero"));
+        }
+        Ok(())
+    }
+}
+
+/// What a member keeps for commits on entries held in memory (core step R-8, `docs/raft.md` §3.7).
+/// Unused, and empty, in a group whose owner states no fates, except that a member whose hard
+/// state names a promise its log does not reach opens marked through it, whatever its owner
+/// states now.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HeldCommit {
+    /// The promise the next hard state states ([`Raft::refresh_held_promise`]): what this member
+    /// may answer for in memory once that hard state is durable, and never less than it may have
+    /// answered for. None (zero) where its log, once written, holds all of that.
+    pub(crate) promise: Lost,
+    /// The promise the durable hard state states, and the log's last index when the `Ready` that
+    /// wrote it was taken.
+    pub(crate) durable: (Lost, u64),
+    /// The promises of the hard states taken to write and not yet durable, by the number of their
+    /// `Ready`, with the log's last index when each was taken, in order; at most the readies in
+    /// flight. A held answer leaves only for entries every one of them covers, and the durable one.
+    pub(crate) pending: VecDeque<(u64, Lost, u64)>,
+    /// How far past its log a promise reaches, measured as a promise becomes durable: as far as
+    /// the log ran while the promise before served, from where it was when that one was taken;
+    /// doubled where the log reached the promise before (it held answers back, so what came is
+    /// less than would have: TCP's slow start, RFC 5681 §3.1, probing what a measure of the
+    /// limited rate cannot show).
+    pub(crate) ahead: u64,
+    /// Entries were taken from the leader since its last heartbeat.
+    pub(crate) taken: bool,
+    /// A heartbeat found nothing taken since the one before: the promise drops to what is owed
+    /// until entries come again, and the write that drops it is the one write a quiet spell costs.
+    pub(crate) idle: bool,
+    /// The greatest entry this member answered for in memory, in this incarnation.
+    pub(crate) answered: Lost,
+    /// The last index its log is known to match its leader's through, in this term: what a held
+    /// answer may name.
+    pub(crate) through: u64,
+    /// The held answers waiting to be taken: at most one, the newest, to the leader.
+    pub(crate) out: Vec<Message>,
+    /// Members the owner says are suspected, in order, at most the configuration's members.
+    pub(crate) suspected: Vec<NodeId>,
+    /// Its owner stopped its held answers ahead of a planned stop ([`Raft::quiet_held`]): its
+    /// promise drops once its disk holds what it answered for, so a group stopped and started
+    /// whole opens unmarked.
+    pub(crate) quiet: bool,
+    /// The mark this member opened with from a promise its log did not reach, narrowed by its
+    /// leader's end; it ends in the log's order (`Lost::reached_by`). None for none.
+    pub(crate) mark: Option<Lost>,
+    /// While `mark` lasts: what storage found the log to lack, kept apart from it, since it ends
+    /// by hyper-log's own rule and no narrowing narrows it.
+    pub(crate) storage: Option<Lost>,
 }
 
 /// What the fast track did at a member since it opened.
@@ -475,6 +587,15 @@ impl Lost {
     /// (`resolves`, mantle `docs/design/raft-log.md` §6).
     pub fn resolved_by(self, index: u64, term: u64) -> bool {
         index >= self.index || term > self.term
+    }
+    /// Whether a log whose last entry is `index`, of `term`, reaches the mark in the log's order
+    /// (thesis §3.6.1): an entry of a later term, or of its term at or past its index. The rule
+    /// of a promise's mark (core step R-8): such a log holds that term's leader's entries through
+    /// the mark (Log Matching), or a later leader's, which hold every committed one. A log whose
+    /// last entry is of an earlier term may hold, past the mark's index, a tail its member
+    /// replaced in memory with that leader's entries and never wrote, so its index says nothing.
+    pub fn reached_by(self, index: u64, term: u64) -> bool {
+        term > self.term || (term == self.term && index >= self.index)
     }
 }
 
@@ -615,6 +736,11 @@ pub struct Raft<S> {
     pub(crate) durable_commit: u64,
     /// What this member's durable log may lack of what it acknowledged ([`Lost`]).
     lost: Option<Lost>,
+    /// Commits on entries held in memory (core step R-8): what a member keeps for them, behind a
+    /// pointer: a group that states no fates never reads it, and inline it would be a fifth of a
+    /// kilobyte in every member a host holds (focal's session, whose inline size its debug stacks on
+    /// Windows bound).
+    pub(crate) held_commit: Box<HeldCommit>,
     /// The configuration the member counts by is the newest its log states, applied or not
     /// (`docs/raft.md` §3.4): the tracker's. `conf_newest_at` is the index of the entry that made
     /// it, and `conf_before` the configuration before that entry, made at `conf_before_at`. Of the
@@ -656,7 +782,10 @@ pub struct Raft<S> {
     /// What a member keeps that elects by suspicion ([`Elections::Suspicion`]);
     /// none on ticks, where it would be eight bytes and a branch.
     pub(crate) watch: Option<Box<Watch>>,
-    pub(crate) config: Config,
+    /// The settings, behind a pointer: read where they are used and never written after the
+    /// member opens, a quarter kilobyte inline in every member a host holds (focal's session,
+    /// whose inline size its debug stacks on Windows bound).
+    pub(crate) config: Box<Config>,
 }
 
 /// The messages that wait to be taken, and what they hold, by capacity,
@@ -890,7 +1019,7 @@ fn push_with(
             }
             // What is forwarded to the leader is the asker's and bears no
             // term.
-            if kind != MessageType::MsgPropose && kind != MessageType::MsgReadIndex {
+            if !matches!(kind, MessageType::MsgPropose | MessageType::MsgReadIndex) {
                 message.term = term;
             }
         }
@@ -1138,6 +1267,12 @@ impl<S: Storage> Outbox<'_, S> {
         // Never a commit the member may not hold, nor a classic one.
         message.commit = progress.matched.min(self.log.committed());
         message.classic = Some(progress.matched.min(self.classic));
+        if progress.asking != 0 {
+            // The member asks where this log ends (R-8): every entry of this term is at or before
+            // its last, then and before, since a leader never cuts its own log.
+            message.incarnation = progress.asking;
+            message.end = self.log.last_index()?;
+        }
         if let Some(context) = context {
             message
                 .context
@@ -1255,6 +1390,7 @@ impl<S: Storage> Raft<S> {
             priority_in_force: 0,
             durable_commit: 0,
             lost: config.lost,
+            held_commit: Box::default(),
             conf_before: Configuration::default(),
             conf_before_at: 0,
             conf_newest_at: 0,
@@ -1277,7 +1413,7 @@ impl<S: Storage> Raft<S> {
                 // It knows no leader yet (`become_follower` below arms it).
                 Elections::Suspicion => Some(Box::default()),
             },
-            config: config.clone(),
+            config: Box::new(config.clone()),
         };
         raft.conf_before = conf_before;
         raft.applied_conf = applied_conf;
@@ -1326,6 +1462,9 @@ impl<S: Storage> Raft<S> {
             }
         }
         raft.settle_priority();
+        // A hard state stating a promise its log does not reach: it may have answered for entries
+        // its disk lacks (R-8), whatever its owner states now.
+        raft.open_held(&initial.hard_state)?;
         Ok(raft)
     }
 
@@ -1461,8 +1600,27 @@ impl<S: Storage> Raft<S> {
     fn end_lost(&mut self, lost: Lost) -> Result<()> {
         let store = self.log.store();
         let last = store.last_index()?;
-        if lost.resolved_by(last, store.term(last)?) {
-            self.lost = None;
+        let term = store.term(last)?;
+        let Some(mark) = self.held_commit.mark else {
+            if lost.resolved_by(last, term) {
+                self.lost = None;
+            }
+            return Ok(());
+        };
+        // Each part by its own rule (R-8): storage's by hyper-log's, the promise's in the log's
+        // order.
+        let storage = self
+            .held_commit
+            .storage
+            .filter(|storage| !storage.resolved_by(last, term));
+        if mark.reached_by(last, term) {
+            self.held_commit.mark = None;
+            self.held_commit.storage = None;
+            self.lost = storage;
+            self.refresh_held_promise()?;
+        } else {
+            self.held_commit.storage = storage;
+            self.lost = Some(merge_lost(storage, mark));
         }
         Ok(())
     }
@@ -1541,6 +1699,8 @@ impl<S: Storage> Raft<S> {
             term: self.term,
             vote: self.vote,
             commit: self.log.committed(),
+            held_index: self.held_commit.promise.index,
+            held_term: self.held_commit.promise.term,
         }
     }
     /// Whether this member may campaign: the newest configuration its log states names it a voter;
@@ -1745,7 +1905,14 @@ impl<S: Storage> Raft<S> {
                 || self.quorum_elapsed.saturating_add(1) >= self.quorum_due())
     }
 
-    pub(crate) fn send(&mut self, message: Message) -> Result<()> {
+    pub(crate) fn send(&mut self, mut message: Message) -> Result<()> {
+        if matches!(
+            message.msg_type,
+            MessageType::MsgAppendResponse | MessageType::MsgHeartbeatResponse
+        ) {
+            // Marked through a promise of its term, it asks its leader where its log ends (R-8).
+            message.incarnation = self.held_asking();
+        }
         push(
             &mut self.msgs,
             self.id,
@@ -1865,7 +2032,9 @@ impl<S: Storage> Raft<S> {
         } else {
             self.term
         };
-        let classic = self.log.maybe_commit(index, term)?;
+        // The first of the classic quorum and a held one commits (R-8, `docs/raft.md` §3.7).
+        let held = self.held_quorum_index()?;
+        let classic = self.log.maybe_commit(index.max(held), term)?;
         // The quorum holds this leader's entry at `index`, so every later leader's log holds it
         // and every entry before it: what this member holds by itself through it is held no more.
         // A fast quorum may have committed it first. The members learn it with the next append or
@@ -1937,6 +2106,10 @@ impl<S: Storage> Raft<S> {
             self.term = term;
             self.vote = 0;
         }
+        // Held answers to an earlier leader are no one's to take, and what its log matches of the
+        // leader's is this term's.
+        self.held_commit.out.clear();
+        self.held_commit.through = 0;
         self.leader_id = 0;
         self.term_start = 0;
         self.reset_randomized_election_timeout();
@@ -2628,7 +2801,7 @@ impl<S: Storage> Raft<S> {
         self.leader_id = leader;
         self.state = StateRole::Follower;
         self.pending_request_snapshot = asked;
-        Ok(())
+        self.refresh_held_promise()
     }
     fn become_candidate(&mut self) -> Result<()> {
         if self.state == StateRole::Leader {
@@ -2642,7 +2815,7 @@ impl<S: Storage> Raft<S> {
         self.reset(term)?;
         self.vote = self.id;
         self.state = StateRole::Candidate;
-        Ok(())
+        self.refresh_held_promise()
     }
     fn become_pre_candidate(&mut self) -> Result<()> {
         if self.state == StateRole::Leader {
@@ -2655,7 +2828,7 @@ impl<S: Storage> Raft<S> {
         self.state = StateRole::PreCandidate;
         self.tracker.reset_votes();
         self.leader_id = 0;
-        Ok(())
+        self.refresh_held_promise()
     }
     fn become_leader(&mut self) -> Result<()> {
         if self.state == StateRole::Follower {
@@ -2676,8 +2849,11 @@ impl<S: Storage> Raft<S> {
         self.state = StateRole::Leader;
         // Elected without its own vote by a quorum that answered for no more
         // than its log holds (R-7): what it lost was committed by no one, and
-        // its first entry, of a later term, will hold what the mark marks.
+        // its first entry, of a later term, will hold what the mark marks. A
+        // promise's mark (R-8) is a claim like any other.
         self.lost = None;
+        self.held_commit.mark = None;
+        self.held_commit.storage = None;
         if let Some(watch) = self.watch.as_mut() {
             watch.led = term;
         }
@@ -2688,8 +2864,10 @@ impl<S: Storage> Raft<S> {
         let last = self.log.last_index()?;
         self.uncommitted_bytes = 0;
         self.leader_tail = last;
-        if self.config.apply_unpersisted {
-            // Every entry after `last` is of this term (`append_entries`).
+        if self.config.apply_unpersisted || self.config.fates.is_some() {
+            // Every entry after `last` is of this term (`append_entries`). Under R-8 a committed
+            // entry may be held in memory alone, by a held quorum, and its leader applies it as
+            // R-6's does an entry durable on a quorum.
             self.log.unpersisted_after = last;
         }
         if let Some(progress) = self.tracker.get_mut(self.id) {
@@ -2716,7 +2894,9 @@ impl<S: Storage> Raft<S> {
         }
         let last = self.log.last_index()?;
         self.term_start = last;
-        Ok(())
+        // A leader answers for no memory: what it answered for as a follower is on its disk with
+        // its first write, of this term (R-8).
+        self.refresh_held_promise()
     }
 
     fn campaign(&mut self, campaign: Campaign) -> Result<()> {
@@ -3102,8 +3282,14 @@ impl<S: Storage> Raft<S> {
             }
             MessageType::MsgPropose => self.propose(&mut message),
             MessageType::MsgReadIndex => self.read_index(message),
-            MessageType::MsgAppendResponse => self.handle_append_response(&message),
-            MessageType::MsgHeartbeatResponse => self.handle_heartbeat_response(&message),
+            MessageType::MsgAppendResponse => {
+                self.hear_asking(&message)?;
+                self.handle_append_response(&message)
+            }
+            MessageType::MsgHeartbeatResponse => {
+                self.hear_asking(&message)?;
+                self.handle_heartbeat_response(&message)
+            }
             MessageType::MsgSnapStatus => {
                 self.handle_snapshot_status(&message);
                 Ok(())
@@ -3323,6 +3509,9 @@ impl<S: Storage> Raft<S> {
     fn handle_append_response(&mut self, message: &Message) -> Result<()> {
         if message.reject {
             return self.handle_append_refusal(message);
+        }
+        if message.held {
+            return self.hear_held(message);
         }
         let last = self.log.last_index()?;
         let Some(progress) = self.tracker.get_mut(message.from) else {
@@ -3778,6 +3967,13 @@ impl<S: Storage> Raft<S> {
                 if let Some(classic) = message.classic {
                     self.learn_classic(classic.min(last))?;
                 }
+                // It holds them in memory now: said at once (R-8), as far as its promises cover
+                // them, its durable answer after.
+                self.held_commit.through = self.held_commit.through.max(last);
+                self.held_commit.taken = true;
+                self.held_commit.idle = false;
+                self.refresh_held_promise()?;
+                self.answer_held(message.from, last)?;
             }
             None if self.lost.is_some() && message.index > self.log.last_index()? => {
                 // What it refuses follows entries it may have acknowledged
@@ -3982,6 +4178,8 @@ impl<S: Storage> Raft<S> {
         Ok(())
     }
     fn handle_heartbeat(&mut self, mut message: Message) -> Result<()> {
+        self.narrow_held(&message)?;
+        self.beat_held()?;
         if let Some(lost) = self.lost
             && message.commit > self.log.last_index()?
         {
@@ -4082,6 +4280,7 @@ impl<S: Storage> Raft<S> {
             progress.maybe_update(held);
         }
         self.pending_request_snapshot = 0;
+        self.refresh_held_promise()?;
         Ok(true)
     }
 
@@ -4093,10 +4292,13 @@ impl<S: Storage> Raft<S> {
     /// tells it what its detectors believe of a member it is given again (hyper-durable's
     /// `Owner::pairs`).
     fn forget_unnamed(&mut self) {
+        let configuration = self.tracker.configuration();
         if let Some(watch) = self.watch.as_deref_mut() {
-            let configuration = self.tracker.configuration();
             watch.forget_unnamed(|member| configuration.contains(member));
         }
+        self.held_commit
+            .suspected
+            .retain(|member| configuration.contains(*member));
     }
     /// The changes in `[from, last]` take effect: an entry that replaced the newest change took the
     /// configuration back to the one before it, and each change the entries state is folded on in
@@ -4169,6 +4371,9 @@ impl<S: Storage> Raft<S> {
         } = self;
         let configuration = tracker.configuration();
         stagings.retain(|member| configuration.contains(member) && !configuration.votes(member));
+        // Whether a held quorum can be, and whether a held answer needs a promise, are the
+        // configuration's (R-8).
+        self.refresh_held_promise()?;
         if self.state != StateRole::Leader {
             return Ok(());
         }
@@ -4321,6 +4526,434 @@ impl Fold {
         self.newest_at = entry.index;
         self.configuration = Some(next.configuration);
         Ok(())
+    }
+}
+
+/// The mark a member keeps when two say what its log may lack: the greater of each.
+fn merge_lost(mark: Option<Lost>, other: Lost) -> Lost {
+    match mark {
+        None => other,
+        Some(mark) => Lost {
+            index: mark.index.max(other.index),
+            term: mark.term.max(other.term),
+        },
+    }
+}
+
+/// Commits on entries held in memory (core step R-8, `docs/raft.md` §3.7).
+impl<S: Storage> Raft<S> {
+    /// Whether a held quorum can exist in the configuration this member counts by: fates stated,
+    /// in each half a majority of its voters with stated fates, and the voters' fates spanning what
+    /// the owner asks. Members that share one fate, as on one machine, never can: they give no
+    /// held answers and state no promise, so a power cut that stops them all reopens them as it
+    /// always did.
+    pub(crate) fn held_possible(&self) -> bool {
+        let Some(fates) = self.config.fates.as_ref() else {
+            return false;
+        };
+        let configuration = self.tracker.configuration();
+        let halves = [configuration.voters(), configuration.outgoing()];
+        // Counted in place, nothing allocated: a configuration names few voters
+        // (`Limits::members`), and this runs at every append a member takes.
+        let mut distinct = 0usize;
+        for (half, voters) in halves.iter().enumerate() {
+            for (position, voter) in voters.iter().enumerate() {
+                let Some(fate) = fates.fate(*voter) else {
+                    continue;
+                };
+                let named = |earlier: &NodeId| fates.fate(*earlier) == Some(fate);
+                let seen = halves
+                    .iter()
+                    .take(half)
+                    .any(|before| before.iter().any(named))
+                    || voters.iter().take(position).any(named);
+                if !seen {
+                    distinct = distinct.saturating_add(1);
+                }
+            }
+        }
+        distinct >= fates.spanning
+            && halves.iter().all(|voters| {
+                voters.is_empty()
+                    || voters
+                        .iter()
+                        .filter(|voter| fates.fate(**voter).is_some())
+                        .count()
+                        >= crate::Quorum::Classic.of(voters.len())
+            })
+    }
+    /// Whether a follower's held answers need a durable promise: everywhere but a configuration of
+    /// one half of at most two voters, where a held quorum counts its leader's disk (a leader
+    /// commits on held answers only as a voter of every half) and every election asks its leader,
+    /// so that what a held quorum commits is on a disk every election meets.
+    fn held_needs_promise(&self) -> bool {
+        let configuration = self.tracker.configuration();
+        !(configuration.outgoing().is_empty() && configuration.voters().len() <= 2)
+    }
+    /// Whether this member answers for memory: a voter that follows a leader that is a voter of
+    /// every half (no other commits on held answers), of a group whose owner states fates a held
+    /// quorum can span, not quieted, and not marked, since a marked member may lack what it would
+    /// answer for.
+    fn answers_held(&self) -> bool {
+        self.state == StateRole::Follower
+            && !self.held_commit.quiet
+            && self.lost.is_none()
+            && self.promotable()
+            && self.votes_in_every_half(self.leader_id)
+            && self.held_possible()
+    }
+    /// Whether `member` is a voter of each half of the configuration this member counts by. Only
+    /// such a leader commits on held answers: one leaving the configuration is in none of its
+    /// held quorums, and a held quorum of a half of one or two voters without it would be its
+    /// followers' memory alone, which no promise covers there (`held_needs_promise`).
+    fn votes_in_every_half(&self, member: NodeId) -> bool {
+        let configuration = self.tracker.configuration();
+        configuration.voters().contains(&member)
+            && (configuration.outgoing().is_empty() || configuration.outgoing().contains(&member))
+    }
+    /// The promise the next hard state states: what this member may answer for in memory once
+    /// that write is durable — its leader's entries through its log and `ahead` more — and never
+    /// less than what it answered for or opened marked through. None where its log, written with that hard state, reaches all of
+    /// it: the log then holds what the promise would.
+    pub(crate) fn refresh_held_promise(&mut self) -> Result<()> {
+        let last = self.log.last_index()?;
+        let last_term = self.log.last_term()?;
+        // Only a member that follows a leader of this term, its log known to match that leader's,
+        // may answer for memory: one that led this term and stepped down, or heard no leader, has
+        // no one to answer, and a promise it stated would mark it for nothing (seeds 11, 12 and 18
+        // of the fated schedules: a voter left marked in a group of one or two, waiting for good).
+        let follows =
+            self.leader_id != 0 && self.leader_id != self.id && self.held_commit.through != 0;
+        // As far past its log as entries are expected before the next promise is durable: a mark
+        // after a crash reaches about as far as its log could have, which a candidate's log can
+        // meet, where a promise of the whole term leaves a voter refusing every candidate once
+        // the term's leader is gone (seed 2 of the crash campaign by suspicion, its leader and a
+        // follower stopped, a change pending: no one elected).
+        let desired = (self.answers_held()
+            && self.held_needs_promise()
+            && follows
+            && !self.held_commit.idle
+            && last_term == self.term)
+            .then(|| Lost {
+                index: last.saturating_add(self.held_commit.ahead).min(LAST),
+                term: self.term,
+            });
+        let owed = [
+            desired,
+            Some(self.held_commit.answered),
+            self.held_commit.mark,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|promise| promise.term != 0)
+        .max_by_key(|promise| (promise.term, promise.index));
+        self.held_commit.promise = owed
+            .filter(|promise| !promise.reached_by(last, last_term))
+            .unwrap_or_default();
+        Ok(())
+    }
+    /// The entries every promise out covers, the durable one's and those of the hard states
+    /// taken and not yet durable: a held answer for more could outlive a lower one made durable
+    /// after it.
+    fn held_cover(&self) -> Lost {
+        let mut cover = self.held_commit.durable.0;
+        for (_, promise, _) in &self.held_commit.pending {
+            if (promise.term, promise.index) < (cover.term, cover.index) {
+                cover = *promise;
+            }
+        }
+        cover
+    }
+    /// The `Ready` numbered `number` is taken: the promise in force once its write is durable, and
+    /// the log's last index now, wait for that write. At most the readies in flight wait.
+    pub(crate) fn held_taken(&mut self, number: u64) -> Result<()> {
+        if self.config.fates.is_none()
+            && self.held_commit.promise.term == 0
+            && self.held_commit.durable.0.term == 0
+            && self.held_commit.pending.is_empty()
+        {
+            return Ok(());
+        }
+        let bound = self.config.limits.readies_in_flight.saturating_add(1);
+        if self.held_commit.pending.len() >= bound {
+            return Err(Error::Capacity("promises out"));
+        }
+        let last = self.log.last_index()?;
+        self.held_commit
+            .pending
+            .try_reserve(1)
+            .map_err(|_| Error::Memory)?;
+        self.held_commit
+            .pending
+            .push_back((number, self.held_commit.promise, last));
+        Ok(())
+    }
+    /// The writes through `number` are durable: the promise of the last of them is the durable
+    /// one, and what it covers is answered for at once. The reach of the next is measured
+    /// (`HeldCommit::ahead`); it is stated with the next entries taken, never in a write alone.
+    pub(crate) fn held_durable(&mut self, number: u64) -> Result<()> {
+        let mut became = None;
+        while let Some(given) = self.held_commit.pending.front() {
+            if given.0 > number {
+                break;
+            }
+            became = self.held_commit.pending.pop_front();
+        }
+        let Some((_, promise, base)) = became else {
+            return Ok(());
+        };
+        let served = std::mem::replace(&mut self.held_commit.durable, (promise, base));
+        let last = self.log.last_index()?;
+        if last > served.1 {
+            let came = last.saturating_sub(served.1);
+            // The log reached what the promise that served covered: answers waited on it, and
+            // what came is what that let come.
+            let reached = served.0.term != self.term || last >= served.0.index;
+            self.held_commit.ahead = if reached {
+                came.max(self.held_commit.ahead.saturating_mul(2)).min(LAST)
+            } else {
+                came
+            };
+        }
+        let (leader, through) = (self.leader_id, self.held_commit.through);
+        if leader != 0 && leader != self.id && through != 0 {
+            self.answer_held(leader, through)?;
+        }
+        Ok(())
+    }
+    /// The highest index a held quorum holds, for the commit: zero where no fates are stated or
+    /// this member does not lead. It counts itself by what its disk holds: a leader's memory is in
+    /// every held commit's span, never in its count, so a leader that stops leaves no mark and a
+    /// group with a member away elects as Raft does.
+    fn held_quorum_index(&mut self) -> Result<u64> {
+        if self.state != StateRole::Leader
+            || !self.votes_in_every_half(self.id)
+            || !self.held_possible()
+        {
+            return Ok(0);
+        }
+        let Some(fates) = self.config.fates.as_ref() else {
+            return Ok(0);
+        };
+        let own = self.log.persisted();
+        Ok(self
+            .tracker
+            .held_quorum_index(fates, self.id, own, &self.held_commit.suspected))
+    }
+    /// A member's held answer: what it holds in memory moves its held index, never its durable
+    /// one, and a held quorum may commit on it. What it names past this leader's log is not
+    /// counted past the log.
+    fn hear_held(&mut self, message: &Message) -> Result<()> {
+        // Where no held quorum can be, as among members of one fate, none is counted.
+        if !self.held_possible() {
+            return Ok(());
+        }
+        let index = message.index.min(self.log.last_index()?);
+        let Some(progress) = self.tracker.get_mut(message.from) else {
+            return Ok(());
+        };
+        progress.recent_active = true;
+        if index <= progress.held {
+            return Ok(());
+        }
+        progress.held = index;
+        if self.maybe_commit()? && self.should_bcast_commit() {
+            self.bcast_append()?;
+        }
+        Ok(())
+    }
+    /// Answers the leader `to` at once that this member holds its entries through `last` in
+    /// memory, as far as every promise out covers them. The newest answer replaces one not yet
+    /// taken, so at most one waits.
+    fn answer_held(&mut self, to: NodeId, last: u64) -> Result<()> {
+        if !self.answers_held() {
+            return Ok(());
+        }
+        let through = if self.held_needs_promise() {
+            let cover = self.held_cover();
+            if cover.term != self.term {
+                return Ok(());
+            }
+            last.min(cover.index)
+        } else {
+            last
+        };
+        // What its disk holds its durable answers say.
+        if through <= self.log.persisted() {
+            return Ok(());
+        }
+        let answered = Lost {
+            index: through,
+            term: self.term,
+        };
+        if (answered.term, answered.index)
+            > (
+                self.held_commit.answered.term,
+                self.held_commit.answered.index,
+            )
+        {
+            self.held_commit.answered = answered;
+        }
+        let commit = self.durable_commit.min(self.log.committed());
+        if let Some(waiting) = self
+            .held_commit
+            .out
+            .iter_mut()
+            .find(|answer| answer.to == to)
+        {
+            waiting.index = waiting.index.max(through);
+            waiting.commit = commit;
+            return Ok(());
+        }
+        let mut answer = proto::message(to, MessageType::MsgAppendResponse);
+        answer.from = self.id;
+        answer.term = self.term;
+        answer.index = through;
+        answer.commit = commit;
+        answer.held = true;
+        self.held_commit
+            .out
+            .try_reserve(1)
+            .map_err(|_| Error::Memory)?;
+        self.held_commit.out.push(answer);
+        Ok(())
+    }
+    /// Opened with the hard state `hard`: a promise its durable log does not reach in the log's
+    /// order marks it through the promise, beside what storage found, until its log reaches the
+    /// mark or its leader's end narrows it.
+    fn open_held(&mut self, hard: &HardState) -> Result<()> {
+        let promise = Lost {
+            index: hard.held_index.min(LAST),
+            term: hard.held_term,
+        };
+        let store = self.log.store();
+        let last = store.last_index()?;
+        let term = store.term(last)?;
+        self.held_commit.durable = (promise, last);
+        if promise.term != 0 && !promise.reached_by(last, term) {
+            self.held_commit.mark = Some(promise);
+            self.held_commit.storage = self.lost;
+            self.lost = Some(merge_lost(self.lost, promise));
+        }
+        self.refresh_held_promise()
+    }
+    /// The incarnation this member's answers state while it is marked through a promise of its
+    /// term: its leader answers with where its log ends. Zero otherwise.
+    fn held_asking(&self) -> u64 {
+        match self.held_commit.mark {
+            Some(mark) if mark.term == self.term => self.config.incarnation,
+            _ => 0,
+        }
+    }
+    /// A member's answer states the incarnation asking where this leader's log ends, or none:
+    /// kept, and a new one answered at once by a heartbeat that states the end.
+    fn hear_asking(&mut self, message: &Message) -> Result<()> {
+        let Some(progress) = self.tracker.get_mut(message.from) else {
+            return Ok(());
+        };
+        if progress.asking == message.incarnation {
+            return Ok(());
+        }
+        progress.asking = message.incarnation;
+        if message.incarnation == 0 {
+            return Ok(());
+        }
+        let (mut outbox, tracker) = self.outbox();
+        if let Some(progress) = tracker.get(message.from) {
+            outbox.heartbeat(message.from, progress, None)?;
+        }
+        Ok(())
+    }
+    /// This term's leader stated where its log ends to this incarnation: a mark through a promise
+    /// of this term narrows to it. Every entry this member answered for in an earlier incarnation
+    /// was in that leader's log when it answered, and is at or before the end it states after this
+    /// incarnation asked; this incarnation answered for none, marked.
+    fn narrow_held(&mut self, message: &Message) -> Result<()> {
+        if message.incarnation == 0 || message.incarnation != self.config.incarnation {
+            return Ok(());
+        }
+        let Some(mark) = self.held_commit.mark else {
+            return Ok(());
+        };
+        if mark.term != self.term || message.term != self.term || message.end >= mark.index {
+            return Ok(());
+        }
+        let narrowed = Lost {
+            index: message.end,
+            term: mark.term,
+        };
+        self.held_commit.mark = Some(narrowed);
+        self.lost = Some(merge_lost(self.held_commit.storage, narrowed));
+        self.settle_lost()?;
+        self.refresh_held_promise()
+    }
+    /// A heartbeat of its leader: where nothing was taken since the one before, the promise drops
+    /// to what is owed (R-8). A quiet spell costs that one write, and leaves a promise past the
+    /// log at most a heartbeat's span, so a group whose members all stop while quiet opens
+    /// unmarked; traffic with shorter gaps keeps its promise, stated with the entries it brings.
+    fn beat_held(&mut self) -> Result<()> {
+        if !std::mem::replace(&mut self.held_commit.taken, false) && !self.held_commit.idle {
+            self.held_commit.idle = true;
+            self.refresh_held_promise()?;
+        }
+        Ok(())
+    }
+    /// The owner's node-level detector suspects `member`: its held answers are not counted until
+    /// it is trusted again. Of a member the configuration does not name, or this one, it keeps
+    /// nothing: what the detectors say of a member goes when the configuration stops naming it, and
+    /// its owner tells it again of one named again (`Raft::forget_unnamed`).
+    pub fn suspect_held(&mut self, member: NodeId) -> Result<()> {
+        if member == self.id || self.tracker.get(member).is_none() {
+            return Ok(());
+        }
+        if let Err(position) = self.held_commit.suspected.binary_search(&member) {
+            if self.held_commit.suspected.len() >= self.config.limits.members {
+                return Err(Error::Capacity("suspected members"));
+            }
+            self.held_commit
+                .suspected
+                .try_reserve(1)
+                .map_err(|_| Error::Memory)?;
+            self.held_commit.suspected.insert(position, member);
+        }
+        Ok(())
+    }
+    /// The owner's detector trusts `member` again: its held answers count from now on.
+    pub fn trust_held(&mut self, member: NodeId) -> Result<()> {
+        if let Ok(position) = self.held_commit.suspected.binary_search(&member) {
+            self.held_commit.suspected.remove(position);
+            if self.state == StateRole::Leader && self.maybe_commit()? {
+                self.bcast_append()?;
+            }
+        }
+        Ok(())
+    }
+    /// Stops this member's held answers ahead of a planned stop: its durable answers go on, and
+    /// its promise drops, in a hard state its owner writes as any other, once its disk holds what
+    /// it answered for. A group whose members all stop so opens unmarked.
+    pub fn quiet_held(&mut self) -> Result<()> {
+        self.held_commit.quiet = true;
+        self.held_commit.out.clear();
+        self.refresh_held_promise()
+    }
+    /// Whether no promise is stated, durable or out: a quieted member may stop with nothing to
+    /// mark it when it opens.
+    pub fn held_settled(&self) -> bool {
+        self.held_commit.promise.term == 0
+            && self.held_commit.durable.0.term == 0
+            && self
+                .held_commit
+                .pending
+                .iter()
+                .all(|(_, promise, _)| promise.term == 0)
+    }
+    /// The held answers waiting to be taken, to send at once (R-8).
+    pub(crate) fn take_held_answers(&mut self) -> Vec<Message> {
+        std::mem::take(&mut self.held_commit.out)
+    }
+    /// Whether held answers wait to be taken.
+    pub(crate) fn has_held_answers(&self) -> bool {
+        !self.held_commit.out.is_empty()
     }
 }
 

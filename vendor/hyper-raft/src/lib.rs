@@ -55,8 +55,8 @@ pub use mutant::Mutant;
 pub use node::{Kept, LightReady, RawNode, Ready, SnapshotStatus, ToPersist};
 pub use quorum::{Quorum, Tally};
 pub use raft::{
-    Ahead, CampaignState, Config, Elections, FastStats, HeartbeatAnswers, Limits, Lost, Outgoing,
-    Raft, ReadRounds, SoftState, StateRole, Stated,
+    Ahead, CampaignState, Config, Elections, FastStats, Fates, HeartbeatAnswers, Limits, Lost,
+    Outgoing, Raft, ReadRounds, SoftState, StateRole, Stated,
 };
 pub use read::ReadState;
 pub use storage::{InitialState, Storage};

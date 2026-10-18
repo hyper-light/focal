@@ -103,6 +103,8 @@ fn follower_with(config: Config) -> RawNode<Memory> {
         term: 1,
         vote: 1,
         commit: 2,
+        held_index: 0,
+        held_term: 0,
     };
     RawNode::new(&config, store).unwrap()
 }
@@ -1153,6 +1155,8 @@ fn what_is_not_durable_has_a_bound() {
         term: 1,
         vote: 1,
         commit: 1,
+        held_index: 0,
+        held_term: 0,
     };
     let mut node = RawNode::new(
         &Config {
@@ -1385,6 +1389,8 @@ fn a_notice_heard_in_a_later_term_makes_nothing_durable() {
         term: 1,
         vote: 1,
         commit: 2,
+        held_index: 0,
+        held_term: 0,
     };
     let mut node = RawNode::new(&with_depth(2, 3), store).unwrap();
     let issue = |node: &mut RawNode<Memory>, from: u64, term: u64, entry_term: u64| {
@@ -2152,6 +2158,8 @@ fn three_at(term: u64) -> Vec<RawNode<Memory>> {
                 term,
                 vote: 0,
                 commit: 0,
+                held_index: 0,
+                held_term: 0,
             };
             RawNode::new(&config(id), store).unwrap()
         })
@@ -2242,6 +2250,8 @@ fn an_append_past_the_last_index_is_refused_whole() {
             term: 3,
             vote: 1,
             commit: start,
+            held_index: 0,
+            held_term: 0,
         };
         let mut follower = RawNode::new(&config(2), store).unwrap();
         let hard = follower.raft.hard_state();
@@ -2270,6 +2280,8 @@ fn a_leader_at_the_last_index_refuses_new_entries() {
         term: 3,
         vote: 1,
         commit: LAST - 1,
+        held_index: 0,
+        held_term: 0,
     };
     let mut leader = RawNode::new(&config(1), store).unwrap();
     leader.campaign().unwrap();
@@ -2309,6 +2321,8 @@ fn a_member_with_no_index_for_a_leaders_first_entry_does_not_campaign() {
         term: 3,
         vote: 1,
         commit: LAST,
+        held_index: 0,
+        held_term: 0,
     };
     let mut node = RawNode::new(&config(1), store).unwrap();
     let before = standing(&node);
@@ -2339,6 +2353,8 @@ fn by_suspicion_a_member_with_no_successor_is_due_for_no_campaign() {
             term,
             vote: 1,
             commit: last,
+            held_index: 0,
+            held_term: 0,
         };
         let suspicion = Config {
             elections: crate::Elections::Suspicion,
@@ -2379,6 +2395,8 @@ fn the_fast_track_proposes_and_holds_nothing_at_the_last_index() {
         term: 3,
         vote: 1,
         commit: LAST - 2,
+        held_index: 0,
+        held_term: 0,
     };
     let mut node = RawNode::new(&fast, store).unwrap();
     let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 3);
@@ -2855,6 +2873,8 @@ fn holding(id: u64, term: u64, terms: &[u64]) -> RawNode<Memory> {
         term,
         vote: 0,
         commit: 0,
+        held_index: 0,
+        held_term: 0,
     };
     RawNode::new(&config(id), store).unwrap()
 }
@@ -4253,6 +4273,8 @@ fn a_voter_the_uncommitted_change_leaves_out_campaigns_and_is_elected_by_the_vot
         term: 1,
         vote: 0,
         commit: 2,
+        held_index: 0,
+        held_term: 0,
     };
     let mut node = RawNode::new(&config(1), store).unwrap();
     assert_eq!(node.raft.configuration().voters(), [2, 3]);
@@ -4289,6 +4311,8 @@ fn a_voter_the_uncommitted_change_leaves_out_campaigns_and_is_elected_by_the_vot
             term: 1,
             vote: 0,
             commit: 3,
+            held_index: 0,
+            held_term: 0,
         };
         store
     })
@@ -4690,9 +4714,410 @@ fn under_elections_by_suspicion_a_quorum_patience_changes_nothing() {
         term: 1,
         vote: 1,
         commit: 0,
+        held_index: 0,
+        held_term: 0,
     };
     let mut node = RawNode::new(&suspicion, store).unwrap();
     node.raft.set_quorum_patience(9).unwrap();
     assert_eq!(node.raft.quorum_patience(), 9);
     assert!(matches!(node.tick(), Err(Error::Settings(_))));
+}
+
+// Core step R-8 (`docs/raft.md` §3.7): commits on entries held in memory across fates.
+
+/// Each of three members its own fate; a held commit's holders must span `spanning`.
+fn fated(id: u64, fates: &[(u64, u64)], spanning: usize) -> Config {
+    let mut config = with_depth(id, 2);
+    config.fates = Some(crate::Fates {
+        of: fates.to_vec(),
+        spanning,
+    });
+    config
+}
+fn apart(id: u64) -> Config {
+    fated(id, &[(1, 10), (2, 20), (3, 30)], 3)
+}
+fn held_answer(from: u64, index: u64, term: u64) -> Message {
+    let mut held = answer(MessageType::MsgAppendResponse, from, 1, term);
+    held.index = index;
+    held.held = true;
+    held
+}
+/// A leader of fates `config` with a proposal of its term taken and issued, none of it durable.
+fn proposing(config: Config) -> RawNode<Memory> {
+    let mut node = leader_with(config);
+    node.propose(vec![], b"x".to_vec()).unwrap();
+    let ready = node.ready().unwrap();
+    node.advance_issued(ready).unwrap();
+    assert_eq!(node.raft.log().persisted(), 1);
+    node
+}
+/// Leader 1's append of term 2 placing entry `index`, after the follower's entries of term 1
+/// through 3.
+fn append_of_two(index: u64) -> Message {
+    let mut append = answer(MessageType::MsgAppend, 1, 2, 2);
+    append.index = index - 1;
+    append.log_term = if index > 4 { 2 } else { 1 };
+    append.commit = 2;
+    append.entries = vec![entry(index, 2)];
+    append
+}
+/// What a `Ready` taken and issued gave: its number, entries and hard state, and its held answers.
+type Issued = (u64, Vec<Entry>, Option<HardState>, Vec<Message>);
+fn issue(node: &mut RawNode<Memory>) -> Issued {
+    let mut ready = node.ready().unwrap();
+    let held = ready.take_held_messages();
+    let issued = (
+        ready.number(),
+        ready.entries().to_vec(),
+        ready.hard_state().copied(),
+        held,
+    );
+    node.advance_issued(ready).unwrap();
+    issued
+}
+/// The write `issued` gave is durable.
+fn persist(node: &mut RawNode<Memory>, issued: &Issued) {
+    node.store_mut().append(&issued.1);
+    if let Some(hard) = issued.2 {
+        node.store_mut().hard_state = hard;
+    }
+    node.on_persist(issued.0).unwrap();
+}
+fn promise_of(hard: Option<HardState>) -> Option<(u64, u64)> {
+    hard.map(|hard| (hard.held_index, hard.held_term))
+}
+
+/// R-8: three members of three fates commit an entry its followers hold in memory, before any
+/// write of it is durable, and the leader applies it before its own write is. The leader counts
+/// its disk, never its memory: its blank entry, on its disk, commits with one follower's memory
+/// (no failure of memory loses an entry a disk holds, so no span is asked), and its proposal,
+/// in the leader's memory and one follower's, does not.
+#[test]
+fn a_held_quorum_commits_before_any_write_of_it_is_durable() {
+    let mut node = proposing(apart(1));
+    node.step(held_answer(2, 2, 1)).unwrap();
+    assert_eq!(
+        node.raft.log().committed(),
+        1,
+        "the blank on the leader's disk; not the proposal in its memory"
+    );
+    node.step(held_answer(3, 2, 1)).unwrap();
+    assert_eq!(node.raft.log().committed(), 2);
+    assert_eq!(node.raft.log().persisted(), 1);
+    let ready = node.ready().unwrap();
+    assert_eq!(held(ready.committed_entries()), vec![(1, 1), (2, 1)]);
+}
+
+/// R-8: members of one fate fail as one, so their memory never commits; durable answers commit as
+/// they always did. Of two voters, a held quorum counts the leader's disk and the follower's
+/// memory, and the follower answers with no promise: every election asks the leader.
+#[test]
+fn members_of_one_fate_never_commit_on_held_answers_and_two_voters_need_no_promise() {
+    let mut node = proposing(fated(1, &[(1, 7), (2, 7), (3, 7)], 2));
+    node.step(held_answer(2, 2, 1)).unwrap();
+    node.step(held_answer(3, 2, 1)).unwrap();
+    assert_eq!(
+        node.raft.log().committed(),
+        0,
+        "one fate: no held quorum can be, and none is counted"
+    );
+    let mut durable = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    durable.index = 2;
+    node.step(durable).unwrap();
+    // The classic quorum holds the blank entry durably (the leader's and member 2's), not the
+    // proposal, whose write at the leader is not durable.
+    assert_eq!(node.raft.log().committed(), 1);
+
+    let mut store = Memory::with_voters(&[1, 2]);
+    store.hard_state = HardState::default();
+    let config = fated(1, &[(1, 10), (2, 20)], 2);
+    let mut pair = RawNode::new(&config, store).unwrap();
+    pair.campaign().unwrap();
+    drain(&mut pair);
+    pair.step(answer(MessageType::MsgRequestPreVoteResponse, 2, 1, 1))
+        .unwrap();
+    drain(&mut pair);
+    pair.step(answer(MessageType::MsgRequestVoteResponse, 2, 1, 1))
+        .unwrap();
+    drain(&mut pair);
+    assert_eq!(pair.raft.state(), StateRole::Leader);
+    pair.propose(vec![], b"x".to_vec()).unwrap();
+    let issued = issue(&mut pair);
+    pair.step(held_answer(2, 2, 1)).unwrap();
+    assert_eq!(
+        pair.raft.log().committed(),
+        1,
+        "the leader's disk holds 1, not 2"
+    );
+    persist(&mut pair, &issued);
+    assert_eq!(pair.raft.log().committed(), 2);
+
+    let mut store = Memory::with_voters(&[1, 2]);
+    store.append(&[entry(1, 1), entry(2, 1), entry(3, 1)]);
+    let mut follower = RawNode::new(&fated(2, &[(1, 10), (2, 20)], 2), store).unwrap();
+    follower.step(append_of_two(4)).unwrap();
+    let (_, _, hard, held) = issue(&mut follower);
+    assert_eq!(promise_of(hard), Some((0, 0)));
+    assert_eq!(held.len(), 1);
+    assert!(held[0].held && held[0].index == 4);
+}
+
+/// R-8: a member its owner's detector suspects has its held answers not counted until trusted;
+/// of a member the configuration does not name it keeps nothing.
+#[test]
+fn a_suspected_members_held_answers_count_only_once_it_is_trusted() {
+    let mut node = proposing(apart(1));
+    node.suspect_held(3).unwrap();
+    node.step(held_answer(2, 2, 1)).unwrap();
+    node.step(held_answer(3, 2, 1)).unwrap();
+    assert_eq!(
+        node.raft.log().committed(),
+        1,
+        "the blank, on the leader's disk"
+    );
+    node.trust_held(3).unwrap();
+    assert_eq!(node.raft.log().committed(), 2);
+    node.suspect_held(9).unwrap();
+    assert!(node.raft.held_commit.suspected.is_empty());
+}
+
+/// R-8: a follower answers for memory only under a durable promise. Its promise reaches as far
+/// past its log as its log ran while the promise before served, doubled where the log reached
+/// that promise (it held answers back), and is stated with the entries it takes, never in a write
+/// of its own; under a durable one, an append is answered at once, before its write, whatever the
+/// writes out (`RawNode::messages_now`). A heartbeat that finds nothing taken since the one before
+/// drops the promise, and while that lower promise is out no answer passes it.
+#[test]
+fn a_follower_answers_for_memory_only_under_a_durable_promise() {
+    let held = |messages: &[Message]| -> Vec<u64> {
+        messages
+            .iter()
+            .filter(|message| message.held)
+            .map(|message| message.index)
+            .collect()
+    };
+    let mut node = follower_with(apart(2));
+    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 2);
+    beat.commit = 2;
+    node.step(append_of_two(4)).unwrap();
+    let first = issue(&mut node);
+    assert_eq!(promise_of(first.2), Some((0, 0)), "nothing measured yet");
+    node.step(append_of_two(5)).unwrap();
+    let second = issue(&mut node);
+    // The first write is durable: the log ran from 3, where it opened, to 5 meanwhile, past the
+    // promise of none, so the next reaches 2 past the log, stated with the next entry.
+    persist(&mut node, &first);
+    assert!(
+        !node.has_ready(),
+        "a promise is stated with entries, not alone"
+    );
+    node.step(append_of_two(6)).unwrap();
+    assert!(
+        held(&node.messages_now()).is_empty(),
+        "no promise durable yet"
+    );
+    let third = issue(&mut node);
+    assert_eq!(promise_of(third.2), Some((8, 2)));
+    persist(&mut node, &second);
+    persist(&mut node, &third);
+    // Under the durable promise of 8, the next append is answered at once, a write still to take.
+    node.step(append_of_two(7)).unwrap();
+    assert_eq!(held(&node.messages_now()), vec![7]);
+    let fourth = issue(&mut node);
+    // A heartbeat after entries keeps the promise; the next, after none, drops it.
+    node.step(beat.clone()).unwrap();
+    assert_ne!(promise_of(Some(node.raft.hard_state())), Some((0, 0)));
+    node.step(beat).unwrap();
+    assert_eq!(promise_of(Some(node.raft.hard_state())), Some((0, 0)));
+    let fifth = issue(&mut node);
+    assert_eq!(promise_of(fifth.2), Some((0, 0)));
+    persist(&mut node, &fourth);
+    // That lower promise is out: an append now is answered when its write is durable, not before.
+    node.step(append_of_two(8)).unwrap();
+    assert!(
+        held(&node.messages_now()).is_empty(),
+        "a lower promise out covers nothing past its write"
+    );
+    let sixth = issue(&mut node);
+    persist(&mut node, &fifth);
+    persist(&mut node, &sixth);
+    assert!(
+        promise_of(sixth.2).is_some_and(|(index, term)| term == 2 && index > 8),
+        "stated again with the entries it brings: {:?}",
+        sixth.2
+    );
+}
+
+/// R-8: without fates nothing changes: no promise, no held answer, no incarnation on the wire.
+#[test]
+fn without_fates_there_is_no_promise_nor_held_answer() {
+    let mut node = follower_with(with_depth(2, 2));
+    node.step(append_of_two(4)).unwrap();
+    let mut ready = node.ready().unwrap();
+    assert_eq!(promise_of(ready.hard_state().copied()), Some((0, 0)));
+    assert!(ready.take_held_messages().is_empty());
+    let mut leader = proposing(with_depth(1, 2));
+    let sent = drain(&mut leader);
+    assert!(sent.iter().all(|message| message.incarnation == 0));
+}
+
+/// R-8: a member that opens with a promise its log does not reach may have answered for
+/// entries its disk lacks: it is marked through it, judges votes by it, and asks its leader
+/// where its log ends. Answered for its own incarnation, the mark narrows to that end, and ends
+/// once its durable log reaches it; an answer for another incarnation changes nothing.
+#[test]
+fn a_member_opened_with_a_promise_is_marked_and_its_leader_narrows_the_mark() {
+    let mut store = Memory::with_voters(&[1, 2, 3]);
+    store.append(&[
+        entry(1, 1),
+        entry(2, 1),
+        entry(3, 1),
+        entry(4, 2),
+        entry(5, 2),
+    ]);
+    store.hard_state = HardState {
+        term: 2,
+        vote: 1,
+        commit: 2,
+        // A persist row's restore: the last index there is.
+        held_index: u64::MAX,
+        held_term: 2,
+    };
+    let mut config = apart(2);
+    config.incarnation = 77;
+    let mut node = RawNode::new(&config, store).unwrap();
+    let mark = node.raft.lost().unwrap();
+    assert_eq!((mark.index, mark.term), (u64::MAX - 1, 2));
+    // A candidate whose log ends at 5 of term 2 lacks what the mark marks.
+    let mut vote = answer(MessageType::MsgRequestPreVote, 3, 2, 3);
+    vote.index = 5;
+    vote.log_term = 2;
+    node.step(vote).unwrap();
+    let refused = drain(&mut node)
+        .into_iter()
+        .find(|message| message.msg_type == MessageType::MsgRequestPreVoteResponse)
+        .unwrap();
+    assert!(refused.reject);
+    // The leader's heartbeat: the member answers stating its incarnation.
+    let mut beat = answer(MessageType::MsgHeartbeat, 1, 2, 2);
+    beat.commit = 2;
+    node.step(beat.clone()).unwrap();
+    let answers = drain(&mut node);
+    assert!(answers.iter().any(|message| {
+        message.msg_type == MessageType::MsgHeartbeatResponse && message.incarnation == 77
+    }));
+    // An end stated to another incarnation narrows nothing.
+    let mut stale = beat.clone();
+    stale.incarnation = 76;
+    stale.end = 5;
+    node.step(stale).unwrap();
+    drain(&mut node);
+    assert_eq!(node.raft.lost().map(|mark| mark.index), Some(u64::MAX - 1));
+    // Its own: the mark narrows to the leader's end, and its promise with it.
+    let mut told = beat;
+    told.incarnation = 77;
+    told.end = 6;
+    node.step(told).unwrap();
+    let mark = node.raft.lost().unwrap();
+    assert_eq!((mark.index, mark.term), (6, 2));
+    assert_eq!(promise_of(Some(node.raft.hard_state())), Some((6, 2)));
+    // The leader's entry 6, durable, ends the mark.
+    node.step(append_of_two(6)).unwrap();
+    drain(&mut node);
+    assert_eq!(node.raft.lost(), None);
+}
+
+/// R-8: a promise's mark ends in the log's order, the order elections judge claims by: a log
+/// whose last entry is of an earlier term does not end a mark past its index, as storage's
+/// index-only rule would. It ends once the leader's entries of the mark's term are on the disk.
+#[test]
+fn a_stale_tail_of_an_earlier_term_never_ends_a_promise_mark() {
+    let mut store = Memory::with_voters(&[1, 2, 3]);
+    store.append(&[
+        entry(1, 1),
+        entry(2, 1),
+        entry(3, 1),
+        entry(4, 1),
+        entry(5, 1),
+        entry(6, 1),
+    ]);
+    store.hard_state = HardState {
+        term: 2,
+        vote: 1,
+        commit: 2,
+        held_index: 5,
+        held_term: 2,
+    };
+    let mut node = RawNode::new(&apart(2), store).unwrap();
+    let mark = node.raft.lost().unwrap();
+    assert_eq!(
+        (mark.index, mark.term),
+        (5, 2),
+        "6 of term 1 is past 5, and ends nothing"
+    );
+    // The leader's entries 4 and 5 of term 2 replace the tail; durable, they end the mark.
+    let mut append = answer(MessageType::MsgAppend, 1, 2, 2);
+    append.index = 3;
+    append.log_term = 1;
+    append.commit = 2;
+    append.entries = vec![entry(4, 2), entry(5, 2)];
+    node.step(append).unwrap();
+    drain(&mut node);
+    assert_eq!(node.raft.lost(), None);
+}
+
+/// R-8: a leader answers a member's incarnation at once, with a heartbeat stating where its log
+/// ends, and its heartbeats state it while the member asks; an answer stating none ends it.
+#[test]
+fn a_leader_answers_an_asking_incarnation_with_its_end() {
+    let mut node = proposing(apart(1));
+    drain(&mut node);
+    let mut asking = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+    asking.incarnation = 77;
+    node.step(asking).unwrap();
+    let told = drain(&mut node)
+        .into_iter()
+        .find(|message| message.msg_type == MessageType::MsgHeartbeat && message.to == 2)
+        .unwrap();
+    assert_eq!((told.incarnation, told.end), (77, 2));
+    node.step(answer(MessageType::MsgHeartbeatResponse, 2, 1, 1))
+        .unwrap();
+    for _ in 0..3 {
+        node.tick().unwrap();
+    }
+    let beats = drain(&mut node);
+    assert!(
+        beats
+            .iter()
+            .filter(|message| message.msg_type == MessageType::MsgHeartbeat)
+            .all(|message| message.incarnation == 0)
+    );
+}
+
+/// R-8: quieted ahead of a planned stop, a member gives no more held answers and its promise drops
+/// once its disk holds what it answered for, so a group stopped and started whole opens
+/// unmarked.
+#[test]
+fn a_quieted_member_drops_its_promise_once_its_disk_holds_what_it_answered_for() {
+    let mut node = follower_with(apart(2));
+    node.step(append_of_two(4)).unwrap();
+    let first = issue(&mut node);
+    node.step(append_of_two(5)).unwrap();
+    let second = issue(&mut node);
+    persist(&mut node, &first);
+    node.step(append_of_two(6)).unwrap();
+    let third = issue(&mut node);
+    assert_eq!(promise_of(third.2), Some((8, 2)));
+    persist(&mut node, &second);
+    persist(&mut node, &third);
+    node.step(append_of_two(7)).unwrap();
+    assert!(node.messages_now().iter().any(|message| message.held));
+    node.quiet_held().unwrap();
+    assert!(!node.held_settled());
+    node.step(append_of_two(8)).unwrap();
+    let rest = drain(&mut node);
+    assert!(rest.iter().all(|message| !message.held));
+    assert!(node.held_settled());
+    assert_eq!(promise_of(Some(node.raft.hard_state())), Some((0, 0)));
 }

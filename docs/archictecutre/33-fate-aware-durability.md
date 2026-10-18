@@ -156,7 +156,7 @@ Doc 32's three classes stay. What changes is what "replicated" and "persisted" c
 | Class | Acknowledged when | Survives |
 |---|---|---|
 | ephemeral | the owner has it | nothing past the owner's crash; gaps are announced |
-| replicated | ⌈n/2⌉+1 voters hold it in memory (SAUCR's fast quorum), none suspected, and the holders span enough independent fates to meet the stream's loss bound with the measured ρ (§4.3); otherwise as persisted | any failure the bound covers; beyond it, unavailable rather than lossy (§4.5) |
+| replicated | a majority of voters hold it, the leader by its disk and each follower in memory under a durable promise or on disk, none suspected, and the holders with the leader span enough independent fates to meet the stream's loss bound with the measured ρ (§4.3; a holder's disk waives the span); otherwise as persisted | any failure the bound covers: lost only if the leader and every follower that held it in memory fail before it is flushed; beyond it, unavailable rather than lossy (§4.5) |
 | persisted | a majority holds it on stable media: a flushed write-back device, or a write-through device at completion | any crash of any number of nodes |
 | windowed | the owner has written it to its log, ordered, and a full flush follows within the stream's window W | any crash, keeping a consistent prefix: writes acknowledged within W of a power cut may be lost, never torn or reordered |
 
@@ -193,8 +193,9 @@ in fates *F* = {f₁…f_k}:
 - With fate failure rates λᵢ, the loss probability is at most about τ·Σᵢ λᵢ·Πⱼ≠ᵢ (λⱼ·ρ) for small rates.
   - The rates are learned from the cluster's own failure history.
   - Ford et al.'s fleet figures seed them until the history is long enough, labelled as such.
-- The commit rule takes the smallest *F* among the ⌈n/2⌉+1 holders (§4.4a) that meets ε. If the live fates cannot
-  meet it, the write commits as persisted.
+- The commit rule takes the smallest *F* among a held quorum's holders and the leader (§4.4a) that
+  meets ε; a holder whose disk holds the write leaves nothing to lose. If the live fates cannot meet
+  it, the write commits as persisted.
 - The estimate is for the failure model of §4.5 only; Byzantine faults, firmware that lies about
   flushes and operator error are outside it, as for every class.
 - **First to arrive.** A write commits on whichever comes first: the durable majority or the held
@@ -217,10 +218,11 @@ in fates *F* = {f₁…f_k}:
 - A fate that recovers and responds promptly for a measured number of rounds restores the faster
   rule, as SAUCR restores fast mode.
 
-### 4.4a Why the memory quorum stays ⌈n/2⌉+1
+### 4.4a Why a plain majority suffices, with durable promises
 
 The first draft of this design committed a replicated write once a plain majority held it in
-memory across enough fates. That is unsafe, and the counterexample fixes the rule.
+memory across enough fates, with SAUCR's recovery. That is unsafe, and the counterexample fixed the
+first build at SAUCR's quorum:
 
 1. Take three voters. The leader L and N hold entry *i* in memory, and L commits *i* on their two
    held acknowledgements. C lags and never received *i*'s append.
@@ -231,27 +233,47 @@ memory across enough fates. That is unsafe, and the counterexample fixes the rul
 4. L takes its durable log as complete, campaigns, and C votes for it. The group then leads on
    without *i*: an acknowledged write lost silently.
 
-SAUCR's fast quorum of ⌈n/2⌉+1 is what makes its max-among-minority recovery sound. The holders of
-a fast commit and any bare minority answering a recovery overlap, so the recovered last-logged
-entry is never below a committed one (its §3.5). The fate condition is therefore added to SAUCR's
-quorum, never in place of it. It refuses a memory commit that SAUCR would make among replicas that
-share a fate (one host, one power feed), and it binds the loss probability where the replicas do
-not. With three voters that means all three hold the write in memory, one round trip and no flush.
+SAUCR's ⌈n/2⌉+1 is what makes its max-among-minority recovery sound: its members record nothing of
+what they acknowledged, so a restarted one must learn it from others. The built design records it
+instead (hyper-raft's core step R-8, its `docs/raft.md` §3.7):
+
+- **A durable promise.** A follower answers for memory only for entries its durable promise covers:
+  the last entry it may answer for, in its hard state, written with the entries it takes before the
+  answers it covers. A member that opens with a promise its log does not reach is marked through it,
+  and judges every vote by the mark as R-5 and R-7 judge a log that lost at rest what it
+  acknowledged. So a member that answered for memory and lost the entry still refuses every
+  candidate that lacks it, and the election quorum meets every commit quorum in a member whose claim
+  covers the entry: Raft's majority suffices.
+- **The leader counts its disk.** Its memory is in every held commit's span (it holds every entry it
+  sent), never in its count: a leader that crashes leaves no mark, and a group with a member away
+  elects as Raft does. In the counterexample L counts only what it has flushed, N's promise marks it
+  past *i*, and with C alone no candidate lacking *i* is elected.
+- **Narrowing.** A promise reaches past the log by what the member expects before its next promise
+  is durable (doubled where that fell short, TCP's slow start), so a mark reaches about as far as its
+  log could have. A restarted member states its incarnation to its leader, which answers with where
+  its log ends, and the mark narrows to that.
+
+What it was held to: hyper-raft's schedules at four settings with every committed entry kept and a
+crash at every persistence step (1,992 points); an exhaustive model of three voters at two and three
+terms (58.2 million classes at three), every rule taken out refused by its shortest history; and the
+design's own dead ends, each found by a schedule and recorded there: SAUCR's recovery left every
+voter recovering with nothing lost, and a promise of a whole term left a voter refusing every
+candidate once its leader was gone. With three voters a write commits on both followers' memory, or
+on the leader's flush and one follower's memory: a round trip and no flush, 396 µs against the
+classic commit's 4.7–17 ms in hyper-raft's simulated pipeline.
 
 ### 4.5 Recovery and the guarantee past the bound
 
-- SAUCR's recovery, carried into hyper-durable:
-  - a persistent marker of the mode an entry was logged in;
-  - each replica's last logged entry, replicated in the leader's appends;
-  - a replica recovering from a memory-mode crash takes the maximum among a bare minority's maps
-    before it may vote, as VR Revisited's recovering replica does.
-- **Batched per node pair.** A restarted node that hosts thousands of groups sends each peer one
-  query naming them all. The peer answers from the maps of every group it shares, in one message, as
-  hyper-multilog batches its groups' traffic per node pair. The node's groups recover in one round
-  trip, not one per group.
-- If more fates fail together than the bound covers, the stream becomes unavailable and says so. It
-  never silently loses data. An operator may accept a loss explicitly, as Kafka's unclean election
-  and KIP-1275's tool let one do.
+- **Marks, not queries.** A replica restarted with a promise its log does not reach is marked through
+  it, narrowed by its leader's end where that leader lives, repaired by entries (R-5) and judged in
+  elections (R-7). No member asks another what it held, so nothing is batched per node pair for
+  recovery; the narrowing rides each group's heartbeats, which hyper-multilog batches per node pair.
+- **A quiet spell.** A follower drops its promise at a heartbeat that finds nothing taken since the
+  one before, so a power cut of every fate while the stream is idle reopens every replica unmarked.
+- If more fates fail together than the bound covers, mid-burst, the stream becomes unavailable and
+  says so: no log shows that what the failed members answered for in memory was committed by no
+  one. It never silently loses data. An operator may accept a loss explicitly, as Kafka's unclean
+  election and KIP-1275's tool let one do.
 
 ### 4.6 The log's confirmation, chosen by fate
 
@@ -335,6 +357,11 @@ These levers pay whichever rule commits:
   window to meet a stated loss bound, with delivery gated on the same bound and the log's
   confirmation chosen by the same fates. To our knowledge from §2's search, no published system or
   paper does this; the parts are SAUCR's, CAD's, AGL+18's and the replica-count models'.
+- **Claim.** A memory commit by a plain majority, made safe by each member's durable promise of what
+  it may answer for, the leader counting its own disk and narrowing a restarted member's mark to its
+  log's end (§4.4a): a majority where SAUCR needs ⌈n/2⌉+1, no recovery query, and a group that elects
+  after any minority's crash. §2's search found no system that bounds a memory acknowledgement by a
+  promise written ahead of it.
 - **Falsified if** a prior system is found that does it. That would be a source to adopt and cite,
   not a reason to stop.
 - **Falsified also if** the measurements do not pay. The replicated class across independent fates
@@ -367,9 +394,9 @@ classifies each run as correct, unavailable (allowed past the bound), or lost (n
 |---|---|---|
 | 3a | Medium detection and calibration on Linux, macOS and Windows; exported; shown in every benchmark row | claims read and costs measured on the box and in CI |
 | 3b | A part replicated over hyper-durable across three nodes; persisted class | against Kafka `flush.messages=1`, JetStream `sync: always` and Redis `WAITAOF`, class for class; the battery's crash rows |
-| 3c | Fate model from topology and detection; replicated class with the commit rule, reaction and recovery of §4.3–4.5 | against Kafka `acks=all` (rack-aware), Redpanda-style write caching and JetStream R3 at their defaults; the battery's full rows |
+| 3c | Fate model from topology and detection; replicated class with the commit rule, reaction and recovery of §4.3–4.5. The core's rule and recovery are built (hyper-raft R-8, vendored at b5ea01b); focal's envelope refuses their fields until this step carries them | against Kafka `acks=all` (rack-aware), Redpanda-style write caching and JetStream R3 at their defaults; the battery's full rows |
 | 3d | Delivery gated on the bound (§4.7); typed acknowledgements (§4.8) | no consumer sees a write later lost, under the battery |
 | 3e | hyper-log's confirmation chosen by fate and by peers (§4.6), with the S01 scenario re-run | persisted-class commit at one flush across fates and on a single node |
 | 3f | The windowed class (§4.2), energy-coalesced flushes (§4.9) | loss after a power cut within W and a consistent prefix, under the battery; joules per committed byte against persisted |
-| 3g | Node-level suspicion for every group, recovery batched per node pair (§4.1, §4.5) | one query per peer on a restart of a node hosting many groups; no per-group heartbeats while idle |
+| 3g | Node-level suspicion for every group (§4.1, §4.5): the core's part built (hyper-raft R-8's `suspect_held`, the shell passing its detector's word) | no per-group heartbeats while idle |
 | 3h | Region-local and multi-region streams (§4.10) | commit latency against CockroachDB's zone and region goals' published costs, class against class |

@@ -15497,3 +15497,19 @@ period's progress, so the peer's period to answer begins when it has the request
 rule says (hyper-raft 4da10dd; two tests there fail under the old rule). Under the same twelve busy
 loops the test passed in 10 runs of 10. `answer_within`'s doc in focal-wire says why its margin still
 serves: one of the asker's judgements may fall just after the acknowledgement.
+
+### 2026-10-18 — Every shared crate at hyper-raft b5ea01b: commits on entries held in memory (R-8), and what leaves without a write
+
+hyper-raft's core step R-8 is in the vendored core, shell and log: a follower answers an append at
+once for the entries its durable promise covers, and a leader that counts its own disk commits on
+the first of the classic quorum and a held quorum, a majority of each half whose fates with its own
+span what the owner asks (doc 33 §4.4a, hyper-raft `docs/raft.md` §3.7). No group of focal's states
+fates, so nothing changes on focal's path until doc 33's step 3c, and focal's envelope refuses a held
+answer, a narrowing's incarnation and a hard state's promise rather than drop them (a held answer
+stripped of its flag would be taken for a durable one; `what_the_envelope_does_not_carry_is_refused`).
+What does change on focal's path: hyper-durable now takes `RawNode::light_now` at every drive, so a
+leader's appends and the entries it commits leave and apply when the core makes them, not when a
+write of the member's own frees a place for the next `Ready` (hyper-raft's simulated pipeline: the
+classic commit at sixty-four clients from 12,990 to 8,660 µs, 4,907 to 7,352 entries a second).
+Doc 33 now states the design as built: a plain majority with durable promises, where its first draft
+kept SAUCR's ⌈n/2⌉+1 for SAUCR's recovery, and why each of the first build's dead ends was left.

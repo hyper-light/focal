@@ -1280,6 +1280,8 @@ fn restore_torn(p: &format::Persisted, g: &state::Group) -> Option<Restore> {
         update: crate::Update {
             hard_state: Some(format::HardState {
                 commit: current.map_or(0, |c| c.commit),
+                // Nor its promise: none was answered for on it, unconfirmed (hyper-raft's R-8).
+                held: current.and_then(|c| c.held),
                 ..h
             }),
             ..crate::Update::default()

@@ -155,6 +155,20 @@ pub struct Message {
     /// member keeps what arrives ahead of a hole (`Ahead::Kept`, R17): it kept the append's
     /// entries, and its leader sends what it lacks before them, not them.
     pub kept: bool,
+    /// On an append's answer: the member holds the leader's entries through `index` in memory,
+    /// said at once, before its write of them (core step R-8, `docs/raft.md` §3.7). It says so
+    /// only of entries its durable promise covers ([`HardState::held_index`]); its durable answer
+    /// follows its write. Only a member of a group whose owner states fates
+    /// ([`crate::Config::fates`]) sends one.
+    pub held: bool,
+    /// Core step R-8's narrowing of a mark (`docs/raft.md` §3.7). On an append's or a heartbeat's
+    /// answer: the incarnation of a member marked through a promise of its term, asking its leader
+    /// where its log ends. On a leader's append or heartbeat: the incarnation it answers. Zero for
+    /// none.
+    pub incarnation: u64,
+    /// On a leader's append or heartbeat that answers an incarnation: the index of the last entry
+    /// of its log as it was sent. Its term holds no entry past it, then or before.
+    pub end: u64,
     /// Where a refused append may resume.
     pub reject_hint: u64,
     /// What the sender attached.
@@ -178,6 +192,14 @@ pub struct HardState {
     pub vote: u64,
     /// The commit index.
     pub commit: u64,
+    /// Core step R-8's promise (`docs/raft.md` §3.7): the last entry this member may answer for in
+    /// memory, an index of the log of term `held_term`'s leader. A held answer leaves only for
+    /// entries a durable promise covers, so a member that opens with a promise its log does not
+    /// reach may have answered for entries its disk lacks, and is marked through it. Zero, with
+    /// `held_term`, for none, which every member of a group that states no fates keeps.
+    pub held_index: u64,
+    /// The term of the promise's leader, at most `term`; zero for none.
+    pub held_term: u64,
 }
 
 /// How a joint change leaves the joint configuration.

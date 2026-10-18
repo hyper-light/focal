@@ -232,6 +232,8 @@ fn verification_refuses_a_copy_that_differs() {
                 term: 1,
                 vote: 1,
                 commit: 0,
+                held_index: 0,
+                held_term: 0,
             }),
             ..Write::default()
         })

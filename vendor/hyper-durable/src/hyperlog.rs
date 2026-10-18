@@ -295,6 +295,11 @@ fn hard_to_log(h: HardState) -> hyper_log::HardState {
         term: h.term,
         vote: h.vote,
         commit: h.commit,
+        // The core's promise (core step R-8): the last entry its member may answer for in memory.
+        held: (h.held_term != 0).then_some(hyper_log::Start {
+            index: h.held_index,
+            term: h.held_term,
+        }),
     }
 }
 
@@ -379,6 +384,10 @@ impl<F: BlockFile + 'static> LogStore for GroupStore<F> {
                     term: h.term,
                     vote: h.vote,
                     commit: h.commit,
+                    // A promise restored from a persist row is the last index there is, which the
+                    // core takes as the last it counts (R-8).
+                    held_index: h.held.map_or(0, |held| held.index),
+                    held_term: h.held.map_or(0, |held| held.term),
                 }),
             health: view.uncertain.map_or(Health::Whole, |mark| {
                 Health::Marked(Point {

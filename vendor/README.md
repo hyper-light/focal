@@ -18,8 +18,8 @@ in this tree.
 
 The `hyper-*` crates are not crates.io archives. They come from the repository focal shares with
 mantle and slates (<https://github.com/hyper-light/hyper-raft>), taken from it whole at one
-revision, which `SNAPSHOT` in each names (since 2026-10-17 all fifteen at 4da10dd of the shared
-repository's `main`, which since 8b36a88 sums CRC-32C with crc-fast, writes a frame on an idle lane
+revision, which `SNAPSHOT` in each names (since 2026-10-18 all fifteen at b5ea01b of the shared
+repository, which since 8b36a88 sums CRC-32C with crc-fast, writes a frame on an idle lane
 straight into its stream, finds a stream's unacknowledged data by binary search, searches each
 path's MTU up to the path's MTU as its kernel holds it, charges a socket's room for what a peer can
 send unprompted at any MTU (a probe timeout after an unanswered one repeats no stream data),
@@ -29,8 +29,11 @@ keeps what a departed peer's socket did in the driver's counts, parks the driver
 fired (a readiness group in hyper-rt), not of every peer socket held, binds a shared port before
 sharing it, so a port-0 bind is never given a port another shared socket holds, sends a probe of the
 path's MTU only as the congestion window and the pacer afford it, refuses a stream as unread only
-when it has written nothing for a window, and gives a request smaller than a datagram, acknowledged
-whole, its peer's period to answer; the event bus's transport, merged at a8f5941 with batched sends and
+when it has written nothing for a window, gives a request smaller than a datagram, acknowledged
+whole, its peer's period to answer, and commits on entries held in memory across the fates an owner
+states (core step R-8: a follower's answer under its durable promise, a leader counting its own disk,
+a restarted member's mark narrowed by its leader, and what may leave or be applied given without a
+write); the event bus's transport, merged at a8f5941 with batched sends and
 receives, the measured receive room, precise timed waits on Linux, macOS and Windows, one CRC pass
 a frame, the sent-packet deque and decimated acknowledgements, and since 76eaa33 a socket's
 account read at an epoch's doublings, a held lane's frame waiting for its owner and an idle turn's
@@ -47,21 +50,21 @@ targets; a change to it is made there first and taken here by a new snapshot, ne
 
 | Crate | Version | Revision | Taken | Why it is here |
 |---|---|---|---|---|
-| `hyper-block` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | Block I/O for the log: aligned direct I/O, each platform's full flush, group commit's wait |
-| `hyper-datagram` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | The sealed datagram plane: consensus and membership messages on a UDP socket of their own beside QUIC, so a vote never waits behind a transfer, keyed from each connection's TLS exporter |
-| `hyper-durable` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | The durable shell a group's replica becomes (27 §15) |
-| `hyper-liveness` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | The node-pair liveness stream, which the shell's owner wires once focal elects by suspicion |
-| `hyper-log` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | The log every group of a data directory writes, one flush for all of them (27 §15.3) |
-| `hyper-measure` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | Measurement only, a dev-dependency of the event bus's benchmarks: the counting allocator, the OS's page-fault, CPU and footprint accounts, the open-loop schedule and quantile intervals |
-| `hyper-quic` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | QUIC (quinn-proto conformed: configuration owned, not shared, no panics), every node's and client's transport |
-| `hyper-raft` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | The consensus core every group runs |
-| `hyper-rt` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | The thread-per-core runtime focal runs on: shards, timers, sockets, signals, the blocking pool (it replaced tokio) |
-| `hyper-rt-transport` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | hyper-transport's endpoint and hyper-datagram's plane driven on a hyper-rt shard, over its batched UDP socket |
-| `hyper-seal` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | Sealing at rest: the log's per-session keys, MACs and tags (hyper-log's sealed log), whole files sealed by STREAM (`sealed_file`), keys wrapped by AES-256-KW and sent to another machine by ML-KEM-1024 |
-| `hyper-sim` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | The deterministic world (seeded streams, virtual time, the simulated block device) hyper-block's `sim` feature builds on, and the bus's simulations will |
-| `hyper-timing` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | The election law's draw the core takes its delays from |
-| `hyper-tls` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | TLS for QUIC and TCP (rustls conformed: configuration owned and lent per call, hybrid post-quantum groups between nodes) |
-| `hyper-transport` | 0.1.0 | `4da10dd5ac0cecc785ec47cc71faee9a823aed61` | 2026-10-17 | Exchanges over QUIC: admission by identity, lanes, credit and the peer's measured timing (it replaced quinn); a lane's `LaneRoom` event, which focal's replication lanes wait on |
+| `hyper-block` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | Block I/O for the log: aligned direct I/O, each platform's full flush, group commit's wait |
+| `hyper-datagram` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | The sealed datagram plane: consensus and membership messages on a UDP socket of their own beside QUIC, so a vote never waits behind a transfer, keyed from each connection's TLS exporter |
+| `hyper-durable` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | The durable shell a group's replica becomes (27 §15) |
+| `hyper-liveness` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | The node-pair liveness stream, which the shell's owner wires once focal elects by suspicion |
+| `hyper-log` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | The log every group of a data directory writes, one flush for all of them (27 §15.3) |
+| `hyper-measure` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | Measurement only, a dev-dependency of the event bus's benchmarks: the counting allocator, the OS's page-fault, CPU and footprint accounts, the open-loop schedule and quantile intervals |
+| `hyper-quic` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | QUIC (quinn-proto conformed: configuration owned, not shared, no panics), every node's and client's transport |
+| `hyper-raft` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | The consensus core every group runs |
+| `hyper-rt` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | The thread-per-core runtime focal runs on: shards, timers, sockets, signals, the blocking pool (it replaced tokio) |
+| `hyper-rt-transport` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | hyper-transport's endpoint and hyper-datagram's plane driven on a hyper-rt shard, over its batched UDP socket |
+| `hyper-seal` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | Sealing at rest: the log's per-session keys, MACs and tags (hyper-log's sealed log), whole files sealed by STREAM (`sealed_file`), keys wrapped by AES-256-KW and sent to another machine by ML-KEM-1024 |
+| `hyper-sim` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | The deterministic world (seeded streams, virtual time, the simulated block device) hyper-block's `sim` feature builds on, and the bus's simulations will |
+| `hyper-timing` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | The election law's draw the core takes its delays from |
+| `hyper-tls` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | TLS for QUIC and TCP (rustls conformed: configuration owned and lent per call, hybrid post-quantum groups between nodes) |
+| `hyper-transport` | 0.1.0 | `b5ea01bad090cc0de7cc7350cc8b4b171dd03cfd` | 2026-10-18 | Exchanges over QUIC: admission by identity, lanes, credit and the peer's measured timing (it replaced quinn); a lane's `LaneRoom` event, which focal's replication lanes wait on |
 
 A new snapshot: `git archive <revision> crates/<name>/src crates/<name>/ORIGIN.md
 crates/<name>/README.md LICENSE` from the shared repository into `vendor/<name>`, `SNAPSHOT` set to
