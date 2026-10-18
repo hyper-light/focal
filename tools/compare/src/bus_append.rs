@@ -1,6 +1,7 @@
-//! The focal event bus's side of `append` (doc 34, step 3b.5): a part replicated by a group of nodes,
-//! and a publisher on the open-loop schedule, each record timed from its intended send to its
-//! batch's acknowledgement, persisted once a majority's disks hold it: the durable replicated append
+//! The focal event bus's side of `append` (doc 34, steps 3b.5 and 3c): a part replicated by a group
+//! of nodes, and a publisher on the open-loop schedule, each record timed from its intended send to
+//! its batch's acknowledgement: persisted once a majority's disks hold it, or, where the group states
+//! its fates, replicated once a majority holds it across them (doc 33 §4.4a): the durable replicated append
 //! the other systems are held to (Kafka `acks=all` with `flush.messages=1`, JetStream `sync: always`,
 //! Redis `appendfsync always` with `WAITAOF`).
 //!
@@ -294,13 +295,23 @@ async fn publish(
                 };
                 last_answer = now;
                 in_flight = in_flight.saturating_sub(batch.records.len());
-                let persisted = Durability::of(ack.class) == Some(Durability::Persisted);
+                // Replicated (a majority across the group's fates, followers in memory under
+                // their durable promises) or persisted (a majority's disks) is a durable replicated
+                // append; anything else (a refusal) failed.
+                let class = Durability::of(ack.class);
+                let durable = matches!(class, Some(Durability::Replicated | Durability::Persisted));
                 for (intended, measured) in batch.records {
-                    if persisted {
+                    if durable {
                         tally.produced = tally.produced.saturating_add(1);
+                        match class {
+                            Some(Durability::Replicated) => {
+                                tally.replicated = tally.replicated.saturating_add(1);
+                            }
+                            _ => tally.persisted = tally.persisted.saturating_add(1),
+                        }
                     }
                     if measured {
-                        let result = if persisted {
+                        let result = if durable {
                             Ok(())
                         } else {
                             Err(format!("class {}", ack.class))

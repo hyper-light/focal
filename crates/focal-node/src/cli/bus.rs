@@ -48,6 +48,54 @@ pub(crate) struct BusStart {
     /// the platform's per-user key directory's `focal-bus-node-ID.key`.
     #[arg(long, requires = "node")]
     pub(crate) key_file: Option<PathBuf>,
+    /// Each node's fate, as `ID=FATE`, one for every node of the group and the same at every node:
+    /// what a failure takes together, a host, a power feed, a zone (doc 33 §4.1). With fates the
+    /// group acknowledges a publish once a majority holds it across `--spanning` fates, in memory
+    /// under durable promises or on disk (doc 33 §4.4a); without, once a majority's disks do.
+    #[arg(long, value_parser = parse_fate, requires = "node")]
+    pub(crate) fate: Vec<(u64, u64)>,
+    /// The distinct fates a commit on entries held in memory spans, with its leader's; by default
+    /// every distinct fate `--fate` states, the most the group can span.
+    #[arg(long, requires = "fate")]
+    pub(crate) spanning: Option<usize>,
+}
+
+/// The group's fates as `--fate` states them, refused unless they name each node of the group,
+/// this one and every `--peer`, exactly once; and the span a held commit must reach.
+fn fates_of(args: &BusStart, node: u64) -> Result<(Vec<(u64, u64)>, usize), focal_bus::BusError> {
+    let mut fates = args.fate.clone();
+    fates.sort_unstable();
+    if fates.is_empty() {
+        return Ok((fates, 0));
+    }
+    let mut named: Vec<u64> = args.peer.iter().map(|(peer, _)| *peer).collect();
+    named.push(node);
+    named.sort_unstable();
+    let stated: Vec<u64> = fates.iter().map(|(id, _)| *id).collect();
+    if stated != named {
+        return Err(focal_bus::BusError::Configuration(
+            "--fate names each node of the group, this one and every --peer, exactly once",
+        ));
+    }
+    let mut distinct: Vec<u64> = fates.iter().map(|(_, fate)| *fate).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let spanning = args.spanning.unwrap_or(distinct.len());
+    Ok((fates, spanning))
+}
+
+/// A `--fate` value: `ID=FATE`.
+fn parse_fate(value: &str) -> Result<(u64, u64), String> {
+    let (id, fate) = value
+        .split_once('=')
+        .ok_or_else(|| format!("a fate is ID=FATE, not {value:?}"))?;
+    let id = id
+        .parse::<u64>()
+        .map_err(|_| format!("a node's id is a number, not {id:?}"))?;
+    let fate = fate
+        .parse::<u64>()
+        .map_err(|_| format!("a fate is a number, not {fate:?}"))?;
+    Ok((id, fate))
 }
 
 /// A `--peer` value: `ID=ADDRESS`.
@@ -85,8 +133,9 @@ pub(crate) fn run(args: BusStart) -> Result<(), Box<dyn std::error::Error + Send
 /// Runs the node.
 pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
     let memory_bytes = node_bytes()?;
-    let group = match (args.node, args.data) {
+    let group = match (args.node, args.data.clone()) {
         (Some(node), Some(data)) => {
+            let (fates, spanning) = fates_of(&args, node)?;
             let key_file = match args.key_file {
                 Some(path) => path,
                 None => focal_seal::default_key_file(&focal_bus::pki::node_name(node)).ok_or(
@@ -98,6 +147,8 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
                 peers: args.peer,
                 data,
                 key_file,
+                fates,
+                spanning,
             })
         }
         _ => None,

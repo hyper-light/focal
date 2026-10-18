@@ -84,6 +84,28 @@ pub struct MemberSettings {
     pub key_file: PathBuf,
     /// The bytes of the node's memory budget: what the window and the log's retention follow.
     pub memory_bytes: u64,
+    /// Each node of the group's fate, in order of node, one each, the same at every node: what a
+    /// failure takes together (doc 33 §4.1). None states no fate, and the group commits on a
+    /// majority's disks alone.
+    pub fates: Vec<(u64, u64)>,
+    /// The distinct fates a commit on entries held in memory must span, with its leader's (core
+    /// step R-8, doc 33 §4.4a).
+    pub spanning: usize,
+}
+
+/// What a group of these fates acknowledges: replicated, held by a majority across `spanning`
+/// fates or on a disk among them, where its members' distinct fates reach the span; otherwise
+/// persisted, a majority's disks, for a group whose replicas share their fates never claims a
+/// memory quorum one failure would erase (doc 33 §4.2).
+fn class_of(fates: &[(u64, u64)], spanning: usize) -> Durability {
+    let mut distinct: Vec<u64> = fates.iter().map(|(_, fate)| *fate).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if !fates.is_empty() && spanning > 0 && distinct.len() >= spanning {
+        Durability::Replicated
+    } else {
+        Durability::Persisted
+    }
 }
 
 /// What a node of a group did.
@@ -248,6 +270,8 @@ pub struct Member {
     origin: Instant,
     encoded: Vec<u8>,
     stats: MemberStats,
+    /// What the group's commit achieves, its acknowledgements' class ([`class_of`]).
+    class: Durability,
 }
 
 impl std::fmt::Debug for Member {
@@ -415,6 +439,9 @@ impl Member {
         })
         .map_err(|_| BusError::Configuration("the group's limits"))?;
         let outbox_bound = limits.pending_messages;
+        let mut fates = settings.fates.clone();
+        fates.sort_unstable();
+        let class = class_of(&fates, settings.spanning);
         let shell = Shell {
             core: Config {
                 max_size_per_msg: wire::ENTRY_BOUND,
@@ -426,6 +453,14 @@ impl Member {
                 check_quorum: true,
                 pre_vote: true,
                 seed: settings.id,
+                // Held commits where the group states its fates (core step R-8): a follower
+                // answers for what it holds in memory under its durable promise, and the leader,
+                // counting its own disk, commits on a majority whose fates with its own span
+                // `spanning`, or on a majority's disks, whichever comes first.
+                fates: (class == Durability::Replicated).then(|| hyper_raft::Fates {
+                    of: fates.clone(),
+                    spanning: settings.spanning,
+                }),
                 ..Config::new(settings.id, limits)
             },
             elections: hyper_raft::Elections::Suspicion,
@@ -466,6 +501,7 @@ impl Member {
             origin: now,
             encoded: Vec::new(),
             stats: MemberStats::default(),
+            class,
         })
     }
 
@@ -487,6 +523,11 @@ impl Member {
     /// The term the node knows the part in.
     pub fn term(&self) -> u64 {
         self.replica.term()
+    }
+
+    /// What the group's commit achieves: the class its acknowledgements state.
+    pub const fn class(&self) -> Durability {
+        self.class
     }
 
     /// The leader the node knows, and the term it knows the part in.
@@ -976,12 +1017,10 @@ impl Member {
             return;
         };
         let (base, count, class) = match applied.outcome {
-            Outcome::Appended { base } => (base, applied.count, Durability::Persisted.code()),
-            Outcome::Again { base: Some(base) } => {
-                (base, applied.count, Durability::Persisted.code())
-            }
+            Outcome::Appended { base } => (base, applied.count, self.class.code()),
+            Outcome::Again { base: Some(base) } => (base, applied.count, self.class.code()),
             // Taken before, its offsets no longer said: an acknowledgement of no records.
-            Outcome::Again { base: None } => (0, 0, Durability::Persisted.code()),
+            Outcome::Again { base: None } => (0, 0, self.class.code()),
             Outcome::Refused(_) => (0, 0, Ack::REFUSED),
         };
         let ack = Ack {

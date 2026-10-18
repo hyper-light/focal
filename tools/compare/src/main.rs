@@ -411,6 +411,10 @@ pub struct Tally {
     pub held_most_ns: u64,
     /// When the hold in progress began.
     pub held_since: Option<std::time::Instant>,
+    /// focal's bus: records acknowledged replicated (a majority across the group's fates) and
+    /// persisted (a majority's disks).
+    pub replicated: u64,
+    pub persisted: u64,
 }
 impl Tally {
     fn record(

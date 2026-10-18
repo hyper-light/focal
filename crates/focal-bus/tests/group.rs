@@ -223,6 +223,8 @@ struct World {
     sent: u32,
     events: u64,
     subscribe_at: Option<u64>,
+    /// The class every acknowledgement states.
+    class: Durability,
 }
 
 impl World {
@@ -326,11 +328,12 @@ impl World {
         let mut redirected = Vec::new();
         let seen = &mut self.seen;
         let unacked = &mut self.unacked;
+        let class = self.class;
         client.on_event(self.client.endpoint(), event, |delivery| match delivery {
             Delivery::Acked(ack) => {
                 assert_eq!(ack.stream, STREAM);
                 assert_eq!(ack.producer, PRODUCER);
-                assert_eq!(Durability::of(ack.class), Some(Durability::Persisted));
+                assert_eq!(Durability::of(ack.class), Some(class));
                 unacked.remove(&ack.sequence);
                 if ack.count == 0 || seen.acked.contains_key(&ack.sequence) {
                     seen.again += 1;
@@ -399,6 +402,7 @@ fn open_node(
     dir: &Path,
     addresses: &[SocketAddr],
     driver: Drv,
+    fates: &[(u64, u64)],
 ) -> Running {
     let budget = MemoryBudget::new(usize::try_from(NODE_MEMORY).unwrap(), 0).unwrap();
     let node = Node::new(
@@ -427,6 +431,8 @@ fn open_node(
             data,
             key_file: keys.join(format!("node-{id}.key")),
             memory_bytes: NODE_MEMORY,
+            fates: fates.to_vec(),
+            spanning: 2,
         },
         node,
         NODES.to_vec(),
@@ -440,8 +446,25 @@ fn open_node(
     Running { driver, member }
 }
 
+/// Persisted: the group states no fates, and acknowledges a publish once a majority's disks hold
+/// it.
 #[test]
 fn a_part_replicated_by_three_nodes_acknowledges_what_it_persisted_and_keeps_it_past_its_leader() {
+    group_keeps_what_it_acknowledged(&[], Durability::Persisted);
+}
+
+/// Replicated (core step R-8): each node its own fate, a publish acknowledged once a majority holds
+/// it across two fates, followers in memory under their durable promises; every acknowledged
+/// batch is in the new leader's part after the old one is killed.
+#[test]
+fn a_part_held_across_three_fates_acknowledges_replicated_and_keeps_it_past_its_leader() {
+    group_keeps_what_it_acknowledged(&[(1, 1), (2, 2), (3, 3)], Durability::Replicated);
+}
+
+/// Three nodes stating `fates`, every acknowledgement of `class` (module docs).
+fn group_keeps_what_it_acknowledged(fates: &[(u64, u64)], class: Durability) {
+    // The runtime's task owns what it uses.
+    let fates = fates.to_vec();
     let ids = Identities::new();
     let dir = tempfile::tempdir().unwrap();
     let client_budget = MemoryBudget::new(64 << 20, 0).unwrap();
@@ -461,7 +484,9 @@ fn a_part_replicated_by_three_nodes_acknowledges_what_it_persisted_and_keeps_it_
             let nodes = NODES
                 .iter()
                 .zip(drivers)
-                .map(|(id, driver)| Some(open_node(&ids, *id, dir.path(), &addresses, driver)))
+                .map(|(id, driver)| {
+                    Some(open_node(&ids, *id, dir.path(), &addresses, driver, &fates))
+                })
                 .collect();
             let client = Driver::bind(
                 ids.client(&client_budget),
@@ -482,6 +507,7 @@ fn a_part_replicated_by_three_nodes_acknowledges_what_it_persisted_and_keeps_it_
                 sent: 0,
                 events: 0,
                 subscribe_at: None,
+                class,
             };
             let now = Instant::now();
             for running in world.running() {

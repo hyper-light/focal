@@ -16,6 +16,10 @@ pub struct Report {
     redis_lanes: usize,
     sent: u64,
     acknowledged: u64,
+    /// focal's bus: of those, acknowledged replicated (a majority across the group's fates) and
+    /// persisted (a majority's disks).
+    acknowledged_replicated: u64,
+    acknowledged_persisted: u64,
     refused_by_generator: u64,
     /// Messages the schedule still held when its time was over, never offered: a rate past what
     /// the generator publishes.
@@ -112,6 +116,8 @@ impl Report {
             redis_lanes: args.lanes,
             sent: tally.sent,
             acknowledged,
+            acknowledged_replicated: tally.replicated,
+            acknowledged_persisted: tally.persisted,
             refused_by_generator: tally.refused,
             behind_schedule: tally.behind,
             publisher_holds: tally.holds,
@@ -162,6 +168,8 @@ impl Report {
             redis_lanes: 0,
             sent: tally.sent,
             acknowledged: tally.produced,
+            acknowledged_replicated: tally.replicated,
+            acknowledged_persisted: tally.persisted,
             refused_by_generator: tally.refused,
             behind_schedule: tally.behind,
             publisher_holds: tally.holds,

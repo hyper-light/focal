@@ -55,6 +55,10 @@ pub struct GroupServe {
     pub data: PathBuf,
     /// The root key file the node's log's keys are kept under, outside `data`.
     pub key_file: PathBuf,
+    /// Each node's fate, the same at every node; none for a group that commits on its disks alone.
+    pub fates: Vec<(u64, u64)>,
+    /// The distinct fates a commit on entries held in memory must span.
+    pub spanning: usize,
 }
 
 /// The most client identities a node of `memory_bytes` admits: each holds its connections
@@ -180,6 +184,8 @@ pub async fn serve(
                 data: group.data,
                 key_file: group.key_file,
                 memory_bytes,
+                fates: group.fates,
+                spanning: group.spanning,
             },
             node,
             members,
