@@ -15420,3 +15420,51 @@ the quiet runs' tail (p99 0.70 to 2.60 ms either way, the machine shared).
 
 Test: `node::tests::a_full_window_lets_its_oldest_segment_go_as_the_tail_fills` (once the window
 fills three segments, no append lets more than two batches go; at the rollover one let 990).
+
+### 2026-10-17 — Every shared crate at hyper-raft b39a889: MTU discovery to the path, and the receive room on small buffers
+
+hyper-raft's search to the path's MTU (c7b7ea1) made a 9,216-byte probe the costliest datagram a
+socket's room charged, and the room charged every unprompted datagram as one. A node's shared
+socket then reserved 9.45 MB of macOS's 8 MiB queue for its admission places, refused every first
+window, and 9 of focal-node's 414 tests failed. The fix at b39a889 charges acknowledgements and a
+handshake's probes as the smallest datagram, charges an admission place only while a handshake
+holds it, and repeats no stream data in a probe after an unanswered one (hyper-quic patch Q23).
+macOS passes 414 of 414. On Docker's default Linux buffer (319 KB usable), 13 failed and 2,285
+first windows were refused before; 8 and 117 after, the rest the shared socket's (closed below,
+2026-10-17, a socket for each peer). The bus's batch CRC-32C is crc-fast's (8977cf5b): the crc32c
+crate took its slow path in every generic build, 135 ns against 18 ns for 1.2 KB.
+
+### 2026-10-17 — Nodes starting together share their key directory; a joiner the sponsor's bounds refuse dials again
+
+A root key's directory, missing, was looked for and then made, and a second node of the same user
+starting at the same moment failed its start with "File exists" (`focal_platform::fs::
+ensure_dir_private` takes a directory another process made after the look, as `create_dir_all`
+does). A joiner whose dial a sponsor's bounds refused gave up at once and failed its join; it now
+dials again within its timeout, the pause the refused dial's own time, doubled at each refusal
+(RFC 6298 §5.5) with equal jitter: of 8 joiners against 1 pending place, 3 ended `Unavailable`
+before, none after.
+
+### 2026-10-17 — A node's listener gives each peer a socket of its own
+
+The service bound its listener's socket itself and handed it over, and a driver handed a socket
+kept every peer on it: every connection a node accepted shared one receive queue. The listener now
+binds through the driver (`Bind::Address`), each connection getting a socket of its own on the
+listener's port, connected to its peer; the node tests' listeners do the same. On deliver at 400/s
+on one CPU, runs with refusals fell from 14 of 30 to 0 of 28 (reads refused 32-894 a run, writes
+604-796, lifecycles abandoned). The listener's UDP counts take in its peers' sockets, where they
+counted its handshakes alone (292 datagrams for a run that moved millions). A comparison run's
+bound now passes what its generator waits for a deliver lifecycle.
+
+### 2026-10-17 — Every shared crate at hyper-raft 1912194: a park at the cost of what fired; a shared port its listener's alone; a probe within the window; a stream read in steps never refused as unread
+
+- With a socket for each peer, every park of the listener's driver polled every socket's wait: an
+  exchange cost 11 ns more for each connection held (18.4-18.9 µs beside 512 against 12.6-12.9
+  beside one). hyper-rt's readiness group tells the driver what fired: 13.6-13.8 µs beside 512.
+- On Linux a port-0 bind flagged `SO_REUSEPORT` could be given a port another flagged socket of the
+  user held, and the two split its datagrams: of 256 clients, 1-3 never connected in 4 runs of 5.
+  A shared port is bound before it is flagged; peers' sockets join it.
+- A probe of the path's MTU went whenever a connection was idle, past its window: behind
+  `evidence_quic`'s 128 kbit/s relays its 33 KB held each link two seconds and three nodes elected
+  no leader in every run on Linux. A probe waits for the window and the pacer (RFC 8899 §3, item 7).
+- A stream its peer read in steps was refused as unread while it moved (8 MiB, 12 runs of 14 under
+  two dozen busy loops); an unread wait now starts again whenever the stream has written more.
