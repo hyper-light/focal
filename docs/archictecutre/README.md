@@ -52,6 +52,7 @@ states or mutations are already implemented.
 | [30 — A write path ten times better: in memory first](30-in-memory-write-path.md) | Measured cost of a write by layer against NATS, the literature by layer, the in-place state structures, capture-scoped checkpoints and the per-write budget for an order of magnitude |
 | [31 — The message ledger: in memory, sharded, durable in the background](31-message-ledger.md) | Focal as a message ledger: partitions on owner shards, a contiguous one-probe hot state, pipelined replication without re-validation, durability classes, retirement into a Bε-tree cold tier, recency-ordered tiers, and the owner's open decisions |
 | [32 — The event bus: in memory, durable off the delivery path](32-event-bus.md) | The rewrite: claims to respondents and testaments to recipients as small messages, artifacts as references, durability classes, one log a part with chained streams, the edge codec, and steps 0–1 measured |
+| [33 — Fate-aware durability: the bus's replicated and persisted classes](33-fate-aware-durability.md) | Step 3's durability: the sources read (SAUCR, CAD, Ford et al., the kernel's cache semantics), what counting nodes instead of fates leaves open, a per-write commit rule from fate diversity, media and a stated loss bound, delivery gated on it, the log's confirmation chosen by fate, and the adversarial battery |
 | [Hecate source snapshot](reference/README.md) | Imported architecture and supporting specs, original provenance and hashes |
 
 ## Authority and current status
