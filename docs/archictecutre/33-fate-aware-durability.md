@@ -151,7 +151,7 @@ Doc 32's three classes stay. What changes is what "replicated" and "persisted" c
 | Class | Acknowledged when | Survives |
 |---|---|---|
 | ephemeral | the owner has it | nothing past the owner's crash; gaps are announced |
-| replicated | a majority holds it, and the holders span enough independent fates to meet the stream's loss bound with the measured ρ (§4.3); otherwise as persisted | any failure the bound covers; beyond it, unavailable rather than lossy (§4.5) |
+| replicated | ⌈n/2⌉+1 voters hold it in memory (SAUCR's fast quorum), none suspected, and the holders span enough independent fates to meet the stream's loss bound with the measured ρ (§4.3); otherwise as persisted | any failure the bound covers; beyond it, unavailable rather than lossy (§4.5) |
 | persisted | a majority holds it on stable media: a flushed write-back device, or a write-through device at completion | any crash of any number of nodes |
 
 A replicated stream with every replica in one fate (a laptop, a single box) commits as persisted, and
@@ -171,7 +171,7 @@ in fates *F* = {f₁…f_k}:
 - With fate failure rates λᵢ, the loss probability is at most about τ·Σᵢ λᵢ·Πⱼ≠ᵢ (λⱼ·ρ) for small rates.
   - The rates are learned from the cluster's own failure history.
   - Ford et al.'s fleet figures seed them until the history is long enough, labelled as such.
-- The commit rule takes the smallest *F* among the majority that meets ε. If the live fates cannot
+- The commit rule takes the smallest *F* among the ⌈n/2⌉+1 holders (§4.4a) that meets ε. If the live fates cannot
   meet it, the write commits as persisted.
 - The estimate is for the failure model of §4.5 only; Byzantine faults, firmware that lies about
   flushes and operator error are outside it, as for every class.
@@ -187,6 +187,27 @@ in fates *F* = {f₁…f_k}:
   separates suspicion from declaration (Lifeguard).
 - A fate that recovers and responds promptly for a measured number of rounds restores the faster
   rule, as SAUCR restores fast mode.
+
+### 4.4a Why the memory quorum stays ⌈n/2⌉+1
+
+The first draft of this design committed a replicated write once a plain majority held it in
+memory across enough fates. That is unsafe, and the counterexample fixes the rule.
+
+1. Take three voters. The leader L and N hold entry *i* in memory, and L commits *i* on their two
+   held acknowledgements. C lags and never received *i*'s append.
+2. L and N crash before either flushes *i*.
+3. Each restarts not knowing how far it acknowledged. It asks a bare minority, which is C, for its
+   last logged entry, as SAUCR's recovery does. C's map, never sent *i*'s append, names an older
+   entry.
+4. L takes its durable log as complete, campaigns, and C votes for it. The group then leads on
+   without *i*: an acknowledged write lost silently.
+
+SAUCR's fast quorum of ⌈n/2⌉+1 is what makes its max-among-minority recovery sound. The holders of
+a fast commit and any bare minority answering a recovery overlap, so the recovered last-logged
+entry is never below a committed one (its §3.5). The fate condition is therefore added to SAUCR's
+quorum, never in place of it. It refuses a memory commit that SAUCR would make among replicas that
+share a fate (one host, one power feed), and it binds the loss probability where the replicas do
+not. With three voters that means all three hold the write in memory, one round trip and no flush.
 
 ### 4.5 Recovery and the guarantee past the bound
 
