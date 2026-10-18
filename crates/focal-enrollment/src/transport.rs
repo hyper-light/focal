@@ -483,8 +483,9 @@ impl EnrollmentClient {
         )
         .map_err(|_| JoinTransportError::Unavailable)?;
         let timeout = self.limits.timeout;
+        let deadline = hyper_rt::futures::now_ns().saturating_add(nanos(timeout));
         let exchanged = hyper_rt::futures::within(nanos(timeout), async {
-            let link = connect(&connector, address, trust).await?;
+            let link = connect(&connector, address, trust, deadline).await?;
             // The link wipes the message however its exchange ends: it holds an invitation's
             // secret.
             let answer = link
@@ -531,19 +532,21 @@ fn nanos(period: Duration) -> u64 {
     u64::try_from(period.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// The connection to the sponsor at `address`, its leaf pinned. A dial the sponsor's bounds refused
-/// (its handshake places or its socket's room taken: `AccessError::Capacity`) or that reached no
-/// sponsor sent nothing, so it is made again after [`dial_pause`]; the caller's timeout ends the
-/// dials. A leaf not pinned and a failed TLS authentication are the sponsor's answer and end them
-/// at once. Each joiner gave up at its first refusal: in a burst of joiners the sponsor's places
+/// The connection to the sponsor at `address`, its leaf pinned, dialed until `deadline` (the
+/// caller's, on `now_ns`'s clock). A dial the sponsor's bounds refused (its handshake places or its
+/// socket's room taken: `AccessError::Capacity`) or that reached no sponsor sent nothing, so it is
+/// made again after the pause [`Backoff`] gives; the caller's timeout ends the dials. A leaf not
+/// pinned and a failed TLS authentication are the sponsor's answer and end them at once. Each joiner gave up at its first refusal: in a burst of joiners the sponsor's places
 /// were taken, and every joiner past them failed its whole join (on Linux's default receive buffer
 /// a sponsor's socket holds two first windows at once, hyper-raft's `docs/transport.md` §4s).
 async fn connect(
     connector: &QuicConnector,
     address: SocketAddr,
     trust: &ServerTrust,
+    deadline: u64,
 ) -> Result<focal_wire::EnrollmentLink, JoinTransportError> {
-    let mut refusals = 0u32;
+    let mut backoff = Backoff::default();
+    let mut refusals = 0u32; // DIAG
     let first = hyper_rt::futures::now_ns(); // DIAG
     // Bound: each pause is at least half of the last dial's time doubled once for each refusal
     // before, and never under the timer's granularity, so 128 of them pass any `Duration`, and the
@@ -555,7 +558,10 @@ async fn connect(
             .await
         {
             Ok(link) => {
-                eprintln!("DIAG dial ok after {refusals} refusals, {} ms since the first dial", hyper_rt::futures::now_ns().saturating_sub(first) / 1_000_000); // DIAG
+                eprintln!(
+                    "DIAG dial ok after {refusals} refusals, {} ms since the first dial",
+                    hyper_rt::futures::now_ns().saturating_sub(first) / 1_000_000
+                ); // DIAG
                 return Ok(link);
             }
             Err(WireError::Unpinned) => {
@@ -563,9 +569,14 @@ async fn connect(
             }
             Err(WireError::Authentication) => return Err(JoinTransportError::Unavailable),
             Err(error) => {
-                let took = Duration::from_nanos(hyper_rt::futures::now_ns().saturating_sub(began));
-                let pause = dial_pause(took, refusals, entropy());
-                eprintln!("DIAG dial refused {error:?}: took {took:?}, pause {pause:?}, refusal {refusals}, {} ms since the first dial", hyper_rt::futures::now_ns().saturating_sub(first) / 1_000_000); // DIAG
+                let now = hyper_rt::futures::now_ns();
+                let took = Duration::from_nanos(now.saturating_sub(began));
+                let left = Duration::from_nanos(deadline.saturating_sub(now));
+                let pause = backoff.pause(took, left, entropy());
+                eprintln!(
+                    "DIAG dial refused {error:?}: took {took:?}, pause {pause:?}, refusal {refusals}, {} ms since the first dial",
+                    hyper_rt::futures::now_ns().saturating_sub(first) / 1_000_000
+                ); // DIAG
                 refusals = refusals.saturating_add(1);
                 let _ = hyper_rt::futures::sleep(nanos(pause)).await;
             }
@@ -574,16 +585,47 @@ async fn connect(
     Err(JoinTransportError::Unavailable)
 }
 
-/// The pause before the dial that follows `refusals` refused ones, the last of which took `took`:
-/// that time, at least the timer's granularity (RFC 9002 §6.1.2), doubled for each refusal as TCP
-/// doubles its retransmission timer (RFC 6298 §5.5); its first half is waited and its second drawn
-/// uniformly from `random`, so joiners refused together come back apart and the pauses still grow
-/// (equal jitter: Brooker, "Exponential Backoff And Jitter", AWS Architecture Blog, 2015). The
-/// time a dial took to be refused is a round trip and the sponsor's work on it, about the time
-/// its handshakes hold a place.
-pub(crate) fn dial_pause(took: Duration, refusals: u32, random: u64) -> Duration {
-    let base = took.max(focal_wire::TIMER_GRANULARITY);
-    let doubled = base.saturating_mul(2u32.saturating_pow(refusals));
+/// The pauses between a joiner's refused dials: equal jitter over an exponential backoff from a
+/// constant base, capped (Brooker, "Exponential Backoff And Jitter", AWS Architecture Blog, 2015:
+/// `min(cap, base · 2^attempt)`, half of it waited and the other half drawn).
+///
+/// - **The base** is the least time a refused dial has taken: a round trip and the sponsor's work
+///   on a dial, without the queue its other handshakes made the dial wait in, the floor TCP keeps
+///   of its round trip (RFC 6298 §2). The last dial's time was the base, and one dial the sponsor
+///   held behind its handshakes multiplied every pause after it: on Windows CI a 138 ms refusal at
+///   the eighth gave a 25-second pause, past the joiner's whole 15-second budget, and three joiners
+///   of eight failed their join in each of six runs.
+/// - **The cap** is what the caller's deadline leaves less one more dial at the base, so a pause
+///   never outlasts the time in which the dial after it could still be answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Backoff {
+    /// The least a refused dial took so far.
+    floor: Option<Duration>,
+    /// Dials refused so far.
+    refusals: u32,
+}
+
+impl Backoff {
+    /// The pause after a dial refused in `took`, the caller's deadline `left` away, drawn from
+    /// `random`.
+    pub(crate) fn pause(&mut self, took: Duration, left: Duration, random: u64) -> Duration {
+        let base = self.floor.map_or(took, |least| least.min(took));
+        self.floor = Some(base);
+        let cap = left.saturating_sub(base);
+        let pause = dial_pause(base, self.refusals, cap, random);
+        self.refusals = self.refusals.saturating_add(1);
+        pause
+    }
+}
+
+/// The pause before the dial that follows `refusals` refused ones: `base`, at least the timer's
+/// granularity (RFC 9002 §6.1.2), doubled for each refusal as TCP doubles its retransmission timer
+/// (RFC 6298 §5.5) and no more than `cap`; its first half is waited and its second drawn uniformly
+/// from `random`, so joiners refused together come back apart and the pauses still grow (equal
+/// jitter, [`Backoff`]).
+pub(crate) fn dial_pause(base: Duration, refusals: u32, cap: Duration, random: u64) -> Duration {
+    let base = base.max(focal_wire::TIMER_GRANULARITY);
+    let doubled = base.saturating_mul(2u32.saturating_pow(refusals)).min(cap);
     let half = doubled.checked_div(2).unwrap_or(Duration::ZERO);
     let drawn = half
         .as_nanos()

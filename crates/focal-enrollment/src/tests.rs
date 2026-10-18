@@ -663,14 +663,15 @@ fn prepared_publication_checks_lineage_revision_and_metadata_budget() {
     EnrollmentRegistry::restore(&bytes, [1; 16], limits).unwrap();
 }
 
-/// A dial's pause doubles from the time the refused dial took, at least the timer's granularity,
-/// its first half waited and its second drawn. Do: pauses for dials of 3 ms and of nothing, at
-/// each of the first four refusals, with the least and the largest draws. Expect: 1.5–3, 3–6,
-/// 6–12 and 12–24 ms for the 3 ms dial; from 0.5–1 ms for the instant one; a saturated doubling
-/// stays a `Duration`.
+/// A dial's pause doubles from its base, at least the timer's granularity, its first half waited and
+/// its second drawn, and never passes its cap. Do: pauses for a base of 3 ms and of nothing, at each
+/// of the first four refusals, with the least and the largest draws, uncapped; then capped. Expect:
+/// 1.5–3, 3–6, 6–12 and 12–24 ms for the 3 ms base; from 0.5–1 ms for the instant one; a saturated
+/// doubling stays a `Duration`; a capped pause is at most its cap.
 #[test]
-fn a_refused_dial_waits_its_own_time_doubled_half_drawn_at_random() {
+fn a_refused_dial_waits_its_base_doubled_half_drawn_at_random_within_its_cap() {
     let ms = Duration::from_millis;
+    let none = Duration::MAX;
     for (refusals, least, most) in [
         (0, 1_500, 3_000),
         (1, 3_000, 6_000),
@@ -678,20 +679,54 @@ fn a_refused_dial_waits_its_own_time_doubled_half_drawn_at_random() {
         (3, 12_000, 24_000),
     ] {
         assert_eq!(
-            transport::dial_pause(ms(3), refusals, 0),
+            transport::dial_pause(ms(3), refusals, none, 0),
             Duration::from_micros(least)
         );
         assert_eq!(
-            transport::dial_pause(ms(3), refusals, u64::MAX),
+            transport::dial_pause(ms(3), refusals, none, u64::MAX),
             Duration::from_micros(most)
         );
     }
     assert_eq!(
-        transport::dial_pause(Duration::ZERO, 0, 0),
+        transport::dial_pause(Duration::ZERO, 0, none, 0),
         Duration::from_micros(500)
     );
-    assert_eq!(transport::dial_pause(Duration::ZERO, 0, u64::MAX), ms(1));
-    assert!(transport::dial_pause(ms(3), u32::MAX, u64::MAX) >= Duration::from_secs(1 << 20));
+    assert_eq!(
+        transport::dial_pause(Duration::ZERO, 0, none, u64::MAX),
+        ms(1)
+    );
+    assert!(transport::dial_pause(ms(3), u32::MAX, none, u64::MAX) >= Duration::from_secs(1 << 20));
+    assert_eq!(transport::dial_pause(ms(3), 10, ms(100), u64::MAX), ms(100));
+    assert_eq!(
+        transport::dial_pause(ms(3), 10, Duration::ZERO, u64::MAX),
+        Duration::ZERO
+    );
+}
+
+/// The backoff's base is the least a refused dial took, so one dial the sponsor held behind its
+/// handshakes does not multiply every pause after it, and no pause outlasts the deadline less a
+/// dial. Do: the refusals Windows CI traced for one joiner (a first dial held 1.2 s, ten refused in
+/// about 10.5 ms, then one held 138 ms at the eighth refusal), the largest draws, a 15-second budget.
+/// Expect: the pause after the 138 ms refusal is 10.5 ms doubled eight times (2.7 s), where the
+/// last dial's time made it 35 s; and every pause leaves the deadline a dial.
+#[test]
+fn a_dial_held_behind_the_sponsors_handshakes_does_not_multiply_the_pauses_after_it() {
+    let budget = Duration::from_secs(15);
+    let mut backoff = transport::Backoff::default();
+    let mut spent = Duration::ZERO;
+    let mut tooks = vec![Duration::from_millis(1_200)];
+    tooks.extend(std::iter::repeat_n(Duration::from_micros(10_500), 7));
+    tooks.push(Duration::from_millis(138));
+    let mut last = Duration::ZERO;
+    for took in tooks {
+        spent += took;
+        let pause = backoff.pause(took, budget.saturating_sub(spent), u64::MAX);
+        assert!(spent + pause + Duration::from_micros(10_500) <= budget || pause.is_zero());
+        spent += pause;
+        last = pause;
+    }
+    // Eight refusals before the 138 ms one: its pause is the floor doubled eight times.
+    assert_eq!(last, Duration::from_micros(10_500) * 256);
 }
 
 /// Joiners the sponsor's bounds refuse dial again within their timeout, where each gave up at
@@ -743,7 +778,10 @@ async fn refused_joiners_dial_again() {
     for joiner in joiners {
         answers.push(joiner.await.unwrap());
     }
-    eprintln!("DIAG answers {answers:?} calls {}", calls.load(Ordering::SeqCst)); // DIAG
+    eprintln!(
+        "DIAG answers {answers:?} calls {}",
+        calls.load(Ordering::SeqCst)
+    ); // DIAG
     assert!(
         answers
             .iter()
