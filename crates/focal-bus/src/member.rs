@@ -168,6 +168,31 @@ pub struct MemberStats {
     pub busy_most_ns: u64,
     /// What the node's log wrote to its device, as the log counted it.
     pub log: LogWrites,
+    /// What the node's liveness stream did, over the peers it watches.
+    pub liveness: LivenessFigures,
+}
+
+/// What a node's liveness stream did, summed over the peers it watches
+/// (`hyper_liveness::PairReport`): its heartbeats, and the empty writes it asked of the log to
+/// prove them, each a frame of the log's where no other durable write came in time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LivenessFigures {
+    /// Empty writes the stream asked the log for: heartbeats no other durable write proved.
+    pub writes: u64,
+    /// Heartbeats sent to the peers.
+    pub sent: u64,
+    /// Heartbeats taken from the peers.
+    pub taken: u64,
+    /// Slots that came due while the node was behind and were never sent.
+    pub skipped: u64,
+    /// Heartbeats refused for their flush proof.
+    pub unproven: u64,
+    /// The least and the most interval the node's heartbeats to a peer are due at, nanoseconds;
+    /// zero before one is scheduled.
+    pub sending_least_ns: u64,
+    pub sending_most_ns: u64,
+    /// The floor under every interval the node sends at (`E[flush] + G`), nanoseconds.
+    pub floor_ns: u64,
 }
 
 /// What a node's log wrote from its opening, as hyper-log counted it (`hyper_log::LogStats`): what
@@ -196,11 +221,16 @@ pub struct LogWrites {
     pub commit_wait_max_ns: u64,
     /// Asks for a slot past the file's bound the log refused, each answered `Full`.
     pub growth_refused: u64,
+    /// Whether the log's file system writes its file in place where it would copy it on write
+    /// (`DeviceFile::written_in_place`): btrfs's mark, asked as an empty file is opened. `None`
+    /// on a file system that writes every file in place.
+    pub written_in_place: Option<bool>,
 }
 
 impl LogWrites {
-    fn of(stats: &hyper_log::LogStats) -> Self {
+    fn of(stats: &hyper_log::LogStats, written_in_place: Option<bool>) -> Self {
         Self {
+            written_in_place,
             frames: stats.frames,
             updates: stats.updates,
             bytes: stats.bytes,
@@ -401,6 +431,8 @@ pub struct Member {
     peers: Vec<(u64, SocketAddr)>,
     replica: PartReplica,
     log: Log<DeviceFile>,
+    /// Whether the log's file is written in place, as its file system said when it was opened.
+    written_in_place: Option<bool>,
     liveness: Liveness,
     asked: Asked,
     attached: Vec<u64>,
@@ -527,8 +559,13 @@ fn log_config(align: Alignment, memory_bytes: u64) -> Result<hyper_log::Config, 
     .map_err(|_| BusError::Configuration("the node's log facts give no configuration"))
 }
 
-/// Opens the node's log in `data`, sealed under the keys `key_file` keeps, or makes it.
-fn open_log(data: &Path, key_file: &Path, memory_bytes: u64) -> Result<Log<DeviceFile>, BusError> {
+/// Opens the node's log in `data`, sealed under the keys `key_file` keeps, or makes it; with
+/// whether its file is written in place (`DeviceFile::written_in_place`).
+fn open_log(
+    data: &Path,
+    key_file: &Path,
+    memory_bytes: u64,
+) -> Result<(Log<DeviceFile>, Option<bool>), BusError> {
     let path = data.join(LOG_FILE);
     let exists = path
         .try_exists()
@@ -551,6 +588,7 @@ fn open_log(data: &Path, key_file: &Path, memory_bytes: u64) -> Result<Log<Devic
     let config = log_config(align, memory_bytes)?;
     let file = DeviceFile::open(&path, false, CachingRequest::PreferDirect, align)
         .map_err(|_| BusError::Configuration("the node's log could not be opened"))?;
+    let written_in_place = file.written_in_place();
     let ((parent, auth), _keys) = focal_seal::open_or_create(data, key_file)
         .map_err(|_| BusError::Configuration("the node's keys could not be opened"))?
         .split();
@@ -558,14 +596,15 @@ fn open_log(data: &Path, key_file: &Path, memory_bytes: u64) -> Result<Log<Devic
         sealing: Some(hyper_log::Sealing { parent, auth }),
         growth: None,
     };
-    if exists {
+    let log = if exists {
         hyper_log::Log::open_with(file, config, LOG_ID, with)
             .map(|(log, _)| log)
-            .map_err(|_| BusError::Configuration("the node's log could not be opened"))
+            .map_err(|_| BusError::Configuration("the node's log could not be opened"))?
     } else {
         hyper_log::Log::create_with(file, config, LOG_ID, with)
-            .map_err(|_| BusError::Configuration("the node's log could not be made"))
-    }
+            .map_err(|_| BusError::Configuration("the node's log could not be made"))?
+    };
+    Ok((log, written_in_place))
 }
 
 impl Member {
@@ -588,7 +627,8 @@ impl Member {
         )
         .map_err(|_| BusError::Configuration("the node's data directory could not be made"))?;
         let run = raise_run(&settings.data.join(RUN_FILE))?;
-        let log = open_log(&settings.data, &settings.key_file, settings.memory_bytes)?;
+        let (log, written_in_place) =
+            open_log(&settings.data, &settings.key_file, settings.memory_bytes)?;
         let store = GroupStore::claim(&log, PART_GROUP)
             .map_err(|_| BusError::Configuration("the part's group could not be claimed"))?;
         let drives = hyper_durable::LogStore::depth(&store).saturating_add(1);
@@ -660,6 +700,7 @@ impl Member {
             peers: settings.peers,
             replica,
             log,
+            written_in_place,
             liveness,
             asked: Asked::default(),
             attached: Vec::new(),
@@ -703,7 +744,27 @@ impl Member {
     pub fn stats(&self) -> MemberStats {
         let mut stats = self.stats;
         if let Ok(log) = self.log.stats(None) {
-            stats.log = LogWrites::of(&log);
+            stats.log = LogWrites::of(&log, self.written_in_place);
+        }
+        let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let figures = &mut stats.liveness;
+        figures.floor_ns = self.liveness.floor().map_or(0, nanos);
+        for report in self
+            .attached
+            .iter()
+            .filter_map(|peer| self.liveness.report(*peer))
+        {
+            figures.sent = figures.sent.saturating_add(report.sent);
+            figures.taken = figures.taken.saturating_add(report.taken);
+            figures.skipped = figures.skipped.saturating_add(report.skipped);
+            figures.unproven = figures.unproven.saturating_add(report.unproven);
+            if let Some(sending) = report.sending.map(nanos) {
+                figures.sending_most_ns = figures.sending_most_ns.max(sending);
+                figures.sending_least_ns = match figures.sending_least_ns {
+                    0 => sending,
+                    least => least.min(sending),
+                };
+            }
         }
         stats
     }
@@ -1272,7 +1333,10 @@ impl Member {
                 Update::default(),
                 waker.clone(),
             ) {
-                Ok(pending) => self.liveness_write = Some((pending, started)),
+                Ok(pending) => {
+                    self.liveness_write = Some((pending, started));
+                    self.stats.liveness.writes = self.stats.liveness.writes.saturating_add(1);
+                }
                 Err(_) => self.liveness_failed = true,
             }
         }

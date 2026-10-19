@@ -25,6 +25,44 @@ pub fn memory_envelope() -> Option<u64> {
     memory_limit().map(|limit| limit.checked_div(4).unwrap_or(0).saturating_mul(3))
 }
 
+/// Turns transparent huge pages off for this process and every process it starts (Linux 3.15's
+/// `PR_SET_THP_DISABLE`, kept across `fork` and `execve`), whatever the machine's own setting.
+///
+/// The allocator asks the kernel to back each arena it maps with huge pages (mimalloc advises
+/// `MADV_HUGEPAGE` while its `allow_thp` option holds, the default), and the kernel's default
+/// `defrag` policy, `madvise`, makes a page fault in an advised region enter direct reclaim and
+/// compaction until a huge page is free (Documentation/admin-guide/mm/transhuge.rst): the thread
+/// that touched the page stalls on it. Measured on a bus under load on a busy Linux host: a
+/// committed batch's first copy into a new segment spent 70–685 ms on CPU migrating other pages
+/// (`__alloc_pages_direct_compact`), 6–14 such appends a node in a 40-second round; with huge
+/// pages off there were none, and the round's throughput and p99 were both better. Redis turns
+/// them off for itself the same way (`disable-thp`), and mimalloc's switch for it (`allow_thp`
+/// at 0) is this call. Elsewhere there is nothing to turn off: no other platform focal ships on
+/// gives a process huge pages it did not map as such.
+pub fn disable_transparent_huge_pages() -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        rustix::thread::disable_transparent_huge_pages(true).map_err(std::io::Error::from)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(())
+    }
+}
+
+/// Whether transparent huge pages are off for this process ([`disable_transparent_huge_pages`]),
+/// as its kernel says: `None` where the platform has none, or the kernel cannot say.
+pub fn transparent_huge_pages_disabled() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        rustix::thread::transparent_huge_pages_are_disabled().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn physical() -> Option<u64> {
     meminfo_total(&read_small("/proc/meminfo")?)
@@ -220,6 +258,35 @@ mod tests {
         assert_eq!(v1_limit("9223372036854771712\n"), None);
         assert_eq!(v1_limit("2147483648\n"), Some(2_147_483_648));
         assert_eq!(v1_limit("garbage"), None);
+    }
+
+    /// The process's huge pages are off once asked, as its kernel reads them back, and off in a
+    /// process it starts: the flag is the process's own, not a thread's, and kept across `execve`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn huge_pages_turned_off_stay_off_in_the_process_and_its_children() {
+        disable_transparent_huge_pages().unwrap();
+        assert_eq!(transparent_huge_pages_disabled(), Some(true));
+        let other = std::thread::spawn(transparent_huge_pages_disabled)
+            .join()
+            .unwrap();
+        assert_eq!(other, Some(true), "another thread of the process");
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat /proc/self/status"])
+            .output()
+            .unwrap();
+        let status = String::from_utf8(status.stdout).unwrap();
+        // `THP_enabled` (Linux 5.0): whether the process may be given huge pages at all.
+        if let Some(line) = status.lines().find(|line| line.starts_with("THP_enabled:")) {
+            assert_eq!(line.split_whitespace().nth(1), Some("0"), "{line}");
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn no_other_platform_has_huge_pages_to_turn_off() {
+        disable_transparent_huge_pages().unwrap();
+        assert_eq!(transparent_huge_pages_disabled(), None);
     }
 
     #[test]

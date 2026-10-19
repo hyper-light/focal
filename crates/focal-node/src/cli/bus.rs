@@ -205,8 +205,13 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
     let (stats, memory, buffers, rooms, counters, group) = focal_bus::serve::serve(
         config,
         |address| {
-            let line =
-                serde_json::json!({ "condition": "Listening", "listen": address.to_string() });
+            // Whether the kernel took the process's huge pages off (`main`): null where the
+            // platform has none to take off.
+            let line = serde_json::json!({
+                "condition": "Listening",
+                "listen": address.to_string(),
+                "transparent_huge_pages_disabled": focal_platform::transparent_huge_pages_disabled(),
+            });
             let _ = std::io::Write::write_all(
                 &mut std::io::stdout().lock(),
                 format!("{line}\n").as_bytes(),
@@ -258,6 +263,19 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
                 "commit_wait_p99_us": member.log.commit_wait_p99_ns as f64 / 1e3,
                 "commit_wait_max_us": member.log.commit_wait_max_ns as f64 / 1e3,
                 "growth_refused": member.log.growth_refused,
+                "written_in_place": member.log.written_in_place,
+            },
+            // Its liveness stream, over the peers it watches: heartbeats, the intervals they are
+            // sent at, and the empty writes to the log that proved the ones nothing else did.
+            "liveness": {
+                "writes": member.liveness.writes,
+                "sent": member.liveness.sent,
+                "taken": member.liveness.taken,
+                "skipped": member.liveness.skipped,
+                "unproven": member.liveness.unproven,
+                "sending_least_ms": member.liveness.sending_least_ns as f64 / 1e6,
+                "sending_most_ms": member.liveness.sending_most_ns as f64 / 1e6,
+                "floor_ms": member.liveness.floor_ns as f64 / 1e6,
             },
         })),
         "published": stats.published,

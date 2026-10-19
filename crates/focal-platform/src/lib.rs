@@ -241,7 +241,9 @@ pub fn sync_dir(path: &std::path::Path) -> io::Result<()> {
 
 pub mod fs;
 mod memory;
-pub use memory::{memory_envelope, memory_limit};
+pub use memory::{
+    disable_transparent_huge_pages, memory_envelope, memory_limit, transparent_huge_pages_disabled,
+};
 #[cfg(windows)]
 mod windows;
 

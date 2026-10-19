@@ -15579,3 +15579,47 @@ of 40 joiners' runs under 24 CPU burners now pass in 0.29 to 0.72 s (median 0.41
 failed and most took 14 to 18 s. The joiners test names the answers when the handler's count is
 short. Only hyper-transport's endpoint.rs and hyper-quic's config (a getter) differ from 2a95628.
 vendor/README.md; docs/dependencies/inventory.tsv.
+
+### 2026-10-19 — Every shared crate at hyper-raft c3e1916: a live segment is found by search, and btrfs writes the log in place
+
+Two costs a profile of the event bus found in the shared log (fedora, one CPU a container, a
+closed loop at a window of 32,768; perf with call graphs). hyper-log asked whether a segment was
+live by scanning every live slot, once for each session after every frame (`Sealer::retain`), so a
+frame cost the sessions times the segments: with the bus's window of 1.5 GiB in the log, the
+log's owner spent 16 to 17% of a node's CPU in that scan. The live slots' incarnations rise from
+the tail to the head, so the question is now a binary search of them (2.3% of a node's CPU in the
+profile after); a proptest checks the search against the scan. btrfs copies
+a file on write by default, so every overwrite of the log's written blocks took new extents from
+its free-space bitmaps and summed btrfs's checksums of the data: the log's I/O thread spent 6 to
+25% of a node's CPU in `_find_next_zero_bit` and `steal_from_bitmap` (fedora's root is mounted
+`compress=zstd:1`, so each overwrite was compressed too). hyper-block now marks a file on btrfs to
+be written in place (`FS_NOCOW_FL`, chattr's `C`) as it is opened while still empty, the one time
+btrfs takes the mark; the log sums and seals its own records, so nothing btrfs checked goes
+unchecked, and systemd's journal marks its files the same way. The mark first went on
+`DeviceFile::preallocate` (c5cffc7), which the log never calls: its file grows by its writes, and
+the bus makes it with `File::create` and opens it without `create`, so a bus node's log was found
+unmarked (`lsattr` inside a run). A bus node now states its log file's mark in its `Stopped` line
+(`group.log.written_in_place`, null on a file system that writes every file in place). Another
+file system is not asked, and a btrfs that refuses leaves the file as before. Only hyper-log's
+state.rs and hyper-block's file.rs differ from 632aaf8. vendor/README.md;
+docs/dependencies/inventory.tsv.
+
+### 2026-10-19 — focal turns transparent huge pages off for itself
+
+A bus node's committed batches waited behind applies of 70 to 685 ms on its CPU, every one in the
+first copy of a batch into a new segment: the page fault took a huge page, and the kernel compacted
+memory to make one (`__alloc_pages_direct_compact`, `migrate_pages`; perf with frame-pointer call
+graphs on fedora, one CPU a container, a closed loop at a window of 32,768). mimalloc advises
+`MADV_HUGEPAGE` on every arena it maps (its `allow_thp` option, on by default), and the kernel's
+default `defrag` policy, `madvise`, has a fault in an advised region reclaim and compact until a huge
+page is free (Documentation/admin-guide/mm/transhuge.rst). The memory was not short (a node's peak
+was 1.53 GB of its 2 GiB; no direct reclaim); a busy host's free memory is fragmented. `focal` now
+turns transparent huge pages off for its process first thing (`PR_SET_THP_DISABLE`, Linux 3.15,
+kept across fork and execve; `focal_platform::disable_transparent_huge_pages`), as Redis does for
+itself (`disable-thp`) and as mimalloc's own switch for it does; a bus node's `Listening` line
+states the kernel's answer. Interleaved A/B on fedora, three rounds each, the same build but for
+the switch: applies of 50 ms or more 4 to 27 a node a round before, none after; the longest busy
+period of a node's loop 133 to 281 ms before, 8 to 17 ms after; throughput 568k to 708k records/s
+before, 667k to 779k after; p99 86 to 221 ms before, 59 to 137 ms after. The tail left is the log's
+commit (a leader's longest commit wait 537 ms against a flush p99 of 10.5 ms), with each node
+using under two thirds of its CPU. Test: memory::tests::huge_pages_turned_off_stay_off_in_the_process_and_its_children.

@@ -229,7 +229,10 @@ pub(crate) struct Segments {
     /// Each slot's incarnation, 0 for one never used, and its nonce.
     pub(crate) incarnation: Vec<u64>,
     pub(crate) nonce: Vec<u64>,
-    /// Live segments' slots, the tail first and the head last.
+    /// Live segments' slots, the tail first and the head last. Their incarnations rise from the
+    /// tail to the head: a segment opens at the head with the next incarnation and leaves only
+    /// from the tail, and an open lays the live ones out from the tail's incarnation to the
+    /// highest.
     pub(crate) live: VecDeque<u32>,
     /// Free slots, each with the sequence of the first frame that recorded a tail past it:
     /// reused only once that frame is durable (mantle docs/design/raft-log.md §5).
@@ -257,14 +260,13 @@ pub(crate) struct State {
 }
 
 impl State {
-    /// Whether the segment of `incarnation` is live: in a slot the log still reads.
+    /// Whether the segment of `incarnation` is live: in a slot the log still reads. A search of
+    /// the live slots by their incarnations, which rise from the tail (`Segments::live`): the
+    /// sealer asks after every frame for each of its sessions, and a scan of every live slot for
+    /// each made that a frame's cost the sessions times the segments, 16 to 17% of an event-bus
+    /// node's CPU with its window's 1.5 GiB in the log (focal on fedora, 2026-10-19).
     pub(crate) fn is_live(&self, incarnation: u64) -> bool {
-        self.segments.live.iter().any(|&slot| {
-            usize::try_from(slot)
-                .ok()
-                .and_then(|i| self.segments.incarnation.get(i))
-                .is_some_and(|&inc| inc == incarnation)
-        })
+        live_holds(&self.segments.live, &self.segments.incarnation, incarnation)
     }
 
     pub(crate) fn tail_incarnation(&self) -> u64 {
@@ -275,6 +277,19 @@ impl State {
             .copied()
             .unwrap_or(self.head.incarnation)
     }
+}
+
+/// Whether `live`, slots whose incarnations in `incarnations` rise from its front, holds a slot of
+/// `incarnation`.
+fn live_holds(live: &VecDeque<u32>, incarnations: &[u64], incarnation: u64) -> bool {
+    let of = |slot: &u32| {
+        usize::try_from(*slot)
+            .ok()
+            .and_then(|at| incarnations.get(at))
+            .copied()
+    };
+    live.binary_search_by(|slot| of(slot).cmp(&Some(incarnation)))
+        .is_ok()
 }
 
 /// A group as replay rebuilds it: entries may arrive out of order, since relocated copies
@@ -369,6 +384,43 @@ impl Replayed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Do: segments opened at the head with the next incarnation, in a free slot or a new
+        /// one, and freed from the tail, in any order the log may take. Expect: the search finds
+        /// every incarnation exactly where a scan of the live slots does, those never used and
+        /// those let go included.
+        #[test]
+        fn the_search_of_live_slots_answers_as_a_scan_of_them(ops in proptest::collection::vec(any::<bool>(), 1..200)) {
+            let mut live: VecDeque<u32> = VecDeque::from([0]);
+            let mut incarnations: Vec<u64> = vec![1];
+            let mut free: VecDeque<u32> = VecDeque::new();
+            let mut next = 2u64;
+            for open in ops {
+                if open || live.len() < 2 {
+                    let slot = match free.pop_front() {
+                        Some(slot) => slot,
+                        None => {
+                            incarnations.push(0);
+                            u32::try_from(incarnations.len() - 1).unwrap()
+                        }
+                    };
+                    incarnations[slot as usize] = next;
+                    live.push_back(slot);
+                    next += 1;
+                } else {
+                    free.push_back(live.pop_front().unwrap());
+                }
+                for incarnation in 0..=next {
+                    let scanned = live
+                        .iter()
+                        .any(|&slot| incarnations.get(slot as usize) == Some(&incarnation));
+                    prop_assert_eq!(live_holds(&live, &incarnations, incarnation), scanned, "incarnation {}", incarnation);
+                }
+            }
+        }
+    }
 
     fn slot(term: u64, slot: u32) -> Slot {
         Slot {

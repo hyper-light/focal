@@ -41,7 +41,9 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 /// The binary's allocator is mimalloc (Leijen, Zorn and de Moura, "Mimalloc: Free List Sharding
 /// in Action", APLAS 2019), the same on every platform. The release links musl, whose allocator
 /// took 4–11% of every node's CPU in the comparison, and a follower about 10% more in the page
-/// faults of memory it handed back and took again (cluster profile run 38187112271).
+/// faults of memory it handed back and took again (cluster profile run 38187112271). Its arenas
+/// are never backed by transparent huge pages: `main` turns them off before anything else
+/// (`focal_platform::disable_transparent_huge_pages` says why).
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -180,6 +182,10 @@ enum McpCommand {
     Serve,
 }
 fn main() {
+    // A page fault that waits for the kernel to compact memory into a huge page stalls whatever
+    // touched it. A kernel without the switch (before Linux 3.15) leaves the machine's own policy
+    // in place, which a bus node states as it starts.
+    let _ = focal_platform::disable_transparent_huge_pages();
     let words: Vec<std::ffi::OsString> = std::env::args_os().collect();
     // Help is focal's own page, read before any parsing.
     let page = match cli::grammar::asked(&words) {
