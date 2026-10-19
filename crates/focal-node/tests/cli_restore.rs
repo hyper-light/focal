@@ -487,7 +487,18 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
             );
             break;
         }
-        assert!(deadline.open(), "the restored session never reopened");
+        if !deadline.open() {
+            // What the client was told last, and what the node says of its replicas: which
+            // says whether the session is unopened, reopening, or open and not answering.
+            let replicas = run(root_b, None, &["inspect", "replicas", "--replicas"]);
+            panic!(
+                "the restored session never reopened: {}\n{}\nthe node's replicas: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&replicas.stdout),
+                String::from_utf8_lossy(&replicas.stderr)
+            );
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
 }
