@@ -24,7 +24,7 @@
 //! refuses a datagram, whose acknowledgements every connection's loss detection needs (RFC 9002
 //! §6).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -33,9 +33,10 @@ use std::time::{Duration, Instant};
 use hyper_quic::congestion::Congestion;
 use hyper_quic::rustls::pki_types::CertificateDer;
 use hyper_quic::{
-    ClientConfigHandle, Connection, ConnectionError, DatagramEvent, Dir, EcnCodepoint,
-    EndpointConfig, Event as QuicEvent, IdleTimeout, Incoming as Attempt, MtuDiscoveryConfig,
-    StreamEvent, StreamId, Transmit, TransportConfig, TransportErrorCode, VarInt,
+    ClientConfigHandle, Connection, ConnectionError, ConnectionId, DatagramEvent, Dir,
+    EcnCodepoint, EndpointConfig, Event as QuicEvent, IdleTimeout, Incoming as Attempt,
+    MtuDiscoveryConfig, ServerConfig, StreamEvent, StreamId, Transmit, TransportConfig,
+    TransportErrorCode, VarInt,
 };
 
 use crate::admission::{Admission, AdmissionLimits, AdmissionStats};
@@ -90,7 +91,14 @@ pub struct Limits {
     pub keep_alive: Option<Duration>,
     /// The endpoint's own responses (version negotiation, retries, refusals, stateless resets)
     /// queued for sending; one past the bound is dropped and counted, as RFC 9000 lets an endpoint
-    /// leave any of them unsent.
+    /// leave any of them unsent. Each answers one datagram the endpoint took since its transmits
+    /// were last polled, so an owner that polls them after each of its receives states what one
+    /// receive hands the endpoint, and none of a burst's is dropped: quinn sends each as its
+    /// datagram is handled, dropping it only for a full socket. A dial whose answer is dropped
+    /// hears nothing until its probe timeout, and dials begun together probe again together:
+    /// eight joiners of an enrollment sponsor with one handshake place, answered one at a time
+    /// from a bound of one, failed their joins after 10 s of probes (focal, 2026-10-19). The
+    /// queue grows as responses come and is never laid out at the bound.
     pub max_responses: usize,
     /// The chunks of [`crate::RECEIVE_CHUNK`] bytes received datagrams are cut from, each reserved
     /// from the budget: the chunk memory a peer can pin is at most this many chunks, whatever it
@@ -335,6 +343,10 @@ struct Conn<R> {
     dialed: Option<PeerId>,
     /// Whether an inbound handshake still holds its pending place.
     pending: bool,
+    /// An inbound handshake's origin: the connection ID its client first sent to, and whether the
+    /// client proved its address with a retry's token, which names that ID (RFC 9000 §8.1.2,
+    /// §7.3). What tells a handshake its client gave up for a retry from the one it went on with.
+    origin: Option<(ConnectionId, bool)>,
     peer: Option<(PeerId, R)>,
     epoch: Epoch,
     /// Its exchanges, oldest first.
@@ -584,6 +596,68 @@ struct Core<C: Classes, B, D> {
     /// By connection key, its lanes counted in `reserving`: what a retry visits, so a budget that
     /// holds more asks again of the connections with a frame waiting, never every connection.
     reserving_at: Vec<u32>,
+    /// The inbound handshakes that hold a pending place, by key: no more than the places.
+    pending_keys: Vec<usize>,
+    /// The attempts the endpoint refused, whose copies are ignored.
+    refused: Refused,
+}
+
+/// The attempts an endpoint refused (its places taken, or a bound it holds), each by its client's
+/// address, the connection ID its client first sent to and whether it carried a retry's token,
+/// oldest first. A copy of one, which its client sent a copy spacing behind it (hyper-quic's
+/// handshake copies) and which may come once a place is free, is ignored: its client was told the
+/// attempt was refused and gave it up, and admitted the copy held its place until its idle timeout
+/// (an enrollment joiner's copy of its token's attempt, 10 s in one run of six under CPU
+/// contention, focal 2026-10-19). Its token's flag keeps a refused copy of a ClientHello sent before
+/// a retry from matching the attempt its client made with the token. Kept while a token is valid
+/// (`ServerConfig::retry_token_validity`), after which a copy that carries one is refused as
+/// expired, and as many as the endpoint answers in one turn (`Limits::max_responses`), the oldest
+/// let go first.
+#[derive(Debug, Default)]
+struct Refused {
+    order: VecDeque<(Instant, (SocketAddr, ConnectionId, bool))>,
+    keys: HashSet<(SocketAddr, ConnectionId, bool)>,
+    /// None for an endpoint that takes no connection.
+    lifetime: Option<Duration>,
+}
+
+impl Refused {
+    /// Lets go of the records past the lifetime.
+    fn expire(&mut self, now: Instant) {
+        let Some(lifetime) = self.lifetime else {
+            return;
+        };
+        while let Some(&(at, key)) = self.order.front() {
+            if now.saturating_duration_since(at) <= lifetime {
+                return;
+            }
+            self.order.pop_front();
+            self.keys.remove(&key);
+        }
+    }
+
+    fn holds(&self, key: &(SocketAddr, ConnectionId, bool)) -> bool {
+        self.keys.contains(key)
+    }
+
+    /// Records a refusal, letting go of the oldest past `bound`: a record that finds no room is
+    /// not kept, and its copy is judged as any attempt is.
+    fn remember(&mut self, now: Instant, key: (SocketAddr, ConnectionId, bool), bound: usize) {
+        if self.lifetime.is_none() || self.keys.contains(&key) {
+            return;
+        }
+        while self.order.len() >= bound {
+            let Some((_, oldest)) = self.order.pop_front() else {
+                return;
+            };
+            self.keys.remove(&oldest);
+        }
+        if self.order.try_reserve(1).is_err() || self.keys.try_reserve(1).is_err() {
+            return;
+        }
+        self.order.push_back((now, key));
+        self.keys.insert(key);
+    }
 }
 
 /// What `conn` has moved, as the wait of an exchange of `rank` reads it.
@@ -708,6 +782,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         config.limits.validate()?;
         let transport = config.limits.transport(C::RANKS, &config.congestion)?;
         let (server, client) = config.tls.prepare(&transport)?;
+        let retry_lifetime = server.as_ref().map(ServerConfig::retry_token_validity);
         let mut endpoint = EndpointConfig::default();
         // Peers may send any datagram the receive chunks hold, where quinn's default told them
         // Ethernet's 1,472 bytes whatever the path carried.
@@ -759,12 +834,17 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 generation: 0,
                 reserving: 0,
                 reserving_at: Vec::new(),
+                pending_keys: Vec::with_capacity(limits.admission.pending),
+                refused: Refused {
+                    lifetime: retry_lifetime,
+                    ..Refused::default()
+                },
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
             path_ceiling: None,
-            responses: VecDeque::with_capacity(limits.max_responses),
-            spare: Vec::with_capacity(limits.max_responses),
+            responses: VecDeque::new(),
+            spare: Vec::new(),
             marks: Vec::with_capacity(peers),
             touched: Vec::with_capacity(peers),
             rearm: Vec::with_capacity(peers),
@@ -826,7 +906,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         out.clear();
         if let Some((transmit, bytes)) = self.responses.pop_front() {
             out.extend_from_slice(&bytes);
-            if self.spare.len() < self.core.limits.max_responses {
+            // A buffer for a later response, as many kept as the handshakes waiting at once:
+            // a burst past them takes its buffers as it comes and gives them up after.
+            if self.spare.len() < self.core.limits.admission.pending
+                && self.spare.try_reserve(1).is_ok()
+            {
                 self.spare.push(bytes);
             }
             return Some(transmit);
@@ -1194,7 +1278,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             }
         };
         self.core.dialing = self.core.dialing.saturating_add(1);
-        self.store(handle.0, quic, Some(peer), grant);
+        self.store(handle.0, quic, Some(peer), None, grant);
         Ok(())
     }
 
@@ -1277,6 +1361,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .limits
             .transport(C::RANKS, &self.core.congestion)?;
         let (server, client) = tls.prepare(&transport)?;
+        let retry_lifetime = server.as_ref().map(ServerConfig::retry_token_validity);
         let client = self
             .quic
             .insert_client_config(client)
@@ -1285,6 +1370,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             self.quic.retire_client_config(client);
             return Err(Refusal::Quic);
         }
+        // Tokens the earlier configuration issued are still checked by its lifetime, and a record
+        // is kept for the longer of the two.
+        self.core.refused.lifetime = match (self.core.refused.lifetime, retry_lifetime) {
+            (Some(was), Some(now)) => Some(was.max(now)),
+            (was, now) => was.or(now),
+        };
         let replaced = std::mem::replace(&mut self.client, client);
         self.quic.retire_client_config(replaced);
         Ok(())
@@ -1956,6 +2047,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         key: usize,
         mut quic: Connection,
         dialed: Option<PeerId>,
+        origin: Option<(ConnectionId, bool)>,
         grant: Reservation,
     ) {
         if let Some(ceiling) = self.path_ceiling {
@@ -1972,6 +2064,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             serial,
             dialed,
             pending: dialed.is_none(),
+            origin,
             peer: None,
             epoch: 0,
             exchanges: Vec::with_capacity(
@@ -2002,6 +2095,36 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     fn attempt(&mut self, now: Instant, attempt: Attempt, buffer: &mut Vec<u8>) {
+        let remote = attempt.remote_address();
+        let origin = (*attempt.orig_dst_cid(), attempt.remote_address_validated());
+        // A client that took a retry may have sent its ClientHello again under the connection ID
+        // it first used before the retry reached it (a probe timeout on a slow path, a client
+        // held off its CPU), and one of the two copies may come while every place is taken and
+        // the other once one is free. Admitted, the copy its client gave up holds its place until
+        // its idle timeout, and the client's own attempt with the token is refused for that place:
+        // eight joiners of an enrollment sponsor with one place waited 10 s behind such a copy in
+        // 15 of 15 runs under CPU contention (focal, 2026-10-19). A token names the ID its client
+        // used before the retry, and binds its address (RFC 9000 §8.1.4), so the attempt it
+        // carries closes a handshake pending under that ID from that address without a token, and
+        // an attempt without one under the ID of a handshake pending with a token is that copy.
+        let superseded = self
+            .core
+            .pending_with(remote, origin.0, !origin.1, &self.conns);
+        if !origin.1 && superseded.is_some() {
+            // Answered nothing: its client goes on with the handshake its token began.
+            self.quic.ignore(attempt);
+            return;
+        }
+        if let Some(key) = superseded {
+            self.close(now, key, Refusal::Closed.code());
+        }
+        let record = (remote, origin.0, origin.1);
+        self.core.refused.expire(now);
+        if self.core.refused.holds(&record) {
+            // A copy of an attempt its client was told was refused, and gave up.
+            self.quic.ignore(attempt);
+            return;
+        }
         let admission = self.core.admission.stats();
         let crowded = admission.pending.saturating_mul(2) >= self.core.admission.limits().pending;
         // A source that has not proven its address takes no place while half of them are taken
@@ -2024,6 +2147,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 if refusal != Refusal::Pending {
                     self.core.admission.end_pending();
                 }
+                let bound = self.core.limits.max_responses;
+                self.core.refused.remember(now, record, bound);
                 buffer.clear();
                 if let Some(transmit) = self.quic.refuse(attempt, buffer) {
                     self.respond(transmit, buffer);
@@ -2034,7 +2159,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         buffer.clear();
         match self.quic.accept(attempt, now, buffer, None, None) {
             Ok((handle, quic)) => {
-                self.store(handle.0, quic, None, grant);
+                self.store(handle.0, quic, None, Some(origin), grant);
+                self.core.pending_keys.push(handle.0);
                 self.pump(now, handle.0);
             }
             Err(error) => {
@@ -2048,13 +2174,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     fn respond(&mut self, transmit: Transmit, bytes: &[u8]) {
-        if self.responses.len() >= self.core.limits.max_responses {
+        let response = bytes.get(..transmit.size).unwrap_or(bytes);
+        if self.responses.len() >= self.core.limits.max_responses
+            || self.responses.try_reserve(1).is_err()
+        {
             self.core.stats.responses_dropped = self.core.stats.responses_dropped.saturating_add(1);
             return;
         }
         let mut copy = self.spare.pop().unwrap_or_default();
         copy.clear();
-        copy.extend_from_slice(bytes.get(..transmit.size).unwrap_or(bytes));
+        if copy.try_reserve(response.len()).is_err() {
+            self.core.stats.responses_dropped = self.core.stats.responses_dropped.saturating_add(1);
+            return;
+        }
+        copy.extend_from_slice(response);
         self.responses.push_back((transmit, copy));
     }
 
@@ -2113,6 +2246,22 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
 }
 
 impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D> {
+    /// The handshake pending from `remote` under `id`, admitted with a token if `validated`: one
+    /// at most, the client's one attempt under that ID. A look at the pending places alone.
+    fn pending_with(
+        &self,
+        remote: SocketAddr,
+        id: ConnectionId,
+        validated: bool,
+        conns: &[Option<Box<Conn<C::Role>>>],
+    ) -> Option<usize> {
+        self.pending_keys.iter().copied().find(|&key| {
+            conns.get(key).and_then(Option::as_ref).is_some_and(|conn| {
+                conn.origin == Some((id, validated)) && conn.quic.remote_address() == remote
+            })
+        })
+    }
+
     /// A connection's first window, with the reserve on top of it: room in the socket's queue
     /// first, then the budget's bytes.
     fn window_grant(&mut self) -> Result<Reservation, Refusal> {
@@ -2367,6 +2516,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if conn.pending {
             conn.pending = false;
             self.admission.end_pending();
+            self.pending_keys.retain(|&held| held != key);
         }
         if conn.dialed.is_some() {
             self.dialing = self.dialing.saturating_sub(1);
@@ -2505,6 +2655,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         if conn.pending {
             conn.pending = false;
             self.admission.end_pending();
+            self.pending_keys.retain(|&held| held != key);
         }
     }
 

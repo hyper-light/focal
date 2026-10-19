@@ -15554,3 +15554,28 @@ a CPU, reading one page after another of 51 to 637 ms, and its heartbeats waited
 nodes suspected each other 18 to 27 times a run). focal-bus's sustained-load test now sees no read
 through the log's owner and no turn past 200 ms where it saw 10 and 15. Only hyper-durable's
 replica.rs differs from 7959df9. vendor/README.md; docs/dependencies/inventory.tsv.
+
+### 2026-10-19 — Every shared crate at hyper-raft 632aaf8: every dial past a listener's places is answered
+
+An endpoint's own responses (a retry under load, a refusal, a version negotiation, a stateless
+reset) each answer a datagram it took and wait for the driver's next send. focal-wire bounded them
+by the handshake places, one for an enrollment sponsor of four connections: of eight joiners
+dialing at once, only the first heard its answer each round, the rest probed again in step at
+their probe timeouts (1, 2 and 4 s), and two failed their joins at the 10 s idle timeout, never
+told the sponsor was full (Windows CI on 23e0112a, calls 7 of 8; 2 of 40 runs on a Mac under 24 CPU
+burners; a passing run dropped 8 responses). focal-wire and focal-bus now state what one receive
+of the driver hands the endpoint (`TURNS` calls of their IO batch), and hyper-transport queues
+responses as they come instead of laying them out at the bound (524 KB an endpoint at that bound,
+a client's connector too). With every refusal sent, the joiners still took 14 to 18 s a run under
+contention, and a silent trace (records kept in memory: a print at each event hid it) found two
+more holders of the sponsor's one place, each for a copy's 10 s idle timeout. hyper-quic's clients
+send a copy of each handshake flight a spacing behind it (`TransportConfig::handshake_copies`): a
+copy of the ClientHello a retry answered, admitted once the place came free, had the joiner's own
+attempt with the token refused for it, and a copy of a token's attempt the sponsor had refused was
+admitted after its joiner heard the refusal. A token names the ID its client gave up and binds its
+address, so the attempt with it now closes that pending copy; the sponsor keeps what it refused,
+exactly, while a token is valid and as many as it answers in a turn, and ignores a copy of it. 40
+of 40 joiners' runs under 24 CPU burners now pass in 0.29 to 0.72 s (median 0.41 s), where 2 of 40
+failed and most took 14 to 18 s. The joiners test names the answers when the handler's count is
+short. Only hyper-transport's endpoint.rs and hyper-quic's config (a getter) differ from 2a95628.
+vendor/README.md; docs/dependencies/inventory.tsv.

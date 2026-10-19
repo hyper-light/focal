@@ -801,7 +801,7 @@ async fn refused_joiners_dial_again() {
             .all(|answer| !matches!(answer, Err(JoinTransportError::Unavailable))),
         "{answers:?}"
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 8);
+    assert_eq!(calls.load(Ordering::SeqCst), 8, "{answers:?}");
     server.close().unwrap();
     task.await.unwrap().unwrap();
 }

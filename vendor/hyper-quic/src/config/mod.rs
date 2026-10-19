@@ -402,6 +402,12 @@ impl ServerConfig {
         self
     }
 
+    /// How long a retry token stays valid after it was issued
+    /// ([`ServerConfig::retry_token_lifetime`]): past it, an attempt that carries one is refused.
+    pub fn retry_token_validity(&self) -> Duration {
+        self.retry_token_lifetime
+    }
+
     /// Whether to allow clients to migrate to new addresses
     ///
     /// Improves behavior for clients that move between different internet connections or suffer NAT

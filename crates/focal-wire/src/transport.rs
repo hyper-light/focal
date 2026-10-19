@@ -183,7 +183,14 @@ pub fn endpoint_limits(
         serve_period: limits.request_timeout,
         idle_timeout: IDLE_TIMEOUT,
         keep_alive: IDLE_TIMEOUT.checked_div(4),
-        max_responses: admission.pending.max(1),
+        // The endpoint's own responses (a retry under load, a refusal, a version negotiation, a
+        // stateless reset) each answer a datagram it took and wait for the driver's next send,
+        // which follows each receive: at most `TURNS` calls of `IO_BATCH` messages
+        // (hyper-rt-transport's `Driver`), so a burst of dials is answered whole. Bounded by the
+        // handshake places, one for an enrollment sponsor, eight joiners dialing at once heard
+        // one answer a round and probed again in step, and two failed their joins (hyper-raft
+        // `docs/transport.md`, "Every dial past the places is answered in its turn").
+        max_responses: hyper_rt_transport::TURNS.saturating_mul(IO_BATCH),
         receive_chunks,
     })
 }

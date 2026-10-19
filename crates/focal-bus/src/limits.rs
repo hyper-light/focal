@@ -159,8 +159,9 @@ fn limits(identities: usize, lanes: u32) -> Result<Limits, BusError> {
         serve_period: SERVE_PERIOD,
         idle_timeout: IDLE_TIMEOUT,
         keep_alive: Some(KEEP_ALIVE),
-        // One answer for each attempt under way (a refusal, a retry), focal-wire's rule.
-        max_responses: connections,
+        // What one receive of the driver hands the endpoint, each datagram answered at most once
+        // (a refusal, a retry) before its next send: focal-wire's rule.
+        max_responses: hyper_rt_transport::TURNS.saturating_mul(IO.batch),
         receive_chunks,
     })
 }
