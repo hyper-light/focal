@@ -22,6 +22,17 @@ use std::{
 
 const CLIENTS: usize = 16;
 const DATAGRAM: usize = 65_536;
+/// Format: the most a datagram carries on the path a relay models: Ethernet's MTU (1,500, IEEE
+/// 802.3) less IPv4's 20-byte header (RFC 791) and UDP's 8 (RFC 768), as hyper-transport's test
+/// links model it (`LINK_PAYLOAD`). A datagram past it is dropped on the wire, as a router drops a
+/// packet past its next hop's MTU that may not be fragmented (RFC 8899 §3), so a node's search for
+/// its path's MTU ends where a real path's would. Without it the loopback's 65,507-byte datagrams
+/// crossed the relay: on Linux a search for the path's MTU sent its padded probes, tens of
+/// kilobytes each, across a path modelled at 100 Mbit/s, and a test counting the bytes a copy was
+/// sent counted 649 KB of them for one 64 KiB chunk (ubuntu CI, bus-replicated d0e309f8;
+/// reproduced on Linux in 2 runs of 12, the connection's datagram at 65,507 and 57,468 bytes in
+/// those two, 1,200 in the rest).
+pub const LINK_PAYLOAD: usize = 1_472;
 const POLL: Duration = Duration::from_millis(1);
 
 /// A datagram waiting to travel.
@@ -69,8 +80,8 @@ pub struct Relay {
     stop: Arc<AtomicBool>,
     /// The bytes carried toward the node behind, and toward its clients;
     /// the datagrams dropped at a full queue each way; the datagrams lost
-    /// each way.
-    carried: Arc<[AtomicU64; 6]>,
+    /// each way; the datagrams past the link's payload each way.
+    carried: Arc<[AtomicU64; 8]>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 impl Relay {
@@ -119,7 +130,9 @@ impl Relay {
         front_socket.set_read_timeout(Some(POLL)).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
-        let carried: Arc<[AtomicU64; 6]> = Arc::new([
+        let carried: Arc<[AtomicU64; 8]> = Arc::new([
+            AtomicU64::new(0),
+            AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
             AtomicU64::new(0),
@@ -166,6 +179,14 @@ impl Relay {
             self.carried[5].load(Ordering::Acquire),
         )
     }
+    /// The datagrams past the link's payload ([`LINK_PAYLOAD`]) dropped on the wire toward the
+    /// node, and toward its clients: a search for the path's MTU probing past it.
+    pub fn oversized(&self) -> (u64, u64) {
+        (
+            self.carried[6].load(Ordering::Acquire),
+            self.carried[7].load(Ordering::Acquire),
+        )
+    }
 }
 impl Drop for Relay {
     fn drop(&mut self) {
@@ -189,7 +210,7 @@ fn run(
     back: SocketAddr,
     shape: Shape,
     stop: &AtomicBool,
-    carried: &[AtomicU64; 6],
+    carried: &[AtomicU64; 8],
 ) {
     let Shape {
         delay,
@@ -259,6 +280,13 @@ fn run(
         }
         while let Some((to, via, bytes)) = taken.pop_front() {
             let way = usize::from(via >= usize::MAX - CLIENTS);
+            // A datagram past the link's payload is dropped on the wire.
+            if bytes.len() > LINK_PAYLOAD {
+                if let Some(oversized) = carried.get(6 + way) {
+                    oversized.fetch_add(1, Ordering::AcqRel);
+                }
+                continue;
+            }
             // A path that loses loses one datagram in so many, each way.
             if let Some(loss) = loss
                 && draw() % loss == 0
