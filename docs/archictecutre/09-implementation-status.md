@@ -15623,3 +15623,22 @@ period of a node's loop 133 to 281 ms before, 8 to 17 ms after; throughput 568k 
 before, 667k to 779k after; p99 86 to 221 ms before, 59 to 137 ms after. The tail left is the log's
 commit (a leader's longest commit wait 537 ms against a flush p99 of 10.5 ms), with each node
 using under two thirds of its CPU. Test: memory::tests::huge_pages_turned_off_stay_off_in_the_process_and_its_children.
+
+### 2026-10-19 — Every shared crate at hyper-raft 6a190be: a frame forgets freed sessions from the tail
+
+With each node's log on ext4 mounted without barriers, as CI's write-through disk is (a loop device
+in fedora's /dev/shm), and one CPU a node, the bus reproduces CI's comparison at 10,000 records a
+second: every node at 0.79 to 0.98 of its CPU, its CFS quota throttled in up to 363 of 401 periods,
+p99 23 to 30 ms, 13 to 21 suspicions a run; each node's log writes about 8,800 one-update frames a
+second, a frame being nearly free to flush there. Under LBR call stacks, `State::is_live` was 22%
+of a node's CPU: after every frame the sealer asked whether each live segment's sessions were
+live, a binary search each since c71a5d0, one per live segment. Segments leave the log only from
+its tail and sessions begin only at its head, so hyper-log now forgets the freed segments' sessions
+from the tail (`Sealer::retain_from_tail`): a look for each session forgotten and one more; an
+open still asks of every session. Interleaved on that disk, two rounds each: p99 22.8 to 24.0 ms
+before, 5.2 to 6.2 ms after; most throttled periods of a node 358 to 363 before, 122 to 234 after;
+suspicions 19 to 20 a run before, 6 to 13 after; `is_live` gone from the profile. What is left of a
+node's CPU there is the kernel's (48%: the log's I/O thread's writes and flushes, 22%; the event
+loop's sends, receives and waits, 16%) and about 1.5 log frames for each entry (`quiet: ZERO`, a
+commit written alone at the first moment no write is out). Only hyper-log's seal.rs and
+owner/write.rs differ from c3e1916. vendor/README.md; docs/dependencies/inventory.tsv.

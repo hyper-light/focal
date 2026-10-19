@@ -176,9 +176,30 @@ impl Sealer {
         Ok(())
     }
 
-    /// Forgets the sessions of segments no longer live: a freed segment's records are dead.
+    /// Forgets the sessions of segments no longer live: a freed segment's records are dead. Every
+    /// session is asked about, as an open must: recovery may have found sessions of segments it
+    /// then found dead, anywhere among the live ones.
     pub(crate) fn retain(&mut self, live: impl Fn(u64) -> bool) {
         self.sessions.retain(|inc, _| live(*inc));
+        if self.writing.as_ref().is_some_and(|(inc, _)| !live(*inc)) {
+            self.writing = None;
+        }
+    }
+
+    /// Forgets the sessions of the segments freed since the last call, once [`Sealer::retain`]
+    /// has run at the open. A segment leaves the log only from its tail, the oldest incarnation
+    /// first (`State::is_live`), and a session is begun only for the head ([`Sealer::begin`]), so
+    /// the sessions no longer live are the oldest keys: the walk stops at the first live one, and
+    /// costs a look at each session forgotten and one more. Asked of every session after every
+    /// frame, it was 22% of an event-bus node's CPU at 8,800 frames a second (focal on fedora,
+    /// the log on ext4 without barriers as on CI's disk, perf with LBR stacks).
+    pub(crate) fn retain_from_tail(&mut self, live: impl Fn(u64) -> bool) {
+        while let Some(entry) = self.sessions.first_entry() {
+            if live(*entry.key()) {
+                break;
+            }
+            entry.remove();
+        }
         if self.writing.as_ref().is_some_and(|(inc, _)| !live(*inc)) {
             self.writing = None;
         }
@@ -309,5 +330,55 @@ impl Sealer {
             .try_into()
             .map_err(|_| LogError::Tampered("a MAC cut short"))?;
         self.mac.verify(bytes, mac).map_err(sealed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use hyper_seal::keys::{KeyId, WrappingKey};
+
+    use super::*;
+
+    fn sealer() -> Sealer {
+        let _ = hyper_seal::lock_keys(256);
+        let sealing = Sealing {
+            parent: WrappingKey::new(KeyId([3; 16]), 0, Secret32::from_bytes(&[3; 32]).unwrap()),
+            auth: Secret32::from_bytes(&[4; 32]).unwrap(),
+        };
+        Sealer::new(sealing, 7).unwrap()
+    }
+
+    /// Do: sessions begun for segments 1 to 8, each the head in turn, then segments 1 to 3 freed
+    /// from the tail. Expect: the walk from the tail forgets exactly those three, asks about four
+    /// segments (each forgotten and the first live one), keeps the writing session, and leaves
+    /// what the full walk leaves; once the head's segment is freed too, nothing writes.
+    #[test]
+    fn the_walk_from_the_tail_forgets_the_freed_sessions_asking_only_about_them() {
+        let mut from_tail = sealer();
+        let mut full = sealer();
+        for incarnation in 1..=8u64 {
+            from_tail.begin(incarnation, 4096).unwrap();
+            full.begin(incarnation, 4096).unwrap();
+        }
+        let asked = Cell::new(0u32);
+        from_tail.retain_from_tail(|inc| {
+            asked.set(asked.get() + 1);
+            inc > 3
+        });
+        full.retain(|inc| inc > 3);
+        assert_eq!(
+            asked.get(),
+            4 + 1,
+            "the freed three, the first live one, and the head"
+        );
+        let kept: Vec<u64> = from_tail.sessions.keys().copied().collect();
+        assert_eq!(kept, (4..=8).collect::<Vec<_>>());
+        assert_eq!(kept, full.sessions.keys().copied().collect::<Vec<_>>());
+        assert!(from_tail.writes(8));
+        from_tail.retain_from_tail(|_| false);
+        assert!(from_tail.sessions.is_empty());
+        assert!(!from_tail.writes(8));
     }
 }

@@ -943,7 +943,7 @@ impl<F: BlockFile + 'static> Owner<F> {
             }
             let state = &self.state;
             if let Some(seal) = self.seal.as_mut() {
-                seal.retain(|inc| state.is_live(inc));
+                seal.retain_from_tail(|inc| state.is_live(inc));
             }
         }
         if let Err(e) = published {
