@@ -149,6 +149,52 @@ pub struct MemberStats {
     pub suspected: u64,
     /// Terms this node saw begin after its first: an election each, its own or another's.
     pub terms: u64,
+    /// What the node's log wrote to its device, as the log counted it.
+    pub log: LogWrites,
+}
+
+/// What a node's log wrote from its opening, as hyper-log counted it (`hyper_log::LogStats`): what
+/// its durable writes cost the device, as Kafka's broker reports its log flushes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogWrites {
+    /// Frames written and flushed: each a group of updates made durable together.
+    pub frames: u64,
+    /// Updates those frames carried: the replica's writes and the liveness stream's.
+    pub updates: u64,
+    /// Bytes written, each frame, persist record and confirmation padded to the file's alignment.
+    pub bytes: u64,
+    /// Flushes of the device's cache.
+    pub flushes: u64,
+    /// Writes made durable on their own (a FUA write), no flush with them.
+    pub durable_writes: u64,
+    /// Durable writes made with a write and a flush instead.
+    pub durable_fallbacks: u64,
+    /// The flushes' p50 and p99, nanoseconds (each at most an eighth more than the quantile).
+    pub flush_p50_ns: u64,
+    pub flush_p99_ns: u64,
+    /// The updates' waits from submission to the flush that let them be answered, p50, p99 and
+    /// the most, nanoseconds.
+    pub commit_wait_p50_ns: u64,
+    pub commit_wait_p99_ns: u64,
+    pub commit_wait_max_ns: u64,
+}
+
+impl LogWrites {
+    fn of(stats: &hyper_log::LogStats) -> Self {
+        Self {
+            frames: stats.frames,
+            updates: stats.updates,
+            bytes: stats.bytes,
+            flushes: stats.flushes,
+            durable_writes: stats.durable_writes,
+            durable_fallbacks: stats.durable_fallbacks,
+            flush_p50_ns: stats.flush.quantile(500_000).unwrap_or(0),
+            flush_p99_ns: stats.flush.quantile(990_000).unwrap_or(0),
+            commit_wait_p50_ns: stats.commit_wait.quantile(500_000).unwrap_or(0),
+            commit_wait_p99_ns: stats.commit_wait.quantile(990_000).unwrap_or(0),
+            commit_wait_max_ns: stats.commit_wait.quantile(1_000_000).unwrap_or(0),
+        }
+    }
 }
 
 /// What a node of a group tells its operator as it happens, each on the turn it happened: what its
@@ -608,9 +654,13 @@ impl Member {
         self.id
     }
 
-    /// What the node did.
-    pub const fn stats(&self) -> MemberStats {
-        self.stats
+    /// What the node did, its log's writes as the log counts them now.
+    pub fn stats(&self) -> MemberStats {
+        let mut stats = self.stats;
+        if let Ok(log) = self.log.stats(None) {
+            stats.log = LogWrites::of(&log);
+        }
+        stats
     }
 
     /// Whether the node leads its part.
