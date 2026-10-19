@@ -55,7 +55,7 @@ use hyper_liveness::{Change, Liveness, Settings as LiveSettings, Suspicion, Writ
 use hyper_log::{Class as LogClass, Facts, Log, Pending, Update};
 use hyper_raft::proto::{ConfState, Message};
 use hyper_raft::wire::Record;
-use hyper_raft::{Config, Limits, Stated};
+use hyper_raft::{Config, Limits, Stated, Storage};
 use hyper_timing::{Exposure, Trust};
 use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, LaneId, PeerId, Refusal};
 
@@ -63,6 +63,7 @@ use crate::BusError;
 use crate::batch::{Batch, MIN_BATCH};
 use crate::group::{Applied, Outcome, PartMachine};
 use crate::node::Node;
+use crate::producer::Verdict;
 use crate::wire::{self, Ack, Bus, Durability, Kind, LANE, LIVENESS_LANE, Leader, Redirect, Reply};
 
 /// Format: the part's group in the node's log.
@@ -129,6 +130,11 @@ pub struct MemberStats {
     pub parked: u64,
     /// Publishes redirected to the leader.
     pub redirected: u64,
+    /// Publishes sent again while their first was in flight: answered when it commits, never
+    /// proposed twice.
+    pub duplicates: u64,
+    /// Inputs the node's memory could not hold until the window gave memory back for them.
+    pub relieved: u64,
     /// Acknowledgements made, sent or waiting for their publisher's lane.
     pub acked: u64,
     /// Answers that waited for their publisher's lane to make room.
@@ -149,6 +155,10 @@ pub struct MemberStats {
     pub suspected: u64,
     /// Terms this node saw begin after its first: an election each, its own or another's.
     pub terms: u64,
+    /// Compactions started: the log letting go of what the window let go.
+    pub compactions: u64,
+    /// Compactions the replica refused, changing nothing; asked again at the next turn.
+    pub refused_compactions: u64,
     /// What the node's log wrote to its device, as the log counted it.
     pub log: LogWrites,
 }
@@ -177,6 +187,8 @@ pub struct LogWrites {
     pub commit_wait_p50_ns: u64,
     pub commit_wait_p99_ns: u64,
     pub commit_wait_max_ns: u64,
+    /// Asks for a slot past the file's bound the log refused, each answered `Full`.
+    pub growth_refused: u64,
 }
 
 impl LogWrites {
@@ -193,6 +205,7 @@ impl LogWrites {
             commit_wait_p50_ns: stats.commit_wait.quantile(500_000).unwrap_or(0),
             commit_wait_p99_ns: stats.commit_wait.quantile(990_000).unwrap_or(0),
             commit_wait_max_ns: stats.commit_wait.quantile(1_000_000).unwrap_or(0),
+            growth_refused: stats.growth_refused,
         }
     }
 }
@@ -281,10 +294,26 @@ fn give_back(held: &mut Option<Allocation>, bytes: usize) -> usize {
     }
 }
 
+impl MemberBudget {
+    /// Holds what is owed on the completion lane once the node's memory has room for it. What a
+    /// transition came to hold past that lane is the replica's either way; refused until a release
+    /// of the replica's own repaid it, a leader that went into debt while its window filled the
+    /// node's memory refused every input after, its followers' acknowledgements among them, whose
+    /// commit was the release that would have repaid it, though the window had since given its
+    /// memory back (2026-10-19: a group of 24 MiB nodes stopped for good, its leader refusing
+    /// 1,752 heartbeat answers and 12 acknowledgements of 272 bytes with 3 MiB of 24 in use).
+    fn settle_owed(&mut self) {
+        if self.owed > 0 && self.hold(BudgetLane::Completion, self.owed) {
+            self.owed = 0;
+        }
+    }
+}
+
 impl ReplicaBudget for MemberBudget {
     const BOUNDED: bool = true;
 
     fn reserve(&mut self, bytes: u64) -> bool {
+        self.settle_owed();
         self.owed == 0 && self.hold(BudgetLane::Ordinary, bytes)
     }
 
@@ -395,6 +424,10 @@ pub struct Member {
     seen_term: u64,
     /// The member the replica believed led at its last turn, zero for none.
     seen_leader: u64,
+    /// The window's segments emptied as of the last turn ([`Member::compact_behind_window`]).
+    emptied_seen: u64,
+    /// A segment was emptied since the log was last compacted.
+    compact_wanted: bool,
     /// Whether the node led at its last turn: a node that stops leading redirects what it owed.
     leading: bool,
     /// The drives one turn makes at most: the store's depth and one.
@@ -633,6 +666,8 @@ impl Member {
             fenced: false,
             seen_term: 0,
             seen_leader: 0,
+            emptied_seen: 0,
+            compact_wanted: false,
             leading: false,
             drives,
             due: false,
@@ -808,8 +843,16 @@ impl Member {
         match Message::decode(bytes) {
             Ok(message) if message.from == peer && self.is_node(peer) => {
                 // A refusal is the core's word on a message it will not take (an older term, a
-                // member it does not know): the message is spent either way.
-                let _ = self.replica.step(message);
+                // member it does not know): the message is spent either way. One the node's memory
+                // could not hold is stepped again once the window gave memory back
+                // ([`Member::relieve_window`]): refused for good, a follower whose window had
+                // filled its memory took no append again, and fell behind for good.
+                if let Err(ReplicaError::Budget(_)) = self.replica.step(message)
+                    && self.relieve_window()
+                    && let Ok(again) = Message::decode(bytes)
+                {
+                    let _ = self.replica.step(again);
+                }
             }
             _ => self.stats.dropped_records = self.stats.dropped_records.saturating_add(1),
         }
@@ -842,6 +885,41 @@ impl Member {
             self.redirect(endpoint, peer, key);
             return;
         }
+        if self.owed.contains(&(peer, key)) {
+            // Proposed already, its acknowledgement owed: the publisher sent it again (a resend
+            // while it waited, or a lane's retry), and the acknowledgement the first earns answers
+            // both, as Kafka's leader answers a duplicate of a batch in flight from its producer's
+            // state before it appends (KIP-98). Proposed again, each copy was replicated and
+            // written by every node before the part recognised it.
+            self.stats.duplicates = self.stats.duplicates.saturating_add(1);
+            return;
+        }
+        // One the part has taken already (applied, so committed: the publisher did not hear its
+        // acknowledgement before it sent it again) is answered from the part's sessions as its
+        // apply answered it, never proposed again, as Kafka's leader answers a duplicate from its
+        // producer's state before it appends (KIP-98). Only that verdict is taken here: a gap the
+        // part sees now may be a proposal still in flight.
+        let (first, count) = (u64::from(batch.sequence()), u64::from(batch.count()));
+        if let Verdict::Again { base } = self
+            .replica
+            .machine()
+            .node()
+            .part()
+            .judge(key.0, peer, key.1, first, count)
+        {
+            let (base, count) = base.map_or((0, 0), |base| (base, batch.count()));
+            let ack = Ack {
+                stream: key.0,
+                producer: key.1,
+                sequence: key.2,
+                base,
+                count,
+                class: self.class.code(),
+            };
+            self.answer(endpoint, peer, Answer::Ack(ack.encode()));
+            self.stats.duplicates = self.stats.duplicates.saturating_add(1);
+            return;
+        }
         if !self.parked.is_empty()
             || self.owed.len() >= self.owed_bound
             || !self.propose(peer, bytes, key)
@@ -855,17 +933,35 @@ impl Member {
     /// holds as many uncommitted bytes as it may refuses it, and its publisher waits.
     fn propose(&mut self, peer: PeerId, batch: &[u8], key: Owed) -> bool {
         // The entry states the identity that published it: every replica judges the batch by that
-        // identity's sessions (`group`, doc 34 P6).
-        if self
+        // identity's sessions (`group`, doc 34 P6). One the node's memory cannot hold is proposed
+        // again once the window gave memory back ([`Member::relieve_window`]); parked without it,
+        // it waited for memory the window, holding all it may, never gave.
+        let mut proposed = self
             .replica
-            .propose(peer.to_le_bytes().to_vec(), batch.to_vec())
-            .is_err()
-        {
+            .propose(peer.to_le_bytes().to_vec(), batch.to_vec());
+        if matches!(proposed, Err(ReplicaError::Budget(_))) && self.relieve_window() {
+            proposed = self
+                .replica
+                .propose(peer.to_le_bytes().to_vec(), batch.to_vec());
+        }
+        if proposed.is_err() {
             return false;
         }
         self.owed.insert((peer, key));
         self.stats.proposed = self.stats.proposed.saturating_add(1);
         true
+    }
+
+    /// Gives the replica memory at the window's expense: the window holds what the node's memory
+    /// holds, and gives it back to what is live (`Node::relieve`: its warm segments, then its
+    /// oldest batches until a segment goes back), as it does for the transport's frames. Whether
+    /// it did.
+    fn relieve_window(&mut self) -> bool {
+        let relieved = self.replica.machine_mut().node_mut().relieve();
+        if relieved {
+            self.stats.relieved = self.stats.relieved.saturating_add(1);
+        }
+        relieved
     }
 
     /// Parks a publish the replica cannot take yet, holding its publisher's lane.
@@ -916,6 +1012,11 @@ impl Member {
                 .ok();
             let (peer, lane) = (parked.peer, parked.lane);
             let taken = match key {
+                // A copy of one proposed since it parked is answered with the first.
+                Some(key) if self.replica.is_leader() && self.owed.contains(&(peer, key)) => {
+                    self.stats.duplicates = self.stats.duplicates.saturating_add(1);
+                    true
+                }
                 Some(key) if self.replica.is_leader() => {
                     let batch = parked.batch.clone();
                     if !self.propose(peer, &batch, key) {
@@ -1024,7 +1125,11 @@ impl Member {
     }
 
     /// Sends one Raft message to its member, or keeps it in the member's outbox while the lane is
-    /// full.
+    /// full. One the node drops (no connection, or the outbox at its bound) is reported unreachable
+    /// to the replica, as raft's owner reports a message its transport did not deliver
+    /// (`MsgUnreachable`): a leader takes what it sent the member ahead of its answers for lost and
+    /// probes it again from what it holds. Untold, a leader whose last appends were dropped waited
+    /// for their answers, the member answering its heartbeats and nothing more being sent.
     fn send_message<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, message: &Message)
     where
         B: Budget<<Bus as Classes>::Class>,
@@ -1038,9 +1143,10 @@ impl Member {
             match endpoint.send_frame(to, LANE, Kind::Raft, &self.encoded) {
                 Ok(()) => return,
                 Err(Refusal::LaneFull) => {}
-                // No connection yet, or the member is gone: Raft sends it again.
+                // No connection yet, or the member is gone.
                 Err(_) => {
                     self.stats.dropped_messages = self.stats.dropped_messages.saturating_add(1);
+                    let _ = self.replica.report_unreachable(to);
                     return;
                 }
             }
@@ -1049,6 +1155,7 @@ impl Member {
         let queue = self.outbox.entry(to).or_default();
         if queue.len() >= bound {
             self.stats.dropped_messages = self.stats.dropped_messages.saturating_add(1);
+            let _ = self.replica.report_unreachable(to);
             return;
         }
         queue.push_back(self.encoded.clone());
@@ -1076,6 +1183,7 @@ impl Member {
                         .dropped_messages
                         .saturating_add(u64::try_from(queue.len()).unwrap_or(u64::MAX));
                     queue.clear();
+                    let _ = self.replica.report_unreachable(peer);
                     return;
                 }
             }
@@ -1241,6 +1349,7 @@ impl Member {
                 break;
             }
         }
+        self.compact_behind_window(waker, clock);
         self.settle_leadership(endpoint);
         self.unpark(endpoint);
         let term = self.replica.term();
@@ -1257,6 +1366,53 @@ impl Member {
                     .saturating_add(term.saturating_sub(self.seen_term));
             }
             self.seen_term = term;
+        }
+    }
+
+    /// Lets the log go of what the part's window let go (doc 34 P10: the group's log holds what the
+    /// window holds), once the window has emptied one of its segments: it gives memory back a
+    /// segment at a time (`NodeConfig::SEGMENT_BYTES`), and a compaction makes the part's image
+    /// durable and moves the log's start to its point, freeing what the log held for the batches
+    /// that segment held. hyper-log retains a group's entries only until its owner compacts (two
+    /// of its cadences and what may be uncommitted, `hyper_log::Config::group_bytes`; its file's
+    /// bound comes first) and refuses the group's writes past that, so a part whose log was never
+    /// compacted took nothing more once it filled: on fedora (2026-10-19) every closed-loop round
+    /// stopped for good 17 to 28 seconds in, its leader's publishes parked and its last window
+    /// unanswered, as CI's sweep had. A compaction that cannot start now (a start already out, or
+    /// no slot for its write) is asked again at the next turn, until it starts or the log holds
+    /// nothing the window let go.
+    fn compact_behind_window(&mut self, waker: &Waker, clock: u64) {
+        let emptied = self.replica.machine().node().segments_emptied();
+        if emptied != self.emptied_seen {
+            self.emptied_seen = emptied;
+            self.compact_wanted = true;
+        }
+        if !self.compact_wanted {
+            return;
+        }
+        match self.replica.compact(0, clock, waker) {
+            Ok(true) => {
+                self.compact_wanted = false;
+                self.stats.compactions = self.stats.compactions.saturating_add(1);
+            }
+            Ok(false) => {
+                // Nothing the window let go lies past the log's start: nothing to do until the
+                // window empties another segment.
+                let released = self.replica.machine().node().released().0;
+                let start = self
+                    .replica
+                    .core()
+                    .store()
+                    .first_index()
+                    .map_or(u64::MAX, |first| first.saturating_sub(1));
+                if released <= start {
+                    self.compact_wanted = false;
+                }
+            }
+            Err(ReplicaError::Fenced(_)) => self.fenced = true,
+            Err(_) => {
+                self.stats.refused_compactions = self.stats.refused_compactions.saturating_add(1);
+            }
         }
     }
 

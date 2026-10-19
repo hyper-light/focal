@@ -230,6 +230,8 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
             "proposed": member.proposed,
             "acked": member.acked,
             "redirected": member.redirected,
+            "duplicates": member.duplicates,
+            "relieved": member.relieved,
             "parked": member.parked,
             "answers_waited": member.answers_waited,
             "unanswered": member.unanswered,
@@ -237,6 +239,8 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
             "dropped_messages": member.dropped_messages,
             "dropped_records": member.dropped_records,
             "refused_heartbeats": member.refused_heartbeats,
+            "compactions": member.compactions,
+            "refused_compactions": member.refused_compactions,
             // What its log wrote to the device: frames, the updates they carried, bytes with their
             // padding, flushes and durable writes, and how long an update waited to be durable.
             "log": {
@@ -251,6 +255,7 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
                 "commit_wait_p50_us": member.log.commit_wait_p50_ns as f64 / 1e3,
                 "commit_wait_p99_us": member.log.commit_wait_p99_ns as f64 / 1e3,
                 "commit_wait_max_us": member.log.commit_wait_max_ns as f64 / 1e3,
+                "growth_refused": member.log.growth_refused,
             },
         })),
         "published": stats.published,

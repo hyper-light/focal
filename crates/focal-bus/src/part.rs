@@ -131,6 +131,12 @@ impl Part {
         self.append_batch(pool, batch)
     }
 
+    /// What `owner`'s sessions say of a batch of `count` records from sequence `first` on
+    /// `producer`'s session in `stream`, as an append of it would judge it now, changing nothing.
+    pub fn judge(&self, stream: u64, owner: u64, producer: u64, first: u64, count: u64) -> Verdict {
+        self.producers.judge(stream, owner, producer, first, count)
+    }
+
     /// Appends a batch its part's group committed, whose CRC the transport and the log checked
     /// on its way here, published by `owner`, in its session's order (`producer`, doc 34 P6,
     /// Kafka's idempotent producer, KIP-98): a batch its session took already is known again and

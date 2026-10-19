@@ -116,7 +116,13 @@ pub async fn serve(
         None => (1, 0),
     };
     let local = pki::load_or_make(&config.pki, peers.saturating_add(1), config.clients)?;
-    let budget = MemoryBudget::new(config.memory_bytes, 0).map_err(BusError::Memory)?;
+    // A node of a part's group applies what its group committed within all of its memory, and
+    // admits inputs within less (`limits::group_budget`).
+    let budget = if config.group.is_some() {
+        crate::limits::group_budget(config.memory_bytes)?
+    } else {
+        MemoryBudget::new(config.memory_bytes, 0).map_err(BusError::Memory)?
+    };
     let mut directory = BusDirectory::new(config.clients.saturating_add(peers));
     for (index, client) in local.clients.iter().enumerate() {
         let peer = local

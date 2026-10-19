@@ -480,6 +480,12 @@ impl Node {
         self.released
     }
 
+    /// The window's segments emptied over the node's life: one each time it let go a segment's
+    /// batches.
+    pub const fn segments_emptied(&self) -> u64 {
+        self.pool.emptied()
+    }
+
     /// Once the window holds what the memory holds, lets the oldest batches go as the tail fills:
     /// the oldest segment is let go in the share the tail has filled, so it is empty and warm when
     /// the tail takes the next. Let go all at once as the tail rolled over, a segment's batches held

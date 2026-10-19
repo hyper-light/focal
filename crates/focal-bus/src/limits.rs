@@ -19,6 +19,46 @@ use crate::wire::{Gap, HEAD_BOUND};
 /// (hyper-rt's batched receive).
 pub const IO: Io = Io { batch: 64 };
 
+/// Derived: what a node of a part's group keeps of its admitted memory from what inputs reserve,
+/// for what its replica comes to hold past their reservations, which cannot be refused: one entry
+/// (`wire::ENTRY_BOUND`), the most one call grows by (hyper-durable's charge).
+pub const GROUP_COMPLETION_RESERVE: usize = if crate::wire::ENTRY_BOUND > usize::MAX as u64 {
+    usize::MAX
+} else {
+    crate::wire::ENTRY_BOUND as usize
+};
+
+/// Derived: what applying a committed entry may take past what a node of a part's group admits,
+/// within its memory: the window's segment (`NodeConfig::SEGMENT_BYTES`), taken on the committed
+/// lane ([`focal_memory::BudgetLane::Committed`]: what a committed fact requires where it
+/// applies, held to the hold limit, doc 31 M3). Applying gives back the entries the replica kept,
+/// and the window recycles its oldest segments as the tail fills, so what was admitted falls back
+/// within its bound. Without it, a follower that took appends while it could hold them had no
+/// segment left to apply them into, the entries it held were given back only by applying them,
+/// and its part fenced the replica for want of memory for a committed batch (2026-10-19, a 20 MiB
+/// node under contention).
+pub const GROUP_APPLY_HOLD: usize = crate::node::NodeConfig::SEGMENT_BYTES;
+
+/// The memory a node of a part's group of `memory_bytes` draws on: inputs, the transport's
+/// included, admitted within its memory less [`GROUP_APPLY_HOLD`] and
+/// [`GROUP_COMPLETION_RESERVE`], its replica's own growth within its memory less the hold, and
+/// applying committed entries within all of it. A node whose memory holds no more than these and
+/// a window segment serves nothing.
+pub fn group_budget(memory_bytes: usize) -> Result<focal_memory::MemoryBudget, BusError> {
+    let least = GROUP_APPLY_HOLD
+        .saturating_add(GROUP_COMPLETION_RESERVE)
+        .saturating_add(crate::node::NodeConfig::SEGMENT_BYTES);
+    if memory_bytes <= least {
+        return Err(BusError::Configuration(
+            "a group node's memory holds no window segment past its apply's hold and reserve",
+        ));
+    }
+    let admitted = memory_bytes.saturating_sub(GROUP_APPLY_HOLD);
+    focal_memory::MemoryBudget::new(memory_bytes, 0)
+        .and_then(|root| root.child_holding(admitted, GROUP_COMPLETION_RESERVE, memory_bytes))
+        .map_err(BusError::Memory)
+}
+
 /// Derived: the connections a client identity holds at once: the one it is served on, and the one
 /// that replaces it after a reconnect, admitted while the old one is held until it has been quiet
 /// for the serve period (hyper-transport's admission replaces only a quiet connection).

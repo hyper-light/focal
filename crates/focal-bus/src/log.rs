@@ -136,6 +136,8 @@ pub struct SegmentPool {
     allocated: u64,
     /// Segments returned to the system.
     released: u64,
+    /// Segments the parts gave back, each emptied of its batches: what the window let go.
+    emptied: u64,
 }
 
 impl SegmentPool {
@@ -154,6 +156,7 @@ impl SegmentPool {
             working: WorkingSet::default(),
             allocated: 0,
             released: 0,
+            emptied: 0,
         })
     }
 
@@ -182,14 +185,30 @@ impl SegmentPool {
         (self.allocated, self.released)
     }
 
+    /// Segments the parts gave back over the pool's life, each emptied of the batches it held.
+    pub const fn emptied(&self) -> u64 {
+        self.emptied
+    }
+
     fn take(&mut self) -> Result<Segment, BusError> {
         let segment = match self.warm.pop() {
             Some(segment) => segment,
             None => {
-                let charge = self
-                    .budget
-                    .reserve(BudgetKind::Payload, BudgetLane::Ordinary, self.size)
-                    .map_err(BusError::Memory)?
+                // What is admitted is spent: the segment is what a committed fact requires where
+                // it applies, a part's appends being its group's committed entries, held to the
+                // budget's hold limit (`limits::GROUP_APPLY_HOLD`); a budget that holds nothing
+                // past what it admits refuses it.
+                let charge =
+                    match self
+                        .budget
+                        .reserve(BudgetKind::Payload, BudgetLane::Ordinary, self.size)
+                    {
+                        Ok(reserved) => reserved,
+                        Err(_) => self
+                            .budget
+                            .reserve(BudgetKind::Payload, BudgetLane::Committed, self.size)
+                            .map_err(BusError::Memory)?,
+                    }
                     .commit();
                 let mut bytes = Vec::new();
                 bytes
@@ -209,6 +228,7 @@ impl SegmentPool {
 
     fn give(&mut self, mut segment: Segment) {
         self.in_use = self.in_use.saturating_sub(1);
+        self.emptied = self.emptied.saturating_add(1);
         let keep = self.working.gave(self.in_use);
         if self.warm.len() < keep {
             segment.bytes.clear();
