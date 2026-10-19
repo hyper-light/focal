@@ -16,6 +16,8 @@ pub struct Report {
     window: usize,
     payload_bytes: usize,
     measured_seconds: u64,
+    /// Seconds sent and not measured, first.
+    warmup_seconds: u64,
     redis_lanes: usize,
     sent: u64,
     acknowledged: u64,
@@ -48,6 +50,12 @@ pub struct Report {
     deliver: Option<Delivery>,
     /// `pubsub`: each message from its publish to its arrival at the subscriber.
     pubsub: Option<Pubsub>,
+    /// The wall clock's time as the run began, milliseconds since the Unix epoch: the nodes' lines
+    /// carry theirs.
+    started_unix_ms: u64,
+    /// Each second's acknowledgements from the run's start, by their records' intended sends.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    timeline: Vec<crate::timeline::Second>,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +125,7 @@ impl Report {
             window: args.inflight,
             payload_bytes: args.payload,
             measured_seconds: args.seconds,
+            warmup_seconds: args.warmup,
             redis_lanes: args.lanes,
             sent: tally.sent,
             acknowledged,
@@ -148,6 +157,8 @@ impl Report {
                 max_us: micros(delivered.histogram.max()),
             }),
             pubsub: None,
+            started_unix_ms: tally.timeline.started_unix_ms(),
+            timeline: tally.timeline.seconds(),
         }
     }
 
@@ -170,6 +181,7 @@ impl Report {
             window: args.inflight,
             payload_bytes: args.payload,
             measured_seconds: args.seconds,
+            warmup_seconds: args.warmup,
             redis_lanes: 0,
             sent: tally.sent,
             acknowledged: tally.produced,
@@ -213,6 +225,8 @@ impl Report {
                 publisher_path: lag.path,
                 subscriber_path: received.path,
             }),
+            started_unix_ms: tally.timeline.started_unix_ms(),
+            timeline: tally.timeline.seconds(),
         }
     }
 

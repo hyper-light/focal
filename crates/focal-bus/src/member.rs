@@ -51,7 +51,7 @@ use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_durable::{
     Budget as ReplicaBudget, GroupStore, Output, Replica, ReplicaError, Settings as Shell,
 };
-use hyper_liveness::{Change, Liveness, Settings as LiveSettings, Write as LiveWrite};
+use hyper_liveness::{Change, Liveness, Settings as LiveSettings, Suspicion, Write as LiveWrite};
 use hyper_log::{Class as LogClass, Facts, Log, Pending, Update};
 use hyper_raft::proto::{ConfState, Message};
 use hyper_raft::wire::Record;
@@ -149,6 +149,34 @@ pub struct MemberStats {
     pub suspected: u64,
     /// Terms this node saw begin after its first: an election each, its own or another's.
     pub terms: u64,
+}
+
+/// What a node of a group tells its operator as it happens, each on the turn it happened: what its
+/// liveness stream came to believe of a peer, and each term its replica entered and the member it
+/// came to believe led it. Kafka's brokers log an ISR shrink and a controller's election alike.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GroupEvent {
+    /// The stream judged a peer late and told the replica: when its freshness point passed and when
+    /// the node noticed, on the node's clock, and the heartbeat before.
+    Suspected(Suspicion),
+    /// A fresh heartbeat left a suspected peer trusted.
+    Trusted {
+        /// The peer.
+        peer: u64,
+    },
+    /// A heartbeat came from a later run of a peer: it restarted.
+    Restarted {
+        /// The peer.
+        peer: u64,
+    },
+    /// The replica stood in `term`, believing `leader` led it: zero while an election is under
+    /// way, then once more as the leader is known.
+    Term {
+        /// The term.
+        term: u64,
+        /// The member it believed led, zero for none.
+        leader: u64,
+    },
 }
 
 /// hyper-durable's budget over the node's memory: what the replica reserves before an input, from
@@ -319,6 +347,8 @@ pub struct Member {
     fenced: bool,
     /// The latest term this node's replica stood in: the terms it saw begin are counted from it.
     seen_term: u64,
+    /// The member the replica believed led at its last turn, zero for none.
+    seen_leader: u64,
     /// Whether the node led at its last turn: a node that stops leading redirects what it owed.
     leading: bool,
     /// The drives one turn makes at most: the store's depth and one.
@@ -556,6 +586,7 @@ impl Member {
             answers: HashMap::new(),
             fenced: false,
             seen_term: 0,
+            seen_leader: 0,
             leading: false,
             drives,
             due: false,
@@ -1051,12 +1082,13 @@ impl Member {
         }
     }
 
-    /// Carries out what the stream asked: its write, its heartbeats, its changes.
+    /// Carries out what the stream asked: its write, its heartbeats, its changes, each change told.
     fn act_on_liveness<B, D>(
         &mut self,
         endpoint: &mut Endpoint<Bus, B, D>,
         waker: &Waker,
         now: Instant,
+        tell: &mut impl FnMut(&GroupEvent),
     ) where
         B: Budget<<Bus as Classes>::Class>,
         D: Directory<Role = <Bus as Classes>::Role>,
@@ -1088,12 +1120,19 @@ impl Member {
         for change in &changes {
             let peer = change.peer();
             let _ = match change {
-                Change::Suspected(_) => {
+                Change::Suspected(suspicion) => {
                     self.stats.suspected = self.stats.suspected.saturating_add(1);
+                    tell(&GroupEvent::Suspected(*suspicion));
                     self.replica.suspect(peer)
                 }
-                Change::Trusted { .. } => self.replica.trust(peer),
-                Change::Restarted { .. } => self.replica.restarted(peer),
+                Change::Trusted { .. } => {
+                    tell(&GroupEvent::Trusted { peer });
+                    self.replica.trust(peer)
+                }
+                Change::Restarted { .. } => {
+                    tell(&GroupEvent::Restarted { peer });
+                    self.replica.restarted(peer)
+                }
             };
         }
         self.asked.changes = changes;
@@ -1102,9 +1141,15 @@ impl Member {
 
     /// One turn of the node's work after the events it took: the liveness stream's, a drive of
     /// the replica, what it gave out sent and acknowledged. `waker` is the shard task's, which the
-    /// log wakes when a write it was given is durable.
-    pub fn turn<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, waker: &Waker, now: Instant)
-    where
+    /// log wakes when a write it was given is durable; `tell` is told each [`GroupEvent`] the turn
+    /// came to.
+    pub fn turn<B, D>(
+        &mut self,
+        endpoint: &mut Endpoint<Bus, B, D>,
+        waker: &Waker,
+        now: Instant,
+        tell: &mut impl FnMut(&GroupEvent),
+    ) where
         B: Budget<<Bus as Classes>::Class>,
         D: Directory<Role = <Bus as Classes>::Role>,
     {
@@ -1113,7 +1158,7 @@ impl Member {
         self.measure();
         let clock = self.now_ns(now);
         self.liveness.poll(clock, &mut self.asked);
-        self.act_on_liveness(endpoint, waker, now);
+        self.act_on_liveness(endpoint, waker, now, tell);
         // Bounded: each drive takes at most one `Ready`, and no more than the store's depth are out
         // until the log answers, so a turn drives at most the depth and once more; `more` is the
         // replica's word that driving again now does more without waiting for the log, and what is
@@ -1149,6 +1194,11 @@ impl Member {
         self.settle_leadership(endpoint);
         self.unpark(endpoint);
         let term = self.replica.term();
+        let leader = self.replica.leader();
+        if term != self.seen_term || leader != self.seen_leader {
+            tell(&GroupEvent::Term { term, leader });
+            self.seen_leader = leader;
+        }
         if term > self.seen_term {
             if self.seen_term != 0 {
                 self.stats.terms = self

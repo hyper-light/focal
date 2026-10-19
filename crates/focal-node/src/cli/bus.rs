@@ -130,6 +130,47 @@ pub(crate) fn run(args: BusStart) -> Result<(), Box<dyn std::error::Error + Send
     Ok(())
 }
 
+/// Milliseconds from `from` to `to` on one clock, as a line states them.
+fn millis(from: u64, to: u64) -> f64 {
+    to.saturating_sub(from) as f64 / 1e6
+}
+
+/// One event of the node's group member as its line states it, with the wall clock's time, the
+/// one a client's timings and the other nodes' lines are read against.
+fn group_event(event: &focal_bus::member::GroupEvent) -> serde_json::Value {
+    use focal_bus::member::GroupEvent;
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    match event {
+        // How long the peer was silent when its freshness point passed, how late this node's own
+        // loop noticed, and how late the peer sent its last heartbeat by its own clock: a peer's
+        // silence, or this node's.
+        GroupEvent::Suspected(suspicion) => serde_json::json!({
+            "condition": "Suspected",
+            "unix_ms": unix_ms,
+            "peer": suspicion.peer,
+            "silent_ms": suspicion.last.map(|last| millis(last.arrival_ns, suspicion.at_ns)),
+            "noticed_late_ms": millis(suspicion.at_ns, suspicion.noticed_ns),
+            "sent_late_ms": suspicion.last.map(|last| millis(last.due_ns, last.sent_ns)),
+            "detection_ms": suspicion.detection.map(|bound| bound.as_secs_f64() * 1e3),
+        }),
+        GroupEvent::Trusted { peer } => {
+            serde_json::json!({ "condition": "Trusted", "unix_ms": unix_ms, "peer": peer })
+        }
+        GroupEvent::Restarted { peer } => {
+            serde_json::json!({ "condition": "Restarted", "unix_ms": unix_ms, "peer": peer })
+        }
+        GroupEvent::Term { term, leader } => serde_json::json!({
+            "condition": "Term",
+            "unix_ms": unix_ms,
+            "term": term,
+            "leader": leader,
+        }),
+    }
+}
+
 /// Runs the node.
 pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
     let memory_bytes = node_bytes()?;
@@ -161,16 +202,25 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
         memory_bytes,
         group,
     };
-    let (stats, memory, buffers, rooms, counters, group) =
-        focal_bus::serve::serve(config, |address| {
+    let (stats, memory, buffers, rooms, counters, group) = focal_bus::serve::serve(
+        config,
+        |address| {
             let line =
                 serde_json::json!({ "condition": "Listening", "listen": address.to_string() });
             let _ = std::io::Write::write_all(
                 &mut std::io::stdout().lock(),
                 format!("{line}\n").as_bytes(),
             );
-        })
-        .await?;
+        },
+        |event| {
+            let line = group_event(event);
+            let _ = std::io::Write::write_all(
+                &mut std::io::stdout().lock(),
+                format!("{line}\n").as_bytes(),
+            );
+        },
+    )
+    .await?;
     let line = serde_json::json!({
         "condition": "Stopped",
         // A node of a part's group: its elections, its publishes and their answers.

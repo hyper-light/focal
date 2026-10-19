@@ -258,6 +258,15 @@ jobs:
               for row in delivered:
                   print("| " + " | ".join(f"{v:,.1f}" if isinstance(v, float) else str(v) for v in row) + " |")
           PY
+      - name: Where each tail fell, beside the nodes' events
+        if: always()
+        run: |
+          {
+            echo
+            echo "### Tails in time"
+            echo
+            python3 tools/compare/tails.py tools/compare/compose/reports
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -99,10 +99,12 @@ pub type Served = (
 );
 
 /// Runs a node until it is told to stop, calling `ready` with the address it listens on once it
-/// does; what it did, when it stops.
+/// does, and `tell` with each event of its group's member as it happens; what it did, when it
+/// stops.
 pub async fn serve(
     config: ServeConfig,
     ready: impl FnOnce(SocketAddr),
+    tell: impl FnMut(&crate::member::GroupEvent),
 ) -> Result<Served, BusError> {
     if config.clients > most_clients(config.memory_bytes) {
         return Err(BusError::Configuration(
@@ -197,7 +199,7 @@ pub async fn serve(
             now,
         )?;
         ready(address);
-        return serve_member(driver, member, signals).await;
+        return serve_member(driver, member, signals, tell).await;
     }
     ready(address);
     // The transport's reservations given back as the node last looked: a delivery that found no
@@ -253,6 +255,7 @@ async fn serve_member(
     mut driver: Driver<Bus, BusBudget, BusDirectory>,
     mut member: Member,
     signals: signal::SignalStream,
+    mut tell: impl FnMut(&crate::member::GroupEvent),
 ) -> Result<Served, BusError> {
     let clock = |driver: &Driver<Bus, BusBudget, BusDirectory>| {
         driver
@@ -318,7 +321,7 @@ async fn serve_member(
             }
             Woke::Freed | Woke::Due => {}
         }
-        member.turn(driver.endpoint(), &waker, now);
+        member.turn(driver.endpoint(), &waker, now, &mut tell);
         if member.fenced() {
             return Err(BusError::Fenced);
         }

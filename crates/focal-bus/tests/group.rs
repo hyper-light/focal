@@ -307,7 +307,9 @@ impl World {
                     self.events += 1;
                 }
                 let waker = self.waker.clone();
-                running.member.turn(running.driver.endpoint(), &waker, now);
+                running
+                    .member
+                    .turn(running.driver.endpoint(), &waker, now, &mut |_| {});
             }
         }
         while let Some(event) = self.client.endpoint().poll_event() {

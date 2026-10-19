@@ -17,6 +17,7 @@ mod pubsub;
 mod report;
 mod schedule;
 mod target;
+mod timeline;
 
 use clap::{Parser, ValueEnum};
 use hdrhistogram::Histogram;
@@ -204,6 +205,7 @@ async fn main() -> Result<(), CompareError> {
     // request due while it is full is refused, never queued.
     let mut flying: JoinSet<Answer> = JoinSet::new();
     let started = Instant::now();
+    tally.timeline = timeline::Timeline::new(total)?;
     let sender = Sender {
         target,
         payload: vec![0x5a_u8; args.payload],
@@ -233,11 +235,14 @@ async fn main() -> Result<(), CompareError> {
             // Answers first: the window a due record is judged against has every answer's place back.
             biased;
             Some(joined) = flying.join_next() => {
-                let (latency, measured, result) =
+                let (intended, latency, measured, result) =
                     joined.map_err(|error| CompareError::Target(error.to_string()))?;
                 last_answer = Instant::now();
                 if result.is_ok() {
                     tally.produced = tally.produced.saturating_add(1);
+                    tally
+                        .timeline
+                        .record(intended.saturating_duration_since(started), latency)?;
                 }
                 if measured {
                     tally.record(&mut histogram, latency, result)?;
@@ -421,8 +426,9 @@ async fn pubsub_main(args: Args) -> Result<(), CompareError> {
     report::Report::pubsub(&args, &tally, &received, &lag, mean).write(&args.out)
 }
 
-/// A request's answer: its latency from its intended send, whether it is measured, and its result.
-type Answer = (Duration, bool, Result<(), String>);
+/// A request's answer: its intended send, its latency from it, whether it is measured, and its
+/// result.
+type Answer = (Instant, Duration, bool, Result<(), String>);
 
 /// What every record of a run is sent with.
 struct Sender {
@@ -454,7 +460,7 @@ impl Sender {
         }
         flying.spawn(async move {
             let result = target.append(sequence, payload).await;
-            (intended.elapsed(), measured, result)
+            (intended, intended.elapsed(), measured, result)
         });
         Ok(())
     }
@@ -486,6 +492,8 @@ pub struct Tally {
     /// persisted (a majority's disks).
     pub replicated: u64,
     pub persisted: u64,
+    /// Each second's acknowledgements, by their records' intended sends.
+    pub timeline: timeline::Timeline,
 }
 impl Tally {
     fn record(

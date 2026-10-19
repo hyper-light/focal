@@ -183,6 +183,7 @@ async fn publish(
     let mut in_flight = 0_usize;
     let mut sequence = 0_u32;
     let began = Instant::now();
+    tally.timeline = crate::timeline::Timeline::new(run.total)?;
     let mut next_due = Duration::ZERO;
     let mut closed: Option<Instant> = None;
     let mut last_answer = began;
@@ -380,6 +381,10 @@ async fn publish(
                 for (intended, measured) in batch.records {
                     if durable {
                         tally.produced = tally.produced.saturating_add(1);
+                        tally.timeline.record(
+                            intended.saturating_duration_since(began),
+                            now.saturating_duration_since(intended),
+                        )?;
                         match class {
                             Some(Durability::Replicated) => {
                                 tally.replicated = tally.replicated.saturating_add(1);
