@@ -937,7 +937,7 @@ fn a_founder_restarted_on_a_new_listen_address_behind_its_advertised_endpoint_re
         drop(first);
         // Restart on the wildcard interface at the same port: the listen address
         // differs from the saved one while the advertised endpoint is unchanged.
-        let second_socket = std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap();
+        let second_socket = bind_or_name_holder(port);
         let second_listen = second_socket.local_addr().unwrap();
         assert_ne!(second_listen, first_listen);
         let mut value = Settings::default();
@@ -1263,4 +1263,26 @@ fn a_joined_host_measures_its_voter_path_and_keeps_the_configured_period_on_a_lo
         founder.stop().await;
     })
     .unwrap()
+}
+
+/// A UDP socket on every interface at `port`, or a panic that names what holds the port: the
+/// stopped founder's sockets are gone once its listener has ended, so a port still held is a socket
+/// that outlived the stop, or one a child process inherited (std sets close-on-exec only after it
+/// makes a socket on Apple targets), and which of the two says where the leak is.
+fn bind_or_name_holder(port: u16) -> std::net::UdpSocket {
+    match std::net::UdpSocket::bind(("0.0.0.0", port)) {
+        Ok(socket) => socket,
+        Err(error) => {
+            let holders = std::process::Command::new("lsof")
+                .args(["-nP", &format!("-iUDP:{port}")])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .unwrap_or_else(|lsof| format!("lsof could not run: {lsof}"));
+            panic!(
+                "port {port} still held after the founder stopped ({error}); this process is {}, \
+                 and the port's holders are:\n{holders}",
+                std::process::id()
+            )
+        }
+    }
 }
