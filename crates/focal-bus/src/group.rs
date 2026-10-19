@@ -18,8 +18,11 @@
 //! member that lacks entries its leader's log no longer holds is given the leader's image, and the
 //! entries after it.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::thread::JoinHandle;
 
 use focal_platform::fs::{FileMedium, Medium};
 use hyper_durable::{EntryRef, Fatal, Point, StateMachine};
@@ -139,8 +142,11 @@ pub struct PartMachine {
     changes: VecDeque<(u64, ConfState)>,
     /// The configuration as of the image's point.
     floor_configuration: ConfState,
-    /// The point of the image last made durable: what a restart opens at.
-    durable: Point,
+    /// The point of the image last made durable: what a restart opens at. The writer moves it as
+    /// it answers.
+    durable: Cell<Point>,
+    /// Makes the part's images durable off the shard that applies.
+    writer: ImageWriter,
     /// Where the image is kept.
     path: PathBuf,
     /// The most bytes an image of this part takes: its stream and producer bounds'.
@@ -193,7 +199,8 @@ impl PartMachine {
             configuration: configuration.clone(),
             changes: VecDeque::new(),
             floor_configuration: configuration,
-            durable: point,
+            durable: Cell::new(point),
+            writer: ImageWriter::start(path.clone())?,
             path,
             image_bound,
             relieved: false,
@@ -218,12 +225,26 @@ impl PartMachine {
         relieved
     }
 
+    /// Waits for the image its writer has out, if any: the tests' fact that an image handed is
+    /// durable.
+    #[cfg(test)]
+    pub(crate) fn settle_image(&self) -> Result<(), Fatal> {
+        self.writer.settle(&self.durable)
+    }
+
+    /// The point of the newest image made durable, the writer's answers taken first.
+    fn imaged(&self) -> Point {
+        // A failure is the next persist's to report: it is what fences the part.
+        let _ = self.writer.take(&self.durable);
+        self.durable.get()
+    }
+
     /// The point the part's floors are its state as of: the newest entry the window let go, or
     /// the image's it opened on.
     fn floor_point(&self) -> Point {
         let (index, term) = self.node.released();
         let released = Point { index, term };
-        released.max(self.durable)
+        released.max(self.imaged())
     }
 
     /// Moves the configuration the image states up to the floor's point.
@@ -347,7 +368,7 @@ impl StateMachine for PartMachine {
     }
 
     fn durable(&self) -> Point {
-        self.durable
+        self.imaged()
     }
 
     fn configuration(&self) -> &ConfState {
@@ -385,6 +406,9 @@ impl StateMachine for PartMachine {
         if decoded.point != at {
             return Err(Fatal("an image of another point"));
         }
+        // An image the writer has out would land after this one, the older over the newer: its
+        // answer comes first.
+        self.writer.settle(&self.durable)?;
         let mut medium = FileMedium;
         focal_platform::fs::install(&mut medium, &self.path, image)
             .map_err(|_| Fatal("the part's image could not be made durable"))?;
@@ -392,25 +416,137 @@ impl StateMachine for PartMachine {
             .restore(decoded.floors(), &decoded.producers, (at.index, at.term))
             .map_err(|_| Fatal("the part could not hold the image's streams"))?;
         self.applied = at;
-        self.durable = at;
+        self.durable.set(at);
         self.configuration = configuration.clone();
         self.floor_configuration = configuration.clone();
         self.changes.clear();
         Ok(())
     }
 
+    /// Hands the image of the part's floor to its writer, which makes it durable off the shard:
+    /// the durable point moves as it answers (`StateMachine::durable`), and a compaction asked
+    /// meanwhile compacts to the image made durable before, as the ledger's machine compacts to
+    /// its owner's last checkpoint. One image is out at a time; with one out, the next waits.
     fn persist(&mut self) -> Result<(), Fatal> {
+        self.writer.take(&self.durable)?;
+        if self.writer.out.get() {
+            return Ok(());
+        }
         self.settle_floor();
         let mut bytes = Vec::new();
         let point = self.write_image(&mut bytes)?;
-        if point == self.durable {
+        if point == self.durable.get() {
             return Ok(());
         }
-        let mut medium = FileMedium;
-        focal_platform::fs::install(&mut medium, &self.path, &bytes)
-            .map_err(|_| Fatal("the part's image could not be made durable"))?;
-        self.durable = point;
+        self.writer.hand(bytes, point)
+    }
+}
+
+/// Makes the part's images durable off the shard that applies. An image is an atomic replace of its
+/// file (`focal_platform::fs::install`: a temporary file and its sync, the rename, the directory's
+/// sync), which the shard waited for at every compaction: 20 to 156 ms an image on fedora's busy
+/// disk, and 4.4 to 4.6 s of each node's 40-second closed loop at a window of 32,768 (2026-10-19),
+/// what its heartbeats and answers waited behind. One thread of its own, which writes one image at
+/// a time and answers each; the part hands it the next only once it has answered.
+#[derive(Debug)]
+struct ImageWriter {
+    /// Images to make durable, each with its point; one at most out. Closed as the part goes.
+    images: Option<SyncSender<(Vec<u8>, Point)>>,
+    /// Each image's answer: its point once durable, or the failure that fences the part.
+    answers: Receiver<Result<Point, ()>>,
+    /// Whether an image is out, its answer not yet taken.
+    out: Cell<bool>,
+    /// A failed image, reported to the part at its next persist.
+    failed: Cell<bool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ImageWriter {
+    /// The writer of the image at `path`, its thread started.
+    fn start(path: PathBuf) -> Result<Self, BusError> {
+        // One image out at most, and its one answer.
+        let (images, requests) = sync_channel::<(Vec<u8>, Point)>(1);
+        let (answering, answers) = sync_channel::<Result<Point, ()>>(1);
+        let thread = std::thread::Builder::new()
+            .name("focal-bus-image".into())
+            .spawn(move || {
+                let mut medium = FileMedium;
+                // Bounded: one write an image handed, until the part closes its end.
+                while let Ok((bytes, point)) = requests.recv() {
+                    let answer = focal_platform::fs::install(&mut medium, &path, &bytes)
+                        .map(|()| point)
+                        .map_err(|_| ());
+                    if answering.send(answer).is_err() {
+                        return;
+                    }
+                }
+            })
+            .map_err(|_| BusError::Configuration("the part's image writer could not start"))?;
+        Ok(Self {
+            images: Some(images),
+            answers,
+            out: Cell::new(false),
+            failed: Cell::new(false),
+            thread: Some(thread),
+        })
+    }
+
+    /// Takes the writer's answer, if it came: `durable` moves to the image's point, or the failure
+    /// is kept and reported.
+    fn take(&self, durable: &Cell<Point>) -> Result<(), Fatal> {
+        if let Ok(answer) = self.answers.try_recv() {
+            self.out.set(false);
+            match answer {
+                Ok(point) => durable.set(durable.get().max(point)),
+                Err(()) => self.failed.set(true),
+            }
+        }
+        if self.failed.get() {
+            return Err(Fatal("the part's image could not be made durable"));
+        }
         Ok(())
+    }
+
+    /// Waits for the image out, if any, and takes its answer.
+    fn settle(&self, durable: &Cell<Point>) -> Result<(), Fatal> {
+        if self.out.get() {
+            match self.answers.recv() {
+                Ok(Ok(point)) => durable.set(durable.get().max(point)),
+                Ok(Err(())) => self.failed.set(true),
+                Err(_) => return Err(Fatal("the part's image writer ended")),
+            }
+            self.out.set(false);
+        }
+        self.take(durable)
+    }
+
+    /// Hands the writer an image of `point`: none is out.
+    fn hand(&self, bytes: Vec<u8>, point: Point) -> Result<(), Fatal> {
+        let Some(images) = &self.images else {
+            return Err(Fatal("the part's image writer ended"));
+        };
+        match images.try_send((bytes, point)) {
+            Ok(()) => {
+                self.out.set(true);
+                Ok(())
+            }
+            // None out, so a full queue is a writer gone wrong as surely as a closed one.
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                Err(Fatal("the part's image writer ended"))
+            }
+        }
+    }
+}
+
+impl Drop for ImageWriter {
+    /// The thread ends once it has answered the image it has out: its end of the queue closes.
+    fn drop(&mut self) {
+        self.images = None;
+        // Its answer, if any, is let go: the queue holds one at most.
+        let _ = self.answers.try_recv();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -803,6 +939,7 @@ mod tests {
             .apply_change(change_at, &ConfChangeV2::default(), &grown)
             .unwrap();
         machine.persist().unwrap();
+        machine.settle_image().unwrap();
         let durable = machine.durable();
         assert!(durable.index > 0 && durable.index < change_at.index);
         assert_eq!(machine.configuration(), &grown);
@@ -835,6 +972,61 @@ mod tests {
             apply(&mut reopened, 99, last).unwrap().outcome,
             Outcome::Again { .. }
         ));
+    }
+
+    /// Do: apply batches past the window's floor, persist, and before the image's answer is taken
+    /// read the durable point and persist again; then wait for the image. Expect: the durable point
+    /// is the image's once its answer comes and never past it before, the second persist hands
+    /// nothing while one is out, and a part reopened on the file opens at that point: the shard
+    /// hands its image to the writer and goes on, where it waited for the file's sync.
+    #[test]
+    fn an_image_is_made_durable_off_the_shard_and_the_durable_point_follows_its_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut machine = machine(2, dir.path());
+        for at in 0..30u32 {
+            let data = batch(u64::from(at % 4), 2, at / 4 * 2, 2, 300 << 10);
+            apply(&mut machine, u64::from(at) + 1, &data).unwrap();
+        }
+        let floor = machine.floor_point();
+        assert!(floor.index > 0, "the window let batches go");
+        machine.persist().unwrap();
+        // Before its answer is taken the durable point is the opening's or the image's, never
+        // past it; a second persist with one out hands nothing.
+        assert!(machine.durable() <= floor);
+        machine.persist().unwrap();
+        machine.settle_image().unwrap();
+        assert_eq!(machine.durable(), floor);
+        let reopened =
+            PartMachine::open(node(2), dir.path().join("part.image"), founding(), 3).unwrap();
+        assert_eq!(reopened.durable(), floor);
+    }
+
+    /// Do: hand the writer an image of the floor, and at once install an image of a later point.
+    /// Expect: a part reopened on the file opens at the installed point: an install waits for the
+    /// image out, so the older never lands over the newer.
+    #[test]
+    fn an_install_waits_for_the_image_out_so_the_older_never_lands_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut machine = machine(2, dir.path());
+        for at in 0..30u32 {
+            let data = batch(u64::from(at % 4), 2, at / 4 * 2, 2, 300 << 10);
+            apply(&mut machine, u64::from(at) + 1, &data).unwrap();
+        }
+        machine.persist().unwrap();
+        let mut leader =
+            PartMachine::open(node(2), dir.path().join("leader.image"), founding(), 3).unwrap();
+        for at in 0..60u32 {
+            let data = batch(u64::from(at % 4), 2, at / 4 * 2, 2, 300 << 10);
+            apply(&mut leader, u64::from(at) + 1, &data).unwrap();
+        }
+        let mut image = Vec::new();
+        let (at, configuration) = leader.image(&mut image).unwrap();
+        assert!(at > machine.floor_point(), "the leader's image is later");
+        machine.install(&image, at, &configuration).unwrap();
+        assert_eq!(machine.durable(), at);
+        let reopened =
+            PartMachine::open(node(2), dir.path().join("part.image"), founding(), 3).unwrap();
+        assert_eq!(reopened.durable(), at);
     }
 
     #[test]
