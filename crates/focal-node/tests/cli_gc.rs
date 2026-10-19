@@ -350,14 +350,19 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
         let restored = restore();
         assert_eq!(restored["result"]["kind"], "gc_restored", "{restored}");
         assert_eq!(restored["result"]["restored"], true, "{restored}");
+        // Listed back, judged with the second request across a window no pass
+        // entered: a pass between the restore and the listing takes the
+        // orphan again, its bytes old (ubuntu CI, bus-replicated 3dadcd5f: the
+        // restored orphan was not listed).
         all = manifests(root, &tenant);
-        assert!(all.contains(&orphan), "{all:?}");
+        let listed = all.contains(&orphan);
         let again = restore();
         let closed = gc_status(root);
         if opened["passes"] == closed["passes"]
             && opened["collecting"] == false
             && closed["collecting"] == false
         {
+            assert!(listed, "{all:?}; collector {opened} then {closed}");
             assert_eq!(
                 again["result"]["restored"], false,
                 "{again}; collector {opened} then {closed}"

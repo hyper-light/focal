@@ -581,6 +581,33 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
             .connect(address, &founder_name)
             .await
             .unwrap();
+        // Its handshake's own reservations go back once it has ended, after the
+        // connection is up: filled before, the lane had room again for the dial
+        // below (Linux CI, bus-replicated 7a79f0d7: the dial refused at a full
+        // lane was admitted). Filled once the listener holds the two
+        // connections and nothing pending.
+        let joined = listener.admission().await.changes;
+        owners::counted_async(
+            async || vec![listener.admission().await.changes],
+            joined,
+            Duration::from_millis(5),
+            async {
+                loop {
+                    let admission = listener.admission().await;
+                    if admission.pending == 0
+                        && admission.connections == 2
+                        && network_budget.stats().used == listener_residency + admission.bytes
+                    {
+                        break;
+                    }
+                    focal_rt::time::sleep(Duration::from_millis(5))
+                        .await
+                        .unwrap();
+                }
+            },
+        )
+        .await
+        .unwrap();
         // The ordinary lane is filled, and filled again with what the refused
         // dial below gives back once its handshake has ended.
         let fill = |pressure: &mut Option<focal_memory::Allocation>| {
@@ -626,7 +653,10 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
             async {
                 loop {
                     let admission = listener.admission().await;
+                    // The refused dial gone whole: no handshake pending, the
+                    // listener back to its two connections.
                     if admission.pending == 0
+                        && admission.connections == 2
                         && network_budget.stats().used
                             == listener_residency + admission.bytes + held
                     {

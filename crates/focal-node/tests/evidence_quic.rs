@@ -664,6 +664,18 @@ impl Fleet {
     async fn leader(&self) -> usize {
         self.leader_at(None).await
     }
+    /// The founder (node 1) leading: elected first, as it campaigns first, or handed leadership by
+    /// Raft's own transfer where a follower's election came first. Across a shaped path a
+    /// connection's setup can outlast the follower's wait on a loaded runner, and the follower's
+    /// election then wins (macOS CI, bus-replicated 7a79f0d7: node 2 led); which node leads is the
+    /// election's to decide, and the tests' steps name the founder.
+    async fn founder_leads(&self) -> usize {
+        let leader = self.leader().await;
+        if leader != 0 {
+            self.replicas[leader].host.transfer_leader(1).await.unwrap();
+        }
+        self.leader_at(Some(1)).await
+    }
     /// The replicas whose owners run, and a wait charged to their own
     /// periods (27 §3.1 P8): what `allowance` holds at their tick, however
     /// long that takes on the machine the test runs on. The waits here were
@@ -995,7 +1007,7 @@ fn managed_routing_preserves_custody_artifact_retry_and_cold_leader_failover_ove
 async fn evidence_scenario(managed: bool) {
     let data = tempfile::tempdir().unwrap();
     let mut fleet = Fleet::open(data.path(), managed).await;
-    let leader = fleet.leader().await;
+    let leader = fleet.founder_leads().await;
     assert_eq!(leader, 0);
     let mut bytes = br#"{"passed":7,"failed":0,"skipped":1}"#.to_vec();
     // More chunks than a transfer keeps in flight and than a copy takes
@@ -1299,7 +1311,7 @@ async fn a_chunk_reaches_its_copy_across(bits: u64) {
         old: &[],
     };
     let fleet = Fleet::open_with(data.path(), false, Some(slow)).await;
-    let leader = fleet.leader().await;
+    let leader = fleet.founder_leads().await;
     assert_eq!(leader, 0);
     // Before the copy has answered a bulk exchange, a part is one window's
     // worth of the path, what it is known to accept in flight: the cold
@@ -1457,7 +1469,7 @@ async fn bytes_crossed_for_a_second_object(old: &'static [u64]) -> u64 {
         old,
     };
     let fleet = Fleet::open_with(data.path(), false, Some(slow)).await;
-    let leader = fleet.leader().await;
+    let leader = fleet.founder_leads().await;
     assert_eq!(leader, 0);
     let mut first = br#"{"passed":7,"failed":0,"skipped":1}"#.to_vec();
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
