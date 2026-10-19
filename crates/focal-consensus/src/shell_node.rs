@@ -39,8 +39,9 @@ type ShellReplica = Replica<Store, HandOver<FileMedium>, FocalBudget>;
 /// hyper-durable's budget over the group's `MemoryBudget`: what the replica reserves before an
 /// input is reserved from the lane the owner's call names, and what it came to hold past that,
 /// which cannot be refused, from the completion lane. What that lane cannot hold is owed:
-/// counted, never reserved, at most one call's growth (the replica settles after every call),
-/// and every reservation is refused until it is released.
+/// counted, at most one call's growth (the replica settles after every call), held on the
+/// completion lane as soon as the group's memory has room for it, and every reservation is
+/// refused while it is owed.
 pub(crate) struct FocalBudget {
     budget: MemoryBudget,
     ordinary: Option<Allocation>,
@@ -58,6 +59,16 @@ impl FocalBudget {
             completion: None,
             owed: 0,
             lane: BudgetLane::Completion,
+        }
+    }
+
+    /// Holds what is owed on the completion lane once the group's memory has room for it: refused
+    /// until a release of the replica's own repaid it, a replica whose release waited on the inputs
+    /// it refused never took another, whatever memory came back meanwhile (focal-bus's member
+    /// budget, the same rule: a leader refused its followers' acknowledgements for good).
+    fn settle_owed(&mut self) {
+        if self.owed > 0 && self.hold(BudgetLane::Completion, self.owed) {
+            self.owed = 0;
         }
     }
 
@@ -102,6 +113,7 @@ impl Budget for FocalBudget {
     const BOUNDED: bool = true;
 
     fn reserve(&mut self, bytes: u64) -> bool {
+        self.settle_owed();
         self.owed == 0 && self.hold(self.lane, bytes)
     }
 
