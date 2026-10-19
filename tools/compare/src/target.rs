@@ -32,6 +32,39 @@ pub enum Target {
     },
 }
 
+/// The producer's configuration against the brokers `endpoints` names, once the run's topic is
+/// made: one partition, three replicas, two in sync at least.
+pub async fn kafka_topic(endpoints: &[String]) -> Result<rdkafka::ClientConfig, CompareError> {
+    use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+    use rdkafka::client::DefaultClientContext;
+    let servers = endpoints.join(",");
+    let mut config = rdkafka::ClientConfig::new();
+    config
+        .set("bootstrap.servers", &servers)
+        // Every in-sync replica before the answer, and no
+        // duplicate from a retry (Kafka's own safe-producer
+        // defaults since 3.0); the brokers'
+        // `log.flush.interval.messages` decides the fsync.
+        .set("acks", "all")
+        .set("enable.idempotence", "true")
+        // The client's own deadline is the histogram's highest
+        // value, so a slow acknowledgement is recorded.
+        .set(
+            "message.timeout.ms",
+            crate::HIGHEST_NS
+                .checked_div(1_000_000)
+                .unwrap_or(0)
+                .to_string(),
+        );
+    let admin: AdminClient<DefaultClientContext> = config
+        .create()
+        .map_err(|error| CompareError::Target(error.to_string()))?;
+    let topic = NewTopic::new(NAME, 1, TopicReplication::Fixed(3)).set("min.insync.replicas", "2");
+    // A topic that exists already is the topic to use.
+    let _ = tokio::time::timeout(SETUP, admin.create_topics([&topic], &AdminOptions::new())).await;
+    Ok(config)
+}
+
 impl Target {
     /// `lanes`: the connections a Redis run spreads its writes over, a
     /// parameter of the experiment that every report records.
@@ -78,37 +111,7 @@ impl Target {
                 Ok(Self::Nats(context))
             }
             System::Kafka => {
-                use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
-                use rdkafka::client::DefaultClientContext;
-                let servers = endpoints.join(",");
-                let mut config = rdkafka::ClientConfig::new();
-                config
-                    .set("bootstrap.servers", &servers)
-                    // Every in-sync replica before the answer, and no
-                    // duplicate from a retry (Kafka's own safe-producer
-                    // defaults since 3.0); the brokers'
-                    // `log.flush.interval.messages` decides the fsync.
-                    .set("acks", "all")
-                    .set("enable.idempotence", "true")
-                    // The client's own deadline is the histogram's highest
-                    // value, so a slow acknowledgement is recorded.
-                    .set(
-                        "message.timeout.ms",
-                        crate::HIGHEST_NS
-                            .checked_div(1_000_000)
-                            .unwrap_or(0)
-                            .to_string(),
-                    );
-                let admin: AdminClient<DefaultClientContext> =
-                    config.create().map_err(|error| fail(error.to_string()))?;
-                let topic = NewTopic::new(NAME, 1, TopicReplication::Fixed(3))
-                    .set("min.insync.replicas", "2");
-                // A topic that exists already is the topic to use.
-                let _ = tokio::time::timeout(
-                    SETUP,
-                    admin.create_topics([&topic], &AdminOptions::new()),
-                )
-                .await;
+                let config = kafka_topic(endpoints).await?;
                 let producer: rdkafka::producer::FutureProducer =
                     config.create().map_err(|error| fail(error.to_string()))?;
                 Ok(Self::Kafka(producer))

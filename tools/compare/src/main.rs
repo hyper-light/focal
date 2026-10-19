@@ -13,6 +13,7 @@ mod bus;
 mod bus_append;
 mod certs;
 mod deliver;
+mod kafka_append;
 mod pubsub;
 mod report;
 mod schedule;
@@ -159,6 +160,9 @@ async fn main() -> Result<(), CompareError> {
             ));
         }
         return bus_append_main(args).await;
+    }
+    if args.system == System::Kafka && args.mode == Mode::Append {
+        return kafka_append_main(args).await;
     }
     let deliver = args.mode == Mode::Deliver;
     if deliver && args.payload < deliver::HEADER {
@@ -325,6 +329,27 @@ async fn bus_append_main(args: Args) -> Result<(), CompareError> {
         inflight: args.inflight,
     };
     let (histogram, tally) = tokio::task::spawn_blocking(move || bus_append::run(run))
+        .await
+        .map_err(|error| CompareError::Target(error.to_string()))??;
+    report::Report::new(&args, &histogram, &tally, None).write(&args.out)
+}
+
+/// The `append` mode against Kafka: its topic made, then its own client's callbacks timing each
+/// record (`kafka_append`) on a thread of their own.
+async fn kafka_append_main(args: Args) -> Result<(), CompareError> {
+    let endpoints: Vec<String> = args.endpoints.split(',').map(str::to_owned).collect();
+    let run = kafka_append::Run {
+        config: target::kafka_topic(&endpoints).await?,
+        topic: target::NAME,
+        rate: args.rate,
+        warmup: Duration::from_secs(args.warmup),
+        total: Duration::from_secs(args.warmup)
+            .checked_add(Duration::from_secs(args.seconds))
+            .ok_or(CompareError::Argument("duration"))?,
+        payload: args.payload,
+        inflight: args.inflight,
+    };
+    let (histogram, tally) = tokio::task::spawn_blocking(move || kafka_append::run(run))
         .await
         .map_err(|error| CompareError::Target(error.to_string()))??;
     report::Report::new(&args, &histogram, &tally, None).write(&args.out)
