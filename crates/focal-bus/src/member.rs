@@ -159,6 +159,13 @@ pub struct MemberStats {
     pub compactions: u64,
     /// Compactions the replica refused, changing nothing; asked again at the next turn.
     pub refused_compactions: u64,
+    /// Nanoseconds the node spent compacting: making the part's image durable and the log's
+    /// start's write submitted.
+    pub compaction_ns: u64,
+    /// The longest the node went without waiting, nanoseconds: from the end of a wait through
+    /// the events it brought and the turn after them, what its timers and its heartbeats waited
+    /// behind.
+    pub busy_most_ns: u64,
     /// What the node's log wrote to its device, as the log counted it.
     pub log: LogWrites,
 }
@@ -428,6 +435,8 @@ pub struct Member {
     emptied_seen: u64,
     /// A segment was emptied since the log was last compacted.
     compact_wanted: bool,
+    /// When the node's last wait ended: its busy period runs from here to its turn's end.
+    woke: Option<Instant>,
     /// Whether the node led at its last turn: a node that stops leading redirects what it owed.
     leading: bool,
     /// The drives one turn makes at most: the store's depth and one.
@@ -668,6 +677,7 @@ impl Member {
             seen_leader: 0,
             emptied_seen: 0,
             compact_wanted: false,
+            woke: None,
             leading: false,
             drives,
             due: false,
@@ -1367,6 +1377,10 @@ impl Member {
             }
             self.seen_term = term;
         }
+        if let Some(woke) = self.woke.take() {
+            let busy = u64::try_from(woke.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.stats.busy_most_ns = self.stats.busy_most_ns.max(busy);
+        }
     }
 
     /// Lets the log go of what the part's window let go (doc 34 P10: the group's log holds what the
@@ -1390,7 +1404,11 @@ impl Member {
         if !self.compact_wanted {
             return;
         }
-        match self.replica.compact(0, clock, waker) {
+        let started = Instant::now();
+        let compacted = self.replica.compact(0, clock, waker);
+        let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.stats.compaction_ns = self.stats.compaction_ns.saturating_add(took);
+        match compacted {
             Ok(true) => {
                 self.compact_wanted = false;
                 self.stats.compactions = self.stats.compactions.saturating_add(1);
@@ -1493,6 +1511,7 @@ impl Member {
     /// (`hyper_liveness::Liveness::on_wait`, `Refusal::Unmeasured`): an owner that never tells
     /// its waits elects no leader.
     pub fn waited(&mut self, began: Instant, woke: Instant) {
+        self.woke = Some(woke);
         let Some(at) = self.liveness.wake() else {
             return;
         };

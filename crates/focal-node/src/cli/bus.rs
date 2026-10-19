@@ -241,6 +241,8 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
             "refused_heartbeats": member.refused_heartbeats,
             "compactions": member.compactions,
             "refused_compactions": member.refused_compactions,
+            "compaction_ms": member.compaction_ns as f64 / 1e6,
+            "busy_most_ms": member.busy_most_ns as f64 / 1e6,
             // What its log wrote to the device: frames, the updates they carried, bytes with their
             // padding, flushes and durable writes, and how long an update waited to be durable.
             "log": {
