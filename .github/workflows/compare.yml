@@ -18,8 +18,11 @@ on:
   workflow_dispatch:
     inputs:
       rates:
-        description: "Offered records a second, space-separated"
+        description: "Offered records a second, space-separated; 0, a closed loop (each answer sends the next record) for a ceiling"
         default: "100 200 1000 4000"
+      windows:
+        description: "Generator windows (requests out at most), space-separated, each run at each; empty, the generator's 4096 (focal-load keeps its own callers)"
+        default: ""
       seconds:
         description: "Seconds measured per run"
         default: "60"
@@ -124,10 +127,20 @@ jobs:
         run: |
           for system in ${{ github.event.inputs.systems || 'focal kafka nats redis' }}; do
             for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'compare/deliver') && '50 100 200 400' || '100 200 1000 4000') }}; do
-              bash tools/compare/compose/run.sh "$system" "$rate" \
-                "${{ github.event.inputs.seconds || '60' }}" \
-                "${{ github.event.inputs.warmup || '15' }}" \
-                "${{ github.event.inputs.payload || '128' }}" reports
+              for window in ${{ github.event.inputs.windows || '-' }}; do
+                if [ "$window" = - ]; then
+                  unset INFLIGHT
+                else
+                  # focal-load paces its own callers: it has no closed loop and no window.
+                  if [ "$system" = focal ]; then continue; fi
+                  export INFLIGHT="$window"
+                fi
+                if [ "$system" = focal ] && [ "$rate" = 0 ]; then continue; fi
+                bash tools/compare/compose/run.sh "$system" "$rate" \
+                  "${{ github.event.inputs.seconds || '60' }}" \
+                  "${{ github.event.inputs.warmup || '15' }}" \
+                  "${{ github.event.inputs.payload || '128' }}" reports
+              done
             done
           done
       - name: One table, every system, one runner
@@ -163,6 +176,33 @@ jobs:
               if not nodes or writes <= 0 or wall <= 0:
                   return ("–", "–", "–")
               return (max(nodes) / writes, sum(nodes) / writes, 100 * max(nodes) / wall)
+          def apart(path):
+              """What else could have been the run's ceiling: the generator's
+              share of the wall clock (a generator at its CPUs measured itself),
+              and the busiest disk's (run.sh's /proc/diskstats counters; its
+              three nodes share it). Dashes where no counters were taken."""
+              def deltas(suffix):
+                  seen = {}
+                  try:
+                      lines = open(path + suffix).read().splitlines()
+                  except OSError:
+                      lines = []
+                  for line in lines:
+                      parts = line.split()
+                      if len(parts) == 4 and parts[3].isdigit():
+                          phase, name, key, value = parts
+                          seen.setdefault(name, {}).setdefault(key, {})[phase] = int(value)
+                  return {n: {k: v["after"] - v["before"] for k, v in keys.items() if len(v) == 2}
+                          for n, keys in seen.items()}
+              cpus = deltas(".cpu.txt")
+              wall = cpus.pop("-", {}).get("wall_usec", 0)
+              if wall <= 0:
+                  return ("–", "–")
+              generator = [d["usage_usec"] for c, d in cpus.items() if "generator" in c and "usage_usec" in d]
+              disks = deltas(".disk.txt")
+              busiest = max(disks.values(), key=lambda d: d.get("sectors_written", 0), default=None)
+              return (100 * sum(generator) / wall if generator else "–",
+                      100 * busiest["busy_ms"] * 1000 / wall if busiest and "busy_ms" in busiest else "–")
           rows = []
           legacy_focal = False
           for path in sorted(glob.glob("tools/compare/compose/reports/*.json")):
@@ -177,14 +217,16 @@ jobs:
                   us = lambda v: v / 1000
                   # The CPU counters span the whole load, warm-up included,
                   # as do the run's committed writes.
-                  rows.append((name, r["shape"].get("rate"), counts["committed"], counts["refused"] + counts["unknown"] + counts.get("expired", 0),
-                               us(l["p50"]), us(l["p99"]), us(l["p999"]), us(l["max"])) + cpu(path, r["committed"]))
+                  rows.append((name, r["shape"].get("rate"), "–", counts["committed"], "–", counts["refused"] + counts["unknown"] + counts.get("expired", 0),
+                               us(l["p50"]), us(l["p99"]), us(l["p999"]), us(l["max"])) + cpu(path, r["committed"]) + apart(path))
               elif "offered_per_second" in r:  # focal-compare
                   # Every write it sent, warm-up included, as the counters span.
-                  rows.append((name, r["offered_per_second"], r["acknowledged"], r["failed"] + r["refused_by_generator"],
-                               r["p50_us"], r["p99_us"], r["p999_us"], r["max_us"]) + cpu(path, r["sent"]))
-          print("| run | offered/s | acknowledged | failed or refused | p50 µs | p99 µs | p99.9 µs | max µs | busiest node CPU µs/write | all nodes CPU µs/write | busiest node busy % |")
-          print("|---|---|---|---|---|---|---|---|---|---|---|")
+                  # A rate of zero is the closed loop: its achieved rate is the ceiling at its window.
+                  rows.append((name, r["offered_per_second"] or "closed", r.get("window", "–"), r["acknowledged"], r["achieved_per_second"],
+                               r["failed"] + r["refused_by_generator"],
+                               r["p50_us"], r["p99_us"], r["p999_us"], r["max_us"]) + cpu(path, r["sent"]) + apart(path))
+          print("| run | offered/s | window | acknowledged | achieved/s | failed or refused | p50 µs | p99 µs | p99.9 µs | max µs | busiest node CPU µs/write | all nodes CPU µs/write | busiest node busy % | generator busy % | disk busy % |")
+          print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
           for row in rows:
               print("| " + " | ".join(f"{v:,.0f}" if isinstance(v, float) else str(v) for v in row) + " |")
           if legacy_focal:

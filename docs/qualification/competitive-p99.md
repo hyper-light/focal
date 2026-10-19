@@ -16,6 +16,18 @@ Tene, "How NOT to Measure Latency", and HdrHistogram's correction). Every run re
 p50, p99, p99.9 and max in an HdrHistogram (3 significant digits), achieved against
 offered throughput, errors and refusals, and each node's CPU and RSS.
 
+A system's ceiling is measured apart from its latency. Past saturation, an open-loop run
+only shows the generator's window divided by the system's latency (Little's law), and
+counting each refused record cost the generator a turn of its loop, which at 1M records a
+second was the generator's own work. The ceiling runs have no schedule (offered rate 0):
+each answer sends the next record, so the window stays full. This is a closed loop, as
+Kafka's `producer-perf-test` runs at `--throughput -1` and the OpenMessaging Benchmark's
+producers run at their highest rate. Each system is swept over the same windows
+(`INFLIGHT`). Its ceiling is the achieved rate where a larger window adds latency but no
+throughput. Latencies from these runs measure a full queue, not the system. Each report
+names its window. The summary also shows the generator's and the busiest disk's share of
+the wall clock: a run where either is near 100% measured that, not the system.
+
 ## Equal terms
 
 All four systems run as three containers in one Docker Linux VM on the same host, each

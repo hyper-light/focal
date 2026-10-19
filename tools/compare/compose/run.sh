@@ -11,10 +11,19 @@
 #   each record also taken by a consumer and acknowledged by it durably, a
 #   work queue's message end to end (focal: its seven-write lifecycle, the
 #   consumer an enrolled client of its own; RATE is messages a second).
+#   RATE 0: no schedule, each answer sending the next record, the window held
+#   full (a closed loop: Kafka's producer-perf-test at --throughput -1), for a
+#   system's ceiling at that window.
+#   INFLIGHT (environment): the generator's window, the requests out at most
+#   (focal-compare's own default, 4096, where unset); a run given one names it
+#   in its report's file.
 set -euo pipefail
 cd "$(dirname "$0")"
 system="$1"; rate="$2"; seconds="$3"; warmup="$4"; payload="$5"; out="$6"
 mode="${MODE:-append}"
+window_args=()
+window=""
+if [ -n "${INFLIGHT:-}" ]; then window_args=(--inflight "$INFLIGHT"); window="-w$INFLIGHT"; fi
 case "$mode" in
   append) suffix="" ;;
   deliver) suffix="-deliver" ;;
@@ -118,6 +127,19 @@ net_stat() {
       }'
   done
 }
+# The machine's disks as its kernel counts them (/proc/diskstats), before and
+# after the load, each line `PHASE DEVICE KEY VALUE`: writes completed, sectors
+# written, the milliseconds the device was busy, and its flushes completed
+# (Linux 5.5 and later), for whether a run measured its disk rather than its
+# system: the three nodes of a run share one. Prints nothing off Linux.
+disk_stat() {
+  local phase=$1
+  [ -r /proc/diskstats ] || return 0
+  awk -v p="$phase" '$3 !~ /^(loop|ram|zram|dm-)/ && NF >= 14 {
+    print p, $3, "writes", $8; print p, $3, "sectors_written", $10; print p, $3, "busy_ms", $13
+    if (NF >= 20) print p, $3, "flushes", $19
+  }' /proc/diskstats
+}
 # Each image the profile runs, pulled once and one at a time before the cluster
 # starts: a registry's anonymous pulls are rate-limited per address (ECR Public
 # answers `Rate exceeded` past about one a second, Docker Hub refuses past its
@@ -140,10 +162,14 @@ trap cleanup EXIT
 cleanup
 pull_images
 dc up -d
-report="$system-$rate-$payload$suffix.json"
+report="$system-$rate-$payload$window$suffix.json"
 
 case "$system" in
   focal)
+    if [ "$rate" = 0 ] || [ -n "$window" ]; then
+      echo "focal-load runs on its own schedule and callers: no closed loop or window here" >&2
+      exit 2
+    fi
     bash focal-bootstrap.sh
     worker=$(dc exec -T focal1 focal --data-dir /data inspect identity | python3 -c '
 import json, sys
@@ -196,6 +222,7 @@ EOF
     fi
     cpu_stat before > "$out/$report.cpu.txt"
     net_stat before > "$out/$report.net.txt"
+    disk_stat before > "$out/$report.disk.txt"
     if ! timeout "$bound" docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
       focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
@@ -204,6 +231,7 @@ EOF
     fi
     cpu_stat after >> "$out/$report.cpu.txt"
     net_stat after >> "$out/$report.net.txt"
+    disk_stat after >> "$out/$report.disk.txt"
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
     dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true
@@ -235,13 +263,15 @@ if [ "$system" != focal ]; then
   generate() {
     dc exec -T generator focal-compare --system "$generator_system" --durable --mode "$mode" \
       --endpoints "$endpoints" --rate "$rate" --payload "$payload" \
-      --seconds "$seconds" --warmup "$warmup" "${pki[@]}" --out "/reports/$report"
+      --seconds "$seconds" --warmup "$warmup" "${window_args[@]}" "${pki[@]}" --out "/reports/$report"
   }
   cpu_stat before > "$out/$report.cpu.txt"
   net_stat before > "$out/$report.net.txt"
+  disk_stat before > "$out/$report.disk.txt"
   retry 60 generate || { evidence; exit 1; }
   cpu_stat after >> "$out/$report.cpu.txt"
   net_stat after >> "$out/$report.net.txt"
+  disk_stat after >> "$out/$report.disk.txt"
   dc exec -T generator cat "/reports/$report" > "$out/$report"
   # Each bus node's log, whatever the run's outcome: stopped first (a node stops on its signal and
   # states what its member did: its elections, its answers that waited), then read, for where a

@@ -6,13 +6,16 @@
 //! corrected by construction, not after the fact). Results are one JSON
 //! report per run. In `deliver` mode each record is also taken by a
 //! consumer and acknowledged durably, and timed from its intended send time
-//! to that acknowledgement (`deliver.rs`).
+//! to that acknowledgement (`deliver.rs`). At a rate of zero there is no schedule: each answer sends
+//! the next record, the window held full (a closed loop, Kafka's `producer-perf-test` with
+//! `--throughput -1`), each record timed from its send, for a system's ceiling at that window.
 mod bus;
 mod bus_append;
 mod certs;
 mod deliver;
 mod pubsub;
 mod report;
+mod schedule;
 mod target;
 
 use clap::{Parser, ValueEnum};
@@ -70,7 +73,8 @@ pub struct Args {
     /// Comma-separated host:port of the three nodes.
     #[arg(long)]
     pub endpoints: String,
-    /// Offered records a second.
+    /// Offered records a second; `0`, no schedule: each answer sends the next record, `inflight`
+    /// requests out at all times (a closed loop), each timed from its send.
     #[arg(long)]
     pub rate: u32,
     /// Bytes of each record's payload.
@@ -82,8 +86,8 @@ pub struct Args {
     /// Seconds sent and not measured, first.
     #[arg(long, default_value_t = 15)]
     pub warmup: u64,
-    /// Requests outstanding at most; a request due while all are out is
-    /// counted as refused by the generator, never queued in it.
+    /// Requests outstanding at most (the window); a request due while all are
+    /// out is counted as refused by the generator, never queued in it.
     #[arg(long, default_value_t = 4096)]
     pub inflight: usize,
     /// Redis only: connections the writes are spread over (WAITAOF blocks the
@@ -134,12 +138,17 @@ async fn main() -> Result<(), CompareError> {
         return certs::write(&task.dir);
     }
     let args = Args::parse();
-    if args.rate == 0 || args.payload == 0 || args.inflight == 0 || args.seconds == 0 {
+    if args.payload == 0 || args.inflight == 0 || args.seconds == 0 {
         return Err(CompareError::Argument(
-            "rate, payload, inflight and seconds must be positive",
+            "payload, inflight and seconds must be positive",
         ));
     }
     if args.mode == Mode::Pubsub {
+        if args.rate == 0 {
+            return Err(CompareError::Argument(
+                "pubsub runs on a schedule: a positive rate",
+            ));
+        }
         return pubsub_main(args).await;
     }
     if args.system == System::FocalBus {
@@ -174,21 +183,33 @@ async fn main() -> Result<(), CompareError> {
         Mode::Append | Mode::Pubsub => None,
     };
     let (produced, stop) = tokio::sync::watch::channel(None);
-    let interval = Duration::from_secs(1)
-        .checked_div(args.rate)
-        .ok_or(CompareError::Argument("rate"))?;
+    // One record due each `interval`; none (a rate of zero), a closed loop.
+    let interval = match args.rate {
+        0 => None,
+        rate => Some(
+            Duration::from_secs(1)
+                .checked_div(rate)
+                .filter(|interval| !interval.is_zero())
+                .ok_or(CompareError::Argument("rate"))?,
+        ),
+    };
     let warmup = Duration::from_secs(args.warmup);
     let total = warmup
         .checked_add(Duration::from_secs(args.seconds))
         .ok_or(CompareError::Argument("duration"))?;
-    let payload = vec![0x5a_u8; args.payload];
     let mut histogram = Histogram::<u64>::new_with_bounds(1_000, HIGHEST_NS, 3)
         .map_err(|error| CompareError::Histogram(error.to_string()))?;
     let mut tally = Tally::default();
     // The requests in flight, owned here: their count is the bound, and a
     // request due while it is full is refused, never queued.
-    let mut flying = JoinSet::new();
+    let mut flying: JoinSet<Answer> = JoinSet::new();
     let started = Instant::now();
+    let sender = Sender {
+        target,
+        payload: vec![0x5a_u8; args.payload],
+        deliver,
+        started,
+    };
     let consuming = consumer
         .map(|consumer| tokio::spawn(consumer.run(started, warmup, deliver::Stop::new(stop))));
     let mut next = started;
@@ -197,40 +218,20 @@ async fn main() -> Result<(), CompareError> {
     let mut closed = None;
     let mut last_answer = started;
     loop {
-        let open = next.saturating_duration_since(started) < total;
+        let open = match interval {
+            Some(_) => next.saturating_duration_since(started) < total,
+            None => started.elapsed() < total,
+        };
         if !open && closed.is_none() {
             closed = Some(Instant::now());
         }
         if !open && flying.is_empty() {
             break;
         }
+        let room = flying.len() < args.inflight;
         tokio::select! {
-            () = tokio::time::sleep_until(next.into()), if open => {
-                let intended = next;
-                next = next.checked_add(interval).ok_or(CompareError::Argument("schedule"))?;
-                let measured = intended.saturating_duration_since(started) >= warmup;
-                if flying.len() >= args.inflight {
-                    if measured {
-                        tally.refused = tally.refused.saturating_add(1);
-                    }
-                    continue;
-                }
-                tally.sent = tally.sent.saturating_add(1);
-                let target = target.lane(tally.sent);
-                let mut payload = payload.clone();
-                let sequence = tally.sent;
-                if deliver {
-                    let intended_ns = u64::try_from(
-                        intended.saturating_duration_since(started).as_nanos(),
-                    )
-                    .map_err(|_| CompareError::Argument("schedule"))?;
-                    deliver::stamp(&mut payload, intended_ns, sequence)?;
-                }
-                flying.spawn(async move {
-                    let result = target.append(sequence, payload).await;
-                    (intended.elapsed(), measured, result)
-                });
-            }
+            // Answers first: the window a due record is judged against has every answer's place back.
+            biased;
             Some(joined) = flying.join_next() => {
                 let (latency, measured, result) =
                     joined.map_err(|error| CompareError::Target(error.to_string()))?;
@@ -241,6 +242,37 @@ async fn main() -> Result<(), CompareError> {
                 if measured {
                     tally.record(&mut histogram, latency, result)?;
                 }
+            }
+            // A closed loop: a place free, the next record goes now.
+            () = std::future::ready(()), if open && room && interval.is_none() => {
+                let intended = Instant::now();
+                let measured = intended.saturating_duration_since(started) >= warmup;
+                sender.send(&mut flying, &mut tally, intended, measured)?;
+            }
+            () = tokio::time::sleep_until(next.into()), if open && interval.is_some() => {
+                let Some(interval) = interval else {
+                    continue;
+                };
+                if !room {
+                    // Every record due by now finds the window full: all counted refused at once,
+                    // the schedule moved past them.
+                    let skipped = schedule::overdue(
+                        next.saturating_duration_since(started),
+                        started.elapsed(),
+                        interval,
+                        warmup,
+                        total,
+                    )?;
+                    tally.refused = tally.refused.saturating_add(skipped.measured);
+                    next = started
+                        .checked_add(skipped.next)
+                        .ok_or(CompareError::Argument("schedule"))?;
+                    continue;
+                }
+                let intended = next;
+                next = next.checked_add(interval).ok_or(CompareError::Argument("schedule"))?;
+                let measured = intended.saturating_duration_since(started) >= warmup;
+                sender.send(&mut flying, &mut tally, intended, measured)?;
             }
         }
     }
@@ -387,6 +419,45 @@ async fn pubsub_main(args: Args) -> Result<(), CompareError> {
         .await
         .map_err(|error| CompareError::Target(error.to_string()))??;
     report::Report::pubsub(&args, &tally, &received, &lag, mean).write(&args.out)
+}
+
+/// A request's answer: its latency from its intended send, whether it is measured, and its result.
+type Answer = (Duration, bool, Result<(), String>);
+
+/// What every record of a run is sent with.
+struct Sender {
+    target: target::Target,
+    payload: Vec<u8>,
+    deliver: bool,
+    started: Instant,
+}
+
+impl Sender {
+    /// One record, intended at `intended`: counted sent, stamped where a consumer takes it, its
+    /// request owned by `flying` until it answers.
+    fn send(
+        &self,
+        flying: &mut JoinSet<Answer>,
+        tally: &mut Tally,
+        intended: Instant,
+        measured: bool,
+    ) -> Result<(), CompareError> {
+        tally.sent = tally.sent.saturating_add(1);
+        let target = self.target.lane(tally.sent);
+        let mut payload = self.payload.clone();
+        let sequence = tally.sent;
+        if self.deliver {
+            let intended_ns =
+                u64::try_from(intended.saturating_duration_since(self.started).as_nanos())
+                    .map_err(|_| CompareError::Argument("schedule"))?;
+            deliver::stamp(&mut payload, intended_ns, sequence)?;
+        }
+        flying.spawn(async move {
+            let result = target.append(sequence, payload).await;
+            (intended.elapsed(), measured, result)
+        });
+        Ok(())
+    }
 }
 
 /// What a run counts beside the histogram.

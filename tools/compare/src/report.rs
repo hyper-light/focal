@@ -10,7 +10,10 @@ pub struct Report {
     durable: bool,
     /// Whether the clients spoke TLS 1.3 to the node (`--tls-ca`; the bus always does).
     tls: bool,
+    /// Zero: no schedule, each answer sending the next record (a closed loop).
     offered_per_second: u32,
+    /// Requests outstanding at most (`--inflight`).
+    window: usize,
     payload_bytes: usize,
     measured_seconds: u64,
     redis_lanes: usize,
@@ -111,6 +114,7 @@ impl Report {
             durable: args.durable,
             tls: args.tls_ca.is_some() || args.system == System::FocalBus,
             offered_per_second: args.rate,
+            window: args.inflight,
             payload_bytes: args.payload,
             measured_seconds: args.seconds,
             redis_lanes: args.lanes,
@@ -163,6 +167,7 @@ impl Report {
             durable: false,
             tls: args.tls_ca.is_some() || args.system == System::FocalBus,
             offered_per_second: args.rate,
+            window: args.inflight,
             payload_bytes: args.payload,
             measured_seconds: args.seconds,
             redis_lanes: 0,

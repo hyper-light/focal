@@ -16,9 +16,11 @@
 //! other systems' clients gather what is published between two of their writes: at a low rate a
 //! batch of one, more as more fall due at once. A record due while the records in flight are at
 //! `inflight` is counted refused by the generator, never queued in it, as the other systems' are.
+//! At a rate of zero there is no schedule: each turn sends as many records as the window has room
+//! for, each timed from its send (a closed loop, the other systems' too).
 //! Every bound is the bus's own (`focal_bus::limits`).
 
-use crate::{CompareError, HIGHEST_NS, Tally};
+use crate::{CompareError, HIGHEST_NS, Tally, schedule};
 use focal_bus::batch::{BatchBuilder, Producing};
 use focal_bus::budget::BusBudget;
 use focal_bus::client::{Client, Delivery};
@@ -56,6 +58,7 @@ pub struct Run {
     /// Each node's address, node 1 first.
     pub nodes: Vec<SocketAddr>,
     pub pki: PathBuf,
+    /// Records a second on the schedule; zero, a closed loop.
     pub rate: u32,
     pub warmup: Duration,
     pub total: Duration,
@@ -155,9 +158,16 @@ async fn publish(
     let mut histogram = Histogram::<u64>::new_with_bounds(1_000, HIGHEST_NS, 3)
         .map_err(|error| fail(error.to_string()))?;
     let mut tally = Tally::default();
-    let interval = Duration::from_secs(1)
-        .checked_div(run.rate)
-        .ok_or_else(|| fail("rate"))?;
+    // One record due each `interval`; none (a rate of zero), a closed loop.
+    let interval = match run.rate {
+        0 => None,
+        rate => Some(
+            Duration::from_secs(1)
+                .checked_div(rate)
+                .filter(|interval| !interval.is_zero())
+                .ok_or_else(|| fail("rate"))?,
+        ),
+    };
     let payload = vec![0x5a_u8; run.payload];
     let batch_bound = usize::try_from(wire::BATCH_BOUND).map_err(fail)?;
     let mut builder = BatchBuilder::new();
@@ -177,7 +187,10 @@ async fn publish(
     let mut closed: Option<Instant> = None;
     let mut last_answer = began;
     loop {
-        let open = next_due < run.total;
+        let open = match interval {
+            Some(_) => next_due < run.total,
+            None => began.elapsed() < run.total,
+        };
         if !open && closed.is_none() {
             closed = Some(Instant::now());
         }
@@ -204,29 +217,28 @@ async fn publish(
             }
             break;
         }
-        // The records due, gathered into one batch.
+        // The records this turn sends, gathered into one batch: on the schedule those due by now
+        // while the window has room, and once it is full every one due counted refused at once; in a
+        // closed loop as many as the window has room for, each sent now. A record the batch has no
+        // room for waits for the next turn's.
         let mut records: Vec<(Instant, bool)> = Vec::new();
         let first = sequence;
-        while open
-            && began
-                .checked_add(next_due)
-                .is_some_and(|due| due <= Instant::now())
-        {
-            let intended = began
-                .checked_add(next_due)
-                .ok_or_else(|| fail("schedule"))?;
-            let measured = next_due >= run.warmup;
-            next_due = next_due
-                .checked_add(interval)
-                .ok_or_else(|| fail("schedule"))?;
-            if next_due > run.total {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(began);
+        let room = run.inflight.saturating_sub(in_flight);
+        // Bounded: each pass takes a record, or ends the turn.
+        for taken in 0..=room {
+            if !open || (interval.is_some() && (next_due > elapsed || next_due >= run.total)) {
                 break;
             }
-            if in_flight.saturating_add(records.len()) >= run.inflight {
-                if measured {
-                    tally.refused = tally.refused.saturating_add(1);
+            if taken == room {
+                if let Some(interval) = interval {
+                    let skipped =
+                        schedule::overdue(next_due, elapsed, interval, run.warmup, run.total)?;
+                    tally.refused = tally.refused.saturating_add(skipped.measured);
+                    next_due = skipped.next;
                 }
-                continue;
+                break;
             }
             if records.is_empty() {
                 builder.begin(&Producing {
@@ -245,6 +257,19 @@ async fn publish(
             {
                 break;
             }
+            let (intended, measured) = match interval {
+                None => (now, elapsed >= run.warmup),
+                Some(interval) => {
+                    let intended = began
+                        .checked_add(next_due)
+                        .ok_or_else(|| fail("schedule"))?;
+                    let measured = next_due >= run.warmup;
+                    next_due = next_due
+                        .checked_add(interval)
+                        .ok_or_else(|| fail("schedule"))?;
+                    (intended, measured)
+                }
+            };
             builder.push(0, &payload).map_err(fail)?;
             records.push((intended, measured));
         }
@@ -282,12 +307,17 @@ async fn publish(
                 }
             }
         }
-        // The connection's events until the next record is due, a tick at most.
-        let wait_ns = began
-            .checked_add(next_due)
-            .map(|due| due.saturating_duration_since(Instant::now()))
-            .unwrap_or_default()
-            .min(Duration::from_millis(1));
+        // The connection's events until the next record is due, a tick at most; in a closed loop,
+        // none while the window has room.
+        let wait_ns = match interval {
+            Some(_) => began
+                .checked_add(next_due)
+                .map(|due| due.saturating_duration_since(Instant::now()))
+                .unwrap_or_default(),
+            None if open && in_flight < run.inflight => Duration::ZERO,
+            None => Duration::MAX,
+        }
+        .min(Duration::from_millis(1));
         let mut tick = pin!(hyper_rt::futures::sleep(
             u64::try_from(wait_ns.as_nanos()).unwrap_or(1).max(1)
         ));
