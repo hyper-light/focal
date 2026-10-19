@@ -427,14 +427,37 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
         "a frame is no object"
     );
     let _ = artifact;
-    // A kill and restart keep the quarantine: the orphan still comes back.
+    // A kill and restart keep the quarantine: the orphan still comes back, judged as the first
+    // restore was, across a window no pass entered. A pass between the restore and the listing
+    // takes it again, its bytes old (ubuntu CI, bus-replicated 72ddad03: restored, then not
+    // listed); such a window is asked again once a pass has taken it back.
     drop(server);
     let _server = start(root, &advertise);
-    let restored = admin(
-        root,
-        &["restore", "object", "--domain", &tenant, "--root", &orphan],
-    );
-    assert_eq!(restored["result"]["restored"], true, "{restored}");
-    assert!(manifests(root, &tenant).contains(&orphan));
+    let mut window = Deadline::after(Duration::from_secs(60));
+    loop {
+        let opened = gc_status(root);
+        let restored = restore();
+        let all = manifests(root, &tenant);
+        let closed = gc_status(root);
+        if opened["passes"] == closed["passes"]
+            && opened["collecting"] == false
+            && closed["collecting"] == false
+        {
+            assert_eq!(
+                restored["result"]["restored"], true,
+                "{restored}; collector {opened} then {closed}"
+            );
+            assert!(
+                all.contains(&orphan),
+                "{all:?}; collector {opened} then {closed}"
+            );
+            break;
+        }
+        assert!(
+            window.open(),
+            "no restore and listing fell between passes: {opened} then {closed}"
+        );
+        pass_where(root, |_| manifests(root, &tenant) == bound);
+    }
     assert_eq!(gc_status(root)["node"], identity["node"]);
 }
