@@ -34,6 +34,9 @@ pub(crate) struct Context<'a> {
     /// What the node measured of its links (`Liveness::renew_evidence`), read only while this pair
     /// has no configuration of its own (`docs/timing.md` §3, item 10).
     pub(crate) evidence: Option<&'a Arrivals>,
+    /// When this node's own log last made a write durable: its local health against the flush
+    /// proof (`Deferred`).
+    pub(crate) durable_ns: Option<u64>,
 }
 
 /// What a heartbeat taken did, for the node.
@@ -186,7 +189,27 @@ struct Counts {
     unproven: u64,
     configurations: u64,
     suspicions: u64,
+    deferred: u64,
     allowance: f64,
+}
+
+/// Where the peer's judgment stands against this node's own durability (Lifeguard's local health
+/// carried to the flush proof, `docs/timing.md` §2.4). The peer's next heartbeat leaves only once
+/// its log made a write durable after the latest was due; a freshness point that passes while this
+/// node's own log made nothing durable since it took that latest heartbeat is no evidence against
+/// the peer, whose heartbeat waits, as this node's own do, on what may be one stalled disk. It is
+/// judged once this node's log made a write durable since, the peer given from that write the time
+/// the point gave it from the heartbeat: what a heartbeat proved as the disk came back takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Deferred {
+    /// Judged at the freshness point.
+    #[default]
+    No,
+    /// The freshness point passed while this node made nothing durable since the heartbeat it
+    /// follows was taken: judged once a completion is fed.
+    Stalled,
+    /// This node's log made a write durable since: judged at this time.
+    Until(u64),
 }
 
 /// One pair.
@@ -200,6 +223,7 @@ pub(crate) struct Pair {
     /// Whether the owner was last told the peer is suspected: a change is reported only where
     /// what the owner was told differs, and the owner trusts a peer until told otherwise.
     told: bool,
+    deferred: Deferred,
     counts: Counts,
 }
 
@@ -212,6 +236,7 @@ impl Pair {
             received: Received::default(),
             unheard: Unheard::default(),
             told: false,
+            deferred: Deferred::No,
             counts: Counts::default(),
         }
     }
@@ -312,6 +337,7 @@ impl Pair {
             sending_due_ns: self.next_due(),
             configurations: counts.configurations,
             suspicions: counts.suspicions,
+            deferred: counts.deferred,
             allowance: counts.allowance,
         }
     }
@@ -322,10 +348,16 @@ impl Pair {
     }
 
     /// The peer's freshness point, while trusted: [`trust`](Self::trust)'s, read without
-    /// building it, since every wake asked reads it of every pair.
+    /// building it, since every wake asked reads it of every pair. A point deferred until this
+    /// node's log is durable again asks no wake: the completion fed in is polled after
+    /// ([`Liveness::poll`](crate::Liveness::poll)).
     pub(crate) fn deadline(&self) -> Option<u64> {
         match self.received.link.as_ref() {
-            Some(link) => link.estimator.deadline(),
+            Some(link) => match self.deferred {
+                Deferred::No => link.estimator.deadline(),
+                Deferred::Stalled => None,
+                Deferred::Until(at) => link.estimator.deadline().map(|until| until.max(at)),
+            },
             None => self.unheard.until_ns.filter(|_| !self.unheard.suspected),
         }
     }
@@ -472,8 +504,14 @@ impl Pair {
         Sent::Message(length)
     }
 
-    /// The peer's freshness at `now_ns`: a suspicion when it passed.
-    pub(crate) fn judge(&mut self, peer: PeerId, now_ns: u64) -> Option<Change> {
+    /// The peer's freshness at `now_ns`, this node's own log last durable at `durable_ns`: a
+    /// suspicion when it passed, unless this node's own durability defers it (`Deferred`).
+    pub(crate) fn judge(
+        &mut self,
+        peer: PeerId,
+        now_ns: u64,
+        durable_ns: Option<u64>,
+    ) -> Option<Change> {
         let Some(link) = self.received.link.as_mut() else {
             // Nothing heard: suspected once its first freshness point passes.
             let until = self.unheard.until_ns.filter(|until| now_ns >= *until)?;
@@ -485,6 +523,31 @@ impl Pair {
         };
         let until = match link.estimator.deadline() {
             Some(until) => {
+                if now_ns < until {
+                    return None;
+                }
+                if let Some(last) = self.received.last {
+                    let taken = last.arrival_ns;
+                    if let Deferred::Until(at) = self.deferred {
+                        if now_ns < at {
+                            return None;
+                        }
+                    } else if durable_ns.is_none_or(|durable| durable <= taken) {
+                        if self.deferred == Deferred::No {
+                            self.counts.deferred = self.counts.deferred.saturating_add(1);
+                        }
+                        self.deferred = Deferred::Stalled;
+                        return None;
+                    } else if self.deferred == Deferred::Stalled {
+                        let durable = durable_ns.unwrap_or(now_ns);
+                        let at = durable.saturating_add(until.saturating_sub(taken));
+                        self.deferred = Deferred::Until(at);
+                        if now_ns < at {
+                            return None;
+                        }
+                    }
+                    self.deferred = Deferred::No;
+                }
                 if link.estimator.poll(now_ns) != Some(Event::Suspected) {
                     return None;
                 }
@@ -614,7 +677,7 @@ impl Pair {
         changes: &mut [Option<Change>; 3],
         taken: &mut Taken,
     ) -> Result<(), Refusal> {
-        changes[0] = self.judge(peer, arrival_ns);
+        changes[0] = self.judge(peer, arrival_ns, context.durable_ns);
         if self.begin_run(beat.run)? {
             // A new incarnation, which the owner's core trusts and holds to lead nothing it led.
             self.told = false;
@@ -663,6 +726,8 @@ impl Pair {
             .on_heartbeat(mapped, arrival_ns)
             .map_err(|_| Refusal::OutOfRange)?;
         let lateness = link.estimator.latest_lateness();
+        // The heartbeat ends the gap a deferred freshness point held.
+        self.deferred = Deferred::No;
         self.received.last = Some(Last {
             seq: beat.seq,
             arrival_ns,
@@ -920,11 +985,15 @@ mod tests {
             exposure.mtbf(),
         );
         let until = pair.deadline().expect("judged from the attach");
-        assert!(matches!(pair.judge(2, until), Some(Change::Suspected(_))));
+        assert!(matches!(
+            pair.judge(2, until, Some(until)),
+            Some(Change::Suspected(_))
+        ));
         let context = Context {
             granularity: Some(granularity),
             exposure: &exposure,
             evidence: None,
+            durable_ns: Some(u64::MAX),
         };
         let (mut changes, mut taken) = ([None, None, None], Taken::default());
         let arrival = until + MS;
@@ -959,6 +1028,7 @@ mod tests {
             granularity: Some(granularity),
             exposure: &exposure,
             evidence: None,
+            durable_ns: Some(u64::MAX),
         };
         let mut pair = pair();
         let mut latest = 0;
@@ -982,7 +1052,7 @@ mod tests {
         pair.pool_margin(&evidence(), granularity, exposure.mtbf());
         let until = pair.deadline().expect("judged by the node's evidence");
         assert!(until > latest);
-        let Some(Change::Suspected(suspicion)) = pair.judge(2, until) else {
+        let Some(Change::Suspected(suspicion)) = pair.judge(2, until, Some(until)) else {
             panic!("suspected at the freshness point");
         };
         let last = suspicion.last.expect("heard from");
@@ -1004,6 +1074,7 @@ mod tests {
             granularity: Some(granularity),
             exposure: &exposure,
             evidence: None,
+            durable_ns: Some(u64::MAX),
         };
         let us = 1_000;
         let now = 10 * MS;
@@ -1103,6 +1174,7 @@ mod tests {
             granularity: Some(granularity),
             exposure: &exposure,
             evidence: None,
+            durable_ns: Some(u64::MAX),
         };
         let mut pair = pair();
         let mut latest = 0;
@@ -1128,7 +1200,8 @@ mod tests {
         // The node's evidence comes, and the next poll imposes its margin and judges.
         pair.pool_margin(&evidence(), granularity, exposure.mtbf());
         assert_eq!(pair.trust(), Trust::Suspected, "the margin finds it late");
-        let Some(Change::Suspected(suspicion)) = pair.judge(2, latest + MS) else {
+        let Some(Change::Suspected(suspicion)) = pair.judge(2, latest + MS, Some(latest + MS))
+        else {
             panic!("the suspicion is told");
         };
         assert!(
@@ -1136,7 +1209,11 @@ mod tests {
             "from the point before the late heartbeat"
         );
         assert_eq!(suspicion.last.map(|last| last.seq), Some(1));
-        assert_eq!(pair.judge(2, latest + 2 * MS), None, "told once");
+        assert_eq!(
+            pair.judge(2, latest + 2 * MS, Some(latest + 2 * MS)),
+            None,
+            "told once"
+        );
     }
 
     /// The node's evidence's margin is put in force as a configuration of the link's own is: where
@@ -1154,6 +1231,7 @@ mod tests {
             granularity: Some(granularity),
             exposure: &exposure,
             evidence: None,
+            durable_ns: Some(u64::MAX),
         };
         let mut pair = pair();
         pair.election = Some(Duration::from_secs(1));

@@ -281,6 +281,10 @@ pub struct PairReport {
     pub configurations: u64,
     /// Suspicions of the peer.
     pub suspicions: u64,
+    /// Freshness points of the peer that passed while this node's own log made nothing durable over
+    /// the window the peer's heartbeat needed, judged once it was durable again (local health,
+    /// `docs/timing.md` §2.4).
+    pub deferred: u64,
     /// The allowance for them: over every heartbeat taken that ended a gap a freshness point
     /// judged, the bound that point put on the heartbeat's coming past it, at the margin in force
     /// on the arrivals as they stood (the node's evidence, scaled to the link's window and widened
@@ -550,6 +554,7 @@ impl Liveness {
             granularity,
             exposure: &self.exposure,
             evidence: self.evidence.as_ref(),
+            durable_ns: self.durable.latest_ns,
         };
         let mut changes = [None, None, None];
         let mut taken = pair::Taken::default();
@@ -623,7 +628,7 @@ impl Liveness {
                     &self.exposure,
                 );
             }
-            if let Some(change) = pair.judge(peer, now_ns) {
+            if let Some(change) = pair.judge(peer, now_ns, self.durable.latest_ns) {
                 out.change(change);
             }
             match pair.send(&sender, now_ns, &mut self.message) {

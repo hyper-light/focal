@@ -15527,3 +15527,16 @@ lost a member to it in silence (the bus now ends a node whose replica fences). T
 now holds what the refused writes held and states no commit past it. The snapshot also carries the
 shared-port driver test expecting Winsock's refusal of a shared bind. vendor/README.md;
 docs/dependencies/inventory.tsv.
+
+### 2026-10-18 — Every shared crate at hyper-raft 7959df9: a node whose own log stalls blames no peer for it
+
+The node-pair liveness stream judges a peer's flush-proved heartbeat late only once the node's own
+log has made a write durable since it took the heartbeat before, the peer given from that write the
+time its freshness point gave it (Lifeguard's local health carried to the flush proof, hyper-raft
+`docs/timing.md` §2.4). Found by the bus on the bare-metal machine: one 0.6 s stall of its one disk
+held every node's heartbeats, each node suspected both others, and the part's leader, left no
+trusted quorum, stepped down and was elected again; the step-down's redirects, dropped on the
+publisher's full lane, were the comparison's unanswered records until 9215c57f. A stall every
+node's disk shares now elects nobody; a node whose disk runs judges as before (the simulation's
+busy world defers nothing). Only hyper-liveness's lib.rs and pair.rs differ from c595ad1.
+vendor/README.md; docs/dependencies/inventory.tsv.
