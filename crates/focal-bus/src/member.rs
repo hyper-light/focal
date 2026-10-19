@@ -145,6 +145,10 @@ pub struct MemberStats {
     pub drives: u64,
     /// Drives the replica refused, changing nothing (stalled for room, refused by the core).
     pub refused_drives: u64,
+    /// Suspicions the liveness stream told the replica: each a node it judged late.
+    pub suspected: u64,
+    /// Terms this node saw begin after its first: an election each, its own or another's.
+    pub terms: u64,
 }
 
 /// hyper-durable's budget over the node's memory: what the replica reserves before an input, from
@@ -313,6 +317,8 @@ pub struct Member {
     answers: HashMap<PeerId, VecDeque<Answer>>,
     /// Whether the replica fenced: the node ends, to be reopened from what is durable.
     fenced: bool,
+    /// The latest term this node's replica stood in: the terms it saw begin are counted from it.
+    seen_term: u64,
     /// Whether the node led at its last turn: a node that stops leading redirects what it owed.
     leading: bool,
     /// The drives one turn makes at most: the store's depth and one.
@@ -549,6 +555,7 @@ impl Member {
             parked: VecDeque::new(),
             answers: HashMap::new(),
             fenced: false,
+            seen_term: 0,
             leading: false,
             drives,
             due: false,
@@ -1081,7 +1088,10 @@ impl Member {
         for change in &changes {
             let peer = change.peer();
             let _ = match change {
-                Change::Suspected(_) => self.replica.suspect(peer),
+                Change::Suspected(_) => {
+                    self.stats.suspected = self.stats.suspected.saturating_add(1);
+                    self.replica.suspect(peer)
+                }
                 Change::Trusted { .. } => self.replica.trust(peer),
                 Change::Restarted { .. } => self.replica.restarted(peer),
             };
@@ -1138,6 +1148,16 @@ impl Member {
         }
         self.settle_leadership(endpoint);
         self.unpark(endpoint);
+        let term = self.replica.term();
+        if term > self.seen_term {
+            if self.seen_term != 0 {
+                self.stats.terms = self
+                    .stats
+                    .terms
+                    .saturating_add(term.saturating_sub(self.seen_term));
+            }
+            self.seen_term = term;
+        }
     }
 
     /// Sends what a drive gave out, and acts on what its state machine answered.

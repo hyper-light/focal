@@ -161,16 +161,33 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
         memory_bytes,
         group,
     };
-    let (stats, memory, buffers, rooms, counters) = focal_bus::serve::serve(config, |address| {
-        let line = serde_json::json!({ "condition": "Listening", "listen": address.to_string() });
-        let _ = std::io::Write::write_all(
-            &mut std::io::stdout().lock(),
-            format!("{line}\n").as_bytes(),
-        );
-    })
-    .await?;
+    let (stats, memory, buffers, rooms, counters, group) =
+        focal_bus::serve::serve(config, |address| {
+            let line =
+                serde_json::json!({ "condition": "Listening", "listen": address.to_string() });
+            let _ = std::io::Write::write_all(
+                &mut std::io::stdout().lock(),
+                format!("{line}\n").as_bytes(),
+            );
+        })
+        .await?;
     let line = serde_json::json!({
         "condition": "Stopped",
+        // A node of a part's group: its elections, its publishes and their answers.
+        "group": group.map(|member| serde_json::json!({
+            "terms": member.terms,
+            "suspected": member.suspected,
+            "proposed": member.proposed,
+            "acked": member.acked,
+            "redirected": member.redirected,
+            "parked": member.parked,
+            "answers_waited": member.answers_waited,
+            "unanswered": member.unanswered,
+            "refused_drives": member.refused_drives,
+            "dropped_messages": member.dropped_messages,
+            "dropped_records": member.dropped_records,
+            "refused_heartbeats": member.refused_heartbeats,
+        })),
         "published": stats.published,
         "refused": stats.refused,
         "delivered": stats.delivered,

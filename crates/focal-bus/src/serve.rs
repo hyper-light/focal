@@ -94,6 +94,8 @@ pub type Served = (
     crate::budget::BusBudgetStats,
     hyper_rt_transport::Rooms,
     Option<hyper_rt::shard_loop::Counters>,
+    // A node of a part's group: what its member did (its elections, its answers that waited).
+    Option<crate::member::MemberStats>,
 );
 
 /// Runs a node until it is told to stop, calling `ready` with the address it listens on once it
@@ -226,6 +228,7 @@ pub async fn serve(
                     driver.endpoint().budget().stats(),
                     driver.rooms(),
                     hyper_rt::futures::shard_counters(),
+                    None,
                 ));
             }
             Woke::Event(event) => {
@@ -302,6 +305,7 @@ async fn serve_member(
                     driver.endpoint().budget().stats(),
                     driver.rooms(),
                     hyper_rt::futures::shard_counters(),
+                    Some(member.stats()),
                 ));
             }
             Woke::Event(event) => {

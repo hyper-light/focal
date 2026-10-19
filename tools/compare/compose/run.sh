@@ -243,9 +243,11 @@ if [ "$system" != focal ]; then
   cpu_stat after >> "$out/$report.cpu.txt"
   net_stat after >> "$out/$report.net.txt"
   dc exec -T generator cat "/reports/$report" > "$out/$report"
-  # Each bus node's log, whatever the run's outcome: its leadership, refusals and what it reported
-  # as it stopped, for where a tail or an unanswered record came from.
+  # Each bus node's log, whatever the run's outcome: stopped first (a node stops on its signal and
+  # states what its member did: its elections, its answers that waited), then read, for where a
+  # tail or an unanswered record came from.
   if [ "$profile" = focal-bus ]; then
+    dc stop focal-bus1 focal-bus2 focal-bus3 >/dev/null 2>&1 || true
     for n in focal-bus1 focal-bus2 focal-bus3; do
       dc logs --no-color "$n" > "$out/$report.$n.log" 2>&1 || true
     done
