@@ -15540,3 +15540,17 @@ publisher's full lane, were the comparison's unanswered records until 9215c57f. 
 node's disk shares now elects nobody; a node whose disk runs judges as before (the simulation's
 busy world defers nothing). Only hyper-liveness's lib.rs and pair.rs differ from c595ad1.
 vendor/README.md; docs/dependencies/inventory.tsv.
+
+### 2026-10-19 — Every shared crate at hyper-raft 2a95628: a compaction's start reads nothing back
+
+A compaction's start, made durable, takes the entries it let go of out of the compaction rule's
+count by what the replica counted of each as it applied, kept beside the count in four bytes an
+entry (hyper-raft `docs/durable.md` §6.1). It walked the log again from the new start and read back
+each applied entry the store's cache had let go, from the device, through the log's owner and
+behind its writes, on the thread that drives the replica. The bus compacts to its part's image,
+whose point is its window's floor, hundreds of megabytes behind its apply point: in fedora's closed
+loop at a window of 32,768 each follower's drive blocked 1.0 to 1.3 s at a time, 7 to 14 ms of it on
+a CPU, reading one page after another of 51 to 637 ms, and its heartbeats waited behind it (the
+nodes suspected each other 18 to 27 times a run). focal-bus's sustained-load test now sees no read
+through the log's owner and no turn past 200 ms where it saw 10 and 15. Only hyper-durable's
+replica.rs differs from 7959df9. vendor/README.md; docs/dependencies/inventory.tsv.

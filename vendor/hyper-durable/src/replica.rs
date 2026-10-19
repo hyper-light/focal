@@ -315,6 +315,19 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     /// entry's ([`EntryRef::encoded_bytes`]): what a compaction frees, and what the compaction
     /// rule weighs ([`Compaction`]).
     compactable: u64,
+    /// What [`Replica::compactable`] counted of each entry, oldest first, the first that of the
+    /// entry at `sizes_from`: the applied entries the log holds past its start. A start made
+    /// durable takes out of the count what it let go of from here, never from the store, which
+    /// holds an applied entry its cache let go only on its device. Read back through the log's
+    /// owner, behind its writes, that count held focal's event bus 51 to 637 ms a page, on the
+    /// thread that serves its heartbeats, and its followers were suspected 23 to 27 times a run
+    /// (fedora, 2026-10-19: a compaction's start leaves the applied entries past the image's
+    /// point, which is the part's window's floor, hundreds of megabytes behind its apply point).
+    /// Each entry's count in four bytes, as the log keeps its entry's length (`hyper_log`'s slot):
+    /// an entry is no larger than a message the transport carries.
+    sizes: VecDeque<u32>,
+    /// The index of the entry whose count `sizes` holds first.
+    sizes_from: u64,
     /// The bytes of the image the log was last compacted to: the one this member made or
     /// installed, or at open, the image of what it opened with; none from a machine that keeps
     /// no image.
@@ -446,6 +459,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             logged_commit: view.hard_state.commit,
             applied: durable,
             compactable: 0,
+            sizes: VecDeque::new(),
+            sizes_from: durable.index.saturating_add(1),
             imaged: None,
             told_applied: durable.index,
             conf_index: durable.index,
@@ -474,8 +489,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         } else {
             replica.machine.image_bytes()
         };
-        replica.compactable = replica
-            .compactable_after(view.start.index)
+        replica
+            .count_applied(view.start.index)
             .map_err(|e| OpenError::Core(hyper_raft::Error::Storage(e)))?;
         replica.settle();
         Ok(replica)
@@ -725,7 +740,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     }
 
     /// The bytes the replica holds: the core's, and the messages, reads and reports the shell
-    /// keeps.
+    /// keeps, and its count of the applied entries the log holds.
     fn held_bytes(&self) -> u64 {
         let messages = |messages: &[Message]| {
             messages
@@ -748,6 +763,11 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         });
         // What the store keeps for this replica's reads is this replica's to bound.
         let kept = usize::try_from(self.node.store().log.kept_bytes()).unwrap_or(usize::MAX);
+        // The count of each applied entry the log holds, the room it has.
+        let sizes = self
+            .sizes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>());
         bytes(
             self.node
                 .raft
@@ -755,7 +775,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 .saturating_add(writes)
                 .saturating_add(stalled)
                 .saturating_add(reads)
-                .saturating_add(kept),
+                .saturating_add(kept)
+                .saturating_add(sizes),
         )
     }
 
@@ -1321,9 +1342,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 // nothing, and is the owner's to ask again (`Replica::make_again`).
                 self.imaged = Some(imaged);
                 let start = self.node.store().log.bounds().map(|(start, _)| start.index);
-                let held = start.and_then(|start| self.compactable_after(start));
-                self.compactable =
-                    held.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+                let start =
+                    start.map_err(|e| self.fence(Cause::Core(hyper_raft::Error::Storage(e))))?;
+                self.let_go_through(start);
                 if let Some(stall) = self.stall.as_mut() {
                     stall.freed = true;
                 }
@@ -1798,6 +1819,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.conf_index = point.index;
         // The log starts at the image's point, holding nothing applied past it.
         self.compactable = 0;
+        self.sizes.clear();
+        self.sizes_from = point.index.saturating_add(1);
         self.imaged = self
             .node
             .store()
@@ -1948,6 +1971,8 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             machine,
             applied,
             compactable,
+            sizes,
+            sizes_from,
             page,
             drive_applied,
             ..
@@ -1971,6 +1996,18 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             }
             *drive_applied = drive_applied.saturating_add(bytes);
             // Applied from here, or failed, which fences the replica: it counts afresh at open.
+            let Ok(size) = u32::try_from(bytes) else {
+                stop = Stop::Failed(Cause::Invariant("an entry past four gibibytes"));
+                return true;
+            };
+            if sizes.try_reserve(1).is_err() {
+                stop = Stop::Failed(Cause::Core(hyper_raft::Error::Memory));
+                return true;
+            }
+            if sizes.is_empty() {
+                *sizes_from = entry.index;
+            }
+            sizes.push_back(size);
             *compactable = compactable.saturating_add(bytes);
             if entry.changes_configuration() {
                 stop = match change_of(&entry) {
@@ -2202,11 +2239,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.compactable
     }
 
-    /// The bytes of the applied entries the log holds past `after`, as the core counts them:
-    /// those the store holds, and a leader's own past them, applied before its write is durable
-    /// (`Config::apply_unpersisted`), where the core holds them. An install not yet durable
-    /// starts the log at its point, and what the store holds before it is not counted.
-    fn compactable_after(&self, after: u64) -> Result<u64, StorageError> {
+    /// Counts the applied entries the log holds past `after` into [`Replica::compactable`], each
+    /// into `sizes` as well, as the core counts an entry's: those the store holds, and a leader's
+    /// own past them, applied before its write is durable (`Config::apply_unpersisted`), where the
+    /// core holds them. An install not yet durable starts the log at its point, and what the
+    /// store holds before it is not counted. At open alone: from then on each entry is counted as
+    /// it is applied, and let go of as a start passes it ([`Replica::let_go_through`]).
+    fn count_applied(&mut self, after: u64) -> Result<(), StorageError> {
         let end = self.applied.index.saturating_add(1);
         let unstable = self.node.raft.log().unstable();
         let after = unstable
@@ -2216,21 +2255,72 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         let held = self.node.store();
         let unstable = unstable.entries();
         let tail = unstable.first().map_or(u64::MAX, |e| e.index);
+        let mut sizes = VecDeque::new();
         let mut bytes = 0u64;
+        let mut refused = None;
+        let mut count = |counted: u64| -> bool {
+            let Ok(size) = u32::try_from(counted) else {
+                refused = Some(StorageError::Other("an entry past four gibibytes"));
+                return true;
+            };
+            if sizes.try_reserve(1).is_err() {
+                refused = Some(StorageError::Other(
+                    "no memory to count the applied entries",
+                ));
+                return true;
+            }
+            sizes.push_back(size);
+            bytes = bytes.saturating_add(counted);
+            false
+        };
         if first < end.min(tail) {
             held.log
                 .visit(first, end.min(tail), held.page, &mut |entry| {
-                    bytes = bytes.saturating_add(entry.encoded_bytes());
-                    false
+                    count(entry.encoded_bytes())
                 })?;
         }
         for entry in unstable
             .iter()
             .filter(|e| e.index >= first && e.index < end)
         {
-            bytes = bytes.saturating_add(EntryRef::of(entry).encoded_bytes());
+            if count(EntryRef::of(entry).encoded_bytes()) {
+                break;
+            }
         }
-        Ok(bytes)
+        if let Some(refused) = refused {
+            return Err(refused);
+        }
+        self.compactable = bytes;
+        self.sizes = sizes;
+        self.sizes_from = first;
+        Ok(())
+    }
+
+    /// Takes the entries a start at `start` let go of out of [`Replica::compactable`], each by
+    /// what it was counted, oldest first. What the count keeps of them shrinks by half once a
+    /// quarter of its room is used (a dynamic table's contraction, Cormen, Leiserson, Rivest and
+    /// Stein, *Introduction to Algorithms*, §17.4), so a log that held many entries once does not
+    /// keep their room, and a log that grows and shrinks around one size does not reallocate on
+    /// each turn.
+    fn let_go_through(&mut self, start: u64) {
+        while self.sizes_from <= start {
+            let Some(size) = self.sizes.pop_front() else {
+                break;
+            };
+            self.compactable = self.compactable.saturating_sub(u64::from(size));
+            self.sizes_from = self.sizes_from.saturating_add(1);
+        }
+        self.sizes_from = self.sizes_from.max(start.saturating_add(1));
+        // Moved into room of its own, as the core gives back a queue's room (`Outgoing::recycle`):
+        // a reallocation in place has no refusal to return.
+        let room = self.sizes.capacity();
+        if self.sizes.len() <= room / 4 {
+            let mut smaller = VecDeque::new();
+            if smaller.try_reserve_exact(room / 2).is_ok() {
+                smaller.extend(self.sizes.drain(..));
+                self.sizes = smaller;
+            }
+        }
     }
 }
 
