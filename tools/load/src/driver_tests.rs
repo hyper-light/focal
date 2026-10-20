@@ -131,3 +131,43 @@ fn only_the_requested_claim_counts_as_a_read_hit() {
     page.objects.clear();
     assert!(!read_hit(&Ok(envelope), 10));
 }
+
+/// A run among enrolled agents takes each agent's own client data directory, in the agents'
+/// order, and its one context's enrollment; an agent whose enrollment never finished is not one of
+/// them, and fewer agents than asked is refused, naming how many were found.
+#[test]
+fn enrolled_agents_are_each_their_own_client_data_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let agents = directory.path().join("agents");
+    for agent in [2u16, 0, 1] {
+        let name = format!("agent-{agent:04}");
+        std::fs::create_dir_all(
+            agents
+                .join(&name)
+                .join("CLIENT.contexts")
+                .join(format!("enrollment-{name}")),
+        )
+        .unwrap();
+    }
+    // Enrolling, not enrolled: a data directory with no context yet.
+    std::fs::create_dir_all(agents.join("agent-0003")).unwrap();
+    std::fs::write(agents.join("agent-notes"), b"not a directory").unwrap();
+    let found = enrolled_agents(&agents, 3).unwrap();
+    assert_eq!(
+        found,
+        (0..3)
+            .map(|agent| {
+                let name = format!("agent-{agent:04}");
+                agents
+                    .join(&name)
+                    .join("CLIENT.contexts")
+                    .join(format!("enrollment-{name}"))
+            })
+            .collect::<Vec<_>>()
+    );
+    let refused = enrolled_agents(&agents, 4).unwrap_err().to_string();
+    assert!(
+        refused.contains("holds 3 agent enrollments of the 4 asked"),
+        "{refused}"
+    );
+}

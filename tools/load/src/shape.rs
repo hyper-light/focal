@@ -162,10 +162,10 @@ pub struct WorkloadShape {
     /// the node's own issuer and worker ([`max_agents`]). Unset, one issuer and one consumer.
     #[serde(default)]
     pub agents: Option<u16>,
-    /// `agents` over `enrolled`: the directory of enrolled client contexts the agents are
-    /// (`<data-dir>/CLIENT.contexts`, as `focal enroll context` leaves each), its
-    /// `enrollment-agent-*` entries in their order, the first `agents` of them; each agent is the
-    /// principal its credential names, on a connection of its own.
+    /// `agents` over `enrolled`: the directory of the agents' client data directories, each an
+    /// agent's own (`<dir>/agent-*`, as `focal --data-dir <dir>/<agent> enroll context <agent>`
+    /// leaves it), in their order, the first `agents` of them; each agent is the principal its
+    /// credential names, on a connection of its own.
     #[serde(default)]
     pub agent_enrollments: Option<PathBuf>,
     /// Offered creations a second over all callers. Set, the writes are

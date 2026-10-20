@@ -16,6 +16,17 @@ use std::{
 const CATALOG: &str = "CLIENT.contexts";
 const MARKER: &str = "CLIENT.contexts.initialized";
 const LIMIT: usize = 60 * 1024;
+/// The contexts a client data directory keeps, removed ones included (their names stay bound to
+/// their connections): what the catalogue's one record of `LIMIT` bytes holds.
+const MAX_CONTEXTS: usize = 64;
+
+/// The refusal of a context past what a client data directory keeps.
+fn catalogue_full() -> CliError {
+    CliError::Capacity(format!(
+        "this client data directory keeps {MAX_CONTEXTS} contexts, removed ones included, and has \
+         them all: give the next client a data directory of its own (--data-dir)"
+    ))
+}
 
 #[derive(Subcommand)]
 pub(crate) enum ContextCommand {
@@ -190,7 +201,7 @@ impl Store {
             None => return Err(InputError::Invalid("client context catalogue is missing").into()),
         };
         if catalog.schema != 1
-            || catalog.profiles.len().saturating_add(catalog.removed.len()) > 64
+            || catalog.profiles.len().saturating_add(catalog.removed.len()) > MAX_CONTEXTS
             || catalog
                 .selected
                 .as_ref()
@@ -207,7 +218,11 @@ impl Store {
     fn save(&mut self) -> Result<()> {
         let bytes = serde_json::to_vec(&self.catalog).map_err(other)?;
         if bytes.len() > LIMIT {
-            return Err(InputError::Capacity.into());
+            return Err(CliError::Capacity(format!(
+                "this client data directory's contexts would take {} bytes, past the {LIMIT} its \
+                 catalogue keeps: give the next client a data directory of its own (--data-dir)",
+                bytes.len()
+            )));
         }
         self.journal.replace(&bytes).map_err(other)
     }
@@ -436,9 +451,9 @@ pub(crate) async fn run(settings: &Settings, command: ContextCommand) -> Result<
                 .profiles
                 .len()
                 .saturating_add(store.catalog.removed.len())
-                >= 64
+                >= MAX_CONTEXTS
             {
-                return Err(InputError::Capacity.into());
+                return Err(catalogue_full());
             }
             let history = root.join(CATALOG).join(format!("history-{selected}"));
             if (store.catalog.profiles.contains_key(&selected)
@@ -873,9 +888,9 @@ async fn enroll(settings: &Settings, selected: &str, invitation: &Path) -> Resul
         .profiles
         .len()
         .saturating_add(store.catalog.removed.len())
-        >= 64
+        >= MAX_CONTEXTS
     {
-        return Err(InputError::Capacity.into());
+        return Err(catalogue_full());
     }
     let pending = PendingClientJoin::open(path, bundle).map_err(other)?;
     let history = root.join(CATALOG).join(format!("history-{selected}"));
@@ -973,6 +988,33 @@ mod tests {
         let mut settings = Settings::default();
         settings.node.data_dir = Some(root.path().into());
         (root, settings)
+    }
+    /// A client data directory keeps its stated number of contexts and refuses the next as its
+    /// capacity, saying what is full and what to do, never as authored input.
+    #[test]
+    fn a_full_catalogue_refuses_the_next_context_by_name() {
+        let (root, settings) = settings();
+        let add = |name: String| {
+            let settings = settings.clone();
+            let command = ContextCommand::Add {
+                name,
+                node_data_dir: Some(root.path().into()),
+                tenant: None,
+                file: None,
+                enrolled_as: None,
+                session: None,
+            };
+            focal_rt::block_on(async move { run(&settings, command).await }).unwrap()
+        };
+        for context in 0..MAX_CONTEXTS {
+            add(format!("context-{context}")).unwrap();
+        }
+        let refused = add("one-too-many".into()).unwrap_err();
+        assert!(matches!(&refused, CliError::Capacity(message) if message.contains("--data-dir")));
+        assert_eq!(
+            super::super::errors::classification(&refused),
+            focal_client::failure::Failure::error("capacity", 6)
+        );
     }
     #[test]
     fn absent_default_is_read_only_and_unknown_names_do_not_create_connections() {

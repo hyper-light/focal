@@ -11,6 +11,7 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
     while let Some(cli) = error.downcast_ref::<CliError>() {
         return match cli {
             CliError::Input(_) => Failure::error("invalid_input", 2),
+            CliError::Capacity(_) => Failure::error("capacity", 6),
             CliError::Document(error) => failure::input(error),
             CliError::Client(error) => failure::client(error),
             CliError::Pending(error) => failure::pending(error),

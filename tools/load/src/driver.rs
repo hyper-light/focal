@@ -1416,22 +1416,29 @@ fn share(total: u64, parts: u16, index: u16) -> Result<u64, LoadError> {
     })
 }
 
-/// The enrolled client contexts of `count` agents in `directory` (`CLIENT.contexts`): its
-/// `enrollment-agent-*` directories in their order, the first `count`; fewer is refused. The entries
-/// are listed to a stated bound, the agents' and a context directory's few others.
+/// The enrolled clients of `count` agents under `directory`: each agent a client data directory of
+/// its own (`agent-*`, as `focal --data-dir <directory>/<agent> enroll context <agent>` leaves it),
+/// taken as its one context's enrollment (`CLIENT.contexts/enrollment-<agent>`), in their order,
+/// the first `count`; fewer is refused. The entries are listed to a stated bound, the agents' and a
+/// few others.
 fn enrolled_agents(directory: &Path, count: u16) -> Result<Vec<PathBuf>, LoadError> {
     let most = usize::from(count).saturating_add(64);
     let mut found = Vec::new();
     for entry in std::fs::read_dir(directory)?.take(most.saturating_add(1)) {
         let entry = entry?;
-        // A context is a directory; its `.client-initialized` marker beside it is not one.
-        if entry.file_type()?.is_dir()
-            && entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with("enrollment-agent-"))
-        {
-            found.push(entry.path());
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !entry.file_type()?.is_dir() || !name.starts_with("agent-") {
+            continue;
+        }
+        // An agent whose enrollment never finished has no context: it is not one of them.
+        let enrollment = entry
+            .path()
+            .join("CLIENT.contexts")
+            .join(format!("enrollment-{name}"));
+        if enrollment.is_dir() {
+            found.push(enrollment);
         }
     }
     found.sort();

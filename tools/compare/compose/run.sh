@@ -197,7 +197,7 @@ print(w if isinstance(w, str) else bytes(w).hex())')
     if [ "$mode" = deliver ] && [ -n "${AGENTS:-}" ]; then
       lifecycle="lifecycle: deliver
 agents: $AGENTS
-agent_enrollments: /client/CLIENT.contexts"
+agent_enrollments: /client/agents"
     elif [ "$mode" = deliver ]; then
       lifecycle="lifecycle: deliver
 consumer_enrollment: /client/CLIENT.contexts/enrollment-consumer"

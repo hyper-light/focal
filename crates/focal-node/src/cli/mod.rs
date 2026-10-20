@@ -62,6 +62,9 @@ fn validation_context_error(
 pub(super) enum CliError {
     #[error("{0}")]
     Input(String),
+    /// A bound of this client's own reached, named with what holds it.
+    #[error("{0}")]
+    Capacity(String),
     #[error(transparent)]
     Document(#[from] InputError),
     #[error(transparent)]
