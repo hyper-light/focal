@@ -3669,6 +3669,87 @@ fn an_mtu_probe_waits_for_the_window_on_a_slow_path() {
     assert_eq!(server.path_mtu(), INITIAL_MTU, "server");
 }
 
+/// RFC 8899 §3, item 7, on a connection that keeps sending: a probe the window and the pacer can
+/// carry goes before new data (`Connection::probe_goes_first`). Sent only in the room data left, a
+/// probe found none while data filled the window as fast as it freed, and the search stayed where
+/// it began until the sending stopped: on loopback, a connection with a window of 130 KB sent no
+/// probe in a minute and carried every byte in 1,200-byte datagrams (hyper-rt-transport's
+/// peer_sockets on arm64, 7 runs of 40). Do: connect over a fast path whose MTU is a loopback's
+/// (65,527), the search allowed up to it and no warm-up, so the idle connection's first window
+/// carries no probe and the flow-control windows never limit the sender, then send 16 MiB, the
+/// server reading as it comes. Expect: no probe before the transfer; the search run during it, so
+/// the transfer takes fewer than half the datagrams it would at 1,200 bytes (without the search
+/// going first, 14,385 for 16 MiB, its one probe starved by the pacer; with it, 318); and the
+/// search ended at the path's MTU.
+#[test]
+fn an_mtu_search_runs_on_a_connection_that_keeps_sending() {
+    let _guard = subscribe();
+    let wide = || {
+        let mut transport = TransportConfig::default();
+        let mut search = MtuDiscoveryConfig::default();
+        search.upper_bound(65_527);
+        transport.mtu_discovery_config(Some(search));
+        // Flow control never what limits the sender: the congestion window is
+        transport.send_window(1 << 30);
+        transport.stream_receive_window(VarInt::from_u32(1 << 30));
+        transport.receive_window(VarInt::from_u32(1 << 30));
+        transport
+    };
+    let mut endpoint_config = util::endpoint_config_without_warm_up();
+    endpoint_config.max_udp_payload_size(65_527).unwrap();
+    let mut server = server_config();
+    server.transport = wide();
+    let mut pair = Pair::new(endpoint_config, server);
+    pair.mtu = 65_527;
+    pair.latency = Duration::from_micros(100);
+    let mut client = client_config();
+    client.transport = wide();
+    let (client_ch, server_ch) = pair.connect_with(client);
+    assert_eq!(
+        pair.client_conn_mut(client_ch)
+            .stats()
+            .path
+            .sent_plpmtud_probes,
+        0,
+        "the idle connection's first window carried a probe: the test sends nothing first"
+    );
+
+    const TRANSFER: usize = 16 << 20;
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let chunk = vec![7u8; 1 << 16];
+    let (mut written, mut received) = (0, 0);
+    let before = pair.client_conn_mut(client_ch).stats().path.sent_packets;
+    for _ in 0..10_000_000 {
+        while written < TRANSFER {
+            let end = chunk.len().min(TRANSFER - written);
+            match pair.client_send(client_ch, s).write(&chunk[..end]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => written += n,
+            }
+        }
+        if received == TRANSFER {
+            break;
+        }
+        let busy = pair.step();
+        if pair.server_streams(server_ch).accept(Dir::Uni).is_some() || received > 0 || busy {
+            received += stream_chunks(pair.server_recv(server_ch, s)).len();
+        }
+    }
+    assert_eq!(received, TRANSFER, "the transfer did not finish");
+    let path = pair.client_conn_mut(client_ch).stats().path;
+    let datagrams = path.sent_packets - before;
+    let at_first = (TRANSFER / usize::from(INITIAL_MTU)) as u64;
+    assert!(
+        datagrams < at_first / 2,
+        "{datagrams} datagrams for {TRANSFER} bytes, where {at_first} carry them at {INITIAL_MTU}: \
+         the search did not run during the transfer: {path:?}"
+    );
+    // And it ends at the path's MTU, its last steps taken as they come.
+    pair.drive();
+    let path = pair.client_conn_mut(client_ch).stats().path;
+    assert_eq!(path.current_mtu, 65_527, "{path:?}");
+}
+
 #[test]
 fn mtud_probes_include_immediate_ack() {
     let _guard = subscribe();

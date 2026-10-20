@@ -15737,3 +15737,18 @@ by a pause of full jitter over an exponential step from the time that ask took (
 test passed six runs of six. Tests: `network_join::tests::a_join_asks_again_while_its_sponsor_cannot_decide_and_is_enrolled_once`
 (three answers that say to ask again, then the enrollment: four asks, one commit) and
 `a_join_stops_asking_at_its_invitations_expiry_and_at_a_terminal_refusal`.
+
+### 2026-10-20 — Every shared crate at hyper-raft 0427988: a busy connection's MTU search no longer starves
+
+One change in hyper-quic (patch Q26). Since Q25 a probe of the path's MTU waits for the congestion
+window and the pacer, and it is still sent only in the room data leaves; a connection that kept
+sending left it none, so its search stayed at 1,200 bytes while it sent. On arm64 Linux the shared
+repository's `peer_sockets::a_connections_mtu_search_ends_at_its_paths_mtu_as_the_kernel_holds_it`
+stalled 7 runs of 40 with windows of 105 to 163 KB and no probe sent in a minute, and failed twice
+on its arm64 CI runners. A probe that the window and the pacer can carry now goes before new data,
+data waiting as an application-limited connection's does until the probe's room drains, as TCP's
+probe takes a place in its window (Linux `tcp_mtu_probe`); a probe larger than the window or the
+bucket still waits, so Q25's slow paths keep their MTU. hyper-quic's test sends 16 MiB in 318
+datagrams where the search starved sent 14,377. For focal it is every QUIC connection that keeps
+sending: the replication lanes, transfers and clients. Only hyper-quic differs from e05956a.
+vendor/README.md; docs/dependencies/inventory.tsv.

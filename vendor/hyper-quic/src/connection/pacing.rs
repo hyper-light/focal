@@ -57,6 +57,11 @@ impl Pacer {
         self.tokens = self.tokens.saturating_sub(packet_length.into())
     }
 
+    /// The most the bucket holds: a datagram larger than it is never let go.
+    pub(super) fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
     /// Return how long we need to wait before sending `bytes_to_send`
     ///
     /// If we can send a packet right away, this returns `None`. Otherwise, returns `Some(d)`,

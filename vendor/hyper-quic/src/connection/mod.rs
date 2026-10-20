@@ -969,6 +969,14 @@ impl Connection {
             space_id == SpaceId::Data && self.path_responses.has_on_path(self.path.remote);
         let mut room = room;
         if ack_eliciting && self.spaces.get(space_id).loss_probes == 0 {
+            // New data waits for an MTU probe the window and the pacer can carry: sent only in
+            // the room data leaves (`send_when_idle`), a probe found none while the connection
+            // kept sending (`probe_goes_first`). Neither congestion- nor pacer-blocked, the
+            // connection holds back as an application-limited one does.
+            if space_id == SpaceId::Data && !responding && self.probe_goes_first(now) {
+                trace!("new data waits for the MTU probe");
+                return Some(Fill::NextSpace);
+            }
             match self.congestion_room(now, tx, responding, room) {
                 Ok(afforded) => room = afforded,
                 Err(fill) => return Some(fill),
@@ -1455,16 +1463,40 @@ impl Connection {
         Some(())
     }
 
-    /// An MTU probe, or else a packet of the path's warm-up, when nothing else was sent
+    /// An MTU probe, or else a packet of the path's warm-up, when nothing else was sent; no
+    /// warm-up while a probe waits for the room it needs (`probe_goes_first`), which the warm-up's
+    /// padding would take as data would
     fn send_when_idle(&mut self, now: Instant, buf: &mut Vec<u8>, tx: &mut TransmitState) {
         if !buf.is_empty() || !self.state.is_established() {
             return;
         }
         if self.write_mtu_probe(now, buf).is_some() {
             tx.num_datagrams = 1;
-        } else if !tx.congestion_blocked {
+        } else if !tx.congestion_blocked && !self.probe_goes_first(now) {
             self.warm_up(now, buf, tx);
         }
+    }
+
+    /// Whether an MTU probe goes before new data: one the search has due that the window could
+    /// carry with nothing in flight and the pacer's bucket could carry full. A probe is held back
+    /// as any packet is, by the window and the pacer (RFC 8899 §3, item 7; `write_mtu_probe`),
+    /// and is sent in the room data leaves; a connection that kept sending left it none, data
+    /// filling the window and the bucket as fast as they freed, and on loopback a connection with
+    /// a window of 130 KB sent no probe of its search's in a minute of sending, its path's MTU
+    /// left at 1,200 of 65,507 (hyper-rt-transport's peer_sockets, arm64). Data waits instead,
+    /// at most until what was in flight drains and the bucket refills by the probe's size, as
+    /// TCP's probe takes its place among the segments of its window (Linux, `tcp_mtu_probe`).
+    /// A probe larger than the window or the bucket waits as it did: on a slow path it would hold
+    /// the link past a round trip, and data does not wait for it there.
+    fn probe_goes_first(&mut self, now: Instant) -> bool {
+        if !self.state.is_established() || self.path.amplification_room(0).is_some() {
+            return false;
+        }
+        let Some(size) = self.path.mtud.probe_due(now) else {
+            return false;
+        };
+        let bytes = u64::from(size);
+        bytes <= self.path.congestion.window() && bytes <= self.path.pacing.capacity()
     }
 
     /// Sends a packet of the path's warm-up, if one is wanted. The warm-up uses the window as data
