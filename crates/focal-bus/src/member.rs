@@ -39,7 +39,7 @@
 //! due: where the group wrote none, the node writes an empty update of the stream's own group, so a
 //! disk that stops stops the heartbeats with it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::task::Waker;
@@ -65,6 +65,11 @@ use crate::group::{Applied, Outcome, PartMachine};
 use crate::node::Node;
 use crate::producer::Verdict;
 use crate::wire::{self, Ack, Bus, Durability, Kind, LANE, LIVENESS_LANE, Leader, Redirect, Reply};
+
+/// A duration's nanoseconds, a duration past what a u64 holds counted at the most.
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
 
 /// Format: the part's group in the node's log.
 const PART_GROUP: u128 = 1;
@@ -121,9 +126,51 @@ fn class_of(fates: &[(u64, u64)], spanning: usize) -> Durability {
     }
 }
 
+/// What a histogram of times counted: how many, and its p50, p99 and most, nanoseconds, each at
+/// most an eighth past its quantile (`hyper_timing::Histogram`); zeros where it counted none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Times {
+    /// How many times it counted.
+    pub count: u64,
+    /// The median.
+    pub p50_ns: u64,
+    /// The 99th percentile.
+    pub p99_ns: u64,
+    /// The most.
+    pub max_ns: u64,
+}
+
+impl Times {
+    fn of(histogram: &hyper_timing::Histogram) -> Self {
+        let at = |ppm| histogram.quantile(ppm).unwrap_or(0);
+        Self {
+            count: histogram.count(),
+            p50_ns: at(500_000),
+            p99_ns: at(990_000),
+            max_ns: at(1_000_000),
+        }
+    }
+}
+
+/// How long a leader's publishes took, by stage ([`Stages`]); a publisher's time beyond the
+/// leader's acknowledgement is its connection's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PublishTimes {
+    /// From each publish's proposal to its acknowledgement.
+    pub acked: Times,
+    /// A parked publish's wait before its proposal.
+    pub parked: Times,
+    /// From a run of entries' append to its durability on the leader's log.
+    pub persisted: Times,
+    /// From a run's append to its commit.
+    pub committed: Times,
+}
+
 /// What a node of a group did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemberStats {
+    /// How long its publishes took while it led, by stage.
+    pub publish: PublishTimes,
     /// Publishes proposed while the node led.
     pub proposed: u64,
     /// Publishes parked, their publisher held, while the replica could take no more.
@@ -414,6 +461,82 @@ struct Parked {
     peer: PeerId,
     lane: LaneId,
     batch: Vec<u8>,
+    /// When it parked: what it waited before it was proposed is `MemberStats::publish`'s.
+    parked_at: Instant,
+}
+
+/// How long a leader's publishes took, split where the group's work splits: each publish from
+/// its proposal to its acknowledgement and a parked one's wait before its proposal, and each run of
+/// entries the leader appended until it was durable on the leader's own log and until a quorum
+/// committed it (the leader's write; its followers' writes and their answers). A run is the entries
+/// one turn appended, timed from the end of that turn to the end of the turn that saw them durable
+/// or committed. Each run queue holds at most `bound` runs, the publishes the node may owe at once
+/// (every run a leader's proposals made holds one it owes until its commit); a run past it joins
+/// the newest, timed from the newest's start, so a sample overstates a run's time rather than lose
+/// it.
+struct Stages {
+    /// Runs not yet durable on the leader's log: each run's last index, when it was seen appended.
+    unpersisted: VecDeque<(u64, Instant)>,
+    /// Runs not yet committed.
+    uncommitted: VecDeque<(u64, Instant)>,
+    /// The last index seen appended: the next run starts past it.
+    seen: u64,
+    bound: usize,
+    acked: hyper_timing::Histogram,
+    parked: hyper_timing::Histogram,
+    persisted: hyper_timing::Histogram,
+    committed: hyper_timing::Histogram,
+}
+
+impl Stages {
+    fn new(bound: usize) -> Self {
+        Self {
+            unpersisted: VecDeque::new(),
+            uncommitted: VecDeque::new(),
+            seen: 0,
+            bound: bound.max(1),
+            acked: hyper_timing::Histogram::new(),
+            parked: hyper_timing::Histogram::new(),
+            persisted: hyper_timing::Histogram::new(),
+            committed: hyper_timing::Histogram::new(),
+        }
+    }
+
+    /// What the leader's log says now: its last index, what is durable on it and what is
+    /// committed. A node that does not lead times nothing: what it appended as a follower is its
+    /// leader's.
+    fn observe(&mut self, leads: bool, last: u64, persisted: u64, committed: u64, now: Instant) {
+        if !leads {
+            self.unpersisted.clear();
+            self.uncommitted.clear();
+            self.seen = last;
+            return;
+        }
+        let appended = last > self.seen;
+        self.seen = self.seen.max(last);
+        for (queue, times, reached) in [
+            (&mut self.unpersisted, &mut self.persisted, persisted),
+            (&mut self.uncommitted, &mut self.committed, committed),
+        ] {
+            while let Some(&(index, at)) = queue.front() {
+                if index > reached {
+                    break;
+                }
+                queue.pop_front();
+                times.record(nanos(now.saturating_duration_since(at)));
+            }
+            if !appended {
+                continue;
+            }
+            let full = queue.len() >= self.bound;
+            match queue.back_mut() {
+                // Durable, or committed, by the end of the turn that appended it.
+                _ if last <= reached => times.record(0),
+                Some(newest) if full => newest.0 = last,
+                _ => queue.push_back((last, now)),
+            }
+        }
+    }
 }
 
 /// An answer to a publish: its acknowledgement or its redirect, as sent.
@@ -462,7 +585,9 @@ pub struct Member {
     /// Acknowledgements owed to publishers, while the node leads: each batch with the identity
     /// that published it, whose sessions it is judged by (a session is its identity's own, so two
     /// identities naming one session owe apart).
-    owed: HashSet<(PeerId, Owed)>,
+    owed: HashMap<(PeerId, Owed), Instant>,
+    /// How long its publishes took while the node led, by stage (boxed: its histograms are 16 KB).
+    stages: Box<Stages>,
     /// The most acknowledgements owed at once: a publisher's lane window for each client the node
     /// admits, what the publishers can have unacknowledged.
     owed_bound: usize,
@@ -727,7 +852,8 @@ impl Member {
             out: Output::default(),
             outbox: HashMap::new(),
             outbox_bound,
-            owed: HashSet::new(),
+            owed: HashMap::new(),
+            stages: Box::new(Stages::new(clients.saturating_mul(lane_window))),
             owed_bound: clients.saturating_mul(lane_window),
             parked: VecDeque::new(),
             answers: HashMap::new(),
@@ -764,8 +890,13 @@ impl Member {
         if let Ok(log) = self.log.stats(None) {
             stats.log = LogWrites::of(&log, self.written_in_place);
         }
+        stats.publish = PublishTimes {
+            acked: Times::of(&self.stages.acked),
+            parked: Times::of(&self.stages.parked),
+            persisted: Times::of(&self.stages.persisted),
+            committed: Times::of(&self.stages.committed),
+        };
         stats.writes = self.replica.writes();
-        let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         let figures = &mut stats.liveness;
         figures.floor_ns = self.liveness.floor().map_or(0, nanos);
         for report in self
@@ -975,7 +1106,7 @@ impl Member {
             self.redirect(endpoint, peer, key);
             return;
         }
-        if self.owed.contains(&(peer, key)) {
+        if self.owed.contains_key(&(peer, key)) {
             // Proposed already, its acknowledgement owed: the publisher sent it again (a resend
             // while it waited, or a lane's retry), and the acknowledgement the first earns answers
             // both, as Kafka's leader answers a duplicate of a batch in flight from its producer's
@@ -1037,7 +1168,7 @@ impl Member {
         if proposed.is_err() {
             return false;
         }
-        self.owed.insert((peer, key));
+        self.owed.insert((peer, key), Instant::now());
         self.stats.proposed = self.stats.proposed.saturating_add(1);
         true
     }
@@ -1081,7 +1212,12 @@ impl Member {
             return;
         }
         batch.extend_from_slice(bytes);
-        self.parked.push_back(Parked { peer, lane, batch });
+        self.parked.push_back(Parked {
+            peer,
+            lane,
+            batch,
+            parked_at: Instant::now(),
+        });
         self.stats.parked = self.stats.parked.saturating_add(1);
     }
 
@@ -1103,16 +1239,18 @@ impl Member {
             let (peer, lane) = (parked.peer, parked.lane);
             let taken = match key {
                 // A copy of one proposed since it parked is answered with the first.
-                Some(key) if self.replica.is_leader() && self.owed.contains(&(peer, key)) => {
+                Some(key) if self.replica.is_leader() && self.owed.contains_key(&(peer, key)) => {
                     self.stats.duplicates = self.stats.duplicates.saturating_add(1);
                     true
                 }
                 Some(key) if self.replica.is_leader() => {
                     let batch = parked.batch.clone();
+                    let parked_at = parked.parked_at;
                     if !self.propose(peer, &batch, key) {
                         // The group has yet to commit enough: the publisher waits on.
                         break;
                     }
+                    self.stages.parked.record(nanos(parked_at.elapsed()));
                     true
                 }
                 Some(key) => {
@@ -1468,6 +1606,13 @@ impl Member {
                 break;
             }
         }
+        let log = self.replica.core().raft.log();
+        if let Ok(last) = log.last_index() {
+            let (persisted, committed) = (log.persisted(), log.committed());
+            let leads = self.replica.is_leader();
+            self.stages
+                .observe(leads, last, persisted, committed, Instant::now());
+        }
         self.compact_behind_window(waker, clock);
         self.settle_leadership(endpoint);
         self.unpark(endpoint);
@@ -1573,9 +1718,9 @@ impl Member {
     {
         let key = (applied.stream, applied.producer, applied.sequence);
         let peer = applied.owner;
-        if !self.owed.remove(&(peer, key)) {
+        let Some(proposed_at) = self.owed.remove(&(peer, key)) else {
             return;
-        }
+        };
         let (base, count, class) = match applied.outcome {
             Outcome::Appended { base } => (base, applied.count, self.class.code()),
             Outcome::Again { base: Some(base) } => (base, applied.count, self.class.code()),
@@ -1594,6 +1739,7 @@ impl Member {
         };
         self.answer(endpoint, peer, Answer::Ack(ack.encode()));
         self.stats.acked = self.stats.acked.saturating_add(1);
+        self.stages.acked.record(nanos(proposed_at.elapsed()));
     }
 
     /// A node that stopped leading redirects every publisher it owed: the group may or may not have
@@ -1605,7 +1751,7 @@ impl Member {
     {
         let leading = self.replica.is_leader();
         if self.leading && !leading {
-            let owed: Vec<(PeerId, Owed)> = self.owed.drain().collect();
+            let owed: Vec<(PeerId, Owed)> = self.owed.drain().map(|(owed, _)| owed).collect();
             for (peer, key) in owed {
                 self.redirect(endpoint, peer, key);
             }
@@ -1643,5 +1789,58 @@ impl Member {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each run of appended entries is timed once at each stage, at the end of the turn that saw it
+    /// reach the stage; a run past the bound joins the newest and is timed from its start; a node
+    /// that stops leading times nothing it appended, and leading again starts from its last index.
+    #[test]
+    fn a_leader_times_each_run_of_its_entries_to_durable_and_to_committed() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let ms = |ns: u64| ns / 1_000_000;
+        let mut stages = Stages::new(2);
+        stages.observe(true, 10, 0, 0, at(0));
+        // Two runs, 1..=10 and 11..=12; the first durable 3 ms after it was appended.
+        stages.observe(true, 12, 10, 0, at(3));
+        assert_eq!(stages.persisted.count(), 1);
+        assert_eq!(ms(stages.persisted.quantile(1_000_000).unwrap()), 3);
+        // Two runs wait for their commit, so a third joins 11..=12 and is timed from its start;
+        // the first is committed only after the third is appended, so it took the bound's room.
+        stages.observe(true, 14, 10, 0, at(5));
+        assert_eq!(stages.uncommitted.len(), 2);
+        assert_eq!(stages.uncommitted.back(), Some(&(14, at(3))));
+        // The leader's log had room for it: two runs wait there.
+        assert_eq!(stages.unpersisted.back(), Some(&(14, at(5))));
+        // A run is timed only once its last index has reached the stage.
+        stages.observe(true, 14, 13, 13, at(8));
+        assert_eq!(stages.persisted.count(), 2);
+        assert_eq!(stages.committed.count(), 1);
+        assert_eq!(ms(stages.committed.quantile(1_000_000).unwrap()), 8);
+        stages.observe(true, 14, 14, 14, at(9));
+        assert_eq!(stages.persisted.count(), 3);
+        assert_eq!(stages.committed.count(), 2);
+        assert_eq!(ms(stages.committed.quantile(0).unwrap()), 6);
+        assert!(stages.unpersisted.is_empty() && stages.uncommitted.is_empty());
+        // A run durable and committed by the end of the turn that appended it took no time.
+        stages.observe(true, 15, 15, 15, at(9));
+        assert_eq!(stages.committed.count(), 3);
+        assert_eq!(stages.committed.quantile(0), Some(0));
+        // A follower's appends are its leader's to time.
+        stages.observe(true, 16, 15, 15, at(10));
+        stages.observe(false, 30, 30, 30, at(20));
+        assert!(stages.unpersisted.is_empty() && stages.uncommitted.is_empty());
+        assert_eq!(stages.committed.count(), 3);
+        // Leading again, only what it appends as leader is timed.
+        stages.observe(true, 31, 30, 30, at(21));
+        stages.observe(true, 31, 31, 31, at(22));
+        assert_eq!(stages.committed.count(), 4);
+        assert_eq!(stages.uncommitted.len(), 0);
+        assert_eq!(ms(stages.committed.quantile(500_000).unwrap()), 1);
     }
 }

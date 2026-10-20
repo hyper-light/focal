@@ -135,6 +135,16 @@ fn millis(from: u64, to: u64) -> f64 {
     to.saturating_sub(from) as f64 / 1e6
 }
 
+/// A histogram's summary as a line states it, in microseconds.
+fn times(times: &focal_bus::member::Times) -> serde_json::Value {
+    serde_json::json!({
+        "count": times.count,
+        "p50_us": times.p50_ns as f64 / 1e3,
+        "p99_us": times.p99_ns as f64 / 1e3,
+        "max_us": times.max_ns as f64 / 1e3,
+    })
+}
+
 /// One event of the node's group member as its line states it, with the wall clock's time, the
 /// one a client's timings and the other nodes' lines are read against.
 fn group_event(event: &focal_bus::member::GroupEvent) -> serde_json::Value {
@@ -268,6 +278,15 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
                 "sweeps": member.log.sweeps,
                 "swept_bytes": member.log.swept_bytes,
                 "zeroed_bytes": member.log.zeroed_bytes,
+            },
+            // How long a publish took while this node led: from its proposal to its
+            // acknowledgement, a parked one's wait before its proposal, and the runs of entries it
+            // appended until durable on its own log and until committed.
+            "publish": {
+                "acked": times(&member.publish.acked),
+                "parked": times(&member.publish.parked),
+                "persisted": times(&member.publish.persisted),
+                "committed": times(&member.publish.committed),
             },
             // Its replica's writes by what each was for: what its log's frames carried.
             "writes": {

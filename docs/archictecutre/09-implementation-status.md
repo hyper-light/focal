@@ -15799,3 +15799,19 @@ resuming and was revived at its next incarnation everywhere, 4 runs of 4. Tests:
 drivers: not revived by its answer, the verdict rides the answer, refuted, revived at the next
 incarnation, the death arriving again stale), `every_answer_at_the_old_incarnation_tells_the_verdict_again`
 and `a_member_that_restarts_behind_its_verdict_is_told_it_and_refutes_past_it`. Doc 24 §12.
+
+### 2026-10-20 — The bus's Stopped line times a leader's publishes by stage
+
+The comparison's focal p99 at 10,000 records a second sat near 23 ms across windows and runs, close
+to the liveness stream's sending interval (21 to 22 ms), and the node's line said only what its log
+measured (a commit's wait, p99 9.4 ms). A node now times, while it leads, each publish from its
+proposal to its acknowledgement and a parked publish's wait before its proposal, and each run of
+entries it appended (the entries one turn appended) until durable on its own log and until
+committed, its followers' writes and answers included (`member::Stages`, `hyper_timing`
+histograms, kept boxed: 16 KB); the line states each as a count, p50, p99 and most
+(`publish.acked`, `parked`, `persisted`, `committed`). Each run queue holds at most the publishes
+the node may owe at once, and a run past it joins the newest, timed from the newest's start. On
+fedora's group test the leader's 200 publishes took 1.57 ms at the median and 6.29 ms at p99 from
+proposal to acknowledgement, its 51 runs 0.49 and 1.31 ms to its own disk and 1.57 and 6.29 ms to
+their commit; a follower times nothing. Test:
+`member::tests::a_leader_times_each_run_of_its_entries_to_durable_and_to_committed`.
