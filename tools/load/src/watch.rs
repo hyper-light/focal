@@ -7,12 +7,14 @@
 //! (or was waited for and given up), and is passed over.
 use crate::driver::Conn;
 use crate::error::LoadError;
+use focal_client::ClientError;
 use focal_model::native_event::{NativeEventRecord, NativeFactRecord, NativeResponseState};
 use focal_model::{
     ClaimStatus, LedgerId, ParticipantId, RequestEpoch, RequestId, RouteEpoch, SessionSeq,
 };
 use focal_wire::{
-    NativeListFilter, NativeListRequest, NativeObject, Operation, RequestEnvelope, Response,
+    AccessError, NativeListFilter, NativeListRequest, NativeObject, NativeWaitRequest, Operation,
+    RequestEnvelope, Response,
 };
 use hyper_rt::combine::{Either, race2};
 use hyper_rt::sync::{OneshotReceiver, OneshotSender, oneshot};
@@ -46,6 +48,8 @@ pub struct TailCounts {
     pub events: u64,
     /// Pages refused or failed.
     pub failed: u64,
+    /// Pages the node held until a delivery came or the wait ended (the waiting profile).
+    pub waited: u64,
 }
 
 /// The waiters of every message under way, by claim, at most `bound` of each kind.
@@ -174,7 +178,7 @@ fn expect<T>(
 pub async fn tail(
     watch: &Watch,
     side: Side,
-    poll: Duration,
+    (poll, wait_ms): (Duration, u32),
     conn: &Conn,
     ledger: LedgerId,
     recipient: ParticipantId,
@@ -185,28 +189,62 @@ pub async fn tail(
     let mut after = None;
     let mut started = false;
     let mut cursor = None;
+    // Whether the node holds a page until a delivery comes: until it says it cannot.
+    let mut waits = wait_ms > 0;
     while !watch.stopped.get() {
         let (max_items, max_visits) = if started {
             (TAIL_ITEMS, TAIL_VISITS)
         } else {
             (1, 1)
         };
+        let list = NativeListRequest {
+            filter: NativeListFilter::Deliveries { recipient, after },
+            cursor: cursor.take(),
+            max_items,
+            max_visits,
+        };
+        // A page that goes on from a cursor has more to read now; one from the inbox's end
+        // waits at the node for the next delivery.
+        let waiting = started && waits && list.cursor.is_none();
+        let (protocol, operation) = if waiting {
+            (
+                focal_wire::WAITING_PROTOCOL_VERSION,
+                Operation::NativeWait(NativeWaitRequest { list, wait_ms }),
+            )
+        } else {
+            (
+                focal_wire::NATIVE_PROTOCOL_VERSION,
+                Operation::NativeList(list),
+            )
+        };
         let envelope = RequestEnvelope {
-            protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
+            protocol,
             ledger,
             route_epoch: RouteEpoch(1),
             request_epoch: RequestEpoch(1),
             request_id: RequestId::from_u128(ids()?),
-            operation: Operation::NativeList(NativeListRequest {
-                filter: NativeListFilter::Deliveries { recipient, after },
-                cursor: cursor.take(),
-                max_items,
-                max_visits,
-            }),
+            operation,
         };
         let reply = conn.request(envelope).await;
         watch.count(side, |counts| counts.polls = counts.polls.saturating_add(1));
-        let page = match reply.map(|envelope| envelope.result) {
+        let result = reply.map(|envelope| envelope.result);
+        if waiting
+            && matches!(
+                result,
+                Err(ClientError::Access(AccessError::UnsupportedProtocol))
+                    | Ok(Response::Error(AccessError::UnsupportedProtocol))
+            )
+        {
+            // A node, or a connection, that does not hold an inbox read: polled from here on.
+            waits = false;
+            continue;
+        }
+        if waiting {
+            watch.count(side, |counts| {
+                counts.waited = counts.waited.saturating_add(1)
+            });
+        }
+        let page = match result {
             Ok(Response::NativeListed(page)) => page,
             _ => {
                 watch.count(side, |counts| {
@@ -237,9 +275,10 @@ pub async fn tail(
             counts.events = counts.events.saturating_add(read)
         });
         if read == 0 {
-            // A page that reached the prefix waits for more.
+            // A page that reached the prefix waits for more: at the node where it holds the
+            // read, here otherwise.
             cursor = page.next;
-            if cursor.is_none() {
+            if cursor.is_none() && !waiting {
                 focal_rt::time::sleep(poll)
                     .await
                     .map_err(LoadError::Runtime)?;

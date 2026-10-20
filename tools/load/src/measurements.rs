@@ -184,8 +184,12 @@ pub struct DeliveryMeasurements {
     pub undelivered: u64,
     pub consumer_polls: u64,
     pub consumer_events: u64,
+    /// Of the consumer's pages, those the node held until a delivery came or the wait ended.
+    pub consumer_waits: u64,
     pub issuer_polls: u64,
     pub issuer_events: u64,
+    /// Of the issuer's pages, those the node held.
+    pub issuer_waits: u64,
     /// Tail pages refused or failed, both sides.
     pub tail_failures: u64,
 }

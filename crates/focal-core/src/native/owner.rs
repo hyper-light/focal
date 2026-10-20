@@ -1270,6 +1270,11 @@ impl NativeOwner {
     pub fn attach_payload_log(&mut self, log: Box<dyn super::payloads::PayloadLog>) {
         self.core.attach_payload_log(log);
     }
+    /// The inboxes the committed core filed deliveries for since this was last asked
+    /// ([`Core::take_delivered`]).
+    pub fn take_delivered(&mut self) -> super::Delivered {
+        self.core.take_delivered()
+    }
     /// Let go of the payload log's sealed segments no committed or pending row references (doc
     /// 31 M3). How many it let go.
     pub fn sweep_payloads(&self) -> usize {

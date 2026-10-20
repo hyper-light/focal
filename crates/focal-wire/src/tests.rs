@@ -6191,17 +6191,58 @@ fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it() {
                 .protocol,
             ORDERED_PROTOCOL_VERSION
         );
-        // The laned profile tops the ladder where both sides take lanes, and implies the
-        // ordered one; a handler that takes no lanes, or an offer without it, stays ordered.
-        let laned = limits.negotiate_laned(&all, [true; 5]).unwrap();
+        // The waiting profile tops the ladder where both sides wait for an inbox, and implies
+        // the laned one; a handler that does not wait stays laned.
+        let waiting = limits.negotiate_laned(&all, [true; 6]).unwrap();
+        assert_eq!(waiting.protocol, WAITING_PROTOCOL_VERSION);
+        assert!(waiting.laned());
+        assert!(
+            [1, 2, 3, 4, 5, 7]
+                .into_iter()
+                .all(|requested| waiting.accepts_protocol(requested))
+        );
+        // The laned profile is next where both sides take lanes, and implies the ordered one; a
+        // handler that takes no lanes, or an offer without it, stays ordered.
+        let laned = limits
+            .negotiate_laned(&all, [true, true, true, true, true, false])
+            .unwrap();
         assert_eq!(laned.protocol, LANED_PROTOCOL_VERSION);
         assert!(laned.laned());
+        assert!(!laned.accepts_protocol(WAITING_PROTOCOL_VERSION));
         assert_eq!(
             limits
-                .negotiate_laned(&all, [true, true, true, true, false])
+                .negotiate_laned(&all, [true, true, true, true, false, false])
                 .unwrap()
                 .protocol,
             ORDERED_PROTOCOL_VERSION
+        );
+        // An offer of an older binary, without the waiting profile, stays laned.
+        let unwaiting = hello(&OFFERED_PROTOCOLS[1..]);
+        assert_eq!(
+            limits
+                .negotiate_laned(&unwaiting, [true; 6])
+                .unwrap()
+                .protocol,
+            LANED_PROTOCOL_VERSION
+        );
+        // A local connection, which carries no lanes, is offered the waiting profile by a
+        // handler that waits, and the native one by one that does not.
+        let local = hello(&[WAITING_PROTOCOL_VERSION]);
+        assert_eq!(
+            limits.negotiate_local(&local, [true; 4]).unwrap().protocol,
+            WAITING_PROTOCOL_VERSION
+        );
+        assert!(
+            limits
+                .negotiate_local(&local, [true, true, true, false])
+                .is_err()
+        );
+        assert_eq!(
+            limits
+                .negotiate_local(&hello(&[NATIVE_PROTOCOL_VERSION]), [true; 4])
+                .unwrap()
+                .protocol,
+            NATIVE_PROTOCOL_VERSION
         );
         let unlaned = hello(&[
             ORDERED_PROTOCOL_VERSION,
@@ -6212,12 +6253,12 @@ fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it() {
         ]);
         assert_eq!(
             limits
-                .negotiate_laned(&unlaned, [true; 5])
+                .negotiate_laned(&unlaned, [true; 6])
                 .unwrap()
                 .protocol,
             ORDERED_PROTOCOL_VERSION
         );
-        assert!(!limits.negotiate_laned(&unlaned, [true; 5]).unwrap().laned());
+        assert!(!limits.negotiate_laned(&unlaned, [true; 6]).unwrap().laned());
         // A handler that does not step frames in order, or a connector that
         // does not ask for it, stays at the native profile.
         assert_eq!(
@@ -6253,11 +6294,11 @@ fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it() {
             max_items: 1,
         };
         // A request's protocol is at most the ordered profile's: the laned profile is a
-        // connection's, and no request names it.
-        for requested in OFFERED_PROTOCOLS
-            .into_iter()
-            .filter(|requested| *requested != LANED_PROTOCOL_VERSION)
-        {
+        // connection's, and no request names it. A waiting read's, the waiting profile's, rides
+        // only a connection that negotiated it.
+        for requested in OFFERED_PROTOCOLS.into_iter().filter(|requested| {
+            ![LANED_PROTOCOL_VERSION, WAITING_PROTOCOL_VERSION].contains(requested)
+        }) {
             assert!(ordered.accepts_protocol(requested), "{requested}");
             assert!(laned.accepts_protocol(requested), "{requested}");
         }
@@ -6312,7 +6353,12 @@ fn the_ordered_profile_tops_the_ladder_and_an_older_offer_never_reaches_it() {
                 .offering(&[PROTOCOL_VERSION, LANED_PROTOCOL_VERSION])
                 .is_ok()
         );
-        assert!(connector().offering(&[PROTOCOL_VERSION, 7]).is_err());
+        assert!(
+            connector()
+                .offering(&[PROTOCOL_VERSION, WAITING_PROTOCOL_VERSION])
+                .is_ok()
+        );
+        assert!(connector().offering(&[PROTOCOL_VERSION, 8]).is_err());
         // A receiver holds an ordered frame to the ordered profile, and a
         // plain frame to the base one; a node sends either.
         let node = || {

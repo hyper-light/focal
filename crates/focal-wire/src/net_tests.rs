@@ -93,8 +93,8 @@ struct Echoes {
     calls: Arc<AtomicUsize>,
 }
 impl crate::net::Serve for Echoes {
-    fn capabilities(&self) -> [bool; 5] {
-        [false; 5]
+    fn capabilities(&self) -> [bool; 6] {
+        [false; 6]
     }
     fn serve(&self, request: crate::net::Served) -> crate::net::ServeFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);

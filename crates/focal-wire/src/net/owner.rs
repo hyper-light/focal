@@ -107,8 +107,8 @@ pub struct Framed {
 /// every frame let go.
 pub trait Serve: Send + 'static {
     /// The profiles this side answers a greeting with ([`WireLimits::negotiate_laned`]'s
-    /// capabilities: managed, participant, native, ordered, laned).
-    fn capabilities(&self) -> [bool; 5];
+    /// capabilities: managed, participant, native, ordered, laned, waiting).
+    fn capabilities(&self) -> [bool; 6];
     /// The answer to one request, on a task of its own.
     fn serve(&self, request: Served) -> ServeFuture;
     /// One frame a peer sent on a lane, taken at once; whether it was. What serves no lanes
@@ -1680,7 +1680,7 @@ impl Owner {
                 let capabilities = self
                     .serve
                     .as_ref()
-                    .map_or([false; 5], |serve| serve.capabilities());
+                    .map_or([false; 6], |serve| serve.capabilities());
                 match self.limits.negotiate_laned(&hello, capabilities) {
                     Ok(negotiated) => {
                         // The connection it came on is greeted, told or not: a peer's lifecycle

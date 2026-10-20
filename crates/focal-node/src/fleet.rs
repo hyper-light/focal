@@ -25,7 +25,7 @@ use focal_wire::*;
 use hyper_rt::sync::{ChannelReceiver, OneshotSender};
 pub use registration::RegistrationFactsReply;
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::mpsc,
@@ -849,6 +849,17 @@ enum WaitingFor {
         profile: NativeProfile,
         read: NativeReadRequest,
     },
+    /// A recipient's inbox read that waits for its page (`Operation::NativeWait`): parked in
+    /// [`Owner::inboxes`] under its recipient, served again when a delivery to it applies
+    /// ([`Owner::wake_inboxes`]), and answered with its empty page at `until`, a period of the
+    /// owner's ([`Owner::expire_inboxes`]).
+    Inbox {
+        principal: ParticipantId,
+        role: NativePeerRole,
+        profile: NativeProfile,
+        wait: focal_wire::NativeWaitRequest,
+        until: u64,
+    },
     ManagedMutation {
         key: ManagedRequestKey,
         intent: ContentHash,
@@ -1133,6 +1144,18 @@ struct Owner {
     /// records (`_platform_memmove`, 2026-10-12). A write whose caller left keeps its room
     /// until its outcome commits or its deadline passes: its work is in the pipeline by then.
     earliest_deadline: u64,
+    /// The inbox reads that wait for their page, by recipient, each its request's charge held
+    /// (its bytes and its place, `NATIVE_READ_PLACE_BYTES`), so the host's budget bounds them and
+    /// refuses one past it `Capacity` as it refuses any request. Kept apart from
+    /// [`Owner::pending`], which each drain looks at whole: a drain looks only at the inboxes it
+    /// delivered to (`SessionEvents::native_delivered`), so a thousand agents waiting cost a
+    /// commit the waits of the inboxes it reaches, not a thousand looks. A recipient with none
+    /// waiting has no entry.
+    inboxes: BTreeMap<ParticipantId, VecDeque<Pending>>,
+    /// No inbox read's wait ends earlier: a bound from below, lowered as each is parked and made
+    /// exact by the sweep that answers those whose wait has ended (`expire_inboxes`), as
+    /// [`Owner::earliest_deadline`] is for the writes.
+    inbox_until: u64,
     memberships: VecDeque<PendingMembershipCall>,
     /// The members the committed directory names for this session, sorted:
     /// the peers whose replication this replica admits beside those of its
@@ -1414,6 +1437,8 @@ impl ReplicaHost {
             writes: VecDeque::new(),
             paced_term: 0,
             earliest_deadline: u64::MAX,
+            inboxes: BTreeMap::new(),
+            inbox_until: u64::MAX,
             memberships: VecDeque::new(),
             admitted: Vec::new(),
             near: Near::default(),
@@ -1945,6 +1970,11 @@ impl RequestHandler for ReplicaHost {
     fn supports_native_requests(&self) -> bool {
         true
     }
+    // Its hosts hold an inbox read until a delivery to its recipient applies (`fleet::Owner::
+    // inboxes`, `host_inboxes`).
+    fn supports_native_waits(&self) -> bool {
+        true
+    }
     fn supports_ordered_replication(&self) -> bool {
         true
     }
@@ -2041,6 +2071,7 @@ impl ReplicaHost {
                     | Operation::ManagedSupport { .. }
                     | Operation::NativeRead(_)
                     | Operation::NativeList(_)
+                    | Operation::NativeWait(_)
             ) {
                 AccessError::Unavailable
             } else {
@@ -2100,7 +2131,8 @@ impl ReplicaHost {
             | Operation::Traverse(_)
             | Operation::Validators(_)
             | Operation::NativeRead(_)
-            | Operation::NativeList(_) => self.client_frame_bytes as usize,
+            | Operation::NativeList(_)
+            | Operation::NativeWait(_) => self.client_frame_bytes as usize,
             // A native receipt, ticket or refusal is a small fixed document.
             Operation::Native { .. } => 4096,
             Operation::Stream(stream) => {
@@ -2111,7 +2143,7 @@ impl ReplicaHost {
         let native_write = matches!(request.request().operation, Operation::Native { .. });
         let native_read = matches!(
             request.request().operation,
-            Operation::NativeRead(_) | Operation::NativeList(_)
+            Operation::NativeRead(_) | Operation::NativeList(_) | Operation::NativeWait(_)
         );
         let amount = postcard::experimental::serialized_size(request.request())
             .ok()
@@ -2317,6 +2349,11 @@ impl Owner {
                 if Instant::now() >= next_tick {
                     let started = Instant::now();
                     self.tick()?;
+                    // What waits its time in the owner's periods is looked at as each passes,
+                    // whether or not the period brought the replica anything to drain: a
+                    // one-voter replica that is idle drains nothing, and a read it parked, or one
+                    // past its deadline, was answered by no one until its caller gave up.
+                    self.expire_pending();
                     self.slow.note("tick", started);
                     next_tick = Instant::now()
                         .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
@@ -3332,6 +3369,13 @@ impl Owner {
             write.finish(Response::Error(AccessError::OutcomeUnknown));
         }
         self.earliest_deadline = u64::MAX;
+        // A read that waits is a read: asked again of a replica that serves.
+        for (_, waits) in std::mem::take(&mut self.inboxes) {
+            for wait in waits {
+                wait.finish(Response::Error(AccessError::Unavailable));
+            }
+        }
+        self.inbox_until = u64::MAX;
         self.publish_oldest_write();
         self.publish_progress(true);
     }
@@ -4558,11 +4602,57 @@ impl Owner {
                     )
                     .map(Response::NativeListed)
                 }
+                Operation::NativeWait(wait) => {
+                    wait.validate(&self.client_limits)?;
+                    let profile = crate::native_reads::profile(&self.session)?;
+                    let role = crate::native_reads::role(peer)?;
+                    if !self.serves_all_members() {
+                        return Err(AccessError::Unavailable);
+                    }
+                    let key = *self.views.list_key()?;
+                    let core = self.session.native_core().map_err(access)?;
+                    let page = crate::native_lists::serve(
+                        &crate::native_reads::Reader {
+                            core,
+                            ledger: self.session.ledger(),
+                            profile,
+                            principal: peer.principal(),
+                            role,
+                            route: request.route_epoch,
+                        },
+                        &key,
+                        &wait.list,
+                        &mut charge,
+                    )?;
+                    // A page with something on it, or a cursor to go on from, is answered now;
+                    // an empty one waits for a delivery to its recipient.
+                    if page.objects.is_empty() && page.next.is_none() {
+                        let until = self
+                            .pace
+                            .periods()
+                            .checked_add(focal_timing::ProgressDeadline::periods(
+                                Duration::from_millis(u64::from(wait.wait_ms)),
+                                self.config.tick,
+                            ))
+                            .ok_or(AccessError::Unavailable)?;
+                        waiting = Some((
+                            WaitingFor::Inbox {
+                                principal: peer.principal(),
+                                role,
+                                profile,
+                                wait: wait.clone(),
+                                until,
+                            },
+                            deadline,
+                        ));
+                    }
+                    Ok(Response::NativeListed(page))
+                }
                 _ => Err(AccessError::UnsupportedOperation),
             }
         })();
         if let Some((waiting, deadline)) = waiting {
-            self.queue_pending(Pending {
+            let pending = Pending {
                 header,
                 response,
                 waiting,
@@ -4570,7 +4660,15 @@ impl Owner {
                 deadline,
                 served: Some(served),
                 _charge: charge,
-            });
+            };
+            if let WaitingFor::Inbox { wait, until, .. } = &pending.waiting
+                && let Some(recipient) = wait.recipient()
+            {
+                let until = *until;
+                self.park_inbox(recipient, until, pending);
+            } else {
+                self.queue_pending(pending);
+            }
         } else {
             let mut header = header;
             header.result = result.unwrap_or_else(Response::Error);
@@ -5324,7 +5422,138 @@ impl Owner {
             }
         }
         self.publish_oldest_write();
+        let delivered = self.session.take_native_delivered();
+        self.wake_inboxes(&delivered);
         Ok(())
+    }
+    /// Parks an inbox read that waits for its page, under `recipient`, until a delivery to it
+    /// applies or its wait ends at `until`. Its time waiting is its inbox's, not the owner's, so
+    /// it measures no service.
+    fn park_inbox(&mut self, recipient: ParticipantId, until: u64, mut pending: Pending) {
+        pending.served = None;
+        self.inbox_until = self.inbox_until.min(until);
+        self.inboxes
+            .entry(recipient)
+            .or_default()
+            .push_back(pending);
+    }
+    /// The inbox reads waiting on the inboxes `delivered` reached are served again: one whose
+    /// page now holds something, or whose replica no longer serves it, is answered, and the rest
+    /// wait on. Only the inboxes delivered to are looked at; where the core could not note them
+    /// exactly, every one is.
+    fn wake_inboxes(&mut self, delivered: &focal_core::native::Delivered) {
+        if delivered.is_empty() || self.inboxes.is_empty() {
+            return;
+        }
+        if delivered.all {
+            let inboxes = std::mem::take(&mut self.inboxes);
+            for (recipient, waits) in inboxes {
+                self.serve_waits(recipient, waits, None);
+            }
+            return;
+        }
+        for &recipient in &delivered.recipients {
+            if let Some(waits) = self.inboxes.remove(&recipient) {
+                self.serve_waits(recipient, waits, None);
+            }
+        }
+    }
+    /// Answers each of `recipient`'s waits whose page holds something, whose caller left, or,
+    /// given `now`, whose wait has ended by it; the rest are parked again.
+    fn serve_waits(
+        &mut self,
+        recipient: ParticipantId,
+        waits: VecDeque<Pending>,
+        now: Option<u64>,
+    ) {
+        let mut left = VecDeque::new();
+        for mut pending in waits {
+            if pending.response.is_closed() {
+                continue;
+            }
+            let ended = match (&pending.waiting, now) {
+                (WaitingFor::Inbox { until, .. }, Some(now)) => now >= *until,
+                _ => false,
+            };
+            match self.serve_inbox(&mut pending, ended) {
+                Some(result) => pending.finish(result),
+                None => left.push_back(pending),
+            }
+        }
+        if !left.is_empty() {
+            self.inboxes.insert(recipient, left);
+        }
+    }
+    /// An inbox read served again from the committed prefix: its page, where it holds something
+    /// or `ended` (the wait's end answers the empty page, its token current), an error where the
+    /// replica no longer serves it, and none while it waits on.
+    fn serve_inbox(&mut self, pending: &mut Pending, ended: bool) -> Option<Response> {
+        let Pending {
+            header, waiting, ..
+        } = pending;
+        let WaitingFor::Inbox {
+            principal,
+            role,
+            profile,
+            wait,
+            ..
+        } = waiting
+        else {
+            return Some(Response::Error(AccessError::Unavailable));
+        };
+        if !self.serves_route(header.route_epoch) || !self.serves_all_members() {
+            return Some(Response::Error(AccessError::Unavailable));
+        }
+        let key = match self.views.list_key() {
+            Ok(key) => *key,
+            Err(error) => return Some(Response::Error(error)),
+        };
+        let core = match self.session.native_core() {
+            Ok(core) => core,
+            Err(error) => return Some(Response::Error(access(error))),
+        };
+        let served = crate::native_lists::serve(
+            &crate::native_reads::Reader {
+                core,
+                ledger: self.session.ledger(),
+                profile: *profile,
+                principal: *principal,
+                role: *role,
+                route: header.route_epoch,
+            },
+            &key,
+            &wait.list,
+            &mut pending._charge,
+        );
+        match served {
+            Ok(page) if ended || !page.objects.is_empty() || page.next.is_some() => {
+                Some(Response::NativeListed(page))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Response::Error(error)),
+        }
+    }
+    /// Answers the inbox reads whose wait has ended by `now`, with their pages as they stand, and
+    /// lets go of those whose callers left; looked at only once one may have ended
+    /// ([`Owner::inbox_until`]).
+    fn expire_inboxes(&mut self, now: u64) {
+        if now < self.inbox_until {
+            return;
+        }
+        let inboxes = std::mem::take(&mut self.inboxes);
+        for (recipient, waits) in inboxes {
+            self.serve_waits(recipient, waits, Some(now));
+        }
+        self.inbox_until = self
+            .inboxes
+            .values()
+            .flatten()
+            .filter_map(|pending| match pending.waiting {
+                WaitingFor::Inbox { until, .. } => Some(until),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(u64::MAX);
     }
     /// What a request the owner gives up is answered with: a read parked
     /// with an empty page gets that page — its barrier was current when it
@@ -5350,6 +5579,7 @@ impl Owner {
                 Response::Error(AccessError::OutcomeUnknown)
             }
             WaitingFor::NativeRead { .. }
+            | WaitingFor::Inbox { .. }
             | WaitingFor::RequestStreamRead { .. }
             | WaitingFor::PeerPersistence
             | WaitingFor::Read { .. }
@@ -5386,6 +5616,7 @@ impl Owner {
         self.expire_placement();
         self.expire_held();
         let now = self.pace.periods();
+        self.expire_inboxes(now);
         let count = self.memberships.len();
         for _ in 0..count {
             let Some(pending) = self.memberships.pop_front() else {

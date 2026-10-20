@@ -255,6 +255,9 @@ pub enum Operation {
         #[serde(with = "focal_memory::serde_bytes")]
         message: Vec<u8>,
     },
+    /// A recipient's inbox read that waits for its page (the waiting profile,
+    /// [`crate::WAITING_PROTOCOL_VERSION`]).
+    NativeWait(crate::NativeWaitRequest),
 }
 /// What a request is to the connection that carries it; see
 /// [`Operation::class`].
@@ -304,8 +307,8 @@ impl TrafficClass {
             7 | 8 | 10 => Some(Self::Bulk),
             // Submit, Read, Subscribe, OpenEpoch, Stream, List, Reconcile, Managed,
             // RequestStreamControl, RequestStreamRead, Traverse, Validators, Summary, Monitor,
-            // Select, Native, NativeRead, NativeList.
-            1 | 2 | 3 | 5 | 6 | 14..=18 | 20..=27 => Some(Self::Exchange),
+            // Select, Native, NativeRead, NativeList, NativeWait.
+            1 | 2 | 3 | 5 | 6 | 14..=18 | 20..=27 | 34 => Some(Self::Exchange),
             _ => None,
         }
     }
@@ -361,6 +364,7 @@ impl Operation {
             Self::RangeControl { .. } => 31,
             Self::SessionControl { .. } => 32,
             Self::RaftOrdered { .. } => 33,
+            Self::NativeWait(_) => 34,
         }
     }
     /// What goes first where one connection carries several requests at
@@ -400,7 +404,8 @@ impl Operation {
             | Self::Select(_)
             | Self::Native { .. }
             | Self::NativeRead(_)
-            | Self::NativeList(_) => TrafficClass::Exchange,
+            | Self::NativeList(_)
+            | Self::NativeWait(_) => TrafficClass::Exchange,
         }
     }
     pub fn is_mutation(&self) -> bool {
@@ -902,6 +907,15 @@ impl Negotiated {
                         | crate::NATIVE_PROTOCOL_VERSION
                         | crate::ORDERED_PROTOCOL_VERSION
                 )
+                | (
+                    crate::WAITING_PROTOCOL_VERSION,
+                    PROTOCOL_VERSION
+                        | MANAGED_PROTOCOL_VERSION
+                        | PEER_PROTOCOL_VERSION
+                        | crate::NATIVE_PROTOCOL_VERSION
+                        | crate::ORDERED_PROTOCOL_VERSION
+                        | crate::WAITING_PROTOCOL_VERSION
+                )
         )
     }
     /// Whether a connection that negotiated this profile carries replication frames on lanes.
@@ -1022,22 +1036,51 @@ impl WireLimits {
         native: bool,
         ordered: bool,
     ) -> Result<Negotiated, AccessError> {
-        self.negotiate_laned(hello, [managed, participant, native, ordered, false])
+        self.negotiate_laned(hello, [managed, participant, native, ordered, false, false])
+    }
+    /// A local connection's profile ([`crate::LocalServer`]): one participant's one request, never
+    /// a peer's frames, so the waiting profile is offered where the handler waits for an inbox
+    /// ([`crate::RequestHandler::supports_native_waits`]) whether or not it replicates; else the
+    /// native profile and those below it.
+    pub fn negotiate_local(
+        &self,
+        hello: &Hello,
+        [managed, participant, native, waiting]: [bool; 4],
+    ) -> Result<Negotiated, AccessError> {
+        if managed
+            && participant
+            && native
+            && waiting
+            && hello.versions.contains(&crate::WAITING_PROTOCOL_VERSION)
+        {
+            return self.negotiate_laned(hello, [true; 6]);
+        }
+        self.negotiate_native(hello, managed, participant, native)
     }
     /// The laned profile is offered by a handler that takes a peer's replication frames from
-    /// its lanes, each answered by nothing ([`crate::LANED_PROTOCOL_VERSION`]); it implies every
-    /// earlier profile. `capabilities` are the handler's: managed, participant, native, ordered
-    /// and laned.
+    /// its lanes, each answered by nothing ([`crate::LANED_PROTOCOL_VERSION`]), and the waiting
+    /// profile by one that also holds an inbox read until it has its page
+    /// ([`crate::WAITING_PROTOCOL_VERSION`]); each implies every earlier profile. `capabilities`
+    /// are the handler's: managed, participant, native, ordered, laned and waiting.
     pub fn negotiate_laned(
         &self,
         hello: &Hello,
-        capabilities: [bool; 5],
+        capabilities: [bool; 6],
     ) -> Result<Negotiated, AccessError> {
-        let [managed, participant, native, ordered, laned] = capabilities;
+        let [managed, participant, native, ordered, laned, waiting] = capabilities;
         if hello.versions.len() > 16 {
             return Err(AccessError::UnsupportedProtocol);
         }
         let protocol = if managed
+            && participant
+            && native
+            && ordered
+            && laned
+            && waiting
+            && hello.versions.contains(&crate::WAITING_PROTOCOL_VERSION)
+        {
+            crate::WAITING_PROTOCOL_VERSION
+        } else if managed
             && participant
             && native
             && ordered

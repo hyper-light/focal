@@ -297,6 +297,11 @@ impl RequestHandler for ManagedService {
     fn supports_native_requests(&self) -> bool {
         true
     }
+    // Its hosts hold an inbox read until a delivery to its recipient applies (`fleet::Owner::
+    // inboxes`, `host_inboxes`).
+    fn supports_native_waits(&self) -> bool {
+        true
+    }
     fn supports_lane_frames(&self) -> bool {
         true
     }

@@ -36,6 +36,7 @@ mod fleet_tests;
 pub mod gc;
 pub mod history;
 pub mod host;
+mod host_inboxes;
 pub mod leader_balancer;
 pub mod leader_return;
 pub mod liveness;

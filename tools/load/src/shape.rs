@@ -15,6 +15,9 @@ pub const MAX_READS: u64 = 10_000_000;
 pub const MAX_CONCURRENCY: u16 = 64;
 /// The most of one caller's writes under way at once (`inflight`).
 pub const MAX_INFLIGHT: u16 = 256;
+/// The longest a side's inbox read is asked to wait at the node (`inbox_wait_ms`): under the
+/// node's request period (30 s by default), which a wait must end within.
+pub const MAX_INBOX_WAIT_MS: u32 = 10_000;
 
 /// Which node the callers reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -143,6 +146,14 @@ pub struct WorkloadShape {
     /// consumer that fetches has one.
     #[serde(default = "default_poll_ms")]
     pub poll_ms: u16,
+    /// `deliver`: how long a side's inbox read waits at the node for its next page before the
+    /// node answers it empty, in milliseconds (0..=MAX_INBOX_WAIT_MS, default 500): the side
+    /// asks the node to hold the read until a delivery to it applies (the waiting profile,
+    /// `Operation::NativeWait`) where it polled, as a Kafka consumer's fetch waits at the broker
+    /// `fetch.max.wait.ms`, 500 by default. Zero, or a node that does not wait, polls every
+    /// `poll_ms`.
+    #[serde(default = "default_inbox_wait_ms")]
+    pub inbox_wait_ms: u32,
     /// Offered creations a second over all callers. Set, the writes are
     /// paced on a fixed schedule and each latency counts from its request's
     /// intended start (wrk2's constant-throughput method), so a stall is
@@ -186,6 +197,9 @@ fn default_lifecycle_reads() -> u16 {
 }
 fn default_poll_ms() -> u16 {
     2
+}
+fn default_inbox_wait_ms() -> u32 {
+    500
 }
 
 impl WorkloadShape {
@@ -260,6 +274,9 @@ impl WorkloadShape {
             }
             if self.poll_ms == 0 || self.poll_ms > 1000 {
                 return Err("poll_ms must be 1..=1000".into());
+            }
+            if self.inbox_wait_ms > MAX_INBOX_WAIT_MS {
+                return Err(format!("inbox_wait_ms must be 0..={MAX_INBOX_WAIT_MS}"));
             }
         } else if self.consumer_enrollment.is_some() {
             return Err("consumer_enrollment applies to the deliver lifecycle".into());

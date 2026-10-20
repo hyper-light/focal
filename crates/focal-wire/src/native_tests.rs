@@ -1265,3 +1265,118 @@ fn native_pages_are_validated_against_the_shape_their_query_names() {
         assert!(!valid(&after_evaluations, bad));
     }
 }
+
+fn inbox_request(wait_ms: u32) -> NativeWaitRequest {
+    NativeWaitRequest {
+        list: NativeListRequest {
+            filter: NativeListFilter::Deliveries {
+                recipient: key().principal,
+                after: None,
+            },
+            cursor: None,
+            max_items: 16,
+            max_visits: 64,
+        },
+        wait_ms,
+    }
+}
+
+/// A waiting inbox read is the waiting profile's alone, as an ordered frame is the ordered
+/// profile's: refused under every other profile, and the waiting profile admits nothing else. It
+/// is an actor's read, carried with the participants' exchanges.
+#[test]
+fn a_waiting_inbox_read_is_the_waiting_profiles_alone() {
+    let wait = Operation::NativeWait(inbox_request(500));
+    assert_eq!(wait.registered_tag(), 34);
+    assert_eq!(TrafficClass::of_tag(34), Some(TrafficClass::Exchange));
+    assert_eq!(wait.class(), TrafficClass::Exchange);
+    assert_eq!(capability(&wait), Capability::Actor);
+    assert!(!wait.is_mutation());
+    assert!(waiting_profile_operation(&wait));
+    assert!(!native_profile_operation(&wait));
+    assert_eq!(participant_protocol(&wait), WAITING_PROTOCOL_VERSION);
+    let actor = peer(PeerRole::Actor, key().principal);
+    let limits = WireLimits::default();
+    for protocol in [
+        PROTOCOL_VERSION,
+        MANAGED_PROTOCOL_VERSION,
+        PEER_PROTOCOL_VERSION,
+        NATIVE_PROTOCOL_VERSION,
+        ORDERED_PROTOCOL_VERSION,
+        LANED_PROTOCOL_VERSION,
+    ] {
+        assert!(
+            matches!(
+                verify_request(actor.clone(), envelope(protocol, wait.clone()), &limits),
+                Err(AccessError::UnsupportedProtocol)
+            ),
+            "{protocol}"
+        );
+    }
+    assert!(
+        verify_request(
+            actor.clone(),
+            envelope(WAITING_PROTOCOL_VERSION, wait),
+            &limits
+        )
+        .is_ok()
+    );
+    for operation in [
+        Operation::NativeList(list_request()),
+        Operation::NativeRead(read_request()),
+        Operation::Summary,
+    ] {
+        assert!(matches!(
+            verify_request(
+                actor.clone(),
+                envelope(WAITING_PROTOCOL_VERSION, operation),
+                &limits
+            ),
+            Err(AccessError::UnsupportedProtocol)
+        ));
+    }
+}
+
+/// A wait reads one recipient's inbox, waits at least a millisecond and less than its request's
+/// period (its empty page is answered before the period ends), and its list keeps a list's own
+/// bounds; it crosses the wire as it was sent.
+#[test]
+fn a_waiting_inbox_read_validates_its_inbox_its_wait_and_its_list() {
+    let limits = WireLimits::default();
+    let period = u32::try_from(limits.request_timeout.as_millis()).unwrap();
+    assert!(inbox_request(1).validate(&limits).is_ok());
+    assert!(inbox_request(period - 1).validate(&limits).is_ok());
+    for wait_ms in [0, period, period + 1, u32::MAX] {
+        assert!(
+            matches!(
+                inbox_request(wait_ms).validate(&limits),
+                Err(AccessError::InvalidRequest)
+            ),
+            "{wait_ms}"
+        );
+    }
+    // Another filter is no inbox.
+    let mut events = inbox_request(500);
+    events.list.filter = NativeListFilter::Events { after: None };
+    assert_eq!(events.recipient(), None);
+    assert!(matches!(
+        events.validate(&limits),
+        Err(AccessError::InvalidRequest)
+    ));
+    let mut empty = inbox_request(500);
+    empty.list.max_items = 0;
+    assert!(matches!(
+        empty.validate(&limits),
+        Err(AccessError::InvalidRequest)
+    ));
+    assert_eq!(inbox_request(500).recipient(), Some(key().principal));
+    let request = envelope(
+        WAITING_PROTOCOL_VERSION,
+        Operation::NativeWait(inbox_request(500)),
+    );
+    let bytes = postcard::to_allocvec(&request).unwrap();
+    assert_eq!(
+        postcard::from_bytes::<RequestEnvelope>(&bytes).unwrap(),
+        request
+    );
+}

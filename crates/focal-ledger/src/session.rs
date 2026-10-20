@@ -860,6 +860,16 @@ impl Session {
     pub fn sequence(&self) -> SessionSeq {
         self.core.sequence()
     }
+    /// The inboxes the committed native core filed deliveries for since this was last asked, each
+    /// once (`focal_core::native::Delivered`): what an owner wakes the inbox reads that wait on
+    /// them by. Taken on demand rather than with a poll's events, so a poll whose events its
+    /// caller drops loses none; none on a session that runs no native engine.
+    pub fn take_native_delivered(&mut self) -> focal_core::native::Delivered {
+        match self.native.as_deref_mut() {
+            Some(engine) => engine.take_delivered(),
+            None => focal_core::native::Delivered::default(),
+        }
+    }
     /// The committed native prefix as ordered outcomes — one per committed
     /// record, in native-sequence order (offline publications reader, R11 §1).
     /// Empty when this ledger has no native engine. Survives a checkpoint (the

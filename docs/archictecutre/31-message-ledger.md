@@ -329,6 +329,52 @@ Recency is the first dimension the tiers are ordered by, though not the only one
 | Archive sweeps every 5 s after a day | retirement events into the cold tier |
 | One owner thread a node | one owner shard a core |
 
+### 4.10 An agent's inbox waits (2026-10-20)
+
+An agent learns of a claim posted for it, and of a testament posted for a claim it issued, only
+from its inbox (`NativeListFilter::Deliveries`, 22 §7), and a list is answered at once: an idle
+agent polls. The deliver workload's two sides polled every 2 ms; a thousand agents polling so ask a
+node half a million reads a second that it has nothing to answer, and an agent that polls less
+often learns later. The audit asked for funded, bounded long polling (F61), and step 5 of §4.2
+names the target: a connected target is sent what is delivered to it.
+
+What the systems that move messages do:
+
+- **Kafka.** A fetch the broker cannot answer from what it holds waits in the fetch purgatory, a
+  `DelayedFetch` of `maxWaitMs` (`server/.../purgatory/DelayedFetch.java`) watched by the
+  partitions it reads (`DelayedOperationPurgatory.tryCompleteElseWatch`, keyed by partition),
+  until `fetch.min.bytes` have come or `fetch.max.wait.ms` has passed (`ConsumerConfig`: 1 byte
+  and 500 ms by default). An append checks the operations watching its key
+  (`checkAndComplete`), not every fetch the broker holds (apache/kafka trunk, read 2026-10-20).
+- **Redis.** `XREAD BLOCK` parks its client on the stream keys it names (`blocking_keys`,
+  `server.h`), and the write that adds to a key signals it ready (the `signalKeyAsReady` family,
+  `blocked.c`); the server then serves the clients blocked on the keys signalled
+  (`handleClientsBlockedOnKeys`), not every blocked client (redis/redis unstable, read
+  2026-10-20).
+- **NATS.** A subscription's interest is pushed what matches it.
+
+The design takes Kafka's and Redis's shape, which keeps the pull and its cursor the agent's own:
+
+- **The read.** `Operation::NativeWait` (tag 34) is a deliveries list and a wait: answered as a
+  list is when its page holds something or a cursor to go on from, held otherwise until a
+  delivery to its recipient applies or the wait ends, when its empty page is answered with the
+  token then current. The wait is at least a millisecond and less than its request's period.
+- **The profile.** It rides a profile of its own, the waiting profile (7, implying every earlier
+  one), negotiated where the handler holds waits (`supports_native_waits`); a connection that did
+  not negotiate it refuses the read unsent, and the agent polls.
+- **The wake.** The core notes the recipient of each delivery it files, each once, while it files
+  it (`native::delivered`); the owner takes the notes after its drains and serves again only the
+  waits of the inboxes they name. Where the notes cannot be kept exactly (their room refused,
+  more recipients than the session has principals, the delivery index let go or built again),
+  the next take names every inbox: each wait looks again, and no delivery is missed.
+- **Bounds.** A parked wait holds its request's charge, its bytes and its place as any read
+  does, so the host's budget bounds the waits and refuses one past it `Capacity`; the table is
+  keyed by the recipients that have one waiting. A wait's end is counted in the owner's periods,
+  and its expiry is looked at only once one may be due.
+
+What it costs: a commit costs the waits of the inboxes it reached, a wait that nothing reaches
+costs its parking and its answer, and an idle agent costs the node one read a wait.
+
 ## 5. What stays
 
 - **Infrastructure:**

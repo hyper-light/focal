@@ -24,6 +24,7 @@ pub const fn participant_protocol(operation: &Operation) -> u16 {
         Operation::Native { .. } | Operation::NativeRead(_) | Operation::NativeList(_) => {
             crate::NATIVE_PROTOCOL_VERSION
         }
+        Operation::NativeWait(_) => crate::WAITING_PROTOCOL_VERSION,
         Operation::Submit { command, .. }
         | Operation::Managed {
             operation: ManagedOperation::Submit { command, .. },

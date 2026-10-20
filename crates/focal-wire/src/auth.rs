@@ -383,9 +383,10 @@ pub fn capability(operation: &Operation) -> Capability {
         Operation::Control { .. } => Capability::Runtime,
         // Native frames carry the authenticated principal; timers never arrive
         // here, and the owner proves every role from its committed prefix.
-        Operation::Native { .. } | Operation::NativeRead(_) | Operation::NativeList(_) => {
-            Capability::Actor
-        }
+        Operation::Native { .. }
+        | Operation::NativeRead(_)
+        | Operation::NativeList(_)
+        | Operation::NativeWait(_) => Capability::Actor,
         Operation::Submit { command, .. }
         | Operation::Managed {
             operation: ManagedOperation::Submit { command, .. },
@@ -624,7 +625,12 @@ pub fn verify_request(
     if ordered != (request.protocol == crate::ORDERED_PROTOCOL_VERSION) {
         return Err(AccessError::UnsupportedProtocol);
     }
-    if ordered {
+    // A waiting inbox read is of the waiting profile, and nothing else is.
+    let waiting = crate::waiting_profile_operation(&request.operation);
+    if waiting != (request.protocol == crate::WAITING_PROTOCOL_VERSION) {
+        return Err(AccessError::UnsupportedProtocol);
+    }
+    if ordered || waiting {
         // Admitted by its capability below, as `Raft` is.
     } else if native {
         if !crate::native_profile_operation(&request.operation) {

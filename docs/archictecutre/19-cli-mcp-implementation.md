@@ -85,6 +85,13 @@ read query's shape changed once, on 2026-09-29 (the audit's F07 and F08: the
 claim expansion's continuation, the declaration page's claim and the
 `SelectEvaluation` query), before any release carried the profile, and the
 fixture was re-registered with it.
+The waiting profile, protocol version 7 above every other
+([native.rs](../../crates/focal-wire/src/native.rs), 2026-10-20), carries one more:
+`NativeWait` (tag 34), a deliveries list the node holds until a delivery to its recipient
+applies or its wait ends ([31 §4.10](31-message-ledger.md)). It is negotiated where the handler
+holds waits (`RequestHandler::supports_native_waits`), on a local socket whatever the handler
+replicates; a connection that did not negotiate it refuses the read unsent, and the caller polls.
+No other operation rides the waiting profile, and the read rides no other.
 Under the profile the shared content transfer,
 managed request stream, reconcile, summary and stream operations stay
 admissible; legacy typed submissions and legacy reads do not, and native

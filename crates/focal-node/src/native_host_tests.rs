@@ -792,3 +792,120 @@ fn proposals_taken_before_one_poll_share_its_flush() {
     let flushes = wal.stats().unwrap().group_commits - before;
     assert_eq!(flushes, 1, "{CALLERS} proposals took {flushes} flushes");
 }
+
+/// An inbox read that waits (the waiting profile) parks on an empty inbox, and the post that
+/// delivers a claim to its recipient answers it with that delivery, long before its wait would
+/// end; a read waiting on an inbox nothing reached is answered with its empty page once its wait
+/// ends, and not before. The waiter's request is taken first (the host takes its requests in their
+/// order), so an answer holding the delivery is the post's waking it: one answered before the
+/// post would be empty.
+#[test]
+fn an_inbox_read_waits_for_a_delivery_to_its_recipient() {
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        native_activation::activate_local(
+            &settings(root.path()),
+            NativeContentProfile::ProjectionOnly,
+        )
+        .unwrap();
+        let node = EmbeddedNode::open(&settings(root.path())).unwrap();
+        let ledger = node.identity.ledger;
+        let issuer = node.identity.issuer;
+        let worker = node.identity.worker;
+        let issuer_peer = peer(&node, issuer, PeerRole::Actor);
+        let worker_peer = peer(&node, worker, PeerRole::Actor);
+        let created = envelope(
+            &node,
+            NATIVE_PROTOCOL_VERSION,
+            1,
+            Operation::Native {
+                frame: frame(ledger, &create(&node, 1, 100)),
+            },
+        );
+        let post = NativeInput {
+            request: RequestKey {
+                principal: issuer,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(2),
+            },
+            command: NativeCommand::Post {
+                expected: binding(ledger, 100),
+            },
+        };
+        let posted = envelope(
+            &node,
+            NATIVE_PROTOCOL_VERSION,
+            2,
+            Operation::Native {
+                frame: frame(ledger, &post),
+            },
+        );
+        let inbox = |recipient, request: u128, wait_ms| {
+            envelope(
+                &node,
+                WAITING_PROTOCOL_VERSION,
+                request,
+                Operation::NativeWait(NativeWaitRequest {
+                    list: NativeListRequest {
+                        filter: NativeListFilter::Deliveries {
+                            recipient,
+                            after: None,
+                        },
+                        cursor: None,
+                        max_items: 16,
+                        max_visits: 256,
+                    },
+                    wait_ms,
+                }),
+            )
+        };
+        let long = inbox(worker, 10, 20_000);
+        let short = inbox(issuer, 11, 300);
+        let (host, owner) = LocalHost::spawn(node, WireLimits::default()).unwrap();
+        assert!(host.supports_native_waits());
+        let waited = |host: LocalHost, peer, request| {
+            focal_rt::spawn(async move {
+                let started = std::time::Instant::now();
+                (call(&host, peer, request).await, started.elapsed())
+            })
+            .unwrap()
+        };
+        let delivered = waited(host.clone(), worker_peer, long);
+        let idle = waited(host.clone(), issuer_peer.clone(), short);
+        // Each waiter's request is queued as its task first runs.
+        hyper_rt::futures::yield_now().await;
+        assert!(matches!(
+            call(&host, issuer_peer.clone(), created).await,
+            Response::Native(NativeMutationReply::Committed(_))
+        ));
+        assert!(matches!(
+            call(&host, issuer_peer, posted).await,
+            Response::Native(NativeMutationReply::Committed(_))
+        ));
+        let (answer, elapsed) = delivered.await.unwrap();
+        let Response::NativeListed(page) = answer else {
+            panic!("the worker's inbox read: {answer:?}")
+        };
+        assert_eq!(page.objects.len(), 1, "the posted claim, delivered");
+        let NativeObject::Event(event) = &page.objects[0] else {
+            panic!("a delivery event")
+        };
+        assert!(matches!(event.fact, NativeFactRecord::Claim(claim) if claim.status == ClaimStatus::Posted));
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "answered by the delivery, not at the wait's end: {elapsed:?}"
+        );
+        let (answer, elapsed) = idle.await.unwrap();
+        let Response::NativeListed(page) = answer else {
+            panic!("the issuer's inbox read: {answer:?}")
+        };
+        assert!(page.objects.is_empty() && page.next.is_none());
+        assert!(
+            elapsed >= std::time::Duration::from_millis(300),
+            "answered before its wait ended: {elapsed:?}"
+        );
+        host.stop().await.unwrap();
+        owner.join_async().await.unwrap();
+    })
+    .unwrap()
+}

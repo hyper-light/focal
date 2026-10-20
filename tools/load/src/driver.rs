@@ -1130,6 +1130,8 @@ struct Consumer<'a> {
     generations: &'a Generations,
     watch: &'a Watch,
     poll: Duration,
+    /// How long an inbox read is asked to wait at the node; zero polls.
+    wait_ms: u32,
     seed: u64,
 }
 
@@ -1241,7 +1243,7 @@ async fn run_phase(
                 watch::tail(
                     side.watch,
                     Side::Consumer,
-                    side.poll,
+                    (side.poll, side.wait_ms),
                     consumer_tail,
                     names.ledger,
                     side.principal,
@@ -1250,7 +1252,7 @@ async fn run_phase(
                 watch::tail(
                     side.watch,
                     Side::Issuer,
-                    side.poll,
+                    (side.poll, side.wait_ms),
                     issuer_tail,
                     names.ledger,
                     names.issuer,
@@ -1551,6 +1553,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             generations: &consumer_generations,
             watch: &watch,
             poll: Duration::from_millis(u64::from(shape.poll_ms)),
+            wait_ms: shape.inbox_wait_ms,
             seed: shape.seed,
         }),
         None => None,
@@ -1628,8 +1631,10 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             let issuer_tail = side.watch.counts(Side::Issuer);
             measured.consumer_polls = consumer_tail.polls;
             measured.consumer_events = consumer_tail.events;
+            measured.consumer_waits = consumer_tail.waited;
             measured.issuer_polls = issuer_tail.polls;
             measured.issuer_events = issuer_tail.events;
+            measured.issuer_waits = issuer_tail.waited;
             measured.tail_failures = consumer_tail.failed.saturating_add(issuer_tail.failed);
             Some(measured)
         }

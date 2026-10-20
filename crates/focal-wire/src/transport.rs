@@ -810,7 +810,7 @@ impl<H: RequestHandler + Clone> DataService<H> {
     }
 }
 impl<H: RequestHandler + Clone> Serve for DataService<H> {
-    fn capabilities(&self) -> [bool; 5] {
+    fn capabilities(&self) -> [bool; 6] {
         // Lanes carry frames that left in order and are stepped in it: only a handler that takes
         // the ordered profile is offered them.
         let ordered = self.handler.supports_ordered_replication();
@@ -820,6 +820,7 @@ impl<H: RequestHandler + Clone> Serve for DataService<H> {
             self.handler.supports_native_requests(),
             ordered,
             ordered && self.handler.supports_lane_frames(),
+            self.handler.supports_native_waits(),
         ]
     }
     fn serve(&self, request: Served) -> ServeFuture {
@@ -841,7 +842,8 @@ pub struct QuicConnector {
 }
 /// Every profile this binary speaks, the newest first: what a connector
 /// offers in its Hello.
-pub const OFFERED_PROTOCOLS: [u16; 6] = [
+pub const OFFERED_PROTOCOLS: [u16; 7] = [
+    crate::WAITING_PROTOCOL_VERSION,
     crate::LANED_PROTOCOL_VERSION,
     crate::ORDERED_PROTOCOL_VERSION,
     crate::NATIVE_PROTOCOL_VERSION,
@@ -1138,6 +1140,7 @@ async fn open_remote(
             | crate::NATIVE_PROTOCOL_VERSION
             | crate::ORDERED_PROTOCOL_VERSION
             | crate::LANED_PROTOCOL_VERSION
+            | crate::WAITING_PROTOCOL_VERSION
     ) {
         return Err(WireError::InvalidFrame);
     }

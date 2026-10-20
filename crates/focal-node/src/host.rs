@@ -35,11 +35,13 @@ const INGRESS: usize = 32;
 /// waits for its reply (`handle`); a native read reserves `fleet::NATIVE_READ_PLACE_BYTES` past
 /// its own.
 const REQUEST_FLOOR: usize = 4096;
-/// What the owner made of one request: its reply, and for a native frame
-/// it proposed, the proposal whose commit the reply waits for.
+/// What the owner made of one request: its reply, for a native frame it proposed the proposal
+/// whose commit the reply waits for, and for an inbox read whose page was empty what it waits on
+/// (`host_inboxes`).
 pub(crate) struct Dispatched {
     pub(crate) reply: ResponseEnvelope,
     pub(crate) proposal: Option<crate::native_ingress::Proposal>,
+    pub(crate) wait: Option<crate::host_inboxes::InboxWait>,
 }
 #[cfg(test)]
 impl Dispatched {
@@ -164,6 +166,7 @@ impl LocalHost {
         let (liveness, ended) =
             watch::channel(()).map_err(|_| NodeError::Ledger(LedgerError::Capacity))?;
         let mut views = crate::reads::ReadViews::new();
+        let mut inboxes = crate::host_inboxes::Inboxes::default();
         let mut streams =
             crate::streams::Streams::new().map_err(|error| NodeError::Domain(error.to_string()))?;
         let thread = std::thread::Builder::new()
@@ -190,32 +193,45 @@ impl LocalHost {
                         };
                         // Sooner when the archive's next walk of the families is due.
                         next_tick = deadline.min(archive.due());
+                        // A timer's delivery may have reached an inbox a read waits on.
+                        inboxes.wake(&mut node, &mut views, &limits, Instant::now());
                     }
+                    // Sooner when a parked inbox read's wait ends.
+                    let wake_at = inboxes.earliest().map_or(next_tick, |at| at.min(next_tick));
                     // Every queued request is taken before the owner waits
                     // on the log; it blocks for a request only when no
                     // proposal waits for its commit.
                     let work = if waiting.is_empty() {
                         match receiver
-                            .recv_timeout(next_tick.saturating_duration_since(Instant::now()))
+                            .recv_timeout(wake_at.saturating_duration_since(Instant::now()))
                         {
                             Ok(work) => work,
-                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                inboxes.wake(&mut node, &mut views, &limits, Instant::now());
+                                continue;
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                inboxes.close(&limits);
+                                break;
+                            }
                         }
                     } else if waiting.len() < INGRESS {
                         match receiver.try_recv() {
                             Ok(work) => work,
                             Err(mpsc::TryRecvError::Empty) => {
                                 settle(&mut node, &mut waiting, &limits);
+                                inboxes.wake(&mut node, &mut views, &limits, Instant::now());
                                 continue;
                             }
                             Err(mpsc::TryRecvError::Disconnected) => {
                                 settle_all(&mut node, &mut waiting, &limits);
+                                inboxes.close(&limits);
                                 break;
                             }
                         }
                     } else {
                         settle(&mut node, &mut waiting, &limits);
+                        inboxes.wake(&mut node, &mut views, &limits, Instant::now());
                         continue;
                     };
                     match work {
@@ -234,22 +250,28 @@ impl LocalHost {
                                 &host_budget,
                                 &mut charge,
                             );
-                            match dispatched.proposal {
-                                None => {
-                                    let _ =
-                                        response.send(finish_response(dispatched.reply, charge));
-                                }
-                                Some(proposal) => waiting.push_back(Waiting {
+                            match (dispatched.proposal, dispatched.wait) {
+                                (Some(proposal), _) => waiting.push_back(Waiting {
                                     header: dispatched.reply,
                                     proposal,
                                     polls: 0,
                                     response,
                                     charge,
                                 }),
+                                (None, Some(wait)) => {
+                                    inboxes.park(dispatched.reply, wait, response, charge);
+                                }
+                                (None, None) => {
+                                    let _ =
+                                        response.send(finish_response(dispatched.reply, charge));
+                                }
                             }
+                            // What the request committed may have reached an inbox.
+                            inboxes.wake(&mut node, &mut views, &limits, Instant::now());
                         }
                         Work::Stop(response) => {
                             settle_all(&mut node, &mut waiting, &limits);
+                            inboxes.close(&limits);
                             let _ = response.send(node.checkpoint());
                             break;
                         }
@@ -338,6 +360,9 @@ impl RequestHandler for LocalHost {
     fn supports_native_requests(&self) -> bool {
         self.native
     }
+    fn supports_native_waits(&self) -> bool {
+        self.native
+    }
     fn handle<'a>(
         &'a self,
         request: &'a VerifiedRequest,
@@ -379,7 +404,7 @@ impl RequestHandler for LocalHost {
                     }
                 }
                 Operation::Monitor { .. } => crate::monitor_reads::RESPONSE_BYTES,
-                Operation::NativeRead(_) | Operation::NativeList(_) => {
+                Operation::NativeRead(_) | Operation::NativeList(_) | Operation::NativeWait(_) => {
                     self.limits.max_frame_bytes as usize
                 }
                 Operation::Native { .. } => 4096,
@@ -440,7 +465,7 @@ impl RequestHandler for LocalHost {
             );
             let native_read = matches!(
                 request.request().operation,
-                Operation::NativeRead(_) | Operation::NativeList(_)
+                Operation::NativeRead(_) | Operation::NativeList(_) | Operation::NativeWait(_)
             );
             let bytes = postcard::experimental::serialized_size(request.request())
                 .ok()
@@ -670,9 +695,11 @@ pub(crate) fn dispatch(
         return Dispatched {
             reply: request.reply(Response::Error(error)),
             proposal: None,
+            wait: None,
         };
     }
     let mut proposal = None;
+    let mut parked = None;
     let result = if request.ledger != node.identity.ledger {
         Err(AccessError::Unauthorized)
     } else if request.route_epoch != RouteEpoch(1)
@@ -800,6 +827,33 @@ pub(crate) fn dispatch(
                 charge,
             )
             .map(Response::NativeListed),
+            // A page with something on it, or a cursor to go on from, is answered now; an empty
+            // one waits for a delivery to its recipient (`host_inboxes`).
+            Operation::NativeWait(wait) => (|| {
+                wait.validate(limits)?;
+                let recipient = wait.recipient().ok_or(AccessError::InvalidRequest)?;
+                let page = crate::native_lists::local(
+                    &mut node.session,
+                    views,
+                    peer,
+                    &wait.list,
+                    request.route_epoch,
+                    limits,
+                    charge,
+                )?;
+                if page.objects.is_empty() && page.next.is_none() {
+                    parked = Some(crate::host_inboxes::InboxWait {
+                        recipient,
+                        until: Instant::now()
+                            .checked_add(Duration::from_millis(u64::from(wait.wait_ms)))
+                            .ok_or(AccessError::Unavailable)?,
+                        peer: peer.clone(),
+                        list: wait.list.clone(),
+                        route: request.route_epoch,
+                    });
+                }
+                Ok(Response::NativeListed(page))
+            })(),
             Operation::Monitor { id } => crate::monitor_reads::local(
                 &mut node.session,
                 principal,
@@ -946,10 +1000,11 @@ pub(crate) fn dispatch(
     Dispatched {
         reply: bounded(response, limits),
         proposal,
+        wait: parked,
     }
 }
 /// The limit alone decides: the reply is encoded once, by the transport.
-fn bounded(mut response: ResponseEnvelope, limits: &WireLimits) -> ResponseEnvelope {
+pub(crate) fn bounded(mut response: ResponseEnvelope, limits: &WireLimits) -> ResponseEnvelope {
     if payload_len(&response, limits.max_frame_bytes).is_err() {
         response.result = Response::Error(AccessError::Capacity);
     }

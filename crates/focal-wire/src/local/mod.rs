@@ -242,11 +242,14 @@ where
     H: RequestHandler,
 {
     let hello: Hello = read_frame(&mut stream, FrameKind::Hello, 4096).await?;
-    let negotiated = match limits.negotiate_native(
+    let negotiated = match limits.negotiate_local(
         &hello,
-        handler.supports_managed_requests(),
-        handler.supports_participant_requests(),
-        handler.supports_native_requests(),
+        [
+            handler.supports_managed_requests(),
+            handler.supports_participant_requests(),
+            handler.supports_native_requests(),
+            handler.supports_native_waits(),
+        ],
     ) {
         Ok(value) => value,
         Err(error) => {
@@ -316,6 +319,7 @@ where
             | MANAGED_PROTOCOL_VERSION
             | PEER_PROTOCOL_VERSION
             | crate::NATIVE_PROTOCOL_VERSION
+            | crate::WAITING_PROTOCOL_VERSION
     ) || !negotiated.accepts_protocol(request.protocol)
         || negotiated.max_frame_bytes > limits.max_frame_bytes
         || negotiated.max_items > limits.max_items

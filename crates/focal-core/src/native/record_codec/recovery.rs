@@ -401,6 +401,7 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
             payloads: None,
             reads: crate::native::read_back::ReadBack::new(limits.native),
             young: crate::native::young::Young::none(),
+            delivered: crate::native::delivered::Notes::new(limits.native.principals),
         },
         limits: limits.native,
     };

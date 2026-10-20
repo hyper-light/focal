@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 mod tests;
 
 pub const NATIVE_PROTOCOL_VERSION: u16 = 4;
+/// The waiting profile: a connection that negotiated it may send a native inbox read that waits
+/// for its page ([`Operation::NativeWait`]). An agent learns of a claim posted for it, and of a
+/// testament posted for a claim it issued, only from its inbox ([`NativeListFilter::Deliveries`]),
+/// and a list is answered at once, so an idle agent polled. It implies every earlier profile.
+pub const WAITING_PROTOCOL_VERSION: u16 = 7;
 /// The frame magic and format version fixed by the native input format (21 §3).
 pub const NATIVE_FRAME_MAGIC: [u8; 8] = *b"FCNINPUT";
 pub const NATIVE_FRAME_VERSION: u16 = 1;
@@ -1607,6 +1612,47 @@ pub struct NativeListPage {
     pub visited: u32,
 }
 
+/// A recipient's inbox read that waits for its page ([`Operation::NativeWait`], the waiting
+/// profile): `list`, whose filter is a recipient's deliveries, answered as a list is as soon as its
+/// page holds an object, and otherwise held until a commit delivers to the recipient or `wait_ms`
+/// has passed, when its empty page is answered with the token then current. Kafka's fetch waits
+/// so, in the broker's purgatory, watched by the partitions it reads, until data comes or
+/// `fetch.max.wait.ms` passes (`DelayedFetch`); Redis's `XREAD BLOCK` parks its client on the
+/// stream's key until a write to it signals the key (`signalKeyAsReady`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWaitRequest {
+    pub list: NativeListRequest,
+    /// The most the read waits, milliseconds: at least one, and less than the request's period,
+    /// so its empty page is answered before the period ends.
+    pub wait_ms: u32,
+}
+impl NativeWaitRequest {
+    /// The recipient whose inbox the read waits on: a deliveries list's, none for another filter.
+    pub fn recipient(&self) -> Option<ParticipantId> {
+        match self.list.filter {
+            NativeListFilter::Deliveries { recipient, .. } => Some(recipient),
+            _ => None,
+        }
+    }
+    pub fn validate(&self, limits: &WireLimits) -> Result<(), AccessError> {
+        self.list.validate(limits)?;
+        if self.recipient().is_none()
+            || self.wait_ms == 0
+            || u128::from(self.wait_ms) >= limits.request_timeout.as_millis()
+        {
+            return Err(AccessError::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
+/// The operations of the waiting profile alone, which no other profile carries: a native inbox
+/// read that waits.
+pub const fn waiting_profile_operation(operation: &Operation) -> bool {
+    matches!(operation, Operation::NativeWait(_))
+}
+
 /// Operations the native profile admits. Legacy typed submissions and legacy
 /// reads stay on their own profiles; content transfer and managed request
 /// streams are shared.
@@ -1629,6 +1675,9 @@ pub const fn native_profile_operation(operation: &Operation) -> bool {
 pub const fn is_native_operation(operation: &Operation) -> bool {
     matches!(
         operation,
-        Operation::Native { .. } | Operation::NativeRead(_) | Operation::NativeList(_)
+        Operation::Native { .. }
+            | Operation::NativeRead(_)
+            | Operation::NativeList(_)
+            | Operation::NativeWait(_)
     )
 }

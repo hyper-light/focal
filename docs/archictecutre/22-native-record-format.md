@@ -543,6 +543,15 @@ or filling the read-back cache. An index that cannot be funded or kept exact
 refuses with capacity; it never silently substitutes a global scan. The existing
 global `Events` variant and canonical record/checkpoint encodings are unchanged.
 
+An inbox read may wait for its page (2026-10-20, [31 §4.10](31-message-ledger.md)):
+`Operation::NativeWait` is a deliveries list and a wait of at least a millisecond and less
+than its request's period, held by the node while its page is empty until a delivery to its
+recipient applies or the wait ends. As the index files a delivery it notes the recipient once
+(`native::delivered`, at most the session's principals, each growth of the notes' room
+charged); the owner takes the notes after its drains and serves again the waits of the inboxes
+named, and every wait where the notes could not be kept exactly. Nothing of it is encoded: the
+record and checkpoint formats are unchanged.
+
 ## 6. Durable Session contract
 
 [NativeSession](../../crates/focal-ledger/src/native_session.rs) binds this

@@ -313,6 +313,7 @@ pub(super) fn request_class(request: &VerifiedRequest) -> WorkClass {
         | Operation::ManagedSupport { .. }
         | Operation::NativeRead(_)
         | Operation::NativeList(_)
+        | Operation::NativeWait(_)
         | Operation::List(_)
         | Operation::Traverse(_)
         | Operation::Validators(_)

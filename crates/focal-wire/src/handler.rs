@@ -81,6 +81,12 @@ pub trait RequestHandler: Send + Sync + 'static {
     fn supports_native_requests(&self) -> bool {
         false
     }
+    /// The handler holds a native inbox read that waits until a commit delivers to its recipient
+    /// or its wait ends ([`Operation::NativeWait`], [`crate::WAITING_PROTOCOL_VERSION`]); one that
+    /// does not is never offered the waiting profile, and its participants poll.
+    fn supports_native_waits(&self) -> bool {
+        false
+    }
     /// The handler steps a peer's bulk frames in the order they left it
     /// ([`Operation::RaftOrdered`], 27 §12): the node's replication
     /// handlers, which hold a frame that overtook the one before it.
@@ -132,6 +138,9 @@ impl RequestHandler for std::sync::Arc<dyn RequestHandler> {
     }
     fn supports_native_requests(&self) -> bool {
         self.as_ref().supports_native_requests()
+    }
+    fn supports_native_waits(&self) -> bool {
+        self.as_ref().supports_native_waits()
     }
     // A shared handler is offered every profile its handler takes: without this the ordered
     // profile (and the laned one above it) was never negotiated for one.
@@ -225,10 +234,14 @@ pub async fn dispatch_accounted_by(
     };
     if (verified.request().protocol == PEER_PROTOCOL_VERSION
         && (!handler.supports_managed_requests() || !handler.supports_participant_requests()))
-        || (verified.request().protocol == crate::NATIVE_PROTOCOL_VERSION
-            && (!handler.supports_managed_requests()
-                || !handler.supports_participant_requests()
-                || !handler.supports_native_requests()))
+        || (matches!(
+            verified.request().protocol,
+            crate::NATIVE_PROTOCOL_VERSION | crate::WAITING_PROTOCOL_VERSION
+        ) && (!handler.supports_managed_requests()
+            || !handler.supports_participant_requests()
+            || !handler.supports_native_requests()))
+        || (verified.request().protocol == crate::WAITING_PROTOCOL_VERSION
+            && !handler.supports_native_waits())
     {
         return OwnedResponse::new(
             verified
@@ -584,8 +597,10 @@ pub fn validate_response(
             validate_native_page(&read.query, page)?;
         }
         Response::NativeListed(page) => {
-            let Operation::NativeList(list) = &request.operation else {
-                return Err(WireError::InvalidFrame);
+            let list = match &request.operation {
+                Operation::NativeList(list) => list,
+                Operation::NativeWait(wait) => &wait.list,
+                _ => return Err(WireError::InvalidFrame),
             };
             if page.token.ledger != request.ledger
                 || page.token.route_epoch != response.route_epoch

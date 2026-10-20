@@ -628,100 +628,117 @@ fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizable_rea
 /// and a place, and the room its page may take is funded only as the owner builds it, one page
 /// at a time. Reserved for every read as it waited (32 times the client's frame, 32 MiB), 64
 /// reads at once took 2 GiB of a 64 MiB session and all but two were refused.
+/// A one-voter replicated host on a fresh ledger in `dir`, activated native and authoritative,
+/// its session charged to `tenant` and its WAL to `budget`: the host, its owner, its replication
+/// frames and the WAL it writes.
+async fn active_host(
+    dir: &std::path::Path,
+    budget: &MemoryBudget,
+    tenant: &MemoryBudget,
+    config: ReplicaConfig,
+) -> (
+    ReplicaHost,
+    ReplicaOwner,
+    ChannelReceiver<ReplicationFrame>,
+    SharedWal,
+) {
+    let content_dir = dir.join("content");
+    let wal = SharedWal::open_with_budget(
+        dir.join("wal"),
+        WalOptions::new(WalIdentity {
+            cluster: CLUSTER,
+            node: 1,
+            stream: 1,
+        }),
+        WalWriterLimits::default(),
+        budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
+    )
+    .unwrap();
+    let _store = ContentStore::open(
+        &content_dir,
+        StoreLimits {
+            max_content_bytes: 64 << 20,
+            max_staging_bytes: 128 << 20,
+            max_uploads: 16,
+            chunk_bytes: 4096,
+            max_manifest_bytes: 1 << 20,
+        },
+    )
+    .unwrap();
+    let node = DurableNode::open_on_wal_in(
+        NodeConfig::single(1, CLUSTER, ledger().session.0),
+        wal.clone(),
+        tenant,
+    )
+    .unwrap();
+    let mut session = Session::from_node_in_hosted(
+        ledger(),
+        node,
+        SessionLimits::default(),
+        tenant,
+        NativeHosting {
+            limits: NativeSessionLimits::standard(domain()),
+            reader: ContentReader::open(&content_dir).unwrap(),
+            seeds: focal_evidence::SeedStore::open(
+                content_dir.join("seeds"),
+                focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+            )
+            .unwrap(),
+            cold: Some(focal_ledger::ColdSource {
+                root: content_dir.join("cold"),
+                disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
+                    .unwrap(),
+                geometry: focal_evidence::ColdGeometry::STANDARD,
+            }),
+            payloads: Some(focal_ledger::PayloadSource {
+                root: content_dir.join("payloads"),
+                disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
+                    .unwrap(),
+            }),
+            range: RangeId(1),
+        },
+    )
+    .unwrap();
+    session.campaign().unwrap();
+    for _ in 0..8 {
+        session.poll().unwrap();
+    }
+    let (host, owner, outgoing) =
+        ReplicaHost::spawn(session, config, ReplicaHost::wire_limits()).unwrap();
+    host.activate_native(ActivateNativeCall {
+        profile: focal_ledger::NativeContentProfile::AuthoredV1,
+        chunk_bytes: 4096,
+        max_manifest_bytes: 1 << 20,
+    })
+    .await
+    .unwrap();
+    let mut active = false;
+    for _ in 0..200 {
+        focal_rt::time::sleep(Duration::from_millis(25))
+            .await
+            .unwrap();
+        let diagnostics = host.diagnostics().await.unwrap();
+        if diagnostics.value().native_active && diagnostics.value().native_authoritative {
+            active = true;
+            break;
+        }
+    }
+    assert!(active, "the fresh ledger never became native");
+    (host, owner, outgoing, wal)
+}
+
 #[test]
 fn many_reads_wait_at_once_within_a_small_sessions_memory() {
     focal_rt::block_on(async move {
         let dir = tempfile::tempdir().unwrap();
         let budget = MemoryBudget::new(512 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
         let tenant = budget.child(160 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
-        let content_dir = dir.path().join("content");
-        let wal = SharedWal::open_with_budget(
-            dir.path().join("wal"),
-            WalOptions::new(WalIdentity {
-                cluster: CLUSTER,
-                node: 1,
-                stream: 1,
-            }),
-            WalWriterLimits::default(),
-            budget.child(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap(),
-        )
-        .unwrap();
-        let _store = ContentStore::open(
-            &content_dir,
-            StoreLimits {
-                max_content_bytes: 64 << 20,
-                max_staging_bytes: 128 << 20,
-                max_uploads: 16,
-                chunk_bytes: 4096,
-                max_manifest_bytes: 1 << 20,
-            },
-        )
-        .unwrap();
-        let node = DurableNode::open_on_wal_in(
-            NodeConfig::single(1, CLUSTER, ledger().session.0),
-            wal.clone(),
-            &tenant,
-        )
-        .unwrap();
-        let mut session = Session::from_node_in_hosted(
-            ledger(),
-            node,
-            SessionLimits::default(),
-            &tenant,
-            NativeHosting {
-                limits: NativeSessionLimits::standard(domain()),
-                reader: ContentReader::open(&content_dir).unwrap(),
-                seeds: focal_evidence::SeedStore::open(
-                    content_dir.join("seeds"),
-                    focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
-                        .unwrap(),
-                )
-                .unwrap(),
-                cold: Some(focal_ledger::ColdSource {
-                    root: content_dir.join("cold"),
-                    disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
-                        .unwrap(),
-                    geometry: focal_evidence::ColdGeometry::STANDARD,
-                }),
-                payloads: Some(focal_ledger::PayloadSource {
-                    root: content_dir.join("payloads"),
-                    disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
-                        .unwrap(),
-                }),
-                range: RangeId(1),
-            },
-        )
-        .unwrap();
-        session.campaign().unwrap();
-        for _ in 0..8 {
-            session.poll().unwrap();
-        }
         let mut config = ReplicaConfig::new(RootCommandId::from_u128(152));
         config.tick = Duration::from_millis(20);
         config.request_timeout = Duration::from_millis(10_000);
         // The queue holds every read at once: memory is the bound under test.
         config.queue_items = 128;
-        let (host, owner, _outgoing) =
-            ReplicaHost::spawn(session, config, ReplicaHost::wire_limits()).unwrap();
-        host.activate_native(ActivateNativeCall {
-            profile: focal_ledger::NativeContentProfile::AuthoredV1,
-            chunk_bytes: 4096,
-            max_manifest_bytes: 1 << 20,
-        })
-        .await
-        .unwrap();
-        let mut active = false;
-        for _ in 0..200 {
-            focal_rt::time::sleep(Duration::from_millis(25))
-                .await
-                .unwrap();
-            let diagnostics = host.diagnostics().await.unwrap();
-            if diagnostics.value().native_active && diagnostics.value().native_authoritative {
-                active = true;
-                break;
-            }
-        }
-        assert!(active, "the fresh ledger never became native");
+        let (host, owner, _outgoing, wal) = active_host(dir.path(), &budget, &tenant, config).await;
         // What the session's memory has left for what waits on it.
         let free = tenant.stats().limit - tenant.stats().used;
         assert!(free < 64 * 32 * 1024 * 1024, "{free}");
@@ -745,6 +762,136 @@ fn many_reads_wait_at_once_within_a_small_sessions_memory() {
             served += 1;
         }
         assert_eq!(served, 64);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        drop(wal);
+    })
+    .unwrap()
+}
+
+/// Commits `frame`, a native write of `actor`'s, as the replicated host answers it: asked again
+/// with the same request while its outcome is unknown, as a client asks.
+async fn commit(host: &ReplicaHost, actor: ParticipantId, request: u128, frame: Vec<u8>) {
+    let ask = || {
+        envelope(
+            request,
+            Operation::Native {
+                frame: frame.clone(),
+            },
+        )
+    };
+    let mut reply = call(host, actor, ask()).await;
+    for _ in 0..50 {
+        if !matches!(reply, Response::Error(AccessError::OutcomeUnknown)) {
+            break;
+        }
+        focal_rt::time::sleep(Duration::from_millis(25))
+            .await
+            .unwrap();
+        reply = call(host, actor, ask()).await;
+    }
+    assert!(
+        matches!(reply, Response::Native(NativeMutationReply::Committed(_))),
+        "{request}: {reply:?}"
+    );
+}
+
+/// An inbox read that waits (the waiting profile) parks on the replicated host, and the post
+/// that delivers a claim to its recipient answers it with that delivery long before its wait
+/// would end; a read waiting on an inbox nothing reached is answered with its empty page once
+/// its wait ends, and not before. The waiter's request is taken before the post's (the host takes
+/// its requests in their order), so an answer holding the delivery is the post's waking it.
+#[test]
+fn an_inbox_read_waits_on_the_replicated_host_for_a_delivery_to_its_recipient() {
+    focal_rt::block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = MemoryBudget::new(512 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
+        let tenant = budget.child(160 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
+        let mut config = ReplicaConfig::new(RootCommandId::from_u128(152));
+        config.tick = Duration::from_millis(20);
+        config.request_timeout = Duration::from_millis(10_000);
+        let (host, owner, _outgoing, wal) = active_host(dir.path(), &budget, &tenant, config).await;
+        assert!(host.supports_native_waits());
+        let inbox = |recipient, request: u128, wait_ms| RequestEnvelope {
+            protocol: WAITING_PROTOCOL_VERSION,
+            ..envelope(
+                request,
+                Operation::NativeWait(NativeWaitRequest {
+                    list: NativeListRequest {
+                        filter: NativeListFilter::Deliveries {
+                            recipient,
+                            after: None,
+                        },
+                        cursor: None,
+                        max_items: 16,
+                        max_visits: 256,
+                    },
+                    wait_ms,
+                }),
+            )
+        };
+        let waited = |host: ReplicaHost, actor, request| {
+            focal_rt::spawn(async move {
+                let started = std::time::Instant::now();
+                (call(&host, actor, request).await, started.elapsed())
+            })
+            .unwrap()
+        };
+        let delivered = waited(host.clone(), WORKER, inbox(WORKER, 100, 8_000));
+        let idle = waited(host.clone(), ISSUER, inbox(ISSUER, 101, 300));
+        // Each waiter's request is queued as its task first runs.
+        hyper_rt::futures::yield_now().await;
+        let created = frame(
+            ISSUER,
+            2,
+            "claim.submit",
+            json!({
+                "description": "A claim for the worker's inbox.",
+                "target": format!("{WORKER}"),
+                "validations": [{"kind": "receipt", "description": "Record delivery.", "deadline": {"at": 4_102_444_800_000u64}}]
+            }),
+            &Resolved::default(),
+        );
+        commit(&host, ISSUER, 2, created).await;
+        let claim = ClaimId::from_u128(2001);
+        let Response::NativeRead(page) = call(
+            &host,
+            ISSUER,
+            envelope(
+                3,
+                read(NativeReadQuery::Objects(vec![NativeObjectRef::Claim(claim)])),
+            ),
+        )
+        .await
+        else {
+            panic!("the claim's read")
+        };
+        let post = frame(
+            ISSUER,
+            5,
+            "claim.post",
+            json!({"claim": format!("{claim}")}),
+            &Resolved::from_objects(ledger(), &page.objects).unwrap(),
+        );
+        commit(&host, ISSUER, 5, post).await;
+        let (answer, elapsed) = delivered.await.unwrap();
+        let Response::NativeListed(page) = answer else {
+            panic!("the worker's inbox read: {answer:?}")
+        };
+        assert_eq!(page.objects.len(), 1, "the posted claim, delivered");
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "answered by the delivery, not at the wait's end: {elapsed:?}"
+        );
+        let (answer, elapsed) = idle.await.unwrap();
+        let Response::NativeListed(page) = answer else {
+            panic!("the issuer's inbox read: {answer:?}")
+        };
+        assert!(page.objects.is_empty() && page.next.is_none());
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "answered before its wait ended: {elapsed:?}"
+        );
         host.stop().await.unwrap();
         owner.join().unwrap();
         drop(wal);

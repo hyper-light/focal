@@ -15883,3 +15883,45 @@ the configured trust anchors allow such a path (rustls/webpki#546). 0.103.16 rej
 takes it (`cargo update -p rustls-webpki --precise 0.103.16`, nothing else moved). focal's own trust
 anchors are its clusters' issuers, never a public root store, so a node's paths never reach those keys; a
 client of a public endpoint (focal-compare's NATS) could. docs/dependencies/inventory.tsv.
+
+### 2026-10-20 — An agent's inbox read waits at the node for its next delivery
+
+An agent learned of a claim posted for it, and of a testament for a claim it issued, only by
+listing its inbox, and a list is answered at once: an idle agent polled (the deliver workload's
+sides every 2 ms; a thousand agents so polling ask a node half a million reads a second). The
+waiting profile (protocol 7, implying every earlier one) carries `Operation::NativeWait` (tag
+34): a deliveries list and a wait of at least a millisecond and less than its request's period,
+answered as the list is when its page holds something, and held otherwise until a delivery to
+its recipient applies or the wait ends, when its empty page is answered with the token then
+current (Kafka's delayed fetch and Redis's `XREAD BLOCK`, read upstream; 31 §4.10). The core
+notes each delivery's recipient once as it files it (`native::delivered`, bounded by the
+session's principals, each growth of its room charged; every inbox where it cannot note them
+exactly), the session hands the notes over on demand (`Session::take_native_delivered`, so a
+poll whose events are dropped loses none), and each host serves again only the waits of the
+inboxes named: the replicated owner from a table by recipient beside its pending requests
+(`Owner::inboxes`, an expiry looked at once one may be due), the local host likewise
+(`host_inboxes`). A wait holds its request's charge, so the host's budget bounds the waits.
+Every node handler offers the profile (`supports_native_waits`), a local socket whatever it
+replicates; a connection that did not negotiate it refuses the read unsent, and the caller polls.
+focal-load's deliver tails ask the node to wait (`inbox_wait_ms`, default 500, Kafka's
+`fetch.max.wait.ms`; 0 polls) and fall back to polling against a node that cannot.
+
+Found on the way: the replicated owner's own loop looked at its pending requests only when it
+drained, and an idle one-voter replica drains nothing, so a read it parked, or one past its
+deadline, was answered by no one until its caller gave up (30 s); each tick now expires them.
+And a growth rule written as `clamp(4, bound)` panicked for a bound under four; caught by the
+notes' test, and every other `clamp` in production code was read and found guarded.
+
+Measured, focal-load deliver on the embedded node (release, macOS beside the gates' clippy and
+tests, interleaved): at 200 lifecycles a second (past this machine's capacity) the tails read
+2,201–2,252 pages polling against 973–1,013 waiting; at 50 a second, 3,337–4,362 against
+1,248–1,530; every message delivered in all eight runs; the latencies moved with the machine's
+load and by mode in neither direction. Tests: `native_host_tests::an_inbox_read_waits_for_a_
+delivery_to_its_recipient` and `fleet::native_tests::an_inbox_read_waits_on_the_replicated_
+host_for_a_delivery_to_its_recipient` (a wait woken by the post that delivers to it; a wait
+nothing reaches answered empty at its end and not before; with parking disabled the first
+fails, its page empty), `native::delivered::tests` (each recipient once, the room charged and
+given back, every inbox past the bound or with its room refused),
+`native_tests::a_waiting_inbox_read_is_the_waiting_profiles_alone` and
+`..._validates_its_inbox_its_wait_and_its_list`, the negotiation ladder's (waiting tops it; an
+older offer stays laned; a local connection takes it where the handler waits). 22 §7, 19, 31 §4.10.

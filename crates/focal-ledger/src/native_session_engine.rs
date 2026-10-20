@@ -548,6 +548,15 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             None => None,
         }
     }
+    /// The inboxes the committed core filed deliveries for since this was last asked: what wakes
+    /// the inbox reads that wait on them (`focal_core::native::Delivered`). With no domain, none.
+    pub(crate) fn take_delivered(&mut self) -> focal_core::native::Delivered {
+        match self.domain.as_mut() {
+            Some(Domain::Passive(core)) => core.take_delivered(),
+            Some(Domain::Active(owner, _)) => owner.take_delivered(),
+            None => focal_core::native::Delivered::default(),
+        }
+    }
     /// The payload log given back to the core it was taken from, whose spilled rows it holds.
     pub(super) fn give_back_payload_log(
         &mut self,

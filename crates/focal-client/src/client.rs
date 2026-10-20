@@ -437,6 +437,22 @@ impl<T: ClientTransport> Client<T> {
             _ => Err(ClientError::InvalidResponse),
         }
     }
+    /// A recipient's inbox read that waits for its page (`Operation::NativeWait`): answered as soon
+    /// as a delivery to the recipient applies, or with the empty page once the wait ends. A
+    /// connection that did not negotiate the waiting profile refuses it here, unsent
+    /// (`AccessError::UnsupportedProtocol`): its node answers lists at once, and is polled.
+    pub async fn native_wait(
+        &self,
+        request: RequestEnvelope,
+    ) -> Result<NativeListPage, ClientError> {
+        if !matches!(request.operation, Operation::NativeWait(_)) {
+            return Err(ClientError::Configuration);
+        }
+        match self.request(request).await?.result {
+            Response::NativeListed(page) => Ok(page),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
     pub async fn read(&self, request: RequestEnvelope) -> Result<ReadPage, ClientError> {
         if !matches!(request.operation, Operation::Read(_)) {
             return Err(ClientError::Configuration);

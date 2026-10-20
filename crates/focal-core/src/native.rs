@@ -25,6 +25,8 @@ mod completion_schemas;
 mod control_graph;
 mod creation_result;
 mod deadlines;
+mod delivered;
+pub use delivered::Delivered;
 mod delivery;
 mod delivery_owned;
 #[cfg(test)]
@@ -289,6 +291,9 @@ pub struct NativeState {
     /// The newest spillable claims and definitions, held until newer ones push them out
     /// (doc 31 M3, [`young`]).
     young: young::Young,
+    /// The recipients deliveries were filed for since the owner last took them
+    /// ([`Core::take_delivered`]).
+    delivered: delivered::Notes,
 }
 impl NativeState {
     /// Directed delivery facts: a posted claim to its subject, a posted response to its
@@ -2271,6 +2276,7 @@ impl Core<NativeState> {
                 payloads,
                 reads,
                 young: young::Young::none(),
+                delivered: delivered::Notes::new(limits.principals),
             },
             limits,
         })
@@ -2848,6 +2854,9 @@ impl Core<NativeState> {
                     ordinal,
                 },
             );
+            if let Some(recipient) = recipient {
+                self.state.delivered.note(recipient, &self.state.budget);
+            }
         }
         // Unused delivery promises return to this publication's exact source. Releasing an
         // arbitrary existing index permit could free ordinary parent credit while its funded
@@ -2858,7 +2867,18 @@ impl Core<NativeState> {
     pub fn build_event_index(&mut self) {
         if !self.state.events.complete() {
             self.state.events = event_index::EventIndex::build(&self.state, self.state.payloads());
+            // Built from the rows, the index filed no delivery one at a time.
+            self.state.delivered.all();
         }
+    }
+    /// The inboxes deliveries were filed for since this was last asked, each once
+    /// ([`Delivered`]); every inbox where they could not be noted exactly, or where the delivery
+    /// index is not whole, so no inbox read can be served from it.
+    pub fn take_delivered(&mut self) -> Delivered {
+        if !self.state.events.complete() {
+            self.state.delivered.all();
+        }
+        self.state.delivered.take()
     }
     /// What the rows take in a checkpoint once `prepared` publishes, each replaced or deleted row
     /// looked up in the committed root: what the preparation's own count must equal.

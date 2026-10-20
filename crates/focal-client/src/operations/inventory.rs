@@ -154,6 +154,14 @@ pub fn wire_coverage(operation: &Operation) -> Coverage {
             "Native profile only; one indexed predicate plus residual filtering within the visit allowance and an authenticated cursor.",
             "NativeListPage with explicit visits and continuation",
         ),
+        Operation::NativeWait(_) => coverage(
+            "native.wait",
+            Capability::Actor,
+            Exposure::WireAvailable,
+            false,
+            "Waiting profile only; a recipient's deliveries list, held by the node until a delivery to the recipient applies or the wait ends, each wait charged as a read.",
+            "NativeListPage: the inbox's next deliveries, or its empty page at the wait's end",
+        ),
         Operation::Validators(_) => coverage(
             "validator.contracts",
             Capability::Actor,
