@@ -904,6 +904,7 @@ dependencies = [
  "focal-model",
  "focal-native-client",
  "focal-node",
+ "focal-platform",
  "focal-rt",
  "focal-wire",
  "futures-util",

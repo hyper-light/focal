@@ -37,6 +37,9 @@ pub enum Side {
     Consumer,
     /// The issuer: testaments posted for its claims.
     Issuer,
+    /// An agent of a run among agents: both, claims posted for it and testaments posted for the
+    /// claims it issued, in its one inbox.
+    Agent,
 }
 
 /// What a tail read, for the report.
@@ -63,6 +66,8 @@ pub struct Watch {
     stopped: Cell<bool>,
     consumer: Cell<TailCounts>,
     issuer: Cell<TailCounts>,
+    /// Every agent's tail together.
+    agents: Cell<TailCounts>,
 }
 
 impl Watch {
@@ -75,6 +80,7 @@ impl Watch {
             stopped: Cell::new(false),
             consumer: Cell::new(TailCounts::default()),
             issuer: Cell::new(TailCounts::default()),
+            agents: Cell::new(TailCounts::default()),
         }
     }
     /// Waits for `claim`'s post to show: registered before the post is sent.
@@ -119,12 +125,13 @@ impl Watch {
         match side {
             Side::Consumer => &self.consumer,
             Side::Issuer => &self.issuer,
+            Side::Agent => &self.agents,
         }
     }
     /// One event a tail of `side` read: a waiter it answers is told.
     fn saw(&self, side: Side, record: &NativeEventRecord) {
         match (side, &record.fact) {
-            (Side::Consumer, NativeFactRecord::Claim(claim))
+            (Side::Consumer | Side::Agent, NativeFactRecord::Claim(claim))
                 if claim.status == ClaimStatus::Posted =>
             {
                 let id = u128::from_be_bytes(claim.after.object.0);
@@ -134,7 +141,7 @@ impl Watch {
                 }
             }
             (
-                Side::Issuer,
+                Side::Issuer | Side::Agent,
                 NativeFactRecord::Response {
                     claim,
                     after,

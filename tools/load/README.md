@@ -61,6 +61,28 @@ at exactly this run's retained size.
 Each run uses a distinct identity space per `seed` (and per worker under it),
 so two runs never collide and a run is reproducible.
 
+### Deliver among agents
+
+```yaml
+lifecycle: deliver    # each message posted, received, answered with a testament and satisfied
+inbox_wait_ms: 500    # optional; how long an inbox read waits at the node (0 polls every poll_ms)
+agents: 1000          # optional; the messages go among this many agents (2..=4094)
+agent_enrollments: /client/CLIENT.contexts   # `enrolled` only: the agents' contexts
+```
+
+A deliver side learns of the other's step only from its inbox. With `inbox_wait_ms`
+the read waits at the node until a delivery to the side applies, or the wait ends
+(the waiting profile, `Operation::NativeWait`; Kafka's consumer waits the same
+way, `fetch.max.wait.ms`, 500 ms by default); a node that cannot wait is polled.
+With `agents` each agent is an identity of its own, on one connection of its own
+that carries both its writes and its inbox read: message `n` goes from agent
+`n mod agents` to agent `n + 1 mod agents`, so each agent issues to the next and
+serves the one before. On `embedded` the agents are the node's participants of
+their own; on `enrolled` they are the `enrollment-agent-*` contexts in
+`agent_enrollments`, one enrolled client each (`focal invite client`, then
+`focal enroll context` per agent). The report's `deliver` section counts the
+agents' tails together (`agent_polls`, `agent_events`, `agent_waits`).
+
 ## Report
 
 ```json

@@ -67,6 +67,9 @@ const PROBE_WORKER: u128 = 0xFF;
 /// worker, below the probe.
 const CONSUMER_TAIL_WORKER: u128 = 0xFE;
 const ISSUER_TAIL_WORKER: u128 = 0xFD;
+/// The worker index every agent's tail numbers its pages under in a run among agents: the pages
+/// are reads, each named by its agent's principal beside its id, so the agents share the space.
+const AGENT_TAIL_WORKER: u128 = 0xFC;
 /// Distinct refusal reasons kept per run, the last place for those past the others
 /// ([`OTHER_REASONS`]).
 const MAX_REFUSALS: usize = 8;
@@ -390,10 +393,12 @@ fn window_envelope(names: &Names, principal: ParticipantId, request: u128) -> Re
 
 /// The write `offset` of this worker: a structural creation names its claim
 /// id; a compiled one mints its identities from a span of the same space.
+/// The creation of lifecycle `offset`'s claim, by `request`'s principal for `subject`.
 fn build(
     job: &Job,
     offset: u128,
     request: RequestKey,
+    subject: ParticipantId,
 ) -> Result<(RequestEnvelope, u128), LoadError> {
     match job.names.profile {
         NativeContentProfile::ProjectionOnly => {
@@ -404,8 +409,8 @@ fn build(
                 .ok_or(LoadError::Bound("claim id space"))?;
             let envelope = native::create_envelope(
                 job.names.ledger,
-                job.names.issuer,
-                job.names.worker,
+                request.principal,
+                subject,
                 job.names.profile,
                 request,
                 claim,
@@ -419,8 +424,8 @@ fn build(
                 .ok_or(LoadError::Bound("claim id space"))?;
             let created = authored::create_envelope(
                 job.names.ledger,
-                job.names.issuer,
-                job.names.worker,
+                request.principal,
+                subject,
                 job.names.root,
                 request,
                 first_id,
@@ -470,12 +475,48 @@ struct Shared<'a> {
     issuer: Actor<'a>,
     /// A `deliver` run's consumer, and what both sides watch for.
     consumer: Option<(Actor<'a>, &'a Watch)>,
+    /// A run among agents: lifecycle `n`'s issuer is the agent at `n` and its consumer the
+    /// next around the ring ([`Shared::sides`]); `issuer` and `consumer` then act for none.
+    agents: Option<(Vec<Actor<'a>>, &'a Watch)>,
     /// The worker's lifecycle reads under way, at most `job.lifecycle_reads`.
     reads: hyper_rt::sync::Semaphore,
     run_start: Instant,
     outcome: std::cell::RefCell<Outcome>,
 }
+/// A lifecycle's issuer, and its consumer with what both watch for ([`Shared::sides`]).
+type Sides<'s> = (&'s Actor<'s>, Option<(&'s Actor<'s>, &'s Watch)>);
+
 impl Shared<'_> {
+    /// Lifecycle `i`'s issuer, and its consumer with what both watch: in a run among agents,
+    /// those of its place on the schedule, the callers' places interleaved (`n = i · callers +
+    /// index`), so every caller's lifecycles go round every agent.
+    fn sides(&self, i: u64) -> Result<Sides<'_>, LoadError> {
+        let Some((agents, watch)) = &self.agents else {
+            return Ok((
+                &self.issuer,
+                self.consumer.as_ref().map(|(actor, watch)| (actor, *watch)),
+            ));
+        };
+        let count = u64::try_from(agents.len()).map_err(|_| LoadError::Bound("agents"))?;
+        let place = i
+            .checked_mul(u64::from(self.job.callers))
+            .and_then(|place| place.checked_add(u64::from(self.job.index)))
+            .ok_or(LoadError::Bound("lifecycle places"))?;
+        let at = |n: u64| -> Result<&Actor<'_>, LoadError> {
+            let index = n
+                .checked_rem(count)
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or(LoadError::Bound("agents"))?;
+            agents.get(index).ok_or(LoadError::Bound("agents"))
+        };
+        Ok((
+            at(place)?,
+            Some((
+                at(place.checked_add(1).ok_or(LoadError::Bound("agents"))?)?,
+                *watch,
+            )),
+        ))
+    }
     fn protocol_request(&self, actor: &Actor<'_>) -> Result<u128, LoadError> {
         let mut protocol = Protocol {
             next: actor.protocol.get(),
@@ -546,7 +587,8 @@ impl Shared<'_> {
     /// next step follows its last answer, not the schedule. A step that did
     /// not commit ends the lifecycle there.
     async fn write(&self, i: u64, started: Instant) -> Result<(), LoadError> {
-        let Some((claim, written, _)) = self.step(&self.issuer, i, 0, started, None).await? else {
+        let (issuer, _) = self.sides(i)?;
+        let Some((claim, written, _)) = self.step(issuer, i, 0, started, None).await? else {
             return Ok(());
         };
         match self.job.lifecycle {
@@ -566,9 +608,10 @@ impl Shared<'_> {
             NativeAuthoredOperation::ClaimCancel(authored::claim_target(claim)),
             NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim)),
         ];
+        let (issuer, _) = self.sides(i)?;
         for (step, operation) in (1u8..).zip(later.iter()) {
             let Some((sequence, _)) = self
-                .later(&self.issuer, i, step, operation, written, 0..0)
+                .later(issuer, i, step, operation, written, 0..0)
                 .await?
             else {
                 return Ok(());
@@ -594,7 +637,8 @@ impl Shared<'_> {
         created: SessionSeq,
         started: Instant,
     ) -> Result<(), LoadError> {
-        let Some((consumer, watch)) = &self.consumer else {
+        let (issuer, consumer) = self.sides(i)?;
+        let Some((consumer, watch)) = consumer else {
             return Err(LoadError::Shape("deliver without a consumer".into()));
         };
         // The receipt and the testament mint from the upper half of the claim's own creation
@@ -616,7 +660,7 @@ impl Shared<'_> {
         let posted = watch.expect_posted(claim)?;
         let post = NativeAuthoredOperation::ClaimPost(authored::claim_target(claim));
         if self
-            .later(&self.issuer, i, 1, &post, created, 0..0)
+            .later(issuer, i, 1, &post, created, 0..0)
             .await?
             .is_none()
         {
@@ -667,14 +711,11 @@ impl Shared<'_> {
         }
         let target = authored::testament_target(claim, testament);
         let receive = NativeAuthoredOperation::TestamentReceive(target.clone());
-        let Some((written, _)) = self.later(&self.issuer, i, 5, &receive, seen, 0..0).await? else {
+        let Some((written, _)) = self.later(issuer, i, 5, &receive, seen, 0..0).await? else {
             return Ok(());
         };
         let enter = NativeAuthoredOperation::ValidationEnterWholeWork(target);
-        let Some((written, _)) = self
-            .later(&self.issuer, i, 6, &enter, written, 0..0)
-            .await?
-        else {
+        let Some((written, _)) = self.later(issuer, i, 6, &enter, written, 0..0).await? else {
             return Ok(());
         };
         let satisfied = Instant::now();
@@ -689,7 +730,7 @@ impl Shared<'_> {
         })?;
         let release = NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim));
         if self
-            .later(&self.issuer, i, 7, &release, written, 0..0)
+            .later(issuer, i, 7, &release, written, 0..0)
             .await?
             .is_none()
         {
@@ -846,7 +887,13 @@ impl Shared<'_> {
             };
             let (envelope, claim, identities) = match &later {
                 None => {
-                    let (envelope, claim) = build(self.job, offset, key)?;
+                    // The claim targets its lifecycle's consumer: the run's worker, or in a run
+                    // among agents the agent after its issuer.
+                    let subject = match self.sides(i)? {
+                        (_, Some((consumer, _))) => consumer.principal,
+                        (_, None) => self.job.names.worker,
+                    };
+                    let (envelope, claim) = build(self.job, offset, key, subject)?;
                     (envelope, claim, Vec::new())
                 }
                 Some((operation, objects, ids)) => {
@@ -1022,13 +1069,31 @@ struct ConsumerSide<'a> {
     watch: &'a Watch,
 }
 
+/// One agent of a run among agents: its principal, the one connection it writes and reads its
+/// inbox on, and its journal's request generations.
+struct Agent {
+    principal: ParticipantId,
+    conn: Conn,
+    generations: Generations,
+}
+
+/// A run among agents, as its callers and tails share it: the agents, the watch every agent's
+/// tail tells, and how the tails read.
+struct Agents<'a> {
+    agents: &'a [Agent],
+    watch: &'a Watch,
+    poll: Duration,
+    wait_ms: u32,
+    seed: u64,
+}
+
 async fn worker(
     job: Job,
     phase: Phase,
     run_start: Instant,
     generations: &Generations,
     conn: &Conn,
-    consumer: Option<ConsumerSide<'_>>,
+    (consumer, agents): (Option<ConsumerSide<'_>>, Option<&Agents<'_>>),
 ) -> Result<Outcome, LoadError> {
     let count = usize::try_from(job.count).map_err(|_| LoadError::Bound("worker count"))?;
     // The shape bounds lifecycles at MAX_CLAIMS; each takes its steps, each
@@ -1074,6 +1139,20 @@ async fn worker(
                             protocol: std::cell::Cell::new(0),
                         },
                         side.watch,
+                    )
+                }),
+                agents: agents.map(|run| {
+                    (
+                        run.agents
+                            .iter()
+                            .map(|agent| Actor {
+                                principal: agent.principal,
+                                conn: &agent.conn,
+                                generations: &agent.generations,
+                                protocol: std::cell::Cell::new(0),
+                            })
+                            .collect(),
+                        run.watch,
                     )
                 }),
                 reads: hyper_rt::sync::Semaphore::new(
@@ -1157,7 +1236,7 @@ async fn run_phase(
     generations: &Generations,
     connector: &Connector,
     connections: u16,
-    consumer: Option<&Consumer<'_>>,
+    (consumer, agents): (Option<&Consumer<'_>>, Option<&Agents<'_>>),
 ) -> Result<(Vec<Outcome>, u128, u128), LoadError> {
     let Some(first) = jobs.first() else {
         return Err(LoadError::Bound("zero workers"));
@@ -1210,7 +1289,7 @@ async fn run_phase(
             .push(async move {
                 (
                     index,
-                    worker(job, phase, run_start, generations, conn, side).await,
+                    worker(job, phase, run_start, generations, conn, (side, agents)).await,
                 )
             })
             .map_err(|_| LoadError::Bound("callers"))?;
@@ -1230,6 +1309,9 @@ async fn run_phase(
         }
         if let Some(side) = consumer {
             side.watch.stop();
+        }
+        if let Some(run) = agents {
+            run.watch.stop();
         }
         match failed {
             Some(error) => Err(error),
@@ -1264,7 +1346,39 @@ async fn run_phase(
             issuer_tailed?;
             outcomes?
         }
-        _ => collect.await?,
+        _ => match agents {
+            // Every agent's inbox read beside the callers, each on the agent's one connection.
+            Some(run) => {
+                let tails = async {
+                    let mut tails = focal_rt::Concurrent::new(run.agents.len())
+                        .map_err(|_| LoadError::Bound("agent tails"))?;
+                    for agent in run.agents {
+                        tails
+                            .push(watch::tail(
+                                run.watch,
+                                Side::Agent,
+                                (run.poll, run.wait_ms),
+                                &agent.conn,
+                                names.ledger,
+                                agent.principal,
+                                tail_ids(run.seed, AGENT_TAIL_WORKER),
+                            ))
+                            .map_err(|_| LoadError::Bound("agent tails"))?;
+                    }
+                    let mut failed = None;
+                    while let Some(tailed) = tails.join_next().await {
+                        if let Err(error) = tailed {
+                            failed.get_or_insert(error);
+                        }
+                    }
+                    failed.map_or(Ok(()), Err)
+                };
+                let (outcomes, tailed) = hyper_rt::combine::join2(collect, tails).await;
+                tailed?;
+                outcomes?
+            }
+            None => collect.await?,
+        },
     };
     // In the callers' order, whichever ended first.
     outcomes.sort_unstable_by_key(|(index, _)| *index);
@@ -1300,6 +1414,46 @@ fn share(total: u64, parts: u16, index: u16) -> Result<u64, LoadError> {
     } else {
         each
     })
+}
+
+/// The enrolled client contexts of `count` agents in `directory` (`CLIENT.contexts`): its
+/// `enrollment-agent-*` directories in their order, the first `count`; fewer is refused. The entries
+/// are listed to a stated bound, the agents' and a context directory's few others.
+fn enrolled_agents(directory: &Path, count: u16) -> Result<Vec<PathBuf>, LoadError> {
+    let most = usize::from(count).saturating_add(64);
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(directory)?.take(most.saturating_add(1)) {
+        let entry = entry?;
+        // A context is a directory; its `.client-initialized` marker beside it is not one.
+        if entry.file_type()?.is_dir()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("enrollment-agent-"))
+        {
+            found.push(entry.path());
+        }
+    }
+    found.sort();
+    if found.len() < usize::from(count) {
+        return Err(LoadError::Shape(format!(
+            "{} holds {} agent enrollments of the {count} asked",
+            directory.display(),
+            found.len()
+        )));
+    }
+    found.truncate(usize::from(count));
+    Ok(found)
+}
+
+/// The principal of agent `agent` of a run among agents: the top bit set, then the run's seed and
+/// the agent's index, so no two agents share one and none is another run's.
+fn agent_principal(seed: u64, agent: u16) -> Result<ParticipantId, LoadError> {
+    u128::from(seed)
+        .checked_shl(16)
+        .map(|seed| seed | u128::from(agent) | (1u128 << 127))
+        .map(ParticipantId::from_u128)
+        .ok_or(LoadError::Bound("agent identity space"))
 }
 
 fn worker_base(seed: u64, index: u128) -> Result<u128, LoadError> {
@@ -1516,7 +1670,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     // identity; every claim targets it.
     let mut names = names;
     let consumer_connector = match (shape.lifecycle, shape.transport) {
-        (Lifecycle::Deliver, Transport::Enrolled) => {
+        (Lifecycle::Deliver, Transport::Enrolled) if shape.agents.is_none() => {
             let directory = shape.consumer_enrollment.clone().ok_or_else(|| {
                 LoadError::Shape("deliver over enrolled needs consumer_enrollment".into())
             })?;
@@ -1530,7 +1684,8 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             names.worker = client.build.actor;
             Some(Connector::Enrolled(Box::new(pending)))
         }
-        (Lifecycle::Deliver, Transport::Embedded) => match &connector {
+        // A run among agents has no consumer of its own: each agent is the next one's.
+        (Lifecycle::Deliver, Transport::Embedded) if shape.agents.is_none() => match &connector {
             Connector::Embedded(host) => Some(Connector::Embedded(host.clone())),
             _ => None,
         },
@@ -1546,6 +1701,51 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         .checked_mul(usize::from(shape.concurrency))
         .ok_or(LoadError::Bound("messages under way"))?;
     let watch = Watch::new(watch_bound);
+    // A run among agents: each agent a principal of its own on the embedded node, with its
+    // connection and its journal's generations.
+    let agent_list = match (shape.agents, &shape.agent_enrollments) {
+        // Each an enrolled client of its own: the principal its credential names, on an
+        // endpoint and a connection of its own.
+        (Some(count), Some(directory)) => enrolled_agents(directory, count)?
+            .into_iter()
+            .map(|enrollment| {
+                let pending =
+                    focal_node::network_join::PendingClientJoin::resume_shared(&enrollment)?;
+                let client = pending.remote_client(unix_now()?, &limits)?;
+                if client.build.ledger != names.ledger {
+                    return Err(LoadError::Shape(format!(
+                        "{} is enrolled with another ledger",
+                        enrollment.display()
+                    )));
+                }
+                let principal = client.build.actor;
+                let connector = Connector::Enrolled(Box::new(pending));
+                Ok(Agent {
+                    principal,
+                    conn: Conn::open(&connector, principal, &names, &limits)?,
+                    generations: Generations::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, LoadError>>()?,
+        (Some(count), None) => (0..count)
+            .map(|agent| {
+                let principal = agent_principal(shape.seed, agent)?;
+                Ok(Agent {
+                    principal,
+                    conn: Conn::open(&connector, principal, &names, &limits)?,
+                    generations: Generations::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, LoadError>>()?,
+        (None, _) => Vec::new(),
+    };
+    let agents = shape.agents.map(|_| Agents {
+        agents: &agent_list,
+        watch: &watch,
+        poll: Duration::from_millis(u64::from(shape.poll_ms)),
+        wait_ms: shape.inbox_wait_ms,
+        seed: shape.seed,
+    });
     let consumer = match &consumer_connector {
         Some(consumer_connector) => Some(Consumer {
             connector: consumer_connector,
@@ -1587,7 +1787,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         &generations,
         &connector,
         connections,
-        consumer.as_ref(),
+        (consumer.as_ref(), agents.as_ref()),
     )
     .await?;
     let (floors_advanced, expired) = generations.counts()?;
@@ -1616,8 +1816,12 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         warmup,
         write_phase_start_epoch_ns,
     )?;
-    let deliver = match consumer.as_ref() {
-        Some(side) => {
+    let deliver = match consumer
+        .as_ref()
+        .map(|side| side.watch)
+        .or(agents.as_ref().map(|run| run.watch))
+    {
+        Some(watch) => {
             let mut measured = DeliveryMeasurements::measure(
                 write_outcomes
                     .iter()
@@ -1627,15 +1831,23 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             measured.undelivered = write_outcomes.iter().fold(0u64, |total, outcome| {
                 total.saturating_add(outcome.undelivered)
             });
-            let consumer_tail = side.watch.counts(Side::Consumer);
-            let issuer_tail = side.watch.counts(Side::Issuer);
+            let consumer_tail = watch.counts(Side::Consumer);
+            let issuer_tail = watch.counts(Side::Issuer);
+            let agents_tail = watch.counts(Side::Agent);
+            measured.agents = shape.agents.unwrap_or(0);
+            measured.agent_polls = agents_tail.polls;
+            measured.agent_events = agents_tail.events;
+            measured.agent_waits = agents_tail.waited;
             measured.consumer_polls = consumer_tail.polls;
             measured.consumer_events = consumer_tail.events;
             measured.consumer_waits = consumer_tail.waited;
             measured.issuer_polls = issuer_tail.polls;
             measured.issuer_events = issuer_tail.events;
             measured.issuer_waits = issuer_tail.waited;
-            measured.tail_failures = consumer_tail.failed.saturating_add(issuer_tail.failed);
+            measured.tail_failures = consumer_tail
+                .failed
+                .saturating_add(issuer_tail.failed)
+                .saturating_add(agents_tail.failed);
             Some(measured)
         }
         None => None,
@@ -1678,7 +1890,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             &generations,
             &connector,
             reader_count.min(connections),
-            None,
+            (None, None),
         )
         .await?;
         let reads = merged(&read_outcomes);
@@ -1693,7 +1905,9 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     } else {
         (0, 0, 0, Latency::default())
     };
-    // Every handle to the embedded host goes before it closes: its owner joins once the last does.
+    // Every handle to the embedded host goes before it closes: its owner joins once the last does,
+    // each agent's connection among them.
+    drop(agent_list);
     drop(consumer_connector);
     drop(connector);
 

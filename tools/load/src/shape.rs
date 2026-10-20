@@ -154,6 +154,20 @@ pub struct WorkloadShape {
     /// `poll_ms`.
     #[serde(default = "default_inbox_wait_ms")]
     pub inbox_wait_ms: u32,
+    /// `deliver` on the embedded node: the agents the messages go among, each an identity of its
+    /// own with its own connection, request generations and inbox read, that issues claims to
+    /// the agent after it around a ring and serves those the agent before it issues; lifecycle
+    /// `n` (the callers' interleaved places on the schedule) is agent `n mod agents`'s, to agent
+    /// `n + 1 mod agents`. At least two, and no more than the session holds principals beside
+    /// the node's own issuer and worker ([`max_agents`]). Unset, one issuer and one consumer.
+    #[serde(default)]
+    pub agents: Option<u16>,
+    /// `agents` over `enrolled`: the directory of enrolled client contexts the agents are
+    /// (`<data-dir>/CLIENT.contexts`, as `focal enroll context` leaves each), its
+    /// `enrollment-agent-*` entries in their order, the first `agents` of them; each agent is the
+    /// principal its credential names, on a connection of its own.
+    #[serde(default)]
+    pub agent_enrollments: Option<PathBuf>,
     /// Offered creations a second over all callers. Set, the writes are
     /// paced on a fixed schedule and each latency counts from its request's
     /// intended start (wrk2's constant-throughput method), so a stall is
@@ -200,6 +214,14 @@ fn default_poll_ms() -> u16 {
 }
 fn default_inbox_wait_ms() -> u32 {
     500
+}
+
+/// The most agents a run goes among: the principals a session keeps a request generation window
+/// for (`NativeLimits::principals`), less the node's own issuer and worker.
+pub fn max_agents() -> usize {
+    focal_core::native::NativeLimits::default()
+        .principals
+        .saturating_sub(2)
 }
 
 impl WorkloadShape {
@@ -264,7 +286,9 @@ impl WorkloadShape {
                         "deliver needs a second principal: transport embedded or enrolled".into(),
                     );
                 }
-                Transport::Enrolled if self.consumer_enrollment.is_none() => {
+                Transport::Enrolled
+                    if self.consumer_enrollment.is_none() && self.agents.is_none() =>
+                {
                     return Err("deliver over enrolled needs consumer_enrollment".into());
                 }
                 Transport::Enrolled if self.worker.is_some() => {
@@ -278,8 +302,29 @@ impl WorkloadShape {
             if self.inbox_wait_ms > MAX_INBOX_WAIT_MS {
                 return Err(format!("inbox_wait_ms must be 0..={MAX_INBOX_WAIT_MS}"));
             }
+            if let Some(agents) = self.agents {
+                if agents < 2 || usize::from(agents) > max_agents() {
+                    return Err(format!("agents must be 2..={}", max_agents()));
+                }
+                match (self.transport, &self.agent_enrollments) {
+                    (Transport::Embedded, None) | (Transport::Enrolled, Some(_)) => {}
+                    (Transport::Enrolled, None) => {
+                        return Err("agents over enrolled need agent_enrollments".into());
+                    }
+                    (Transport::Embedded, Some(_)) => {
+                        return Err("agent_enrollments apply to the enrolled transport".into());
+                    }
+                    (Transport::Unix, _) => {
+                        return Err("agents run on the embedded or the enrolled transport".into());
+                    }
+                }
+            } else if self.agent_enrollments.is_some() {
+                return Err("agent_enrollments apply to a run among agents".into());
+            }
         } else if self.consumer_enrollment.is_some() {
             return Err("consumer_enrollment applies to the deliver lifecycle".into());
+        } else if self.agents.is_some() {
+            return Err("agents apply to the deliver lifecycle".into());
         }
         if self.rate == Some(0) {
             return Err("rate must be greater than zero".to_string());

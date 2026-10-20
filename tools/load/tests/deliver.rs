@@ -82,3 +82,49 @@ fn every_message_is_delivered_through_the_events_and_measured_end_to_end() {
         assert_eq!(order, (0..8).collect::<Vec<_>>(), "{message:?}");
     }
 }
+
+/// A run among agents: every message goes from its agent to the next around the ring, each agent
+/// an identity of its own on its own connection, tailing its one inbox, which holds both what is
+/// posted for it and the testaments posted for the claims it issued. Every message is delivered,
+/// each inbox carries exactly its two events a message, and the tails wait at the node for them
+/// rather than poll.
+#[test]
+fn every_message_among_agents_is_delivered_to_the_next_agent() {
+    let directory = tempfile::tempdir().unwrap();
+    let shape = directory.path().join("shape.yaml");
+    let report = directory.path().join("report.json");
+    std::fs::write(
+        &shape,
+        "claims: 48\ntransport: embedded\nprofile: authored_v1\nlifecycle: deliver\n\
+         concurrency: 4\ninflight: 4\nrate: 60\nagents: 16\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_focal-load"))
+        .args([
+            "--shape",
+            shape.to_str().unwrap(),
+            "--out",
+            report.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    assert_eq!(report["committed"], 48 * 8, "eight writes a message");
+    assert_eq!(report["refused"], 0, "{}", report["refusals"]);
+    assert_eq!(report["unknown"], 0);
+    assert_eq!(report["lifecycles"], 48);
+    let deliver = &report["deliver"];
+    assert_eq!(deliver["delivered"], 48);
+    assert_eq!(deliver["undelivered"], 0);
+    assert_eq!(deliver["tail_failures"], 0);
+    assert_eq!(deliver["agents"], 16);
+    assert_eq!(deliver["agent_events"].as_u64().unwrap(), 2 * 48);
+    assert_eq!(deliver["consumer_events"].as_u64().unwrap(), 0);
+    assert_eq!(deliver["issuer_events"].as_u64().unwrap(), 0);
+    assert!(deliver["agent_waits"].as_u64().unwrap() > 0, "{deliver}");
+}

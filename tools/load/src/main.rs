@@ -89,6 +89,9 @@ fn parse_shape(text: &str) -> Result<shape::WorkloadShape, LoadError> {
 
 fn run(args: &Args) -> Result<(), LoadError> {
     let shape = read_shape(&args.shape)?;
+    // A run among enrolled agents holds a socket for each agent's connection: as many as the
+    // kernel lets the process hold, as the node takes (`focal_platform::raise_open_files`).
+    let _ = focal_platform::raise_open_files();
     let report = driver::run(shape)?;
     let json = serde_json::to_string_pretty(&report)?;
     let mut stderr = std::io::stderr().lock();

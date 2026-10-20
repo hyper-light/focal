@@ -190,6 +190,12 @@ pub struct DeliveryMeasurements {
     pub issuer_events: u64,
     /// Of the issuer's pages, those the node held.
     pub issuer_waits: u64,
+    /// A run among agents: how many, and every agent's tail together (each tails its one inbox,
+    /// both kinds in it); the consumer's and the issuer's counts are then zero.
+    pub agents: u16,
+    pub agent_polls: u64,
+    pub agent_events: u64,
+    pub agent_waits: u64,
     /// Tail pages refused or failed, both sides.
     pub tail_failures: u64,
 }

@@ -21,6 +21,7 @@ focal-memory = { version = "0.1.0", path = "../../crates/focal-memory" }
 focal-model = { version = "0.1.0", path = "../../crates/focal-model" }
 focal-native-client = { version = "0.1.0", path = "../../crates/focal-native-client" }
 focal-node = { version = "0.1.0", path = "../../crates/focal-node" }
+focal-platform = { version = "0.1.0", path = "../../crates/focal-platform" }
 focal-wire = { version = "0.1.0", path = "../../crates/focal-wire" }
 focal-rt = { version = "0.1.0", path = "../../crates/focal-rt" }
 hyper-rt.workspace = true

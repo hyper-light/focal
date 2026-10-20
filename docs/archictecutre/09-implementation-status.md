@@ -15925,3 +15925,34 @@ given back, every inbox past the bound or with its room refused),
 `native_tests::a_waiting_inbox_read_is_the_waiting_profiles_alone` and
 `..._validates_its_inbox_its_wait_and_its_list`, the negotiation ladder's (waiting tops it; an
 older offer stays laned; a local connection takes it where the handler waits). 22 §7, 19, 31 §4.10.
+
+### 2026-10-20 — focal-load delivers among a thousand agents, each waiting at the node for its inbox
+
+Toward 1,000 agents (goal condition 2). focal-load's deliver ran between one issuer and one
+consumer. With `agents: n` the messages go among `n` agents, each an identity of its own with one
+connection that carries both its writes and its waiting inbox read (`Operation::NativeWait`),
+issuing to the next agent around a ring and serving the one before: lifecycle `m` (the callers'
+interleaved places on the schedule) goes from agent `m mod n` to agent `m + 1 mod n`, so every
+caller's lifecycles go round every agent. On the embedded node the agents are participants of their
+own; over `enrolled` they are the `enrollment-agent-*` contexts of `agent_enrollments`, one
+enrolled client each (`focal invite client`, `focal enroll context`), each on an endpoint of its
+own; the bound is the session's principals less the node's issuer and worker (4,094). Found on the
+way: the embedded host's owner joins once the last handle to it goes, and the agents' connections
+held one past the close, so a run among agents never ended; they go with the other handles now.
+focal-load raises its open files as the node does (`focal_platform::raise_open_files`).
+
+Measured on the embedded node (release, macOS beside a gate run): 1,000 agents, 10,000 messages at
+100 a second, 32 callers: 80,000 writes committed, none refused or unknown, every one of the 9,500
+measured messages delivered, each inbox carrying exactly its two events a message (20,000), handled
+at p50 81 ms and p99 471 ms; the thousand tails read 210,390 pages in 100 s, 209,390 of them held
+at the node, about two a second an agent, each a wait of 500 ms ending (polling every 2 ms asks up
+to 500 a second an agent); 26.9 s of CPU in 101.7 s, 516 MB resident. 100 agents, three
+interleaved rounds each way: the tails read 129,469 to 175,408 pages polling and 6,226 to 6,251
+waiting, 18 to 34% less CPU waiting, the latencies overlapping (p50 64 to 97 ms either way, p99 268
+to 569 polling and 250 to 531 waiting). Over QUIC (a founder started with `--listen`, a `bench`
+context and 8 `agent-*` contexts enrolled by invitation, release, macOS): 80 messages, 640 writes
+committed, none refused or unknown, all 80 delivered, 160 inbox events, 180 of the tails' 188 pages
+held at the node. Open: a write there took 124 ms at p50 against about 10 ms on the embedded node, a
+path to trace on its own. Test: `deliver::every_message_among_agents_is_delivered_to_the_next_agent`
+(16 agents, 48 messages: every message delivered, two inbox events a message, the tails held at the
+node); the shape's bounds. tools/load/README.md.
