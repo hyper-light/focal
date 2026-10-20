@@ -112,6 +112,23 @@ async fn call(remote: &QuicRemote, rpc: ControlRpc) -> ControlReply {
     };
     ControlReply::decode(&response, limits().max_frame_bytes as usize).unwrap()
 }
+/// A node's answer to `request`, or the refusal its answer window gave for it: the window (the
+/// wire's request time, from the request's arrival) may pass while the node's barrier or write
+/// still waits for a quorum, its own deadline being charged to its owner's periods, which a
+/// loaded machine stretches; the dispatcher then answers a read `Unavailable` and a write
+/// `OutcomeUnknown` (`dispatch_accounted_by`).
+async fn answer(
+    remote: &QuicRemote,
+    request: &RequestEnvelope,
+) -> Result<ControlReply, AccessError> {
+    match remote.request(request).await.unwrap().result {
+        Response::Control { response } => {
+            Ok(ControlReply::decode(&response, limits().max_frame_bytes as usize).unwrap())
+        }
+        Response::Error(error) => Err(error),
+        other => panic!("expected a metadata response or a refusal: {other:?}"),
+    }
+}
 struct Identity {
     certificate: Vec<u8>,
     key: Vec<u8>,
@@ -527,12 +544,17 @@ fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_operator_
             packet
         };
         for query in [ControlRead::State, ControlRead::Membership] {
+            let asked = std::time::Instant::now();
             let result = node_remote
                 .request(&discovery(ControlRpc::Read(query.clone())))
                 .await
                 .unwrap();
             let Response::Control { response } = result.result else {
-                panic!("node discovery response")
+                panic!(
+                    "node discovery response: {:?} after {:?}",
+                    result.result,
+                    asked.elapsed()
+                )
             };
             match ControlReply::decode(&response, limits().max_frame_bytes as usize).unwrap() {
                 ControlReply::Read(ControlReadResult::State(snapshot)) => {
@@ -632,32 +654,42 @@ fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_operator_
             };
             replica.pool.replace_routes(2, allowed).unwrap();
         }
-        // The isolated former leader cannot serve node discovery from its stale RAM.
-        let Response::Control { response } = node_remote
-            .request(&discovery(ControlRpc::Read(ControlRead::Membership)))
-            .await
-            .unwrap()
-            .result
-        else {
-            panic!("isolated discovery response")
-        };
-        assert!(matches!(
-            ControlReply::decode(&response, 65536).unwrap(),
-            ControlReply::Rejected(
-                ControlFailure::Unavailable
-                    | ControlFailure::NotLeader { .. }
-                    | ControlFailure::NotReady
-            )
-        ));
+        // The isolated former leader cannot serve node discovery from its stale RAM: it refuses,
+        // or its answer window does while its barrier waits for a quorum it cannot reach.
+        let isolated_reply = answer(
+            &node_remote,
+            &discovery(ControlRpc::Read(ControlRead::Membership)),
+        )
+        .await;
+        assert!(
+            matches!(
+                isolated_reply,
+                Ok(ControlReply::Rejected(
+                    ControlFailure::Unavailable
+                        | ControlFailure::NotLeader { .. }
+                        | ControlFailure::NotReady
+                )) | Err(AccessError::Unavailable)
+            ),
+            "{isolated_reply:?}"
+        );
+        // Nor commit a write: its outcome is unknown to it, or to its answer window.
         let retry = request(2, 1);
-        assert!(matches!(
-            call(&replicas[first].remote, ControlRpc::Submit(retry.clone())).await,
-            ControlReply::Rejected(
-                ControlFailure::OutcomeUnknown
-                    | ControlFailure::NotReady
-                    | ControlFailure::NotLeader { .. }
-            )
-        ));
+        let retried = answer(
+            &replicas[first].remote,
+            &envelope(ControlRpc::Submit(retry.clone())),
+        )
+        .await;
+        assert!(
+            matches!(
+                retried,
+                Ok(ControlReply::Rejected(
+                    ControlFailure::OutcomeUnknown
+                        | ControlFailure::NotReady
+                        | ControlFailure::NotLeader { .. }
+                )) | Err(AccessError::OutcomeUnknown)
+            ),
+            "{retried:?}"
+        );
         let replacement = leader(&replicas, first).await;
         let ControlReply::Committed(receipt) = call(
             &replicas[replacement].remote,
