@@ -605,6 +605,13 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         self.writes_made
     }
 
+    /// The owner's period from now on ([`Settings::quiet`]): for an owner whose period is a
+    /// measure that moves, as an event-driven owner's is the interval its liveness stream sends
+    /// at. A quiet period already begun is judged by the new one at the next drive.
+    pub fn set_quiet(&mut self, quiet: Duration) {
+        self.quiet = quiet;
+    }
+
     /// The bytes the budget holds for this replica.
     pub fn charged(&self) -> u64 {
         self.charged

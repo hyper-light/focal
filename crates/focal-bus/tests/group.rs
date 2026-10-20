@@ -477,6 +477,43 @@ fn a_part_held_across_three_fates_acknowledges_replicated_and_keeps_it_past_its_
     group_keeps_what_it_acknowledged(&[(1, 1), (2, 2), (3, 3)], Durability::Replicated);
 }
 
+/// A steady stream of publishes is written with its commits riding its entries: each node's commit
+/// that moved alone waits for its next write within the node's period, the interval its liveness
+/// stream sends at (`Member::restate_period`), and is written alone only once a period passed with
+/// none. At a period of zero every commit was written alone the moment no write was out, as many
+/// writes of the commit alone as of entries (on CI's disk, two log frames for each entry).
+#[test]
+fn a_steady_stream_writes_its_commits_with_its_entries() {
+    const BATCHES: u32 = 200;
+    let ids = Identities::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime = LocalRuntime::new(&runtime()).unwrap();
+    runtime
+        .block_on(async move {
+            let mut world =
+                open_world(&ids, dir.path(), &[], Durability::Persisted, 64 << 20, 128).await;
+            let mut wait = ProgressDeadline::begin(&[0], u64::MAX, FROZEN);
+            while world.seen.acked.len() < BATCHES as usize {
+                let acked = u32::try_from(world.seen.acked.len()).unwrap();
+                world.publish((acked + 4).min(BATCHES));
+                world.step().await;
+                wait.check(&[world.seen.acked.len() as u64])
+                    .expect("the stream was not acknowledged");
+            }
+            for running in world.running() {
+                let stats = running.member.stats();
+                assert!(
+                    stats.writes.quiet * 2 < stats.writes.readies,
+                    "node {} wrote its commit alone {} times beside {} writes of entries: {stats:?}",
+                    running.member.id(),
+                    stats.writes.quiet,
+                    stats.writes.readies
+                );
+            }
+        })
+        .unwrap();
+}
+
 /// A part whose publishes pass what its log may hold keeps taking them, and every node comes to
 /// hold every batch. Each node has 24 MiB, so its log holds about twice that and a mebibyte
 /// (`hyper_log::Config` from the part's facts), and its window gives memory back a 5 MiB segment

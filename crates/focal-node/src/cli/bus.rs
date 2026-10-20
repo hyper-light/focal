@@ -265,6 +265,15 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
                 "growth_refused": member.log.growth_refused,
                 "written_in_place": member.log.written_in_place,
             },
+            // Its replica's writes by what each was for: what its log's frames carried.
+            "writes": {
+                "readies": member.writes.readies,
+                "empty": member.writes.empty,
+                "fenced": member.writes.fenced,
+                "quiet": member.writes.quiet,
+                "starts": member.writes.starts,
+                "held": member.writes.held,
+            },
             // Its liveness stream, over the peers it watches: heartbeats, the intervals they are
             // sent at, and the empty writes to the log that proved the ones nothing else did.
             "liveness": {

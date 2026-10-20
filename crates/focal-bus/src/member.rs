@@ -170,6 +170,9 @@ pub struct MemberStats {
     pub log: LogWrites,
     /// What the node's liveness stream did, over the peers it watches.
     pub liveness: LivenessFigures,
+    /// The replica's writes by what each was for: a `Ready`'s, a commit alone the fence or a
+    /// quiet period asked for, a compaction's start (`hyper_durable::Writes`), each a log update.
+    pub writes: hyper_durable::Writes,
 }
 
 /// What a node's liveness stream did, summed over the peers it watches
@@ -680,8 +683,9 @@ impl Member {
                 ..Config::new(settings.id, limits)
             },
             elections: hyper_raft::Elections::Suspicion,
-            // An owner woken by events has no period: the commit is written alone at the first
-            // moment no write is out (hyper-durable-e2e's rule, `docs/durable.md` §4.1).
+            // The owner's period is the interval its liveness stream sends at, restated each turn
+            // as it moves (`Member::restate_period`); before the stream schedules a heartbeat there
+            // is none, and a commit that moved alone is written the moment no write is out.
             quiet: Duration::ZERO,
         };
         let replica = Replica::open(&shell, store, machine, MemberBudget::new(budget))
@@ -746,6 +750,7 @@ impl Member {
         if let Ok(log) = self.log.stats(None) {
             stats.log = LogWrites::of(&log, self.written_in_place);
         }
+        stats.writes = self.replica.writes();
         let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         let figures = &mut stats.liveness;
         figures.floor_ns = self.liveness.floor().map_or(0, nanos);
@@ -1284,6 +1289,31 @@ impl Member {
         self.attached = now;
     }
 
+    /// The owner's period, restated as the stream's moves (`Replica::set_quiet`): the least interval
+    /// this node's heartbeats go at, the cadence its own stream wakes it at. A commit that moved
+    /// alone rides any write that comes within it, as a ledger owner's rides the writes within its
+    /// period (focal F17), and is written alone only once a period has passed with no write; at
+    /// zero it was written alone the moment no write was out, a second log frame for each entry at
+    /// a steady rate. A deferred commit holds no answer back (`RawNode::defer_commit` states the
+    /// durable commit in them), so the period costs the leader's activity while its followers state
+    /// the durable commit, not an acknowledgement's latency. Until the stream schedules a heartbeat,
+    /// and for a member with no peer (it decides alone and writes its commit with its entries), the
+    /// period stays what it was.
+    fn restate_period(&mut self) {
+        let least = self
+            .attached
+            .iter()
+            .filter_map(|peer| {
+                self.liveness
+                    .report(*peer)
+                    .and_then(|report| report.sending)
+            })
+            .min();
+        if let Some(period) = least {
+            self.replica.set_quiet(period);
+        }
+    }
+
     /// The group's timing from what the stream measured, each pair charged the group's election.
     fn measure(&mut self) {
         if let Ok(Some(span)) = self.replica.measure(&self.liveness) {
@@ -1390,6 +1420,7 @@ impl Member {
         self.measure();
         let clock = self.now_ns(now);
         self.liveness.poll(clock, &mut self.asked);
+        self.restate_period();
         self.act_on_liveness(endpoint, waker, now, tell);
         // Bounded: each drive takes at most one `Ready`, and no more than the store's depth are out
         // until the log answers, so a turn drives at most the depth and once more; `more` is the

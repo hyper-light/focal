@@ -15642,3 +15642,24 @@ node's CPU there is the kernel's (48%: the log's I/O thread's writes and flushes
 loop's sends, receives and waits, 16%) and about 1.5 log frames for each entry (`quiet: ZERO`, a
 commit written alone at the first moment no write is out). Only hyper-log's seal.rs and
 owner/write.rs differ from c3e1916. vendor/README.md; docs/dependencies/inventory.tsv.
+
+### 2026-10-19 — A bus node's commits ride its writes within its period
+
+The bus opened its replica with no owner period (`quiet` zero: "an owner woken by events has no
+period"), so a commit that moved alone was written alone the moment no write was out: as many
+writes of the commit alone as of entries at a steady rate. With each node's log on ext4 without
+barriers, as on CI's disk, that was 2.0 log frames for each entry at 1,000 records a second and
+1.85 at 10,000, each frame a write, a record, a flush and a confirmation of the kernel's. A ledger
+owner writes a commit alone only after a whole period of its own (focal F17: a group that keeps
+writing never writes a commit for itself). The bus's owner has one cadence it keeps whatever it
+is doing: its liveness stream wakes it to heartbeat each peer. Each turn the member now restates
+its replica's period as the least interval its heartbeats go at (`Member::restate_period`,
+hyper-durable's `Replica::set_quiet`, hyper-raft a57b30b), so a commit rides the next write within
+it and is written alone only once a period passed with none. A deferred commit holds no answer
+back (`RawNode::defer_commit` states the durable commit in the answers and sends them), so the
+period costs the leader's activity while its followers state the durable commit, not an
+acknowledgement's latency. Test: `group::a_steady_stream_writes_its_commits_with_its_entries` (200
+batches, four in flight: each node's commits written alone fewer than half its writes of entries;
+without the restated period node 1 wrote its commit alone 28 times beside 49 writes of entries).
+The bus's `Stopped` line states the replica's writes by what each was for (`group.writes`). Only
+hyper-durable's replica.rs differs from 6a190be. vendor/README.md; docs/dependencies/inventory.tsv.
