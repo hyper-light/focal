@@ -112,7 +112,8 @@ impl DeviceFile {
             Caching::Buffered => crate::resident::Resident::probed(&file)
                 .map_err(wrap("ask whether reads from memory are taken"))?,
         };
-        let fills = caching == Caching::Direct && sys::journals_allocation(&file);
+        // Measurement only (ab/zeros-off): no slot is written with zeros on any file system.
+        let fills = caching == Caching::Direct && sys::journals_allocation(&file) && false;
         Ok(Self {
             file,
             path: path.to_path_buf(),

@@ -27,6 +27,12 @@ on:
       warmup:
         description: "Seconds sent and not measured, first"
         default: "15"
+      system:
+        description: "The focal system both sides run: focal (focal-load), focal-bus or focal-bus-fates"
+        default: "focal"
+      windows:
+        description: "Generator windows (bus only), space-separated; - for the generator's own"
+        default: "-"
 
 permissions:
   contents: read
@@ -164,13 +170,16 @@ jobs:
             order="a b"
             if [ $((round % 2)) -eq 0 ]; then order="b a"; fi
             for rate in ${{ github.event.inputs.rates || '100 1000 4000' }}; do
-              for side in $order; do
-                docker tag "focal:bench-$side" focal:bench
-                # A failed run is recorded and the rest still run.
-                bash tools/compare/compose/run.sh focal "$rate" \
-                  "${{ github.event.inputs.seconds || '60' }}" \
-                  "${{ github.event.inputs.warmup || '15' }}" \
-                  128 "reports/$side/$round" || echo "$side round $round at $rate/s failed"
+              for window in ${{ github.event.inputs.windows || '-' }}; do
+                if [ "$window" = - ]; then unset INFLIGHT; else export INFLIGHT="$window"; fi
+                for side in $order; do
+                  docker tag "focal:bench-$side" focal:bench
+                  # A failed run is recorded and the rest still run.
+                  bash tools/compare/compose/run.sh "${{ github.event.inputs.system || 'focal' }}" "$rate" \
+                    "${{ github.event.inputs.seconds || '60' }}" \
+                    "${{ github.event.inputs.warmup || '15' }}" \
+                    128 "reports/$side/$round" || echo "$side round $round at $rate/s failed"
+                done
               done
             done
           done
