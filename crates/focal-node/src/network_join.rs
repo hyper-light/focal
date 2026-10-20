@@ -422,6 +422,54 @@ impl PendingJoin {
         drop(self.verify(&receipt, now)?);
         Ok(receipt)
     }
+    /// Redeems the join, asking again, the same join exactly, for as long as the sponsor's answer
+    /// says to ([`retryable`]) and the invitation lives. An answer of no room, of a group between
+    /// leaders, or of an outcome unknown is not the end of a join but the reason for its next ask
+    /// (24 §24), as a Raft client asks again where its leader was lost (Ongaro's thesis §6.2):
+    /// before, the node stopped and told its operator to start it again, and a node joining while
+    /// the root group elected under a loaded disk exited with "enrollment outcome is unknown".
+    /// Each ask follows the one before it by a pause of full jitter over an exponential step from
+    /// the time that ask took ([`focal_client::RetryPolicy::pause`]; Brooker, 2015), never past
+    /// the invitation's expiry, after which the founder admits no new join: the last answer is
+    /// returned there.
+    pub async fn redeem_settled(
+        &self,
+        client: &EnrollmentClient,
+    ) -> Result<EnrollmentReceipt, JoinError> {
+        let expires = self.bundle.invitation.expires_at();
+        let mut backoffs = 0u32;
+        loop {
+            let asked = std::time::Instant::now();
+            let now = crate::network_bootstrap::unix_time().map_err(|_| JoinError::Runtime)?;
+            let error = match self.redeem(client, now).await {
+                Ok(receipt) => return Ok(receipt),
+                Err(error) if retryable(&error) => error,
+                Err(error) => return Err(error),
+            };
+            let took = asked.elapsed();
+            let now = crate::network_bootstrap::unix_time().map_err(|_| JoinError::Runtime)?;
+            let left = expires
+                .checked_sub(now)
+                .and_then(|seconds| u64::try_from(seconds).ok())
+                .filter(|seconds| *seconds > 0)
+                .map(std::time::Duration::from_secs);
+            // An ask that took no time gives no step to grow from: none is drawn from it.
+            let (Some(left), false) = (left, took.is_zero()) else {
+                return Err(error);
+            };
+            let policy = focal_client::RetryPolicy {
+                max_attempts: u32::MAX,
+                max_elapsed: left,
+                base_backoff: took,
+                max_backoff: left,
+            };
+            let pause = policy.pause(backoffs).min(left);
+            backoffs = backoffs.saturating_add(1);
+            focal_rt::time::sleep(pause)
+                .await
+                .map_err(|_| JoinError::Runtime)?;
+        }
+    }
     fn verify(
         &self,
         receipt: &EnrollmentReceipt,
@@ -706,10 +754,26 @@ fn genesis_registry(genesis: &NetworkGenesis) -> Result<EnrollmentRegistry, Join
         EnrollmentLimits::default(),
     )?)
 }
+/// Whether a join's answer says to ask again, the same join exactly: the sponsor had no room, its
+/// group could not decide (between leaders), or the outcome is unknown, the exchange lost or past
+/// its time (24 §24). A terminal refusal ([`terminal_rejection`]) ends the join, and so does
+/// anything else, which asking again would not change.
+pub fn retryable(error: &JoinError) -> bool {
+    matches!(
+        error,
+        JoinError::Transport(
+            JoinTransportError::OutcomeUnknown
+                | JoinTransportError::Unavailable
+                | JoinTransportError::Rejected(
+                    JoinFailure::Capacity | JoinFailure::Unavailable | JoinFailure::OutcomeUnknown
+                )
+        )
+    )
+}
 /// Whether the founder refused a join for good: the invitation is revoked,
 /// expired, redeemed under another key, for another cluster, or not
 /// authorized. Capacity, unavailability and an unknown outcome are not
-/// terminal — the same join is retried exactly.
+/// terminal — the same join is retried exactly ([`PendingJoin::redeem_settled`]).
 pub fn terminal_rejection(error: &JoinError) -> bool {
     matches!(
         error,

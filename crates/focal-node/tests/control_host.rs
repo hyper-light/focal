@@ -276,9 +276,13 @@ impl Rig {
                             &ControlHost::wire_limits(),
                         )
                         .unwrap();
-                        // Delivered as a node's transport hands a frame to its owner; each
-                        // owner times its peers' answers itself (27 §8.4).
-                        let _ = target.handle(&verified).await;
+                        // Handed over as a node's transport hands its owner a lane's frame
+                        // (`RequestHandler::take_frame`): queued and answered by nothing, so no
+                        // frame waits on the drain the one before it caused; each owner times
+                        // its peers' answers itself (27 §8.4). Awaiting each frame's answer here
+                        // held every frame of a member behind its peers' drains, which a starved
+                        // machine turned into a backlog its reads timed out behind (2026-10-19).
+                        let _ = target.take_frame(verified);
                         if sampled.is_none_or(|at| at.elapsed() >= RIG_TICK) {
                             let asked = std::time::Instant::now();
                             focal_rt::time::sleep(Duration::from_millis(1))

@@ -14,7 +14,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// A control call's future: awaited by the signer on its shard, never moved
@@ -94,7 +94,6 @@ pub struct QuorumEnrollmentConfig {
     pub tenants: BTreeSet<TenantId>,
     pub limits: EnrollmentLimits,
     pub queue_items: usize,
-    pub request_timeout: Duration,
 }
 impl QuorumEnrollmentConfig {
     pub fn new(
@@ -110,7 +109,6 @@ impl QuorumEnrollmentConfig {
             tenants,
             limits: EnrollmentLimits::default(),
             queue_items: 16,
-            request_timeout: Duration::from_secs(10),
         }
     }
     fn validate(&self) -> Result<(), QuorumEnrollmentError> {
@@ -122,8 +120,6 @@ impl QuorumEnrollmentConfig {
             || self.tenants.len() > 1024
             || self.tenants.iter().any(|tenant| tenant.is_zero())
             || !(1..=128).contains(&self.queue_items)
-            || self.request_timeout.is_zero()
-            || self.request_timeout > Duration::from_secs(60)
             || !(16 * 1024..=8 * 1024 * 1024).contains(&self.limits.max_checkpoint_bytes)
         {
             return Err(EnrollmentError::Invalid.into());
@@ -464,6 +460,14 @@ fn join_response(result: Result<EnrollmentReceipt, QuorumEnrollmentError>) -> Jo
         Err(QuorumEnrollmentError::Control(ControlFailure::Capacity)) => {
             JoinResponse::Rejected(JoinFailure::Capacity)
         }
+        // The group could not take the request now (between leaders, or not yet serving): nothing
+        // was decided by this call, and a request it left pending is settled by the next. An
+        // answer the control path could not learn comes as `OutcomeUnknown` and stays one.
+        Err(QuorumEnrollmentError::Control(
+            ControlFailure::NotLeader { .. }
+            | ControlFailure::Unavailable
+            | ControlFailure::NotReady,
+        )) => JoinResponse::Rejected(JoinFailure::Unavailable),
         Err(QuorumEnrollmentError::Identity) => JoinResponse::Rejected(JoinFailure::WrongCluster),
         Err(_) => JoinResponse::Rejected(JoinFailure::OutcomeUnknown),
     }
@@ -577,12 +581,12 @@ impl QuorumEnrollmentDriver {
         self.check_router(control)?;
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|_| EnrollmentError::Crypto)?;
-        let state = focal_rt::time::timeout(
-            self.config.request_timeout,
-            control.read_state(RequestId(id)),
-        )
-        .await
-        .map_err(|_| ControlFailure::OutcomeUnknown)??;
+        // The wait is the control path's own: the host gives a request up at a deadline counted
+        // in its periods (`ControlHost`'s `request_deadline`) and the network's asks are counted
+        // and each bounded by its peer's exchange time, so a loaded machine stretches the wait
+        // with the group it waits on. A wall-clock bound here would give up on a read the group
+        // is still answering, as unknown, which a read never is.
+        let state = control.read_state(RequestId(id)).await?;
         if state.identity != self.config.root {
             return Err(QuorumEnrollmentError::Identity);
         }
@@ -626,10 +630,9 @@ impl QuorumEnrollmentDriver {
         let Some(request) = self.journal.pending.clone() else {
             return Ok(());
         };
-        let result =
-            focal_rt::time::timeout(self.config.request_timeout, control.submit(request.clone()))
-                .await
-                .map_err(|_| ControlFailure::OutcomeUnknown)?;
+        // Bounded by the control path, as a read is (`registry`); an outcome the path cannot
+        // learn is answered unknown there, and this request stays pending for the next call.
+        let result = control.submit(request.clone()).await;
         match result {
             Ok(receipt) => {
                 let encoded =

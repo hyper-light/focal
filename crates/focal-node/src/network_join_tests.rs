@@ -83,6 +83,14 @@ impl Fixture {
         }
     }
     fn invite(&mut self, address: SocketAddr, role: EnrollmentRole) -> Invitation {
+        self.invite_until(address, role, now() + 600)
+    }
+    fn invite_until(
+        &mut self,
+        address: SocketAddr,
+        role: EnrollmentRole,
+        expires_at: i64,
+    ) -> Invitation {
         let draft = self
             .registry
             .prepare_invitation(
@@ -91,7 +99,7 @@ impl Fixture {
                     endpoint: address.to_string(),
                     server_name: "enrollment.focal.test".into(),
                     role,
-                    expires_at: now() + 600,
+                    expires_at,
                 },
                 now(),
             )
@@ -424,6 +432,162 @@ fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_membershi
         client.close();
         server.close().unwrap();
         task.await.unwrap();
+    })
+    .unwrap()
+}
+
+/// What a scripted sponsor holds: its authority and registry, the joiner's asks, and the joins it
+/// committed.
+struct Scripted {
+    authority: BootstrapAuthority,
+    registry: EnrollmentRegistry,
+    asks: usize,
+    commits: usize,
+}
+/// A sponsor that answers each join with the next of `answers`, then with the enrollment: the
+/// joiner's asks counted, and the receipt committed once, at the first ask, however many follow.
+fn scripted_sponsor(
+    fixture: Fixture,
+    server: Arc<EnrollmentServer>,
+    answers: Vec<JoinFailure>,
+) -> (Arc<Mutex<Scripted>>, focal_rt::JoinHandle<()>) {
+    let state = Arc::new(Mutex::new(Scripted {
+        authority: fixture.authority,
+        registry: fixture.registry,
+        asks: 0,
+        commits: 0,
+    }));
+    let serving = state.clone();
+    let task = focal_rt::spawn(async move {
+        server
+            .serve(move |request: focal_enrollment::JoinRequest| {
+                let state = serving.clone();
+                let answers = answers.clone();
+                async move {
+                    let mut guard = state.lock().unwrap();
+                    let state = &mut *guard;
+                    let prepared = state
+                        .registry
+                        .prepare_join(&state.authority, &request, now())
+                        .unwrap();
+                    let receipt = match prepared {
+                        JoinPreparation::Existing(receipt) => receipt,
+                        JoinPreparation::Commit(command) => {
+                            let index = state.registry.applied_index() + 1;
+                            state.registry.apply_committed(&command, index).unwrap();
+                            state.commits += 1;
+                            state.registry.release(&request, now()).unwrap()
+                        }
+                    };
+                    let ask = state.asks;
+                    state.asks += 1;
+                    match answers.get(ask) {
+                        Some(failure) => JoinResponse::Rejected(*failure),
+                        None => JoinResponse::Enrolled(receipt),
+                    }
+                }
+            })
+            .await
+            .unwrap()
+    })
+    .unwrap();
+    (state, task)
+}
+
+/// A join whose sponsor's group cannot decide (between leaders), has no room, or cannot say what
+/// came of the ask is asked again, the same join, until the sponsor answers: the joiner is
+/// enrolled, committed once at the first ask. Before, the joiner stopped at the first such answer,
+/// and a node joining while the root group elected under a loaded disk exited.
+#[test]
+fn a_join_asks_again_while_its_sponsor_cannot_decide_and_is_enrolled_once() {
+    focal_rt::block_on(async move {
+        let mut fixture = Fixture::new();
+        let server = Arc::new(
+            EnrollmentServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                &fixture.authority.server_identity(),
+                TransportLimits::default(),
+            )
+            .unwrap(),
+        );
+        let invitation = fixture.invite(server.local_addr().unwrap(), EnrollmentRole::Node);
+        let bundle = NodeInvitation::new("worker-2", fixture.genesis.clone(), invitation).unwrap();
+        let answers = vec![
+            JoinFailure::Unavailable,
+            JoinFailure::Capacity,
+            JoinFailure::OutcomeUnknown,
+        ];
+        let (state, task) = scripted_sponsor(fixture, server.clone(), answers);
+        let disk = tempfile::tempdir().unwrap();
+        let settings = settings(disk.path());
+        let (listen, advertise) = addresses();
+        let pending = PendingJoin::open(&settings, bundle, listen, advertise).unwrap();
+        let client =
+            EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default())
+                .unwrap();
+        let receipt = pending.redeem_settled(&client).await.unwrap();
+        assert!(receipt.identity.node_id.is_some());
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(
+                state.asks, 4,
+                "three answers that said to ask again, then the enrollment"
+            );
+            assert_eq!(state.commits, 1, "the join was committed once");
+        }
+        client.close();
+        server.close().unwrap();
+        task.await.unwrap();
+    })
+    .unwrap()
+}
+
+/// A join asked again stops where asking cannot succeed: at the invitation's expiry, after which
+/// the founder admits no new join, with the sponsor's last answer; and at once at a terminal
+/// refusal, which no ask changes.
+#[test]
+fn a_join_stops_asking_at_its_invitations_expiry_and_at_a_terminal_refusal() {
+    focal_rt::block_on(async move {
+        for (answer, lifetime) in [(JoinFailure::Unavailable, 2), (JoinFailure::Revoked, 600)] {
+            let mut fixture = Fixture::new();
+            let server = Arc::new(
+                EnrollmentServer::bind(
+                    "127.0.0.1:0".parse().unwrap(),
+                    &fixture.authority.server_identity(),
+                    TransportLimits::default(),
+                )
+                .unwrap(),
+            );
+            let expires = now() + lifetime;
+            let invitation =
+                fixture.invite_until(server.local_addr().unwrap(), EnrollmentRole::Node, expires);
+            let bundle =
+                NodeInvitation::new("worker-2", fixture.genesis.clone(), invitation).unwrap();
+            // The sponsor never enrolls: each ask is answered `answer`.
+            let (state, task) = scripted_sponsor(fixture, server.clone(), vec![answer; 4096]);
+            let disk = tempfile::tempdir().unwrap();
+            let settings = settings(disk.path());
+            let (listen, advertise) = addresses();
+            let pending = PendingJoin::open(&settings, bundle, listen, advertise).unwrap();
+            let client =
+                EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default())
+                    .unwrap();
+            let ended = pending.redeem_settled(&client).await;
+            assert!(
+                matches!(&ended, Err(JoinError::Transport(JoinTransportError::Rejected(failure))) if *failure == answer),
+                "{ended:?}"
+            );
+            let asks = state.lock().unwrap().asks;
+            if answer == JoinFailure::Revoked {
+                assert_eq!(asks, 1, "a terminal refusal is not asked again");
+            } else {
+                assert!(asks > 1, "an unavailable sponsor was asked again");
+                assert!(now() >= expires, "the join stopped before its invitation expired");
+            }
+            client.close();
+            server.close().unwrap();
+            task.await.unwrap();
+        }
     })
     .unwrap()
 }

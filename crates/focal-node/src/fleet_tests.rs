@@ -103,24 +103,27 @@ impl Fleet {
                             continue;
                         }
                         let target = &targets[frame.target as usize - 1];
-                        let response = dispatch(
-                            target,
+                        // Handed over as a node's transport hands its owner a lane's frame
+                        // (`RequestHandler::take_frame`): queued and answered by nothing, so no
+                        // frame waits on the drain the one before it caused. Awaiting each frame's
+                        // answer here held every frame of a member behind its peers' drains, a
+                        // backlog on a starved machine that production's lanes never build.
+                        let verified = verify_request(
                             peer(source as u64),
                             frame.request.clone(),
                             &ReplicaHost::wire_limits(),
                         )
-                        .await;
+                        .unwrap();
+                        let taken = target.take_frame(verified);
                         assert!(
                             matches!(
-                                response.result,
-                                Response::PeerAccepted
-                                    | Response::Error(
-                                        AccessError::Unavailable
-                                            | AccessError::OutcomeUnknown
-                                            | AccessError::Capacity
-                                    )
+                                taken,
+                                Ok(())
+                                    | Err(AccessError::Unavailable
+                                        | AccessError::OutcomeUnknown
+                                        | AccessError::Capacity)
                             ),
-                            "{response:?}"
+                            "{taken:?}"
                         );
                     }
                 })

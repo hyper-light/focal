@@ -15690,3 +15690,50 @@ own 132), and its commits' median wait was the same both ways (23 to 27 ms at th
 38 ms at 1,000 and 10,000 a second). Only hyper-log and hyper-block differ from a57b30b.
 vendor/README.md; docs/dependencies/inventory.tsv.
 
+### 2026-10-19 — The enrollment signer waits on the control path's own bound, and the rigs hand frames over as lanes do
+
+`quorum_enrollment::quorum_decisions_survive_lost_responses_leader_change_and_signer_restart` failed
+the local gate with `Control(OutcomeUnknown)` while other work held the machine at a load of 31 to
+49: ten of twelve runs failed, at a different signer step each, and eight of eight under sixteen
+CPU burners. Two causes, found one under the other.
+
+The signer bounded each call to the control group with a wall-clock timeout of its own
+(`QuorumEnrollmentConfig::request_timeout`, ten seconds, two in the test), tighter than the bound the
+control path already holds (the host gives a request up at a deadline counted in its own periods;
+the network's asks are counted, each bounded by its peer's exchange time), and answered a read that
+ran past it `OutcomeUnknown`, which a read never is. Traced, every failure was the signer's read
+timed out at 2.0 to 2.07 s with the host still serving it. The timeout is gone: the signer's wait
+is the control path's, which a loaded machine stretches with the group it waits on.
+
+The test then failed further on, `Control(Unavailable)`: with the group healthy (one leader, one
+term, every member at the same applied index, nothing persisting, no frame held), every read the
+leader asked was given up at its deadline. The rig delivered each member's frames by awaiting each
+frame's answer, which the target gives once the drain after its step has run, so a member's frames
+waited in turn on its peers' drains. On a starved machine the leader's heartbeats came faster than
+those drains: the followers' answers to a read's round came back 0.3 s late at first and 6 s late
+forty seconds on, 3 rounds behind and then 35, until reads outlived their deadlines. A node's
+transport hands its owner a peer's frame from its lane (`RequestHandler::take_frame`), queued and
+answered by nothing; the four rigs that awaited each frame (`tests/quorum_enrollment.rs`,
+`tests/control_host.rs`, `tests/runtime_host.rs`, `src/fleet_tests.rs`) now hand frames over that
+way, as `tests/control_quic.rs` and `network_control_tests.rs` did through their real transport.
+
+Under the sixteen burners (load 33 to 42) the test passed six runs of six; `control_host` passed
+its twelve tests and `runtime_host` its two under them, and the fleet tests (67) unloaded. The test's
+refusal assertions name the answer that came in place of the one expected (`assert_refused!`).
+
+The next gate run failed `deployment_regions::the_region_stage_spans_regions_shows_latency_and_fences_residency`:
+a joining node exited with "enrollment outcome is unknown; retry the saved join identity". Under
+sixteen burners and four writers each flushing a file a MiB at a time it failed two runs of six,
+and both times the sponsor's signer had been told `NotLeader` by the control path (once
+`leader: 0`: the root group between leaders) and answered the joiner `OutcomeUnknown`, which
+nothing had made unknown, while the joiner stopped at the first answer that was not terminal, though
+`terminal_rejection` documents that the same join is asked again. The sponsor now answers a group
+that could not take the request (`NotLeader`, `Unavailable`, `NotReady`) `Unavailable`, and the
+joiner asks again, the same join exactly, while the answer says to (`network_join::retryable`: no
+room, unavailable, unknown) and the invitation lives (`PendingJoin::redeem_settled`), as a Raft
+client asks again where its leader was lost (Ongaro's thesis §6.2): each ask follows the one before
+by a pause of full jitter over an exponential step from the time that ask took (the client's
+`RetryPolicy::pause`; Brooker, 2015), never past the invitation's expiry. Under the same load the
+test passed six runs of six. Tests: `network_join::tests::a_join_asks_again_while_its_sponsor_cannot_decide_and_is_enrolled_once`
+(three answers that say to ask again, then the enrollment: four asks, one commit) and
+`a_join_stops_asking_at_its_invitations_expiry_and_at_a_terminal_refusal`.

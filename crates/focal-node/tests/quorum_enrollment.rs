@@ -155,7 +155,14 @@ impl Rig {
                             &ControlHost::wire_limits(),
                         )
                         .unwrap();
-                        let _ = target.handle(&verified).await;
+                        // Handed over as a node's transport hands its owner a lane's frame
+                        // (`RequestHandler::take_frame`): queued and answered by nothing, so no
+                        // frame waits on the drain the one before it caused. Awaiting each
+                        // frame's answer here held every frame of a member behind its peers'
+                        // drains; on a starved machine the leader's heartbeats outran them, its
+                        // followers answered rounds late, and its reads were answered past their
+                        // deadline (sixteen CPU burners, 2026-10-19).
+                        let _ = target.take_frame(verified);
                         drop(frame);
                     }
                 })
@@ -427,14 +434,12 @@ fn authority(path: &std::path::Path) -> BootstrapAuthority {
     .unwrap()
 }
 fn signer_config(identity: ControlIdentity) -> QuorumEnrollmentConfig {
-    let mut config = QuorumEnrollmentConfig::new(
+    QuorumEnrollmentConfig::new(
         identity,
         ParticipantId(OPERATOR),
         "enroll.focal.internal".into(),
         [namespace().tenant].into_iter().collect(),
-    );
-    config.request_timeout = Duration::from_secs(2);
-    config
+    )
 }
 fn intent(role: EnrollmentRole) -> InviteIntent {
     InviteIntent {
@@ -448,6 +453,16 @@ fn serve(
     router: Router,
 ) -> focal_rt::JoinHandle<Result<(), QuorumEnrollmentError>> {
     focal_rt::spawn(async move { driver.run(&router).await }).unwrap()
+}
+
+/// Asserts that `value` matches `pattern`, showing the error it holds when it does not: an
+/// answer a loaded machine gives in place of the one expected is named in the failure.
+macro_rules! assert_refused {
+    ($value:expr, $pattern:pat) => {{
+        let value = $value;
+        let shown = value.as_ref().err().map(|error| format!("{error:?}"));
+        assert!(matches!(value, $pattern), "{shown:?}");
+    }};
 }
 
 #[test]
@@ -470,12 +485,12 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         let node_intent = intent(EnrollmentRole::Node);
         // A lost send leaves durable exact proposal custody but releases no token.
         router.fault.store(1, Ordering::SeqCst);
-        assert!(matches!(
+        assert_refused!(
             host.invite(request, node_intent.clone()).await,
             Err(QuorumEnrollmentError::Control(
                 ControlFailure::OutcomeUnknown
             ))
-        ));
+        );
         assert_eq!(registry(&rig.state(first).await).revision(), 0);
         host.stop().await.unwrap();
         task.await.unwrap().unwrap();
@@ -490,10 +505,10 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         let invitation = host.invite(request, node_intent.clone()).await.unwrap();
         let token = invitation.expose_token().unwrap();
         assert_eq!(registry(&rig.state(replacement).await).revision(), 1);
-        assert!(matches!(
+        assert_refused!(
             host.invite(request, intent(EnrollmentRole::Client)).await,
             Err(QuorumEnrollmentError::IntentConflict)
-        ));
+        );
         assert!(
             host.invite(request, node_intent.clone())
                 .await
@@ -507,12 +522,12 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         let join = join_request(&material, &invitation, &key);
         // Actual quorum commit succeeds, but the signer sees an unknown outcome.
         router.fault.store(2, Ordering::SeqCst);
-        assert!(matches!(
+        assert_refused!(
             host.redeem(join.clone()).await,
             Err(QuorumEnrollmentError::Control(
                 ControlFailure::OutcomeUnknown
             ))
-        ));
+        );
         let committed = registry(&rig.state(replacement).await)
             .enrollments()
             .next()
@@ -560,19 +575,19 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         // Competing CSR/request identities cannot reuse the committed invitation.
         let other = JoinKey::open_or_create(keys.path().join("other"), CLUSTER).unwrap();
         let other_join = join_request(&material, &invitation, &other);
-        assert!(matches!(
+        assert_refused!(
             host.redeem(other_join).await,
             Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Used))
-        ));
+        );
         // Client certificates receive Actor authority only, never Runtime or voter.
         router.fault.store(1, Ordering::SeqCst);
-        assert!(matches!(
+        assert_refused!(
             host.invite(RequestId::from_u128(2), intent(EnrollmentRole::Client))
                 .await,
             Err(QuorumEnrollmentError::Control(
                 ControlFailure::OutcomeUnknown
             ))
-        ));
+        );
         // Another authenticated operator wins the comparison while this signer's
         // invitation is unresolved. Exact retry rebases the same persisted token.
         let public = registry(&router.read_state(RequestId::from_u128(902)).await.unwrap());
@@ -603,14 +618,14 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         assert_eq!(grant.role, PeerRole::Actor);
         host.revoke(invitation.id()).await.unwrap();
         host.revoke(invitation.id()).await.unwrap();
-        assert!(matches!(
+        assert_refused!(
             host.authorize_certificate(recovered.certificate).await,
             Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Revoked))
-        ));
-        assert!(matches!(
+        );
+        assert_refused!(
             host.redeem(join).await,
             Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Revoked))
-        ));
+        );
         // New admission after expiry fails even though the CSR was constructed
         // while the invitation was valid.
         let mut short = intent(EnrollmentRole::Client);
@@ -621,10 +636,10 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         focal_rt::time::sleep(Duration::from_millis(2200))
             .await
             .unwrap();
-        assert!(matches!(
+        assert_refused!(
             host.redeem(expired_join).await,
             Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Expired))
-        ));
+        );
         // Losing an entire secret directory must not regenerate a second token for
         // its stable operator request. Its durable parent marker detects the loss.
         let slot = blake3::derive_key(
@@ -633,25 +648,22 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         );
         std::fs::remove_dir_all(staging.join(blake3::Hash::from_bytes(slot).to_hex().as_str()))
             .unwrap();
-        assert!(matches!(
+        assert_refused!(
             host.invite(RequestId::from_u128(2), intent(EnrollmentRole::Client))
                 .await,
             Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Corrupt))
-        ));
-        assert!(matches!(
-            task.await.unwrap(),
-            Err(QuorumEnrollmentError::Stopped)
-        ));
+        );
+        assert_refused!(task.await.unwrap(), Err(QuorumEnrollmentError::Stopped));
         // Lost initialized journal cannot create a second sequence authority.
         std::fs::remove_file(staging.join("journal.bin")).unwrap();
-        assert!(matches!(
+        assert_refused!(
             QuorumEnrollmentHost::open(authority(&ca_path), &staging, config.clone(), budget()),
             Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Corrupt))
-        ));
-        assert!(matches!(
+        );
+        assert_refused!(
             QuorumEnrollmentHost::create(authority(&ca_path), &staging, config, budget()),
             Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Corrupt))
-        ));
+        );
         rig.stop().await;
     })
     .unwrap()

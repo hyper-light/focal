@@ -720,8 +720,7 @@ async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
             if !settings.data_dir()?.join("IDENTITY").exists() =>
         {
             let previous = PendingJoin::resume(settings)?;
-            let now = focal_node::network_bootstrap::unix_time()?;
-            match previous.redeem(&client, now).await {
+            match previous.redeem_settled(&client).await {
                 Ok(receipt) => {
                     client.close();
                     let joined =
@@ -744,9 +743,7 @@ async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
             return Err(error.into());
         }
     };
-    let receipt = pending
-        .redeem(&client, focal_node::network_bootstrap::unix_time()?)
-        .await;
+    let receipt = pending.redeem_settled(&client).await;
     client.close();
     let joined = pending.install(receipt?, focal_node::network_bootstrap::unix_time()?)?;
     print_json(joined.directory.identity())
