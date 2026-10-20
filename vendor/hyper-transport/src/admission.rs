@@ -133,7 +133,7 @@ impl Admission {
         Ok(Self {
             limits,
             quiet,
-            identities: Vec::with_capacity(limits.identities),
+            identities: Vec::new(),
             stats: AdmissionStats::default(),
         })
     }

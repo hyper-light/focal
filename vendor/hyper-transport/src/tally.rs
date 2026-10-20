@@ -180,10 +180,11 @@ pub(crate) struct Table<K> {
     /// Indexed by the connection's key: a binary min-heap of (due, id), one entry for each
     /// exchange whose wait has a due time (src/deadlines.rs).
     deadlines: Vec<Vec<(Instant, u64)>>,
-    /// Each exchange's index in its connection's heap, by arena slot: sized to the bound once.
+    /// Each exchange's index in its connection's heap, by arena slot: an entry for every slot the
+    /// arena has made, added as it makes one ([`Table::insert`]).
     positions: Vec<Option<usize>>,
     /// The frontier of a walk of a deadline heap: at most the heap's entries, so at most the
-    /// exchange bound, reserved once.
+    /// exchanges held, reserved as the arena makes slots.
     walk: Vec<usize>,
     /// Settles that found the sums by recounting (the non-vacuity counter for the oracle).
     #[cfg(feature = "oracle")]
@@ -192,17 +193,21 @@ pub(crate) struct Table<K> {
 
 impl<K> Table<K> {
     /// A table of at most `capacity` exchanges, of classes ranked below `ranks`.
+    /// A table of at most `capacity` exchanges. Its lists with an entry for each exchange grow with
+    /// the slots the arena makes, never sized to the bound before any exchange comes: an endpoint
+    /// whose owner derives a bound of thousands of connections from its memory states an exchange
+    /// bound of 65,536, and the three lists held 32 bytes for each, about 2 MB, charged to nothing.
     pub(crate) fn new(capacity: usize, ranks: u8) -> Self {
         Self {
             arena: Arena::new(capacity),
-            touched: Vec::with_capacity(capacity),
+            touched: Vec::new(),
             tallies: Vec::new(),
             ranks,
             actives: Vec::new(),
             next_order: 0,
             deadlines: Vec::new(),
-            positions: vec![None; capacity],
-            walk: Vec::with_capacity(capacity),
+            positions: Vec::new(),
+            walk: Vec::new(),
             #[cfg(feature = "oracle")]
             settled: 0,
         }
@@ -211,9 +216,24 @@ impl<K> Table<K> {
     pub(crate) fn insert(&mut self, mut value: Exchange<K>) -> Result<u64, Refusal> {
         value.order = self.next_order;
         let id = self.arena.insert(value)?;
+        self.made(self.arena.slots());
         self.next_order = self.next_order.saturating_add(1);
         self.mark(id);
         Ok(id)
+    }
+
+    /// The arena holds `slots` slots: each has its heap index, and the touched list and the walk's
+    /// frontier have room for an entry of each, the touched list's room being what a settle is
+    /// due at ([`Table::mark`]). A reservation the allocator refuses leaves a list to grow as it is
+    /// filled.
+    fn made(&mut self, slots: usize) {
+        if self.positions.len() < slots {
+            self.positions.resize(slots, None);
+        }
+        let _ = self
+            .touched
+            .try_reserve(slots.saturating_sub(self.touched.len()));
+        let _ = self.walk.try_reserve(slots.saturating_sub(self.walk.len()));
     }
 
     pub(crate) fn get(&self, id: u64) -> Option<&Exchange<K>> {

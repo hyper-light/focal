@@ -15846,3 +15846,30 @@ its last piece; a frame that opens a slot writes none. The bus's `Stopped` line 
 (`group.log.fills`, `fill_pieces`, `fill_failures`). And the log-bound group test names every node's
 role, term and statistics when it stalls, as macOS CI's run of c0e4b6d1 left none to read. Only
 hyper-log differs from 0427988. vendor/README.md; docs/dependencies/inventory.tsv.
+
+### 2026-10-20 — A node's listener admits what its memory funds: a thousand agents and more
+
+Toward 1,000 agents (goal condition 2). A node's listener admitted at most 128 connections
+(`WireLimits::default().max_connections`), a count no node's memory decided, and admission's fair
+share then replaced an agent's connection with another's past the 128th. Every shared crate is now at
+hyper-raft c37c267, whose hyper-transport charges what a connection holds beside its windows as it
+is held (its state, measured at 27.3 to 29.1 KB of its server's heap, charged 30 KiB, and the
+exchange tables its streams size, 24 bytes a stream), with the endpoint's tables growing with the
+connections and exchanges it holds rather than allocated to its admission's bound (about 650 bytes
+an admitted connection and 32 an exchange, charged to nothing); of what is vendored here, only
+hyper-transport differs from 16e9db2. focal's listener now admits
+what its budget funds: `focal_wire::funded_connections(limits, bytes)` is the budget past its
+socket's charge over `hyper_transport::connection_charge` (first window, reserve and state), at
+least one and at most `MAX_CONNECTIONS` (65,536, what the tables may name); `NetworkListener::bind`
+admits that (`AdmissionLimits::for_connections`), and its exchanges stay bounded by its limits, a
+participant opening what its pooled stream credit lets it. The node's listener budget
+(`LISTENER_BYTES`, 64 MiB, named where it was inline) funds 1,341 connections of 48,396 bytes each
+(142 streams). Tests: `admission::a_thousand_agents_each_hold_a_connection_to_one_listener` (1,000
+identities, each a process of its own, connected to one listener, each answered while every other
+holds its connection, 1,000 state charges held, every byte given back once they leave: a closed
+connection's charge returns as it drains, RFC 9000 §10.2, so the wait is on the bytes, not the
+count; 19.7 s in a debug build on macOS), `admission::a_listeners_bound_is_what_its_budget_funds`,
+`network_service::tests::a_nodes_listener_holds_a_thousand_agents`. Open: the 64 MiB allowance is
+stated, not derived from the node's envelope; a participant's connection reserves exchange tables
+for the consensus window's streams though its credit starts at one; the listener's exchange bound
+is still the 128-connection product. vendor/README.md; docs/dependencies/inventory.tsv.

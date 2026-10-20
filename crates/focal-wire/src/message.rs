@@ -915,6 +915,10 @@ pub enum HelloReply {
     Rejected(AccessError),
 }
 
+/// The most connections an endpoint's tables may name: a [`WireLimits::max_connections`], and what
+/// a listener admits of what its budget funds (`funded_connections`).
+pub const MAX_CONNECTIONS: usize = 65_536;
+
 #[derive(Debug, Clone)]
 pub struct WireLimits {
     pub max_frame_bytes: u32,
@@ -964,7 +968,7 @@ impl WireLimits {
             || self.max_items > 65536
             || self.max_cost < self.max_frame_bytes as u64
             || self.max_connections == 0
-            || self.max_connections > 65536
+            || self.max_connections > MAX_CONNECTIONS
             || self.streams_per_connection == 0
             || self.streams_per_connection > 1024
             || self.control_streams == 0

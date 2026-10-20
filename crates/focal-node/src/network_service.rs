@@ -811,7 +811,10 @@ impl NetworkService {
             &state.sponsor.root_certificates(),
             registry.clone(),
             limits.clone(),
-            budget.child(64 * 1024 * 1024, 16 * 1024 * 1024)?,
+            budget.child(
+                crate::network_listener::LISTENER_BYTES,
+                crate::network_listener::LISTENER_COMPLETION,
+            )?,
         )?;
         let bind = if state.listen.is_ipv4() {
             "0.0.0.0:0"

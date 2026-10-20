@@ -164,6 +164,12 @@ impl<T> Arena<T> {
     pub(crate) fn len(&self) -> usize {
         self.live
     }
+
+    /// The slots made so far, taken or free: every identifier the table has given names one below
+    /// this, and it never shrinks.
+    pub(crate) fn slots(&self) -> usize {
+        self.slots.len()
+    }
 }
 
 #[cfg(test)]

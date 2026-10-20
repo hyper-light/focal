@@ -116,6 +116,13 @@ impl ListenerIdentity {
             .await
     }
 }
+/// What a node's listener may hold of the node's budget: its connections' charges as they are
+/// made, the request bodies it reads and its receive pool.
+pub(crate) const LISTENER_BYTES: usize = 64 * 1024 * 1024;
+/// Of [`LISTENER_BYTES`], what the completion lane keeps: a quarter, as the node's budget keeps of
+/// its own (`memory_envelope::node_budget`).
+pub(crate) const LISTENER_COMPLETION: usize = LISTENER_BYTES / 4;
+
 pub struct NetworkListener {
     server: QuicServer,
     registry: PeerRegistry,
@@ -145,11 +152,15 @@ impl NetworkListener {
     ) -> Result<Self, WireError> {
         limits.validate()?;
         let tls = server_config(node, enrollment, roots)?;
-        // Handshakes take pending places apart from authenticated connections, which are charged
+        // The listener admits the connections its budget funds (`focal_wire::funded_connections`);
+        // handshakes take pending places apart from authenticated connections, which are charged
         // to the identity they authenticated as (27 §3.1 P5); the listener's budget funds the
-        // request bodies it admits (the audit's F03).
-        let admission = AdmissionLimits::for_connections(limits.max_connections)
-            .replacing_after(limits.request_timeout);
+        // request bodies it admits (the audit's F03). Its exchanges stay bounded by `limits`.
+        let admission = AdmissionLimits::for_connections(focal_wire::funded_connections(
+            &limits,
+            budget.limit(),
+        )?)
+        .replacing_after(limits.request_timeout);
         let server = QuicServer::bind_serving(
             address,
             tls,

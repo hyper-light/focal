@@ -12,7 +12,8 @@
 //!
 //! The indices live in one array for every connection, indexed by arena slot: an exchange is on one
 //! connection, its slot is below the exchange bound (the arena makes a new slot only while fewer
-//! than the bound are taken), and the array is sized to the bound once.
+//! than the bound are taken), and the array has an entry for each slot the arena has made, added as
+//! it makes one (`Table::insert`).
 
 use std::time::Instant;
 

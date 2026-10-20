@@ -9,8 +9,9 @@ use crate::Refusal;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane<K> {
     /// A connection's receive window: the bytes QUIC may buffer for the peer before the
-    /// application reads them (quinn: "upper bound proportional to receive_window", node.md §3.3).
-    /// Accounting only; such a reservation carries no buffer.
+    /// application reads them (quinn: "upper bound proportional to receive_window", node.md §3.3);
+    /// and the connection's own state beside it ([`crate::CONNECTION_STATE`]). Accounting only;
+    /// such a reservation carries no buffer.
     Window,
     /// A message of this class: its head, a piece of its body, or a lane's frame.
     Class(K),

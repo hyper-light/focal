@@ -235,6 +235,27 @@ pub fn endpoint_socket_bytes() -> usize {
     hyper_rt::udp::Io { batch: IO_BATCH }.held_bound()
 }
 
+/// The connections a listener under `limits` admits at once on a budget of `bytes`: as many as the
+/// budget, past its socket's charge ([`endpoint_socket_bytes`]), pays each one's charge as it is
+/// made (hyper-transport's `connection_charge`: its first window, the reserve on top of it, and its
+/// state with its exchange tables), at least one and at most [`MAX_CONNECTIONS`]. The count bounds
+/// the rows a listener's admission and directory keep for its connections and handshakes
+/// ([`AdmissionLimits::for_connections`]); what a connection holds beyond its charge as it works
+/// (its windows' growth, its messages) is charged as it is held, and a budget that cannot fund it
+/// refuses it then. Its exchanges are bounded apart from it (`WireLimits::max_connections`' streams):
+/// a participant opens what its pooled stream credit lets it, not its connection's whole streams. A
+/// node's listener admitted at most 128 connections, a count no node's memory decided, and its
+/// agents past the 128th took each other's connections.
+pub fn funded_connections(limits: &WireLimits, bytes: usize) -> Result<usize, WireError> {
+    let transport = endpoint_limits(limits, &AdmissionLimits::for_connections(1))?;
+    let charge = hyper_transport::connection_charge::<FocalClasses>(&transport);
+    let funded = bytes
+        .saturating_sub(endpoint_socket_bytes())
+        .checked_div(usize::try_from(charge).map_err(|_| WireError::Limit)?)
+        .unwrap_or(0);
+    Ok(funded.clamp(1, MAX_CONNECTIONS))
+}
+
 /// What one endpoint of `limits` may hold, as an allowance: [`endpoint_bytes`] at the admission
 /// a connector of these limits keeps (`AdmissionLimits::for_connections`), its messages on the
 /// completion lane kept for them. A child of `parent` where the endpoint is charged to its owner's

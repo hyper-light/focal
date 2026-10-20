@@ -2,6 +2,21 @@ use super::*;
 #[path = "client_join_service_tests.rs"]
 mod client_join;
 
+/// A node's listener admits a thousand agents' connections and more: what its budget funds of each
+/// connection's charge, its streams sizing each one's exchange tables, where it admitted 128 and
+/// the 129th agent took another's connection.
+#[test]
+fn a_nodes_listener_holds_a_thousand_agents() {
+    let limits = crate::control_host::ControlHost::wire_limits();
+    let funded =
+        focal_wire::funded_connections(&limits, crate::network_listener::LISTENER_BYTES).unwrap();
+    assert!(
+        funded > 1_000,
+        "the node's listener funds {funded} connections"
+    );
+    assert!(funded < focal_wire::MAX_CONNECTIONS, "{funded}");
+}
+
 #[test]
 fn network_service_requires_runtime_before_starting_physical_owners() {
     let directory = tempfile::tempdir().unwrap();

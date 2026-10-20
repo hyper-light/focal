@@ -332,6 +332,47 @@ struct Ask<'a, K> {
     deadline: Progress,
 }
 
+/// What a connection holds of its endpoint's memory beside its windows, the messages it carries and
+/// its exchange tables ([`state_charge`]): its QUIC state (`hyper_quic::Connection`, 8,128 bytes
+/// inline, and what that allocates), its stream tables and its rows in the endpoint's own, which
+/// grow with the connections held. Charged to the budget as the connection is made, beside its
+/// first window, and given back as it goes, so a node's connections are bounded by its memory as
+/// their windows are, not by a count stated apart from it. An idle connection was measured to hold
+/// 27.3 to 29.1 KB of its server's heap on macOS and Linux, its exchange tables for 16 streams
+/// among it (`docs/benchmarks.md`, "What a server holds for each connection");
+/// hyper-rt-transport's `connection_memory` test holds the measure to the charge.
+pub const CONNECTION_STATE: u64 = 30 * 1024;
+
+/// The bytes a connection's exchange tables hold for `streams` exchanges: each exchange's id and its
+/// stream's entry (`Conn::exchanges`, `Conn::by_stream`), reserved to the streams the connection
+/// may have at once as it is made, so no insert allocates.
+fn exchange_tables(streams: u32) -> u64 {
+    let entry = size_of::<u64>().saturating_add(size_of::<(StreamId, u64)>());
+    u64::from(streams).saturating_mul(u64::try_from(entry).unwrap_or(u64::MAX))
+}
+
+/// What a connection's own state is charged under `limits` as it is made: [`CONNECTION_STATE`] and
+/// its exchange tables, which `limits.streams_per_connection` sizes.
+pub fn state_charge(limits: &Limits) -> u64 {
+    CONNECTION_STATE.saturating_add(exchange_tables(limits.streams_per_connection))
+}
+
+/// What a connection of classes `C` is charged under `limits` as it is made: its first window, the
+/// reserve on top of it, and its state ([`state_charge`]). An owner that states its connections'
+/// bound from its memory divides what it gives its endpoint by this.
+pub fn connection_charge<C: Classes>(limits: &Limits) -> u64 {
+    let reserve = class_reserve(C::RANKS.saturating_sub(1));
+    initial_window(MIN_DATAGRAM)
+        .saturating_add(reserve)
+        .saturating_add(state_charge(limits))
+}
+
+/// A connection's first grants: its window's, and its state's ([`state_charge`]).
+struct Grant {
+    window: Reservation,
+    state: Reservation,
+}
+
 struct Conn<R> {
     quic: Connection,
     /// The endpoint's key for it: the QUIC layer's handle, which a later connection may reuse.
@@ -375,6 +416,9 @@ struct Conn<R> {
     delivered: Delivered,
     /// The budget's grants for the receive window: the initial one and one per growth.
     grants: Vec<Reservation>,
+    /// What the connection's own state takes of the budget ([`CONNECTION_STATE`]), given back as
+    /// it goes.
+    state: Option<Reservation>,
     /// When its window was set back, while its growth's grants go back as its peer's reads pay
     /// what QUIC still owes of the credit given (`Core::repay`).
     set_back: Option<Instant>,
@@ -796,10 +840,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .insert_client_config(client)
             .map_err(|_| Refusal::Quic)?;
         let limits = config.limits;
-        let peers = limits
-            .admission
-            .identities
-            .max(limits.admission.connections);
+        // The tables a connection or an identity has a row in start empty and grow with what the
+        // endpoint holds (`Endpoint::reserve_marks`), each connection's rows charged with its state
+        // (`CONNECTION_STATE`): sized to what admission could hold before any came, they held about
+        // 650 bytes for each connection admitted (docs/benchmarks.md), charged to nothing.
         Ok(Self {
             quic,
             client,
@@ -819,7 +863,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 #[cfg(feature = "oracle")]
                 mismatches: 0,
                 events: VecDeque::new(),
-                peers: Vec::with_capacity(peers),
+                peers: Vec::new(),
                 now,
                 granularity: K_GRANULARITY,
                 tick: 0,
@@ -829,12 +873,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 pool: Pool::new(u64::from(limits.streams_per_connection)),
                 room: Room::unbounded(),
                 handshake_room: 0,
-                grown: VecDeque::with_capacity(limits.admission.connections),
+                grown: VecDeque::new(),
                 wanted: Wanted::default(),
                 generation: 0,
                 reserving: 0,
                 reserving_at: Vec::new(),
-                pending_keys: Vec::with_capacity(limits.admission.pending),
+                pending_keys: Vec::new(),
                 refused: Refused {
                     lifetime: retry_lifetime,
                     ..Refused::default()
@@ -845,14 +889,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             path_ceiling: None,
             responses: VecDeque::new(),
             spare: Vec::new(),
-            marks: Vec::with_capacity(peers),
-            touched: Vec::with_capacity(peers),
-            rearm: Vec::with_capacity(peers),
-            sending: VecDeque::with_capacity(peers),
-            deadlines: Vec::with_capacity(peers),
-            positions: Vec::with_capacity(peers),
-            due: Vec::with_capacity(peers),
-            walk: Vec::with_capacity(peers),
+            marks: Vec::new(),
+            touched: Vec::new(),
+            rearm: Vec::new(),
+            sending: VecDeque::new(),
+            deadlines: Vec::new(),
+            positions: Vec::new(),
+            due: Vec::new(),
+            walk: Vec::new(),
             serials: 0,
             keys: Vec::with_capacity(limits.admission.per_identity),
         })
@@ -1103,10 +1147,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     }
 
     /// Room for key `key`'s marks and heap index: the keys are the QUIC endpoint's connection
-    /// handles, bounded by the connections it holds at once.
+    /// handles, bounded by the connections it holds at once. The lists a turn fills with keys grow
+    /// with them, so a turn that lists every key allocates nothing; a reservation the allocator
+    /// refuses leaves a list to grow as it is filled.
     fn reserve_marks(&mut self, key: usize) {
         if self.marks.len() <= key {
             self.marks.resize(key.saturating_add(1), Marks::default());
+            let keys = self.marks.len();
+            for list in [&mut self.touched, &mut self.rearm, &mut self.walk] {
+                let _ = list.try_reserve(keys.saturating_sub(list.len()));
+            }
+            let _ = self.due.try_reserve(keys.saturating_sub(self.due.len()));
+            let _ = self
+                .sending
+                .try_reserve(keys.saturating_sub(self.sending.len()));
+            let _ = self
+                .deadlines
+                .try_reserve(keys.saturating_sub(self.deadlines.len()));
         }
         if self.positions.len() <= key {
             self.positions.resize(key.saturating_add(1), None);
@@ -2048,14 +2105,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         mut quic: Connection,
         dialed: Option<PeerId>,
         origin: Option<(ConnectionId, bool)>,
-        grant: Reservation,
+        grant: Grant,
     ) {
         if let Some(ceiling) = self.path_ceiling {
             quic.set_path_ceiling(self.core.now, ceiling);
         }
         let limits = self.core.limits;
         let initial = initial_window(MIN_DATAGRAM);
-        let grants = vec![grant];
+        let Grant { window, state } = grant;
+        let grants = vec![window];
         let serial = self.serials;
         self.serials = serial.saturating_add(1);
         let conn = Conn {
@@ -2081,6 +2139,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             window: Window::new(initial, limits.window_ceiling),
             delivered: Delivered::new(C::RANKS),
             grants,
+            state: Some(state),
             set_back: None,
             listed: false,
             lost: false,
@@ -2264,16 +2323,28 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
 
     /// A connection's first window, with the reserve on top of it: room in the socket's queue
     /// first, then the budget's bytes.
-    fn window_grant(&mut self) -> Result<Reservation, Refusal> {
+    fn window_grant(&mut self) -> Result<Grant, Refusal> {
         let bytes = Self::first_window();
         if let Err(refusal) = self.room.first(bytes, self.handshake_room) {
             self.wanted.room = true;
             return Err(refusal);
         }
-        match self.budget.reserve(bytes, Lane::Window) {
-            Ok(grant) => Ok(grant),
+        let window = match self.budget.reserve(bytes, Lane::Window) {
+            Ok(grant) => grant,
             Err(refusal) => {
                 self.room.release(bytes);
+                self.wanted.budget = true;
+                return Err(refusal);
+            }
+        };
+        match self
+            .budget
+            .reserve(state_charge(&self.limits), Lane::Window)
+        {
+            Ok(state) => Ok(Grant { window, state }),
+            Err(refusal) => {
+                self.room.release(window.granted());
+                self.budget.release(window);
                 self.wanted.budget = true;
                 Err(refusal)
             }
@@ -2295,10 +2366,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         more.saturating_mul(Self::first_window().saturating_add(self.handshake_room))
     }
 
-    /// A window grant given back: its room in the socket's queue and its bytes.
-    fn release_window(&mut self, grant: Reservation) {
-        self.room.release(grant.granted());
-        self.budget.release(grant);
+    /// A connection's first grants given back before it was made: its window's room in the
+    /// socket's queue and its bytes, and its state's.
+    fn release_window(&mut self, grant: Grant) {
+        self.room.release(grant.window.granted());
+        self.budget.release(grant.window);
+        self.budget.release(grant.state);
     }
 
     fn connection_of(&self, peer: PeerId) -> Option<usize> {
@@ -2675,6 +2748,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.room.release(grant.granted());
             }
             self.budget.release(grant);
+        }
+        if let Some(state) = conn.state.take() {
+            self.budget.release(state);
         }
         self.generation = self.generation.wrapping_add(1);
     }

@@ -59,7 +59,10 @@ pub use credit::{
     K_GRANULARITY, MIN_DATAGRAM, STREAM_BYTES_PER_PACKET, class_reserve, initial_window,
     socket_buffer_ask, stream_window_ceiling,
 };
-pub use endpoint::{AskQueue, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit};
+pub use endpoint::{
+    AskQueue, CONNECTION_STATE, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit,
+    connection_charge, state_charge,
+};
 pub use error::Refusal;
 pub use frame::Embedded;
 /// The congestion controllers a connection may run ([`Config::congestion`]).
