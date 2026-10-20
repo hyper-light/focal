@@ -51,10 +51,18 @@ pub struct LogStats {
     /// own: the device measured a write and a flush of its cache cheaper than its durable write (a
     /// consumer NVMe drive's FUA write costs more than a flush). Each also counts in `flushes`.
     pub flushed_confirmations: u64,
-    /// Bytes of zeros written over the slots the file grew by, each before its first frame
-    /// (`docs/durable.md` §6.3), counted in `bytes` too: what growing the log wrote that no
-    /// record holds.
+    /// Bytes of zeros written over the slots the file grew by, ahead of their first frames while
+    /// the device had nothing else to do (`docs/durable.md` §6.3), counted in `bytes` too: what
+    /// growing the log wrote that no record holds.
     pub zeroed_bytes: u64,
+    /// Slots written whole with zeros and flushed ahead of their first frame: every frame in one
+    /// is an overwrite.
+    pub fills: u64,
+    /// The pieces those fills were written in, each a write no larger than the frame before it.
+    pub fill_pieces: u64,
+    /// Fills ahead whose write or flush failed: their slots are written by their frames as any
+    /// unwritten space is, and nothing is fenced.
+    pub fill_failures: u64,
     /// Asks for a slot past the file's end the owner refused (`crate::Growth`), each read as the
     /// file's bound reached: the frame that needed it answered `Full`. It counts asks, not
     /// episodes: the log asks again whenever it looks for room, so one bound reached counts as
@@ -82,6 +90,9 @@ impl LogStats {
             durable_fallbacks: 0,
             flushed_confirmations: 0,
             zeroed_bytes: 0,
+            fills: 0,
+            fill_pieces: 0,
+            fill_failures: 0,
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),
@@ -144,8 +155,12 @@ pub(crate) struct Tally {
     pub(crate) durable_fallbacks: u64,
     /// Confirmations written and flushed by the device's choice (`Timing::flushed_confirmation`).
     pub(crate) flushed_confirmations: u64,
-    /// Bytes of zeros the frames that grew the file wrote.
+    /// Bytes of zeros written ahead of the frames of the slots the file grew by.
     pub(crate) zeroed_bytes: u64,
+    /// Slots filled ahead whole, the pieces written, and fills ahead that failed.
+    pub(crate) fills: u64,
+    pub(crate) fill_pieces: u64,
+    pub(crate) fill_failures: u64,
     pub(crate) flush: Histogram,
     pub(crate) write: Histogram,
     pub(crate) commit_wait: Histogram,
@@ -163,6 +178,9 @@ impl Tally {
             durable_fallbacks: 0,
             flushed_confirmations: 0,
             zeroed_bytes: 0,
+            fills: 0,
+            fill_pieces: 0,
+            fill_failures: 0,
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),

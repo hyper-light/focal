@@ -283,6 +283,16 @@ pub(crate) struct Owner<F> {
     tally: Box<Tally>,
     /// When the frame or confirmation on the device went to it, while one is there.
     flushing_since: Option<Instant>,
+    /// The slot past the file's last being written with zeros ahead of its first frame, and how
+    /// many of its bytes are (`write::FillAhead`), while one is.
+    fill: Option<write::FillAhead>,
+    /// The slot written with zeros and flushed ahead, its admission held, until a frame opens it.
+    filled: Option<u32>,
+    /// A slot whose fill ahead failed: it is not filled ahead again.
+    unfilled: Option<u32>,
+    /// The bytes the last frame wrote: a fill's piece is no larger, so a frame that waits behind
+    /// one waits no longer than behind another frame.
+    frame_bytes: u64,
 }
 
 impl<F: BlockFile + 'static> Owner<F> {
@@ -352,6 +362,10 @@ impl<F: BlockFile + 'static> Owner<F> {
             releasing: HashMap::new(),
             tally: Tally::new(),
             flushing_since: None,
+            fill: None,
+            filled: None,
+            unfilled: None,
+            frame_bytes: 0,
         }
     }
 
@@ -803,6 +817,7 @@ impl<F: BlockFile + 'static> Owner<F> {
                 self.buffers.frame = Some(frame);
                 self.buffers.record = Some(record);
                 self.tally.job(&timing, true);
+                self.frame_bytes = timing.bytes;
                 // A device that confirms the frame on its own goes on to it as the flush ends.
                 self.flushing_since = timing.flushed_at.filter(|_| confirming);
                 let done = write::Flushed {
@@ -825,6 +840,10 @@ impl<F: BlockFile + 'static> Owner<F> {
                 self.tally.job(&timing, false);
                 self.flushing_since = None;
                 self.confirmed(result, these, timing.flushed_at);
+            }
+            Completion::Fill { result, timing } => {
+                self.tally.job(&timing, false);
+                self.filled_ahead(result);
             }
             Completion::Read(reads) => self.read(reads),
             Completion::Looked => {

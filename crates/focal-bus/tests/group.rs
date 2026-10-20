@@ -259,6 +259,30 @@ impl World {
             .sum()
     }
 
+    /// What a stalled run leaves to read: the client's view and each node's role, term and
+    /// statistics, its log's, window's, parked and owed among them.
+    fn diagnose(&self) -> String {
+        let mut out = format!(
+            "client: leader {} term {}, {} acknowledged, {} unacknowledged, {} sent",
+            self.leader,
+            self.term,
+            self.seen.acked.len(),
+            self.unacked.len(),
+            self.sent
+        );
+        for running in self.nodes.iter().flatten() {
+            let member = &running.member;
+            out.push_str(&format!(
+                "\nnode {}: leads {}, term {}: {:?}",
+                member.id(),
+                member.is_leader(),
+                member.term(),
+                member.stats()
+            ));
+        }
+        out
+    }
+
     /// Handles every event that is ready, then gives each node its turn; waits at most until the
     /// soonest of the nodes' deadlines, or a tick.
     async fn step(&mut self) {
@@ -552,8 +576,12 @@ fn a_part_whose_publishes_pass_its_logs_bound_lets_its_log_go_and_takes_them() {
                 let acked = u32::try_from(world.seen.acked.len()).unwrap();
                 world.publish((acked + 4).min(BATCHES));
                 world.step().await;
-                wait.check(&[world.seen.acked.len() as u64])
-                    .expect("the batches past the log's bound were not acknowledged");
+                if let Err(frozen) = wait.check(&[world.seen.acked.len() as u64]) {
+                    panic!(
+                        "the batches past the log's bound were not acknowledged: {frozen:?}\n{}",
+                        world.diagnose()
+                    );
+                }
             }
             for (sequence, (base, count)) in &world.seen.acked {
                 assert_eq!(
@@ -582,8 +610,12 @@ fn a_part_whose_publishes_pass_its_logs_bound_lets_its_log_go_and_takes_them() {
             let mut wait = ProgressDeadline::begin(&ends(&world), u64::MAX, FROZEN);
             while ends(&world).iter().any(|end| *end < u64::from(BATCHES)) {
                 world.step().await;
-                wait.check(&ends(&world))
-                    .expect("a node never came to hold every batch");
+                if let Err(frozen) = wait.check(&ends(&world)) {
+                    panic!(
+                        "a node never came to hold every batch: {frozen:?}\n{}",
+                        world.diagnose()
+                    );
+                }
             }
             for running in world.running() {
                 let stats = running.member.stats();

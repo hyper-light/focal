@@ -281,9 +281,15 @@ pub struct LogWrites {
     /// fewer than two segments free, and the bytes they copied: what it wrote a second time.
     pub sweeps: u64,
     pub swept_bytes: u64,
-    /// Bytes of zeros written over the slots the log's file grew by, each before its first frame:
-    /// what growing the log wrote that no record holds (counted in `bytes` too).
+    /// Bytes of zeros written over the slots the log's file grew by, ahead of their first frames
+    /// while its device had nothing else to do: what growing the log wrote that no record holds
+    /// (counted in `bytes` too).
     pub zeroed_bytes: u64,
+    /// Slots filled with zeros whole ahead of their frames, the pieces they were written in, and
+    /// fills whose write or flush failed (hyper-log's `LogStats::fills`, durable.md §6.3).
+    pub fills: u64,
+    pub fill_pieces: u64,
+    pub fill_failures: u64,
     /// Whether the log's file system writes its file in place where it would copy it on write
     /// (`DeviceFile::written_in_place`): btrfs's mark, asked as an empty file is opened. `None`
     /// on a file system that writes every file in place.
@@ -310,6 +316,9 @@ impl LogWrites {
             sweeps: stats.sweeps,
             swept_bytes: stats.swept_bytes,
             zeroed_bytes: stats.zeroed_bytes,
+            fills: stats.fills,
+            fill_pieces: stats.fill_pieces,
+            fill_failures: stats.fill_failures,
         }
     }
 }

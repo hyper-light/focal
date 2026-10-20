@@ -321,6 +321,9 @@ pub(crate) struct Params {
     /// Bytes of the tag after each entry's and proposal's bytes: [`format::TAG_LEN`] in a sealed
     /// log, 0 in an unsealed one.
     pub(crate) tag: usize,
+    /// Whether the file writes the slots it grows by with zeros ahead of their frames
+    /// (`BlockFile::fills_new_space`), as its file said when the log's threads started.
+    pub(crate) fills: bool,
 }
 
 /// `update` for `group` in parts that each fit a frame of `room` payload bytes
@@ -775,6 +778,7 @@ impl<F: BlockFile + 'static> Log<F> {
             frame_room: room_bytes,
             queue_bytes,
             tag: if sealed { format::TAG_LEN } else { 0 },
+            fills: false,
         };
         let waiters = config
             .max_groups
@@ -834,7 +838,7 @@ impl<F: BlockFile + 'static> Log<F> {
     )]
     fn spawn(
         file: F,
-        p: Params,
+        mut p: Params,
         state: state::State,
         room: room::Room,
         first: Vec<Submission<F>>,
@@ -889,6 +893,9 @@ impl<F: BlockFile + 'static> Log<F> {
         };
         let largest = usize::try_from(config.segment_bytes).unwrap_or(usize::MAX);
         let pool = Pool::new(p.align, largest.saturating_mul(2), largest);
+        // The file is the caller's code: asked inside the unwind boundary, and an unwinding answer
+        // fills nothing.
+        p.fills = crate::unwind::contained(|| file.fills_new_space()).unwrap_or(false);
         let (more, told) = sync_channel(device::MORE);
         let device = device::Device::new(file, pool, config.segment_bytes, told)
             .sealed(sealer.as_ref().map(seal::Sealer::frame_mac));

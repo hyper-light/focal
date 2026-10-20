@@ -135,6 +135,32 @@ fn millis(from: u64, to: u64) -> f64 {
     to.saturating_sub(from) as f64 / 1e6
 }
 
+/// A node log's writes as a line states them ([`focal_bus::member::LogWrites`]).
+fn log_writes(log: &focal_bus::member::LogWrites) -> serde_json::Value {
+    serde_json::json!({
+        "frames": log.frames,
+        "updates": log.updates,
+        "bytes": log.bytes,
+        "flushes": log.flushes,
+        "durable_writes": log.durable_writes,
+        "durable_fallbacks": log.durable_fallbacks,
+        "flushed_confirmations": log.flushed_confirmations,
+        "flush_p50_us": log.flush_p50_ns as f64 / 1e3,
+        "flush_p99_us": log.flush_p99_ns as f64 / 1e3,
+        "commit_wait_p50_us": log.commit_wait_p50_ns as f64 / 1e3,
+        "commit_wait_p99_us": log.commit_wait_p99_ns as f64 / 1e3,
+        "commit_wait_max_us": log.commit_wait_max_ns as f64 / 1e3,
+        "growth_refused": log.growth_refused,
+        "written_in_place": log.written_in_place,
+        "sweeps": log.sweeps,
+        "swept_bytes": log.swept_bytes,
+        "zeroed_bytes": log.zeroed_bytes,
+        "fills": log.fills,
+        "fill_pieces": log.fill_pieces,
+        "fill_failures": log.fill_failures,
+    })
+}
+
 /// A histogram's summary as a line states it, in microseconds.
 fn times(times: &focal_bus::member::Times) -> serde_json::Value {
     serde_json::json!({
@@ -260,25 +286,7 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
             "busy_most_ms": member.busy_most_ns as f64 / 1e6,
             // What its log wrote to the device: frames, the updates they carried, bytes with their
             // padding, flushes and durable writes, and how long an update waited to be durable.
-            "log": {
-                "frames": member.log.frames,
-                "updates": member.log.updates,
-                "bytes": member.log.bytes,
-                "flushes": member.log.flushes,
-                "durable_writes": member.log.durable_writes,
-                "durable_fallbacks": member.log.durable_fallbacks,
-                "flushed_confirmations": member.log.flushed_confirmations,
-                "flush_p50_us": member.log.flush_p50_ns as f64 / 1e3,
-                "flush_p99_us": member.log.flush_p99_ns as f64 / 1e3,
-                "commit_wait_p50_us": member.log.commit_wait_p50_ns as f64 / 1e3,
-                "commit_wait_p99_us": member.log.commit_wait_p99_ns as f64 / 1e3,
-                "commit_wait_max_us": member.log.commit_wait_max_ns as f64 / 1e3,
-                "growth_refused": member.log.growth_refused,
-                "written_in_place": member.log.written_in_place,
-                "sweeps": member.log.sweeps,
-                "swept_bytes": member.log.swept_bytes,
-                "zeroed_bytes": member.log.zeroed_bytes,
-            },
+            "log": log_writes(&member.log),
             // How long a publish took while this node led: from its proposal to its
             // acknowledgement, a parked one's wait before its proposal, and the runs of entries it
             // appended until a write was issued for them, until durable on its own log and until

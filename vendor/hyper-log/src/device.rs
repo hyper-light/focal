@@ -272,6 +272,22 @@ pub(crate) enum Job<F> {
         record_at: u64,
         these: Vec<Answering>,
     },
+    /// A piece of the slot past the file's last written with zeros ahead of its first frame, while
+    /// the owner has nothing else for the device (`owner::write`'s fill ahead): `len` bytes at
+    /// `at`, then, with `flush`, the slot's last piece, one flush. The slot's blocks are then
+    /// written and the file's length covers them, so every frame in it is an overwrite the file
+    /// system need not log: a flush of the device's cache alone, and a confirmation that is one FUA
+    /// write where the device has FUA. On ext4 and XFS a write into an unwritten extent converts
+    /// it, a change the journal must commit (fallocate(2), "Allocating disk space"; the kernel's
+    /// fs/iomap/direct-io.c takes no FUA path for an unwritten extent or a write past the file's
+    /// size), so allocating the slot is not enough: it is written. Zeros past the last frame read
+    /// as no frame, as the end of the file does (`recover::Reader::frame_at`: neither magic has a
+    /// zero byte).
+    Fill {
+        at: u64,
+        len: u64,
+        flush: bool,
+    },
     /// The tail's frames, read through a window of a segment and decoded.
     Sweep {
         segment: Segment,
@@ -287,17 +303,6 @@ pub(crate) enum Job<F> {
 pub(crate) struct Frame {
     pub(crate) frame: AlignedBuf,
     pub(crate) at: u64,
-    /// Where the frame opens a slot past the file's last: the slot, written whole with zeros
-    /// before the frame, under the frame's own flush. The file's blocks in it are then written and
-    /// its length covers it, so every later frame in the slot is an overwrite the file system need
-    /// not log: a flush of the device's cache alone, and a confirmation that is one FUA write where
-    /// the device has FUA. On ext4 and XFS a write into an unwritten extent converts it, a change
-    /// the journal must commit (fallocate(2), "Allocating disk space"; the kernel's
-    /// fs/iomap/direct-io.c takes no FUA path for an unwritten extent or a write past the file's
-    /// size), so allocating the slot is not enough: it is written. Zeros past the last frame read as
-    /// no frame, as the end of the file does (`recover::Reader::frame_at`: neither magic has a zero
-    /// byte).
-    pub(crate) zero: Option<(u64, u64)>,
     pub(crate) record: AlignedBuf,
     pub(crate) record_at: u64,
     /// The frame's sequence.
@@ -338,6 +343,12 @@ pub(crate) enum Completion {
         timing: Timing,
     },
     Sweep(Result<Vec<Swept>, LogError>),
+    /// A piece of a fill ahead written, flushed with the slot's last piece, or failed.
+    Fill {
+        result: Result<(), LogError>,
+        /// Its write and flush, timed.
+        timing: Timing,
+    },
     Read(Reads),
     Looked,
 }
@@ -440,8 +451,8 @@ pub(crate) struct Device<F> {
     pub(crate) file: F,
     /// Buffers for reading entries back, kept between reads.
     pool: Pool,
-    /// A segment of zeros, written over each slot the file grows by (`Device::zero_fill`): made at
-    /// the first and kept.
+    /// Zeros, written over the pieces of each slot the file grows by (`Device::zero_fill`): made
+    /// at the first piece, grown to the largest asked and kept.
     zeros: Option<AlignedBuf>,
     segment_bytes: u64,
     /// The owner's word that another frame follows the one with this sequence.
@@ -553,6 +564,10 @@ impl<F: BlockFile> Device<F> {
                 offset,
                 end,
             } => Completion::Sweep(guarded(|| self.sweep(segment, offset, end))),
+            Job::Fill { at, len, flush } => {
+                let (result, timing) = self.fill(at, len, flush);
+                Completion::Fill { result, timing }
+            }
             Job::Read(reads) => {
                 let group = reads.group;
                 let read = crate::unwind::contained(|| self.read(reads)).unwrap_or_else(|| Reads {
@@ -579,11 +594,8 @@ impl<F: BlockFile> Device<F> {
         answers: &mut Vec<Answering>,
         lines: &Lines<F>,
     ) -> Completion {
-        let (result, timing) = self.write_then_flush(
-            f.zero,
-            (&mut f.frame, f.at),
-            Some((&mut f.record, f.record_at)),
-        );
+        let (result, timing) =
+            self.write_then_flush((&mut f.frame, f.at), Some((&mut f.record, f.record_at)));
         let confirming = result.is_ok() && !(f.more || self.follows(f.sequence));
         if result.is_ok() {
             // This frame's record confirms the frame before.
@@ -658,24 +670,15 @@ impl<F: BlockFile> Device<F> {
     /// ([`Costs`]).
     fn write_then_flush(
         &mut self,
-        zero: Option<(u64, u64)>,
         first: (&mut AlignedBuf, u64),
         second: Option<(&mut AlignedBuf, u64)>,
     ) -> (Result<(), LogError>, Timing) {
         let started = stats::now();
         let mut bytes = 0u64;
-        let mut zeroed = 0u64;
         let mut record_ns = None;
-        // Every call into the file, its asking whether it fills new space included, is inside the
-        // boundary: the file is the caller's code.
+        // Every call into the file is inside the boundary: the file is the caller's code.
         let wrote = guarded(|| {
-            if let Some((at, len)) = zero
-                && self.file.fills_new_space()
-            {
-                zeroed = self.zero_fill(at, len)?;
-                bytes = zeroed;
-            }
-            bytes = bytes.saturating_add(self.write(first.0, first.1)?);
+            bytes = self.write(first.0, first.1)?;
             if let Some((buf, at)) = second {
                 let from = stats::now();
                 bytes = bytes.saturating_add(self.write(buf, at)?);
@@ -696,7 +699,7 @@ impl<F: BlockFile> Device<F> {
             durable_write: false,
             durable_fallback: false,
             flushed_confirmation: false,
-            zeroed,
+            zeroed: 0,
         };
         if wrote.is_err() {
             return (wrote, timing);
@@ -814,13 +817,49 @@ impl<F: BlockFile> Device<F> {
         (result, timing)
     }
 
-    /// Writes zeros over `[at, at + len)`, a slot the file grows by (`Frame::zero`), in one write:
-    /// a segment, the log's largest write, from a zeroed buffer of a segment the device makes at the
-    /// first slot it fills and keeps for the log's life, so a slot costs no allocation and no page
-    /// fault after the first. The bytes written.
+    /// A fill ahead's piece ([`Job::Fill`]): its zeros written, then with `flush` the file
+    /// flushed, nothing after a failed write. The write and the flush are timed apart, and the
+    /// zeros counted.
+    fn fill(&mut self, at: u64, len: u64, flush: bool) -> (Result<(), LogError>, Timing) {
+        let started = stats::now();
+        let wrote = guarded(|| self.zero_fill(at, len));
+        let written = stats::now();
+        let mut timing = Timing {
+            took_ns: stats::nanos(started, written),
+            write_ns: stats::nanos(started, written),
+            flush_ns: None,
+            bytes: 0,
+            flushed_at: None,
+            durable_write: false,
+            durable_fallback: false,
+            flushed_confirmation: false,
+            zeroed: 0,
+        };
+        match wrote {
+            Ok(zeroed) => {
+                timing.bytes = zeroed;
+                timing.zeroed = zeroed;
+            }
+            Err(e) => return (Err(e), timing),
+        }
+        if !flush {
+            return (Ok(()), timing);
+        }
+        let flushed = guarded(|| self.file.sync_data().map_err(LogError::from));
+        let ended = stats::now();
+        timing.took_ns = stats::nanos(started, ended);
+        timing.flush_ns = Some(stats::nanos(written, ended));
+        timing.flushed_at = flushed.is_ok().then_some(ended);
+        (flushed, timing)
+    }
+
+    /// Writes zeros over `[at, at + len)`, a piece of a slot the file grows by ([`Job::Fill`]),
+    /// in one write, from a zeroed buffer the device keeps for the log's life, grown to the largest
+    /// piece asked: a piece costs no allocation and no page fault past the first of its size. The
+    /// bytes written.
     fn zero_fill(&mut self, at: u64, len: u64) -> Result<u64, LogError> {
-        let size = usize::try_from(len).map_err(|_| LogError::Damaged("a slot past usize"))?;
-        if self.zeros.as_ref().is_none_or(|zeros| zeros.len() != size) {
+        let size = usize::try_from(len).map_err(|_| LogError::Damaged("a piece past usize"))?;
+        if self.zeros.as_ref().is_none_or(|zeros| zeros.len() < size) {
             let mut zeros = AlignedBuf::zeroed(size, self.file.layout_block())
                 .map_err(|e| LogError::Disk(e.into()))?;
             zeros.set_len(size).map_err(|e| LogError::Disk(e.into()))?;
@@ -829,8 +868,9 @@ impl<F: BlockFile> Device<F> {
         let zeros = self
             .zeros
             .as_ref()
+            .and_then(|zeros| zeros.as_slice().get(..size))
             .ok_or(LogError::Damaged("no zeros to fill a slot with"))?;
-        self.file.write_all_at(zeros.as_slice(), at)?;
+        self.file.write_all_at(zeros, at)?;
         Ok(len)
     }
 

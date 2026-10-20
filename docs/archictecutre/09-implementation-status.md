@@ -15832,3 +15832,17 @@ rlimit.go`, go.dev/issue/46279; `rlimit_darwin.go`, verified upstream). A soft l
 is left as it is. Tests: `member::tests::a_leader_times_a_runs_wait_for_its_write_apart_from_the_write`,
 `files::tests::the_open_files_limit_rises_to_the_most_the_kernel_lets_a_process_hold` (run at the
 shell's limit and at 256: a thousand files held open past it).
+
+### 2026-10-20 — Every shared crate at hyper-raft 16e9db2: a log's slots are filled ahead while it idles
+
+One change in hyper-log. A frame that opened a slot past its file's end wrote the slot's whole
+segment of zeros under its own flush, and every frame behind it waited: on CI's ext4 the bus's
+10,000/s leader waited 23 ms at p99 for a write to be issued, its p99 was 24.4 ms, and its closed
+loop was disk-bound at 183,000 and 293,000 records a second, against 3.7 ms and 511,000 and 592,000
+with no zeros at all (A/B 39436443557), while at 1,000/s, the device idle, the zeros had kept p99 at
+2.3 ms against 5 to 17 ms. Now the log writes the next slot's zeros ahead in pieces no larger than
+its last frame's writes, only while its device has nothing else to do, and flushes the slot with
+its last piece; a frame that opens a slot writes none. The bus's `Stopped` line states the fills
+(`group.log.fills`, `fill_pieces`, `fill_failures`). And the log-bound group test names every node's
+role, term and statistics when it stalls, as macOS CI's run of c0e4b6d1 left none to read. Only
+hyper-log differs from 0427988. vendor/README.md; docs/dependencies/inventory.tsv.
