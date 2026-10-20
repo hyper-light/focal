@@ -929,7 +929,22 @@ incarnation from the target, which increments its incarnation whenever it
 learns it is suspected) clears the suspicion. A suspicion timer is set once
 and only shortened by confirmations, never rescheduled by repeated gossip of
 the same evidence, so gossip cannot starve it. An expired suspicion declares
-the target dead; a later acknowledgement or a higher incarnation revives it.
+the target dead, and only its refutation revives it, as only a refutation
+clears a suspicion: SWIM's ordering (Das et al., DSN 2002, §4.2), where an
+`Alive` overrides a `Suspect` or `Alive` only at a higher incarnation and a
+death overrides both at any. An acknowledgement at the incarnation the target
+is suspected or dead at proves it answers, not that it heard its verdict, so
+the driver disseminates the verdict again from its first broadcast and the
+next message it sends carries it first (the answer to the target's own probe,
+when that was the acknowledgement), as memberlist adds a `suspect` to its ping
+of a node it holds suspect or dead "so that it has a chance to refute as soon
+as possible"; the target refutes on hearing it, and the refutation revives it
+at every member. A revival at the same incarnation would be one member's
+alone: the others hold the verdict and take no `Alive` no newer, its own
+buffer still carries the verdict, and the verdict coming back kills the
+target again (macOS CI, 2026-10-20: a zone stopped with `SIGSTOP` was
+committed dead, then alive once it resumed, and was dead again at the same
+incarnation seconds later).
 
 **Late extension.** A host under load that learns it is suspected refutes
 (above) and, when its own health score says it is slow, also asks its

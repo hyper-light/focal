@@ -1448,7 +1448,9 @@ impl LivenessDriver {
             origin: node,
         });
     }
-    /// Direct evidence that `node` answers at `incarnation`.
+    /// Direct evidence that `node` answers at `incarnation`. A member
+    /// suspected or dead at that incarnation or a later one is told its
+    /// verdict again, not revived: only its refutation revives it.
     fn learn_alive(&mut self, node: u64, incarnation: u64, now_ms: u64, direct: bool) {
         let config = self.config;
         let me = self.node;
@@ -1463,13 +1465,43 @@ impl LivenessDriver {
             member.last_alive_ms = now_ms;
             member.unconfirmed_rounds = 0;
         }
-        if incarnation < member.incarnation {
-            return;
-        }
         let mut events = Vec::new();
-        if !member.confirmed {
+        if incarnation >= member.incarnation && !member.confirmed {
             member.confirmed = true;
             events.push(LivenessEvent::Confirmed { node });
+        }
+        let generation = member.generation;
+        let unheard = incarnation <= member.incarnation && member.status != MemberStatus::Alive;
+        if incarnation < member.incarnation || unheard {
+            // A member suspected or dead here that answers at the verdict's
+            // incarnation, or at an older one (a restart whose clock began
+            // behind it), has not heard its verdict, and only its refutation
+            // (an incarnation past the verdict's, which it takes on hearing
+            // it) clears the verdict, here and at every member that holds it,
+            // since none takes an alive no newer than what it holds (SWIM's
+            // ordering, Das et al. 2002 §4.2; memberlist's aliveNode).
+            // Cleared here alone, the views part: the others hold the
+            // verdict, this node's buffer still carries it, and the verdict
+            // coming back suspects or kills the member again. So the verdict
+            // is disseminated again from its first broadcast, and the next
+            // message this node sends carries it first: the answer to the
+            // member's own probe when the evidence was that probe. An older
+            // incarnation from a member held alive is a stale answer.
+            let verdict = unheard.then_some(LivenessUpdate {
+                node,
+                generation,
+                incarnation: member.incarnation,
+                status: member.status,
+                origin: me,
+            });
+            for event in events {
+                self.state.event(event);
+            }
+            if let Some(verdict) = verdict {
+                let population = self.state.population();
+                self.state.gossip.rearm(verdict, population);
+            }
+            return;
         }
         if incarnation > member.incarnation {
             member.incarnation = incarnation;
@@ -1486,7 +1518,6 @@ impl LivenessDriver {
             member.status = MemberStatus::Alive;
             member.decided_at_ms = now_ms;
         }
-        let generation = member.generation;
         for event in events {
             self.state.event(event);
         }

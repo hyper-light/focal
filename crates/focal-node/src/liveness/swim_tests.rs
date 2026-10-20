@@ -284,3 +284,165 @@ fn direct_proof_of_life_resets_the_unconfirmed_patience() {
         "a confirmed member is suspected on its first failed round"
     );
 }
+
+/// A driver for `PEER` itself, knowing `SELF` and `RUMOURED`: the member the
+/// tests' first driver suspects or declares dead.
+fn peer_driver() -> (LivenessHandle, LivenessDriver, MemoryBudget) {
+    let budget = MemoryBudget::new(64 << 20, 16 << 20).unwrap();
+    let (handle, mut driver) =
+        LivenessHandle::channel(&budget, LivenessConfig::default(), PEER, namespace()).unwrap();
+    handle.report(LocalFacts {
+        generation: GENERATION,
+        members: Arc::new(BTreeMap::from([(SELF, GENERATION), (RUMOURED, GENERATION)])),
+        witness: 1,
+        overloaded: false,
+    });
+    driver.sync_facts(SENT_AT_MS);
+    (handle, driver, budget)
+}
+/// `RUMOURED`'s word that `PEER` is `status` at `incarnation`.
+fn rumour(incarnation: u64, status: MemberStatus) -> LivenessUpdate {
+    LivenessUpdate {
+        node: PEER,
+        generation: GENERATION,
+        incarnation,
+        status,
+        origin: RUMOURED,
+    }
+}
+/// What the next message `driver` sends says about `PEER`.
+fn told_of_peer(driver: &mut LivenessDriver) -> Vec<LivenessUpdate> {
+    let reply = driver.reply(ProbeOutcome::Ack, SEQUENCE, None);
+    reply
+        .updates
+        .into_iter()
+        .filter(|update| update.node == PEER)
+        .collect()
+}
+
+/// A member suspected or declared dead at its incarnation that answers at
+/// that incarnation has not heard its verdict. It is not revived here: the
+/// next message this node sends tells it the verdict again, it refutes with
+/// the next incarnation, and that revives it; the verdict arriving again
+/// afterwards is stale. Revived at the same incarnation, as it was, it was
+/// alive here alone: the other members hold the verdict and take no alive no
+/// newer than it, this node's buffer still carried the verdict, and the
+/// verdict coming back killed the member again (macOS CI, deployment_zones,
+/// 2026-10-20: a zone resumed after SIGSTOP was dead again seconds after it
+/// rejoined, its verdict committed back and forth).
+#[test]
+fn a_member_dead_or_suspected_at_its_incarnation_comes_back_only_by_its_refutation() {
+    for status in [MemberStatus::Dead, MemberStatus::Suspect] {
+        let (_handle, mut driver, _budget) = driver();
+        let (_peer_handle, mut peer, _peer_budget) = peer_driver();
+        let incarnation = peer.state.incarnation;
+        driver.learn_alive(PEER, incarnation, NOW_MS, true);
+        driver.on_update(rumour(incarnation, status), NOW_MS);
+        assert_eq!(driver.state.members[&PEER].status, status);
+        // The member was silent long enough for every broadcast of its verdict
+        // to run out.
+        while !driver.state.gossip.is_empty() {
+            driver.state.gossip.piggyback();
+        }
+        // It answers, at the incarnation it has: still suspected or dead here.
+        driver.learn_alive(PEER, incarnation, NOW_MS + 1_000, true);
+        let member = &driver.state.members[&PEER];
+        assert_eq!(
+            member.status, status,
+            "{status:?}: not revived by its answer"
+        );
+        assert_eq!(member.incarnation, incarnation);
+        // The answer it is sent tells it, and it refutes.
+        let told = told_of_peer(&mut driver);
+        assert_eq!(told.len(), 1, "{status:?}: the verdict rides the answer");
+        assert_eq!((told[0].incarnation, told[0].status), (incarnation, status));
+        for update in told {
+            peer.on_update(update, NOW_MS + 1_000);
+        }
+        assert_eq!(peer.state.incarnation, incarnation + 1);
+        let probe = peer.request(ProbeKind::Direct, None);
+        driver.learn_alive(PEER, probe.incarnation, NOW_MS + 2_000, true);
+        let member = &driver.state.members[&PEER];
+        assert_eq!(
+            member.status,
+            MemberStatus::Alive,
+            "{status:?}: revived by its refutation"
+        );
+        assert_eq!(member.incarnation, incarnation + 1);
+        assert!(member.suspicion.is_none());
+        // Its revival supersedes the verdict everywhere: the verdict arriving
+        // again, from a member that has not heard the refutation, is stale.
+        driver.on_update(rumour(incarnation, MemberStatus::Dead), NOW_MS + 3_000);
+        assert_eq!(driver.state.members[&PEER].status, MemberStatus::Alive);
+        let told = told_of_peer(&mut driver);
+        assert!(
+            told.iter()
+                .all(|update| update.status == MemberStatus::Alive
+                    && update.incarnation == incarnation + 1),
+            "{status:?}: {told:?}"
+        );
+    }
+}
+
+/// The verdict is told again on every answer at the old incarnation, not once:
+/// an answer whose reply is lost leaves the member to hear it from the next.
+#[test]
+fn every_answer_at_the_old_incarnation_tells_the_verdict_again() {
+    let (_handle, mut driver, _budget) = driver();
+    driver.learn_alive(PEER, 5, NOW_MS, true);
+    driver.on_update(rumour(5, MemberStatus::Dead), NOW_MS);
+    for round in 1..=3 {
+        while !driver.state.gossip.is_empty() {
+            driver.state.gossip.piggyback();
+        }
+        driver.learn_alive(PEER, 5, NOW_MS + round * 1_000, true);
+        let told = told_of_peer(&mut driver);
+        assert_eq!(told.len(), 1, "round {round}");
+        assert_eq!(told[0].status, MemberStatus::Dead);
+    }
+    // An answer at an older incarnation (a reply delayed past a refutation)
+    // proves life but tells and changes nothing.
+    driver.learn_alive(PEER, 6, NOW_MS + 5_000, true);
+    while !driver.state.gossip.is_empty() {
+        driver.state.gossip.piggyback();
+    }
+    driver.learn_alive(PEER, 5, NOW_MS + 6_000, true);
+    assert_eq!(driver.state.members[&PEER].status, MemberStatus::Alive);
+    assert_eq!(driver.state.members[&PEER].last_alive_ms, NOW_MS + 6_000);
+    assert!(told_of_peer(&mut driver).is_empty());
+}
+
+/// A member that restarts with an incarnation behind the one it was declared
+/// dead at (its clock began behind) is told its death and refutes past it;
+/// ignored as a stale answer, it would stay dead for good.
+#[test]
+fn a_member_that_restarts_behind_its_verdict_is_told_it_and_refutes_past_it() {
+    let (_handle, mut driver, _budget) = driver();
+    let (_peer_handle, mut peer, _peer_budget) = peer_driver();
+    driver.learn_alive(PEER, 9, NOW_MS, true);
+    driver.on_update(rumour(9, MemberStatus::Dead), NOW_MS);
+    while !driver.state.gossip.is_empty() {
+        driver.state.gossip.piggyback();
+    }
+    peer.state.incarnation = 7;
+    let probe = peer.request(ProbeKind::Direct, None);
+    driver.learn_alive(PEER, probe.incarnation, NOW_MS + 1_000, true);
+    assert_eq!(driver.state.members[&PEER].status, MemberStatus::Dead);
+    let told = told_of_peer(&mut driver);
+    assert_eq!(told.len(), 1);
+    assert_eq!(
+        (told[0].incarnation, told[0].status),
+        (9, MemberStatus::Dead)
+    );
+    for update in told {
+        peer.on_update(update, NOW_MS + 1_000);
+    }
+    assert_eq!(peer.state.incarnation, 10);
+    let probe = peer.request(ProbeKind::Direct, None);
+    driver.learn_alive(PEER, probe.incarnation, NOW_MS + 2_000, true);
+    let member = &driver.state.members[&PEER];
+    assert_eq!(
+        (member.status, member.incarnation),
+        (MemberStatus::Alive, 10)
+    );
+}

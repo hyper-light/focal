@@ -102,6 +102,21 @@ impl GossipBuffer {
         );
         true
     }
+    /// Disseminates the verdict again from its first broadcast: `update`, or what the buffer
+    /// carries about its node that is as new or newer. A member that answers at the incarnation
+    /// it is suspected or dead at has not heard its verdict, which its refutation needs
+    /// (`LivenessDriver::learn_alive`), though the verdict's broadcasts may have run out while it
+    /// was silent. Returns whether the buffer changed.
+    pub fn rearm(&mut self, update: LivenessUpdate, members: usize) -> bool {
+        if let Some(entry) = self.entries.get_mut(&update.node)
+            && !update.supersedes(&entry.update)
+        {
+            entry.broadcasts = 0;
+            entry.max_broadcasts = Self::max_broadcasts(members);
+            return true;
+        }
+        self.add(update, members)
+    }
     /// The newest verdict the buffer carries about a node.
     pub fn latest(&self, node: u64) -> Option<LivenessUpdate> {
         self.entries.get(&node).map(|entry| entry.update)

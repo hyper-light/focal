@@ -15773,3 +15773,29 @@ each kind) and `the_same_membership_change_asked_again_resumes_its_unsettled_req
 unsettled `AddLearner` against a founding network: a different change refused `Pending`, the same
 change committed under the saved operation and sequence 1, the next change admitted at sequence 2;
 with the rule off it fails `Pending`, as the CI run did).
+
+### 2026-10-20 — A node held dead or suspected comes back only by its own refutation
+
+macOS CI failed `deployment_zones::the_zone_stage_adds_a_zone_fact_and_survives_a_zone_loss` at its
+last check: the zone stopped with `SIGSTOP` had been committed dead, then alive once it resumed, and
+was dead again, at the incarnation it first died at, seconds later (`DeadNode` three times,
+`achieved_max_failures` 0). The liveness driver revived a member it held dead, or cleared its
+suspicion, on any direct evidence at the same incarnation, which the design allowed ("a later
+acknowledgement … revives it"). Every other member ignores an `Alive` no newer than what it holds
+and the reviving node's own gossip buffer keeps the death, so the views part, and the death coming
+back kills the member again. Traced on fedora with the zone held 8 s past its death, long enough
+for every broadcast of its verdict to run out, the resumed node never heard its verdict and never refuted: both other nodes revived it at the
+incarnation it died at, in 4 runs of 4, and the directory committed it alive there. Run as the test
+runs it, the node heard its verdict only because it resumed about a second after its death, while
+the death's broadcasts were still in a buffer. Now only a refutation revives a member or clears its
+suspicion, as in SWIM (Das et al., DSN 2002, §4.2: an `Alive` overrides a `Suspect` or `Alive`
+only at a higher incarnation): evidence at the verdict's incarnation, or at an older one (a restart
+whose clock began behind it), disseminates the verdict again from its first broadcast
+(`GossipBuffer::rearm`), so the next message the driver sends, the answer to the member's own probe
+when that was the evidence, tells the member, as memberlist adds a `suspect` to its ping of a node
+it holds suspect or dead. With the same 8 s hold the resumed node refuted within 20 to 33 ms of
+resuming and was revived at its next incarnation everywhere, 4 runs of 4. Tests:
+`swim_tests::a_member_dead_or_suspected_at_its_incarnation_comes_back_only_by_its_refutation` (two
+drivers: not revived by its answer, the verdict rides the answer, refuted, revived at the next
+incarnation, the death arriving again stale), `every_answer_at_the_old_incarnation_tells_the_verdict_again`
+and `a_member_that_restarts_behind_its_verdict_is_told_it_and_refutes_past_it`. Doc 24 §12.
