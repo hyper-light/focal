@@ -38,6 +38,9 @@ on:
       mode:
         description: "append (each record stored) or deliver (each also consumed and acknowledged durably, a work queue's message end to end)"
         default: "append"
+      agents:
+        description: "deliver mode on focal: the messages go among this many enrolled agents, each a client of its own (focal-load's agents, 2..=4094); empty, one issuer and one consumer"
+        default: ""
 
 permissions:
   contents: read
@@ -120,6 +123,7 @@ jobs:
         env:
           NODE_CPUS: "1"
           MODE: ${{ github.event.inputs.mode || (startsWith(github.ref_name, 'compare/deliver') && 'deliver' || 'append') }}
+          AGENTS: ${{ github.event.inputs.agents || '' }}
           # The competitors' images from the repository's registry where the image
           # job copied them (compose.yaml's defaults are the public sources).
           BENCH_LIBRARY: ${{ needs.image.outputs.registry || 'public.ecr.aws/docker/library' }}
@@ -234,7 +238,8 @@ jobs:
           # Deliver mode: each message from its intended send time to its consumer's
           # acknowledgement confirmed (focal: the testament posted; satisfied as well).
           delivered = []
-          for path in sorted(glob.glob("tools/compare/compose/reports/*-deliver.json")):
+          # A deliver run among agents names its agents after the mode (`-deliver-agents1000`).
+          for path in sorted(glob.glob("tools/compare/compose/reports/*-deliver*.json")):
               r = json.load(open(path))
               d = r.get("deliver")
               if not d:

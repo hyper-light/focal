@@ -59,4 +59,23 @@ f1 invite client --name bench --output /invite/client.invite
 $DC exec -T focal-load focal --data-dir /client enroll context --invite-file /invite/client.invite bench
 f1 invite client --name consumer --output /invite/consumer.invite
 $DC exec -T focal-load focal --data-dir /client enroll context --invite-file /invite/consumer.invite consumer
+# AGENTS (environment), for the deliver mode among agents: that many more clients, each an
+# identity of its own (agent-0000, ...), invited on the founder and enrolled in the generator's
+# container, each side in one exec so a thousand agents cost two.
+if [ -n "${AGENTS:-}" ]; then
+  $DC exec -T -e AGENTS="$AGENTS" focal1 sh -c '
+    i=0
+    while [ "$i" -lt "$AGENTS" ]; do
+      name=$(printf "agent-%04d" "$i")
+      focal --data-dir /data invite client --name "$name" --output "/invite/$name.invite" >/dev/null
+      i=$((i + 1))
+    done'
+  $DC exec -T -e AGENTS="$AGENTS" focal-load sh -c '
+    i=0
+    while [ "$i" -lt "$AGENTS" ]; do
+      name=$(printf "agent-%04d" "$i")
+      focal --data-dir /client enroll context --invite-file "/invite/$name.invite" "$name" >/dev/null
+      i=$((i + 1))
+    done'
+fi
 f1 inspect identity

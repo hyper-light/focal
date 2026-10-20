@@ -14,6 +14,9 @@
 #   RATE 0: no schedule, each answer sending the next record, the window held
 #   full (a closed loop: Kafka's producer-perf-test at --throughput -1), for a
 #   system's ceiling at that window.
+#   AGENTS (environment), deliver mode on focal: the messages go among that many enrolled
+#   agents, each a client of its own (focal-load's `agents`), where unset one issuer and one
+#   consumer; the report's file names it.
 #   INFLIGHT (environment): the generator's window, the requests out at most
 #   (focal-compare's own default, 4096, where unset); a run given one names it
 #   in its report's file.
@@ -26,7 +29,7 @@ window=""
 if [ -n "${INFLIGHT:-}" ]; then window_args=(--inflight "$INFLIGHT"); window="-w$INFLIGHT"; fi
 case "$mode" in
   append) suffix="" ;;
-  deliver) suffix="-deliver" ;;
+  deliver) suffix="-deliver${AGENTS:+-agents$AGENTS}" ;;
   *) echo "unknown mode $mode" >&2; exit 2 ;;
 esac
 mkdir -p "$out"
@@ -191,7 +194,11 @@ print(w if isinstance(w, str) else bytes(w).hex())')
     inflight=64
     # Append: every claim targets the node's worker. Deliver: every claim targets the
     # consumer, a client of its own that completes it.
-    if [ "$mode" = deliver ]; then
+    if [ "$mode" = deliver ] && [ -n "${AGENTS:-}" ]; then
+      lifecycle="lifecycle: deliver
+agents: $AGENTS
+agent_enrollments: /client/CLIENT.contexts"
+    elif [ "$mode" = deliver ]; then
       lifecycle="lifecycle: deliver
 consumer_enrollment: /client/CLIENT.contexts/enrollment-consumer"
     else
