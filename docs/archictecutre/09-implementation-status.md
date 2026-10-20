@@ -15873,3 +15873,13 @@ count; 19.7 s in a debug build on macOS), `admission::a_listeners_bound_is_what_
 stated, not derived from the node's envelope; a participant's connection reserves exchange tables
 for the consensus window's streams though its credit starts at one; the listener's exchange bound
 is still the 128-connection product. vendor/README.md; docs/dependencies/inventory.tsv.
+
+### 2026-10-20 — rustls-webpki 0.103.16: distrusted emSign intermediates refused
+
+`cargo deny` refused the tree for RUSTSEC-2026-0382 (published after the morning's gates): rustls-webpki
+0.103.15, under hyper-tls (every node's and client's TLS) and async-nats (focal-compare), may accept a
+certificate path containing distrusted emSign intermediate keys, whose private keys are now public, where
+the configured trust anchors allow such a path (rustls/webpki#546). 0.103.16 rejects those paths; the lock
+takes it (`cargo update -p rustls-webpki --precise 0.103.16`, nothing else moved). focal's own trust
+anchors are its clusters' issuers, never a public root store, so a node's paths never reach those keys; a
+client of a public endpoint (focal-compare's NATS) could. docs/dependencies/inventory.tsv.

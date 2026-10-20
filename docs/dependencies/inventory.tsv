@@ -201,7 +201,7 @@ rustix	1.1.4	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	registry+https:
 rustls	0.23.46	Apache-2.0 OR ISC OR MIT	registry+https://github.com/rust-lang/crates.io-index
 rustls-native-certs	0.8.4	Apache-2.0 OR ISC OR MIT	registry+https://github.com/rust-lang/crates.io-index
 rustls-pki-types	1.15.1	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
-rustls-webpki	0.103.15	ISC	registry+https://github.com/rust-lang/crates.io-index
+rustls-webpki	0.103.16	ISC	registry+https://github.com/rust-lang/crates.io-index
 rustversion	1.0.23	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 ryu	1.0.23	Apache-2.0 OR BSL-1.0	registry+https://github.com/rust-lang/crates.io-index
 schannel	0.1.29	MIT	registry+https://github.com/rust-lang/crates.io-index
