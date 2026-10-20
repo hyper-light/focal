@@ -24,7 +24,9 @@ focal-stream = { version = "0.1.0", path = "../focal-stream" }
 focal-directory = { version = "0.1.0", path = "../focal-directory" }
 focal-ranges = { version = "0.1.0", path = "../focal-ranges" }
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
+focal-seal = { version = "0.1.0", path = "../focal-seal" }
 blake3.workspace = true
+hyper-seal.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true

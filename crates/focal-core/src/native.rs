@@ -2385,8 +2385,13 @@ impl Core<NativeState> {
     /// The committed rows frozen at this prefix, for a checkpoint to encode
     /// on another thread while this core goes on (`record_codec::checkpoint`).
     pub fn freeze_native(&self) -> Result<NativeFrozen, MemoryError> {
+        // A checkpoint's reader is what a committed fact requires: charged in the committed lane,
+        // which a full share still has, so the checkpoint that frees it is never refused for it.
         let payloads = match self.state.payloads.as_deref() {
-            Some(log) => Some(log.reader().map_err(|_| MemoryError::AllocationFailed)?),
+            Some(log) => Some(
+                log.reader(focal_memory::BudgetLane::Committed)
+                    .map_err(|_| MemoryError::AllocationFailed)?,
+            ),
             None => None,
         };
         Ok(NativeFrozen {
@@ -2956,7 +2961,10 @@ impl Core<NativeState> {
     pub fn pin_native(&mut self, now: u64, ttl: u64) -> Result<NativeRead, MemoryError> {
         // A reader that cannot be made (its handles) refuses the lease, as a frozen image's does.
         let payloads = match self.state.payloads.as_deref() {
-            Some(log) => Some(log.reader().map_err(|_| MemoryError::AllocationFailed)?),
+            Some(log) => Some(
+                log.reader(focal_memory::BudgetLane::Ordinary)
+                    .map_err(|_| MemoryError::AllocationFailed)?,
+            ),
             None => None,
         };
         self.state.rows.pin(now, ttl).map(|lease| NativeRead {

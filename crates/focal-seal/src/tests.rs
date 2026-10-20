@@ -207,3 +207,24 @@ fn root_keys_made_at_once_share_the_directory_they_make() {
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 16);
     }
 }
+
+/// A cache's writer and its readers each make the cache's key and open what the others sealed;
+/// another cache's key, in this process or after it, opens nothing of it.
+#[test]
+fn a_caches_keys_open_what_it_sealed_and_no_other_caches_do() {
+    let cache = Cache::new().unwrap();
+    let (writer, reader) = (cache.key().unwrap(), cache.key().unwrap());
+    let plain = *b"a payload, spilled to the volume";
+    let mut sealed = plain;
+    let tag = writer.seal(3, 64, false, &mut sealed).unwrap();
+    assert_ne!(sealed, plain, "nothing of it is on the volume in the clear");
+    let mut opened = sealed;
+    reader.open(3, 64, false, &mut opened, &tag).unwrap();
+    assert_eq!(opened, plain);
+    // At another position, or under another cache's key, it does not open.
+    let mut moved = sealed;
+    assert!(reader.open(3, 65, false, &mut moved, &tag).is_err());
+    let other = Cache::new().unwrap().key().unwrap();
+    let mut foreign = sealed;
+    assert!(other.open(3, 64, false, &mut foreign, &tag).is_err());
+}

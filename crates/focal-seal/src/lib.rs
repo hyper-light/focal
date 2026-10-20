@@ -84,6 +84,8 @@ pub enum SealSetupError {
     Seal(#[from] SealError),
     #[error("the operating system's random source failed")]
     Random,
+    #[error("the process's cache key is unavailable: a holder of it failed while holding it")]
+    CacheKey,
 }
 
 /// The keys a node's stores seal under, unwrapped for the node's life.
@@ -503,6 +505,51 @@ pub fn store_key(
         .unwrap(&entry.record)
         .map_err(|_| SealSetupError::Damaged("a store key that does not unwrap"))?;
     Ok(WrappingKey::new(entry.id, entry.generation, secret))
+}
+
+/// The parent of every cache this process keeps on a volume: random when a cache first asks for a
+/// key, held in the locked region for the process's life, never written anywhere. Made at that
+/// first ask rather than kept as a failure, so a moment's want of a key slot refuses that cache
+/// alone.
+static CACHE_PARENT: std::sync::Mutex<Option<WrappingKey>> = std::sync::Mutex::new(None);
+
+/// What a cache's key is derived for (HKDF's salt and info, `derive_child`).
+const CACHE_PURPOSE: &[u8] = b"focal cache key";
+
+/// A cache this process keeps on a volume, such as a session replica's payload log, which is
+/// emptied at every open and refilled from what the replica's records and checkpoints hold. Its
+/// files are sealed under a key derived from the process's cache parent and the cache's own random
+/// ID, so they open only in the process that wrote them, while it runs: after a crash, or in a copy
+/// of the volume, they are ciphertext under a key nothing holds (an erase as NIST SP 800-88r1
+/// describes it, with nothing left to destroy). The ID is not secret; it is every seal's additional
+/// data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cache {
+    id: [u8; 16],
+}
+
+impl Cache {
+    /// A new cache, its ID random.
+    pub fn new() -> Result<Self, SealSetupError> {
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id).map_err(|_| SealSetupError::Random)?;
+        Ok(Self { id })
+    }
+
+    /// The cache's key: the same for this cache for the process's life, so its writer and each of
+    /// its readers make their own. What it seals is a version and an index of
+    /// `hyper_seal::stream::VersionKey`, which the cache never seals twice with other bytes.
+    pub fn key(&self) -> Result<hyper_seal::stream::VersionKey, SealSetupError> {
+        hyper_seal::lock_keys(key_slots())?;
+        let mut held = CACHE_PARENT.lock().map_err(|_| SealSetupError::CacheKey)?;
+        let parent = match &mut *held {
+            Some(parent) => parent,
+            empty @ None => empty.insert(WrappingKey::generate(0)?),
+        };
+        let (secret, _) = parent.derive_child(CACHE_PURPOSE, &self.id)?;
+        drop(held);
+        Ok(hyper_seal::stream::VersionKey::new(&secret, self.id)?)
+    }
 }
 
 #[cfg(test)]

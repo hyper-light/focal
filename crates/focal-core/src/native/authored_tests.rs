@@ -1280,11 +1280,12 @@ impl crate::native::payloads::PayloadLog for Switched {
     }
     fn reader(
         &self,
+        lane: focal_memory::BudgetLane,
     ) -> Result<
         Box<dyn crate::native::payloads::PayloadRead + Send>,
         crate::native::payloads::PayloadError,
     > {
-        self.log.reader()
+        self.log.reader(lane)
     }
 }
 

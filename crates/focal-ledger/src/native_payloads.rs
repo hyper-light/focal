@@ -23,11 +23,26 @@
 //! rather than wait. A reader for another thread reads the files, behind a barrier the writer
 //! answers once every byte appended before it is written: the reader waits on its own thread, never
 //! the appender.
+//!
+//! Nothing reaches the volume in the clear (doc 29 §12). Each payload is a record of its length,
+//! its bytes and a tag; the writer seals each record's length and bytes in its I/O buffer before it
+//! writes them (AES-256-GCM, `hyper_seal::stream::VersionKey`: the segment its version, the
+//! record's offset its index, the log's ID its additional data), and a read from a file opens the
+//! record before the reference's check. The key is the log's alone, derived from the process's
+//! cache key and never written (`focal_seal::Cache`): the log is emptied at every open, so what an
+//! earlier run left is ciphertext under a key nothing holds. A position is sealed once, or again
+//! with the same bytes when a failed write is handed again, which seals them to the same bytes;
+//! segments are never reused, so no position seals other bytes under the key. The window holds
+//! records as appended, so a read it serves is a copy, and the owner never seals.
 
-use focal_core::native::payloads::{PayloadError, PayloadLog, PayloadRead, PayloadRef};
+use focal_core::native::payloads::{
+    PayloadError, PayloadLog, PayloadRead, PayloadRef, SPILLED_BYTES,
+};
 use focal_memory::{
     Allocation, BudgetKind, BudgetLane, DiskBudget, DiskKind, DiskReservation, MemoryBudget,
 };
+use hyper_seal::TAG;
+use hyper_seal::stream::VersionKey;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -57,6 +72,19 @@ const BARRIERS: usize = 4;
 const BARRIER_WAIT: Duration = Duration::from_secs(30);
 /// How long a log let go waits for its writer to finish what it holds before letting it go.
 const CLOSE_WAIT: Duration = Duration::from_secs(30);
+/// Bytes of a record's length, before its payload: what the writer finds each record by.
+const LENGTH: usize = 4;
+/// Bytes a record holds beside its payload: its length before it and its tag after it.
+const RECORD_OVERHEAD: usize = LENGTH + TAG;
+/// The widest payload the log takes: the widest a row spills, what a reader's stack buffer holds.
+const MAX_PAYLOAD: usize = SPILLED_BYTES;
+/// The widest record: the widest payload with its length and tag.
+const MAX_RECORD: usize = MAX_PAYLOAD + RECORD_OVERHEAD;
+/// The heap bytes of one of the log's keys: aws-lc's `EVP_AEAD_CTX` (a pointer, a 564-byte state
+/// union aligned to 8 and two bytes: 584, include/openssl/aead.h), allocated by `OPENSSL_malloc`
+/// with its 8-byte length before it (crypto/mem.c, `OPENSSL_MALLOC_PREFIX`), as aws-lc-rs's
+/// `build_context` makes it.
+const KEY_BYTES: usize = 592;
 
 /// Where a session keeps its payload log, and the volume it is charged to.
 #[derive(Clone)]
@@ -172,10 +200,95 @@ fn pass(gate: &WriteGate) {
 #[cfg(not(test))]
 fn pass(_: &WriteGate) {}
 
-/// The writer's loop: each write done in order, its buffer given back; each barrier answered once
-/// every write before it is done. It ends when the log lets go of its queue, or of what the writer
-/// gives back.
-fn write_behind(jobs: &Receiver<Job>, returned: &SyncSender<Written>, gate: &WriteGate) {
+/// Seals in place each record of `bytes`, which begin with a record's start at `offset` in
+/// `segment`, as every hand begins: each record's length and payload under the log's key at the
+/// record's position, its tag after them. False when they are not whole records or a seal fails.
+fn seal_records(key: &VersionKey, segment: u32, offset: u64, bytes: &mut [u8]) -> bool {
+    let mut at = 0usize;
+    // Each pass seals one whole record or ends the loop: at most one pass a record.
+    while at < bytes.len() {
+        let Some(len) = bytes
+            .get(at..at.saturating_add(LENGTH))
+            .and_then(|length| <[u8; LENGTH]>::try_from(length).ok())
+            .and_then(|length| usize::try_from(u32::from_le_bytes(length)).ok())
+        else {
+            return false;
+        };
+        let Some(sealed) = at.checked_add(LENGTH).and_then(|end| end.checked_add(len)) else {
+            return false;
+        };
+        let Some(end) = sealed.checked_add(TAG) else {
+            return false;
+        };
+        let Some(index) = u64::try_from(at)
+            .ok()
+            .and_then(|at| offset.checked_add(at))
+            .and_then(|index| u32::try_from(index).ok())
+        else {
+            return false;
+        };
+        let Some((record, tag)) = bytes
+            .get_mut(at..end)
+            .and_then(|record| record.split_at_mut_checked(LENGTH.saturating_add(len)))
+        else {
+            return false;
+        };
+        match key.seal(u64::from(segment), index, false, record) {
+            Ok(sealed_tag) if tag.len() == TAG => tag.copy_from_slice(&sealed_tag),
+            _ => return false,
+        }
+        at = end;
+    }
+    true
+}
+
+/// The payload `at` names, from its sealed record in `file`, opened under `key` into `into`
+/// (exactly its length): refused unless it opens at its own place in the log, under the log's key,
+/// with the length the reference states.
+fn read_sealed(
+    file: &File,
+    key: &VersionKey,
+    at: PayloadRef,
+    into: &mut [u8],
+) -> Result<(), PayloadError> {
+    let len = into.len();
+    let start = u64::try_from(LENGTH)
+        .ok()
+        .and_then(|length| u64::from(at.offset()).checked_sub(length))
+        .ok_or(PayloadError::Corrupt)?;
+    let index = u32::try_from(start).map_err(|_| PayloadError::Corrupt)?;
+    let sealed_len = LENGTH.checked_add(len).ok_or(PayloadError::Corrupt)?;
+    let mut scratch = [0u8; MAX_RECORD];
+    let record = scratch
+        .get_mut(..sealed_len.checked_add(TAG).ok_or(PayloadError::Corrupt)?)
+        .ok_or(PayloadError::Corrupt)?;
+    read_at(file, record, start).map_err(|_| PayloadError::Unavailable)?;
+    let (sealed, tag) = record
+        .split_at_mut_checked(sealed_len)
+        .ok_or(PayloadError::Corrupt)?;
+    let tag = <&[u8; TAG]>::try_from(&*tag).map_err(|_| PayloadError::Corrupt)?;
+    key.open(u64::from(at.segment()), index, false, sealed, tag)
+        .map_err(|_| PayloadError::Corrupt)?;
+    let (length, payload) = sealed
+        .split_at_checked(LENGTH)
+        .ok_or(PayloadError::Corrupt)?;
+    let stated = <[u8; LENGTH]>::try_from(length).map_err(|_| PayloadError::Corrupt)?;
+    if usize::try_from(u32::from_le_bytes(stated)).ok() != Some(len) || payload.len() != len {
+        return Err(PayloadError::Corrupt);
+    }
+    into.copy_from_slice(payload);
+    Ok(())
+}
+
+/// The writer's loop: each write sealed and done in order, its buffer given back; each barrier
+/// answered once every write before it is done. It ends when the log lets go of its queue, or of
+/// what the writer gives back.
+fn write_behind(
+    jobs: &Receiver<Job>,
+    returned: &SyncSender<Written>,
+    gate: &WriteGate,
+    key: &VersionKey,
+) {
     let mut failures = 0u64;
     while let Ok(job) = jobs.recv() {
         match job {
@@ -183,11 +296,14 @@ fn write_behind(jobs: &Receiver<Job>, returned: &SyncSender<Written>, gate: &Wri
                 segment,
                 offset,
                 file,
-                buffer,
+                mut buffer,
                 extra,
             } => {
                 pass(gate);
-                let ok = write_at(&file, &buffer.bytes, offset).is_ok();
+                // Bytes that do not seal are not written: their write fails, and they are handed
+                // again, never written in the clear.
+                let ok = seal_records(key, segment, offset, &mut buffer.bytes)
+                    && write_at(&file, &buffer.bytes, offset).is_ok();
                 if !ok {
                     failures = failures.saturating_add(1);
                 }
@@ -235,6 +351,8 @@ struct Writer {
     /// The window's first chunk that may hold bytes the writer was not handed, never past the
     /// chunk appends go to: where a hand begins, so an append does not walk the window.
     unsent_from: usize,
+    /// The log's key, for what it reads from its files (the writer's thread holds its own).
+    key: VersionKey,
 }
 
 impl Writer {
@@ -441,6 +559,10 @@ impl Writer {
 pub struct FilePayloads {
     root: PathBuf,
     disk: DiskBudget,
+    /// The session's budget, which each reader's key is charged to in the lane it is made for.
+    memory: MemoryBudget,
+    /// What the log's keys come from: its writer's, its own and each reader's (see the module).
+    cache: focal_seal::Cache,
     /// A segment's bytes at most ([`SEGMENT_BYTES`] but in tests), and a chunk's.
     segment_bytes: u64,
     chunk_bytes: usize,
@@ -651,21 +773,25 @@ impl FilePayloads {
             .checked_mul(2)
             .and_then(|jobs| jobs.checked_add(BARRIERS))
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        // The writer's thread holds the queues' slots and its key.
         let slots = depth
             .checked_mul(size_of::<Job>().saturating_add(size_of::<Written>()))
+            .and_then(|slots| slots.checked_add(KEY_BYTES))
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        // The log holds its window's first chunks, the I/O buffers and its own key.
         let held = FIRST
             .checked_add(IO_BUFFERS)
             .and_then(|buffers| buffers.checked_mul(chunk_bytes))
             .and_then(|buffers| buffers.checked_add(slots))
+            .and_then(|held| held.checked_add(KEY_BYTES))
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
         let out_of_memory = |_| std::io::Error::from(std::io::ErrorKind::OutOfMemory);
         let mut charge = memory
             .reserve(BudgetKind::Payload, BudgetLane::Ordinary, held)
             .map_err(out_of_memory)?
             .commit();
-        // The queues' slots are charged to the writer's thread, each I/O buffer carries its own:
-        // what the log charges is the window's chunks.
+        // The queues' slots and its key are charged to the writer's thread, each I/O buffer carries
+        // its own: what the log charges is the window's chunks and its own key.
         let slots = charge.split_off(slots).map_err(out_of_memory)?;
         let mut spare = Vec::new();
         spare
@@ -708,22 +834,30 @@ impl FilePayloads {
             }
             Err(error) => return Err(error),
         }
+        // The log's keys, its writer's and its own, each from the log's cache (see the module).
+        let unkeyed = |_| std::io::Error::other("the payload log's key");
+        let cache = focal_seal::Cache::new().map_err(unkeyed)?;
+        let writer_key = cache.key().map_err(unkeyed)?;
+        let key = cache.key().map_err(unkeyed)?;
         let (jobs, queue) = sync_channel(depth);
         let (back, returned) = sync_channel(depth);
         let thread = std::thread::Builder::new()
             .name("focal-payloads".into())
             .spawn(move || {
-                // The queues' slots are this thread's charge: let go once it has let go of its
-                // ends, after the log let go of its own.
+                // The queues' slots and the key are this thread's charge: let go once it has let
+                // go of its ends, after the log let go of its own.
                 let slots = slots;
-                write_behind(&queue, &back, &gate);
+                write_behind(&queue, &back, &gate, &writer_key);
                 drop(queue);
                 drop(back);
+                drop(writer_key);
                 drop(slots);
             })?;
         let log = Self {
             root: source.root.clone(),
             disk: source.disk.clone(),
+            memory: memory.clone(),
+            cache,
             segment_bytes,
             chunk_bytes,
             writer: Mutex::new(Writer {
@@ -740,6 +874,7 @@ impl FilePayloads {
                 charge,
                 failures_seen: 0,
                 unsent_from: 0,
+                key,
             }),
             thread: Some(thread),
             close_wait: CLOSE_WAIT,
@@ -855,13 +990,13 @@ impl PayloadRead for FilePayloads {
             // The window holds it: a copy.
             Some(bytes) => into.copy_from_slice(bytes),
             // Older than the window, so in the file: a chunk leaves the window only once its
-            // bytes are written.
+            // bytes are written. Its record is opened there.
             None => {
                 let segment = writer
                     .segments
                     .get(&at.segment())
                     .ok_or(PayloadError::Unavailable)?;
-                read_at(&segment.file, into, offset).map_err(|_| PayloadError::Unavailable)?;
+                read_sealed(&segment.file, &writer.key, at, into)?;
             }
         }
         if at.holds(into) {
@@ -874,8 +1009,14 @@ impl PayloadRead for FilePayloads {
 
 impl PayloadLog for FilePayloads {
     fn append(&self, bytes: &[u8]) -> Option<PayloadRef> {
-        let len = u64::try_from(bytes.len()).ok()?;
-        if len > self.segment_bytes || bytes.len() > self.chunk_bytes {
+        // A record: the payload's length, its bytes, and room for the tag the writer seals it
+        // with (see the module).
+        if bytes.len() > MAX_PAYLOAD {
+            return None;
+        }
+        let record = bytes.len().checked_add(RECORD_OVERHEAD)?;
+        let len = u64::try_from(record).ok()?;
+        if len > self.segment_bytes || record > self.chunk_bytes {
             return None;
         }
         let mut writer = self.writer.lock().ok()?;
@@ -907,7 +1048,7 @@ impl PayloadLog for FilePayloads {
                 && chunk
                     .bytes
                     .len()
-                    .checked_add(bytes.len())
+                    .checked_add(record)
                     .is_some_and(|after| after <= self.chunk_bytes)
         });
         if !fits {
@@ -915,10 +1056,14 @@ impl PayloadLog for FilePayloads {
             writer.hand(true, false);
             writer.open_chunk(current, tail)?;
         }
-        let at = PayloadRef::at(current, u32::try_from(tail).ok()?, bytes).ok()?;
+        let payload_at = tail.checked_add(u64::try_from(LENGTH).ok()?)?;
+        let at = PayloadRef::at(current, u32::try_from(payload_at).ok()?, bytes).ok()?;
+        let length = u32::try_from(bytes.len()).ok()?.to_le_bytes();
         let chunk = writer.window.back_mut()?;
         // Within the chunk's capacity: no reallocation.
+        chunk.bytes.extend_from_slice(&length);
         chunk.bytes.extend_from_slice(bytes);
+        chunk.bytes.extend_from_slice(&[0u8; TAG]);
         writer.tail = tail.checked_add(len)?;
         Some(at)
     }
@@ -932,7 +1077,15 @@ impl PayloadLog for FilePayloads {
     fn held_bytes(&self) -> u64 {
         self.bytes()
     }
-    fn reader(&self) -> Result<Box<dyn PayloadRead + Send>, PayloadError> {
+    fn reader(&self, lane: BudgetLane) -> Result<Box<dyn PayloadRead + Send>, PayloadError> {
+        // The reader's own key, charged in the lane its maker reads for while it holds it, and
+        // made before the log's lock is taken.
+        let charge = self
+            .memory
+            .reserve(BudgetKind::Payload, lane, KEY_BYTES)
+            .map_err(|_| PayloadError::Capacity)?
+            .commit();
+        let key = self.cache.key().map_err(|_| PayloadError::Unavailable)?;
         let mut writer = self.writer.lock().map_err(|_| PayloadError::Unavailable)?;
         writer.settle();
         // A reader on another thread reads the files alone: every byte appended is handed to
@@ -961,16 +1114,27 @@ impl PayloadLog for FilePayloads {
         Ok(Box::new(FileReader {
             segments,
             gate: Mutex::new(Gate::Waiting(barrier, failures)),
+            key,
+            _charge: charge,
         }))
     }
 }
 
 /// What a payload log held when the reader was made, through handles of its own, read once the
-/// log's writer has written it.
-#[derive(Debug)]
+/// log's writer has written it, each record opened under the reader's own key.
 struct FileReader {
     segments: BTreeMap<u32, File>,
     gate: Mutex<Gate>,
+    key: VersionKey,
+    _charge: Allocation,
+}
+
+impl std::fmt::Debug for FileReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileReader")
+            .field("segments", &self.segments.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Whether a reader's bytes are in the files: waiting on the writer's barrier (and the failures
@@ -1010,7 +1174,7 @@ impl PayloadRead for FileReader {
             .segments
             .get(&at.segment())
             .ok_or(PayloadError::Unavailable)?;
-        read_at(file, into, u64::from(at.offset())).map_err(|_| PayloadError::Unavailable)?;
+        read_sealed(file, &self.key, at, into)?;
         if at.holds(into) {
             Ok(())
         } else {

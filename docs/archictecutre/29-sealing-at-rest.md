@@ -93,6 +93,7 @@ originator-usage period is at most two years (SP 800-57 Pt 1, Table 1).
 | Group files | `raft/groups/*/{image,meta}` | `hyper_seal::sealed_file` over the framed file (magic, version, payload, CRC kept inside), a data key per file wrapped by the node's group-file key, which is unwrapped from the root key file for that write or read and wiped after it (`focal_seal::store_key`): no store key is held between files, so a node's 1,058 groups never reach the locked region's bound | focal-consensus (`group_files`) |
 | Content | `content/` | STREAM per object, names keyed per node (`hyper_seal::name`) so a stored name does not reveal the content's hash | focal-evidence |
 | Journals and small files | `*.admin`, `CLIENT.contexts`, `MCP.operations`, `catalogue.bin`, `trust-adopted.bin`, `IDENTITY`'s secret half | STREAM per file, written by the existing atomic replace | focal-platform `install` |
+| Payload log | `payloads/*.seg` (a cache, emptied at every open) | each record AES-256-GCM at its segment and offset, under a key of the log's own derived from the process's cache key, never written (§12.1) | focal-ledger `native_payloads` |
 | Legacy WAL | `wal/` (below the storage level) | not sealed. The conversion to hyper-log seals as it copies, and the WAL is removed after the conversion is verified | focal-consensus `convert` |
 
 A store is sealed from its creation. A store that exists unsealed is sealed by rewriting it once
@@ -228,3 +229,60 @@ Tests owed with it:
 - no stored file or name contains a chunk's bytes or hash;
 - erasing a domain's key record leaves its chunks unreadable while other domains read;
 - a crash cut at every step of the rewrite.
+
+## 12. Every other file focal writes (inventory, 2026-10-20)
+
+Steps 1, 2 and 5 sealed the node log and the group files. Every other file focal writes was
+listed from its writers (each `File::create`, `OpenOptions`, `create_private_new`, `fs::write`,
+`atomic_replace` and `install` outside tests):
+
+| Store | Files | Holds | Writer | State |
+|---|---|---|---|---|
+| Payload log | `payloads/*.seg` | spilled rows' bytes: message payloads | focal-ledger `native_payloads` | sealed (§12.1) |
+| Checkpoint seeds | `seeds/<ledger>/` | a checkpoint's native rows, 1 MiB chunks | focal-evidence `seeds` | clear |
+| Cold stream | `cold/<ledger>/` | retired families' archive frames | focal-evidence `cold` | clear |
+| Content | `content/objects/…` | artifacts, manifests, uploads, custody | focal-evidence `store`, `transfer`, `gc`, `upload_terminal` | clear |
+| Session backups | a backup's directory | checkpoint, seeds, content, cold | focal-ledger `session_backup` | clear |
+| Enrollment | private directories | the cluster CA's key, nodes' and clients' keys, invitations, the signer's journal | focal-enrollment `files::PrivateDirectory` | clear |
+| Bus identities | the bus's identity directory | its local CA's and members' keys | focal-bus `pki` | clear |
+| Bus part | a part's image, the node's run | streams' floors, producers' sessions | focal-bus `group`, `member` | clear |
+| Client stores | a client's data directory | requests, receipts, pending writes, artifact uploads | focal-client `operation_store`, `native_store`, `pending`, `artifact_transfer` | clear |
+| Node files | `CLUSTER.admin`, `CLIENT.contexts`, `MCP.operations`, `trust-adopted.bin`, `IDENTITY`, `POLICY`, `STORAGE.level`, `cluster/partitions` | the node's journals, catalogue, trust and identity | focal-node | clear |
+
+They are sealed in this order, the message data first (the payload log, then seeds, cold and
+content as step 4 designs it), then the keys (enrollment, the bus's identities), then the journals
+and small files of nodes and clients (step 3). A client's data directory has no node to take keys
+from: it gets a `SEAL.node` of its own under a root key in the user's configuration directory
+(`default_key_file("client")`), one file for every data directory of that user, each directory's
+keys its own below it.
+
+### 12.1 The payload log, sealed (2026-10-20)
+
+The payload log is a cache: emptied at every open, refilled from the records and checkpoints. So
+its key is the process's alone and never written. `focal_seal::Cache` derives each log's key
+(HKDF-SHA-384) from one parent made at random when a cache first asks for a key, held in the
+locked region for the process's life, and a random ID of the log's own. The writer's thread, the log
+and each reader make their own AES-256-GCM context from it (`hyper_seal::stream::VersionKey`). What
+a crash leaves on the volume is ciphertext under a key nothing holds: an erase with nothing left to
+destroy (NIST SP 800-88r1, cryptographic erase).
+
+- **A record** is the payload's length (4 bytes), its bytes, and a 16-byte tag. The owner appends
+  records in the clear to its window, which serves recent reads as copies; the writer's thread
+  seals each record's length and bytes in its I/O buffer, at the nonce of its segment (version)
+  and offset (index), and only then writes it. A record that does not seal is not written, and is
+  handed again, never written in the clear.
+- **No position seals two plaintexts.** Segments are never reused within a log, and a record's
+  bytes never change once appended. A write handed again after a failure seals the same bytes at
+  the same nonce, which gives the same ciphertext (GCM is deterministic for one key, nonce and
+  plaintext), so nothing is learned from the repeat.
+- **A read from a file** opens the record at its own place under the log's key, and checks the
+  length the reference states, then the reference's CRC as before. A flipped byte, a record moved
+  within its file, or another log's file in place of its own is refused as corrupt (tested).
+- **The bound.** A log takes payloads no wider than a row spills (`SPILLED_BYTES`, 1,024), so a
+  read opens a record in a buffer on its stack.
+- **Charged.** Each key's AES-GCM context is aws-lc's `EVP_AEAD_CTX` (584 bytes) with
+  `OPENSSL_malloc`'s 8-byte prefix: the log charges its own and its writer's at open, and each
+  reader its own while it holds it, in the lane its maker reads for: a checkpoint's frozen image
+  in the committed lane, which a session whose share is full still has (a full session must still
+  checkpoint, which is what frees it: the two tests that say so refused a reader charged
+  ordinarily), a read lease's in the ordinary lane, where a full share refuses it.

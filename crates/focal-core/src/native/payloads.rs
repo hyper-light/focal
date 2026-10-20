@@ -9,8 +9,8 @@
 //! refuses a payload (its bound, an I/O error) leaves the row holding its bytes.
 
 /// Most a spilled row's bytes may be, whatever its kind: what a reader's stack buffer holds. A row
-/// whose bytes are wider stays held.
-pub(crate) const SPILLED_BYTES: usize = 1024;
+/// whose bytes are wider stays held, and a log refuses a payload wider than this.
+pub const SPILLED_BYTES: usize = 1024;
 
 /// What spilling a row came to: its spilled form; held for what it is (it may not spill, or its
 /// encoding is wider than a spilled row's), which only a change to it alters; or refused by the
@@ -107,8 +107,14 @@ pub trait PayloadLog: PayloadRead + Send + Sync {
     /// `bytes` appended: where they are, or `None` when the log refuses them (its bound, an I/O
     /// error), and the row keeps its bytes.
     fn append(&self, bytes: &[u8]) -> Option<PayloadRef>;
-    /// A reader of what the log holds now, for another thread (a frozen image's encoder).
-    fn reader(&self) -> Result<Box<dyn PayloadRead + Send>, PayloadError>;
+    /// A reader of what the log holds now, for another thread (a frozen image's encoder), what it
+    /// holds charged in `lane`: a checkpoint's in the committed lane, which a session whose share
+    /// is full still has (so it still checkpoints, which is what frees it), a read lease's in the
+    /// ordinary lane, where a full share refuses it.
+    fn reader(
+        &self,
+        lane: focal_memory::BudgetLane,
+    ) -> Result<Box<dyn PayloadRead + Send>, PayloadError>;
     /// Let go of every sealed part of the log no row references, `live` naming the segments
     /// that some row does (every committed and pending row's, [`segments_of`]). How many parts
     /// it let go.
@@ -271,7 +277,10 @@ impl PayloadLog for MemoryPayloads {
         held.extend_from_slice(bytes);
         Some(at)
     }
-    fn reader(&self) -> Result<Box<dyn PayloadRead + Send>, PayloadError> {
+    fn reader(
+        &self,
+        _lane: focal_memory::BudgetLane,
+    ) -> Result<Box<dyn PayloadRead + Send>, PayloadError> {
         let bytes = self.bytes.lock().map_err(|_| PayloadError::Unavailable)?;
         Ok(Box::new(Self {
             bytes: std::sync::Mutex::new(bytes.clone()),
