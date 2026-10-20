@@ -281,10 +281,12 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
             },
             // How long a publish took while this node led: from its proposal to its
             // acknowledgement, a parked one's wait before its proposal, and the runs of entries it
-            // appended until durable on its own log and until committed.
+            // appended until a write was issued for them, until durable on its own log and until
+            // committed.
             "publish": {
                 "acked": times(&member.publish.acked),
                 "parked": times(&member.publish.parked),
+                "issued": times(&member.publish.issued),
                 "persisted": times(&member.publish.persisted),
                 "committed": times(&member.publish.committed),
             },

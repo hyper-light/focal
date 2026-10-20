@@ -160,6 +160,9 @@ pub struct PublishTimes {
     pub acked: Times,
     /// A parked publish's wait before its proposal.
     pub parked: Times,
+    /// From a run of entries' append to the write issued for it: its wait for room in the
+    /// replica's pipeline of writes out.
+    pub issued: Times,
     /// From a run of entries' append to its durability on the leader's log.
     pub persisted: Times,
     /// From a run's append to its commit.
@@ -467,15 +470,18 @@ struct Parked {
 
 /// How long a leader's publishes took, split where the group's work splits: each publish from
 /// its proposal to its acknowledgement and a parked one's wait before its proposal, and each run of
-/// entries the leader appended until it was durable on the leader's own log and until a quorum
-/// committed it (the leader's write; its followers' writes and their answers). A run is the entries
-/// one turn appended, timed from the end of that turn to the end of the turn that saw them durable
-/// or committed. Each run queue holds at most `bound` runs, the publishes the node may owe at once
+/// entries the leader appended until a write was issued for it (the replica's pipeline of writes
+/// out, `hyper_log::GroupLog::depth`, had room), until it was durable on the leader's own log and
+/// until a quorum committed it (the leader's write; its followers' writes and their answers). A run
+/// is the entries one turn appended, timed from the end of that turn to the end of the turn that saw
+/// them issued, durable or committed. Each run queue holds at most `bound` runs, the publishes the node may owe at once
 /// (every run a leader's proposals made holds one it owes until its commit); a run past it joins
 /// the newest, timed from the newest's start, so a sample overstates a run's time rather than lose
 /// it.
 struct Stages {
-    /// Runs not yet durable on the leader's log: each run's last index, when it was seen appended.
+    /// Runs no write was issued for yet: each run's last index, when it was seen appended.
+    unissued: VecDeque<(u64, Instant)>,
+    /// Runs not yet durable on the leader's log.
     unpersisted: VecDeque<(u64, Instant)>,
     /// Runs not yet committed.
     uncommitted: VecDeque<(u64, Instant)>,
@@ -484,6 +490,7 @@ struct Stages {
     bound: usize,
     acked: hyper_timing::Histogram,
     parked: hyper_timing::Histogram,
+    issued: hyper_timing::Histogram,
     persisted: hyper_timing::Histogram,
     committed: hyper_timing::Histogram,
 }
@@ -491,22 +498,25 @@ struct Stages {
 impl Stages {
     fn new(bound: usize) -> Self {
         Self {
+            unissued: VecDeque::new(),
             unpersisted: VecDeque::new(),
             uncommitted: VecDeque::new(),
             seen: 0,
             bound: bound.max(1),
             acked: hyper_timing::Histogram::new(),
             parked: hyper_timing::Histogram::new(),
+            issued: hyper_timing::Histogram::new(),
             persisted: hyper_timing::Histogram::new(),
             committed: hyper_timing::Histogram::new(),
         }
     }
 
-    /// What the leader's log says now: its last index, what is durable on it and what is
-    /// committed. A node that does not lead times nothing: what it appended as a follower is its
-    /// leader's.
-    fn observe(&mut self, leads: bool, last: u64, persisted: u64, committed: u64, now: Instant) {
+    /// What the leader's log says now: its last index, what a write was issued for, what is
+    /// durable on it and what is committed. A node that does not lead times nothing: what it
+    /// appended as a follower is its leader's.
+    fn observe(&mut self, leads: bool, last: u64, reached: Reached, now: Instant) {
         if !leads {
+            self.unissued.clear();
             self.unpersisted.clear();
             self.uncommitted.clear();
             self.seen = last;
@@ -515,8 +525,17 @@ impl Stages {
         let appended = last > self.seen;
         self.seen = self.seen.max(last);
         for (queue, times, reached) in [
-            (&mut self.unpersisted, &mut self.persisted, persisted),
-            (&mut self.uncommitted, &mut self.committed, committed),
+            (&mut self.unissued, &mut self.issued, reached.issued),
+            (
+                &mut self.unpersisted,
+                &mut self.persisted,
+                reached.persisted,
+            ),
+            (
+                &mut self.uncommitted,
+                &mut self.committed,
+                reached.committed,
+            ),
         ] {
             while let Some(&(index, at)) = queue.front() {
                 if index > reached {
@@ -537,6 +556,15 @@ impl Stages {
             }
         }
     }
+}
+
+/// How far the leader's log has come, by index: what a write was issued for, what is durable and
+/// what is committed.
+#[derive(Clone, Copy, Debug)]
+struct Reached {
+    issued: u64,
+    persisted: u64,
+    committed: u64,
 }
 
 /// An answer to a publish: its acknowledgement or its redirect, as sent.
@@ -893,6 +921,7 @@ impl Member {
         stats.publish = PublishTimes {
             acked: Times::of(&self.stages.acked),
             parked: Times::of(&self.stages.parked),
+            issued: Times::of(&self.stages.issued),
             persisted: Times::of(&self.stages.persisted),
             committed: Times::of(&self.stages.committed),
         };
@@ -1608,10 +1637,15 @@ impl Member {
         }
         let log = self.replica.core().raft.log();
         if let Ok(last) = log.last_index() {
-            let (persisted, committed) = (log.persisted(), log.committed());
+            // The first index no write was issued for: every one before it was given a write.
+            let issued = log.unstable().issued().saturating_sub(1).min(last);
+            let reached = Reached {
+                issued,
+                persisted: log.persisted(),
+                committed: log.committed(),
+            };
             let leads = self.replica.is_leader();
-            self.stages
-                .observe(leads, last, persisted, committed, Instant::now());
+            self.stages.observe(leads, last, reached, Instant::now());
         }
         self.compact_behind_window(waker, clock);
         self.settle_leadership(endpoint);
@@ -1796,6 +1830,39 @@ impl Member {
 mod tests {
     use super::*;
 
+    fn marks(issued: u64, persisted: u64, committed: u64) -> Reached {
+        Reached {
+            issued,
+            persisted,
+            committed,
+        }
+    }
+
+    /// A run waits for room in the pipeline apart from its write: issued when a write takes it,
+    /// durable when that write is, so the two stages split a run's time to its disk.
+    #[test]
+    fn a_leader_times_a_runs_wait_for_its_write_apart_from_the_write() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let ms = |ns: u64| ns / 1_000_000;
+        let mut stages = Stages::new(4);
+        // Two runs: the first issued at once, the second waiting for room.
+        stages.observe(true, 10, marks(10, 0, 0), at(0));
+        stages.observe(true, 20, marks(10, 0, 0), at(1));
+        assert_eq!(stages.issued.count(), 1);
+        assert_eq!(stages.issued.quantile(0), Some(0));
+        // The first durable at 3 ms; the second issued then, after waiting 2 ms.
+        stages.observe(true, 20, marks(20, 10, 10), at(3));
+        assert_eq!(stages.issued.count(), 2);
+        assert_eq!(ms(stages.issued.quantile(1_000_000).unwrap()), 2);
+        assert_eq!(ms(stages.persisted.quantile(1_000_000).unwrap()), 3);
+        // Durable 4 ms after its write was issued, 6 after its append.
+        stages.observe(true, 20, marks(20, 20, 20), at(7));
+        assert_eq!(stages.persisted.count(), 2);
+        assert_eq!(ms(stages.persisted.quantile(1_000_000).unwrap()), 6);
+        assert!(stages.unissued.is_empty() && stages.unpersisted.is_empty());
+    }
+
     /// Each run of appended entries is timed once at each stage, at the end of the turn that saw it
     /// reach the stage; a run past the bound joins the newest and is timed from its start; a node
     /// that stops leading times nothing it appended, and leading again starts from its last index.
@@ -1805,40 +1872,40 @@ mod tests {
         let at = |ms: u64| start + Duration::from_millis(ms);
         let ms = |ns: u64| ns / 1_000_000;
         let mut stages = Stages::new(2);
-        stages.observe(true, 10, 0, 0, at(0));
+        stages.observe(true, 10, marks(0, 0, 0), at(0));
         // Two runs, 1..=10 and 11..=12; the first durable 3 ms after it was appended.
-        stages.observe(true, 12, 10, 0, at(3));
+        stages.observe(true, 12, marks(10, 10, 0), at(3));
         assert_eq!(stages.persisted.count(), 1);
         assert_eq!(ms(stages.persisted.quantile(1_000_000).unwrap()), 3);
         // Two runs wait for their commit, so a third joins 11..=12 and is timed from its start;
         // the first is committed only after the third is appended, so it took the bound's room.
-        stages.observe(true, 14, 10, 0, at(5));
+        stages.observe(true, 14, marks(10, 10, 0), at(5));
         assert_eq!(stages.uncommitted.len(), 2);
         assert_eq!(stages.uncommitted.back(), Some(&(14, at(3))));
         // The leader's log had room for it: two runs wait there.
         assert_eq!(stages.unpersisted.back(), Some(&(14, at(5))));
         // A run is timed only once its last index has reached the stage.
-        stages.observe(true, 14, 13, 13, at(8));
+        stages.observe(true, 14, marks(13, 13, 13), at(8));
         assert_eq!(stages.persisted.count(), 2);
         assert_eq!(stages.committed.count(), 1);
         assert_eq!(ms(stages.committed.quantile(1_000_000).unwrap()), 8);
-        stages.observe(true, 14, 14, 14, at(9));
+        stages.observe(true, 14, marks(14, 14, 14), at(9));
         assert_eq!(stages.persisted.count(), 3);
         assert_eq!(stages.committed.count(), 2);
         assert_eq!(ms(stages.committed.quantile(0).unwrap()), 6);
         assert!(stages.unpersisted.is_empty() && stages.uncommitted.is_empty());
         // A run durable and committed by the end of the turn that appended it took no time.
-        stages.observe(true, 15, 15, 15, at(9));
+        stages.observe(true, 15, marks(15, 15, 15), at(9));
         assert_eq!(stages.committed.count(), 3);
         assert_eq!(stages.committed.quantile(0), Some(0));
         // A follower's appends are its leader's to time.
-        stages.observe(true, 16, 15, 15, at(10));
-        stages.observe(false, 30, 30, 30, at(20));
+        stages.observe(true, 16, marks(15, 15, 15), at(10));
+        stages.observe(false, 30, marks(30, 30, 30), at(20));
         assert!(stages.unpersisted.is_empty() && stages.uncommitted.is_empty());
         assert_eq!(stages.committed.count(), 3);
         // Leading again, only what it appends as leader is timed.
-        stages.observe(true, 31, 30, 30, at(21));
-        stages.observe(true, 31, 31, 31, at(22));
+        stages.observe(true, 31, marks(30, 30, 30), at(21));
+        stages.observe(true, 31, marks(31, 31, 31), at(22));
         assert_eq!(stages.committed.count(), 4);
         assert_eq!(stages.uncommitted.len(), 0);
         assert_eq!(ms(stages.committed.quantile(500_000).unwrap()), 1);
