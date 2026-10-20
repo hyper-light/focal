@@ -186,6 +186,10 @@ fn main() {
     // touched it. A kernel without the switch (before Linux 3.15) leaves the machine's own policy
     // in place, which a bus node states as it starts.
     let _ = focal_platform::disable_transparent_huge_pages();
+    // Each connection a node holds is a socket of its own, and the soft limit on open files some
+    // systems start a process with (256 on macOS, 1,024 on many Linux distributions) bounded its
+    // connections before its memory did: raised to the most the kernel lets it hold.
+    let _ = focal_platform::raise_open_files();
     let words: Vec<std::ffi::OsString> = std::env::args_os().collect();
     // Help is focal's own page, read before any parsing.
     let page = match cli::grammar::asked(&words) {

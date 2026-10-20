@@ -15815,3 +15815,20 @@ fedora's group test the leader's 200 publishes took 1.57 ms at the median and 6.
 proposal to acknowledgement, its 51 runs 0.49 and 1.31 ms to its own disk and 1.57 and 6.29 ms to
 their commit; a follower times nothing. Test:
 `member::tests::a_leader_times_each_run_of_its_entries_to_durable_and_to_committed`.
+
+### 2026-10-20 — A leader's runs are timed to the write issued for them, and a process holds as many files as its kernel lets it
+
+Two measures toward 1,000 agents and the 10,000/s tail. The bus leader's stage timing gains
+`publish.issued`, a run's wait from its append to the write issued for it (hyper-raft's
+`Unstable::issued`): on CI's slow-disk runner the 10,000/s leader waited 23 ms at p99 for a write
+to be issued, beside a log commit wait of 9.4 ms (compare run 39445571062), which located the tail
+in the pipeline behind a slot's zeros (the A/B that followed, 39436443557, and hyper-raft's fill
+ahead). And `focal_platform::raise_open_files`, called first in `main`, raises the soft limit on
+open files to the hard limit, on macOS no further than `kern.maxfilesperproc`: systems start a
+process at 256 (macOS) or 1,024 (many Linux distributions) for programs that use `select(2)`, focal
+never does, and each connection a node holds has a socket of its own, so that limit bounded a node's
+connections before its memory did. Go raises it the same way for every program (`src/syscall/
+rlimit.go`, go.dev/issue/46279; `rlimit_darwin.go`, verified upstream). A soft limit already higher
+is left as it is. Tests: `member::tests::a_leader_times_a_runs_wait_for_its_write_apart_from_the_write`,
+`files::tests::the_open_files_limit_rises_to_the_most_the_kernel_lets_a_process_hold` (run at the
+shell's limit and at 256: a thousand files held open past it).

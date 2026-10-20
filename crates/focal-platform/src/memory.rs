@@ -70,10 +70,16 @@ fn physical() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn physical() -> Option<u64> {
-    // `hw.memsize`: the machine's bytes of memory (sysctl(3)). Read through
-    // the system's own tool: one short-lived process at start, no `unsafe`.
+    // `hw.memsize`: the machine's bytes of memory (sysctl(3)).
+    sysctl_u64("hw.memsize")
+}
+
+/// A number the kernel states under `name` (sysctl(3)), read through the system's own tool: one
+/// short-lived process, no `unsafe`.
+#[cfg(target_os = "macos")]
+pub(crate) fn sysctl_u64(name: &str) -> Option<u64> {
     let output = std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", "hw.memsize"])
+        .args(["-n", name])
         .output()
         .ok()?;
     if !output.status.success() {

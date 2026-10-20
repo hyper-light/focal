@@ -239,8 +239,10 @@ pub fn sync_dir(path: &std::path::Path) -> io::Result<()> {
     }
 }
 
+mod files;
 pub mod fs;
 mod memory;
+pub use files::{open_files_limit, raise_open_files};
 pub use memory::{
     disable_transparent_huge_pages, memory_envelope, memory_limit, transparent_huge_pages_disabled,
 };
