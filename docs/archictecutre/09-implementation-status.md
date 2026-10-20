@@ -15752,3 +15752,24 @@ bucket still waits, so Q25's slow paths keep their MTU. hyper-quic's test sends 
 datagrams where the search starved sent 14,377. For focal it is every QUIC connection that keeps
 sending: the replication lanes, transfers and clients. Only hyper-quic differs from e05956a.
 vendor/README.md; docs/dependencies/inventory.tsv.
+
+### 2026-10-20 — An operator's command asked again resumes the request it left unsettled
+
+macOS CI failed `deployment_fleet::the_vm_stage_adds_addresses_invitations_and_a_durability_intent`
+at `revoke invitation`: "an earlier admin request remains pending; inspect and retry it before
+creating another". An admin mutation (a membership change, a revocation, a node's eligibility, a
+contact's retirement) saves its exact request in the operator's journal before it is sent, and a
+later call is refused `Pending` while that request has no receipt. The first revocation met the root
+group between leaders and ended `not_leader` or `unavailable`, exit 6, which the manual defines as
+"busy … temporarily unavailable authority" and the journey's harness, like any script, answers by
+running the command again; the command run again was refused `Pending`, exit 7, for the request
+its own first run had saved. The same call now resumes the request saved for it (`resumes`): the same
+membership change at the configuration index it expected when the call names one, the same
+invitation revoked at the same revision, the same node's eligibility, the same contact retired. It is
+driven under its own identity and sequence, which the group commits at most once, as `retry` drives
+it; a different call is still refused until it is settled. Tests:
+`cluster_admin::tests::an_unsettled_request_is_resumed_by_the_same_call_and_no_other` (the rule for
+each kind) and `the_same_membership_change_asked_again_resumes_its_unsettled_request` (a journal's
+unsettled `AddLearner` against a founding network: a different change refused `Pending`, the same
+change committed under the saved operation and sequence 1, the next change admitted at sequence 2;
+with the rule off it fails `Pending`, as the CI run did).

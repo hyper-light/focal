@@ -142,6 +142,108 @@ pub enum ClusterAdminError {
 }
 type Result<T> = std::result::Result<T, ClusterAdminError>;
 
+/// What an admin call asks for, to know it again in the request an earlier call saved
+/// ([`resumes`]).
+enum Intent {
+    Membership {
+        change: MembershipChange,
+        expected_index: Option<u64>,
+    },
+    Revoke {
+        id: focal_enrollment::InvitationId,
+        expected_revision: Option<u64>,
+    },
+    Eligibility {
+        node: u64,
+        eligible: bool,
+    },
+    RetireContact {
+        node: u64,
+    },
+}
+/// The request an earlier call saved and never saw settled: no receipt, and not superseded.
+fn unsettled(saved: &Saved) -> Option<&Latest> {
+    saved
+        .latest
+        .as_ref()
+        .filter(|latest| latest.receipt.is_none() && !latest.superseded)
+}
+/// Whether `latest`, unsettled, asks what `intent` asks: the same change, with what the caller
+/// expects of it. Then the call resumes the request already saved, under its own identity, which
+/// the group commits at most once, as `retry` does; any other call is refused until it is
+/// settled. Before, the same call made again was refused too: a call left pending by a refusal
+/// the CLI names "try again" (`not_leader`, `unavailable`, exit 6) could not be tried again, and
+/// a revocation asked again as its root group changed leaders failed for good
+/// (`deployment_fleet`, macOS CI).
+fn resumes(latest: &Latest, intent: &Intent) -> bool {
+    match (&latest.request.command, intent) {
+        (
+            ControlCommand::Membership(command),
+            Intent::Membership {
+                change,
+                expected_index,
+            },
+        ) => {
+            command.change == *change
+                && expected_index.is_none_or(|index| index == command.expected_configuration_index)
+        }
+        (
+            ControlCommand::Enrollment(command),
+            Intent::Revoke {
+                id,
+                expected_revision,
+            },
+        ) => {
+            command.revoked_invitation() == Some(*id)
+                && expected_revision.is_none_or(|revision| revision == command.expected_revision())
+        }
+        (ControlCommand::Authority(command), Intent::Eligibility { node, eligible }) => matches!(
+            &command.operation,
+            focal_directory::AuthorityOperation::GrantNode { grant, .. }
+                if grant.enrollment.node == *node && grant.enrollment.eligible == *eligible
+        ),
+        (ControlCommand::RetireContact(command), Intent::RetireContact { node }) => {
+            command.node == *node
+        }
+        _ => false,
+    }
+}
+/// The generation a saved grant names, which its eligibility result states.
+fn granted_generation(latest: &Latest) -> Option<u64> {
+    match &latest.request.command {
+        ControlCommand::Authority(command) => match &command.operation {
+            focal_directory::AuthorityOperation::GrantNode { grant, .. } => {
+                Some(grant.enrollment.generation)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+/// An eligibility change committed: what the call answers.
+fn eligibility_changed(
+    node: u64,
+    generation: u64,
+    eligible: bool,
+    committed: AdminResult,
+) -> Result<AdminResult> {
+    match committed {
+        AdminResult::Committed {
+            operation_id,
+            committed_index,
+            ..
+        } => Ok(AdminResult::NodeEligibility {
+            node,
+            generation,
+            eligible,
+            changed: true,
+            operation_id: Some(operation_id),
+            committed_index: Some(committed_index),
+        }),
+        _ => Err(ClusterAdminError::Invalid),
+    }
+}
+
 impl ClusterAdminError {
     /// One classification for CLI and MCP; a retired administrative reference
     /// never proves that its historical request did not commit.
@@ -999,11 +1101,16 @@ impl ClusterAdmin {
         expected_index: Option<u64>,
     ) -> Result<AdminResult> {
         let (mut journal, mut saved) = self.journal(true)?;
-        if saved
-            .latest
-            .as_ref()
-            .is_some_and(|latest| latest.receipt.is_none() && !latest.superseded)
-        {
+        if let Some(latest) = unsettled(&saved) {
+            if resumes(
+                latest,
+                &Intent::Membership {
+                    change,
+                    expected_index,
+                },
+            ) {
+                return self.drive(&mut journal, &mut saved).await;
+            }
             return Err(ClusterAdminError::Pending);
         }
         let current = self.configuration().await?;
@@ -1068,11 +1175,16 @@ impl ClusterAdmin {
         expected_revision: Option<u64>,
     ) -> Result<AdminResult> {
         let (mut journal, mut saved) = self.journal(true)?;
-        if saved
-            .latest
-            .as_ref()
-            .is_some_and(|latest| latest.receipt.is_none() && !latest.superseded)
-        {
+        if let Some(latest) = unsettled(&saved) {
+            if resumes(
+                latest,
+                &Intent::Revoke {
+                    id,
+                    expected_revision,
+                },
+            ) {
+                return self.drive(&mut journal, &mut saved).await;
+            }
             return Err(ClusterAdminError::Pending);
         }
         let reply = self
@@ -1249,11 +1361,12 @@ impl ClusterAdmin {
             return Err(ClusterAdminError::Invalid);
         }
         let (mut journal, mut saved) = self.journal(true)?;
-        if saved
-            .latest
-            .as_ref()
-            .is_some_and(|latest| latest.receipt.is_none() && !latest.superseded)
-        {
+        if let Some(latest) = unsettled(&saved) {
+            if resumes(latest, &Intent::Eligibility { node, eligible }) {
+                let generation = granted_generation(latest).ok_or(ClusterAdminError::Corrupt)?;
+                let committed = self.drive(&mut journal, &mut saved).await?;
+                return eligibility_changed(node, generation, eligible, committed);
+            }
             return Err(ClusterAdminError::Pending);
         }
         let reply = self
@@ -1332,21 +1445,8 @@ impl ClusterAdmin {
             superseded: false,
         });
         save(&mut journal, &saved)?;
-        match self.drive(&mut journal, &mut saved).await? {
-            AdminResult::Committed {
-                operation_id,
-                committed_index,
-                ..
-            } => Ok(AdminResult::NodeEligibility {
-                node,
-                generation,
-                eligible,
-                changed: true,
-                operation_id: Some(operation_id),
-                committed_index: Some(committed_index),
-            }),
-            _ => Err(ClusterAdminError::Invalid),
-        }
+        let committed = self.drive(&mut journal, &mut saved).await?;
+        eligibility_changed(node, generation, eligible, committed)
     }
     /// Remove a drained node (24 §19): refused while its grant is eligible
     /// or any session still names it (a voter, materializer, content copy
@@ -1532,11 +1632,11 @@ impl ClusterAdmin {
             return Ok(false);
         };
         let (mut journal, mut saved) = self.journal(true)?;
-        if saved
-            .latest
-            .as_ref()
-            .is_some_and(|latest| latest.receipt.is_none() && !latest.superseded)
-        {
+        if let Some(latest) = unsettled(&saved) {
+            if resumes(latest, &Intent::RetireContact { node }) {
+                self.drive(&mut journal, &mut saved).await?;
+                return Ok(true);
+            }
             return Err(ClusterAdminError::Pending);
         }
         let sequence = saved.next_control;
