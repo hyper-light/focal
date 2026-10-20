@@ -47,11 +47,25 @@ pub struct LogStats {
     /// `flushes`. (Where the device has no FUA, the kernel's own fallback is invisible here: such a
     /// write counts in `durable_writes`, and only the device's counters show its flush.)
     pub durable_fallbacks: u64,
+    /// Confirmations written and flushed where the file could have written them durable on their
+    /// own: the device measured a write and a flush of its cache cheaper than its durable write (a
+    /// consumer NVMe drive's FUA write costs more than a flush). Each also counts in `flushes`.
+    pub flushed_confirmations: u64,
+    /// Bytes of zeros written over the slots the file grew by, each before its first frame
+    /// (`docs/durable.md` §6.3), counted in `bytes` too: what growing the log wrote that no
+    /// record holds.
+    pub zeroed_bytes: u64,
     /// Asks for a slot past the file's end the owner refused (`crate::Growth`), each read as the
     /// file's bound reached: the frame that needed it answered `Full`. It counts asks, not
     /// episodes: the log asks again whenever it looks for room, so one bound reached counts as
     /// often as the log looked while it held.
     pub growth_refused: u64,
+    /// Sweeps made: frames that copied the tail segment's live entries ahead of their updates,
+    /// so the tail could be let go when the log had fewer than two segments free.
+    pub sweeps: u64,
+    /// Bytes those sweeps copied, the relocated records laid before the frames' updates: what the
+    /// log wrote a second time, its write amplification's own part.
+    pub swept_bytes: u64,
 }
 
 impl LogStats {
@@ -66,10 +80,14 @@ impl LogStats {
             flushes: 0,
             durable_writes: 0,
             durable_fallbacks: 0,
+            flushed_confirmations: 0,
+            zeroed_bytes: 0,
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),
             growth_refused: 0,
+            sweeps: 0,
+            swept_bytes: 0,
         }
     }
 }
@@ -102,6 +120,12 @@ pub(crate) struct Timing {
     pub(crate) durable_write: bool,
     /// The job asked for a durable write and the file made it with a write and a flush instead.
     pub(crate) durable_fallback: bool,
+    /// A confirmation written and flushed, the device having measured that cheaper than a write
+    /// made durable on its own (`device::Device::confirm`).
+    pub(crate) flushed_confirmation: bool,
+    /// Bytes of zeros written over a slot the file grew by, before its first frame (`zero_fill`);
+    /// counted in `bytes` too.
+    pub(crate) zeroed: u64,
 }
 
 /// The nanoseconds from `from` to `to`, saturating.
@@ -118,9 +142,16 @@ pub(crate) struct Tally {
     pub(crate) durable_writes: u64,
     /// Durable writes made with a write and a flush instead (`Timing::durable_fallback`).
     pub(crate) durable_fallbacks: u64,
+    /// Confirmations written and flushed by the device's choice (`Timing::flushed_confirmation`).
+    pub(crate) flushed_confirmations: u64,
+    /// Bytes of zeros the frames that grew the file wrote.
+    pub(crate) zeroed_bytes: u64,
     pub(crate) flush: Histogram,
     pub(crate) write: Histogram,
     pub(crate) commit_wait: Histogram,
+    /// Sweeps laid, and the bytes of the records they relocated.
+    pub(crate) sweeps: u64,
+    pub(crate) swept_bytes: u64,
 }
 
 impl Tally {
@@ -130,9 +161,13 @@ impl Tally {
             flushes: 0,
             durable_writes: 0,
             durable_fallbacks: 0,
+            flushed_confirmations: 0,
+            zeroed_bytes: 0,
             flush: Histogram::new(),
             write: Histogram::new(),
             commit_wait: Histogram::new(),
+            sweeps: 0,
+            swept_bytes: 0,
         })
     }
 
@@ -152,6 +187,10 @@ impl Tally {
         }
         if timing.durable_fallback {
             self.durable_fallbacks = self.durable_fallbacks.saturating_add(1);
+        }
+        self.zeroed_bytes = self.zeroed_bytes.saturating_add(timing.zeroed);
+        if timing.flushed_confirmation {
+            self.flushed_confirmations = self.flushed_confirmations.saturating_add(1);
         }
     }
 

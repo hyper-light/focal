@@ -448,6 +448,54 @@ pub(crate) struct Device<F> {
     more: Receiver<u64>,
     /// A sealed log's framing MAC, which every frame a sweep reads is checked against.
     mac: Option<hyper_seal::log::FrameMac>,
+    /// What making a record durable has cost this file each way ([`Device::confirm`]).
+    costs: Costs,
+}
+
+/// A running mean of nanoseconds, of every sample since the log opened: no constant weighs them.
+#[derive(Clone, Copy, Debug, Default)]
+struct Mean {
+    total: u64,
+    count: u64,
+}
+
+impl Mean {
+    fn add(&mut self, ns: u64) {
+        self.total = self.total.saturating_add(ns);
+        self.count = self.count.saturating_add(1);
+    }
+
+    fn get(&self) -> Option<u64> {
+        self.total.checked_div(self.count)
+    }
+}
+
+/// What making a record durable has cost a file each way, as the device measured it: a frame's
+/// flush and its record's write, which every frame makes, and a confirmation's durable write and
+/// its write and flush, each when made.
+#[derive(Clone, Copy, Debug, Default)]
+struct Costs {
+    flush: Mean,
+    record: Mean,
+    durable: Mean,
+    flushed: Mean,
+}
+
+impl Costs {
+    /// Whether a confirmation costs less written and flushed than written durable on its own:
+    /// never before a durable write has been measured, the only way there was; the write and
+    /// flush judged by its own mean once it has one, by a frame's record write and flush before.
+    fn flushing_is_cheaper(&self) -> bool {
+        let Some(durable) = self.durable.get() else {
+            return false;
+        };
+        let flushed = self.flushed.get().or_else(|| {
+            self.flush
+                .get()
+                .and_then(|flush| self.record.get().map(|record| flush.saturating_add(record)))
+        });
+        flushed.is_some_and(|flushed| flushed < durable)
+    }
 }
 
 impl<F: BlockFile> Device<F> {
@@ -459,6 +507,7 @@ impl<F: BlockFile> Device<F> {
             segment_bytes,
             more,
             mac: None,
+            costs: Costs::default(),
         }
     }
 
@@ -488,7 +537,7 @@ impl<F: BlockFile> Device<F> {
                 record_at,
                 mut these,
             } => {
-                let (result, timing) = self.write_durable(&mut record, record_at);
+                let (result, timing) = self.confirm(&mut record, record_at);
                 if result.is_ok() {
                     answers.append(&mut these);
                 }
@@ -578,7 +627,7 @@ impl<F: BlockFile> Device<F> {
                 answering.durable();
             }
         }
-        let (result, timing) = self.write_durable(&mut f.confirm, f.record_at);
+        let (result, timing) = self.confirm(&mut f.confirm, f.record_at);
         if result.is_ok() {
             answers.append(&mut f.these);
         }
@@ -604,7 +653,9 @@ impl<F: BlockFile> Device<F> {
 
     /// Writes `first`, then `second` if there is one, each at its offset, then flushes the file
     /// once: nothing after a failed write, and a failed flush never retried (mantle
-    /// docs/design/raft-log.md §3). The writes and the flush are timed apart.
+    /// docs/design/raft-log.md §3). The writes and the flush are timed apart, and the record's
+    /// write and the flush counted in what a record made durable by a write and a flush costs
+    /// ([`Costs`]).
     fn write_then_flush(
         &mut self,
         zero: Option<(u64, u64)>,
@@ -613,20 +664,28 @@ impl<F: BlockFile> Device<F> {
     ) -> (Result<(), LogError>, Timing) {
         let started = stats::now();
         let mut bytes = 0u64;
+        let mut zeroed = 0u64;
+        let mut record_ns = None;
         // Every call into the file, its asking whether it fills new space included, is inside the
         // boundary: the file is the caller's code.
         let wrote = guarded(|| {
             if let Some((at, len)) = zero
                 && self.file.fills_new_space()
             {
-                bytes = self.zero_fill(at, len)?;
+                zeroed = self.zero_fill(at, len)?;
+                bytes = zeroed;
             }
             bytes = bytes.saturating_add(self.write(first.0, first.1)?);
             if let Some((buf, at)) = second {
+                let from = stats::now();
                 bytes = bytes.saturating_add(self.write(buf, at)?);
+                record_ns = Some(stats::nanos(from, stats::now()));
             }
             Ok(())
         });
+        if let Some(ns) = record_ns {
+            self.costs.record.add(ns);
+        }
         let written = stats::now();
         let mut timing = Timing {
             took_ns: stats::nanos(started, written),
@@ -636,9 +695,72 @@ impl<F: BlockFile> Device<F> {
             flushed_at: None,
             durable_write: false,
             durable_fallback: false,
+            flushed_confirmation: false,
+            zeroed,
         };
         if wrote.is_err() {
             return (wrote, timing);
+        }
+        let flushed = guarded(|| self.file.sync_data().map_err(LogError::from));
+        let ended = stats::now();
+        timing.took_ns = stats::nanos(started, ended);
+        timing.flush_ns = Some(stats::nanos(written, ended));
+        timing.flushed_at = flushed.is_ok().then_some(ended);
+        if flushed.is_ok() {
+            self.costs.flush.add(stats::nanos(written, ended));
+        }
+        (flushed, timing)
+    }
+
+    /// Makes a confirmation, `buf` at `at`, durable before it returns, the cheaper of the two ways
+    /// this file has measured: a write made durable on its own ([`Device::write_durable`], a FUA
+    /// write on Linux), or a write and a flush of the device's cache ([`Device::write_flushed`]).
+    /// Which is cheaper is the device's: a drive whose FUA write costs less than a flush of its
+    /// cache takes the first, one whose FUA write costs more (a consumer NVMe drive, measured: a
+    /// 4 KiB `O_DSYNC` write 4.3 ms at the median against a 4 KiB write and `fdatasync` 2.9 ms)
+    /// the second. The durable write is measured first, as it was the only way; the write and
+    /// flush is judged by what every frame's record write and flush cost until it has costs of its
+    /// own. Each mean is of every sample since the log opened, so no constant weighs them; a way
+    /// not taken keeps the mean it had, and is taken again once the other's mean passes it.
+    fn confirm(&mut self, buf: &mut AlignedBuf, at: u64) -> (Result<(), LogError>, Timing) {
+        if self.costs.flushing_is_cheaper() {
+            let (result, timing) = self.write_flushed(buf, at);
+            if result.is_ok() {
+                self.costs.flushed.add(timing.took_ns);
+            }
+            return (result, timing);
+        }
+        let (result, timing) = self.write_durable(buf, at);
+        if result.is_ok() && timing.durable_write {
+            self.costs.durable.add(timing.took_ns);
+        }
+        (result, timing)
+    }
+
+    /// Writes a confirmation, `buf` at `at`, then flushes the file: durable before it returns,
+    /// as a frame is. Counted a flush, and a confirmation flushed.
+    fn write_flushed(&self, buf: &mut AlignedBuf, at: u64) -> (Result<(), LogError>, Timing) {
+        let started = stats::now();
+        let mut timing = Timing {
+            took_ns: 0,
+            write_ns: 0,
+            flush_ns: None,
+            bytes: 0,
+            flushed_at: None,
+            durable_write: false,
+            durable_fallback: false,
+            flushed_confirmation: true,
+            zeroed: 0,
+        };
+        let wrote = guarded(|| self.write(buf, at));
+        let written = stats::now();
+        timing.write_ns = stats::nanos(started, written);
+        match wrote {
+            Ok(bytes) => timing.bytes = bytes,
+            Err(e) => {
+                timing.took_ns = timing.write_ns;
+                return (Err(e), timing);
+            }
         }
         let flushed = guarded(|| self.file.sync_data().map_err(LogError::from));
         let ended = stats::now();
@@ -663,6 +785,8 @@ impl<F: BlockFile> Device<F> {
             flushed_at: None,
             durable_write: false,
             durable_fallback: false,
+            flushed_confirmation: false,
+            zeroed: 0,
         };
         let written = guarded(|| {
             let bytes = buf.padded().map_err(|e| LogError::Disk(e.into()))?;

@@ -358,7 +358,13 @@ impl<F: BlockFile + 'static> Owner<F> {
             )
         });
         match sweep {
-            Ok(sweep) => self.lay_out(batch, whole, Some(sweep), payload, records),
+            Ok(sweep) => {
+                let tally = &mut self.tally;
+                tally.sweeps = tally.sweeps.saturating_add(1);
+                let copied = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+                tally.swept_bytes = tally.swept_bytes.saturating_add(copied);
+                self.lay_out(batch, whole, Some(sweep), payload, records)
+            }
             Err(e) => self.failed(batch, Vec::new(), e),
         }
     }

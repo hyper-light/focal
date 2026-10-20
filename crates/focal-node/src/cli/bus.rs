@@ -257,6 +257,7 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
                 "flushes": member.log.flushes,
                 "durable_writes": member.log.durable_writes,
                 "durable_fallbacks": member.log.durable_fallbacks,
+                "flushed_confirmations": member.log.flushed_confirmations,
                 "flush_p50_us": member.log.flush_p50_ns as f64 / 1e3,
                 "flush_p99_us": member.log.flush_p99_ns as f64 / 1e3,
                 "commit_wait_p50_us": member.log.commit_wait_p50_ns as f64 / 1e3,
@@ -264,6 +265,9 @@ pub(crate) async fn start(args: BusStart) -> Result<(), focal_bus::BusError> {
                 "commit_wait_max_us": member.log.commit_wait_max_ns as f64 / 1e3,
                 "growth_refused": member.log.growth_refused,
                 "written_in_place": member.log.written_in_place,
+                "sweeps": member.log.sweeps,
+                "swept_bytes": member.log.swept_bytes,
+                "zeroed_bytes": member.log.zeroed_bytes,
             },
             // Its replica's writes by what each was for: what its log's frames carried.
             "writes": {

@@ -15663,3 +15663,30 @@ batches, four in flight: each node's commits written alone fewer than half its w
 without the restated period node 1 wrote its commit alone 28 times beside 49 writes of entries).
 The bus's `Stopped` line states the replica's writes by what each was for (`group.writes`). Only
 hyper-durable's replica.rs differs from 6a190be. vendor/README.md; docs/dependencies/inventory.tsv.
+
+### 2026-10-19 — Every shared crate at hyper-raft e05956a: confirmations as cheap as the drive allows, the log's sweeps and zeros counted, and zeros only where they pay
+
+Three changes in hyper-log and one in hyper-block. A frame's confirmation was always a write made durable on its own (a FUA
+write), on the argument that one record's FUA write costs less than a flush of the drive's cache;
+on fedora's consumer NVMe drive (Samsung 9100 PRO, fio on a btrfs file written in place) a 4 KiB
+`O_DSYNC` write took 4.3 ms at the median against 2.9 ms for a 4 KiB write and `fdatasync`, and half
+the bus's frames at its closed-loop ceiling there were confirmed on their own. The log's device now
+makes each confirmation the cheaper of the two ways it has measured on its file (running means of
+every sample since open, no constant). And `LogStats` counts the sweeps a full log lays and the
+bytes they relocate: the bus at its closed-loop ceiling on CI logged 195 bytes for each 128-byte
+record whose batch bytes are 132, with every node's log on the runner's one disk, which bounded the
+ceiling. And it counts the zeros written over the slots a file grows by (`zeroed_bytes`), each
+slot once before its first frame: they were the rest of the bus's bytes. At the closed-loop
+ceiling on fedora, a new log a node over a 40-second run, 1.88 GB of each node's 5.87 GB were
+zeros (32%), with no sweeps and every entry written once; 28% at 1,000 records a second. They are
+what a new log writes on its way to the size its retention holds, and nothing once it is there. A
+bus node's `Stopped` line states all three (`group.log.flushed_confirmations`, `group.log.sweeps`,
+`group.log.swept_bytes`, `group.log.zeroed_bytes`). And the zeros are written only where they pay:
+on a file system that allocates in place and journals the allocation (ext2 to ext4, XFS, by
+statfs's `f_type`), where they were measured to take the journal's flush out of every append. On
+btrfs they bought nothing: three interleaved rounds on fedora against the same tree without them,
+the log wrote 193 to 211 bytes a node for each record with them and 132 to 139 without (the batch's
+own 132), and its commits' median wait was the same both ways (23 to 27 ms at the ceiling, 21 to
+38 ms at 1,000 and 10,000 a second). Only hyper-log and hyper-block differ from a57b30b.
+vendor/README.md; docs/dependencies/inventory.tsv.
+

@@ -214,6 +214,9 @@ pub struct LogWrites {
     pub durable_writes: u64,
     /// Durable writes made with a write and a flush instead.
     pub durable_fallbacks: u64,
+    /// Confirmations written and flushed where a durable write was possible, the log's device
+    /// having measured the write and flush cheaper on this drive.
+    pub flushed_confirmations: u64,
     /// The flushes' p50 and p99, nanoseconds (each at most an eighth more than the quantile).
     pub flush_p50_ns: u64,
     pub flush_p99_ns: u64,
@@ -224,6 +227,13 @@ pub struct LogWrites {
     pub commit_wait_max_ns: u64,
     /// Asks for a slot past the file's bound the log refused, each answered `Full`.
     pub growth_refused: u64,
+    /// Sweeps the log laid, its tail's live entries copied ahead of a frame's updates when it had
+    /// fewer than two segments free, and the bytes they copied: what it wrote a second time.
+    pub sweeps: u64,
+    pub swept_bytes: u64,
+    /// Bytes of zeros written over the slots the log's file grew by, each before its first frame:
+    /// what growing the log wrote that no record holds (counted in `bytes` too).
+    pub zeroed_bytes: u64,
     /// Whether the log's file system writes its file in place where it would copy it on write
     /// (`DeviceFile::written_in_place`): btrfs's mark, asked as an empty file is opened. `None`
     /// on a file system that writes every file in place.
@@ -240,12 +250,16 @@ impl LogWrites {
             flushes: stats.flushes,
             durable_writes: stats.durable_writes,
             durable_fallbacks: stats.durable_fallbacks,
+            flushed_confirmations: stats.flushed_confirmations,
             flush_p50_ns: stats.flush.quantile(500_000).unwrap_or(0),
             flush_p99_ns: stats.flush.quantile(990_000).unwrap_or(0),
             commit_wait_p50_ns: stats.commit_wait.quantile(500_000).unwrap_or(0),
             commit_wait_p99_ns: stats.commit_wait.quantile(990_000).unwrap_or(0),
             commit_wait_max_ns: stats.commit_wait.quantile(1_000_000).unwrap_or(0),
             growth_refused: stats.growth_refused,
+            sweeps: stats.sweeps,
+            swept_bytes: stats.swept_bytes,
+            zeroed_bytes: stats.zeroed_bytes,
         }
     }
 }
