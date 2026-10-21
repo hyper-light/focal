@@ -315,3 +315,43 @@ fn a_file_on_a_real_disk_is_renamed_into_place_and_reads_back() {
     assert_eq!(out, plain);
     assert!(!temporary.exists());
 }
+
+/// What a reader opened and what a writer sealed are held in the clear in their buffer while they
+/// work; the buffer is wiped when let go, so neither leaves a file's plaintext in memory it gives
+/// back. Do: open a file whose plaintext repeats a marker, and fill a writer's segment with it
+/// unsealed; take each one's buffer and wipe it as its drop does. Expect: the marker is in each
+/// buffer before, and every byte each can hold is zero after.
+#[test]
+fn a_readers_and_a_writers_buffers_are_wiped_when_let_go() {
+    let key = parent();
+    let marker = *b"plaintext a sealed file holds..";
+    let plain: Vec<u8> = marker.iter().copied().cycle().take(3 * SU).collect();
+    let bytes = sealed(&key, &plain, 512);
+    let holds_marker = |buf: &mut Wiped| {
+        buf.as_mut_capacity()
+            .windows(marker.len())
+            .any(|w| w == marker)
+    };
+
+    let mut reader = SealedReader::open(file_of(&bytes, 512), &key, S).unwrap();
+    let mut out = vec![0; plain.len()];
+    reader.read_at(&mut out, 0).unwrap();
+    assert_eq!(out, plain);
+    let SealedReader { mut buf, .. } = reader;
+    assert!(
+        holds_marker(&mut buf),
+        "the reader's buffer held what it opened"
+    );
+    buf.wipe();
+    assert!(buf.as_mut_capacity().iter().all(|byte| *byte == 0));
+
+    let mut writer = SealedWriter::new(sim(512), &key, S).unwrap();
+    writer.write(&plain[..SU / 2]).unwrap();
+    let SealedWriter { mut buf, .. } = writer;
+    assert!(
+        holds_marker(&mut buf),
+        "the writer's buffer held what it had not sealed yet"
+    );
+    buf.wipe();
+    assert!(buf.as_mut_capacity().iter().all(|byte| *byte == 0));
+}

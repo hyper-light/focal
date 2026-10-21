@@ -60,9 +60,40 @@ pub enum SealedFileError {
     Bound(&'static str),
 }
 
+/// A writer's or reader's buffer, which holds a segment's plaintext as it is sealed or opened in
+/// place: wiped when let go (`memory::wipe`, as a key's slot is), so what a file held in the clear
+/// is never left in memory it gives back.
+pub(crate) struct Wiped(AlignedBuf);
+
+impl Wiped {
+    /// Zeroes every byte the buffer can hold.
+    fn wipe(&mut self) {
+        crate::memory::wipe(self.0.as_mut_capacity());
+    }
+}
+
+impl Drop for Wiped {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl core::ops::Deref for Wiped {
+    type Target = AlignedBuf;
+    fn deref(&self) -> &AlignedBuf {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Wiped {
+    fn deref_mut(&mut self) -> &mut AlignedBuf {
+        &mut self.0
+    }
+}
+
 /// The buffer a writer or reader keeps: a segment and its tag, the footer, and an alignment
 /// either side, rounded to the alignment.
-fn working_buffer(segment: u32, align: Alignment) -> Result<AlignedBuf, SealedFileError> {
+fn working_buffer(segment: u32, align: Alignment) -> Result<Wiped, SealedFileError> {
     let bytes = usize::try_from(segment)
         .ok()
         .and_then(|s| s.checked_add(TAG))
@@ -73,6 +104,7 @@ fn working_buffer(segment: u32, align: Alignment) -> Result<AlignedBuf, SealedFi
             "a segment past what this machine addresses",
         ))?;
     AlignedBuf::zeroed(bytes, align)
+        .map(Wiped)
         .map_err(|_| SealedFileError::Bound("a segment past the largest buffer"))
 }
 
@@ -91,7 +123,7 @@ pub struct SealedWriter<F: BlockFile> {
     sealer: FileSealer,
     align: Alignment,
     segment: usize,
-    buf: AlignedBuf,
+    buf: Wiped,
     /// Sealed stream bytes at the front of `buf` not yet written: fewer than an alignment once a
     /// segment is done.
     pending: usize,
@@ -351,7 +383,7 @@ pub struct SealedReader<F: BlockFile> {
     opener: FileOpener,
     align: Alignment,
     shape: Shape,
-    buf: AlignedBuf,
+    buf: Wiped,
 }
 
 impl<F: BlockFile> SealedReader<F> {
