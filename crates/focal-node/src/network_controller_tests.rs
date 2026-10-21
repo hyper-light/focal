@@ -95,7 +95,7 @@ fn controller_admission_precedes_private_journal_and_releases_on_drop() {
                 receipt.clone(),
                 credentials.clone(),
                 directory.path().to_owned(),
-                focal_seal::test_keys(directory.path().to_owned()).unwrap(),
+                focal_seal::test_keys(directory.path()).unwrap(),
                 small.clone()
             ),
             Err(ControllerError::Capacity)
@@ -108,7 +108,7 @@ fn controller_admission_precedes_private_journal_and_releases_on_drop() {
             receipt,
             credentials,
             directory.path().to_owned(),
-            focal_seal::test_keys(directory.path().to_owned()).unwrap(),
+            focal_seal::test_keys(directory.path()).unwrap(),
             budget.clone(),
         )
         .unwrap();
@@ -347,7 +347,7 @@ fn a_refresh_is_charged_what_it_decodes_and_keeps_and_refused_without_it() {
             network.receipt.clone(),
             network.credentials.clone(),
             directory.path().to_owned(),
-            focal_seal::test_keys(directory.path().to_owned()).unwrap(),
+            focal_seal::test_keys(directory.path()).unwrap(),
             budget.clone(),
         )
         .unwrap();
@@ -456,7 +456,7 @@ fn off_a_shard_or_stopped_controller_clears_existing_ingress_grants() {
         network.receipt.clone(),
         network.credentials.clone(),
         directory.path().to_owned(),
-        focal_seal::test_keys(directory.path().to_owned()).unwrap(),
+        focal_seal::test_keys(directory.path()).unwrap(),
         controller_budget.clone(),
     )
     .unwrap();
@@ -497,7 +497,7 @@ fn off_a_shard_or_stopped_controller_clears_existing_ingress_grants() {
         network.receipt,
         network.credentials,
         directory.path().to_owned(),
-        focal_seal::test_keys(directory.path().to_owned()).unwrap(),
+        focal_seal::test_keys(directory.path()).unwrap(),
         controller_budget.clone(),
     )
     .unwrap();
@@ -578,7 +578,7 @@ fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections() {
             network.receipt.clone(),
             network.credentials.clone(),
             directory.path().to_owned(),
-            focal_seal::test_keys(directory.path().to_owned()).unwrap(),
+            focal_seal::test_keys(directory.path()).unwrap(),
             controller_budget.clone(),
         )
         .unwrap();
@@ -654,7 +654,7 @@ fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections() {
             network.receipt,
             network.credentials,
             directory.path().to_owned(),
-            focal_seal::test_keys(directory.path().to_owned()).unwrap(),
+            focal_seal::test_keys(directory.path()).unwrap(),
             controller_budget.clone(),
         )
         .unwrap();
@@ -687,7 +687,7 @@ fn contact_announcement_reaches_alternate_after_blackholed_preferred_leader_with
             network.receipt.clone(),
             network.credentials.clone(),
             directory.path().to_owned(),
-            focal_seal::test_keys(directory.path().to_owned()).unwrap(),
+            focal_seal::test_keys(directory.path()).unwrap(),
             MemoryBudget::new(128 * 1024 * 1024, 64 * 1024 * 1024).unwrap(),
         )
         .unwrap();

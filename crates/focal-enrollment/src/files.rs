@@ -11,8 +11,10 @@ use zeroize::Zeroizing;
 const FRAME_MAGIC: &[u8; 8] = b"FCLKEY01";
 /// The most a record's payload is.
 const MAX_PAYLOAD: usize = 60 * 1024;
-/// The most a record's framed bytes are: its magic, its payload and the BLAKE3 hash after them.
-const MAX_FRAMED: usize = MAX_PAYLOAD + FRAME_MAGIC.len() + 32;
+/// Bytes a record's frame adds to its payload: its magic and the BLAKE3 hash after them.
+const FRAMING: usize = FRAME_MAGIC.len() + 32;
+/// The most a record's framed bytes are.
+const MAX_FRAMED: usize = MAX_PAYLOAD + FRAMING;
 /// The marker a directory holds once every record in it is sealed (29 §12): from then on a record
 /// in the clear is refused as corrupt, never read.
 const SEALED: &str = "SEALED";
@@ -42,7 +44,9 @@ fn max_entries() -> usize {
 /// through the atomic replace that writes any record, then marked sealed.
 pub(crate) struct PrivateDirectory {
     path: PathBuf,
-    keys: focal_seal::DataKeys,
+    /// Boxed: a journal travels by value through the control owner's admission and back in its
+    /// refusals, which stay within a small error's size.
+    keys: Box<focal_seal::DataKeys>,
     _lock: focal_platform::FileLock,
     /// A shared owner reads beside other readers and never writes; a writer
     /// holds the directory exclusively.
@@ -107,7 +111,7 @@ impl PrivateDirectory {
         }
         let directory = Self {
             path: path.to_path_buf(),
-            keys: keys.clone(),
+            keys: Box::new(keys.clone()),
             _lock: lock,
             shared,
         };
@@ -199,7 +203,7 @@ impl PrivateDirectory {
         }
         check_file(&path, &store_owner(&self.path)?)?;
         let bytes = read_file(&path, sealed_limit()?)?;
-        let payload = open_record(&self.path, &bytes, Some(&self.keys))?;
+        let payload = open_record(&self.path, &bytes, Some(&*self.keys))?;
         // The file was installed durably (write-through atomic_replace fsyncs the
         // bytes before the rename), so it is already on disk before any marker
         // claims it - there is no read-time re-sync to do, and none is portable:
@@ -261,7 +265,7 @@ impl PrivateDirectory {
             .try_reserve_exact(
                 payload
                     .len()
-                    .checked_add(FRAME_MAGIC.len() + 32)
+                    .checked_add(FRAMING)
                     .ok_or(EnrollmentError::Capacity)?,
             )
             .map_err(|_| EnrollmentError::Capacity)?;
@@ -352,9 +356,7 @@ fn read_file(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>, Enrollment
 /// The payload of a record's framed bytes: its magic, the payload and the BLAKE3 hash of both,
 /// checked.
 fn unframe(framed: &[u8]) -> Result<Zeroizing<Vec<u8>>, EnrollmentError> {
-    if framed.len() < FRAME_MAGIC.len() + 32
-        || framed.get(..FRAME_MAGIC.len()) != Some(FRAME_MAGIC.as_slice())
-    {
+    if framed.len() < FRAMING || framed.get(..FRAME_MAGIC.len()) != Some(FRAME_MAGIC.as_slice()) {
         return Err(EnrollmentError::Corrupt);
     }
     let split = framed

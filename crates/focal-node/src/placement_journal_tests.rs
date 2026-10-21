@@ -31,7 +31,7 @@ fn left(root: &Path, saved: &Saved) {
     crate::embedded::durable_dir(&root.join("cluster")).unwrap();
     PrivateJournal::open(
         root.join("cluster").join(NAME),
-        &focal_seal::test_keys(&root).unwrap(),
+        &focal_seal::test_keys(root).unwrap(),
     )
     .unwrap()
     .replace(&postcard::to_stdvec(saved).unwrap())

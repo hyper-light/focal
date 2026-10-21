@@ -190,20 +190,21 @@ fn root_keys_made_at_once_share_the_directory_they_make() {
     for _ in 0..20 {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join("config").join("focal").join("keys");
-        let start = std::sync::Arc::new(std::sync::Barrier::new(16));
-        let makers: Vec<_> = (0..16)
-            .map(|node| {
-                let path = dir.join(format!("{node:016x}.key"));
-                let start = start.clone();
-                std::thread::spawn(move || {
-                    start.wait();
-                    create_root_key(&path)
+        let start = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            let makers: Vec<_> = (0..16)
+                .map(|node| {
+                    let (path, start) = (dir.join(format!("{node:016x}.key")), &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        create_root_key(&path)
+                    })
                 })
-            })
-            .collect();
-        for maker in makers {
-            maker.join().unwrap().unwrap();
-        }
+                .collect();
+            for maker in makers {
+                maker.join().unwrap().unwrap();
+            }
+        });
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 16);
     }
 }
@@ -269,4 +270,155 @@ fn a_data_directorys_key_file_is_found_from_the_directory() {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The names in `dir`, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Processes making a fresh data directory's keys at once all end with the same keys: one root
+/// key, the first `SEAL.node` standing, never one over it, and every other maker opening it. Do:
+/// sixteen threads, released together, resolve one directory with no keys, over twenty rounds:
+/// odd rounds under one configured key file none has made, even ones under the directory's own
+/// (each maker with a random root ID of its own, as a release build makes them). Expect: every
+/// one succeeds, all name one key file, a key made by any opens what another sealed, and nothing
+/// else is left: no temporary, no key file but the one. Before, a maker read the configured key
+/// file another was still writing ("a key file of other than 32 bytes"), and a `SEAL.node`
+/// installed by an atomic replace could stand over the one a maker had sealed under.
+#[test]
+fn keys_made_at_once_for_one_directory_are_one_directorys_keys() {
+    for round in 0..20 {
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let user = home.path().join("user");
+        let configured = home.path().join("configured").join("node.key");
+        let configured = (round % 2 == 1).then_some(configured.as_path());
+        let start = std::sync::Barrier::new(16);
+        let keys: Vec<DataKeys> = std::thread::scope(|scope| {
+            let makers: Vec<_> = (0..16)
+                .map(|_| {
+                    let (data, user, start) = (&data, &user, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        resolve_in(Some(user), data, configured, None, random_root)
+                    })
+                })
+                .collect();
+            makers
+                .into_iter()
+                .map(|maker| maker.join().unwrap().unwrap())
+                .collect()
+        });
+        assert!(
+            keys.iter().all(|k| k.key_file == keys[0].key_file),
+            "round {round}"
+        );
+        let probe = Secret32::from_bytes(&[5; 32]).unwrap();
+        let sealed = keys[3].key(Store::Journal).unwrap().wrap(&probe).unwrap();
+        let opened = keys[11]
+            .key(Store::Journal)
+            .unwrap()
+            .unwrap(&sealed)
+            .unwrap();
+        assert_eq!(*opened.bytes(), [5; 32]);
+        if let Some(configured) = configured {
+            assert_eq!(names(&data), [SEAL_FILE], "round {round}");
+            assert_eq!(
+                names(configured.parent().unwrap()),
+                ["node.key"],
+                "round {round}"
+            );
+        } else {
+            assert_eq!(names(&data), [SEAL_FILE, INTENT_FILE], "round {round}");
+            assert_eq!(names(&user).len(), 1, "one key file, round {round}");
+        }
+    }
+}
+
+/// What a maker cut short between its write and its link leaves of `name` in `dir`: a temporary of
+/// it; and a file of another form beside it, which is no temporary of it.
+fn cut_short(dir: &Path, name: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join(format!("{name}.0123456789abcdef.part")), b"cut").unwrap();
+    std::fs::write(dir.join(format!("{name}.kept.part")), b"other").unwrap();
+}
+
+/// A start that failed or crashed before the directory's `SEAL.node` leaves the key file its next
+/// start makes the keys under, never a key an attempt made that nothing names, and what a maker
+/// cut short left mid-publication goes at its name's publication. Do: leave a temporary of the
+/// intent, as a start cut short publishing it leaves it, and record the intent; then leave a
+/// temporary of the key file and of `SEAL.node`, as a start cut short making them leaves them;
+/// resolve the directory. Expect: the intent's temporary goes with its publication; the keys are
+/// made under the intent's key file, the one key file there; every temporary gone, every file of
+/// another form kept. A damaged intent is refused, never answered by a new root.
+#[test]
+fn a_start_cut_short_leaves_the_key_its_next_start_makes_the_keys_under() {
+    let home = tempfile::tempdir().unwrap();
+    let data = home.path().join("data");
+    let user = home.path().join("user");
+    hyper_seal::lock_keys(key_slots()).unwrap();
+    cut_short(&data, INTENT_FILE);
+    let id = intended_root(&data, random_root).unwrap();
+    assert_eq!(
+        names(&data),
+        [INTENT_FILE.to_owned(), format!("{INTENT_FILE}.kept.part")]
+    );
+    let key_file = key_file_in(&user, id);
+    let key_name = key_file.file_name().unwrap().to_str().unwrap().to_owned();
+    cut_short(&user, &key_name);
+    cut_short(&data, SEAL_FILE);
+    // A later attempt's intent: the same root, whatever ID it would make.
+    assert_eq!(intended_root(&data, random_root).unwrap(), id);
+    let keys = resolve_in(Some(&user), &data, None, None, random_root).unwrap();
+    assert_eq!(keys.key_file, key_file);
+    keys.key(Store::Journal).unwrap();
+    assert_eq!(
+        names(&user),
+        [key_name.clone(), format!("{key_name}.kept.part")]
+    );
+    assert_eq!(
+        names(&data),
+        [
+            SEAL_FILE.to_owned(),
+            format!("{SEAL_FILE}.kept.part"),
+            INTENT_FILE.to_owned(),
+            format!("{INTENT_FILE}.kept.part"),
+        ]
+    );
+    let other = home.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    intended_root(&other, random_root).unwrap();
+    let intent = other.join(INTENT_FILE);
+    let mut bytes = std::fs::read(&intent).unwrap();
+    bytes[9] ^= 1;
+    std::fs::write(&intent, &bytes).unwrap();
+    assert!(matches!(
+        resolve_in(Some(&user), &other, None, None, random_root),
+        Err(SealSetupError::IntentDamaged(_))
+    ));
+}
+
+/// Under a build with test support every data directory made without a key file shares the one
+/// test root key file, and each still has keys of its own. Do: resolve two directories; seal under
+/// one's journal key. Expect: one key file, named for [`TEST_ROOT`]; the other's journal key opens
+/// nothing the first sealed.
+#[test]
+fn test_directories_share_one_root_key_file_and_keep_keys_of_their_own() {
+    let home = tempfile::tempdir().unwrap();
+    let (a, b) = (home.path().join("a"), home.path().join("b"));
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    let (a, b) = (test_keys(&a).unwrap(), test_keys(&b).unwrap());
+    assert_eq!(a.key_file, b.key_file);
+    assert_eq!(Some(a.key_file.clone()), key_file_for(TEST_ROOT));
+    let probe = Secret32::from_bytes(&[7; 32]).unwrap();
+    let sealed = a.key(Store::Journal).unwrap().wrap(&probe).unwrap();
+    assert!(b.key(Store::Journal).unwrap().unwrap(&sealed).is_err());
 }

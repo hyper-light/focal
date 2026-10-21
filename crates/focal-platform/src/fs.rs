@@ -298,7 +298,9 @@ pub fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
 /// publication guarantee). Durable: on Windows the move is write-through; on
 /// Unix the caller fsyncs the parent directory afterwards. On Unix this links
 /// then unlinks `from`; a crash between the two leaves `from` as a second link
-/// to the same inode, which the caller's crash-recovery removes.
+/// to the same inode, which the caller's crash-recovery removes. `from` gone
+/// by then (another process's crash-recovery removed it) is still published:
+/// `to` was linked.
 pub fn atomic_create_new(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -316,7 +318,10 @@ pub fn atomic_create_new(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         std::fs::hard_link(from, to)?;
-        std::fs::remove_file(from)
+        match std::fs::remove_file(from) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            removed => removed,
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {

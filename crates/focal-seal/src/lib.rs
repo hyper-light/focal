@@ -23,11 +23,10 @@
 //!   from a wrong key: key wrap's own integrity check refuses the wrong key.
 //! - **Every key is random**, never derived (docs/seal.md §3.1), so one store's key reveals nothing
 //!   of another's and each is rotated alone.
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use focal_platform::fs::{
-    FileMedium, Medium as _, create_private_new, ensure_dir_private, install,
-};
+use focal_platform::fs::{FileMedium, Medium as _, create_private_new, ensure_dir_private};
 use hyper_seal::keys::{KeyId, KeySource as _, RECORD, Wrapped, WrappingKey};
 use hyper_seal::{FileSource, SealError, Secret32};
 
@@ -35,6 +34,13 @@ pub mod file;
 
 /// The file in the data directory that holds the node's wrapped keys.
 pub const SEAL_FILE: &str = "SEAL.node";
+
+/// The file in a data directory whose owner names no key file that names the root key its keys
+/// are made under, recorded before that key file is made ([`resolve`]): every maker of the
+/// directory's keys, processes at once or a start after one that failed or crashed, makes and
+/// opens the one key file it names, never a key an attempt made that nothing names. It stays
+/// beside `SEAL.node`, which names the same root.
+pub const INTENT_FILE: &str = "SEAL.root";
 
 /// Where a data directory's keys come from (§2–§3): the directory, whose `SEAL.node` holds them,
 /// and the root key file that opens it. A node's or a client's: each data directory has keys of its
@@ -70,15 +76,11 @@ impl DataKeys {
 /// The keys of the data directory `root` in a dependent's tests, found or made as a node's or a
 /// client's start finds or makes them ([`resolve`], no key file configured), so a test and the
 /// code it runs, in its process or a binary it spawns, find the same keys: under a build with
-/// test support the per-user directory is the system's temporary one ([`keys_dir`]). Opens are
-/// serialized: tests in parallel open one data directory at once, and a `SEAL.node` is installed
-/// through one temporary name (`focal_platform::fs::install`).
+/// test support the per-user directory is the system's temporary one ([`keys_dir`]) and the root
+/// key is the one every test's directory shares ([`TEST_ROOT`]). Tests in parallel may open one
+/// data directory at once: its keys are published once, never one maker's over another's.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_keys(root: impl AsRef<Path>) -> Result<DataKeys, SealSetupError> {
-    static OPENING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _opening = OPENING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     resolve(root.as_ref(), None, None)
 }
 
@@ -99,6 +101,10 @@ const ENTRY: usize = 16 + 4 + RECORD;
 const KEYS: usize = 6;
 /// Bytes of the BLAKE3 hash that ends the file.
 const HASH: usize = 32;
+/// The format `SEAL.root` is written in.
+const INTENT_MAGIC: &[u8; 8] = b"FCLROOT1";
+/// Bytes of `SEAL.root`: the magic, the root key's ID, the hash.
+const INTENT_BYTES: usize = INTENT_MAGIC.len() + 16 + HASH;
 /// Bytes of `SEAL.node`: the magic, the root's ID and generation, every entry, the hash.
 const SEAL_BYTES: usize = MAGIC.len() + 16 + 4 + KEYS * ENTRY + HASH;
 
@@ -128,6 +134,8 @@ pub enum SealSetupError {
     NoKeys(PathBuf),
     #[error("{SEAL_FILE} is damaged: {0}")]
     Damaged(&'static str),
+    #[error("{INTENT_FILE} is damaged: {0}")]
+    IntentDamaged(&'static str),
     #[error("the root key file {path}: {source}")]
     KeyFile {
         path: PathBuf,
@@ -142,6 +150,9 @@ pub enum SealSetupError {
     Random,
     #[error("the process's cache key is unavailable: a holder of it failed while holding it")]
     CacheKey,
+    /// Another process made the data directory's keys first: what it made is opened instead.
+    #[error("{SEAL_FILE} was made by another process first")]
+    Raced,
 }
 
 /// The keys a node's stores seal under, unwrapped for the node's life.
@@ -239,12 +250,17 @@ pub fn user_keys_dir() -> Option<PathBuf> {
 /// The root key file named for the root key `id` in the per-user directory (§2): what a data
 /// directory whose owner names none keeps its keys under.
 pub fn key_file_for(id: KeyId) -> Option<PathBuf> {
+    Some(key_file_in(&keys_dir()?, id))
+}
+
+/// The root key file named for the root key `id` in the directory of key files `keys`.
+fn key_file_in(keys: &Path, id: KeyId) -> PathBuf {
     let mut name = String::with_capacity(id.0.len().saturating_mul(2).saturating_add(4));
     for byte in id.0 {
         name.push_str(&format!("{byte:02x}"));
     }
     name.push_str(".key");
-    Some(keys_dir()?.join(name))
+    keys.join(name)
 }
 
 /// The root key `SEAL.node` in `data_dir` names, none where the directory has no keys yet: what
@@ -285,23 +301,119 @@ pub fn resolve(
     configured: Option<&Path>,
     legacy: Option<PathBuf>,
 ) -> Result<DataKeys, SealSetupError> {
+    resolve_in(
+        keys_dir().as_deref(),
+        data_dir,
+        configured,
+        legacy,
+        new_root,
+    )
+}
+
+/// [`resolve`] with the directory of key files `keys` and the maker of a new directory's root key
+/// ID `new_root`.
+fn resolve_in(
+    keys: Option<&Path>,
+    data_dir: &Path,
+    configured: Option<&Path>,
+    legacy: Option<PathBuf>,
+    new_root: fn() -> Result<KeyId, SealSetupError>,
+) -> Result<DataKeys, SealSetupError> {
     if let Some(key_file) = configured {
         let keys = DataKeys::new(data_dir, key_file);
         keys.ensure()?;
         return Ok(keys);
     }
-    if let Some(keys) = find(data_dir, None, legacy)? {
-        return Ok(keys);
+    if let Some(found) = find_in(keys, data_dir, None, legacy)? {
+        return Ok(found);
     }
+    let keys = keys.ok_or_else(|| unnamed_keys_dir(data_dir))?;
     hyper_seal::lock_keys(key_slots())?;
-    let id = KeyId::random()?;
-    let key_file = key_file_for(id).ok_or_else(|| unnamed_keys_dir(data_dir))?;
-    if inside(&key_file, data_dir)? {
-        return Err(SealSetupError::KeyInDataDir(key_file));
-    }
-    create_root_key(&key_file)?;
-    create_as(data_dir, &key_file, id)?;
+    let id = intended_root(data_dir, new_root)?;
+    let key_file = key_file_in(keys, id);
+    // Made where it is missing, then the directory's keys under it, or opened where another maker
+    // made them first: every maker names the one file the intent does.
+    open_or_make(data_dir, &key_file, Some(id))?;
     Ok(DataKeys::new(data_dir, key_file))
+}
+
+/// A new data directory's root key ID (§2): random, a root key of its own.
+#[cfg(not(any(test, feature = "test-support")))]
+fn new_root() -> Result<KeyId, SealSetupError> {
+    random_root()
+}
+
+/// A new data directory's root key ID under a build with test support: [`TEST_ROOT`].
+#[cfg(any(test, feature = "test-support"))]
+fn new_root() -> Result<KeyId, SealSetupError> {
+    Ok(TEST_ROOT)
+}
+
+/// A random root key ID.
+fn random_root() -> Result<KeyId, SealSetupError> {
+    Ok(KeyId::random()?)
+}
+
+/// The root key every data directory a test makes without naming a key file shares, under a build
+/// with test support: one key file in the system's temporary directory ([`keys_dir`]), made once,
+/// so a test run leaves no key file behind for each data directory it made and let go of (a key
+/// file a directory, in a directory nothing empties, grew by every test run). Each directory's own
+/// keys below it are random, as they are everywhere ([`create_as`]), so no directory's records
+/// open under another's keys.
+#[cfg(any(test, feature = "test-support"))]
+pub const TEST_ROOT: KeyId = KeyId(*b"focal test root.");
+
+/// The root key ID the keys of `data_dir`, which has none, are made under: the one its
+/// [`INTENT_FILE`] names, or one `new_root` makes, recorded there first; another maker's recorded
+/// first is taken.
+fn intended_root(
+    data_dir: &Path,
+    new_root: fn() -> Result<KeyId, SealSetupError>,
+) -> Result<KeyId, SealSetupError> {
+    if let Some(id) = read_intent(data_dir)? {
+        return Ok(id);
+    }
+    let id = new_root()?;
+    let mut bytes = Vec::with_capacity(INTENT_BYTES);
+    bytes.extend_from_slice(INTENT_MAGIC);
+    bytes.extend_from_slice(&id.0);
+    let hash = blake3::hash(&bytes);
+    bytes.extend_from_slice(hash.as_bytes());
+    match publish_once(data_dir, OsStr::new(INTENT_FILE), &bytes).map_err(SealSetupError::Io)? {
+        Published::Made => Ok(id),
+        Published::Found => read_intent(data_dir)?.ok_or(SealSetupError::IntentDamaged(
+            "gone after another maker made it",
+        )),
+    }
+}
+
+/// The root key ID `data_dir`'s [`INTENT_FILE`] names, none where it has none; the file is checked
+/// whole first.
+fn read_intent(data_dir: &Path) -> Result<Option<KeyId>, SealSetupError> {
+    let path = data_dir.join(INTENT_FILE);
+    let medium = FileMedium;
+    if !medium.exists(&path).map_err(SealSetupError::Io)? {
+        return Ok(None);
+    }
+    let bytes = medium
+        .read(&path, INTENT_BYTES)
+        .map_err(SealSetupError::Io)?;
+    if bytes.len() != INTENT_BYTES {
+        return Err(SealSetupError::IntentDamaged("a file of the wrong length"));
+    }
+    let (body, stated) = bytes.split_at(INTENT_BYTES.saturating_sub(HASH));
+    if blake3::hash(body).as_bytes() != stated {
+        return Err(SealSetupError::IntentDamaged(
+            "its hash does not match its bytes",
+        ));
+    }
+    let mut at = 0usize;
+    if take::<8>(body, &mut at)? != *INTENT_MAGIC {
+        return Err(SealSetupError::IntentDamaged(
+            "not a root intent of this format",
+        ));
+    }
+    Ok(Some(KeyId(take::<16>(body, &mut at)?)))
 }
 
 /// The refusal of a default key file where the platform names no per-user directory.
@@ -321,6 +433,16 @@ pub fn find(
     configured: Option<&Path>,
     legacy: Option<PathBuf>,
 ) -> Result<Option<DataKeys>, SealSetupError> {
+    find_in(keys_dir().as_deref(), data_dir, configured, legacy)
+}
+
+/// [`find`] with the directory of key files `keys`.
+fn find_in(
+    keys: Option<&Path>,
+    data_dir: &Path,
+    configured: Option<&Path>,
+    legacy: Option<PathBuf>,
+) -> Result<Option<DataKeys>, SealSetupError> {
     let Some(id) = recorded_root(data_dir)? else {
         return Ok(None);
     };
@@ -329,7 +451,7 @@ pub fn find(
         keys.ensure()?;
         return Ok(Some(keys));
     }
-    let named = key_file_for(id).ok_or_else(|| unnamed_keys_dir(data_dir))?;
+    let named = key_file_in(keys.ok_or_else(|| unnamed_keys_dir(data_dir))?, id);
     let exists = |path: &Path| {
         path.try_exists().map_err(|source| SealSetupError::KeyFile {
             path: path.to_path_buf(),
@@ -378,16 +500,20 @@ fn inside(key_file: &Path, data_dir: &Path) -> Result<bool, SealSetupError> {
 }
 
 /// Makes a root key file at `path`: a new owner-only file of 32 random bytes, durable with its
-/// directory, never over a file that is there. What a node makes at its first start, and what an
-/// operator makes for a deployment that keeps the key in a secret store (29 §10).
+/// directory, never over a file that is there (`AlreadyExists`), published whole so a reader finds
+/// no file or the key ([`publish_once`]): nodes starting at once under one key file make one key,
+/// and every one of them opens it. What a node makes at its first start, and what an operator
+/// makes for a deployment that keeps the key in a secret store (29 §10).
 pub fn create_root_key(path: &Path) -> Result<(), SealSetupError> {
     let fail = |source| SealSetupError::KeyFile {
         path: path.to_path_buf(),
         source,
     };
-    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty())
-        && !dir.exists()
-    {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !dir.exists() {
         let mut ancestors = Vec::new();
         let mut at = dir.to_path_buf();
         while !at.exists() {
@@ -406,16 +532,20 @@ pub fn create_root_key(path: &Path) -> Result<(), SealSetupError> {
             }
         }
     }
-    let mut bytes = [0u8; ROOT_BYTES];
-    getrandom::fill(&mut bytes).map_err(|_| SealSetupError::Random)?;
-    let mut file = create_private_new(path, false, true).map_err(fail)?;
-    let written = std::io::Write::write_all(&mut file, &bytes).and_then(|()| file.sync_all());
-    bytes.fill(0);
-    written.map_err(fail)?;
-    if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        focal_platform::sync_dir(dir).map_err(fail)?;
+    let name = path.file_name().ok_or_else(|| {
+        fail(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a key file's path names no file",
+        ))
+    })?;
+    let mut bytes = zeroize::Zeroizing::new([0u8; ROOT_BYTES]);
+    getrandom::fill(bytes.as_mut()).map_err(|_| SealSetupError::Random)?;
+    match publish_once(dir, name, bytes.as_ref()).map_err(fail)? {
+        Published::Made => Ok(()),
+        Published::Found => Err(fail(std::io::Error::from(
+            std::io::ErrorKind::AlreadyExists,
+        ))),
     }
-    Ok(())
 }
 
 /// A random key from the operating system's generator, wiped wherever it was staged.
@@ -497,6 +627,16 @@ fn read_entry(bytes: &[u8], at: &mut usize) -> Result<Entry, SealSetupError> {
 /// Opens the keys of the data directory `data_dir` under the root key in `key_file`, or, in a data
 /// directory that has none, makes them, making the root key file too where it does not exist.
 pub fn open_or_create(data_dir: &Path, key_file: &Path) -> Result<NodeKeys, SealSetupError> {
+    open_or_make(data_dir, key_file, None)
+}
+
+/// [`open_or_create`], the keys of a directory that has none recorded under the root key ID `root`
+/// where it is given (the directory's intent, [`resolve`]), else under a random one.
+fn open_or_make(
+    data_dir: &Path,
+    key_file: &Path,
+    root: Option<KeyId>,
+) -> Result<NodeKeys, SealSetupError> {
     // Keys live only in the process's locked region, made once for the derived count; a region
     // already made for at least as many serves this call too.
     hyper_seal::lock_keys(key_slots())?;
@@ -525,16 +665,31 @@ pub fn open_or_create(data_dir: &Path, key_file: &Path) -> Result<NodeKeys, Seal
             source,
         })?
     {
-        create_root_key(key_file)?;
+        match create_root_key(key_file) {
+            // Made by another process starting this directory at once: the same file, whole.
+            Err(SealSetupError::KeyFile { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+            made => made?,
+        }
     }
-    create(data_dir, key_file)
+    let root = match root {
+        Some(id) => id,
+        None => random_root()?,
+    };
+    match create_as(data_dir, key_file, root) {
+        // Another process made the directory's keys first, under the same key file: theirs.
+        Err(SealSetupError::Raced) => {
+            let bytes = medium.read(&seal, SEAL_BYTES).map_err(SealSetupError::Io)?;
+            open(&bytes, key_file)
+        }
+        made => made,
+    }
 }
 
-fn create(data_dir: &Path, key_file: &Path) -> Result<NodeKeys, SealSetupError> {
-    create_as(data_dir, key_file, KeyId::random()?)
-}
-
-/// [`create`], the root key recorded under `root_id`.
+/// The keys of `data_dir`, which has none, made under the root key in `key_file`, recorded under
+/// `root_id`, and published in `SEAL.node` where none is ([`publish_once`]); [`SealSetupError::Raced`]
+/// where another maker's stood first (an atomic replace let a second maker's file stand over the
+/// first's, whose maker then sealed under keys no file named).
 fn create_as(data_dir: &Path, key_file: &Path, root_id: KeyId) -> Result<NodeKeys, SealSetupError> {
     let mut root = read_root(key_file, root_id, 0)?;
     // The node key: random, wrapped by the root.
@@ -556,9 +711,94 @@ fn create_as(data_dir: &Path, key_file: &Path, root_id: KeyId) -> Result<NodeKey
     }
     let hash = blake3::hash(&bytes);
     bytes.extend_from_slice(hash.as_bytes());
-    let mut medium = FileMedium;
-    install(&mut medium, &data_dir.join(SEAL_FILE), &bytes).map_err(SealSetupError::Io)?;
-    keys(children, (root_id, 0))
+    match publish_once(data_dir, OsStr::new(SEAL_FILE), &bytes).map_err(SealSetupError::Io)? {
+        Published::Made => keys(children, (root_id, 0)),
+        Published::Found => Err(SealSetupError::Raced),
+    }
+}
+
+/// What a no-clobber publication ([`publish_once`]) found at its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Published {
+    /// This maker's bytes stand at the name.
+    Made,
+    /// Another maker's do, whole: every maker syncs its bytes before it links them.
+    Found,
+}
+
+/// `bytes` published as `dir`/`name` where nothing is, never over what is: written to a temporary
+/// of this maker's own beside it (`<name>.<16 hex digits>.part`), synced, then linked to the name
+/// (`focal_platform::fs::atomic_create_new`), which only the first maker's link does, so a reader
+/// finds no file or a whole one. Once the name stands every temporary of it is removed
+/// ([`sweep`]): this maker's where another's stood first, and any left by a maker that crashed or
+/// failed between its write and its link; a maker whose temporary was so removed before its link
+/// finds the name made. A temporary is left only by a maker that began before the name stood and
+/// ended between its write and its link.
+fn publish_once(dir: &Path, name: &OsStr, bytes: &[u8]) -> std::io::Result<Published> {
+    let target = dir.join(name);
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce)
+        .map_err(|_| std::io::Error::other("the operating system's random source failed"))?;
+    let mut temporary = name.to_os_string();
+    temporary.push(format!(".{:016x}.part", u64::from_le_bytes(nonce)));
+    let temporary = dir.join(temporary);
+    let written = create_private_new(&temporary, false, true).and_then(|mut file| {
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()
+    });
+    if let Err(error) = written {
+        // What is left of it goes with the name's next publication's sweep.
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    let published = match focal_platform::fs::atomic_create_new(&temporary, &target) {
+        Ok(()) => Published::Made,
+        // Another maker linked first, or removed this maker's temporary once its own stood.
+        Err(_) if target.try_exists()? => Published::Found,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    sweep(dir, name)?;
+    focal_platform::sync_dir(dir)?;
+    Ok(published)
+}
+
+/// Removes every temporary of `name` in `dir` ([`publish_once`]): one walk of the directory's
+/// entries, removing only names of a temporary's exact form. A temporary its maker still holds
+/// open on Windows, already removed by another sweep, is refused (`PermissionDenied`) and goes when
+/// its maker's handle closes.
+fn sweep(dir: &Path, name: &OsStr) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !is_temporary(
+            entry.file_name().as_encoded_bytes(),
+            name.as_encoded_bytes(),
+        ) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Err(error)
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return Err(error);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether the file named `file` is a temporary of `name`: `<name>.<16 hex digits>.part`.
+fn is_temporary(file: &[u8], name: &[u8]) -> bool {
+    file.strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix(b"."))
+        .and_then(|rest| rest.strip_suffix(b".part"))
+        .is_some_and(|nonce| nonce.len() == 16 && nonce.iter().all(u8::is_ascii_hexdigit))
 }
 
 /// The node's keys from the children the node key unwrapped, in their order in `SEAL.node`.

@@ -48,10 +48,29 @@ configuration when present (§7).
 - **A key inside the data directory is refused at start** (typed, before anything opens): a
   copy of the data directory alone, in a backup, an rsync or a detached volume, must never
   carry what opens it.
-- **It is made once**, at a node's first start, by `create_private_new` and a durable
-  directory sync, before any sealed store is created. A data directory whose seal record (§3)
-  names a root key ID that the file does not hold is refused, typed: a wrong or missing key is
-  never answered by a fresh one.
+- **It is made once**, at a node's first start, before any sealed store is created. A data
+  directory whose seal record (§3) names a root key ID that the file does not hold is refused,
+  typed: a wrong or missing key is never answered by a fresh one.
+- **Made once even by makers at once** (2026-10-20). Two processes may make one directory's keys
+  together (two command lines in a new client directory, nodes starting under one configured key
+  file), and a start may fail or be killed part-way. Every file of the making, the root key file,
+  `SEAL.root` and `SEAL.node`, is therefore published where none is and never over one: written
+  to a temporary of the maker's own beside its name (`<name>.<16 hex digits>.part`), synced, and
+  linked to the name without clobbering (a hard link on Unix, `MoveFileExW` without
+  `MOVEFILE_REPLACE_EXISTING` on Windows), which only the first maker's link does. A reader finds
+  no file or a whole one (before, a maker could read the configured key file while another was
+  writing it, and a `SEAL.node` installed by an atomic replace could stand over the one another
+  maker had already sealed under). Once a name stands, its maker removes every temporary of it,
+  so what a maker cut short between its write and its link left goes with the name's next
+  publication. A directory whose owner names no key file records its root key's ID in
+  `SEAL.root` before it makes the key file: every maker, and every start after one cut short,
+  makes and opens the one file the intent names, where a fresh ID each attempt left a key file
+  nothing named for every start a failing disk cut short.
+- **Under a build with test support** (tests only; a release build never has it), the per-user
+  directory is the system's temporary one, and a directory made without a key file takes the one
+  root key every test's directory shares (`focal_seal::TEST_ROOT`): its node and store keys are
+  its own and random, so no directory's records open under another's, and a test run leaves no
+  key file behind for each directory it made (one each had left 1,153 files in four hours).
 - **Losing the key loses the data**, as with every system that seals at rest. `focal backup`
   states which root key ID a backup needs, and the operator keeps the key file as they keep
   any secret. Rotation is a rewrap (§4); nothing below the node key moves.
