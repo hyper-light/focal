@@ -176,9 +176,32 @@ fn zone_survival_seats_the_root_across_the_zones_and_states_what_the_control_pla
     let ready = readiness(&founder);
     assert_eq!(ready["control_satisfied"], true, "{ready}");
     assert_eq!(ready["policy_satisfied"], true, "{ready}");
+    // The root's leader reports its two peers' progress. Only a leader keeps
+    // progress, and once the root is seated across the zones any of the three
+    // may lead it: in one run on a loaded machine another node led it (term 3)
+    // when the founder's readiness was read, and the founder, a follower,
+    // reported no peers.
+    let mut wait = Progress::begin(&[&founder, &host_b, &host_c], Duration::from_secs(120));
+    let leading = loop {
+        let led = [
+            (&founder, founder_node),
+            (&host_b, node_b),
+            (&host_c, node_c),
+        ]
+        .into_iter()
+        .map(|(node, id)| (readiness(node), id))
+        .find(|(ready, id)| ready["root"]["leader"].as_u64() == Some(*id));
+        if let Some((ready, _)) = led {
+            break ready;
+        }
+        if let Some(spent) = wait.spent() {
+            panic!("no node reported leading the root: {spent}");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
     assert!(
-        ready["root"]["peers"].as_array().unwrap().len() >= 2,
-        "{ready}"
+        leading["root"]["peers"].as_array().unwrap().len() >= 2,
+        "{leading}"
     );
     // The same plan applied again is exact: nothing moves, all complete.
     let again = admin(
