@@ -18,7 +18,12 @@ fn admission_reopens_exact_request_and_rejects_lost_or_inconsistent_journal() {
     focal_rt::block_on(async move {
         let directory = tempfile::tempdir().unwrap();
         let (state, _, _) = founder(directory.path()).await;
-        let mut admission = RootAdmission::open(&state, directory.path()).unwrap();
+        let mut admission = RootAdmission::open(
+            &state,
+            directory.path(),
+            &focal_seal::test_keys(directory.path()).unwrap(),
+        )
+        .unwrap();
         let pending = ControlRequest {
             id: ControlRequestId {
                 client: admission.principal.0,
@@ -38,7 +43,12 @@ fn admission_reopens_exact_request_and_rejects_lost_or_inconsistent_journal() {
         admission.intent.pending = Some(pending.clone());
         admission.save().unwrap();
         drop(admission);
-        let mut recovered = RootAdmission::open(&state, directory.path()).unwrap();
+        let mut recovered = RootAdmission::open(
+            &state,
+            directory.path(),
+            &focal_seal::test_keys(directory.path()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             postcard::to_stdvec(recovered.intent.pending.as_ref().unwrap()).unwrap(),
             postcard::to_stdvec(&pending).unwrap()
@@ -47,12 +57,20 @@ fn admission_reopens_exact_request_and_rejects_lost_or_inconsistent_journal() {
         recovered.save().unwrap();
         drop(recovered);
         assert!(matches!(
-            RootAdmission::open(&state, directory.path()),
+            RootAdmission::open(
+                &state,
+                directory.path(),
+                &focal_seal::test_keys(directory.path()).unwrap()
+            ),
             Err(ControllerError::Identity)
         ));
         std::fs::remove_dir_all(directory.path().join("cluster/root-admission")).unwrap();
         assert!(matches!(
-            RootAdmission::open(&state, directory.path()),
+            RootAdmission::open(
+                &state,
+                directory.path(),
+                &focal_seal::test_keys(directory.path()).unwrap()
+            ),
             Err(ControllerError::Identity)
         ));
         assert!(!directory.path().join("cluster/root-admission").exists());
@@ -77,6 +95,7 @@ fn controller_admission_precedes_private_journal_and_releases_on_drop() {
                 receipt.clone(),
                 credentials.clone(),
                 directory.path().to_owned(),
+                focal_seal::test_keys(directory.path().to_owned()).unwrap(),
                 small.clone()
             ),
             Err(ControllerError::Capacity)
@@ -89,6 +108,7 @@ fn controller_admission_precedes_private_journal_and_releases_on_drop() {
             receipt,
             credentials,
             directory.path().to_owned(),
+            focal_seal::test_keys(directory.path().to_owned()).unwrap(),
             budget.clone(),
         )
         .unwrap();
@@ -327,6 +347,7 @@ fn a_refresh_is_charged_what_it_decodes_and_keeps_and_refused_without_it() {
             network.receipt.clone(),
             network.credentials.clone(),
             directory.path().to_owned(),
+            focal_seal::test_keys(directory.path().to_owned()).unwrap(),
             budget.clone(),
         )
         .unwrap();
@@ -435,6 +456,7 @@ fn off_a_shard_or_stopped_controller_clears_existing_ingress_grants() {
         network.receipt.clone(),
         network.credentials.clone(),
         directory.path().to_owned(),
+        focal_seal::test_keys(directory.path().to_owned()).unwrap(),
         controller_budget.clone(),
     )
     .unwrap();
@@ -475,6 +497,7 @@ fn off_a_shard_or_stopped_controller_clears_existing_ingress_grants() {
         network.receipt,
         network.credentials,
         directory.path().to_owned(),
+        focal_seal::test_keys(directory.path().to_owned()).unwrap(),
         controller_budget.clone(),
     )
     .unwrap();
@@ -555,6 +578,7 @@ fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections() {
             network.receipt.clone(),
             network.credentials.clone(),
             directory.path().to_owned(),
+            focal_seal::test_keys(directory.path().to_owned()).unwrap(),
             controller_budget.clone(),
         )
         .unwrap();
@@ -630,6 +654,7 @@ fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections() {
             network.receipt,
             network.credentials,
             directory.path().to_owned(),
+            focal_seal::test_keys(directory.path().to_owned()).unwrap(),
             controller_budget.clone(),
         )
         .unwrap();
@@ -662,6 +687,7 @@ fn contact_announcement_reaches_alternate_after_blackholed_preferred_leader_with
             network.receipt.clone(),
             network.credentials.clone(),
             directory.path().to_owned(),
+            focal_seal::test_keys(directory.path().to_owned()).unwrap(),
             MemoryBudget::new(128 * 1024 * 1024, 64 * 1024 * 1024).unwrap(),
         )
         .unwrap();
@@ -837,6 +863,7 @@ fn a_credential_is_retired_by_what_the_registry_knows_of_it_not_by_its_absence()
     let now = unix_time().unwrap();
     let authority = BootstrapAuthority::open_or_create(
         dir.path().join("authority"),
+        &focal_seal::test_keys_beside(dir.path().join("authority")).unwrap(),
         cluster,
         vec!["localhost".into()],
         now,
@@ -866,7 +893,12 @@ fn a_credential_is_retired_by_what_the_registry_knows_of_it_not_by_its_absence()
         .apply_committed(draft.command(), registry.applied_index() + 1)
         .unwrap();
     let invitation = draft.release(&registry).unwrap();
-    let key = JoinKey::open_or_create(dir.path().join("node"), cluster).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join("node"),
+        &focal_seal::test_keys_beside(dir.path().join("node")).unwrap(),
+        cluster,
+    )
+    .unwrap();
     // A join request is only issued over a connection the invitation trusts.
     let mut client_config = invitation.client_config().unwrap();
     let mut client = rustls::ClientConnection::new(

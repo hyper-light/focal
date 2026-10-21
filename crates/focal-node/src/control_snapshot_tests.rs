@@ -25,6 +25,7 @@ impl Fixture {
         let budget = MemoryBudget::new(256 * 1024 * 1024, 96 * 1024 * 1024).unwrap();
         let ca = BootstrapAuthority::open_or_create(
             directory.path().join("ca"),
+            &focal_seal::test_keys_beside(directory.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             1_800_000_000,

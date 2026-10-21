@@ -31,8 +31,64 @@ use focal_platform::fs::{
 use hyper_seal::keys::{KeyId, KeySource as _, RECORD, Wrapped, WrappingKey};
 use hyper_seal::{FileSource, SealError, Secret32};
 
+pub mod file;
+
 /// The file in the data directory that holds the node's wrapped keys.
 pub const SEAL_FILE: &str = "SEAL.node";
+
+/// Where a data directory's keys come from (§2–§3): the directory, whose `SEAL.node` holds them,
+/// and the root key file that opens it. A node's or a client's: each data directory has keys of its
+/// own, under the root key file its owner names. It holds no key, only where they are: a writer
+/// unwraps the one store key it seals a file with, for that file ([`DataKeys::key`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataKeys {
+    pub data_dir: PathBuf,
+    pub key_file: PathBuf,
+}
+
+impl DataKeys {
+    pub fn new(data_dir: impl Into<PathBuf>, key_file: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            key_file: key_file.into(),
+        }
+    }
+
+    /// The directory's keys made where it has none, the root key file with them where it is
+    /// missing, or opened where it has them: what a node's or a client's start does before any
+    /// sealed store is made, with every refusal of §2.
+    pub fn ensure(&self) -> Result<(), SealSetupError> {
+        open_or_create(&self.data_dir, &self.key_file).map(drop)
+    }
+
+    /// The key of `store`, unwrapped for one file and dropped after it ([`store_key`]).
+    pub fn key(&self, store: Store) -> Result<WrappingKey, SealSetupError> {
+        store_key(&self.data_dir, &self.key_file, store)
+    }
+}
+
+/// The keys of the data directory `root` in a dependent's tests, found or made as a node's or a
+/// client's start finds or makes them ([`resolve`], no key file configured), so a test and the
+/// code it runs, in its process or a binary it spawns, find the same keys: under a build with
+/// test support the per-user directory is the system's temporary one ([`keys_dir`]). Opens are
+/// serialized: tests in parallel open one data directory at once, and a `SEAL.node` is installed
+/// through one temporary name (`focal_platform::fs::install`).
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_keys(root: impl AsRef<Path>) -> Result<DataKeys, SealSetupError> {
+    static OPENING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _opening = OPENING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    resolve(root.as_ref(), None, None)
+}
+
+/// [`test_keys`] of the data directory a private directory or a store at `path` lies in: its
+/// parent, as a dependent's test lays its stores out under its own temporary directory.
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_keys_beside(path: impl AsRef<Path>) -> Result<DataKeys, SealSetupError> {
+    let path = path.as_ref();
+    test_keys(path.parent().unwrap_or(path))
+}
 /// The format `SEAL.node` is written in.
 const MAGIC: &[u8; 8] = b"FCLSEAL1";
 /// Bytes of a root key (AES-256).
@@ -146,8 +202,28 @@ impl std::fmt::Debug for NodeKeys {
 /// The root key file a node keeps by default when its configuration names none: the platform's
 /// per-user configuration directory, never its data directory (§2).
 pub fn default_key_file(node: &str) -> Option<PathBuf> {
+    Some(keys_dir()?.join(format!("{node}.key")))
+}
+
+/// The platform's per-user directory of root key files (§2), never a data directory. Under a
+/// build with test support, one under the system's temporary directory instead: no test makes a
+/// key file where the user keeps theirs, and every process of a test run (its own and the
+/// binaries it spawns) finds the same files.
+pub fn keys_dir() -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        Some(std::env::temp_dir().join("focal-test-keys"))
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        user_keys_dir()
+    }
+}
+
+/// The platform's per-user configuration directory of root key files.
+pub fn user_keys_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let dir = if cfg!(target_os = "macos") {
+    Some(if cfg!(target_os = "macos") {
         home?.join("Library/Application Support/Focal Keys")
     } else if cfg!(windows) {
         PathBuf::from(std::env::var_os("APPDATA")?)
@@ -157,8 +233,116 @@ pub fn default_key_file(node: &str) -> Option<PathBuf> {
         PathBuf::from(config).join("focal").join("keys")
     } else {
         home?.join(".config").join("focal").join("keys")
+    })
+}
+
+/// The root key file named for the root key `id` in the per-user directory (§2): what a data
+/// directory whose owner names none keeps its keys under.
+pub fn key_file_for(id: KeyId) -> Option<PathBuf> {
+    let mut name = String::with_capacity(id.0.len().saturating_mul(2).saturating_add(4));
+    for byte in id.0 {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    name.push_str(".key");
+    Some(keys_dir()?.join(name))
+}
+
+/// The root key `SEAL.node` in `data_dir` names, none where the directory has no keys yet: what
+/// finds the key file of a directory whose owner names none ([`resolve`]). The file is checked
+/// whole, as an open checks it, before its ID is taken.
+pub fn recorded_root(data_dir: &Path) -> Result<Option<KeyId>, SealSetupError> {
+    let seal = data_dir.join(SEAL_FILE);
+    let medium = FileMedium;
+    if !medium.exists(&seal).map_err(SealSetupError::Io)? {
+        return Ok(None);
+    }
+    let bytes = medium.read(&seal, SEAL_BYTES).map_err(SealSetupError::Io)?;
+    if bytes.len() != SEAL_BYTES {
+        return Err(SealSetupError::Damaged("a file of the wrong length"));
+    }
+    let (body, stated) = bytes.split_at(SEAL_BYTES.saturating_sub(HASH));
+    if blake3::hash(body).as_bytes() != stated {
+        return Err(SealSetupError::Damaged("its hash does not match its bytes"));
+    }
+    let mut at = 0usize;
+    if take::<8>(body, &mut at)? != *MAGIC {
+        return Err(SealSetupError::Damaged(
+            "not a sealed-keys file of this format",
+        ));
+    }
+    Ok(Some(KeyId(take::<16>(body, &mut at)?)))
+}
+
+/// The keys of the data directory `data_dir`, made where it has none (§2): under `configured`
+/// where its owner names a root key file; else under the one named for its root key's ID in the
+/// per-user directory ([`key_file_for`]), so a directory's key file is found from the directory
+/// alone, whatever it holds or has yet to learn (a joining node has no node ID when it first seals
+/// its join); and a directory whose keys an earlier binary made under the file named for its
+/// node keeps that one (`legacy`). Every refusal of §2 holds: a missing key file is never made
+/// again for a directory that has keys.
+pub fn resolve(
+    data_dir: &Path,
+    configured: Option<&Path>,
+    legacy: Option<PathBuf>,
+) -> Result<DataKeys, SealSetupError> {
+    if let Some(key_file) = configured {
+        let keys = DataKeys::new(data_dir, key_file);
+        keys.ensure()?;
+        return Ok(keys);
+    }
+    if let Some(keys) = find(data_dir, None, legacy)? {
+        return Ok(keys);
+    }
+    hyper_seal::lock_keys(key_slots())?;
+    let id = KeyId::random()?;
+    let key_file = key_file_for(id).ok_or_else(|| unnamed_keys_dir(data_dir))?;
+    if inside(&key_file, data_dir)? {
+        return Err(SealSetupError::KeyInDataDir(key_file));
+    }
+    create_root_key(&key_file)?;
+    create_as(data_dir, &key_file, id)?;
+    Ok(DataKeys::new(data_dir, key_file))
+}
+
+/// The refusal of a default key file where the platform names no per-user directory.
+fn unnamed_keys_dir(data_dir: &Path) -> SealSetupError {
+    SealSetupError::KeyFile {
+        path: data_dir.to_path_buf(),
+        source: std::io::Error::other("the platform names no per-user configuration directory"),
+    }
+}
+
+/// [`resolve`] of a data directory that has keys, made nowhere: none where it has none yet. What a
+/// reader beside a running owner (a command line on the owner's data directory) opens with, so it
+/// never makes keys in a directory it does not own. A directory under `configured` is taken as
+/// having keys where its `SEAL.node` is.
+pub fn find(
+    data_dir: &Path,
+    configured: Option<&Path>,
+    legacy: Option<PathBuf>,
+) -> Result<Option<DataKeys>, SealSetupError> {
+    let Some(id) = recorded_root(data_dir)? else {
+        return Ok(None);
     };
-    Some(dir.join(format!("{node}.key")))
+    if let Some(key_file) = configured {
+        let keys = DataKeys::new(data_dir, key_file);
+        keys.ensure()?;
+        return Ok(Some(keys));
+    }
+    let named = key_file_for(id).ok_or_else(|| unnamed_keys_dir(data_dir))?;
+    let exists = |path: &Path| {
+        path.try_exists().map_err(|source| SealSetupError::KeyFile {
+            path: path.to_path_buf(),
+            source,
+        })
+    };
+    let key_file = match legacy {
+        Some(legacy) if !exists(&named)? && exists(&legacy)? => legacy,
+        _ => named,
+    };
+    let keys = DataKeys::new(data_dir, key_file);
+    keys.ensure()?;
+    Ok(Some(keys))
 }
 
 /// Whether `key_file` lies within `data_dir`, each resolved through the links that exist.
@@ -347,7 +531,11 @@ pub fn open_or_create(data_dir: &Path, key_file: &Path) -> Result<NodeKeys, Seal
 }
 
 fn create(data_dir: &Path, key_file: &Path) -> Result<NodeKeys, SealSetupError> {
-    let root_id = KeyId::random()?;
+    create_as(data_dir, key_file, KeyId::random()?)
+}
+
+/// [`create`], the root key recorded under `root_id`.
+fn create_as(data_dir: &Path, key_file: &Path, root_id: KeyId) -> Result<NodeKeys, SealSetupError> {
     let mut root = read_root(key_file, root_id, 0)?;
     // The node key: random, wrapped by the root.
     let node_secret = random_key()?;

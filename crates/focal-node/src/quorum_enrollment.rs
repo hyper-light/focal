@@ -171,6 +171,8 @@ pub struct QuorumEnrollmentHost {
 pub struct QuorumEnrollmentDriver {
     authority: BootstrapAuthority,
     directory: PathBuf,
+    /// The data directory's keys, which every record here is sealed under (29 §12).
+    keys: focal_seal::DataKeys,
     config: QuorumEnrollmentConfig,
     disk: PrivateJournal,
     journal: Journal,
@@ -185,23 +187,26 @@ impl QuorumEnrollmentHost {
     pub fn create(
         authority: BootstrapAuthority,
         directory: impl AsRef<Path>,
+        keys: &focal_seal::DataKeys,
         config: QuorumEnrollmentConfig,
         budget: MemoryBudget,
     ) -> Result<(Self, QuorumEnrollmentDriver), QuorumEnrollmentError> {
-        Self::build(authority, directory.as_ref(), config, budget, true)
+        Self::build(authority, directory.as_ref(), keys, config, budget, true)
     }
     /// Missing initialized state is corruption, never a fresh sequence authority.
     pub fn open(
         authority: BootstrapAuthority,
         directory: impl AsRef<Path>,
+        keys: &focal_seal::DataKeys,
         config: QuorumEnrollmentConfig,
         budget: MemoryBudget,
     ) -> Result<(Self, QuorumEnrollmentDriver), QuorumEnrollmentError> {
-        Self::build(authority, directory.as_ref(), config, budget, false)
+        Self::build(authority, directory.as_ref(), keys, config, budget, false)
     }
     fn build(
         authority: BootstrapAuthority,
         directory: &Path,
+        keys: &focal_seal::DataKeys,
         config: QuorumEnrollmentConfig,
         budget: MemoryBudget,
         create: bool,
@@ -211,7 +216,7 @@ impl QuorumEnrollmentHost {
             return Err(QuorumEnrollmentError::Identity);
         }
         let state_charge = reserve(&budget, BudgetKind::Control, 512 * 1024)?;
-        let mut disk = PrivateJournal::open(directory)?;
+        let mut disk = PrivateJournal::open(directory, keys)?;
         let saved = disk.read()?;
         let journal = match (create, saved) {
             (true, None) => {
@@ -268,6 +273,7 @@ impl QuorumEnrollmentHost {
             QuorumEnrollmentDriver {
                 authority,
                 directory: directory.to_owned(),
+                keys: keys.clone(),
                 config,
                 disk,
                 journal,
@@ -707,7 +713,7 @@ impl QuorumEnrollmentDriver {
         // corruption. A redeemed invitation still denotes its enrolled node.
         let mut retired = None;
         if path.try_exists().map_err(EnrollmentError::Io)? {
-            let pending = PendingInvitation::open(&path, self.config.root.cluster.0)?;
+            let pending = PendingInvitation::open(&path, &self.keys, self.config.root.cluster.0)?;
             if finished(&registry, pending.id(), now) {
                 let marker = retired_marker(&path, pending.id());
                 std::fs::rename(&path, &marker).map_err(EnrollmentError::Io)?;
@@ -731,7 +737,7 @@ impl QuorumEnrollmentDriver {
             }
         }
         let pending = if path.try_exists().map_err(EnrollmentError::Io)? {
-            PendingInvitation::open(&path, self.config.root.cluster.0)?
+            PendingInvitation::open(&path, &self.keys, self.config.root.cluster.0)?
         } else {
             let expires_at = now
                 .checked_add(
@@ -749,7 +755,7 @@ impl QuorumEnrollmentDriver {
                     },
                     now,
                 )?
-                .persist(&path, hash)?
+                .persist(&path, &self.keys, hash)?
         };
         if pending.intent_hash() != hash {
             return Err(QuorumEnrollmentError::IntentConflict);

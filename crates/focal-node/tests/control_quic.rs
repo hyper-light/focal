@@ -311,6 +311,7 @@ fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_operator_
             .as_secs() as i64;
         let authority = BootstrapAuthority::open_or_create(
             data.path().join("ca"),
+            &focal_seal::test_keys_beside(data.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now,
@@ -352,8 +353,12 @@ fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_operator_
         // logs before TLS owners start. Certificate grants alone cannot authorize
         // a Node RPC against the root's committed enrollment registry.
         for node in 1..=3 {
-            let key =
-                JoinKey::open_or_create(data.path().join(format!("key{node}")), CLUSTER).unwrap();
+            let key = JoinKey::open_or_create(
+                data.path().join(format!("key{node}")),
+                &focal_seal::test_keys_beside(data.path().join(format!("key{node}"))).unwrap(),
+                CLUSTER,
+            )
+            .unwrap();
             let draft = seeded[0]
                 .0
                 .enrollment()

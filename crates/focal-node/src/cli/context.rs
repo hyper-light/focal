@@ -146,16 +146,23 @@ fn name(value: &str) -> Result<()> {
     Ok(())
 }
 impl Store {
-    fn open(root: &Path, create: bool) -> Result<Option<Self>> {
-        Self::open_with(root, create, false)
+    fn open(settings: &Settings, root: &Path, create: bool) -> Result<Option<Self>> {
+        Self::open_with(settings, root, create, false)
     }
     /// Open the catalogue for reading beside other processes of this data
     /// directory: ordinary commands select their context without excluding
     /// each other, while `context` commands still own the catalogue exclusively.
-    fn open_read(root: &Path) -> Result<Option<Self>> {
-        Self::open_with(root, false, true)
+    fn open_read(settings: &Settings, root: &Path) -> Result<Option<Self>> {
+        Self::open_with(settings, root, false, true)
     }
-    fn open_with(root: &Path, create: bool, shared: bool) -> Result<Option<Self>> {
+    /// The catalogue of the data directory `root`, sealed under its keys (29 §12), which are
+    /// made here only once it has a catalogue or is given one.
+    fn open_with(
+        settings: &Settings,
+        root: &Path,
+        create: bool,
+        shared: bool,
+    ) -> Result<Option<Self>> {
         let path = root.join(CATALOG);
         let marker = root.join(MARKER);
         let initialized = exists(&marker)?;
@@ -181,10 +188,11 @@ impl Store {
                 File::open(root)?.sync_all()?;
             }
         }
+        let keys = settings.data_keys(root).map_err(other)?;
         let mut journal = if shared {
-            PrivateJournal::open_shared(&path).map_err(other)?
+            PrivateJournal::open_shared(&path, &keys).map_err(other)?
         } else {
-            PrivateJournal::open(&path).map_err(other)?
+            PrivateJournal::open(&path, &keys).map_err(other)?
         };
         let catalog = match journal.read().map_err(other)? {
             Some(bytes) => parse_document::<Catalog>(&bytes, InputFormat::Json)?,
@@ -352,7 +360,7 @@ pub(crate) async fn run(settings: &Settings, command: ContextCommand) -> Result<
     }
     let root = settings.data_dir().map_err(other)?;
     let create = matches!(command, ContextCommand::Add { .. });
-    let mut store = Store::open(&root, create)?;
+    let mut store = Store::open(settings, &root, create)?;
     let result = match command {
         ContextCommand::Enroll { .. } => {
             return Err(InputError::Invalid("invalid enrollment dispatch").into());
@@ -517,7 +525,7 @@ pub(super) fn selected(
         return Ok(None);
     }
     let root = settings.data_dir().map_err(other)?;
-    let store = Store::open_read(&root)?;
+    let store = Store::open_read(settings, &root)?;
     let selection =
         requested.or_else(|| store.as_ref().and_then(|s| s.catalog.selected.as_deref()));
     let Some(selection) = selection else {
@@ -653,7 +661,7 @@ impl ClientTransport for Transport {
         }
     }
 }
-pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
+pub(super) fn connect(settings: &Settings, profile: Profile, history: PathBuf) -> Result<Context> {
     profile.validate()?;
     match profile {
         Profile::Unix {
@@ -681,8 +689,13 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
             enrollment,
             session,
         } => {
-            let pending = focal_node::network_join::PendingClientJoin::resume_shared(enrollment)
+            // The enrollment lives in this client's data directory, sealed under its keys.
+            let keys = settings
+                .data_keys(&settings.data_dir().map_err(other)?)
                 .map_err(other)?;
+            let pending =
+                focal_node::network_join::PendingClientJoin::resume_shared(enrollment, &keys)
+                    .map_err(other)?;
             if pending.enrollment().map_err(other)?.is_none() {
                 return Err(InputError::Invalid(
                     "client enrollment is pending; retry `enroll context` with its original invitation",
@@ -866,7 +879,7 @@ async fn enroll(settings: &Settings, selected: &str, invitation: &Path) -> Resul
     let root = settings.data_dir().map_err(other)?;
     super::private_parent(&root)?;
     let root = fs::canonicalize(root)?;
-    let mut store = Store::open(&root, true)?.ok_or(CliError::InvalidResponse)?;
+    let mut store = Store::open(settings, &root, true)?.ok_or(CliError::InvalidResponse)?;
     let path = root.join(CATALOG).join(format!("enrollment-{selected}"));
     let profile = Profile::Enrolled {
         enrollment: path.clone(),
@@ -892,7 +905,8 @@ async fn enroll(settings: &Settings, selected: &str, invitation: &Path) -> Resul
     {
         return Err(catalogue_full());
     }
-    let pending = PendingClientJoin::open(path, bundle).map_err(other)?;
+    let keys = settings.data_keys(&root).map_err(other)?;
+    let pending = PendingClientJoin::open(path, &keys, bundle).map_err(other)?;
     let history = root.join(CATALOG).join(format!("history-{selected}"));
     if (store.catalog.profiles.contains_key(selected)
         || store.catalog.removed.contains_key(selected))
@@ -1028,7 +1042,7 @@ mod tests {
     #[test]
     fn selected_context_is_pinned_and_missing_catalogue_or_history_never_recreated() {
         let (root, settings) = settings();
-        let mut store = Store::open(root.path(), true).unwrap().unwrap();
+        let mut store = Store::open(&settings, root.path(), true).unwrap().unwrap();
         store.catalog.profiles.insert(
             "alice".into(),
             Profile::Unix {
@@ -1048,12 +1062,12 @@ mod tests {
         assert!(selected(&settings, None).is_err());
         assert!(!history.exists());
         fs::remove_dir_all(root.path().join(CATALOG)).unwrap();
-        assert!(Store::open(root.path(), true).is_err());
+        assert!(Store::open(&settings, root.path(), true).is_err());
         assert!(!root.path().join(CATALOG).exists());
     }
     #[test]
     fn removed_names_remain_bound_and_remote_metadata_never_discloses_key_paths() {
-        let (root, _) = settings();
+        let (root, settings) = settings();
         let profile = Profile::Quic(Box::new(QuicProfile {
             endpoint: "127.0.0.1:4433".into(),
             server_name: "focal.local".into(),
@@ -1068,7 +1082,7 @@ mod tests {
         }));
         profile.validate().unwrap();
         assert!(!profile.redacted().to_string().contains("secret-key"));
-        let mut store = Store::open(root.path(), true).unwrap().unwrap();
+        let mut store = Store::open(&settings, root.path(), true).unwrap().unwrap();
         store
             .catalog
             .removed
@@ -1076,7 +1090,7 @@ mod tests {
         store.save().unwrap();
         drop(store);
         assert!(
-            Store::open(root.path(), false)
+            Store::open(&settings, root.path(), false)
                 .unwrap()
                 .unwrap()
                 .catalog
@@ -1117,7 +1131,7 @@ mod tests {
     fn administration_resolves_selected_unix_node_and_rejects_remote_fallback() {
         let (root, settings) = settings();
         assert_eq!(admin_settings(&settings, None).unwrap(), settings);
-        let mut store = Store::open(root.path(), true).unwrap().unwrap();
+        let mut store = Store::open(&settings, root.path(), true).unwrap().unwrap();
         let node = root.path().join("another-node");
         let history = root.path().join(CATALOG).join("history-near");
         super::super::private_parent(&history).unwrap();

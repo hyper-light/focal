@@ -69,10 +69,11 @@ pub struct NodeSettings {
     /// An optional loopback endpoint for the read-only metrics text (doc
     /// 08 §9); node-local, never a cluster fact.
     pub metrics_listen: Option<SocketAddr>,
-    /// The file the node's root key lives in (29 §2): 32 bytes, owner-only,
-    /// never inside the data directory. Unset, the platform's per-user
-    /// configuration directory (`focal_seal::default_key_file`); in a
-    /// container, a mounted secret file. Node-local, never a cluster fact.
+    /// The file the data directory's root key lives in (29 §2): 32 bytes,
+    /// owner-only, never inside the data directory. Unset, the platform's
+    /// per-user configuration directory, the file named for the directory's
+    /// root key (`focal_seal::resolve`); in a container, a mounted secret
+    /// file. Node-local, never a cluster fact.
     pub root_key: Option<PathBuf>,
     /// How long a credential the cluster issues lasts, in seconds — the
     /// founder's own, every joined node's and every participant's; a node
@@ -353,16 +354,48 @@ impl Settings {
             placement: self.placement.clone(),
         }
     }
-    /// The root key file of node `node` (29 §2): the configured file, or the
-    /// platform's default, named for the node.
-    pub fn root_key_file(&self, node: u64) -> Result<PathBuf, ConfigError> {
-        if let Some(path) = &self.node.root_key {
-            return Ok(path.clone());
-        }
-        focal_seal::default_key_file(&format!("{node:016x}")).ok_or(ConfigError::Invalid {
-            field: "node.root_key",
-            reason: "unset, and the platform names no per-user configuration directory",
-        })
+    /// The keys of the data directory `root` (29 §2), made where it has
+    /// none: under the configured root key file; else under the file named
+    /// for the directory's root key in the platform's per-user directory, a
+    /// node's or a client's alike, which a directory finds from itself
+    /// before it knows any identity (a joining node seals its join first).
+    /// A node's directory whose keys an earlier binary made under the file
+    /// named for its node keeps that file.
+    pub fn data_keys(
+        &self,
+        root: &std::path::Path,
+    ) -> Result<focal_seal::DataKeys, crate::embedded::NodeError> {
+        let identity = root.join("IDENTITY");
+        let legacy = if identity.is_file() {
+            let node = crate::embedded::decode_identity(&identity)?.node;
+            focal_seal::default_key_file(&format!("{node:016x}"))
+        } else {
+            None
+        };
+        Ok(focal_seal::resolve(
+            root,
+            self.node.root_key.as_deref(),
+            legacy,
+        )?)
+    }
+    /// [`Self::data_keys`] of a data directory that has keys, made nowhere: none where it has none
+    /// yet. What a command line beside the directory's running owner opens its records with.
+    pub fn found_data_keys(
+        &self,
+        root: &std::path::Path,
+    ) -> Result<Option<focal_seal::DataKeys>, crate::embedded::NodeError> {
+        let identity = root.join("IDENTITY");
+        let legacy = if identity.is_file() {
+            let node = crate::embedded::decode_identity(&identity)?.node;
+            focal_seal::default_key_file(&format!("{node:016x}"))
+        } else {
+            None
+        };
+        Ok(focal_seal::find(
+            root,
+            self.node.root_key.as_deref(),
+            legacy,
+        )?)
     }
     pub fn data_dir(&self) -> Result<PathBuf, ConfigError> {
         if let Some(path) = &self.node.data_dir {

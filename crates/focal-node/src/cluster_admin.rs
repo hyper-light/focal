@@ -325,6 +325,8 @@ struct Latest {
 pub struct ClusterAdmin {
     root: PathBuf,
     identity: NodeIdentity,
+    /// The node's data directory's keys, which its journal is sealed under (29 §12).
+    keys: focal_seal::DataKeys,
 }
 impl ClusterAdmin {
     pub async fn operator(&self, read: crate::network_admin::OperatorRead) -> Result<AdminResult> {
@@ -859,7 +861,12 @@ impl ClusterAdmin {
     pub fn open(settings: &Settings) -> Result<Self> {
         let root = settings.data_dir()?;
         let identity = decode_identity(&root.join("IDENTITY"))?;
-        Ok(Self { root, identity })
+        let keys = settings.data_keys(&root)?;
+        Ok(Self {
+            root,
+            identity,
+            keys,
+        })
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -2087,7 +2094,7 @@ impl ClusterAdmin {
     }
     fn journal(&self, create: bool) -> Result<(PrivateJournal, Saved)> {
         let fresh = initialize(&self.root, &self.identity, create)?;
-        let mut journal = PrivateJournal::open(self.root.join(DIRECTORY))?;
+        let mut journal = PrivateJournal::open(self.root.join(DIRECTORY), &self.keys)?;
         let saved = match journal.read()? {
             Some(bytes) => {
                 let (saved, tail): (Saved, _) =

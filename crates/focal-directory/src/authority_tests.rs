@@ -64,6 +64,7 @@ impl Fixture {
             .as_secs() as i64;
         let issuer = BootstrapAuthority::open_or_create(
             dir.path().join("ca"),
+            &focal_seal::test_keys_beside(dir.path().join("ca")).unwrap(),
             [61; 16],
             vec!["localhost".into()],
             now,
@@ -95,8 +96,12 @@ impl Fixture {
                 .apply_committed(draft.command(), enrollment.applied_index() + 1)
                 .unwrap();
             let invitation = draft.release(&enrollment).unwrap();
-            let key = JoinKey::open_or_create(dir.path().join(format!("key{ordinal}")), [61; 16])
-                .unwrap();
+            let key = JoinKey::open_or_create(
+                dir.path().join(format!("key{ordinal}")),
+                &focal_seal::test_keys_beside(dir.path().join(format!("key{ordinal}"))).unwrap(),
+                [61; 16],
+            )
+            .unwrap();
             let request = invitation
                 .request_after_tls(&tls(&invitation, &issuer), &key, now)
                 .unwrap();

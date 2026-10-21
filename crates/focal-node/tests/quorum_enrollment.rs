@@ -427,6 +427,7 @@ impl EnrollmentControl for Router {
 fn authority(path: &std::path::Path) -> BootstrapAuthority {
     BootstrapAuthority::open_or_create(
         path,
+        &focal_seal::test_keys_beside(path).unwrap(),
         CLUSTER,
         vec!["enroll.focal.internal".to_owned()],
         now(),
@@ -478,8 +479,14 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         let first = rig.leader(0).await;
         let router = Router::following(&rig, first);
         let config = signer_config(router.identity());
-        let (host, driver) =
-            QuorumEnrollmentHost::create(ca, &staging, config.clone(), budget()).unwrap();
+        let (host, driver) = QuorumEnrollmentHost::create(
+            ca,
+            &staging,
+            &focal_seal::test_keys_beside(&staging).unwrap(),
+            config.clone(),
+            budget(),
+        )
+        .unwrap();
         let task = serve(driver, router.clone());
         let request = RequestId::from_u128(1);
         let node_intent = intent(EnrollmentRole::Node);
@@ -498,9 +505,14 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         rig.isolated.store(first as u64 + 1, Ordering::SeqCst);
         let replacement = rig.leader(first as u64 + 1).await;
         router.selected.store(replacement as u64, Ordering::SeqCst);
-        let (host, driver) =
-            QuorumEnrollmentHost::open(authority(&ca_path), &staging, config.clone(), budget())
-                .unwrap();
+        let (host, driver) = QuorumEnrollmentHost::open(
+            authority(&ca_path),
+            &staging,
+            &focal_seal::test_keys_beside(&staging).unwrap(),
+            config.clone(),
+            budget(),
+        )
+        .unwrap();
         let task = serve(driver, router.clone());
         let invitation = host.invite(request, node_intent.clone()).await.unwrap();
         let token = invitation.expose_token().unwrap();
@@ -518,7 +530,12 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
                 == token
         );
         let keys = tempfile::tempdir().unwrap();
-        let key = JoinKey::open_or_create(keys.path().join("node"), CLUSTER).unwrap();
+        let key = JoinKey::open_or_create(
+            keys.path().join("node"),
+            &focal_seal::test_keys_beside(keys.path().join("node")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let join = join_request(&material, &invitation, &key);
         // Actual quorum commit succeeds, but the signer sees an unknown outcome.
         router.fault.store(2, Ordering::SeqCst);
@@ -542,9 +559,14 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         rig.start();
         let leader = rig.leader(0).await;
         let router = Router::following(&rig, leader);
-        let (host, driver) =
-            QuorumEnrollmentHost::open(authority(&ca_path), &staging, config.clone(), budget())
-                .unwrap();
+        let (host, driver) = QuorumEnrollmentHost::open(
+            authority(&ca_path),
+            &staging,
+            &focal_seal::test_keys_beside(&staging).unwrap(),
+            config.clone(),
+            budget(),
+        )
+        .unwrap();
         let task = serve(driver, router.clone());
         let recovered = host.redeem(join.clone()).await.unwrap();
         assert_eq!(recovered, committed);
@@ -573,7 +595,12 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         assert_eq!(grant.role, PeerRole::Node { node_id: 4 });
         assert_eq!(grant.tenants, config.tenants);
         // Competing CSR/request identities cannot reuse the committed invitation.
-        let other = JoinKey::open_or_create(keys.path().join("other"), CLUSTER).unwrap();
+        let other = JoinKey::open_or_create(
+            keys.path().join("other"),
+            &focal_seal::test_keys_beside(keys.path().join("other")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let other_join = join_request(&material, &invitation, &other);
         assert_refused!(
             host.redeem(other_join).await,
@@ -608,7 +635,12 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
             .invite(RequestId::from_u128(2), intent(EnrollmentRole::Client))
             .await
             .unwrap();
-        let actor_key = JoinKey::open_or_create(keys.path().join("actor"), CLUSTER).unwrap();
+        let actor_key = JoinKey::open_or_create(
+            keys.path().join("actor"),
+            &focal_seal::test_keys_beside(keys.path().join("actor")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let actor = host
             .redeem(join_request(&material, &actor_invite, &actor_key))
             .await
@@ -631,7 +663,12 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         let mut short = intent(EnrollmentRole::Client);
         short.lifetime_seconds = 2;
         let expiring = host.invite(RequestId::from_u128(3), short).await.unwrap();
-        let expired_key = JoinKey::open_or_create(keys.path().join("expired"), CLUSTER).unwrap();
+        let expired_key = JoinKey::open_or_create(
+            keys.path().join("expired"),
+            &focal_seal::test_keys_beside(keys.path().join("expired")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let expired_join = join_request(&material, &expiring, &expired_key);
         focal_rt::time::sleep(Duration::from_millis(2200))
             .await
@@ -657,11 +694,23 @@ fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restart() {
         // Lost initialized journal cannot create a second sequence authority.
         std::fs::remove_file(staging.join("journal.bin")).unwrap();
         assert_refused!(
-            QuorumEnrollmentHost::open(authority(&ca_path), &staging, config.clone(), budget()),
+            QuorumEnrollmentHost::open(
+                authority(&ca_path),
+                &staging,
+                &focal_seal::test_keys_beside(&staging).unwrap(),
+                config.clone(),
+                budget()
+            ),
             Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Corrupt))
         );
         assert_refused!(
-            QuorumEnrollmentHost::create(authority(&ca_path), &staging, config, budget()),
+            QuorumEnrollmentHost::create(
+                authority(&ca_path),
+                &staging,
+                &focal_seal::test_keys_beside(&staging).unwrap(),
+                config,
+                budget()
+            ),
             Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Corrupt))
         );
         rig.stop().await;
@@ -682,6 +731,7 @@ fn minority_and_wrong_authority_cannot_release_new_enrollment() {
         let (host, driver) = QuorumEnrollmentHost::create(
             ca,
             private.path().join("signer"),
+            &focal_seal::test_keys_beside(private.path().join("signer")).unwrap(),
             config.clone(),
             budget(),
         )
@@ -703,6 +753,7 @@ fn minority_and_wrong_authority_cannot_release_new_enrollment() {
         let (host, driver) = QuorumEnrollmentHost::create(
             rogue,
             private.path().join("rogue-signer"),
+            &focal_seal::test_keys_beside(private.path().join("rogue-signer")).unwrap(),
             config,
             budget(),
         )
@@ -737,6 +788,7 @@ fn queue_and_state_allocations_are_bounded_and_released_on_cancellation() {
         let (host, driver) = QuorumEnrollmentHost::create(
             ca,
             private.path().join("signer"),
+            &focal_seal::test_keys_beside(private.path().join("signer")).unwrap(),
             config,
             allowance.clone(),
         )

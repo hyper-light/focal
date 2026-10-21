@@ -1453,6 +1453,19 @@ fn enrolled_agents(directory: &Path, count: u16) -> Result<Vec<PathBuf>, LoadErr
     Ok(found)
 }
 
+/// The keys of the client data directory an enrollment lies in (`<data-dir>/CLIENT.contexts/
+/// enrollment-<name>`, as `focal enroll context` leaves it), found as the CLI that enrolled it
+/// found them (29 §2): its journal and key are sealed under them.
+fn client_keys(enrollment: &Path) -> Result<focal_seal::DataKeys, LoadError> {
+    let data_dir = enrollment.parent().and_then(Path::parent).ok_or_else(|| {
+        LoadError::Shape(format!(
+            "{} is no context's enrollment",
+            enrollment.display()
+        ))
+    })?;
+    Ok(focal_node::config::Settings::default().data_keys(data_dir)?)
+}
+
 /// The principal of agent `agent` of a run among agents: the top bit set, then the run's seed and
 /// the agent's index, so no two agents share one and none is another run's.
 fn agent_principal(seed: u64, agent: u16) -> Result<ParticipantId, LoadError> {
@@ -1627,7 +1640,13 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                     .as_secs(),
             )
             .map_err(|_| LoadError::Clock)?;
-            let actor = focal_node::network_join::local_unix_principal(&root, &identity, now)?;
+            let keys = settings.found_data_keys(&root)?;
+            let actor = focal_node::network_join::local_unix_principal(
+                &root,
+                keys.as_ref(),
+                &identity,
+                now,
+            )?;
             let names = Names {
                 ledger: identity.ledger,
                 issuer: actor,
@@ -1661,7 +1680,10 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                     .as_secs(),
             )
             .map_err(|_| LoadError::Clock)?;
-            let pending = focal_node::network_join::PendingClientJoin::resume_shared(&enrollment)?;
+            let pending = focal_node::network_join::PendingClientJoin::resume_shared(
+                &enrollment,
+                &client_keys(&enrollment)?,
+            )?;
             let client = pending.remote_client(now, &limits)?;
             let names = Names {
                 ledger: client.build.ledger,
@@ -1681,7 +1703,10 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             let directory = shape.consumer_enrollment.clone().ok_or_else(|| {
                 LoadError::Shape("deliver over enrolled needs consumer_enrollment".into())
             })?;
-            let pending = focal_node::network_join::PendingClientJoin::resume_shared(&directory)?;
+            let pending = focal_node::network_join::PendingClientJoin::resume_shared(
+                &directory,
+                &client_keys(&directory)?,
+            )?;
             let client = pending.remote_client(unix_now()?, &limits)?;
             if client.build.ledger != names.ledger {
                 return Err(LoadError::Shape(
@@ -1716,8 +1741,10 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         (Some(count), Some(directory)) => enrolled_agents(directory, count)?
             .into_iter()
             .map(|enrollment| {
-                let pending =
-                    focal_node::network_join::PendingClientJoin::resume_shared(&enrollment)?;
+                let pending = focal_node::network_join::PendingClientJoin::resume_shared(
+                    &enrollment,
+                    &client_keys(&enrollment)?,
+                )?;
                 let client = pending.remote_client(unix_now()?, &limits)?;
                 if client.build.ledger != names.ledger {
                     return Err(LoadError::Shape(format!(

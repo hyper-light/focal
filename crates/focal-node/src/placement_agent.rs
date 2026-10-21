@@ -349,14 +349,18 @@ struct InstallJournal {
     record: InstallRecord,
 }
 impl InstallJournal {
-    fn open(root: &std::path::Path, node: u64) -> Result<Self, AgentError> {
+    fn open(
+        root: &std::path::Path,
+        keys: &focal_seal::DataKeys,
+        node: u64,
+    ) -> Result<Self, AgentError> {
         let path = root.join("cluster/placement-installs");
         let marker = root.join("PLACEMENT-INSTALLS.initialized");
         if marker.exists() && !path.join("journal.bin").is_file() {
             return Err(AgentError::Identity);
         }
         crate::embedded::durable_dir(&root.join("cluster"))?;
-        let mut journal = PrivateJournal::open(path)?;
+        let mut journal = PrivateJournal::open(path, keys)?;
         let record = match journal.read()? {
             Some(bytes) => InstallRecord::decode(&bytes)?,
             None => {
@@ -419,6 +423,8 @@ pub struct AgentInputs {
     pub settings: Settings,
     pub credentials: CredentialMaterial,
     pub root: PathBuf,
+    /// The data directory's keys, which the agent's journals are sealed under (29 §12).
+    pub keys: focal_seal::DataKeys,
     /// The custody scope installed for the founder's own session, if any.
     pub active_custody: Option<CustodyScope>,
     /// The node's whole allowance, sampled for load reports.
@@ -439,6 +445,7 @@ pub struct PlacementAgent {
     settings: Settings,
     credentials: CredentialMaterial,
     root: PathBuf,
+    keys: focal_seal::DataKeys,
     custody: BTreeMap<LedgerId, CustodyScope>,
     /// The residency fence installed with each ledger's custody scope
     /// (24 §22), re-installed when the boundary or a node's region changes.
@@ -563,6 +570,7 @@ impl PlacementAgent {
             settings,
             credentials,
             root,
+            keys,
             active_custody,
             node_budget,
             admission,
@@ -586,6 +594,7 @@ impl PlacementAgent {
             settings,
             credentials,
             root,
+            keys,
             custody,
             pending_custody: BTreeMap::new(),
             fences: BTreeMap::new(),
@@ -852,7 +861,7 @@ impl PlacementAgent {
         let node = self.state.node;
         let client = Self::local_client(self.state.genesis.founder.cluster, node);
         if self.installs.is_none() {
-            self.installs = Some(InstallJournal::open(&self.root, node)?);
+            self.installs = Some(InstallJournal::open(&self.root, &self.keys, node)?);
         }
         if !self.reopened {
             self.reopen_installed(handles).await?;
@@ -874,6 +883,7 @@ impl PlacementAgent {
             self.journals = Some(Journals {
                 root: IntentJournal::open(
                     &self.root,
+                    &self.keys,
                     "placement-root",
                     self.state.genesis.root,
                     root_client,
@@ -1397,7 +1407,8 @@ impl PlacementAgent {
                 u128::from_be_bytes(delegation.partition.0)
             )
         };
-        let journal = IntentJournal::open(&self.root, &name, identity, partition_client)?;
+        let journal =
+            IntentJournal::open(&self.root, &self.keys, &name, identity, partition_client)?;
         let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
         if journals.partitions.len()
             >= crate::network_service::MAX_HOSTED_PARTITIONS.saturating_add(1)

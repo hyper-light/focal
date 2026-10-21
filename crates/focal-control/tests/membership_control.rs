@@ -55,6 +55,7 @@ impl Cluster {
         let dirs = tempfile::tempdir().unwrap();
         let ca = BootstrapAuthority::open_or_create(
             dirs.path().join("ca"),
+            &focal_seal::test_keys_beside(dirs.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             1_800_000_000,

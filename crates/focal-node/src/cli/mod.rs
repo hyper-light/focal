@@ -131,7 +131,7 @@ impl Context {
     fn open(settings: &Settings, selection: Option<&str>) -> Result<Self> {
         match context::selected(settings, selection)? {
             Some((profile, history, name)) => {
-                let mut context = context::connect(profile, history)?;
+                let mut context = context::connect(settings, profile, history)?;
                 context.invocation = Self::recovery_invocation(
                     &settings
                         .data_dir()
@@ -151,11 +151,18 @@ impl Context {
             decode_identity(&root.join("IDENTITY")).map_err(|e| CliError::Other(Box::new(e)))?;
         // NETWORK also proves joined identity if its private JOIN files are
         // lost. Never fall back to the founder's issuer in that case.
-        let actor =
-            focal_node::network_join::local_unix_principal(&root, &identity, context::now()?)
-                .map_err(|error| {
-                    CliError::Input(format!("invalid local node client context: {error}"))
-                })?;
+        // The data directory's keys where it has them, made nowhere: this command runs beside the
+        // node that owns them.
+        let keys = settings
+            .found_data_keys(&root)
+            .map_err(|e| CliError::Other(Box::new(e)))?;
+        let actor = focal_node::network_join::local_unix_principal(
+            &root,
+            keys.as_ref(),
+            &identity,
+            context::now()?,
+        )
+        .map_err(|error| CliError::Input(format!("invalid local node client context: {error}")))?;
         let limits = WireLimits::default();
         let transport = LocalTransport::connect(
             root.join(focal_node::network_admin::LOCAL_SOCKET),

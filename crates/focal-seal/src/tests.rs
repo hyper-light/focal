@@ -228,3 +228,45 @@ fn a_caches_keys_open_what_it_sealed_and_no_other_caches_do() {
     let mut foreign = sealed;
     assert!(other.open(3, 64, false, &mut foreign, &tag).is_err());
 }
+
+/// A data directory's key file is found from the directory: the configured one where its owner
+/// names it; else, where `SEAL.node` names a root key, the file named for it or, for keys an
+/// earlier binary made under its node's name, that one; and never a fresh key for a directory that
+/// has keys.
+#[test]
+fn a_data_directorys_key_file_is_found_from_the_directory() {
+    let d = dirs();
+    assert_eq!(recorded_root(&d.data).unwrap(), None, "no keys yet");
+    // The owner names one: the keys are made under it, and its ID is recorded.
+    let keys = resolve(&d.data, Some(&d.key), None).unwrap();
+    assert_eq!(keys.key_file, d.key);
+    let id = recorded_root(&d.data).unwrap().unwrap();
+    let named = key_file_for(id).unwrap();
+    assert!(named.ends_with(format!("{}.key", hex(&id.0))));
+    // Unconfigured, the keys an earlier binary made under its node's file are opened by that
+    // file while none is named for the root.
+    if !named.exists() {
+        let legacy = resolve(&d.data, None, Some(d.key.clone())).unwrap();
+        assert_eq!(legacy.key_file, d.key);
+        legacy.key(Store::Journal).unwrap();
+        // Without that file the directory's keys are missing, never made again.
+        let elsewhere = d.data.parent().unwrap().join("nowhere.key");
+        assert!(matches!(
+            resolve(&d.data, None, Some(elsewhere)),
+            Err(SealSetupError::MissingKey(_))
+        ));
+    }
+    // A damaged record names no root.
+    let seal = d.data.join(SEAL_FILE);
+    let mut bytes = std::fs::read(&seal).unwrap();
+    bytes[20] ^= 1;
+    std::fs::write(&seal, &bytes).unwrap();
+    assert!(matches!(
+        recorded_root(&d.data),
+        Err(SealSetupError::Damaged(_))
+    ));
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}

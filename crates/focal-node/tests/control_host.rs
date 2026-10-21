@@ -517,7 +517,7 @@ fn directory_bootstrap_authorization_requires_a_fresh_root_quorum() {
         use focal_node::directory_bootstrap::{DirectoryBootstrapError, FirstDirectoryPlan};
         let directory = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
-            directory.path().join("ca"),
+            directory.path().join("ca"), &focal_seal::test_keys_beside(directory.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now(),
@@ -628,6 +628,7 @@ fn eventual_state_rediscovers_majority_after_cached_owner_loses_quorum() {
         let keys = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             keys.path().join("ca"),
+            &focal_seal::test_keys_beside(keys.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now(),
@@ -671,6 +672,7 @@ fn root_enrollment_majority_commit_exact_retry_and_disk_restart() {
         let keys = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             keys.path().join("ca"),
+            &focal_seal::test_keys_beside(keys.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now(),
@@ -745,7 +747,12 @@ fn root_enrollment_majority_commit_exact_retry_and_disk_restart() {
             .unwrap();
         let (majority, snapshot) = rig.state_on_leader(majority).await;
         let invitation = draft.release(&registry(&snapshot)).unwrap();
-        let join_key = JoinKey::open_or_create(keys.path().join("join"), CLUSTER).unwrap();
+        let join_key = JoinKey::open_or_create(
+            keys.path().join("join"),
+            &focal_seal::test_keys_beside(keys.path().join("join")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let join = join_request(&authority, &invitation, &join_key);
         let JoinPreparation::Commit(command) = registry(&snapshot)
             .prepare_join(&authority, &join, now())
@@ -965,6 +972,7 @@ fn owned_control_response_retains_input_and_export_budgets_until_delivery_drop()
         let data = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             data.path().join("ca"),
+            &focal_seal::test_keys_beside(data.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now(),
@@ -1072,14 +1080,21 @@ fn follower_root_observation_exports_one_durable_prefix_and_retains_delivery_bud
         let data = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             data.path().join("ca"),
+            &focal_seal::test_keys_beside(data.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now(),
         )
         .unwrap();
-        let key = JoinKey::open_or_create(data.path().join("key"), CLUSTER).unwrap();
+        let key = JoinKey::open_or_create(
+            data.path().join("key"),
+            &focal_seal::test_keys_beside(data.path().join("key")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let founder = FoundingEnrollmentDraft::open_or_create(
             data.path().join("founder"),
+            &focal_seal::test_keys_beside(data.path().join("founder")).unwrap(),
             &authority,
             &key,
             1,
@@ -1311,6 +1326,7 @@ fn membership_requires_runtime_and_returns_only_committed_configuration_receipts
         let keys = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             keys.path().join("ca"),
+            &focal_seal::test_keys_beside(keys.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now(),
@@ -1464,6 +1480,7 @@ fn recovered_control_events_are_forwarded_once_and_keep_frames_charged_after_own
         let data = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             data.path().join("ca"),
+            &focal_seal::test_keys_beside(data.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now(),
@@ -1562,6 +1579,7 @@ fn an_owner_refused_the_room_waits_and_goes_on() {
         let data = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             data.path().join("ca"),
+            &focal_seal::test_keys_beside(data.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now(),
@@ -1669,6 +1687,7 @@ fn what_comes_while_the_owner_decides_another_command_waits_its_turn() {
         let keys = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             keys.path().join("ca"),
+            &focal_seal::test_keys_beside(keys.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now(),
@@ -1796,6 +1815,7 @@ fn a_follower_read_answered_ahead_of_what_it_applied_waits_and_never_fails_it() 
         let keys = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             keys.path().join("ca"),
+            &focal_seal::test_keys_beside(keys.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now(),
@@ -1888,6 +1908,7 @@ fn a_follower_answers_a_read_through_its_leader() {
         let keys = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             keys.path().join("ca"),
+            &focal_seal::test_keys_beside(keys.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["localhost".into()],
             now(),

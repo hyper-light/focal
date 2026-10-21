@@ -9,6 +9,7 @@ license.workspace = true
 blake3.workspace = true
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
+focal-seal = { version = "0.1.0", path = "../focal-seal" }
 focal-wire = { version = "0.1.0", path = "../focal-wire" }
 hyper-rt.workspace = true
 getrandom.workspace = true
@@ -26,6 +27,7 @@ aws-lc-rs = "1.18"
 
 [dev-dependencies]
 tempfile.workspace = true
+focal-seal = { version = "0.1.0", path = "../focal-seal", features = ["test-support"] }
 focal-log = { version = "0.1.0", path = "../focal-log" }
 focal-rt = { version = "0.1.0", path = "../focal-rt" }
 

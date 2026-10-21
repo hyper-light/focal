@@ -83,15 +83,24 @@ pub struct RootEnrollment {
     authority: BootstrapAuthority,
     control: ControlReplica,
     staging: PathBuf,
+    /// The node's data directory's keys, which its invitations are sealed under (29 §12).
+    keys: focal_seal::DataKeys,
     server_name: String,
     failed: bool,
 }
 impl RootEnrollment {
     pub fn for_node(node: &EmbeddedNode, now: i64) -> Result<Self, ClusterError> {
-        Self::open(node.root(), &node.identity, node.wal.clone(), now)
+        Self::open(
+            node.root(),
+            node.keys(),
+            &node.identity,
+            node.wal.clone(),
+            now,
+        )
     }
     pub fn open(
         root: &Path,
+        keys: &focal_seal::DataKeys,
         identity: &NodeIdentity,
         wal: SharedWal,
         now: i64,
@@ -101,6 +110,7 @@ impl RootEnrollment {
         let server_name = format!("cluster-{}.focal.internal", hex(&identity.cluster));
         let authority = BootstrapAuthority::open_or_create(
             directory.join("authority"),
+            keys,
             identity.cluster,
             vec![server_name.clone()],
             now,
@@ -194,6 +204,7 @@ impl RootEnrollment {
             authority,
             control,
             staging,
+            keys: keys.clone(),
             server_name,
             failed: false,
         })
@@ -232,7 +243,7 @@ impl RootEnrollment {
         let pending = if path.join("invitation.bin").exists()
             || path.join("invitation.bin.initialized").exists()
         {
-            PendingInvitation::open(&path, self.authority.cluster())?
+            PendingInvitation::open(&path, &self.keys, self.authority.cluster())?
         } else {
             let expires_at = now
                 .checked_add(
@@ -250,7 +261,7 @@ impl RootEnrollment {
                     },
                     now,
                 )?
-                .persist(&path, intent_hash)?
+                .persist(&path, &self.keys, intent_hash)?
         };
         if pending.intent_hash() != intent_hash {
             return Err(ClusterError::IntentConflict);

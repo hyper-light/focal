@@ -21,7 +21,6 @@
 //! file is ever on the disk in the clear, and no key of the store is held between its files.
 //!
 //! [27]: ../../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md
-use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -92,11 +91,7 @@ pub enum GroupFileError {
 
 /// Where a group file's key comes from: the node's data directory, whose `SEAL.node` holds the
 /// group-file key, and the root key file that opens it (29 §2–§3).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GroupSeal {
-    pub data_dir: PathBuf,
-    pub key_file: PathBuf,
-}
+pub type GroupSeal = focal_seal::DataKeys;
 
 /// The seal of the group files under the data directory `root` in this crate's tests.
 #[cfg(test)]
@@ -107,72 +102,11 @@ pub(crate) fn test_seal(root: &Path) -> GroupSeal {
     }
 }
 
-/// Plaintext bytes of a sealed group file's segment: 64 KiB, the segment hyper-seal's sealed-file
-/// bench measures (docs/benchmarks.md "Sealed files"); a group's records fit one.
-const SEGMENT: u32 = 64 * 1024;
-/// A sealed file's footer: the stream's length (`hyper_seal::sealed_file`).
-const SEALED_FOOTER: u64 = 8;
-
-/// A file held in memory, for a sealed file made whole before it is installed and opened whole
-/// once read: byte-aligned, flushed by the install that writes it.
-#[derive(Default)]
-struct MemFile(RefCell<Vec<u8>>);
-
-impl hyper_block::block::BlockFile for MemFile {
-    fn alignment(&self) -> hyper_block::buf::Alignment {
-        hyper_block::buf::Alignment::BYTE
-    }
-    fn len(&self) -> Result<u64, hyper_block::DiskError> {
-        u64::try_from(self.0.borrow().len()).map_err(|_| short(0, 0))
-    }
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<(), hyper_block::DiskError> {
-        let bytes = self.0.borrow();
-        let from = usize::try_from(offset).map_err(|_| short(offset, buf.len()))?;
-        let to = from
-            .checked_add(buf.len())
-            .ok_or(short(offset, buf.len()))?;
-        let src = bytes.get(from..to).ok_or(short(offset, buf.len()))?;
-        buf.copy_from_slice(src);
-        Ok(())
-    }
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> Result<(), hyper_block::DiskError> {
-        let mut bytes = self.0.borrow_mut();
-        let from = usize::try_from(offset).map_err(|_| short(offset, buf.len()))?;
-        let to = from
-            .checked_add(buf.len())
-            .ok_or(short(offset, buf.len()))?;
-        let grow = to.saturating_sub(bytes.len());
-        if grow > 0 {
-            bytes
-                .try_reserve(grow)
-                .map_err(|_| short(offset, buf.len()))?;
-            bytes.resize(to, 0);
-        }
-        bytes
-            .get_mut(from..to)
-            .ok_or(short(offset, buf.len()))?
-            .copy_from_slice(buf);
-        Ok(())
-    }
-    fn sync_data(&self) -> Result<(), hyper_block::DiskError> {
-        Ok(())
-    }
-}
-
-fn short(offset: u64, missing: usize) -> hyper_block::DiskError {
-    hyper_block::DiskError::ShortRead {
-        path: PathBuf::new(),
-        offset,
-        missing,
-    }
-}
-
-/// `framed` sealed whole under a new data key wrapped by the node's group-file key.
+/// `framed` sealed whole under a new data key wrapped by the node's group-file key
+/// (`focal_seal::file`), which is unwrapped for this file and dropped after it.
 fn sealed(seal: &GroupSeal, framed: &[u8]) -> Result<Vec<u8>, GroupFileError> {
-    let key = focal_seal::store_key(&seal.data_dir, &seal.key_file, focal_seal::Store::Group)?;
-    let mut writer = hyper_seal::sealed_file::SealedWriter::new(MemFile::default(), &key, SEGMENT)?;
-    writer.write(framed)?;
-    Ok(writer.finish()?.0.into_inner())
+    let key = seal.key(focal_seal::Store::Group)?;
+    focal_seal::file::seal(&key, framed).map_err(|error| sealing(error, "", 0))
 }
 
 /// The framed bytes `bytes` seal, no more than `most` of them.
@@ -182,20 +116,18 @@ fn opened(
     bytes: Vec<u8>,
     most: usize,
 ) -> Result<Vec<u8>, GroupFileError> {
-    let key = focal_seal::store_key(&seal.data_dir, &seal.key_file, focal_seal::Store::Group)?;
-    let mut reader =
-        hyper_seal::sealed_file::SealedReader::open(MemFile(RefCell::new(bytes)), &key, SEGMENT)?;
-    let len = usize::try_from(reader.len())
-        .ok()
-        .filter(|len| *len <= most)
-        .ok_or(GroupFileError::Bound { file, bound: most })?;
-    let mut framed = Vec::new();
-    framed
-        .try_reserve_exact(len)
-        .map_err(|_| GroupFileError::Bound { file, bound: most })?;
-    framed.resize(len, 0);
-    reader.read_at(&mut framed, 0)?;
-    Ok(framed)
+    let key = seal.key(focal_seal::Store::Group)?;
+    focal_seal::file::open(&key, bytes, most)
+        .map(|mut plain| std::mem::take(&mut *plain))
+        .map_err(|error| sealing(error, file, most))
+}
+
+/// A sealed file's refusal as a group file's: its seal's, or its bound's.
+fn sealing(error: focal_seal::file::FileError, file: &'static str, bound: usize) -> GroupFileError {
+    match error {
+        focal_seal::file::FileError::Seal(error) => GroupFileError::Seal(error),
+        focal_seal::file::FileError::Bound(_) => GroupFileError::Bound { file, bound },
+    }
 }
 
 /// What the group is, and what its entries need to be read ([27] §15.2): its identity, whether it
@@ -490,12 +422,7 @@ fn read_bounded<M: Medium>(
             file,
             bound: payload_bound,
         })?;
-    let limit = u64::try_from(framed)
-        .ok()
-        .and_then(|n| hyper_seal::stream::sealed_len(n, SEGMENT).ok())
-        .and_then(|n| n.checked_add(SEALED_FOOTER))
-        .and_then(|n| usize::try_from(n).ok())
-        .ok_or(bound)?;
+    let limit = focal_seal::file::sealed_bound(framed).ok_or(bound)?;
     let bytes = medium.read(path, limit).map_err(GroupFileError::Io)?;
     opened(seal, file, bytes, framed)
 }

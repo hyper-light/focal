@@ -93,6 +93,9 @@ pub enum NodeError {
     Entropy(String),
     #[error("domain refused the operation: {0}")]
     Domain(String),
+    /// The data directory's keys did not open or could not be made (29 §2).
+    #[error("the data directory's keys: {0}")]
+    Keys(#[from] focal_seal::SealSetupError),
 }
 impl From<focal_consensus::storage_open::OpenError> for NodeError {
     fn from(error: focal_consensus::storage_open::OpenError) -> Self {
@@ -106,6 +109,9 @@ pub struct EmbeddedNode {
     pub content: ContentStore,
     pub(crate) wal: SharedWal,
     directory: crate::node_directory::NodeDirectory,
+    /// The data directory's keys (29 §2), made at its first start: what its sealed records are
+    /// sealed under.
+    keys: focal_seal::DataKeys,
 }
 
 impl EmbeddedNode {
@@ -122,6 +128,7 @@ impl EmbeddedNode {
         if crate::network_state::network_requested(root, settings) {
             return Err(NodeError::NetworkRequired);
         }
+        let keys = settings.data_keys(root)?;
         let identity = directory.identity().clone();
         // An initialized store's committed policy is checked before anything
         // else: a differing file is refused by its field, never re-solved.
@@ -190,11 +197,16 @@ impl EmbeddedNode {
             content,
             wal,
             directory,
+            keys,
         })
     }
 
     pub fn root(&self) -> &Path {
         self.directory.root()
+    }
+    /// The data directory's keys (29 §2).
+    pub fn keys(&self) -> &focal_seal::DataKeys {
+        &self.keys
     }
     pub fn checkpoint(&mut self) -> Result<(), NodeError> {
         self.session.checkpoint()?;

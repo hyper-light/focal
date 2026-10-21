@@ -30,6 +30,7 @@ impl FoundingEnrollmentDraft {
     #[allow(clippy::too_many_arguments)] // One founding: the place, the authority, the key, the identity, the policy, the level and the moment, each its own fact.
     pub fn open_or_create(
         path: impl AsRef<Path>,
+        keys: &focal_seal::DataKeys,
         authority: &BootstrapAuthority,
         key: &JoinKey,
         node: u64,
@@ -41,7 +42,7 @@ impl FoundingEnrollmentDraft {
         if node == 0 || principal == [0; 16] || key.cluster() != authority.cluster() {
             return Err(EnrollmentError::WrongCluster);
         }
-        let directory = PrivateDirectory::open(path.as_ref())?;
+        let directory = PrivateDirectory::open(path.as_ref(), keys)?;
         let (registry, receipt) = match directory.read("founder.bin")? {
             Some(bytes) => {
                 let saved: SavedFounder = decode(&bytes)?;
@@ -125,15 +126,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             dir.path().join("ca"),
+            &focal_seal::test_keys_beside(dir.path().join("ca")).unwrap(),
             [5; 16],
             vec!["founder.internal".into()],
             now(),
         )
         .unwrap();
-        let key = JoinKey::open_or_create(dir.path().join("key"), [5; 16]).unwrap();
+        let key = JoinKey::open_or_create(
+            dir.path().join("key"),
+            &focal_seal::test_keys_beside(dir.path().join("key")).unwrap(),
+            [5; 16],
+        )
+        .unwrap();
         let path = dir.path().join("founder");
         let draft = FoundingEnrollmentDraft::open_or_create(
             &path,
+            &focal_seal::test_keys_beside(&path).unwrap(),
             &authority,
             &key,
             41,
@@ -157,6 +165,7 @@ mod tests {
         drop(draft);
         let retry = FoundingEnrollmentDraft::open_or_create(
             &path,
+            &focal_seal::test_keys_beside(&path).unwrap(),
             &authority,
             &key,
             41,
@@ -183,6 +192,7 @@ mod tests {
         assert!(matches!(
             FoundingEnrollmentDraft::open_or_create(
                 &path,
+                &focal_seal::test_keys_beside(&path).unwrap(),
                 &authority,
                 &key,
                 42,
@@ -196,6 +206,7 @@ mod tests {
         assert!(matches!(
             FoundingEnrollmentDraft::open_or_create(
                 &path,
+                &focal_seal::test_keys_beside(&path).unwrap(),
                 &authority,
                 &key,
                 41,
@@ -206,10 +217,16 @@ mod tests {
             ),
             Err(EnrollmentError::Conflict)
         ));
-        let other = JoinKey::open_or_create(dir.path().join("other-key"), [5; 16]).unwrap();
+        let other = JoinKey::open_or_create(
+            dir.path().join("other-key"),
+            &focal_seal::test_keys_beside(dir.path().join("other-key")).unwrap(),
+            [5; 16],
+        )
+        .unwrap();
         assert!(matches!(
             FoundingEnrollmentDraft::open_or_create(
                 &path,
+                &focal_seal::test_keys_beside(&path).unwrap(),
                 &authority,
                 &other,
                 41,
@@ -224,6 +241,7 @@ mod tests {
         assert!(matches!(
             FoundingEnrollmentDraft::open_or_create(
                 &path,
+                &focal_seal::test_keys_beside(&path).unwrap(),
                 &authority,
                 &key,
                 41,
@@ -240,15 +258,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             dir.path().join("ca"),
+            &focal_seal::test_keys_beside(dir.path().join("ca")).unwrap(),
             [5; 16],
             vec!["founder.internal".into()],
             now(),
         )
         .unwrap();
-        let wrong = JoinKey::open_or_create(dir.path().join("wrong"), [8; 16]).unwrap();
+        let wrong = JoinKey::open_or_create(
+            dir.path().join("wrong"),
+            &focal_seal::test_keys_beside(dir.path().join("wrong")).unwrap(),
+            [8; 16],
+        )
+        .unwrap();
         assert!(matches!(
             FoundingEnrollmentDraft::open_or_create(
                 dir.path().join("founder"),
+                &focal_seal::test_keys_beside(dir.path().join("founder")).unwrap(),
                 &authority,
                 &wrong,
                 41,
@@ -259,10 +284,16 @@ mod tests {
             ),
             Err(EnrollmentError::WrongCluster)
         ));
-        let key = JoinKey::open_or_create(dir.path().join("key"), [5; 16]).unwrap();
+        let key = JoinKey::open_or_create(
+            dir.path().join("key"),
+            &focal_seal::test_keys_beside(dir.path().join("key")).unwrap(),
+            [5; 16],
+        )
+        .unwrap();
         assert!(matches!(
             FoundingEnrollmentDraft::open_or_create(
                 dir.path().join("overflow"),
+                &focal_seal::test_keys_beside(dir.path().join("overflow")).unwrap(),
                 &authority,
                 &key,
                 u64::MAX,

@@ -812,6 +812,7 @@ dependencies = [
  "focal-enrollment",
  "focal-memory",
  "focal-model",
+ "focal-seal",
  "hyper-tls",
  "postcard",
  "serde",
@@ -828,6 +829,7 @@ dependencies = [
  "focal-memory",
  "focal-platform",
  "focal-rt",
+ "focal-seal",
  "focal-wire",
  "getrandom 0.3.4",
  "hyper-rt",
@@ -908,6 +910,7 @@ dependencies = [
  "focal-node",
  "focal-platform",
  "focal-rt",
+ "focal-seal",
  "focal-wire",
  "futures-util",
  "getrandom 0.3.4",
@@ -1097,9 +1100,11 @@ dependencies = [
  "blake3",
  "focal-platform",
  "getrandom 0.3.4",
+ "hyper-block",
  "hyper-seal",
  "tempfile",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

@@ -14,6 +14,7 @@
 //! Network adapters run on a hyper-rt shard, on focal-wire's endpoint; off one
 //! they return a typed transport error before socket work.
 mod files;
+pub use files::open_record as open_private_record;
 mod founding;
 mod invitation;
 mod journal;
@@ -75,6 +76,10 @@ pub enum EnrollmentError {
     Crypto,
     #[error("private credential persistence failed")]
     Io(#[source] std::io::Error),
+    /// The data directory's keys did not open (29 §2): its key file missing, another's, or
+    /// readable by others.
+    #[error("the data directory's keys: {0}")]
+    Keys(#[source] focal_seal::SealSetupError),
 }
 impl From<std::io::Error> for EnrollmentError {
     fn from(error: std::io::Error) -> Self {

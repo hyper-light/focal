@@ -493,13 +493,17 @@ struct RootAdmission {
     policy_regions: Vec<String>,
 }
 impl RootAdmission {
-    fn open(state: &NetworkState, root: &std::path::Path) -> Result<Self, ControllerError> {
+    fn open(
+        state: &NetworkState,
+        root: &std::path::Path,
+        keys: &focal_seal::DataKeys,
+    ) -> Result<Self, ControllerError> {
         let path = root.join("cluster/root-admission");
         let marker = root.join("ROOT-ADMISSION.initialized");
         if marker.exists() && !path.join("journal.bin").is_file() {
             return Err(ControllerError::Identity);
         }
-        let mut journal = PrivateJournal::open(path)?;
+        let mut journal = PrivateJournal::open(path, keys)?;
         let intent = match journal.read()? {
             Some(bytes) => {
                 let (value, rest): (RootIntent, _) = postcard::take_from_bytes(&bytes)?;
@@ -1076,6 +1080,8 @@ pub struct NetworkController {
     receipt: EnrollmentReceipt,
     credentials: CredentialMaterial,
     root: PathBuf,
+    /// The data directory's keys, which the node's private records are sealed under (29 §12).
+    keys: focal_seal::DataKeys,
     /// The fence level last recorded for the next start (`storage_level`), so a fence that has
     /// not moved writes nothing.
     recorded_level: u32,
@@ -1184,6 +1190,7 @@ impl NetworkController {
         receipt: EnrollmentReceipt,
         credentials: CredentialMaterial,
         root: PathBuf,
+        keys: focal_seal::DataKeys,
         budget: MemoryBudget,
     ) -> Result<Self, ControllerError> {
         let genesis_founder = {
@@ -1216,7 +1223,7 @@ impl NetworkController {
                 .ok_or(ControllerError::Capacity)?,
         )?;
         let admission = if state.node == state.genesis.founder.node {
-            Some(RootAdmission::open(&state, &root)?)
+            Some(RootAdmission::open(&state, &root, &keys)?)
         } else {
             None
         };
@@ -1233,6 +1240,7 @@ impl NetworkController {
             receipt,
             credentials,
             root,
+            keys,
             // Nothing recorded by this controller yet: the first observation writes the record
             // only if it rises past what the data directory holds (`storage_level::record`).
             recorded_level: 0,
@@ -1640,6 +1648,7 @@ impl NetworkController {
     fn held_key(&self) -> Result<focal_enrollment::JoinKey, RenewalError> {
         focal_enrollment::JoinKey::open_or_create(
             self.key_directory(),
+            &self.keys,
             self.state.genesis.founder.cluster,
         )
         .map_err(|_| RenewalError::Identity)
@@ -1648,6 +1657,7 @@ impl NetworkController {
     fn staged_key(&self) -> Result<focal_enrollment::JoinKey, RenewalError> {
         focal_enrollment::JoinKey::open_or_create(
             self.key_directory().with_extension("next"),
+            &self.keys,
             self.state.genesis.founder.cluster,
         )
         .map_err(|_| RenewalError::Identity)

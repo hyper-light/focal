@@ -244,6 +244,7 @@ fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_pin_and
         let ca_path = disk.path().join("ca");
         let authority = BootstrapAuthority::open_or_create(
             &ca_path,
+            &focal_seal::test_keys_beside(&ca_path).unwrap(),
             CLUSTER,
             vec!["root.focal.test".into()],
             now(),
@@ -258,9 +259,15 @@ fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_pin_and
             budget(),
         )
         .unwrap();
-        let founder_key = JoinKey::open_or_create(disk.path().join("key1"), CLUSTER).unwrap();
+        let founder_key = JoinKey::open_or_create(
+            disk.path().join("key1"),
+            &focal_seal::test_keys_beside(disk.path().join("key1")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let draft = FoundingEnrollmentDraft::open_or_create(
             disk.path().join("draft1"),
+            &focal_seal::test_keys_beside(disk.path().join("draft1")).unwrap(),
             &authority,
             &founder_key,
             founder.node,
@@ -317,8 +324,12 @@ fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_pin_and
         seeded[0].0.campaign().unwrap();
         drain_seed_replicas(&mut seeded);
         for node in 2..=3u64 {
-            let key =
-                JoinKey::open_or_create(disk.path().join(format!("key{node}")), CLUSTER).unwrap();
+            let key = JoinKey::open_or_create(
+                disk.path().join(format!("key{node}")),
+                &focal_seal::test_keys_beside(disk.path().join(format!("key{node}"))).unwrap(),
+                CLUSTER,
+            )
+            .unwrap();
             let draft = seeded[0]
                 .0
                 .enrollment()
@@ -647,9 +658,14 @@ fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_pin_and
             BTreeSet::from([namespace.tenant]),
         );
         let staging = disk.path().join("signer");
-        let (signer, driver) =
-            QuorumEnrollmentHost::create(authority, &staging, config.clone(), allowance.clone())
-                .unwrap();
+        let (signer, driver) = QuorumEnrollmentHost::create(
+            authority,
+            &staging,
+            &focal_seal::test_keys_beside(&staging).unwrap(),
+            config.clone(),
+            allowance.clone(),
+        )
+        .unwrap();
         let intent = InviteIntent {
             endpoint: "127.0.0.1:7443".into(),
             role: EnrollmentRole::Client,
@@ -752,13 +768,20 @@ fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_pin_and
         // the public decisions remain in the replicated root on the new leader.
         let authority = BootstrapAuthority::open_or_create(
             &ca_path,
+            &focal_seal::test_keys_beside(&ca_path).unwrap(),
             CLUSTER,
             vec!["root.focal.test".into()],
             now(),
         )
         .unwrap();
-        let (signer, driver) =
-            QuorumEnrollmentHost::open(authority, &staging, config, allowance.clone()).unwrap();
+        let (signer, driver) = QuorumEnrollmentHost::open(
+            authority,
+            &staging,
+            &focal_seal::test_keys_beside(&staging).unwrap(),
+            config,
+            allowance.clone(),
+        )
+        .unwrap();
         let (result, ()) = hyper_rt::combine::join2(driver.run(&adapter), async {
             assert_eq!(
                 decided(&replicas, async || {

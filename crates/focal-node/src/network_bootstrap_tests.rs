@@ -175,6 +175,7 @@ fn manifest_validates_ca_genesis_and_exact_framing_before_installation() {
         let other = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             other.path().join("ca"),
+            &focal_seal::test_keys_beside(other.path().join("ca")).unwrap(),
             [9; 16],
             vec!["other.internal".into()],
             unix_time().unwrap(),

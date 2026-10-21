@@ -48,6 +48,7 @@ fn budget() -> MemoryBudget {
 fn authority(dir: &tempfile::TempDir) -> BootstrapAuthority {
     BootstrapAuthority::open_or_create(
         dir.path().join("keys"),
+        &focal_seal::test_keys_beside(dir.path().join("keys")).unwrap(),
         CLUSTER,
         vec!["localhost".into()],
         NOW,

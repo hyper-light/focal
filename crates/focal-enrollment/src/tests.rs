@@ -49,7 +49,11 @@ fn privately_saved_invitation_recovers_without_releasing_uncommitted_secrets() {
             now(),
         )
         .unwrap()
-        .persist(dir.path().join("pending"), [92; 32])
+        .persist(
+            dir.path().join("pending"),
+            &focal_seal::test_keys_beside(dir.path().join("pending")).unwrap(),
+            [92; 32],
+        )
         .unwrap();
     assert!(matches!(
         pending.release(&registry),
@@ -58,14 +62,24 @@ fn privately_saved_invitation_recovers_without_releasing_uncommitted_secrets() {
     let command = pending.command().clone();
     let id = pending.id();
     drop(pending); // crash before proposal; private bytes remain under owner-only custody
-    let pending = PendingInvitation::open(dir.path().join("pending"), authority.cluster()).unwrap();
+    let pending = PendingInvitation::open(
+        dir.path().join("pending"),
+        &focal_seal::test_keys_beside(dir.path().join("pending")).unwrap(),
+        authority.cluster(),
+    )
+    .unwrap();
     assert_eq!(pending.command(), &command);
     assert_eq!(pending.id(), id);
     assert_eq!(pending.intent_hash(), [92; 32]);
     registry.apply_committed(&command, 1).unwrap();
     let first = pending.release(&registry).unwrap().expose_token().unwrap();
     drop(pending); // crash after commit, before a client could receive the token
-    let pending = PendingInvitation::open(dir.path().join("pending"), authority.cluster()).unwrap();
+    let pending = PendingInvitation::open(
+        dir.path().join("pending"),
+        &focal_seal::test_keys_beside(dir.path().join("pending")).unwrap(),
+        authority.cluster(),
+    )
+    .unwrap();
     let second = pending.release(&registry).unwrap().expose_token().unwrap();
     assert!(first == second);
     let revoke = registry.prepare_revoke(id, now()).unwrap();
@@ -78,6 +92,7 @@ fn privately_saved_invitation_recovers_without_releasing_uncommitted_secrets() {
 fn authority(dir: &tempfile::TempDir, cluster: ClusterId) -> BootstrapAuthority {
     BootstrapAuthority::open_or_create(
         dir.path().join("authority"),
+        &focal_seal::test_keys_beside(dir.path().join("authority")).unwrap(),
         cluster,
         vec!["localhost".into()],
         now(),
@@ -98,6 +113,17 @@ fn invite(
     authority: &BootstrapAuthority,
     role: EnrollmentRole,
 ) -> Invitation {
+    invite_at(registry, authority, role, now())
+}
+/// An invitation decided at `at`: a test whose later decisions are named by the time of an earlier
+/// one decides this one on that clock, not the wall's (a second passing between them on a loaded
+/// host put the registry's floor past the later decision's time).
+fn invite_at(
+    registry: &mut EnrollmentRegistry,
+    authority: &BootstrapAuthority,
+    role: EnrollmentRole,
+    at: i64,
+) -> Invitation {
     let draft = registry
         .prepare_invitation(
             authority,
@@ -105,9 +131,9 @@ fn invite(
                 endpoint: "127.0.0.1:8443".into(),
                 server_name: "localhost".into(),
                 role,
-                expires_at: now() + 600,
+                expires_at: at + 600,
             },
-            now(),
+            at,
         )
         .unwrap();
     registry
@@ -193,7 +219,12 @@ fn committed_metadata_precedes_delivery_and_exact_retry_survives_restart() {
     assert!(!format!("{invitation:?}").contains(&hex(&invitation.data.secret.0)));
     let invitation = Invitation::parse(&token).unwrap();
     let key_dir = dir.path().join("join");
-    let key = JoinKey::open_or_create(&key_dir, [1; 16]).unwrap();
+    let key = JoinKey::open_or_create(
+        &key_dir,
+        &focal_seal::test_keys_beside(&key_dir).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let connection = handshake(
         &invitation,
         authority.server_identity().server_config().unwrap(),
@@ -232,7 +263,12 @@ fn committed_metadata_precedes_delivery_and_exact_retry_survives_restart() {
         .unwrap();
     let original_csr = key.csr().to_vec();
     drop(key);
-    let restored_key = JoinKey::open_or_create(&key_dir, [1; 16]).unwrap();
+    let restored_key = JoinKey::open_or_create(
+        &key_dir,
+        &focal_seal::test_keys_beside(&key_dir).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     assert_eq!(restored_key.csr(), original_csr);
     assert_eq!(restored_key.enrollment().unwrap(), Some(receipt.clone()));
     let restored = EnrollmentRegistry::restore(
@@ -261,7 +297,12 @@ fn expired_revoked_wrong_cluster_role_and_identity_reuse_are_rejected() {
     let authority = authority(&dir, [1; 16]);
     let mut registry = registry(&authority);
     let invitation = invite(&mut registry, &authority, EnrollmentRole::Node);
-    let key = JoinKey::open_or_create(dir.path().join("join"), [1; 16]).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join("join"),
+        &focal_seal::test_keys_beside(dir.path().join("join")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let request = invitation.request(&key, now()).unwrap();
     let mut forged = request.clone();
     forged.cluster = [2; 16];
@@ -291,7 +332,12 @@ fn expired_revoked_wrong_cluster_role_and_identity_reuse_are_rejected() {
     let prepared = registry.prepare_join(&authority, &request, now()).unwrap();
     commit(&mut registry, prepared);
     let receipt = registry.release(&request, now()).unwrap();
-    let other_key = JoinKey::open_or_create(dir.path().join("other"), [1; 16]).unwrap();
+    let other_key = JoinKey::open_or_create(
+        dir.path().join("other"),
+        &focal_seal::test_keys_beside(dir.path().join("other")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let after_admission_expiry = invitation.expires_at() + 1;
     let saved_retry = invitation.request(&key, after_admission_expiry).unwrap();
     assert_eq!(
@@ -336,8 +382,18 @@ fn concurrent_preparations_commit_one_identity_and_the_loser_retries() {
     let authority = authority(&dir, [1; 16]);
     let mut registry = registry(&authority);
     let invitation = invite(&mut registry, &authority, EnrollmentRole::Node);
-    let first_key = JoinKey::open_or_create(dir.path().join("first"), [1; 16]).unwrap();
-    let other_key = JoinKey::open_or_create(dir.path().join("other"), [1; 16]).unwrap();
+    let first_key = JoinKey::open_or_create(
+        dir.path().join("first"),
+        &focal_seal::test_keys_beside(dir.path().join("first")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
+    let other_key = JoinKey::open_or_create(
+        dir.path().join("other"),
+        &focal_seal::test_keys_beside(dir.path().join("other")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let first = invitation.request(&first_key, now()).unwrap();
     let other = invitation.request(&other_key, now()).unwrap();
     let JoinPreparation::Commit(first_command) =
@@ -399,7 +455,12 @@ fn metadata_wal_failure_never_releases_certificate_and_replay_is_identical() {
     wal.append(&[record(1, draft.command())]).unwrap();
     registry.apply_committed(draft.command(), 1).unwrap();
     let invitation = draft.release(&registry).unwrap();
-    let key = JoinKey::open_or_create(dir.path().join("join"), [1; 16]).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join("join"),
+        &focal_seal::test_keys_beside(dir.path().join("join")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let request = invitation.request(&key, now()).unwrap();
     let JoinPreparation::Commit(command) =
         registry.prepare_join(&authority, &request, now()).unwrap()
@@ -444,7 +505,12 @@ fn caller_csr_names_and_privileges_are_replaced_by_assigned_identity() {
     let authority = authority(&dir, [1; 16]);
     let mut registry = registry(&authority);
     let invitation = invite(&mut registry, &authority, EnrollmentRole::Client);
-    let key = JoinKey::open_or_create(dir.path().join("join"), [1; 16]).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join("join"),
+        &focal_seal::test_keys_beside(dir.path().join("join")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let mut request = invitation.request(&key, now()).unwrap();
     let attack_key = KeyPair::generate().unwrap();
     let mut parameters =
@@ -525,7 +591,12 @@ fn tls_ca_and_name_verification_does_not_replace_the_exact_invited_leaf_pin() {
         config
     };
     let dir = tempfile::tempdir().unwrap();
-    let key = JoinKey::open_or_create(dir.path().join("join"), [1; 16]).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join("join"),
+        &focal_seal::test_keys_beside(dir.path().join("join")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let wrong = handshake(&invitation, config(other_leaf.der().to_vec(), &other_key)).unwrap();
     // The chain is the CA's; the leaf is not the one pinned.
     assert!(matches!(
@@ -564,17 +635,34 @@ fn private_material_is_owner_only_cluster_bound_locked_and_missing_state_fails_c
         0o700
     );
     assert!(matches!(
-        BootstrapAuthority::open_or_create(&path, [1; 16], vec!["localhost".into()], now()),
+        BootstrapAuthority::open_or_create(
+            &path,
+            &focal_seal::test_keys_beside(&path).unwrap(),
+            [1; 16],
+            vec!["localhost".into()],
+            now()
+        ),
         Err(EnrollmentError::Locked)
     ));
     drop(original);
     assert!(matches!(
-        BootstrapAuthority::open_or_create(&path, [2; 16], vec!["localhost".into()], now()),
+        BootstrapAuthority::open_or_create(
+            &path,
+            &focal_seal::test_keys_beside(&path).unwrap(),
+            [2; 16],
+            vec!["localhost".into()],
+            now()
+        ),
         Err(EnrollmentError::WrongCluster)
     ));
-    let recovered =
-        BootstrapAuthority::open_or_create(&path, [1; 16], vec!["localhost".into()], now())
-            .unwrap();
+    let recovered = BootstrapAuthority::open_or_create(
+        &path,
+        &focal_seal::test_keys_beside(&path).unwrap(),
+        [1; 16],
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
     assert_eq!(recovered.ca_certificate(), ca);
     drop(recovered);
     std::fs::set_permissions(
@@ -583,12 +671,24 @@ fn private_material_is_owner_only_cluster_bound_locked_and_missing_state_fails_c
     )
     .unwrap();
     assert!(matches!(
-        BootstrapAuthority::open_or_create(&path, [1; 16], vec!["localhost".into()], now()),
+        BootstrapAuthority::open_or_create(
+            &path,
+            &focal_seal::test_keys_beside(&path).unwrap(),
+            [1; 16],
+            vec!["localhost".into()],
+            now()
+        ),
         Err(EnrollmentError::Permissions)
     ));
     std::fs::remove_file(path.join("authority.bin")).unwrap();
     assert!(matches!(
-        BootstrapAuthority::open_or_create(&path, [1; 16], vec!["localhost".into()], now()),
+        BootstrapAuthority::open_or_create(
+            &path,
+            &focal_seal::test_keys_beside(&path).unwrap(),
+            [1; 16],
+            vec!["localhost".into()],
+            now()
+        ),
         Err(EnrollmentError::Corrupt)
     ));
 }
@@ -783,7 +883,14 @@ async fn refused_joiners_dial_again() {
         EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default()).unwrap(),
     );
     let address = server.local_addr().unwrap();
-    let key = Rc::new(JoinKey::open_or_create(dir.path().join("join"), [1; 16]).unwrap());
+    let key = Rc::new(
+        JoinKey::open_or_create(
+            dir.path().join("join"),
+            &focal_seal::test_keys_beside(dir.path().join("join")).unwrap(),
+            [1; 16],
+        )
+        .unwrap(),
+    );
     let invitation = Rc::new(invitation);
     let joiners: Vec<_> = (0..8)
         .map(|_| {
@@ -854,7 +961,12 @@ async fn pin_precedes_token_and_unknown_commit_retries() {
     let task = spawn(async move { running.serve(handler).await });
     let client =
         EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default()).unwrap();
-    let key = JoinKey::open_or_create(dir.path().join("join"), [1; 16]).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join("join"),
+        &focal_seal::test_keys_beside(dir.path().join("join")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let mut bad_pin = invitation.clone();
     bad_pin.data.trust.server_fingerprint[0] ^= 1;
     assert!(matches!(
@@ -974,7 +1086,12 @@ fn node_statements_bind_payload_cluster_certificate_role_and_revocation() {
     let authority = authority(&dir, [75; 16]);
     let mut registry = registry(&authority);
     let invitation = invite(&mut registry, &authority, EnrollmentRole::Node);
-    let key = JoinKey::open_or_create(dir.path().join("node-key"), authority.cluster()).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join("node-key"),
+        &focal_seal::test_keys_beside(dir.path().join("node-key")).unwrap(),
+        authority.cluster(),
+    )
+    .unwrap();
     let request = invitation.request(&key, now()).unwrap();
     let prepared = registry.prepare_join(&authority, &request, now()).unwrap();
     commit(&mut registry, prepared);
@@ -1037,7 +1154,12 @@ fn node_statements_bind_payload_cluster_certificate_role_and_revocation() {
     ));
 
     let invitation = invite(&mut registry, &authority, EnrollmentRole::Client);
-    let key = JoinKey::open_or_create(dir.path().join("client-key"), authority.cluster()).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join("client-key"),
+        &focal_seal::test_keys_beside(dir.path().join("client-key")).unwrap(),
+        authority.cluster(),
+    )
+    .unwrap();
     let request = invitation.request(&key, now()).unwrap();
     let prepared = registry.prepare_join(&authority, &request, now()).unwrap();
     commit(&mut registry, prepared);
@@ -1061,7 +1183,12 @@ fn enroll_node(
     name: &str,
 ) -> (JoinKey, EnrollmentReceipt, CredentialMaterial) {
     let invitation = invite(registry, authority, EnrollmentRole::Node);
-    let key = JoinKey::open_or_create(dir.path().join(name), [1; 16]).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join(name),
+        &focal_seal::test_keys_beside(dir.path().join(name)).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let request = invitation.request(&key, now()).unwrap();
     commit(
         registry,
@@ -1351,7 +1478,12 @@ fn renewals_need_the_holder_s_own_key_and_a_live_unrevoked_enrollment() {
     ));
     // A client credential cannot renew through the node statement path.
     let client_invitation = invite(&mut registry, &authority, EnrollmentRole::Client);
-    let client_key = JoinKey::open_or_create(dir.path().join("client"), [1; 16]).unwrap();
+    let client_key = JoinKey::open_or_create(
+        dir.path().join("client"),
+        &focal_seal::test_keys_beside(dir.path().join("client")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let request = client_invitation.request(&client_key, now()).unwrap();
     let preparation = registry.prepare_join(&authority, &request, now()).unwrap();
     commit(&mut registry, preparation);
@@ -1596,7 +1728,12 @@ fn a_rotation_changes_the_key_under_the_same_identity_and_the_old_key_signs_only
     let authority = authority(&dir, [1; 16]);
     let mut registry = registry(&authority);
     let (key, first, material) = enroll_node(&dir, &mut registry, &authority, "node");
-    let next = JoinKey::open_or_create(dir.path().join("node-next"), [1; 16]).unwrap();
+    let next = JoinKey::open_or_create(
+        dir.path().join("node-next"),
+        &focal_seal::test_keys_beside(dir.path().join("node-next")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     assert_ne!(next.key_identity().unwrap(), key.key_identity().unwrap());
     // A rotation request names the new key under the current credential.
     let request = material.rotation_request(&key, &next, &first).unwrap();
@@ -1683,7 +1820,12 @@ fn a_rotation_changes_the_key_under_the_same_identity_and_the_old_key_signs_only
     ));
     // A later rotation request under the previous credential, for yet
     // another key, is refused once the grace passed (checked below).
-    let other = JoinKey::open_or_create(dir.path().join("node-other"), [1; 16]).unwrap();
+    let other = JoinKey::open_or_create(
+        dir.path().join("node-other"),
+        &focal_seal::test_keys_beside(dir.path().join("node-other")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let stale = material.rotation_request(&key, &other, &first).unwrap();
     let next_request = next.request_id();
     // The holder adopts the rotation: the primary directory now holds the
@@ -1694,11 +1836,21 @@ fn a_rotation_changes_the_key_under_the_same_identity_and_the_old_key_signs_only
     assert_eq!(adopted.certificate_chain()[0], rotated.certificate);
     drop(key);
     drop(next);
-    let reopened = JoinKey::open_or_create(dir.path().join("node"), [1; 16]).unwrap();
+    let reopened = JoinKey::open_or_create(
+        dir.path().join("node"),
+        &focal_seal::test_keys_beside(dir.path().join("node")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     assert_eq!(reopened.request_id(), next_request);
     assert_eq!(reopened.enrollment().unwrap().unwrap(), rotated);
     assert_eq!(reopened.key_identity().unwrap(), rotated.public_key);
-    let restaged = JoinKey::open_or_create(dir.path().join("node-next"), [1; 16]).unwrap();
+    let restaged = JoinKey::open_or_create(
+        dir.path().join("node-next"),
+        &focal_seal::test_keys_beside(dir.path().join("node-next")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     assert_ne!(restaged.request_id(), next_request);
     assert_ne!(restaged.key_identity().unwrap(), rotated.public_key);
     // Under the new key a renewal is an ordinary renewal, and a second
@@ -1797,7 +1949,12 @@ fn founder(
     EnrollmentReceipt,
     CredentialMaterial,
 ) {
-    let key = JoinKey::open_or_create(dir.path().join(name), [1; 16]).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join(name),
+        &focal_seal::test_keys_beside(dir.path().join(name)).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let (registry, receipt) =
         EnrollmentRegistry::founding(authority, &key, 1, [7; 16], limits, 0, now()).unwrap();
     let material = key
@@ -1880,7 +2037,12 @@ fn the_founder_renews_under_its_founding_subject_and_rotates_carrying_its_princi
     assert_eq!(key.enrollment().unwrap().unwrap(), renewed);
     // A rotation of the founder's key carries the assigned principal to the
     // new key in a CA-signed subject, as any rotation does.
-    let next = JoinKey::open_or_create(dir.path().join("founder-key.next"), [1; 16]).unwrap();
+    let next = JoinKey::open_or_create(
+        dir.path().join("founder-key.next"),
+        &focal_seal::test_keys_beside(dir.path().join("founder-key.next")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let rotation = material.rotation_request(&key, &next, &renewed).unwrap();
     let RenewPreparation::Commit(command) = registry
         .prepare_renew(&authority, &rotation, at + 5, 30)
@@ -1908,7 +2070,12 @@ fn the_founder_renews_under_its_founding_subject_and_rotates_carrying_its_princi
     drop(key);
     drop(next);
     // The key directory now holds the rotated key and its receipt.
-    let key = JoinKey::open_or_create(dir.path().join("founder-key"), [1; 16]).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join("founder-key"),
+        &focal_seal::test_keys_beside(dir.path().join("founder-key")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     assert_eq!(key.key_identity().unwrap(), rotated.public_key);
     assert_eq!(key.enrollment().unwrap().unwrap(), rotated);
     // Under the rotated key a renewal carries the principal again.
@@ -1955,7 +2122,12 @@ fn a_restored_registry_keeps_the_lifetimes_it_committed_and_the_capacities_it_is
         Err(EnrollmentError::Corrupt)
     ));
     // A lifetime the registry would not admit cannot be founded.
-    let key = JoinKey::open_or_create(dir.path().join("short-key"), [1; 16]).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join("short-key"),
+        &focal_seal::test_keys_beside(dir.path().join("short-key")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     for lifetime in [0, MIN_CREDENTIAL_LIFETIME - 1, MAX_CREDENTIAL_LIFETIME + 1] {
         assert!(matches!(
             EnrollmentRegistry::founding(
@@ -2002,6 +2174,7 @@ fn the_bootstrap_server_certificate_is_recorded_staged_and_presented_once_older_
     let dir = tempfile::tempdir().unwrap();
     let mut authority = BootstrapAuthority::open_or_create_for(
         dir.path().join("authority"),
+        &focal_seal::test_keys_beside(dir.path().join("authority")).unwrap(),
         [1; 16],
         vec!["localhost".into()],
         3600,
@@ -2124,6 +2297,7 @@ fn the_bootstrap_server_certificate_is_recorded_staged_and_presented_once_older_
     drop(authority);
     let authority = BootstrapAuthority::open_or_create_for(
         dir.path().join("authority"),
+        &focal_seal::test_keys_beside(dir.path().join("authority")).unwrap(),
         [1; 16],
         vec!["localhost".into()],
         3600,
@@ -2187,6 +2361,7 @@ fn the_bootstrap_server_certificate_is_recorded_staged_and_presented_once_older_
     drop(authority);
     let authority = BootstrapAuthority::open_or_create_for(
         dir.path().join("authority"),
+        &focal_seal::test_keys_beside(dir.path().join("authority")).unwrap(),
         [1; 16],
         vec!["localhost".into()],
         3600,
@@ -2242,6 +2417,7 @@ fn the_issuer_succeeds_itself_endorsed_by_its_predecessor_and_retires_once_nothi
     };
     let mut authority = BootstrapAuthority::open_or_create_for(
         dir.path().join("authority"),
+        &focal_seal::test_keys_beside(dir.path().join("authority")).unwrap(),
         [1; 16],
         vec!["localhost".into()],
         lifetime,
@@ -2290,6 +2466,7 @@ fn the_issuer_succeeds_itself_endorsed_by_its_predecessor_and_retires_once_nothi
     // A staging whose endorsement is not the current issuer's is refused.
     let stranger = BootstrapAuthority::open_or_create_for(
         dir.path().join("stranger"),
+        &focal_seal::test_keys_beside(dir.path().join("stranger")).unwrap(),
         [1; 16],
         vec!["localhost".into()],
         lifetime,
@@ -2329,7 +2506,7 @@ fn the_issuer_succeeds_itself_endorsed_by_its_predecessor_and_retires_once_nothi
     assert_eq!(registry.trust_roots().count(), 2);
     // An invitation issued now carries both issuers; a credential is still
     // the genesis issuer's until the activation.
-    let invitation = invite(&mut registry, &authority, EnrollmentRole::Node);
+    let invitation = invite_at(&mut registry, &authority, EnrollmentRole::Node, at);
     assert_eq!(invitation.trust().issuers.len(), 2);
     assert_eq!(
         invitation.trust().ca_certificate,
@@ -2487,6 +2664,7 @@ fn the_issuer_succeeds_itself_endorsed_by_its_predecessor_and_retires_once_nothi
     drop(authority);
     let reopened = BootstrapAuthority::open_or_create_for(
         dir.path().join("authority"),
+        &focal_seal::test_keys_beside(dir.path().join("authority")).unwrap(),
         [1; 16],
         vec!["localhost".into()],
         lifetime,
@@ -2510,6 +2688,7 @@ fn an_older_trust_verifies_an_endorsed_chain_and_refuses_an_unendorsed_or_forged
     let issuer_lifetime = EnrollmentLimits::issuer_lifetime_for(lifetime);
     let mut authority = BootstrapAuthority::open_or_create_for(
         dir.path().join("authority"),
+        &focal_seal::test_keys_beside(dir.path().join("authority")).unwrap(),
         [1; 16],
         vec!["localhost".into()],
         lifetime,
@@ -2554,6 +2733,7 @@ fn an_older_trust_verifies_an_endorsed_chain_and_refuses_an_unendorsed_or_forged
     // Endorsed by a stranger: refused.
     let stranger = BootstrapAuthority::open_or_create_for(
         dir.path().join("stranger"),
+        &focal_seal::test_keys_beside(dir.path().join("stranger")).unwrap(),
         [1; 16],
         vec!["localhost".into()],
         lifetime,
@@ -2649,7 +2829,12 @@ fn closed_records_compact_so_onboarding_outlives_the_active_bound() {
     assert!(registry.invitation_status(first[0].id()).is_none());
     // An expired token of a compacted invitation is unknown: it never
     // redeems.
-    let stale_key = JoinKey::open_or_create(dir.path().join("stale"), [1; 16]).unwrap();
+    let stale_key = JoinKey::open_or_create(
+        dir.path().join("stale"),
+        &focal_seal::test_keys_beside(dir.path().join("stale")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let stale = first[1].request(&stale_key, t1).unwrap();
     assert!(matches!(
         registry.prepare_join(&authority, &stale, t1),
@@ -2659,7 +2844,12 @@ fn closed_records_compact_so_onboarding_outlives_the_active_bound() {
     let second: Vec<Invitation> = (0..7)
         .map(|_| invite_at(&mut registry, t1).unwrap())
         .collect();
-    let key = JoinKey::open_or_create(dir.path().join("node"), [1; 16]).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join("node"),
+        &focal_seal::test_keys_beside(dir.path().join("node")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let request = second[0].request(&key, t1).unwrap();
     let prepared = registry.prepare_join(&authority, &request, t1).unwrap();
     commit(&mut registry, prepared);
@@ -2681,7 +2871,12 @@ fn closed_records_compact_so_onboarding_outlives_the_active_bound() {
     assert_eq!(registry.compacted(), 13);
     assert!(registry.invitation_status(second[1].id()).is_none());
     assert!(registry.invitation_status(second[0].id()).is_some());
-    let revoked_key = JoinKey::open_or_create(dir.path().join("revoked"), [1; 16]).unwrap();
+    let revoked_key = JoinKey::open_or_create(
+        dir.path().join("revoked"),
+        &focal_seal::test_keys_beside(dir.path().join("revoked")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
     let replay = second[1].request(&revoked_key, t2).unwrap();
     assert!(matches!(
         registry.prepare_join(&authority, &replay, t2),

@@ -200,6 +200,9 @@ impl FoundingNetwork {
         }
         let now = unix_time()?;
         let names = vec![format!("cluster-{}.focal.internal", hex(&identity.cluster))];
+        // The data directory's keys, made here where it has none: every private record below
+        // is sealed under them (29 §12), and the storage opens under the same root key file.
+        let keys = settings.data_keys(directory.root())?;
         let private = directory.root().join("cluster/network");
         let founder_path = private.join("founder/founder.bin");
         // A crash may leave private intent before NETWORK was installed. That
@@ -223,15 +226,17 @@ impl FoundingNetwork {
         // itself before it expires (24 §11).
         let authority = BootstrapAuthority::open_or_create_for(
             private.join("authority"),
+            &keys,
             identity.cluster,
             names.clone(),
             limits.credential_lifetime,
             limits.issuer_lifetime,
             now,
         )?;
-        let key = JoinKey::open_or_create(private.join("node-key"), identity.cluster)?;
+        let key = JoinKey::open_or_create(private.join("node-key"), &keys, identity.cluster)?;
         let founder = FoundingEnrollmentDraft::open_or_create(
             private.join("founder"),
+            &keys,
             &authority,
             &key,
             identity.node,
@@ -319,9 +324,7 @@ impl FoundingNetwork {
                 stream: 0,
             },
             &budget,
-            &settings
-                .root_key_file(identity.node)
-                .map_err(NodeError::Config)?,
+            &keys.key_file,
             founder.registry().fence().level,
         )?;
         let mut control = ControlReplica::open_on_storage(
@@ -409,14 +412,14 @@ impl FoundingNetwork {
         let initialized = if saved.is_some() {
             true
         } else {
-            let journal = PrivateJournal::open(&signer_path)?;
+            let journal = PrivateJournal::open(&signer_path, &keys)?;
             journal.read()?.is_some()
         };
         let allowance = budget.child(64 * 1024 * 1024, 16 * 1024 * 1024)?;
         let (enrollment, enrollment_driver) = if initialized {
-            QuorumEnrollmentHost::open(authority, signer_path, config, allowance)?
+            QuorumEnrollmentHost::open(authority, signer_path, &keys, config, allowance)?
         } else {
-            QuorumEnrollmentHost::create(authority, signer_path, config, allowance)?
+            QuorumEnrollmentHost::create(authority, signer_path, &keys, config, allowance)?
         };
         state.install(&directory)?;
         drop(founder);

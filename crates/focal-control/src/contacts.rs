@@ -803,14 +803,21 @@ mod tests {
         let disk = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             disk.path().join("ca"),
+            &focal_seal::test_keys_beside(disk.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["root.focal.test".into()],
             NOW,
         )
         .unwrap();
-        let key = JoinKey::open_or_create(disk.path().join("key"), CLUSTER).unwrap();
+        let key = JoinKey::open_or_create(
+            disk.path().join("key"),
+            &focal_seal::test_keys_beside(disk.path().join("key")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let draft = FoundingEnrollmentDraft::open_or_create(
             disk.path().join("founder"),
+            &focal_seal::test_keys_beside(disk.path().join("founder")).unwrap(),
             &authority,
             &key,
             1,

@@ -26,7 +26,9 @@ fn client_invitation_enrolls_only_actor_and_preserves_key_across_restart_and_los
         let invitation = bundle.invitation().id();
         assert_eq!(bundle.invitation().role(), EnrollmentRole::Client);
         let path = client_disk.path().join("reviewer.join");
-        let pending = PendingClientJoin::open(&path, bundle).unwrap();
+        let pending =
+            PendingClientJoin::open(&path, &focal_seal::test_keys_beside(&path).unwrap(), bundle)
+                .unwrap();
         let request = pending.request_id();
         let csr = pending.csr().to_vec();
         let client =
@@ -42,7 +44,9 @@ fn client_invitation_enrolls_only_actor_and_preserves_key_across_restart_and_los
             &receipt.certificate
         );
         drop(pending);
-        let resumed = PendingClientJoin::resume(&path).unwrap();
+        let resumed =
+            PendingClientJoin::resume(&path, &focal_seal::test_keys_beside(&path).unwrap())
+                .unwrap();
         assert_eq!(resumed.request_id(), request);
         assert_eq!(resumed.csr(), csr);
         assert_eq!(
@@ -62,7 +66,14 @@ fn client_invitation_enrolls_only_actor_and_preserves_key_across_restart_and_los
         assert_eq!(entries[0].credential.as_ref().unwrap().node, None);
         drop(resumed);
         std::fs::remove_dir_all(&path).unwrap();
-        assert!(PendingClientJoin::open(&path, ClientInvitation::load(&file).unwrap()).is_err());
+        assert!(
+            PendingClientJoin::open(
+                &path,
+                &focal_seal::test_keys_beside(&path).unwrap(),
+                ClientInvitation::load(&file).unwrap()
+            )
+            .is_err()
+        );
         founder.stop().await;
     })
     .unwrap()

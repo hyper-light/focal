@@ -197,6 +197,7 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
         let disk = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             disk.path().join("ca"),
+            &focal_seal::test_keys_beside(disk.path().join("ca")).unwrap(),
             CLUSTER,
             vec![BOOTSTRAP_NAME.into()],
             now(),
@@ -209,9 +210,15 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
         let issuers = authority.issuers().unwrap();
         let authority_server = authority.server_certificate().to_vec();
         let enrollment_identity = authority.server_identity();
-        let key = JoinKey::open_or_create(disk.path().join("founder-key"), CLUSTER).unwrap();
+        let key = JoinKey::open_or_create(
+            disk.path().join("founder-key"),
+            &focal_seal::test_keys_beside(disk.path().join("founder-key")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let draft = FoundingEnrollmentDraft::open_or_create(
             disk.path().join("founder"),
+            &focal_seal::test_keys_beside(disk.path().join("founder")).unwrap(),
             &authority,
             &key,
             1,
@@ -269,6 +276,7 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
         let (enrollment, driver) = QuorumEnrollmentHost::create(
             authority,
             disk.path().join("signer"),
+            &focal_seal::test_keys_beside(disk.path().join("signer")).unwrap(),
             QuorumEnrollmentConfig::new(
                 host.progress().identity,
                 ParticipantId(SIGNER),
@@ -331,7 +339,12 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
             )
             .await
             .unwrap();
-        let joining_key = JoinKey::open_or_create(disk.path().join("joined-key"), CLUSTER).unwrap();
+        let joining_key = JoinKey::open_or_create(
+            disk.path().join("joined-key"),
+            &focal_seal::test_keys_beside(disk.path().join("joined-key")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let client = EnrollmentClient::bind(
             "127.0.0.1:0".parse().unwrap(),
             TransportLimits {
@@ -459,7 +472,12 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
             )
             .await
             .unwrap();
-        let client_key = JoinKey::open_or_create(disk.path().join("client-key"), CLUSTER).unwrap();
+        let client_key = JoinKey::open_or_create(
+            disk.path().join("client-key"),
+            &focal_seal::test_keys_beside(disk.path().join("client-key")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let attack = KeyPair::generate().unwrap();
         let mut parameters = CertificateParams::new(vec!["admin.focal.test".into()]).unwrap();
         parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -707,6 +725,7 @@ fn off_a_shard_a_listener_is_refused_and_holds_nothing() {
     let disk = tempfile::tempdir().unwrap();
     let authority = BootstrapAuthority::open_or_create(
         disk.path().join("ca"),
+        &focal_seal::test_keys_beside(disk.path().join("ca")).unwrap(),
         CLUSTER,
         vec![BOOTSTRAP_NAME.into()],
         now(),

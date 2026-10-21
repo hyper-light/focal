@@ -88,14 +88,21 @@ fn contact_uses_active_committed_certificate_and_exact_receipt_survives_lost_rep
         let disk = tempfile::tempdir().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             disk.path().join("ca"),
+            &focal_seal::test_keys_beside(disk.path().join("ca")).unwrap(),
             CLUSTER,
             vec!["root.focal.test".into()],
             now(),
         )
         .unwrap();
-        let key = JoinKey::open_or_create(disk.path().join("key"), CLUSTER).unwrap();
+        let key = JoinKey::open_or_create(
+            disk.path().join("key"),
+            &focal_seal::test_keys_beside(disk.path().join("key")).unwrap(),
+            CLUSTER,
+        )
+        .unwrap();
         let draft = FoundingEnrollmentDraft::open_or_create(
             disk.path().join("genesis-node"),
+            &focal_seal::test_keys_beside(disk.path().join("genesis-node")).unwrap(),
             &authority,
             &key,
             2,

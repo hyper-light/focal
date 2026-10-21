@@ -400,7 +400,7 @@ impl ClusterAdmin {
     }
     fn replica_journal(&self, create: bool) -> Result<(PrivateJournal, State)> {
         let fresh = initialize_named(&self.root, &self.identity, create, DIRECTORY, MARKER)?;
-        let mut journal = PrivateJournal::open(self.root.join(DIRECTORY))?;
+        let mut journal = PrivateJournal::open(self.root.join(DIRECTORY), &self.keys)?;
         let state = match journal.read()? {
             Some(bytes) => {
                 let (state, tail): (State, _) =

@@ -242,22 +242,9 @@ impl NodeStorage {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(crate) fn test_key_file(root: &Path) -> PathBuf {
-    use std::hash::{Hash as _, Hasher as _};
-    static KEYS: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    let keys = KEYS.get_or_init(|| tempfile::tempdir().unwrap());
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    root.hash(&mut hasher);
-    let key = keys.path().join(format!("{:016x}.key", hasher.finish()));
-    // Tests in parallel open one data directory's keys at once (a suite's one home), and a seal is
-    // installed through one temporary name (`focal_platform::fs::install`): two first opens raced
-    // to it, the second rename finding nothing (CI run 38079021596). A node's data-directory lock
-    // admits one opener; here the opens are serialized.
-    static OPENING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _opening = OPENING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    focal_seal::open_or_create(root, &key).unwrap();
-    key
+    // The data directory's keys as a node's start finds or makes them (`focal_seal::test_keys`),
+    // so this crate's tests and the code they run share one key file per directory.
+    focal_seal::test_keys(root).unwrap().key_file
 }
 
 /// A handle on `log` for this crate's tests: groups' files under `root`, disk drawn from `disk`.

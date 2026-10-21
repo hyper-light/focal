@@ -215,12 +215,23 @@ fn evidence(snapshot: &ControlAuthoritySnapshot, now: i64) -> ControlEvidence {
 }
 
 fn activated_roots(path: &Path) -> Group {
-    let ca =
-        BootstrapAuthority::open_or_create(path.join("ca"), CLUSTER, vec!["localhost".into()], NOW)
-            .unwrap();
-    let key = JoinKey::open_or_create(path.join("key"), CLUSTER).unwrap();
+    let ca = BootstrapAuthority::open_or_create(
+        path.join("ca"),
+        &focal_seal::test_keys_beside(path.join("ca")).unwrap(),
+        CLUSTER,
+        vec!["localhost".into()],
+        NOW,
+    )
+    .unwrap();
+    let key = JoinKey::open_or_create(
+        path.join("key"),
+        &focal_seal::test_keys_beside(path.join("key")).unwrap(),
+        CLUSTER,
+    )
+    .unwrap();
     let founder = FoundingEnrollmentDraft::open_or_create(
         path.join("founder"),
+        &focal_seal::test_keys_beside(path.join("founder")).unwrap(),
         &ca,
         &key,
         1,
@@ -489,14 +500,21 @@ fn quorum_activation_installed_topology_revocation_and_checkpoint_replay_are_aut
     let dirs = tempfile::tempdir().unwrap();
     let ca = BootstrapAuthority::open_or_create(
         dirs.path().join("ca"),
+        &focal_seal::test_keys_beside(dirs.path().join("ca")).unwrap(),
         CLUSTER,
         vec!["localhost".into()],
         NOW,
     )
     .unwrap();
-    let key = JoinKey::open_or_create(dirs.path().join("key"), CLUSTER).unwrap();
+    let key = JoinKey::open_or_create(
+        dirs.path().join("key"),
+        &focal_seal::test_keys_beside(dirs.path().join("key")).unwrap(),
+        CLUSTER,
+    )
+    .unwrap();
     let founder = FoundingEnrollmentDraft::open_or_create(
         dirs.path().join("founder"),
+        &focal_seal::test_keys_beside(dirs.path().join("founder")).unwrap(),
         &ca,
         &key,
         1,

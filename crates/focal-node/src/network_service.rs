@@ -582,9 +582,7 @@ impl Prepared {
                     stream: 0,
                 },
                 &budget,
-                &settings
-                    .root_key_file(state.node)
-                    .map_err(NodeError::Config)?,
+                &settings.data_keys(joined.directory.root())?.key_file,
                 crate::network_join::genesis_fence(&state.genesis)?.level,
             )?;
             let options = ControlOptions::new(NodeConfig::joining(
@@ -758,11 +756,15 @@ impl NetworkService {
         let sponsor_address = crate::network_state::resolve_endpoint(&state.sponsor.endpoint)
             .await
             .ok();
+        // The data directory's keys, which the controller's and the placement agent's private
+        // records are sealed under (29 §12).
+        let keys = settings.data_keys(&root)?;
         let mut controller = NetworkController::new(
             state.clone(),
             receipt.clone(),
             credentials.clone(),
             root.clone(),
+            keys.clone(),
             budget.child(128 * 1024 * 1024, 32 * 1024 * 1024)?,
         )?;
         if let Some(address) = sponsor_address {
@@ -1013,6 +1015,7 @@ impl NetworkService {
                 settings: settings.clone(),
                 credentials,
                 root: root.clone(),
+                keys: keys.clone(),
                 active_custody: policy.as_ref().map(CustodyPolicy::scope),
                 node_budget: budget.clone(),
                 admission: crate::admission::TenantAdmission::new(

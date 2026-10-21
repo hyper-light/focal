@@ -151,6 +151,7 @@ impl BootstrapAuthority {
     /// founding without a committed policy of its own takes.
     pub fn open_or_create(
         path: impl AsRef<Path>,
+        keys: &focal_seal::DataKeys,
         cluster: ClusterId,
         server_names: Vec<String>,
         now: i64,
@@ -158,6 +159,7 @@ impl BootstrapAuthority {
         let standard = crate::registry::EnrollmentLimits::default();
         Self::open_or_create_for(
             path,
+            keys,
             cluster,
             server_names,
             standard.credential_lifetime,
@@ -172,6 +174,7 @@ impl BootstrapAuthority {
     /// issuer issues (24 §11).
     pub fn open_or_create_for(
         path: impl AsRef<Path>,
+        keys: &focal_seal::DataKeys,
         cluster: ClusterId,
         server_names: Vec<String>,
         lifetime: u64,
@@ -187,7 +190,7 @@ impl BootstrapAuthority {
         {
             return Err(EnrollmentError::Invalid);
         }
-        let directory = PrivateDirectory::open(path.as_ref())?;
+        let directory = PrivateDirectory::open(path.as_ref(), keys)?;
         let bundle: AuthorityBundle = if let Some(bytes) = directory.read("authority.bin")? {
             let (schema, _) = postcard::take_from_bytes::<u16>(&bytes)?;
             if schema == 1 {
@@ -757,12 +760,13 @@ impl JoinKey {
     /// enrollment cannot be completed through this handle.
     pub fn open_shared(
         path: impl AsRef<Path>,
+        keys: &focal_seal::DataKeys,
         cluster: ClusterId,
     ) -> Result<Self, EnrollmentError> {
         if cluster == [0; 16] {
             return Err(EnrollmentError::Invalid);
         }
-        let directory = PrivateDirectory::open_shared(path.as_ref())?;
+        let directory = PrivateDirectory::open_shared(path.as_ref(), keys)?;
         let bundle: JoinKeyBundle = decode(
             &directory
                 .read("join-key.bin")?
@@ -778,12 +782,13 @@ impl JoinKey {
     }
     pub fn open_or_create(
         path: impl AsRef<Path>,
+        keys: &focal_seal::DataKeys,
         cluster: ClusterId,
     ) -> Result<Self, EnrollmentError> {
         if cluster == [0; 16] {
             return Err(EnrollmentError::Invalid);
         }
-        let directory = PrivateDirectory::open(path.as_ref())?;
+        let directory = PrivateDirectory::open(path.as_ref(), keys)?;
         let bundle: JoinKeyBundle = if let Some(bytes) = directory.read("join-key.bin")? {
             decode(&bytes)?
         } else {

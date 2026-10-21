@@ -70,8 +70,12 @@ fn root_metadata_commits_before_invite_and_join_release_and_recovers_exactly() {
         let handler = host.clone();
         let task = focal_rt::spawn(async move { serving.serve(handler).await }).unwrap();
         let key_directory = tempfile::tempdir().unwrap();
-        let key =
-            JoinKey::open_or_create(key_directory.path().join("credentials"), cluster).unwrap();
+        let key = JoinKey::open_or_create(
+            key_directory.path().join("credentials"),
+            &focal_seal::test_keys_beside(key_directory.path().join("credentials")).unwrap(),
+            cluster,
+        )
+        .unwrap();
         let client =
             EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default())
                 .unwrap();

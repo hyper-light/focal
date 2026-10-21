@@ -89,7 +89,12 @@ fn enroll(
     name: &str,
 ) {
     let invitation = invite(registry, authority, role);
-    let key = JoinKey::open_or_create(dir.path().join(name), authority.cluster()).unwrap();
+    let key = JoinKey::open_or_create(
+        dir.path().join(name),
+        &focal_seal::test_keys_beside(dir.path().join(name)).unwrap(),
+        authority.cluster(),
+    )
+    .unwrap();
     let request = invitation.request(&key, now()).unwrap();
     let JoinPreparation::Commit(command) =
         registry.prepare_join(authority, &request, now()).unwrap()
@@ -119,6 +124,7 @@ fn a_restored_registry_holds_no_more_than_its_charge() {
     let dir = tempfile::tempdir().unwrap();
     let authority = BootstrapAuthority::open_or_create(
         dir.path().join("authority"),
+        &focal_seal::test_keys_beside(dir.path().join("authority")).unwrap(),
         [7; 16],
         vec!["localhost".into()],
         now(),

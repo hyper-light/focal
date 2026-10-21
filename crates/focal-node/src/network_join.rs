@@ -306,7 +306,10 @@ impl PendingJoin {
         if expected.is_none() && !join.join("journal.bin").is_file() {
             return Err(JoinError::Invalid);
         }
-        let mut journal = PrivateJournal::open(&join)?;
+        // The data directory's keys, made at its join where it has none: the join's journal and
+        // the node's key are its first records sealed, before it knows its node ID (29 §12).
+        let keys = settings.data_keys(directory.root())?;
+        let mut journal = PrivateJournal::open(&join, &keys)?;
         let saved = journal.read()?;
         let expected = expected
             .map(|(bundle, listen, advertise)| {
@@ -358,7 +361,7 @@ impl PendingJoin {
         if state.key.is_some() && !keypath.join("join-key.bin").is_file() {
             return Err(JoinError::Invalid);
         }
-        let key = JoinKey::open_or_create(&keypath, bundle.invitation.cluster())?;
+        let key = JoinKey::open_or_create(&keypath, &keys, bundle.invitation.cluster())?;
         let pin = KeyPin {
             request: key.request_id(),
             csr: *blake3::hash(key.csr()).as_bytes(),

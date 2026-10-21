@@ -52,6 +52,7 @@ fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_stale_
         drop(network.enrollment_driver);
         let authority = BootstrapAuthority::open_or_create(
             directory.path().join("cluster/network/authority"),
+            &focal_seal::test_keys(directory.path()).unwrap(),
             plan.identity().unwrap().cluster.0,
             vec![network.state.sponsor.server_name.clone()],
             now,

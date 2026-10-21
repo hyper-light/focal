@@ -33,15 +33,21 @@ impl Fixture {
         let identity = new_identity().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             disk.path().join("authority"),
+            &focal_seal::test_keys_beside(disk.path().join("authority")).unwrap(),
             identity.cluster,
             vec!["enrollment.focal.test".into()],
             now(),
         )
         .unwrap();
-        let key =
-            JoinKey::open_or_create(disk.path().join("founder-key"), identity.cluster).unwrap();
+        let key = JoinKey::open_or_create(
+            disk.path().join("founder-key"),
+            &focal_seal::test_keys_beside(disk.path().join("founder-key")).unwrap(),
+            identity.cluster,
+        )
+        .unwrap();
         let draft = FoundingEnrollmentDraft::open_or_create(
             disk.path().join("founder"),
+            &focal_seal::test_keys_beside(disk.path().join("founder")).unwrap(),
             &authority,
             &key,
             identity.node,
@@ -382,7 +388,13 @@ fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_membershi
         let original_key = fs::read(&key_path).unwrap();
         let original_receipt = fs::read(&receipt_path).unwrap();
         assert_eq!(
-            joined_unix_principal(disk.path(), &assigned, now()).unwrap(),
+            joined_unix_principal(
+                disk.path(),
+                Some(&focal_seal::test_keys(disk.path()).unwrap()),
+                &assigned,
+                now()
+            )
+            .unwrap(),
             focal_model::ParticipantId(receipt.identity.principal)
         );
         assert_eq!(fs::read(&key_path).unwrap(), original_key);
@@ -394,10 +406,26 @@ fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_membershi
         let checksum = *blake3::hash(&record).as_bytes();
         record.extend_from_slice(&checksum);
         fs::write(&receipt_path, &record).unwrap();
-        assert!(joined_unix_principal(disk.path(), &assigned, now()).is_err());
+        assert!(
+            joined_unix_principal(
+                disk.path(),
+                Some(&focal_seal::test_keys(disk.path()).unwrap()),
+                &assigned,
+                now()
+            )
+            .is_err()
+        );
         fs::write(&receipt_path, &original_receipt).unwrap();
         fs::remove_file(&key_path).unwrap();
-        assert!(joined_unix_principal(disk.path(), &assigned, now()).is_err());
+        assert!(
+            joined_unix_principal(
+                disk.path(),
+                Some(&focal_seal::test_keys(disk.path()).unwrap()),
+                &assigned,
+                now()
+            )
+            .is_err()
+        );
         assert!(!key_path.exists());
         fs::write(&key_path, &original_key).unwrap();
         #[cfg(unix)]
@@ -428,7 +456,15 @@ fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_membershi
         drop(joined);
         fs::remove_dir_all(disk.path().join("JOIN")).unwrap();
         fs::remove_file(disk.path().join("JOIN.initialized")).unwrap();
-        assert!(local_unix_principal(disk.path(), &assigned, now()).is_err());
+        assert!(
+            local_unix_principal(
+                disk.path(),
+                Some(&focal_seal::test_keys(disk.path()).unwrap()),
+                &assigned,
+                now()
+            )
+            .is_err()
+        );
         client.close();
         server.close().unwrap();
         task.await.unwrap();
@@ -642,6 +678,7 @@ fn a_client_adopts_the_endorsed_issuers_it_did_not_hold_within_the_bound_and_ref
     let authority_at = |name: &str| {
         focal_enrollment::BootstrapAuthority::open_or_create(
             dir.path().join(name),
+            &focal_seal::test_keys_beside(dir.path().join(name)).unwrap(),
             [9; 16],
             vec!["localhost".into()],
             1_783_000_000,

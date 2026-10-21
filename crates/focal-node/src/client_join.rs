@@ -182,21 +182,31 @@ pub struct EnrolledClient {
 }
 
 impl PendingClientJoin {
-    pub fn open(path: impl AsRef<Path>, bundle: ClientInvitation) -> Result<Self, JoinError> {
-        Self::build(path.as_ref(), Some(bundle), false)
+    /// A client's join at `path`, its records sealed under the keys of the client's data
+    /// directory (`keys`, 29 §12).
+    pub fn open(
+        path: impl AsRef<Path>,
+        keys: &focal_seal::DataKeys,
+        bundle: ClientInvitation,
+    ) -> Result<Self, JoinError> {
+        Self::build(path.as_ref(), keys, Some(bundle), false)
     }
-    pub fn resume(path: impl AsRef<Path>) -> Result<Self, JoinError> {
-        Self::build(path.as_ref(), None, false)
+    pub fn resume(path: impl AsRef<Path>, keys: &focal_seal::DataKeys) -> Result<Self, JoinError> {
+        Self::build(path.as_ref(), keys, None, false)
     }
     /// Resume a completed enrollment for reading beside other processes of
     /// the same participant. An enrollment that still needs a write is
     /// reported pending; it is completed by `enroll context`, which owns the
     /// directory exclusively.
-    pub fn resume_shared(path: impl AsRef<Path>) -> Result<Self, JoinError> {
-        Self::build(path.as_ref(), None, true)
+    pub fn resume_shared(
+        path: impl AsRef<Path>,
+        keys: &focal_seal::DataKeys,
+    ) -> Result<Self, JoinError> {
+        Self::build(path.as_ref(), keys, None, true)
     }
     fn build(
         path: &Path,
+        keys: &focal_seal::DataKeys,
         expected: Option<ClientInvitation>,
         shared: bool,
     ) -> Result<Self, JoinError> {
@@ -226,9 +236,9 @@ impl PendingClientJoin {
             return Err(JoinError::Pending);
         }
         let mut journal = if shared {
-            PrivateJournal::open_shared(path)?
+            PrivateJournal::open_shared(path, keys)?
         } else {
-            PrivateJournal::open(path)?
+            PrivateJournal::open(path, keys)?
         };
         let expected = expected.map(|bundle| bundle.encode()).transpose()?;
         let mut state = match journal.read()? {
@@ -272,9 +282,9 @@ impl PendingClientJoin {
             return Err(JoinError::Invalid);
         }
         let key = if shared {
-            JoinKey::open_shared(&keypath, bundle.invitation().cluster())?
+            JoinKey::open_shared(&keypath, keys, bundle.invitation().cluster())?
         } else {
-            JoinKey::open_or_create(&keypath, bundle.invitation().cluster())?
+            JoinKey::open_or_create(&keypath, keys, bundle.invitation().cluster())?
         };
         let keypin = KeyPin {
             request: key.request_id(),

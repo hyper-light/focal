@@ -103,6 +103,7 @@ impl IntentJournal {
     /// next to it detects a journal removed after initialization.
     pub(crate) fn open(
         root: &Path,
+        keys: &focal_seal::DataKeys,
         name: &str,
         target: ControlIdentity,
         client: [u8; 16],
@@ -114,7 +115,7 @@ impl IntentJournal {
         }
         // A joined host has no cluster directory until its first journal.
         crate::embedded::durable_dir(&root.join("cluster"))?;
-        let mut journal = PrivateJournal::open(path)?;
+        let mut journal = PrivateJournal::open(path, keys)?;
         let saved = match journal.read()? {
             Some(bytes) => {
                 let mut value = match postcard::take_from_bytes::<Saved>(&bytes) {

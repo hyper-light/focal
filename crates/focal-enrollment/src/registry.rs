@@ -603,9 +603,10 @@ impl InvitationDraft {
     pub fn persist(
         self,
         path: impl AsRef<std::path::Path>,
+        keys: &focal_seal::DataKeys,
         intent_hash: Fingerprint,
     ) -> Result<PendingInvitation, EnrollmentError> {
-        let directory = crate::files::PrivateDirectory::open(path.as_ref())?;
+        let directory = crate::files::PrivateDirectory::open(path.as_ref(), keys)?;
         if directory.read("invitation.bin")?.is_some() {
             return Err(EnrollmentError::Conflict);
         }
@@ -672,9 +673,10 @@ pub struct PendingInvitation {
 impl PendingInvitation {
     pub fn open(
         path: impl AsRef<std::path::Path>,
+        keys: &focal_seal::DataKeys,
         cluster: ClusterId,
     ) -> Result<Self, EnrollmentError> {
-        let directory = crate::files::PrivateDirectory::open(path.as_ref())?;
+        let directory = crate::files::PrivateDirectory::open(path.as_ref(), keys)?;
         let bytes = directory
             .read("invitation.bin")?
             .ok_or(EnrollmentError::Corrupt)?;

@@ -64,7 +64,8 @@ fn rejected_journal_admission_returns_exact_ownership_and_never_changes_disk() {
     focal_rt::block_on(async move {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("intent");
-        let mut journal = PrivateJournal::open(&path).unwrap();
+        let mut journal =
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()).unwrap();
         journal.replace(b"old-intent").unwrap();
         let before = std::fs::read(path.join("journal.bin")).unwrap();
         let budget = MemoryBudget::new(128 * 1024, 32 * 1024).unwrap();
@@ -107,7 +108,7 @@ fn rejected_journal_admission_returns_exact_ownership_and_never_changes_disk() {
         assert_eq!(std::fs::read(path.join("journal.bin")).unwrap(), before);
         drop(returned);
         assert_eq!(
-            PrivateJournal::open(&path)
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap())
                 .unwrap()
                 .read()
                 .unwrap()
@@ -126,7 +127,8 @@ fn canceled_queued_intent_retains_lock_and_charge_until_persistence_or_unknown_d
         for persist in [true, false] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("intent");
-            let mut journal = PrivateJournal::open(&path).unwrap();
+            let mut journal =
+                PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()).unwrap();
             journal.replace(b"previous").unwrap();
             let budget = MemoryBudget::new(128 * 1024, 32 * 1024).unwrap();
             let (host, queue) = queued_host(budget.clone());
@@ -136,7 +138,7 @@ fn canceled_queued_intent_retains_lock_and_charge_until_persistence_or_unknown_d
             let admitted = budget.stats().used;
             assert!(admitted >= 16 * 1024);
             assert!(matches!(
-                PrivateJournal::open(&path),
+                PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()),
                 Err(EnrollmentError::Locked)
             ));
             if persist {
@@ -158,7 +160,8 @@ fn canceled_queued_intent_retains_lock_and_charge_until_persistence_or_unknown_d
                 assert!(failure.rejected.is_none());
                 assert_eq!(budget.stats().used, 0);
             }
-            let reopened = PrivateJournal::open(&path).unwrap();
+            let reopened =
+                PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()).unwrap();
             let expected: &[u8] = if persist {
                 b"new exact intent"
             } else {
@@ -175,7 +178,8 @@ fn delivered_journal_reply_retains_charge_and_lock_until_consumed() {
     focal_rt::block_on(async move {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("intent");
-        let journal = PrivateJournal::open(&path).unwrap();
+        let journal =
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()).unwrap();
         let budget = MemoryBudget::new(128 * 1024, 32 * 1024).unwrap();
         let (host, queue) = queued_host(budget.clone());
         let mut save = Box::pin(host.persist_local_intent(journal, b"committed".to_vec()));
@@ -187,7 +191,7 @@ fn delivered_journal_reply_retains_charge_and_lock_until_consumed() {
         write.persist();
         assert_eq!(budget.stats().used, charged);
         assert!(matches!(
-            PrivateJournal::open(&path),
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()),
             Err(EnrollmentError::Locked)
         ));
         let journal = save.await.unwrap();
@@ -195,7 +199,7 @@ fn delivered_journal_reply_retains_charge_and_lock_until_consumed() {
         assert_eq!(journal.read().unwrap().unwrap().as_slice(), b"committed");
         drop(journal);
         assert_eq!(
-            PrivateJournal::open(&path)
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap())
                 .unwrap()
                 .read()
                 .unwrap()
@@ -227,7 +231,8 @@ fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and_reope
         )
         .unwrap();
         let path = directory.path().join("journal");
-        let mut journal = PrivateJournal::open(&path).unwrap();
+        let mut journal =
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()).unwrap();
         journal.replace(b"before").unwrap();
         let pause = crate::storage_start::test_wal(&network.storage.storage)
             .pause_for_test()
@@ -262,7 +267,7 @@ fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and_reope
         pending(save.as_mut()).await;
         drop(save);
         assert!(matches!(
-            PrivateJournal::open(&path),
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()),
             Err(EnrollmentError::Locked)
         ));
         assert!(budget.stats().used >= 16 * 1024);
@@ -279,7 +284,8 @@ fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and_reope
         // A later owner request proves the queued write has been processed; the
         // abandoned reply releases its journal lock and admission charge.
         drop(host.observe_root().await.unwrap());
-        let mut journal = PrivateJournal::open(&path).unwrap();
+        let mut journal =
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()).unwrap();
         assert_eq!(
             journal.read().unwrap().unwrap().as_slice(),
             b"after canceled caller"
@@ -299,7 +305,7 @@ fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and_reope
         drop(outgoing);
         assert_eq!(budget.stats().used, 0);
         assert_eq!(
-            PrivateJournal::open(&path)
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap())
                 .unwrap()
                 .read()
                 .unwrap()

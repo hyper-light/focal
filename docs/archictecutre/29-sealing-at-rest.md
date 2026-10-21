@@ -34,12 +34,17 @@ other principal can read it. The hardware sources (macOS Keychain or Secure Encl
 Windows DPAPI/CNG, a cloud KMS) implement the same `KeySource` trait and are chosen by
 configuration when present (§7).
 
-- **Its path** is `storage.root_key` in the node's configuration. Unset, it is the platform's
+- **Its path** is `storage.root_key` in the node's configuration. Unset, it is in the platform's
   per-user configuration directory, never the data directory: `~/Library/Application
-  Support/Focal Keys/<node>.key` on macOS, `$XDG_CONFIG_HOME/focal/keys/<node>.key` (else
-  `~/.config/focal/keys/`) on Linux, `%APPDATA%\Focal\keys\<node>.key` on Windows. In a
-  container or Kubernetes the data directory is a volume and the key is a mounted secret file
-  named by `storage.root_key`, as CockroachDB's store keys and TiKV's master key are.
+  Support/Focal Keys/` on macOS, `$XDG_CONFIG_HOME/focal/keys/` (else `~/.config/focal/keys/`) on
+  Linux, `%APPDATA%\Focal\keys\` on Windows, the file named for the data directory's root key ID
+  (`<root key id>.key`, the ID `SEAL.node` records in the clear), so a directory finds its key
+  file from itself before it knows any identity: a joining node seals its join, its private key
+  among it, before it has a node ID (2026-10-20). A node whose keys an earlier binary made under
+  the file named for its node (`<node>.key`) keeps that file; a client's data directory has keys
+  of its own the same way. In a container or Kubernetes the data directory is a volume and the key
+  is a mounted secret file named by `storage.root_key`, as CockroachDB's store keys and TiKV's
+  master key are; a backup names the root key ID it needs, which is the file's name.
 - **A key inside the data directory is refused at start** (typed, before anything opens): a
   copy of the data directory alone, in a backup, an rsync or a detached volume, must never
   carry what opens it.
@@ -243,7 +248,8 @@ listed from its writers (each `File::create`, `OpenOptions`, `create_private_new
 | Cold stream | `cold/<ledger>/` | retired families' archive frames | focal-evidence `cold` | clear |
 | Content | `content/objects/…` | artifacts, manifests, uploads, custody | focal-evidence `store`, `transfer`, `gc`, `upload_terminal` | clear |
 | Session backups | a backup's directory | checkpoint, seeds, content, cold | focal-ledger `session_backup` | clear |
-| Enrollment | private directories | the cluster CA's key, nodes' and clients' keys, invitations, the signer's journal | focal-enrollment `files::PrivateDirectory` | clear |
+| Enrollment | private directories | the cluster CA's key, nodes' and clients' keys, invitations, the signer's journal | focal-enrollment `files::PrivateDirectory` | sealed (§12.2) |
+| Embedded node log | `wal/` of a node that is its own cluster | every record of its session | focal-node `EmbeddedNode` on focal-log | clear: the embedded node opens focal-log itself, never the shell |
 | Bus identities | the bus's identity directory | its local CA's and members' keys | focal-bus `pki` | clear |
 | Bus part | a part's image, the node's run | streams' floors, producers' sessions | focal-bus `group`, `member` | clear |
 | Client stores | a client's data directory | requests, receipts, pending writes, artifact uploads | focal-client `operation_store`, `native_store`, `pending`, `artifact_transfer` | clear |
@@ -286,3 +292,36 @@ destroy (NIST SP 800-88r1, cryptographic erase).
   in the committed lane, which a session whose share is full still has (a full session must still
   checkpoint, which is what frees it: the two tests that say so refused a reader charged
   ordinarily), a read lease's in the ordinary lane, where a full share refuses it.
+
+### 12.2 The private directories, sealed (2026-10-20)
+
+Every record of an enrollment's private directory (`focal_enrollment::files::PrivateDirectory`:
+the cluster CA's key and its server certificate's, a node's and a client's join key and
+enrollment, the founder's draft, invitation drafts, the signer's and every agent's journal, a
+client's context catalogue) is sealed whole under the journal key of the data directory it lies in
+(`Store::Journal`), unwrapped for that one record and dropped after it, through `focal_seal::file`
+(`hyper_seal::sealed_file`, a data key of its own per record). The record's framed bytes (magic,
+payload, BLAKE3 hash) are the sealed file's plaintext, so another record's bytes under a valid seal
+still read as corrupt. Every opener takes the data directory's keys (`focal_seal::DataKeys`), which
+its owner resolves once: a node's at its start (`Settings::data_keys`), a client's by its CLI and
+focal-load the same way.
+
+- **Converted once, then refused in the clear.** A directory an earlier binary wrote in the clear is
+  sealed by its first writer under this one, under the writer's exclusive lock: each record's
+  framed bytes are checked and written again sealed through the atomic replace that writes any
+  record, and then the directory is marked (`SEALED`). A crash before the mark leaves each record
+  whole in one form or the other, and the next writer finishes. A shared reader reads either form
+  and seals nothing; once marked, a record in the clear is refused as corrupt (tested: a planted
+  plaintext record after conversion).
+- **Temporaries.** Every writer's open lets go of the temporaries (`.pending-*`) a crash left before
+  their rename, which were never records and were never removed.
+- **Bounded.** A conversion visits at most every record and marker the registry's bounds admit
+  (`max_entries`: the fixed records, one an invitation or an enrollment under `EnrollmentLimits`'
+  defaults, each with its marker, the lock and the seal's marker).
+- **Tests:** no record's secret is in any file of its directory; a flipped byte and another data
+  directory's keys are refused; a directory laid out in the clear is read by a shared reader as it
+  is, sealed by its first writer, and refuses plaintext after; the crash windows of a sealed write
+  (a temporary synced and not renamed; a record renamed before its marker).
+- **Found and left open:** a quorum enrollment's `invite-<request>` records are never removed, one
+  for every invitation name the node ever issued; and the embedded node's log is still focal-log's
+  plaintext WAL (row above). Both are owed.

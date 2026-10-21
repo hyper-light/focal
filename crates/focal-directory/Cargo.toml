@@ -14,6 +14,7 @@ postcard.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
+focal-seal = { version = "0.1.0", path = "../focal-seal", features = ["test-support"] }
 tempfile.workspace = true
 focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
 # hyper-raft's conformed rustls, as focal-enrollment builds its configurations with.

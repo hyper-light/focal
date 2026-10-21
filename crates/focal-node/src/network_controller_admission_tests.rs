@@ -67,6 +67,7 @@ impl Fixture {
         let now = unix_time().unwrap();
         let authority = BootstrapAuthority::open_or_create(
             directory.root().join("cluster/network/authority"),
+            &focal_seal::test_keys(directory.root()).unwrap(),
             state.genesis.founder.cluster,
             vec![state.sponsor.server_name.clone()],
             now,
@@ -167,6 +168,12 @@ impl Fixture {
             self.directory
                 .root()
                 .join(format!("test-join-{}", self.sequence)),
+            &focal_seal::test_keys_beside(
+                self.directory
+                    .root()
+                    .join(format!("test-join-{}", self.sequence)),
+            )
+            .unwrap(),
             self.state.genesis.founder.cluster,
         )
         .unwrap();
@@ -326,7 +333,12 @@ fn withdrawn_grant_fences_a_reopened_journal_intent_without_consuming_its_reques
         .unwrap()
         .unwrap();
         assert!(matches!(command, ControlCommand::Membership(_)));
-        let mut admission = RootAdmission::open(&fixture.state, dir.path()).unwrap();
+        let mut admission = RootAdmission::open(
+            &fixture.state,
+            dir.path(),
+            &focal_seal::test_keys(dir.path()).unwrap(),
+        )
+        .unwrap();
         let intent = ControlRequest {
             id: ControlRequestId {
                 client: admission.principal.0,
@@ -338,7 +350,12 @@ fn withdrawn_grant_fences_a_reopened_journal_intent_without_consuming_its_reques
         admission.intent.pending = Some(intent.clone());
         admission.save().unwrap();
         drop(admission);
-        let mut admission = RootAdmission::open(&fixture.state, dir.path()).unwrap();
+        let mut admission = RootAdmission::open(
+            &fixture.state,
+            dir.path(),
+            &focal_seal::test_keys(dir.path()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(admission.intent.pending.as_ref(), Some(&intent));
         let mut withdrawn = grant.clone();
         withdrawn.enrollment.generation = 2;
@@ -363,7 +380,12 @@ fn withdrawn_grant_fences_a_reopened_journal_intent_without_consuming_its_reques
         assert_eq!(rejected.configuration(), after_withdrawal.configuration());
         assert!(!rejected.configuration().configuration.contains(node));
         drop(admission);
-        let mut admission = RootAdmission::open(&fixture.state, dir.path()).unwrap();
+        let mut admission = RootAdmission::open(
+            &fixture.state,
+            dir.path(),
+            &focal_seal::test_keys(dir.path()).unwrap(),
+        )
+        .unwrap();
         assert!(admission.intent.pending.is_none());
         assert_eq!(admission.intent.completed, 0);
 

@@ -7,6 +7,7 @@ use focal_model::ParticipantId;
 /// JOIN directory and marker were both removed.
 pub fn local_unix_principal(
     root: &Path,
+    keys: Option<&focal_seal::DataKeys>,
     identity: &NodeIdentity,
     now: i64,
 ) -> Result<ParticipantId, JoinError> {
@@ -22,7 +23,7 @@ pub fn local_unix_principal(
         }
     }
     if joined {
-        joined_unix_principal(root, identity, now)
+        joined_unix_principal(root, keys, identity, now)
     } else if decode_identity(&root.join("IDENTITY"))? == *identity {
         Ok(identity.issuer)
     } else {
@@ -35,6 +36,7 @@ pub fn local_unix_principal(
 /// does not turn the Node certificate into a remote Actor credential.
 pub fn joined_unix_principal(
     root: &Path,
+    keys: Option<&focal_seal::DataKeys>,
     identity: &NodeIdentity,
     now: i64,
 ) -> Result<ParticipantId, JoinError> {
@@ -44,9 +46,8 @@ pub fn joined_unix_principal(
     {
         return Err(JoinError::Invalid);
     }
-    let journal_bytes = read_record(&root.join("JOIN/journal.bin"))?;
-    let (journal, trailing): (JoinJournal, _) =
-        postcard::take_from_bytes(payload(&journal_bytes)?)?;
+    let journal_bytes = read_record(&root.join("JOIN"), "journal.bin", keys)?;
+    let (journal, trailing): (JoinJournal, _) = postcard::take_from_bytes(&journal_bytes)?;
     if !trailing.is_empty() || journal.schema != 1 {
         return Err(JoinError::Invalid);
     }
@@ -60,11 +61,11 @@ pub fn joined_unix_principal(
     {
         return Err(JoinError::Conflict);
     }
-    let key_bytes = read_record(&root.join("JOIN/node-key/join-key.bin"))?;
-    let receipt_bytes = read_record(&root.join("JOIN/node-key/enrollment.bin"))?;
+    let key_bytes = read_record(&root.join("JOIN/node-key"), "join-key.bin", keys)?;
+    let receipt_bytes = read_record(&root.join("JOIN/node-key"), "enrollment.bin", keys)?;
     let (receipt, csr) = JoinKey::inspect_saved(
-        payload(&key_bytes)?,
-        payload(&receipt_bytes)?,
+        &key_bytes,
+        &receipt_bytes,
         identity.cluster,
         bundle.invitation.trust().issuers.iter(),
         now,
@@ -82,16 +83,13 @@ pub fn joined_unix_principal(
     Ok(ParticipantId(receipt.identity.principal))
 }
 
-fn read_record(path: &Path) -> Result<Zeroizing<Vec<u8>>, JoinError> {
-    let bytes = read_private(path, 64 * 1024)?;
-    payload(&bytes)?;
-    Ok(bytes)
-}
-fn payload(bytes: &[u8]) -> Result<&[u8], JoinError> {
-    let end = bytes.len().checked_sub(32).ok_or(JoinError::Invalid)?;
-    let (body, checksum) = bytes.split_at_checked(end).ok_or(JoinError::Invalid)?;
-    if body.get(..8) != Some(b"FCLKEY01".as_slice()) || blake3::hash(body).as_bytes() != checksum {
-        return Err(JoinError::Invalid);
-    }
-    body.get(8..).ok_or(JoinError::Invalid)
+/// The payload of the record `name` of the private directory `directory`, read with no lease on it
+/// and opened as the directory opens its records (sealed, 29 §12).
+fn read_record(
+    directory: &Path,
+    name: &str,
+    keys: Option<&focal_seal::DataKeys>,
+) -> Result<Zeroizing<Vec<u8>>, JoinError> {
+    let bytes = read_private(&directory.join(name), 64 * 1024)?;
+    focal_enrollment::open_private_record(directory, &bytes, keys).map_err(|_| JoinError::Invalid)
 }

@@ -29,10 +29,13 @@ fn intent(client: [u8; 16], sequence: u64) -> ControlRequest {
 /// The journal at `root` as a node left it.
 fn left(root: &Path, saved: &Saved) {
     crate::embedded::durable_dir(&root.join("cluster")).unwrap();
-    PrivateJournal::open(root.join("cluster").join(NAME))
-        .unwrap()
-        .replace(&postcard::to_stdvec(saved).unwrap())
-        .unwrap();
+    PrivateJournal::open(
+        root.join("cluster").join(NAME),
+        &focal_seal::test_keys(&root).unwrap(),
+    )
+    .unwrap()
+    .replace(&postcard::to_stdvec(saved).unwrap())
+    .unwrap();
 }
 
 /// A node that led its partition journaled an intent under its local client
@@ -57,7 +60,14 @@ fn an_intent_journaled_under_one_client_resolves_after_a_reopen_under_the_other(
             windows: BTreeMap::from([(PRINCIPAL, 7)]),
         },
     );
-    let mut journal = IntentJournal::open(directory.path(), NAME, target(), PRINCIPAL).unwrap();
+    let mut journal = IntentJournal::open(
+        directory.path(),
+        &focal_seal::test_keys(directory.path()).unwrap(),
+        NAME,
+        target(),
+        PRINCIPAL,
+    )
+    .unwrap();
     assert_eq!(journal.pending(), Some(&pending));
     assert_eq!(journal.completed(), 3);
     // Its receipt arrives: the local client's window stands at the intent,
@@ -88,7 +98,14 @@ fn a_journal_with_nothing_pending_adopts_its_opener_and_a_refusal_frees_its_sequ
             windows: BTreeMap::new(),
         },
     );
-    let journal = IntentJournal::open(directory.path(), NAME, target(), PRINCIPAL).unwrap();
+    let journal = IntentJournal::open(
+        directory.path(),
+        &focal_seal::test_keys(directory.path()).unwrap(),
+        NAME,
+        target(),
+        PRINCIPAL,
+    )
+    .unwrap();
     assert_eq!(journal.saved.client, PRINCIPAL);
     assert_eq!(journal.completed(), 0);
     assert_eq!(journal.saved.windows.get(&LOCAL), Some(&3));
@@ -107,7 +124,14 @@ fn a_journal_with_nothing_pending_adopts_its_opener_and_a_refusal_frees_its_sequ
             windows: BTreeMap::from([(LOCAL, 3)]),
         },
     );
-    let mut journal = IntentJournal::open(directory.path(), NAME, target(), LOCAL).unwrap();
+    let mut journal = IntentJournal::open(
+        directory.path(),
+        &focal_seal::test_keys(directory.path()).unwrap(),
+        NAME,
+        target(),
+        LOCAL,
+    )
+    .unwrap();
     journal.resolved().unwrap();
     assert_eq!(journal.saved.client, LOCAL);
     assert_eq!(journal.completed(), 3);
@@ -136,7 +160,13 @@ fn a_journal_of_another_owner_or_out_of_sequence_or_without_room_is_refused() {
         },
     );
     assert!(matches!(
-        IntentJournal::open(directory.path(), NAME, target(), LOCAL),
+        IntentJournal::open(
+            directory.path(),
+            &focal_seal::test_keys(directory.path()).unwrap(),
+            NAME,
+            target(),
+            LOCAL
+        ),
         Err(IntentError::Identity)
     ));
     let directory = tempfile::tempdir().unwrap();
@@ -152,7 +182,13 @@ fn a_journal_of_another_owner_or_out_of_sequence_or_without_room_is_refused() {
         },
     );
     assert!(matches!(
-        IntentJournal::open(directory.path(), NAME, target(), PRINCIPAL),
+        IntentJournal::open(
+            directory.path(),
+            &focal_seal::test_keys(directory.path()).unwrap(),
+            NAME,
+            target(),
+            PRINCIPAL
+        ),
         Err(IntentError::Identity)
     ));
     let directory = tempfile::tempdir().unwrap();
@@ -168,7 +204,13 @@ fn a_journal_of_another_owner_or_out_of_sequence_or_without_room_is_refused() {
         },
     );
     assert!(matches!(
-        IntentJournal::open(directory.path(), NAME, target(), PRINCIPAL),
+        IntentJournal::open(
+            directory.path(),
+            &focal_seal::test_keys(directory.path()).unwrap(),
+            NAME,
+            target(),
+            PRINCIPAL
+        ),
         Err(IntentError::Capacity)
     ));
 }
