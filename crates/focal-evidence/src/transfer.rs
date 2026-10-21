@@ -219,6 +219,27 @@ impl ContentStore {
         result
     }
 
+    /// Whether chunk `index` of `transfer` is installed under its hash: the
+    /// object's chunk this store already holds, as a content-addressed chunk of
+    /// another object may be. What is installed is verified as it is read.
+    pub fn chunk_installed(
+        &self,
+        transfer: &TransferManifest,
+        index: usize,
+    ) -> Result<bool, ContentError> {
+        self.check()?;
+        let chunk = transfer
+            .manifest
+            .chunks
+            .get(index)
+            .ok_or(ContentError::Invalid)?;
+        let path = self
+            .root
+            .join("objects")
+            .join(hex(&transfer.reference.domain.0))
+            .join(format!("{}.chunk", chunk.hash));
+        Ok(path.try_exists()?)
+    }
     /// How much of chunk `index` is staged in parts: the offset the next
     /// part is taken at. Zero where none is, or the chunk is installed.
     pub fn staged_chunk_bytes(

@@ -1436,31 +1436,53 @@ fn a_megabyte_chunk_reaches_its_copy_across_8_kbit_per_second() {
 /// audit's F50). Chunk files are content-addressed, so a second object that
 /// shares three of its four chunks with one the copy holds is held in three
 /// parts before it is pushed: a holder whose connection admits the ordered
-/// profile asks the copy what it holds and sends the one chunk it lacks; a
+/// profile asks the copy what it holds and offers the one chunk it lacks; a
 /// holder offering what a binary before the profile offered is told the
-/// first chunk lacked and sends three, as every holder did.
+/// first chunk lacked and offers the three from there, as every holder did.
+///
+/// What crosses for the older ask is the offers' cost, which the path decides:
+/// a chunk the path carries within an exchange's time goes whole, one it does
+/// not goes in parts (`part_bytes`), and a chunk the copy holds already is
+/// answered stored at its first part. On a loaded host the path's estimate
+/// shrinks and the two held chunks cost a part each (151,906 bytes crossed
+/// under 18 CPU burners and 4 syncing writers, every chunk answered): what
+/// tells the asks apart is what the copy is offered.
 #[test]
 fn a_copy_is_sent_the_chunks_it_lacks_and_none_it_holds() {
     focal_rt::block_on(async move {
-        let ordered = bytes_crossed_for_a_second_object(&[]).await;
-        let older = bytes_crossed_for_a_second_object(&[1]).await;
+        let (ordered, ordered_offers) = bytes_crossed_for_a_second_object(&[]).await;
+        let (older, older_offers) = bytes_crossed_for_a_second_object(&[1]).await;
         println!(
-            "a second object sharing three chunks of four: {ordered} bytes crossed toward the copy with its inventory asked, {older} with the first chunk lacked"
+            "a second object sharing three chunks of four: {ordered} bytes crossed toward the copy with its inventory asked ({ordered_offers:?}), {older} with the first chunk lacked ({older_offers:?})"
         );
         assert!(
             ordered < 2 * SHARED_CHUNK as u64,
             "{ordered} bytes crossed toward the copy for one chunk of {SHARED_CHUNK} it lacked"
         );
+        assert_eq!(
+            (ordered_offers.chunks_offered, ordered_offers.offered_held),
+            (1, 0),
+            "the ordered ask offers the chunk the copy lacks, and no chunk it holds"
+        );
+        assert_eq!(
+            (older_offers.chunks_offered, older_offers.offered_held),
+            (3, 2),
+            "the older ask offers every chunk from the first the copy lacks, the two it holds among them"
+        );
         assert!(
-            older >= 3 * SHARED_CHUNK as u64,
-            "{older} bytes crossed where the older ask sends three chunks of {SHARED_CHUNK}"
+            older > ordered,
+            "{older} bytes crossed for three chunks offered, {ordered} for one"
         );
     }).unwrap()
 }
 const SHARED_CHUNK: usize = 64 * 1024;
 /// The bytes that crossed toward the copy while a second object, differing
 /// from the first in its second chunk alone, was uploaded and sealed.
-async fn bytes_crossed_for_a_second_object(old: &'static [u64]) -> u64 {
+/// The bytes that crossed toward the copy (node 2) for a second object, and what the chunks
+/// offered to it came to meanwhile.
+async fn bytes_crossed_for_a_second_object(
+    old: &'static [u64],
+) -> (u64, focal_node::custody::CustodyStats) {
     let data = tempfile::tempdir().unwrap();
     let slow = Slow {
         bits: 100_000_000,
@@ -1491,8 +1513,14 @@ async fn bytes_crossed_for_a_second_object(old: &'static [u64]) -> u64 {
     // has carried it, or never if it drops it, and the sender as it sends.
     let warmed = warm_ups_ended_toward(&fleet, &slow, 2).await;
     let before = fleet.relays[1].carried_toward_back();
+    let offered_before = fleet.replicas[1].content.custody_stats().await.unwrap();
     let reference = sealed(&fleet, leader, &slow, 2, &second).await;
     let crossed = fleet.relays[1].carried_toward_back() - before;
+    let offered_after = fleet.replicas[1].content.custody_stats().await.unwrap();
+    let offers = focal_node::custody::CustodyStats {
+        chunks_offered: offered_after.chunks_offered - offered_before.chunks_offered,
+        offered_held: offered_after.offered_held - offered_before.offered_held,
+    };
     assert_eq!(
         warm_up_bytes_toward(&fleet, 2).await,
         warmed,
@@ -1503,7 +1531,7 @@ async fn bytes_crossed_for_a_second_object(old: &'static [u64]) -> u64 {
         &second,
     );
     fleet.stop().await;
-    crossed
+    (crossed, offers)
 }
 /// Wait until no other node's connection to node `target` has a path warm-up still to come
 /// (`PathFacts::warming_up`), within four exchanges across the path in the replicas' periods, as a

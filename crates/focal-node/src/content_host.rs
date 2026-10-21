@@ -82,6 +82,8 @@ enum Command {
     ),
     /// The volume envelope's statistics and what the store has staged.
     DiskStats,
+    /// What the chunks offered to this node's copies came to.
+    CustodyStats,
     /// One slice of a custody request's pass over a whole object (the
     /// audit's F51).
     Advance(Box<PendingPass>),
@@ -121,6 +123,7 @@ enum Output {
     Restored(bool),
     Imported(u64),
     Disk(focal_memory::DiskStats, usize, u64),
+    Custody(crate::custody::CustodyStats),
     Pending(Box<PendingPass>),
     /// An upload's seal or a restore not done yet: the store keeps it, and
     /// the next ask carries it on (the audit's F51).
@@ -621,6 +624,13 @@ impl ContentHost {
             _ => Err(AccessError::Unavailable),
         }
     }
+    /// What the chunks offered to this node's copies came to (the audit's F50).
+    pub async fn custody_stats(&self) -> Result<crate::custody::CustodyStats, AccessError> {
+        match self.call(Command::CustodyStats, 4096, true).await? {
+            Output::Custody(stats) => Ok(stats),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
     /// Trusted: import every object a backup lists into this node's store,
     /// chunk by chunk as a custody transfer would (26 §6).
     pub async fn restore_content(
@@ -768,6 +778,7 @@ fn execute(
         Command::Restore(domain, root) => {
             Ok(Output::Restored(owner.restore_quarantined(domain, root)?))
         }
+        Command::CustodyStats => Ok(Output::Custody(owner.stats())),
         Command::DiskStats => {
             let (uploads, bytes) = owner.content().staged();
             Ok(Output::Disk(owner.content().disk_stats(), uploads, bytes))

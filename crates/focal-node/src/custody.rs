@@ -258,8 +258,27 @@ fn make_room<K: Ord + Clone, V>(
     entries.remove(&finished);
     Ok(())
 }
+/// A chunk offered to a copy counted, and counted held where the store had it already.
+fn count_offer(offers: &mut CustodyStats, held: bool) {
+    offers.chunks_offered = offers.chunks_offered.saturating_add(1);
+    if held {
+        offers.offered_held = offers.offered_held.saturating_add(1);
+    }
+}
+
+/// What the chunks custody copies were offered came to (the audit's F50): every chunk offered,
+/// whole or by its first part, and those of them the store held already, which a holder that
+/// asks the copy's inventory first never offers. Counted since the store opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CustodyStats {
+    pub chunks_offered: u64,
+    pub offered_held: u64,
+}
+
 pub struct CustodyStore {
     store: ContentStore,
+    /// What the chunks offered to this node's copies came to.
+    offers: CustodyStats,
     config: CustodyConfig,
     budget: MemoryBudget,
     policies: BTreeMap<LedgerId, Installed>,
@@ -291,6 +310,7 @@ impl CustodyStore {
         }
         Ok(Self {
             store,
+            offers: CustodyStats::default(),
             config,
             budget,
             policies: BTreeMap::new(),
@@ -305,6 +325,10 @@ impl CustodyStore {
     }
     pub fn config(&self) -> &CustodyConfig {
         &self.config
+    }
+    /// What the chunks offered to this node's copies came to.
+    pub fn stats(&self) -> CustodyStats {
+        self.offers
     }
     pub(crate) fn content(&self) -> &ContentStore {
         &self.store
@@ -833,6 +857,11 @@ impl CustodyStore {
                     .get_mut(&(scope, node_id, *transfer))
                     .ok_or(AccessError::Unavailable)?;
                 let index_usize = usize::try_from(*index).map_err(|_| AccessError::Capacity)?;
+                let held = self
+                    .store
+                    .chunk_installed(&retained.manifest, index_usize)
+                    .map_err(content_error)?;
+                count_offer(&mut self.offers, held);
                 // Any chunk of the manifest, in any order: the store holds
                 // each to the hash the manifest names it by.
                 self.store
@@ -858,6 +887,14 @@ impl CustodyStore {
                     .manifest
                     .chunk_length(index_usize)
                     .map_err(content_error)?;
+                // A chunk's first part is its offer.
+                if *offset == 0 {
+                    let held = self
+                        .store
+                        .chunk_installed(&retained.manifest, index_usize)
+                        .map_err(content_error)?;
+                    count_offer(&mut self.offers, held);
+                }
                 let staged = self
                     .store
                     .import_chunk_part(&retained.manifest, index_usize, u64::from(*offset), bytes)
