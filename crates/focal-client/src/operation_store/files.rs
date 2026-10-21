@@ -11,8 +11,6 @@ use std::{
 mod lock_tests;
 
 const MARKER: &str = "INITIALIZED";
-/// Longest wait for another process's critical section on the native journal.
-const NATIVE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const INITIALIZED: &[u8; 8] = b"FCLOPS01";
 const OVERHEAD: usize = 44;
 const MANAGED_INITIALIZED: &[u8; 8] = b"FCLMST01";
@@ -221,11 +219,16 @@ impl Directory {
         }
         .map_err(missing_is_corrupt)?;
         check_open_file(&lock_path, &lock, &owner)?;
-        // The native journal is shared by every process of one adapter;
-        // its critical sections are short and never span a network wait,
-        // so a contending process waits briefly instead of failing.
+        // The native journal is shared by every process of one adapter, and
+        // every holder holds it for its own file work, never across a network
+        // wait (the driver reads before it prepares and sends after it lets
+        // go): a contending process waits for the holder to let go, however
+        // long its syncs take on a busy disk. A five-second clock refused it
+        // ("locked by another admission") whenever the syncs of the makers
+        // ahead of it took longer, as six makers at once on one directory
+        // under other processes' F_FULLFSYNCs did.
         let acquired = if layout == Layout::Native {
-            FileLock::acquire_within(lock, NATIVE_LOCK_WAIT)
+            FileLock::acquire_waiting(lock)
         } else {
             FileLock::acquire(lock)
         };

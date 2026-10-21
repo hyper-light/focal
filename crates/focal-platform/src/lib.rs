@@ -46,6 +46,17 @@ impl FileLock {
         try_lock_exclusive(&file)?;
         Ok(Self { file })
     }
+    /// Take an exclusive lock on `file`, waiting while another owner holds
+    /// it, and own it. The wait is the holder's: the operating system wakes
+    /// this owner when the holder releases the lock or its process ends,
+    /// however long either takes, with no clock and no guess of how long a
+    /// holder may hold it. Only for a lock whose every holder holds it for
+    /// its own bounded work, never across a wait on another lock it does not
+    /// already hold, another process or the network.
+    pub fn exclusive_waiting(file: File) -> io::Result<Self> {
+        File::lock(&file)?;
+        Ok(Self { file })
+    }
     /// Take a shared lock on `file` without blocking, and own it;
     /// `WouldBlock` when an exclusive lock is held.
     pub fn shared(file: File) -> io::Result<Self> {
@@ -274,6 +285,45 @@ mod tests {
         );
         unlock(&owner).unwrap();
         try_lock_exclusive(&other).unwrap();
+    }
+
+    /// A waiting owner takes the lock once its holder lets it go: never
+    /// before, and never refused for how long the holder kept it. Do: hold
+    /// the lock; start a waiting owner on another thread, which says when it
+    /// asks; mark the release, then let go. Expect: the waiter takes the
+    /// lock, and finds the release marked when it holds it; a third owner is
+    /// then refused.
+    #[test]
+    fn a_waiting_owner_takes_the_lock_once_its_holder_lets_go() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("LOCK");
+        File::create(&path).unwrap();
+        let open = || File::options().read(true).write(true).open(&path).unwrap();
+        let holder = FileLock::exclusive(open()).unwrap();
+        let released = AtomicBool::new(false);
+        let (asking, asked) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let file = open();
+                asking.send(()).unwrap();
+                let lock = FileLock::exclusive_waiting(file).unwrap();
+                (released.load(Ordering::SeqCst), lock)
+            });
+            asked.recv().unwrap();
+            released.store(true, Ordering::SeqCst);
+            drop(holder);
+            let (after_release, lock) = waiter.join().unwrap();
+            assert!(
+                after_release,
+                "the waiter held the lock before it was let go"
+            );
+            assert_eq!(
+                FileLock::exclusive(open()).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(lock);
+        });
     }
 
     /// A lock its owner let go is free at once, though a copy of the

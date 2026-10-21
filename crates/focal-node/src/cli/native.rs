@@ -330,7 +330,9 @@ pub(super) fn store_in(
     Ok(Some(store))
 }
 /// The exclusive creation lock `<name>.lock` beside the store, held only
-/// while the store is created; contenders wait for the short critical section.
+/// while the store is created, its holder doing nothing but that file work:
+/// a contender waits for the holder to let go (`exclusive_waiting`), however
+/// long its syncs take, then finds the store made.
 fn creation_lock(parent: &Path, name: &str) -> Result<focal_platform::FileLock> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -340,23 +342,7 @@ fn creation_lock(parent: &Path, name: &str) -> Result<focal_platform::FileLock> 
         options.mode(0o600);
     }
     let file = options.open(parent.join(format!("{name}.lock")))?;
-    let deadline = std::time::Instant::now()
-        .checked_add(std::time::Duration::from_secs(5))
-        .ok_or_else(|| CliError::Other("clock overflow".into()))?;
-    loop {
-        match focal_platform::try_lock_exclusive(&file) {
-            Ok(()) => return Ok(focal_platform::FileLock::owning(file)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(CliError::Other(
-                        "another process is still creating the native request journal".into(),
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
+    Ok(focal_platform::FileLock::exclusive_waiting(file)?)
 }
 
 pub(super) fn profile(standing: &NativeStanding) -> NativeContentProfile {

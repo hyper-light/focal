@@ -213,6 +213,47 @@ fn claim_document(target: &str, description: &str) -> Value {
         "validations": [{"kind": "receipt", "description": "Record delivery.", "deadline": {"at": FAR}}]
     })
 }
+/// Each `(data directory, context, document)` submitted as a claim by its own
+/// process, all at once, each run to its end before any is judged: the
+/// committed operation IDs, in order. A failure lists every client's own
+/// outcome; a test that unwound at the first left the others running in
+/// directories its teardown removed, which reported their stores missing.
+fn submit_all(clients: &[(&Path, Option<&str>, String)]) -> Vec<String> {
+    let outcomes: Vec<Output> = std::thread::scope(|scope| {
+        let running: Vec<_> = clients
+            .iter()
+            .map(|(dir, context, document)| {
+                scope.spawn(move || {
+                    run(
+                        dir,
+                        *context,
+                        &["submit", "claim", "--json", document, "--format", "json"],
+                    )
+                })
+            })
+            .collect();
+        running
+            .into_iter()
+            .map(|client| client.join().unwrap())
+            .collect()
+    });
+    let failed: Vec<String> = outcomes
+        .iter()
+        .filter(|output| !output.status.success())
+        .map(|output| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+        .collect();
+    assert!(failed.is_empty(), "{failed:#?}");
+    outcomes
+        .iter()
+        .map(|output| committed(&serde_json::from_slice(&output.stdout).unwrap()).0)
+        .collect()
+}
 /// A failed command's structured output (stdout or stderr) with its exit code.
 fn failed(root: &Path, context: Option<&str>, args: &[&str]) -> (i32, Value) {
     let mut full = args.to_vec();
@@ -248,8 +289,18 @@ fn claims_of(root: &Path, issuer: &str) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exactly_once() {
+/// A founder node serving a native ledger, and a client data directory
+/// enrolled into it as `alice`, with each one's principal: what every test
+/// here starts from.
+struct Founded {
+    founder: tempfile::TempDir,
+    client: tempfile::TempDir,
+    server: Server,
+    advertise: String,
+    issuer: String,
+    alice: String,
+}
+fn founded() -> Founded {
     let founder = tempfile::Builder::new()
         .prefix("focal-native-a4-")
         .tempdir_in("/tmp")
@@ -262,7 +313,6 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     private(client.path());
     let root = founder.path();
     let alice_root = client.path();
-    let alice_ctx = Some("alice");
     let activation = admin(root, None, &["activate", "native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
@@ -295,45 +345,86 @@ fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exa
     );
     assert!(
         enrolled.status.success(),
-        "enroll: {}
-{}",
+        "enroll: {}\n{}",
         String::from_utf8_lossy(&enrolled.stderr),
         String::from_utf8_lossy(&enrolled.stdout)
     );
     let alice = hex_hash(
-        &objects(&admin(alice_root, alice_ctx, &["inspect", "prefix"]))[0]["Standing"]["principal"],
+        &objects(&admin(alice_root, Some("alice"), &["inspect", "prefix"]))[0]["Standing"]["principal"],
     );
+    Founded {
+        founder,
+        client,
+        server,
+        advertise,
+        issuer,
+        alice,
+    }
+}
+
+/// Twelve clients at once on one client data directory whose request
+/// journal does not exist yet: one makes it while the others wait for it,
+/// then each waits its turn behind the others' syncs, and every one commits
+/// exactly once. Before, a client that waited more than five seconds for the
+/// syncs of those ahead of it was refused "locked by another admission"
+/// (busy), as concurrent clients were when other processes shared the disk.
+#[test]
+fn twelve_clients_at_once_on_one_new_journal_each_commit_once() {
+    let Founded {
+        founder,
+        client,
+        server,
+        issuer,
+        alice,
+        ..
+    } = founded();
+    let (root, alice_root) = (founder.path(), client.path());
+    let before = sequence(root);
+    let clients: Vec<_> = (0..12)
+        .map(|index| {
+            let document = claim_document(&issuer, &format!("Respondent claim {index}."));
+            (alice_root, Some("alice"), document.to_string())
+        })
+        .collect();
+    let ids = submit_all(&clients);
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 12, "{ids:?}");
+    assert_eq!(sequence(root), before + 12);
+    assert!(native_rows(&cli(alice_root, Some("alice"), &["list", "requests"])).is_empty());
+    assert_eq!(claims_of(root, &alice).len(), 12);
+    drop(server);
+}
+
+#[test]
+fn concurrent_clients_lost_replies_restarts_and_exhausted_capacity_reconcile_exactly_once() {
+    let Founded {
+        founder,
+        client,
+        server,
+        advertise,
+        issuer,
+        alice,
+    } = founded();
+    let root = founder.path();
+    let alice_root = client.path();
+    let alice_ctx = Some("alice");
 
     // ---- Concurrency: six processes on two durable journals at once ----
     let before = sequence(root);
-    let handles: Vec<_> = (0..6)
+    let clients: Vec<_> = (0..6)
         .map(|index| {
-            let (dir, context, target, description) = if index % 2 == 0 {
-                (
-                    root.to_path_buf(),
-                    None,
-                    alice.clone(),
-                    format!("Issuer claim {index}."),
-                )
+            if index % 2 == 0 {
+                let document = claim_document(&alice, &format!("Issuer claim {index}."));
+                (root, None, document.to_string())
             } else {
-                (
-                    alice_root.to_path_buf(),
-                    Some("alice"),
-                    issuer.clone(),
-                    format!("Respondent claim {index}."),
-                )
-            };
-            std::thread::spawn(move || {
-                let document = claim_document(&target, &description).to_string();
-                let value = cli(&dir, context, &["submit", "claim", "--json", &document]);
-                committed(&value)
-            })
+                let document = claim_document(&issuer, &format!("Respondent claim {index}."));
+                (alice_root, Some("alice"), document.to_string())
+            }
         })
         .collect();
-    let mut ids: Vec<String> = handles
-        .into_iter()
-        .map(|handle| handle.join().unwrap().0)
-        .collect();
+    let mut ids = submit_all(&clients);
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), 6, "{ids:?}");

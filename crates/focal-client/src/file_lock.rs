@@ -12,22 +12,11 @@ impl FileLock {
         // initialization after it releases the lock as its completion does.
         focal_platform::FileLock::exclusive(file).map(Self)
     }
-    /// Acquire, waiting up to `wait` for another owner's short critical
-    /// section to end; a lock still held afterwards is `WouldBlock`.
-    pub(crate) fn acquire_within(file: File, wait: std::time::Duration) -> io::Result<Self> {
-        let deadline = std::time::Instant::now().checked_add(wait);
-        loop {
-            match focal_platform::try_lock_exclusive(&file) {
-                Ok(()) => return Ok(Self(focal_platform::FileLock::owning(file))),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
-                        return Err(error);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                Err(error) => return Err(error),
-            }
-        }
+    /// Acquire, waiting while another owner holds it
+    /// (`focal_platform::FileLock::exclusive_waiting`): for a lock whose
+    /// every holder holds it for its own file work alone.
+    pub(crate) fn acquire_waiting(file: File) -> io::Result<Self> {
+        focal_platform::FileLock::exclusive_waiting(file).map(Self)
     }
     pub(crate) fn file(&self) -> &File {
         self.0.file()
