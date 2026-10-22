@@ -80,7 +80,7 @@ fn rejected_journal_admission_returns_exact_ownership_and_never_changes_disk() {
             panic!("capacity must reject")
         };
         assert!(matches!(failure.error, LocalIntentError::Capacity));
-        let (returned, bytes) = failure.rejected.unwrap();
+        let (returned, bytes) = *failure.rejected.unwrap();
         assert_eq!(bytes, secret);
         assert!(bytes.capacity() >= 256 * 1024);
         assert_eq!(returned.read().unwrap().unwrap().as_slice(), b"old-intent");
@@ -95,7 +95,7 @@ fn rejected_journal_admission_returns_exact_ownership_and_never_changes_disk() {
         assert!(matches!(failure.error, LocalIntentError::Capacity));
         let debug = format!("{failure:?}");
         assert!(!debug.contains(std::str::from_utf8(secret).unwrap()));
-        let (returned, bytes) = failure.rejected.unwrap();
+        let (returned, bytes) = *failure.rejected.unwrap();
         assert_eq!(bytes, secret);
         assert_eq!(budget.stats().used, 0);
         drop(queue);
@@ -103,7 +103,7 @@ fn rejected_journal_admission_returns_exact_ownership_and_never_changes_disk() {
             panic!("disconnected queue must reject")
         };
         assert!(matches!(failure.error, LocalIntentError::Unavailable));
-        let (returned, bytes) = failure.rejected.unwrap();
+        let (returned, bytes) = *failure.rejected.unwrap();
         assert_eq!(bytes, secret);
         assert_eq!(std::fs::read(path.join("journal.bin")).unwrap(), before);
         drop(returned);

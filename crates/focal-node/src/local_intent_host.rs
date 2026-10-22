@@ -17,8 +17,13 @@ pub(crate) struct LocalIntentFailure {
     pub error: LocalIntentError,
     /// Present only when the write was definitely not admitted. An unknown
     /// outcome requires reopening the durable journal, never a new intent.
-    pub rejected: Option<(PrivateJournal, Vec<u8>)>,
+    /// Boxed: the journal with its sealing keys made the failure 128 bytes
+    /// and more on Windows, where a path is wider, and every result carrying
+    /// it as large.
+    pub rejected: Option<Rejected>,
 }
+/// A write definitely not admitted: the journal it was to go to, and its bytes.
+pub(crate) type Rejected = Box<(PrivateJournal, Vec<u8>)>;
 impl std::fmt::Debug for LocalIntentFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -56,8 +61,9 @@ pub(crate) async fn save_local_intent(
             }
             Ok(Err(LocalIntentFailure {
                 error: LocalIntentError::Capacity,
-                rejected: Some((owner, returned)),
+                rejected: Some(rejected),
             })) => {
+                let (owner, returned) = *rejected;
                 *journal = Some(owner);
                 bytes = returned;
                 if Instant::now() >= deadline {
@@ -68,7 +74,7 @@ pub(crate) async fn save_local_intent(
                     .map_err(|_| LocalIntentError::Unavailable)?;
             }
             Ok(Err(failure)) => {
-                *journal = failure.rejected.map(|(owner, _)| owner);
+                *journal = failure.rejected.map(|rejected| rejected.0);
                 return Err(failure.error);
             }
             Err(_) => return Err(LocalIntentError::Unavailable),
@@ -86,7 +92,7 @@ impl LocalIntentWrite {
     fn rejected(self, error: LocalIntentError) -> LocalIntentFailure {
         LocalIntentFailure {
             error,
-            rejected: Some((self.journal, self.bytes)),
+            rejected: Some(Box::new((self.journal, self.bytes))),
         }
     }
     pub(super) fn persist(mut self) {
@@ -135,14 +141,14 @@ impl ControlHost {
             Err(error) => {
                 return Err(LocalIntentFailure {
                     error,
-                    rejected: Some((journal, bytes)),
+                    rejected: Some(Box::new((journal, bytes))),
                 });
             }
         };
         let Ok((response, receive)) = hyper_rt::sync::oneshot() else {
             return Err(LocalIntentFailure {
                 error: LocalIntentError::Capacity,
-                rejected: Some((journal, bytes)),
+                rejected: Some(Box::new((journal, bytes))),
             });
         };
         let work = Work::PersistLocalIntent(Box::new(LocalIntentWrite {

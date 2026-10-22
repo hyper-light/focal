@@ -4627,13 +4627,19 @@ impl Owner {
                     // A page with something on it, or a cursor to go on from, is answered now;
                     // an empty one waits for a delivery to its recipient.
                     if page.objects.is_empty() && page.next.is_none() {
+                        // Counted from the next period: the one under way is partly spent, and a
+                        // wait counted from it ended up to a period before it was asked to (an
+                        // inbox read of 300 ms answered at 299.6, Linux CI, 2026-10-22).
                         let until = self
                             .pace
                             .periods()
-                            .checked_add(focal_timing::ProgressDeadline::periods(
-                                Duration::from_millis(u64::from(wait.wait_ms)),
-                                self.config.tick,
-                            ))
+                            .checked_add(1)
+                            .and_then(|next| {
+                                next.checked_add(focal_timing::ProgressDeadline::periods(
+                                    Duration::from_millis(u64::from(wait.wait_ms)),
+                                    self.config.tick,
+                                ))
+                            })
                             .ok_or(AccessError::Unavailable)?;
                         waiting = Some((
                             WaitingFor::Inbox {

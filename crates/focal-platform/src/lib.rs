@@ -350,6 +350,10 @@ mod tests {
                 FileLock::exclusive(open()).unwrap_err().kind(),
                 io::ErrorKind::WouldBlock
             );
+            // Let go as its owner would: closed alone, it stays held by any copy of the descriptor
+            // a process started in the meantime holds until its `exec` (another test of this
+            // binary starts one), and the next lock below was refused (Linux CI, 2026-10-22).
+            copy.unlock().unwrap();
             drop(copy);
         }
         // Released by its owner, it is free whatever copies there are.
