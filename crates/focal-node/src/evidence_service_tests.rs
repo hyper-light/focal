@@ -925,7 +925,8 @@ fn a_job_held_past_its_request_time_is_refused_and_counted() {
             coordinator.door_stats(),
             EvidenceDoorStats {
                 held: 1,
-                timed_out: 1
+                timed_out: 1,
+                window: 1
             }
         );
         // The job the queue took goes with the driver that never ran, and its charge with it.

@@ -16138,7 +16138,16 @@ however small their payloads, and a door holding more would have been refused fo
 the content host charges what verifying, sealing and replicating hold as it does them. Metrics:
 `focal_evidence_requests_held_total`, `focal_evidence_requests_timed_out_total`. Tests:
 `artifact_jobs_past_the_queue_wait_at_the_door_and_are_each_served` (eight jobs through a driver of
-one), `a_job_held_past_its_request_time_is_refused_and_counted`. Open: the driver runs a fixed four
-jobs at once (`EvidenceCoordinator::channel`'s concurrency, network_service.rs), a number no
-measurement chose; the held counts at scale say how often it binds, and its window is to be learned
-from the jobs' completions, as the session's write window is.
+one), `a_job_held_past_its_request_time_is_refused_and_counted`. With the door, 500 agents' work committed every write at 20, 50 and 100 claims a second (CI
+39866057075; the enrollment registry decoded once per root beside it): the leader 37% busy at 20 and
+48% at 50 (58% and 94% before), satisfied p50 24 and 41 ms (40 and 728 ms), and none refused (23,
+224 and 524). At 100 a second the door held 17,568 jobs, none past its request's time, for the four
+the driver ran at once, a number no measurement chose. The driver now runs as many as it has learned
+from its jobs' completions (`completion_window::CompletionWindow`): BBR's window, twice what it
+completes within the least time a job takes (its bandwidth-delay product by Little's law, counted
+directly as the session's write window is), the most of each interval kept over BBR's 10 s
+filters, and never fewer than TCP's initial window (RFC 6928) it starts from; its set of running jobs
+widens to the window as memory allows (`focal_rt::Concurrent::widen`). Gauge `focal_evidence_window`.
+Tests: `completion_window::tests` (the window of a job a millisecond taking 10 ms each is 20; a stale
+most gives way; a slow job does not stretch the bound),
+`a_widened_set_runs_as_many_more_and_a_narrower_width_changes_nothing`.

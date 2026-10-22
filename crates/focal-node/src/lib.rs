@@ -18,6 +18,7 @@ mod archive_derive;
 pub mod backup;
 pub mod cluster;
 pub mod cluster_admin;
+mod completion_window;
 pub mod config;
 pub mod content_host;
 pub mod control_host;

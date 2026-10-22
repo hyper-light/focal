@@ -235,6 +235,32 @@ impl<F: Future + ?Sized> Concurrent<F> {
         Ok(())
     }
 
+    /// Raises the set's bound to `capacity`, its new slots reserved now: a set whose bound is
+    /// learned grows as it is, its running futures staying where they are (each is boxed apart
+    /// from the slots that point at it). A lower `capacity` leaves the bound as it is.
+    pub fn widen(&mut self, capacity: usize) -> Result<(), RtError> {
+        if capacity <= self.capacity {
+            return Ok(());
+        }
+        let refused = RtError::Capacity {
+            what: "concurrent futures",
+            bound: capacity,
+        };
+        let more = capacity.saturating_sub(self.slots.len());
+        self.slots
+            .try_reserve_exact(more)
+            .map_err(|_| refused.clone())?;
+        let free = capacity.saturating_sub(self.free.len());
+        self.free.try_reserve_exact(free).map_err(|_| refused)?;
+        self.capacity = capacity;
+        Ok(())
+    }
+
+    /// The most futures the set runs at once.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Futures still running.
     pub fn len(&self) -> usize {
         self.running
@@ -497,6 +523,37 @@ pub async fn on_pool<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A set widened past its first bound takes as many more futures, every one ending with its
+    /// output; a narrower width leaves the bound as it was.
+    #[test]
+    fn a_widened_set_runs_as_many_more_and_a_narrower_width_changes_nothing() {
+        async fn sleeper(after: u64) -> u64 {
+            hyper_rt::futures::sleep(after).await.unwrap();
+            after
+        }
+        let outputs = block_on(async {
+            let mut set = Concurrent::new(2).unwrap();
+            set.push(sleeper(3_000_000)).unwrap();
+            set.push(sleeper(1_000_000)).unwrap();
+            assert!(set.push(sleeper(0)).is_err(), "past its bound");
+            set.widen(1).unwrap();
+            assert_eq!(set.capacity(), 2);
+            set.widen(4).unwrap();
+            assert_eq!(set.capacity(), 4);
+            set.push(sleeper(2_000_000)).unwrap();
+            set.push(sleeper(4_000_000)).unwrap();
+            let mut outputs = Vec::new();
+            while let Some(output) = set.join_next().await {
+                outputs.push(output);
+            }
+            outputs
+        })
+        .unwrap();
+        let mut sorted = outputs.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, [1_000_000, 2_000_000, 3_000_000, 4_000_000]);
+    }
 
     #[test]
     fn a_spawned_task_gives_its_output_to_its_handle_and_an_aborted_one_is_cancelled() {

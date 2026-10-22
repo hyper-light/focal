@@ -401,7 +401,7 @@ fn now_ns() -> u64 {
 /// RTT's (Cardwell et al., "BBR: Congestion-Based Congestion Control", ACM
 /// Queue 2016; draft-cardwell-iccrg-bbr-congestion-control, MinRTTFilterLen =
 /// 10 s).
-const BASE_WINDOW: Duration = Duration::from_secs(10);
+pub(crate) const BASE_WINDOW: Duration = Duration::from_secs(10);
 /// The multiple of a session's uncongested write cycle a write may take in its
 /// pipeline, and wait in its queue, before the session holds the next: the
 /// latency it gives for its throughput. A pipeline batches: a cycle carrying

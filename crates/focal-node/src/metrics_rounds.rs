@@ -612,6 +612,7 @@ impl MetricsSnapshot {
             evidence: crate::evidence_service::EvidenceDoorStats {
                 held: wide,
                 timed_out: wide,
+                window: wide,
             },
             storage: Some(crate::metrics::StorageMetrics::Wal(
                 focal_log::WalWriterStats::default(),

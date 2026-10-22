@@ -900,6 +900,11 @@ impl MetricsSnapshot {
             "Of those held, the jobs whose request time ran out at the door, refused for it.",
             self.evidence.timed_out,
         );
+        text.gauge(
+            "focal_evidence_window",
+            "Artifact jobs the evidence driver runs at once, learned from their completions.",
+            self.evidence.window,
+        );
         if let Some(StorageMetrics::Log(log)) = &self.storage {
             render_log(&mut text, log);
         }

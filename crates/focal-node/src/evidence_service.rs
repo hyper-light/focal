@@ -1,6 +1,7 @@
 //! Bounded evidence custody coordination outside the Raft owner. A content
 //! reference is acknowledged only after every selected durable copy confirms it.
 use crate::{
+    completion_window::CompletionWindow,
     config::Placement,
     content_host::ContentHost,
     custody::{CustodyPolicy, CustodyScope},
@@ -509,13 +510,16 @@ struct EvidenceDoor {
     door: crate::pace::Door,
     held: AtomicU64,
     timed_out: AtomicU64,
+    /// The jobs the driver runs at once, as it has learned them ([`CompletionWindow`]).
+    window: AtomicU64,
 }
 /// What the evidence coordinator's door has held: requests held at all, and those whose request
-/// time ran out while held.
+/// time ran out while held; and the jobs its driver runs at once, as it has learned them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EvidenceDoorStats {
     pub held: u64,
     pub timed_out: u64,
+    pub window: u64,
 }
 pub struct EvidenceDriver {
     door: Arc<EvidenceDoor>,
@@ -524,7 +528,12 @@ pub struct EvidenceDriver {
     content: ContentHost,
     node: u64,
     placements: BTreeMap<LedgerId, PlacementRow>,
-    concurrency: usize,
+    /// The jobs it runs at once, learned from their completions: what it completes within the
+    /// least time a job takes, twice (BBR's window, [`CompletionWindow`]). A job's time is its
+    /// seal, its copies' transfers and their receipts, which no fixed count fits: four were run
+    /// at once, and at 100 claims a second among 500 agents 17,568 jobs waited at the door for
+    /// them while the leader had the CPU for more (CI 39866057075).
+    window: CompletionWindow,
     budget: MemoryBudget,
     _configuration: Allocation,
 }
@@ -536,9 +545,9 @@ impl EvidenceCoordinator {
         node: u64,
         placements: Vec<EvidencePlacement>,
         budget: MemoryBudget,
-        concurrency: usize,
+        initial: usize,
     ) -> Result<(Self, EvidenceDriver), AccessError> {
-        if node == 0 || !(1..=64).contains(&concurrency) || placements.len() > 1024 {
+        if node == 0 || initial == 0 || placements.len() > 1024 {
             return Err(AccessError::InvalidRequest);
         }
         let configuration_bytes = placements
@@ -553,7 +562,7 @@ impl EvidenceCoordinator {
                     .and_then(|n| sum.checked_add(n))
             })
             .and_then(|n| {
-                concurrency
+                initial
                     .checked_mul(4096)
                     .and_then(|queue| n.checked_add(queue))
             })
@@ -586,9 +595,13 @@ impl EvidenceCoordinator {
             );
         }
         let (sender, receiver) =
-            hyper_rt::sync::channel(concurrency).map_err(|_| AccessError::Capacity)?;
+            hyper_rt::sync::channel(initial).map_err(|_| AccessError::Capacity)?;
         let (control, updates) = hyper_rt::sync::channel(1).map_err(|_| AccessError::Capacity)?;
         let door = Arc::new(EvidenceDoor::default());
+        door.window.store(
+            u64::try_from(initial).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         Ok((
             Self {
                 sender,
@@ -603,7 +616,7 @@ impl EvidenceCoordinator {
                 content,
                 node,
                 placements: rows,
-                concurrency,
+                window: CompletionWindow::new(initial),
                 budget,
                 _configuration: configuration,
             },
@@ -698,6 +711,7 @@ impl EvidenceCoordinator {
         EvidenceDoorStats {
             held: self.door.held.load(Ordering::Relaxed),
             timed_out: self.door.timed_out.load(Ordering::Relaxed),
+            window: self.door.window.load(Ordering::Relaxed),
         }
     }
     pub async fn seal(
@@ -888,7 +902,7 @@ impl EvidenceDriver {
     async fn run_inner(mut self, pool: &PeerConnectionPool) -> Result<(), AccessError> {
         let content = self.content.clone();
         let node = self.node;
-        let mut tasks = Concurrent::new(self.concurrency).map_err(|_| AccessError::Capacity)?;
+        let mut tasks = Concurrent::new(self.window.window()).map_err(|_| AccessError::Capacity)?;
         // The participant jobs in flight, by what each is, and the jobs of
         // the same identity that run after each: an exact retry that comes
         // while its first is in flight (its client gave up the exchange
@@ -900,13 +914,24 @@ impl EvidenceDriver {
         let mut same: BTreeMap<JobIdentity, VecDeque<Job>> = BTreeMap::new();
         let begin = |placement, identity, job| {
             let content = &content;
-            async move { (identity, process(content, pool, node, placement, job).await) }
+            async move {
+                let began = std::time::Instant::now();
+                let done = process(content, pool, node, placement, job).await;
+                (identity, began, done)
+            }
         };
         let mut receiving = true;
         let mut updates = true;
         while receiving || updates || !tasks.is_empty() {
             // A placement's replacement first, then a job while there is
             // room for one, then a job that ended.
+            // The jobs it may run now: its window, the set widened to it while memory allows (a
+            // widening refused runs what the set holds until a later one is not).
+            let window = self.window.window();
+            if tasks.capacity() < window {
+                let _ = tasks.widen(window);
+            }
+            let room = window.min(tasks.capacity());
             let mut update_slot = None;
             let mut job_slot = None;
             let turn = std::future::poll_fn(|cx| {
@@ -920,7 +945,7 @@ impl EvidenceDriver {
                     });
                 }
                 if receiving
-                    && tasks.len() < self.concurrency
+                    && tasks.len() < room
                     && let Poll::Ready(job) = pin!(self.receiver.recv()).poll(cx)
                 {
                     return Poll::Ready(match job {
@@ -957,7 +982,7 @@ impl EvidenceDriver {
                     let identity = job.identity();
                     match identity.and_then(|identity| same.get_mut(&identity)) {
                         Some(after) => {
-                            if after.len() < self.concurrency && after.try_reserve(1).is_ok() {
+                            if after.len() < room && after.try_reserve(1).is_ok() {
                                 after.push_back(job);
                             } else {
                                 job.refuse(AccessError::Capacity);
@@ -978,8 +1003,14 @@ impl EvidenceDriver {
                 Turn::Closed(Queue::Jobs, SyncError::Closed(())) => receiving = false,
                 // No wait could be kept: the driver is off its shard.
                 Turn::Closed(_, _) => return Err(AccessError::Unavailable),
-                Turn::Done((identity, done)) => {
+                Turn::Done((identity, began, done)) => {
                     done.send(&self.placements);
+                    self.window
+                        .ended(began.elapsed(), std::time::Instant::now());
+                    self.door.window.store(
+                        u64::try_from(self.window.window()).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
                     if let Some(identity) = identity
                         && let Some(mut after) = same.remove(&identity)
                         && let Some(job) = after.pop_front()

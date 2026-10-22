@@ -1182,7 +1182,9 @@ impl NetworkService {
             identity.node,
             placement.into_iter().collect(),
             budget.child(128 * 1024 * 1024, 32 * 1024 * 1024)?,
-            4,
+            // The jobs its driver runs before it has measured any, TCP's initial window (RFC
+            // 6928), from which it learns its own ([`crate::completion_window`]).
+            crate::pace::INITIAL_WINDOW,
         )?;
         let (gc_agent, gc_handle) = crate::gc::GcAgent::from_env(
             identity.node,
