@@ -1643,6 +1643,7 @@ impl NetworkService {
             disk,
             staged_uploads,
             staged_bytes,
+            evidence: self.handles.evidence.door_stats(),
             storage: match self.storage.backend() {
                 focal_consensus::StorageBackend::Wal(wal) => {
                     wal.stats().ok().map(crate::metrics::StorageMetrics::Wal)

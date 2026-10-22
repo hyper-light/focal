@@ -187,7 +187,7 @@ fn error_diagnostics_are_shape_checked_for_inline_and_durable_content() {
                         88,
                         payload,
                         focal_evidence::error_report_schema(),
-                    ))
+                    ), far())
                     .await
                     .unwrap();
                 let attestation = witnessed
@@ -207,7 +207,7 @@ fn error_diagnostics_are_shape_checked_for_inline_and_durable_content() {
                             89,
                             payload,
                             focal_evidence::test_report_schema()
-                        ))
+                        ), far())
                         .await,
                     Err(AccessError::InvalidRequest)
                 ));
@@ -218,7 +218,7 @@ fn error_diagnostics_are_shape_checked_for_inline_and_durable_content() {
                         90,
                         ArtifactPayload::Inline(diagnostic.to_vec()),
                         ContentHash::default()
-                    ))
+                    ), far())
                     .await,
                 Err(AccessError::UnsupportedOperation)
             ));
@@ -228,7 +228,7 @@ fn error_diagnostics_are_shape_checked_for_inline_and_durable_content() {
                         91,
                         ArtifactPayload::Inline(br#"{"code":"x","message":" "}"#.to_vec()),
                         focal_evidence::error_report_schema()
-                    ))
+                    ), far())
                     .await,
                 Err(AccessError::InvalidRequest)
             ));
@@ -240,7 +240,7 @@ fn error_diagnostics_are_shape_checked_for_inline_and_durable_content() {
                         92,
                         ArtifactPayload::Content(oversized),
                         focal_evidence::error_report_schema()
-                    ))
+                    ), far())
                     .await,
                 Err(AccessError::Capacity)
             ));
@@ -308,7 +308,8 @@ fn empty_owner_reconciles_cancellation_after_content_cas_and_fences_completed_pr
         let old_snapshot = driver.snapshot(ledger(), RouteEpoch(1)).unwrap();
         let (send, receive) = hyper_rt::sync::oneshot().unwrap();
         coordinator
-            .admit(seal_request(), JobKind::Seal(send))
+            .admit(seal_request(), JobKind::Seal(send), far())
+            .await
             .unwrap();
         let job = driver.receiver.recv().await.unwrap();
         let completed = process(&fixture.host, &pool, 1, Ok(old_snapshot), job).await;
@@ -401,10 +402,10 @@ fn control_mailbox_replaces_policy_while_all_transfer_slots_are_blocked() {
         let exercise = async {
             let next = placement(2, &[1]);
             {
-                let request = coordinator.attest(artifact_request(
-                    10,
-                    ArtifactPayload::Content(fixture.reference.clone()),
-                ));
+                let request = coordinator.attest(
+                    artifact_request(10, ArtifactPayload::Content(fixture.reference.clone())),
+                    far(),
+                );
                 let mut request = std::pin::pin!(request);
                 let mut datagram = [0; 2048];
                 // No owner runs either: the request reaches the path, and the
@@ -457,7 +458,10 @@ fn control_mailbox_replaces_policy_while_all_transfer_slots_are_blocked() {
                 assert!(request.await.is_err());
             }
             let checked = coordinator
-                .attest(artifact_request(11, ArtifactPayload::Inline(report())))
+                .attest(
+                    artifact_request(11, ArtifactPayload::Inline(report())),
+                    far(),
+                )
                 .await
                 .unwrap();
             assert_eq!(checked.witness.scope, next.scope());
@@ -492,14 +496,14 @@ fn required_new_copies_apply_to_existing_content_and_restart_retains_bytes() {
                 .await
                 .unwrap();
             let witness = coordinator
-                .attest(artifact_request(
-                    12,
-                    ArtifactPayload::Content(fixture.reference.clone()),
-                ))
+                .attest(
+                    artifact_request(12, ArtifactPayload::Content(fixture.reference.clone())),
+                    far(),
+                )
                 .await
                 .unwrap();
             assert_eq!(
-                coordinator.seal(seal_request()).await.unwrap(),
+                coordinator.seal(seal_request(), far()).await.unwrap(),
                 fixture.reference
             );
             coordinator
@@ -514,15 +518,15 @@ fn required_new_copies_apply_to_existing_content_and_restart_retains_bytes() {
             );
             drop(witness);
             assert_eq!(
-                coordinator.seal(seal_request()).await,
+                coordinator.seal(seal_request(), far()).await,
                 Err(AccessError::OutcomeUnknown)
             );
             assert!(
                 coordinator
-                    .attest(artifact_request(
-                        13,
-                        ArtifactPayload::Content(fixture.reference.clone())
-                    ))
+                    .attest(
+                        artifact_request(13, ArtifactPayload::Content(fixture.reference.clone())),
+                        far()
+                    )
                     .await
                     .is_err()
             );
@@ -793,7 +797,7 @@ fn native_inline_payloads_are_sealed_locally_and_replicated_to_every_required_co
                 .await
                 .unwrap();
             let evidenced = coordinator
-                .attest_native(native_work_frame(21, &report()))
+                .attest_native(native_work_frame(21, &report()), far())
                 .await
                 .unwrap();
             let payload = evidenced.evidence.custody().payload();
@@ -823,7 +827,7 @@ fn native_inline_payloads_are_sealed_locally_and_replicated_to_every_required_co
                 .unwrap();
             assert!(
                 coordinator
-                    .attest_native(native_work_frame(22, &report()))
+                    .attest_native(native_work_frame(22, &report()), far())
                     .await
                     .is_err()
             );
@@ -832,6 +836,101 @@ fn native_inline_payloads_are_sealed_locally_and_replicated_to_every_required_co
         let (result, ()) = hyper_rt::combine::join2(driver.run(&pool), exercise).await;
         result.unwrap();
         pool.close();
+        fixture.close().await;
+    })
+    .unwrap()
+}
+
+/// Participants' artifact jobs past what the driver runs and queues wait at the coordinator's
+/// door and are each served in turn, none refused: 500 agents' work at 50 claims a second met a
+/// queue of four that refused the rest (`access: Capacity`, CI 39848959332).
+#[test]
+fn artifact_jobs_past_the_queue_wait_at_the_door_and_are_each_served() {
+    focal_rt::block_on(async move {
+        let fixture = Fixture::new();
+        let (coordinator, driver) = EvidenceCoordinator::channel(
+            fixture.host.clone(),
+            1,
+            vec![],
+            fixture.budget.clone(),
+            1,
+        )
+        .unwrap();
+        let pool = pool();
+        let exercise = async {
+            coordinator
+                .replace_placement(None, placement(1, &[1]))
+                .await
+                .unwrap();
+            const JOBS: u128 = 8;
+            let mut jobs = focal_rt::Concurrent::new(JOBS as usize).unwrap();
+            for id in 0..JOBS {
+                let coordinator = &coordinator;
+                jobs.push(async move {
+                    coordinator
+                        .attest_native(native_work_frame(40 + id, &report()), far())
+                        .await
+                })
+                .unwrap();
+            }
+            let mut served = 0;
+            while let Some(evidenced) = jobs.join_next().await {
+                evidenced.unwrap();
+                served += 1;
+            }
+            assert_eq!(served, JOBS);
+            drop(jobs);
+            let door = coordinator.door_stats();
+            assert!(door.held >= 1, "{door:?}");
+            assert_eq!(door.timed_out, 0, "{door:?}");
+            drop(coordinator);
+        };
+        let (result, ()) = hyper_rt::combine::join2(driver.run(&pool), exercise).await;
+        result.unwrap();
+        pool.close();
+        fixture.close().await;
+    })
+    .unwrap()
+}
+
+/// A job held at the door no longer than its request's time: with the queue full and nothing
+/// taking from it, the job is refused as its deadline passes, and counted.
+#[test]
+fn a_job_held_past_its_request_time_is_refused_and_counted() {
+    focal_rt::block_on(async move {
+        let fixture = Fixture::new();
+        let (coordinator, driver) = EvidenceCoordinator::channel(
+            fixture.host.clone(),
+            1,
+            vec![],
+            fixture.budget.clone(),
+            1,
+        )
+        .unwrap();
+        let (send, _receive) = hyper_rt::sync::oneshot().unwrap();
+        coordinator
+            .admit(seal_request(), JobKind::Seal(send), far())
+            .await
+            .unwrap();
+        let (send, _receive) = hyper_rt::sync::oneshot().unwrap();
+        let soon =
+            focal_rt::time::Instant::now().saturating_add(std::time::Duration::from_millis(20));
+        assert_eq!(
+            coordinator
+                .admit(seal_request(), JobKind::Seal(send), soon)
+                .await,
+            Err(AccessError::Capacity)
+        );
+        assert_eq!(
+            coordinator.door_stats(),
+            EvidenceDoorStats {
+                held: 1,
+                timed_out: 1
+            }
+        );
+        // The job the queue took goes with the driver that never ran, and its charge with it.
+        drop(driver);
+        drop(coordinator);
         fixture.close().await;
     })
     .unwrap()
@@ -869,7 +968,7 @@ fn replication_records_a_receipt_per_verified_copy_and_the_obligation_reads_them
                     .is_none()
             );
             assert_eq!(
-                coordinator.seal(seal_request()).await.unwrap(),
+                coordinator.seal(seal_request(), far()).await.unwrap(),
                 fixture.reference
             );
             let receipt = fixture
@@ -882,7 +981,7 @@ fn replication_records_a_receipt_per_verified_copy_and_the_obligation_reads_them
             assert_eq!(receipt.policy_revision, 1);
             assert_eq!(receipt.length, fixture.reference.length);
             let (obligation, _) = coordinator
-                .obligation(seal_request(), fixture.reference.clone())
+                .obligation(seal_request(), fixture.reference.clone(), far())
                 .await
                 .unwrap();
             assert_eq!(obligation.required, BTreeSet::from([1]));
@@ -897,7 +996,7 @@ fn replication_records_a_receipt_per_verified_copy_and_the_obligation_reads_them
                 .await
                 .unwrap();
             let (obligation, _) = coordinator
-                .obligation(seal_request(), fixture.reference.clone())
+                .obligation(seal_request(), fixture.reference.clone(), far())
                 .await
                 .unwrap();
             assert_eq!(obligation.required, BTreeSet::from([1, 2]));
@@ -1310,4 +1409,9 @@ fn a_transfer_goes_by_as_many_streams_as_the_path_holds_when_a_chunk_is_begun() 
         assert!(seen.iter().any(|(_, flying)| *flying == 4));
     })
     .unwrap()
+}
+
+/// A deadline no test waits out: a participant job's request time, far off.
+fn far() -> focal_rt::time::Instant {
+    focal_rt::time::Instant::now().saturating_add(std::time::Duration::from_secs(600))
 }

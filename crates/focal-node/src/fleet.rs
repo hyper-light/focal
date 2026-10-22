@@ -1279,6 +1279,13 @@ struct Owner {
     wake_at: Instant,
 }
 impl ReplicaHost {
+    /// The time the session gives a request it has taken: what a participant's request may wait
+    /// on its way to the owner, at the session's door or ahead of it.
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+}
+impl ReplicaHost {
     /// Internal peer framing supports the consensus adapter's complete bounded
     /// message, including an installed checkpoint. This is a deployment default,
     /// not a knob needed to move from local to replicated operation.

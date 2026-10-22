@@ -13,6 +13,8 @@ use focal_wire::*;
 use futures_util::FutureExt;
 use hyper_rt::sync::{ChannelReceiver, OneshotSender, Sender, SyncError};
 use std::pin::pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -21,6 +23,13 @@ use std::{
 };
 
 const JOB_BYTES: usize = 8 * 1024 * 1024;
+/// What a native artifact job holds beside its frame and the evidence it brings back: the job,
+/// and its reply's cell.
+const NATIVE_JOB_PLACE_BYTES: usize = size_of::<Job>()
+    .saturating_add(size_of::<Result<NativeEvidencedRequest, AccessError>>())
+    .saturating_add(size_of::<
+        Result<(CustodyObligation, VerifiedRequest), AccessError>,
+    >());
 
 /// The custody an object owes under a placement (doc 04 §7, R8): the copies
 /// the placement requires and those with a verified receipt at the current
@@ -486,8 +495,30 @@ pub struct EvidenceCoordinator {
     sender: Sender<Job>,
     control: Sender<Replacement>,
     budget: MemoryBudget,
+    door: Arc<EvidenceDoor>,
+}
+/// The participants' jobs held for room in the driver's queue, oldest first, and what was held
+/// there. Held, not refused: a job turned away while the queue was full is a refusal its
+/// participant sees and asks again, where one held waits for the driver to take one before it,
+/// as a session holds its participants' requests at its door ([`crate::pace::Door`]); each is
+/// charged what it holds before it is held, and waits no longer than its request's time. Shared
+/// by the coordinator's every clone, which hold, and the driver, which wakes, as the session's
+/// door is shared by its owner and its requests (`TickPeriod`).
+#[derive(Default)]
+struct EvidenceDoor {
+    door: crate::pace::Door,
+    held: AtomicU64,
+    timed_out: AtomicU64,
+}
+/// What the evidence coordinator's door has held: requests held at all, and those whose request
+/// time ran out while held.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvidenceDoorStats {
+    pub held: u64,
+    pub timed_out: u64,
 }
 pub struct EvidenceDriver {
+    door: Arc<EvidenceDoor>,
     receiver: ChannelReceiver<Job>,
     control: ChannelReceiver<Replacement>,
     content: ContentHost,
@@ -557,13 +588,16 @@ impl EvidenceCoordinator {
         let (sender, receiver) =
             hyper_rt::sync::channel(concurrency).map_err(|_| AccessError::Capacity)?;
         let (control, updates) = hyper_rt::sync::channel(1).map_err(|_| AccessError::Capacity)?;
+        let door = Arc::new(EvidenceDoor::default());
         Ok((
             Self {
                 sender,
                 control,
                 budget: budget.clone(),
+                door: Arc::clone(&door),
             },
             EvidenceDriver {
+                door,
                 receiver,
                 control: updates,
                 content,
@@ -575,12 +609,30 @@ impl EvidenceCoordinator {
             },
         ))
     }
-    fn admit(&self, request: VerifiedRequest, kind: JobKind) -> Result<(), AccessError> {
-        let bytes = postcard::experimental::serialized_size(request.request())
-            .map_err(|_| AccessError::InvalidRequest)?
-            .checked_mul(32)
-            .and_then(|n| n.checked_add(JOB_BYTES))
-            .ok_or(AccessError::Capacity)?;
+    /// Takes a participant's job for the driver: charged what it holds, then handed to the
+    /// driver's queue, or held at the door while the queue is full until the driver takes one
+    /// before it, oldest first, or `deadline` passes. A native frame waits as the bytes it came
+    /// in and the evidence it brings back, an artifact descriptor no larger than its frame,
+    /// beside its place (`NATIVE_JOB_PLACE_BYTES`); the content host charges what verifying,
+    /// sealing and replicating it hold as it does them.
+    async fn admit(
+        &self,
+        request: VerifiedRequest,
+        kind: JobKind,
+        deadline: focal_rt::time::Instant,
+    ) -> Result<(), AccessError> {
+        let encoded = postcard::experimental::serialized_size(request.request())
+            .map_err(|_| AccessError::InvalidRequest)?;
+        let bytes = if matches!(request.request().operation, Operation::Native { .. }) {
+            encoded
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(NATIVE_JOB_PLACE_BYTES))
+        } else {
+            encoded
+                .checked_mul(32)
+                .and_then(|n| n.checked_add(JOB_BYTES))
+        }
+        .ok_or(AccessError::Capacity)?;
         let allocation = self
             .budget
             .reserve(BudgetKind::Payload, BudgetLane::Ordinary, bytes)
@@ -588,27 +640,82 @@ impl EvidenceCoordinator {
             .commit();
         let ledger = request.request().ledger;
         let route = request.request().route_epoch;
-        self.sender
-            .try_send(Job {
-                request: Some(request),
-                ledger,
-                route,
-                kind,
-                _allocation: allocation,
-            })
-            .map_err(|error| match error {
-                SyncError::Full(_) => AccessError::Capacity,
-                _ => AccessError::Unavailable,
-            })
+        let mut job = Job {
+            request: Some(request),
+            ledger,
+            route,
+            kind,
+            _allocation: allocation,
+        };
+        let mut first = false;
+        let mut held = false;
+        // Each turn is a wake: the loop ends when the queue takes the job or its deadline passes.
+        loop {
+            job = match self.sender.try_send(job) {
+                Ok(()) => return Ok(()),
+                Err(SyncError::Full(job)) => job,
+                Err(_) => return Err(AccessError::Unavailable),
+            };
+            if deadline.remaining().is_zero() {
+                self.door.timed_out.fetch_add(1, Ordering::Relaxed);
+                return Err(AccessError::Capacity);
+            }
+            if !held {
+                held = true;
+                self.door.held.fetch_add(1, Ordering::Relaxed);
+            }
+            let (word, woken) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
+            self.door
+                .door
+                .hold(word, first)
+                .map_err(|refusal| match refusal {
+                    crate::pace::DoorRefusal::Memory => AccessError::Capacity,
+                    _ => AccessError::Unavailable,
+                })?;
+            // The driver may have taken a job between the queue found full and the word held,
+            // and woken none: the job is offered once more, and a word left held is let go by
+            // the wake that finds it unwaited.
+            job = match self.sender.try_send(job) {
+                Ok(()) => return Ok(()),
+                Err(SyncError::Full(job)) => job,
+                Err(_) => return Err(AccessError::Unavailable),
+            };
+            match focal_rt::time::timeout_at(deadline, woken).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(AccessError::Unavailable),
+                Err(_) => {
+                    self.door.timed_out.fetch_add(1, Ordering::Relaxed);
+                    return Err(AccessError::Capacity);
+                }
+            }
+            // Woken to a queue full again, another job taken between: it was the oldest held,
+            // and is held first.
+            first = true;
+        }
     }
-    pub async fn seal(&self, request: VerifiedRequest) -> Result<ContentRef, AccessError> {
+    /// What the door has held ([`EvidenceDoorStats`]).
+    pub fn door_stats(&self) -> EvidenceDoorStats {
+        EvidenceDoorStats {
+            held: self.door.held.load(Ordering::Relaxed),
+            timed_out: self.door.timed_out.load(Ordering::Relaxed),
+        }
+    }
+    pub async fn seal(
+        &self,
+        request: VerifiedRequest,
+        deadline: focal_rt::time::Instant,
+    ) -> Result<ContentRef, AccessError> {
         let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
-        self.admit(request, JobKind::Seal(send))?;
+        self.admit(request, JobKind::Seal(send), deadline).await?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
-    pub async fn attest(&self, request: VerifiedRequest) -> Result<EvidencedRequest, AccessError> {
+    pub async fn attest(
+        &self,
+        request: VerifiedRequest,
+        deadline: focal_rt::time::Instant,
+    ) -> Result<EvidencedRequest, AccessError> {
         let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
-        self.admit(request, JobKind::Attest(send))?;
+        self.admit(request, JobKind::Attest(send), deadline).await?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
     /// Seal and verify the inline payload of an artifact-bearing native frame
@@ -617,9 +724,11 @@ impl EvidenceCoordinator {
     pub async fn attest_native(
         &self,
         request: VerifiedRequest,
+        deadline: focal_rt::time::Instant,
     ) -> Result<NativeEvidencedRequest, AccessError> {
         let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
-        self.admit(request, JobKind::AttestNative(send))?;
+        self.admit(request, JobKind::AttestNative(send), deadline)
+            .await?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
     /// The custody obligation of one object under the request's placement:
@@ -630,9 +739,11 @@ impl EvidenceCoordinator {
         &self,
         request: VerifiedRequest,
         reference: ContentRef,
+        deadline: focal_rt::time::Instant,
     ) -> Result<(CustodyObligation, VerifiedRequest), AccessError> {
         let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
-        self.admit(request, JobKind::Obligation(reference, send))?;
+        self.admit(request, JobKind::Obligation(reference, send), deadline)
+            .await?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
     /// Seal an archive bundle (26 §4) as content of `ledger` under its
@@ -838,6 +949,8 @@ impl EvidenceDriver {
                 }
                 Turn::Closed(Queue::Updates, SyncError::Closed(())) => updates = false,
                 Turn::Job => {
+                    // A place in the queue is free: the oldest job held at the door takes it.
+                    self.door.door.wake_one();
                     let Some(job) = job_slot.take() else {
                         continue;
                     };
@@ -2377,7 +2490,11 @@ impl FleetService {
     /// evidence coordinator; a copy short of custody refuses the frame as a
     /// retryable capacity condition naming the copies, and an artifact the
     /// prefix does not hold is left for the owner to refuse.
-    async fn eligible(&self, request: VerifiedRequest) -> Result<VerifiedRequest, Eligibility> {
+    async fn eligible(
+        &self,
+        request: VerifiedRequest,
+        deadline: focal_rt::time::Instant,
+    ) -> Result<VerifiedRequest, Eligibility> {
         let Operation::Native { frame } = &request.request().operation else {
             return Ok(request);
         };
@@ -2404,7 +2521,7 @@ impl FleetService {
         };
         let (obligation, request) = self
             .evidence
-            .obligation(request, reference)
+            .obligation(request, reference, deadline)
             .await
             .map_err(Eligibility::Failed)?;
         if obligation.satisfied() {
@@ -2453,6 +2570,10 @@ impl RequestHandler for FleetService {
         // branches (content, replica) pass a borrow.
         let request = request.clone();
         Box::pin(async move {
+            // The time the session gives a request it has taken bounds its wait for the evidence
+            // coordinator as well ([`EvidenceCoordinator::admit`]).
+            let deadline =
+                focal_rt::time::Instant::now().saturating_add(self.replica.request_timeout());
             let mut response = request
                 .request()
                 .reply(Response::Error(AccessError::Unavailable));
@@ -2460,7 +2581,7 @@ impl RequestHandler for FleetService {
                 request.request().operation,
                 Operation::Upload(UploadRequest::Seal { .. })
             ) {
-                response.result = match self.evidence.seal(request).await {
+                response.result = match self.evidence.seal(request, deadline).await {
                     Ok(reference) => Response::Upload(UploadReply::Sealed(reference)),
                     Err(error) => Response::Error(error),
                 };
@@ -2483,7 +2604,7 @@ impl RequestHandler for FleetService {
                 && inspect_native_frame(frame)
                     .is_ok_and(|header| crate::native_ingress::artifact_bearing(header.command))
             {
-                match self.evidence.attest_native(request).await {
+                match self.evidence.attest_native(request, deadline).await {
                     Ok(evidence) => {
                         self.replica
                             .submit_with_native_evidence(evidence.request, evidence.evidence)
@@ -2498,7 +2619,7 @@ impl RequestHandler for FleetService {
                 && inspect_native_frame(frame)
                     .is_ok_and(|header| crate::native_ingress::evaluates_artifact(header.command))
             {
-                match self.eligible(request).await {
+                match self.eligible(request, deadline).await {
                     Ok(request) => self.replica.handle_accounted(&request).await,
                     Err(Eligibility::Refused(refusal)) => {
                         response.result = Response::Native(NativeMutationReply::Refused(refusal));
@@ -2527,7 +2648,7 @@ impl RequestHandler for FleetService {
                     drop(request);
                     return crate::host::finish_response(response, allocation);
                 }
-                let evidence = self.evidence.attest(*request).await;
+                let evidence = self.evidence.attest(*request, deadline).await;
                 drop(allocation);
                 match evidence {
                     Ok(evidence) => {

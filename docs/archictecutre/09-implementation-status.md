@@ -16117,3 +16117,28 @@ where they decoded the registry for that one number. A decode per observed root 
 commit to the root still costs one verification of every enrolled certificate, which an enrollment
 burst of N agents makes quadratic, measured next at 1,000 agents. Test:
 `an_observation_decodes_its_registry_once_and_charges_it_while_held`.
+
+### 2026-10-22 — An artifact job past the evidence queue waits at its door
+
+focal-load's `work` among 500 agents (CI 39848959332, three 1-CPU nodes) refused writes at 50 and
+100 claims a second, `access: Capacity` every one, and only three steps: the worker's artifact, the
+evaluator's begin and its report. Each goes through the evidence coordinator before its session: an
+artifact-bearing frame to be sealed and replicated (`attest_native`), a frame that begins evaluating
+an artifact to have its custody checked (`obligation`). The coordinator handed each job to its
+driver's queue with `try_send`, and the queue held four, the driver running four: a fifth job past
+those four was refused, where a session holds its participants' requests at its door
+(`TickPeriod::hold`). The session's counters showed it: 79,115 requests held at the session's door
+and none refused, while the coordinator refused 524. Now a participant's job is charged what it
+holds and then waits at the coordinator's door while the queue is full, oldest first, until the
+driver takes one before it, no longer than its request's time (`ReplicaHost::request_timeout`), as
+the session's door does (`crate::pace::Door`, shared). A native frame is charged as the bytes it came
+in and the evidence it brings back, beside its place: each job had been charged 32 times its encoding
+and 8 MiB more (`JOB_BYTES`, from the first commit), so 16 jobs filled the coordinator's 128 MiB
+however small their payloads, and a door holding more would have been refused for memory instead;
+the content host charges what verifying, sealing and replicating hold as it does them. Metrics:
+`focal_evidence_requests_held_total`, `focal_evidence_requests_timed_out_total`. Tests:
+`artifact_jobs_past_the_queue_wait_at_the_door_and_are_each_served` (eight jobs through a driver of
+one), `a_job_held_past_its_request_time_is_refused_and_counted`. Open: the driver runs a fixed four
+jobs at once (`EvidenceCoordinator::channel`'s concurrency, network_service.rs), a number no
+measurement chose; the held counts at scale say how often it binds, and its window is to be learned
+from the jobs' completions, as the session's write window is.

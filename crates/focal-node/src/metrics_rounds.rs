@@ -609,6 +609,10 @@ impl MetricsSnapshot {
             }),
             staged_uploads: wide,
             staged_bytes: wide,
+            evidence: crate::evidence_service::EvidenceDoorStats {
+                held: wide,
+                timed_out: wide,
+            },
             storage: Some(crate::metrics::StorageMetrics::Wal(
                 focal_log::WalWriterStats::default(),
             )),

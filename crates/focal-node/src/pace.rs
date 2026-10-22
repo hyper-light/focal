@@ -255,8 +255,10 @@ pub(crate) enum DoorRefusal {
 /// request's place, charged to the session's memory before it is held
 /// (`ReplicaHost::submit_inner`), within what the transport lets participants open at once
 /// (the stream pool, docs/archictecutre/27 §17); and each wait is bounded by its deadline.
+/// The evidence coordinator holds the participants' artifact jobs at a door of its own, by the
+/// same rule (`evidence_service::EvidenceCoordinator`).
 #[derive(Default)]
-struct Door {
+pub(crate) struct Door {
     held: Mutex<std::collections::VecDeque<hyper_rt::sync::OneshotSender<()>>>,
     /// How many words `held` holds, read without its lock: the owner wakes one as it takes
     /// each request, and a door that holds none is passed by its lock.
@@ -264,7 +266,7 @@ struct Door {
 }
 impl Door {
     /// Holds `word` last, or first for one woken to a door shut again: it was the oldest.
-    fn hold(
+    pub(crate) fn hold(
         &self,
         word: hyper_rt::sync::OneshotSender<()>,
         first: bool,
@@ -282,7 +284,7 @@ impl Door {
     /// Wakes the oldest request still held, if any is: the words of those that stopped waiting
     /// (their deadlines passed, their exchanges gone) are let go on the way, each once. A
     /// poisoned lock wakes none, and those held end at their deadlines.
-    fn wake_one(&self) {
+    pub(crate) fn wake_one(&self) {
         if self.count.load(Ordering::Acquire) == 0 {
             return;
         }

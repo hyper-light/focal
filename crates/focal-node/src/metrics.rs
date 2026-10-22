@@ -445,6 +445,9 @@ pub struct MetricsSnapshot {
     pub disk: Option<DiskStats>,
     pub staged_uploads: u64,
     pub staged_bytes: u64,
+    /// The evidence coordinator's door: participants' artifact jobs held while its queue was
+    /// full, and those whose request time ran out there.
+    pub evidence: crate::evidence_service::EvidenceDoorStats,
     pub storage: Option<StorageMetrics>,
     pub fleet: FleetStatus,
     pub root: RootMetrics,
@@ -886,6 +889,16 @@ impl MetricsSnapshot {
             "focal_uploads_staged_bytes",
             "Bytes uploads in progress have staged.",
             self.staged_bytes,
+        );
+        text.counter(
+            "focal_evidence_requests_held_total",
+            "Participants' artifact jobs held at the evidence coordinator's door while its queue was full, each until the driver took one before it.",
+            self.evidence.held,
+        );
+        text.counter(
+            "focal_evidence_requests_timed_out_total",
+            "Of those held, the jobs whose request time ran out at the door, refused for it.",
+            self.evidence.timed_out,
         );
         if let Some(StorageMetrics::Log(log)) = &self.storage {
             render_log(&mut text, log);
@@ -2147,6 +2160,7 @@ mod tests {
             disk: None,
             staged_uploads: 0,
             staged_bytes: 0,
+            evidence: Default::default(),
             storage: None,
             fleet: FleetStatus {
                 latest_sequence: 1,
