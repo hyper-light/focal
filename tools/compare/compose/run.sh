@@ -250,6 +250,9 @@ EOF
     cpu_stat before > "$out/$report.cpu.txt"
     net_stat before > "$out/$report.net.txt"
     disk_stat before > "$out/$report.disk.txt"
+    # The leader's processor with call graphs, twenty seconds into the measured window: what a
+    # message among the agents costs it (diag: profile-agents).
+    dc exec -d focal1 sh -c "sleep $(( warmup + 20 )); perf record -F 499 --call-graph fp -p 1 -o /data/perf.data -- sleep 20 > /data/perf.log 2>&1" || true
     if ! timeout "$bound" docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
       focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
@@ -259,6 +262,12 @@ EOF
     cpu_stat after >> "$out/$report.cpu.txt"
     net_stat after >> "$out/$report.net.txt"
     disk_stat after >> "$out/$report.disk.txt"
+    echo "::group::leader profile (focal at $rate/s)"
+    dc exec -T focal1 sh -c "cat /data/perf.log; perf report -i /data/perf.data --stdio --no-children --sort comm -g none 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -25" || true
+    # Inclusive time by function (what each costs with what it calls), then each thread's own.
+    dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --children --sort symbol -g none --percent-limit 1.5 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -150" || true
+    dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --no-children --sort comm,symbol -g none --percent-limit 0.4 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -120" || true
+    echo "::endgroup::"
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
     dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true
