@@ -722,14 +722,23 @@ fn proposals_taken_before_one_poll_share_its_flush() {
     let mut node = EmbeddedNode::open(&settings(root.path())).unwrap();
     let ledger = node.identity.ledger;
     let actor = peer(&node, node.identity.issuer, PeerRole::Actor);
-    let wal = node.session.shared_wal().unwrap();
+    // The frames the node's log has written and flushed: each is one group commit.
+    let frames = |node: &EmbeddedNode| {
+        node.storage
+            .log
+            .as_ref()
+            .expect("an embedded node lives on the shell's log")
+            .stats(None)
+            .unwrap()
+            .frames
+    };
     let budget = MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap();
     let limits = WireLimits::default();
     let mut views = crate::reads::ReadViews::new();
     let mut streams = crate::streams::Streams::new().unwrap();
     let mut waiting = std::collections::VecDeque::new();
     let mut answers = Vec::new();
-    let before = wal.stats().unwrap().group_commits;
+    let before = frames(&node);
     for request in 1..=CALLERS {
         let envelope = envelope(
             &node,
@@ -788,9 +797,9 @@ fn proposals_taken_before_one_poll_share_its_flush() {
         );
     }
     // Nothing is persisted until the poll, and the poll persists every
-    // proposal it finds in one append.
-    let flushes = wal.stats().unwrap().group_commits - before;
-    assert_eq!(flushes, 1, "{CALLERS} proposals took {flushes} flushes");
+    // proposal it finds in one frame of the log, flushed once.
+    let written = frames(&node) - before;
+    assert_eq!(written, 1, "{CALLERS} proposals took {written} frames");
 }
 
 /// An inbox read that waits (the waiting profile) parks on an empty inbox, and the post that

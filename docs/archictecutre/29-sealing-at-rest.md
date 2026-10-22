@@ -268,7 +268,7 @@ listed from its writers (each `File::create`, `OpenOptions`, `create_private_new
 | Content | `content/objects/…` | artifacts, manifests, uploads, custody | focal-evidence `store`, `transfer`, `gc`, `upload_terminal` | clear |
 | Session backups | a backup's directory | checkpoint, seeds, content, cold | focal-ledger `session_backup` | clear |
 | Enrollment | private directories | the cluster CA's key, nodes' and clients' keys, invitations, the signer's journal | focal-enrollment `files::PrivateDirectory` | sealed (§12.2) |
-| Embedded node log | `wal/` of a node that is its own cluster | every record of its session | focal-node `EmbeddedNode` on focal-log | clear: the embedded node opens focal-log itself, never the shell |
+| Embedded node log | the shell's log of a node that is its own cluster (`wal/` before) | every record of its session and its root's control group | focal-node `EmbeddedNode` through `storage_start`, as a networked node | sealed (§12.3) |
 | Bus identities | the bus's identity directory | its local CA's and members' keys | focal-bus `pki` | clear |
 | Bus part | a part's image, the node's run | streams' floors, producers' sessions | focal-bus `group`, `member` | clear |
 | Client stores | a client's data directory | requests, receipts, pending writes, artifact uploads | focal-client `operation_store`, `native_store`, `pending`, `artifact_transfer` | clear |
@@ -342,5 +342,18 @@ focal-load the same way.
   is, sealed by its first writer, and refuses plaintext after; the crash windows of a sealed write
   (a temporary synced and not renamed; a record renamed before its marker).
 - **Found and left open:** a quorum enrollment's `invite-<request>` records are never removed, one
-  for every invitation name the node ever issued; and the embedded node's log is still focal-log's
-  plaintext WAL (row above). Both are owed.
+  for every invitation name the node ever issued (owed); and the embedded node's log was still
+  focal-log's plaintext WAL (§12.3).
+
+### 12.3 The embedded node's log, sealed (2026-10-21)
+
+A node that is its own cluster (`focal start` without a network) opened focal-log's WAL itself,
+so every record of its session, its root's control group beside it among them, reached its disk in
+the clear, though a networked node's groups had lived on the sealed shell since the storage level.
+It now opens its storage as a networked node's start does (`storage_start::open`): its binary's
+announced level is its fence, so its groups live on hyper-log's log under the shell, sealed under
+the data directory's root key (§2) from its first start, and a directory an earlier binary left on
+the WAL is converted at its next start by the conversion every networked node takes at the storage
+level. Its root's control group is a member of the same storage (`ControlReplica::open_on_storage`).
+The node lets its storage go in the order the networked node's shutdown keeps, the session first
+and the data directory's lock last, and its host's stop answers with what the log's close found.

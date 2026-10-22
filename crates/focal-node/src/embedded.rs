@@ -4,10 +4,11 @@ use crate::{
     config::Settings,
     placement::{self, NodeFacts},
 };
-use focal_consensus::{DurableNode, NodeConfig};
+use focal_consensus::NodeConfig;
+use focal_consensus::storage_open::{OpenError, OpenedStorage};
 use focal_evidence::{ContentStore, StoreLimits};
 use focal_ledger::{LedgerError, Session};
-use focal_log::{SharedWal, WalIdentity, WalOptions};
+use focal_log::WalIdentity;
 use focal_model::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -103,11 +104,17 @@ impl From<focal_consensus::storage_open::OpenError> for NodeError {
     }
 }
 
+/// The fields drop in the order a node's storage is let go (`close`): the session that writes
+/// through the log, then the content store, then the storage (its handle, the shell's log, its
+/// cache), and the data directory's lock last.
 pub struct EmbeddedNode {
     pub identity: NodeIdentity,
     pub session: Session,
     pub content: ContentStore,
-    pub(crate) wal: SharedWal,
+    /// The node's storage as a networked node's start opens it (`storage_start`): hyper-log's log
+    /// under the shell, sealed under the data directory's root key (29 §2), its WAL converted
+    /// where an earlier binary left one. An embedded node wrote focal-log's WAL in the clear.
+    pub(crate) storage: OpenedStorage,
     directory: crate::node_directory::NodeDirectory,
     /// The data directory's keys (29 §2), made at its first start: what its sealed records are
     /// sealed under.
@@ -144,16 +151,25 @@ impl EmbeddedNode {
         if committed.is_none() {
             install_policy(root, settings)?;
         }
-        let wal = SharedWal::open(
-            root.join("wal"),
-            WalOptions::new(WalIdentity {
+        // An embedded node is its own cluster: the level its binary announces is its fence, the
+        // storage level among it, so its groups live on the shell from its first start.
+        let level = crate::upgrade::announced_level();
+        let budget = crate::memory_envelope::node_budget(settings).map_err(LedgerError::from)?;
+        let storage = crate::storage_start::open(
+            root,
+            WalIdentity {
                 cluster: identity.cluster,
                 node: identity.node,
                 stream: 0,
-            }),
+            },
+            &budget,
+            &keys.key_file,
+            level,
         )?;
         let config = NodeConfig::single(identity.node, identity.cluster, identity.ledger.session.0);
-        let consensus = DurableNode::open_on_wal(config, wal.clone())?;
+        let consensus = storage
+            .storage
+            .open_member(config, &budget, focal_ledger::entry_needs)?;
         // The content writer exists before the session so a native ledger can
         // read its evidence during recovery.
         let content = ContentStore::open_with_disk(
@@ -165,11 +181,9 @@ impl EmbeddedNode {
                 chunk_bytes: 1024 * 1024,
                 max_manifest_bytes: 1024 * 1024,
             },
-            wal.disk_budget(),
+            storage.storage.disk_budget(),
         )?;
         let limits = crate::memory_envelope::found_limits(root, settings, &consensus)?;
-        // An embedded node is its own cluster: the level its binary announces is its fence.
-        let level = crate::upgrade::announced_level();
         let rule = if level >= crate::upgrade::SEAL_LEVEL {
             focal_ledger::SealRule::Anchored
         } else {
@@ -179,7 +193,7 @@ impl EmbeddedNode {
         let hosting = crate::network_service::native_hosting(
             root,
             &identity,
-            wal.disk_budget(),
+            storage.storage.disk_budget(),
             &limits,
             rule,
             retire,
@@ -195,10 +209,41 @@ impl EmbeddedNode {
             identity,
             session,
             content,
-            wal,
+            storage,
             directory,
             keys,
         })
+    }
+
+    /// The node let go in the order its storage needs, with what its log's close found: the
+    /// session that writes through the log first, then the content store, the storage's handle,
+    /// the shell's log (its last answers given, its threads ended), its cache, and the data
+    /// directory's lock last, as a networked node's shutdown does (`network_service`). Dropped
+    /// instead, the node lets go in the same order and a failed close goes unreported.
+    pub fn close(self) -> Result<(), NodeError> {
+        let Self {
+            session,
+            content,
+            storage,
+            directory,
+            ..
+        } = self;
+        drop(session);
+        drop(content);
+        let OpenedStorage {
+            storage,
+            log,
+            cache,
+            // The store keys beside the log, wiped as they drop (29 §8).
+            keys: _,
+        } = storage;
+        drop(storage);
+        let closed = log.map(focal_consensus::ShellLog::close).transpose();
+        drop(cache);
+        drop(directory);
+        closed
+            .map(drop)
+            .map_err(|error| OpenError::Log(error).into())
     }
 
     pub fn root(&self) -> &Path {
@@ -332,6 +377,152 @@ pub(crate) fn atomic_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Erro
 mod tests {
     use super::*;
     use std::fs;
+
+    /// A claim written through `node`'s session whose description is `marker`.
+    fn write_marked(node: &mut EmbeddedNode, marker: &str) -> ClaimId {
+        // The issuer's request generation first, as every writer negotiates its own (F12).
+        let negotiate = crate::demo::request(
+            &node.identity,
+            "sealed-log-epoch",
+            node.identity.issuer,
+            Command::NegotiateEpoch {
+                epoch: RequestEpoch(1),
+            },
+            vec![],
+        );
+        let negotiated = node.session.submit_local(&negotiate).unwrap();
+        assert!(
+            matches!(negotiated, focal_ledger::Submission::Committed(_)),
+            "{negotiated:?}"
+        );
+        let id = ClaimId::from_u128(0x5ea1);
+        let mut claim = crate::demo::claim(&node.identity, id).unwrap();
+        claim.content.description = marker.into();
+        let input = crate::demo::request(
+            &node.identity,
+            "sealed-log",
+            node.identity.issuer,
+            Command::GenerateClaim { claim },
+            vec![],
+        );
+        let result = node.session.submit_local(&input).unwrap();
+        assert!(
+            matches!(result, focal_ledger::Submission::Committed(_)),
+            "{result:?}"
+        );
+        id
+    }
+    /// A marker no file holds by chance: a fixed text and random bytes.
+    fn marker() -> String {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).unwrap();
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("embedded sealed log marker {hex}")
+    }
+    /// Every file under `dir` whose bytes hold `needle`, walked with a stack of its own.
+    fn holding(dir: &Path, needle: &[u8]) -> Vec<std::path::PathBuf> {
+        let mut found = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(at) = stack.pop() {
+            for entry in fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if fs::read(&path)
+                    .unwrap()
+                    .windows(needle.len())
+                    .any(|window| window == needle)
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// An embedded node's session lives on the shell's log, sealed under its data directory's
+    /// root key (29 §12.3), as a networked node's does. Do: write a claim whose description is a
+    /// marker and let the node go, its log closed. Expect: no WAL; no file of the log and its
+    /// group files holds the marker; the claim reads back after a reopen.
+    #[test]
+    fn an_embedded_nodes_session_lives_on_the_sealed_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(dir.path().to_owned());
+        let marker = marker();
+        let mut node = EmbeddedNode::open(&settings).unwrap();
+        let id = write_marked(&mut node, &marker);
+        node.close().unwrap();
+        assert!(!dir.path().join(focal_consensus::convert::WAL_DIR).exists());
+        assert_eq!(
+            holding(
+                &dir.path().join(focal_consensus::convert::RAFT_DIR),
+                marker.as_bytes()
+            ),
+            Vec::<std::path::PathBuf>::new()
+        );
+        let node = EmbeddedNode::open(&settings).unwrap();
+        assert!(
+            node.session
+                .read_at_least(focal_ledger::SessionSeq(0))
+                .unwrap()
+                .claims
+                .contains_key(&id)
+        );
+        node.close().unwrap();
+    }
+
+    /// A data directory an earlier binary left on focal-log's WAL is converted at the node's next
+    /// start, as a networked node's is at the storage level: its session's records are kept, now
+    /// in the sealed log. Do: found the node below the storage level and write a marked claim (the
+    /// WAL holds it in the clear); reopen at the compiled level. Expect: the claim reads back; no
+    /// file of the log holds the marker; the old segments wait in `wal-converted/`, still in the
+    /// clear, for the operator.
+    #[test]
+    fn an_embedded_node_left_on_the_wal_converts_and_keeps_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(dir.path().to_owned());
+        let marker = marker();
+        let id = {
+            let _level = crate::upgrade::announce_for_test(crate::upgrade::BELOW_STORAGE_LEVEL);
+            let mut node = EmbeddedNode::open(&settings).unwrap();
+            let id = write_marked(&mut node, &marker);
+            node.close().unwrap();
+            id
+        };
+        assert!(
+            !holding(
+                &dir.path().join(focal_consensus::convert::WAL_DIR),
+                marker.as_bytes()
+            )
+            .is_empty(),
+            "the WAL held the record in the clear"
+        );
+        let node = EmbeddedNode::open(&settings).unwrap();
+        assert!(
+            node.session
+                .read_at_least(focal_ledger::SessionSeq(0))
+                .unwrap()
+                .claims
+                .contains_key(&id)
+        );
+        node.close().unwrap();
+        assert_eq!(
+            holding(
+                &dir.path().join(focal_consensus::convert::RAFT_DIR),
+                marker.as_bytes()
+            ),
+            Vec::<std::path::PathBuf>::new()
+        );
+        assert!(
+            !holding(
+                &dir.path().join(focal_consensus::convert::CONVERTED_DIR),
+                marker.as_bytes()
+            )
+            .is_empty()
+        );
+    }
     #[test]
     fn identity_and_owner_survive_restart() {
         let dir = tempfile::tempdir().unwrap();

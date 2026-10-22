@@ -272,8 +272,12 @@ impl LocalHost {
                         Work::Stop(response) => {
                             settle_all(&mut node, &mut waiting, &limits);
                             inboxes.close(&limits);
-                            let _ = response.send(node.checkpoint());
-                            break;
+                            // The checkpoint, then the storage closed in its order: what
+                            // either found is the stop's answer.
+                            let checkpoint = node.checkpoint();
+                            let closed = node.close();
+                            let _ = response.send(checkpoint.and(closed));
+                            return;
                         }
                         #[cfg(test)]
                         Work::Hold(gate) => {

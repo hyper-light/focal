@@ -5,7 +5,6 @@ use focal_consensus::NodeConfig;
 use focal_control::*;
 use focal_directory::{AuthorityVerifier, DirectoryError, RootConfig, RootDirectory};
 use focal_enrollment::*;
-use focal_log::SharedWal;
 use focal_memory::MemoryBudget;
 use focal_model::RequestId;
 use hyper_rt::sync::OneshotSender;
@@ -94,15 +93,17 @@ impl RootEnrollment {
             node.root(),
             node.keys(),
             &node.identity,
-            node.wal.clone(),
+            &node.storage.storage,
             now,
         )
     }
+    /// The root's enrollment of the node `identity` names, its control group a member of the
+    /// node's `storage` beside its session (the shell's sealed log, as the node's start opened it).
     pub fn open(
         root: &Path,
         keys: &focal_seal::DataKeys,
         identity: &NodeIdentity,
-        wal: SharedWal,
+        storage: &focal_consensus::NodeStorage,
         now: i64,
     ) -> Result<Self, ClusterError> {
         let directory = root.join("cluster");
@@ -175,12 +176,13 @@ impl RootEnrollment {
         if !marker.exists() {
             atomic_file(&marker, b"initialized")?;
         }
-        let mut control = ControlReplica::open_on_wal(
+        let mut control = ControlReplica::open_on_storage(
             ControlOptions::new(NodeConfig::single(identity.node, identity.cluster, group)),
             genesis.bootstrap,
             budget,
-            wal,
+            storage,
         )?;
+        control.set_raft_wire(storage.wire())?;
         control.drain(&NoDirectoryAuthority)?;
         if control
             .enrollment()
