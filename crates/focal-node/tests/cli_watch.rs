@@ -67,11 +67,19 @@ fn json(root: &Path, args: &[&str]) -> Value {
     );
     serde_json::from_slice(&out.stdout).unwrap()
 }
+/// An output whose reader is gone before the command starts, so its first write breaks whenever
+/// it comes. The reader dropped after the spawn raced the command's write: under load the command
+/// wrote its page into the pipe's buffer first, the write succeeded, and it exited 0.
+fn closed_output() -> Stdio {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    Stdio::from(writer)
+}
 #[test]
 fn broken_output_retains_exact_page_and_resume_flushes_before_ack() {
     let root = tempfile::tempdir().unwrap();
     let server = start(root.path());
-    let mut child = command(
+    let child = command(
         root.path(),
         &[
             "watch",
@@ -85,11 +93,10 @@ fn broken_output_retains_exact_page_and_resume_flushes_before_ack() {
             "json",
         ],
     )
-    .stdout(Stdio::piped())
+    .stdout(closed_output())
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-    drop(child.stdout.take());
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
