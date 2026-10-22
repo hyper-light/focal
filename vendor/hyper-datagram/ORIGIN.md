@@ -28,7 +28,9 @@ Built new, from three sources:
   - It starts at 64 and widens only on authenticated late arrivals, up to
     `PlaneLimits::window_limit`.
   - The counter travels in the authenticated prologue.
-- **Fencing.** The owner's `Fence` is consulted before any cryptography (slates: owed).
+- **Fencing.** The owner's `Fence` is consulted before any cryptography (slates: owed). It is
+  `Sync` (2026-10-20), so a driver's receive that holds it across an await is a `Send` future, which
+  a runtime's `spawn_on` takes (`docs/transport.md` §4z).
 - **Integrity.** The sealed body carries a CRC-32C of its messages (mantle CLAUDE.md §6). A
   message whose tag verifies but whose checksum fails is `Refusal::Corrupt`, a fault to report, not
   a forgery.

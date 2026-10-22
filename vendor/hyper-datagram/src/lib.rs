@@ -48,7 +48,7 @@
 mod schedule;
 mod window;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use aws_lc_rs::aead::{Aad, LessSafeKey, NONCE_LEN, Nonce};
 
@@ -93,7 +93,8 @@ pub const INTEGRITY_LIMIT: u64 = 1 << 52;
 pub enum Refusal {
     /// A limit given to [`Plane::new`] is zero.
     Limits,
-    /// The plane already holds [`PlaneLimits::max_peers`] peers.
+    /// The plane already holds [`PlaneLimits::max_peers`] peers, or the allocator has no room for
+    /// another.
     TooManyPeers,
     /// The peer has no epoch installed.
     UnknownPeer,
@@ -152,8 +153,11 @@ pub struct PlaneLimits {
     pub window_limit: usize,
 }
 
-/// The owner's view of who may send: the sender's current epoch, and any term it fences.
-pub trait Fence {
+/// The owner's view of who may send: the sender's current epoch, and any term it fences. `Sync`: a
+/// driver's receive reads it across its awaits (hyper-rt-transport's and hyper-tokio's
+/// `PlaneSocket::receive`), and a task awaiting that receive may be moved to another thread with its
+/// future, as a runtime's `spawn_on` moves it to its shard, so `&dyn Fence` must be `Send`.
+pub trait Fence: Sync {
     /// Whether datagrams from `sender` under `epoch` are admitted.
     fn admits(&self, sender: PeerId, epoch: Epoch) -> bool;
 }
@@ -178,6 +182,8 @@ struct EpochState {
 }
 
 struct Peer {
+    /// Who, as the owner names it: the key the plane's peers are kept sorted by.
+    id: PeerId,
     /// Oldest first; sealing uses the newest.
     epochs: VecDeque<EpochState>,
     max_datagram: usize,
@@ -244,7 +250,11 @@ fn split_message(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
 pub struct Plane {
     local: PeerId,
     limits: PlaneLimits,
-    peers: HashMap<PeerId, Peer>,
+    /// The peers, sorted by their ids, each found by a binary search, and flushed in that order: the
+    /// same in every process, where a map of the standard random hasher walked its peers in an order
+    /// drawn per process, and a simulated network that draws for each datagram in the order it is
+    /// sent drew differently from one seed. At most [`PlaneLimits::max_peers`].
+    peers: Vec<Peer>,
     /// The datagram being sealed, reused across flushes.
     scratch: Vec<u8>,
 }
@@ -258,7 +268,7 @@ impl Plane {
         Ok(Self {
             local,
             limits,
-            peers: HashMap::new(),
+            peers: Vec::new(),
             scratch: Vec::new(),
         })
     }
@@ -273,17 +283,34 @@ impl Plane {
         secret: &ExporterSecret,
         role: Role,
     ) -> Result<(), Refusal> {
-        if !self.peers.contains_key(&peer) && self.peers.len() >= self.limits.max_peers {
+        let found = self.find(peer);
+        if found.is_err() && self.peers.len() >= self.limits.max_peers {
             return Err(Refusal::TooManyPeers);
         }
         let EpochKeys { seal, open } = epoch_keys(secret, role)?;
         let window_limit = self.limits.window_limit;
         let epochs_per_peer = self.limits.epochs_per_peer;
-        let state = self.peers.entry(peer).or_insert_with(|| Peer {
-            epochs: VecDeque::with_capacity(epochs_per_peer),
-            max_datagram: UNMEASURED_DATAGRAM_BYTES,
-            pending: Vec::new(),
-        });
+        let at = match found {
+            Ok(at) => at,
+            Err(at) => {
+                // Room for one more, asked of the allocator and refused typed: the list holds fewer
+                // than `max_peers` here, and grows as peers are added.
+                self.peers
+                    .try_reserve(1)
+                    .map_err(|_| Refusal::TooManyPeers)?;
+                self.peers.insert(
+                    at,
+                    Peer {
+                        id: peer,
+                        epochs: VecDeque::with_capacity(epochs_per_peer),
+                        max_datagram: UNMEASURED_DATAGRAM_BYTES,
+                        pending: Vec::new(),
+                    },
+                );
+                at
+            }
+        };
+        let state = self.peers.get_mut(at).ok_or(Refusal::UnknownPeer)?;
         if state
             .epochs
             .back()
@@ -307,20 +334,33 @@ impl Plane {
 
     /// Retires one epoch of `peer`: its datagrams are refused from now on.
     pub fn retire(&mut self, peer: PeerId, epoch: Epoch) {
-        if let Some(state) = self.peers.get_mut(&peer) {
+        if let Some(state) = self.peer_mut(peer) {
             state.epochs.retain(|held| held.epoch != epoch);
         }
     }
 
     /// Forgets `peer` entirely, with its pending messages.
     pub fn remove_peer(&mut self, peer: PeerId) {
-        self.peers.remove(&peer);
+        if let Ok(at) = self.find(peer) {
+            self.peers.remove(at);
+        }
+    }
+
+    /// Where `peer` is among the peers, or where it would go.
+    fn find(&self, peer: PeerId) -> Result<usize, usize> {
+        self.peers.binary_search_by_key(&peer, |state| state.id)
+    }
+
+    /// `peer`'s state, if the plane holds it.
+    fn peer_mut(&mut self, peer: PeerId) -> Option<&mut Peer> {
+        let at = self.find(peer).ok()?;
+        self.peers.get_mut(at)
     }
 
     /// The largest datagram the path to `peer` carries, from the transport's measurement of it,
     /// clamped to what UDP can carry at most and what the plane's overhead needs at least.
     pub fn set_path(&mut self, peer: PeerId, max_datagram: usize) -> Result<(), Refusal> {
-        let state = self.peers.get_mut(&peer).ok_or(Refusal::UnknownPeer)?;
+        let state = self.peer_mut(peer).ok_or(Refusal::UnknownPeer)?;
         state.max_datagram = max_datagram.clamp(
             OVERHEAD_BYTES.saturating_add(LENGTH_BYTES),
             MAX_DATAGRAM_BYTES,
@@ -331,7 +371,7 @@ impl Plane {
     /// Queues `message` for `peer`'s next datagram. Refused with [`Refusal::TooLarge`] if it can
     /// never fit one, and with [`Refusal::Busy`] if it does not fit beside what is queued.
     pub fn queue(&mut self, peer: PeerId, message: &[u8]) -> Result<(), Refusal> {
-        let state = self.peers.get_mut(&peer).ok_or(Refusal::UnknownPeer)?;
+        let state = self.peer_mut(peer).ok_or(Refusal::UnknownPeer)?;
         if state.epochs.is_empty() {
             return Err(Refusal::UnknownPeer);
         }
@@ -359,18 +399,18 @@ impl Plane {
 
     /// Seals each peer's queued messages into one datagram and hands it to `out`, or hands the
     /// refusal that stopped it; the messages are dropped either way, since nothing is
-    /// retransmitted. At most one datagram per peer per call.
+    /// retransmitted. At most one datagram per peer per call, in the order of the peers' ids.
     pub fn flush<F: FnMut(PeerId, Result<&[u8], Refusal>)>(&mut self, mut out: F) {
         let local = self.local;
-        for (&peer, state) in &mut self.peers {
+        for state in &mut self.peers {
             if state.pending.is_empty() {
                 continue;
             }
             let sealed = seal(local, state, &mut self.scratch);
             state.pending.clear();
             match sealed {
-                Ok(()) => out(peer, Ok(&self.scratch)),
-                Err(refusal) => out(peer, Err(refusal)),
+                Ok(()) => out(state.id, Ok(&self.scratch)),
+                Err(refusal) => out(state.id, Err(refusal)),
             }
         }
     }
@@ -395,7 +435,7 @@ impl Plane {
         if sender == self.local {
             return Err(Refusal::FromSelf);
         }
-        let peer = self.peers.get_mut(&sender).ok_or(Refusal::UnknownPeer)?;
+        let peer = self.peer_mut(sender).ok_or(Refusal::UnknownPeer)?;
         let state = peer.epoch_mut(epoch).ok_or(Refusal::UnknownEpoch)?;
         if !fence.admits(sender, epoch) {
             return Err(Refusal::Fenced);
@@ -432,8 +472,9 @@ impl Plane {
 
     /// The replay window's current width for `peer` under `epoch`, in counters.
     pub fn window_width(&self, peer: PeerId, epoch: Epoch) -> Option<usize> {
+        let at = self.find(peer).ok()?;
         self.peers
-            .get(&peer)?
+            .get(at)?
             .epochs
             .iter()
             .find(|state| state.epoch == epoch)
@@ -549,6 +590,39 @@ mod tests {
     fn messages(plane: &mut Plane, datagram: &mut [u8]) -> Result<Vec<Vec<u8>>, Refusal> {
         let opened = plane.open(datagram, &AdmitAll)?;
         Ok(opened.messages().map(<[u8]>::to_vec).collect())
+    }
+
+    /// A flush hands its datagrams out in the order of the peers' ids, whatever order the peers were
+    /// installed in: the same in every process, so a simulated network that draws a delay or a loss
+    /// for each datagram in the order it is sent draws the same for each from one seed. With the
+    /// peers in a map of the standard library's per-process random hasher, the order was drawn.
+    #[test]
+    fn a_flush_hands_out_each_peers_datagram_in_the_order_of_their_ids() {
+        // Sixteen distinct ids, none the plane's own, out of order: multiples of 7,919 modulo the
+        // prime 101 (7,919 is no multiple of it, so distinct multipliers give distinct ids).
+        let ids: Vec<PeerId> = (2..18).map(|at| (at * 7_919) % 101).collect();
+        let mut plane = Plane::new(
+            A,
+            PlaneLimits {
+                max_peers: ids.len(),
+                ..LIMITS
+            },
+        )
+        .unwrap();
+        for &peer in &ids {
+            plane
+                .install_epoch(peer, 1, &secret(7), Role::Initiator)
+                .unwrap();
+            plane.queue(peer, b"heartbeat").unwrap();
+        }
+        let order: Vec<PeerId> = flushed(&mut plane)
+            .into_iter()
+            .map(|(peer, _)| peer)
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_ne!(ids, sorted, "the peers were installed out of order");
+        assert_eq!(order, sorted);
     }
 
     #[test]
@@ -671,6 +745,18 @@ mod tests {
         );
     }
 
+    /// An owner's fence is shared with the futures that read it across their awaits (a driver's
+    /// receive), which a task may move to another thread: `&dyn Fence` is `Send`. Checked when the
+    /// test compiles.
+    #[test]
+    fn a_fence_is_shared_with_the_futures_that_hold_it() {
+        fn send<T: Send>(value: T) -> T {
+            value
+        }
+        let fence = send::<&dyn Fence>(&AdmitAll);
+        assert!(fence.admits(A, 1));
+    }
+
     #[test]
     fn a_new_epoch_seals_under_new_keys_and_the_old_one_overlaps_until_retired() {
         let (mut a, mut b) = pair(1);
@@ -750,7 +836,7 @@ mod tests {
     #[test]
     fn a_key_refuses_past_its_confidentiality_limit() {
         let (mut a, _) = pair(1);
-        a.peers.get_mut(&B).unwrap().epochs.back_mut().unwrap().next = CONFIDENTIALITY_LIMIT;
+        a.peer_mut(B).unwrap().epochs.back_mut().unwrap().next = CONFIDENTIALITY_LIMIT;
         a.queue(B, b"x").unwrap();
         let mut refusals = Vec::new();
         a.flush(|_, datagram: Result<&[u8], Refusal>| refusals.push(datagram.err()));
@@ -773,7 +859,7 @@ mod tests {
         .write(&mut forged);
         forged.extend_from_slice(&crc32c::crc32c(&queued).to_le_bytes());
         forged.extend_from_slice(&[4, 0, b'd', b'a', b't', b'X']);
-        let epoch = a.peers.get_mut(&B).unwrap().epochs.back_mut().unwrap();
+        let epoch = a.peer_mut(B).unwrap().epochs.back_mut().unwrap();
         let (prologue, body) = forged.split_at_mut(PROLOGUE_BYTES);
         let tag = epoch
             .seal

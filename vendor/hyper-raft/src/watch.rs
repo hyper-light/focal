@@ -122,9 +122,14 @@ pub(crate) struct Watch {
     /// often than the law says. Past `u32::MAX` it wraps, repeating this member's own sequence,
     /// which nothing else is drawn from.
     pub(crate) draws: u32,
-    /// The hand-overs this member made since it opened: whose turn, among the heirs that hold as
-    /// much, the next one names.
+    /// The hand-overs this member made since it opened or last became leader: whose turn, among
+    /// every heir in the order `Raft::hand_over` takes them, the next one names. Past `u32::MAX`
+    /// it wraps, and the turn goes on from the first.
     pub(crate) handovers: u32,
+    /// When this member last ordered a hand-over, on the owner's clock as of its latest wake: an
+    /// order forces a campaign, and until the election the law expects has passed since
+    /// (`election`), the member that led neither orders another nor campaigns (`Raft::wake`).
+    pub(crate) ordered: Option<u64>,
     /// The last term this member led: while it is the member's term and the
     /// member leads no more, its followers may trust it still, and it
     /// hands over.

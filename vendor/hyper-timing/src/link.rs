@@ -1020,6 +1020,37 @@ impl LinkEstimator {
         })
     }
 
+    /// The least count of latenesses at which `τ_int` can be measured: a level of window `m`
+    /// holds Madras and Sokal's window only where `m ≥ c·τ_int ≥ c` (`τ_int` is at least one), and
+    /// enters the comparison once it has [`ALLAN_WINDOWS`] windows, `ALLAN_WINDOWS·m` latenesses;
+    /// so `ALLAN_WINDOWS` times the least power of two `m ≥ c`: 56. Past it, each window a
+    /// qualifying level finishes is another chance.
+    pub fn first_measure() -> u64 {
+        (0..LEVELS)
+            .filter_map(|j| 1u64.checked_shl(u32::try_from(j).ok()?))
+            // u64 → f64 is exact for the powers of two below 2⁵³, past every level kept.
+            .filter(|window| *window as f64 >= SOKAL_C)
+            .find_map(|window| window.checked_mul(ALLAN_WINDOWS))
+            .unwrap_or(u64::MAX)
+    }
+
+    /// What the arrivals show before their `τ_int` is measured, at the most correlation their
+    /// history can carry: [`arrivals`](Self::arrivals) with `τ_int` at the count `n`, one
+    /// independent arrival, so the unseen share is `1/(1 + 1)`. The mean of `n` latenesses of
+    /// variance `V` has variance `(V/n)(1 + 2·Σ_k (1 − k/n)·ρ_k)`, at most `V` whatever the
+    /// correlations `ρ_k` (it is `V` when every lateness is the first), and `τ_int` is that over
+    /// `V/n`: at most `n`. No measured `τ_int` gives a larger unseen share. `None` before two
+    /// latenesses.
+    pub fn arrivals_most_correlated(&self) -> Option<Arrivals> {
+        let seen = self.arrivals_seen()?;
+        // `n/τ_int` at `τ_int = n`.
+        let independent = 1.0;
+        Some(Arrivals {
+            unseen: 1.0 / (independent + 1.0),
+            ..seen
+        })
+    }
+
     /// Configures the detector from the arrivals, for an election and node failures costing
     /// `costs`, on the receiver's timer `granularity` (the search's resolution) and above the
     /// sender's stability `floor`. The detector in force takes force at once: the one minimizing
@@ -1398,6 +1429,43 @@ mod tests {
     /// configured at its interval within 63 to 1,201 heartbeats, 182 at the median: 1.2 s at the most
     /// at a millisecond, where moved for its evidence it took up to 576 heartbeats at intervals up to
     /// 1.26 s.
+    /// `first_measure` is the least count at which `τ_int` can be measured, 56, the first level of
+    /// eight with its seven windows: none is measured before it, and latenesses with no
+    /// correlation are measured once some window of a qualifying level says so. Before, what they
+    /// show at their most correlation has the unseen share of one independent arrival, a half,
+    /// which no measured `τ_int` exceeds: the count over `τ_int` is at least one.
+    #[test]
+    fn no_measure_comes_before_the_first_and_none_is_less_seen() {
+        let mut link = LinkEstimator::new(Duration::from_millis(5), GRANULARITY, None).unwrap();
+        assert_eq!(LinkEstimator::first_measure(), 56);
+        assert_eq!(link.arrivals_most_correlated(), None, "no lateness yet");
+        let mut state = 0x2545_F491_4F6C_DD1D;
+        let mut taken = 0u64;
+        let mut feed = |link: &mut LinkEstimator| {
+            link.on_lateness(taken, (noise(&mut state) % MS) as i64)
+                .unwrap();
+            taken += 1;
+        };
+        for _ in 0..55 {
+            feed(&mut link);
+            assert!(
+                link.arrivals().is_err(),
+                "measured before the first measure"
+            );
+        }
+        let seen = link.arrivals_seen().unwrap();
+        let most = link.arrivals_most_correlated().unwrap();
+        assert_eq!(most.unseen, 0.5);
+        assert_eq!(
+            (most.lateness, most.deviation),
+            (seen.lateness, seen.deviation)
+        );
+        while link.arrivals().is_err() && link.estimates().arrivals < 4 * 56 {
+            feed(&mut link);
+        }
+        assert!(link.arrivals().unwrap().unseen < most.unseen);
+    }
+
     #[test]
     fn a_link_too_correlated_to_measure_yet_configures_at_its_interval_once_a_level_holds_its_window()
      {

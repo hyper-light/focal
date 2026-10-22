@@ -598,6 +598,23 @@ argument, the configurations and marks it covers, and CTRL mapped onto it; `docs
   (`restarted`), where it waited on ten messages that went with the old incarnation, freeing one a
   beat (seed 478, a window of one byte, `HeartbeatAnswers::Bare`). Each has its directed test in
   `tests/suspicion.rs`, which fails without it.
+- **A hand-over to suspected voters** (found by mantle, 2026-10-20; `docs/timing.md` §2.9, "Who
+  the heir is"): `hand_over` took heirs only among the voters the leader trusted, and a leader steps
+  down exactly when it trusts no quorum, so one that suspected every other voter named none, while
+  they heard it and trusted it, and the range stayed leaderless as long as its suspicions lasted
+  (mantle's node simulation with the leader's plane deaf; its Windows CI, run 39503516282, a
+  starved host). The heirs are now every other voter, trusted before suspected, then by what each
+  holds and by id, in turn over all of them, the turn starting again at each term led.
+  `a_leader_that_suspects_every_other_voter_hands_over_all_the_same` and
+  `a_dead_heir_that_holds_the_most_does_not_absorb_every_hand_over` fail on `1b85eaf`;
+  `a_leader_that_led_before_hands_over_first_to_the_voter_it_trusts` fails with the turn counted
+  from the member's start. At the step-down it orders at once only where it still trusts a voter;
+  trusting none it may be the one that stalled, and its `led` path decides a round and a draw later,
+  re-electing it if it trusts a quorum again: ordered at once, every short stall moved the group's
+  leadership (mantle run 39525134119; `a_leader_that_suspects_every_voter_for_less_than_a_round_is_elected_again`,
+  red on `757740c`). It orders no heir and campaigns not within `Timing::election` of its last order
+  (`Watch::ordered`): a round and a draw apart, its orders forced competing candidates
+  (`a_member_that_led_orders_no_heir_within_an_expected_election_of_the_last`, red at `eb85154`).
 - **Tests**: `tests/repair.rs` gains three: PAR's Figure 4(b) in suffix form (fails on R-5: "no one
   was elected"), a marked log that may lack a committed entry never elected (fails with the
   candidate's own vote counted, and with the voters judging by their logs: "committed another entry

@@ -690,12 +690,12 @@ fn a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connec
         );
         assert!(raw.try_write(exchange, &body[body.len() / 2..]).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        // What it held is given back: the listener holds its receive pool alone.
+        // What it held is given back: the listener holds its receive pool and its ring alone.
         let stats = admission_settles(&server, |stats| {
-            stats.bytes == stats.pooled && stats.connections == 0
+            stats.bytes == stats.pooled + stats.ring_charged && stats.connections == 0
         })
         .await;
-        assert_eq!(stats.bytes, stats.pooled);
+        assert_eq!(stats.bytes, stats.pooled + stats.ring_charged);
         server.close().unwrap();
         task.join().await.unwrap();
     })
@@ -4371,9 +4371,10 @@ mod admission {
             let admission = AdmissionLimits::for_connections(funded).replacing_after(QUIET);
             let (server, task) = admitting(&pki, registry, admission).await;
             let address = server.local_addr().unwrap();
-            // What the listener holds apart from its receive pool, which it keeps whether or not
-            // a connection is up: its socket's charge, before any agent comes.
-            let own = |stats: &AdmissionStats| (stats.bytes - stats.pooled) as u64;
+            // What the listener holds apart from its receive pool and its ring's growth, which it
+            // keeps whether or not a connection is up: its socket's charge, before any agent comes.
+            let own =
+                |stats: &AdmissionStats| (stats.bytes - stats.pooled - stats.ring_charged) as u64;
             let before = own(&server.admission().await);
             let mut held_by_agents = Vec::with_capacity(AGENTS);
             for (agent, (certificate, key)) in agents.iter().enumerate() {
@@ -4676,7 +4677,10 @@ mod admission {
             // The first ends without its body: its reservation goes back.
             raw.disconnect();
             let _ = first;
-            let stats = admission_settles(&server, |stats| stats.bytes == stats.pooled).await;
+            let stats = admission_settles(&server, |stats| {
+                stats.bytes == stats.pooled + stats.ring_charged
+            })
+            .await;
             assert_eq!(stats.refused_bytes, 1);
             drop(raw);
             server.close().unwrap();

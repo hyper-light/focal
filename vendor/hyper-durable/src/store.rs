@@ -210,7 +210,9 @@ pub trait LogStore {
     fn term(&self, index: u64) -> Result<u64, StorageError>;
 
     /// The entries of `[low, high)` in order, appended to `into`: as many as `max_bytes` of
-    /// their encoding admit, and one at least.
+    /// their encoding admit, and one at least, each counted at what it takes in a message, as
+    /// the core counts it ([`EntryRef::encoded_bytes`]). The core takes a page the store cut as
+    /// whole: one counted short runs past the core's bounds on what it sends.
     fn entries(
         &self,
         low: u64,
@@ -221,7 +223,8 @@ pub trait LogStore {
 
     /// Walks the entries of `[low, high)` in order where the store holds them, without copying
     /// any, until `visit` says to stop by returning true. The walk reads a page of at most
-    /// `page` bytes at a time, and one entry at least.
+    /// `page` bytes at a time, counted as [`LogStore::entries`] counts them, and one entry at
+    /// least.
     fn visit(
         &self,
         low: u64,

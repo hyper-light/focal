@@ -293,6 +293,36 @@ impl Fetched {
     }
 }
 
+/// How many entries one fetch gives ([`Log::fetch`], [`GroupLog::fetch`]): of its range, those
+/// whose running total fits `max_bytes`, and the first whatever its bytes, each entry counted at
+/// its payload and `per_entry` more. `per_entry` is what the caller's own measure of an entry adds
+/// to the payload the log holds of it, so a caller whose bound is in that measure is given the page
+/// it asks for, chosen before anything is copied: hyper-durable's store pages by what an entry takes
+/// in a Raft message, whose term, index and lengths the log holds outside the entry's payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Page {
+    /// The bytes the page's entries are counted at, at most, unless it holds one.
+    pub max_bytes: u64,
+    /// The bytes each entry is counted at beyond its payload.
+    pub per_entry: u64,
+}
+
+impl Page {
+    /// As many entries as `max_bytes` of payload admit, and one at least.
+    pub const fn payload(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            per_entry: 0,
+        }
+    }
+
+    /// What an entry of `payload` bytes is counted at. A count past `u64` is `u64::MAX`, past every
+    /// bound but none.
+    pub(crate) fn count(self, payload: u64) -> u64 {
+        payload.saturating_add(self.per_entry)
+    }
+}
+
 thread_local! {
     /// The reservation [`Log::entries`] fetches into, kept for this thread's next call: one
     /// segment's bytes at most.
@@ -1123,7 +1153,7 @@ impl<F: BlockFile + 'static> Log<F> {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let fetched = self.fetch(group, low, high, max_bytes, into)?;
+        let fetched = self.fetch(group, low, high, Page::payload(max_bytes), into)?;
         let entries = fetched
             .iter()
             .map(|(term, bytes)| Entry {
@@ -1140,17 +1170,18 @@ impl<F: BlockFile + 'static> Log<F> {
         Ok(entries)
     }
 
-    /// The entries of `[low, high)` as [`Log::entries`] gives them, copied into the caller's
-    /// reservation `into`, which comes back filled.
+    /// The entries of `[low, high)`, as many as `page` admits and one at least, reading from the
+    /// file those no longer in memory, copied into the caller's reservation `into`, which comes
+    /// back filled.
     pub fn fetch(
         &self,
         group: u128,
         low: u64,
         high: u64,
-        max_bytes: u64,
+        page: Page,
         into: Fetched,
     ) -> Result<Fetched, LogError> {
-        self.fetch_waking(group, low, high, max_bytes, into, None)?
+        self.fetch_waking(group, low, high, page, into, None)?
             .wait()
     }
 
@@ -1161,7 +1192,7 @@ impl<F: BlockFile + 'static> Log<F> {
         group: u128,
         low: u64,
         high: u64,
-        max_bytes: u64,
+        page: Page,
         into: Fetched,
         waker: Option<Waker>,
     ) -> Result<Fetching, LogError> {
@@ -1170,7 +1201,7 @@ impl<F: BlockFile + 'static> Log<F> {
             group,
             low,
             high,
-            max_bytes,
+            page,
             into,
         };
         self.lines

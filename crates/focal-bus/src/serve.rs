@@ -160,13 +160,15 @@ pub async fn serve(
         Instant::now(),
     )
     .map_err(BusError::Transport)?;
-    // The socket's buffers, charged for as long as it is bound: its receive places and its outbox
-    // (`Io::held_bound`).
+    // What the driver holds for its sockets as it is made, charged for as long as it is bound:
+    // its receive ring at one buffer and its listener's socket (`hyper_rt_transport::least_bytes`).
+    // What the ring grows by as its drains need it, the driver charges to the endpoint's budget as
+    // it grows (hyper-raft docs/transport.md §4aa).
     let _socket = budget
         .reserve(
             BudgetKind::Pending,
             BudgetLane::Ordinary,
-            crate::limits::IO.held_bound(),
+            hyper_rt_transport::least_bytes(crate::limits::IO),
         )
         .map_err(BusError::Memory)?
         .commit();

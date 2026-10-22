@@ -16019,3 +16019,33 @@ handshake may be under way at once). Open: `per_node` (4) and `per_participant` 
 the handshake places themselves follow the count (each charged as it is held); Windows' and
 macOS's kernel socket memory is not charged to the process and not counted. vendor/README.md;
 docs/dependencies/inventory.tsv.
+
+### 2026-10-22 — An endpoint's receive ring holds what its drains needed
+
+Each endpoint's driver received into a ring of 32 buffers of 64 KiB, made and zeroed as the
+endpoint started, so all of them were resident on Linux, and focal charged every endpoint the most
+a socket of that batch holds (`Io::held_bound`, 4.2 MiB on Linux) whatever it received. An agent is
+a client of one connection: its endpoint's 2 MiB of ring was most of what it held, and focal-load's
+500 agents in one process came to 1.04 GiB of a 2 GiB container in the stalled comparison of
+2026-10-21 (1,000 agents would have reached it). The charge was also worst-case: one figure for
+every endpoint, used or not. Every shared crate is now at hyper-raft 0e89f97, the shared repository's
+two lines merged (main's 14 commits since 2026-10-17 beside fate-commit's 40: main's hyper-liveness
+judge, which blames no peer for its own flush proof's stall, in place of fate-commit's first version;
+hyper-raft's leader hand-over rules; every dial ending in an event its owner is told; GroupStore's
+page read; the kernel's receive stamps in its own ticks; the transport on the simulation runtime),
+whose rings hold what their drains needed (hyper-raft `docs/transport.md` §4aa). focal builds
+against it unchanged. A ring starts with one buffer and grows
+to the messages a drain took, doubling where a drain stopped with its last call full; it shrinks to
+the most a spell of as many drains as it holds took, if fewer. The driver charges a growth to the
+endpoint's budget first and gives a shrink back, and a growth the budget refuses leaves the ring as
+it was.
+
+focal charges an endpoint what its driver holds as it is made (`endpoint_socket_bytes`, now
+`hyper_rt_transport::least_bytes`: one buffer, a batch's headers and the lent listener socket), where
+it charged the batch's bound; the event bus's server likewise. A socket handed to the driver
+(`Bind::Socket`) goes over lent (`Batched::lent`): the driver receives every socket into its ring,
+and the adopted socket had held a batch of its own beside it. The listener's admission reports its
+ring (`AdmissionStats::ring_*`; metrics `focal_listener_receive_ring_buffers`, `_bytes` and
+`focal_listener_receive_ring_changes_total{change}`), and counts the ring's growth as the
+endpoint's own beside its receive pool (`ring_charged`): what the connections hold is what the
+listener holds past both.

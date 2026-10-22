@@ -4,9 +4,12 @@
 //! Every simulated shard reads one clock, which the runtime sets on each shard's flags.
 //! `SimRuntime::run_until_idle` steps each shard in turn; when all are idle it advances the clock to the
 //! earliest deadline any shard asked for or the earliest datagram in flight, and stops when nothing is
-//! pending. Fault injection: `kill_driver` makes a shard's next wait fail with `DriverLost`, which the
-//! shard answers by cancelling every task with a terminal completion and exiting (T-0.7). The registry
-//! owns each shard's flags; the runtime owns its shards, by value, and the fabric between them.
+//! pending. `SimRuntime::run_until` is the same loop stopped at a deadline, the clock left there, for a
+//! world that always has a next deadline (a cell of nodes: heartbeats, liveness, the transport's
+//! timers), run in slices. Fault injection: `kill_driver` makes a shard's next wait fail with
+//! `DriverLost`, which the shard answers by cancelling every task with a terminal completion and
+//! exiting (T-0.7). The registry owns each shard's flags; the runtime owns its shards, by value, and
+//! the fabric between them.
 //!
 //! The simulated UDP fabric below carries the fleet plane at N=1 and models the network under test
 //! ([`SimPath`]): a one-way delay with seeded jitter (since 2026-09-14, so the consensus timing rules of
@@ -1219,8 +1222,33 @@ impl SimRuntime {
     /// Steps every shard until none has work, advancing virtual time to the earliest deadline — a shard's
     /// timer or a datagram's arrival — whenever all are idle. What the shards sent is put on the fabric after
     /// each shard's step, and datagrams due by the current time are handed over (and their receivers woken)
-    /// before each pass. Returns the number of steps taken.
+    /// before each pass. Returns the number of steps taken. A world that always has a next deadline (a
+    /// periodic timer, a node's heartbeats and its transport's timers) never leaves this loop: run it in
+    /// slices with [`SimRuntime::run_until`].
     pub fn run_until_idle(&mut self) -> u64 {
+        self.run(u64::MAX)
+    }
+
+    /// The loop of [`SimRuntime::run_until_idle`], stopped at `deadline_ns`: every event due at or before
+    /// it is taken (a shard's timer, a datagram's arrival, and the work each wakes, the work their tasks
+    /// make at that instant among it), none due after it, and the clock is left at `deadline_ns`, so the
+    /// next call goes on from there as if the run had never stopped: a world run in slices sees what it
+    /// sees run in one, each event at the same time. A deadline at or before now takes what is due now
+    /// and moves the clock nowhere; time never runs back. Its steps are bounded as that loop's are: it
+    /// stops only once no shard has work at the time it reached, so a task that never stops working at
+    /// one instant holds it there, as it holds `run_until_idle`. Returns the number of steps taken.
+    pub fn run_until(&mut self, deadline_ns: u64) -> u64 {
+        let steps = self.run(deadline_ns);
+        if deadline_ns > self.now_ns {
+            self.set_clock(deadline_ns);
+        }
+        steps
+    }
+
+    /// Passes over every shard until none has work, the clock advanced whenever all are idle to the
+    /// earliest event (a shard's deadline or a datagram's arrival), until no event is pending or the next
+    /// is past `deadline_ns`; the steps taken.
+    fn run(&mut self, deadline_ns: u64) -> u64 {
         let mut steps = 0u64;
         loop {
             self.pump();
@@ -1233,9 +1261,10 @@ impl SimRuntime {
                 earliest = Some(earliest.map_or(arrival, |e| e.min(arrival)));
             }
             match earliest {
-                Some(deadline) if deadline > self.now_ns => self.set_clock(deadline),
-                Some(_) => {}
-                None => break,
+                // Due now: the next pass takes it.
+                Some(next) if next <= self.now_ns => {}
+                Some(next) if next <= deadline_ns => self.set_clock(next),
+                _ => break,
             }
         }
         steps

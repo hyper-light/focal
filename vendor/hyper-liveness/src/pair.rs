@@ -12,7 +12,7 @@ use crate::codec::{Echo, Heartbeat, MAX_BYTES};
 use crate::{Change, Last, PairReport, PeerId, Refusal, Suspicion};
 
 /// `duration` in nanoseconds, saturating at `u64::MAX` (584 years).
-fn nanos(duration: Duration) -> u64 {
+pub(crate) fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -25,6 +25,61 @@ pub(crate) struct Sender {
     pub(crate) durable_ns: Option<u64>,
 }
 
+/// What a judge knows of its own durability (`docs/timing.md` §2.8, "A judge whose own proof
+/// stalls"): its latest durable completion, and the latest stretch its stream waited for a proof it
+/// lacked, from when it first wanted one to the completion that ended it, if one has.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Local {
+    pub(crate) durable_ns: Option<u64>,
+    pub(crate) stall: Option<(u64, Option<u64>)>,
+}
+
+/// When a freshness point that has passed is judged, given the judge's own durability.
+pub(crate) enum Held {
+    /// At this time: the point itself, or later where the judge's own proof stalled over it.
+    At(u64),
+    /// Not until the judge's own proof comes; `probe` when none is outstanding and nothing is durable
+    /// since the point, so the judge's next completion, of any write, is what it waits for.
+    Waiting { probe: bool },
+}
+
+impl Local {
+    /// When a point that has passed, a peer's expected arrival plus `margin_ns`, is judged. A judge
+    /// whose own proof is outstanding waits for it: its peers' proofs may be stalled with it, as on
+    /// a volume they share, and a judge whose own stream stopped judges by a proof it cannot
+    /// produce. Once it comes, a stall at least as long as the margin it holds the peer to gives the
+    /// peer that margin again from its end, since the peer's stream resumes no sooner; a shorter one
+    /// proves nothing past its end. A judge with nothing durable since the point, and no proof
+    /// outstanding, waits for its next completion and judges on it: what it judges by is its own
+    /// device's progress since the peer was due. Lifeguard's local health (Dadgar, Phillips and
+    /// Currey 2018) applied to the flush proof.
+    pub(crate) fn judge(&self, point: u64, margin_ns: u64) -> Held {
+        let expected = point.saturating_sub(margin_ns);
+        match self.stall {
+            Some((_, None)) => return Held::Waiting { probe: false },
+            Some((since, Some(end)))
+                if end >= expected && end.saturating_sub(since) >= margin_ns =>
+            {
+                return Held::At(point.max(end.saturating_add(margin_ns)));
+            }
+            // A shorter wait proves nothing past its end: an ordinary flush that ended after the
+            // peer's expected arrival but before its point, the journal stalling after it, held a
+            // judge to the point it then could not judge by (macOS seed 254 of 256 of
+            // `flushes_stalled_together_...`).
+            _ => {}
+        }
+        // Its device proved itself since the point: the peer's silence is not one it shares. A
+        // completion after the expected arrival but before the point does not prove it, since a
+        // shared journal can stall after it with the peer's flush, asked earlier, still in it
+        // (`flushes_stalled_together_...`, macOS seed 254 of 256).
+        if self.durable_ns.is_some_and(|durable| durable >= point) {
+            Held::At(point)
+        } else {
+            Held::Waiting { probe: true }
+        }
+    }
+}
+
 /// What the node gives a pair's receiver with a heartbeat.
 pub(crate) struct Context<'a> {
     pub(crate) granularity: Option<Duration>,
@@ -34,9 +89,8 @@ pub(crate) struct Context<'a> {
     /// What the node measured of its links (`Liveness::renew_evidence`), read only while this pair
     /// has no configuration of its own (`docs/timing.md` §3, item 10).
     pub(crate) evidence: Option<&'a Arrivals>,
-    /// When this node's own log last made a write durable: its local health against the flush
-    /// proof (`Deferred`).
-    pub(crate) durable_ns: Option<u64>,
+    /// The node's own durability, which a point that passed is judged with.
+    pub(crate) local: Local,
 }
 
 /// What a heartbeat taken did, for the node.
@@ -88,8 +142,10 @@ pub(crate) fn scaled(pool: &Arrivals, window: u64) -> Arrivals {
 
 /// What a poll's send did.
 pub(crate) enum Sent {
-    /// A heartbeat of this many bytes is in the node's buffer.
-    Message(usize),
+    /// A heartbeat of this many bytes is in the node's buffer, and its lateness past the slot after
+    /// the previous heartbeat sent the peer, nanoseconds: what the peer will take it as, but the
+    /// path's delay (`Stream::expected_ns`); `None` for the first.
+    Message(usize, Option<i64>),
     /// A heartbeat is due and no flush proves it.
     NeedsFlush,
     /// Nothing due.
@@ -112,6 +168,10 @@ struct Stream {
     floor_from: u64,
     /// The latest heartbeat's number sent.
     sent: Option<u64>,
+    /// The slot after the latest heartbeat sent, when it was due: the arrival the peer expects of
+    /// the next, but the path's delay. A heartbeat sent past it, a skipped slot's or its own
+    /// lateness, is late by as much at the peer (`docs/timing.md` §2.2).
+    expected_ns: Option<u64>,
 }
 
 /// How a peer from which no heartbeat has come is judged: from when the node first attached the
@@ -122,6 +182,8 @@ struct Unheard {
     since_ns: Option<u64>,
     /// The freshness point of the first heartbeat, once the pool can give a margin.
     until_ns: Option<u64>,
+    /// The margin of that point past the first heartbeat's expected arrival.
+    margin_ns: u64,
     /// The bound the node's evidence put on the first heartbeat's coming past it: what the
     /// allowance is charged when it comes.
     bound: Option<f64>,
@@ -168,9 +230,10 @@ struct Received {
     configured_interval: Option<Duration>,
     round_trip: ExchangeRtt,
     /// While the pair has no configuration of its own: the arrivals its margin was imposed from,
-    /// the node's evidence scaled to the link's window and widened by the link's own, and the
-    /// heartbeats taken then.
-    pooled: Option<(Arrivals, u64)>,
+    /// the node's evidence scaled to the link's window and widened by the link's own, the
+    /// heartbeats taken then, and whether that evidence was measured: one that was not is renewed
+    /// as soon as the node's is.
+    pooled: Option<(Arrivals, u64, bool)>,
     /// The interval asked of the peer for the margin of the node's evidence, nanoseconds, where at
     /// the link's own interval that margin promised nothing (`pool_margin`); zero otherwise, and
     /// from the link's first configuration on.
@@ -189,27 +252,7 @@ struct Counts {
     unproven: u64,
     configurations: u64,
     suspicions: u64,
-    deferred: u64,
     allowance: f64,
-}
-
-/// Where the peer's judgment stands against this node's own durability (Lifeguard's local health
-/// carried to the flush proof, `docs/timing.md` §2.4). The peer's next heartbeat leaves only once
-/// its log made a write durable after the latest was due; a freshness point that passes while this
-/// node's own log made nothing durable since it took that latest heartbeat is no evidence against
-/// the peer, whose heartbeat waits, as this node's own do, on what may be one stalled disk. It is
-/// judged once this node's log made a write durable since, the peer given from that write the time
-/// the point gave it from the heartbeat: what a heartbeat proved as the disk came back takes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Deferred {
-    /// Judged at the freshness point.
-    #[default]
-    No,
-    /// The freshness point passed while this node made nothing durable since the heartbeat it
-    /// follows was taken: judged once a completion is fed.
-    Stalled,
-    /// This node's log made a write durable since: judged at this time.
-    Until(u64),
 }
 
 /// One pair.
@@ -223,7 +266,13 @@ pub(crate) struct Pair {
     /// Whether the owner was last told the peer is suspected: a change is reported only where
     /// what the owner was told differs, and the owner trusts a peer until told otherwise.
     told: bool,
-    deferred: Deferred,
+    /// A passed freshness point the node's own stall held later (`Local::judge`), and the time it
+    /// is judged at: once held, it is held no further, whatever the node's own durability does
+    /// after. Restated at every wait, a judge whose every write was slower than the margin held its
+    /// point past each next one and suspected a dead peer never
+    /// (`a_judge_whose_writes_are_all_slow_still_suspects_a_dead_peer`). One for a point other
+    /// than the pair's present one is spent.
+    held: Option<(u64, u64)>,
     counts: Counts,
 }
 
@@ -236,7 +285,7 @@ impl Pair {
             received: Received::default(),
             unheard: Unheard::default(),
             told: false,
-            deferred: Deferred::No,
+            held: None,
             counts: Counts::default(),
         }
     }
@@ -298,8 +347,22 @@ impl Pair {
                     .saturating_add(nanos(interval))
                     .saturating_add(nanos(detector.margin)),
             );
+            self.unheard.margin_ns = nanos(detector.margin);
             self.unheard.bound = Some(lateness_bound(&behaviour, detector.margin));
         }
+    }
+
+    /// The interval this node's heartbeats to the peer are due at, once the first is scheduled.
+    pub(crate) fn sending_interval(&self) -> Option<Duration> {
+        (self.stream.interval_ns != 0).then(|| Duration::from_nanos(self.stream.interval_ns))
+    }
+
+    /// The interval the peer's heartbeats come at, once one has come.
+    pub(crate) fn heard_interval(&self) -> Option<Duration> {
+        self.received
+            .link
+            .as_ref()
+            .map(|link| link.estimator.interval())
     }
 
     pub(crate) fn configuration(&self) -> Option<Configuration> {
@@ -337,7 +400,6 @@ impl Pair {
             sending_due_ns: self.next_due(),
             configurations: counts.configurations,
             suspicions: counts.suspicions,
-            deferred: counts.deferred,
             allowance: counts.allowance,
         }
     }
@@ -347,18 +409,63 @@ impl Pair {
         self.stream.next.map(|(_, due)| due)
     }
 
-    /// The peer's freshness point, while trusted: [`trust`](Self::trust)'s, read without
-    /// building it, since every wake asked reads it of every pair. A point deferred until this
-    /// node's log is durable again asks no wake: the completion fed in is polled after
-    /// ([`Liveness::poll`](crate::Liveness::poll)).
-    pub(crate) fn deadline(&self) -> Option<u64> {
+    /// The peer's freshness point, while trusted: read at every poll of every pair.
+    fn point(&self) -> Option<u64> {
         match self.received.link.as_ref() {
-            Some(link) => match self.deferred {
-                Deferred::No => link.estimator.deadline(),
-                Deferred::Stalled => None,
-                Deferred::Until(at) => link.estimator.deadline().map(|until| until.max(at)),
-            },
+            Some(link) => link.estimator.deadline(),
             None => self.unheard.until_ns.filter(|_| !self.unheard.suspected),
+        }
+    }
+
+    /// The margin of the freshness point past the peer's expected arrival: read only for a point
+    /// that has passed, since it is a conversion through a `Duration` every pair's poll paid for
+    /// nothing (`docs/benchmarks.md`).
+    fn margin_ns(&self) -> u64 {
+        match self.received.link.as_ref() {
+            Some(link) => link.estimator.margin().map_or(0, nanos),
+            None => self.unheard.margin_ns,
+        }
+    }
+
+    /// How a passed `point` is judged: at the time it was held to, if it was, or as the node's own
+    /// durability holds it now.
+    fn hold(&self, point: u64, local: &Local) -> Held {
+        match self.held {
+            Some((held, at)) if held == point => Held::At(at),
+            _ => local.judge(point, self.margin_ns()),
+        }
+    }
+
+    /// When the peer is next judged, while trusted, at `now_ns` and with the node's own
+    /// durability: its freshness point, or for one that has passed the time `Local::judge` holds
+    /// it to; none while that waits for the node's own proof, whose completion polls the stream.
+    /// Read without building the trust, since every wake asked reads it of every pair.
+    pub(crate) fn deadline(&self, local: &Local, now_ns: u64) -> Option<u64> {
+        let point = self.point()?;
+        if point > now_ns {
+            return Some(point);
+        }
+        match self.hold(point, local) {
+            Held::At(at) => Some(at),
+            Held::Waiting { .. } => None,
+        }
+    }
+
+    /// The trust the owner is shown at `now_ns`: [`trust`](Self::trust), with a point that has
+    /// passed restated to the later time the node's own durability holds it to (`Local::judge`).
+    /// While that waits for the node's own proof, the pair shows its own trust, to the point that
+    /// passed, as before the rule: shown judged by no point (`Trust::Unconfigured`, a pair's state
+    /// before its first margin), every judged link read as unjudged to an owner through a start
+    /// whose first flushes took seconds (mantle's real processes on windows-x86_64 at `b96bed9`).
+    pub(crate) fn trust_at(&self, local: &Local, now_ns: u64) -> Trust {
+        match (self.trust(), self.point()) {
+            (Trust::Trusted { until_ns }, Some(point)) if until_ns <= now_ns => {
+                match self.hold(point, local) {
+                    Held::At(at) => Trust::Trusted { until_ns: at },
+                    Held::Waiting { .. } => Trust::Trusted { until_ns },
+                }
+            }
+            (trust, _) => trust,
         }
     }
 
@@ -486,6 +593,10 @@ impl Pair {
             echo,
         };
         let length = beat.encode(out).len();
+        let own = self
+            .stream
+            .expected_ns
+            .map(|expected| i64::try_from(sent_ns.saturating_sub(expected)).unwrap_or(i64::MAX));
         // The slots between the latest heartbeat sent and this one were due while this node was
         // behind and are never sent: the peer takes them as this one's lateness.
         let skipped = self
@@ -500,21 +611,42 @@ impl Pair {
             self.stream.floor_from = sender.durable_count;
         }
         self.stream.next = Some((seq.saturating_add(1), due.saturating_add(interval)));
+        self.stream.expected_ns = Some(due.saturating_add(interval));
         self.counts.sent = self.counts.sent.saturating_add(1);
-        Sent::Message(length)
+        Sent::Message(length, own)
     }
 
-    /// The peer's freshness at `now_ns`, this node's own log last durable at `durable_ns`: a
-    /// suspicion when it passed, unless this node's own durability defers it (`Deferred`).
+    /// The peer's freshness at `now_ns`, with the node's own durability: a suspicion when its point
+    /// passed and `Local::judge` holds it no longer, told at the time it holds it to; and whether the
+    /// node must ask for a proof of its own first.
     pub(crate) fn judge(
         &mut self,
         peer: PeerId,
         now_ns: u64,
-        durable_ns: Option<u64>,
-    ) -> Option<Change> {
+        local: &Local,
+    ) -> (Option<Change>, bool) {
+        let at = match self.point() {
+            // Not passed: every poll of every pair, so nothing more is read.
+            Some(point) if now_ns < point => return (None, false),
+            Some(point) => match self.hold(point, local) {
+                Held::At(at) if now_ns >= at => Some(at),
+                Held::At(at) => {
+                    // Held later: held there, and no further.
+                    self.held = Some((point, at));
+                    return (None, false);
+                }
+                Held::Waiting { probe } => return (None, probe),
+            },
+            None => None,
+        };
+        (self.judge_at(peer, now_ns, at), false)
+    }
+
+    /// The suspicion at `now_ns`, of a point that passed and is judged at `at`, if any.
+    fn judge_at(&mut self, peer: PeerId, now_ns: u64, at: Option<u64>) -> Option<Change> {
         let Some(link) = self.received.link.as_mut() else {
             // Nothing heard: suspected once its first freshness point passes.
-            let until = self.unheard.until_ns.filter(|until| now_ns >= *until)?;
+            let until = at?;
             if self.unheard.suspected {
                 return None;
             }
@@ -522,36 +654,12 @@ impl Pair {
             return self.tell_suspected(peer, until, now_ns);
         };
         let until = match link.estimator.deadline() {
-            Some(until) => {
-                if now_ns < until {
-                    return None;
-                }
-                if let Some(last) = self.received.last {
-                    let taken = last.arrival_ns;
-                    if let Deferred::Until(at) = self.deferred {
-                        if now_ns < at {
-                            return None;
-                        }
-                    } else if durable_ns.is_none_or(|durable| durable <= taken) {
-                        if self.deferred == Deferred::No {
-                            self.counts.deferred = self.counts.deferred.saturating_add(1);
-                        }
-                        self.deferred = Deferred::Stalled;
-                        return None;
-                    } else if self.deferred == Deferred::Stalled {
-                        let durable = durable_ns.unwrap_or(now_ns);
-                        let at = durable.saturating_add(until.saturating_sub(taken));
-                        self.deferred = Deferred::Until(at);
-                        if now_ns < at {
-                            return None;
-                        }
-                    }
-                    self.deferred = Deferred::No;
-                }
+            Some(_) => {
+                let at = at?;
                 if link.estimator.poll(now_ns) != Some(Event::Suspected) {
                     return None;
                 }
-                until
+                at
             }
             // Suspected with no freshness point passing at a poll, and not told: a margin imposed
             // at a poll (the node's evidence's, `pool_margin`) found the latest heartbeat already
@@ -626,7 +734,7 @@ impl Pair {
         let link = self.received.link.as_ref()?;
         let margin = link.estimator.margin()?;
         let behaviour = match self.received.pooled {
-            Some((pooled, _)) if self.received.configuration.is_none() => pooled,
+            Some((pooled, ..)) if self.received.configuration.is_none() => pooled,
             _ => link.estimator.arrivals().ok().or(self
                 .received
                 .configuration
@@ -677,7 +785,7 @@ impl Pair {
         changes: &mut [Option<Change>; 3],
         taken: &mut Taken,
     ) -> Result<(), Refusal> {
-        changes[0] = self.judge(peer, arrival_ns, context.durable_ns);
+        changes[0] = self.judge(peer, arrival_ns, &context.local).0;
         if self.begin_run(beat.run)? {
             // A new incarnation, which the owner's core trusts and holds to lead nothing it led.
             self.told = false;
@@ -726,8 +834,6 @@ impl Pair {
             .on_heartbeat(mapped, arrival_ns)
             .map_err(|_| Refusal::OutOfRange)?;
         let lateness = link.estimator.latest_lateness();
-        // The heartbeat ends the gap a deferred freshness point held.
-        self.deferred = Deferred::No;
         self.received.last = Some(Last {
             seq: beat.seq,
             arrival_ns,
@@ -747,9 +853,9 @@ impl Pair {
         // The MTBF is a float division: read only where the margin is renewed.
         if self.received.configuration.is_none()
             && let Some(evidence) = context.evidence
-            && self.pool_margin_due()
+            && self.pool_margin_due(true)
         {
-            self.pool_margin(evidence, granularity, context.exposure.mtbf());
+            self.pool_margin(evidence, true, granularity, context.exposure.mtbf());
         }
         taken.lateness = lateness;
         taken.own = self.received.configuration.is_some();
@@ -758,11 +864,12 @@ impl Pair {
     }
 
     /// Whether the margin of the node's evidence is due, on the configuration's doubling schedule:
-    /// never imposed, or the heartbeats taken have doubled since it was.
-    fn pool_margin_due(&self) -> bool {
-        self.received
-            .pooled
-            .is_none_or(|(_, at)| self.counts.taken >= at.saturating_mul(2))
+    /// never imposed, or the heartbeats taken have doubled since it was; or at once, where it was
+    /// imposed from evidence that was not measured and the node's now is.
+    fn pool_margin_due(&self, measured: bool) -> bool {
+        self.received.pooled.is_none_or(|(_, at, was)| {
+            (measured && !was) || self.counts.taken >= at.saturating_mul(2)
+        })
     }
 
     /// While the pair has no configuration of its own, the margin the node's evidence configures
@@ -779,13 +886,14 @@ impl Pair {
     pub(crate) fn pool_margin(
         &mut self,
         pool: &Arrivals,
+        measured: bool,
         granularity: Duration,
         mtbf: Option<Duration>,
     ) {
         let (Some(election), Some(mtbf)) = (self.election, mtbf) else {
             return;
         };
-        if !self.pool_margin_due() {
+        if !self.pool_margin_due(measured) {
             return;
         }
         let taken = self.counts.taken;
@@ -817,7 +925,7 @@ impl Pair {
             }
         };
         link.estimator.impose(detector.margin);
-        self.received.pooled = Some((behaviour, taken));
+        self.received.pooled = Some((behaviour, taken, measured));
         self.received.pooled_ask_ns = ask_ns;
     }
 
@@ -922,6 +1030,82 @@ impl Pair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule a point that passed is judged by, given the judge's own durability, branch by
+    /// branch (`Local::judge`): a point at 100 ms, a margin of 20 ms, the peer expected at 80 ms.
+    #[test]
+    fn a_judge_whose_own_proof_stalls_holds_its_peers_to_it() {
+        const POINT: u64 = 100 * 1_000_000;
+        const MARGIN: u64 = 20 * 1_000_000;
+        let at = |local: Local| match local.judge(POINT, MARGIN) {
+            Held::At(at) => Some(at),
+            Held::Waiting { probe } => {
+                assert!(probe || matches!(local.stall, Some((_, None))));
+                None
+            }
+        };
+        let ms = |n: u64| n * 1_000_000;
+        // Its device made something durable since the point: judged at the point.
+        assert_eq!(
+            at(Local {
+                durable_ns: Some(ms(101)),
+                stall: None
+            }),
+            Some(POINT)
+        );
+        // Nothing durable since the point, nothing asked: it asks first.
+        assert!(matches!(
+            Local {
+                durable_ns: Some(ms(99)),
+                stall: None
+            }
+            .judge(POINT, MARGIN),
+            Held::Waiting { probe: true }
+        ));
+        // Its own proof outstanding: it waits.
+        assert!(matches!(
+            Local {
+                durable_ns: Some(ms(50)),
+                stall: Some((ms(60), None))
+            }
+            .judge(POINT, MARGIN),
+            Held::Waiting { probe: false }
+        ));
+        // A wait as long as the margin, ended after the expected arrival: the margin again from
+        // its end.
+        assert_eq!(
+            at(Local {
+                durable_ns: Some(ms(150)),
+                stall: Some((ms(90), Some(ms(150))))
+            }),
+            Some(ms(170))
+        );
+        // A shorter wait, ended before the point: proves nothing past its end, so it asks first.
+        assert!(matches!(
+            Local {
+                durable_ns: Some(ms(95)),
+                stall: Some((ms(90), Some(ms(95))))
+            }
+            .judge(POINT, MARGIN),
+            Held::Waiting { probe: true }
+        ));
+        // A long wait that ended before the peer was expected: none of the peer's silence.
+        assert_eq!(
+            at(Local {
+                durable_ns: Some(ms(101)),
+                stall: Some((ms(10), Some(ms(70))))
+            }),
+            Some(POINT)
+        );
+    }
+
+    /// A judge whose own device works: everything durable, no proof outstanding.
+    fn steady() -> Local {
+        Local {
+            durable_ns: Some(u64::MAX),
+            stall: None,
+        }
+    }
     use hyper_timing::Exposure;
 
     const MS: u64 = 1_000_000;
@@ -984,16 +1168,16 @@ mod tests {
             granularity,
             exposure.mtbf(),
         );
-        let until = pair.deadline().expect("judged from the attach");
+        let until = pair.deadline(&steady(), 0).expect("judged from the attach");
         assert!(matches!(
-            pair.judge(2, until, Some(until)),
+            pair.judge(2, until, &steady()).0,
             Some(Change::Suspected(_))
         ));
         let context = Context {
             granularity: Some(granularity),
             exposure: &exposure,
             evidence: None,
-            durable_ns: Some(u64::MAX),
+            local: steady(),
         };
         let (mut changes, mut taken) = ([None, None, None], Taken::default());
         let arrival = until + MS;
@@ -1028,7 +1212,7 @@ mod tests {
             granularity: Some(granularity),
             exposure: &exposure,
             evidence: None,
-            durable_ns: Some(u64::MAX),
+            local: steady(),
         };
         let mut pair = pair();
         let mut latest = 0;
@@ -1049,10 +1233,12 @@ mod tests {
                 .unwrap();
             latest = arrival;
         }
-        pair.pool_margin(&evidence(), granularity, exposure.mtbf());
-        let until = pair.deadline().expect("judged by the node's evidence");
+        pair.pool_margin(&evidence(), true, granularity, exposure.mtbf());
+        let until = pair
+            .deadline(&steady(), 0)
+            .expect("judged by the node's evidence");
         assert!(until > latest);
-        let Some(Change::Suspected(suspicion)) = pair.judge(2, until, Some(until)) else {
+        let Some(Change::Suspected(suspicion)) = pair.judge(2, until, &steady()).0 else {
             panic!("suspected at the freshness point");
         };
         let last = suspicion.last.expect("heard from");
@@ -1074,7 +1260,7 @@ mod tests {
             granularity: Some(granularity),
             exposure: &exposure,
             evidence: None,
-            durable_ns: Some(u64::MAX),
+            local: steady(),
         };
         let us = 1_000;
         let now = 10 * MS;
@@ -1093,7 +1279,7 @@ mod tests {
             durable_ns: Some(now),
         };
         let mut out = [0; MAX_BYTES];
-        let Sent::Message(length) = node.send(&sender, now, &mut out) else {
+        let Sent::Message(length, _) = node.send(&sender, now, &mut out) else {
             panic!("due, and a flush proves it");
         };
         let ours = Heartbeat::decode(out.get(..length).unwrap()).unwrap();
@@ -1142,7 +1328,7 @@ mod tests {
             };
             let mut out = [0; MAX_BYTES];
             assert!(
-                matches!(node.send(&sender, now, &mut out), Sent::Message(_)),
+                matches!(node.send(&sender, now, &mut out), Sent::Message(..)),
                 "flush {n}: due and proven"
             );
             // The floor at the latest doubling of the flushes, at or before this one.
@@ -1174,7 +1360,7 @@ mod tests {
             granularity: Some(granularity),
             exposure: &exposure,
             evidence: None,
-            durable_ns: Some(u64::MAX),
+            local: steady(),
         };
         let mut pair = pair();
         let mut latest = 0;
@@ -1198,10 +1384,9 @@ mod tests {
         }
         assert_eq!(pair.trust(), Trust::Unconfigured);
         // The node's evidence comes, and the next poll imposes its margin and judges.
-        pair.pool_margin(&evidence(), granularity, exposure.mtbf());
+        pair.pool_margin(&evidence(), true, granularity, exposure.mtbf());
         assert_eq!(pair.trust(), Trust::Suspected, "the margin finds it late");
-        let Some(Change::Suspected(suspicion)) = pair.judge(2, latest + MS, Some(latest + MS))
-        else {
+        let Some(Change::Suspected(suspicion)) = pair.judge(2, latest + MS, &steady()).0 else {
             panic!("the suspicion is told");
         };
         assert!(
@@ -1210,7 +1395,7 @@ mod tests {
         );
         assert_eq!(suspicion.last.map(|last| last.seq), Some(1));
         assert_eq!(
-            pair.judge(2, latest + 2 * MS, Some(latest + 2 * MS)),
+            pair.judge(2, latest + 2 * MS, &steady()).0,
             None,
             "told once"
         );
@@ -1231,7 +1416,7 @@ mod tests {
             granularity: Some(granularity),
             exposure: &exposure,
             evidence: None,
-            durable_ns: Some(u64::MAX),
+            local: steady(),
         };
         let mut pair = pair();
         pair.election = Some(Duration::from_secs(1));
@@ -1251,8 +1436,8 @@ mod tests {
             unseen: 0.02,
             ..evidence()
         };
-        pair.pool_margin(&evidence, granularity, exposure.mtbf());
-        let (behaviour, _) = pair.received.pooled.expect("a margin is in force");
+        pair.pool_margin(&evidence, true, granularity, exposure.mtbf());
+        let (behaviour, ..) = pair.received.pooled.expect("a margin is in force");
         let costs = Costs {
             election: Duration::from_secs(1),
             mtbf: exposure.mtbf().unwrap(),

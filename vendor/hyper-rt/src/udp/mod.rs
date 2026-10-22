@@ -167,9 +167,13 @@ impl UdpSocket {
     /// held, whatever process held it (the kernel's choice of a free port passes over a port held by
     /// a socket it may share with), and the two then split one port's datagrams: of 256 clients
     /// bound so, one to three never heard their server in four runs of five, each sharing its port
-    /// with another client. Refused `BadConfig` on Windows, where a shared port hands a connected
-    /// socket no peer's datagrams of its own, and on the simulation fabric, whose ports are one
-    /// socket's each.
+    /// with another client: Linux's search for a free port leaves out of the ports in use those held
+    /// by a socket that shares its port with the binder's user (`udp_lib_lport_inuse`,
+    /// net/ipv4/udp.c). Shared after its bind, the port still takes the sockets that join it, as each
+    /// kernel checks the held socket's flag when another binds (Linux `udp_lib_lport_inuse` and
+    /// `udp_reuseport_add_sock`, XNU `in_pcbbind`). Refused `BadConfig` on Windows, where a shared
+    /// port hands a connected socket no peer's datagrams of its own, and on the simulation fabric,
+    /// whose ports are one socket's each.
     pub fn bind_shared(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
         let addr = addr.into();
         if on_sim() {

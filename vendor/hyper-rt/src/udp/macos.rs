@@ -10,6 +10,13 @@
 //! - `mach_absolute_time` scaled by `mach_timebase_info` (<mach/mach_time.h>): the clock the stamps are
 //!   on, `CLOCK_UPTIME_RAW`, which stops while the host sleeps. The shard's clock (`CLOCK_MONOTONIC`)
 //!   does not, so a stamp is carried onto it by its age, read on the stamps' clock (`super::batched`).
+//! - The stamp is the kernel's own `mach_absolute_time()`, in the kernel's ticks, which a process's
+//!   timebase describes only where the process runs natively: Rosetta 2 shows a translated process a
+//!   timebase of 1/1 and its own `mach_absolute_time` in nanoseconds, and leaves the stamp in Apple
+//!   silicon's 24 MHz ticks. Its age read with the process's timebase alone came out as 122/125 of
+//!   the host's uptime (13.25 days where it was measured), so every arrival fell to the shard clock's
+//!   zero. The kernel's rate is read (`hw.tbfrequency`) and the stamp carried into the process's ticks
+//!   before the age is taken ([`crate::machine::clock::MachTicks`]).
 //!
 //! Moved here from hyper-tokio's `sys/macos.rs` so both drivers share one layer (docs/runtime.md §5.1).
 
@@ -21,6 +28,9 @@ use std::mem::{size_of, zeroed};
 use std::os::fd::RawFd;
 use std::ptr;
 
+use crate::error::RtError;
+use crate::machine::clock::{MachTicks, mach_ticks};
+
 /// `SCM_TIMESTAMP_MONOTONIC`, 0x04 in XNU's `bsd/sys/socket.h`, which libc 0.2.189 does not
 /// declare.
 const SCM_TIMESTAMP_MONOTONIC: libc::c_int = 0x04;
@@ -29,48 +39,34 @@ const SCM_TIMESTAMP_MONOTONIC: libc::c_int = 0x04;
 /// 12 bytes of header rounded to 4-byte alignment and 8 of stamp, 20, in three words.
 const CONTROL_WORDS: usize = 3;
 
-/// The stamps' clock, `mach_absolute_time`, as nanoseconds.
+/// The stamps' clock, `mach_absolute_time`, and the kernel's ticks the stamps count.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Clock {
-    /// `mach_timebase_info`: nanoseconds are ticks × `numer` / `denom`; `denom` is never zero.
-    numer: u64,
-    denom: u64,
+    ticks: MachTicks,
 }
 
 impl Clock {
+    /// The process's timebase and the kernel's rate, read once for the process ([`mach_ticks`]);
+    /// refused as that read is.
+    pub(crate) fn new() -> Result<Self, RtError> {
+        mach_ticks().map(|ticks| Self { ticks })
+    }
+
+    /// Now, in this process's ticks: the clock a stamp's age is read on.
     #[expect(
         deprecated,
         reason = "libc deprecates its Mach declarations in favour of the mach2 crate, which is not \
                   a dependency; the declarations themselves are unchanged in libc"
     )]
-    pub(crate) fn new() -> io::Result<Self> {
-        let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
-        // SAFETY: `info` is a live, writable `mach_timebase_info` for the call, which writes that
-        // one structure (<mach/mach_time.h>).
-        let status = unsafe { libc::mach_timebase_info(&raw mut info) };
-        if status != libc::KERN_SUCCESS || info.denom == 0 {
-            return Err(io::Error::other("mach_timebase_info failed"));
-        }
-        Ok(Self {
-            numer: u64::from(info.numer),
-            denom: u64::from(info.denom),
-        })
-    }
-
-    /// Now, in ticks: the clock a stamp's age is read on.
-    #[expect(deprecated, reason = "as in `new`")]
     pub(crate) fn now_ticks(&self) -> u64 {
         // SAFETY: takes no argument and reads the timebase register (<mach/mach_time.h>).
         unsafe { libc::mach_absolute_time() }
     }
 
-    /// `ticks` × `numer` / `denom`, in 128 bits so it cannot overflow before the division.
-    pub(crate) fn ticks_ns(&self, ticks: u64) -> u64 {
-        let ns = u128::from(ticks)
-            .checked_mul(u128::from(self.numer))
-            .and_then(|scaled| scaled.checked_div(u128::from(self.denom)))
-            .unwrap_or(u128::MAX);
-        u64::try_from(ns).unwrap_or(u64::MAX)
+    /// How long before `now`, this process's ticks, the kernel took `stamp`, its own ticks:
+    /// nanoseconds ([`MachTicks::age_ns`]).
+    pub(crate) fn age_ns(&self, now: u64, stamp: u64) -> u64 {
+        self.ticks.age_ns(now, stamp)
     }
 }
 
@@ -115,8 +111,8 @@ pub(crate) fn enable_stamps(fd: RawFd) -> bool {
     status == 0
 }
 
-/// One datagram received: who sent it, how long it is, and the kernel's stamp in
-/// `mach_absolute_time` ticks, when there is one.
+/// One datagram received: who sent it, how long it is, and the kernel's stamp, its
+/// `mach_absolute_time` in its own ticks, when there is one.
 pub(crate) struct Received {
     pub(crate) from: SocketAddr,
     pub(crate) length: usize,

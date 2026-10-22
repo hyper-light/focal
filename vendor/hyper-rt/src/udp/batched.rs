@@ -14,9 +14,10 @@
 //! (hyper-raft docs/timing.md §2.4), so a stamped socket hands each datagram over with the kernel's
 //! receive stamp carried onto the shard's clock ([`crate::shard::ShardContext::now_ns`]), the clock its
 //! timers run on. The kernel stamps on a clock of its own (`CLOCK_REALTIME` on Linux, `mach_absolute_time`
-//! on macOS), so a stamp is carried over by its age: with the stamps' clock read after the receive and the
-//! shard's clock after it, so that a preemption between the two makes the stamp late and never early, the
-//! arrival is `now − (stamps_now − stamp)`. It is held within the read's time and no earlier than the
+//! on macOS, in the kernel's ticks, which a process Rosetta 2 translates does not count in), so a stamp
+//! is carried over by its age: with the stamps' clock read after the receive and the shard's clock after
+//! it, so that a preemption between the two makes the stamp late and never early, the arrival is
+//! `now − (stamps_now − stamp)`. It is held within the read's time and no earlier than the
 //! arrival handed over before it (a socket's queue is first in, first out). On Windows, where only a NIC
 //! miniport stamps and no loopback or virtual NIC does, and in simulation, a datagram is stamped when it
 //! is read.
@@ -187,16 +188,42 @@ pub struct Slot {
 }
 
 /// Receive buffers a driver lends whichever of its sockets it reads ([`Batched::receive_with`]):
-/// one batch of them for any number of sockets, where a socket that holds its own holds a batch
-/// each. [`Io::batch`] buffers of [`RECEIVE_BYTES`] on Linux and one elsewhere, and on Linux the
-/// headers of a receive.
+/// one set of them for any number of sockets, where a socket that holds its own holds a batch
+/// each.
+///
+/// On Linux one call takes a message into each buffer it is offered, so the ring holds as many
+/// buffers of [`RECEIVE_BYTES`] as its drains need ([`Ring::wants`]), from one up to
+/// [`Io::batch`]. A drain that took more messages than the ring holds (more than one call's worth)
+/// wants as many as it took. One that stopped with its last call full, the socket perhaps holding
+/// more ([`Queued::More`]), wants at least twice what the ring holds: a socket without the kernel's
+/// stamps takes one call a drain on Linux (its `FIONREAD` tells only the next datagram), so its
+/// backlog is found by doubling. Once the ring has served as many drains as it holds buffers, and
+/// the most any of them wanted is fewer, it wants that many; if they wanted just what it holds,
+/// it counts the next spell afresh. The headers of a whole batch are made with it. Its owner makes each change ([`Ring::resize`]) and charges what it adds. The ring then
+/// holds what its traffic needed. Before, it held a batch of 64 KiB buffers, resident and charged
+/// whether the endpoint received anything or not: 2 MiB for a client of one connection.
+///
+/// A change allocates or frees only the difference. A growth either makes again what a shrink
+/// freed, or takes the ring past any size it held before, which comes to less than its bound over
+/// its life. A shrink waits for as many drains as the ring holds, so it frees at most one buffer for
+/// each drain it waited for. Over its life the ring therefore allocates at most its bound plus one
+/// buffer a drain. Elsewhere a call takes one datagram, and the ring holds one buffer.
 pub struct Ring {
+    /// The most messages a receive into it takes ([`Io::batch`]).
     batch: usize,
+    /// The most buffers it holds: `batch` on Linux, one elsewhere.
+    bound: usize,
+    /// Its buffers, room for `bound` of them reserved as it is made, so that growing allocates
+    /// only the buffers; the first is the one it was made with.
     buffers: Vec<Vec<u8>>,
     #[cfg(target_os = "linux")]
     headers: linux::Headers,
     #[cfg(target_os = "linux")]
     received: Vec<linux::Received>,
+    /// The drains it served since its buffers last changed in number.
+    drains: usize,
+    /// The most buffers one of those drains wanted.
+    most: usize,
 }
 
 impl std::fmt::Debug for Ring {
@@ -204,54 +231,158 @@ impl std::fmt::Debug for Ring {
         f.debug_struct("Ring")
             .field("batch", &self.batch)
             .field("buffers", &self.buffers.len())
+            .field("drains", &self.drains)
+            .field("most", &self.most)
             .finish()
     }
 }
 
 impl Ring {
-    /// A ring for batches of `io`'s size. Refused `BadConfig` for a batch outside 1 to
-    /// [`MAX_BATCH`], and `Capacity` when its buffers cannot be reserved.
+    /// A ring for batches of `io`'s size, holding one buffer. Refused `BadConfig` for a batch
+    /// outside 1 to [`MAX_BATCH`], and `Capacity` when its buffer cannot be reserved.
     pub fn new(io: Io) -> Result<Self, RtError> {
         if io.batch == 0 || io.batch > MAX_BATCH {
             return Err(RtError::BadConfig {
                 what: "a datagram batch outside 1 to MAX_BATCH",
             });
         }
-        let count = if cfg!(target_os = "linux") {
-            io.batch
-        } else {
-            1
-        };
+        let bound = Self::bound_of(io);
         let mut buffers = Vec::new();
         buffers
-            .try_reserve_exact(count)
+            .try_reserve_exact(bound)
             .map_err(|_| RtError::Capacity {
                 what: "datagram receive buffers",
-                bound: count,
+                bound,
             })?;
-        for _ in 0..count {
-            buffers.push(zeroed(RECEIVE_BYTES)?);
-        }
+        buffers.push(zeroed(RECEIVE_BYTES)?);
         Ok(Self {
             batch: io.batch,
+            bound,
             buffers,
             #[cfg(target_os = "linux")]
             headers: linux::Headers::new(io.batch),
             #[cfg(target_os = "linux")]
             received: Vec::with_capacity(io.batch),
+            drains: 0,
+            most: 0,
         })
     }
 
-    /// The bytes it holds while it lives: what its owner charges for it.
-    pub fn held_bound(&self) -> usize {
+    /// The most buffers a ring for `io` holds.
+    fn bound_of(io: Io) -> usize {
+        if cfg!(target_os = "linux") {
+            io.batch.clamp(1, MAX_BATCH)
+        } else {
+            1
+        }
+    }
+
+    /// The bytes a ring for `io` holding `buffers` buffers holds (as many as it may, within one and
+    /// its bound): its buffers, the room for its bound of them, and on Linux the headers of a
+    /// batch. What its owner charges for it; a new ring holds one buffer.
+    pub fn bytes_for(io: Io, buffers: usize) -> usize {
+        let bound = Self::bound_of(io);
         #[cfg(target_os = "linux")]
-        let headers = linux::message_bytes().saturating_mul(self.batch);
+        let headers = linux::receive_message_bytes().saturating_mul(io.batch);
         #[cfg(not(target_os = "linux"))]
         let headers = 0;
-        self.buffers
-            .len()
+        buffers
+            .clamp(1, bound)
             .saturating_mul(RECEIVE_BYTES)
+            .saturating_add(bound.saturating_mul(size_of::<Vec<u8>>()))
             .saturating_add(headers)
+    }
+
+    /// The buffers it holds.
+    pub fn buffers(&self) -> usize {
+        self.buffers.len()
+    }
+
+    /// The bytes it holds now: [`Ring::bytes_for`] its buffers.
+    pub fn held_bytes(&self) -> usize {
+        let buffers = self.buffers.iter().fold(0usize, |held, buffer| {
+            held.saturating_add(buffer.capacity())
+        });
+        #[cfg(target_os = "linux")]
+        let headers = linux::receive_message_bytes().saturating_mul(self.batch);
+        #[cfg(not(target_os = "linux"))]
+        let headers = 0;
+        buffers
+            .saturating_add(self.buffers.capacity().saturating_mul(size_of::<Vec<u8>>()))
+            .saturating_add(headers)
+    }
+
+    /// The bytes it holds past the buffer it was made with: what it grew by, allocated as its owner
+    /// ran.
+    pub fn grown_bytes(&self) -> usize {
+        self.buffers.iter().skip(1).fold(0usize, |held, buffer| {
+            held.saturating_add(buffer.capacity())
+        })
+    }
+
+    /// The most it holds: [`Ring::bytes_for`] its bound.
+    pub fn held_bound(&self) -> usize {
+        Self::bytes_for(Io { batch: self.batch }, self.bound)
+    }
+
+    /// A drain through it took `messages` messages, one call of a batch at a time, and stopped
+    /// with the socket perhaps holding more (`more`, its last call full): it wanted as many buffers
+    /// as it took, and twice what the ring holds where it may have left some.
+    fn took(&mut self, messages: usize, more: bool) {
+        self.drains = self.drains.saturating_add(1);
+        let wanted = if more {
+            messages.max(self.buffers.len().saturating_mul(2))
+        } else {
+            messages
+        };
+        self.most = self.most.max(wanted);
+        // A spell of as many drains as it holds, which wanted just what it holds, ends and the
+        // next begins: what the drains to come want is theirs to say.
+        if self.drains >= self.buffers.len() && self.wants().is_none() {
+            self.keep();
+        }
+    }
+
+    /// The buffers it wants, where that is not what it holds: as many as the most a drain wanted
+    /// since it last changed, within one and its bound, once a drain wanted more than it holds, or
+    /// once it has served as many drains as it holds and none wanted as many.
+    pub fn wants(&self) -> Option<usize> {
+        let held = self.buffers.len();
+        let most = self.most.clamp(1, self.bound);
+        if most > held {
+            return Some(most);
+        }
+        (self.drains >= held && most < held).then_some(most)
+    }
+
+    /// Holds `buffers` buffers (within one and its bound): those it adds allocated and zeroed here,
+    /// fallibly, all of them or none (`Capacity`); those it lets go, the last it added. Either way
+    /// the drains it served are forgotten, and it wants nothing until those to come say so.
+    pub fn resize(&mut self, buffers: usize) -> Result<(), RtError> {
+        self.keep();
+        let buffers = buffers.clamp(1, self.bound);
+        let held = self.buffers.len();
+        if buffers <= held {
+            self.buffers.truncate(buffers);
+            return Ok(());
+        }
+        for _ in held..buffers {
+            match zeroed(RECEIVE_BYTES) {
+                Ok(buffer) => self.buffers.push(buffer),
+                Err(error) => {
+                    self.buffers.truncate(held);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps the buffers it holds as if it had just been resized to them: what it wanted, its
+    /// owner could not fund, and it asks again only once the drains to come want it again.
+    pub fn keep(&mut self) {
+        self.drains = 0;
+        self.most = 0;
     }
 }
 
@@ -490,10 +621,7 @@ impl Batched {
         let (mach, buffer_count) = {
             let mach = match raw {
                 Some(fd) if stamps && macos::enable_stamps(fd) => {
-                    let clock = macos::Clock::new().map_err(|error| RtError::DriverRefused {
-                        call: "mach_timebase_info",
-                        code: error.raw_os_error(),
-                    })?;
+                    let clock = macos::Clock::new()?;
                     stats.kernel_stamps = true;
                     Some(clock)
                 }
@@ -612,6 +740,24 @@ impl Batched {
         #[cfg(not(target_os = "linux"))]
         let headers = 0;
         buffers.saturating_add(slots).saturating_add(headers)
+    }
+
+    /// What a lent socket ([`Batched::lent`]) holds, bytes, as it is made and while it sends from
+    /// its owner's buffers: its outbox's one slot, empty, and on Linux the headers of a
+    /// one-message call.
+    pub fn lent_bytes() -> usize {
+        #[cfg(target_os = "linux")]
+        let headers = linux::message_bytes();
+        #[cfg(not(target_os = "linux"))]
+        let headers = 0;
+        size_of::<Slot>().saturating_add(headers)
+    }
+
+    /// Lets go of the socket's own receive buffers: from now on it receives into a ring its owner
+    /// lends it ([`Batched::receive_with`]), as a lent socket does, and its own `receive` is
+    /// refused. A socket handed to a driver holds nothing the driver's ring does not.
+    pub fn release_buffers(&mut self) {
+        self.buffers = Vec::new();
     }
 
     /// Queues a copy of `bytes` for `to`; with the outbox full it is dropped and counted, and `false`
@@ -883,6 +1029,13 @@ impl Batched {
         self.lend(ring);
         let received = self.receive_until_past(began_ns, calls, deliver);
         self.lend(ring);
+        // What the drain took tells the ring what one call should have offered, where one call
+        // takes a batch.
+        if self.one_call_takes_the_batch()
+            && let Ok((taken, ended)) = &received
+        {
+            ring.took(taken.messages, *ended == Queued::More);
+        }
         received
     }
 
@@ -1090,12 +1243,13 @@ impl Batched {
         let Some(taken) = taken else {
             return Ok(ReceiveStep::Skipped);
         };
-        // The stamps' clock first, then the shard's (as on Linux).
+        // The stamps' clock first, then the shard's (as on Linux). The stamp is in the kernel's ticks
+        // and the reading in the process's, which a translated process does not share (`macos`).
         let ticks_now = mach.now_ticks();
         let now_ns = shard_now()?;
         let stamp = taken
             .stamp
-            .map(|ticks| now_ns.saturating_sub(mach.ticks_ns(ticks_now.saturating_sub(ticks))));
+            .map(|ticks| now_ns.saturating_sub(mach.age_ns(ticks_now, ticks)));
         let arrived = arrival(&mut self.latest_ns, taken.from, stamp, now_ns);
         let Some(bytes) = buffer.get_mut(..taken.length) else {
             return Ok(ReceiveStep::Skipped);
@@ -1146,5 +1300,160 @@ impl Batched {
             }
             Outcome::NotNow => Ok(ReceiveStep::Empty),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ring for batches of `batch` that holds up to `bound` buffers, as one on Linux does, made
+    /// so on every platform: the rule its owner follows is the same wherever it grows.
+    fn bounded(batch: usize, bound: usize) -> Ring {
+        let mut ring = Ring::new(Io { batch }).unwrap();
+        ring.bound = bound;
+        ring
+    }
+
+    /// Do: a ring of one buffer, a drain of five messages, then one of twenty. Expect: it wants
+    /// what the first took, holds it once resized, and wants no more than its bound after the
+    /// second; what it holds is what `bytes_for` says a ring of that many holds, its growth past
+    /// the first buffer.
+    #[test]
+    fn a_ring_wants_what_a_drain_took_within_its_bound() {
+        let mut ring = bounded(8, 8);
+        assert_eq!((ring.buffers(), ring.wants()), (1, None));
+        assert_eq!(ring.grown_bytes(), 0);
+        ring.took(5, false);
+        assert_eq!(ring.wants(), Some(5));
+        ring.resize(5).unwrap();
+        assert_eq!((ring.buffers(), ring.wants()), (5, None));
+        assert_eq!(ring.grown_bytes(), 4 * RECEIVE_BYTES);
+        if cfg!(target_os = "linux") {
+            assert_eq!(ring.held_bytes(), Ring::bytes_for(Io { batch: 8 }, 5));
+        }
+        ring.took(20, false);
+        assert_eq!(ring.wants(), Some(8), "never past its bound");
+    }
+
+    /// Do: a ring of four buffers serves drains of two, two, two and one. Expect: it wants nothing
+    /// until it has served four, then the most any took; resized, it lets go of the buffers it added
+    /// last and keeps the one it was made with.
+    #[test]
+    fn a_ring_shrinks_to_the_most_once_it_served_as_many_drains_as_it_holds() {
+        let mut ring = bounded(8, 8);
+        let first = ring.buffers[0].as_ptr();
+        ring.resize(4).unwrap();
+        for _ in 0..3 {
+            ring.took(2, false);
+            assert_eq!(ring.wants(), None, "{ring:?}");
+        }
+        ring.took(1, false);
+        assert_eq!(ring.wants(), Some(2));
+        ring.resize(2).unwrap();
+        assert_eq!((ring.buffers(), ring.grown_bytes()), (2, RECEIVE_BYTES));
+        assert_eq!(ring.buffers[0].as_ptr(), first, "its first buffer stays");
+        ring.took(0, false);
+        ring.took(0, false);
+        assert_eq!(ring.wants(), Some(1), "never below one");
+        ring.resize(1).unwrap();
+        assert_eq!(
+            (ring.buffers(), ring.grown_bytes(), ring.wants()),
+            (1, 0, None)
+        );
+    }
+
+    /// Do: a ring of four buffers serves four drains that each fill it, then four that take one.
+    /// Expect: the first spell wants nothing and ends, and the next, quiet, wants one buffer: a
+    /// spell that needed the whole ring does not hold it for good.
+    #[test]
+    fn a_spell_that_wanted_the_whole_ring_ends_and_a_quiet_one_shrinks_it() {
+        let mut ring = bounded(8, 8);
+        ring.resize(4).unwrap();
+        for _ in 0..4 {
+            ring.took(4, false);
+            assert_eq!(ring.wants(), None, "{ring:?}");
+        }
+        for _ in 0..3 {
+            ring.took(1, false);
+            assert_eq!(ring.wants(), None, "{ring:?}");
+        }
+        ring.took(1, false);
+        assert_eq!(ring.wants(), Some(1));
+    }
+
+    /// Do: drains of a ring of one buffer that each stopped with their last call full (a socket
+    /// without the kernel's stamps takes one call a drain), the ring resized each time. Expect: it
+    /// doubles each time, to its bound.
+    #[test]
+    fn a_drain_that_left_more_doubles_the_ring() {
+        let mut ring = bounded(8, 8);
+        for (took, wanted) in [(1, 2), (2, 4), (4, 8)] {
+            ring.took(took, true);
+            assert_eq!(ring.wants(), Some(wanted));
+            ring.resize(wanted).unwrap();
+        }
+        ring.took(8, true);
+        assert_eq!(ring.wants(), None, "never past its bound");
+    }
+
+    /// Do: a ring wants more after a drain, and is kept as it is. Expect: it wants nothing until a
+    /// drain to come wants more again.
+    #[test]
+    fn a_ring_kept_asks_again_only_once_a_drain_wants_more() {
+        let mut ring = bounded(8, 8);
+        ring.took(5, false);
+        ring.keep();
+        assert_eq!((ring.buffers(), ring.wants()), (1, None));
+        ring.took(1, false);
+        assert_eq!(ring.wants(), None);
+        ring.took(3, false);
+        assert_eq!(ring.wants(), Some(3));
+    }
+
+    /// Do: 100,000 drains of a seeded mix of quiet spells, bursts and drains that stopped with
+    /// more to take, the ring resized each time it wants. Expect: the buffers its growths allocate
+    /// come to at most its bound and one a drain (the type's doc), it never holds fewer than one
+    /// buffer or more than its bound, and a drain that took more than it held finds it grown.
+    #[test]
+    fn a_ring_allocates_at_most_a_buffer_a_drain() {
+        const BOUND: usize = 32;
+        const DRAINS: u64 = 100_000;
+        let mut ring = bounded(BOUND, BOUND);
+        // xorshift64*: a seeded sequence, the same on every run.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let mut allocated = 0u64;
+        for drain in 0..DRAINS {
+            // Spells of quiet drains (none to two messages) between bursts of up to twice the bound.
+            let messages = if next() % 64 == 0 {
+                (next() % (2 * BOUND as u64)) as usize
+            } else {
+                (next() % 3) as usize
+            };
+            let more = next() % 16 == 0;
+            ring.took(messages, more);
+            if let Some(wanted) = ring.wants() {
+                let held = ring.buffers();
+                ring.resize(wanted).unwrap();
+                if wanted > held {
+                    allocated += (wanted - held) as u64;
+                }
+            }
+            assert!((1..=BOUND).contains(&ring.buffers()));
+            assert!(
+                ring.buffers() >= messages.min(BOUND),
+                "drain {drain}: took {messages} into {ring:?}"
+            );
+        }
+        assert!(
+            allocated <= DRAINS + BOUND as u64,
+            "{allocated} buffers allocated over {DRAINS} drains"
+        );
     }
 }

@@ -6,6 +6,9 @@
 //! Evidence and the failing cross-process history: docs/bugs/2026-09-17-heartbeats-use-different-clock-origins.md.
 #![allow(unsafe_code)]
 
+#[cfg(target_os = "macos")]
+use crate::error::RtError;
+
 /// Monotonic nanoseconds in this host's boot/time namespace, shared across process restarts.
 #[cfg(unix)]
 pub fn monotonic_ns() -> u64 {
@@ -75,7 +78,11 @@ pub fn monotonic_ns() -> u64 {
 /// resident get path (`benchmark-results/mantle-resident-reads-smoke-20261010/reads3m-sample.txt`).
 /// Elsewhere [`monotonic_ns`]'s clocks are already the cheap ones (Linux's vDSO `CLOCK_BOOTTIME`, Windows'
 /// interrupt time) and this is that clock. Its readings are the host's on every OS but, on macOS, not
-/// [`monotonic_ns`]'s: the two are never compared.
+/// [`monotonic_ns`]'s: the two are never compared. A process Rosetta 2 translates reads its continuous time
+/// translated, nanoseconds at a timebase of 1/1, and it counts as a native process's does: read beside one
+/// on the M5 Max (2026-10-20), both stood 1,587.183436 s past `mach_absolute_time`, the time the host had
+/// slept, and agreed with `CLOCK_MONOTONIC_RAW` to the microsecond. The process's own clock and its own
+/// timebase, it takes no kernel rate ([`MachTicks`]).
 #[cfg(target_os = "macos")]
 pub fn shard_clock_ns() -> u64 {
     match continuous_scale() {
@@ -258,6 +265,166 @@ fn continuous_scale() -> Option<u64> {
     })
 }
 
+/// Format: nanoseconds in a second (SI units), the unit `hw.tbfrequency` counts ticks in.
+#[cfg(any(target_os = "macos", test))]
+const SECOND_NS: u64 = 1_000_000_000;
+
+/// macOS's two tick counts (docs/runtime.md §5.1, "Kernel receive stamps"). This process's own clocks,
+/// `mach_absolute_time` and `mach_continuous_time`, count ticks of its timebase, `numer / denom` nanoseconds
+/// (`mach_timebase_info`). What the kernel takes on its own clock and hands over counts the kernel's ticks,
+/// `hw.tbfrequency` a second: a datagram's receive stamp (`SCM_TIMESTAMP_MONOTONIC`, the kernel's
+/// `mach_absolute_time()` in `ip_savecontrol`, bsd/netinet/ip_input.c lines 3448-3457 at
+/// apple-oss-distributions/xnu xnu-12377.121.6; `ip6_savecontrol_v4`, bsd/netinet6/ip6_input.c lines
+/// 1874-1883) and a thread's run time (`thread_selfusage`, bsd/kern/kern_resource.c lines 3606-3613,
+/// `recount_current_thread_time_mach`). XNU derives the timebase from that frequency: `timebase_callback`
+/// sets `numer / denom` to 10⁹ over the frequency in lowest terms (osfmk/arm/rtclock.c lines 118-137),
+/// given `timebase_frequency_hz` (pexpert/arm/pe_init.c lines 598-599), the value `hw.tbfrequency` reads
+/// (bsd/kern/kern_mib.c lines 683-689, 986); on Intel the frequency is 10⁹
+/// (pexpert/i386/pe_identify_machine.c line 47) and the timebase 1/1 (osfmk/i386/rtclock.c lines 410-414).
+/// So for a native process the two are one counter. A process Rosetta 2 translates is shown a timebase of
+/// 1/1 and its own clocks in nanoseconds, since "the value returned by the mach_absolute_time function is
+/// different for native and translated processes" (Apple, "Addressing architectural differences in your
+/// macOS code", "Apply Timebase Information to Mach Absolute Time Values"), while the kernel's values stay
+/// in the hardware's ticks, 24 MHz on Apple silicon: there a kernel tick is 125/3 of the process's.
+/// Measured on the M5 Max (macOS 26.4.1, 2026-10-20; docs/research/timing.md, "Rosetta 2 and the kernel's
+/// ticks"): an x86_64 process reads a timebase of 1/1 and `hw.tbfrequency` 24,000,000, and the stamp of a
+/// datagram it sent itself is 1/41.667 of the `mach_absolute_time` read around it.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MachTicks {
+    /// A tick of this process's: `numer / denom` nanoseconds, neither zero (`mach_timebase_info`'s
+    /// two `uint32_t`s).
+    numer: u32,
+    /// See `numer`.
+    denom: u32,
+    /// A tick of the kernel's in this process's ticks, `up / down`: 10⁹ · `denom` over `hw.tbfrequency` ·
+    /// `numer`. `None` where that is one, the two counters one (a native process).
+    kernel: Option<(u64, u64)>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MachTicks {
+    /// The process's timebase, `numer / denom` nanoseconds a tick, and the kernel's `hz` ticks a second;
+    /// `None` when any of them is zero, or when `hz` · `numer` passes 2⁶⁴, which no host comes near (Apple
+    /// silicon's is 24 MHz · 125 natively, 24 MHz · 1 translated; Intel's 10⁹ · 1).
+    pub fn new(numer: u32, denom: u32, hz: u64) -> Option<MachTicks> {
+        if numer == 0 || denom == 0 || hz == 0 {
+            return None;
+        }
+        // At most 10⁹ · 2³², under 2⁶².
+        let up = SECOND_NS.checked_mul(u64::from(denom))?;
+        let down = hz.checked_mul(u64::from(numer))?;
+        Some(MachTicks {
+            numer,
+            denom,
+            kernel: (up != down).then_some((up, down)),
+        })
+    }
+
+    /// `ticks` of this process's clocks as nanoseconds: × `numer` / `denom`, rounded down, in 128 bits so it
+    /// cannot overflow before the division; past `u64`, `u64::MAX`.
+    pub fn ns(&self, ticks: u64) -> u64 {
+        u128::from(ticks)
+            .checked_mul(u128::from(self.numer))
+            .and_then(|scaled| scaled.checked_div(u128::from(self.denom)))
+            .and_then(|ns| u64::try_from(ns).ok())
+            .unwrap_or(u64::MAX)
+    }
+
+    /// `ticks` of the kernel's as this process's: the same count where the two are one counter, else
+    /// × `up` / `down`, rounded down; a count of at most 2⁶⁴ by an `up` under 2⁶² cannot overflow 128 bits;
+    /// past `u64`, `u64::MAX`.
+    pub fn of_kernel(&self, ticks: u64) -> u64 {
+        match self.kernel {
+            None => ticks,
+            Some((up, down)) => u128::from(ticks)
+                .checked_mul(u128::from(up))
+                .and_then(|scaled| scaled.checked_div(u128::from(down)))
+                .and_then(|ticks| u64::try_from(ticks).ok())
+                .unwrap_or(u64::MAX),
+        }
+    }
+
+    /// How long before this process's `now` ticks the kernel took a value at its `then` ticks, nanoseconds;
+    /// zero for one taken after `now`. The kernel's ticks are carried into the process's first and the
+    /// difference converted once, so a native process, whose counters are one, gets the age it got from
+    /// `ns(now - then)` to the bit: nanoseconds worked out for each and subtracted could differ from it by
+    /// one, each rounded down on its own.
+    pub fn age_ns(&self, now: u64, then: u64) -> u64 {
+        self.ns(now.saturating_sub(self.of_kernel(then)))
+    }
+
+    /// Nanoseconds a library worked out from the kernel's ticks at this process's timebase, at the kernel's
+    /// rate instead. libc's `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` is `__thread_selfusage()`, the kernel's
+    /// ticks, × `numer` / `denom` (gen/clock_gettime.c lines 105-135 at apple-oss-distributions/Libc
+    /// Libc-1752.120.2), so a translated process is told its thread ran 3/125 of what it ran (measured: 1.4 ms
+    /// where `getrusage` and `thread_info` said 57.4). The correction is the factor [`MachTicks::of_kernel`]
+    /// carries a count by, a kernel tick's nanoseconds over a process tick's; one for a native process, which
+    /// keeps libc's reading to the bit.
+    pub fn at_kernel_rate(&self, ns: u64) -> u64 {
+        self.of_kernel(ns)
+    }
+}
+
+/// This host's two tick counts ([`MachTicks`]): the timebase and `hw.tbfrequency`, read once for the
+/// process's life. Refused when either call is, or a rate is zero.
+#[cfg(target_os = "macos")]
+pub fn mach_ticks() -> Result<MachTicks, RtError> {
+    static TICKS: std::sync::OnceLock<Result<MachTicks, RtError>> = std::sync::OnceLock::new();
+    TICKS.get_or_init(read_mach_ticks).clone()
+}
+
+#[cfg(target_os = "macos")]
+#[expect(
+    deprecated,
+    reason = "libc deprecates its Mach declarations in favour of the mach2 crate, which is not a \
+              dependency; the declarations themselves are unchanged in libc (as in `udp::macos`)"
+)]
+fn read_mach_ticks() -> Result<MachTicks, RtError> {
+    /// The call that reads the kernel's tick rate, as a refusal names it.
+    const TBFREQUENCY: &str = "sysctlbyname(hw.tbfrequency)";
+    let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+    // SAFETY: the call writes the two `u32` fields of this frame's own value, live and exclusive for the
+    // call, and returns its status, checked before the value is read.
+    let status = unsafe { libc::mach_timebase_info(&raw mut info) };
+    if status != libc::KERN_SUCCESS {
+        return Err(RtError::DriverRefused {
+            call: "mach_timebase_info",
+            code: Some(status),
+        });
+    }
+    let mut hz: u64 = 0;
+    let mut length = size_of::<u64>();
+    // SAFETY: the name is NUL-terminated; the out pointer and its length name one live local `u64`, the
+    // sysctl's type (`CTLTYPE_QUAD`, bsd/kern/kern_mib.c line 986); no new value is written.
+    let outcome = unsafe {
+        libc::sysctlbyname(
+            c"hw.tbfrequency".as_ptr(),
+            (&raw mut hz).cast::<libc::c_void>(),
+            &raw mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if outcome != 0 {
+        return Err(RtError::os(TBFREQUENCY));
+    }
+    if length != size_of::<u64>() {
+        return Err(RtError::DriverRefused {
+            call: TBFREQUENCY,
+            code: None,
+        });
+    }
+    MachTicks::new(info.numer, info.denom, hz).ok_or(RtError::DriverRefused {
+        call: if hz == 0 {
+            TBFREQUENCY
+        } else {
+            "mach_timebase_info"
+        },
+        code: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +441,152 @@ mod tests {
         assert_eq!(ticks_to_ns(123_456_789, intel), 123_456_789);
         assert_eq!(scale_of(0, 1), None);
         assert_eq!(scale_of(1, 0), None);
+    }
+
+    /// Apple silicon's rates: a native process's timebase is 125/3 and a translated one's 1/1, the kernel's
+    /// 24 MHz either way (both read on the M5 Max, 2026-10-20); Intel's 1/1 against 10⁹.
+    const KERNEL_HZ: u64 = 24_000_000;
+
+    /// Instants and spans the sweeps below take, in the kernel's ticks: the edges, a tick's neighbours, the
+    /// M5 Max's uptime when the stamp was measured (28,155,671,796,901 ticks, 13.6 days), and a splitmix64
+    /// sequence over the whole range from a fixed seed.
+    fn instants() -> Vec<u64> {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let mut instants = vec![
+            0,
+            1,
+            2,
+            3,
+            4,
+            23_999_999,
+            24_000_000,
+            28_155_671_796_901,
+            u64::MAX,
+        ];
+        instants.extend((0..2_000).map(|_| next()));
+        instants.extend((0..2_000).map(|_| next() >> 20));
+        instants
+    }
+
+    /// The age a stamp got before the kernel's rate was read: the process's timebase on the difference.
+    fn age_before(numer: u128, denom: u128, now: u64, then: u64) -> u64 {
+        u64::try_from(u128::from(now.saturating_sub(then)) * numer / denom).unwrap_or(u64::MAX)
+    }
+
+    /// A native process, whose timebase is the kernel's (125/3 against 24 MHz; 1/1 against 10⁹ on Intel),
+    /// takes the kernel's ticks as its own: a stamp's age, a library's reading and a count are what they
+    /// were before the kernel's rate was read, to the bit.
+    #[test]
+    fn a_native_process_reads_the_kernels_ticks_as_its_own() {
+        for (numer, denom, hz) in [(125, 3, KERNEL_HZ), (1, 1, 1_000_000_000)] {
+            let ticks = MachTicks::new(numer, denom, hz).unwrap();
+            let instants = instants();
+            for (&now, &then) in instants.iter().zip(instants.iter().rev()) {
+                assert_eq!(ticks.of_kernel(now), now);
+                assert_eq!(ticks.at_kernel_rate(now), now);
+                assert_eq!(
+                    ticks.age_ns(now, then),
+                    age_before(u128::from(numer), u128::from(denom), now, then),
+                    "{numer}/{denom} against {hz} Hz, now {now} then {then}"
+                );
+            }
+        }
+    }
+
+    /// A translated process is shown a timebase of 1/1 and its own clock in nanoseconds, the kernel's 24 MHz
+    /// tick scaled by 125/3 (the measured stamp, 28,155,671,796,901 ticks, lay between the process's readings
+    /// 1,173,152,991,501,583 and 1,173,152,991,549,999 ns around it): the kernel's ticks are carried into its
+    /// own at 125/3, and a library's nanoseconds worked out at 1/1 are restated at it.
+    #[test]
+    fn a_translated_process_carries_the_kernels_ticks_into_its_own() {
+        let translated = MachTicks::new(1, 1, KERNEL_HZ).unwrap();
+        assert_eq!(translated.of_kernel(3), 125);
+        assert_eq!(translated.of_kernel(1), 41);
+        assert_eq!(translated.of_kernel(KERNEL_HZ), 1_000_000_000);
+        let stamp = translated.of_kernel(28_155_671_796_901);
+        assert!(
+            (1_173_152_991_501_583..=1_173_152_991_549_999).contains(&stamp),
+            "{stamp}"
+        );
+        assert_eq!(
+            translated.of_kernel(u64::MAX),
+            u64::MAX,
+            "saturates past u64"
+        );
+        // The thread's time libc gave the translated probe, 1,377,054 ticks read as nanoseconds.
+        assert_eq!(translated.at_kernel_rate(1_377_054), 57_377_250);
+        assert_eq!(
+            translated.age_ns(5, 1_000),
+            0,
+            "a stamp after now has no age"
+        );
+    }
+
+    /// The same instant, a stamp's age read by a native process and by a translated one: the native age is
+    /// the span in the kernel's ticks at 125/3, rounded down; the translated one is its own clock (Rosetta's
+    /// 125/3 of the kernel's, rounded down) less the stamp carried in (rounded down), so at most the
+    /// nanosecond one more rounding takes past it.
+    #[test]
+    fn a_translated_process_and_a_native_one_read_one_age() {
+        let native = MachTicks::new(125, 3, KERNEL_HZ).unwrap();
+        let translated = MachTicks::new(1, 1, KERNEL_HZ).unwrap();
+        let rosetta = |kernel_ticks: u64| {
+            u64::try_from(u128::from(kernel_ticks) * 125 / 3).unwrap_or(u64::MAX)
+        };
+        let instants = instants();
+        for (&a, &b) in instants.iter().zip(instants.iter().rev()) {
+            // Only instants whose translated readings fit a u64, as a host's uptime does for 14,000 years.
+            let (now, then) = (a.max(b) >> 6, a.min(b) >> 6);
+            let read_natively = native.age_ns(now, then);
+            let read_translated = translated.age_ns(rosetta(now), then);
+            assert!(
+                read_natively <= read_translated && read_translated <= read_natively + 1,
+                "now {now} then {then}: native {read_natively}, translated {read_translated}"
+            );
+        }
+    }
+
+    /// A zero rate, the kernel's or either half of the timebase, has no reading.
+    #[test]
+    fn a_zero_rate_has_no_ticks() {
+        assert_eq!(MachTicks::new(0, 3, KERNEL_HZ), None);
+        assert_eq!(MachTicks::new(125, 0, KERNEL_HZ), None);
+        assert_eq!(MachTicks::new(125, 3, 0), None);
+    }
+
+    /// This host's two rates as this process reads them: one counter where the process runs natively, and
+    /// where Rosetta 2 translates it (`sysctl.proc_translated` 1; the name is absent on an Intel Mac) a
+    /// kernel tick of 125/3 of its own, Apple silicon's 24 MHz against its 1/1.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_hosts_ticks_are_this_process_s() {
+        let mut translated: libc::c_int = 0;
+        let mut length = size_of::<libc::c_int>();
+        // SAFETY: the name is NUL-terminated; the out pointer and its length name one live local `int`, the
+        // sysctl's type; no new value is written. A missing name fails the call and leaves the zero.
+        let outcome = unsafe {
+            libc::sysctlbyname(
+                c"sysctl.proc_translated".as_ptr(),
+                (&raw mut translated).cast::<libc::c_void>(),
+                &raw mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        let translated = outcome == 0 && translated == 1;
+        let ticks = mach_ticks().unwrap();
+        if translated {
+            assert_eq!(ticks.of_kernel(3), 125, "{ticks:?}");
+        } else {
+            assert_eq!(ticks.of_kernel(1_000_003), 1_000_003, "{ticks:?}");
+        }
     }
 
     /// The carried clock by use: a reading is the base plus the ticks since at the scale, exactly, and a

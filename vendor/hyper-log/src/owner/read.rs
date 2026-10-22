@@ -11,7 +11,7 @@ use crate::device::{Job, Reads, Run, Wanted};
 use crate::state::Group;
 use crate::stats::{self, LogStats};
 use crate::ticket::{Answer, Ticket};
-use crate::{Fetched, LogError, Proposal, View};
+use crate::{Fetched, LogError, Page, Proposal, View};
 
 /// What a caller asks of the log's state.
 pub(crate) enum Query {
@@ -22,7 +22,7 @@ pub(crate) enum Query {
         group: u128,
         low: u64,
         high: u64,
-        max_bytes: u64,
+        page: Page,
         into: Fetched,
     },
     Flushed,
@@ -53,10 +53,10 @@ impl<F: BlockFile + 'static> Owner<F> {
                 group,
                 low,
                 high,
-                max_bytes,
+                page,
                 into,
             } => {
-                self.fetch(group, (low, high, max_bytes), into, ticket);
+                self.fetch(group, (low, high, page), into, ticket);
                 return;
             }
             Query::Flushed => Ok(Answer::Flushed(self.schedule.frames, self.schedule.updates)),
@@ -135,15 +135,14 @@ impl<F: BlockFile + 'static> Owner<F> {
         g.term(index).ok_or(LogError::Unavailable { group, index })
     }
 
-    /// The entries of `[low, high)`, as many as `max_bytes` of payload admit and one at least:
-    /// those in memory copied into the caller's reservation at once, those no longer in memory
-    /// read from the file on the device, a run whose blocks touch in one read, as an update's
-    /// entries lie together in its frame and a replica catching up asks for runs of them (mantle
-    /// audit P07).
+    /// The entries of `[low, high)`, as many as the page admits and one at least: those in
+    /// memory copied into the caller's reservation at once, those no longer in memory read from
+    /// the file on the device, a run whose blocks touch in one read, as an update's entries lie
+    /// together in its frame and a replica catching up asks for runs of them (mantle audit P07).
     fn fetch(
         &mut self,
         group: u128,
-        range: (u64, u64, u64),
+        range: (u64, u64, Page),
         mut into: Fetched,
         mut ticket: Ticket,
     ) {
@@ -183,11 +182,12 @@ impl<F: BlockFile + 'static> Owner<F> {
     }
 
     /// What to read of `[low, high)`: entries in memory go into `into` now, the others leave a
-    /// place there and are grouped into runs whose blocks touch.
+    /// place there and are grouped into runs whose blocks touch. The page is chosen by each
+    /// entry's payload as the group's slot holds it, before anything is copied or read.
     fn plan(
         &self,
         group: u128,
-        (low, high, max_bytes): (u64, u64, u64),
+        (low, high, page): (u64, u64, Page),
         into: &mut Fetched,
         reads: &mut Reads,
     ) -> Result<(), LogError> {
@@ -205,8 +205,8 @@ impl<F: BlockFile + 'static> Owner<F> {
             let slot = g
                 .slot(index)
                 .ok_or(LogError::Unavailable { group, index })?;
-            total = total.saturating_add(u64::from(slot.len));
-            if !into.is_empty() && total > max_bytes {
+            total = total.saturating_add(page.count(u64::from(slot.len)));
+            if !into.is_empty() && total > page.max_bytes {
                 break;
             }
             plan_one(g, index, (self.p.align, self.p.tag), into, reads)

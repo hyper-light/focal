@@ -450,3 +450,22 @@ start is the log's.
   `a_group_stopped_with_its_compaction_out_opens_again_at_once` (`tests/hyperlog.rs`) is focal's case
   whole: a replica dropped with its compaction out and opened again at once, 16 seeds, failing
   `Core(Storage(Compacted))` without the change.
+
+## A fetch counts each entry in its caller's measure (2026-10-19)
+
+- **The defect.** A fetch took as many entries as `max_bytes` of payload admit, the bytes the log
+  holds of each. hyper-durable's store bounds its pages by what an entry takes in a Raft message,
+  20 bytes more than the payload it stores (the term, the index and two lengths the log keeps
+  outside it), so the page it was given ran past the core's bound, which takes a page its storage cut
+  as whole. Found by mantle: an append read from the store was 1,553 bytes where
+  `max_size_per_msg` was 1,024, refused by its transport on every retry (hyper-durable's
+  `ORIGIN.md`, the same date).
+- **The change.** `Log::fetch`, `Log::fetch_waking` and `GroupLog::fetch` take a `Page`: its bytes,
+  and a part each entry is counted at beside its payload, counted where the page is chosen, by the
+  handle from its memory and by the owner from the group's slots, so nothing the page drops is
+  copied or read. `Log::entries` and `GroupLog::entries` count the payload alone, as before
+  (`Page::payload`).
+- **Tests** (`tests/group.rs`): `a_fetch_counts_each_entry_at_its_payload_and_the_pages_part_for_each`
+  (every bound a page turns at, with no part, a part of 25 and one of 1,000, from the handle's memory
+  and from the log's file), and `a_handle_reads_as_the_log_does` holds the handle's fetches to the
+  log's with a part for each entry too; each fails with either count leaving the part out.

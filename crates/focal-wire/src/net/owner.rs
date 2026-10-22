@@ -190,6 +190,10 @@ pub struct NetStats {
     /// connection has a socket of its own, which takes its peer's datagrams (those of peers
     /// gone included, so no count goes back).
     pub io: hyper_rt::udp::IoStats,
+    /// The receive ring every socket of the endpoint is lent: the buffers it holds, as many as its
+    /// drains have needed, and what of its growth the budget is charged (hyper-raft
+    /// docs/transport.md §4aa).
+    pub ring: hyper_rt_transport::RingStats,
 }
 
 /// What a handle asks of the owner.
@@ -813,6 +817,7 @@ impl Owner {
             endpoint: endpoint.stats(),
             budget: endpoint.budget().stats(),
             io: self.driver.stats().plus(&self.driver.peer_stats()),
+            ring: self.driver.ring(),
             ..self.stats
         }
     }

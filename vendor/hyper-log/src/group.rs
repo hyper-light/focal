@@ -35,7 +35,9 @@ use crate::room::GROUP_SUBMISSIONS;
 use crate::state::resolves;
 use crate::ticket::{self, Answer, Waiting};
 use crate::writer::{self, Submission};
-use crate::{Class, Entries, Entry, Fetched, LogError, Marks, Params, Proposal, Update, View};
+use crate::{
+    Class, Entries, Entry, Fetched, LogError, Marks, Page, Params, Proposal, Update, View,
+};
 
 /// Writes a handle keeps out at most: the group's own room in the log's queue and the waiters
 /// it may have beyond it (`room.rs`), past which the log would refuse it `Busy` too.
@@ -637,13 +639,13 @@ impl<F: BlockFile + 'static> GroupLog<F> {
         &self,
         low: u64,
         high: u64,
-        max_bytes: u64,
+        page: Page,
         mut into: Fetched,
     ) -> Result<Fetched, LogError> {
         let group = self.group;
         let m = &self.mirror;
         if self.stale {
-            return self.fetch_from_log(low, high, max_bytes, into);
+            return self.fetch_from_log(low, high, page, into);
         }
         if !m.exists {
             return Err(LogError::Unavailable { group, index: low });
@@ -654,7 +656,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
         }
         // Entries older than the cache are read from the file, through the log.
         if low < m.cache_from && low <= m.last && low < high {
-            return self.fetch_from_log(low, high, max_bytes, into);
+            return self.fetch_from_log(low, high, page, into);
         }
         into.clear();
         let mut total = 0u64;
@@ -665,8 +667,8 @@ impl<F: BlockFile + 'static> GroupLog<F> {
                 .and_then(|at| m.cache.get(at))
                 .filter(|_| index <= m.last)
                 .ok_or(LogError::Unavailable { group, index })?;
-            total = total.saturating_add(len(bytes));
-            if !into.is_empty() && total > max_bytes {
+            total = total.saturating_add(page.count(len(bytes)));
+            if !into.is_empty() && total > page.max_bytes {
                 break;
             }
             let term = m.term_of(index).ok_or(LogError::Corrupt { group, index })?;
@@ -679,14 +681,14 @@ impl<F: BlockFile + 'static> GroupLog<F> {
         &self,
         low: u64,
         high: u64,
-        max_bytes: u64,
+        page: Page,
         into: Fetched,
     ) -> Result<Fetched, LogError> {
         let query = Query::Entries {
             group: self.group,
             low,
             high,
-            max_bytes,
+            page,
             into,
         };
         match self.ask(query)? {
@@ -695,9 +697,10 @@ impl<F: BlockFile + 'static> GroupLog<F> {
         }
     }
 
-    /// The entries of `[low, high)` as [`GroupLog::fetch`] gives them, copied out.
+    /// The entries of `[low, high)`, as many as `max_bytes` of payload admit and one at least,
+    /// as [`GroupLog::fetch`] gives them, copied out.
     pub fn entries(&self, low: u64, high: u64, max_bytes: u64) -> Result<Vec<Entry>, LogError> {
-        let fetched = self.fetch(low, high, max_bytes, Fetched::new())?;
+        let fetched = self.fetch(low, high, Page::payload(max_bytes), Fetched::new())?;
         Ok(fetched
             .iter()
             .map(|(term, bytes)| Entry {

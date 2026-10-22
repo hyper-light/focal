@@ -27,6 +27,15 @@
 //! the kernel segments (`UDP_SEGMENT`), so a peer's bulk leaves, and arrives through `UDP_GRO`, as
 //! a few large messages, where it left a datagram a slot of a two-slot outbox (quinn's driver and
 //! `quinn-udp` send a connection's batch so; measured in `docs/transport.md` §4h).
+//!
+//! **A ring of what its drains need.** The ring starts at one buffer and holds as many as the
+//! drains through it took messages (hyper-rt's `Ring::wants`), up to the batch. The driver makes
+//! each change after a turn's drains and charges what the ring grows by to the endpoint's budget,
+//! giving it back as the ring shrinks. A growth the budget or the allocator refuses leaves the ring
+//! as it was, and its sockets take what they hold in more calls. What a driver holds as it is made
+//! ([`least_bytes`]) is its owner's to charge. Before, every ring held a batch of 64 KiB buffers,
+//! resident and charged from the start: 2 MiB for a client of one connection on Linux
+//! (`docs/transport.md` §4aa).
 
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
@@ -37,8 +46,10 @@ use std::time::{Duration, Instant};
 use hyper_rt::RtError;
 use hyper_rt::futures::{Sleep, sleep};
 use hyper_rt::readiness::{Member, Ready, ReadyGroup};
-use hyper_rt::udp::{Batched, Io, IoStats, MAX_BATCH, QueueCharge, Queued, Ring, UdpSocket};
-use hyper_transport::{Account, SocketCharge};
+use hyper_rt::udp::{
+    Batched, Io, IoStats, MAX_BATCH, QueueCharge, Queued, RECEIVE_BYTES, Ring, UdpSocket,
+};
+use hyper_transport::{Account, Reservation, SocketCharge};
 use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, Lateness, PeerId};
 
 /// Derived: the turns one poll of [`Driver::event`] takes before it yields to the shard, the bound
@@ -107,6 +118,31 @@ impl Rooms {
             self.unmeasured = self.unmeasured.saturating_add(1);
         }
     }
+}
+
+/// What a driver for sockets batched by `io` holds for them as it is made, bytes: its ring of one
+/// buffer (hyper-rt's `Ring::bytes_for`) and its listener's socket, lent (`Batched::lent_bytes`).
+/// Its owner charges this; what the ring grows by, the driver charges to the endpoint's budget as
+/// it grows ([`Driver::ring`]).
+pub fn least_bytes(io: Io) -> usize {
+    Ring::bytes_for(io, 1).saturating_add(Batched::lent_bytes())
+}
+
+/// A driver's receive ring ([`Driver::ring`]): what it holds and how it came to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RingStats {
+    /// The buffers it holds now.
+    pub buffers: usize,
+    /// The bytes it holds now.
+    pub bytes: usize,
+    /// The bytes of its growth the endpoint's budget is charged now.
+    pub charged: u64,
+    /// Changes that added buffers.
+    pub grown: u64,
+    /// Changes that let buffers go.
+    pub shrunk: u64,
+    /// Growths the budget or the allocator refused.
+    pub refused: u64,
 }
 
 /// A socket connected to one of the endpoint's peers, sharing the listener's port.
@@ -181,6 +217,10 @@ pub struct Driver<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>>
     outgoing: Vec<u8>,
     /// The receive buffers every socket is lent as it is read.
     ring: Ring,
+    /// What the ring grew by past its first buffer, charged to the endpoint's budget.
+    ring_charge: Reservation,
+    /// The ring's changes: grown, shrunk, refused.
+    ring_changes: (u64, u64, u64),
     /// Whether the listener may hold datagrams: its readiness fired, or its last drain left some.
     listener_ready: bool,
     /// Polls that spent their turns with work still to do and woke their task to come back.
@@ -215,15 +255,16 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         }
     }
 
-    /// A driver for `endpoint` on `socket`, whose sockets receive into a ring of `socket`'s batch.
-    /// A socket bound with its port shared ([`UdpSocket::bind_shared`]) shares it with a socket for
-    /// each peer, as [`Driver::bind`] does: a caller that holds its port from the moment it learns it
-    /// (an adopted socket, a supervisor's) loses no peer's queue of its own by handing the socket
-    /// over. Called on a shard thread.
-    pub fn new(endpoint: Endpoint<C, B, D>, socket: Batched) -> Result<Self, RtError> {
-        let ring = Ring::new(Io {
-            batch: socket.batch(),
-        })?;
+    /// A driver for `endpoint` on `socket`, whose sockets receive into a ring of `io`'s batch: the
+    /// socket's own receive buffers, if it holds any, are let go (`Batched::release_buffers`), so a
+    /// socket handed over best comes lent (`Batched::lent`). A socket bound with its port shared
+    /// ([`UdpSocket::bind_shared`]) shares it with a socket for each peer, as [`Driver::bind`]
+    /// does: a caller that holds its port from the moment it learns it (an adopted socket, a
+    /// supervisor's) loses no peer's queue of its own by handing the socket over. Called on a
+    /// shard thread.
+    pub fn new(endpoint: Endpoint<C, B, D>, mut socket: Batched, io: Io) -> Result<Self, RtError> {
+        let ring = Ring::new(io)?;
+        socket.release_buffers();
         let shared = match socket.socket().shares_port()? {
             true => Some(socket.local_addr()?),
             false => None,
@@ -278,6 +319,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             held: None,
             outgoing: Vec::new(),
             ring,
+            ring_charge: Reservation::default(),
+            ring_changes: (0, 0, 0),
             listener_ready: true,
             yields: 0,
             measure: SocketCharge::new(unmeasured),
@@ -355,8 +398,80 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
     /// state on Linux includes its socket's buffers, which a container's limit counts
     /// (docs/transport.md §4x).
     pub fn observe(&mut self, user: u64) {
-        let held = user.saturating_add(self.kernel_held().unwrap_or(0));
+        // What the ring grew by was allocated as the driver ran, on the heap the owner reads, and
+        // is charged as the ring's ([`Driver::ring`]): no connection's state.
+        let grown = u64::try_from(self.ring.grown_bytes()).unwrap_or(u64::MAX);
+        let held = user
+            .saturating_sub(grown)
+            .saturating_add(self.kernel_held().unwrap_or(0));
         self.endpoint.observe(held);
+    }
+
+    /// The receive ring every socket is lent: what it holds, what of that the endpoint's budget is
+    /// charged, and its changes.
+    pub fn ring(&self) -> RingStats {
+        let (grown, shrunk, refused) = self.ring_changes;
+        RingStats {
+            buffers: self.ring.buffers(),
+            bytes: self.ring.held_bytes(),
+            charged: self.ring_charge.granted(),
+            grown,
+            shrunk,
+            refused,
+        }
+    }
+
+    /// Holds the ring to what the turn's drains wanted (hyper-rt's `Ring::wants`): the bytes it
+    /// grows by reserved from the endpoint's budget first and taken into its one reservation, the
+    /// bytes it lets go given back. A growth refused, by the budget or by the allocator, leaves it
+    /// as it was until a drain wants more again.
+    fn size_ring(&mut self) {
+        let Some(wanted) = self.ring.wants() else {
+            return;
+        };
+        let held = self.ring.buffers();
+        // A buffer's bytes: the ring's headers and room were made with it, for its whole batch.
+        let buffers =
+            |count: usize| u64::try_from(count.saturating_mul(RECEIVE_BYTES)).unwrap_or(u64::MAX);
+        if wanted < held {
+            let _ = self.ring.resize(wanted);
+            let freed = buffers(held.saturating_sub(self.ring.buffers()));
+            if let Some(part) = self
+                .ring_charge
+                .split(freed.min(self.ring_charge.granted()))
+            {
+                self.endpoint.release(part);
+            }
+            self.ring_changes.1 = self.ring_changes.1.saturating_add(1);
+            return;
+        }
+        let more = buffers(wanted.saturating_sub(held));
+        let grant = match self.endpoint.reserve_own(more) {
+            Ok(grant) => grant,
+            Err(_) => {
+                self.ring.keep();
+                self.ring_changes.2 = self.ring_changes.2.saturating_add(1);
+                return;
+            }
+        };
+        let taken = if self.ring.resize(wanted).is_err() {
+            Err(grant)
+        } else if self.ring_charge.granted() == 0 {
+            self.ring_charge = grant;
+            Ok(())
+        } else {
+            self.ring_charge.absorb(grant)
+        };
+        match taken {
+            Ok(()) => self.ring_changes.0 = self.ring_changes.0.saturating_add(1),
+            Err(grant) => {
+                // The allocator refused the buffers, or the grant is one the charge cannot hold
+                // (another accountant's mark): the ring holds what it is charged for.
+                self.endpoint.release(grant);
+                let _ = self.ring.resize(held);
+                self.ring_changes.2 = self.ring_changes.2.saturating_add(1);
+            }
+        }
     }
 
     /// The rooms its peers' sockets were told since it began (`docs/transport.md` §4i).
@@ -836,6 +951,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         }
         draining.clear();
         self.draining = draining;
+        self.size_ring();
         Ok(())
     }
 

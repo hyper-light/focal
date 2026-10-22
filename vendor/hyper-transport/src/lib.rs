@@ -275,7 +275,9 @@ pub enum Event<C: Classes> {
         /// admission replaced closes with its bound ([`Refusal::Connections`]).
         refusal: Option<Refusal>,
     },
-    /// A dial to `peer` ended before it authenticated, or authenticated as someone else.
+    /// A dial to `peer` ended before it authenticated, or authenticated as someone else. Told for
+    /// every dial that ends so with no connection to the peer up, even when the last event the
+    /// owner polled said the same: an owner that dials again on it hears of each dial's end.
     Unreachable {
         /// The peer.
         peer: PeerId,

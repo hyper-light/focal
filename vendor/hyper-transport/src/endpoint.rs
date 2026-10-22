@@ -475,7 +475,8 @@ struct PeerEntry<R> {
     unreachable: Option<Option<Refusal>>,
     /// Why its newest connection closed, when either side said.
     closed: Option<Refusal>,
-    /// The state the owner was last told, by the lifecycle event it polled last.
+    /// The state the owner was last told, by the lifecycle event it polled last; forgotten when a
+    /// dial ends unreachable, whose end is told whatever was told before (`Core::dial_failed`).
     reported: Option<Lifecycle>,
     /// The state of the lifecycle event waiting for the owner, if one does.
     waiting: Option<Lifecycle>,
@@ -1308,7 +1309,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// Dial `peer` at `address`, unless a connection to it exists or is being dialed: concurrent
     /// cold calls to one peer dial once and share the connection (T42, focal's F60). The dial
     /// holds the peer's entry for the lifecycle event it ends in; [`Refusal::Events`] when every
-    /// entry is held by events the owner has not polled.
+    /// entry is held by events the owner has not polled. Every dial started ends in an event the
+    /// owner is told: [`Event::Connected`], or [`Event::Unreachable`] even when the last event the
+    /// owner polled said the same (one waiting unpolled stands for it), or, when a connection the
+    /// peer opened is up as the dial fails, that connection's `Connected`.
     pub fn connect(
         &mut self,
         now: Instant,
@@ -1527,6 +1531,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// into.
     pub fn reserve(&mut self, class: C::Class, bytes: u64) -> Result<Reservation, Refusal> {
         self.core.budget.reserve(bytes, Lane::Class(class))
+    }
+
+    /// Bytes the endpoint's driver holds for its sockets past what its owner charged as it made
+    /// the driver (its receive ring's growth), from the budget on [`Lane::Window`]: accounting
+    /// only, as the windows and the receive pool's chunks are. Given back with
+    /// [`Endpoint::release`].
+    pub fn reserve_own(&mut self, bytes: u64) -> Result<Reservation, Refusal> {
+        self.core.budget.reserve(bytes, Lane::Window)
     }
 
     /// Give a reservation back to the budget: a frame's, or one the owner reserved. A lossless frame
@@ -2514,7 +2526,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
 
     /// The peer's lifecycle may have changed: the event of it waiting for the owner, if any, is
     /// replaced by its state now and moved to the back, after every event queued before the
-    /// change; a state the owner was already told waits as nothing.
+    /// change; a state the owner was already told waits as nothing, but for a dial's end
+    /// (`Core::dial_failed` forgets what was told).
     fn report_lifecycle(&mut self, peer: PeerId) {
         let Ok(at) = self.peers.binary_search_by_key(&peer, |entry| entry.peer) else {
             return;
@@ -2758,11 +2771,20 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     }
 
     /// A dial to `peer` ended before a connection to it was up, for `refusal` when either side
-    /// said why: unreachable, unless a connection to it came up meanwhile.
+    /// said why: unreachable, unless a connection to it came up meanwhile. The dial is owed the
+    /// event it ends in ([`Endpoint::connect`]): unreachable, what the owner was told is
+    /// forgotten, so the dial's `Unreachable` is told even when the last event the owner polled
+    /// said the same, and one waiting unpolled stands for it. With a connection up, that
+    /// connection's state was told or waits.
     fn dial_failed(&mut self, peer: PeerId, refusal: Option<Refusal>) {
         if let Some(entry) = self.peer_entry_mut(peer) {
             entry.dialing = false;
-            entry.unreachable = entry.connection.is_none().then_some(refusal);
+            if entry.connection.is_none() {
+                entry.unreachable = Some(refusal);
+                entry.reported = None;
+            } else {
+                entry.unreachable = None;
+            }
         }
         self.report_lifecycle(peer);
     }

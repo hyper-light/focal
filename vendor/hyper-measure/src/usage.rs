@@ -7,9 +7,10 @@
 //! for the member processes it started.
 //!
 //! - macOS: `proc_pid_rusage(pid, RUSAGE_INFO_V6)` (`<libproc.h>`; `struct rusage_info_v6` is
-//!   declared here from the SDK's `<sys/resource.h>`, since libc stops at V4). The times are Mach
-//!   absolute-time units, converted to nanoseconds by `mach_timebase_info`
-//!   (`<mach/mach_time.h>`); the energy is in nanojoules (`ri_energy_nj`); the wakeups are the
+//!   declared here from the SDK's `<sys/resource.h>`, since libc stops at V4). The times are the
+//!   kernel's Mach absolute-time units, converted to nanoseconds at the kernel's tick rate,
+//!   `hw.tbfrequency` (sysctl(3)), which a translated process's `mach_timebase_info` is not; the
+//!   energy is in nanojoules (`ri_energy_nj`); the wakeups are the
 //!   package-idle exits and interrupt wakeups charged to the process; the footprint is the
 //!   physical footprint the system charges it, now and at its highest.
 //! - Linux: `/proc/<pid>/stat`'s `utime` and `stime` (proc(5)), in ticks of
@@ -225,23 +226,54 @@ mod os {
         ) -> libc::c_int;
     }
 
-    /// Nanoseconds of `ticks` Mach absolute-time units.
-    #[expect(
-        deprecated,
-        reason = "libc deprecates its Mach declarations in favour of the mach2 crate, which is not \
-                  a dependency; the declarations themselves are unchanged in libc"
-    )]
+    /// Format: nanoseconds in a second (SI units), the unit `hw.tbfrequency` counts ticks in.
+    const SECOND_NS: u64 = 1_000_000_000;
+
+    /// The kernel's ticks a second, `hw.tbfrequency` (an 8-byte quad, XNU bsd/kern/kern_mib.c),
+    /// read once for the process; refused when the call is, or it reads zero.
+    fn kernel_hz() -> Result<u64, UsageError> {
+        static HZ: std::sync::OnceLock<Result<u64, UsageError>> = std::sync::OnceLock::new();
+        *HZ.get_or_init(|| {
+            let mut hz: u64 = 0;
+            let mut length = std::mem::size_of::<u64>();
+            // SAFETY: the name is NUL-terminated; the out pointer and its length name one live
+            // local `u64`, the sysctl's type; no new value is written.
+            let code = unsafe {
+                libc::sysctlbyname(
+                    c"hw.tbfrequency".as_ptr(),
+                    (&raw mut hz).cast(),
+                    &raw mut length,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if code != 0 {
+                return Err(UsageError::Call(i64::from(
+                    std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(code),
+                )));
+            }
+            if length != std::mem::size_of::<u64>() || hz == 0 {
+                return Err(UsageError::Unreadable);
+            }
+            Ok(hz)
+        })
+    }
+
+    /// Nanoseconds of `ticks` of the kernel's, the unit of the account's times: × 10⁹ /
+    /// `hw.tbfrequency`. The kernel fills them from its own counts (`fill_task_rusage`,
+    /// osfmk/kern/bsd_kern.c lines 1166-1167 at apple-oss-distributions/xnu xnu-12377.121.6, a
+    /// task's `total_user` and `total_system`), which this process's `mach_timebase_info`
+    /// describes only where the process runs natively: Rosetta 2 shows a translated one 1/1
+    /// against Apple silicon's 24 MHz, and its user time read that way came out at 3/125 of
+    /// getrusage(2)'s (docs/research/timing.md, "Rosetta 2 and the kernel's ticks"). For a native
+    /// process the two are one fraction, so the same nanoseconds.
     fn nanos(ticks: u64) -> Result<u64, UsageError> {
-        let mut base = libc::mach_timebase_info { numer: 0, denom: 0 };
-        // SAFETY: `base` is a writable `mach_timebase_info` that lives across the call, which
-        // writes one (<mach/mach_time.h>).
-        let code = unsafe { libc::mach_timebase_info(&raw mut base) };
-        if code != libc::KERN_SUCCESS || base.denom == 0 {
-            return Err(UsageError::Call(i64::from(code)));
-        }
+        let hz = kernel_hz()?;
         let scaled = u128::from(ticks)
-            .checked_mul(u128::from(base.numer))
-            .and_then(|product| product.checked_div(u128::from(base.denom)))
+            .checked_mul(u128::from(SECOND_NS))
+            .and_then(|product| product.checked_div(u128::from(hz)))
             .ok_or(UsageError::Unreadable)?;
         u64::try_from(scaled).map_err(|_| UsageError::Unreadable)
     }
@@ -609,7 +641,9 @@ mod tests {
     }
 
     /// The account's user time is in nanoseconds, not Mach ticks, which differ by the timebase's
-    /// ratio (125/3 on Apple silicon). `proc_pid_rusage` and getrusage(2) read two accountings of
+    /// ratio (125/3 on Apple silicon), and converted at the kernel's rate: under Rosetta 2, read
+    /// at the process's timebase (1/1), it was 3/125 of getrusage(2)'s, far below the bound below.
+    /// `proc_pid_rusage` and getrusage(2) read two accountings of
     /// the same user time, which skew by less than a microsecond (macos-15-intel, 2026-10-05: the
     /// account 387,867,412 ns, a later getrusage 387,866 us), so neither is held strictly inside
     /// the other's reads; the account is held within a factor of two of them, which the ratio

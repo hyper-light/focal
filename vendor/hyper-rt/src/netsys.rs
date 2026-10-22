@@ -518,10 +518,10 @@ mod imp {
         Ok(())
     }
 
-    /// Lets other sockets bind `socket`'s port as well (`SO_REUSEPORT`): set on a socket before it
-    /// joins a shared port, and on a listener once it is bound to a port of its own (Linux makes the
-    /// port's group when the first joiner binds, and the BSDs judge each bind by both sockets' flags
-    /// at that bind; measured on both).
+    /// Lets other sockets bind `socket`'s port as well (`SO_REUSEPORT`; on Linux those of the same
+    /// effective user, socket(7)): set on a socket before it joins a shared port, and on a listener
+    /// once it is bound to a port of its own (Linux makes the port's group when the first joiner
+    /// binds, and the BSDs judge each bind by both sockets' flags at that bind; measured on both).
     pub(crate) fn share_port(socket: &Socket) -> Result<(), RtError> {
         rustix::net::sockopt::set_socket_reuseport(&socket.fd, true)
             .map_err(|e| refused("setsockopt(SO_REUSEPORT)", e))

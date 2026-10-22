@@ -110,6 +110,10 @@ pub struct AdmissionStats {
     /// whether or not a connection is up (hyper-transport's `receive`, bounded by its
     /// `receive_chunks`).
     pub pooled: usize,
+    /// Of those, what the receive ring grew by past its first buffer, charged as it grew: the
+    /// endpoint's, held whether or not a connection is up, until quiet drains let it shrink
+    /// (hyper-raft docs/transport.md §4aa).
+    pub ring_charged: usize,
     /// Exchanges under way on the connections held: what keeps a connection from being replaced.
     pub serving: usize,
     pub admitted: u64,
@@ -133,6 +137,14 @@ pub struct AdmissionStats {
     /// Streams granted to waiting connections, and taken back from idle ones for them, counted.
     pub pool_grants: u64,
     pub pool_reclaimed: u64,
+    /// The listener's receive ring: the buffers it holds and their bytes, as many as its drains
+    /// have needed (hyper-raft docs/transport.md §4aa), and its growths, shrinks and the growths
+    /// its budget or the allocator refused.
+    pub ring_buffers: usize,
+    pub ring_bytes: usize,
+    pub ring_grown: u64,
+    pub ring_shrunk: u64,
+    pub ring_refused: u64,
 }
 impl AdmissionStats {
     /// A listener's admission, from what its owner reports.
@@ -160,6 +172,7 @@ impl AdmissionStats {
                 .endpoint
                 .receive_chunks
                 .saturating_mul(hyper_transport::RECEIVE_CHUNK),
+            ring_charged: usize::try_from(stats.ring.charged).unwrap_or(usize::MAX),
             serving: admission.serving,
             admitted: admission.admitted,
             replaced: admission.replaced,
@@ -177,6 +190,11 @@ impl AdmissionStats {
             pool_wanting: stats.endpoint.pool.wanting,
             pool_grants: stats.endpoint.pool.grants,
             pool_reclaimed: stats.endpoint.pool.reclaimed,
+            ring_buffers: stats.ring.buffers,
+            ring_bytes: stats.ring.bytes,
+            ring_grown: stats.ring.grown,
+            ring_shrunk: stats.ring.shrunk,
+            ring_refused: stats.ring.refused,
         }
     }
 }

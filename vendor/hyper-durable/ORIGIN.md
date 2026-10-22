@@ -251,3 +251,25 @@ slates by the rule inside its own core (`crates/cluster/src/fold.rs`).
 - **Tests** (`tests/shell.rs`): `a_follower_past_its_durable_commit_asks_to_be_driven_when_its_quiet_period_ends`,
   which fails without the fix at the deadline it asks for.
 
+
+## A page read from the store is the core's (2026-10-19)
+
+- **The defect.** `GroupStore` gave the core's `max_bytes` to hyper-log's fetch, which counted each
+  entry at the bytes the log stores of it (`encode_entry`: its kind, its context's length, its
+  context and its data), 20 fewer than its body in a message (`hyper_raft::proto::encoded_bytes`),
+  and the core takes a page its storage cut as whole (`Log::slice_page`). Found by mantle, vendoring
+  `6df7b3e`: a range with `max_size_per_msg` 1,024 and entries of about 50 bytes sent a follower a
+  snapshot had caught up an append of 1,553 bytes, 1,449 of them entries, where the core promises
+  `MESSAGE_RECORD_FIXED_BYTES` and the larger of the bound and one entry. Its transport bounds the
+  replication class's frame by that promise and refused the append on all 1,158 retries; the
+  follower never caught up. Appends of the live tail, which the core pages itself, were within it.
+- **The fix.** The store has the log count each entry at its stored bytes and the 20 a message adds
+  (`IN_MESSAGE_BEYOND_STORED`, `hyper_log::Page`), so the log chooses the core's page before
+  anything is copied, for `entries` and for `visit`'s pages, which its callers state in the core's
+  measure (`max_committed_size_per_ready`). `LogStore` states the rule for every store.
+- **Tests** (`tests/hyperlog.rs`), each failing without the fix:
+  `a_page_read_from_the_store_is_the_cores_by_what_its_entries_take_in_a_message` (every bound a
+  page turns at from five starts, from the handle's memory and from the log's file; two entries of
+  111 bytes by a bound of 110), `a_walk_of_the_store_reads_pages_of_the_cores_rule` (46 reads of the
+  log where the rule gives 58) and `a_learner_caught_up_from_the_log_is_sent_appends_within_the_bound`
+  (an append of five entries, 325 bytes, against 256).

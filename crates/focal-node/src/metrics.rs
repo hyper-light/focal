@@ -1262,6 +1262,32 @@ impl MetricsSnapshot {
             "Streams taken back from idle connections for those waiting.",
             self.listener.pool_reclaimed,
         );
+        text.gauge(
+            "focal_listener_receive_ring_buffers",
+            "Receive buffers the listener's sockets are lent, as many as their drains have needed.",
+            self.listener.ring_buffers,
+        );
+        text.gauge(
+            "focal_listener_receive_ring_bytes",
+            "Bytes the listener's receive ring holds.",
+            self.listener.ring_bytes,
+        );
+        text.header(
+            "focal_listener_receive_ring_changes_total",
+            "counter",
+            "Changes of the listener's receive ring: buffers added, let go, and growths refused for want of memory.",
+        );
+        for (change, count) in [
+            ("grown", self.listener.ring_grown),
+            ("shrunk", self.listener.ring_shrunk),
+            ("refused", self.listener.ring_refused),
+        ] {
+            text.labeled(
+                "focal_listener_receive_ring_changes_total",
+                &[("change", change)],
+                count,
+            );
+        }
         let sockets = [
             ("listener", self.sockets.listener),
             ("peers", self.sockets.peers),

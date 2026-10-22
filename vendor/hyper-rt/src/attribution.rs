@@ -17,7 +17,8 @@
 //! counted as the bounded-work rule's bug signal.
 //!
 //! The shard reads the calling thread's account ([`ThreadAccount`]) at the start of a window and at the
-//! end of a long poll: its CPU time (`CLOCK_THREAD_CPUTIME_ID` on Linux and macOS) and, on Linux, its
+//! end of a long poll: its CPU time (`CLOCK_THREAD_CPUTIME_ID` on Linux and macOS, on macOS restated at the
+//! kernel's tick rate, which a translated process's timebase is not: `thread_cpu_ns`) and, on Linux, its
 //! voluntary context switches (`getrusage(RUSAGE_THREAD)`'s `ru_nvcsw`: the thread blocked in a call;
 //! Linux counts a preemption and a `sched_yield` as involuntary). hyper-rt's runtime never yields the
 //! thread inside a poll (no wake waits for a full ring: docs/runtime.md §3.2), so slates' report of its own
@@ -52,16 +53,23 @@ pub(crate) struct ThreadAccount {
     pub(crate) voluntary_switches: Option<u64>,
 }
 
-/// The calling thread's CPU time in nanoseconds (Linux and macOS: `CLOCK_THREAD_CPUTIME_ID`).
+/// The calling thread's CPU time in nanoseconds (Linux and macOS: `CLOCK_THREAD_CPUTIME_ID`). macOS's libc
+/// works it out from the kernel's ticks at the process's timebase, which a process Rosetta 2 translates does
+/// not count in (1/1 against Apple silicon's 24 MHz), so there it is restated at the kernel's rate
+/// ([`crate::machine::clock::MachTicks::at_kernel_rate`], the same reading natively); `None` where the rates
+/// are refused.
 #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
 fn thread_cpu_ns() -> Option<u64> {
     /// Format: nanoseconds per second.
     const NS_PER_SECOND: u64 = 1_000_000_000;
     let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
-    u64::try_from(reading.tv_sec)
+    let ns = u64::try_from(reading.tv_sec)
         .ok()?
         .checked_mul(NS_PER_SECOND)?
-        .checked_add(u64::try_from(reading.tv_nsec).ok()?)
+        .checked_add(u64::try_from(reading.tv_nsec).ok()?)?;
+    #[cfg(target_os = "macos")]
+    let ns = crate::machine::clock::mach_ticks().ok()?.at_kernel_rate(ns);
+    Some(ns)
 }
 
 /// The calling thread's voluntary context switches (Linux: `getrusage(RUSAGE_THREAD)`'s `ru_nvcsw`).
@@ -626,5 +634,41 @@ mod tests {
         );
         tracker.step_ended(true);
         assert!(!tracker.reads_at_step_start(), "by step, a window open");
+    }
+
+    /// Shape: the CPU time the thread runs before its reading is judged, a millisecond by the kernel's own
+    /// account, so a reading of 3/125 of it (libc's at a translated process's timebase) falls most of it short.
+    #[cfg(all(target_os = "macos", not(miri)))]
+    const RUN_NS: u64 = 1_000_000;
+
+    /// macOS: the thread's CPU time is the kernel's account of it whatever timebase the process is shown. It
+    /// is no less than `thread_info`'s account read before it (`thread_read_times`, whole microseconds, so at
+    /// most what the thread had run), and grows no faster than the shard's clock, which reads the counter the
+    /// kernel accounts run time on (`recount`, its `mach_absolute_time`), each reading rounded down once. Under
+    /// Rosetta 2, libc's reading alone (the kernel's ticks at a timebase of 1/1) was 1/41.667 of the account.
+    #[cfg(all(target_os = "macos", not(miri)))]
+    #[test]
+    fn a_threads_cpu_time_is_the_kernels_account() {
+        let handle = crate::thread_clock::current().unwrap();
+        let account = || crate::thread_clock::read(handle).unwrap().spent_ns;
+        let wall_before = crate::machine::clock::shard_clock_ns();
+        let cpu_before = thread_cpu_now().unwrap();
+        let mut spun = 0u64;
+        while account() < RUN_NS {
+            spun = std::hint::black_box(spun.wrapping_add(1));
+        }
+        let accounted = account();
+        let cpu_after = thread_cpu_now().unwrap();
+        let wall_after = crate::machine::clock::shard_clock_ns();
+        assert!(
+            accounted <= cpu_after,
+            "thread_info accounted {accounted} ns, the CPU clock read {cpu_after} ns after it"
+        );
+        assert!(
+            cpu_after - cpu_before <= wall_after - wall_before + 2,
+            "{} ns of CPU in {} ns",
+            cpu_after - cpu_before,
+            wall_after - wall_before
+        );
     }
 }

@@ -197,7 +197,7 @@ pub fn endpoint_limits(
 }
 
 /// What an endpoint under `limits` and `admission` holds of its budget at most, bytes, in two
-/// parts: the transport's own — its socket's buffers, its receive pool and each connection's
+/// parts: the transport's own — its driver's buffers as it is made, its receive pool and each connection's
 /// receive window, charged to the ordinary lane — and its messages', a body each way on each
 /// stream of each connection at the frame bound, charged to the lane its class is funded from. A budget of both funds the endpoint
 /// so that the transport's own bounds refuse before the budget does.
@@ -230,10 +230,14 @@ pub fn endpoint_bytes(
     })
 }
 
-/// What an endpoint's socket is charged for its life, bytes: the most it holds, its receive
-/// buffers and its outbox (`hyper_rt::udp::Io::held_bound`).
+/// What an endpoint's driver holds for its sockets as it is made, bytes, charged for the
+/// endpoint's life: its receive ring at one buffer and its listener's socket
+/// (`hyper_rt_transport::least_bytes`). What the ring grows by as its drains need it, the driver
+/// charges to the endpoint's budget as it grows and gives back as it shrinks (hyper-raft
+/// docs/transport.md §4aa). An endpoint was charged the most a socket of its batch holds, 4.2 MiB on
+/// Linux, whatever it received: a client of one connection held 2 MiB of buffers it never filled.
 pub fn endpoint_socket_bytes() -> usize {
-    hyper_rt::udp::Io { batch: IO_BATCH }.held_bound()
+    hyper_rt_transport::least_bytes(IO)
 }
 
 /// The connections a listener under `limits` admits at once on a budget of `bytes`: as many as the
@@ -426,8 +430,10 @@ fn congestion() -> Congestion {
 }
 
 /// The datagrams one system call carries each way: hyper-rt's batch bound, at most the 64
-/// segments of a Linux GSO/GRO send or receive.
+/// segments of a Linux GSO/GRO send or receive. A driver's receive ring grows to it as its drains
+/// need, from one buffer.
 const IO_BATCH: usize = 32;
+const IO: hyper_rt::udp::Io = hyper_rt::udp::Io { batch: IO_BATCH };
 
 /// An endpoint on `address`, its owner started on the current shard, woken at every withdrawal of
 /// a grant by `revocations` when it serves under a registry.
@@ -500,8 +506,9 @@ pub(crate) fn endpoint_driver(
         limits: endpoint_limits,
         congestion: congestion(),
     };
-    let io = hyper_rt::udp::Io { batch: IO_BATCH };
-    // The socket's buffers are the endpoint's from the start: charged their bound now.
+    let io = IO;
+    // What the driver holds for its sockets as it is made is the endpoint's from the start,
+    // charged now; what its ring grows by, the driver charges as it grows.
     let budget = NetBudget::new(budget, endpoint_socket_bytes()).map_err(|_| WireError::Limit)?;
     // Made the instant before the driver anchors its clock to the shard's: every later instant
     // the driver gives it is that anchor's or after.
@@ -510,9 +517,11 @@ pub(crate) fn endpoint_driver(
             .map_err(|_| WireError::Authentication)?;
     match bind.into() {
         Bind::Address(address) => Driver::bind(endpoint, address, io),
+        // Handed over lent: the driver receives every socket into its ring, so the socket holds
+        // no receive buffers of its own.
         Bind::Socket(socket) => hyper_rt::udp::UdpSocket::adopt(socket.into())
-            .and_then(|socket| hyper_rt::udp::Batched::new(socket, io, false))
-            .and_then(|socket| Driver::new(endpoint, socket)),
+            .and_then(|socket| hyper_rt::udp::Batched::lent(socket, false))
+            .and_then(|socket| Driver::new(endpoint, socket, io)),
     }
     .map_err(|_| WireError::Connection)
 }

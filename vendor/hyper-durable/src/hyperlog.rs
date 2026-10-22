@@ -9,12 +9,18 @@
 //! answered once every part is. Parts beyond the handle's bound wait here and go out as answers
 //! free room. A part refused, and every part sent behind it, changes nothing; parts not yet sent
 //! then are never sent.
+//!
+//! A read is paged as the core pages: each entry counted at what it takes in a message, the bytes
+//! the log stores of it and those the message adds (`IN_MESSAGE_BEYOND_STORED`), which the log
+//! counts as it chooses the page, before anything is copied. The core takes a page its storage cut
+//! as whole, so a page cut by the stored bytes alone ran past the core's bound on a message
+//! (mantle, 2026-10-19).
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::task::Waker;
 
 use hyper_block::block::BlockFile;
-use hyper_log::{Fetched, GroupLog, Log, LogError, LogOpener, Proposal, Start, Update};
+use hyper_log::{Fetched, GroupLog, Log, LogError, LogOpener, Page, Proposal, Start, Update};
 use hyper_raft::StorageError;
 use hyper_raft::proto::{Entry, EntryType, HardState};
 
@@ -23,6 +29,12 @@ use crate::store::{Entries, EntryRef, Fault, Health, LogStore, Point, StoreView,
 /// Bytes an entry's encoding adds to its data and context: its kind and its context's length,
 /// as mantle's store writes them (mantle `crates/range/src/store.rs`, `ENTRY_OVERHEAD`).
 pub const ENTRY_OVERHEAD: usize = 1 + 4;
+
+/// Bytes an entry takes in a message beyond those the log stores of it: its body there, what the
+/// core counts an entry at (`hyper_raft::proto::encoded_bytes`), is its data, its context and
+/// `hyper_raft::wire::ENTRY_FIXED_BYTES` (its kind, term, index and two lengths), and the log
+/// stores its data, its context and [`ENTRY_OVERHEAD`], its term and index kept outside them.
+const IN_MESSAGE_BEYOND_STORED: u64 = (hyper_raft::wire::ENTRY_FIXED_BYTES - ENTRY_OVERHEAD) as u64;
 
 /// What a write's parts came to.
 #[derive(Debug)]
@@ -183,10 +195,16 @@ impl<F: BlockFile + 'static> GroupStore<F> {
         }
     }
 
+    /// The entries of `[low, high)`, as many as `max_bytes` of what they take in a message admit,
+    /// and one at least: the core's page (`hyper_raft::Storage::entries`), chosen by the log.
     fn fetch(&self, low: u64, high: u64, max_bytes: u64) -> Result<Fetched, StorageError> {
         let into = self.fetched.take().unwrap_or_default();
+        let page = Page {
+            max_bytes,
+            per_entry: IN_MESSAGE_BEYOND_STORED,
+        };
         self.group
-            .fetch(low, high, max_bytes, into)
+            .fetch(low, high, page, into)
             .map_err(|e| storage(&e))
     }
 

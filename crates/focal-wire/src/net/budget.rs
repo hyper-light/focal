@@ -1,9 +1,10 @@
 //! The transport's bytes, held against the node's memory budget (`focal_memory::MemoryBudget`), as
 //! focal-wire held the request bodies it admitted (the audit's F03): every byte hyper-transport
 //! reserves — a connection's receive window, a message's head, a body the owner reads, a frame — is
-//! a `Pending` charge before it is allocated, given back when the reservation is. The endpoint's
-//! socket is charged the most it holds (`hyper_rt::udp::Io::held_bound`: its receive buffers and its
-//! outbox) when the endpoint is made, and given back when it is dropped.
+//! a `Pending` charge before it is allocated, given back when the reservation is. What the
+//! endpoint's driver holds for its sockets as it is made (`hyper_rt_transport::least_bytes`: its
+//! receive ring at one buffer, its listener's socket) is charged when the endpoint is made and
+//! given back when it is dropped; what the ring grows by, the driver reserves as it grows.
 //!
 //! The control class (consensus, liveness, the fleet's own control) is funded from the completion
 //! lane, which ordinary work cannot spend, so participants' bodies and content never starve what keeps
@@ -216,12 +217,13 @@ mod tests {
         assert_eq!((net.stats().ordinary, net.stats().completion), (0, 0));
     }
 
-    /// The socket is charged its bound when the endpoint is made, held while it lives and given back
-    /// with it; a budget that cannot fund the socket refuses the endpoint.
+    /// What the driver holds for its sockets as it is made is charged when the endpoint is made,
+    /// held while it lives and given back with it; a budget that cannot fund it refuses the
+    /// endpoint.
     #[test]
-    fn the_socket_is_charged_its_bound_for_the_endpoints_life() {
+    fn the_sockets_start_is_charged_for_the_endpoints_life() {
         let memory = budget(1 << 20, 64 << 10);
-        let socket = hyper_rt::udp::Io { batch: 4 }.held_bound();
+        let socket = hyper_rt_transport::least_bytes(hyper_rt::udp::Io { batch: 4 });
         let net = NetBudget::new(memory.clone(), socket).unwrap();
         assert_eq!(net.stats().socket, socket);
         // What the endpoint's peers share is the lane less the socket.
