@@ -286,8 +286,14 @@ impl Network {
         let (commands, receiver) = channel(queue.max(1)).map_err(|_| WireError::Connection)?;
         let (answers, answered) = channel(queue.max(1)).map_err(|_| WireError::Connection)?;
         let owner = Owner::new((driver, role), limits, answers, enrollment);
-        hyper_rt::futures::spawn_detached(owner.run(receiver, answered, revocations))
-            .map_err(|_| WireError::Connection)?;
+        // On a heap of its own: what the owner's work holds is on its pages and nothing else is,
+        // and the endpoint charges its connections what that says (`Owner::observe`).
+        hyper_rt::futures::spawn_detached(hyper_heap::OnHeap::new(owner.run(
+            receiver,
+            answered,
+            revocations,
+        )))
+        .map_err(|_| WireError::Connection)?;
         Ok(Self { commands })
     }
 
@@ -577,6 +583,8 @@ impl Owner {
     ) {
         // Whether a handle may still send: once every one is gone the queue is read no more.
         let mut asked = true;
+        // What the work holds before any connection: the base the endpoint's account measures from.
+        self.observe();
         loop {
             // What the endpoint has first, then the answers of this owner's own tasks, then what
             // it is asked, then the registry's word.
@@ -631,6 +639,7 @@ impl Owner {
             // What waited for room on a lane takes what the turn freed.
             self.flush_parked();
             let _ = self.driver.flush();
+            self.observe();
             if self.closing && self.asking.is_empty() && self.serving.is_empty() {
                 break;
             }
@@ -641,6 +650,20 @@ impl Owner {
         drop(self);
         for done in done {
             let _ = done.send(());
+        }
+    }
+
+    /// What the endpoint's work holds, observed when its endpoint wants an observation (hyper-raft
+    /// docs/transport.md §4x): the owner runs on a heap of its own (`Network::start`), whose bytes
+    /// in use are that work's, the kernel's holdings for the endpoint's sockets added by the driver
+    /// where the platform charges them. Its connections are then charged what that says, not a
+    /// constant measured on another host. Off a heap (a process that does not allocate through
+    /// mimalloc) nothing is observed, and a connection is charged its structures' own bytes.
+    fn observe(&mut self) {
+        if self.driver.endpoint().wants_observation()
+            && let Some(held) = hyper_heap::held_here()
+        {
+            self.driver.observe(held.in_use);
         }
     }
 
@@ -1742,12 +1765,16 @@ impl Owner {
             self.end_serving(exchange);
             return;
         };
-        let work = serve.serve(served);
         let answers = self.answers.clone();
-        let task = hyper_rt::futures::spawn_detached(async move {
-            let reply = work.await;
-            // The owner reads its queue until it ends; one that ended has nothing to write to.
-            let _ = answers.send((exchange, reply)).await;
+        // The handler's work and its task are the handler's, off the owner's heap: a task's frame
+        // is recycled for the shard's later tasks, and what a handler keeps is no connection's.
+        let task = hyper_heap::outside(|| {
+            let work = serve.serve(served);
+            hyper_rt::futures::spawn_detached(async move {
+                let reply = work.await;
+                // The owner reads its queue until it ends; one that ended has nothing to write to.
+                let _ = answers.send((exchange, reply)).await;
+            })
         });
         match task {
             Ok(task) => {

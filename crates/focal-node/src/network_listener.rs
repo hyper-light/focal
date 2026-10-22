@@ -116,13 +116,6 @@ impl ListenerIdentity {
             .await
     }
 }
-/// What a node's listener may hold of the node's budget: its connections' charges as they are
-/// made, the request bodies it reads and its receive pool.
-pub(crate) const LISTENER_BYTES: usize = 64 * 1024 * 1024;
-/// Of [`LISTENER_BYTES`], what the completion lane keeps: a quarter, as the node's budget keeps of
-/// its own (`memory_envelope::node_budget`).
-pub(crate) const LISTENER_COMPLETION: usize = LISTENER_BYTES / 4;
-
 pub struct NetworkListener {
     server: QuicServer,
     registry: PeerRegistry,
@@ -152,15 +145,22 @@ impl NetworkListener {
     ) -> Result<Self, WireError> {
         limits.validate()?;
         let tls = server_config(node, enrollment, roots)?;
-        // The listener admits the connections its budget funds (`focal_wire::funded_connections`);
+        // The listener admits the connections its budget funds (`focal_wire::funded_connections`):
+        // its budget is the node's, so the count is what the node's memory funds at the least a
+        // connection is charged, a bound memory reaches first, each connection charged what its
+        // endpoint learns connections hold on this host (hyper-raft docs/transport.md §4x);
         // handshakes take pending places apart from authenticated connections, which are charged
-        // to the identity they authenticated as (27 §3.1 P5); the listener's budget funds the
-        // request bodies it admits (the audit's F03). Its exchanges stay bounded by `limits`.
+        // to the identity they authenticated as (27 §3.1 P5); the budget funds the request bodies
+        // it admits (the audit's F03). Its exchanges stay bounded by `limits`.
         let admission = AdmissionLimits::for_connections(focal_wire::funded_connections(
             &limits,
             budget.limit(),
         )?)
-        .replacing_after(limits.request_timeout);
+        .replacing_after(limits.request_timeout)
+        // A handshake from an unproven address is answered with a Retry once the handshakes in
+        // progress hold msquic's default share of the node's memory, not once half of places
+        // derived from that memory are taken.
+        .retrying_past(focal_wire::retry_memory(budget.limit()));
         let server = QuicServer::bind_serving(
             address,
             tls,

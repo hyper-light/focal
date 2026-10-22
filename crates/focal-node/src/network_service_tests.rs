@@ -2,19 +2,28 @@ use super::*;
 #[path = "client_join_service_tests.rs"]
 mod client_join;
 
-/// A node's listener admits a thousand agents' connections and more: what its budget funds of each
-/// connection's charge, its streams sizing each one's exchange tables, where it admitted 128 and
-/// the 129th agent took another's connection.
+/// A node's listener admits what the node's memory funds: its budget is the node's, the count what
+/// that budget funds at the least a connection is charged (its first window, the reserve on it, its
+/// structures' own bytes), so it grows with the node's memory and no allowance caps it: the least
+/// envelope a node holds funds a thousand agents and more, one of sixteen times as much sixteen times
+/// as many, past the 65,536 a constant once capped every node at. Each connection is then charged
+/// what its endpoint learns connections hold where the node runs, and the memory refuses first.
 #[test]
-fn a_nodes_listener_holds_a_thousand_agents() {
+fn a_nodes_listener_admits_what_the_nodes_memory_funds() {
     let limits = crate::control_host::ControlHost::wire_limits();
-    let funded =
-        focal_wire::funded_connections(&limits, crate::network_listener::LISTENER_BYTES).unwrap();
-    assert!(
-        funded > 1_000,
-        "the node's listener funds {funded} connections"
-    );
-    assert!(funded < focal_wire::MAX_CONNECTIONS, "{funded}");
+    let mut settings = Settings::default();
+    settings.node.memory_bytes = Some(crate::memory_envelope::MIN_NODE_BYTES);
+    let least = crate::memory_envelope::node_budget(&settings).unwrap();
+    let funded = focal_wire::funded_connections(&limits, least.limit()).unwrap();
+    assert!(funded > 1_000, "the least node funds {funded} connections");
+    settings.node.memory_bytes = Some(crate::memory_envelope::MIN_NODE_BYTES * 16);
+    let larger = crate::memory_envelope::node_budget(&settings).unwrap();
+    let more = focal_wire::funded_connections(&limits, larger.limit()).unwrap();
+    assert!(more >= funded * 16, "{more} against {funded}");
+    settings.node.memory_bytes = Some(16 << 30);
+    let large = crate::memory_envelope::node_budget(&settings).unwrap();
+    let many = focal_wire::funded_connections(&limits, large.limit()).unwrap();
+    assert!(many > 65_536, "a 16 GiB node funds {many} connections");
 }
 
 #[test]

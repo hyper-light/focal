@@ -21,6 +21,9 @@ hyper-quic.workspace = true
 hyper-rt.workspace = true
 hyper-rt-transport.workspace = true
 hyper-transport.workspace = true
+# Each endpoint's owner runs on a heap of its own, whose bytes in use its endpoint observes as what
+# its connections hold (hyper-raft docs/transport.md §4x).
+hyper-heap.workspace = true
 # hyper-raft's conformed rustls, under the name every configuration here was written against (as
 # hyper-quic names it): owned verifiers and resolvers, a &'static provider.
 rustls = { package = "hyper-tls", version = "0.1.0", path = "../../vendor/hyper-tls" }
@@ -34,6 +37,9 @@ bytes = "1"
 focal-sim = { version = "0.1.0", path = "../focal-sim" }
 serde_json.workspace = true
 tempfile.workspace = true
+# The unit tests allocate through mimalloc, as the focal binary does: its endpoints then run on heaps
+# of their own and learn what their connections hold, the path a node takes.
+mimalloc.workspace = true
 
 [lints]
 workspace = true

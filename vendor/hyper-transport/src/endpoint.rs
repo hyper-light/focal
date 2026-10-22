@@ -52,6 +52,7 @@ use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
 use crate::pool::{Pool, PoolStats, Share};
 use crate::progress::{Carry, Delivered, LEAST_PROGRESS, Moved, Progress};
 use crate::receive::Receive;
+use crate::state::{StateAccount, StateStats};
 use crate::tally::{Table, Tally};
 use crate::timing::PeerTiming;
 use crate::tls::Tls;
@@ -106,6 +107,14 @@ pub struct Limits {
     /// receive window of unread data, packed, occupies `window_ceiling / RECEIVE_CHUNK` chunks; the
     /// owner sets this from that and its budget.
     pub receive_chunks: usize,
+    /// The bytes the handshakes in progress may hold before one from an address not yet proven is
+    /// answered with a Retry (RFC 9000 §8.1.2), each counted at what a connection is charged as it
+    /// is made ([`Endpoint::connection_charge`], learned where the endpoint runs): an owner states
+    /// it from its memory, as msquic does (`RetryMemoryLimit`, 65/65535 of the memory available by
+    /// default; its `QuicBindingShouldRetryConnection`). None, once half the pending places are
+    /// taken: a rule that tracks a count, which an owner deriving its places from its memory
+    /// would make tens of thousands, the crypto of every one done before the first Retry.
+    pub retry_bytes: Option<u64>,
 }
 
 /// How connections are given the exchanges their peers may open at once (QUIC's bidirectional
@@ -310,6 +319,9 @@ pub struct Stats {
     pub receive_copied: u64,
     /// The stream pool ([`StreamCredit::Pooled`]).
     pub pool: PoolStats,
+    /// The connections' state as charged, learned from what the owner observes
+    /// ([`Endpoint::observe`]).
+    pub state: StateStats,
 }
 
 /// The QUIC application error code a connection closes with when it ends without a fault.
@@ -332,17 +344,6 @@ struct Ask<'a, K> {
     deadline: Progress,
 }
 
-/// What a connection holds of its endpoint's memory beside its windows, the messages it carries and
-/// its exchange tables ([`state_charge`]): its QUIC state (`hyper_quic::Connection`, 8,128 bytes
-/// inline, and what that allocates), its stream tables and its rows in the endpoint's own, which
-/// grow with the connections held. Charged to the budget as the connection is made, beside its
-/// first window, and given back as it goes, so a node's connections are bounded by its memory as
-/// their windows are, not by a count stated apart from it. An idle connection was measured to hold
-/// 27.3 to 29.1 KB of its server's heap on macOS and Linux, its exchange tables for 16 streams
-/// among it (`docs/benchmarks.md`, "What a server holds for each connection");
-/// hyper-rt-transport's `connection_memory` test holds the measure to the charge.
-pub const CONNECTION_STATE: u64 = 30 * 1024;
-
 /// The bytes a connection's exchange tables hold for `streams` exchanges: each exchange's id and its
 /// stream's entry (`Conn::exchanges`, `Conn::by_stream`), reserved to the streams the connection
 /// may have at once as it is made, so no insert allocates.
@@ -351,23 +352,35 @@ fn exchange_tables(streams: u32) -> u64 {
     u64::from(streams).saturating_mul(u64::try_from(entry).unwrap_or(u64::MAX))
 }
 
-/// What a connection's own state is charged under `limits` as it is made: [`CONNECTION_STATE`] and
-/// its exchange tables, which `limits.streams_per_connection` sizes.
-pub fn state_charge(limits: &Limits) -> u64 {
-    CONNECTION_STATE.saturating_add(exchange_tables(limits.streams_per_connection))
+/// What a connection of classes `C` is charged for its state under `limits` before its endpoint
+/// has observed what its connections hold (docs/transport.md §4x): its structures' own bytes — the
+/// connection itself, its QUIC state inline among them, and its exchange tables, which
+/// `limits.streams_per_connection` sizes — the least a connection holds on any host. What the
+/// connections hold past that (what the QUIC state allocates, the endpoint's rows for them, the C
+/// library's keys, the allocator's rounding) is learned on the host the endpoint runs on, where its
+/// owner observes it ([`Endpoint::observe`]); measured, 26.6 to 36.6 KB a connection across three
+/// hosts and two allocators (docs/benchmarks.md), which no constant says for a host it was not
+/// measured on.
+pub fn state_charge<C: Classes>(limits: &Limits) -> u64 {
+    u64::try_from(size_of::<Conn<C::Role>>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(exchange_tables(limits.streams_per_connection))
 }
 
-/// What a connection of classes `C` is charged under `limits` as it is made: its first window, the
-/// reserve on top of it, and its state ([`state_charge`]). An owner that states its connections'
-/// bound from its memory divides what it gives its endpoint by this.
+/// What a connection of classes `C` is charged under `limits` as it is made before its endpoint has
+/// observed what its connections hold: its first window, the reserve on top of it, and its state's
+/// least ([`state_charge`]): the least any connection is charged, so a bound an owner divides its
+/// memory by this for is one memory reaches first. An endpoint that has observed says what it
+/// charges now ([`Endpoint::connection_charge`]).
 pub fn connection_charge<C: Classes>(limits: &Limits) -> u64 {
     let reserve = class_reserve(C::RANKS.saturating_sub(1));
     initial_window(MIN_DATAGRAM)
         .saturating_add(reserve)
-        .saturating_add(state_charge(limits))
+        .saturating_add(state_charge::<C>(limits))
 }
 
-/// A connection's first grants: its window's, and its state's ([`state_charge`]).
+/// A connection's first grants: its window's, and its state's (what the endpoint's account of its
+/// connections' state charges one more, [`StateAccount::each`]).
 struct Grant {
     window: Reservation,
     state: Reservation,
@@ -416,9 +429,6 @@ struct Conn<R> {
     delivered: Delivered,
     /// The budget's grants for the receive window: the initial one and one per growth.
     grants: Vec<Reservation>,
-    /// What the connection's own state takes of the budget ([`CONNECTION_STATE`]), given back as
-    /// it goes.
-    state: Option<Reservation>,
     /// When its window was set back, while its growth's grants go back as its peer's reads pay
     /// what QUIC still owes of the credit given (`Core::repay`).
     set_back: Option<Instant>,
@@ -644,6 +654,9 @@ struct Core<C: Classes, B, D> {
     pending_keys: Vec<usize>,
     /// The attempts the endpoint refused, whose copies are ignored.
     refused: Refused,
+    /// What the connections' own state is charged, learned from what the owner observes the
+    /// endpoint's work holds (docs/transport.md §4x).
+    state: StateAccount,
 }
 
 /// The attempts an endpoint refused (its places taken, or a bound it holds), each by its client's
@@ -842,8 +855,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         let limits = config.limits;
         // The tables a connection or an identity has a row in start empty and grow with what the
         // endpoint holds (`Endpoint::reserve_marks`), each connection's rows charged with its state
-        // (`CONNECTION_STATE`): sized to what admission could hold before any came, they held about
-        // 650 bytes for each connection admitted (docs/benchmarks.md), charged to nothing.
+        // (what the endpoint learns its connections hold, docs/transport.md §4x): sized to what
+        // admission could hold before any came, they held about 650 bytes for each connection
+        // admitted (docs/benchmarks.md), charged to nothing.
         Ok(Self {
             quic,
             client,
@@ -883,6 +897,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                     lifetime: retry_lifetime,
                     ..Refused::default()
                 },
+                state: StateAccount::new(state_charge::<C>(&limits)),
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
@@ -1726,8 +1741,48 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 .flatten()
                 .filter(|conn| conn.room.is_some())
                 .count(),
+            state: self.core.state.stats(),
             ..self.core.stats
         }
+    }
+
+    /// Whether the endpoint wants its owner to observe what its work holds ([`Endpoint::observe`]):
+    /// its account of its connections' state is due an observation (its first, then each time the
+    /// connections held double or halve or turn over, docs/transport.md §4x) and nothing is in
+    /// flight that an observation would count as state — no exchange open, no handshake pending
+    /// or dial under way, no event waiting, no lane frame queued. The lanes are looked at only
+    /// once the rest holds.
+    pub fn wants_observation(&self) -> bool {
+        self.core.state.due()
+            && self.core.exchanges.len() == 0
+            && self.core.admission.stats().pending == 0
+            && self.core.dialing == 0
+            && self.core.events.is_empty()
+            && self.conns.iter().flatten().all(|conn| {
+                conn.lanes_out.iter().all(|lane| lane.queue.is_empty())
+                    && conn.lanes_in.iter().all(|lane| lane.queued == 0)
+            })
+    }
+
+    /// The owner's observation of what the endpoint's work holds: `held`, the bytes in use on the
+    /// heap that work runs on and nothing else does (hyper-heap's `Held::in_use`), with what the
+    /// kernel holds for the endpoint's sockets where it charges the process for them. Made when
+    /// [`Endpoint::wants_observation`] says so, the first as the endpoint is made: the connections'
+    /// state is charged what the work holds past what it held with none and past the receive pool
+    /// (which is charged as the pool), grown as far as the budget funds it, and one more connection
+    /// what one held on average (docs/transport.md §4x).
+    pub fn observe(&mut self, held: u64) {
+        let pool = u64::try_from(self.receive.chunks().saturating_mul(crate::RECEIVE_CHUNK))
+            .unwrap_or(u64::MAX);
+        let target = self.core.state.observe(held, pool);
+        self.core.true_up_state(target);
+    }
+
+    /// What one more connection is charged as it is made now: its first window, the reserve on top
+    /// of it, and its state as the endpoint has learned it ([`Endpoint::observe`]); before any
+    /// observation, [`connection_charge`].
+    pub fn connection_charge(&self) -> u64 {
+        Core::<C, B, D>::first_window().saturating_add(self.core.state.each())
     }
 
     /// What the endpoint's windows may grant at most, summed, payload bytes: for every connection
@@ -2139,7 +2194,6 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             window: Window::new(initial, limits.window_ceiling),
             delivered: Delivered::new(C::RANKS),
             grants,
-            state: Some(state),
             set_back: None,
             listed: false,
             lost: false,
@@ -2151,6 +2205,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             self.conns.resize_with(key.saturating_add(1), || None);
         }
         self.put(key, Box::new(conn));
+        // Its state's grant joins the one reservation the connections' state is charged in.
+        if let Err(state) = self.core.state.made(state) {
+            self.core.budget.release(state);
+        }
     }
 
     fn attempt(&mut self, now: Instant, attempt: Attempt, buffer: &mut Vec<u8>) {
@@ -2185,9 +2243,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             return;
         }
         let admission = self.core.admission.stats();
-        let crowded = admission.pending.saturating_mul(2) >= self.core.admission.limits().pending;
-        // A source that has not proven its address takes no place while half of them are taken
-        // (RFC 9000 §8.1.2, Retry under load; focal `validate_address`).
+        let crowded = match self.core.limits.retry_bytes {
+            Some(limit) => {
+                u64::try_from(admission.pending)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(self.connection_charge())
+                    >= limit
+            }
+            None => admission.pending.saturating_mul(2) >= self.core.admission.limits().pending,
+        };
+        // A source that has not proven its address takes no place while the handshakes in
+        // progress hold what the owner allows them before a Retry, or half the places (RFC 9000
+        // §8.1.2, Retry under load; focal `validate_address`).
         if crowded && !attempt.remote_address_validated() && attempt.may_retry() {
             buffer.clear();
             if let Ok(transmit) = self.quic.retry(attempt, buffer) {
@@ -2337,10 +2404,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 return Err(refusal);
             }
         };
-        match self
-            .budget
-            .reserve(state_charge(&self.limits), Lane::Window)
-        {
+        match self.budget.reserve(self.state.each(), Lane::Window) {
             Ok(state) => Ok(Grant { window, state }),
             Err(refusal) => {
                 self.room.release(window.granted());
@@ -2364,6 +2428,25 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let waiting = self.admission.stats().pending;
         let more = u64::try_from(limit.saturating_sub(waiting)).unwrap_or(u64::MAX);
         more.saturating_mul(Self::first_window().saturating_add(self.handshake_room))
+    }
+
+    /// The connections' state charged `target` bytes: the reservation grown by what it is short,
+    /// as far as the budget funds it (what it cannot is recorded unfunded), or what it holds past
+    /// the target given back.
+    fn true_up_state(&mut self, target: u64) {
+        match self.state.short_of(target) {
+            Some(short) => {
+                let grant = self.budget.reserve(short, Lane::Window).ok();
+                if let Err(grant) = self.state.grown(target, grant) {
+                    self.budget.release(grant);
+                }
+            }
+            None => {
+                if let Some(past) = self.state.shrink(target) {
+                    self.budget.release(past);
+                }
+            }
+        }
     }
 
     /// A connection's first grants given back before it was made: its window's room in the
@@ -2749,8 +2832,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             }
             self.budget.release(grant);
         }
-        if let Some(state) = conn.state.take() {
-            self.budget.release(state);
+        if let Some(share) = self.state.gone() {
+            self.budget.release(share);
         }
         self.generation = self.generation.wrapping_add(1);
     }

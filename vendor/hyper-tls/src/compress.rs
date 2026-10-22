@@ -221,7 +221,12 @@ mod feat_brotli {
                 CompressionLevel::Amortized => QUALITY_SLOW,
             };
             let output = Cursor::new(Vec::with_capacity(input.len() / 2));
-            let mut compressor = brotli::CompressorWriter::new(output, BUFFER_SIZE, quality, LGWIN);
+            let mut compressor = brotli::CompressorWriter::new(
+                output,
+                BUFFER_SIZE,
+                quality,
+                window_bits(input.len()),
+            );
             compressor
                 .write_all(&input)
                 .map_err(|_| CompressionFailed)?;
@@ -238,8 +243,27 @@ mod feat_brotli {
     /// Chosen based on brotli `examples/compress.rs`.
     const BUFFER_SIZE: usize = 4096;
 
-    /// This is the default lgwin parameter, see `BrotliEncoderInitParams()`
-    const LGWIN: u32 = 22;
+    /// The least window Brotli takes, in bits (RFC 7932 §9.1, WBITS 10 to 24).
+    const MIN_LGWIN: u32 = 10;
+    /// The most window Brotli takes without its large-window extension.
+    const MAX_LGWIN: u32 = 24;
+    /// The bytes a Brotli window of `2^WBITS` keeps short of it (RFC 7932 §9.1: the window is
+    /// `(1 << WBITS) - 16`).
+    const WINDOW_GAP: usize = 16;
+
+    /// The least window holding `len` bytes whole, in bits: a certificate's compression is one shot
+    /// of a length known first, and every match within it stays reachable, as Brotli's reference
+    /// encoder sizes its binary-tree hasher to the input of a one-shot compression
+    /// (`HashMemAllocInBytes`: `num_nodes` the input's size where it is the smaller). The window was
+    /// Brotli's default, 2^22, for a chain of a few kilobytes: the quality-11 hasher's forest, two
+    /// `u32` a window position, was 32 MiB, allocated at a server's first handshake and at every
+    /// client's that compresses its own certificate.
+    pub(super) fn window_bits(len: usize) -> u32 {
+        let needed = len.saturating_add(WINDOW_GAP);
+        // The least `bits` with `1 << bits >= needed`.
+        let bits = usize::BITS.saturating_sub(needed.saturating_sub(1).leading_zeros());
+        bits.clamp(MIN_LGWIN, MAX_LGWIN)
+    }
 
     /// Compression quality we use for interactive compressions.
     /// See <https://blog.cloudflare.com/results-experimenting-brotli> for data.
@@ -447,6 +471,72 @@ mod tests {
     #[test]
     fn test_brotli() {
         test_compressor(BROTLI_COMPRESSOR, BROTLI_DECOMPRESSOR);
+    }
+
+    /// Brotli's window for a certificate holds the input whole and no more than the least power
+    /// of two that does: at its least for a small one, and at Brotli's most for one past it.
+    #[test]
+    fn brotli_window_holds_the_input_whole() {
+        use super::feat_brotli::window_bits;
+        assert_eq!(window_bits(0), 10);
+        assert_eq!(window_bits(1008), 10, "1,008 bytes and the gap fill 2^10");
+        assert_eq!(window_bits(1009), 11);
+        assert_eq!(window_bits(4096), 13);
+        assert_eq!(window_bits(usize::MAX), 24);
+        for len in [1usize, 700, 1008, 1009, 3000, 70_000] {
+            let bits = window_bits(len);
+            assert!(
+                (1usize << bits) - 16 >= len.min((1 << 24) - 16),
+                "{len} in 2^{bits}"
+            );
+        }
+    }
+
+    /// A certificate-sized input, irregular as a certificate's DER is, compressed under the window
+    /// its length gives decompresses to itself, and is within a byte of what Brotli's default window
+    /// of 2^22, which the compressor used, gave: the window holds the input whole either way, and
+    /// only the stream's header, which codes the window in one to seven bits (RFC 7932 §9.1), may
+    /// differ.
+    #[test]
+    fn brotli_under_the_inputs_window_compresses_as_under_the_default() {
+        use std::io::Write as _;
+        // A deterministic irregular input with repeats, as a chain's names and keys have.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut input = Vec::new();
+        for index in 0..3_000usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let byte = if index % 97 < 40 {
+                (index % 61) as u8
+            } else {
+                state as u8
+            };
+            input.push(byte);
+        }
+        let compressed = BROTLI_COMPRESSOR
+            .compress(input.clone(), CompressionLevel::Amortized)
+            .unwrap();
+        let mut recovered = vec![0u8; input.len()];
+        BROTLI_DECOMPRESSOR
+            .decompress(&compressed, &mut recovered)
+            .unwrap();
+        assert_eq!(recovered, input);
+        let mut default = brotli::CompressorWriter::new(Vec::new(), 4096, 11, 22);
+        default.write_all(&input).unwrap();
+        let default = default.into_inner();
+        println!(
+            "{} B -> {} B, default window {} B",
+            input.len(),
+            compressed.len(),
+            default.len()
+        );
+        assert!(
+            compressed.len() <= default.len() + 1,
+            "{} against {}",
+            compressed.len(),
+            default.len()
+        );
     }
 
     fn test_compressor(comp: &dyn CertCompressor, decomp: &dyn CertDecompressor) {

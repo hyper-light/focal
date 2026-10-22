@@ -48,6 +48,7 @@ mod pool;
 mod progress;
 mod receive;
 mod round;
+mod state;
 mod tally;
 mod timing;
 pub mod tls;
@@ -60,8 +61,8 @@ pub use credit::{
     socket_buffer_ask, stream_window_ceiling,
 };
 pub use endpoint::{
-    AskQueue, CONNECTION_STATE, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit,
-    connection_charge, state_charge,
+    AskQueue, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit, connection_charge,
+    state_charge,
 };
 pub use error::Refusal;
 pub use frame::Embedded;
@@ -75,6 +76,7 @@ pub use pool::PoolStats;
 pub use progress::{LEAST_PROGRESS, Progress};
 pub use receive::RECEIVE_CHUNK;
 pub use round::{Round, RoundEnd};
+pub use state::StateStats;
 pub use timing::spread;
 
 use std::fmt::Debug;

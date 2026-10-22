@@ -85,6 +85,12 @@ pub struct QueueCharge {
     /// mbuf limit `charged` does not read, a datagram's mbufs over `sb_efficiency`; nothing where
     /// `charged` is the kernel's whole account.
     pub message_floor: u64,
+    /// What the kernel holds for the socket's buffers and charges to the process's memory: on Linux
+    /// the queue's charge and the memory reserved ahead of it (`SK_MEMINFO_FWD_ALLOC`), which a
+    /// container's memory limit counts (cgroup v2's `memory.stat` `sock`) though no process's
+    /// footprint holds it. None where the kernel charges the process for no socket buffer (macOS's
+    /// mbufs are the system's), and on the simulation fabric.
+    pub held: Option<u64>,
 }
 
 /// An async UDP socket: a real OS datagram socket, or a port on the simulation's in-memory fabric.
@@ -342,12 +348,10 @@ impl UdpSocket {
         match &self.inner {
             #[cfg(target_os = "linux")]
             Inner::Real { socket } => {
-                let (charged, buffer, drops) =
-                    linux::queue_charge(socket.raw_id()).map_err(|error| {
-                        RtError::DriverRefused {
-                            call: "getsockopt(SO_MEMINFO)",
-                            code: error.raw_os_error(),
-                        }
+                let (charged, buffer, drops, reserved) = linux::queue_charge(socket.raw_id())
+                    .map_err(|error| RtError::DriverRefused {
+                        call: "getsockopt(SO_MEMINFO)",
+                        code: error.raw_os_error(),
                     })?;
                 Ok(Some(QueueCharge {
                     charged: u64::from(charged),
@@ -355,6 +359,8 @@ impl UdpSocket {
                     drops: drops.map(u64::from),
                     release_lag: u64::from(buffer >> 2),
                     message_floor: 0,
+                    held: reserved
+                        .map(|reserved| u64::from(charged).saturating_add(u64::from(reserved))),
                 }))
             }
             // XNU's byte limit counts each datagram's payload, address and control (`sbappendaddr`)
@@ -367,6 +373,7 @@ impl UdpSocket {
                 drops: None,
                 release_lag: 0,
                 message_floor: macos::message_floor(),
+                held: None,
             })),
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             Inner::Real { .. } => Ok(None),
@@ -378,6 +385,7 @@ impl UdpSocket {
                     drops: None,
                     release_lag: 0,
                     message_floor: 0,
+                    held: None,
                 }))
             }
             Inner::Moved => Err(moved()),

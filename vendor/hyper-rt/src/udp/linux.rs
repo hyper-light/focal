@@ -109,9 +109,11 @@ const MEMINFO_WORDS: usize = 9;
 
 /// What the kernel charges `fd`'s receive queue now (`SO_MEMINFO`, `sk_get_meminfo`): the bytes
 /// charged for the datagrams queued (`SK_MEMINFO_RMEM_ALLOC`, each its allocation's truesize), the
-/// buffer they count against (`SK_MEMINFO_RCVBUF`) and, where the kernel reports them, the
-/// datagrams it has dropped for want of room (`SK_MEMINFO_DROPS`).
-pub(crate) fn queue_charge(fd: RawFd) -> io::Result<(u32, u32, Option<u32>)> {
+/// buffer they count against (`SK_MEMINFO_RCVBUF`), where the kernel reports them the datagrams it
+/// has dropped for want of room (`SK_MEMINFO_DROPS`), and the memory it holds reserved for the
+/// socket ahead of what it queues (`SK_MEMINFO_FWD_ALLOC`, charged to the socket's memory control
+/// group with what is queued).
+pub(crate) fn queue_charge(fd: RawFd) -> io::Result<(u32, u32, Option<u32>, Option<u32>)> {
     let mut info = [0u32; MEMINFO_WORDS];
     let mut length = socklen(size_of::<[u32; MEMINFO_WORDS]>());
     // SAFETY: `info` and `length` are live locals of the sizes passed; getsockopt writes at most
@@ -142,7 +144,12 @@ pub(crate) fn queue_charge(fd: RawFd) -> io::Result<(u32, u32, Option<u32>)> {
         .ok_or_else(|| io::Error::other("SO_MEMINFO without the receive queue's charge"))?;
     let buffer = word(libc::SK_MEMINFO_RCVBUF)
         .ok_or_else(|| io::Error::other("SO_MEMINFO without the receive buffer"))?;
-    Ok((charged, buffer, word(libc::SK_MEMINFO_DROPS)))
+    Ok((
+        charged,
+        buffer,
+        word(libc::SK_MEMINFO_DROPS),
+        word(libc::SK_MEMINFO_FWD_ALLOC),
+    ))
 }
 
 /// What the kernel offers this socket.

@@ -336,6 +336,29 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         self.peers.len()
     }
 
+    /// What the kernel holds for the driver's sockets and charges the process's memory for, summed:
+    /// the listener's and every peer's (`QueueCharge::held`, Linux's `SO_MEMINFO`). None where the
+    /// platform charges the process for no socket buffer, or a socket's account cannot be read.
+    pub fn kernel_held(&self) -> Option<u64> {
+        let held = |socket: &Batched| socket.socket().queue_charge().ok().flatten()?.held;
+        self.peers
+            .iter()
+            .try_fold(held(&self.socket)?, |sum, peer| {
+                Some(sum.saturating_add(held(&peer.socket)?))
+            })
+    }
+
+    /// The owner's observation of what the endpoint's work holds, `user` bytes in use on the heap
+    /// it runs on and nothing else does, made when the endpoint wants one
+    /// ([`Endpoint::wants_observation`]): what the kernel holds for the driver's sockets is added
+    /// where the platform charges the process for it ([`Driver::kernel_held`]), so a connection's
+    /// state on Linux includes its socket's buffers, which a container's limit counts
+    /// (docs/transport.md §4x).
+    pub fn observe(&mut self, user: u64) {
+        let held = user.saturating_add(self.kernel_held().unwrap_or(0));
+        self.endpoint.observe(held);
+    }
+
     /// The rooms its peers' sockets were told since it began (`docs/transport.md` §4i).
     pub fn rooms(&self) -> Rooms {
         self.rooms

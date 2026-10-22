@@ -15956,3 +15956,66 @@ held at the node. Open: a write there took 124 ms at p50 against about 10 ms on 
 path to trace on its own. Test: `deliver::every_message_among_agents_is_delivered_to_the_next_agent`
 (16 agents, 48 messages: every message delivered, two inbox events a message, the tails held at the
 node); the shape's bounds. tools/load/README.md.
+
+### 2026-10-21 — A connection is charged what it holds where the node runs; the listener holds the node's memory
+
+The user's ask: the per-connection charge (`CONNECTION_STATE`, 30 KiB) and the listener's allowance
+(`LISTENER_BYTES`, 64 MiB, which with it funded 1,341 connections) learned from data on whatever host a
+node runs on, not measured once on ours, with the ways of learning them measured. Every shared crate
+is now at hyper-raft 64acd86, whose hyper-transport learns a connection's state where its endpoint runs
+(hyper-raft `docs/transport.md` §4x), and the vendored crates gain hyper-heap.
+
+**The ways, measured** (hyper-raft `docs/benchmarks.md`, "How a node could learn what a connection
+costs it, under churn" and "What a connection holds, read from a heap of its own"): a stepped server
+holding 32 to 1,024 connections, churned between steps by blocks of random sizes to a random total
+below 24 MiB. The process footprint regressed on the connections held erred by +19% to +392%
+(macOS, Linux and Windows, each host's allocator: an allocator keeps the pages others freed, and a
+footprint is no truth of what one piece of work holds — on macOS under mimalloc it grew less per
+connection than the connections' own blocks); the program's count of its own requests was steady
+but 5–27% short of what the allocator holds for them; ratios of the two carried the churn's error
+back. Read from a mimalloc heap the connections' work runs on alone, the bytes in use per connection
+reproduced the clean run's within 7% at 128 connections and 2% from 512 on, on macOS and Linux.
+
+**What runs now.** A node's binary allocates through mimalloc; each endpoint's owner task
+(`focal_wire::net::owner`) runs on a heap of its own (`hyper_heap::OnHeap`), the request handlers'
+tasks and the message buffers its budget charges (`NetBudget::reserve`) made off it
+(`hyper_heap::outside`). The owner observes the heap's bytes in use when its endpoint wants
+(`Owner::observe`: as it starts, then as its connections double, halve or turn over, with nothing in
+flight), and the driver adds Linux's kernel holdings for its sockets (`SO_MEMINFO`). The endpoint
+charges its connections' state what the heap holds past what it held with none and past its receive
+pool, as one reservation trued up at each observation, and a connection made between observations
+what one held on average then; before any observation, its structures' own bytes, the least.
+
+**The listener.** It holds the node's budget, as a child of the node's limit and completion reserve
+(`network_service`): no allowance of its own runs out before the node's memory does. Its connection
+count is what the node's memory funds at the least a connection is charged
+(`focal_wire::funded_connections`, no longer clamped at `MAX_CONNECTIONS`, 65,536, which no table
+needed): a bound the memory reaches first. The least node envelope funds more than a thousand
+agents, sixteen times the memory sixteen times as many, and a 16 GiB node more than 65,536
+(`network_service::tests::a_nodes_listener_admits_what_the_nodes_memory_funds`).
+
+**What the learning found.** focal's listener, observed so, first charged 160,204 bytes a
+connection where hyper-transport's measurement held 35 KB; the heap's blocks by size
+(`hyper_heap::sizes_here`) showed a 128 KiB block for each: hyper-transport's admission reserved each
+identity's list of connections to `per_identity`, which focal states as the listener's whole bound,
+so every agent held room for every connection (53,640 bytes an identity at the 1,341 the listener
+funded before, charged to nothing; megabytes at the bound the node's memory now funds). Fixed at the
+source: the list grows with what the identity holds. The listener now charges 29,295 bytes a
+connection (debug build, macOS). Tests: `admission::a_listener_charges_its_connections_what_they_hold_where_it_runs`
+(32 agents: at least two observations, the base known, nothing unfunded, a connection charged more
+than its structures, the budget holding the whole, and the charge given back as they leave);
+focal-wire's unit tests now allocate through mimalloc, as the binary does.
+
+**When a handshake meets a Retry.** A handshake from an unproven address met a Retry once half the
+handshake places were taken, a quarter of the connection count: with the count now the node's
+memory's, that would be thousands of handshakes' crypto before the first Retry. The listener now
+answers one with a Retry once the handshakes in progress hold 65/65535 of the node's budget
+(`focal_wire::retry_memory`, `AdmissionLimits::retrying_past`), each counted at the endpoint's
+learned charge: Microsoft msquic's rule and default (`RetryMemoryLimit`, "the percentage of
+available memory usable for handshake connections before stateless retry is used", N/65535,
+default 65; `QuicBindingShouldRetryConnection`), against the node's budget where msquic takes the
+machine's memory. The event bus's endpoints keep the rule of half their places (every seat's
+handshake may be under way at once). Open: `per_node` (4) and `per_participant` (16) are fixed;
+the handshake places themselves follow the count (each charged as it is held); Windows' and
+macOS's kernel socket memory is not charged to the process and not counted. vendor/README.md;
+docs/dependencies/inventory.tsv.

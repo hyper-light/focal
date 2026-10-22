@@ -818,10 +818,11 @@ impl NetworkService {
             &state.sponsor.root_certificates(),
             registry.clone(),
             limits.clone(),
-            budget.child(
-                crate::network_listener::LISTENER_BYTES,
-                crate::network_listener::LISTENER_COMPLETION,
-            )?,
+            // The node's whole budget, its completion reserve kept as the node keeps it: the
+            // listener holds what its connections and requests hold as they hold it, beside the
+            // sessions, with no allowance of its own to run out of first (a fixed 64 MiB funded
+            // 1,341 connections whatever the node's memory).
+            budget.child(budget.limit(), budget.stats().completion_reserve)?,
         )?;
         let bind = if state.listen.is_ipv4() {
             "0.0.0.0:0"

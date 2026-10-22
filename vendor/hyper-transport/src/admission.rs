@@ -215,6 +215,31 @@ impl Admission {
             bump(&mut self.stats.admitted);
             return Ok(Some(replaced.key));
         }
+        // Room for the connection in its identity's list before anything moves: the list grows with
+        // the connections its identity holds. It was reserved to `per_identity` as the identity was
+        // made, which an owner may state as the endpoint's whole bound (focal's listener: one
+        // identity may hold every connection), so each identity held room for every connection:
+        // 115,400 bytes an identity under a listener funding 2,885, measured on the heap its
+        // endpoint's work runs on, and megabytes at the bound a node's memory funds.
+        let room = match found {
+            Ok(at) => self
+                .identities
+                .get_mut(at)
+                .ok_or(Refusal::Identities)?
+                .held
+                .try_reserve(1)
+                .map(|()| None),
+            Err(_) => {
+                let mut held = Vec::new();
+                held.try_reserve(1)
+                    .and_then(|()| self.identities.try_reserve(1))
+                    .map(|()| Some(held))
+            }
+        };
+        let Ok(made) = room else {
+            bump(&mut self.stats.refused_identities);
+            return Err(Refusal::Identities);
+        };
         // A full endpoint: a connection from the identity holding the most, over the share.
         let mut taken = None;
         if self.stats.connections >= self.limits.connections {
@@ -242,7 +267,7 @@ impl Admission {
             Err(at) => {
                 let identity = Identity {
                     peer,
-                    held: Vec::with_capacity(self.limits.per_identity),
+                    held: made.unwrap_or_default(),
                 };
                 self.identities.insert(at, identity);
                 at
@@ -416,6 +441,55 @@ mod tests {
     /// An instant `seconds` after the tests' origin.
     fn at(origin: Instant, seconds: u64) -> Instant {
         origin + Duration::from_secs(seconds)
+    }
+
+    /// An identity holds room for the connections it holds, not for its bound: under limits that
+    /// let one identity hold a million (an owner's whole bound, as focal's listener states it),
+    /// each of a thousand identities admitted once holds a list of a few, where each held room for
+    /// a million (40 MB an identity; 115,400 bytes under a listener funding 2,885, measured).
+    #[test]
+    fn an_identity_holds_room_for_what_it_holds_not_its_bound() {
+        let mut admission = Admission::new(
+            AdmissionLimits {
+                pending: 8,
+                identities: 1_000,
+                connections: 1_000_000,
+                per_identity: 1_000_000,
+            },
+            QUIET,
+        )
+        .unwrap();
+        let origin = hyper_sim::Anchor::new().instant(0).unwrap();
+        for peer in 0..1_000u64 {
+            admission
+                .admit(peer, usize::try_from(peer).unwrap(), peer, origin)
+                .unwrap();
+        }
+        let most = admission
+            .identities
+            .iter()
+            .map(|identity| identity.held.capacity())
+            .max()
+            .unwrap();
+        assert!(
+            most <= 4,
+            "an identity holding one connection has room for {most}"
+        );
+        // One identity holding more grows its own list, and only its own.
+        for connection in 1_000..1_100usize {
+            admission.admit(7, connection, 0, origin).unwrap();
+        }
+        let seventh = admission
+            .identities
+            .iter()
+            .find(|identity| identity.peer == 7)
+            .unwrap();
+        assert_eq!(seventh.held.len(), 101);
+        assert!(
+            seventh.held.capacity() < 1_000,
+            "{}",
+            seventh.held.capacity()
+        );
     }
 
     #[test]

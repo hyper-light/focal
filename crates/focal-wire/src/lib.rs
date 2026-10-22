@@ -54,6 +54,12 @@ pub use trust::*;
 pub use validators::*;
 #[cfg(test)]
 mod tests;
+/// The unit tests allocate through mimalloc, as the focal binary does (`focal-node`'s `main`): a
+/// listener's owner runs on a heap of its own and its endpoint learns what its connections hold
+/// (hyper-raft docs/transport.md §4x), as a node's does.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Whether this thread is a hyper-rt shard's: what every async entry point
 /// needs, its timers and sockets the shard's.

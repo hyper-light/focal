@@ -163,6 +163,9 @@ fn limits(identities: usize, lanes: u32) -> Result<Limits, BusError> {
         // (a refusal, a retry) before its next send: focal-wire's rule.
         max_responses: hyper_rt_transport::TURNS.saturating_mul(IO.batch),
         receive_chunks,
+        // Every seat's handshake may be under way at once, the places the seats: the rule of half
+        // of them holds.
+        retry_bytes: None,
     })
 }
 

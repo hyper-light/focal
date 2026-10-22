@@ -5,6 +5,7 @@ exclude = [
     "vendor/hyper-block",
     "vendor/hyper-datagram",
     "vendor/hyper-durable",
+    "vendor/hyper-heap",
     "vendor/hyper-liveness",
     "vendor/hyper-log",
     "vendor/hyper-measure",
@@ -49,6 +50,9 @@ hyper-durable = { version = "0.1.0", path = "vendor/hyper-durable" }
 hyper-log = { version = "0.1.0", path = "vendor/hyper-log" }
 hyper-liveness = { version = "0.1.0", path = "vendor/hyper-liveness" }
 hyper-timing = { version = "0.1.0", path = "vendor/hyper-timing" }
+# A node's endpoints run on heaps of their own, which say what their connections hold
+# (vendor/hyper-heap/SNAPSHOT; hyper-raft docs/transport.md §4x).
+hyper-heap = { version = "0.1.0", path = "vendor/hyper-heap" }
 # Sealing at rest, vendored from hyper-raft (vendor/hyper-seal/SNAPSHOT;
 # docs/archictecutre/29-sealing-at-rest.md).
 hyper-seal = { version = "0.1.0", path = "vendor/hyper-seal" }

@@ -10,7 +10,7 @@ use crate::Refusal;
 pub enum Lane<K> {
     /// A connection's receive window: the bytes QUIC may buffer for the peer before the
     /// application reads them (quinn: "upper bound proportional to receive_window", node.md §3.3);
-    /// and the connection's own state beside it ([`crate::CONNECTION_STATE`]). Accounting only;
+    /// and the connections' own state beside it (docs/transport.md §4x). Accounting only;
     /// such a reservation carries no buffer.
     Window,
     /// A message of this class: its head, a piece of its body, or a lane's frame.
@@ -75,6 +75,37 @@ impl Reservation {
     /// Empty the reservation, keeping its grant, to read into it again.
     pub fn clear(&mut self) {
         self.buffer.clear();
+    }
+    /// `other`'s grant taken into this one, to be given back with it: how an owner that charges a
+    /// sum as one reservation (an endpoint's connections' state, docs/transport.md §4x) grows it.
+    /// Both must be of one accountant's mark and hold no buffer (accounting only); one that is not
+    /// so, or whose grant the sum cannot hold, is handed back as it was.
+    pub fn absorb(&mut self, other: Reservation) -> Result<(), Reservation> {
+        if other.tag != self.tag || other.buffer.capacity() > 0 || self.buffer.capacity() > 0 {
+            return Err(other);
+        }
+        match self.granted.checked_add(other.granted) {
+            Some(granted) => {
+                self.granted = granted;
+                Ok(())
+            }
+            None => Err(other),
+        }
+    }
+    /// `bytes` of this grant split off as a reservation of their own, of the same mark, to be given
+    /// back apart; none past the grant, or of a reservation holding a buffer. An accountant gives
+    /// back what each release carries, so a reservation split and absorbed gives back, in all, what
+    /// was granted.
+    pub fn split(&mut self, bytes: u64) -> Option<Reservation> {
+        if self.buffer.capacity() > 0 {
+            return None;
+        }
+        self.granted = self.granted.checked_sub(bytes)?;
+        Some(Self {
+            granted: bytes,
+            buffer: Vec::new(),
+            tag: self.tag,
+        })
     }
     /// The buffer, for an accountant that recycles it.
     pub fn into_buffer(self) -> Vec<u8> {

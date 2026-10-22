@@ -1,0 +1,24 @@
+[package]
+name = "hyper-heap"
+version = "0.1.0"
+edition = "2024"
+# focal's toolchain (rust-toolchain.toml); this snapshot builds on it, which focal's gates show.
+rust-version = "1.98.1"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+
+[dependencies]
+# mimalloc's heap API (the `extended` bindings), at the version focal's binary allocates through
+# (the workspace's `mimalloc`, whose sys crate this is).
+libmimalloc-sys = { version = "=0.1.49", default-features = false, features = ["v2", "extended"] }
+# A future polled on a heap holds its future in place, projected without `unsafe` of the crate's.
+pin-project-lite = "0.2.17"
+
+# hyper-raft's workspace declares the configurations its model checks and fuzzers build under
+# (its Cargo.toml [workspace.lints.rust]); this root declares the same.
+[lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(fuzzing)"] }
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside focal's workspace. Its
+# suites, benchmarks and lint wall run in hyper-raft's repository, on all six targets.
+[workspace]

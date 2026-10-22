@@ -117,9 +117,11 @@ impl Budget<TrafficClass> for NetBudget {
         let Ok(size) = usize::try_from(bytes) else {
             return Err(self.refuse());
         };
-        // The buffer first, fallibly: a grant is never charged for memory that could not be had.
+        // The buffer first, fallibly: a grant is never charged for memory that could not be had. It
+        // is the reservation's, charged by it, so it is made off the owner's heap, whose bytes are
+        // the connections' state (`Owner::observe`), and freed wherever its body ends.
         let mut buffer = Vec::new();
-        if buffered && buffer.try_reserve_exact(size).is_err() {
+        if buffered && hyper_heap::outside(|| buffer.try_reserve_exact(size)).is_err() {
             return Err(self.refuse());
         }
         let Ok(reservation) = self.budget.reserve(BudgetKind::Pending, budget_lane, size) else {

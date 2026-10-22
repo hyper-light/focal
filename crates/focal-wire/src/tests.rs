@@ -4074,6 +4074,7 @@ mod admission {
             per_node: 4,
             per_participant: 2,
             replace_after: QUIET,
+            retry_bytes: None,
         }
     }
     /// A process of the identity of `certificate`: an endpoint of its own, its own connection.
@@ -4133,9 +4134,17 @@ mod admission {
                 per_node: 4,
                 per_participant: 16,
                 replace_after: Duration::ZERO,
+                retry_bytes: None,
             }
         );
         assert_eq!(AdmissionLimits::for_connections(1).pending, 1);
+        // A Retry once the handshakes hold msquic's default share of the node's memory.
+        assert_eq!(
+            AdmissionLimits::for_connections(8)
+                .retrying_past(retry_memory(4 << 30))
+                .retry_bytes,
+            Some((4u64 << 30) / 65_535 * 65)
+        );
         assert_eq!(
             AdmissionLimits::for_connections(8)
                 .replacing_after(QUIET)
@@ -4144,10 +4153,10 @@ mod admission {
         );
     }
 
-    /// A listener admits what its budget funds: the budget past its socket's charge over each
-    /// connection's charge as it is made, its first window, the reserve on it and its state with
-    /// the exchange tables its streams size; at least one, at most `MAX_CONNECTIONS`, whatever count
-    /// its limits state for its exchanges.
+    /// A listener admits what its budget funds: the budget past its socket's charge over the least
+    /// a connection is charged as it is made, its first window, the reserve on it and its
+    /// structures' own bytes with the exchange tables its streams size; at least one, and nothing
+    /// but the budget bounds it, whatever count its limits state for its exchanges.
     #[test]
     fn a_listeners_bound_is_what_its_budget_funds() {
         let charge = hyper_transport::connection_charge::<crate::net::FocalClasses>(
@@ -4169,12 +4178,107 @@ mod admission {
             funded_connections(&wide, 64 << 20).unwrap()
                 < funded_connections(&quick(), 64 << 20).unwrap()
         );
-        // No budget gives less than one, and none more than the tables may name.
+        // No budget gives less than one, and no constant caps what one funds.
         assert_eq!(funded_connections(&quick(), 0).unwrap(), 1);
         assert_eq!(
             funded_connections(&quick(), usize::MAX).unwrap(),
-            MAX_CONNECTIONS
+            (usize::MAX - socket) / charge
         );
+    }
+
+    /// A listener charges its connections what they hold where it runs, learned there: its owner
+    /// runs on a heap of its own (the test, as the focal binary, allocates through mimalloc), its
+    /// endpoint observes that heap as its connections double, and once agents hold connections and
+    /// go quiet each is charged what one held on average, past the least a connection is charged
+    /// before anything is observed, the listener's budget holding the whole. Once they have left,
+    /// what the connections were charged goes back with them (hyper-raft docs/transport.md §4x).
+    #[test]
+    fn a_listener_charges_its_connections_what_they_hold_where_it_runs() {
+        const AGENTS: usize = 32;
+        focal_rt::block_on(async move {
+            let pki = Pki::new();
+            let registry = PeerRegistry::new(AGENTS).unwrap();
+            let agents: Vec<(Vec<u8>, Vec<u8>)> = (0..AGENTS)
+                .map(|agent| {
+                    let (certificate, key) = pki.issue(false);
+                    let principal = ParticipantId::from_u128(3_000 + agent as u128);
+                    registry
+                        .register_certificate(
+                            &certificate,
+                            PeerGrant {
+                                principal,
+                                ..grant()
+                            },
+                        )
+                        .unwrap();
+                    (certificate, key)
+                })
+                .collect();
+            let funded = funded_connections(&quick(), budget().limit()).unwrap();
+            let admission = AdmissionLimits::for_connections(funded).replacing_after(QUIET);
+            let (server, task) = admitting(&pki, registry, admission).await;
+            let address = server.local_addr().unwrap();
+            let mut held_by_agents = Vec::with_capacity(AGENTS);
+            for (agent, (certificate, key)) in agents.iter().enumerate() {
+                let (process, remote) = dial(&pki, certificate, key, address).await;
+                let remote = remote.unwrap_or_else(|error| panic!("agent {agent}: {error:?}"));
+                assert!(serves(&remote, agent as u128).await, "agent {agent}");
+                held_by_agents.push((process, remote));
+            }
+            held(&server, AGENTS).await;
+            let least = hyper_transport::state_charge::<crate::net::FocalClasses>(
+                &endpoint_limits(&quick(), &admission).unwrap(),
+            );
+            // The owner observes as its loop turns; once the connections are quiet it has.
+            let mut wait = focal_timing::ProgressDeadline::begin(
+                &[server.admission().await.changes],
+                u64::MAX,
+                Duration::from_secs(30),
+            );
+            let stats = loop {
+                let stats = server.stats().await;
+                if stats.endpoint.state.observations >= 2 && stats.endpoint.state.each > least {
+                    break stats;
+                }
+                if let Err(spent) = wait.check(&[server.admission().await.changes]) {
+                    panic!(
+                        "the listener learned nothing: {spent}: {:?}",
+                        stats.endpoint.state
+                    );
+                }
+                pause(QUIET).await;
+            };
+            let state = stats.endpoint.state;
+            assert!(state.base.is_some(), "{state:?}");
+            assert_eq!(state.unfunded, 0, "{state:?}");
+            assert!(
+                state.charged >= AGENTS as u64 * least,
+                "{AGENTS} connections charged {} B, each at least {least} B",
+                state.charged
+            );
+            // The listener's budget holds the connections' state with their windows and its socket.
+            assert!(stats.budget.ordinary as u64 >= state.charged, "{stats:?}");
+            drop(held_by_agents);
+            held(&server, 0).await;
+            let mut wait = focal_timing::ProgressDeadline::begin(
+                &[server.admission().await.changes],
+                u64::MAX,
+                Duration::from_secs(30),
+            );
+            loop {
+                let state = server.stats().await.endpoint.state;
+                if state.charged < AGENTS as u64 * least {
+                    break;
+                }
+                if let Err(spent) = wait.check(&[server.admission().await.changes]) {
+                    panic!("the connections' state was not given back: {spent}: {state:?}");
+                }
+                pause(QUIET).await;
+            }
+            server.close().unwrap();
+            task.join().await.unwrap();
+        })
+        .unwrap()
     }
 
     /// A participant alone uses the whole listener, and replaces nothing until it is full; full,
@@ -4227,9 +4331,8 @@ mod admission {
 
     /// A thousand agents, each an identity and a process of its own, hold a connection each to one
     /// listener at once, and each is answered while the others are held: the listener admits what
-    /// the node's listener budget (64 MiB) funds of each connection's charge as it is made
-    /// (`funded_connections`), where it admitted 128 and the 129th agent took another's
-    /// connection. Each connection holds its state's charge of the budget while it is up and gives
+    /// its budget funds of each connection's charge as it is made (`funded_connections`), where it
+    /// admitted 128 and the 129th agent took another's connection. Each connection holds its state's charge of the budget while it is up and gives
     /// it back as it goes: once every agent has left, the listener holds what it held before any
     /// came.
     #[test]
@@ -4281,8 +4384,9 @@ mod admission {
             }
             let stats = held(&server, AGENTS).await;
             assert_eq!((stats.identities, stats.replaced), (AGENTS, 0), "{stats:?}");
-            let state =
-                hyper_transport::state_charge(&endpoint_limits(&quick(), &admission).unwrap());
+            let state = hyper_transport::state_charge::<crate::net::FocalClasses>(
+                &endpoint_limits(&quick(), &admission).unwrap(),
+            );
             let connections = own(&stats) - before;
             assert!(
                 connections >= AGENTS as u64 * state,
