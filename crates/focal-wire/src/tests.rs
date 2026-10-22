@@ -4071,8 +4071,6 @@ mod admission {
             pending: 8,
             identities: 8,
             connections: 16,
-            per_node: 4,
-            per_participant: 2,
             replace_after: QUIET,
             retry_bytes: None,
         }
@@ -4131,8 +4129,6 @@ mod admission {
                 pending: 32,
                 identities: 128,
                 connections: 128,
-                per_node: 4,
-                per_participant: 16,
                 replace_after: Duration::ZERO,
                 retry_bytes: None,
             }

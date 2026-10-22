@@ -29,15 +29,10 @@ pub struct AdmissionLimits {
     pub pending: usize,
     /// Identities holding a connection.
     pub identities: usize,
-    /// Connections held in all, once authenticated.
+    /// Connections held in all, once authenticated. An identity's share of them is the
+    /// endpoint's fair share, the listener among the identities holding connections; no bound of
+    /// its own (a node's and a participant's fixed shares, 4 and 16, were read by nothing).
     pub connections: usize,
-    /// The most connections a node holds: its peer pool's few. Kept for the configurations that
-    /// state it; the endpoint's fair share bounds every identity alike.
-    pub per_node: usize,
-    /// The least share of the listener a participant is ever left. Kept for the configurations
-    /// that state it; the endpoint's fair share is the listener among the identities holding
-    /// connections.
-    pub per_participant: usize,
     /// How long a connection must have begun no request before it may be replaced: a live client
     /// between requests is not, one that left its connection behind is. The endpoint counts it as
     /// the listener's request timeout, its serve period.
@@ -55,8 +50,6 @@ impl AdmissionLimits {
             pending: connections.checked_div(4).unwrap_or(0).max(1),
             identities: connections.max(1),
             connections: connections.max(1),
-            per_node: 4,
-            per_participant: 16,
             replace_after: Duration::ZERO,
             retry_bytes: None,
         }
