@@ -49,10 +49,12 @@ fn every_message_is_delivered_through_the_events_and_measured_end_to_end() {
     assert_eq!(deliver["delivered"], 12);
     assert_eq!(deliver["undelivered"], 0);
     assert_eq!(deliver["tail_failures"], 0);
-    // The indexed inbox delivers only the other side's posted message, once a lifecycle:
-    // neither side materializes the rest of the ledger's events and filters them locally.
+    // The indexed inbox delivers what each side acts on, once a lifecycle: the consumer the claim
+    // posted for it; the issuer the testament posted for its claim, and its claim settled (the
+    // claimant observes the committed result). Neither side materializes the rest of the
+    // ledger's events and filters them locally.
     assert_eq!(deliver["consumer_events"].as_u64().unwrap(), 12);
-    assert_eq!(deliver["issuer_events"].as_u64().unwrap(), 12);
+    assert_eq!(deliver["issuer_events"].as_u64().unwrap(), 2 * 12);
     let handled = deliver["handled_latency_ns"]["max"].as_u64().unwrap();
     let satisfied = deliver["satisfied_latency_ns"]["max"].as_u64().unwrap();
     assert!(handled > 0 && handled <= satisfied, "{handled} {satisfied}");
@@ -123,7 +125,8 @@ fn every_message_among_agents_is_delivered_to_the_next_agent() {
     assert_eq!(deliver["undelivered"], 0);
     assert_eq!(deliver["tail_failures"], 0);
     assert_eq!(deliver["agents"], 16);
-    assert_eq!(deliver["agent_events"].as_u64().unwrap(), 2 * 48);
+    // Each message's post to its consumer, and its testament and its settlement to its issuer.
+    assert_eq!(deliver["agent_events"].as_u64().unwrap(), 3 * 48);
     assert_eq!(deliver["consumer_events"].as_u64().unwrap(), 0);
     assert_eq!(deliver["issuer_events"].as_u64().unwrap(), 0);
     assert!(deliver["agent_waits"].as_u64().unwrap() > 0, "{deliver}");

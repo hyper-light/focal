@@ -12,7 +12,8 @@ name: Competitive tail latency
 on:
   # A branch named compare/<anything> runs it with the defaults below, which
   # starts a run without the workflow on the default branch; one named
-  # compare/deliver-<anything> runs the deliver mode at its own rates.
+  # compare/deliver-<anything> runs the deliver mode at its own rates, and one
+  # named compare/work-<anything> focal's work mode among 500 agents.
   push:
     branches: ["compare/**"]
   workflow_dispatch:
@@ -36,7 +37,7 @@ on:
         description: "Systems measured, space-separated, on one runner in turn"
         default: "focal kafka nats redis"
       mode:
-        description: "append (each record stored) or deliver (each also consumed and acknowledged durably, a work queue's message end to end)"
+        description: "append (each record stored), deliver (each also consumed and acknowledged durably, a work queue's message end to end) or work (focal alone: each claim posted, worked, handed in, judged and settled among three of the agents, eleven writes)"
         default: "append"
       agents:
         description: "deliver mode on focal: the messages go among this many enrolled agents, each a client of its own (focal-load's agents, 2..=4094); empty, one issuer and one consumer"
@@ -122,15 +123,15 @@ jobs:
       - name: Runs
         env:
           NODE_CPUS: "1"
-          MODE: ${{ github.event.inputs.mode || (startsWith(github.ref_name, 'compare/deliver') && 'deliver' || 'append') }}
-          AGENTS: ${{ github.event.inputs.agents || '' }}
+          MODE: ${{ github.event.inputs.mode || (startsWith(github.ref_name, 'compare/deliver') && 'deliver' || (startsWith(github.ref_name, 'compare/work') && 'work' || 'append')) }}
+          AGENTS: ${{ github.event.inputs.agents || (startsWith(github.ref_name, 'compare/work') && '500' || '') }}
           # The competitors' images from the repository's registry where the image
           # job copied them (compose.yaml's defaults are the public sources).
           BENCH_LIBRARY: ${{ needs.image.outputs.registry || 'public.ecr.aws/docker/library' }}
           BENCH_KAFKA: ${{ needs.image.outputs.registry && format('{0}/kafka', needs.image.outputs.registry) || 'apache/kafka' }}
         run: |
-          for system in ${{ github.event.inputs.systems || 'focal kafka nats redis' }}; do
-            for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'compare/deliver') && '50 100 200 400' || '100 200 1000 4000') }}; do
+          for system in ${{ github.event.inputs.systems || (startsWith(github.ref_name, 'compare/work') && 'focal' || 'focal kafka nats redis') }}; do
+            for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'compare/deliver') && '50 100 200 400' || (startsWith(github.ref_name, 'compare/work') && '20 50 100' || '100 200 1000 4000')) }}; do
               for window in ${{ github.event.inputs.windows || '-' }}; do
                 if [ "$window" = - ]; then
                   unset INFLIGHT
@@ -238,8 +239,10 @@ jobs:
           # Deliver mode: each message from its intended send time to its consumer's
           # acknowledgement confirmed (focal: the testament posted; satisfied as well).
           delivered = []
-          # A deliver run among agents names its agents after the mode (`-deliver-agents1000`).
-          for path in sorted(glob.glob("tools/compare/compose/reports/*-deliver*.json")):
+          # A deliver run among agents names its agents after the mode (`-deliver-agents1000`);
+          # a work run likewise (`-work-agents500`), each claim's satisfaction its delivery.
+          for path in sorted(glob.glob("tools/compare/compose/reports/*-deliver*.json")
+                             + glob.glob("tools/compare/compose/reports/*-work*.json")):
               r = json.load(open(path))
               d = r.get("deliver")
               if not d:
@@ -257,7 +260,7 @@ jobs:
                                     ms(d["p50_us"]), ms(d["p99_us"]), ms(d["p999_us"]), "–", "–", "–")
                                    + cpu(path, max(r["sent"], 1))[:2])
           if delivered:
-              print("\n### Delivered end to end (deliver mode)\n")
+              print("\n### Delivered end to end (deliver and work modes)\n")
               print("| run | offered msg/s | delivered | undelivered or failed | acked p50 ms | p99 ms | p99.9 ms | focal satisfied p50 ms | p99 ms | p99.9 ms | busiest node CPU µs/msg | all nodes CPU µs/msg |")
               print("|---|---|---|---|---|---|---|---|---|---|---|---|")
               for row in delivered:

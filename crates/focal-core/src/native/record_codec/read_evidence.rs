@@ -15,7 +15,7 @@ use focal_model::{ArtifactRef, ClaimId, ValidationId};
 
 #[path = "read_evidence_content.rs"]
 mod content;
-pub(in crate::native) use content::{content_profile, decode_definition};
+pub(in crate::native) use content::{content_profile, decode_definition, definition_program};
 #[path = "read_evidence_creation.rs"]
 mod creation;
 #[path = "read_evidence_response.rs"]

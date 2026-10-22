@@ -17,6 +17,10 @@
 #   AGENTS (environment), deliver mode on focal: the messages go among that many enrolled
 #   agents, each a client of its own (focal-load's `agents`), where unset one issuer and one
 #   consumer; the report's file names it.
+#   MODE work, focal alone (no other system has its lifecycle): each claim done among three of
+#   AGENTS enrolled agents, 3 at least, an issuer, a worker and an evaluator, its eleven writes
+#   each learned of from the next agent's inbox (focal-load's `lifecycle: work`); RATE is
+#   claims a second.
 #   INFLIGHT (environment): the generator's window, the requests out at most
 #   (focal-compare's own default, 4096, where unset); a run given one names it
 #   in its report's file.
@@ -30,6 +34,10 @@ if [ -n "${INFLIGHT:-}" ]; then window_args=(--inflight "$INFLIGHT"); window="-w
 case "$mode" in
   append) suffix="" ;;
   deliver) suffix="-deliver${AGENTS:+-agents$AGENTS}" ;;
+  work)
+    if [ "$system" != focal ]; then echo "work is focal's lifecycle: no $system run" >&2; exit 2; fi
+    if [ "${AGENTS:-0}" -lt 3 ]; then echo "work goes among AGENTS agents, 3 at least" >&2; exit 2; fi
+    suffix="-work-agents$AGENTS" ;;
   *) echo "unknown mode $mode" >&2; exit 2 ;;
 esac
 mkdir -p "$out"
@@ -198,7 +206,11 @@ print(w if isinstance(w, str) else bytes(w).hex())')
     inflight=64
     # Append: every claim targets the node's worker. Deliver: every claim targets the
     # consumer, a client of its own that completes it.
-    if [ "$mode" = deliver ] && [ -n "${AGENTS:-}" ]; then
+    if [ "$mode" = work ]; then
+      lifecycle="lifecycle: work
+agents: $AGENTS
+agent_enrollments: /client/agents"
+    elif [ "$mode" = deliver ] && [ -n "${AGENTS:-}" ]; then
       lifecycle="lifecycle: deliver
 agents: $AGENTS
 agent_enrollments: /client/agents"
@@ -230,6 +242,10 @@ EOF
     bound=$(( (seconds + warmup) * 4 + 120 ))
     if [ "$mode" = deliver ]; then
       bound=$(( bound + 2 * 120 ))
+    elif [ "$mode" = work ]; then
+      # A work claim's agents wait four times: the post, the testament, the evaluation due and
+      # the settlement.
+      bound=$(( bound + 4 * 120 ))
     fi
     cpu_stat before > "$out/$report.cpu.txt"
     net_stat before > "$out/$report.net.txt"

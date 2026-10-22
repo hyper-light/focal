@@ -61,6 +61,16 @@ pub enum Lifecycle {
     /// other's step but through the events it polls, as a consumer learns of a message only by
     /// fetching it.
     Deliver,
+    /// Work done and judged among agents, the whole flow an agent runs (02 §3, §6): the issuer
+    /// creates a work claim whose required whole-work validation names a third agent its
+    /// evaluator, checking the claim's output slot, and posts it to the next agent; the worker
+    /// finds it in its events, acquires its receipt, submits a work artifact for the slot and its
+    /// testament citing it, and posts the testament; the issuer finds the testament in its events,
+    /// receives it and enters its whole-work validation; the evaluator finds its evaluation due in
+    /// its events, begins it and reports a verdict with its result artifact; the issuer finds the
+    /// claim satisfied in its events and releases its scope. Eleven writes, among agents only:
+    /// every hand-off is learned from the recipient's own events, as an agent learns of work.
+    Work,
 }
 impl Lifecycle {
     /// The writes one claim's lifecycle takes.
@@ -69,7 +79,13 @@ impl Lifecycle {
             Self::Create => 1,
             Self::CancelRelease => 3,
             Self::Deliver => 8,
+            Self::Work => 11,
         }
+    }
+    /// Whether the lifecycle goes between principals that learn of each other's steps through
+    /// their events: deliver's issuer and consumer, work's issuer, worker and evaluator.
+    pub fn among_principals(self) -> bool {
+        matches!(self, Self::Deliver | Self::Work)
     }
 }
 
@@ -266,7 +282,7 @@ impl WorkloadShape {
             }
             Transport::Enrolled
                 if self.enrollment.is_none()
-                    || (self.lifecycle != Lifecycle::Deliver && self.worker.is_none()) =>
+                    || (!self.lifecycle.among_principals() && self.worker.is_none()) =>
             {
                 return Err(
                     "transport enrolled needs enrollment (the client's directory) and worker"
@@ -275,7 +291,12 @@ impl WorkloadShape {
             }
             _ => {}
         }
-        if self.lifecycle == Lifecycle::Deliver {
+        if self.lifecycle == Lifecycle::Work && self.agents.is_none_or(|agents| agents < 3) {
+            return Err(
+                "work goes among agents: an issuer, a worker and an evaluator, 3 at least".into(),
+            );
+        }
+        if self.lifecycle.among_principals() {
             // The consumer is a second principal, and its steps are authored operations.
             if self.profile() != Profile::AuthoredV1 {
                 return Err("deliver compiles authored operations: profile authored_v1".into());

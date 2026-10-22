@@ -116,6 +116,32 @@ pub enum ProgramView<'a> {
         check: PhasePolicyView<'a>,
     },
 }
+impl From<PhasePolicyView<'_>> for PhaseFields {
+    fn from(value: PhasePolicyView<'_>) -> Self {
+        Self {
+            evaluator: value.evaluator(),
+            definition: value.definition(),
+            required_policy: value.required_policy(),
+            handlers: value.policy.handlers.len(),
+        }
+    }
+}
+/// A retained program's fields, as its encoding's view gives them (`ProgramFields::from` a
+/// `Program`), with nothing copied.
+impl From<ProgramView<'_>> for ProgramFields {
+    fn from(value: ProgramView<'_>) -> Self {
+        match value {
+            ProgramView::Delivery => Self::Delivery,
+            ProgramView::Programmatic { check, quality } => Self::Programmatic {
+                check: check.into(),
+                quality: quality.map(Into::into),
+            },
+            ProgramView::Agentic { check } => Self::Agentic {
+                check: check.into(),
+            },
+        }
+    }
+}
 impl OwnedPhasePolicy {
     fn retained_bytes(&self) -> Result<usize, ContractError> {
         self.handlers

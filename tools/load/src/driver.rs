@@ -394,12 +394,18 @@ fn window_envelope(names: &Names, principal: ParticipantId, request: u128) -> Re
 
 /// The write `offset` of this worker: a structural creation names its claim
 /// id; a compiled one mints its identities from a span of the same space.
-/// The creation of lifecycle `offset`'s claim, by `request`'s principal for `subject`.
+/// Objects one evaluation selection's page holds at most: the evaluation the owner selects and
+/// what it binds (its definition and results), as the native client reads it (`READ_ITEMS`).
+const LIFECYCLE_SELECTION_ITEMS: u32 = focal_native_client::READ_ITEMS;
+
+/// The creation of lifecycle `offset`'s claim, by `request`'s principal for `subject`, judged by
+/// `evaluator` where it names one (a work claim).
 fn build(
     job: &Job,
     offset: u128,
     request: RequestKey,
     subject: ParticipantId,
+    evaluator: Option<ParticipantId>,
 ) -> Result<(RequestEnvelope, u128), LoadError> {
     match job.names.profile {
         NativeContentProfile::ProjectionOnly => {
@@ -427,6 +433,7 @@ fn build(
                 job.names.ledger,
                 request.principal,
                 subject,
+                evaluator,
                 job.names.root,
                 request,
                 first_id,
@@ -599,6 +606,7 @@ impl Shared<'_> {
             Lifecycle::Create => Ok(()),
             Lifecycle::CancelRelease => self.cancel_release(i, claim, written).await,
             Lifecycle::Deliver => self.deliver(i, claim, written, started).await,
+            Lifecycle::Work => self.work(i, claim, written, started).await,
         }
     }
     /// The issuer cancels the claim it created at `written`, then releases its scope.
@@ -765,6 +773,218 @@ impl Shared<'_> {
         Ok(())
     }
 
+    /// The work claim the issuer created at `created`, done and judged among three agents (02 §3,
+    /// §6): posted by the issuer; found by the worker in its events, its receipt acquired, a work
+    /// artifact submitted for the claim's slot, read back for the reference a manifest binds,
+    /// and a testament citing it submitted and posted; the testament found by the issuer in its
+    /// events, received, and its whole-work validation entered; the evaluation found due by the
+    /// evaluator in its events, begun and reported a pass with its result artifact; the claim
+    /// found settled by the issuer in its events, and its scope released. Every hand-off is
+    /// learned from the recipient's own events, each waiter registered before the write that
+    /// answers it. Recorded: when the testament was posted (the work handed in) and when the
+    /// claim was seen satisfied, from the claim's place on the schedule.
+    async fn work(
+        &self,
+        i: u64,
+        claim: u128,
+        created: SessionSeq,
+        started: Instant,
+    ) -> Result<(), LoadError> {
+        let (issuer, worker) = self.sides(i)?;
+        let Some((worker, watch)) = worker else {
+            return Err(LoadError::Shape("work without a worker".into()));
+        };
+        let evaluator = self.evaluator(i)?;
+        // The identities each step mints, from the upper half of the claim's own creation span,
+        // which its creation leaves unused: an eighth each for the receipt, the work artifact,
+        // the testament and the report's result artifact.
+        let span = self.creation_span(i)?;
+        let eighth = authored::IDS_PER_CREATION / 8;
+        let part = |n: u128| -> Result<std::ops::Range<u128>, LoadError> {
+            let start = n
+                .checked_add(4)
+                .and_then(|eighths| eighth.checked_mul(eighths))
+                .and_then(|offset| span.start.checked_add(offset))
+                .ok_or(LoadError::Bound("work id space"))?;
+            let end = start
+                .checked_add(eighth)
+                .filter(|end| *end <= span.end)
+                .ok_or(LoadError::Bound("work id space"))?;
+            Ok(start..end)
+        };
+        let (receipt_ids, artifact_ids, testament_ids, report_ids) =
+            (part(0)?, part(1)?, part(2)?, part(3)?);
+        // The issuer posts; the worker finds the claim in its events.
+        let posted = watch.expect_posted(claim)?;
+        let post = NativeAuthoredOperation::ClaimPost(authored::claim_target(claim));
+        let at = PROGRESS.at(Stage::Post);
+        if self
+            .later(issuer, i, 1, &post, created, 0..0)
+            .await?
+            .is_none()
+        {
+            watch.forget(claim);
+            return Ok(());
+        }
+        drop(at);
+        let at = PROGRESS.at(Stage::WaitPosted);
+        let Some(seen) = watch.wait(posted).await? else {
+            return self.undelivered(claim, watch);
+        };
+        drop(at);
+        // The worker takes the claim and does its work.
+        let acquire = NativeAuthoredOperation::ReceiptAcquire(authored::receipt(claim));
+        let at = PROGRESS.at(Stage::Acquire);
+        let Some((written, _)) = self
+            .later(worker, i, 2, &acquire, seen, receipt_ids)
+            .await?
+        else {
+            return Ok(());
+        };
+        drop(at);
+        let artifact = NativeAuthoredOperation::ArtifactSubmit(authored::work_artifact(claim));
+        let at = PROGRESS.at(Stage::Artifact);
+        let Some((written, minted)) = self
+            .later(worker, i, 3, &artifact, written, artifact_ids)
+            .await?
+        else {
+            return Ok(());
+        };
+        drop(at);
+        let artifact = minted
+            .iter()
+            .find(|identity| identity.kind == NativeIdentityKind::Artifact)
+            .map(|identity| u128::from_be_bytes(identity.id))
+            .ok_or_else(|| LoadError::Fixture("the work artifact minted no artifact".into()))?;
+        let Some(reference) = self.work_reference(worker, artifact, written).await? else {
+            let mut outcome = self.outcome.borrow_mut();
+            outcome.abandoned = outcome.abandoned.saturating_add(1);
+            return Ok(());
+        };
+        let submit =
+            NativeAuthoredOperation::TestamentSubmit(authored::work_testament(claim, reference));
+        let at = PROGRESS.at(Stage::Submit);
+        let Some((written, minted)) = self
+            .later(worker, i, 4, &submit, written, testament_ids)
+            .await?
+        else {
+            return Ok(());
+        };
+        drop(at);
+        let testament = minted
+            .iter()
+            .find(|identity| identity.kind == NativeIdentityKind::Response)
+            .map(|identity| u128::from_be_bytes(identity.id))
+            .ok_or_else(|| LoadError::Fixture("the testament minted no response".into()))?;
+        // The worker posts its testament; the issuer finds it in its events. Every later waiter is
+        // registered here too, before the post: what materializes the evaluation, or settles the
+        // claim, may follow any write after it, and an event that comes before its waiter is
+        // passed over.
+        let answered = watch.expect_testament(claim)?;
+        let due = watch.expect_evaluation(claim)?;
+        let settled = watch.expect_settled(claim)?;
+        let post =
+            NativeAuthoredOperation::TestamentPost(authored::testament_target(claim, testament));
+        let at = PROGRESS.at(Stage::PostTestament);
+        if self
+            .later(worker, i, 5, &post, written, 0..0)
+            .await?
+            .is_none()
+        {
+            watch.forget(claim);
+            return Ok(());
+        }
+        drop(at);
+        let handled = Instant::now();
+        let at = PROGRESS.at(Stage::WaitAnswered);
+        let Some((posted, seen)) = watch.wait(answered).await? else {
+            return self.undelivered(claim, watch);
+        };
+        drop(at);
+        if posted != testament {
+            self.note(format!(
+                "the testament the issuer saw posted for {claim:032x} is not the worker's"
+            ));
+        }
+        // The issuer receives the testament and enters its whole-work validation; the evaluator
+        // finds its evaluation due, and the issuer will find the claim settled.
+        let target = authored::testament_target(claim, testament);
+        let receive = NativeAuthoredOperation::TestamentReceive(target.clone());
+        let at = PROGRESS.at(Stage::Receive);
+        let Some((written, _)) = self.later(issuer, i, 6, &receive, seen, 0..0).await? else {
+            return Ok(());
+        };
+        drop(at);
+        let enter = NativeAuthoredOperation::ValidationEnterWholeWork(target);
+        let at = PROGRESS.at(Stage::Enter);
+        if self
+            .later(issuer, i, 7, &enter, written, 0..0)
+            .await?
+            .is_none()
+        {
+            watch.forget(claim);
+            return Ok(());
+        }
+        drop(at);
+        let at = PROGRESS.at(Stage::WaitEvaluation);
+        let Some((validation, seen)) = watch.wait(due).await? else {
+            return self.undelivered(claim, watch);
+        };
+        drop(at);
+        // The evaluator judges the work.
+        let begin = NativeAuthoredOperation::ValidationBegin(authored::begin(claim, validation));
+        let at = PROGRESS.at(Stage::Begin);
+        let Some((written, _)) = self.later(evaluator, i, 8, &begin, seen, 0..0).await? else {
+            watch.forget(claim);
+            return Ok(());
+        };
+        drop(at);
+        let report = NativeAuthoredOperation::ValidationReport(authored::report(claim, validation));
+        let at = PROGRESS.at(Stage::Report);
+        let Some((_, _)) = self
+            .later(evaluator, i, 9, &report, written, report_ids)
+            .await?
+        else {
+            watch.forget(claim);
+            return Ok(());
+        };
+        drop(at);
+        // The issuer finds the claim settled by the evaluator's verdict.
+        let at = PROGRESS.at(Stage::WaitSettled);
+        let Some((status, written)) = watch.wait(settled).await? else {
+            return self.undelivered(claim, watch);
+        };
+        drop(at);
+        if status != focal_model::ClaimStatus::Satisfied {
+            self.note(format!(
+                "the work claim {claim:032x} settled {status:?}, not satisfied"
+            ));
+            return self.undelivered(claim, watch);
+        }
+        let satisfied = Instant::now();
+        self.outcome.borrow_mut().deliveries.push(Delivery {
+            start_ns: started.saturating_duration_since(self.run_start).as_nanos(),
+            handled_ns: handled.saturating_duration_since(self.run_start).as_nanos(),
+            satisfied_ns: satisfied
+                .saturating_duration_since(self.run_start)
+                .as_nanos(),
+        })?;
+        let release = NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim));
+        let at = PROGRESS.at(Stage::Release);
+        if self
+            .later(issuer, i, 10, &release, written, 0..0)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+        drop(at);
+        PROGRESS.lifecycle();
+        let mut outcome = self.outcome.borrow_mut();
+        outcome.lifecycles = outcome.lifecycles.saturating_add(1);
+        Ok(())
+    }
+
     /// A step the other side never showed in the events within the wait's bound: counted, its
     /// waiter let go.
     fn undelivered(&self, claim: u128, watch: &Watch) -> Result<(), LoadError> {
@@ -815,7 +1035,9 @@ impl Shared<'_> {
             .map(|(_, sequence, minted)| (sequence, minted)))
     }
     /// The objects `operation` binds to (`requirements`), as `actor` reads them at least at
-    /// `written`, in one page; `None`, with the reason noted, when they could not be read.
+    /// `written`: the objects it names in one page, and each evaluation it binds to selected by
+    /// the owner in a page of its own, as the native client resolves them (its driver's
+    /// `resolve`); `None`, with the reason noted, when they could not be read.
     async fn read_for(
         &self,
         actor: &Actor<'_>,
@@ -823,6 +1045,7 @@ impl Shared<'_> {
         written: SessionSeq,
     ) -> Result<Option<Vec<NativeObject>>, LoadError> {
         let mut references = Vec::new();
+        let mut queries = Vec::new();
         for requirement in focal_native_client::requirements(operation)
             .map_err(|error| LoadError::Fixture(format!("requirements: {error}")))?
         {
@@ -830,15 +1053,45 @@ impl Shared<'_> {
                 focal_native_client::Requirement::Objects(objects) => {
                     references.extend(objects);
                 }
-                focal_native_client::Requirement::Evaluation { .. } => {
-                    return Err(LoadError::Fixture(
-                        "a lifecycle step needs an evaluation selection".into(),
-                    ));
-                }
+                focal_native_client::Requirement::Evaluation {
+                    claim,
+                    validation,
+                    selector,
+                } => queries.push((
+                    NativeReadQuery::SelectEvaluation(focal_wire::NativeSelectionQuery {
+                        claim,
+                        validation,
+                        selector,
+                        generation: None,
+                        live: true,
+                    }),
+                    LIFECYCLE_SELECTION_ITEMS,
+                )),
             }
         }
-        let wanted =
-            u32::try_from(references.len()).map_err(|_| LoadError::Bound("lifecycle read"))?;
+        if !references.is_empty() {
+            let wanted =
+                u32::try_from(references.len()).map_err(|_| LoadError::Bound("lifecycle read"))?;
+            queries.push((NativeReadQuery::Objects(references), wanted));
+        }
+        let mut objects = Vec::new();
+        for (query, wanted) in queries {
+            let Some(page) = self.read_page(actor, query, wanted, written).await? else {
+                return Ok(None);
+            };
+            objects.extend(page);
+        }
+        Ok(Some(objects))
+    }
+    /// One page of `query`, as `actor` reads it at least at `written`, at most `wanted` objects;
+    /// `None`, with the reason noted, when it could not be read or held nothing.
+    async fn read_page(
+        &self,
+        actor: &Actor<'_>,
+        query: NativeReadQuery,
+        wanted: u32,
+        written: SessionSeq,
+    ) -> Result<Option<Vec<NativeObject>>, LoadError> {
         let Ok(_permit) = self.reads.acquire().await else {
             return Err(LoadError::Bound("lifecycle reads"));
         };
@@ -855,7 +1108,7 @@ impl Shared<'_> {
                     sequence: written,
                     route_epoch: RouteEpoch(1),
                 }),
-                query: NativeReadQuery::Objects(references),
+                query,
                 max_items: wanted,
             }),
         };
@@ -873,12 +1126,55 @@ impl Shared<'_> {
             }
         }
     }
+    /// The work artifact `artifact` as `actor` reads it at least at `written`: its reference (its
+    /// identity and content hash), which a testament's manifest binds; `None`, noted, when it
+    /// could not be read.
+    async fn work_reference(
+        &self,
+        actor: &Actor<'_>,
+        artifact: u128,
+        written: SessionSeq,
+    ) -> Result<Option<focal_model::ArtifactRef>, LoadError> {
+        let query = NativeReadQuery::Objects(vec![focal_wire::NativeObjectRef::Work(
+            focal_model::ArtifactId::from_u128(artifact),
+        )]);
+        let Some(objects) = self.read_page(actor, query, 1, written).await? else {
+            return Ok(None);
+        };
+        for object in objects {
+            if let NativeObject::Work(work) = object {
+                return Ok(Some(work.reference));
+            }
+        }
+        self.note(format!(
+            "the work artifact {artifact:032x} read as something else"
+        ));
+        Ok(None)
+    }
     /// Step `step` of lifecycle `i`, from `started`: its creation (`later`
     /// none) or a later step compiled against the claim as read. Issued in
     /// the generation the run's journal stands at; one the owner refused by
     /// name is issued once more, with the next request id, in the generation
     /// the owner admits — never executed twice. The claim and the sequence
     /// it committed at, once committed.
+    /// Lifecycle `i`'s evaluator in a run among agents: the agent after its consumer around the
+    /// ring, so a work claim's issuer, worker and evaluator are three principals of their own.
+    fn evaluator(&self, i: u64) -> Result<&Actor<'_>, LoadError> {
+        let Some((agents, _)) = &self.agents else {
+            return Err(LoadError::Shape("work goes among agents".into()));
+        };
+        let count = u64::try_from(agents.len()).map_err(|_| LoadError::Bound("agents"))?;
+        let place = i
+            .checked_mul(u64::from(self.job.callers))
+            .and_then(|place| place.checked_add(u64::from(self.job.index)))
+            .and_then(|place| place.checked_add(2))
+            .ok_or(LoadError::Bound("lifecycle places"))?;
+        let index = place
+            .checked_rem(count)
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or(LoadError::Bound("agents"))?;
+        agents.get(index).ok_or(LoadError::Bound("agents"))
+    }
     async fn step(
         &self,
         actor: &Actor<'_>,
@@ -918,7 +1214,12 @@ impl Shared<'_> {
                         (_, Some((consumer, _))) => consumer.principal,
                         (_, None) => self.job.names.worker,
                     };
-                    let (envelope, claim) = build(self.job, offset, key, subject)?;
+                    // A work claim names its evaluator: the agent after its worker.
+                    let evaluator = match self.job.lifecycle {
+                        Lifecycle::Work => Some(self.evaluator(i)?.principal),
+                        _ => None,
+                    };
+                    let (envelope, claim) = build(self.job, offset, key, subject, evaluator)?;
                     (envelope, claim, Vec::new())
                 }
                 Some((operation, objects, ids)) => {
@@ -1136,7 +1437,7 @@ async fn worker(
         Phase::Read => 0,
     };
     let delivered = match (phase, job.lifecycle) {
-        (Phase::Write, Lifecycle::Deliver) => count,
+        (Phase::Write, lifecycle) if lifecycle.among_principals() => count,
         _ => 0,
     };
     let mut outcome = Outcome {
@@ -1692,7 +1993,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 .ok_or_else(|| LoadError::Shape("transport enrolled needs enrollment".into()))?;
             // A `deliver` run's claims target its consumer, named below.
             let worker = match shape.lifecycle {
-                Lifecycle::Deliver => [0; 16],
+                Lifecycle::Deliver | Lifecycle::Work => [0; 16],
                 _ => shape
                     .worker
                     .as_deref()

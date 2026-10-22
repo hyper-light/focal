@@ -1704,3 +1704,68 @@ fn actual_custody_cannot_authorize_missing_or_substituted_result_provenance() {
         assert!(core.native_artifact(ArtifactId::from_u128(561)).is_none());
     }
 }
+
+/// The inbox delivers each fact to whom acts on it next (`NativeState::delivery_recipient`): the
+/// posted claim to its subject, and an evaluation materialized ready to the evaluator its
+/// declaration designates for the phase — never to the claim's issuer or subject, who do not judge
+/// it. A claimant learned of a posted response alone, and an evaluator of nothing at all: an
+/// evaluator agent had no inbox fact to learn its work by (focal-load's `work` lifecycle waited out
+/// its bound for every evaluation it was never told was due).
+#[test]
+fn an_evaluation_due_is_delivered_to_its_designated_evaluator_alone() {
+    let mut core = core();
+    let inbox = |core: &Core<NativeState>, who| {
+        core.native_deliveries_from(who, None)
+            .unwrap()
+            .collect::<Vec<_>>()
+    };
+    publish(
+        &mut core,
+        10,
+        creation(1, 1, &[(ValidationMode::Required, false)], None),
+    );
+    let created = [ISSUER, SUBJECT, EVALUATOR, QUALITY].map(|who| inbox(&core, who).len());
+    publish(&mut core, 20, post(2, binding(1)));
+    let posted = [ISSUER, SUBJECT, EVALUATOR, QUALITY].map(|who| inbox(&core, who).len());
+    assert_eq!(
+        posted[1],
+        created[1] + 1,
+        "the posted claim, to its subject"
+    );
+    assert_eq!(posted[2], 1, "the evaluation due, to its evaluator alone");
+    assert_eq!(posted[0], 0, "nothing the issuer acts on yet");
+    assert_eq!(posted[3], 0, "no quality phase is declared");
+}
+
+/// A claim's settlement goes to its claimant, whoever settled it (02 §6.2: participants observe
+/// the committed result to continue their own work), and what follows a settlement — the claim's
+/// scope released — to no one: a claimant learns the claim ended once.
+#[test]
+fn a_claims_settlement_is_delivered_to_its_claimant_once() {
+    let mut core = running(&[(ValidationMode::Required, false)]);
+    let inbox =
+        |core: &Core<NativeState>, who| core.native_deliveries_from(who, None).unwrap().count();
+    let before = [ISSUER, SUBJECT, EVALUATOR].map(|who| inbox(&core, who));
+    let claim = core.native_claim(key(1).claim).unwrap().binding();
+    publish(
+        &mut core,
+        90,
+        NativeInput {
+            request: request(ISSUER, 111),
+            command: NativeCommand::Cancel { expected: claim },
+        },
+    );
+    let settled = [ISSUER, SUBJECT, EVALUATOR].map(|who| inbox(&core, who));
+    assert_eq!(settled[0], before[0] + 1, "the settlement, to its claimant");
+    assert_eq!((settled[1], settled[2]), (before[1], before[2]));
+    let claim = core.native_claim(key(1).claim).unwrap().binding();
+    publish(
+        &mut core,
+        100,
+        NativeInput {
+            request: request(ISSUER, 112),
+            command: NativeCommand::ReleaseScope { expected: claim },
+        },
+    );
+    assert_eq!(inbox(&core, ISSUER), settled[0], "the release, to no one");
+}

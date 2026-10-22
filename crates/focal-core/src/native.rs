@@ -296,8 +296,14 @@ pub struct NativeState {
     delivered: delivered::Notes,
 }
 impl NativeState {
-    /// Directed delivery facts: a posted claim to its subject, a posted response to its
-    /// claimant. The claim's participants are immutable and replay verifies that invariant.
+    /// Directed delivery facts, each to the participant who acts on it next: a posted claim to
+    /// its subject, a posted response to its claimant, an evaluation materialized ready to its
+    /// designated evaluator (02 §6.2: the evaluator acts once it observes the committed fence),
+    /// and a claim's settlement to its claimant (02 §6.2: participants observe the committed
+    /// result to continue their own work). A receipt evaluation is delivered to no one: it is
+    /// pure, decided as the response arrives, and no evaluator acts on it (D-07). A claim's later
+    /// facts once settled (its scope released) are delivered to no one. The claim's participants
+    /// and an evaluation's evaluator are immutable, and replay verifies that invariant.
     fn delivery_recipient(&self, event: NativeEvent) -> Result<Option<ParticipantId>, NativeError> {
         self.delivery_recipient_from(event, self.payloads())
     }
@@ -310,11 +316,21 @@ impl NativeState {
             NativeFact::Claim(claim) if claim.kind == NativeEventKind::Posted => {
                 (ClaimId(claim.after.object.0), true)
             }
+            NativeFact::Claim(claim) if settles(claim.kind) => {
+                (ClaimId(claim.after.object.0), false)
+            }
             NativeFact::Response {
                 claim,
                 state: ResponseState::Posted,
                 ..
             } => (claim, false),
+            NativeFact::Evaluation {
+                kind: NativeEvaluationEventKind::Materialized,
+                key,
+                state: validation::State::Ready,
+                phase,
+                ..
+            } => return self.designated_evaluator(key.validation, phase, payloads),
             _ => return Ok(None),
         };
         let participants = match self.rows.get(&Key::Claim(id)) {
@@ -334,6 +350,48 @@ impl NativeState {
         } else {
             participants.0
         }))
+    }
+    /// The principal the declaration `validation` designates to act on its evaluation in
+    /// `phase`: the check's evaluator for a programmatic phase, the quality evaluator for a
+    /// quality phase (an agentic check's own evaluator, where the check is the quality judgment);
+    /// none for a phase no evaluator acts on (a delivery, decided as the response arrives). A
+    /// spilled declaration's program is read from its encoding in place, never built or held
+    /// among the reads, as a spilled claim's participants are.
+    fn designated_evaluator(
+        &self,
+        validation: ValidationId,
+        phase: validation::Phase,
+        payloads: Option<&dyn payloads::PayloadRead>,
+    ) -> Result<Option<ParticipantId>, NativeError> {
+        let program = match self.rows.get(&Key::Definition(validation)) {
+            Some(Row::Definition(stored)) => match stored.get() {
+                Some(declaration) => validation::ProgramFields::from(declaration.program()),
+                None => {
+                    let at = stored.logged().ok_or(ContractError::InvalidManifest)?;
+                    with_spilled(payloads, at, |bytes| {
+                        record_codec::definition_program(validation, bytes, self.ledger)
+                    })?
+                }
+            },
+            _ => return Err(ContractError::InvalidManifest.into()),
+        };
+        Ok(match (program, phase) {
+            (
+                validation::ProgramFields::Programmatic { check, .. },
+                validation::Phase::Programmatic,
+            ) => Some(check.evaluator),
+            (
+                validation::ProgramFields::Programmatic {
+                    quality: Some(quality),
+                    ..
+                },
+                validation::Phase::Quality,
+            ) => Some(quality.evaluator),
+            (validation::ProgramFields::Agentic { check }, validation::Phase::Quality) => {
+                Some(check.evaluator)
+            }
+            _ => None,
+        })
     }
     /// Where a spilled row's bytes are read from.
     pub(crate) fn payloads(&self) -> Option<&dyn payloads::PayloadRead> {
@@ -3102,6 +3160,23 @@ fn as_evaluation(row: Option<&Row>) -> Option<&validation::EvaluationState> {
         Some(Row::Evaluation(value)) => value.get(),
         _ => None,
     }
+}
+/// Whether a claim fact of `kind` settles the claim: the fact that moves it to a terminal status,
+/// whichever end it came to. What follows a settlement (its scope released) settles nothing.
+const fn settles(kind: NativeEventKind) -> bool {
+    matches!(
+        kind,
+        NativeEventKind::Satisfied
+            | NativeEventKind::ValidationIncomplete
+            | NativeEventKind::ValidationFailed
+            | NativeEventKind::ValidationErrored
+            | NativeEventKind::DependencyFailed
+            | NativeEventKind::Cancelled
+            | NativeEventKind::Expired
+            | NativeEventKind::Deadlocked
+            | NativeEventKind::Superseded
+            | NativeEventKind::PostFailed
+    )
 }
 /// A state as a read sees it: the committed rows, the pending chain's changes
 /// over them as of one candidate, and over those a candidate being prepared

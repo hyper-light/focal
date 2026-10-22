@@ -39,25 +39,52 @@ fn fixture<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> LoadEr
 
 /// One compiled `claim.submit`: `actor` issues to `subject`, sent as
 /// `request` (the principal, its generation and the request id), minting
-/// identities from `first_id` upward (fewer than [`IDS_PER_CREATION`]).
+/// identities from `first_id` upward (fewer than [`IDS_PER_CREATION`]). With an `evaluator`, a
+/// work claim: beside the receipt validation every claim has (D-07), a required whole-work test
+/// validation that `evaluator` judges, checking the claim's output slot (02 §3.3, §6).
 pub fn create_envelope(
     ledger: LedgerId,
     actor: ParticipantId,
     subject: ParticipantId,
+    evaluator: Option<ParticipantId>,
     root: RootCommandId,
     request: RequestKey,
     first_id: u128,
 ) -> Result<Authored, LoadError> {
-    let document: NativeClaimDocument = serde_json::from_value(serde_json::json!({
-        "description": format!("focal-load claim {}", hex(request.id.0)),
-        "target": hex(subject.0),
-        "validations": [{
-            "kind": "receipt",
-            "description": "Record delivery.",
-            "deadline": {"at": FAR_FUTURE_MS},
-        }],
-    }))
-    .map_err(fixture("claim document"))?;
+    let receipt = serde_json::json!({
+        "kind": "receipt",
+        "description": "Record delivery.",
+        "deadline": {"at": FAR_FUTURE_MS},
+    });
+    let claim = match evaluator {
+        None => serde_json::json!({
+            "description": format!("focal-load claim {}", hex(request.id.0)),
+            "target": hex(subject.0),
+            "validations": [receipt],
+        }),
+        Some(evaluator) => serde_json::json!({
+            "description": format!("focal-load work {}", hex(request.id.0)),
+            "target": hex(subject.0),
+            "validations": [receipt, {
+                "kind": "test",
+                "description": "The work's report passes.",
+                "target": {"type": "slot", "index": WORK_SLOT, "name": "report"},
+                "evaluator": hex(evaluator.0),
+                "handlers": [{
+                    "id": hex(*VALIDATOR_ID),
+                    "version": VALIDATOR_VERSION
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                    "attempts": 1,
+                }],
+                "deadline": {"at": FAR_FUTURE_MS},
+            }],
+            "slots": [{"slot": WORK_SLOT, "checks": [{"declaration": 1}]}],
+        }),
+    };
+    let document: NativeClaimDocument =
+        serde_json::from_value(claim).map_err(fixture("claim document"))?;
     let operation = NativeAuthoredOperation::ClaimSubmit(document);
     let context = BuildContext {
         ledger,
@@ -203,6 +230,89 @@ pub fn receipt(claim: u128) -> focal_client::operations::NativeReceiptDocument {
     focal_client::operations::NativeReceiptDocument {
         claim: hex(claim.to_be_bytes()),
         id: None,
+    }
+}
+
+/// The output slot a work claim declares and its worker fills.
+pub const WORK_SLOT: u32 = 0;
+/// The validator a work claim pins for its test validation (02 §6.1: a stable identity and a
+/// version digest, which the evaluator runs in its own environment): the load tool's report
+/// check, named by its own bytes.
+const VALIDATOR_ID: &[u8; 16] = b"focal-load-check";
+const VALIDATOR_VERSION: &[u8; 32] = b"focal-load report check, first..";
+/// A work artifact's report, in the builtin test-report schema an artifact defaults to.
+const REPORT: &str = r#"{"passed":1,"failed":0,"skipped":0}"#;
+
+fn hash_hex(hash: focal_model::ContentHash) -> String {
+    hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The worker's work artifact for its claim's output slot, under its receipt, its identity
+/// minted.
+pub fn work_artifact(claim: u128) -> focal_client::operations::NativeWorkArtifactDocument {
+    focal_client::operations::NativeWorkArtifactDocument {
+        claim: hex(claim.to_be_bytes()),
+        slot: WORK_SLOT,
+        id: None,
+        kind: None,
+        schema_hash: None,
+        metadata: Vec::new(),
+        payload: focal_client::operations::NativePayloadDocument::Text {
+            text: REPORT.to_owned(),
+        },
+        inputs: Vec::new(),
+        visibility: Vec::new(),
+    }
+}
+
+/// The worker's closing testament for a work claim: complete, its output slot bound to the
+/// artifact it submitted (`artifact`, as the ledger holds it), its identity minted.
+pub fn work_testament(
+    claim: u128,
+    artifact: focal_model::ArtifactRef,
+) -> focal_client::operations::NativeResponseDocument {
+    focal_client::operations::NativeResponseDocument {
+        manifest: vec![focal_client::operations::NativeSlotBindingDocument {
+            slot: WORK_SLOT,
+            artifact: focal_client::operations::NativeArtifactReferenceDocument {
+                id: hex(artifact.id.0),
+                hash: hash_hex(artifact.hash),
+            },
+        }],
+        ..testament(claim)
+    }
+}
+
+/// The evaluator's beginning of the current whole-work evaluation of `validation`.
+pub fn begin(claim: u128, validation: u128) -> focal_client::operations::NativeEvaluationDocument {
+    focal_client::operations::NativeEvaluationDocument {
+        claim: hex(claim.to_be_bytes()),
+        validation: hex(validation.to_be_bytes()),
+        slot: None,
+        phase: "whole_work".to_owned(),
+        target: None,
+    }
+}
+
+/// The evaluator's report of the evaluation it began: a pass, with its result artifact, its
+/// identity minted.
+pub fn report(claim: u128, validation: u128) -> focal_client::operations::NativeReportDocument {
+    focal_client::operations::NativeReportDocument {
+        claim: hex(claim.to_be_bytes()),
+        validation: hex(validation.to_be_bytes()),
+        slot: None,
+        phase: "whole_work".to_owned(),
+        target: None,
+        verdict: "pass".to_owned(),
+        id: None,
+        kind: None,
+        schema_hash: None,
+        metadata: Vec::new(),
+        payload: focal_client::operations::NativePayloadDocument::Text {
+            text: REPORT.to_owned(),
+        },
+        inputs: Vec::new(),
+        visibility: Vec::new(),
     }
 }
 

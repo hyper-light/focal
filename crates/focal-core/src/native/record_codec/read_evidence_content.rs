@@ -294,10 +294,7 @@ pub(in crate::native) fn decode_definition(
     fund: &dyn Fn(usize) -> Result<focal_memory::Allocation, NativeError>,
 ) -> Result<(crate::native::OwnedDeclaration, focal_memory::Allocation), NativeError> {
     let len = bytes.len();
-    let visits = len
-        .checked_mul(256)
-        .and_then(|n| n.checked_add(4096))
-        .ok_or(NativeError::Capacity("definition decode"))?;
+    let visits = definition_visits(len)?;
     let mut cursor = Cursor::new(bytes, len, visits).map_err(codec)?;
     let mut input = definition(&mut cursor)?;
     cursor.finish().map_err(codec)?;
@@ -325,6 +322,37 @@ pub(in crate::native) fn decode_definition(
         Row::Definition(owned) if owned.heap_charge()? <= charge.bytes() => Ok((owned, charge)),
         _ => Err(ContractError::InvalidManifest.into()),
     }
+}
+
+/// Only what a spilled definition's program names (doc 31 M3), read in place from its record
+/// encoding: the definition was checked before it was spilled, and building an inbox index reads
+/// whom each phase names without building the declaration or holding it among the reads, as a
+/// spilled claim's routing header is read (`claim_participants`).
+pub(in crate::native) fn definition_program(
+    id: ValidationId,
+    bytes: &[u8],
+    ledger: crate::native::LedgerId,
+) -> Result<validation::ProgramFields, NativeError> {
+    let len = bytes.len();
+    let mut cursor = Cursor::new(bytes, len, definition_visits(len)?).map_err(codec)?;
+    let input = definition(&mut cursor)?;
+    cursor.finish().map_err(codec)?;
+    let DefinitionInput::Authored(body) = input else {
+        return Err(ContractError::InvalidManifest.into());
+    };
+    let fields = body.fields();
+    if fields.ledger != ledger || fields.id != id {
+        return Err(ContractError::InvalidManifest.into());
+    }
+    Ok(fields.program)
+}
+
+/// The codec work reading a definition's encoding of `len` bytes may take: an element takes a
+/// byte of it at least.
+fn definition_visits(len: usize) -> Result<usize, NativeError> {
+    len.checked_mul(256)
+        .and_then(|n| n.checked_add(4096))
+        .ok_or(NativeError::Capacity("definition decode"))
 }
 
 pub(in crate::native::record_codec) struct ClaimContentInput<'a> {

@@ -530,15 +530,21 @@ repositioned. Because every family but `ByStatus` is written once, a cursor
 stays valid while the prefix grows: a later page sees later rows at a later
 prefix, which the page's token names.
 
-`NativeListFilter::Deliveries` reads one participant's inbox: a posted claim goes
-to its subject and a posted response goes to its claimant. The derived event
+`NativeListFilter::Deliveries` reads one participant's inbox, each fact delivered
+to the participant who acts on it next: a posted claim to its subject, a posted
+response to its claimant, an evaluation materialized ready to the evaluator its
+declaration names for the phase (the check's for a programmatic phase, the quality
+evaluator for a quality phase; a delivery phase is decided as the response arrives
+and goes to no one), and the fact that settles a claim, whichever end it came to,
+to its claimant; what follows a settlement goes to no one (2026-10-22). The derived event
 index keeps these publication coordinates in a separate recipient namespace,
 in sequence and ordinal order. Seeking after a coordinate visits only the next
 deliveries for that participant; event bodies are read after selection. The
 index is funded before publication (at most two entries per event, with an
 unused inbox entry's charge returned immediately), maintained during follower
 replay and retirement, and rebuilt from checkpoint rows on restore. A spilled
-claim supplies its immutable routing header without hydrating its declarations
+claim supplies its immutable routing header, and a spilled declaration its
+program's evaluators read in place from its encoding, without hydrating either
 or filling the read-back cache. An index that cannot be funded or kept exact
 refuses with capacity; it never silently substitutes a global scan. The existing
 global `Events` variant and canonical record/checkpoint encodings are unchanged.

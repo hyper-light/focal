@@ -84,6 +84,37 @@ enrolled client in a data directory of its own (`focal invite client`, then
 data directory keeps at most 64 contexts). The report's `deliver` section counts
 the agents' tails together (`agent_polls`, `agent_events`, `agent_waits`).
 
+### Work among agents
+
+```yaml
+lifecycle: work       # each claim posted, worked, handed in, judged and settled among three agents
+agents: 16            # 3 at least: claim n's issuer is agent n, its worker n + 1, its evaluator n + 2, mod agents
+inbox_wait_ms: 500    # optional, as for deliver
+```
+
+`work` runs the authored lifecycle a team of agents runs (02 §3, §6), eleven writes a
+claim across three principals, each learning of the step before its own only from its
+own inbox:
+
+| Step | Agent | Write | Learned from |
+|---|---|---|---|
+| 1 | issuer | `claim.submit`: one required test validation of the work slot, a programmatic check whose evaluator is the claim's evaluator | — |
+| 2 | issuer | `claim.post` | — |
+| 3 | worker | `receipt.acquire` | the posted claim |
+| 4 | worker | `artifact.submit`: the work, for the claim's slot | — |
+| 5 | worker | `testament.submit`: a manifest binding the artifact to the slot | — |
+| 6 | worker | `testament.post` | — |
+| 7 | issuer | `testament.receive` | the posted testament |
+| 8 | issuer | `validation.enter_whole_work` | — |
+| 9 | evaluator | `validation.begin` | the evaluation due |
+| 10 | evaluator | `validation.report`: a pass, with its result artifact | — |
+| 11 | issuer | `claim.release_scope` | the claim settled satisfied |
+
+Each waiter is registered before the write that answers it, so a fact that arrives
+first is not passed over. The report's `deliver` section counts a claim settled
+satisfied as `delivered`; a claim that settled any other way, or whose next fact did
+not reach its agent within the run's bound, as `undelivered`.
+
 ## Report
 
 ```json

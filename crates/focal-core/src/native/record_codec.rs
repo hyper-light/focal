@@ -78,7 +78,7 @@ pub use fixed::RowFamily;
 pub(in crate::native) use read_events::event_in as decode_event;
 pub(in crate::native) use read_evidence::content_profile as read_content_profile;
 pub(in crate::native) use read_evidence::{
-    creation_decode_bound, decode_creation, decode_definition,
+    creation_decode_bound, decode_creation, decode_definition, definition_program,
 };
 pub(in crate::native) use read_history::event_object;
 pub(in crate::native) use spilled::{ClaimRows, claim_participants, decode_claim};

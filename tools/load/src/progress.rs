@@ -32,10 +32,20 @@ pub(crate) enum Stage {
     Enter,
     /// The issuer's release of the claim's scope.
     Release,
+    /// A work claim's worker: its work artifact for the claim's slot.
+    Artifact,
+    /// A work claim's evaluator: its wait for the evaluation due in its events.
+    WaitEvaluation,
+    /// The evaluator's beginning of the evaluation.
+    Begin,
+    /// The evaluator's report.
+    Report,
+    /// A work claim's issuer: its wait for the claim settled in its events.
+    WaitSettled,
 }
 
 impl Stage {
-    const ALL: [Stage; 10] = [
+    const ALL: [Stage; 15] = [
         Stage::Create,
         Stage::Post,
         Stage::WaitPosted,
@@ -46,6 +56,11 @@ impl Stage {
         Stage::Receive,
         Stage::Enter,
         Stage::Release,
+        Stage::Artifact,
+        Stage::WaitEvaluation,
+        Stage::Begin,
+        Stage::Report,
+        Stage::WaitSettled,
     ];
     fn index(self) -> usize {
         match self {
@@ -59,6 +74,11 @@ impl Stage {
             Stage::Receive => 7,
             Stage::Enter => 8,
             Stage::Release => 9,
+            Stage::Artifact => 10,
+            Stage::WaitEvaluation => 11,
+            Stage::Begin => 12,
+            Stage::Report => 13,
+            Stage::WaitSettled => 14,
         }
     }
     fn name(self) -> &'static str {
@@ -73,6 +93,11 @@ impl Stage {
             Stage::Receive => "receive",
             Stage::Enter => "enter",
             Stage::Release => "release",
+            Stage::Artifact => "artifact",
+            Stage::WaitEvaluation => "wait-evaluation",
+            Stage::Begin => "begin",
+            Stage::Report => "report",
+            Stage::WaitSettled => "wait-settled",
         }
     }
 }
@@ -88,7 +113,7 @@ pub(crate) struct Progress {
     committed: AtomicU64,
     refused: AtomicU64,
     unknown: AtomicU64,
-    at: [AtomicU64; 10],
+    at: [AtomicU64; 15],
     tail_polls: AtomicU64,
     tail_waits: AtomicU64,
     tail_events: AtomicU64,
@@ -105,7 +130,7 @@ pub(crate) static PROGRESS: Progress = Progress {
     committed: AtomicU64::new(0),
     refused: AtomicU64::new(0),
     unknown: AtomicU64::new(0),
-    at: [const { AtomicU64::new(0) }; 10],
+    at: [const { AtomicU64::new(0) }; 15],
     tail_polls: AtomicU64::new(0),
     tail_waits: AtomicU64::new(0),
     tail_events: AtomicU64::new(0),

@@ -16069,3 +16069,32 @@ stream poll that may acknowledge is not one, since its acknowledgement is work. 
 admission reports the parked reads (`AdmissionStats::pool_parked`, `pool_parks`,
 `pool_parks_refused`; metrics `focal_listener_stream_pool_parked`, `_parks_total`,
 `_parks_refused_total`). vendor/README.md; docs/dependencies/inventory.tsv.
+
+### 2026-10-22 — Agents do the claims, artifacts, testaments and validations among themselves
+
+focal-load's `lifecycle: work` runs the lifecycle a team of agents runs (02 §3, §6), eleven writes
+a claim among three principals of their own: the issuer submits a claim with one required test
+validation of a work slot, whose programmatic check names the claim's evaluator, and posts it; the
+worker, finding the claim in its inbox, acquires its receipt, submits the work as an artifact for the
+slot and a testament whose manifest binds it, and posts the testament; the issuer, finding the
+testament in its inbox, receives it and enters its whole-work validation; the evaluator, finding the
+evaluation due in its inbox, begins it and reports a pass with its result artifact; the issuer,
+finding the claim settled in its inbox, releases its scope (tools/load/README.md, "Work among
+agents"; `tests/work.rs`: 32 claims among 16 agents, all 352 writes committed, none refused or
+unknown, every claim satisfied by its evaluator's verdict).
+
+The first run found that an evaluator could not learn its work from its inbox: the inbox delivered a
+posted claim to its subject and a posted response to its claimant, and nothing else, so an evaluation
+due reached no one, and a claimant learned of its claim's end only by reading the claim. Each fact now
+goes to the participant who acts on it next (`NativeState::delivery_recipient`; 22 §5): an
+evaluation materialized ready to the evaluator its declaration names for the phase (the check's for a
+programmatic phase, the quality evaluator for a quality phase; a delivery phase, decided as the
+response arrives, to no one), and the fact that settles a claim, whichever end it came to, to its
+claimant, once (its scope's release after it to no one). A spilled declaration's evaluators are read
+in place from its encoding (`record_codec::definition_program`), as a spilled claim's participants
+are, so filing an evaluation or building the inbox again reads no declaration back. Nothing is
+encoded: record and checkpoint formats are unchanged, and the inbox is the index every replica
+derives. Tests: `report_tests::an_evaluation_due_is_delivered_to_its_designated_evaluator_alone`,
+`a_claims_settlement_is_delivered_to_its_claimant_once`,
+`owned::tests::a_spilled_definitions_program_reads_in_place_as_the_held_ones`; focal-load's deliver
+test counts the settlement each issuer now hears of.

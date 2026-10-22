@@ -637,6 +637,43 @@ fn authored_copies_compact_container_capacity_preserve_profiles_and_outlive_sour
     assert_eq!(copied.held().unwrap().profile(), Some(profile));
 }
 
+/// A spilled authored definition's program is read from its encoding in place, as its held form
+/// gives it (`record_codec::definition_program`), and only under its own id and ledger: whom an
+/// inbox files an evaluation due for, found without reading the definition back.
+#[test]
+fn a_spilled_definitions_program_reads_in_place_as_the_held_ones() {
+    use crate::native::payloads::{MemoryPayloads, PayloadRead, Spill};
+    let claim = crate::native::tests::owned_claim_fixture();
+    let held = OwnedDeclaration::new_authored(authored_definition(&claim)).unwrap();
+    let log = MemoryPayloads::default();
+    let Ok(Spill::Spilled(spilled)) = held.spill(&log) else {
+        panic!("an authored definition spills");
+    };
+    let at = spilled.logged().unwrap();
+    let mut bytes = vec![0; at.len()];
+    log.read(at, &mut bytes).unwrap();
+    let id = focal_model::ValidationId::from_u128(70);
+    let ledger = claim.binding().ledger;
+    let program = crate::native::record_codec::definition_program(id, &bytes, ledger).unwrap();
+    assert_eq!(
+        program,
+        v::ProgramFields::from(held.get().unwrap().program())
+    );
+    assert!(matches!(
+        program,
+        v::ProgramFields::Programmatic { check, quality: None } if check.evaluator == claim.issuer()
+    ));
+    let other = focal_model::ValidationId::from_u128(71);
+    assert!(crate::native::record_codec::definition_program(other, &bytes, ledger).is_err());
+    let elsewhere = LedgerId {
+        session: focal_model::SessionId::from_u128(0x5e55),
+        ..ledger
+    };
+    assert!(crate::native::record_codec::definition_program(id, &bytes, elsewhere).is_err());
+    let cut = bytes.len() - 1;
+    assert!(crate::native::record_codec::definition_program(id, &bytes[..cut], ledger).is_err());
+}
+
 #[test]
 fn authored_container_allocation_refusal_preserves_copy_sources_and_allows_retry() {
     let claim = crate::native::tests::owned_claim_fixture();

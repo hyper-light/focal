@@ -9,7 +9,10 @@ use crate::driver::Conn;
 use crate::error::LoadError;
 use crate::progress::PROGRESS;
 use focal_client::ClientError;
-use focal_model::native_event::{NativeEventRecord, NativeFactRecord, NativeResponseState};
+use focal_model::native_event::{
+    NativeEvaluationEventKind, NativeEventRecord, NativeFactRecord, NativeResponseState,
+    NativeValidationState,
+};
 use focal_model::{
     ClaimStatus, LedgerId, ParticipantId, RequestEpoch, RequestId, RouteEpoch, SessionSeq,
 };
@@ -63,6 +66,12 @@ pub struct Watch {
     /// Claims whose testament the issuer waits to see: the testament and the sequence its post
     /// committed at.
     answered: RefCell<BTreeMap<u128, OneshotSender<(u128, SessionSeq)>>>,
+    /// Work claims whose whole-work evaluation the evaluator waits to see due: the validation
+    /// it judges and the sequence the evaluation was materialized at.
+    evaluations: RefCell<BTreeMap<u128, OneshotSender<(u128, SessionSeq)>>>,
+    /// Work claims whose end the issuer waits to see: the terminal status and the sequence it
+    /// was reached at.
+    settled: RefCell<BTreeMap<u128, OneshotSender<(ClaimStatus, SessionSeq)>>>,
     bound: usize,
     stopped: Cell<bool>,
     consumer: Cell<TailCounts>,
@@ -77,6 +86,8 @@ impl Watch {
         Self {
             posted: RefCell::new(BTreeMap::new()),
             answered: RefCell::new(BTreeMap::new()),
+            evaluations: RefCell::new(BTreeMap::new()),
+            settled: RefCell::new(BTreeMap::new()),
             bound,
             stopped: Cell::new(false),
             consumer: Cell::new(TailCounts::default()),
@@ -95,10 +106,28 @@ impl Watch {
     ) -> Result<OneshotReceiver<(u128, SessionSeq)>, LoadError> {
         expect(&self.answered, self.bound, claim)
     }
+    /// Waits for `claim`'s whole-work evaluation to show due to its evaluator: registered before
+    /// the write that enters it is sent.
+    pub fn expect_evaluation(
+        &self,
+        claim: u128,
+    ) -> Result<OneshotReceiver<(u128, SessionSeq)>, LoadError> {
+        expect(&self.evaluations, self.bound, claim)
+    }
+    /// Waits for `claim` to show at a terminal status: registered before the write that settles
+    /// it is sent.
+    pub fn expect_settled(
+        &self,
+        claim: u128,
+    ) -> Result<OneshotReceiver<(ClaimStatus, SessionSeq)>, LoadError> {
+        expect(&self.settled, self.bound, claim)
+    }
     /// Lets go of whatever waits on `claim`: its write was never committed, or its wait ended.
     pub fn forget(&self, claim: u128) {
         self.posted.borrow_mut().remove(&claim);
         self.answered.borrow_mut().remove(&claim);
+        self.evaluations.borrow_mut().remove(&claim);
+        self.settled.borrow_mut().remove(&claim);
     }
     /// What `receiver` waits for, or `None` past [`WAIT`] or once its tail stopped.
     pub async fn wait<T>(&self, receiver: OneshotReceiver<T>) -> Result<Option<T>, LoadError> {
@@ -117,6 +146,8 @@ impl Watch {
         self.stopped.set(true);
         self.posted.borrow_mut().clear();
         self.answered.borrow_mut().clear();
+        self.evaluations.borrow_mut().clear();
+        self.settled.borrow_mut().clear();
     }
     /// What the tail of `side` read.
     pub fn counts(&self, side: Side) -> TailCounts {
@@ -153,6 +184,30 @@ impl Watch {
                 let id = u128::from_be_bytes(claim.0);
                 if let Some(sender) = self.answered.borrow_mut().remove(&id) {
                     let _ = sender.send((u128::from_be_bytes(after.object.0), record.sequence));
+                }
+            }
+            // An evaluation materialized ready for its evaluator: the work claim's whole work is
+            // entered and its evaluator may begin.
+            (
+                Side::Agent,
+                NativeFactRecord::Evaluation {
+                    kind: NativeEvaluationEventKind::Materialized,
+                    key,
+                    state: NativeValidationState::Ready,
+                    ..
+                },
+            ) => {
+                let id = u128::from_be_bytes(key.claim.0);
+                if let Some(sender) = self.evaluations.borrow_mut().remove(&id) {
+                    let _ = sender.send((u128::from_be_bytes(key.validation.0), record.sequence));
+                }
+            }
+            (Side::Issuer | Side::Agent, NativeFactRecord::Claim(claim))
+                if focal_model::semantics_v1::is_terminal(claim.status) =>
+            {
+                let id = u128::from_be_bytes(claim.after.object.0);
+                if let Some(sender) = self.settled.borrow_mut().remove(&id) {
+                    let _ = sender.send((claim.status, record.sequence));
                 }
             }
             _ => {}
