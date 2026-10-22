@@ -279,8 +279,29 @@ pub struct RootObservation {
     configuration: ControlConfiguration,
     authority: Option<focal_directory::AuthorityCheckpoint>,
     enrollment_restore: usize,
+    /// The upgrade fence of the registry the snapshot holds, as the owner held it.
+    fence: Option<focal_enrollment::UpgradeFence>,
+    /// The registry the snapshot holds, decoded by the first reader that asks
+    /// ([`Self::enrollment`]) and kept for the rest, with its charge.
+    enrollment: std::sync::OnceLock<ObservedEnrollment>,
     _input: Allocation,
     _state: Allocation,
+}
+/// A root observation's enrollment registry, decoded, and what holding it is charged.
+struct ObservedEnrollment {
+    registry: focal_enrollment::EnrollmentRegistry,
+    _charge: Allocation,
+}
+/// Why a root observation's enrollment registry could not be read
+/// ([`RootObservation::enrollment`]).
+#[derive(Debug)]
+pub enum ObservedEnrollmentError {
+    /// The snapshot is a partition's, which holds no registry.
+    NotRoot,
+    /// The budget refused what decoding the registry holds.
+    Capacity,
+    /// The bytes are not a registry of the cluster asked for.
+    Enrollment(focal_enrollment::EnrollmentError),
 }
 impl RootObservation {
     pub fn snapshot(&self) -> &ControlSnapshot {
@@ -291,6 +312,55 @@ impl RootObservation {
     /// registry it encoded: what a reader charges before decoding it.
     pub fn enrollment_restore(&self) -> usize {
         self.enrollment_restore
+    }
+    /// The enrollment registry this snapshot holds, decoded once, by the first reader that asks,
+    /// and kept with the snapshot for every reader after: charged to `budget` at what the owner
+    /// measured restoring it takes ([`Self::enrollment_restore`]) for as long as the snapshot is
+    /// held. A decode verifies every enrolled certificate, and each reader of one observation
+    /// decoded it again: the root controller's admission did once a pass, 5.5% of a 500-agent
+    /// leader's CPU (2026-10-22).
+    pub fn enrollment(
+        &self,
+        cluster: focal_enrollment::ClusterId,
+        budget: &MemoryBudget,
+    ) -> Result<&focal_enrollment::EnrollmentRegistry, ObservedEnrollmentError> {
+        if let Some(decoded) = self.enrollment.get() {
+            return if decoded.registry.cluster() == cluster {
+                Ok(&decoded.registry)
+            } else {
+                Err(ObservedEnrollmentError::Enrollment(
+                    focal_enrollment::EnrollmentError::WrongCluster,
+                ))
+            };
+        }
+        let ControlBootstrap::Root { enrollment, .. } = &self.snapshot.state else {
+            return Err(ObservedEnrollmentError::NotRoot);
+        };
+        let charge = budget
+            .reserve(
+                BudgetKind::Control,
+                BudgetLane::Completion,
+                self.enrollment_restore,
+            )
+            .map_err(|_| ObservedEnrollmentError::Capacity)?
+            .commit();
+        let registry = focal_enrollment::EnrollmentRegistry::restore(
+            enrollment,
+            cluster,
+            focal_enrollment::EnrollmentLimits::default(),
+        )
+        .map_err(ObservedEnrollmentError::Enrollment)?;
+        let decoded = ObservedEnrollment {
+            registry,
+            _charge: charge,
+        };
+        // A reader that raced another's decode keeps the first, and its own goes.
+        Ok(&self.enrollment.get_or_init(move || decoded).registry)
+    }
+    /// The upgrade fence of the registry this snapshot holds, as the owner held it: none for a
+    /// partition's. Read without decoding the registry.
+    pub fn fence(&self) -> Option<focal_enrollment::UpgradeFence> {
+        self.fence
     }
     pub fn contacts(&self) -> &ContactSnapshot {
         &self.contacts
@@ -1460,6 +1530,11 @@ impl<V: AuthorityVerifier> Owner<V> {
                 .authority()
                 .map(|authority| authority.checkpoint().clone()),
             enrollment_restore,
+            fence: self
+                .replica
+                .enrollment()
+                .map(focal_enrollment::EnrollmentRegistry::fence),
+            enrollment: std::sync::OnceLock::new(),
             _input: input,
             _state: state,
         })

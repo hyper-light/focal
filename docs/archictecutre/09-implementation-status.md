@@ -16098,3 +16098,22 @@ derives. Tests: `report_tests::an_evaluation_due_is_delivered_to_its_designated_
 `a_claims_settlement_is_delivered_to_its_claimant_once`,
 `owned::tests::a_spilled_definitions_program_reads_in_place_as_the_held_ones`; focal-load's deliver
 test counts the settlement each issuer now hears of.
+
+### 2026-10-22 — The root controller decodes the enrollment registry once per root it observes
+
+A profile of a 500-agent deliver run's leader (CI, frame-pointer call graphs, 50 messages a second)
+put 5.8% of its CPU in `EnrollmentRegistry::restore`, 5.5% of it under the root controller's
+admission: each pass (at most 250 ms apart) its `next_root_command` decoded the registry from the
+observed root snapshot again, and a decode verifies every live enrolled certificate (an X.509 parse
+and a P-256 signature each, `verify_issued`, 3.4%), so the leader's work grew with the agents
+enrolled and was repeated forever, the snapshot unchanged. A root observation now decodes the
+registry it holds once, for the first reader that asks, and keeps it for every reader after,
+charged at what the owner measured restoring it takes for as long as the observation is held
+(`RootObservation::enrollment`): the controller's refresh and its admission's every pass read one
+decode until the root's applied index moves. A node's metrics read the observed fence without a
+decode (`RootObservation::fence`, from the registry the owner holds), and the placement paths read
+the registry's revision beside its bytes in the same snapshot (`ControlRevisions::enrollment`)
+where they decoded the registry for that one number. A decode per observed root remains: each
+commit to the root still costs one verification of every enrolled certificate, which an enrollment
+burst of N agents makes quadratic, measured next at 1,000 agents. Test:
+`an_observation_decodes_its_registry_once_and_charges_it_while_held`.

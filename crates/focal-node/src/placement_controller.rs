@@ -816,16 +816,13 @@ impl PlacementAgent {
         &self,
         root: &RootObservation,
     ) -> Result<u64, AgentError> {
-        let ControlBootstrap::Root { enrollment, .. } = &root.snapshot().state else {
+        // The revision the snapshot read beside its registry (`ControlRevisions`): one number, not
+        // the registry decoded and every enrolled certificate verified again for it.
+        let snapshot = root.snapshot();
+        if !matches!(snapshot.state, ControlBootstrap::Root { .. }) {
             return Err(AgentError::Identity);
-        };
-        Ok(focal_enrollment::EnrollmentRegistry::restore(
-            enrollment,
-            self.state.genesis.founder.cluster,
-            focal_enrollment::EnrollmentLimits::default(),
-        )
-        .map_err(|_| AgentError::Identity)?
-        .revision())
+        }
+        Ok(snapshot.revisions.enrollment)
     }
     /// The node `driver` reaches the log at.
     fn leads(&self, driver: &SessionDriver) -> u64 {

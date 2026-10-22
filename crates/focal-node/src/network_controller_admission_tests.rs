@@ -92,6 +92,7 @@ impl Fixture {
             &BTreeSet::new(),
             fixture.now,
             &[],
+            &fixture.budget,
         )
         .unwrap()
         .unwrap();
@@ -257,6 +258,7 @@ impl Fixture {
             &BTreeSet::from([node]),
             self.now,
             &[],
+            &self.budget,
         )
         .unwrap()
         else {
@@ -329,6 +331,7 @@ fn withdrawn_grant_fences_a_reopened_journal_intent_without_consuming_its_reques
             &BTreeSet::from([node]),
             fixture.now,
             &[],
+            &fixture.budget,
         )
         .unwrap()
         .unwrap();
@@ -470,7 +473,8 @@ fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
                     &observation,
                     &BTreeSet::from([node]),
                     fixture.now,
-                    &[]
+                    &[],
+                    &fixture.budget
                 )
                 .unwrap(),
                 Some(ControlCommand::Authority(_))
@@ -489,6 +493,7 @@ fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
                 &BTreeSet::from([node]),
                 at,
                 &[],
+                &fixture.budget,
             )
             .unwrap() else {
                 panic!("the grant follows its credential")
@@ -511,7 +516,8 @@ fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
                 &observation,
                 &BTreeSet::from([node]),
                 receipt.expires_at,
-                &[]
+                &[],
+                &fixture.budget
             )
             .unwrap(),
             None
@@ -526,7 +532,8 @@ fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
                 &observation,
                 &BTreeSet::from([node]),
                 grant.expires_at - 1,
-                &[]
+                &[],
+                &fixture.budget
             )
             .unwrap(),
             Some(ControlCommand::Membership(_))
@@ -537,7 +544,8 @@ fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
                 &observation,
                 &BTreeSet::from([node]),
                 grant.expires_at,
-                &[]
+                &[],
+                &fixture.budget
             )
             .unwrap(),
             None
@@ -550,6 +558,7 @@ fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
             &BTreeSet::from([node]),
             fixture.now,
             &[],
+            &fixture.budget,
         )
         .unwrap()
         .unwrap();
@@ -612,6 +621,7 @@ fn full_capability_table_admits_an_existing_grant_before_an_ungranted_lower_id()
             &BTreeSet::from([lower_node, higher_node]),
             fixture.now,
             &[],
+            &fixture.budget,
         )
         .unwrap()
         .unwrap();
@@ -636,4 +646,43 @@ fn full_capability_table_admits_an_existing_grant_before_an_ungranted_lower_id()
         fixture.close().await;
     })
     .unwrap()
+}
+
+/// A root observation decodes the registry it holds once, for every reader of it, and charges it
+/// while it is held: the controller's refresh and its admission's every pass read one decode, where
+/// each decoded the registry again and verified every enrolled certificate again with it. The
+/// fence is read without a decode.
+#[test]
+fn an_observation_decodes_its_registry_once_and_charges_it_while_held() {
+    focal_rt::block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Fixture::open(dir.path(), 1).await;
+        let observation = fixture.observe().await;
+        let budget = MemoryBudget::new(64 * 1024 * 1024, 1024 * 1024).unwrap();
+        let cluster = fixture.state.genesis.founder.cluster;
+        assert_eq!(budget.stats().used, 0);
+        let first: *const EnrollmentRegistry = observation.enrollment(cluster, &budget).unwrap();
+        let charged = budget.stats().used;
+        assert_eq!(charged, observation.enrollment_restore());
+        assert!(charged > 0);
+        let second: *const EnrollmentRegistry = observation.enrollment(cluster, &budget).unwrap();
+        assert!(std::ptr::eq(first, second), "decoded once");
+        assert_eq!(budget.stats().used, charged, "charged once");
+        assert!(matches!(
+            observation.enrollment([0x5a; 16], &budget),
+            Err(crate::control_host::ObservedEnrollmentError::Enrollment(
+                focal_enrollment::EnrollmentError::WrongCluster
+            ))
+        ));
+        let registry = fixture.enrollment().await;
+        assert_eq!(observation.fence(), Some(registry.fence()));
+        assert_eq!(
+            observation.snapshot().revisions.enrollment,
+            registry.revision()
+        );
+        drop(observation);
+        assert_eq!(budget.stats().used, 0, "let go with the observation");
+        fixture.close().await;
+    })
+    .unwrap();
 }

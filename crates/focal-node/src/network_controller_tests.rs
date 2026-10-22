@@ -370,19 +370,21 @@ fn a_refresh_is_charged_what_it_decodes_and_keeps_and_refused_without_it() {
         assert!(registry.authenticate(fingerprint).is_err());
         assert_eq!(budget.stats().used, founded + pressure.bytes());
         drop(pressure);
-        // With room, the projection is installed and kept charged; the
-        // decode's charge went with the refresh.
+        // With room, the projection is installed and kept charged, and the
+        // registry decoded is the observation's, charged while it is held:
+        // every reader of the observation reads that one decode.
         controller
             .refresh(&observation, &pool, &registry, unix_time().unwrap())
             .unwrap();
         assert!(registry.authenticate(fingerprint).is_ok());
         let refreshed = budget.stats().used;
-        assert!(refreshed > founded, "{refreshed} of {founded}");
+        let decoded = observation.enrollment_restore();
         assert!(
-            refreshed - founded < observation.enrollment_restore(),
-            "{refreshed} of {founded}"
+            refreshed > founded + decoded,
+            "{refreshed} of {founded} and {decoded} decoded"
         );
-        // Refreshing again replaces the projection's charge: nothing grows.
+        // Refreshing again decodes nothing and replaces the projection's
+        // charge: nothing grows.
         for _ in 0..8 {
             controller
                 .refresh(&observation, &pool, &registry, unix_time().unwrap())
@@ -390,8 +392,13 @@ fn a_refresh_is_charged_what_it_decodes_and_keeps_and_refused_without_it() {
             assert_eq!(budget.stats().used, refreshed);
         }
         drop(controller);
-        assert_eq!(budget.stats().used, 0);
+        assert_eq!(
+            budget.stats().used,
+            decoded,
+            "the decode is the observation's"
+        );
         drop(observation);
+        assert_eq!(budget.stats().used, 0);
         host.stop().await.unwrap();
         owner.join().unwrap();
     })

@@ -69,6 +69,17 @@ pub enum ControllerError {
     Retired,
 }
 
+impl From<crate::control_host::ObservedEnrollmentError> for ControllerError {
+    fn from(error: crate::control_host::ObservedEnrollmentError) -> Self {
+        use crate::control_host::ObservedEnrollmentError as Observed;
+        match error {
+            Observed::NotRoot => Self::Identity,
+            Observed::Capacity => Self::Capacity,
+            Observed::Enrollment(error) => Self::Enrollment(error),
+        }
+    }
+}
+
 /// What one announcement is given, the leader and the routes it is handed
 /// on to together; and how many peers it asks at most, the leader first.
 const ANNOUNCE_ROUND: Duration = Duration::from_secs(5);
@@ -581,30 +592,35 @@ impl RootAdmission {
         }
         if self.intent.pending.is_none() {
             let now = unix_time()?;
-            let command =
-                match next_root_command(state, observation, eligible, now, &self.policy_regions)? {
-                    Some(command) => Some(command),
-                    None => {
-                        use crate::directory_bootstrap::{
-                            DirectoryBootstrapError, FirstDirectoryPlan,
-                            next_first_directory_command,
-                        };
-                        let plan = FirstDirectoryPlan::derive(
-                            state.genesis.founder.cluster,
-                            state.genesis.founder.node,
-                        )
-                        .map_err(|_| ControllerError::Identity)?;
-                        match next_first_directory_command(plan, observation, now, budget) {
-                            Ok(command) => command,
-                            Err(
-                                DirectoryBootstrapError::Unauthorized
-                                | DirectoryBootstrapError::Capacity
-                                | DirectoryBootstrapError::NotReady,
-                            ) => None,
-                            Err(_) => return Err(ControllerError::Identity),
-                        }
+            let command = match next_root_command(
+                state,
+                observation,
+                eligible,
+                now,
+                &self.policy_regions,
+                budget,
+            )? {
+                Some(command) => Some(command),
+                None => {
+                    use crate::directory_bootstrap::{
+                        DirectoryBootstrapError, FirstDirectoryPlan, next_first_directory_command,
+                    };
+                    let plan = FirstDirectoryPlan::derive(
+                        state.genesis.founder.cluster,
+                        state.genesis.founder.node,
+                    )
+                    .map_err(|_| ControllerError::Identity)?;
+                    match next_first_directory_command(plan, observation, now, budget) {
+                        Ok(command) => command,
+                        Err(
+                            DirectoryBootstrapError::Unauthorized
+                            | DirectoryBootstrapError::Capacity
+                            | DirectoryBootstrapError::NotReady,
+                        ) => None,
+                        Err(_) => return Err(ControllerError::Identity),
                     }
-                };
+                }
+            };
             let Some(command) = command else {
                 return Ok(());
             };
@@ -820,6 +836,7 @@ fn next_root_command(
     eligible: &BTreeSet<u64>,
     now: i64,
     policy_regions: &[String],
+    budget: &MemoryBudget,
 ) -> Result<Option<ControlCommand>, ControllerError> {
     let snapshot = observation.snapshot();
     if snapshot.identity != state.genesis.root {
@@ -834,20 +851,13 @@ fn next_root_command(
             },
         )));
     };
-    let ControlBootstrap::Root { enrollment, .. } = &snapshot.state else {
-        return Err(ControllerError::Identity);
-    };
-    let enrollment = EnrollmentRegistry::restore(
-        enrollment,
-        state.genesis.founder.cluster,
-        EnrollmentLimits::default(),
-    )?;
+    let enrollment = observation.enrollment(state.genesis.founder.cluster, budget)?;
     let current = observation.configuration();
     // Regions the founder's policy names are registered ahead of any node
     // reporting them, so a residency can name a region before a node runs
     // there (24 §22).
     for label in policy_regions {
-        if let Some(command) = register_region(observation, authority, &enrollment, label, now)? {
+        if let Some(command) = register_region(observation, authority, enrollment, label, now)? {
             return Ok(Some(command));
         }
     }
@@ -908,7 +918,7 @@ fn next_root_command(
             continue;
         }
         if let Some(label) = &label
-            && let Some(command) = register_region(observation, authority, &enrollment, label, now)?
+            && let Some(command) = register_region(observation, authority, enrollment, label, now)?
         {
             return Ok(Some(command));
         }
@@ -977,7 +987,7 @@ fn next_root_command(
             .find(|receipt| receipt.identity.node_id == Some(*node))
             .ok_or(ControllerError::Identity)?;
         let identity = authorize_node_contact(
-            &enrollment,
+            enrollment,
             *node,
             contact.principal,
             contact.certificate_fingerprint,
@@ -988,7 +998,7 @@ fn next_root_command(
         // region is registered first.
         let (region, zone, label) = contact_topology(observation, *node);
         if let Some(label) = &label
-            && let Some(command) = register_region(observation, authority, &enrollment, label, now)?
+            && let Some(command) = register_region(observation, authority, enrollment, label, now)?
         {
             return Ok(Some(command));
         }
@@ -1934,17 +1944,9 @@ impl NetworkController {
         {
             return Err(ControllerError::Identity);
         }
-        let ControlBootstrap::Root { enrollment, .. } = &snapshot.state else {
-            return Err(ControllerError::Identity);
-        };
-        // The registry decoded for this refresh, charged as its owner
-        // measured it, for the refresh.
-        let _decoding = charge(&self.budget, observed.enrollment_restore())?;
-        let enrollment = EnrollmentRegistry::restore(
-            enrollment,
-            self.state.genesis.founder.cluster,
-            EnrollmentLimits::default(),
-        )?;
+        // The registry the observation holds, decoded once for every reader of it and charged
+        // while it is held.
+        let enrollment = observed.enrollment(self.state.genesis.founder.cluster, &self.budget)?;
         if enrollment.ca_certificate() != self.state.sponsor.ca_certificate {
             return Err(ControllerError::Identity);
         }
@@ -1959,7 +1961,7 @@ impl NetworkController {
         }
         // A credential the registry no longer authorizes stops serving at
         // once, as a binary behind the fence does (24 §11; runbooks/expired-credentials).
-        if credential_retired(&enrollment, self.state.node, &self.receipt, now) {
+        if credential_retired(enrollment, self.state.node, &self.receipt, now) {
             return Err(ControllerError::Retired);
         }
         // The level the committed fence opens, for the next start to choose where the node's
@@ -1969,19 +1971,19 @@ impl NetworkController {
             crate::storage_level::record(&self.root, level)?;
             self.recorded_level = level;
         }
-        self.publish_local_grant(&enrollment);
+        self.publish_local_grant(enrollment);
         // What this refresh builds and keeps, charged before it is built.
         let projection = charge(
             &self.budget,
             projection_bytes(
-                &enrollment,
+                enrollment,
                 &observed.contacts().contacts.records,
                 self.state.sponsor.endpoint.len(),
                 now,
             )
             .ok_or(ControllerError::Capacity)?,
         )?;
-        let grants = active_grants(&enrollment, &self.state, now)?;
+        let grants = active_grants(enrollment, &self.state, now)?;
         let known = enrollment
             .enrollments()
             .find(|known| known.identity.node_id == Some(self.state.node));
@@ -2055,7 +2057,7 @@ impl NetworkController {
                 continue;
             }
             let identity = authorize_node_contact(
-                &enrollment,
+                enrollment,
                 contact.node,
                 contact.principal,
                 contact.certificate_fingerprint,
@@ -2123,7 +2125,7 @@ impl NetworkController {
         }
         let held = certificate_fingerprint(&self.receipt.certificate);
         let held_granted = grants.contains_key(&held);
-        registry.replace_projection(grants, enrolled_keys(&enrollment, &self.state)?)?;
+        registry.replace_projection(grants, enrolled_keys(enrollment, &self.state)?)?;
         if held_granted && let Some(presented) = &self.presented {
             presented.send_if_modified(|current| {
                 if *current == held {

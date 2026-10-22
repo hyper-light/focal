@@ -514,9 +514,6 @@ pub struct NetworkService {
     presented: focal_rt::watch::Receiver<[u8; 32]>,
     budget: MemoryBudget,
     _configuration: Allocation,
-    /// The cluster this node belongs to, for restoring the enrollment
-    /// registry the metrics sampler reads the fence from.
-    cluster: [u8; 16],
     /// The node's storage, for its statistics in the metrics snapshot.
     storage: focal_consensus::NodeStorage,
     /// The fixed labels of this node's metrics and the latest snapshot the
@@ -1284,7 +1281,6 @@ impl NetworkService {
             presented,
             budget,
             _configuration: allocation,
-            cluster: identity.cluster,
             storage: storage.clone(),
             metrics_labels,
             metrics,
@@ -1638,19 +1634,8 @@ impl NetworkService {
             .observe_root()
             .await
             .ok()
-            .and_then(|observation| match &observation.snapshot().state {
-                focal_control::ControlBootstrap::Root { enrollment, .. } => {
-                    focal_enrollment::EnrollmentRegistry::restore(
-                        enrollment,
-                        self.cluster,
-                        focal_enrollment::EnrollmentLimits::default(),
-                    )
-                    .ok()
-                    .map(|registry| registry.fence().level)
-                }
-                _ => None,
-            })
-            .unwrap_or(0);
+            .and_then(|observation| observation.fence())
+            .map_or(0, |fence| fence.level);
         Ok(MetricsSnapshot {
             sampled_ms: now,
             labels: self.metrics_labels.clone(),
