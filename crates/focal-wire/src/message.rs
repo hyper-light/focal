@@ -328,6 +328,14 @@ pub const MAX_PLACEMENT_CONTROL_REQUEST_BYTES: usize = 256 * 1024;
 pub const MAX_SESSION_SIGN_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_ENROLLMENT_CONTROL_REQUEST_BYTES: usize = 128 * 1024;
 impl Operation {
+    /// Whether the operation registered as `tag` waits on an event at the node rather than on its
+    /// service: a recipient's inbox read held until a delivery comes or its wait ends
+    /// ([`Operation::NativeWait`]). The transport parks one as its head arrives, holding none of
+    /// the stream pool's credit while it waits (hyper-transport's `Classes::waits`, hyper-raft
+    /// docs/transport.md §4ab): a participant's writes are never held behind its waits.
+    pub const fn waits_tag(tag: u16) -> bool {
+        tag == 34
+    }
     /// IDs are registered protocol values, independent of Rust enum layout.
     pub fn registered_tag(&self) -> u16 {
         match self {

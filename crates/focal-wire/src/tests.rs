@@ -6936,3 +6936,33 @@ fn loopback_round_trip_floor() {
     })
     .unwrap()
 }
+
+/// The transport parks the inbox read that waits and nothing else (hyper-raft docs/transport.md
+/// §4ab): `Operation::NativeWait`'s tag is the one tag that waits, and its kind on the wire is what
+/// `FocalClasses::waits` parks; a greeting, and every other operation (a stream poll, whose
+/// acknowledgement is work, among them), is served in the pool's account.
+#[test]
+fn only_the_waiting_inbox_read_is_parked() {
+    use hyper_transport::Classes as _;
+    let wait = Operation::NativeWait(NativeWaitRequest {
+        list: NativeListRequest {
+            filter: NativeListFilter::Definitions {
+                claim: None,
+                evaluator: None,
+            },
+            cursor: None,
+            max_items: 1,
+            max_visits: 1,
+        },
+        wait_ms: 1,
+    });
+    let tag = wait.registered_tag();
+    assert!(crate::net::FocalClasses::waits(
+        crate::net::Kind::Operation(tag)
+    ));
+    let waiting: Vec<u16> = (0..=u16::MAX)
+        .filter(|tag| Operation::waits_tag(*tag))
+        .collect();
+    assert_eq!(waiting, vec![tag]);
+    assert!(!crate::net::FocalClasses::waits(crate::net::Kind::Hello));
+}

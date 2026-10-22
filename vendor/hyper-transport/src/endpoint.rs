@@ -1068,10 +1068,14 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 };
                 if let Some(Some(conn)) = self.conns.get_mut(key)
                     && conn.serial == serial
-                    && let Some(granted) = self.core.pool.reclaim(&mut conn.share, conn.served)
+                    && self
+                        .core
+                        .pool
+                        .reclaim(&mut conn.share, conn.served)
+                        .is_some()
                 {
                     conn.quic
-                        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+                        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(conn.share.limit()));
                 }
                 continue;
             };
@@ -1081,9 +1085,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                         self.core.pool.passed(&mut conn.share);
                         false
                     } else {
-                        let granted = self.core.pool.grant(&mut conn.share, most);
-                        conn.quic
-                            .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+                        self.core.pool.grant(&mut conn.share, most);
+                        conn.quic.set_max_concurrent_streams(
+                            Dir::Bi,
+                            VarInt::from_u32(conn.share.limit()),
+                        );
                         true
                     }
                 }
@@ -2721,12 +2727,13 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             if C::pooled(role) {
                 self.pool
                     .join(&mut conn.share, initial, conn.key, conn.serial);
-                if let Some(granted) = self
+                if self
                     .pool
                     .welcome(&mut conn.share, self.limits.streams_per_connection)
+                    .is_some()
                 {
                     conn.quic
-                        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+                        .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(conn.share.limit()));
                 }
             } else {
                 // A role outside the pool holds every stream a connection may from here on.
@@ -2934,6 +2941,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             starved: false,
             ended: false,
             credit_settled: false,
+            parked: false,
         };
         match self.exchanges.insert(exchange) {
             Ok(id) => {
@@ -3044,15 +3052,18 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         prefix: Prefix,
     ) -> Result<(), Refusal> {
         let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
-        let class = if exchange.opened {
+        let (class, waits) = if exchange.opened {
             if prefix.kind != 0 {
                 return Err(Refusal::Corrupt);
             }
-            exchange.class.ok_or(Refusal::Order)?
+            (exchange.class.ok_or(Refusal::Order)?, false)
         } else {
             let role = conn.peer.map(|(_, role)| role).ok_or(Refusal::Identity)?;
             let kind = C::kind_of(prefix.kind).ok_or(Refusal::Kind)?;
-            C::class_of(kind, role).ok_or(Refusal::Kind)?
+            (
+                C::class_of(kind, role).ok_or(Refusal::Kind)?,
+                C::waits(kind),
+            )
         };
         if prefix.head > self.limits.max_head || prefix.length() > C::frame_bound(class) {
             return Err(Refusal::FrameBound);
@@ -3073,6 +3084,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let (at, backlog) = (moved(conn, rank), self.backlog(conn, rank));
         let exchange = self.exchanges.get_mut(id).ok_or(Refusal::UnknownExchange)?;
         exchange.carry.answering(now, at, prefix.length(), backlog);
+        // A peer's exchange that waits on its owner's event holds none of the pool's credit while
+        // it waits: parked, it holds a stream of its own (`crate::pool`), and is no open one of its
+        // peer's in the pool's accounts.
+        if waits
+            && let Some(limit) = self.pool.park(
+                &mut conn.share,
+                self.limits.streams_per_connection,
+                conn.served.saturating_sub(1),
+                conn.key,
+                conn.serial,
+            )
+        {
+            exchange.parked = true;
+            conn.served = conn.served.saturating_sub(1);
+            conn.quic
+                .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(limit));
+        }
         Ok(())
     }
 
@@ -3310,6 +3338,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             starved: false,
             ended: false,
             credit_settled: false,
+            parked: false,
         };
         let id = self.exchanges.insert(exchange)?;
         self.exchanges.place(id, conn.exchanges.len());
@@ -3740,17 +3769,27 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
     /// An exchange on `conn` ended, this side's own if `opened`. A pooled connection's grant
     /// serves the exchanges its peer opens, so one of those ended may give streams back to the
     /// pool (`crate::pool`).
-    fn exchange_ended(&mut self, conn: &mut Conn<C::Role>, opened: bool) {
+    /// A parked one's stream goes with it, granted to no other, and it was no open one in the
+    /// pool's accounts.
+    fn exchange_ended(&mut self, conn: &mut Conn<C::Role>, opened: bool, parked: bool) {
         if opened {
             return;
         }
+        if parked {
+            if self.pool.unpark(&mut conn.share).is_some() {
+                conn.quic
+                    .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(conn.share.limit()));
+            }
+            return;
+        }
         conn.served = conn.served.saturating_sub(1);
-        if let Some(granted) = self
+        if self
             .pool
             .ended(&mut conn.share, conn.served, conn.key, conn.serial)
+            .is_some()
         {
             conn.quic
-                .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(granted));
+                .set_max_concurrent_streams(Dir::Bi, VarInt::from_u32(conn.share.limit()));
         }
     }
 
@@ -3766,14 +3805,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             return;
         }
         exchange.credit_settled = true;
-        self.exchange_ended(conn, false);
+        let parked = exchange.parked;
+        self.exchange_ended(conn, false, parked);
     }
 
     /// An exchange that ended without its credit settled as its reply finished (one this side
     /// opened, or one refused) settles it now.
     fn unsettled_ended(&mut self, conn: &mut Conn<C::Role>, exchange: &Exchange<C::Class>) {
         if !exchange.credit_settled {
-            self.exchange_ended(conn, exchange.opened);
+            self.exchange_ended(conn, exchange.opened, exchange.parked);
         }
     }
 

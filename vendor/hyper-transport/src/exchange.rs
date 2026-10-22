@@ -301,4 +301,8 @@ pub(crate) struct Exchange<K> {
     /// A peer's exchange whose stream's credit its connection settled with the pool as its reply
     /// was finished (`Endpoint::settle_credit`): its end settles nothing again.
     pub(crate) credit_settled: bool,
+    /// A peer's exchange parked as its head arrived ([`crate::Classes::waits`]): it holds a stream
+    /// of its own and none of the pool's, and is not one of its peer's open ones in the pool's
+    /// accounts (`crate::pool`).
+    pub(crate) parked: bool,
 }

@@ -30,6 +30,16 @@
 //!   peer may still open the streams it was told of, so the pool is overcommitted by them, as
 //!   Breakwater overcommits its credit to idle clients and keeps its queue by dropping what an
 //!   overload sends past it (the owner's door).
+//! - **Parking.** An exchange that waits on an event its owner awaits, not on the endpoint's
+//!   service (a long poll: [`crate::Classes::waits`]), holds no credit while it waits: it is parked
+//!   as its head arrives, and its connection is granted a stream of its own for it, so its peer
+//!   may still open what the pool grants it. Kafka holds a fetch that waits for data in its
+//!   purgatory, apart from the request handlers that serve (`DelayedFetch`); Breakwater issues
+//!   credit for the server's work, which a waiting read does none of. A parked exchange is not
+//!   one of its peer's open ones in the pool's accounts, so a connection that holds only parked
+//!   exchanges is idle, its credit reclaimed for others. Parked at most up to the streams one
+//!   connection may hold, its grant and its parked together: past that an exchange is served in
+//!   the pool's account like any other. Its stream goes as it ends, granted to no other.
 //! - **Bounds.** A connection waits once and is queued as idle once at most, so each queue holds
 //!   no more than the pooled connections; its entries name a connection by its key and serial,
 //!   and one gone, or one busy again, is passed when reached.
@@ -47,6 +57,15 @@ pub(crate) struct Share {
     pub(crate) wanting: bool,
     /// It is in the pool's queue of idle connections.
     pub(crate) idle: bool,
+    /// Exchanges of its peer's parked: each holds a stream of its own, apart from the grant.
+    pub(crate) parked: u32,
+}
+
+impl Share {
+    /// The streams its peer may hold open at once: its grant and its parked exchanges' own.
+    pub(crate) fn limit(&self) -> u32 {
+        self.granted.saturating_add(self.parked)
+    }
 }
 
 /// The credit pooled connections share.
@@ -72,6 +91,11 @@ pub(crate) struct Pool {
     grants: u64,
     /// Streams connections gave back, counted.
     given_back: u64,
+    /// Exchanges parked now, all connections' together.
+    parked: u64,
+    /// Exchanges parked, counted; and those not parked for want of room in their connection.
+    parks: u64,
+    parks_refused: u64,
 }
 
 /// What the pool holds and has done, for the owner's statistics.
@@ -93,6 +117,13 @@ pub struct PoolStats {
     /// Streams taken back from idle connections for those waiting, counted: the pool's
     /// overcommitment, as their peers may still open the streams they were told of.
     pub reclaimed: u64,
+    /// Exchanges parked now, holding no credit of the pool's ([`crate::Classes::waits`]).
+    pub parked: u64,
+    /// Exchanges parked, counted.
+    pub parks: u64,
+    /// Exchanges that would have parked, their connection holding as many streams as one may:
+    /// served in the pool's account instead.
+    pub parks_refused: u64,
 }
 
 impl Pool {
@@ -108,6 +139,9 @@ impl Pool {
             reclaimed: 0,
             grants: 0,
             given_back: 0,
+            parked: 0,
+            parks: 0,
+            parks_refused: 0,
         }
     }
 
@@ -127,6 +161,9 @@ impl Pool {
             grants: self.grants,
             given_back: self.given_back,
             reclaimed: self.reclaimed,
+            parked: self.parked,
+            parks: self.parks,
+            parks_refused: self.parks_refused,
         }
     }
 
@@ -152,6 +189,7 @@ impl Pool {
             granted,
             wanting: false,
             idle: false,
+            parked: 0,
         };
         self.granted = self.granted.saturating_add(u64::from(granted));
         self.connections = self.connections.saturating_add(1);
@@ -223,11 +261,52 @@ impl Pool {
             return;
         }
         self.granted = self.granted.saturating_sub(u64::from(share.granted));
+        self.parked = self.parked.saturating_sub(u64::from(share.parked));
         self.connections = self.connections.saturating_sub(1);
         if share.wanting {
             self.waiting = self.waiting.saturating_sub(1);
         }
         *share = Share::default();
+    }
+
+    /// An exchange its peer opened waits on its owner's event: parked, it holds a stream of its own
+    /// and none of the pool's, if the connection holds fewer than `most` streams, its grant and its
+    /// parked together. `open` of its peer's exchanges are open past it, the connection named by
+    /// `key` and `serial`: one left with none open in the pool's account is queued as idle. The
+    /// connection's new stream limit, if parked.
+    pub(crate) fn park(
+        &mut self,
+        share: &mut Share,
+        most: u32,
+        open: u32,
+        key: usize,
+        serial: u64,
+    ) -> Option<u32> {
+        if !share.pooled {
+            return None;
+        }
+        if share.limit() >= most {
+            self.parks_refused = self.parks_refused.saturating_add(1);
+            return None;
+        }
+        share.parked = share.parked.saturating_add(1);
+        self.parked = self.parked.saturating_add(1);
+        self.parks = self.parks.saturating_add(1);
+        if open == 0 {
+            self.went_idle(share, key, serial);
+        }
+        Some(share.limit())
+    }
+
+    /// A parked exchange ended: its stream goes with it, granted to no other. The connection's new
+    /// stream limit.
+    pub(crate) fn unpark(&mut self, share: &mut Share) -> Option<u32> {
+        if !share.pooled || share.parked == 0 {
+            return None;
+        }
+        share.parked = share.parked.saturating_sub(1);
+        self.parked = self.parked.saturating_sub(1);
+        Some(share.limit())
     }
 
     /// The connection's peer is blocked at its grant: it waits its turn, once.
@@ -539,5 +618,53 @@ mod tests {
         assert_eq!(pool.next(), Some((1, 9)));
         assert_eq!(pool.grant(&mut shares[1], 16), 4);
         assert_eq!(pool.next(), None);
+    }
+
+    /// A parked exchange holds a stream of its own beside the grant, within what one connection
+    /// may hold, and is no open one in the pool's accounts: a connection whose only open exchange
+    /// is parked is idle, and its grant is taken back for one waiting, the parked stream kept.
+    /// Ended, the parked stream goes with it.
+    #[test]
+    fn a_parked_exchange_holds_a_stream_of_its_own_and_none_of_the_pools() {
+        let (mut pool, mut shares) = pool(2, 2, 1);
+        // Connection 0's peer parks a wait: its limit rises past its grant, the pool's untouched.
+        assert_eq!(pool.park(&mut shares[0], 4, 0, 0, 0), Some(2));
+        assert_eq!((shares[0].granted, shares[0].parked), (1, 1));
+        let stats = pool.stats();
+        assert_eq!((stats.granted, stats.parked, stats.parks), (2, 1, 1));
+        // Connection 1 waits with nothing spare: connection 0, idle in the pool's accounts though
+        // its parked exchange is open, gives its grant back and keeps the parked stream.
+        pool.wants(&mut shares[1], 1, 0);
+        assert_eq!(pool.next(), None, "nothing spare");
+        let idle = pool.next_idle();
+        assert_eq!(idle, Some((0, 0)));
+        assert_eq!(pool.reclaim(&mut shares[0], 0), Some(0));
+        assert_eq!((shares[0].granted, shares[0].limit()), (0, 1));
+        assert_eq!(pool.next(), Some((1, 0)));
+        assert_eq!(pool.grant(&mut shares[1], 4), 2);
+        // The parked exchange ends: its stream goes, granted to no other.
+        assert_eq!(pool.unpark(&mut shares[0]), Some(0));
+        assert_eq!(pool.unpark(&mut shares[0]), None, "nothing parked");
+        let stats = pool.stats();
+        assert_eq!((stats.granted, stats.parked), (2, 0));
+    }
+
+    /// A connection that holds as many streams as one may parks nothing more: the exchange is
+    /// served in the pool's account, counted; and one that leaves takes its parked count with it.
+    #[test]
+    fn parking_stops_at_the_streams_one_connection_may_hold() {
+        let (mut pool, mut shares) = pool(8, 1, 2);
+        assert_eq!(pool.park(&mut shares[0], 3, 1, 0, 0), Some(3));
+        assert_eq!(pool.park(&mut shares[0], 3, 1, 0, 0), None);
+        let stats = pool.stats();
+        assert_eq!((stats.parked, stats.parks, stats.parks_refused), (1, 1, 1));
+        pool.leave(&mut shares[0]);
+        assert_eq!(pool.stats().parked, 0);
+        let mut outside = Share::default();
+        assert_eq!(
+            pool.park(&mut outside, 3, 0, 1, 0),
+            None,
+            "a role outside the pool"
+        );
     }
 }

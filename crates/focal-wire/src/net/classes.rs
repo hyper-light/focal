@@ -105,6 +105,15 @@ impl Classes for FocalClasses {
         matches!(role, Sender::Participant)
     }
 
+    /// A participant's inbox read that waits for a delivery ([`crate::Operation::waits_tag`]) is
+    /// parked as it arrives: it holds a stream of its own and none of the pool's, so the writes its
+    /// participant sends are not held behind its waits. 500 agents' waits held every stream of a
+    /// pool of 142 with 360 connections waiting, and their writes committed 10 a second of the 350
+    /// offered (hyper-raft docs/transport.md §4ab).
+    fn waits(kind: Kind) -> bool {
+        matches!(kind, Kind::Operation(tag) if crate::Operation::waits_tag(tag))
+    }
+
     fn kind_code(kind: Kind) -> u16 {
         match kind {
             Kind::Hello => HELLO_CODE,

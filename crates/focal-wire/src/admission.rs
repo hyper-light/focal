@@ -137,6 +137,12 @@ pub struct AdmissionStats {
     /// Streams granted to waiting connections, and taken back from idle ones for them, counted.
     pub pool_grants: u64,
     pub pool_reclaimed: u64,
+    /// The pool's parked exchanges: inbox reads waiting for a delivery, each holding a stream of
+    /// its own and none of the pool's; those parked, counted; and those served in the pool's
+    /// account for want of room in their connection.
+    pub pool_parked: u64,
+    pub pool_parks: u64,
+    pub pool_parks_refused: u64,
     /// The listener's receive ring: the buffers it holds and their bytes, as many as its drains
     /// have needed (hyper-raft docs/transport.md §4aa), and its growths, shrinks and the growths
     /// its budget or the allocator refused.
@@ -190,6 +196,9 @@ impl AdmissionStats {
             pool_wanting: stats.endpoint.pool.wanting,
             pool_grants: stats.endpoint.pool.grants,
             pool_reclaimed: stats.endpoint.pool.reclaimed,
+            pool_parked: stats.endpoint.pool.parked,
+            pool_parks: stats.endpoint.pool.parks,
+            pool_parks_refused: stats.endpoint.pool.parks_refused,
             ring_buffers: stats.ring.buffers,
             ring_bytes: stats.ring.bytes,
             ring_grown: stats.ring.grown,

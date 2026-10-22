@@ -16049,3 +16049,23 @@ ring (`AdmissionStats::ring_*`; metrics `focal_listener_receive_ring_buffers`, `
 `focal_listener_receive_ring_changes_total{change}`), and counts the ring's growth as the
 endpoint's own beside its receive pool (`ring_charged`): what the connections hold is what the
 listener holds past both.
+
+### 2026-10-22 — An inbox read that waits holds none of the stream pool
+
+focal's deliver comparison of 500 agents (CI 39745325712, with focal-load's progress lines and the
+listener's pool in the evidence) did not stall: it committed 4,885 writes in 512 seconds of the 350
+a second offered, refused none, finished no message's lifecycle, and its node used 21% of a CPU.
+The listener's stream pool held 142 streams, all granted, with 360 connections waiting for one; of
+the 121,144 pages the agents' tails read, 120,644 had been held at the node. A held page is a
+`NativeWait` whose reply waits for a delivery, and it held its stream, and the pool's credit with
+it, for its whole wait, so every write waited at its agent behind the waits. Every shared crate is
+now at hyper-raft d4e8447, whose stream pool parks an exchange of a kind its owner says waits
+(`Classes::waits`): parked as its head arrives, it holds a stream of its own, within the streams
+one connection may hold, and none of the pool's, and a connection holding only waits is idle in the
+pool's accounts (hyper-raft `docs/transport.md` §4ab; Kafka's purgatory holds a waiting fetch
+apart from the handlers that serve, and Breakwater credits the server's work, which a wait does
+none of). focal's waiting kind is `NativeWait` (`Operation::waits_tag`; `FocalClasses::waits`); a
+stream poll that may acknowledge is not one, since its acknowledgement is work. The listener's
+admission reports the parked reads (`AdmissionStats::pool_parked`, `pool_parks`,
+`pool_parks_refused`; metrics `focal_listener_stream_pool_parked`, `_parks_total`,
+`_parks_refused_total`). vendor/README.md; docs/dependencies/inventory.tsv.

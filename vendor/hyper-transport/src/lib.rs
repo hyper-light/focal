@@ -124,6 +124,16 @@ pub trait Classes {
         let _ = role;
         false
     }
+    /// Whether an exchange of `kind` waits on an event its owner awaits rather than on the
+    /// endpoint's service: a read held until something arrives for it or its wait ends (a long
+    /// poll). One a pooled peer opens is parked as its head arrives, holding none of the pool's
+    /// credit while it waits: its connection is granted a stream of its own for it, within the
+    /// streams one connection may hold (`crate::pool`, docs/transport.md §4ab). None does, unless a
+    /// side says so.
+    fn waits(kind: Self::Kind) -> bool {
+        let _ = kind;
+        false
+    }
     /// Whether a lane frame of `class` is never skipped. A frame whose class bound or budget cannot
     /// take it is skipped and counted, so one full range never stalls a lane (`lane`'s module doc):
     /// right for a class whose frames the protocol above sends again (consensus messages). A class

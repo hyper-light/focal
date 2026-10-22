@@ -1263,6 +1263,21 @@ impl MetricsSnapshot {
             self.listener.pool_reclaimed,
         );
         text.gauge(
+            "focal_listener_stream_pool_parked",
+            "Inbox reads waiting for a delivery, each holding a stream of its own and none of the pool's.",
+            self.listener.pool_parked,
+        );
+        text.counter(
+            "focal_listener_stream_pool_parks_total",
+            "Waiting reads parked as they arrived.",
+            self.listener.pool_parks,
+        );
+        text.counter(
+            "focal_listener_stream_pool_parks_refused_total",
+            "Waiting reads served in the pool's account, their connection holding as many streams as one may.",
+            self.listener.pool_parks_refused,
+        );
+        text.gauge(
             "focal_listener_receive_ring_buffers",
             "Receive buffers the listener's sockets are lent, as many as their drains have needed.",
             self.listener.ring_buffers,
