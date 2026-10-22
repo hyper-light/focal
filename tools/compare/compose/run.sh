@@ -71,6 +71,10 @@ evidence() {
     for n in focal1 focal2 focal3; do
       echo "--- $n replicas"
       timeout 30 docker compose -f compose.yaml --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas || true
+      # Its metrics: the listener's connections, refusals and stream pool among them.
+      echo "--- $n metrics"
+      timeout 30 docker compose -f compose.yaml --profile focal exec -T "$n" focal --data-dir /data inspect node --metrics \
+        | grep -E '^focal_(listener|peer|overload|admission|session)' || true
       echo "--- $n log"
       dc logs --no-color --tail 120 "$n" || true
     done

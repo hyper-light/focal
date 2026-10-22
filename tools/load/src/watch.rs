@@ -7,6 +7,7 @@
 //! (or was waited for and given up), and is passed over.
 use crate::driver::Conn;
 use crate::error::LoadError;
+use crate::progress::PROGRESS;
 use focal_client::ClientError;
 use focal_model::native_event::{NativeEventRecord, NativeFactRecord, NativeResponseState};
 use focal_model::{
@@ -234,6 +235,7 @@ pub async fn tail(
         };
         let reply = conn.request(envelope).await;
         watch.count(side, |counts| counts.polls = counts.polls.saturating_add(1));
+        PROGRESS.tail_poll();
         let result = reply.map(|envelope| envelope.result);
         if waiting
             && matches!(
@@ -250,6 +252,7 @@ pub async fn tail(
             watch.count(side, |counts| {
                 counts.waited = counts.waited.saturating_add(1)
             });
+            PROGRESS.tail_wait();
         }
         let page = match result {
             Ok(Response::NativeListed(page)) => page,
@@ -257,6 +260,7 @@ pub async fn tail(
                 watch.count(side, |counts| {
                     counts.failed = counts.failed.saturating_add(1)
                 });
+                PROGRESS.tail_failed();
                 focal_rt::time::sleep(poll)
                     .await
                     .map_err(LoadError::Runtime)?;
@@ -281,6 +285,7 @@ pub async fn tail(
         watch.count(side, |counts| {
             counts.events = counts.events.saturating_add(read)
         });
+        PROGRESS.tail_events(read);
         if read == 0 {
             // A page that reached the prefix waits for more: at the node where it holds the
             // read, here otherwise.

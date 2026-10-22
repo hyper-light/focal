@@ -125,6 +125,14 @@ pub struct AdmissionStats {
     pub refused_memory: u64,
     /// Every admission and refusal so far: what a wait on this listener is charged in.
     pub changes: u64,
+    /// The stream pool its participants share (hyper-transport's `StreamCredit::Pooled`): its
+    /// size, what its connections hold of it, and the connections waiting for a stream.
+    pub pool_size: u64,
+    pub pool_granted: u64,
+    pub pool_wanting: u64,
+    /// Streams granted to waiting connections, and taken back from idle ones for them, counted.
+    pub pool_grants: u64,
+    pub pool_reclaimed: u64,
 }
 impl AdmissionStats {
     /// A listener's admission, from what its owner reports.
@@ -164,6 +172,11 @@ impl AdmissionStats {
             changes: refusals
                 .into_iter()
                 .fold(admission.admitted, u64::saturating_add),
+            pool_size: stats.endpoint.pool.size,
+            pool_granted: stats.endpoint.pool.granted,
+            pool_wanting: stats.endpoint.pool.wanting,
+            pool_grants: stats.endpoint.pool.grants,
+            pool_reclaimed: stats.endpoint.pool.reclaimed,
         }
     }
 }

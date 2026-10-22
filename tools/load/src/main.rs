@@ -23,6 +23,7 @@ mod error;
 mod generations;
 mod measurements;
 mod native;
+mod progress;
 mod report;
 mod shape;
 mod watch;

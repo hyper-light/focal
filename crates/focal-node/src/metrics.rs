@@ -1237,6 +1237,31 @@ impl MetricsSnapshot {
             "Bytes of request bodies permitted to the listener's identities and not yet given back.",
             self.listener.bytes,
         );
+        text.gauge(
+            "focal_listener_stream_pool_size",
+            "Streams the listener's participants share, as the node sized the pool.",
+            self.listener.pool_size,
+        );
+        text.gauge(
+            "focal_listener_stream_pool_granted",
+            "Streams the pooled connections hold, summed.",
+            self.listener.pool_granted,
+        );
+        text.gauge(
+            "focal_listener_stream_pool_wanting",
+            "Pooled connections waiting for a stream.",
+            self.listener.pool_wanting,
+        );
+        text.counter(
+            "focal_listener_stream_pool_grants_total",
+            "Streams granted to connections that waited for one.",
+            self.listener.pool_grants,
+        );
+        text.counter(
+            "focal_listener_stream_pool_reclaimed_total",
+            "Streams taken back from idle connections for those waiting.",
+            self.listener.pool_reclaimed,
+        );
         let sockets = [
             ("listener", self.sockets.listener),
             ("peers", self.sockets.peers),

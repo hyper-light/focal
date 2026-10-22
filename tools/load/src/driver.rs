@@ -16,6 +16,7 @@ use crate::measurements::{
     WriteOutcome, WriteSample, WriteSamples,
 };
 use crate::native;
+use crate::progress::{PROGRESS, Stage};
 use crate::report::{self, Latency, Report};
 use crate::shape::{Lifecycle, Profile, Transport, WorkloadShape};
 use crate::watch::{self, Side, Watch};
@@ -588,9 +589,12 @@ impl Shared<'_> {
     /// not commit ends the lifecycle there.
     async fn write(&self, i: u64, started: Instant) -> Result<(), LoadError> {
         let (issuer, _) = self.sides(i)?;
+        PROGRESS.started();
+        let creating = PROGRESS.at(Stage::Create);
         let Some((claim, written, _)) = self.step(issuer, i, 0, started, None).await? else {
             return Ok(());
         };
+        drop(creating);
         match self.job.lifecycle {
             Lifecycle::Create => Ok(()),
             Lifecycle::CancelRelease => self.cancel_release(i, claim, written).await,
@@ -618,6 +622,7 @@ impl Shared<'_> {
             };
             written = sequence;
         }
+        PROGRESS.lifecycle();
         let mut outcome = self.outcome.borrow_mut();
         outcome.lifecycles = outcome.lifecycles.saturating_add(1);
         Ok(())
@@ -659,6 +664,7 @@ impl Shared<'_> {
             .ok_or(LoadError::Bound("testament id space"))?;
         let posted = watch.expect_posted(claim)?;
         let post = NativeAuthoredOperation::ClaimPost(authored::claim_target(claim));
+        let at = PROGRESS.at(Stage::Post);
         if self
             .later(issuer, i, 1, &post, created, 0..0)
             .await?
@@ -667,23 +673,30 @@ impl Shared<'_> {
             watch.forget(claim);
             return Ok(());
         }
+        drop(at);
+        let at = PROGRESS.at(Stage::WaitPosted);
         let Some(seen) = watch.wait(posted).await? else {
             return self.undelivered(claim, watch);
         };
+        drop(at);
         let acquire = NativeAuthoredOperation::ReceiptAcquire(authored::receipt(claim));
+        let at = PROGRESS.at(Stage::Acquire);
         let Some((written, _)) = self
             .later(consumer, i, 2, &acquire, seen, receipt_ids)
             .await?
         else {
             return Ok(());
         };
+        drop(at);
         let submit = NativeAuthoredOperation::TestamentSubmit(authored::testament(claim));
+        let at = PROGRESS.at(Stage::Submit);
         let Some((written, minted)) = self
             .later(consumer, i, 3, &submit, written, testament_ids)
             .await?
         else {
             return Ok(());
         };
+        drop(at);
         let testament = minted
             .iter()
             .find(|identity| identity.kind == NativeIdentityKind::Response)
@@ -692,6 +705,7 @@ impl Shared<'_> {
         let answered = watch.expect_testament(claim)?;
         let post =
             NativeAuthoredOperation::TestamentPost(authored::testament_target(claim, testament));
+        let at = PROGRESS.at(Stage::PostTestament);
         if self
             .later(consumer, i, 4, &post, written, 0..0)
             .await?
@@ -700,10 +714,13 @@ impl Shared<'_> {
             watch.forget(claim);
             return Ok(());
         }
+        drop(at);
         let handled = Instant::now();
+        let at = PROGRESS.at(Stage::WaitAnswered);
         let Some((posted, seen)) = watch.wait(answered).await? else {
             return self.undelivered(claim, watch);
         };
+        drop(at);
         if posted != testament {
             self.note(format!(
                 "the testament the issuer saw posted for {claim:032x} is not the consumer's"
@@ -711,13 +728,17 @@ impl Shared<'_> {
         }
         let target = authored::testament_target(claim, testament);
         let receive = NativeAuthoredOperation::TestamentReceive(target.clone());
+        let at = PROGRESS.at(Stage::Receive);
         let Some((written, _)) = self.later(issuer, i, 5, &receive, seen, 0..0).await? else {
             return Ok(());
         };
+        drop(at);
         let enter = NativeAuthoredOperation::ValidationEnterWholeWork(target);
+        let at = PROGRESS.at(Stage::Enter);
         let Some((written, _)) = self.later(issuer, i, 6, &enter, written, 0..0).await? else {
             return Ok(());
         };
+        drop(at);
         let satisfied = Instant::now();
         // Delivered once satisfied, whether or not the release that ends its lifecycle commits:
         // a message delivered and a lifecycle completed are counted apart.
@@ -729,6 +750,7 @@ impl Shared<'_> {
                 .as_nanos(),
         })?;
         let release = NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim));
+        let at = PROGRESS.at(Stage::Release);
         if self
             .later(issuer, i, 7, &release, written, 0..0)
             .await?
@@ -736,6 +758,8 @@ impl Shared<'_> {
         {
             return Ok(());
         }
+        drop(at);
+        PROGRESS.lifecycle();
         let mut outcome = self.outcome.borrow_mut();
         outcome.lifecycles = outcome.lifecycles.saturating_add(1);
         Ok(())
@@ -745,6 +769,7 @@ impl Shared<'_> {
     /// waiter let go.
     fn undelivered(&self, claim: u128, watch: &Watch) -> Result<(), LoadError> {
         watch.forget(claim);
+        PROGRESS.undelivered();
         let mut outcome = self.outcome.borrow_mut();
         outcome.undelivered = outcome.undelivered.saturating_add(1);
         Ok(())
@@ -943,6 +968,7 @@ impl Shared<'_> {
             }
             match reply {
                 Reply::Committed(sequence) => {
+                    PROGRESS.committed();
                     let mut outcome = self.outcome.borrow_mut();
                     outcome.committed = outcome.committed.saturating_add(1);
                     if later.is_none() {
@@ -955,6 +981,7 @@ impl Shared<'_> {
                     if attempt < ATTEMPTS && self.learn(actor).await? {
                         continue;
                     }
+                    PROGRESS.refused();
                     let mut outcome = self.outcome.borrow_mut();
                     outcome.refused = outcome.refused.saturating_add(1);
                     note(
@@ -963,11 +990,13 @@ impl Shared<'_> {
                     );
                 }
                 Reply::Refused(reason, _) => {
+                    PROGRESS.refused();
                     let mut outcome = self.outcome.borrow_mut();
                     outcome.refused = outcome.refused.saturating_add(1);
                     note(&mut outcome.refusals, reason);
                 }
                 Reply::Unknown(reason) => {
+                    PROGRESS.unknown();
                     let mut outcome = self.outcome.borrow_mut();
                     outcome.unknown = outcome.unknown.saturating_add(1);
                     note(&mut outcome.refusals, reason);
@@ -1735,6 +1764,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     let watch = Watch::new(watch_bound);
     // A run among agents: each agent a principal of its own on the embedded node, with its
     // connection and its journal's generations.
+    PROGRESS.agents(u64::from(shape.agents.unwrap_or(0)));
     let agent_list = match (shape.agents, &shape.agent_enrollments) {
         // Each an enrolled client of its own: the principal its credential names, on an
         // endpoint and a connection of its own.
@@ -1754,9 +1784,11 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 }
                 let principal = client.build.actor;
                 let connector = Connector::Enrolled(Box::new(pending));
+                let conn = Conn::open(&connector, principal, &names, &limits)?;
+                PROGRESS.agent_opened();
                 Ok(Agent {
                     principal,
-                    conn: Conn::open(&connector, principal, &names, &limits)?,
+                    conn,
                     generations: Generations::new(),
                 })
             })
@@ -1764,9 +1796,11 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         (Some(count), None) => (0..count)
             .map(|agent| {
                 let principal = agent_principal(shape.seed, agent)?;
+                let conn = Conn::open(&connector, principal, &names, &limits)?;
+                PROGRESS.agent_opened();
                 Ok(Agent {
                     principal,
-                    conn: Conn::open(&connector, principal, &names, &limits)?,
+                    conn,
                     generations: Generations::new(),
                 })
             })
@@ -1815,15 +1849,24 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     // One journal's generations for every caller, as N processes of one
     // participant share one (the audit's F12).
     let generations = Generations::new();
-    let (write_outcomes, write_nanos, write_phase_start_epoch_ns) = run_phase(
-        jobs,
-        Phase::Write,
-        &generations,
-        &connector,
-        connections,
-        (consumer.as_ref(), agents.as_ref()),
+    // The write phase, its progress said on stderr as it goes (`progress`): a run that stalls
+    // says where, though its report never comes.
+    let written = race2(
+        run_phase(
+            jobs,
+            Phase::Write,
+            &generations,
+            &connector,
+            connections,
+            (consumer.as_ref(), agents.as_ref()),
+        ),
+        crate::progress::report(Instant::now()),
     )
-    .await?;
+    .await;
+    let (write_outcomes, write_nanos, write_phase_start_epoch_ns) = match written {
+        Either::First(written) => written?,
+        Either::Second(never) => match never {},
+    };
     let (floors_advanced, expired) = generations.counts()?;
     let mut writes = merged(&write_outcomes);
     let (committed, refused, unknown) = (writes.committed, writes.refused, writes.unknown);
