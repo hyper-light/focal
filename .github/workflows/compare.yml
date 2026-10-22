@@ -102,6 +102,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Let perf sample a container's process
+        run: sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0
       - name: The disk the runs write to
         run: |
           mkdir -p tools/compare/compose/reports
