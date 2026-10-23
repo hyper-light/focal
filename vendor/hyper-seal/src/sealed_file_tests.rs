@@ -355,3 +355,67 @@ fn a_readers_and_a_writers_buffers_are_wiped_when_let_go() {
     buf.wipe();
     assert!(buf.as_mut_capacity().iter().all(|byte| *byte == 0));
 }
+
+/// A file sealed by its content is the same bytes for the same plaintext under one parent, opens as
+/// any sealed file does, and differs for another plaintext or another parent; the parent it was not
+/// sealed under opens nothing.
+#[test]
+fn a_file_sealed_by_its_content_is_one_file_a_plaintext_and_opens_as_any() {
+    let parent = WrappingKey::generate(0).unwrap();
+    let other = WrappingKey::generate(0).unwrap();
+    for len in [0, 1, SU - 1, SU, SU + 1, 3 * SU + 5] {
+        let plain = plaintext(len);
+        let once = seal_content(sim(512), &parent, &plain, S)
+            .unwrap()
+            .durable_image()
+            .unwrap();
+        let again = seal_content(sim(512), &parent, &plain, S)
+            .unwrap()
+            .durable_image()
+            .unwrap();
+        assert_eq!(once, again, "{len} bytes sealed twice");
+        assert_eq!(open(&once, &parent, 512).unwrap(), plain, "{len}");
+        assert!(
+            open(&once, &other, 512).is_err(),
+            "{len}: another parent opened it"
+        );
+        let elsewhere = seal_content(sim(512), &other, &plain, S)
+            .unwrap()
+            .durable_image()
+            .unwrap();
+        assert_ne!(once, elsewhere, "{len}: two parents, one file");
+        let mut changed = plain.clone();
+        changed.push(1);
+        let different = seal_content(sim(512), &parent, &changed, S)
+            .unwrap()
+            .durable_image()
+            .unwrap();
+        assert_ne!(
+            stream_of(&once)[..HEADER],
+            stream_of(&different)[..HEADER],
+            "{len}"
+        );
+    }
+}
+
+/// A file sealed by its content refuses a flipped byte as any sealed file does, and is written only
+/// into an empty file.
+#[test]
+fn a_file_sealed_by_its_content_refuses_a_change_and_a_used_file() {
+    let parent = WrappingKey::generate(0).unwrap();
+    let plain = plaintext(2 * SU + 3);
+    let image = seal_content(sim(512), &parent, &plain, S)
+        .unwrap()
+        .durable_image()
+        .unwrap();
+    for at in [0, HEADER, seg(1) + 5, image.len() - 9] {
+        let mut flipped = image.clone();
+        flipped[at] ^= 1;
+        assert!(open(&flipped, &parent, 512).is_err(), "flipped at {at}");
+    }
+    let used = file_of(&image, 512);
+    assert!(matches!(
+        seal_content(used, &parent, &plain, S),
+        Err(SealedFileError::Bound(_))
+    ));
+}

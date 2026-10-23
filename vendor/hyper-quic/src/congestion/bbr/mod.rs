@@ -594,8 +594,8 @@ impl Controller for Bbr {
         ControllerMetrics {
             congestion_window: self.window(),
             ssthresh: None,
-            // Bits per second
-            pacing_rate: Some(self.pacing_rate.saturating_mul(8)),
+            // Bits per second: the rate it paces at, the start-up's before its model has one.
+            pacing_rate: self.pacing_rate().map(|rate| rate.saturating_mul(8)),
         }
     }
 
@@ -1011,6 +1011,26 @@ mod tests {
 
     /// RFC 9002 §7.2's initial window by the path's datagram size, as CUBIC's and NewReno's are; a
     /// window set in the configuration is kept whatever the datagram size
+    /// What the controller tells the connection's statistics it paces at is what it paces at:
+    /// nothing before it has a round trip, its start-up's rate (its gain times its first window a
+    /// round trip) until its model has a bandwidth, the model's after. It told a rate of zero
+    /// until its model had one, where it paced at the start-up's.
+    #[test]
+    fn the_rate_reported_is_the_rate_paced_at() {
+        let mut sender = Sender::new();
+        assert_eq!(
+            (sender.bbr.pacing_rate(), sender.bbr.metrics().pacing_rate),
+            (None, None)
+        );
+        let began = start();
+        let (snapshot, app_limited, number) = sender.send(began);
+        let acked = began + Duration::from_millis(10);
+        sender.ack((acked, began, snapshot, app_limited, number));
+        let paced = sender.bbr.pacing_rate();
+        assert!(paced.is_some_and(|rate| rate > 0));
+        assert_eq!(sender.bbr.metrics().pacing_rate, paced.map(|rate| rate * 8));
+    }
+
     #[test]
     fn the_initial_window_is_rfc_9002s_by_the_datagram_size_unless_set() {
         let mut bbr = Bbr::new(BbrConfig::default(), BASE_DATAGRAM_SIZE as u16);

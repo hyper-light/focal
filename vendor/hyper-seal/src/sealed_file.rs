@@ -145,6 +145,16 @@ impl<F: BlockFile> SealedWriter<F> {
             ));
         }
         let (sealer, header) = FileSealer::new(parent, segment)?;
+        Self::begin(file, sealer, header, segment)
+    }
+
+    /// A writer of `file`, empty, under `sealer`, its header `header` queued first.
+    fn begin(
+        file: F,
+        sealer: FileSealer,
+        header: Header,
+        segment: u32,
+    ) -> Result<Self, SealedFileError> {
         let align = file.alignment();
         let mut buf = working_buffer(segment, align)?;
         let encoded = header.encode();
@@ -375,6 +385,34 @@ impl Shape {
             self.segment
         }
     }
+}
+
+/// Seals `plaintext` whole into `file`, which must be empty, keyed by its content (`docs/seal.md`
+/// §4): its data key and its ID derive from `parent` and the SHA-256 of exactly these bytes, taken
+/// here, so the same plaintext under one parent always seals to the same file, two plaintexts share
+/// a key only if their hashes collide, and a caller has no hash to keep paired with the bytes it
+/// seals (`FileSealer::content_keyed`'s contract, kept by construction). Segments of `segment`
+/// bytes; flushed as [`SealedWriter::finish`] flushes, and the file handed back.
+pub fn seal_content<F: BlockFile>(
+    file: F,
+    parent: &WrappingKey,
+    plaintext: &[u8],
+    segment: u32,
+) -> Result<F, SealedFileError> {
+    if !file.is_empty()? {
+        return Err(SealedFileError::Bound(
+            "a sealed file is written once, into an empty file",
+        ));
+    }
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, plaintext);
+    let content: [u8; 32] = digest
+        .as_ref()
+        .try_into()
+        .map_err(|_| SealedFileError::Bound("a SHA-256 digest is 32 bytes"))?;
+    let (sealer, header) = FileSealer::content_keyed(parent, &content, segment)?;
+    let mut writer = SealedWriter::begin(file, sealer, header, segment)?;
+    writer.write(plaintext)?;
+    writer.finish()
 }
 
 /// Reads any plaintext range of a sealed file through `F`, opening only the segments it covers.

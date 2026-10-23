@@ -252,8 +252,8 @@ pub struct PathFacts {
     pub delivery_rate: u64,
     /// The receive window this side advertises to the peer now, reserve excluded.
     pub receive_window: u64,
-    /// The rate the congestion controller paces at, bytes a second, when it states one (Copa does,
-    /// once it has a round trip; NewReno, CUBIC and BBR keep the connection's rule).
+    /// The rate the congestion controller paces at, bytes a second, when it states one (Copa and
+    /// BBR do, once they have a round trip; NewReno and CUBIC keep the connection's rule).
     pub pacing_rate: Option<u64>,
     /// The controller's slow-start threshold, bytes, when it keeps one.
     pub ssthresh: Option<u64>,

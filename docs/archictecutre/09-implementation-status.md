@@ -16450,3 +16450,16 @@ being still founding or joining. Test: `an_admin_command_beside_a_founding_direc
 (a founder's directory, its identity written: refused `not_ready`, no keys made; before, the open
 succeeded and made them). Found while reading what a test's start wait may ask of a node still
 starting (the entry above).
+
+### 2026-10-23 — The shared crates at hyper-raft 5a22c8c
+
+The sixteen `hyper-*` snapshots move from e911aab to 5a22c8c of the shared repository (its
+fate-commit line). Two changes reach focal: hyper-quic's BBR reports the pacing rate it paces at,
+in bits a second as `PathFacts::pacing_rate` documents, where it reported bytes (e15ee61; its test
+`the_rate_reported_is_the_rate_paced_at`), and hyper-seal seals a whole file by its content with
+the hash taken by the writer (`sealed_file::seal_content`, 5a22c8c: the data key and file ID derived
+from the parent and the SHA-256 of exactly the bytes sealed, so a caller has no hash to keep paired
+with its plaintext), what the content store's chunks are sealed with (29 §11). Only those three
+files changed (hyper-quic's BBR, hyper-seal's sealed file and its tests, a hyper-transport
+document comment); the workspace's Clippy is clean against the snapshot. vendor/README.md;
+docs/dependencies/inventory.tsv.
