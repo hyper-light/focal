@@ -16309,3 +16309,16 @@ a second. A job's time is now a sample only when the job served, as BBR takes a 
 from what was delivered (Cardwell et al., ACM Queue 2016). Test:
 `refusals_sampled_hold_the_window_at_its_floor_through_a_drain` (the drain replayed: sampled, the
 window stays at ten for the first ten seconds; served jobs only, it grows from the second).
+
+### 2026-10-23 — focal-load reads as many of a caller's lifecycle steps at once as it writes
+
+focal's work among 500 agents over an 80 ms path took 69 s from a claim's post to its settlement
+(netem `delay 80ms 30ms`; 2.5 s over 40 ms) while each of the cluster's writes took 0.3 s at the
+median and 0.6 s at the 99th percentile, none refused. The time was focal-load's: every step of a
+lifecycle after its creation reads what it binds to, at least at the write before it, before it
+writes, and a caller read one step at a time (`lifecycle_reads`, default 1), so sixteen callers
+driving the 500 agents read sixteen at a time, about 80 a second over the 160 ms round trip where
+the steps asked 180; the reads queued behind each other, and the claims' first writes behind the
+claims before them (step 0's 99th percentile 7.9 s). A caller now reads as many steps at once as
+it writes (`inflight`), unless the shape sets fewer, as each agent of a real run reads for itself.
+Test: `a_callers_lifecycle_reads_are_its_writes_unless_set`.

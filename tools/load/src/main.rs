@@ -203,4 +203,20 @@ mod tests {
         assert!(parse_shape("claims: &n 5\nseed: *n\n").is_err());
         assert!(serde_saphyr::from_str::<shape::WorkloadShape>("claims: &n 5\nseed: *n\n").is_ok());
     }
+
+    /// A caller reads as many of its lifecycles' steps at once as it writes, unless the shape
+    /// says fewer: one read a caller paced 500 agents' work by the round trip of sixteen reads.
+    #[test]
+    fn a_callers_lifecycle_reads_are_its_writes_unless_set() {
+        let unset = parse_shape("claims: 10\ninflight: 64\n").unwrap();
+        assert_eq!(unset.lifecycle_reads(), 64);
+        assert!(unset.validate().is_ok());
+        let set = parse_shape("claims: 10\ninflight: 64\nlifecycle_reads: 4\n").unwrap();
+        assert_eq!(set.lifecycle_reads(), 4);
+        assert!(set.validate().is_ok());
+        let past = parse_shape("claims: 10\ninflight: 4\nlifecycle_reads: 5\n").unwrap();
+        assert!(past.validate().is_err());
+        let none = parse_shape("claims: 10\ninflight: 4\nlifecycle_reads: 0\n").unwrap();
+        assert!(none.validate().is_err());
+    }
 }

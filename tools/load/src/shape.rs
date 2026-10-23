@@ -209,10 +209,15 @@ pub struct WorkloadShape {
     /// count lifecycles, each started at its place on the schedule.
     #[serde(default)]
     pub lifecycle: Lifecycle,
-    /// The most of one caller's lifecycle reads under way at once (default 1): each read waits
-    /// for its claim's step to commit, so at a caller's write depth they run beside its writes.
-    #[serde(default = "default_lifecycle_reads")]
-    pub lifecycle_reads: u16,
+    /// The most of one caller's lifecycle reads under way at once: unset, as many as its writes
+    /// (`inflight`). Every step of a lifecycle after its creation reads what it binds to, at
+    /// least at the write before it, before it writes, so a caller's reads are its lifecycles'
+    /// pace: at one read a caller, sixteen callers driving 500 agents' work read sixteen at a
+    /// time, about 80 a second over a 160 ms round trip where the steps asked 180, and a claim
+    /// took 69 s from its post to its settlement while each of the cluster's writes took 0.3 s
+    /// (compare/work-faults, netem `delay 80ms 30ms`, 2026-10-23).
+    #[serde(default)]
+    pub lifecycle_reads: Option<u16>,
     /// `embedded` only: after the run, close the node and reopen the same
     /// directory, timing exec-to-serving and the first linearizable read —
     /// single-node recovery at exactly this run's retained size.
@@ -227,9 +232,6 @@ fn default_concurrency() -> u16 {
     1
 }
 fn default_inflight() -> u16 {
-    1
-}
-fn default_lifecycle_reads() -> u16 {
     1
 }
 fn default_poll_ms() -> u16 {
@@ -248,6 +250,11 @@ pub fn max_agents() -> usize {
 }
 
 impl WorkloadShape {
+    /// The most of one caller's lifecycle reads under way at once (the field's): as many as its
+    /// writes unless set lower.
+    pub fn lifecycle_reads(&self) -> u16 {
+        self.lifecycle_reads.unwrap_or(self.inflight)
+    }
     pub fn validate(&self) -> Result<(), String> {
         if self.claims == 0 {
             return Err("claims must be greater than zero".to_string());
@@ -270,7 +277,10 @@ impl WorkloadShape {
         if self.inflight == 0 || self.inflight > MAX_INFLIGHT {
             return Err(format!("inflight must be 1..={MAX_INFLIGHT}"));
         }
-        if self.lifecycle_reads == 0 || self.lifecycle_reads > self.inflight {
+        if self
+            .lifecycle_reads
+            .is_some_and(|reads| reads == 0 || reads > self.inflight)
+        {
             return Err("lifecycle_reads must be 1..=inflight".to_string());
         }
         // The seed sits above bit 40 of the id space; a larger one would fold

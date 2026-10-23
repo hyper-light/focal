@@ -2176,7 +2176,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             limits: limits.clone(),
             created: Vec::new(),
             lifecycle: shape.lifecycle,
-            lifecycle_reads: shape.lifecycle_reads,
+            lifecycle_reads: shape.lifecycle_reads(),
             pace,
         });
     }
