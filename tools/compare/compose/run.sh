@@ -267,6 +267,11 @@ EOF
     # Inclusive time by function (what each costs with what it calls), then each thread's own.
     dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --children --sort symbol -g none --percent-limit 1.5 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -150" || true
     dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --no-children --sort comm,symbol -g none --percent-limit 0.4 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -120" || true
+    # Who calls the session owner's copies and comparisons: each symbol's callers, the
+    # deepest first (diag: work-callers).
+    for symbol in memcpy memcmp memmove; do
+      dc exec -T focal1 sh -c "perf report -i /data/perf.data --stdio --no-children --comms focal-node-sess --symbols $symbol -g caller,0.5,callee,function,percent --percent-limit 0.3 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -70" || true
+    done
     echo "::endgroup::"
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
