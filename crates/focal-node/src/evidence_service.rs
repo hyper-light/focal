@@ -242,6 +242,16 @@ impl EvidenceWitness {
     }
 }
 
+/// The kinds of job the driver runs, in the order its window keeps their filters and the node's
+/// metrics name them ([`JobKind::index`]).
+pub const EVIDENCE_JOB_KINDS: [&str; 6] = [
+    "seal",
+    "attest",
+    "attest_native",
+    "obligation",
+    "archive",
+    "repair",
+];
 enum JobKind {
     Seal(OneshotSender<Result<ContentRef, AccessError>>),
     Attest(OneshotSender<Result<EvidencedRequest, AccessError>>),
@@ -315,6 +325,19 @@ struct Job {
 /// What a participant job is: the ledger, the request exactly (a managed
 /// request by its key, as its transfer is named) and the kind of job.
 type JobIdentity = (LedgerId, [u8; 16], u8);
+impl JobKind {
+    /// Its place in [`EVIDENCE_JOB_KINDS`].
+    fn index(&self) -> usize {
+        match self {
+            Self::Seal(_) => 0,
+            Self::Attest(_) => 1,
+            Self::AttestNative(_) => 2,
+            Self::Obligation(..) => 3,
+            Self::Archive { .. } => 4,
+            Self::Repair { .. } => 5,
+        }
+    }
+}
 impl Job {
     /// A trusted node job has none: it runs as it comes.
     fn identity(&self) -> Option<JobIdentity> {
@@ -542,11 +565,11 @@ struct EvidenceDoor {
     door: crate::pace::Door,
     held: AtomicU64,
     timed_out: AtomicU64,
-    /// The jobs the driver runs at once, as it has learned them ([`CompletionWindow`]), and the
-    /// least a served job took within its filter's window, in nanoseconds: the time the window
-    /// counts completions over.
+    /// The jobs the driver runs at once, as it has learned them ([`CompletionWindow`]), and, by
+    /// kind ([`EVIDENCE_JOB_KINDS`]), the least a served job of the kind took within its filter's
+    /// window, in nanoseconds: the time the kind's share counts completions over.
     window: AtomicU64,
-    window_least_ns: AtomicU64,
+    window_least_ns: [AtomicU64; EVIDENCE_JOB_KINDS.len()],
     /// Required copies a job did not ask, the liveness view holding them suspect or dead
     /// ([`CopyHealth`]).
     copies_unavailable: AtomicU64,
@@ -623,8 +646,8 @@ pub struct EvidenceDoorStats {
     pub held: u64,
     pub timed_out: u64,
     pub window: u64,
-    /// The least a served job took within the window's filter ([`EvidenceDoor`]).
-    pub window_least_ns: u64,
+    /// The least a served job of each kind took within its filter ([`EVIDENCE_JOB_KINDS`]).
+    pub window_least_ns: [u64; EVIDENCE_JOB_KINDS.len()],
     pub copies_unavailable: u64,
     pub copies_given_up: u64,
     /// Requests refused before their job ran, by cause ([`EvidenceDoor`]).
@@ -643,12 +666,13 @@ pub struct EvidenceDriver {
     content: ContentHost,
     node: u64,
     placements: BTreeMap<LedgerId, PlacementRow>,
-    /// The jobs it runs at once, learned from their completions: what it completes within the
-    /// least time a job takes, twice (BBR's window, [`CompletionWindow`]). A job's time is its
-    /// seal, its copies' transfers and their receipts, which no fixed count fits: four were run
-    /// at once, and at 100 claims a second among 500 agents 17,568 jobs waited at the door for
-    /// them while the leader had the CPU for more (CI 39866057075).
-    window: CompletionWindow,
+    /// The jobs it runs at once, learned from their completions: what each kind completes within
+    /// the least time a job of the kind takes, twice, the kinds together (BBR's window,
+    /// [`CompletionWindow`]). A job's time is its seal, its copies' transfers and their
+    /// receipts, which no fixed count fits: four were run at once, and at 100 claims a second
+    /// among 500 agents 17,568 jobs waited at the door for them while the leader had the CPU for
+    /// more (CI 39866057075).
+    window: CompletionWindow<{ EVIDENCE_JOB_KINDS.len() }>,
     budget: MemoryBudget,
     _configuration: Allocation,
 }
@@ -833,7 +857,12 @@ impl EvidenceCoordinator {
             held: self.door.held.load(Ordering::Relaxed),
             timed_out: self.door.timed_out.load(Ordering::Relaxed),
             window: self.door.window.load(Ordering::Relaxed),
-            window_least_ns: self.door.window_least_ns.load(Ordering::Relaxed),
+            window_least_ns: std::array::from_fn(|kind| {
+                self.door
+                    .window_least_ns
+                    .get(kind)
+                    .map_or(0, |least| least.load(Ordering::Relaxed))
+            }),
             copies_unavailable: self.door.copies_unavailable.load(Ordering::Relaxed),
             copies_given_up: self.door.copies_given_up.load(Ordering::Relaxed),
             refused_memory: self.door.refused_memory.load(Ordering::Relaxed),
@@ -1053,7 +1082,8 @@ impl EvidenceDriver {
         };
         // The view's changes, watched for the jobs ([`CopyHealth`]): one wait, the driver's.
         let mut changes = liveness.map(crate::liveness::LivenessHandle::changes);
-        let mut tasks = Concurrent::new(self.window.window()).map_err(|_| AccessError::Capacity)?;
+        let mut tasks = Concurrent::new(self.window.window(std::time::Instant::now()))
+            .map_err(|_| AccessError::Capacity)?;
         // The participant jobs in flight, by what each is, and the jobs of
         // the same identity that run after each: an exact retry that comes
         // while its first is in flight (its client gave up the exchange
@@ -1063,13 +1093,14 @@ impl EvidenceDriver {
         // most as many wait behind one as run at once; the rest are
         // refused the room.
         let mut same: BTreeMap<JobIdentity, VecDeque<Job>> = BTreeMap::new();
-        let begin = |placement, identity, job| {
+        let begin = |placement, identity, job: Job| {
             let content = &content;
             let health = &health;
+            let kind = job.kind.index();
             async move {
                 let began = std::time::Instant::now();
                 let done = process(content, pool, health, node, placement, job).await;
-                (identity, began, done)
+                (identity, kind, began, done)
             }
         };
         let mut receiving = true;
@@ -1079,7 +1110,7 @@ impl EvidenceDriver {
             // room for one, then a job that ended.
             // The jobs it may run now: its window, the set widened to it while memory allows (a
             // widening refused runs what the set holds until a later one is not).
-            let window = self.window.window();
+            let window = self.window.window(std::time::Instant::now());
             if tasks.capacity() < window {
                 let _ = tasks.widen(window);
             }
@@ -1170,7 +1201,7 @@ impl EvidenceDriver {
                 Turn::Liveness(false) => changes = None,
                 // No wait could be kept: the driver is off its shard.
                 Turn::Closed(_, _) => return Err(AccessError::Unavailable),
-                Turn::Done((identity, began, done)) => {
+                Turn::Done((identity, kind, began, done)) => {
                     let refused = done.send(&self.placements);
                     match refused {
                         Some(refused) => self.door.answered(refused),
@@ -1183,17 +1214,20 @@ impl EvidenceDriver {
                         // at twenty a second through a window of ten).
                         None => {
                             self.window
-                                .ended(began.elapsed(), std::time::Instant::now());
-                            self.door.window_least_ns.store(
-                                self.window.least().map_or(0, |least| {
-                                    u64::try_from(least.as_nanos()).unwrap_or(u64::MAX)
-                                }),
-                                Ordering::Relaxed,
-                            );
+                                .ended(kind, began.elapsed(), std::time::Instant::now());
+                            if let Some(least) = self.door.window_least_ns.get(kind) {
+                                least.store(
+                                    self.window.least(kind).map_or(0, |least| {
+                                        u64::try_from(least.as_nanos()).unwrap_or(u64::MAX)
+                                    }),
+                                    Ordering::Relaxed,
+                                );
+                            }
                         }
                     }
                     self.door.window.store(
-                        u64::try_from(self.window.window()).unwrap_or(u64::MAX),
+                        u64::try_from(self.window.window(std::time::Instant::now()))
+                            .unwrap_or(u64::MAX),
                         Ordering::Relaxed,
                     );
                     if let Some(identity) = identity

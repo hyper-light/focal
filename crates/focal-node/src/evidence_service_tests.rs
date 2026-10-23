@@ -890,11 +890,19 @@ fn artifact_jobs_past_the_queue_wait_at_the_door_and_are_each_served() {
             let door = coordinator.door_stats();
             assert!(door.held >= 1, "{door:?}");
             assert_eq!(door.timed_out, 0, "{door:?}");
-            // Every job served, each a sample: the least of them is what the window counts over,
-            // at most the whole exercise's time.
-            assert!(door.window_least_ns > 0, "{door:?}");
+            // Every job served, each a sample of its kind: the least of them is what the kind's
+            // share counts over, at most the whole exercise's time, and no other kind was sampled.
+            let native = door.window_least_ns[2];
+            assert!(native > 0, "{door:?}");
             assert!(
-                u128::from(door.window_least_ns) <= exercised.elapsed().as_nanos(),
+                u128::from(native) <= exercised.elapsed().as_nanos(),
+                "{door:?}"
+            );
+            assert!(
+                door.window_least_ns
+                    .iter()
+                    .enumerate()
+                    .all(|(kind, least)| kind == 2 || *least == 0),
                 "{door:?}"
             );
             drop(coordinator);
@@ -941,7 +949,7 @@ fn a_job_held_past_its_request_time_is_refused_and_counted() {
                 held: 1,
                 timed_out: 1,
                 window: 1,
-                window_least_ns: 0,
+                window_least_ns: [0; crate::evidence_service::EVIDENCE_JOB_KINDS.len()],
                 copies_unavailable: 0,
                 copies_given_up: 0,
                 refused_memory: 0,

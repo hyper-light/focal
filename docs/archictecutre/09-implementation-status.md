@@ -16395,3 +16395,28 @@ the served jobs' count and time) overran by 125 bytes (`metrics::rounds::tests`,
 the page's fixed part is now 43,530 bytes at its widest, 552 under that round. Test:
 `artifact_jobs_past_the_queue_wait_at_the_door_and_are_each_served` checks the least of its eight
 served jobs is set and within the exercise's time.
+
+### 2026-10-23 — The evidence window keeps a filter a kind of job
+
+The evidence window was one BBR filter over every kind of job the driver runs, and the kinds differ
+by orders of magnitude: an obligation whose copies already hold receipts (an evaluation's begin)
+ends in about a millisecond, an artifact's seal takes its copies' round trips. The least a job took
+was the obligation's, the interval the window counts completions over twice that, two milliseconds,
+in which one or two jobs end, and the window stood at its floor of ten whatever the seals needed: ten
+on every node at the end of every work run, the leader holding 587, 4,201 and 3,674 artifact requests
+at its door over an 80 ms path with jitter, with 3% loss, and with both and reordering (the entry
+above), and a post-restart backlog draining at twenty a second, ten jobs of half a second. The jobs
+a pipeline holds are the sum over its kinds of each kind's rate times its time (Little's law holds
+class by class), so the window is now the sum of the kinds' products, each counted over its own
+least as BBR counts a path's over its own round trip (`CompletionWindow<KINDS>`), and a kind that has
+ended no job within the filter's window holds no share. The gauge of the window's least is now each kind's
+(`focal_evidence_window_least_nanoseconds{kind}`); the metrics page's fixed part is 43,958 bytes at
+its widest, 124 under a three-host fleet's round.
+Tests: `a_fast_kind_does_not_hold_a_slow_kinds_window_at_its_floor` (a hundred a second of each, 1 ms
+and 250 ms: kept apart, 51, twice the slow kind's 25 in flight and the fast kind's one; as one kind,
+the floor), `a_kind_gone_quiet_gives_its_share_back`. Replayed in a model of the driver at 46 jobs a
+second, two seals to an obligation: the window 35 to 39 where it stood at 10, a seal waiting only its
+service, up to a tenth of a seal's round trips losing a datagram; a kind's window still falls to the
+floor once its jobs take more than twice its least on average (BBR's gain of two), the bound an
+unloaded measurement of a kind's time would lift (Envoy's adaptive concurrency re-measures its least
+at a pinned low concurrency and compares like percentiles).

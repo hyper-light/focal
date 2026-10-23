@@ -615,7 +615,7 @@ impl MetricsSnapshot {
                 held: wide,
                 timed_out: wide,
                 window: wide,
-                window_least_ns: wide,
+                window_least_ns: [wide; crate::evidence_service::EVIDENCE_JOB_KINDS.len()],
                 copies_unavailable: wide,
                 copies_given_up: wide,
                 refused_memory: wide,

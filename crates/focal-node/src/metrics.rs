@@ -919,11 +919,21 @@ impl MetricsSnapshot {
             "Artifact jobs the evidence driver runs at once, learned from their completions.",
             self.evidence.window,
         );
-        text.gauge(
+        text.header(
             "focal_evidence_window_least_nanoseconds",
-            "The least a served evidence job took within the window's filter: what the window counts completions over.",
-            self.evidence.window_least_ns,
+            "gauge",
+            "The least a served evidence job of the kind took within its filter: what the kind's share of the window counts completions over.",
         );
+        for (kind, least) in crate::evidence_service::EVIDENCE_JOB_KINDS
+            .iter()
+            .zip(self.evidence.window_least_ns)
+        {
+            text.labeled(
+                "focal_evidence_window_least_nanoseconds",
+                &[("kind", kind)],
+                least,
+            );
+        }
         text.counter(
             "focal_evidence_copies_unavailable_total",
             "Required copies an artifact job did not ask, the liveness view holding them suspect or dead; each refused its job at once.",
