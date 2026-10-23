@@ -226,6 +226,37 @@ cpu_stat() {
     fi
   done
 }
+# Each focal node's CPU each second its load runs, read on the host from its control group as
+# `cpu_stat` reads it, the group looked up again each second since a node killed and started
+# again is a new process: lines `SECONDS CONTAINER usage_usec throttled_usec`, the seconds since
+# the load began, for when a node was busy against the writes waiting on it (a node restarted and
+# catching up, say). A second: the unit the fault log keeps time in. Prints nothing off Linux.
+series_pid=""
+cpu_series_start() {
+  local started
+  started=$(date +%s)
+  (
+    while :; do
+      for c in $(dc ps --format '{{.Name}}'); do
+        case "$c" in *focal[123]*) ;; *) continue ;; esac
+        pid=$(docker inspect --format '{{.State.Pid}}' "$c" 2>/dev/null) || continue
+        group=$(awk -F: '$1 == "0" && $2 == "" { print $3 }' "/proc/$pid/cgroup" 2>/dev/null) || continue
+        [ -r "/sys/fs/cgroup$group/cpu.stat" ] || continue
+        awk -v t="$(( $(date +%s) - started ))" -v c="$c" \
+          '$1 == "usage_usec" { u = $2 } $1 == "throttled_usec" { th = $2 } END { print t, c, u, th }' \
+          "/sys/fs/cgroup$group/cpu.stat"
+      done
+      sleep 1
+    done
+  ) >> "$out/$report.cpu-series.txt" 2>/dev/null &
+  series_pid=$!
+}
+cpu_series_stop() {
+  [ -n "$series_pid" ] || return 0
+  kill "$series_pid" 2>/dev/null || true
+  wait "$series_pid" 2>/dev/null || true
+  series_pid=""
+}
 # Each of the run's containers' network as its own namespace counts it, read
 # on the host (`/proc/PID/net` is the namespace of PID): its UDP and TCP
 # counters and its interface's bytes and packets each way, before and after
@@ -364,15 +395,18 @@ EOF
     cpu_stat before > "$out/$report.cpu.txt"
     net_stat before > "$out/$report.net.txt"
     disk_stat before > "$out/$report.disk.txt"
+    cpu_series_start
     faults_start
     if ! timeout "$bound" docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
       focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
       faults_end
+      cpu_series_stop
       evidence
       exit 1
     fi
     faults_end
+    cpu_series_stop
     cpu_stat after >> "$out/$report.cpu.txt"
     net_stat after >> "$out/$report.net.txt"
     disk_stat after >> "$out/$report.disk.txt"
