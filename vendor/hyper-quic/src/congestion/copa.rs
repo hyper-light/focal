@@ -1633,7 +1633,7 @@ mod tests {
     #[test]
     fn the_controller_counts_from_when_it_was_built() {
         let began = Instant::now();
-        let mut controller = Congestion::Copa(CopaConfig::default()).build(began, 1_200);
+        let mut controller = Congestion::Copa(CopaConfig::default()).build(began, 1_200, 0);
         assert_eq!(controller.window(), 12_000);
         assert_eq!(controller.initial_window(), 12_000);
         controller.on_mtu_update(1_400);
@@ -1783,7 +1783,7 @@ mod tests {
     #[test]
     fn the_controller_takes_an_event_without_lost_bytes_for_a_mark() {
         let began = Instant::now();
-        let mut controller = Congestion::Copa(CopaConfig::default()).build(began, 1_200);
+        let mut controller = Congestion::Copa(CopaConfig::default()).build(began, 1_200, 0);
         let window = controller.window();
         let later = began + Duration::from_millis(100);
         controller.on_congestion_event(later, began, false, 0);

@@ -75,8 +75,9 @@ impl PathData {
         generation: u64,
         now: Instant,
         config: &TransportConfig,
+        seed: u64,
     ) -> Self {
-        let congestion = config.congestion.build(now, config.get_initial_mtu());
+        let congestion = config.congestion.build(now, config.get_initial_mtu(), seed);
         Self {
             remote,
             rtt: RttEstimator::new(config.initial_rtt),
@@ -152,9 +153,9 @@ impl PathData {
     /// Resets RTT, congestion control, pacing and MTU states.
     ///
     /// This is useful when it is known the underlying path has changed.
-    pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
+    pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig, seed: u64) {
         self.rtt = RttEstimator::new(config.initial_rtt);
-        self.congestion = config.congestion.build(now, config.get_initial_mtu());
+        self.congestion = config.congestion.build(now, config.get_initial_mtu(), seed);
         self.delivery = super::Delivery::default();
         self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
         self.pacing = Pacer::new(
@@ -561,7 +562,7 @@ mod tests {
         let now = Instant::now();
         let config = TransportConfig::default();
         let remote = "203.0.113.1:4433".parse().unwrap();
-        let mut path = PathData::new(remote, true, None, 0, now, &config);
+        let mut path = PathData::new(remote, true, None, 0, now, &config, 0);
         let mtu = path.current_mtu();
         let window = path.congestion.window();
 
@@ -595,7 +596,7 @@ mod tests {
                 .is_some()
         );
 
-        path.reset(now, &config);
+        path.reset(now, &config, 0);
 
         assert_eq!(
             path.pacing.delay(

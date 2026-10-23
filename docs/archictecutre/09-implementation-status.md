@@ -16186,3 +16186,19 @@ ID arrived after its retirement and were answered with stateless resets), and cr
 same bytes however often it is asked (hyper-raft `docs/transport.md` §4ac to §4af). Open in its
 STATUS: BBR's window where a share of the packets skips the path's delay, as netem's `reorder` sends
 them, its least round trip theirs. vendor/README.md; docs/dependencies/inventory.tsv.
+
+### 2026-10-23 — BBR paces at its model's rate
+
+With the reordering tolerance in (above), focal's work over a 40 ms path that netem reorders, 5% of
+the packets sent with no delay, still took 3.0 s a write at the median and 14.8 s at the 99th
+percentile (compare/work-reorder, run 39924087539): QUIC's round trip is sampled from the largest
+packet acknowledged, there one that skipped the delay, and BBR's least round trip read a millisecond
+where the rest took 80, its window a fraction of the path. Every shared crate is now at hyper-raft
+e911aab, whose BBR states its pacing rate (it computed it and never gave it to the pacer, which sent
+five quarters of its window a round trip, keeping about a product queued: 2,634 packets lost at a
+drop-tail queue of one product where NewReno lost 215, now 195), takes no round trip from a packet
+acknowledged while one sent before it is not (TCP's gap-filling sample, RFC 7323 §4.3), and draws
+its gain cycle's phases from its connection's seed. In hyper-quic's harness BBR now carries 96.3%
+of 10 Mbit/s at 80 ms with 5% of the packets skipping the delay, where it carried 27.0%, and slates'
+bake-off puts its ping p99 at 1.125 of the best where 1.484 (hyper-raft `docs/transport.md` §4ag).
+vendor/README.md; docs/dependencies/inventory.tsv.

@@ -132,7 +132,9 @@ pub struct RateSample {
     /// Whether the newest packet was sent in a phase the application limited (§3.4): its rate
     /// measures the application, a floor of the path's
     pub app_limited: bool,
-    /// The newest packet's round trip as measured, the peer's ACK delay in it
+    /// The newest packet's round trip as measured, the peer's ACK delay in it; zero, no round trip
+    /// to take, for a packet acknowledged while one sent before it is not (one that overtook it
+    /// on a path that reorders)
     pub rtt: Duration,
 }
 
@@ -171,12 +173,12 @@ impl Default for Congestion {
 }
 
 impl Congestion {
-    /// A fresh controller for one path
-    pub(crate) fn build(&self, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+    /// A fresh controller for one path, what it draws at random drawn from `seed`
+    pub(crate) fn build(&self, now: Instant, current_mtu: u16, seed: u64) -> Box<dyn Controller> {
         match self {
             Self::Cubic(config) => Box::new(Cubic::new(config.clone(), now, current_mtu)),
             Self::NewReno(config) => Box::new(NewReno::new(config.clone(), now, current_mtu)),
-            Self::Bbr(config) => Box::new(Bbr::new(config.clone(), current_mtu)),
+            Self::Bbr(config) => Box::new(Bbr::seeded(config.clone(), current_mtu, seed)),
             Self::Copa(config) => Box::new(Copa::new(config.clone(), now, current_mtu)),
         }
     }

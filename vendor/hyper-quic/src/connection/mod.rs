@@ -212,6 +212,8 @@ pub struct Connection {
     ledger: Ledger,
     /// The loss thresholds widened by the spurious losses the path has shown (`reordering.rs`)
     reordering: Reordering,
+    /// What a path's congestion controller draws at random is drawn from, with the path's count
+    congestion_seed: u64,
     /// Whether the spin bit is in use for this connection
     spin_enabled: bool,
     /// Outgoing spin bit state
@@ -342,6 +344,13 @@ impl Connection {
             client_hello: None,
         });
         let mut rng = StdRng::from_seed(rng_seed);
+        // The controllers' draws come from the connection's seed, not from its generator, whose
+        // draws would all move
+        let mut seed = [0u8; 8];
+        for (byte, from) in seed.iter_mut().zip(rng_seed.iter()) {
+            *byte = *from;
+        }
+        let congestion_seed = u64::from_le_bytes(seed);
         let mut this = Self {
             grease_quic_bit,
             qlog,
@@ -356,7 +365,8 @@ impl Connection {
                 now,
                 if pref_addr_cid.is_some() { 2 } else { 1 },
             ),
-            path: PathData::new(remote, allow_mtud, None, 0, now, &config),
+            path: PathData::new(remote, allow_mtud, None, 0, now, &config, congestion_seed),
+            congestion_seed,
             path_counter: 0,
             allow_mtud,
             local_ip,
@@ -2076,7 +2086,11 @@ impl Connection {
     /// faster or reduce loss to settle on optimal values by restarting from the initial
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
-        self.path.reset(now, &self.config);
+        self.path.reset(
+            now,
+            &self.config,
+            self.congestion_seed.wrapping_add(self.path_counter),
+        );
         self.datagrams().drop_oversized();
     }
 
@@ -2179,9 +2193,7 @@ impl Connection {
         // order: the RTT, then the congestion event)
         let sample =
             (new_largest && ack_eliciting_acked).then(|| self.update_rtt(now, space, ack.delay));
-        if let Some(delivered) = self.path.delivery.sample(now, self.path.rtt.min()) {
-            self.path.congestion.on_delivered(now, &delivered);
-        }
+        self.deliver_sample(now, space, ack.largest);
         self.path.congestion.on_end_acks(
             now,
             self.path.in_flight.bytes,
@@ -2334,6 +2346,34 @@ impl Connection {
         } else {
             rtt
         }
+    }
+
+    /// Hands the acknowledgement's delivery-rate sample, if it gives one, to the controller,
+    /// `largest` the packet it acknowledged last
+    fn deliver_sample(&mut self, now: Instant, space: SpaceId, largest: u64) {
+        let Some(mut delivered) = self.path.delivery.sample(now, self.path.rtt.min()) else {
+            return;
+        };
+        // A packet acknowledged while one sent before it is not gives the controller no round
+        // trip, its delivery rate standing: on a path that reorders it is one that overtook
+        // the rest, its round trip the fastest route's, and BBR's least round trip taken from
+        // it, a millisecond where the rest took 80 with netem's reorder skipping 5% of the
+        // packets, held its window to a fraction of what the path holds. TCP samples the
+        // segment that fills a gap, the late one, for the same reason (RFC 7323 §4.3). On a
+        // path that does not reorder, the packet sent before is lost, and the controller's
+        // filter has the samples before and after it.
+        let overtook = space == SpaceId::Data
+            && self
+                .spaces
+                .get(space)
+                .sent_packets
+                .range(..largest)
+                .next()
+                .is_some();
+        if overtook {
+            delivered.rtt = Duration::ZERO;
+        }
+        self.path.congestion.on_delivered(now, &delivered);
     }
 
     /// Checks the ECN counts an ACK carries
@@ -4513,6 +4553,7 @@ impl Connection {
                 self.path_counter,
                 now,
                 &self.config,
+                self.congestion_seed.wrapping_add(self.path_counter),
             )
         };
         new_path.challenge = Some(self.rng.random());

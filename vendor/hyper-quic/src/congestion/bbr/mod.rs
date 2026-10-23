@@ -73,8 +73,16 @@ pub struct Bbr {
 }
 
 impl Bbr {
-    /// Construct a state using the given `config` and current time `now`
+    /// Construct a state using the given `config` and current time `now`, its gain cycle's
+    /// starting phase drawn at random
     pub fn new(config: BbrConfig, current_mtu: u16) -> Self {
+        Self::seeded(config, current_mtu, rand::rng().random())
+    }
+
+    /// [`Bbr::new`] with its gain cycle's starting phases drawn from `seed`: a connection seeds it
+    /// from its own seed, so a run seeded whole replays whole. Paced at its model's rate, the
+    /// phase ProbeBW starts in moves what it sends, which the window's pacing hid.
+    pub fn seeded(config: BbrConfig, current_mtu: u16, seed: u64) -> Self {
         let window = config
             .initial_window
             .unwrap_or_else(|| initial_window(current_mtu.into()));
@@ -115,7 +123,7 @@ impl Bbr {
             bw_at_last_round: 0,
             round_wo_bw_gain: 0,
             ack_aggregation: AckAggregationState::default(),
-            random_number_generator: Pcg32::from_rng(&mut rand::rng()),
+            random_number_generator: Pcg32::seed_from_u64(seed),
         }
     }
 
@@ -564,6 +572,24 @@ impl Controller for Bbr {
         self.cwnd
     }
 
+    /// The rate its model sends at, as Chromium's BBR paces (`BbrSender::PacingRate`): the gain of
+    /// its phase times its bandwidth, or, before it has one, the startup gain times the initial
+    /// window a least round trip; none before a round trip is measured (the connection's own rule).
+    /// The port computed the rate and never gave it to the pacer, which sent five quarters of the
+    /// window a round trip: Drain's gain (0.35) and ProbeBW's cycle moved nothing, and a sender the
+    /// window held kept its window in flight, about a bandwidth-delay product queued at its
+    /// bottleneck (`VENDORED.md` §31).
+    fn pacing_rate(&self) -> Option<u64> {
+        if self.pacing_rate != 0 {
+            return Some(self.pacing_rate);
+        }
+        if self.min_rtt.is_zero() {
+            return None;
+        }
+        bw_from_delta(self.init_cwnd, self.min_rtt)
+            .map(|rate| float::saturating_u64(rate as f64 * f64::from(self.high_gain)))
+    }
+
     fn metrics(&self) -> ControllerMetrics {
         ControllerMetrics {
             congestion_window: self.window(),
@@ -784,7 +810,7 @@ mod tests {
     impl Sender {
         fn new() -> Self {
             Self {
-                bbr: Bbr::new(BbrConfig::default(), BASE_DATAGRAM_SIZE as u16),
+                bbr: Bbr::seeded(BbrConfig::default(), BASE_DATAGRAM_SIZE as u16, 0),
                 delivery: Delivery::default(),
                 rtt: RttEstimator::new(Duration::from_millis(333)),
                 in_flight: 0,
@@ -868,11 +894,24 @@ mod tests {
         assert_eq!(sender.bbr.mode, Mode::Startup);
     }
 
-    /// What a bulk sender saw through a bottleneck of `RATE` and `PROPAGATION` each way, its
-    /// sends held by the window alone or also paced at the rate the controller states: the
-    /// controller, and the longest round trip of the second half of its packets
-    fn bulk(paced: bool) -> (Bbr, Duration) {
-        const PACKETS: u64 = 4_000;
+    /// A bottleneck of 12.5 MB/s (100 Mbit/s)
+    const RATE: u64 = 12_500_000;
+    /// A packet's time at the bottleneck: 96 µs
+    const SERIALIZE: Duration = Duration::from_nanos(PACKET * 1_000_000_000 / RATE);
+
+    /// A packet's round trip alone over `propagation` each way, and the path's bandwidth-delay
+    /// product
+    fn alone(propagation: Duration) -> (Duration, u64) {
+        let alone = 2 * propagation + SERIALIZE;
+        let bdp = RATE * u64::try_from(alone.as_nanos()).unwrap() / 1_000_000_000;
+        (alone, bdp)
+    }
+
+    /// What a bulk sender saw through the bottleneck and `propagation` each way, its sends held
+    /// by the window alone or also paced at the rate the controller states: the controller, and
+    /// the longest round trip of the second half of its packets
+    fn bulk(propagation: Duration, paced: bool) -> (Bbr, Duration) {
+        const PACKETS: u64 = 8_000;
         let mut sender = Sender::new();
         let mut now = start();
         let (mut free, mut next_send) = (now, now);
@@ -883,7 +922,7 @@ mod tests {
             if open && now >= next_send {
                 let (snapshot, app_limited, number) = sender.send(now);
                 free = free.max(now) + SERIALIZE;
-                due.push_back((free + 2 * PROPAGATION, now, snapshot, app_limited, number));
+                due.push_back((free + 2 * propagation, now, snapshot, app_limited, number));
                 if let Some(rate) = sender.bbr.pacing_rate().filter(|_| paced) {
                     next_send = now + Duration::from_nanos(PACKET * 1_000_000_000 / rate);
                 }
@@ -906,32 +945,19 @@ mod tests {
         (sender.bbr, most)
     }
 
-    /// A bottleneck of 12.5 MB/s (100 Mbit/s)
-    const RATE: u64 = 12_500_000;
-    /// 40 µs of propagation each way
-    const PROPAGATION: Duration = Duration::from_micros(40);
-    /// A packet's time at the bottleneck: 96 µs
-    const SERIALIZE: Duration = Duration::from_nanos(PACKET * 1_000_000_000 / RATE);
-
-    /// A packet's round trip alone, 176 µs, and the path's bandwidth-delay product, 2.2 kB
-    fn alone() -> (Duration, u64) {
-        let alone = 2 * PROPAGATION + SERIALIZE;
-        let bdp = RATE * u64::try_from(alone.as_nanos()).unwrap() / 1_000_000_000;
-        (alone, bdp)
-    }
-
-    /// A sender with all it can send, its window alone holding it, through the bottleneck: its
-    /// bandwidth is the bottleneck's, and its window a few times the product, so the queue it
-    /// keeps is a few packets. With the port's estimator, the bytes of each packet acknowledged
-    /// over the gap since the acknowledgement before and of the latest packet sent over the gap
-    /// since the one before, whichever packets those were, a pair on this path estimated 357 MB/s
-    /// and its window grew to 147 kB, 65 times the product, its queue lengthening the round trip
-    /// from 143 µs to 5 ms (`VENDORED.md` §30).
+    /// A sender with all it can send, its window alone holding it, through the bottleneck and 40 µs
+    /// each way, a product of 2.2 kB: its bandwidth is the bottleneck's, and its window a few times
+    /// the product, so the queue it keeps is a few packets. With the port's estimator, the bytes of
+    /// each packet acknowledged over the gap since the acknowledgement before and of the latest
+    /// packet sent over the gap since the one before, whichever packets those were, a pair on this
+    /// path estimated 357 MB/s and its window grew to 147 kB, 65 times the product, its queue
+    /// lengthening the round trip from 143 µs to 5 ms (`VENDORED.md` §30).
     #[test]
     fn a_bulk_sender_measures_its_bottleneck_and_keeps_a_window_of_a_few_bandwidth_delay_products()
     {
-        let (bbr, most) = bulk(false);
-        let (alone, bdp) = alone();
+        let propagation = Duration::from_micros(40);
+        let (bbr, most) = bulk(propagation, false);
+        let (alone, bdp) = alone(propagation);
         let estimate = bbr.max_bandwidth.get();
         assert!(
             (RATE * 9 / 10..=RATE).contains(&estimate),
@@ -945,6 +971,40 @@ mod tests {
         );
         assert!(
             most <= alone * 4,
+            "round trips to {most:?} on a path of {alone:?}"
+        );
+    }
+
+    /// A sender held by its window alone over 1 ms each way, a product of 26 kB, keeps its window in
+    /// flight, about two products, and the queue that leaves lengthens its round trips to about
+    /// three times the path's (2.98 measured; 2.88 at 10 ms each way). Paced at the rate BBR
+    /// states, what it has in flight is about the product, and its longest round trip is ProbeBW's
+    /// probe past the path's, a quarter or so (1.30; 1.25 at 10 ms). The port never gave the pacer
+    /// its rate (`VENDORED.md` §31).
+    #[test]
+    fn a_paced_bulk_sender_keeps_about_its_bandwidth_delay_product_in_flight() {
+        let propagation = Duration::from_millis(1);
+        let (alone, _) = alone(propagation);
+        let (held, held_most) = bulk(propagation, false);
+        assert_eq!(held.mode, Mode::ProbeBw);
+        assert!(
+            held_most > alone * 2,
+            "round trips to {held_most:?} on a path of {alone:?}"
+        );
+        let (paced, most) = bulk(propagation, true);
+        println!(
+            "longest round trip at 1 ms each way: window-held {:.2}, paced {:.2} of the path's",
+            held_most.as_secs_f64() / alone.as_secs_f64(),
+            most.as_secs_f64() / alone.as_secs_f64()
+        );
+        assert_eq!(paced.mode, Mode::ProbeBw);
+        let estimate = paced.max_bandwidth.get();
+        assert!(
+            (RATE * 9 / 10..=RATE).contains(&estimate),
+            "estimated {estimate} B/s of a {RATE} B/s bottleneck"
+        );
+        assert!(
+            most <= alone * 3 / 2,
             "round trips to {most:?} on a path of {alone:?}"
         );
     }

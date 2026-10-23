@@ -1528,3 +1528,69 @@ CUBIC stalled in 10 runs, where 11.
 Tests: `connection::pacing::tests::the_credit_is_the_same_however_often_the_pacer_is_asked` (fails on
 upstream's: 1,000 bytes for 1,562), `a_wait_is_never_due_when_asked`; every pacing test passes as it
 was.
+
+## 42. BBR draws its gain cycle's phases from the connection's seed (2026-10-23)
+
+Patch Q32. BBR drew the phase its ProbeBW cycle starts in from the operating system's generator
+(upstream's `Pcg32::from_rng(&mut rand::rng())`): BBR picks it at random so flows sharing a bottleneck
+cycle apart (the BBR draft's randomized ProbeBW phase). Window-held, BBR's cycle moved nothing (§30),
+so no run showed it; paced at its model's rate (§43), the phase moves what it sends, and a run the
+simulation seeded whole no longer replayed: the same path, 1% of its packets skipping their delay,
+carried 90.7, 90.0 and 89.3% in three runs. A path's controller now draws from the connection's seed,
+its first eight bytes with the path's count added (`Congestion::build`'s `seed`, `Bbr::seeded`), not
+from the connection's generator: a draw from it would move every draw after it. In production the
+connection's seed is the operating system's, so flows still start their cycles apart; `Bbr::new` keeps
+its random draw. The same path now carries 92.5% in every run.
+
+## 43. BBR paced at its model's rate, its least round trip from packets in order (2026-10-23)
+
+Patch Q33, in two parts measured together: each alone was worse than neither.
+
+**BBR states its pacing rate** (`Bbr::pacing_rate`, Chromium's `BbrSender::PacingRate`: the gain of
+its phase times its bandwidth, or, before it has one, the startup gain times the initial window a
+least round trip). The port computed the rate and never gave it to the pacer, which sent five
+quarters of the window a round trip (§30's open item): Drain's gain and ProbeBW's cycle moved
+nothing, and BBR, held by its window of twice its product, kept about a product queued. At a
+drop-tail queue of one product, 10 Mbit/s and 100 ms, it lost 4,978 of 25,476 packets where NewReno
+lost 215, and 2,634 once §41 credited its pacer exactly. Paced, a bulk sender's longest round trip is 1.30 the path's at 1 ms each way where
+window-held it is 2.98 (`a_paced_bulk_sender_keeps_about_its_bandwidth_delay_product_in_flight`, from
+the attempt of 2026-10-15 that did not land for its warm-ups: here the warm-up tests pass 200 runs
+of 200 each, the warm-up's rules changed since).
+
+**A packet acknowledged while one sent before it is not gives BBR no round trip**
+(`RateSample::rtt` zero, its delivery rate standing). On a path that reorders that packet is one that
+overtook the rest, its round trip the fastest route's: with 5% of the packets skipping the delay, as
+netem's `reorder` sends them, BBR's least round trip was a millisecond where the rest took 80, and
+paced it carried 14.6% of the link (window-held, 27.0%). TCP samples the segment that fills a gap,
+the late one, for the same reason (RFC 7323 §4.3). On a path that does not reorder, the packet before
+is lost, and BBR's ten-second filter has the samples around it; the connection's own round trip, RFC
+9002's, is sampled as before, so no other law sees a change. Gated on the tolerance of reordering
+(§38) it was weaker: where reordering comes seldom, as with 1% skipping, the tolerance returns to the
+RFC's between events and the next overtaking sample set the least round trip again (43.8% in a run
+before BBR's draws were seeded, against 92.5%).
+
+Measured, BBR (`congestion::print_the_reordering_table`, `print_the_skipping_table`; `docs/benchmarks.md`):
+
+| Path | before (§41) | paced | paced, round trips in order |
+|---|---|---|---|
+| 10 Mbit/s, 100 ms, no jitter | 96.6% (2,634 lost) | 96.8% (195) | 96.8% (195) |
+| ±20 ms each way | 98.5% (916) | 93.4% (55) | 97.1% (341) |
+| ±40 ms each way | 96.0% (37) | 75.8% (43) | 96.2% (2,619) |
+| ±60 ms each way | 11.2% | 10.3% | 95.0% |
+| 80 ms, 1% skipping | 64.7% | 14.1% | 92.5% |
+| 80 ms, 5% skipping | 27.0% | 14.6% | 96.3% |
+| 80 ms, 25% skipping | 28.8% | 25.6% | 97.3% |
+
+slates' bake-off against §41, every BBR row moved and no other law's: BBR's ping p99 against the best,
+geometric mean, 1.484 → 1.125, its worst 4.00 → 1.81; its goodput shortfall 1.019 → 1.013; Jain's
+index at 20 and 100 ms 0.533 → 0.829, still under slates' floor of 0.9.
+
+Open: at ±40 ms BBR declares 2,619 packets lost where, its least round trip the fast tail's, it
+declared 37. Its least round trip is now near the path's propagation, and BBR v1's window of twice
+its product overflows a queue of one product when jitter bunches its acknowledgements; BBRv2's bound
+on what is in flight after loss (`inflight_hi`, draft-ietf-ccwg-bbr) is the answer.
+
+Tests: `congestion::bbr_at_a_queue_of_one_product_loses_no_more_than_newreno` (195 against 215; 2,634
+before), `congestion::a_path_where_packets_skip_its_delay_is_carried_by_bbr_as_its_delays_kept_in_order`
+(1% and 5% keep nine tenths of the same delays kept in order; 14.1% and 14.6% paced without the
+filter), `congestion::bbr::tests::a_paced_bulk_sender_keeps_about_its_bandwidth_delay_product_in_flight`.
