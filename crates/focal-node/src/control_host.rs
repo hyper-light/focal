@@ -390,7 +390,9 @@ enum Waiting {
     /// for capacity — an operator's `membership remove` that met a
     /// placement intent of the node's own, on a machine slow enough for
     /// the two to meet. It waits here for its own time, in the order it
-    /// came, and is refused for capacity only when this list is full.
+    /// came, and is refused for capacity only when this list is full. A
+    /// transfer waits too for its leader to be ready to hand over
+    /// (`ControlReplica::transfer_waits`), within its request's time.
     Turn(Option<Box<Turn>>),
     Write(ControlRequestId),
     Read {
@@ -2013,7 +2015,11 @@ impl<V: AuthorityVerifier> Owner<V> {
             }
             match rpc {
                 ControlRpc::Transfer(request) => {
-                    if self.replica.has_pending() {
+                    // A leader still applying what it committed, or yet to commit in its term,
+                    // hands over once it has: the transfer waits for it as it waits its turn,
+                    // where it was refused `NotReady` for the moment it came at (an operator's
+                    // `transfer leader` just after a membership change committed).
+                    if self.replica.has_pending() || self.replica.transfer_waits() {
                         waiting = Some(Waiting::Turn(Some(Box::new(Turn::Transfer(request)))));
                         Err(ControlFailure::OutcomeUnknown)
                     } else {
@@ -2249,7 +2255,9 @@ impl<V: AuthorityVerifier> Owner<V> {
                 Waiting::Turn(waited)
                     if pending.term == status.term
                         && status.role == StateRole::Leader
-                        && !self.replica.has_pending() =>
+                        && !self.replica.has_pending()
+                        && !(matches!(waited.as_deref(), Some(Turn::Transfer(_)))
+                            && self.replica.transfer_waits()) =>
                 {
                     self.took_turn = true;
                     match waited.take().map(|turn| *turn) {

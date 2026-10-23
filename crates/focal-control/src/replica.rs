@@ -414,6 +414,13 @@ impl ControlReplica {
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
+    /// Whether a transfer asked of this replica now would be refused only for the moment it is
+    /// asked at: it leads, and has yet to drain, to commit an entry of its term or to apply what it
+    /// committed (`check_ready`), each of which a leader reaches by its own progress.
+    pub fn transfer_waits(&self) -> bool {
+        self.node.status().role == StateRole::Leader
+            && matches!(self.check_ready(), Err(ControlError::NotReady))
+    }
     /// Whether the replica's write or checkpoint is in flight: consensus
     /// takes no input until it is durable (`DurableNode::persistence_pending`),
     /// and what is due to be stepped then waits for it.

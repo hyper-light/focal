@@ -16227,3 +16227,16 @@ request time. Counters `focal_evidence_copies_unavailable_total`,
 `a_copy_the_liveness_view_holds_dead_is_not_asked_and_its_job_is_refused_at_once` (refused, counted,
 no dial; held alive again, the copy's address hears the job; held dead while waited for, the job is
 refused and the wait counted).
+
+### 2026-10-23 — A leader asked to hand over while it applies hands over once it has
+
+`cli_network`'s promote-and-transfer test failed on macOS CI (run 39933447657): `transfer leader`,
+asked just after the learner's promotion committed, was refused `[not_ready] metadata leader is
+not ready`. A control leader hands over only once it has drained its start, committed an entry of
+its term and applied all it committed (`ControlReplica::check_ready`), and a leader whose own
+agents keep proposing is often an entry from that at the moment a request comes; the host passed
+the refusal on, where every one of the three is reached by the leader's own progress. The host now
+holds such a transfer as it holds one that waits for the replica's proposal, within its request's
+time, and asks it once the leader is ready (`ControlReplica::transfer_waits`). Test:
+`a_leader_that_has_not_applied_what_it_committed_waits_to_hand_over` (focal-control: committed and
+not applied, the transfer is refused `NotReady` and waits; applied, it waits no more).

@@ -364,3 +364,65 @@ fn learner_admission_catchup_promotion_and_exact_receipt_survive_checkpoint_and_
         Err(ControlError::Directory(DirectoryError::CompareFailed))
     ));
 }
+
+/// A leader hands over what it has applied: with an entry committed and not yet applied, a
+/// transfer asked of it waits (`transfer_waits`), as the control host holds it until the leader is
+/// ready where it was refused `NotReady` for the moment it came at (an operator's `transfer leader`
+/// just after a membership change committed, macOS CI 39933447657); applied, it waits no more. A
+/// follower never waits: it asks the leader.
+#[test]
+fn a_leader_that_has_not_applied_what_it_committed_waits_to_hand_over() {
+    let mut cluster = Cluster::new();
+    assert_eq!(cluster.nodes[0].status().role, StateRole::Leader);
+    assert!(!cluster.nodes[0].transfer_waits());
+    assert!(!cluster.nodes[1].transfer_waits());
+    let add = cluster.request(0, 1, MembershipChange::AddLearner { node: 4 });
+    assert!(matches!(
+        cluster.nodes[0].submit(add, &NoEvidence).unwrap(),
+        ControlSubmission::Pending(_)
+    ));
+    // The proposal reaches the voters and their answers the leader, which commits it; its next
+    // drain applies it.
+    for message in cluster.nodes[0].drain(&NoEvidence).unwrap().messages {
+        if message.to != 4 {
+            cluster.nodes[(message.to - 1) as usize]
+                .step_authenticated(
+                    message.from,
+                    &focal_consensus::encode_message(&message).unwrap(),
+                )
+                .unwrap();
+        }
+    }
+    for follower in 1..3 {
+        for message in cluster.nodes[follower].drain(&NoEvidence).unwrap().messages {
+            if message.to == 1 {
+                cluster.nodes[0]
+                    .step_authenticated(
+                        message.from,
+                        &focal_consensus::encode_message(&message).unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    assert!(cluster.nodes[0].status().committed_index > cluster.nodes[0].applied_index());
+    assert!(cluster.nodes[0].transfer_waits());
+    assert!(!cluster.nodes[1].transfer_waits());
+    // What the replica answers a transfer asked at this moment, and the control host no longer
+    // passes on: the CLI's `[not_ready] metadata leader is not ready`.
+    let current = cluster.nodes[0].configuration();
+    assert!(matches!(
+        cluster.nodes[0].transfer(&focal_control::ControlTransfer {
+            expected_configuration_index: current.configuration_index,
+            expected: current.configuration,
+            target: 2,
+        }),
+        Err(ControlError::NotReady)
+    ));
+    cluster.pump(None);
+    assert_eq!(
+        cluster.nodes[0].status().committed_index,
+        cluster.nodes[0].applied_index()
+    );
+    assert!(!cluster.nodes[0].transfer_waits());
+}
