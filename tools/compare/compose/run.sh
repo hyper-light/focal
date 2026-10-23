@@ -26,9 +26,13 @@
 #   and logged with its time (`<report>.faults.txt`):
 #     netem=ARGS        `tc qdisc ... netem ARGS` on every node's interface for the whole run,
 #                       e.g. `netem=delay 80ms 30ms loss 3% reorder 5%`
-#     kill=NODE@S+D     NODE (focal1, focal2 or focal3) killed S seconds in, started again D later
-#     isolate=NODE@S+D  NODE cut off from every peer and client (all its datagrams lost) S seconds
-#                       in, for D seconds
+#     kill=NODE@S+D     NODE killed S seconds in, started again D later. NODE is focal1, focal2 or
+#                       focal3, or a role in the bench session's placement as the fault begins
+#                       (`focal inspect placement`): `copy`, a node holding one of its content
+#                       copies other than its preferred leader, or `leader`, its preferred leader.
+#                       A role makes a run hit what it names whichever node the run seated there.
+#     isolate=NODE@S+D  NODE (as kill's) cut off from every peer and client (all its datagrams
+#                       lost) S seconds in, for D seconds
 #   The report's file names the run as faulted (`-faults`).
 #   INFLIGHT (environment): the generator's window, the requests out at most
 #   (focal-compare's own default, 4096, where unset); a run given one names it
@@ -114,6 +118,33 @@ fault_shape() {
     dc exec -T "$node" tc qdisc del dev eth0 root 2>/dev/null || true
   fi
 }
+# The container a fault's NODE names: itself, or the node that holds the role in the bench
+# session's placement now, by the zone it is configured in (focalN.yaml: a, b, c), read from the
+# first node that answers. Nothing where no node answers or none holds the role.
+fault_node() {
+  local role=$1 n
+  case "$role" in focal1 | focal2 | focal3) echo "$role"; return 0 ;; esac
+  for n in focal1 focal2 focal3; do
+    dc exec -T "$n" focal --data-dir /data inspect placement 2>/dev/null | python3 -c '
+import json, sys
+role = sys.argv[1]
+document = json.load(sys.stdin)
+placement = document.get("result", document)
+placement = placement.get("placement", placement)
+zones = {node["node"]: node.get("zone") for partition in placement["partitions"] for node in partition["nodes"]}
+for partition in placement["partitions"]:
+    for session in partition["sessions"]:
+        leader = session["preferred_leader"]
+        held = [leader] if role == "leader" else sorted(c for c in session["content_copies"] if c != leader)
+        for node in held:
+            if zones.get(node) in ("a", "b", "c"):
+                print("focal%d" % ("abc".index(zones[node]) + 1), session["session"], session["content_copies"], leader)
+                sys.exit(0)
+sys.exit(1)
+' "$role" && return 0
+  done
+  return 1
+}
 faults_start() {
   [ -n "${FAULTS:-}" ] || return 0
   fault_started=$(date +%s)
@@ -130,9 +161,16 @@ faults_start() {
       kill=*@*+* | isolate=*@*+*)
         what=${spec%%=*}; node=${spec#*=}; node=${node%@*}
         at=${spec#*@}; at=${at%+*}; down=${spec##*+}
-        case "$node" in focal1 | focal2 | focal3) ;; *) echo "FAULTS: no node $node" >&2; return 2 ;; esac
+        case "$node" in focal1 | focal2 | focal3 | copy | leader) ;; *) echo "FAULTS: no node $node" >&2; return 2 ;; esac
         (
           sleep "$at"
+          role=$node
+          if ! found=$(fault_node "$role"); then
+            fault_log "no node holds $role: $what not done"
+            exit 0
+          fi
+          node=${found%% *}
+          [ "$role" = "$node" ] || fault_log "$role is $node (session, copies, leader: ${found#* })"
           if [ "$what" = kill ]; then
             dc kill "$node" >/dev/null 2>&1; fault_log "$node killed"
             sleep "$down"
