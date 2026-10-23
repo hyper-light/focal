@@ -238,6 +238,7 @@ fn exact_visit_boundary_admits_and_covers_every_real_sibling_report() {
             chunk_bytes: 1024,
             max_manifest_bytes: 128 * 1024,
         },
+        &focal_seal::test_keys(directory.path()).unwrap(),
     )
     .unwrap();
     let custody_budget = MemoryBudget::new(16 * 1024 * 1024, 0).unwrap();

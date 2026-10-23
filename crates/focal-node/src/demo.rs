@@ -494,19 +494,12 @@ mod tests {
         let mut node = EmbeddedNode::open(&settings).unwrap();
         let report = run(&mut node).unwrap();
         let manifest = node
-            .root()
-            .join("content")
-            .join("objects")
-            .join(
-                report
-                    .artifact
-                    .domain
-                    .0
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>(),
-            )
-            .join(format!("{}.manifest", report.artifact.root));
+            .content
+            .reader()
+            .unwrap()
+            .manifest_file(report.artifact.domain, report.artifact.root)
+            .unwrap()
+            .unwrap();
         node.checkpoint().unwrap();
         drop(node);
         std::fs::remove_file(&manifest).unwrap();

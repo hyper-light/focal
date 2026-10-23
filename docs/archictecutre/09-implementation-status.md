@@ -16489,3 +16489,69 @@ follower's append-to-acknowledgement time and appends a second on the leader, th
 appends, and forward erasure correction (Michel, De Coninck and Bonaventure, IFIP Networking 2019)
 if a repair's round trip remains the cost. hyper-quic already acknowledges a packet that arrives
 out of order at once (its reordering threshold 1), so a loss costs a round trip, not a probe timeout.
+
+### 2026-10-23 — The content store seals its objects from the content level
+
+A node's content store kept every artifact in the clear, each chunk and manifest named by its own
+hash (29 §12's inventory). It now seals both once the fence the node last recorded opens level 9
+(`upgrade::CONTENT_LEVEL`, `CAPABILITY_LEVEL` 9; `storage_level::content_form`; an embedded node
+from the level it announces): each file sealed whole under its domain's key with hyper-seal's
+`seal_content` (the data key and file ID from the domain key and the SHA-256 of exactly the bytes,
+taken by the writer), named by the domain's keyed hash of what it is filed under (HMAC-SHA-256, 128
+bits), every read still checked against the BLAKE3 hash. Below the level the store writes the
+layout every earlier binary reads, byte for byte, so a node can be rolled back while the fence is
+below it. A store asked to seal that holds files in the clear is marked as converting and converted
+by its owner while it serves, a file a step when no call waits: sealed beside itself, then its name
+in the clear removed, so every lookup that looks in the clear first and then under the keyed name
+finds each file at every moment; the quarantine first, the collector holding its passes over objects
+until the end, a conversion once begun finishing whatever a later start asks, a step without room
+on the volume held and resumed on the same file. Doc 29 §12.4; 24 §21.
+
+Tests: focal-evidence `convert_tests` (a store converted while it serves, read at every step by the
+store, a reader made before and one made then, with an object sealed meanwhile, the collector held
+then collecting, the quarantined object restored, a start in the clear after the mark; a cut at
+every step, names in the clear put back beside their sealed forms and a sealed form damaged beside
+its bytes in the clear, each resumed by a start that asks for the clear; a volume without room; the
+clear layout and an empty store sealed at once), `sealing_tests` (refused tampering, no hash or
+plaintext in any name or byte, a domain erased by its record, the clear layout, either form found
+while converting, marks read back from names), focal-node
+`the_content_store_seals_once_the_recorded_fence_opens_the_content_level`. Tests that named a stored
+file by its hash find it through the store's keys (`ContentReader::manifest_file`, `chunk_file`,
+`manifest_roots`, `plaintext`, test support) and compare copies by what they open to, each node
+sealing under its own keys.
+
+The gate on the landing tree (macOS 26.4.1 arm64, loaded by other sessions' builds, load 15 to 62):
+the whole workspace's tests, every target, ran to the end with no stop at failures (173 test
+binaries); its failures were each a test of a stored file by its hash name, a test's keys given for
+a directory not yet made, or the upgrade journey's recorded fence arguments, which follow the
+capability level (10, 10, 9 where 9, 9, 8, as 51e63004 recorded the last level), all fixed and run
+again (focal-evidence 82, focal-ledger 193, focal-client 180, focal-wire 139, the node's touched
+library tests and its upgrade, collector, repair and runbook journeys), and one credential test
+that failed under that load and passes alone. `cargo fmt --all --check`, `python3
+scripts/check-contracts.py`, `bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D
+warnings`, `bash scripts/check-production.sh` and `cargo deny check advisories bans licenses
+sources` pass.
+
+What sealing costs (crates/focal-evidence/benches/content.rs, `FOCAL_BENCH_OBJECTS=16
+FOCAL_BENCH_SIZES='64 1024 8192' FOCAL_BENCH_READS=50 bash scripts/cargo.sh bench -p focal-evidence
+--bench content`, release, macOS 26.4.1 arm64 under other sessions' work, load 4.8): medians of
+each object's upload and seal, verified read (50 passes over 16 objects) and copy as custody makes
+it, in the clear and sealed, and a store in the clear converted a file a step. Reads touch no flush,
+so they measure the CPU; uploads and copies are the flushes of this disk.
+
+| Object | Read, clear | Read, sealed | Upload, clear / sealed | Copy, clear / sealed | Conversion |
+|---|---|---|---|---|---|
+| 64 KiB | 0.076 ms | 0.137 ms (55%) | 45.5 / 45.1 ms | 16.9 / 17.0 ms | 3.4 MiB/s |
+| 1 MiB | 0.922 ms, 1,084 MiB/s | 1.101 ms, 908 MiB/s (84%) | 55.3 / 46.4 ms | 23.2 / 19.9 ms | 52.8 MiB/s |
+| 8 MiB | 7.487 ms, 1,069 MiB/s | 8.821 ms, 907 MiB/s (85%) | 217.1 / 145.1 ms | 147.4 / 94.4 ms | 93.9 MiB/s |
+
+A small object's read paid most: profiled (`sample`, 10 s of the sealed read phase at 64 KiB,
+about 9,000 samples), `open` took 29%, BLAKE3 22%, and dropping a sealed reader 18%, where AES-GCM
+took 3%. Each read opened its manifest twice (its length, then its bytes) and unwrapped its
+domain's key twice (the manifest, then the chunks): a manifest is now read with one open whose
+length is what it opened (`DomainKey::read_sized`), and a read opens its domain's key once for the
+manifest and every chunk. The drop is hyper-seal's: `SealedReader` makes a buffer of a whole
+segment at every open, the header's look included, and wipes all of it at drop a byte at a time
+with volatile writes, which no compiler merges; a wipe at `memset`'s speed behind a barrier that
+keeps it, and a segment's buffer made when a segment is first read, are owed in hyper-seal
+(shared crate) with the next re-vendor.

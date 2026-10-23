@@ -176,20 +176,24 @@ fn pass_where(root: &Path, condition: impl Fn(&Value) -> bool) -> Value {
         std::thread::sleep(Duration::from_millis(250));
     }
 }
+/// The roots of the objects the node's store holds for `tenant`, read through the store's keys:
+/// sealed, a manifest's name is a keyed hash, never its root (29 §11).
 fn manifests(root: &Path, tenant: &str) -> Vec<String> {
-    let directory = root.join("content").join("objects").join(tenant);
-    let mut names: Vec<String> = std::fs::read_dir(&directory)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| {
-                    let name = entry.unwrap().file_name().to_str().unwrap().to_owned();
-                    name.strip_suffix(".manifest").map(str::to_owned)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    names
+    let mut domain = [0u8; 16];
+    for (index, byte) in domain.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&tenant[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    let reader = focal_evidence::ContentReader::open(
+        root.join("content"),
+        focal_seal::test_keys(root).unwrap(),
+    )
+    .unwrap();
+    reader
+        .manifest_roots(focal_model::ContentDomainId(domain))
+        .unwrap()
+        .into_iter()
+        .map(|root| root.to_string())
+        .collect()
 }
 const FAR: u64 = 4_102_444_800_000;
 const PROOF: &str = r#"{"passed":3,"failed":0,"skipped":0}"#;

@@ -244,9 +244,10 @@ largest store a node keeps, and its file names alone reveal the content hashes o
   delivered is still hashed whole, as now.
 - **Transfers stay plaintext inside TLS** (F58): a node seals what it receives under its own keys.
   Replicas therefore hold different ciphertext for the same chunk, and none needs another's keys.
-- **Existing stores.** A store written before the storage fence is rewritten once, chunk by chunk,
-  when the node crosses the fence, resumable from any crash cut as the log's conversion is. Reads
-  during the rewrite find each chunk in exactly one form.
+- **Existing stores.** A store written before the fence is rewritten once, chunk by chunk, when the
+  node crosses the fence, resumable from any crash cut as the log's conversion is. Reads during the
+  rewrite find each chunk in one form or both. As built (§12.4) the fence is its own, the content
+  level, and the rewrite runs while the store serves.
 
 Tests owed with it:
 - a flipped byte, a truncation, a chunk swapped between domains, and a renamed file are refused;
@@ -265,7 +266,8 @@ listed from its writers (each `File::create`, `OpenOptions`, `create_private_new
 | Payload log | `payloads/*.seg` | spilled rows' bytes: message payloads | focal-ledger `native_payloads` | sealed (§12.1) |
 | Checkpoint seeds | `seeds/<ledger>/` | a checkpoint's native rows, 1 MiB chunks | focal-evidence `seeds` | clear |
 | Cold stream | `cold/<ledger>/` | retired families' archive frames | focal-evidence `cold` | clear |
-| Content | `content/objects/…` | artifacts, manifests, uploads, custody | focal-evidence `store`, `transfer`, `gc`, `upload_terminal` | clear |
+| Content | `content/objects/…`, `content/quarantine/…` | artifacts' chunks and manifests | focal-evidence `store`, `transfer`, `gc`, `native_artifact` | sealed from the content level (§12.4) |
+| Content staging and custody | `content/staging/`, `objects/<domain>/*.part`, `content/{custody,checkpoints,receipts}/` | uploads and transfers being received; custody records | focal-evidence `store`, `transfer`, `upload_terminal` | clear |
 | Session backups | a backup's directory | checkpoint, seeds, content, cold | focal-ledger `session_backup` | clear |
 | Enrollment | private directories | the cluster CA's key, nodes' and clients' keys, invitations, the signer's journal | focal-enrollment `files::PrivateDirectory` | sealed (§12.2) |
 | Embedded node log | the shell's log of a node that is its own cluster (`wal/` before) | every record of its session and its root's control group | focal-node `EmbeddedNode` through `storage_start`, as a networked node | sealed (§12.3) |
@@ -357,3 +359,68 @@ the WAL is converted at its next start by the conversion every networked node ta
 level. Its root's control group is a member of the same storage (`ControlReplica::open_on_storage`).
 The node lets its storage go in the order the networked node's shutdown keeps, the session first
 and the data directory's lock last, and its host's stop answers with what the log's close found.
+
+### 12.4 The content store, sealed (2026-10-23)
+
+Every chunk and manifest a node's content store installs is sealed under its domain's key and named
+by a keyed hash once the fence the node last recorded opens the content level
+(`upgrade::CONTENT_LEVEL`, 9; `storage_level::content_form`); an embedded node takes it from the
+level it announces, as it does the other rules. Below the level the store writes the layout every
+earlier binary reads, each file in the clear and named by its hash, byte for byte, so a node can
+still be rolled back while the fence is below it: sealing a store a binary below the level would
+open is what the fence forbids.
+
+- **As §11 designs it, with what changed.** A domain's key is random, kept beside its objects as
+  its 61-byte record under the node's content key (`DOMAIN.key`). A file is sealed whole by
+  `hyper_seal::sealed_file::seal_content` (hyper-raft 5a22c8c): its data key and file ID derive
+  from the domain key and the SHA-256 of exactly its bytes, which the writer takes as it seals, so
+  equal bytes seal to equal files and deduplication, idempotent installs and verify-by-rehash keep
+  working. A name is the domain's keyed name of the BLAKE3 hash it is filed under
+  (`hyper_seal::name`, HMAC-SHA-256 under a child of the domain key, 128 bits, 32 hex digits where
+  a name in the clear is 64). No cache of unwrapped domain keys is kept: a domain's key is
+  unwrapped from its record for the file in hand and dropped after it, as the group files' are, and
+  the store's one writer holds the content key for its life; a reader holds none, and unwraps it
+  from the data directory's keys as it opens a domain's record. A file's volume bytes are promised
+  at its sealed size (`focal_seal::file::sealed_bound`), and a domain's record at its first
+  install.
+- **The way between the forms.** A store asked to seal that holds files in the clear is marked as
+  converting before anything is sealed (`SEALING` in the store's root) and converted by its owner
+  as it serves, a file a step whenever no call waits (`ContentStore::convert_step`, driven from the
+  content owner's idle turns, and the embedded node's owner's): the file is read, sealed beside
+  itself under its keyed name, and only then is its name in the clear removed, each domain's
+  directory flushed as the conversion leaves it, and the store marked sealed at the end (`SEALED`).
+  So every file lies in one form or both at every moment, and every lookup while the store is not
+  marked looks in the clear first and then under the keyed name: a reader that misses a file in
+  the clear finds it sealed whatever the conversion does between. A failure in the clear gives way
+  to the sealed form where one opens (the writer seals over a damaged file while the store
+  converts). The quarantine's rounds are converted first, then the store's own objects, so an object
+  restored meanwhile comes back in a form the rest of the pass meets; the collector leaves objects
+  alone while the store converts. A conversion once begun finishes whatever form a later start
+  asks for, a store marked sealed stays sealed, and a store that holds nothing is sealed as it
+  opens. A step whose sealed file the volume has no room for is held and takes the same file first
+  when the owner asks again; one that fails ends the conversion for that run and is reported, the
+  store reading both forms until its next start resumes it.
+- **Bounded.** A step visits at most the collector's step of entries and converts at most one file,
+  read into the owner's chunk of scratch (the embedded owner's charged to its budget while the
+  conversion runs). A file longer than the format's bound was never an object's and is left as it
+  is, as are the parts and temporaries a domain's directory holds.
+- **Tests:** a store in the clear converted while it serves, every object read at every step by
+  the store, a reader made before the conversion and one made then; an object sealed meanwhile; the
+  collector holding then collecting; the quarantined object restored; a start in the clear after the
+  mark (`a_store_in_the_clear_is_converted_while_it_serves`). A cut at every step, with the names in
+  the clear put back beside their sealed forms and a sealed form damaged beside its bytes in the
+  clear, each resumed by a start that asks for the clear
+  (`a_conversion_cut_at_any_step_resumes_and_loses_nothing`). A volume without room
+  (`a_conversion_without_room_holds_and_takes_the_same_file_next`). The clear layout an earlier
+  binary reads, and an empty store sealed at once
+  (`an_empty_store_is_sealed_at_once_and_one_in_the_clear_stays_so`). §11's: a flipped byte, a cut,
+  a file under another chunk's name and a chunk carried into another domain refused; no stored name
+  or byte holding a hash or plaintext; a domain erased by its record while another reads
+  (`sealing_tests`). The level's rule (`the_content_store_seals_once_the_recorded_fence_opens_the_content_level`).
+- **Still in the clear** (this inventory's next rows): parts of chunks a transfer is receiving
+  (`objects/<domain>/*.part`, named by the chunk's hash), uploads being staged (`staging/`), and the
+  custody records (`custody/`, `checkpoints/`, `receipts/`).
+- **Owed.** An operator sees a conversion only by its failure (the node's error stream, "the
+  content store's conversion stopped"); its progress belongs in the collector's view
+  (`inspect node --gc`). A reader made while its store converted keeps looking in the clear first
+  for its life, one missed open a file, until the node's next start.

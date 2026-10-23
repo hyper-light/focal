@@ -68,6 +68,7 @@ impl Rows {
                 chunk_bytes: 17,
                 max_manifest_bytes: 65536,
             },
+            &focal_seal::test_keys(directory.path()).unwrap(),
         )
         .unwrap();
         let mut rows = Self {

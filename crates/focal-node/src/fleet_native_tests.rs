@@ -117,7 +117,7 @@ fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizable_rea
                 max_uploads: 16,
                 chunk_bytes: 4096,
                 max_manifest_bytes: 1 << 20,
-            },
+            }, &focal_seal::test_keys_beside(&content_dir).unwrap(),
         )
         .unwrap();
         let wal = SharedWal::open_with_budget(
@@ -144,7 +144,7 @@ fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizable_rea
             &tenant,
             NativeHosting {
                 limits: NativeSessionLimits::standard(domain()),
-                reader: ContentReader::open(&content_dir).unwrap(),
+                reader: ContentReader::open(&content_dir, focal_seal::test_keys_beside(&content_dir).unwrap()).unwrap(),
                 seeds: focal_evidence::SeedStore::open(
                     content_dir.join("seeds"),
                     focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
@@ -663,6 +663,7 @@ async fn active_host(
             chunk_bytes: 4096,
             max_manifest_bytes: 1 << 20,
         },
+        &focal_seal::test_keys_beside(&content_dir).unwrap(),
     )
     .unwrap();
     let node = DurableNode::open_on_wal_in(
@@ -678,7 +679,11 @@ async fn active_host(
         tenant,
         NativeHosting {
             limits: NativeSessionLimits::standard(domain()),
-            reader: ContentReader::open(&content_dir).unwrap(),
+            reader: ContentReader::open(
+                &content_dir,
+                focal_seal::test_keys_beside(&content_dir).unwrap(),
+            )
+            .unwrap(),
             seeds: focal_evidence::SeedStore::open(
                 content_dir.join("seeds"),
                 focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),

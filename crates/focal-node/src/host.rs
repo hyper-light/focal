@@ -175,8 +175,14 @@ impl LocalHost {
                 let _liveness = liveness;
                 let mut archive = crate::archive_agent::EmbeddedArchive::from_env();
                 let mut next_tick = Instant::now();
+                // The content store's conversion (29 §11): the chunk its steps read into,
+                // charged while it runs, and whether its last step was held for room until the
+                // next tick.
+                let mut conversion: Option<(Vec<u8>, Allocation)> = None;
+                let mut held = false;
                 loop {
                     if Instant::now() >= next_tick {
+                        held = false;
                         if let Err(error) =
                             maintain(&mut node, &mut views, &mut archive, &host_budget)
                         {
@@ -198,14 +204,32 @@ impl LocalHost {
                     }
                     // Sooner when a parked inbox read's wait ends.
                     let wake_at = inboxes.earliest().map_or(next_tick, |at| at.min(next_tick));
+                    // While the content store converts its files in the clear, the owner converts
+                    // one whenever nothing else waits, and waits for a request only once it is
+                    // done or held.
+                    let store_converting = node.content.converting();
+                    if !store_converting {
+                        conversion = None;
+                    }
+                    let converting = !held && waiting.is_empty() && store_converting;
                     // Every queued request is taken before the owner waits
                     // on the log; it blocks for a request only when no
                     // proposal waits for its commit.
                     let work = if waiting.is_empty() {
-                        match receiver
-                            .recv_timeout(wake_at.saturating_duration_since(Instant::now()))
-                        {
+                        let wait = if converting {
+                            Duration::ZERO
+                        } else {
+                            wake_at.saturating_duration_since(Instant::now())
+                        };
+                        match receiver.recv_timeout(wait) {
                             Ok(work) => work,
+                            Err(mpsc::RecvTimeoutError::Timeout) if converting => {
+                                held = convert_step(&mut node, &mut conversion, &host_budget);
+                                if Instant::now() >= wake_at {
+                                    inboxes.wake(&mut node, &mut views, &limits, Instant::now());
+                                }
+                                continue;
+                            }
                             Err(mpsc::RecvTimeoutError::Timeout) => {
                                 inboxes.wake(&mut node, &mut views, &limits, Instant::now());
                                 continue;
@@ -653,6 +677,46 @@ pub(crate) fn access(error: LedgerError) -> AccessError {
         _ => AccessError::OutcomeUnknown,
     }
 }
+/// One step of the embedded node's content store conversion (29 §11), its chunk of scratch
+/// charged to the host's budget while the conversion runs: whether the step was held, the volume
+/// without room for the next file's sealed form or the budget without the scratch, so the owner
+/// waits for its next tick before it asks again.
+fn convert_step(
+    node: &mut EmbeddedNode,
+    conversion: &mut Option<(Vec<u8>, Allocation)>,
+    budget: &MemoryBudget,
+) -> bool {
+    if conversion.is_none() {
+        let bytes = node.content.max_chunk_bytes();
+        let Ok(charge) = budget.reserve(BudgetKind::Payload, BudgetLane::Ordinary, bytes) else {
+            return true;
+        };
+        let mut scratch = Vec::new();
+        if scratch.try_reserve_exact(bytes).is_err() {
+            return true;
+        }
+        scratch.resize(bytes, 0);
+        *conversion = Some((scratch, charge.commit()));
+    }
+    let Some((scratch, _)) = conversion.as_mut() else {
+        return true;
+    };
+    match node.content.convert_step(scratch, crate::gc::PAGE) {
+        Ok(focal_evidence::Conversion::Held) => true,
+        Ok(_) => false,
+        // The conversion ends for this run; the store reads either form and its next open
+        // resumes it.
+        Err(error) => {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "focal: the content store's conversion stopped: {error}"
+            );
+            false
+        }
+    }
+}
+
 fn maintain(
     node: &mut EmbeddedNode,
     views: &mut crate::reads::ReadViews,

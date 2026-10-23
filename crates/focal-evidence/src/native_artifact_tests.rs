@@ -20,7 +20,7 @@ fn limits() -> StoreLimits {
 }
 
 fn store(path: &Path) -> ContentStore {
-    ContentStore::open(path, limits()).unwrap()
+    ContentStore::open(path, limits(), &crate::store::test_keys(path)).unwrap()
 }
 
 fn request() -> RequestKey {
@@ -405,7 +405,17 @@ fn verified_inline_content_survives_reopen_and_matches_original_upload_tree_byte
     let native_ref = reference(custody.payload());
     let original_ref = uploaded(&mut original, REPORT);
     assert_eq!(native_ref, original_ref);
+    // Each data directory seals under keys of its own (29 §11): the two trees are the same
+    // objects opened, and as many files, never the same stored bytes.
     assert_eq!(
+        native.export_manifest(&native_ref).unwrap().encoded(),
+        original.export_manifest(&original_ref).unwrap().encoded()
+    );
+    assert_eq!(
+        files(&native_root.path().join("objects")).len(),
+        files(&old_root.path().join("objects")).len()
+    );
+    assert_ne!(
         files(&native_root.path().join("objects")),
         files(&old_root.path().join("objects"))
     );
@@ -601,12 +611,11 @@ fn corrupt_chunk_or_manifest_cannot_produce_a_local_custody_token() {
         let mut store = store(root.path());
         let actual = uploaded(&mut store, REPORT);
         let artifact = descriptor_for_pointer(pointer(&actual));
-        let directory = root.path().join("objects").join(hex(&actual.domain.0));
         let path = if corrupt_manifest {
-            directory.join(format!("{}.manifest", actual.root))
+            store.manifest_file(actual.domain, actual.root)
         } else {
             let manifest = store.manifest(&actual).unwrap();
-            directory.join(format!("{}.chunk", manifest.chunks.last().unwrap().hash))
+            store.chunk_file(actual.domain, manifest.chunks.last().unwrap().hash)
         };
         let original = fs::read(&path).unwrap();
         let mut corrupt = original.clone();
@@ -817,7 +826,8 @@ fn local_content_and_manifest_limits_refuse_without_leaking_memory_or_staging_id
         },
     ] {
         let root = tempfile::tempdir().unwrap();
-        let mut store = ContentStore::open(root.path(), limits).unwrap();
+        let mut store =
+            ContentStore::open(root.path(), limits, &crate::store::test_keys(root.path())).unwrap();
         let before = files(root.path());
         let budget = budget();
         let artifact = descriptor(specification(PayloadSpec::Inline(REPORT)));
@@ -928,7 +938,8 @@ fn funded_custody_succeeds_at_full_parent_and_returns_workspace_to_its_pool() {
     assert_eq!(store.staged(), (0, 0));
 
     drop(store);
-    let reopened = ContentStore::open(root.path(), limits()).unwrap();
+    let reopened =
+        ContentStore::open(root.path(), limits(), &crate::store::test_keys(root.path())).unwrap();
     assert_eq!(reopened.read_bytes(&content, REPORT.len()).unwrap(), REPORT);
     drop(pool);
     assert_eq!(parent.stats().used, pressure.bytes());
@@ -965,11 +976,7 @@ fn funded_schema_and_corrupt_content_refusals_restore_all_credit() {
     assert_eq!(files(root.path()), before_files);
 
     let manifest = store.manifest(&actual).unwrap();
-    let chunk = root
-        .path()
-        .join("objects")
-        .join(hex(&actual.domain.0))
-        .join(format!("{}.chunk", manifest.chunks.last().unwrap().hash));
+    let chunk = store.chunk_file(actual.domain, manifest.chunks.last().unwrap().hash);
     let original = fs::read(&chunk).unwrap();
     let mut corrupt = original.clone();
     corrupt[0] ^= 1;
@@ -988,7 +995,8 @@ fn funded_schema_and_corrupt_content_refusals_restore_all_credit() {
     // substitutes for another real verification after the refusal.
     fs::write(&chunk, original).unwrap();
     drop(store);
-    let mut reopened = ContentStore::open(root.path(), limits()).unwrap();
+    let mut reopened =
+        ContentStore::open(root.path(), limits(), &crate::store::test_keys(root.path())).unwrap();
     let verified = reopened
         .verify_native_artifact(request(), &artifact, domain(), &pool, &BuiltinNativeSchemas)
         .unwrap();
@@ -1040,14 +1048,15 @@ fn complete_manifest_header_is_preflighted_before_installing_any_chunk() {
         chunk_bytes: REPORT.len(),
         ..limits()
     };
-    let mut original = ContentStore::open(original_root.path(), one_chunk.clone()).unwrap();
+    let mut original = ContentStore::open(
+        original_root.path(),
+        one_chunk.clone(),
+        &crate::store::test_keys(original_root.path()),
+    )
+    .unwrap();
     let expected = uploaded(&mut original, REPORT);
-    let original_manifest = original_root
-        .path()
-        .join("objects")
-        .join(hex(&domain().0))
-        .join(format!("{}.manifest", expected.root));
-    let exact_manifest_bytes = fs::read(original_manifest).unwrap().len();
+    // The manifest's plaintext length, what the limit bounds (its file is sealed, longer).
+    let exact_manifest_bytes = original.manifest_length(&expected).unwrap();
     // The one-chunk estimate fits; only the complete encoded header exposes the
     // refusal. This reaches the late-size path that formerly left orphan chunks.
     assert!(40 < exact_manifest_bytes - 1);
@@ -1058,6 +1067,7 @@ fn complete_manifest_header_is_preflighted_before_installing_any_chunk() {
             max_manifest_bytes: exact_manifest_bytes - 1,
             ..one_chunk.clone()
         },
+        &crate::store::test_keys(root.path()),
     )
     .unwrap();
     let before = files(root.path());
@@ -1084,6 +1094,7 @@ fn complete_manifest_header_is_preflighted_before_installing_any_chunk() {
             max_manifest_bytes: exact_manifest_bytes,
             ..one_chunk
         },
+        &crate::store::test_keys(root.path()),
     )
     .unwrap();
     let verified = current
@@ -1116,6 +1127,7 @@ fn a_node_bundle_past_the_inline_bound_seals_and_reads_back() {
             chunk_bytes: 64 << 10,
             max_manifest_bytes: 128 << 10,
         },
+        &crate::store::test_keys(root.path()),
     )
     .unwrap();
     let bytes: Vec<u8> = (0..3usize << 20).map(|index| (index % 251) as u8).collect();

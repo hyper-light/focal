@@ -171,6 +171,7 @@ impl Fixture {
                     chunk_bytes: 17,
                     max_manifest_bytes: 65536,
                 },
+                &focal_seal::test_keys(directory.path()).unwrap(),
             )
             .unwrap();
             fixture.serial += 1;
@@ -658,6 +659,7 @@ fn already_begun_sibling_can_report_after_checked_work_response_and_claim_failur
             chunk_bytes: 17,
             max_manifest_bytes: 65536,
         },
+        &focal_seal::test_keys(directory.path()).unwrap(),
     )
     .unwrap();
     let custody = store

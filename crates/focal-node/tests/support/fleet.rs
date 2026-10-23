@@ -512,6 +512,17 @@ pub fn read_claim(node: &Node, claim: &str) -> Value {
 pub fn claim_id(object: &Value) -> String {
     hex_hash(&object["Claim"]["binding"]["object"])
 }
+/// The plaintext of `node`'s stored chunk at `path`, opened through the node's keys: each node
+/// seals what it holds under its own (29 §11), so copies are compared by what they open to.
+pub fn chunk_plaintext(node: &Node, path: &Path) -> Vec<u8> {
+    focal_evidence::ContentReader::open(
+        node.root().join("content"),
+        focal_seal::test_keys(node.root()).unwrap(),
+    )
+    .unwrap()
+    .plaintext(path)
+    .unwrap()
+}
 pub fn chunk_files(node: &Node, tenant: &str) -> Vec<PathBuf> {
     let directory = node.root().join("content").join("objects").join(tenant);
     let mut files: Vec<PathBuf> = std::fs::read_dir(&directory)

@@ -543,6 +543,7 @@ fn admitted_scope_growth_and_actual_failed_report_fit_the_original_pinned_envelo
             chunk_bytes: 17,
             max_manifest_bytes: 128 * 1024,
         },
+        &focal_seal::test_keys(dir.path()).unwrap(),
     )
     .unwrap();
     let verified = store

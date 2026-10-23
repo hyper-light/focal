@@ -82,10 +82,14 @@ netem, a leader killed); the claim is not made.
 **Recorded.** In transit: "2026-10-04 — F58: every connection exchanges its keys post-quantum"
 (X25519MLKEM768 on every provider focal builds, through aws-lc-rs). At rest (doc 29 §12): the node
 log, the group files, the payload log (per-record AES-GCM), every data directory's keys and the
-enrollment secrets are sealed; a sealed record is opened only when read.
+enrollment secrets are sealed; a sealed record is opened only when read. The content store's chunks
+and manifests are sealed under a key per domain and named by keyed hashes from the content level
+(level 9; doc 29 §12.4, "2026-10-23 — The content store seals its objects from the content level"),
+a store in the clear converted while it serves.
 
 **Open.** Still written in the clear (doc 29 §12's inventory): seeds, the cold stream, the content
-store, session backups, client stores and several small node files.
+store's staging, transfer parts and custody records, session backups, client stores and several
+small node files.
 
 ## 6. Adversarial batteries
 

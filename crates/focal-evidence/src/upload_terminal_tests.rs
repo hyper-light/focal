@@ -12,6 +12,7 @@ fn store(path: &Path) -> ContentStore {
             chunk_bytes: 4,
             max_manifest_bytes: 2048,
         },
+        &crate::store::test_keys(path),
     )
     .unwrap()
 }
@@ -124,7 +125,9 @@ fn malformed_terminal_state_and_trailing_active_bytes_fail_closed() {
             chunk_bytes: 4,
             max_manifest_bytes: 2048,
         };
-        assert!(ContentStore::open(root.path(), limits).is_err());
+        assert!(
+            ContentStore::open(root.path(), limits, &crate::store::test_keys(root.path())).is_err()
+        );
     }
 }
 

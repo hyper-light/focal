@@ -917,6 +917,8 @@ impl NetworkService {
                         max_manifest_bytes: 1024 * 1024,
                     },
                     storage.disk_budget(),
+                    &settings.data_keys(&root)?,
+                    crate::storage_level::content_form(&root)?,
                 )?;
                 let session = if founder {
                     let mut consensus = storage.open_member(
@@ -934,11 +936,14 @@ impl NetworkService {
                     let hosting = native_hosting(
                         &root,
                         &identity,
+                        content.reader()?,
                         storage.disk_budget(),
                         &limits,
-                        crate::storage_level::seal_rule(&root)?,
-                        crate::storage_level::retire_rule(&root)?,
-                        crate::storage_level::native_share(&root)?,
+                        crate::storage_level::Rules {
+                            seal: crate::storage_level::seal_rule(&root)?,
+                            retire: crate::storage_level::retire_rule(&root)?,
+                            share: crate::storage_level::native_share(&root)?,
+                        },
                     )
                     .map_err(NodeError::Content)?;
                     Some(Session::from_node_in_hosted(
@@ -2327,12 +2332,16 @@ fn require_runtime() -> Result<(), ServiceError> {
 pub(crate) fn native_hosting(
     root: &Path,
     identity: &crate::embedded::NodeIdentity,
+    reader: focal_evidence::ContentReader,
     disk: focal_memory::DiskBudget,
     session: &SessionLimits,
-    seal_rule: focal_ledger::SealRule,
-    retire_rule: focal_ledger::RetireRule,
-    share: focal_ledger::NativeShare,
+    rules: crate::storage_level::Rules,
 ) -> Result<focal_ledger::NativeHosting, focal_evidence::ContentError> {
+    let crate::storage_level::Rules {
+        seal: seal_rule,
+        retire: retire_rule,
+        share,
+    } = rules;
     let mut limits = native_limits(
         focal_model::ContentDomainId(identity.ledger.tenant.0),
         session.native_memory_bytes(share),
@@ -2342,7 +2351,7 @@ pub(crate) fn native_hosting(
     limits.retire_rule = retire_rule;
     Ok(focal_ledger::NativeHosting {
         limits,
-        reader: focal_evidence::ContentReader::open(root.join("content"))?,
+        reader,
         seeds: focal_evidence::SeedStore::open(
             crate::custody::seed_directory(&root.join("seeds"), identity.ledger),
             disk.clone(),

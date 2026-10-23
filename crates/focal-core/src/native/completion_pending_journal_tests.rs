@@ -140,6 +140,7 @@ fn separate_pending_seal_journals_retain_and_refund_their_own_credit_under_press
             chunk_bytes: 17,
             max_manifest_bytes: 128 * 1024,
         },
+        &focal_seal::test_keys(directory.path()).unwrap(),
     )
     .unwrap();
     let pressure = exhaust(&owner);

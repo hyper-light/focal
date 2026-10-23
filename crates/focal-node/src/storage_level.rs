@@ -81,6 +81,15 @@ pub fn member_wire(root: &Path) -> Result<focal_consensus::Wire, NodeError> {
     )
 }
 
+/// What a session's hosting follows at the node's level: when it seals, how it retires, and its
+/// native share (`crate::network_service::native_hosting`).
+#[derive(Debug, Clone, Copy)]
+pub struct Rules {
+    pub seal: focal_ledger::SealRule,
+    pub retire: focal_ledger::RetireRule,
+    pub share: focal_ledger::NativeShare,
+}
+
 /// How the sessions a node hosts seal (F12, 26 §4a): by the anchored rule once the fence it last
 /// knew opens `SEAL_LEVEL`, as a node founded there does from its first start; by the derived
 /// rule below it. Read as each session's hosting is built: a node that saw the fence rise while it
@@ -117,6 +126,24 @@ pub fn native_share_at(level: u32) -> focal_ledger::NativeShare {
         focal_ledger::NativeShare::Wide
     } else {
         focal_ledger::NativeShare::Half
+    }
+}
+
+/// The form a node's content store installs its files in (29 §11): sealed once the fence it last
+/// knew opens `CONTENT_LEVEL`, as a node founded there does from its first start; in the clear
+/// below it, where a binary that cannot open a sealed file may still be rolled back to. Read as the
+/// store is opened at the node's start: a node that saw the fence rise while it ran seals from its
+/// next start, converting what it holds in the clear as it serves.
+pub fn content_form(root: &Path) -> Result<focal_evidence::ContentForm, NodeError> {
+    Ok(content_form_at(known(root)?.unwrap_or(0)))
+}
+
+/// The content form a fence at `level` opens.
+pub fn content_form_at(level: u32) -> focal_evidence::ContentForm {
+    if level >= crate::upgrade::CONTENT_LEVEL {
+        focal_evidence::ContentForm::Sealed
+    } else {
+        focal_evidence::ContentForm::Clear
     }
 }
 
@@ -227,5 +254,34 @@ mod tests {
         assert_eq!(native_share_at(0), focal_ledger::NativeShare::Half);
         std::fs::write(dir.path().join(FILE), b"short").unwrap();
         assert!(native_share(dir.path()).is_err());
+    }
+
+    /// A node's content store keeps the clear until the fence it last knew opens `CONTENT_LEVEL`,
+    /// and seals from there (29 §11); a node that knows no fence keeps the clear, and a damaged
+    /// record opens no store.
+    #[test]
+    fn the_content_store_seals_once_the_recorded_fence_opens_the_content_level() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            content_form(dir.path()).unwrap(),
+            focal_evidence::ContentForm::Clear
+        );
+        record(dir.path(), crate::upgrade::CONTENT_LEVEL - 1).unwrap();
+        assert_eq!(
+            content_form(dir.path()).unwrap(),
+            focal_evidence::ContentForm::Clear
+        );
+        record(dir.path(), crate::upgrade::CONTENT_LEVEL).unwrap();
+        assert_eq!(
+            content_form(dir.path()).unwrap(),
+            focal_evidence::ContentForm::Sealed
+        );
+        assert_eq!(
+            content_form_at(crate::upgrade::CAPABILITY_LEVEL),
+            focal_evidence::ContentForm::Sealed
+        );
+        assert_eq!(content_form_at(0), focal_evidence::ContentForm::Clear);
+        std::fs::write(dir.path().join(FILE), b"short").unwrap();
+        assert!(content_form(dir.path()).is_err());
     }
 }

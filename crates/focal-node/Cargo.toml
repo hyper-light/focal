@@ -68,5 +68,6 @@ focal-sim = { version = "0.1.0", path = "../focal-sim" }
 focal-core = { version = "0.1.0", path = "../focal-core", features = ["test-support"] }
 focal-ledger = { version = "0.1.0", path = "../focal-ledger", features = ["test-support"] }
 focal-log = { version = "0.1.0", path = "../focal-log", features = ["test-support"] }
+focal-evidence = { version = "0.1.0", path = "../focal-evidence", features = ["test-support"] }
 tempfile.workspace = true
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "aws_lc_rs", "x509-parser"] }

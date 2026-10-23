@@ -79,9 +79,14 @@ impl DataKeys {
 /// test support the per-user directory is the system's temporary one ([`keys_dir`]) and the root
 /// key is the one every test's directory shares ([`TEST_ROOT`]). Tests in parallel may open one
 /// data directory at once: its keys are published once, never one maker's over another's.
+///
+/// A node's start makes its data directory before its keys; so does this, for a test that names a
+/// directory its store or node has not made yet.
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_keys(root: impl AsRef<Path>) -> Result<DataKeys, SealSetupError> {
-    resolve(root.as_ref(), None, None)
+    let root = root.as_ref();
+    std::fs::create_dir_all(root).map_err(SealSetupError::Io)?;
+    resolve(root, None, None)
 }
 
 /// [`test_keys`] of the data directory a private directory or a store at `path` lies in: its

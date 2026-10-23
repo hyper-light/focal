@@ -179,6 +179,7 @@ impl Lab {
                 chunk_bytes: 4096,
                 max_manifest_bytes: 128 * 1024,
             },
+            &focal_seal::test_keys(dir.path()).unwrap(),
         )
         .unwrap();
         Self {

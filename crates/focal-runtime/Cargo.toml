@@ -23,4 +23,6 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The keys of a test's data directory, which every content store is sealed under (29 §11).
+focal-seal = { version = "0.1.0", path = "../focal-seal", features = ["test-support"] }
 tempfile.workspace = true

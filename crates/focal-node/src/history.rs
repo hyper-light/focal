@@ -93,11 +93,17 @@ pub fn offline_native_publications(
     let hosting = crate::network_service::native_hosting(
         root,
         identity,
+        focal_evidence::ContentReader::open(
+            root.join("content"),
+            focal_seal::DataKeys::new(root, key_file),
+        )?,
         storage.storage.disk_budget(),
         &limits,
-        rule,
-        retire,
-        share,
+        crate::storage_level::Rules {
+            seal: rule,
+            retire,
+            share,
+        },
     )?;
     let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;
     session.campaign()?;

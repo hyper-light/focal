@@ -102,6 +102,7 @@ impl Harness {
                 chunk_bytes: 4096,
                 max_manifest_bytes: 128 * 1024,
             },
+            &focal_seal::test_keys(root.path()).unwrap(),
         )
         .unwrap();
         let core = Core::new_native_authored(

@@ -461,6 +461,7 @@ impl Fleet {
             let store = ContentStore::open(
                 path.join(id.to_string()).join("content"),
                 store_limits_with(slow.map_or(store_limits().chunk_bytes, |slow| slow.chunk_bytes)),
+                &focal_seal::test_keys_beside(path.join(id.to_string()).join("content")).unwrap(),
             )
             .unwrap();
             let (content, content_owner) = ContentHost::spawn(
@@ -1281,6 +1282,8 @@ async fn evidence_scenario(managed: bool) {
         let store = ContentStore::open(
             data.path().join(id.to_string()).join("content"),
             store_limits(),
+            &focal_seal::test_keys_beside(data.path().join(id.to_string()).join("content"))
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(store.read_bytes(&reference, bytes.len()).unwrap(), bytes);

@@ -16,7 +16,7 @@ fn limits() -> StoreLimits {
     }
 }
 fn open(root: &Path) -> ContentStore {
-    ContentStore::open(root, limits()).unwrap()
+    ContentStore::open(root, limits(), &crate::store::test_keys(root)).unwrap()
 }
 fn domain(byte: u8) -> ContentDomainId {
     ContentDomainId([byte; 16])
@@ -481,11 +481,13 @@ fn a_file_gone_since_the_walk_listed_it_is_passed_over() {
         steps += 1;
         assert!(steps < 1_000, "the walk never reached the manifests");
     }
-    // Every other object's files go: the walk's listing names what is no longer there.
+    // Every other object's files go: the walk's listing names what is no longer there. The first
+    // object's manifest stays under its keyed name, and the domain's key record with it.
+    let kept = store.manifest_file(sealed[0].domain, sealed[0].root);
     for entry in fs::read_dir(&objects).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if !name.starts_with(&sealed[0].root.to_string()) && !name.ends_with(".chunk") {
+        if path != kept && !name.ends_with(".chunk") && name != crate::store::sealing::DOMAIN_KEY {
             fs::remove_file(&path).unwrap();
         }
     }

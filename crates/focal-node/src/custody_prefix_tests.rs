@@ -153,7 +153,12 @@ fn fixture(path: &std::path::Path) -> (Session, ContentStore, ContentRef) {
             .unwrap(),
         Submission::Committed(_)
     ));
-    let mut store = ContentStore::open(path.join("content"), limits()).unwrap();
+    let mut store = ContentStore::open(
+        path.join("content"),
+        limits(),
+        &focal_seal::test_keys_beside(path.join("content")).unwrap(),
+    )
+    .unwrap();
     let upload = UploadId([7; 16]);
     store
         .begin(
@@ -189,17 +194,17 @@ fn finish(
     }
     panic!("bounded fixture verification did not finish");
 }
+/// Where the node's store keeps the chunk of `bytes`: sealed, its name is keyed and found through
+/// the data directory's keys (29 §11).
 fn chunk_path(path: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
-    let domain: String = ledger()
-        .tenant
-        .0
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    path.join("content/objects").join(domain).join(format!(
-        "{}.chunk",
-        ContentHash(*blake3::hash(bytes).as_bytes())
-    ))
+    focal_evidence::ContentReader::open(path.join("content"), focal_seal::test_keys(path).unwrap())
+        .unwrap()
+        .chunk_file(
+            focal_model::ContentDomainId(ledger().tenant.0),
+            ContentHash(*blake3::hash(bytes).as_bytes()),
+        )
+        .unwrap()
+        .unwrap()
 }
 
 #[test]
@@ -247,7 +252,12 @@ fn exact_checkpoint_and_all_artifacts_survive_advance_compaction_and_content_reo
         drop(host);
         assert_eq!(budget.stats().used, 0);
         drop(session);
-        let reopened = ContentStore::open(dir.path().join("content"), limits()).unwrap();
+        let reopened = ContentStore::open(
+            dir.path().join("content"),
+            limits(),
+            &focal_seal::test_keys_beside(dir.path().join("content")).unwrap(),
+        )
+        .unwrap();
         let durable_checkpoint = reopened
             .read_custody_record(
                 CustodyRecordKind::Checkpoint,

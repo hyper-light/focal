@@ -48,6 +48,7 @@ fn content(path: &Path) -> ContentStore {
             chunk_bytes: TRANSFER_CHUNK_BYTES,
             max_manifest_bytes: 64 * 1024,
         },
+        &focal_seal::test_keys(path).unwrap(),
     )
     .unwrap()
 }

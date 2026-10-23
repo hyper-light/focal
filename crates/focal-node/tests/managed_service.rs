@@ -147,7 +147,7 @@ fn one_handler_routes_live_installations_without_management_round_trips_and_pres
                     max_uploads: 8,
                     chunk_bytes: 4096,
                     max_manifest_bytes: 65536,
-                },
+                }, &focal_seal::test_keys_beside(data.path().join("content")).unwrap(),
             )
             .unwrap(),
             CustodyConfig::new(1),

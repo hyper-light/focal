@@ -80,9 +80,12 @@ impl ContentStore {
         encoded: usize,
     ) -> Result<TransferManifest, ContentError> {
         self.check()?;
-        let encoded = read_bounded(
-            &manifest_path(&self.root, reference),
-            encoded.min(MAX_TRANSFER_MANIFEST_BYTES),
+        let encoded = manifest_plain(
+            &self.root,
+            &self.keys,
+            reference.domain,
+            reference.root,
+            encoded,
         )?;
         self.prepare_import(reference.clone(), encoded)
     }
@@ -151,17 +154,17 @@ impl ContentStore {
         if chunk.length as usize > MAX_TRANSFER_CHUNK_BYTES {
             return Err(ContentError::Capacity);
         }
-        let path = self
-            .root
-            .join("objects")
-            .join(hex(&transfer.reference.domain.0))
-            .join(format!("{}.chunk", chunk.hash));
-        let bytes = read_bounded(&path, chunk.length as usize)?;
-        if bytes.len() != chunk.length as usize
-            || ContentHash(*blake3::hash(&bytes).as_bytes()) != chunk.hash
-        {
-            return Err(ContentError::Corrupt);
-        }
+        let domain = transfer.reference.domain;
+        let directory = domain_directory(&self.root, domain);
+        let key = self.keys.domain(&directory, domain, false)?;
+        let mut bytes = zeroed_buffer(chunk.length as usize)?;
+        verify_chunk_into(
+            &directory,
+            &key,
+            chunk.hash,
+            chunk.length as usize,
+            &mut bytes,
+        )?;
         Ok(bytes)
     }
 
@@ -190,28 +193,41 @@ impl ContentStore {
             {
                 return Err(ContentError::Corrupt);
             }
-            let directory = self
-                .root
-                .join("objects")
-                .join(hex(&transfer.reference.domain.0));
-            let path = directory.join(format!("{}.chunk", chunk.hash));
+            let domain = transfer.reference.domain;
+            let directory = domain_directory(&self.root, domain);
+            let key = self.keys.domain(&directory, domain, false)?;
             // A verified duplicate — an exact retry, or a resumed transfer's
-            // chunk already held — adds no byte to the volume: it needs no
-            // promise and lowers no estimate (the audit's F59).
-            if already_installed(&path, bytes, Some(chunk.hash))? {
+            // chunk already held, in either form — adds no byte to the volume:
+            // it needs no promise and lowers no estimate (the audit's F59).
+            if already_held(
+                &key,
+                &directory,
+                chunk.hash,
+                sealing::Kind::Chunk,
+                bytes.len(),
+            )? {
                 return Ok(());
             }
             // Custody transfers are fleet work: they draw on the completion
-            // lane so a tenant's uploads cannot starve replication.
+            // lane so a tenant's uploads cannot starve replication. The chunk
+            // is promised its file's bytes as the writer installs it, and the
+            // domain its key record where the writer seals and it has none
+            // yet (29 §11).
             let copy = disk_reserve(
                 &self.disk,
                 &self.root,
                 DiskKind::Content,
                 focal_memory::BudgetLane::Completion,
-                u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
+                key.file_bytes(bytes.len())?
+                    .checked_add(key.record_bytes())
+                    .ok_or(ContentError::Capacity)?,
             )?;
             durable_directory(&directory)?;
-            atomic_install(&path, bytes)?;
+            let key = self.keys.writable(&directory, domain, key)?;
+            key.install(
+                &key.path(&directory, chunk.hash, sealing::Kind::Chunk)?,
+                bytes,
+            )?;
             copy.commit();
             Ok(())
         })();
@@ -233,12 +249,13 @@ impl ContentStore {
             .chunks
             .get(index)
             .ok_or(ContentError::Invalid)?;
-        let path = self
-            .root
-            .join("objects")
-            .join(hex(&transfer.reference.domain.0))
-            .join(format!("{}.chunk", chunk.hash));
-        Ok(path.try_exists()?)
+        let domain = transfer.reference.domain;
+        let directory = domain_directory(&self.root, domain);
+        self.keys.domain(&directory, domain, false)?.exists(
+            &directory,
+            chunk.hash,
+            sealing::Kind::Chunk,
+        )
     }
     /// How much of chunk `index` is staged in parts: the offset the next
     /// part is taken at. Zero where none is, or the chunk is installed.
@@ -298,12 +315,11 @@ impl ContentStore {
             {
                 return Err(ContentError::Invalid);
             }
-            let directory = self
-                .root
-                .join("objects")
-                .join(hex(&transfer.reference.domain.0));
-            let installed = directory.join(format!("{}.chunk", chunk.hash));
-            if installed.exists() && self.read_transfer_chunk(transfer, index).is_ok() {
+            let domain = transfer.reference.domain;
+            let directory = domain_directory(&self.root, domain);
+            if self.chunk_installed(transfer, index)?
+                && self.read_transfer_chunk(transfer, index).is_ok()
+            {
                 // Held whole already (F59): the part adds nothing.
                 return Ok(length);
             }
@@ -351,7 +367,26 @@ impl ContentStore {
                 sync_directory(&directory)?;
                 return Err(ContentError::Corrupt);
             }
-            focal_platform::fs::atomic_replace(&path, &installed)?;
+            // Installed in its place as the writer installs, sealed under its domain's key from the
+            // fence on (29 §11), promised its file's bytes and the domain its key record where the
+            // writer seals and it has none yet; the staged part then goes.
+            let key = self.keys.domain(&directory, domain, false)?;
+            let installed = disk_reserve(
+                &self.disk,
+                &self.root,
+                DiskKind::Content,
+                focal_memory::BudgetLane::Completion,
+                key.file_bytes(held.len())?
+                    .checked_add(key.record_bytes())
+                    .ok_or(ContentError::Capacity)?,
+            )?;
+            let key = self.keys.writable(&directory, domain, key)?;
+            key.install(
+                &key.path(&directory, chunk.hash, sealing::Kind::Chunk)?,
+                &held,
+            )?;
+            installed.commit();
+            std::fs::remove_file(&path)?;
             sync_directory(&directory)?;
             Ok(length)
         })();
@@ -469,23 +504,32 @@ impl ContentStore {
         if completion.root != transfer.reference.root {
             return Err(ContentError::Invalid);
         }
-        let directory = self
-            .root
-            .join("objects")
-            .join(hex(&transfer.reference.domain.0));
+        let domain = transfer.reference.domain;
+        let directory = domain_directory(&self.root, domain);
+        // A domain this store holds nothing of holds none of the transfer's chunks.
+        let key = self.keys.domain(&directory, domain, false)?;
+        if key.holds_nothing() {
+            return Err(ContentError::Incomplete {
+                received: completion.received,
+                expected: transfer.reference.length,
+            });
+        }
         if let Some(chunk) = transfer.manifest.chunks.get(completion.next) {
-            let bytes =
-                match verify_chunk_into(&directory, chunk.hash, chunk.length as usize, scratch) {
-                    Err(ContentError::Io(error))
-                        if error.kind() == std::io::ErrorKind::NotFound =>
-                    {
-                        return Err(ContentError::Incomplete {
-                            received: completion.received,
-                            expected: transfer.reference.length,
-                        });
-                    }
-                    result => result?,
-                };
+            let bytes = match verify_chunk_into(
+                &directory,
+                &key,
+                chunk.hash,
+                chunk.length as usize,
+                scratch,
+            ) {
+                Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(ContentError::Incomplete {
+                        received: completion.received,
+                        expected: transfer.reference.length,
+                    });
+                }
+                result => result?,
+            };
             completion.whole.update(bytes);
             completion.received = completion
                 .received
@@ -500,10 +544,15 @@ impl ContentStore {
         if ContentHash(*completion.whole.finalize().as_bytes()) != transfer.manifest.stream_digest {
             return Err(ContentError::Corrupt);
         }
-        let path = directory.join(format!("{}.manifest", transfer.reference.root));
-        // A repeated completion finds its manifest installed: no promise,
-        // no byte.
-        if already_installed(&path, &transfer.encoded, Some(transfer.reference.root))? {
+        // A repeated completion finds its manifest installed, in either form:
+        // no promise, no byte.
+        if already_held(
+            &key,
+            &directory,
+            transfer.reference.root,
+            sealing::Kind::Manifest,
+            transfer.encoded.len(),
+        )? {
             return Ok(Some(transfer.reference.clone()));
         }
         let manifest = disk_reserve(
@@ -511,10 +560,16 @@ impl ContentStore {
             &self.root,
             DiskKind::Content,
             focal_memory::BudgetLane::Completion,
-            u64::try_from(transfer.encoded.len()).map_err(|_| ContentError::Capacity)?,
+            key.file_bytes(transfer.encoded.len())?
+                .checked_add(key.record_bytes())
+                .ok_or(ContentError::Capacity)?,
         )?;
         durable_directory(&directory)?;
-        atomic_install(&path, &transfer.encoded)?;
+        let key = self.keys.writable(&directory, domain, key)?;
+        key.install(
+            &key.path(&directory, transfer.reference.root, sealing::Kind::Manifest)?,
+            &transfer.encoded,
+        )?;
         manifest.commit();
         Ok(Some(transfer.reference.clone()))
     }
@@ -534,11 +589,13 @@ impl ContentStore {
             .chunks
             .get(index)
             .ok_or(ContentError::Invalid)?;
-        let directory = self
-            .root
-            .join("objects")
-            .join(hex(&transfer.reference.domain.0));
-        match verify_chunk_into(&directory, chunk.hash, chunk.length as usize, scratch) {
+        let domain = transfer.reference.domain;
+        let directory = domain_directory(&self.root, domain);
+        let key = self.keys.domain(&directory, domain, false)?;
+        if key.holds_nothing() {
+            return Ok(false);
+        }
+        match verify_chunk_into(&directory, &key, chunk.hash, chunk.length as usize, scratch) {
             Ok(_) => Ok(true),
             Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(false)
@@ -579,12 +636,13 @@ impl ContentReader {
         domain: ContentDomainId,
         root: ContentHash,
     ) -> Result<TransferManifest, ContentError> {
-        let path = self
-            .root
-            .join("objects")
-            .join(hex(&domain.0))
-            .join(format!("{root}.manifest"));
-        let encoded = read_bounded(&path, MAX_TRANSFER_MANIFEST_BYTES)?;
+        let encoded = manifest_plain(
+            &self.root,
+            &self.keys(),
+            domain,
+            root,
+            MAX_TRANSFER_MANIFEST_BYTES,
+        )?;
         describe_encoded(domain, root, encoded)
     }
     /// One authenticated chunk of an object described by `describe_object`.
@@ -601,17 +659,17 @@ impl ContentReader {
         if chunk.length as usize > MAX_TRANSFER_CHUNK_BYTES {
             return Err(ContentError::Capacity);
         }
-        let path = self
-            .root
-            .join("objects")
-            .join(hex(&transfer.reference.domain.0))
-            .join(format!("{}.chunk", chunk.hash));
-        let bytes = read_bounded(&path, chunk.length as usize)?;
-        if bytes.len() != chunk.length as usize
-            || ContentHash(*blake3::hash(&bytes).as_bytes()) != chunk.hash
-        {
-            return Err(ContentError::Corrupt);
-        }
+        let domain = transfer.reference.domain;
+        let directory = domain_directory(&self.root, domain);
+        let key = self.keys().domain(&directory, domain, false)?;
+        let mut bytes = zeroed_buffer(chunk.length as usize)?;
+        verify_chunk_into(
+            &directory,
+            &key,
+            chunk.hash,
+            chunk.length as usize,
+            &mut bytes,
+        )?;
         Ok(bytes)
     }
 }
@@ -671,7 +729,12 @@ mod tests {
     #[test]
     fn truncated_manifest_count_is_rejected_before_chunk_allocation() {
         let root = tempfile::tempdir().unwrap();
-        let store = ContentStore::open(root.path(), limits(4)).unwrap();
+        let store = ContentStore::open(
+            root.path(),
+            limits(4),
+            &crate::store::test_keys(root.path()),
+        )
+        .unwrap();
         let domain = ContentDomainId([2; 16]);
         let mut encoded = MANIFEST_MAGIC.to_vec();
         encoded.extend(
@@ -704,7 +767,12 @@ mod tests {
     fn imported_format_bounds_survive_smaller_upload_preferences_and_restart() {
         let source_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-        let mut source_store = ContentStore::open(source_dir.path(), limits(8)).unwrap();
+        let mut source_store = ContentStore::open(
+            source_dir.path(),
+            limits(8),
+            &crate::store::test_keys(source_dir.path()),
+        )
+        .unwrap();
         let reference = source(&mut source_store);
         let exported = source_store.export_manifest(&reference).unwrap();
         let mut target_limits = limits(1);
@@ -714,7 +782,12 @@ mod tests {
         assert!(exported.encoded().len() > target_limits.max_manifest_bytes);
         assert!(exported.chunk_length(0).unwrap() > target_limits.chunk_bytes);
         {
-            let mut target = ContentStore::open(target_dir.path(), target_limits.clone()).unwrap();
+            let mut target = ContentStore::open(
+                target_dir.path(),
+                target_limits.clone(),
+                &crate::store::test_keys(target_dir.path()),
+            )
+            .unwrap();
             let imported = target
                 .prepare_import(reference.clone(), exported.encoded().to_vec())
                 .unwrap();
@@ -729,7 +802,12 @@ mod tests {
             }
             assert_eq!(target.complete_import(&imported).unwrap(), reference);
         }
-        let reopened = ContentStore::open(target_dir.path(), target_limits).unwrap();
+        let reopened = ContentStore::open(
+            target_dir.path(),
+            target_limits,
+            &crate::store::test_keys(target_dir.path()),
+        )
+        .unwrap();
         assert!(matches!(
             reopened.read_bytes(&reference, 4),
             Err(ContentError::Capacity)
@@ -751,13 +829,23 @@ mod tests {
     fn a_chunk_imported_in_parts_is_the_chunk_once_whole() {
         let source_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-        let mut source_store = ContentStore::open(source_dir.path(), limits(8)).unwrap();
+        let mut source_store = ContentStore::open(
+            source_dir.path(),
+            limits(8),
+            &crate::store::test_keys(source_dir.path()),
+        )
+        .unwrap();
         let reference = source(&mut source_store);
         let exported = source_store.export_manifest(&reference).unwrap();
         assert_eq!(exported.chunks(), 2);
         let first = source_store.read_transfer_chunk(&exported, 0).unwrap();
         let second = source_store.read_transfer_chunk(&exported, 1).unwrap();
-        let mut target = ContentStore::open(target_dir.path(), limits(8)).unwrap();
+        let mut target = ContentStore::open(
+            target_dir.path(),
+            limits(8),
+            &crate::store::test_keys(target_dir.path()),
+        )
+        .unwrap();
         let imported = target
             .prepare_import(reference.clone(), exported.encoded().to_vec())
             .unwrap();
@@ -888,7 +976,12 @@ mod tests {
             (1, &b"abcdefghijklmnopqrst"[..]),
         ] {
             let root = tempfile::tempdir().unwrap();
-            let mut store = ContentStore::open(root.path(), limits(chunk_bytes)).unwrap();
+            let mut store = ContentStore::open(
+                root.path(),
+                limits(chunk_bytes),
+                &crate::store::test_keys(root.path()),
+            )
+            .unwrap();
             let upload = UploadId([1; 16]);
             let domain = ContentDomainId([2; 16]);
             store
@@ -911,11 +1004,11 @@ mod tests {
             drop(sealing);
             let reference = store.seal(upload).unwrap();
             let encoded = store.manifest_length(&reference).unwrap();
+            // The length a holder charges is the manifest's plaintext, read from its sealed
+            // file's stated stream: what the export opens.
             assert_eq!(
-                encoded as u64,
-                fs::metadata(manifest_path(root.path(), &reference))
-                    .unwrap()
-                    .len()
+                encoded,
+                store.export_manifest(&reference).unwrap().encoded().len()
             );
             let manifest = store.export_manifest_within(&reference, encoded).unwrap();
             assert_eq!(manifest.chunks(), object.len().div_ceil(chunk_bytes));
@@ -957,11 +1050,21 @@ mod tests {
     fn interrupted_transfer_reuses_durable_chunks_and_preserves_the_original_root() {
         let source_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-        let mut sender = ContentStore::open(source_dir.path(), limits(4)).unwrap();
+        let mut sender = ContentStore::open(
+            source_dir.path(),
+            limits(4),
+            &crate::store::test_keys(source_dir.path()),
+        )
+        .unwrap();
         let reference = source(&mut sender);
         let descriptor = sender.export_manifest(&reference).unwrap();
         {
-            let mut receiver = ContentStore::open(target_dir.path(), limits(8)).unwrap();
+            let mut receiver = ContentStore::open(
+                target_dir.path(),
+                limits(8),
+                &crate::store::test_keys(target_dir.path()),
+            )
+            .unwrap();
             let imported = receiver
                 .prepare_import(reference.clone(), descriptor.encoded().to_vec())
                 .unwrap();
@@ -989,7 +1092,12 @@ mod tests {
                 .unwrap();
             assert!(receiver.verify(&reference).is_err());
         }
-        let mut receiver = ContentStore::open(target_dir.path(), limits(8)).unwrap();
+        let mut receiver = ContentStore::open(
+            target_dir.path(),
+            limits(8),
+            &crate::store::test_keys(target_dir.path()),
+        )
+        .unwrap();
         let imported = receiver
             .prepare_import(reference.clone(), descriptor.encoded().to_vec())
             .unwrap();
@@ -1001,17 +1109,32 @@ mod tests {
         assert_eq!(receiver.complete_import(&imported).unwrap(), reference);
         assert_eq!(receiver.complete_import(&imported).unwrap(), reference);
         drop(receiver);
-        let receiver = ContentStore::open(target_dir.path(), limits(8)).unwrap();
+        let receiver = ContentStore::open(
+            target_dir.path(),
+            limits(8),
+            &crate::store::test_keys(target_dir.path()),
+        )
+        .unwrap();
         assert_eq!(receiver.read_bytes(&reference, 10).unwrap(), b"abcdefghij");
     }
     #[test]
     fn invalid_manifest_chunk_and_missing_prefix_never_install_a_reference() {
         let source_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-        let mut sender = ContentStore::open(source_dir.path(), limits(4)).unwrap();
+        let mut sender = ContentStore::open(
+            source_dir.path(),
+            limits(4),
+            &crate::store::test_keys(source_dir.path()),
+        )
+        .unwrap();
         let reference = source(&mut sender);
         let descriptor = sender.export_manifest(&reference).unwrap();
-        let mut receiver = ContentStore::open(target_dir.path(), limits(8)).unwrap();
+        let mut receiver = ContentStore::open(
+            target_dir.path(),
+            limits(8),
+            &crate::store::test_keys(target_dir.path()),
+        )
+        .unwrap();
         let mut corrupted = descriptor.encoded().to_vec();
         corrupted[0] ^= 1;
         assert!(
@@ -1038,7 +1161,12 @@ mod tests {
     fn duplicate_chunk_imports_and_a_repeated_completion_charge_the_volume_once() {
         let source_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-        let mut sender = ContentStore::open(source_dir.path(), limits(4)).unwrap();
+        let mut sender = ContentStore::open(
+            source_dir.path(),
+            limits(4),
+            &crate::store::test_keys(source_dir.path()),
+        )
+        .unwrap();
         let reference = source(&mut sender);
         let descriptor = sender.export_manifest(&reference).unwrap();
         let disk = DiskBudget::new(DiskBudgetConfig {
@@ -1047,12 +1175,24 @@ mod tests {
             sample_interval: 64,
         })
         .unwrap();
-        // Exactly the payload, the manifest and four more bytes: a duplicate
-        // that charged the estimate would leave the completion without room.
-        let manifest_bytes = descriptor.encoded().len() as u64;
-        disk.observe(reference.length + manifest_bytes + 4);
-        let mut receiver =
-            ContentStore::open_with_disk(target_dir.path(), limits(8), disk.clone()).unwrap();
+        // Exactly the sealed payload, the sealed manifest, the domain's key
+        // record and four more bytes (29 §11): a duplicate that charged the
+        // estimate would leave the completion without room.
+        let sealed = |plain: usize| focal_seal::file::sealed_bound(plain).unwrap() as u64;
+        let record = hyper_seal::keys::RECORD as u64;
+        let chunks_sealed: u64 = (0..descriptor.chunks())
+            .map(|index| sealed(descriptor.chunk_length(index).unwrap()))
+            .sum();
+        let manifest_bytes = sealed(descriptor.encoded().len());
+        disk.observe(record + chunks_sealed + manifest_bytes + 4);
+        let mut receiver = ContentStore::open_with_disk(
+            target_dir.path(),
+            limits(8),
+            disk.clone(),
+            &crate::store::test_keys(target_dir.path()),
+            ContentForm::Sealed,
+        )
+        .unwrap();
         let imported = receiver
             .prepare_import(reference.clone(), descriptor.encoded().to_vec())
             .unwrap();
@@ -1060,7 +1200,7 @@ mod tests {
         let before = disk.uncommitted_free();
         receiver.import_chunk(&imported, 0, &chunk).unwrap();
         let once = disk.uncommitted_free();
-        assert_eq!(once, before - chunk.len() as u64);
+        assert_eq!(once, before - sealed(chunk.len()) - record);
         for _ in 0..4 {
             receiver.import_chunk(&imported, 0, &chunk).unwrap();
         }
@@ -1073,10 +1213,10 @@ mod tests {
             let bytes = sender.read_transfer_chunk(&descriptor, index).unwrap();
             receiver.import_chunk(&imported, index, &bytes).unwrap();
         }
-        assert_eq!(disk.uncommitted_free(), before - reference.length);
+        assert_eq!(disk.uncommitted_free(), before - record - chunks_sealed);
         assert_eq!(receiver.complete_import(&imported).unwrap(), reference);
         let completed = disk.uncommitted_free();
-        assert_eq!(completed, before - reference.length - manifest_bytes);
+        assert_eq!(completed, before - record - chunks_sealed - manifest_bytes);
         assert_eq!(receiver.complete_import(&imported).unwrap(), reference);
         assert_eq!(
             disk.uncommitted_free(),

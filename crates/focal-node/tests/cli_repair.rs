@@ -238,6 +238,14 @@ fn repair(root: &Path, tenant: &str, ledger: &str) -> Value {
     assert_eq!(report["result"]["kind"], "repaired", "{report}");
     report["result"]["repair"].clone()
 }
+/// The plaintext of the node's stored chunk at `path`, opened through the node's keys: each node
+/// seals what it holds under its own (29 §11), so copies are compared by what they open to.
+fn plaintext(root: &Path, path: &Path) -> Vec<u8> {
+    focal_evidence::ContentReader::open(root.join("content"), focal_seal::test_keys(root).unwrap())
+        .unwrap()
+        .plaintext(path)
+        .unwrap()
+}
 fn chunk_files(root: &Path, tenant: &str) -> Vec<PathBuf> {
     let directory = root.join("content").join("objects").join(tenant);
     let mut files: Vec<PathBuf> = std::fs::read_dir(&directory)
@@ -329,7 +337,8 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
     ));
     let founder_chunks = chunk_files(founder, &tenant);
     assert_eq!(founder_chunks.len(), 1, "{founder_chunks:?}");
-    let original = std::fs::read(&founder_chunks[0]).unwrap();
+    let original = plaintext(founder, &founder_chunks[0]);
+    let original_file = std::fs::read(&founder_chunks[0]).unwrap();
     // Alone, the founder verifies its one object; nothing to push.
     let report = wait_for_report(founder, &tenant, &ledger, |report| report["objects"] == 1);
     assert_eq!(report["verified"], 1, "{report}");
@@ -410,15 +419,15 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
     assert_eq!(report["repaired"], 1, "{report}");
     assert_eq!(report["verified"], 0);
     assert_eq!(report["unrecoverable_count"], 0);
-    assert_eq!(std::fs::read(&chunk_b).unwrap(), original);
+    assert_eq!(plaintext(host_b, &chunk_b), original);
     // A copy that holds the chunk corrupt receives verified bytes over it.
     let chunk_a = chunk_files(host_a, &tenant).remove(0);
-    let mut tampered = original.clone();
+    let mut tampered = std::fs::read(&chunk_a).unwrap();
     tampered[0] ^= 0xff;
     std::fs::write(&chunk_a, &tampered).unwrap();
     let report = repair(host_a, &tenant, &ledger);
     assert_eq!(report["repaired"], 1, "{report}");
-    assert_eq!(std::fs::read(&chunk_a).unwrap(), original);
+    assert_eq!(plaintext(host_a, &chunk_a), original);
     // No copy holds the object: it is reported unrecoverable, restore
     // required; nothing is manufactured.
     for root in [founder, host_a, host_b] {
@@ -439,7 +448,7 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
     // One copy recovers its bytes (an operator's restore of the file): the
     // holder gives the object back to every required copy that lost it;
     // the voter that owes no custody recopies it through its own repair.
-    std::fs::write(&founder_chunks[0], &original).unwrap();
+    std::fs::write(&founder_chunks[0], &original_file).unwrap();
     let report = repair(founder, &tenant, &ledger);
     assert_eq!(report["verified"], 1, "{report}");
     assert_eq!(report["pushed"], other_copies as u64, "{report}");
@@ -448,7 +457,7 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
         if copies.contains(&id) {
             let files = chunk_files(host, &tenant);
             assert_eq!(files.len(), 1, "{files:?}");
-            assert_eq!(std::fs::read(&files[0]).unwrap(), original);
+            assert_eq!(plaintext(host, &files[0]), original);
             let report = repair(host, &tenant, &ledger);
             assert_eq!(report["verified"], 1, "{report}");
         } else {
@@ -457,7 +466,7 @@ fn repair_recopies_lost_or_corrupt_objects_completes_peers_and_reports_the_unrec
             assert_eq!(report["repaired"], 1, "{report}");
             let files = chunk_files(host, &tenant);
             assert_eq!(files.len(), 1, "{files:?}");
-            assert_eq!(std::fs::read(&files[0]).unwrap(), original);
+            assert_eq!(plaintext(host, &files[0]), original);
         }
     }
     // A bounded walk resumes where it stopped.

@@ -39,6 +39,7 @@ fn open_store(dir: &std::path::Path) -> ContentStore {
             chunk_bytes: CHUNK,
             max_manifest_bytes: 1 << 20,
         },
+        &focal_seal::test_keys_beside(dir.join("content")).unwrap(),
     )
     .unwrap()
 }

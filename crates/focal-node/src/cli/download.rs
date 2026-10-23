@@ -233,6 +233,7 @@ mod tests {
                 chunk_bytes: 4096,
                 max_manifest_bytes: 4096,
             },
+            &focal_seal::test_keys(path).unwrap(),
         )
         .unwrap();
         let id = UploadId([4; 16]);

@@ -128,7 +128,12 @@ impl Fixture {
     fn with_bytes(bytes: &[u8]) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let budget = MemoryBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
-        let mut store = ContentStore::open(directory.path(), store_limits()).unwrap();
+        let mut store = ContentStore::open(
+            directory.path(),
+            store_limits(),
+            &focal_seal::test_keys(directory.path()).unwrap(),
+        )
+        .unwrap();
         let id = UploadId(upload_scope(&actor(), ledger(), [7; 16]));
         store
             .begin(
@@ -554,7 +559,12 @@ fn required_new_copies_apply_to_existing_content_and_restart_retains_bytes() {
         fixture.owner.join().unwrap();
         assert_eq!(fixture.budget.stats().used, 0);
         let (reopened, owner) = ContentHost::spawn(
-            ContentStore::open(fixture.directory.path(), store_limits()).unwrap(),
+            ContentStore::open(
+                fixture.directory.path(),
+                store_limits(),
+                &focal_seal::test_keys(fixture.directory.path()).unwrap(),
+            )
+            .unwrap(),
             CustodyConfig::new(1),
             WireLimits::default(),
             fixture.budget.clone(),
@@ -1234,7 +1244,12 @@ fn replication_records_a_receipt_per_verified_copy_and_the_obligation_reads_them
         fixture.host.stop().await.unwrap();
         fixture.owner.join().unwrap();
         assert_eq!(fixture.budget.stats().used, 0);
-        let reopened = ContentStore::open(fixture.directory.path(), store_limits()).unwrap();
+        let reopened = ContentStore::open(
+            fixture.directory.path(),
+            store_limits(),
+            &focal_seal::test_keys(fixture.directory.path()).unwrap(),
+        )
+        .unwrap();
         let kept = reopened
             .custody_receipt(ledger(), root, 1)
             .unwrap()

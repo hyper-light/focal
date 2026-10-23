@@ -390,6 +390,7 @@ impl Fleet {
                             chunk_bytes: 4096,
                             max_manifest_bytes: 1 << 20,
                         },
+                        &focal_seal::test_keys_beside(&content_dir).unwrap(),
                     )
                     .unwrap();
                     drop(store);
@@ -402,7 +403,11 @@ impl Fleet {
                             limits: focal_ledger::NativeSessionLimits::standard(ContentDomainId(
                                 ledger().tenant.0,
                             )),
-                            reader: focal_evidence::ContentReader::open(&content_dir).unwrap(),
+                            reader: focal_evidence::ContentReader::open(
+                                &content_dir,
+                                focal_seal::test_keys_beside(&content_dir).unwrap(),
+                            )
+                            .unwrap(),
                             seeds: focal_evidence::SeedStore::open(
                                 content_dir.join("seeds"),
                                 focal_memory::DiskBudget::new(

@@ -13,10 +13,26 @@ focal-model = { version = "0.1.0", path = "../focal-model" }
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
 blake3.workspace = true
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
+# Sealing at rest (29 §11): the node's content key and its whole-file segment (focal-seal), every
+# object file sealed by its content and named by a keyed hash (hyper-seal), written and read
+# through a buffered device file (hyper-block).
+focal-seal = { version = "0.1.0", path = "../focal-seal" }
+hyper-seal = { workspace = true, features = ["files"] }
+hyper-block.workspace = true
 postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[features]
+# What a dependent's tests name a stored object's files by (`ContentReader::manifest_file`,
+# `ContentReader::chunk_file`): sealed, a file's name says nothing a test could find it by.
+test-support = []
+
+[[bench]]
+name = "content"
+harness = false
+
 [dev-dependencies]
 tempfile.workspace = true
+focal-seal = { version = "0.1.0", path = "../focal-seal", features = ["test-support"] }

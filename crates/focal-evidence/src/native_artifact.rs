@@ -552,25 +552,30 @@ impl ContentStore {
         )?;
         // All deterministic limits and buffer allocations precede disk writes;
         // the committed record's payload is completion work on the volume.
+        // Every file as the writer installs it, sealed from the fence on (29 §11): the chunks' and
+        // the manifest's bytes on the volume, and the domain's key record where the writer seals
+        // and the domain has none yet.
+        let directory = domain_directory(&self.root, domain);
+        let key = self.keys.domain(&directory, domain, false)?;
         let objects = disk_reserve(
             &self.disk,
             &self.root,
             DiskKind::Content,
             focal_memory::BudgetLane::Completion,
-            length
-                .checked_add(u64::try_from(encoded.len()).map_err(|_| ContentError::Capacity)?)
+            chunk_files_bound(&key, length, chunk_bytes)?
+                .checked_add(key.file_bytes(encoded.len())?)
+                .and_then(|bytes| bytes.checked_add(key.record_bytes()))
                 .ok_or(ContentError::Capacity)?,
         )?;
-        let directory = self.root.join("objects").join(hex(&domain.0));
         durable_directory(&directory)?;
+        let key = self.keys.writable(&directory, domain, key)?;
         for (block, chunk) in bytes.chunks(chunk_bytes).zip(&manifest.chunks) {
-            install_verified_chunk(
-                &directory.join(format!("{}.chunk", chunk.hash)),
-                block,
-                chunk.hash,
-            )?;
+            install_chunk(&key, &directory, block, chunk.hash)?;
         }
-        atomic_install(&directory.join(format!("{root}.manifest")), &encoded)?;
+        key.install(
+            &key.path(&directory, root, sealing::Kind::Manifest)?,
+            &encoded,
+        )?;
         objects.commit();
         Ok(ContentRef {
             domain,

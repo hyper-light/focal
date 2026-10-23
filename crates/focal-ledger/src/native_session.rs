@@ -860,7 +860,8 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
             consensus.begin_decoder_floor(decoder())?;
             consensus.finish_decoder_floor()?;
         }
-        let reader = ContentReader::open(store.root())
+        let reader = store
+            .reader()
             .map_err(|error| NativeSessionError::Native(NativeEvidenceError::from(error).into()))?;
         let seeds = SeedStore::open(store.root().join("seeds"), consensus.disk_budget())
             .map_err(|error| NativeSessionError::Native(NativeEvidenceError::from(error).into()))?;

@@ -47,6 +47,9 @@ struct ContentDoor {
 #[derive(Clone)]
 pub struct ContentHost {
     sender: mpsc::SyncSender<Work>,
+    /// A lock-free reader of the store the owner holds, under the same data directory's keys
+    /// (29 §11): what a backup's export reads the store's objects through.
+    reader: focal_evidence::ContentReader,
     door: Arc<ContentDoor>,
     budget: MemoryBudget,
     timeout: Duration,
@@ -200,6 +203,7 @@ impl ContentHost {
         budget: MemoryBudget,
     ) -> Result<(Self, ContentOwner), AccessError> {
         limits.validate()?;
+        let reader = store.reader().map_err(|_| AccessError::Unavailable)?;
         let queue_items = 32usize;
         let queue_charge = budget
             .reserve(
@@ -242,6 +246,8 @@ impl ContentHost {
                 let mut scratch = scratch;
                 let mut owner = owner;
                 let mut next_expiry = Instant::now();
+                // A conversion step the volume had no room for waits for the next tick.
+                let mut held = false;
                 loop {
                     let now = Instant::now();
                     if now >= next_expiry {
@@ -249,10 +255,18 @@ impl ContentHost {
                         next_expiry = now
                             .checked_add(Duration::from_millis(250))
                             .ok_or(AccessError::Unavailable)?;
+                        held = false;
                     }
-                    match receiver
-                        .recv_timeout(next_expiry.saturating_duration_since(Instant::now()))
-                    {
+                    // While the store converts its files in the clear (29 §11), the owner
+                    // converts one whenever no call waits, and waits for calls only once it is
+                    // done or held.
+                    let converting = !held && owner.content().converting();
+                    let wait = if converting {
+                        Duration::ZERO
+                    } else {
+                        next_expiry.saturating_duration_since(Instant::now())
+                    };
+                    match receiver.recv_timeout(wait) {
                         Ok(work) => {
                             // A place in the queue is free: the oldest call held takes it.
                             taking.door.wake_one();
@@ -273,6 +287,24 @@ impl ContentHost {
                                 return Ok(());
                             }
                         }
+                        Err(mpsc::RecvTimeoutError::Timeout) if converting => {
+                            match owner
+                                .content_mut()
+                                .convert_step(&mut scratch, crate::gc::PAGE)
+                            {
+                                Ok(focal_evidence::Conversion::Held) => held = true,
+                                Ok(_) => {}
+                                // The conversion ends for this run; the store reads either form
+                                // and its next open resumes it.
+                                Err(error) => {
+                                    use std::io::Write as _;
+                                    let _ = writeln!(
+                                        std::io::stderr().lock(),
+                                        "focal: the content store's conversion stopped: {error}"
+                                    );
+                                }
+                            }
+                        }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                     }
@@ -284,6 +316,7 @@ impl ContentHost {
         Ok((
             Self {
                 sender,
+                reader,
                 door,
                 budget,
                 timeout,
@@ -393,6 +426,10 @@ impl ContentHost {
             })
             .map_err(|_| AccessError::Capacity)?;
         Ok(release)
+    }
+    /// A reader of the store the owner holds.
+    pub fn reader(&self) -> focal_evidence::ContentReader {
+        self.reader.clone()
     }
     /// The calls held while the owner's queue was full, and those whose time ran out held
     /// ([`ContentDoor`]).

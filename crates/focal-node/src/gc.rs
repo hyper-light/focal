@@ -30,8 +30,9 @@ pub const QUARANTINE_ENV: &str = "FOCAL_GC_QUARANTINE_MS";
 /// Milliseconds a finished upload's identity stays fenced.
 pub const TERMINAL_ENV: &str = "FOCAL_GC_TERMINAL_MS";
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
-/// Rows one root page visits, and file visits one collector step takes.
-const PAGE: usize = 4096;
+/// Rows one root page visits, and file visits one collector step takes (and one step of the
+/// content store's conversion, `ContentStore::convert_step`).
+pub(crate) const PAGE: usize = 4096;
 /// Collector steps one pass runs before it yields to the next tick.
 const MAX_STEPS: usize = 256;
 /// Bundles whose content roots are remembered between passes.

@@ -1727,14 +1727,17 @@ impl PlacementAgent {
         let hosting = crate::network_service::native_hosting(
             &self.root,
             &identity,
+            focal_evidence::ContentReader::open(self.root.join("content"), self.keys.clone())?,
             self.storage.disk_budget(),
             &limits,
-            crate::storage_level::seal_rule(&self.root)
-                .map_err(|error| AgentError::Level(Box::new(error)))?,
-            crate::storage_level::retire_rule(&self.root)
-                .map_err(|error| AgentError::Level(Box::new(error)))?,
-            crate::storage_level::native_share(&self.root)
-                .map_err(|error| AgentError::Level(Box::new(error)))?,
+            crate::storage_level::Rules {
+                seal: crate::storage_level::seal_rule(&self.root)
+                    .map_err(|error| AgentError::Level(Box::new(error)))?,
+                retire: crate::storage_level::retire_rule(&self.root)
+                    .map_err(|error| AgentError::Level(Box::new(error)))?,
+                share: crate::storage_level::native_share(&self.root)
+                    .map_err(|error| AgentError::Level(Box::new(error)))?,
+            },
         )?;
         let session = Session::from_node_in_hosted(ledger, consensus, limits, tenant, hosting)?;
         // A reopened copy serves the route its log has committed; a fresh copy
@@ -2678,6 +2681,7 @@ impl PlacementAgent {
         let input = request.input.clone();
         let manifest_for_rewrite = manifest.clone();
         let work = tenant.clone();
+        let keys = self.keys.clone();
         let (rewritten, seeds_installed) = focal_rt::on_pool(&focal_rt::WORK, move || {
             use focal_ledger::backup::{
                 BackupContent, BackupMedium as _, BackupSeeds, FileMedium, Incarnation,
@@ -2706,7 +2710,7 @@ impl PlacementAgent {
                 .map_err(focal_ledger::backup::BackupError::Io)?;
             // Recovery reads every live artifact's object: the node's own
             // store holds them now, imported above.
-            let reader = focal_evidence::ContentReader::open(content_root)?;
+            let reader = focal_evidence::ContentReader::open(content_root, keys)?;
             let _ = BackupContent::new(&FileMedium, &input);
             let rewritten = focal_ledger::backup::rewrite(
                 &checkpoint,

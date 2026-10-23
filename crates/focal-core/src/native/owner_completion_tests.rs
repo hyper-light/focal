@@ -157,6 +157,7 @@ impl Store {
                 chunk_bytes: 17,
                 max_manifest_bytes: 128 * 1024,
             },
+            &focal_seal::test_keys(directory.path()).unwrap(),
         )
         .unwrap();
         Self {

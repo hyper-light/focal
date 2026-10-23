@@ -89,7 +89,12 @@ fn custody(ledger: LedgerId, id: u128, operation: CustodyRequest) -> VerifiedReq
 fn session_transfer_namespaces_policy_fences_and_expiry_share_one_budget() {
     let source = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
-    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+    let mut sender = ContentStore::open(
+        source.path(),
+        limits(),
+        &focal_seal::test_keys(source.path()).unwrap(),
+    )
+    .unwrap();
     let a = stored(&mut sender, 1, 1, b"abcdefgh");
     let b = stored(&mut sender, 2, 2, b"QRSTUVWX");
     let ma = sender.export_manifest(&a).unwrap();
@@ -99,7 +104,12 @@ fn session_transfer_namespaces_policy_fences_and_expiry_share_one_budget() {
     config.max_transfers = 2;
     config.max_transfer_bytes = 16;
     let mut receiver = CustodyStore::new(
-        ContentStore::open(target.path(), limits()).unwrap(),
+        ContentStore::open(
+            target.path(),
+            limits(),
+            &focal_seal::test_keys(target.path()).unwrap(),
+        )
+        .unwrap(),
         config,
         budget.clone(),
     )
@@ -230,7 +240,12 @@ fn session_transfer_namespaces_policy_fences_and_expiry_share_one_budget() {
 #[test]
 fn an_export_is_charged_at_its_manifest_and_its_chunks_are_read_by_name() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = ContentStore::open(root.path(), limits()).unwrap();
+    let mut store = ContentStore::open(
+        root.path(),
+        limits(),
+        &focal_seal::test_keys(root.path()).unwrap(),
+    )
+    .unwrap();
     let content = stored(&mut store, 1, 1, b"abcdefgh");
     let budget = memory();
     let mut custody = CustodyStore::new(store, CustodyConfig::new(1), budget.clone()).unwrap();
@@ -254,19 +269,7 @@ fn an_export_is_charged_at_its_manifest_and_its_chunks_are_read_by_name() {
         exported.value().chunk(1).unwrap(),
     ];
     // The manifest gone, the chunks are still read by their names.
-    let domain = content
-        .domain
-        .0
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    std::fs::remove_file(
-        root.path()
-            .join("objects")
-            .join(domain)
-            .join(format!("{}.manifest", content.root)),
-    )
-    .unwrap();
+    std::fs::remove_file(stored_manifest(root.path(), &content).unwrap()).unwrap();
     let before = budget.stats().used;
     let first = custody
         .read_chunk(scope, content.clone(), names[0].0, names[0].1 as usize)
@@ -320,7 +323,12 @@ fn an_export_is_charged_at_its_manifest_and_its_chunks_are_read_by_name() {
 #[test]
 fn network_manifest_and_read_chunk_require_exact_authorized_transfer() {
     let root = tempfile::tempdir().unwrap();
-    let mut store = ContentStore::open(root.path(), limits()).unwrap();
+    let mut store = ContentStore::open(
+        root.path(),
+        limits(),
+        &focal_seal::test_keys(root.path()).unwrap(),
+    )
+    .unwrap();
     let content = stored(&mut store, 1, 1, b"abcdefgh");
     let budget = memory();
     let mut owner = CustodyStore::new(store, CustodyConfig::new(1), budget.clone()).unwrap();
@@ -430,7 +438,12 @@ fn download_upper_bound_returns_store_sized_pages_with_exact_eof() {
             chunk_bytes: 4 * 1024,
             ..limits()
         };
-        let mut store = ContentStore::open(root.path(), store_limits).unwrap();
+        let mut store = ContentStore::open(
+            root.path(),
+            store_limits,
+            &focal_seal::test_keys(root.path()).unwrap(),
+        )
+        .unwrap();
         let bytes = vec![42; 6 * 1024];
         let upload = UploadId([1; 16]);
         store
@@ -495,7 +508,12 @@ fn one_actor_hosts_multiple_ledgers_and_external_seal_never_attests_custody() {
         let root = tempfile::tempdir().unwrap();
         let budget = memory();
         let (host, owner) = ContentHost::spawn(
-            ContentStore::open(root.path(), limits()).unwrap(),
+            ContentStore::open(
+                root.path(),
+                limits(),
+                &focal_seal::test_keys(root.path()).unwrap(),
+            )
+            .unwrap(),
             CustodyConfig::new(1),
             WireLimits::default(),
             budget.clone(),
@@ -650,7 +668,12 @@ fn one_actor_hosts_multiple_ledgers_and_external_seal_never_attests_custody() {
         // The one writer lock is released at shutdown; exact scoped upload seals
         // and immutable content survive actual disk reopen under a fresh actor.
         let (recovered, owner) = ContentHost::spawn(
-            ContentStore::open(root.path(), limits()).unwrap(),
+            ContentStore::open(
+                root.path(),
+                limits(),
+                &focal_seal::test_keys(root.path()).unwrap(),
+            )
+            .unwrap(),
             CustodyConfig::new(1),
             WireLimits::default(),
             budget.clone(),
@@ -693,7 +716,12 @@ fn policy_capacity_and_memory_rejection_leave_all_installed_facts_unchanged() {
     let mut config = CustodyConfig::new(1);
     config.max_policies = 1;
     let mut owner = CustodyStore::new(
-        ContentStore::open(root.path(), limits()).unwrap(),
+        ContentStore::open(
+            root.path(),
+            limits(),
+            &focal_seal::test_keys(root.path()).unwrap(),
+        )
+        .unwrap(),
         config,
         budget.clone(),
     )
@@ -760,7 +788,12 @@ fn policy_update_off_a_shard_rejects_before_enqueue_and_releases_reservation() {
     let root = tempfile::tempdir().unwrap();
     let budget = memory();
     let (host, owner) = ContentHost::spawn(
-        ContentStore::open(root.path(), limits()).unwrap(),
+        ContentStore::open(
+            root.path(),
+            limits(),
+            &focal_seal::test_keys(root.path()).unwrap(),
+        )
+        .unwrap(),
         CustodyConfig::new(1),
         WireLimits::default(),
         budget.clone(),
@@ -785,7 +818,12 @@ fn missing_runtime_rejects_before_enqueue_and_dropping_handles_stops_the_owner()
     let root = tempfile::tempdir().unwrap();
     let budget = memory();
     let (host, owner) = ContentHost::spawn(
-        ContentStore::open(root.path(), limits()).unwrap(),
+        ContentStore::open(
+            root.path(),
+            limits(),
+            &focal_seal::test_keys(root.path()).unwrap(),
+        )
+        .unwrap(),
         CustodyConfig::new(1),
         WireLimits::default(),
         budget.clone(),
@@ -811,14 +849,24 @@ fn abandoned_transfer_expires_without_another_network_request() {
     focal_rt::block_on(async move {
         let source = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
-        let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+        let mut sender = ContentStore::open(
+            source.path(),
+            limits(),
+            &focal_seal::test_keys(source.path()).unwrap(),
+        )
+        .unwrap();
         let content = stored(&mut sender, 1, 1, b"abcdefgh");
         let manifest = sender.export_manifest(&content).unwrap();
         let budget = memory();
         let mut config = CustodyConfig::new(1);
         config.transfer_ttl = Duration::from_millis(20);
         let (host, owner) = ContentHost::spawn(
-            ContentStore::open(target.path(), limits()).unwrap(),
+            ContentStore::open(
+                target.path(),
+                limits(),
+                &focal_seal::test_keys(target.path()).unwrap(),
+            )
+            .unwrap(),
             config,
             WireLimits::default(),
             budget.clone(),
@@ -867,7 +915,12 @@ fn seed_chunks_are_served_to_installed_peers_and_announced_pending_peers_only() 
     let mut config = CustodyConfig::new(1);
     config.seed_root = Some(seed_root);
     let mut store = CustodyStore::new(
-        ContentStore::open(dir.path().join("content"), limits()).unwrap(),
+        ContentStore::open(
+            dir.path().join("content"),
+            limits(),
+            &focal_seal::test_keys_beside(dir.path().join("content")).unwrap(),
+        )
+        .unwrap(),
         config,
         memory(),
     )
@@ -988,12 +1041,22 @@ fn seed_chunks_are_served_to_installed_peers_and_announced_pending_peers_only() 
 fn an_ask_of_what_a_copy_holds_is_admitted_where_an_open_is() {
     let source = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
-    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+    let mut sender = ContentStore::open(
+        source.path(),
+        limits(),
+        &focal_seal::test_keys(source.path()).unwrap(),
+    )
+    .unwrap();
     let bytes: Vec<u8> = (1..=16).collect();
     let content = stored(&mut sender, 1, 1, &bytes);
     let manifest = sender.export_manifest(&content).unwrap();
     let mut store = CustodyStore::new(
-        ContentStore::open(target.path(), limits()).unwrap(),
+        ContentStore::open(
+            target.path(),
+            limits(),
+            &focal_seal::test_keys(target.path()).unwrap(),
+        )
+        .unwrap(),
         CustodyConfig::new(1),
         memory(),
     )
@@ -1079,14 +1142,24 @@ fn the_chunks_of_a_manifest_are_taken_in_any_order() {
         max_manifest_bytes: 16384,
         ..limits()
     };
-    let mut sender = ContentStore::open(source.path(), wide.clone()).unwrap();
+    let mut sender = ContentStore::open(
+        source.path(),
+        wide.clone(),
+        &focal_seal::test_keys(source.path()).unwrap(),
+    )
+    .unwrap();
     // 200 chunks of four bytes and one of two: more than three words of
     // bits.
     let bytes: Vec<u8> = (0..802_u32).map(|at| (at % 251) as u8).collect();
     let content = stored(&mut sender, 1, 1, &bytes);
     let manifest = sender.export_manifest(&content).unwrap();
     let mut receiver = CustodyStore::new(
-        ContentStore::open(target.path(), wide).unwrap(),
+        ContentStore::open(
+            target.path(),
+            wide,
+            &focal_seal::test_keys(target.path()).unwrap(),
+        )
+        .unwrap(),
         CustodyConfig::new(1),
         memory(),
     )
@@ -1184,13 +1257,23 @@ fn the_chunks_of_a_manifest_are_taken_in_any_order() {
 fn a_copy_tells_what_it_holds_and_a_gap_filled_seals_the_object() {
     let source = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
-    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+    let mut sender = ContentStore::open(
+        source.path(),
+        limits(),
+        &focal_seal::test_keys(source.path()).unwrap(),
+    )
+    .unwrap();
     // Four chunks of four bytes.
     let bytes: Vec<u8> = (1..=16).collect();
     let content = stored(&mut sender, 1, 1, &bytes);
     let manifest = sender.export_manifest(&content).unwrap();
     let mut receiver = CustodyStore::new(
-        ContentStore::open(target.path(), limits()).unwrap(),
+        ContentStore::open(
+            target.path(),
+            limits(),
+            &focal_seal::test_keys(target.path()).unwrap(),
+        )
+        .unwrap(),
         CustodyConfig::new(1),
         memory(),
     )
@@ -1306,22 +1389,13 @@ fn a_copy_tells_what_it_holds_and_a_gap_filled_seals_the_object() {
     );
     // A chunk file that holds other bytes under chunk 2's name is lacked;
     // the chunk sent again installs over it and the object seals.
-    let objects = target.path().join("objects");
-    let mut corrupted = 0;
-    for domain in std::fs::read_dir(&objects).unwrap() {
-        for entry in std::fs::read_dir(domain.unwrap().path()).unwrap() {
-            let path = entry.unwrap().path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "chunk")
-                && std::fs::read(&path).unwrap() == part(2)
-            {
-                std::fs::write(&path, part(0)).unwrap();
-                corrupted += 1;
-            }
-        }
-    }
-    assert_eq!(corrupted, 1);
+    let path = stored_chunk(
+        target.path(),
+        &content,
+        ContentHash(*blake3::hash(part(2)).as_bytes()),
+    )
+    .unwrap();
+    std::fs::write(&path, part(0)).unwrap();
     let fourth = [4; 16];
     assert_eq!(open_held(&mut receiver, fourth), (4, vec![0b1011]));
     assert_eq!(
@@ -1347,13 +1421,23 @@ fn a_copy_tells_what_it_holds_and_a_gap_filled_seals_the_object() {
 fn a_chunk_in_parts_renews_the_lease_and_is_the_chunk_once_whole() {
     let source = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
-    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+    let mut sender = ContentStore::open(
+        source.path(),
+        limits(),
+        &focal_seal::test_keys(source.path()).unwrap(),
+    )
+    .unwrap();
     // Three chunks of four bytes.
     let bytes: Vec<u8> = (1..=12).collect();
     let content = stored(&mut sender, 1, 1, &bytes);
     let manifest = sender.export_manifest(&content).unwrap();
     let mut receiver = CustodyStore::new(
-        ContentStore::open(target.path(), limits()).unwrap(),
+        ContentStore::open(
+            target.path(),
+            limits(),
+            &focal_seal::test_keys(target.path()).unwrap(),
+        )
+        .unwrap(),
         CustodyConfig::new(1),
         memory(),
     )
@@ -1546,7 +1630,12 @@ fn a_chunk_in_parts_renews_the_lease_and_is_the_chunk_once_whole() {
 #[test]
 fn a_chunk_is_read_in_parts_from_a_verified_whole() {
     let source = tempfile::tempdir().unwrap();
-    let mut store = ContentStore::open(source.path(), limits()).unwrap();
+    let mut store = ContentStore::open(
+        source.path(),
+        limits(),
+        &focal_seal::test_keys(source.path()).unwrap(),
+    )
+    .unwrap();
     let bytes: Vec<u8> = (1..=8).collect();
     let content = stored(&mut store, 1, 1, &bytes);
     let manifest = store.export_manifest(&content).unwrap();
@@ -1613,12 +1702,17 @@ fn imported(
     bytes: &[u8],
 ) -> (CustodyStore, LedgerId, ContentRef, MemoryBudget) {
     let source = tempfile::tempdir().unwrap();
-    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+    let mut sender = ContentStore::open(
+        source.path(),
+        limits(),
+        &focal_seal::test_keys(source.path()).unwrap(),
+    )
+    .unwrap();
     let content = stored(&mut sender, 1, 1, bytes);
     let manifest = sender.export_manifest(&content).unwrap();
     let budget = memory();
     let mut receiver = CustodyStore::new(
-        ContentStore::open(target, limits()).unwrap(),
+        ContentStore::open(target, limits(), &focal_seal::test_keys(target).unwrap()).unwrap(),
         CustodyConfig::new(1),
         budget.clone(),
     )
@@ -1653,17 +1747,26 @@ fn imported(
     (receiver, ledger, content, budget)
 }
 fn manifest_installed(root: &std::path::Path, content: &ContentRef) -> bool {
-    root.join("objects")
-        .join(
-            content
-                .domain
-                .0
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
-        )
-        .join(format!("{}.manifest", content.root))
-        .exists()
+    stored_manifest(root, content).is_some()
+}
+/// Where the store at `root` keeps `content`'s manifest, if anywhere: sealed, its name is keyed and
+/// found through the store's keys (29 §11).
+fn stored_manifest(root: &std::path::Path, content: &ContentRef) -> Option<std::path::PathBuf> {
+    focal_evidence::ContentReader::open(root, focal_seal::test_keys(root).unwrap())
+        .unwrap()
+        .manifest_file(content.domain, content.root)
+        .unwrap()
+}
+/// Where the store at `root` keeps the chunk of `content` named `hash`, if anywhere.
+fn stored_chunk(
+    root: &std::path::Path,
+    content: &ContentRef,
+    hash: ContentHash,
+) -> Option<std::path::PathBuf> {
+    focal_evidence::ContentReader::open(root, focal_seal::test_keys(root).unwrap())
+        .unwrap()
+        .chunk_file(content.domain, hash)
+        .unwrap()
 }
 
 /// A seal reads every chunk back a slice — a chunk — at a time, the store
@@ -1763,18 +1866,14 @@ fn a_seal_that_meets_a_corrupt_chunk_or_a_cancel_installs_nothing() {
     let Step::Pending(pass) = receiver.advance(pass, &mut scratch).unwrap() else {
         panic!("a pass");
     };
-    // The last chunk's file is overwritten with other bytes of its length.
-    let domain: String = content
-        .domain
-        .0
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    // The last chunk's file is overwritten with other bytes.
     let last = blake3::hash(&bytes[60..64]);
-    let path = target.path().join("objects").join(&domain).join(format!(
-        "{}.chunk",
-        focal_model::ContentHash(*last.as_bytes())
-    ));
+    let path = stored_chunk(
+        target.path(),
+        &content,
+        focal_model::ContentHash(*last.as_bytes()),
+    )
+    .unwrap();
     std::fs::write(&path, b"wxyz").unwrap();
     let mut step = Ok(Step::Pending(pass));
     for _ in 0..32 {
@@ -1848,7 +1947,12 @@ fn an_inventory_and_a_verification_go_a_chunk_a_slice() {
     let bytes: Vec<u8> = (0..64u8).collect();
     let (mut receiver, ledger, content, budget) = imported(target.path(), &bytes);
     let source = tempfile::tempdir().unwrap();
-    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+    let mut sender = ContentStore::open(
+        source.path(),
+        limits(),
+        &focal_seal::test_keys(source.path()).unwrap(),
+    )
+    .unwrap();
     let held = stored(&mut sender, 1, 1, &bytes);
     let manifest = sender.export_manifest(&held).unwrap();
     let mut scratch = vec![0u8; receiver.content().max_chunk_bytes()];
@@ -1972,6 +2076,7 @@ fn an_upload_seal_is_kept_between_asks_and_answers_once_done() {
                 max_uploads: 2,
                 ..limits()
             },
+            &focal_seal::test_keys(target.path()).unwrap(),
         )
         .unwrap(),
         CustodyConfig::new(1),
@@ -2043,7 +2148,12 @@ fn an_upload_seal_is_kept_between_asks_and_answers_once_done() {
 fn a_restore_is_kept_between_asks_and_answers_once_done() {
     use focal_ledger::backup::{BackupChunk, BackupManifest, BackupObject, CONTENT_DIR};
     let source = tempfile::tempdir().unwrap();
-    let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+    let mut sender = ContentStore::open(
+        source.path(),
+        limits(),
+        &focal_seal::test_keys(source.path()).unwrap(),
+    )
+    .unwrap();
     let bytes: Vec<u8> = (0..16u8).collect();
     let content = stored(&mut sender, 1, 1, &bytes);
     let transfer = sender.export_manifest(&content).unwrap();
@@ -2112,7 +2222,12 @@ fn a_restore_is_kept_between_asks_and_answers_once_done() {
     let budget = memory();
     let work = memory();
     let mut store = CustodyStore::new(
-        ContentStore::open(target.path(), limits()).unwrap(),
+        ContentStore::open(
+            target.path(),
+            limits(),
+            &focal_seal::test_keys(target.path()).unwrap(),
+        )
+        .unwrap(),
         CustodyConfig::new(1),
         budget.clone(),
     )
@@ -2195,13 +2310,13 @@ fn a_seal_and_a_verification_go_through_the_owner_a_slice_at_a_time() {
     focal_rt::block_on(async move {
         let source = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
-        let mut sender = ContentStore::open(source.path(), limits()).unwrap();
+        let mut sender = ContentStore::open(source.path(), limits(), &focal_seal::test_keys(source.path()).unwrap()).unwrap();
         let bytes: Vec<u8> = (0..400u32).map(|at| (at % 251) as u8).collect();
         let content = stored(&mut sender, 1, 1, &bytes);
         let manifest = sender.export_manifest(&content).unwrap();
         let budget = memory();
         let (host, owner) = ContentHost::spawn(
-            ContentStore::open(target.path(), limits()).unwrap(),
+            ContentStore::open(target.path(), limits(), &focal_seal::test_keys(target.path()).unwrap()).unwrap(),
             CustodyConfig::new(1),
             WireLimits::default(),
             budget.clone(),
@@ -2306,7 +2421,7 @@ fn measure_small_request_waits_while_a_large_upload_seals() {
                     max_uploads: 1,
                     chunk_bytes: CHUNK,
                     max_manifest_bytes: 64 * 1024,
-                },
+                }, &focal_seal::test_keys(root.path()).unwrap(),
             )
             .unwrap(),
             CustodyConfig::new(1),

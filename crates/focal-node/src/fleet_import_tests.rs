@@ -287,6 +287,7 @@ fn a_populated_ledger_is_imported_through_the_node_after_its_host_seals_the_payl
                 chunk_bytes: CHUNK,
                 max_manifest_bytes: 1 << 20,
             },
+            &focal_seal::test_keys_beside(&content_dir).unwrap(),
         )
         .unwrap();
         let wal = SharedWal::open_with_budget(
@@ -313,7 +314,11 @@ fn a_populated_ledger_is_imported_through_the_node_after_its_host_seals_the_payl
             &tenant,
             NativeHosting {
                 limits: NativeSessionLimits::standard(domain()),
-                reader: ContentReader::open(&content_dir).unwrap(),
+                reader: ContentReader::open(
+                    &content_dir,
+                    focal_seal::test_keys_beside(&content_dir).unwrap(),
+                )
+                .unwrap(),
                 seeds: focal_evidence::SeedStore::open(
                     content_dir.join("seeds"),
                     focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())

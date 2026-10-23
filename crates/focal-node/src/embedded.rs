@@ -182,6 +182,8 @@ impl EmbeddedNode {
                 max_manifest_bytes: 1024 * 1024,
             },
             storage.storage.disk_budget(),
+            &keys,
+            crate::storage_level::content_form_at(level),
         )?;
         let limits = crate::memory_envelope::found_limits(root, settings, &consensus)?;
         let rule = if level >= crate::upgrade::SEAL_LEVEL {
@@ -193,11 +195,14 @@ impl EmbeddedNode {
         let hosting = crate::network_service::native_hosting(
             root,
             &identity,
+            content.reader()?,
             storage.storage.disk_budget(),
             &limits,
-            rule,
-            retire,
-            crate::storage_level::native_share_at(level),
+            crate::storage_level::Rules {
+                seal: rule,
+                retire,
+                share: crate::storage_level::native_share_at(level),
+            },
         )?;
         let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;
         session.campaign()?;

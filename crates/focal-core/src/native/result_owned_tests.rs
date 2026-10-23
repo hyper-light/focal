@@ -246,7 +246,12 @@ struct Fixture {
 }
 fn fixture(id: u128) -> Fixture {
     let root = tempfile::tempdir().unwrap();
-    let mut store = ContentStore::open(root.path(), store_limits()).unwrap();
+    let mut store = ContentStore::open(
+        root.path(),
+        store_limits(),
+        &focal_seal::test_keys(root.path()).unwrap(),
+    )
+    .unwrap();
     let descriptor = descriptor(id, PayloadSpec::Inline(PAYLOAD));
     let budget = MemoryBudget::new(32 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
     let witness = store
@@ -355,7 +360,12 @@ fn copied_artifact_retains_synced_content_and_exact_result_facts_after_reopen() 
     drop(record);
     drop(original);
     drop(store);
-    let store = ContentStore::open(root.path(), store_limits()).unwrap();
+    let store = ContentStore::open(
+        root.path(),
+        store_limits(),
+        &focal_seal::test_keys(root.path()).unwrap(),
+    )
+    .unwrap();
     let retained = copied.get().unwrap();
     retained
         .custody()

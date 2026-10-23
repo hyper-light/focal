@@ -853,6 +853,7 @@ fn durable_content_chunks_are_read_and_validated_off_owner() {
             chunk_bytes: 8,
             max_manifest_bytes: 4096,
         },
+        &focal_seal::test_keys(content_dir.path()).unwrap(),
     )
     .unwrap();
     let upload = focal_evidence::UploadId([1; 16]);

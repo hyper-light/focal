@@ -2795,7 +2795,22 @@
           "activate",
           "upgrade",
           "--fence",
-          "9"
+          "10"
+        ]
+      },
+      {
+        "concept": "upgrade activate",
+        "inputs": [
+          "fence level"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "activate",
+          "upgrade",
+          "--fence",
+          "10"
         ]
       },
       {
@@ -2811,21 +2826,6 @@
           "upgrade",
           "--fence",
           "9"
-        ]
-      },
-      {
-        "concept": "upgrade activate",
-        "inputs": [
-          "fence level"
-        ],
-        "command": [
-          "focal",
-          "--data-dir",
-          "<founder>",
-          "activate",
-          "upgrade",
-          "--fence",
-          "8"
         ]
       },
       {

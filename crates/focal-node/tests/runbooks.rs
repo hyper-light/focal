@@ -129,7 +129,7 @@ fn runbook_corrupt_or_missing_content() {
     let workload = Workload::new(&founder);
     let claim = workload.write(&founder, "deliver the report");
     workload.deliver(&claim);
-    let original = std::fs::read(&chunk_files(&founder, &tenant)[0]).unwrap();
+    let original = chunk_plaintext(&founder, &chunk_files(&founder, &tenant)[0]);
     let (_server_a, node_a) = join_start(&founder, &host_a, "host-a", &addresses[1]);
     let (_server_b, node_b) = join_start(&founder, &host_b, "host-b", &addresses[2]);
     let all = [founder_node, node_a, node_b];
@@ -158,15 +158,15 @@ fn runbook_corrupt_or_missing_content() {
     let report = repair(lost, &tenant, &ledger);
     assert_eq!(report["repaired"], 1, "{report}");
     assert_eq!(report["unrecoverable_count"], 0, "{report}");
-    assert_eq!(std::fs::read(&chunk).unwrap(), original);
+    assert_eq!(chunk_plaintext(lost, &chunk), original);
     // The founder's copy holds it corrupt: repair replaces the bytes.
     let founder_chunk = chunk_files(&founder, &tenant).remove(0);
-    let mut tampered = original.clone();
+    let mut tampered = std::fs::read(&founder_chunk).unwrap();
     tampered[0] ^= 0xff;
     std::fs::write(&founder_chunk, &tampered).unwrap();
     let report = repair(&founder, &tenant, &ledger);
     assert_eq!(report["repaired"], 1, "{report}");
-    assert_eq!(std::fs::read(&founder_chunk).unwrap(), original);
+    assert_eq!(chunk_plaintext(&founder, &founder_chunk), original);
     // Verification: a second run finds everything verified and nothing to
     // repair, and the artifact reads back.
     for node in [&founder, lost] {

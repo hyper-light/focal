@@ -174,18 +174,20 @@ enum Phase {
         domains: Vec<ContentDomainId>,
         index: usize,
     },
+    /// A domain's manifests; `marks` name the chunks the kept ones hold as the store files them
+    /// (29 §11: sealed, a stored name is the domain's keyed name of a hash, never the hash).
     Manifests {
         domains: Vec<ContentDomainId>,
         index: usize,
         dir: ReadDir,
-        marks: BTreeSet<ContentHash>,
+        marks: BTreeSet<sealing::Mark>,
         overflow: bool,
     },
     Chunks {
         domains: Vec<ContentDomainId>,
         index: usize,
         dir: ReadDir,
-        marks: BTreeSet<ContentHash>,
+        marks: BTreeSet<sealing::Mark>,
     },
     Records {
         kinds: usize,
@@ -265,7 +267,7 @@ fn parse_hash(name: &str) -> Option<ContentHash> {
     }
     Some(ContentHash(bytes))
 }
-fn parse_domain(name: &str) -> Option<ContentDomainId> {
+pub(super) fn parse_domain(name: &str) -> Option<ContentDomainId> {
     if name.len() != 32 {
         return None;
     }
@@ -413,8 +415,24 @@ impl ContentStore {
                         index: index.saturating_add(1),
                     }
                 }
+                // While the store converts, its files lie in either form and the collector's marks
+                // name one: nothing of a domain is collected until the conversion ends (it visits
+                // every file once and finishes on its own). A domain whose key record does not stand
+                // in a sealed store holds nothing.
+                Some(domain)
+                    if self.keys.converting()
+                        || self
+                            .keys
+                            .domain(&domain_directory(&self.root, domain), domain, false)?
+                            .holds_nothing() =>
+                {
+                    Phase::Domains {
+                        domains,
+                        index: index.saturating_add(1),
+                    }
+                }
                 Some(domain) => {
-                    let dir = fs::read_dir(self.root.join("objects").join(hex(&domain.0)))?;
+                    let dir = fs::read_dir(domain_directory(&self.root, domain))?;
                     Phase::Manifests {
                         domains,
                         index,
@@ -665,14 +683,18 @@ impl ContentStore {
         &mut self,
         domain: ContentDomainId,
         dir: &mut ReadDir,
-        marks: &mut BTreeSet<ContentHash>,
+        marks: &mut BTreeSet<sealing::Mark>,
         overflow: &mut bool,
         protection: &ProtectionSet,
         config: CollectorConfig,
         now_ms: u64,
         budget: &mut usize,
     ) -> Result<bool, ContentError> {
-        let directory = self.root.join("objects").join(hex(&domain.0));
+        let directory = domain_directory(&self.root, domain);
+        let key = self.keys.domain(&directory, domain, false)?;
+        if key.holds_nothing() {
+            return Ok(true);
+        }
         let mut changed = false;
         while *budget > 0 {
             let Some(entry) = dir.next() else {
@@ -683,15 +705,12 @@ impl ContentStore {
             };
             let entry = entry?;
             self.visit(budget);
-            let Some((stem, extension)) = split_name(&entry) else {
+            let Some((_, extension)) = split_name(&entry) else {
                 continue;
             };
             if extension != "manifest" {
                 continue;
             }
-            let Some(root) = parse_hash(&stem) else {
-                continue;
-            };
             let Some(metadata) = still_there(&entry)? else {
                 continue;
             };
@@ -702,9 +721,15 @@ impl ContentStore {
             // is skipped, exactly as sweep_receipts skips an undecodable receipt.
             // Leaving its chunks unmarked is correct: an object whose manifest is
             // unreadable is already unrecoverable.
-            let bytes = match read_listed(&entry.path(), MAX_TRANSFER_MANIFEST_BYTES) {
-                Ok(Some(bytes)) => bytes,
+            // Sealed, the manifest is opened under its domain's key, its root the hash of what
+            // opened, and a file whose name is not that root's keyed name opens to nothing; in the
+            // clear its name is its root. A name the writer does not file with is left as it is.
+            let (bytes, root) = match key.open_listed(&entry.path(), MAX_TRANSFER_MANIFEST_BYTES) {
+                Ok(Some(opened)) => opened,
                 Ok(None) => continue,
+                Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
                 Err(ContentError::Io(error)) => return Err(ContentError::Io(error)),
                 Err(_) => continue,
             };
@@ -719,11 +744,12 @@ impl ContentStore {
                 || age_ms(&metadata, now_ms)? < config.grace_ms;
             if keep {
                 for chunk in manifest.chunks {
-                    if marks.len() >= config.max_marks && !marks.contains(&chunk.hash) {
+                    let mark = key.mark(chunk.hash)?;
+                    if marks.len() >= config.max_marks && !marks.contains(&mark) {
                         *overflow = true;
                         break;
                     }
-                    marks.insert(chunk.hash);
+                    marks.insert(mark);
                 }
                 continue;
             }
@@ -746,7 +772,7 @@ impl ContentStore {
         &mut self,
         domain: ContentDomainId,
         dir: &mut ReadDir,
-        marks: &BTreeSet<ContentHash>,
+        marks: &BTreeSet<sealing::Mark>,
         config: CollectorConfig,
         now_ms: u64,
         budget: &mut usize,
@@ -765,13 +791,15 @@ impl ContentStore {
             let Some((stem, extension)) = split_name(&entry) else {
                 continue;
             };
+            // A name the writer does not file with is left as it is, as every name that is not a
+            // hash was before the store sealed.
             if extension != "chunk" {
                 continue;
             }
-            let Some(hash) = parse_hash(&stem) else {
+            let Some(mark) = self.keys.mark_of(&stem) else {
                 continue;
             };
-            if marks.contains(&hash) {
+            if marks.contains(&mark) {
                 continue;
             }
             let Some(metadata) = still_there(&entry)? else {
@@ -889,12 +917,14 @@ impl ContentStore {
             let Ok(receipt) = crate::CustodyReceipt::decode(&bytes) else {
                 continue;
             };
+            // The object the receipt names is held while its manifest stands, in either form while
+            // the store converts (29 §11); a domain of a sealed store without a key record holds
+            // none.
+            let directory = domain_directory(&self.root, receipt.domain);
             let present = self
-                .root
-                .join("objects")
-                .join(hex(&receipt.domain.0))
-                .join(format!("{}.manifest", receipt.root))
-                .is_file();
+                .keys
+                .domain(&directory, receipt.domain, false)?
+                .exists(&directory, receipt.root, sealing::Kind::Manifest)?;
             if present {
                 continue;
             }
@@ -1058,41 +1088,57 @@ impl ContentStore {
                 rounds.push(entry.path());
             }
         }
-        let manifest = format!("{root}.manifest");
-        let Some(round) = rounds
-            .iter()
-            .find(|round| round.join(&relative).join(&manifest).is_file())
-        else {
+        // The domain's key record never leaves its directory (the collector quarantines
+        // manifests and chunks, sealed under it): without it, a sealed store holds nothing of the
+        // domain to restore. While the store converts, a quarantined file lies in either form,
+        // and comes back in the form it lies in, which the conversion meets (rounds first).
+        let key = self.keys.domain(&target, domain, false)?;
+        if key.holds_nothing() {
+            return Ok(false);
+        }
+        let mut found = None;
+        for round in &rounds {
+            let directory = round.join(&relative);
+            if let Some(path) = key.existing(&directory, root, sealing::Kind::Manifest)? {
+                found = Some((directory, path));
+                break;
+            }
+        }
+        let Some((holder, source)) = found else {
             return Ok(false);
         };
         durable_directory(&target)?;
-        let source = round.join(&relative).join(&manifest);
-        let bytes = read_bounded(&source, MAX_TRANSFER_MANIFEST_BYTES)?;
-        if ContentHash(*blake3::hash(&bytes).as_bytes()) != root {
-            return Err(ContentError::Corrupt);
-        }
+        let length = usize::try_from(key.plain_length(&holder, root, sealing::Kind::Manifest)?)
+            .ok()
+            .filter(|length| *length <= MAX_TRANSFER_MANIFEST_BYTES)
+            .ok_or(ContentError::Capacity)?;
+        let mut bytes = zeroed_buffer(length)?;
+        let bytes = key.open_into(&holder, root, sealing::Kind::Manifest, length, &mut bytes)?;
         let decoded = decode_manifest(
             bytes
                 .get(MANIFEST_MAGIC.len()..)
                 .ok_or(ContentError::Corrupt)?,
         )?;
         for chunk in decoded.chunks {
-            let name = format!("{}.chunk", chunk.hash);
-            if target.join(&name).is_file() {
+            if key.exists(&target, chunk.hash, sealing::Kind::Chunk)? {
                 continue;
             }
-            let Some(holder) = rounds
-                .iter()
-                .find(|round| round.join(&relative).join(&name).is_file())
-            else {
+            let mut moved = false;
+            for round in &rounds {
+                let directory = round.join(&relative);
+                if let Some(path) = key.existing(&directory, chunk.hash, sealing::Kind::Chunk)? {
+                    let name = path.file_name().ok_or(ContentError::Invalid)?;
+                    focal_platform::fs::atomic_replace(&path, &target.join(name))?;
+                    moved = true;
+                    break;
+                }
+            }
+            if !moved {
                 return Err(ContentError::Corrupt);
-            };
-            focal_platform::fs::atomic_replace(
-                &holder.join(&relative).join(&name),
-                &target.join(&name),
-            )?;
+            }
         }
-        focal_platform::fs::atomic_replace(&source, &target.join(&manifest))?;
+        let name = source.file_name().ok_or(ContentError::Invalid)?;
+        focal_platform::fs::atomic_replace(&source, &target.join(name))?;
         sync_directory(&target)?;
         Ok(true)
     }

@@ -109,6 +109,7 @@ fn with_budget(requirements: &[(ValidationMode, Program)]) -> (Fixture, MemoryBu
             chunk_bytes: 17,
             max_manifest_bytes: 128 * 1024,
         },
+        &focal_seal::test_keys(directory.path()).unwrap(),
     )
     .unwrap();
     let mut f = Fixture {
@@ -1358,6 +1359,7 @@ fn reconstruction_refunds_refusal_then_funds_live_increment_after_received_respo
             chunk_bytes: 17,
             max_manifest_bytes: 128 * 1024,
         },
+        &focal_seal::test_keys(directory.path()).unwrap(),
     )
     .unwrap();
     let input = NativeInput {

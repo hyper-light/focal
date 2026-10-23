@@ -77,6 +77,20 @@ pub use cold::{
 };
 #[path = "native_artifact.rs"]
 mod native_artifact;
+#[path = "sealing.rs"]
+mod sealing;
+pub use sealing::ContentForm;
+#[path = "convert.rs"]
+mod convert;
+pub use convert::Conversion;
+
+/// The keys of the data directory a test's store lies in, as a node's start finds or makes them
+/// (`focal_seal::test_keys`): every test store is sealed, as every store is.
+#[cfg(test)]
+pub(crate) fn test_keys(root: impl AsRef<Path>) -> focal_seal::DataKeys {
+    #[allow(clippy::unwrap_used)]
+    focal_seal::test_keys(root.as_ref()).unwrap()
+}
 pub use native_artifact::*;
 
 #[derive(Debug, Clone)]
@@ -344,6 +358,14 @@ pub struct ContentStore {
     /// digest (the audit's F19); a lock, since readers share the store
     /// across threads, held for one range's read; poisoned, it is an error.
     plans: Mutex<PlanCache>,
+    /// The node's content key, held for the writer's life where it seals (29 §11): every domain's
+    /// key is unwrapped under it for one file. Its form says where a file may lie.
+    keys: sealing::ContentKeys<'static>,
+    /// The conversion of the store's files in the clear, while one runs ([`Self::convert_step`]).
+    conversion: Option<convert::Converting>,
+    /// Where the data directory's keys are, which a reader of this store is given
+    /// ([`ContentStore::reader`]).
+    data_keys: focal_seal::DataKeys,
     _writer_lock: focal_platform::FileLock,
 }
 
@@ -405,14 +427,19 @@ impl PlanCache {
     /// The object's plan, loaded and validated once, then held; a reference
     /// that names the same root with another class or length is refused as
     /// the manifest's own validation refuses it.
-    fn plan(&mut self, root: &Path, reference: &ContentRef) -> Result<&Plan, ContentError> {
+    fn plan(
+        &mut self,
+        root: &Path,
+        keys: &sealing::ContentKeys<'_>,
+        reference: &ContentRef,
+    ) -> Result<&Plan, ContentError> {
         let key = (reference.domain, reference.root);
         if let Some(at) = self.plans.iter().position(|(held, _)| *held == key) {
             if let Some(entry) = self.plans.remove(at) {
                 self.plans.push_back(entry);
             }
         } else {
-            let plan = Plan::of(manifest_at(root, reference)?)?;
+            let plan = Plan::of(manifest_at(root, keys, reference)?)?;
             self.loads = self.loads.saturating_add(1);
             while self.plans.len() >= self.bound {
                 self.plans.pop_front();
@@ -446,12 +473,7 @@ impl ContentStore {
     /// ([`TransferManifest::resident_for`], [`ObjectVerification::resident_for`]).
     pub fn manifest_length(&self, reference: &ContentRef) -> Result<usize, ContentError> {
         self.check()?;
-        let length = usize::try_from(fs::metadata(manifest_path(&self.root, reference))?.len())
-            .map_err(|_| ContentError::Capacity)?;
-        if length > MAX_TRANSFER_MANIFEST_BYTES {
-            return Err(ContentError::Capacity);
-        }
-        Ok(length)
+        manifest_length_at(&self.root, &self.keys, reference)
     }
     /// The chunk of `domain` named `hash`, of `length` bytes, read and
     /// checked against its name: what a sender that holds the object's
@@ -467,28 +489,41 @@ impl ContentStore {
         if length > MAX_TRANSFER_CHUNK_BYTES {
             return Err(ContentError::Capacity);
         }
-        let directory = self.root.join("objects").join(hex(&domain.0));
+        let directory = domain_directory(&self.root, domain);
+        let key = self.keys.domain(&directory, domain, false)?;
         let mut bytes = zeroed_buffer(length)?;
-        verify_chunk_into(&directory, hash, length, &mut bytes)?;
+        verify_chunk_into(&directory, &key, hash, length, &mut bytes)?;
         Ok(bytes)
     }
     /// The uploads the store stages at once at most.
     pub fn max_uploads(&self) -> usize {
         self.limits.max_uploads
     }
-    /// Open the store guarded by the standard disk watermark alone.
-    pub fn open(root: impl AsRef<Path>, limits: StoreLimits) -> Result<Self, ContentError> {
+    /// Open the store guarded by the standard disk watermark alone, sealing what it installs.
+    pub fn open(
+        root: impl AsRef<Path>,
+        limits: StoreLimits,
+        keys: &focal_seal::DataKeys,
+    ) -> Result<Self, ContentError> {
         let disk =
             DiskBudget::new(DiskBudgetConfig::default()).map_err(|_| ContentError::Capacity)?;
-        Self::open_with_disk(root, limits, disk)
+        Self::open_with_disk(root, limits, disk, keys, ContentForm::Sealed)
     }
     /// Open the store on the disk envelope shared by every durable owner of
     /// its volume: uploads, sealed objects, imports and custody records are
     /// promised their bytes before any acknowledgement.
+    ///
+    /// `form` is what the node's fence asks of its files (29 §11): in the clear below the content
+    /// level, sealed from it. A store marked sealed stays sealed, and one whose conversion began
+    /// finishes it, whatever `form` asks; a store asked to seal that holds files in the clear is
+    /// marked as converting and converted by its owner as it serves ([`Self::convert_step`]), and
+    /// one that holds nothing is sealed at once.
     pub fn open_with_disk(
         root: impl AsRef<Path>,
         limits: StoreLimits,
         disk: DiskBudget,
+        keys: &focal_seal::DataKeys,
+        form: ContentForm,
     ) -> Result<Self, ContentError> {
         if limits.chunk_bytes == 0
             || limits.chunk_bytes > MAX_TRANSFER_CHUNK_BYTES
@@ -520,6 +555,23 @@ impl ContentStore {
         durable_directory(&root.join("custody"))?;
         durable_directory(&root.join("receipts"))?;
         let plans = Mutex::new(PlanCache::new(limits.max_uploads));
+        let data_keys = keys.clone();
+        let sealed = root.join(sealing::SEALED).try_exists()?;
+        let begun = root.join(sealing::SEALING).try_exists()?;
+        let keys = if sealed {
+            // A conversion that ended before its marker went.
+            convert::remove_marker(&root, sealing::SEALING)?;
+            sealing::ContentKeys::sealing(keys, false)?
+        } else if begun || form == ContentForm::Sealed {
+            // Marked before anything is sealed: from here the store holds files in either form,
+            // and only a writer that reads both may open it.
+            if !begun {
+                convert::write_marker(&root, sealing::SEALING)?;
+            }
+            sealing::ContentKeys::sealing(keys, true)?
+        } else {
+            sealing::ContentKeys::clear()
+        };
         let mut store = Self {
             root,
             limits,
@@ -531,6 +583,9 @@ impl ContentStore {
             failed: false,
             collector: gc::CollectorState::new(),
             plans,
+            keys,
+            conversion: None,
+            data_keys,
             _writer_lock: lock,
         };
         store.recover_uploads()?;
@@ -559,6 +614,13 @@ impl ContentStore {
                 sync_directory(Path::new("."))?;
             } else if directory.parent().is_some() {
                 sync_directory(directory)?;
+            }
+        }
+        if store.keys.converting() {
+            if holds_no_object(&store.root)? {
+                store.mark_sealed()?;
+            } else {
+                store.conversion = Some(convert::Converting::begin(&store.root)?);
             }
         }
         Ok(store)
@@ -893,15 +955,22 @@ impl ContentStore {
             .get_mut(&id)
             .ok_or(ContentError::MissingUpload)?;
         upload.file.sync_all()?;
-        let directory = self.root.join("objects").join(hex(&upload.meta.domain.0));
+        let directory = domain_directory(&self.root, upload.meta.domain);
         // The sealed object is a second copy of the staged bytes until the
-        // part is removed at finish; promise it before the first chunk lands.
+        // part is removed at finish; promise it before the first chunk lands:
+        // each chunk's file as the writer installs it, and the domain's key
+        // record where the writer seals and the domain has none yet. The
+        // manifest is promised its file's bytes as it is installed, its
+        // length known then.
+        let key = self.keys.domain(&directory, upload.meta.domain, false)?;
         let objects = disk_reserve(
             &self.disk,
             &self.root,
             DiskKind::Content,
             BudgetLane::Ordinary,
-            upload.offset,
+            chunk_files_bound(&key, upload.offset, self.limits.chunk_bytes)?
+                .checked_add(key.record_bytes())
+                .ok_or(ContentError::Capacity)?,
         )?;
         durable_directory(&directory)?;
         let mut chunks = Vec::new();
@@ -947,7 +1016,8 @@ impl ContentStore {
             return Err(ContentError::Invalid);
         }
         let domain = upload.meta.domain;
-        let directory = self.root.join("objects").join(hex(&domain.0));
+        let directory = domain_directory(&self.root, domain);
+        let key = self.keys.domain(&directory, domain, true)?;
         let remaining = sealing
             .length
             .checked_sub(sealing.done)
@@ -960,7 +1030,7 @@ impl ContentStore {
             upload.file.read_exact(block)?;
             sealing.whole.update(block);
             let hash = ContentHash(*blake3::hash(block).as_bytes());
-            install_verified_chunk(&directory.join(format!("{hash}.chunk")), block, hash)?;
+            install_chunk(&key, &directory, block, hash)?;
             // The list was reserved whole: a chunk past it is no seal of
             // this length.
             if sealing.chunks.len() >= sealing.chunks.capacity() {
@@ -1009,7 +1079,18 @@ impl ContentStore {
             return Err(ContentError::Capacity);
         }
         let root = ContentHash(*blake3::hash(&bytes).as_bytes());
-        atomic_install(&directory.join(format!("{root}.manifest")), &bytes)?;
+        let manifest_file = disk_reserve(
+            &self.disk,
+            &self.root,
+            DiskKind::Content,
+            BudgetLane::Ordinary,
+            key.file_bytes(bytes.len())?,
+        )?;
+        key.install(
+            &key.path(&directory, root, sealing::Kind::Manifest)?,
+            &bytes,
+        )?;
+        manifest_file.commit();
         objects.commit();
         // Upload metadata stays for an idempotent seal after a lost
         // response or a restart, until an explicit finish acknowledges that
@@ -1079,7 +1160,7 @@ impl ContentStore {
         sink: impl Write,
     ) -> Result<(), ContentError> {
         self.check()?;
-        read_verified_at(&self.root, reference, sink)
+        read_verified_at(&self.root, &self.keys, reference, sink)
     }
 
     pub fn read_bytes(
@@ -1088,7 +1169,7 @@ impl ContentStore {
         budget: usize,
     ) -> Result<Vec<u8>, ContentError> {
         self.check()?;
-        read_bytes_at(&self.root, reference, budget)
+        read_bytes_at(&self.root, &self.keys, reference, budget)
     }
 
     pub fn verify(&self, reference: &ContentRef) -> Result<(), ContentError> {
@@ -1108,7 +1189,7 @@ impl ContentStore {
         encoded: usize,
     ) -> Result<ObjectVerification, ContentError> {
         self.check()?;
-        let manifest = manifest_within(&self.root, reference, encoded)?;
+        let manifest = manifest_within(&self.root, &self.keys, reference, encoded)?;
         Ok(ObjectVerification {
             reference: reference.clone(),
             chunks: manifest.chunks,
@@ -1126,12 +1207,12 @@ impl ContentStore {
         scratch: &mut [u8],
     ) -> Result<bool, ContentError> {
         self.check()?;
-        let directory = self
-            .root
-            .join("objects")
-            .join(hex(&verification.reference.domain.0));
+        let domain = verification.reference.domain;
+        let directory = domain_directory(&self.root, domain);
         if let Some(chunk) = verification.chunks.get(verification.next) {
-            let block = verify_chunk_into(&directory, chunk.hash, chunk.length as usize, scratch)?;
+            let key = self.keys.domain(&directory, domain, false)?;
+            let block =
+                verify_chunk_into(&directory, &key, chunk.hash, chunk.length as usize, scratch)?;
             verification.whole.update(block);
             verification.next = verification
                 .next
@@ -1159,7 +1240,7 @@ impl ContentStore {
         }
         self.check()?;
         let mut plans = self.plans.lock().map_err(|_| ContentError::Failed)?;
-        let plan = plans.plan(&self.root, reference)?;
+        let plan = plans.plan(&self.root, &self.keys, reference)?;
         let end = offset
             .checked_add(max_bytes as u64)
             .ok_or(ContentError::Capacity)?
@@ -1169,7 +1250,8 @@ impl ContentStore {
         output
             .try_reserve_exact(usize::try_from(length).map_err(|_| ContentError::Capacity)?)
             .map_err(|_| ContentError::Capacity)?;
-        let directory = self.root.join("objects").join(hex(&reference.domain.0));
+        let directory = domain_directory(&self.root, reference.domain);
+        let key = self.keys.domain(&directory, reference.domain, false)?;
         let first = plan.first_chunk(offset);
         let mut start = plan.starts.get(first).copied().unwrap_or(reference.length);
         for chunk in plan.chunks.iter().skip(first) {
@@ -1177,15 +1259,14 @@ impl ContentStore {
                 .checked_add(u64::from(chunk.length))
                 .ok_or(ContentError::Corrupt)?;
             if next > offset && start < end {
-                let bytes = read_bounded(
-                    &directory.join(format!("{}.chunk", chunk.hash)),
-                    MAX_TRANSFER_CHUNK_BYTES,
+                let mut bytes = zeroed_buffer(chunk.length as usize)?;
+                verify_chunk_into(
+                    &directory,
+                    &key,
+                    chunk.hash,
+                    chunk.length as usize,
+                    &mut bytes,
                 )?;
-                if bytes.len() != chunk.length as usize
-                    || ContentHash(*blake3::hash(&bytes).as_bytes()) != chunk.hash
-                {
-                    return Err(ContentError::Corrupt);
-                }
                 let from = usize::try_from(
                     offset
                         .max(start)
@@ -1233,17 +1314,47 @@ impl ContentStore {
         (self.uploads.len(), self.staged_bytes)
     }
 
+    /// The file the chunk of `domain` filed under `hash` lies in, its domain's keyed name: what a
+    /// test that changes a stored chunk writes to.
+    #[cfg(test)]
+    pub(crate) fn chunk_file(&self, domain: ContentDomainId, hash: ContentHash) -> PathBuf {
+        let directory = domain_directory(&self.root, domain);
+        #[allow(clippy::unwrap_used)]
+        self.keys
+            .domain(&directory, domain, false)
+            .and_then(|key| key.path(&directory, hash, sealing::Kind::Chunk))
+            .unwrap()
+    }
+    /// The file the manifest of `domain` whose root is `root` lies in.
+    #[cfg(test)]
+    pub(crate) fn manifest_file(&self, domain: ContentDomainId, root: ContentHash) -> PathBuf {
+        let directory = domain_directory(&self.root, domain);
+        #[allow(clippy::unwrap_used)]
+        self.keys
+            .domain(&directory, domain, false)
+            .and_then(|key| key.path(&directory, root, sealing::Kind::Manifest))
+            .unwrap()
+    }
     /// The manifest read and validated afresh: what the tests compare a
     /// held plan against.
     #[cfg(test)]
     fn manifest(&self, reference: &ContentRef) -> Result<Manifest, ContentError> {
         self.check()?;
-        manifest_at(&self.root, reference)
+        manifest_at(&self.root, &self.keys, reference)
     }
     /// The store directory; a lock-free [`ContentReader`] over the same path
     /// serves replay and recovery reads while this writer owns installation.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+    /// A lock-free reader of this store, opening what it installed under the same data
+    /// directory's keys.
+    pub fn reader(&self) -> Result<ContentReader, ContentError> {
+        Ok(ContentReader {
+            root: self.root.clone(),
+            keys: self.data_keys.clone(),
+            clear: self.keys.clear_allowed(),
+        })
     }
 
     fn reserve_upload(&self, domain: ContentDomainId, length: u64) -> Result<(), ContentError> {
@@ -1395,26 +1506,105 @@ fn zeroed_buffer(length: usize) -> Result<Vec<u8>, ContentError> {
     Ok(bytes)
 }
 
-fn manifest_at(root: &Path, reference: &ContentRef) -> Result<Manifest, ContentError> {
-    manifest_within(root, reference, MAX_TRANSFER_MANIFEST_BYTES)
+fn manifest_at(
+    root: &Path,
+    keys: &sealing::ContentKeys<'_>,
+    reference: &ContentRef,
+) -> Result<Manifest, ContentError> {
+    manifest_within(root, keys, reference, MAX_TRANSFER_MANIFEST_BYTES)
 }
-/// Where the manifest of `reference` is installed under `root`.
-pub(crate) fn manifest_path(root: &Path, reference: &ContentRef) -> PathBuf {
-    root.join("objects")
-        .join(hex(&reference.domain.0))
-        .join(format!("{}.manifest", reference.root))
+/// The directory `domain`'s objects are installed in under `root`.
+pub(crate) fn domain_directory(root: &Path, domain: ContentDomainId) -> PathBuf {
+    root.join("objects").join(hex(&domain.0))
+}
+/// The length of an installed object's manifest, from its file's stated stream, nothing opened
+/// past a sealed file's header: what a holder charges reading it at.
+fn manifest_length_at(
+    root: &Path,
+    keys: &sealing::ContentKeys<'_>,
+    reference: &ContentRef,
+) -> Result<usize, ContentError> {
+    let directory = domain_directory(root, reference.domain);
+    let key = keys.domain(&directory, reference.domain, false)?;
+    let length =
+        usize::try_from(key.plain_length(&directory, reference.root, sealing::Kind::Manifest)?)
+            .map_err(|_| ContentError::Capacity)?;
+    if length > MAX_TRANSFER_MANIFEST_BYTES {
+        return Err(ContentError::Capacity);
+    }
+    Ok(length)
+}
+/// The bytes the chunks of a `length`-byte object take as `key`'s writer installs them, cut at
+/// `chunk` bytes.
+pub(crate) fn chunk_files_bound(
+    key: &sealing::DomainKey,
+    length: u64,
+    chunk: usize,
+) -> Result<u64, ContentError> {
+    let chunk64 = u64::try_from(chunk.max(1)).map_err(|_| ContentError::Capacity)?;
+    let full = length.checked_div(chunk64).ok_or(ContentError::Capacity)?;
+    let rest = usize::try_from(length.checked_rem(chunk64).ok_or(ContentError::Capacity)?)
+        .map_err(|_| ContentError::Capacity)?;
+    let whole = full
+        .checked_mul(key.file_bytes(chunk)?)
+        .ok_or(ContentError::Capacity)?;
+    let last = if rest == 0 { 0 } else { key.file_bytes(rest)? };
+    whole.checked_add(last).ok_or(ContentError::Capacity)
+}
+/// Whether the store at `root` holds no object file: its objects' directory and its quarantine are
+/// empty, so a store asked to seal has nothing to convert.
+fn holds_no_object(root: &Path) -> Result<bool, ContentError> {
+    if fs::read_dir(root.join("objects"))?.next().is_some() {
+        return Ok(false);
+    }
+    match fs::read_dir(root.join("quarantine")) {
+        Ok(mut rounds) => Ok(rounds.next().is_none()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+/// The manifest `root` of `domain` opened to its plaintext, at most `limit` bytes, and checked
+/// against its root: the encoded bytes a transfer sends (inside TLS) and a description decodes.
+pub(crate) fn manifest_plain(
+    store: &Path,
+    keys: &sealing::ContentKeys<'_>,
+    domain: ContentDomainId,
+    root: ContentHash,
+    limit: usize,
+) -> Result<Vec<u8>, ContentError> {
+    let directory = domain_directory(store, domain);
+    keys.domain(&directory, domain, false)?.read_sized(
+        &directory,
+        root,
+        sealing::Kind::Manifest,
+        limit.min(MAX_TRANSFER_MANIFEST_BYTES),
+    )
 }
 /// [`manifest_at`] of a manifest at most `limit` bytes, nothing more read.
 fn manifest_within(
     root: &Path,
+    keys: &sealing::ContentKeys<'_>,
     reference: &ContentRef,
     limit: usize,
 ) -> Result<Manifest, ContentError> {
-    let path = manifest_path(root, reference);
-    let bytes = read_bounded(&path, limit.min(MAX_TRANSFER_MANIFEST_BYTES))?;
-    if ContentHash(*blake3::hash(&bytes).as_bytes()) != reference.root
-        || !bytes.starts_with(MANIFEST_MAGIC)
-    {
+    let directory = domain_directory(root, reference.domain);
+    let key = keys.domain(&directory, reference.domain, false)?;
+    manifest_with(&directory, &key, reference, limit)
+}
+/// [`manifest_within`] under the domain's key already opened, its file opened once.
+fn manifest_with(
+    directory: &Path,
+    key: &sealing::DomainKey,
+    reference: &ContentRef,
+    limit: usize,
+) -> Result<Manifest, ContentError> {
+    let bytes = key.read_sized(
+        directory,
+        reference.root,
+        sealing::Kind::Manifest,
+        limit.min(MAX_TRANSFER_MANIFEST_BYTES),
+    )?;
+    if !bytes.starts_with(MANIFEST_MAGIC) {
         return Err(ContentError::Corrupt);
     }
     let m = decode_manifest(
@@ -1443,11 +1633,14 @@ fn manifest_within(
 }
 fn read_verified_at(
     root: &Path,
+    keys: &sealing::ContentKeys<'_>,
     reference: &ContentRef,
     mut sink: impl Write,
 ) -> Result<(), ContentError> {
-    let manifest = manifest_at(root, reference)?;
-    let dir = root.join("objects").join(hex(&reference.domain.0));
+    // The domain's key opened once for the manifest and every chunk.
+    let dir = domain_directory(root, reference.domain);
+    let key = keys.domain(&dir, reference.domain, false)?;
+    let manifest = manifest_with(&dir, &key, reference, MAX_TRANSFER_MANIFEST_BYTES)?;
     let mut whole = blake3::Hasher::new();
     // One scratch buffer sized to the largest chunk, reused for every chunk,
     // instead of allocating a fresh buffer (up to a full chunk) per chunk.
@@ -1459,7 +1652,7 @@ fn read_verified_at(
         .unwrap_or(0);
     let mut scratch = zeroed_buffer(scratch_len)?;
     for chunk in &manifest.chunks {
-        let block = verify_chunk_into(&dir, chunk.hash, chunk.length as usize, &mut scratch)?;
+        let block = verify_chunk_into(&dir, &key, chunk.hash, chunk.length as usize, &mut scratch)?;
         whole.update(block);
         sink.write_all(block)?;
     }
@@ -1468,13 +1661,14 @@ fn read_verified_at(
     }
     Ok(())
 }
-/// The chunk of `length` bytes named `hash` in `directory`, read into the
-/// head of `scratch` and checked against its name: the verified bytes,
-/// borrowed from the scratch. A file of another length is corrupt — a short
-/// one is not the volume's failure — and a scratch too small for the chunk
-/// is refused before anything is read.
+/// The chunk of `length` bytes filed under `hash` in `directory`, opened in whichever form it lies
+/// (`sealing::DomainKey::opened`) into the head of `scratch` and checked against its hash: the
+/// verified bytes, borrowed from the scratch. A file of another plaintext length, one that does
+/// not open, or bytes that hash otherwise are corrupt, and a scratch too small for the chunk is
+/// refused before anything is read.
 pub(crate) fn verify_chunk_into<'a>(
     directory: &Path,
+    key: &sealing::DomainKey,
     hash: ContentHash,
     length: usize,
     scratch: &'a mut [u8],
@@ -1482,25 +1676,11 @@ pub(crate) fn verify_chunk_into<'a>(
     if length > MAX_TRANSFER_CHUNK_BYTES {
         return Err(ContentError::Capacity);
     }
-    let block = scratch.get_mut(..length).ok_or(ContentError::Capacity)?;
-    let mut file = File::open(directory.join(format!("{hash}.chunk")))?;
-    if file.metadata()?.len() != length as u64 {
-        return Err(ContentError::Corrupt);
-    }
-    file.read_exact(block)?;
-    // The chunk file must be exactly `length`: a byte appended since the
-    // length was read is corruption.
-    let mut extra = [0u8; 1];
-    if file.read(&mut extra)? != 0 {
-        return Err(ContentError::Corrupt);
-    }
-    if ContentHash(*blake3::hash(block).as_bytes()) != hash {
-        return Err(ContentError::Corrupt);
-    }
-    Ok(block)
+    key.open_into(directory, hash, sealing::Kind::Chunk, length, scratch)
 }
 fn read_bytes_at(
     root: &Path,
+    keys: &sealing::ContentKeys<'_>,
     reference: &ContentRef,
     budget: usize,
 ) -> Result<Vec<u8>, ContentError> {
@@ -1511,7 +1691,7 @@ fn read_bytes_at(
     bytes
         .try_reserve_exact(usize::try_from(reference.length).map_err(|_| ContentError::Capacity)?)
         .map_err(|_| ContentError::Capacity)?;
-    read_verified_at(root, reference, &mut bytes)?;
+    read_verified_at(root, keys, reference, &mut bytes)?;
     Ok(bytes)
 }
 
@@ -1522,24 +1702,131 @@ fn read_bytes_at(
 #[derive(Debug, Clone)]
 pub struct ContentReader {
     root: PathBuf,
+    /// The data directory's keys: the content key is unwrapped from them as a domain's record is
+    /// opened, and dropped with it, so a reader holds no key between reads (29 §11).
+    keys: focal_seal::DataKeys,
+    /// Whether a file may lie in the clear: the store was not marked sealed as the reader was made,
+    /// so each file is looked for in the clear first and then sealed (`sealing::DomainKey::opened`).
+    clear: bool,
 }
 impl ContentReader {
-    /// The length of an installed object's manifest, from its file's
-    /// metadata, nothing read.
+    /// The length of an installed object's manifest, from its file's stated stream, nothing
+    /// opened past a sealed file's header.
     pub fn manifest_length(&self, reference: &ContentRef) -> Result<usize, ContentError> {
-        let length = usize::try_from(fs::metadata(manifest_path(&self.root, reference))?.len())
-            .map_err(|_| ContentError::Capacity)?;
-        if length > MAX_TRANSFER_MANIFEST_BYTES {
-            return Err(ContentError::Capacity);
-        }
-        Ok(length)
+        manifest_length_at(&self.root, &self.keys(), reference)
     }
-    pub fn open(root: impl AsRef<Path>) -> Result<Self, ContentError> {
+    /// A reader of the store at `root` under the data directory's `keys`, in the form the store's
+    /// marker says its files are in.
+    pub fn open(root: impl AsRef<Path>, keys: focal_seal::DataKeys) -> Result<Self, ContentError> {
         let root = root.as_ref().to_path_buf();
         if !root.join("objects").is_dir() || !root.join("custody").is_dir() {
             return Err(ContentError::Invalid);
         }
-        Ok(Self { root })
+        let clear = !root.join(sealing::SEALED).try_exists()?;
+        Ok(Self { root, keys, clear })
+    }
+    fn keys(&self) -> sealing::ContentKeys<'_> {
+        sealing::ContentKeys::reading(&self.keys, self.clear)
+    }
+    /// Where the manifest of `domain` whose root is `root` lies, in whichever form, if anywhere:
+    /// what a test that removes, damages or looks for a stored object's file names it by.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn manifest_file(
+        &self,
+        domain: ContentDomainId,
+        root: ContentHash,
+    ) -> Result<Option<PathBuf>, ContentError> {
+        let directory = domain_directory(&self.root, domain);
+        self.keys().domain(&directory, domain, false)?.existing(
+            &directory,
+            root,
+            sealing::Kind::Manifest,
+        )
+    }
+    /// The roots of every manifest `domain` holds, in whichever form each lies: what a test lists
+    /// a store's objects by, their names keyed. A file gone since it was listed is passed over.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn manifest_roots(
+        &self,
+        domain: ContentDomainId,
+    ) -> Result<Vec<ContentHash>, ContentError> {
+        let directory = domain_directory(&self.root, domain);
+        let key = self.keys().domain(&directory, domain, false)?;
+        let mut roots = Vec::new();
+        let listing = match fs::read_dir(&directory) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(roots),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in listing {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("manifest") {
+                continue;
+            }
+            match self.plaintext_with(&key, &path) {
+                Ok(Some((_, root))) => roots.push(root),
+                Ok(None) => {}
+                Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        roots.sort();
+        Ok(roots)
+    }
+    /// The plaintext of the chunk or manifest of this store at `path`, in whichever form it lies,
+    /// checked against the hash it is filed under: what a test compares a copy's bytes by, each
+    /// node's sealed under its own keys.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn plaintext(&self, path: &Path) -> Result<Vec<u8>, ContentError> {
+        let domain = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .and_then(gc::parse_domain)
+            .ok_or(ContentError::Invalid)?;
+        let key = self
+            .keys()
+            .domain(&domain_directory(&self.root, domain), domain, false)?;
+        self.plaintext_with(&key, path)?
+            .map(|(bytes, _)| bytes)
+            .ok_or(ContentError::Invalid)
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    fn plaintext_with(
+        &self,
+        key: &sealing::DomainKey,
+        path: &Path,
+    ) -> Result<Option<(Vec<u8>, ContentHash)>, ContentError> {
+        let most = MAX_TRANSFER_CHUNK_BYTES.max(MAX_TRANSFER_MANIFEST_BYTES);
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or(ContentError::Invalid)?;
+        let Some(hash) = sealing::parse_hash(stem) else {
+            return key.open_listed(path, most);
+        };
+        if !self.clear {
+            return Ok(None);
+        }
+        let bytes = read_bounded(path, most)?;
+        if ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
+            return Err(ContentError::Corrupt);
+        }
+        Ok(Some((bytes, hash)))
+    }
+    /// Where the chunk of `domain` filed under `hash` lies, in whichever form, if anywhere.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn chunk_file(
+        &self,
+        domain: ContentDomainId,
+        hash: ContentHash,
+    ) -> Result<Option<PathBuf>, ContentError> {
+        let directory = domain_directory(&self.root, domain);
+        self.keys().domain(&directory, domain, false)?.existing(
+            &directory,
+            hash,
+            sealing::Kind::Chunk,
+        )
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -1549,17 +1836,17 @@ impl ContentReader {
         reference: &ContentRef,
         sink: impl Write,
     ) -> Result<(), ContentError> {
-        read_verified_at(&self.root, reference, sink)
+        read_verified_at(&self.root, &self.keys(), reference, sink)
     }
     pub fn read_bytes(
         &self,
         reference: &ContentRef,
         budget: usize,
     ) -> Result<Vec<u8>, ContentError> {
-        read_bytes_at(&self.root, reference, budget)
+        read_bytes_at(&self.root, &self.keys(), reference, budget)
     }
     pub fn verify(&self, reference: &ContentRef) -> Result<(), ContentError> {
-        read_verified_at(&self.root, reference, std::io::sink())
+        read_verified_at(&self.root, &self.keys(), reference, std::io::sink())
     }
     pub fn read_custody_record(
         &self,
@@ -1598,6 +1885,9 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, ContentError> {
     Ok(bytes)
 }
 
+/// A file in the clear named by its content's `hash` (the stores 29 §12 has yet to seal: seeds, the
+/// cold stream, custody records): a file already there holding these bytes is kept, its freshness
+/// refreshed; one holding anything else is corrupt under a content-addressed name and refused.
 fn install_verified_chunk(
     path: &Path,
     bytes: &[u8],
@@ -1612,6 +1902,56 @@ fn install_verified_chunk(
         return Ok(());
     }
     atomic_install(path, bytes)
+}
+/// A chunk of an upload installed under its domain's name of `hash` in `directory`, in the form the
+/// writer installs: a file already there, in either form, that opens to these bytes is kept, its
+/// freshness refreshed; one that opens to anything else, or not at all, is corrupt under a
+/// content-addressed name and refused.
+fn install_chunk(
+    key: &sealing::DomainKey,
+    directory: &Path,
+    bytes: &[u8],
+    hash: ContentHash,
+) -> Result<(), ContentError> {
+    if key.exists(directory, hash, sealing::Kind::Chunk)? {
+        let mut previous = zeroed_buffer(bytes.len())?;
+        let (path, _) = key.opened(
+            directory,
+            hash,
+            sealing::Kind::Chunk,
+            bytes.len(),
+            &mut previous,
+        )?;
+        refresh_mtime(&path)?;
+        return Ok(());
+    }
+    key.install(&key.path(directory, hash, sealing::Kind::Chunk)?, bytes)
+}
+/// Whether a file filed under `hash` in `directory` already opens, in either form, to `length`
+/// bytes hashing to `hash`; when one does its freshness is refreshed and nothing else is written.
+/// Asked before a durable write is promised its bytes (the audit's F59), as [`already_installed`]
+/// asks of a custody record: a chunk an exact retry or a resumed transfer sends again, or a
+/// manifest a repeated completion installs, adds no byte to the volume.
+pub(crate) fn already_held(
+    key: &sealing::DomainKey,
+    directory: &Path,
+    hash: ContentHash,
+    kind: sealing::Kind,
+    length: usize,
+) -> Result<bool, ContentError> {
+    if !key.exists(directory, hash, kind)? {
+        return Ok(false);
+    }
+    let mut previous = zeroed_buffer(length)?;
+    match key.opened(directory, hash, kind, length, &mut previous) {
+        Ok((path, _)) => {
+            refresh_mtime(&path)?;
+            Ok(true)
+        }
+        Err(ContentError::Corrupt) => Ok(false),
+        Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 /// Mark a content-addressed file as freshly referenced. Dedup keeps an existing
 /// file rather than rewriting it, so without this a chunk shared with a newly
@@ -1705,8 +2045,14 @@ mod tests {
             sample_interval: 4,
         })
         .unwrap();
-        let mut store =
-            ContentStore::open_with_disk(dir.path(), limits(), guarded.clone()).unwrap();
+        let mut store = ContentStore::open_with_disk(
+            dir.path(),
+            limits(),
+            guarded.clone(),
+            &crate::store::test_keys(dir.path()),
+            ContentForm::Sealed,
+        )
+        .unwrap();
         let id = UploadId([7; 16]);
         assert!(matches!(
             store.begin(
@@ -1734,7 +2080,14 @@ mod tests {
         // An unguarded envelope promises the staging bytes to the upload and
         // the object copy to the seal, and charges the copy once installed.
         let open = DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap();
-        let mut store = ContentStore::open_with_disk(dir.path(), limits(), open.clone()).unwrap();
+        let mut store = ContentStore::open_with_disk(
+            dir.path(),
+            limits(),
+            open.clone(),
+            &crate::store::test_keys(dir.path()),
+            ContentForm::Sealed,
+        )
+        .unwrap();
         store
             .begin(
                 id,
@@ -1756,7 +2109,8 @@ mod tests {
     #[test]
     fn one_domain_cannot_fill_the_whole_staging_allowance() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = ContentStore::open(dir.path(), limits()).unwrap();
+        let mut store =
+            ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path())).unwrap();
         assert_eq!(limits().domain_staging_bytes(), 64);
         let noisy = ContentDomainId([1; 16]);
         let other = ContentDomainId([2; 16]);
@@ -1775,7 +2129,8 @@ mod tests {
         assert_eq!(store.staged(), (2, 128));
         drop(store);
         // The per-domain accounting is rebuilt from the recovered uploads.
-        let mut store = ContentStore::open(dir.path(), limits()).unwrap();
+        let mut store =
+            ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path())).unwrap();
         assert_eq!(store.staged_for(noisy), 64);
         for offset in (0..64).step_by(4) {
             store.append(UploadId([1; 16]), offset, &[9; 4]).unwrap();
@@ -1793,7 +2148,9 @@ mod tests {
         let checkpoint = b"exact checkpoint bytes";
         let hash;
         {
-            let mut store = ContentStore::open(dir.path(), limits()).unwrap();
+            let mut store =
+                ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path()))
+                    .unwrap();
             hash = store
                 .install_custody_record(CustodyRecordKind::Checkpoint, checkpoint)
                 .unwrap();
@@ -1812,7 +2169,8 @@ mod tests {
                 Err(ContentError::Capacity)
             ));
         }
-        let mut reopened = ContentStore::open(dir.path(), limits()).unwrap();
+        let mut reopened =
+            ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path())).unwrap();
         assert_eq!(
             reopened
                 .read_custody_record(CustodyRecordKind::Checkpoint, hash, 4096)
@@ -1838,7 +2196,8 @@ mod tests {
     #[test]
     fn custody_record_io_failure_never_returns_success_and_requires_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = ContentStore::open(dir.path(), limits()).unwrap();
+        let mut store =
+            ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path())).unwrap();
         std::fs::remove_dir(dir.path().join("custody")).unwrap();
         assert!(matches!(
             store.install_custody_record(CustodyRecordKind::Manifest, b"verified prefix"),
@@ -1849,7 +2208,8 @@ mod tests {
             Err(ContentError::Failed)
         ));
         drop(store);
-        let mut reopened = ContentStore::open(dir.path(), limits()).unwrap();
+        let mut reopened =
+            ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path())).unwrap();
         assert!(
             reopened
                 .install_custody_record(CustodyRecordKind::Manifest, b"verified prefix")
@@ -1863,7 +2223,9 @@ mod tests {
         let domain = ContentDomainId([2; 16]);
         let digest = ContentHash(*blake3::hash(b"abcdefghij").as_bytes());
         {
-            let mut s = ContentStore::open(dir.path(), limits()).unwrap();
+            let mut s =
+                ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path()))
+                    .unwrap();
             s.begin(id, domain, ContentClass::Evidence, 10, Some(digest))
                 .unwrap();
             assert_eq!(s.append(id, 0, b"abcd").unwrap(), 4);
@@ -1876,7 +2238,9 @@ mod tests {
         }
         let reference;
         {
-            let mut s = ContentStore::open(dir.path(), limits()).unwrap();
+            let mut s =
+                ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path()))
+                    .unwrap();
             assert_eq!(
                 s.begin(id, domain, ContentClass::Evidence, 10, Some(digest))
                     .unwrap(),
@@ -1890,7 +2254,8 @@ mod tests {
             s.finish(id).unwrap();
             assert_eq!(s.staged(), (0, 0));
         }
-        let s = ContentStore::open(dir.path(), limits()).unwrap();
+        let s =
+            ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path())).unwrap();
         assert_eq!(s.read_bytes(&reference, 10).unwrap(), b"abcdefghij");
         let mut wrong = reference.clone();
         wrong.domain = ContentDomainId([3; 16]);
@@ -1906,7 +2271,8 @@ mod tests {
         let mut limits = limits();
         limits.chunk_bytes = 4;
         limits.max_uploads = 2;
-        let mut store = ContentStore::open(root.path(), limits).unwrap();
+        let mut store =
+            ContentStore::open(root.path(), limits, &crate::store::test_keys(root.path())).unwrap();
         let mut references = Vec::new();
         for object in 0..3u8 {
             let id = UploadId([object; 16]);
@@ -1961,7 +2327,9 @@ mod tests {
     #[test]
     fn bounded_ranges_verify_selected_chunks_across_boundaries() {
         let root = tempfile::tempdir().unwrap();
-        let mut store = ContentStore::open(root.path(), limits()).unwrap();
+        let mut store =
+            ContentStore::open(root.path(), limits(), &crate::store::test_keys(root.path()))
+                .unwrap();
         let id = UploadId([1; 16]);
         let bytes = b"abcdefghij";
         store
@@ -1992,11 +2360,7 @@ mod tests {
             Err(ContentError::Capacity)
         ));
         let manifest = store.manifest(&reference).unwrap();
-        let path = root
-            .path()
-            .join("objects")
-            .join(hex(&reference.domain.0))
-            .join(format!("{}.chunk", manifest.chunks[1].hash));
+        let path = store.chunk_file(reference.domain, manifest.chunks[1].hash);
         fs::write(path, b"BAD!").unwrap();
         assert!(matches!(
             store.read_range(&reference, 3, 4),
@@ -2008,7 +2372,9 @@ mod tests {
     #[test]
     fn mutation_io_error_stops_writer_until_recovery() {
         let root = tempfile::tempdir().unwrap();
-        let mut store = ContentStore::open(root.path(), limits()).unwrap();
+        let mut store =
+            ContentStore::open(root.path(), limits(), &crate::store::test_keys(root.path()))
+                .unwrap();
         let old_upload = UploadId([9; 16]);
         store
             .begin(
@@ -2065,7 +2431,9 @@ mod tests {
             Err(ContentError::Failed)
         ));
         drop(store);
-        let mut recovered = ContentStore::open(root.path(), limits()).unwrap();
+        let mut recovered =
+            ContentStore::open(root.path(), limits(), &crate::store::test_keys(root.path()))
+                .unwrap();
         assert_eq!(recovered.read_bytes(&reference, 4).unwrap(), b"safe");
         recovered
             .begin(
@@ -2087,7 +2455,8 @@ mod tests {
     #[test]
     fn corruption_and_budget_limits_do_not_produce_valid_evidence() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = ContentStore::open(dir.path(), limits()).unwrap();
+        let mut s =
+            ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path())).unwrap();
         let id = UploadId([1; 16]);
         s.begin(
             id,
@@ -2105,17 +2474,10 @@ mod tests {
         let r = s.seal(id).unwrap();
         assert!(matches!(s.read_bytes(&r, 3), Err(ContentError::Capacity)));
         let hash = ContentHash(*blake3::hash(b"1234").as_bytes());
-        fs::write(
-            s.root
-                .join("objects")
-                .join(hex(&r.domain.0))
-                .join(format!("{hash}.chunk")),
-            b"oops",
-        )
-        .unwrap();
+        fs::write(s.chunk_file(r.domain, hash), b"oops").unwrap();
         assert!(matches!(s.verify(&r), Err(ContentError::Corrupt)));
         assert!(matches!(
-            ContentStore::open(dir.path(), limits()),
+            ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path())),
             Err(ContentError::Locked)
         ));
     }
@@ -2133,7 +2495,8 @@ mod tests {
         let id = UploadId([7; 16]);
         let domain = ContentDomainId([1; 16]);
         let staged = |root: &Path, limits: StoreLimits| {
-            let mut store = ContentStore::open(root, limits).unwrap();
+            let mut store =
+                ContentStore::open(root, limits, &crate::store::test_keys(root)).unwrap();
             store
                 .begin(id, domain, ContentClass::Evidence, 30, None)
                 .unwrap();
@@ -2146,18 +2509,17 @@ mod tests {
         let mut store = staged(sliced.path(), limits());
         let mut sealing = store.begin_seal(id).unwrap();
         let mut scratch = vec![0u8; 4];
-        let manifest = sliced
-            .path()
-            .join("objects")
-            .join(hex(&domain.0))
-            .join(format!("{}.manifest", whole.root));
         let mut slices = 0;
         let reference = loop {
             slices += 1;
             if let Some(reference) = store.advance_seal(&mut sealing, &mut scratch).unwrap() {
                 break reference;
             }
-            assert!(!manifest.exists(), "{slices}");
+            // Named by the domain's key, which the first slice's chunk made.
+            assert!(
+                !store.manifest_file(domain, whole.root).exists(),
+                "{slices}"
+            );
         };
         // Eight chunks — seven of four bytes and one of two — then the
         // manifest.
@@ -2183,7 +2545,8 @@ mod tests {
     #[test]
     fn a_verification_in_slices_reads_every_chunk_and_finds_a_corrupt_one() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = ContentStore::open(dir.path(), limits()).unwrap();
+        let mut store =
+            ContentStore::open(dir.path(), limits(), &crate::store::test_keys(dir.path())).unwrap();
         let id = UploadId([3; 16]);
         let domain = ContentDomainId([2; 16]);
         let bytes: Vec<u8> = (0..16u8).collect();
@@ -2207,14 +2570,7 @@ mod tests {
         assert_eq!(verification.verified(), 4);
         // The third chunk overwritten with other bytes of its length.
         let third = ContentHash(*blake3::hash(&bytes[8..12]).as_bytes());
-        fs::write(
-            dir.path()
-                .join("objects")
-                .join(hex(&domain.0))
-                .join(format!("{third}.chunk")),
-            b"wxyz",
-        )
-        .unwrap();
+        fs::write(store.chunk_file(domain, third), b"wxyz").unwrap();
         let mut verification = store.begin_verify(&reference).unwrap();
         let mut outcome = Ok(false);
         for _ in 0..5 {

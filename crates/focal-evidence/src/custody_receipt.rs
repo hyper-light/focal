@@ -239,7 +239,12 @@ mod tests {
         };
         let first = receipt(2, 5);
         {
-            let mut store = ContentStore::open(directory.path(), limits.clone()).unwrap();
+            let mut store = ContentStore::open(
+                directory.path(),
+                limits.clone(),
+                &crate::store::test_keys(directory.path()),
+            )
+            .unwrap();
             assert!(
                 store
                     .custody_receipt(first.ledger, first.root, 2)
@@ -266,7 +271,12 @@ mod tests {
                     .is_none()
             );
         }
-        let store = ContentStore::open(directory.path(), limits).unwrap();
+        let store = ContentStore::open(
+            directory.path(),
+            limits,
+            &crate::store::test_keys(directory.path()),
+        )
+        .unwrap();
         let held = store
             .custody_receipt(first.ledger, first.root, 2)
             .unwrap()

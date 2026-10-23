@@ -1302,9 +1302,15 @@ impl LocalNetworkAdmin {
         if ledger.tenant.is_zero() || ledger.session.is_zero() || output.is_empty() {
             return Err(AccessError::InvalidRequest);
         }
+        let reader = self
+            .content
+            .as_ref()
+            .ok_or(AccessError::Unavailable)?
+            .reader();
         let backup = crate::backup::create(
             fleet,
             &self.directory,
+            reader,
             ledger,
             PathBuf::from(output),
             &self.budget,

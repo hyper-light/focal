@@ -76,6 +76,7 @@ fn backup_error(error: BackupError) -> AccessError {
 pub async fn create(
     fleet: &FleetManager,
     data_dir: &Path,
+    reader: focal_evidence::ContentReader,
     ledger: LedgerId,
     output: PathBuf,
     budget: &MemoryBudget,
@@ -114,8 +115,6 @@ pub async fn create(
     // The export reads the checkpoint of a session this node hosts, which
     // its budget funds: limits sized to that budget hold it.
     let limits = crate::network_service::native_limits(domain, budget.limit(), budget.limit())
-        .map_err(|_| AccessError::Unavailable)?;
-    let reader = focal_evidence::ContentReader::open(data_dir.join("content"))
         .map_err(|_| AccessError::Unavailable)?;
     let seeds = backup::SessionSeeds {
         seeds: focal_evidence::SeedReader::open(crate::custody::seed_directory(

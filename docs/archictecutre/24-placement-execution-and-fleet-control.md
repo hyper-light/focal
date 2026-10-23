@@ -1765,7 +1765,12 @@ binary at the level applies what its session committed within the whole
 allowance whatever its share (its committed work is held to the allowance,
 `BudgetLane::Committed`), and a node takes the share its leaders admit within
 from the fence it last recorded (`storage_level::native_share`) as it does the
-seal rule.
+seal rule. A node's content store seals its object files from level 9
+(`upgrade::CONTENT_LEVEL`; 29 §12.4): a sealed file is one a binary below the
+level cannot open, so a node takes the form from the fence it last recorded
+(`storage_level::content_form`) as its store is opened at its start, keeps the
+clear layout below it, and from it seals what it installs and converts what it
+holds in the clear as it serves.
 A cluster founded by a binary holds the fence at the level
 its founder *announces* from genesis (its one node runs it; a founder
 staging a rollout at a lower level founds at that level, never at one it
