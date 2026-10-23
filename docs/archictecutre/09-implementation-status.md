@@ -16166,3 +16166,23 @@ their places, so the first claims could be posted behind where their workers rea
 now begins, and its clock with it, once every tail has taken its place (`Watch::all_positioned`,
 bounded by the tails' progress: refused once a whole `WAIT` passes with none more taking it). Tests:
 `the_run_waits_for_every_tail_to_take_its_place`, `a_stop_ends_the_wait_for_the_tails`.
+
+### 2026-10-23 — QUIC tolerates a path that reorders
+
+focal's work among 500 agents over a 40 ms path (compare/work-faults, 2026-10-22), each impairment
+added alone: a write answered at 125 ms at the median and 230 ms at the 99th percentile with delay
+alone, 193 and 553 ms with 2% loss, 204 ms and 1.6 s with ±20 ms of jitter, and 3.2 s and 33 s with 5%
+of the packets reordered. RFC 9002's fixed loss thresholds declared every late packet lost, its data
+sent again and each a congestion event. Every shared crate is now at hyper-raft c8c3cb6, whose
+hyper-quic learns the tolerance from spurious losses (packets declared lost that are acknowledged
+afterwards): its packet threshold rises to their farthest distance plus one and its time threshold to
+at least the longest one took, with RACK's window on top (RFC 9002 §6.1.1, RFC 8985 §6.2), and returns
+to the RFC's after sixteen recovery periods without one. In hyper-quic's harness BBR at 10 Mbit/s and
+100 ms carried 21.2% of the link with ±20 ms of jitter each way and 6.0% with ±40 ms, and carries
+98.4% and 96.2%, as with the same jitter kept in order. The same revision fires a probe timeout a loss
+time held back in the wake that ends it, keeps a connection ID its peer retired routing for three
+probe timeouts (Chromium's rule: on a reordering path a server's packets sent with the client's first
+ID arrived after its retirement and were answered with stateless resets), and credits its pacer the
+same bytes however often it is asked (hyper-raft `docs/transport.md` §4ac to §4af). Open in its
+STATUS: BBR's window where a share of the packets skips the path's delay, as netem's `reorder` sends
+them, its least round trip theirs. vendor/README.md; docs/dependencies/inventory.tsv.

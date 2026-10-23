@@ -532,6 +532,15 @@ impl Path {
         }
     }
 
+    /// The path letting a message overtake an earlier one on its flow: a measured path drawn
+    /// apart for each message, as netem's `reorder` sends a share of packets with no delay.
+    pub const fn overtaking(self) -> Self {
+        Self {
+            reorders: true,
+            ..self
+        }
+    }
+
     /// The path with `loss`.
     pub const fn with_loss(self, loss: Loss) -> Self {
         Self { loss, ..self }

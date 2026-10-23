@@ -242,7 +242,7 @@ impl Endpoint {
                     warn!("duplicate reset token");
                 }
             }
-            RetireConnectionId(now, seq, allow_more_cids) => {
+            RetireConnectionId(seq) => {
                 if let Some(cid) = self
                     .connections
                     .get_mut(ch.0)
@@ -250,9 +250,6 @@ impl Endpoint {
                 {
                     trace!("peer retired CID {}: {}", seq, cid);
                     self.index.retire(cid);
-                    if allow_more_cids {
-                        return Some(self.send_new_identifiers(now, ch, 1));
-                    }
                 }
             }
             NewToken { server_name, token } => {

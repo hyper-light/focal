@@ -22,6 +22,9 @@ pub(super) struct CidState {
     cid_len: usize,
     //// cid lifetime
     cid_lifetime: Option<Duration>,
+    /// Connection IDs the peer retired that still route to the connection, oldest retired first,
+    /// each with when it stops (`Connection::on_retire_connection_id`)
+    retiring: VecDeque<(u64, Instant)>,
 }
 
 impl CidState {
@@ -44,6 +47,7 @@ impl CidState {
             retire_seq: 0,
             cid_len,
             cid_lifetime,
+            retiring: VecDeque::new(),
         };
         // Track lifetime of CIDs used in handshaking
         for seq in 0..issued {
@@ -150,12 +154,14 @@ impl CidState {
 
     /// Update CidState for receipt of a `RETIRE_CONNECTION_ID` frame
     ///
-    /// Returns whether a new CID can be issued, or an error if the frame was illegal.
+    /// Returns `None` for a frame naming an ID already retired, a frame repeated (its packet sent
+    /// again, both arriving), which retires nothing and asks for no new CID; else whether a new CID
+    /// can be issued; or an error if the frame was illegal.
     pub(crate) fn on_cid_retirement(
         &mut self,
         sequence: u64,
         limit: u64,
-    ) -> Result<bool, TransportError> {
+    ) -> Result<Option<bool>, TransportError> {
         if self.cid_len == 0 {
             return Err(TransportError::PROTOCOL_VIOLATION(
                 "RETIRE_CONNECTION_ID when CIDs aren't in use",
@@ -170,13 +176,41 @@ impl CidState {
                 "RETIRE_CONNECTION_ID for unissued sequence number",
             ));
         }
-        self.active_seq.remove(&sequence);
+        if !self.active_seq.remove(&sequence) {
+            return Ok(None);
+        }
         // Consider a scenario where peer A has active remote cid 0,1,2.
         // Peer B first send a NEW_CONNECTION_ID with cid 3 and retire_prior_to set to 1.
         // Peer A processes this NEW_CONNECTION_ID frame; update remote cid to 1,2,3
         // and meanwhile send a RETIRE_CONNECTION_ID to retire cid 0 to peer B.
         // If peer B doesn't check the cid limit here and send a new cid again, peer A will then face CONNECTION_ID_LIMIT_ERROR
-        Ok(limit > self.active_seq.len() as u64)
+        Ok(Some(limit > self.active_seq.len() as u64))
+    }
+
+    /// Keeps the connection ID `sequence`, which the peer retired, routing to the connection until
+    /// `until`, at most `cap` of them; past that, returns the oldest, to stop routing now
+    pub(crate) fn retire_later(
+        &mut self,
+        sequence: u64,
+        until: Instant,
+        cap: usize,
+    ) -> Option<u64> {
+        self.retiring.push_back((sequence, until));
+        if self.retiring.len() > cap.max(1) {
+            return self.retiring.pop_front().map(|(sequence, _)| sequence);
+        }
+        None
+    }
+
+    /// A retired connection ID whose routing ends by `now`, taken
+    pub(crate) fn retired_due(&mut self, now: Instant) -> Option<u64> {
+        let at = self.retiring.iter().position(|&(_, until)| until <= now)?;
+        self.retiring.remove(at).map(|(sequence, _)| sequence)
+    }
+
+    /// When the next retired connection ID stops routing to the connection
+    pub(crate) fn next_retired(&self) -> Option<Instant> {
+        self.retiring.iter().map(|&(_, until)| until).min()
     }
 
     /// Length of local Connection IDs
@@ -221,4 +255,46 @@ struct CidTimestamp {
     sequence: u64,
     /// Timestamp when cid needs to be retired
     timestamp: Instant,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    /// A connection ID the peer retired routes until its time, the earliest first whatever the
+    /// order retired, and no more are kept than the cap: past it the oldest retired stops at once.
+    #[test]
+    fn a_retired_id_routes_until_its_time_and_no_more_are_kept_than_the_cap() {
+        let start = Instant::now();
+        let mut state = CidState::new(8, None, start, 4);
+        assert_eq!(state.retire_later(0, start + MS * 30, 2), None);
+        assert_eq!(state.retire_later(1, start + MS * 20, 2), None);
+        assert_eq!(state.next_retired(), Some(start + MS * 20));
+        assert_eq!(state.retired_due(start + MS * 19), None);
+        assert_eq!(state.retired_due(start + MS * 20), Some(1));
+        assert_eq!(state.next_retired(), Some(start + MS * 30));
+        assert_eq!(state.retire_later(2, start + MS * 40, 2), None);
+        assert_eq!(
+            state.retire_later(3, start + MS * 50, 2),
+            Some(0),
+            "past the cap the oldest retired stops routing at once"
+        );
+        assert_eq!(state.retired_due(start + MS * 50), Some(2));
+        assert_eq!(state.retired_due(start + MS * 50), Some(3));
+        assert_eq!(state.retired_due(start + MS * 50), None);
+        assert_eq!(state.next_retired(), None);
+    }
+
+    /// A RETIRE_CONNECTION_ID repeated, its packet sent again and both arriving, retires nothing and
+    /// asks for no new connection ID: a second one for the same retired ID would pass the peer's
+    /// limit, as an upstream server's CONNECTION_ID_LIMIT_ERROR showed in hyper-quic's e2e.
+    #[test]
+    fn a_repeated_retirement_retires_nothing_and_asks_for_nothing() {
+        let start = Instant::now();
+        let mut state = CidState::new(8, None, start, 2);
+        assert_eq!(state.on_cid_retirement(0, 2), Ok(Some(true)));
+        assert_eq!(state.on_cid_retirement(0, 2), Ok(None));
+    }
 }

@@ -51,6 +51,9 @@ use copies::copy_spacing;
 mod losses;
 pub(crate) use losses::{Ledger, LossFit, LossMemory};
 
+mod reordering;
+use reordering::Reordering;
+
 mod datagrams;
 use datagrams::DatagramState;
 
@@ -207,6 +210,8 @@ pub struct Connection {
     /// What the path's losses say of their bursts: the endpoint's memory of the remote when the
     /// connection began, and what the connection counted since (`losses.rs`)
     ledger: Ledger,
+    /// The loss thresholds widened by the spurious losses the path has shown (`reordering.rs`)
+    reordering: Reordering,
     /// Whether the spin bit is in use for this connection
     spin_enabled: bool,
     /// Outgoing spin bit state
@@ -379,6 +384,7 @@ impl Connection {
             resume,
             received_eliciting: None,
             ledger: Ledger::new(losses),
+            reordering: Reordering::default(),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
             spaces: Spaces::new(initial_space, PacketSpace::new(now), PacketSpace::new(now)),
@@ -1845,6 +1851,7 @@ impl Connection {
                         .push_back(EndpointEventInner::NeedIdentifiers(now, num_new_cid));
                 }
             }
+            Timer::RetiredCid => self.on_retired_cid_timeout(now),
             Timer::MaxAckDelay => {
                 trace!("max ack delay reached");
                 // This timer is only armed in the Data space
@@ -2136,11 +2143,25 @@ impl Connection {
 
         // Avoid DoS from unreasonably huge ack ranges by filtering out just the new acks.
         let mut newly_acked = ArrayRangeSet::new();
+        let next_packet = self.spaces.get(space).next_packet_number;
         for range in ack.iter() {
             self.packet_number_filter.check_ack(space, range.clone())?;
             // A packet declared lost that the peer acknowledges was reordered, not lost
             self.ledger
                 .acknowledged(space, *range.start(), *range.end());
+            // ... and widens the tolerance of reordering before this acknowledgement's losses
+            // are looked for
+            if space == SpaceId::Data && self.reordering.remembers_declared_losses() {
+                let spurious = self.reordering.on_acknowledged(
+                    (*range.start(), *range.end()),
+                    now,
+                    ack.largest,
+                    next_packet,
+                    self.config.packet_threshold,
+                );
+                self.stats.path.spurious_losses =
+                    self.stats.path.spurious_losses.saturating_add(spurious);
+            }
             for (&pn, _) in self.spaces.get(space).sent_packets.range(range) {
                 newly_acked.insert_one(pn);
             }
@@ -2458,7 +2479,18 @@ impl Connection {
             // Time threshold loss Detection
             self.detect_lost_packets(now, pn_space, false);
             self.set_loss_detection_timer(now);
-            return;
+            // A loss time holds the probe timeout back (RFC 9002 §6.2.1 arms it only once no loss
+            // time is), so the probe timeout armed now may be due already: a loss time later than
+            // it, as the reordering window makes one, ends after it. It fires in this wake, or the
+            // connection would ask to be woken again at the time it was woken.
+            let probe_due = self.loss_time_and_space().is_none()
+                && self
+                    .timers
+                    .get(Timer::LossDetection)
+                    .is_some_and(|due| due <= now);
+            if !probe_due {
+                return;
+            }
         }
 
         let (_, space) = match self.pto_time_and_space(now) {
@@ -2555,12 +2587,38 @@ impl Connection {
             return;
         };
         let rtt = self.path.rtt.conservative();
-        let loss_delay = cmp::max(
-            float::scale_duration(rtt, self.config.time_threshold),
-            TIMER_GRANULARITY,
+        // RFC 9002's time threshold, or the longest a spurious loss took, and the reordering window
+        // spurious losses have added to it (`reordering.rs`)
+        let loss_delay = self.reordering.time_threshold(
+            cmp::max(
+                float::scale_duration(rtt, self.config.time_threshold),
+                TIMER_GRANULARITY,
+            ),
+            self.path.rtt.min(),
+            self.path.rtt.get(),
         );
         let lost =
             self.find_lost_packets(now, pn_space, largest_acked_packet, loss_delay, due_to_ack);
+        if pn_space == SpaceId::Data && !lost.packets.is_empty() {
+            // A declared loss is remembered for a probe timeout, and no more of them than the
+            // packets a window holds for each round trip it spans: no more are sent within it
+            let memory = self.pto(SpaceId::Data);
+            let round_trips = memory
+                .as_nanos()
+                .div_ceil(self.path.rtt.get().as_nanos().max(1));
+            let cap = u128::from(self.window_packets()).saturating_mul(round_trips);
+            // Each is still held: they are taken once their losses are handled, below
+            let sent = &self.spaces.get(SpaceId::Data).sent_packets;
+            self.reordering.on_declared_lost(
+                lost.packets
+                    .iter()
+                    .filter_map(|&packet| sent.get(&packet).map(|info| (packet, info.time_sent))),
+                largest_acked_packet,
+                now,
+                memory,
+                usize::try_from(cap).unwrap_or(usize::MAX),
+            );
+        }
 
         if let Some(largest_lost_sent) = lost.largest_sent {
             self.on_packets_lost(now, pn_space, loss_delay, largest_lost_sent, &lost);
@@ -2597,8 +2655,10 @@ impl Connection {
             persistent_congestion: false,
         };
         let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
-        // Packet numbers are below 2^62
-        let packet_threshold = u64::from(self.config.packet_threshold);
+        // Packet numbers are below 2^62; RFC 9002's threshold, raised by spurious losses
+        let packet_threshold = self
+            .reordering
+            .packet_threshold(self.config.packet_threshold);
 
         // InPersistentCongestion: Determine if all packets in the time period before the newest
         // lost packet, including the edges, are marked lost. PTO computation must always
@@ -2730,10 +2790,22 @@ impl Connection {
                 lost.bytes,
             );
             self.resume.on_congestion(&mut *self.path.congestion);
+            self.reordering.on_congestion_event(largest_lost_sent, now);
             // Entering recovery reduces the window; a loss within a recovery period does not
             // (RFC 9002 §7.3.2), and gets no extra packet
             self.recovery_packet |= self.path.congestion.window() < window;
         }
+    }
+
+    /// The packets a congestion window holds, one at least: what a round trip sends
+    fn window_packets(&self) -> u64 {
+        let mtu = u64::from(self.path.current_mtu());
+        self.path
+            .congestion
+            .window()
+            .checked_div(mtu)
+            .unwrap_or(0)
+            .max(1)
     }
 
     fn loss_time_and_space(&self) -> Option<(Instant, SpaceId)> {
@@ -4205,16 +4277,54 @@ impl Connection {
         now: Instant,
         sequence: u64,
     ) -> Result<(), TransportError> {
-        let allow_more_cids = self
-            .local_cid_state
-            .on_cid_retirement(sequence, self.peer_params.issue_cids_limit())?;
-        self.endpoint_events
-            .push_back(EndpointEventInner::RetireConnectionId(
-                now,
-                sequence,
-                allow_more_cids,
-            ));
+        let limit = self.peer_params.issue_cids_limit();
+        // A frame repeated retires nothing and asks for nothing: a second new CID for one retired
+        // would pass the peer's limit (upstream's endpoint found the ID gone and issued none)
+        let Some(allow_more_cids) = self.local_cid_state.on_cid_retirement(sequence, limit)? else {
+            return Ok(());
+        };
+        if allow_more_cids {
+            self.endpoint_events
+                .push_back(EndpointEventInner::NeedIdentifiers(now, 1));
+        }
+        // The retired ID routes to the connection for three probe timeouts more: what the peer
+        // sent with it before its RETIRE_CONNECTION_ID may arrive after it on a path that reorders,
+        // and unrouted it was dropped and answered with a stateless reset. Chromium keeps a retired
+        // ID so (`QuicSelfIssuedConnectionIdManager`, `3 * pto_delay`), as RFC 9001 §6.5 keeps old
+        // read keys for packets still in flight. No more are kept than the connection issues; the
+        // oldest stops routing past that.
+        match now.checked_add(self.pto(SpaceId::Data).saturating_mul(3)) {
+            Some(until) => {
+                let cap = usize::try_from(limit).unwrap_or(usize::MAX);
+                if let Some(oldest) = self.local_cid_state.retire_later(sequence, until, cap) {
+                    self.endpoint_events
+                        .push_back(EndpointEventInner::RetireConnectionId(oldest));
+                }
+                self.reset_retired_cid_timer();
+            }
+            None => self
+                .endpoint_events
+                .push_back(EndpointEventInner::RetireConnectionId(sequence)),
+        }
         Ok(())
+    }
+
+    /// Stops routing the retired connection IDs whose time has come
+    fn on_retired_cid_timeout(&mut self, now: Instant) {
+        // Bounded by the IDs kept routing, at most what the connection issues
+        while let Some(sequence) = self.local_cid_state.retired_due(now) {
+            self.endpoint_events
+                .push_back(EndpointEventInner::RetireConnectionId(sequence));
+        }
+        self.reset_retired_cid_timer();
+    }
+
+    /// Arms the timer for the next retired connection ID to stop routing, or stops it
+    fn reset_retired_cid_timer(&mut self) {
+        match self.local_cid_state.next_retired() {
+            Some(at) => self.timers.set(Timer::RetiredCid, at),
+            None => self.timers.stop(Timer::RetiredCid),
+        }
     }
 
     fn on_new_connection_id(
@@ -5155,7 +5265,12 @@ impl Connection {
     pub(crate) fn is_idle(&self) -> bool {
         Timer::VALUES
             .iter()
-            .filter(|&&t| !matches!(t, Timer::KeepAlive | Timer::PushNewCid | Timer::KeyDiscard))
+            .filter(|&&t| {
+                !matches!(
+                    t,
+                    Timer::KeepAlive | Timer::PushNewCid | Timer::KeyDiscard | Timer::RetiredCid
+                )
+            })
             .filter_map(|&t| Some((t, self.timers.get(t)?)))
             .min_by_key(|&(_, time)| time)
             .is_none_or(|(timer, _)| timer == Timer::Idle)

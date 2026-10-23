@@ -2552,6 +2552,98 @@ fn cid_retirement() {
     );
 }
 
+/// The client sends a PING, held back for `hold`, and a second PING delivered at once: the first
+/// arrives after the second's acknowledgement, as on a path that reorders
+fn hold_one_ping(pair: &mut Pair, client_ch: ConnectionHandle, hold: Duration) {
+    pair.client_conn_mut(client_ch).ping();
+    pair.client.drive(pair.time, pair.server.addr);
+    pair.client.delay_outbound();
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    let until = pair.time + hold;
+    // Each turn advances to the next wakeup, the hold's end at most
+    for _ in 0..10_000 {
+        if pair.time >= until {
+            break;
+        }
+        pair.drive_client();
+        pair.drive_server();
+        let next = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup());
+        pair.time = next.map_or(until, |next| next.clamp(pair.time, until));
+    }
+    pair.client.finish_delay();
+    pair.drive();
+    // Idle connections leave what has arrived unread: the acknowledgement of the held packet
+    pair.drive_client();
+}
+
+/// A packet as late as a spurious loss showed is not declared lost again (patch Q30): the time
+/// threshold covers the longest a spurious loss took. A PING held 50 ms behind the next is declared
+/// lost by RFC 9002's time threshold, which rests on round trips of the acknowledgement delay at
+/// most, and acknowledged afterwards; a second held 40 ms then arrives with no declaration.
+#[test]
+fn a_packet_as_late_as_a_spurious_loss_is_not_declared_lost_again() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect();
+    pair.drive();
+    hold_one_ping(&mut pair, client_ch, Duration::from_millis(50));
+    let path = pair.client_conn_mut(client_ch).stats().path;
+    assert_eq!((path.lost_packets, path.spurious_losses), (1, 1));
+    hold_one_ping(&mut pair, client_ch, Duration::from_millis(40));
+    let path = pair.client_conn_mut(client_ch).stats().path;
+    assert_eq!(
+        (path.lost_packets, path.spurious_losses),
+        (1, 1),
+        "the second, less late than the first, is not declared lost"
+    );
+}
+
+/// A connection ID the peer retired routes to its connection for three probe timeouts more (patch
+/// Q29): a packet the peer sent with it before its RETIRE_CONNECTION_ID, arriving after it, reaches the
+/// connection, where the endpoint had unrouted the ID, dropped the packet and answered it with a
+/// stateless reset; once the three probe timeouts pass, the ID routes no more.
+#[test]
+fn a_retired_cid_routes_for_three_probe_timeouts() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    // A client packet with the server's current connection ID, held back
+    pair.client_conn_mut(client_ch).ping();
+    pair.client.drive(pair.time, pair.server.addr);
+    pair.client.delay_outbound();
+    // The server asks the client to retire the IDs before 1: the client moves to another and
+    // retires the old, and the server takes its RETIRE_CONNECTION_ID before the held packet
+    let now = pair.time;
+    pair.server_conn_mut(server_ch).rotate_local_cid(1, now);
+    pair.drive();
+    assert_eq!(pair.client_conn_mut(client_ch).active_rem_cid_seq(), 1);
+    let pings = pair.server_conn_mut(server_ch).stats().frame_rx.ping;
+    let routed = pair.server.endpoint.known_cids();
+    pair.client.finish_delay();
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server_ch).stats().frame_rx.ping,
+        pings + 1,
+        "the held packet reached its connection"
+    );
+    assert!(!pair.server_conn_mut(server_ch).is_closed());
+    // Its three probe timeouts pass: the ID routes no more
+    let retired_at = pair.time;
+    for _ in 0..16 {
+        if pair.server.endpoint.known_cids() < routed {
+            break;
+        }
+        let Some(next) = pair.server.next_wakeup() else {
+            break;
+        };
+        pair.time = pair.time.max(next);
+        pair.server.drive(pair.time, pair.client.addr);
+    }
+    assert_eq!(pair.server.endpoint.known_cids(), routed - 1);
+    assert!(pair.time > retired_at);
+}
+
 #[test]
 fn finish_stream_flow_control_reordered() {
     let _guard = subscribe();

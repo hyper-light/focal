@@ -58,9 +58,9 @@ pub(crate) enum EndpointEventInner {
     ResetToken(SocketAddr, ResetToken),
     /// The connection needs connection identifiers
     NeedIdentifiers(Instant, u64),
-    /// Stop routing connection ID for this sequence number to the connection
-    /// When `bool == true`, a new connection ID will be issued to peer
-    RetireConnectionId(Instant, u64, bool),
+    /// Stop routing the connection ID of this sequence number to the connection: one the peer
+    /// retired, three probe timeouts after it did (a replacement is asked for by `NeedIdentifiers`)
+    RetireConnectionId(u64),
     /// The server sent an address validation token (NEW_TOKEN) for later connections to it
     NewToken { server_name: String, token: Bytes },
     /// What the connection leaves its endpoint's Careful Resume memory for its remote (RFC 9959

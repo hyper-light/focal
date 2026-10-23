@@ -107,46 +107,74 @@ impl Pacer {
             return None;
         }
 
-        let time_elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
-            warn!("received a timestamp early than a previous recorded time, ignoring");
-            Default::default()
-        });
-
         if smoothed_rtt.as_nanos() == 0 {
             return None;
         }
-
-        let elapsed_rtts = time_elapsed.as_secs_f64() / smoothed_rtt.as_secs_f64();
-        let new_tokens = f64::from(window) * 1.25 * elapsed_rtts;
-        self.tokens = self
-            .tokens
-            .saturating_add(crate::float::saturating_u64(new_tokens))
-            .min(self.capacity);
-
-        self.prev = now;
+        // Five quarters of the window a smoothed round trip: 5·window bytes in 4·srtt nanoseconds
+        let rate = (
+            u128::from(window).saturating_mul(5),
+            smoothed_rtt.as_nanos().saturating_mul(4),
+        );
+        self.refill(rate, now);
 
         // if we can already send a packet, there is no need for delay
         if self.tokens >= bytes_to_send {
             return None;
         }
+        self.wait(rate, bytes_to_send)
+    }
 
-        // `tokens` is below `bytes_to_send` here; a deficit past u32::MAX saturates, as does the
-        // product.
+    /// Refills the bucket at `bytes / nanos` for the time since it last did: the whole bytes that
+    /// time bought, its clock moved on by just the time they took, so what a fraction of a byte
+    /// took waits for the next refill rather than being lost. However often the pacer is asked, it
+    /// credits the same bytes: upstream credited each call its truncated share and moved its clock
+    /// to the call, so a connection asked again and again while it waited, as a busy endpoint's
+    /// are and as any wake of its own asks it, lost up to a byte each time, a share of the rate
+    /// that grows with how often it is asked. A bucket that fills keeps nothing past its capacity,
+    /// as before.
+    fn refill(&mut self, (bytes, nanos): (u128, u128), now: Instant) {
+        let elapsed = now
+            .checked_duration_since(self.prev)
+            .unwrap_or_else(|| {
+                warn!("received a timestamp early than a previous recorded time, ignoring");
+                Duration::ZERO
+            })
+            .as_nanos();
+        let credit = bytes
+            .saturating_mul(elapsed)
+            .checked_div(nanos)
+            .unwrap_or(0);
+        let room = self.capacity.saturating_sub(self.tokens);
+        let Some(credit) = u64::try_from(credit).ok().filter(|&credit| credit < room) else {
+            // Full: the time past what filled it adds nothing
+            self.tokens = self.tokens.max(self.capacity);
+            self.prev = self.prev.max(now);
+            return;
+        };
+        self.tokens = self.tokens.saturating_add(credit);
+        // Rounded up, the time the whole bytes took is within the time elapsed
+        let took = u128::from(credit)
+            .saturating_mul(nanos)
+            .div_ceil(bytes.max(1));
+        let took = Duration::from_nanos(u64::try_from(took).unwrap_or(u64::MAX));
+        self.prev = self
+            .prev
+            .checked_add(took)
+            .map_or(now, |prev| prev.min(now));
+    }
+
+    /// When the bucket, refilling at `bytes / nanos`, holds `bytes_to_send` or its capacity,
+    /// whichever is more: the time that deficit takes from its clock, rounded up, so it is never
+    /// due before a whole byte more has been bought; a time past what `Instant` represents does not
+    /// pace (upstream's addition overflowed)
+    fn wait(&self, (bytes, nanos): (u128, u128), bytes_to_send: u64) -> Option<Instant> {
         let deficit = bytes_to_send.max(self.capacity).saturating_sub(self.tokens);
-        let unscaled_delay = smoothed_rtt
-            .checked_mul(u32::try_from(deficit).unwrap_or(u32::MAX))
-            .unwrap_or(Duration::MAX)
-            .checked_div(window)
-            .unwrap_or(Duration::MAX);
-
-        // divisions come before multiplications to prevent overflow
-        // this is the time at which the pacing window becomes empty; a time past what `Instant`
-        // represents does not pace (upstream's addition overflowed)
-        let delay = unscaled_delay
-            .checked_div(5)
-            .and_then(|fifth| fifth.checked_mul(4))
-            .unwrap_or(Duration::MAX);
-        self.prev.checked_add(delay)
+        let wait = u128::from(deficit)
+            .saturating_mul(nanos)
+            .div_ceil(bytes.max(1));
+        self.prev.checked_add(Duration::from_nanos(
+            u64::try_from(wait).unwrap_or(u64::MAX),
+        ))
     }
 
     /// `delay` at a rate the controller states, bytes a second: the bucket holds what the rate
@@ -170,27 +198,12 @@ impl Pacer {
         if self.tokens >= bytes_to_send || rate == 0 {
             return None;
         }
-        let elapsed = now.checked_duration_since(self.prev).unwrap_or_else(|| {
-            warn!("received a timestamp early than a previous recorded time, ignoring");
-            Default::default()
-        });
-        // A u64 rate times a u64 nanosecond count fits a u128; the quotient saturates into a u64.
-        let new_tokens = u128::from(rate)
-            .saturating_mul(elapsed.as_nanos())
-            .checked_div(NANOS_PER_SECOND)
-            .map_or(u64::MAX, |tokens| u64::try_from(tokens).unwrap_or(u64::MAX));
-        self.tokens = self.tokens.saturating_add(new_tokens).min(self.capacity);
-        self.prev = now;
+        let rate = (u128::from(rate), NANOS_PER_SECOND);
+        self.refill(rate, now);
         if self.tokens >= bytes_to_send {
             return None;
         }
-        let deficit = bytes_to_send.max(self.capacity).saturating_sub(self.tokens);
-        let wait = u128::from(deficit)
-            .saturating_mul(NANOS_PER_SECOND)
-            .checked_div(u128::from(rate))
-            .map_or(u64::MAX, |nanos| u64::try_from(nanos).unwrap_or(u64::MAX));
-        // A time past what `Instant` represents does not pace, as the window's rule.
-        self.prev.checked_add(Duration::from_nanos(wait))
+        self.wait(rate, bytes_to_send)
     }
 }
 
@@ -364,6 +377,59 @@ mod tests {
         assert_eq!(full.tokens, 80_000);
         assert_eq!(full.delay(rtt, None, 8_954, 8_954, 2_000_000, now), None);
         assert_eq!(full.tokens, 80_000);
+    }
+
+    /// However often the pacer is asked, it credits the same bytes. 10 Mbit/s and 100 ms, its
+    /// window's rule refilling 1.5625 bytes a microsecond and a stated rate 1.25: asked every
+    /// microsecond for a millisecond or once at its end, the bucket holds the same. Upstream
+    /// credited each call its truncated share, one byte a microsecond: 1,000 bytes where 1,562 and
+    /// 1,250 were bought.
+    #[test]
+    fn the_credit_is_the_same_however_often_the_pacer_is_asked() {
+        let rtt = Duration::from_millis(100);
+        let (window, mtu) = (125_000u64, 1_200u16);
+        let start = Instant::now();
+        for (rate, bought) in [(None, 1_562), (Some(1_250_000), 1_250)] {
+            let mut once = Pacer::new(rtt, window, mtu, start);
+            let mut often = Pacer::new(rtt, window, mtu, start);
+            // Asked first to settle a stated rate's capacity, then emptied
+            once.delay(rtt, rate, u64::MAX, mtu, window, start);
+            often.delay(rtt, rate, u64::MAX, mtu, window, start);
+            (once.tokens, often.tokens) = (0, 0);
+            for micros in 1..=1_000 {
+                let now = start + Duration::from_micros(micros);
+                often.delay(rtt, rate, u64::MAX, mtu, window, now);
+            }
+            once.delay(
+                rtt,
+                rate,
+                u64::MAX,
+                mtu,
+                window,
+                start + Duration::from_millis(1),
+            );
+            assert_eq!((often.tokens, once.tokens), (bought, bought), "{rate:?}");
+        }
+    }
+
+    /// A send the bucket cannot cover waits until a later time, never one already due, though its
+    /// clock keeps the time a fraction of a byte took: what it waits for is a whole byte more.
+    #[test]
+    fn a_wait_is_never_due_when_asked() {
+        let rtt = Duration::from_millis(100);
+        let (window, mtu) = (125_000u64, 1_200u16);
+        let start = Instant::now();
+        for rate in [None, Some(1_250_000)] {
+            let mut pacer = Pacer::new(rtt, window, mtu, start);
+            pacer.delay(rtt, rate, u64::MAX, mtu, window, start);
+            pacer.tokens = 0;
+            for nanos in (1..=2_000_000u64).step_by(997) {
+                let now = start + Duration::from_nanos(nanos);
+                if let Some(due) = pacer.delay(rtt, rate, u64::from(mtu), mtu, window, now) {
+                    assert!(due > now, "{rate:?} at {nanos} ns: due {due:?}");
+                }
+            }
+        }
     }
 
     #[test]
