@@ -16289,7 +16289,16 @@ A leader now refuses a read only while it drains its start, as a follower does, 
 read on a new leader waits the moment out with it. Test:
 `a_new_leader_holds_a_read_until_it_has_committed_in_its_term` (focal-control: leader 1 hands over
 to node 2, delivered only to its election; its read, refused `NotReady` before, is held and
-answered once its term's entry commits).
+answered once its term's entry commits). The refusal dates from focal's first commit, when its core
+was raft-rs, which drops a read-index request from a leader that has committed nothing in its term:
+refused, a read was not lost. focal's own core (since stage D) defers it and answers it once the
+term's entry commits. The directory bootstrap's barrier read is such a read: a root leading a term it
+has committed nothing in now holds it, a preparation asked while it waits is refused for capacity,
+and its request's time ends it `Unavailable`, which the bootstrap's rounds retry as they retried
+`NotReady` (test
+`elected_root_without_current_term_commit_holds_the_directory_barrier_and_answers_retryably`, which
+stated the refusal before; CI 39978994830 failed it on all three platforms).
+
 ### 2026-10-23 — An availability refusal is resent for the client's whole clock
 
 In the work runs with a content copy isolated for 20 s (above), the artifact submissions refused

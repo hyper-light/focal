@@ -2,8 +2,14 @@ use super::*;
 use crate::{config::Settings, network_bootstrap::FoundingNetwork};
 use focal_consensus::{MessageType, NodeConfig};
 
+/// A root that leads a term it has committed nothing in holds the directory's barrier read, as Raft's
+/// read index waits for a leader's first commit in its term (Ongaro's thesis §6.4), where it refused
+/// it `NotReady` (a raft-rs leader dropped such a read; focal's core defers it): this leader can
+/// commit nothing, so a preparation asked while the barrier waits is refused for capacity, one at
+/// a time, and the barrier is answered `Unavailable` at its request's time, which the bootstrap's
+/// rounds retry as they retried `NotReady`; the host serves on.
 #[test]
-fn elected_root_without_current_term_commit_returns_retryable_directory_readiness() {
+fn elected_root_without_current_term_commit_holds_the_directory_barrier_and_answers_retryably() {
     focal_rt::block_on(async move {
         let directory = tempfile::tempdir().unwrap();
         let mut settings = Settings::default();
@@ -67,6 +73,7 @@ fn elected_root_without_current_term_commit_returns_retryable_directory_readines
         let budget = MemoryBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
         let mut config = ControlHostConfig::new(network.state.genesis.root_namespace);
         config.tick = Duration::from_secs(1);
+        config.request_timeout = Duration::from_secs(2);
         let (host, owner, _outgoing) = ControlHost::spawn(
             replica,
             crate::cluster::NoDirectoryAuthority,
@@ -74,15 +81,27 @@ fn elected_root_without_current_term_commit_returns_retryable_directory_readines
             budget,
         )
         .unwrap();
-        assert!(matches!(
-            host.prepare_directory(plan).await,
-            Err(DirectoryBootstrapError::NotReady)
-        ));
+        let (held, behind) =
+            hyper_rt::combine::join2(host.prepare_directory(plan), host.prepare_directory(plan))
+                .await;
+        assert!(
+            matches!(held, Err(DirectoryBootstrapError::Unavailable)),
+            "{:?}",
+            held.as_ref().err()
+        );
+        assert!(
+            matches!(behind, Err(DirectoryBootstrapError::Capacity)),
+            "{:?}",
+            behind.as_ref().err()
+        );
         assert!(!host.progress().stopped);
-        assert!(matches!(
-            host.prepare_directory(plan).await,
-            Err(DirectoryBootstrapError::NotReady)
-        ));
+        let again = host.prepare_directory(plan).await;
+        assert!(
+            matches!(again, Err(DirectoryBootstrapError::Unavailable)),
+            "{:?}",
+            again.as_ref().err()
+        );
+        assert!(!host.progress().stopped);
         host.stop().await.unwrap();
         owner.join().unwrap();
     })
