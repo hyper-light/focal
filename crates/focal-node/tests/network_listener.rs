@@ -644,6 +644,28 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
                 None => *pressure = Some(more),
             }
         };
+        // The listener's receive ring at its least before the lane is filled. What the ring grew
+        // by is the endpoint's own, charged to this lane as it grew, and given back as quiet
+        // drains shrink it (hyper-raft docs/transport.md §4aa): given back after a fill, it funded
+        // what the full lane was to refuse, a dial or a participant's body (Linux CI on
+        // compare/work-wait 35a2e5c0; 7 of 40 runs on a loaded Linux host, each with the ring
+        // shrunk between the fill and the refused request). Once the lane is full, the ring cannot
+        // grow again: a growth is reserved first. The node's requests, funded from the
+        // completion reserve, are the drains that shrink it: a ring of `n` buffers shrinks to the
+        // most any of `n` drains wanted, each request one drain at least, so each pass of `n`
+        // requests that leaves it grown has shrunk it by one buffer at least.
+        let grown = listener.admission().await;
+        for _ in 0..grown.ring_buffers.saturating_mul(grown.ring_buffers.max(1)) {
+            if listener.admission().await.ring_charged == 0 {
+                break;
+            }
+            assert!(matches!(
+                remote.request(&discovery()).await.unwrap().result,
+                Response::Control { .. }
+            ));
+        }
+        let quiet = listener.admission().await;
+        assert_eq!(quiet.ring_charged, 0, "the ring at its least: {quiet:?}");
         let mut pressure = None;
         fill(&mut pressure);
         // The ordinary lane is full: no connection is admitted (a dial of its
@@ -688,8 +710,18 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
         )
         .await
         .unwrap();
+        // Nothing has grown the ring since the lane was first filled: a growth is reserved first,
+        // and the full lane refuses it.
+        let quiet = listener.admission().await;
+        assert_eq!(quiet.ring_charged, 0, "the ring at its least: {quiet:?}");
         fill(&mut pressure);
-        assert!(actor.request(&discovery()).await.is_err());
+        let refused = actor.request(&discovery()).await;
+        assert!(
+            refused.is_err(),
+            "a participant's body at a full lane: {:?}; listener {:?}",
+            refused.map(|reply| reply.result),
+            listener.admission().await
+        );
         assert!(matches!(
             remote.request(&discovery()).await.unwrap().result,
             Response::Control { .. }
