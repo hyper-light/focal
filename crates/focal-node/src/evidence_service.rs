@@ -594,6 +594,24 @@ impl CopyHealth<'_> {
             .and_then(|liveness| liveness.status_of(peer))
             .is_some_and(|status| status != crate::liveness::MemberStatus::Alive)
     }
+    /// Refuses a job that replicates, before its own work, where the view holds one of its other
+    /// required copies down: that copy would not be asked and would fail the replication, so the
+    /// job's seal would be work for nothing, paid again on each resend through an outage (a copy
+    /// isolated for 20 s brought 13,399 such refusals, each after its job had verified and stored
+    /// its payload; compare/work-faults on 7e99c823). The copies not asked are counted.
+    fn all_up(&self, node: u64, placement: &EvidencePlacement) -> Result<(), AccessError> {
+        let down = placement
+            .copies
+            .iter()
+            .filter(|peer| **peer != node && self.held_down(**peer))
+            .count();
+        if down == 0 {
+            return Ok(());
+        }
+        self.not_asked
+            .fetch_add(u64::try_from(down).unwrap_or(u64::MAX), Ordering::Relaxed);
+        Err(AccessError::Unavailable)
+    }
 }
 /// What the evidence coordinator's door has held: requests held at all, and those whose request
 /// time ran out while held; and the jobs its driver runs at once, as it has learned them.
@@ -1913,6 +1931,7 @@ async fn archive(
     placement: &EvidencePlacement,
     bytes: Vec<u8>,
 ) -> Result<ArchiveOutcome, AccessError> {
+    health.all_up(node, placement)?;
     let scope = placement.scope;
     let (chunk_bytes, _) = content.import_chunking();
     let domain = ContentDomainId(scope.ledger.tenant.0);
@@ -2041,6 +2060,7 @@ async fn attest_native(
     {
         return Err(AccessError::Unauthorized);
     }
+    health.all_up(node, placement)?;
     let evidence = content
         .verify_native(crate::content_host::NativeVerification {
             scope: placement.scope,
@@ -2068,6 +2088,7 @@ async fn seal(
     placement: &EvidencePlacement,
     request: &VerifiedRequest,
 ) -> Result<ContentRef, AccessError> {
+    health.all_up(node, placement)?;
     let reference = content
         .seal_upload(placement.scope, request.clone())
         .await?;
@@ -2147,6 +2168,7 @@ async fn attest(
             if reference.length > u64::try_from(maximum).map_err(|_| AccessError::Capacity)? {
                 return Err(AccessError::Capacity);
             }
+            health.all_up(node, placement)?;
             ensure_local(content, pool, node, placement, custody_id, reference).await?;
             replicate(
                 content, pool, health, node, placement, custody_id, reference,
