@@ -16421,6 +16421,21 @@ floor once its jobs take more than twice its least on average (BBR's gain of two
 unloaded measurement of a kind's time would lift (Envoy's adaptive concurrency re-measures its least
 at a pinned low concurrency and compares like percentiles).
 
+Measured, focal's work among 500 agents at 20 claims a second (compare.yml, before 267d0e42 and
+after 9e68a154, one run each; the window and the door's counts are the leader's at the run's end;
+the pre-change gauge read the least a job took as 41, 64 and 71 µs):
+
+| Path | Refused | Write p99 / p99.9 | Claim settled p50 / p99 | Held / timed out at the door | Window |
+|---|---|---|---|---|---|
+| 80 ms ± 30 ms, before | 0 | 590 / 671 ms | 4.60 / 5.13 s | 94 / 0 | 10 |
+| 80 ms ± 30 ms, after | 0 | 565 / 638 ms | 4.76 / 5.23 s | 0 / 0 | 14 |
+| 80 ms, 3% loss, before | 54 | 16.7 / 20.7 s | 17.1 / 35.8 s | 4,230 / 936 | 12 |
+| 80 ms, 3% loss, after | 0 | 4.07 / 5.08 s | 10.5 / 14.1 s | 1,073 / 0 | 40 |
+
+A copy holder killed for 30 s ended as before (88 refused `Unavailable` and 14 unknown after, 109
+and 11 before; committed p99 23.2 s and 23.4 s): its artifacts wait for the copy it holds (26 §1),
+which no window shortens, and the backlog drained at about a hundred jobs a second on both.
+
 ### 2026-10-23 — An operator's command beside a node finds its directory's keys and makes none
 
 `ClusterAdmin::open`, which every admin command opens (`focal diagnose node --metrics` among them),
